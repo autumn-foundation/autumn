@@ -1672,8 +1672,12 @@ The command emits three files at the project root:
 > The production Dockerfile adds cargo-chef dependency caching (so rebuilds only
 > recompile what changed), installs `libpq`, `tini`, and `ca-certificates` in the
 > slim runtime, copies compiled Tailwind assets from `static/`, leaves
-> migrations to an explicit primary-role job, and wires the `/health` endpoint as the container
-> `HEALTHCHECK`.
+> migrations to an explicit primary-role job, and wires the `/startup` probe
+> as the container `HEALTHCHECK`. `/startup` fails until startup is complete,
+> so `docker compose up --wait` waits for a started app. After that it does
+> not fail on a dependency. Plain Docker and Compose only mark a failed
+> container `unhealthy`, but Docker Swarm replaces it, so the check does not
+> use `/ready`.
 
 ---
 
@@ -2479,12 +2483,13 @@ APP_URL="$(terraform output -raw app_url)"   # known only after the FIRST apply 
 # merges it — RuntimeEnvironmentSecrets must be re-supplied here alongside
 # the real image, or the cutover silently drops
 # AUTUMN_DATABASE__PRIMARY_URL/AUTUMN_SECURITY__SIGNING_SECRET and the real
-# app can't boot. HealthCheckConfiguration restores the real "/health" path
-# — main.tf's bootstrap revision used "/" (nginx's own default response)
-# since the bootstrap placeholder doesn't serve /health.
+# app can't boot. HealthCheckConfiguration sets the real "/ready" path —
+# main.tf's bootstrap revision used "/" (nginx's own default response)
+# since the bootstrap placeholder doesn't serve /ready. /ready goes to 503
+# when a drain starts. /health is only an alias of /ready.
 OPERATION_ID=$(aws apprunner update-service --service-arn "$SERVICE_ARN" \
   --instance-configuration "{\"InstanceRoleArn\": \"$INSTANCE_ROLE\"}" \
-  --health-check-configuration "{\"Protocol\": \"HTTP\", \"Path\": \"/health\"}" \
+  --health-check-configuration "{\"Protocol\": \"HTTP\", \"Path\": \"/ready\"}" \
   --source-configuration "{
   \"ImageRepository\": {
     \"ImageIdentifier\": \"$ECR:$TAG\",

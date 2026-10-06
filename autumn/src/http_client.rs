@@ -2005,10 +2005,9 @@ impl RequestBuilder {
         let breaker = breaker_for_url(self.resilience_config.as_ref(), &self.url);
 
         // Check if circuit breaker is open
-        if breaker.before_call().is_err() {
+        let Ok(guard) = breaker.admit() else {
             return Err(ClientError::CircuitBreakerOpen);
-        }
-        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
+        };
 
         let is_half_open = breaker.state() == crate::circuit_breaker::CircuitState::HalfOpen;
         let res = self.send_inner(is_half_open).await;
@@ -2029,7 +2028,7 @@ impl RequestBuilder {
     }
 
     /// The custom send path (`send_custom`), with breaker accounting exactly
-    /// like the plain-path breaker block above: `before_call` gate,
+    /// like the plain-path breaker block above: `admit` gate,
     /// `CircuitBreakerGuard` covering the call (its `Drop` releases a
     /// half-open slot if this future is cancelled or panics before finishing),
     /// `< 500` success threshold. Only reached when `breaker_scoped()` was
@@ -2037,10 +2036,10 @@ impl RequestBuilder {
     /// an external wrapper around `send()`.
     async fn send_custom_breaker_guarded(self) -> Result<Response, ClientError> {
         let breaker = breaker_for_url(self.resilience_config.as_ref(), &self.url);
-        if breaker.before_call().is_err() {
+        let Ok(guard) = breaker.admit() else {
             return Err(ClientError::CircuitBreakerOpen);
-        }
-        // Read before the breaker moves into the guard below. Mirrors the
+        };
+        // Mirrors the
         // plain-path breaker block's own `is_half_open` (passed to
         // `send_inner` to force a single attempt): a half-open probe is a
         // budgeted, limited trial (`half_open_trial_count`), and letting
@@ -2049,7 +2048,6 @@ impl RequestBuilder {
         // instead of testing recovery with independent probes (#2480
         // review, round 10).
         let is_half_open = breaker.state() == crate::circuit_breaker::CircuitState::HalfOpen;
-        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker);
         let res = self.send_custom(is_half_open).await;
         match &res {
             Ok(resp) if resp.status().as_u16() < 500 => guard.success(),

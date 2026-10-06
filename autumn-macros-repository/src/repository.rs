@@ -3321,6 +3321,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { ::core::result::Result::Ok(::core::option::Option::None) }
     };
 
+    let m2m_soft_delete = config.soft_delete;
     let m2m_conn_source_impl = quote! {
         impl ::autumn_web::repository::M2mConnSource for #pg_name {
             type Model = #model_name;
@@ -3356,6 +3357,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 &self,
             ) -> ::autumn_web::AutumnResult<::core::option::Option<::std::string::String>> {
                 #m2m_tenant_scope_body
+            }
+
+            // `#[commentable]` parent check: this repository's own rule (#2284).
+            fn __autumn_m2m_soft_delete(&self) -> ::core::option::Option<bool> {
+                ::core::option::Option::Some(#m2m_soft_delete)
             }
         }
     };
@@ -21652,6 +21658,28 @@ mod tests {
             generated.contains("__autumn_m2m_write_conn"),
             "expected the M2mConnSource method to be generated"
         );
+    }
+
+    /// #2284: each repository tells the `#[commentable]` helpers its own
+    /// soft-delete fact.
+    #[test]
+    fn repository_macro_reports_its_own_soft_delete_fact() {
+        let fact = |args| {
+            let generated =
+                repository_macro(args, quote! { pub trait PostRepository {} }).to_string();
+            let start = generated
+                .find("fn __autumn_m2m_soft_delete")
+                .unwrap_or_else(|| panic!("expected the soft-delete fact: {generated}"));
+            let body = &generated[start..];
+            let end = body.find('}').expect("method body");
+            body[..end].to_owned()
+        };
+
+        let soft = fact(quote! { Post, table = "posts", soft_delete });
+        assert!(soft.contains("Some (true)"), "{soft}");
+
+        let plain = fact(quote! { Post, table = "posts" });
+        assert!(plain.contains("Some (false)"), "{plain}");
     }
 
     #[test]

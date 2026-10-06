@@ -537,3 +537,48 @@ fn response_headers_refuse_a_framing_header() {
         http::HeaderValue::from_static("0"),
     )]);
 }
+
+#[test]
+fn the_response_header_check_refuses_framing_session_and_hop_headers() {
+    use autumn_edge::gateway::check_response_header;
+    use http::HeaderName;
+
+    for allowed in [
+        "x-frame-options",
+        "content-security-policy",
+        "cache-control",
+    ] {
+        assert!(check_response_header(&HeaderName::from_static(allowed)).is_ok());
+    }
+    for refused in [
+        "content-length",
+        "set-cookie",
+        "x-autumn-edge-fallthrough",
+        "connection",
+        "transfer-encoding",
+    ] {
+        let err = check_response_header(&HeaderName::from_static(refused)).expect_err("refused");
+        assert!(err.contains(refused), "{err}");
+    }
+}
+
+#[test]
+fn an_upgrade_request_skips_the_capsule() {
+    let seen = Seen::default();
+    let gateway = EdgeGateway::new(serving_guest(), origin(&seen));
+
+    let request = Request::get("/greet")
+        .header("connection", "keep-alive, Upgrade")
+        .header("upgrade", "websocket")
+        .body(Body::empty())
+        .unwrap();
+    let response = block_on(gateway.handle(request));
+
+    assert_eq!(lane(&response), Lane::OriginOnly);
+    assert_eq!(body_text(response), "origin");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the origin gets the handshake"
+    );
+}

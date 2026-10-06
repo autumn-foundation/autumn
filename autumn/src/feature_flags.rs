@@ -19,8 +19,8 @@
 //! svc.enable("dark_mode", None).unwrap();
 //! assert!(svc.is_enabled("dark_mode", Some("user:1")));
 //!
-//! // 3. Disable it — all replicas pick up the change within seconds when
-//! //    backed by the Postgres store with LISTEN/NOTIFY.
+//! // 3. Disable it. With the Postgres store, all replicas see the change on
+//! //    their next refresh (about one poll interval).
 //! svc.disable("dark_mode", None).unwrap();
 //! assert!(!svc.is_enabled("dark_mode", Some("user:1")));
 //! ```
@@ -56,7 +56,8 @@
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -220,6 +221,19 @@ pub trait FlagStore: Send + Sync + 'static {
     ///
     /// Returns a [`FlagStoreError`] on backend failure.
     fn history(&self, key: &str, limit: usize) -> Result<Vec<FlagChangeRecord>, FlagStoreError>;
+
+    /// Load the store before the first read. This can block.
+    ///
+    /// [`AppBuilder::with_flag_store`](crate::app::AppBuilder::with_flag_store)
+    /// calls it once, on its own thread, when the app installs the store. The
+    /// default does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FlagStoreError`] on backend failure.
+    fn preload(&self) -> Result<(), FlagStoreError> {
+        Ok(())
+    }
 }
 
 // Blanket delegation so `Box<dyn FlagStore>` can be passed to `with_flag_store`.
@@ -253,19 +267,22 @@ impl FlagStore for Box<dyn FlagStore> {
     fn history(&self, key: &str, limit: usize) -> Result<Vec<FlagChangeRecord>, FlagStoreError> {
         (**self).history(key, limit)
     }
+    fn preload(&self) -> Result<(), FlagStoreError> {
+        (**self).preload()
+    }
 }
 
 /// `Arc<T>` delegates every method to the inner `T`.
 ///
 /// This allows sharing the **same** store instance — and therefore the same
-/// cache — between `with_flag_store` and `PgFlagStore::spawn_poll_listener`:
+/// snapshot — between `with_flag_store` and `PgFlagStore::spawn_poll_listener`:
 ///
 /// ```rust,ignore
 /// use std::sync::Arc;
 /// use autumn_web::feature_flags::pg::PgFlagStore;
 ///
 /// let store = Arc::new(PgFlagStore::new(&db_url));
-/// // Listener and app service share the same Arc → same cache.
+/// // Listener and app service share the same Arc → same snapshot.
 /// PgFlagStore::spawn_poll_listener(Arc::clone(&store), Duration::from_secs(1));
 /// app.with_flag_store(Arc::clone(&store)).run().await;
 /// ```
@@ -298,6 +315,9 @@ impl<T: FlagStore + ?Sized> FlagStore for Arc<T> {
     }
     fn history(&self, key: &str, limit: usize) -> Result<Vec<FlagChangeRecord>, FlagStoreError> {
         (**self).history(key, limit)
+    }
+    fn preload(&self) -> Result<(), FlagStoreError> {
+        (**self).preload()
     }
 }
 
@@ -435,69 +455,371 @@ impl FlagStore for InMemoryFlagStore {
 
 // ── Postgres FlagStore ───────────────────────────────────────────────────────
 
-/// Postgres-backed flag storage with LISTEN/NOTIFY cache invalidation.
+/// Postgres-backed flag storage.
 ///
 /// Uses the framework-owned `autumn_feature_flags` and `feature_flag_changes`
-/// tables managed by the `create_feature_flags` migration. On any write the
-/// store sends a `NOTIFY autumn_flags` notification so all replicas running
-/// the background LISTEN task pick up the change within seconds.
+/// tables managed by the `create_feature_flags` migration. Reads come from an
+/// in-memory snapshot of all flags. A refresh loads the snapshot off the
+/// request path. Replicas see a remote write on their next refresh. Each write
+/// also sends `NOTIFY autumn_flags`; Autumn does not `LISTEN` for it.
 #[cfg(feature = "db")]
 pub mod pg {
     use super::{FlagChangeRecord, FlagConfig, FlagStore, FlagStoreError};
+    use diesel::connection::SimpleConnection;
     use diesel::prelude::*;
     use std::collections::HashMap;
-    use std::sync::RwLock;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError, RwLock};
     use std::time::{Duration, Instant};
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum CacheLookup {
-        Hit(Option<FlagConfig>),
-        Miss,
+    /// Columns that `FlagRow` reads.
+    const FLAG_COLUMNS: &str =
+        "key, description, enabled, rollout_pct, actor_allowlist, group_allowlist";
+
+    /// Connect timeout that the store adds when the URL sets none.
+    const CONNECT_TIMEOUT_SECS: u64 = 5;
+
+    /// Statement timeout on each store connection.
+    const STATEMENT_TIMEOUT_MS: u64 = 5_000;
+
+    /// Longest wait between refresh attempts while refreshes fail.
+    const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+    /// Add `connect_timeout` to `url` when it sets none, so that a refresh
+    /// cannot hang on a connect.
+    fn with_connect_timeout(url: &str) -> String {
+        if has_connect_timeout(url) {
+            url.to_owned()
+        } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            let separator = if url.contains('?') { '&' } else { '?' };
+            format!("{url}{separator}connect_timeout={CONNECT_TIMEOUT_SECS}")
+        } else {
+            // A `key=value` connection string.
+            format!("{url} connect_timeout={CONNECT_TIMEOUT_SECS}")
+        }
     }
 
-    #[derive(Debug, Clone)]
-    struct CachedFlag {
-        value: Option<FlagConfig>,
-        expires_at: Instant,
+    /// `true` when `url` sets the `connect_timeout` parameter.
+    fn has_connect_timeout(url: &str) -> bool {
+        if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            // Only a query parameter counts, not text in the user or path.
+            let query = url.split_once('?').map_or("", |(_, query)| query);
+            let query = query.split_once('#').map_or(query, |(query, _)| query);
+            return query
+                .split('&')
+                .any(|pair| pair.split('=').next() == Some("connect_timeout"));
+        }
+        conninfo_keys(url)
+            .iter()
+            .any(|key| key == "connect_timeout")
     }
 
-    /// Postgres-backed [`FlagStore`] with a short-lived read-through cache.
+    /// The keys of a libpq `key=value` connection string. A value can be in
+    /// single quotes, and `\` escapes the next character.
+    fn conninfo_keys(conninfo: &str) -> Vec<String> {
+        let mut keys = Vec::new();
+        let mut chars = conninfo.chars().peekable();
+        loop {
+            while chars.next_if(|c| c.is_whitespace()).is_some() {}
+            let mut key = String::new();
+            while let Some(c) = chars.next_if(|c| *c != '=' && !c.is_whitespace()) {
+                key.push(c);
+            }
+            if key.is_empty() {
+                return keys;
+            }
+            while chars.next_if(|c| c.is_whitespace()).is_some() {}
+            if chars.next_if_eq(&'=').is_none() {
+                // Not a valid pair: libpq refuses the string.
+                return keys;
+            }
+            keys.push(key);
+            while chars.next_if(|c| c.is_whitespace()).is_some() {}
+            // Skip the value.
+            if chars.next_if_eq(&'\'').is_some() {
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => {
+                            chars.next();
+                        }
+                        '\'' => break,
+                        _ => {}
+                    }
+                }
+            } else {
+                while let Some(c) = chars.next_if(|c| !c.is_whitespace()) {
+                    if c == '\\' {
+                        chars.next();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Wait before the next refresh attempt after `failures` failed attempts
+    /// in a row: `base`, doubled for each failure, up to `MAX_RETRY_DELAY`.
+    fn retry_delay(base: Duration, failures: u32) -> Duration {
+        if failures == 0 {
+            return base;
+        }
+        base.saturating_mul(2_u32.saturating_pow(failures.min(16)))
+            .min(base.max(MAX_RETRY_DELAY))
+    }
+
+    /// All flags, as the last refresh and local writes left them.
+    #[derive(Debug, Default)]
+    struct Snapshot {
+        flags: HashMap<String, FlagConfig>,
+        /// `true` after the first full load.
+        loaded: bool,
+        /// Start of the last refresh attempt, good or bad.
+        checked_at: Option<Instant>,
+    }
+
+    /// State that a background refresh shares with the store.
+    struct Shared {
+        database_url: String,
+        /// `database_url` with a connect timeout.
+        connect_url: String,
+        cache_ttl: Duration,
+        snapshot: RwLock<Snapshot>,
+        /// Increments on each local write. A refresh that started before a
+        /// write does not replace the snapshot.
+        generation: AtomicU64,
+        /// `true` while a background refresh runs. Only one runs at a time.
+        refreshing: AtomicBool,
+        /// The refresh connection, kept between refreshes. Loads hold this
+        /// lock, so they run and install in order.
+        refresh_conn: Mutex<Option<diesel::PgConnection>>,
+        /// Held across a write and its snapshot update, so local writes
+        /// reach the snapshot in commit order.
+        write_lock: Mutex<()>,
+        refresh_errors: AtomicU64,
+        /// Failed refreshes in a row. Zero after a good refresh.
+        failures: AtomicU32,
+        #[cfg(test)]
+        connect_threads: Mutex<Vec<std::thread::ThreadId>>,
+    }
+
+    impl std::fmt::Debug for Shared {
+        /// Leaves out the URL: it can hold a password.
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("PgFlagStore")
+                .field("cache_ttl", &self.cache_ttl)
+                .field("refresh_errors", &self.refresh_errors)
+                .finish_non_exhaustive()
+        }
+    }
+
+    /// Holds the single refresh slot. Drop releases it, also when a spawned
+    /// refresh never runs.
+    struct RefreshSlot(Arc<Shared>);
+
+    impl Drop for RefreshSlot {
+        fn drop(&mut self) {
+            self.0.refreshing.store(false, Ordering::Release);
+        }
+    }
+
+    impl Shared {
+        fn connect(&self) -> Result<diesel::PgConnection, FlagStoreError> {
+            #[cfg(test)]
+            self.connect_threads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(std::thread::current().id());
+            let mut conn = diesel::PgConnection::establish(&self.connect_url)
+                .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
+            conn.batch_execute(&format!("SET statement_timeout = {STATEMENT_TIMEOUT_MS}"))
+                .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
+            Ok(conn)
+        }
+
+        /// `true` when the last refresh attempt is older than the TTL, or
+        /// older than the retry delay while refreshes fail.
+        fn is_stale(&self) -> bool {
+            let wait = retry_delay(self.cache_ttl, self.failures.load(Ordering::Relaxed));
+            let snapshot = self.snapshot.read().unwrap_or_else(PoisonError::into_inner);
+            snapshot.checked_at.is_none_or(|checked| {
+                checked
+                    .checked_add(wait)
+                    .is_some_and(|due| crate::time::system_instant() >= due)
+            })
+        }
+
+        fn read(&self, key: &str) -> Result<Option<FlagConfig>, FlagStoreError> {
+            let snapshot = self.snapshot.read().unwrap_or_else(PoisonError::into_inner);
+            match snapshot.flags.get(key) {
+                Some(flag) => Ok(Some(flag.clone())),
+                None if snapshot.loaded => Ok(None),
+                None => Err(FlagStoreError::Backend(
+                    "flag snapshot not loaded yet; call PgFlagStore::refresh at startup".to_owned(),
+                )),
+            }
+        }
+
+        /// Take the refresh slot, or `None` when a refresh already runs.
+        fn begin_refresh(self: &Arc<Self>) -> Option<RefreshSlot> {
+            self.refreshing
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .ok()
+                .map(|_| RefreshSlot(Arc::clone(self)))
+        }
+
+        /// Load all flags on this thread and install them. This blocks.
+        fn reload(&self) -> Result<(), FlagStoreError> {
+            self.load().map(drop)
+        }
+
+        /// Load all flags on this thread, install them, and return them.
+        /// This blocks.
+        fn load(&self) -> Result<Vec<FlagConfig>, FlagStoreError> {
+            let mut conn = self
+                .refresh_conn
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let started = self.generation.load(Ordering::Acquire);
+            self.snapshot
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .checked_at = Some(crate::time::system_instant());
+            let loaded = conn
+                .take()
+                .map_or_else(|| self.connect(), Ok)
+                .and_then(|mut open| {
+                    let flags = load_all(&mut open)?;
+                    // Keep the connection only after a good load.
+                    *conn = Some(open);
+                    Ok(flags)
+                });
+            if let Ok(flags) = &loaded {
+                // Install before the lock drops, so loads install in order.
+                self.install(flags.clone(), started);
+            }
+            drop(conn);
+            match loaded {
+                Ok(flags) => {
+                    if self.failures.swap(0, Ordering::AcqRel) > 0 {
+                        tracing::info!("feature flag refresh recovered");
+                    }
+                    Ok(flags)
+                }
+                Err(error) => {
+                    self.refresh_errors.fetch_add(1, Ordering::Relaxed);
+                    if self.failures.fetch_add(1, Ordering::AcqRel) == 0 {
+                        tracing::warn!(
+                            %error,
+                            "feature flag refresh failed; serving the last-known snapshot"
+                        );
+                    } else {
+                        tracing::debug!(%error, "feature flag refresh failed again");
+                    }
+                    Err(error)
+                }
+            }
+        }
+
+        /// Replace the snapshot with `flags`, unless a local write came after
+        /// generation `started`. Return `true` when it replaced the snapshot.
+        fn install(&self, flags: Vec<FlagConfig>, started: u64) -> bool {
+            let mut snapshot = self
+                .snapshot
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            if self.generation.load(Ordering::Acquire) != started {
+                // The loaded data can be older than the write. Refresh again soon.
+                snapshot.checked_at = None;
+                return false;
+            }
+            snapshot.flags = flags.into_iter().map(|f| (f.key.clone(), f)).collect();
+            snapshot.loaded = true;
+            true
+        }
+
+        /// Put a flag that this process wrote into the snapshot.
+        ///
+        /// Two writes to one key can apply out of order, so this also marks
+        /// the snapshot stale: the next read starts a refresh.
+        fn apply_local(&self, flag: FlagConfig) {
+            let mut snapshot = self
+                .snapshot
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            snapshot.flags.insert(flag.key.clone(), flag);
+            snapshot.checked_at = None;
+        }
+    }
+
+    fn load_all(conn: &mut diesel::PgConnection) -> Result<Vec<FlagConfig>, FlagStoreError> {
+        diesel::sql_query(format!(
+            "SELECT {FLAG_COLUMNS} FROM autumn_feature_flags ORDER BY key"
+        ))
+        .load::<FlagRow>(conn)
+        .map(|rows| rows.into_iter().map(FlagRow::into_config).collect())
+        .map_err(|e| FlagStoreError::Backend(e.to_string()))
+    }
+
+    /// Postgres-backed [`FlagStore`] that serves reads from memory.
     ///
-    /// On each write the store sends `NOTIFY autumn_flags` so replicas
-    /// subscribed via a background LISTEN task can invalidate their caches
-    /// within seconds — achieving the sub-5-second kill-switch SLA without
-    /// requiring Redis.
+    /// `get` reads an in-memory snapshot of all flags. It does not connect on
+    /// the calling thread when a Tokio runtime is present. When the snapshot is
+    /// older than the cache TTL, `get` starts one refresh on the blocking pool
+    /// and returns the current value at once. With no runtime, `get` refreshes
+    /// on the calling thread.
+    ///
+    /// When a refresh fails, the store keeps the last-known snapshot, logs a
+    /// warning and counts the error ([`refresh_errors`](Self::refresh_errors)).
+    /// Before the first load, `get` returns an error.
+    ///
+    /// Load the snapshot at startup: [`AppBuilder::with_flag_store`] calls
+    /// [`FlagStore::preload`], and [`spawn_poll_listener`](Self::spawn_poll_listener)
+    /// loads at once and then on each interval.
+    ///
+    /// [`AppBuilder::with_flag_store`]: crate::app::AppBuilder::with_flag_store
     #[derive(Debug)]
     pub struct PgFlagStore {
-        database_url: String,
-        cache_ttl: Duration,
-        cache: RwLock<HashMap<String, CachedFlag>>,
+        shared: Arc<Shared>,
     }
 
     impl Clone for PgFlagStore {
+        /// Make a new store with the same URL and TTL and an empty snapshot.
         fn clone(&self) -> Self {
-            Self::with_cache_ttl(self.database_url.clone(), self.cache_ttl)
+            Self::with_cache_ttl(self.shared.database_url.clone(), self.shared.cache_ttl)
         }
     }
 
     impl PgFlagStore {
-        /// Default read-through cache lifetime.
+        /// Default snapshot lifetime before `get` starts a refresh.
         pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(1);
 
-        /// Create a store using the default 1 s read-through cache.
+        /// Create a store with the default 1 s snapshot TTL.
         #[must_use]
         pub fn new(database_url: impl Into<String>) -> Self {
             Self::with_cache_ttl(database_url, Self::DEFAULT_CACHE_TTL)
         }
 
-        /// Create a store with an explicit cache TTL. Use `Duration::ZERO` to
-        /// disable caching.
+        /// Create a store with an explicit snapshot TTL. With `Duration::ZERO`,
+        /// each `get` starts a refresh.
         #[must_use]
         pub fn with_cache_ttl(database_url: impl Into<String>, cache_ttl: Duration) -> Self {
+            let database_url = database_url.into();
             Self {
-                database_url: database_url.into(),
-                cache_ttl,
-                cache: RwLock::new(HashMap::new()),
+                shared: Arc::new(Shared {
+                    connect_url: with_connect_timeout(&database_url),
+                    database_url,
+                    cache_ttl,
+                    snapshot: RwLock::new(Snapshot::default()),
+                    generation: AtomicU64::new(0),
+                    refreshing: AtomicBool::new(false),
+                    refresh_conn: Mutex::new(None),
+                    write_lock: Mutex::new(()),
+                    refresh_errors: AtomicU64::new(0),
+                    failures: AtomicU32::new(0),
+                    #[cfg(test)]
+                    connect_threads: Mutex::new(Vec::new()),
+                }),
             }
         }
 
@@ -514,39 +836,21 @@ pub mod pg {
             config.effective_primary_postgres_url().map(Self::new)
         }
 
-        fn connect(&self) -> Result<diesel::PgConnection, FlagStoreError> {
-            diesel::PgConnection::establish(&self.database_url)
-                .map_err(|e| FlagStoreError::Backend(e.to_string()))
+        /// Load all flags into the snapshot now. This blocks: call it at
+        /// startup or from `spawn_blocking`.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`FlagStoreError::Backend`] when the load fails. The last-known
+        /// snapshot stays in use.
+        pub fn refresh(&self) -> Result<(), FlagStoreError> {
+            self.shared.reload()
         }
 
-        fn cached(&self, key: &str) -> CacheLookup {
-            let now = crate::time::ambient_instant();
-            let Ok(cache) = self.cache.read() else {
-                return CacheLookup::Miss;
-            };
-            match cache.get(key) {
-                Some(c) if c.expires_at > now => CacheLookup::Hit(c.value.clone()),
-                _ => CacheLookup::Miss,
-            }
-        }
-
-        fn store_cache(&self, key: &str, value: Option<FlagConfig>) {
-            if self.cache_ttl.is_zero() {
-                return;
-            }
-            let Some(expires_at) = crate::time::ambient_instant().checked_add(self.cache_ttl)
-            else {
-                return;
-            };
-            if let Ok(mut cache) = self.cache.write() {
-                cache.insert(key.to_owned(), CachedFlag { value, expires_at });
-            }
-        }
-
-        fn invalidate(&self, key: &str) {
-            if let Ok(mut cache) = self.cache.write() {
-                cache.remove(key);
-            }
+        /// Number of failed refreshes since the store was made.
+        #[must_use]
+        pub fn refresh_errors(&self) -> u64 {
+            self.shared.refresh_errors.load(Ordering::Relaxed)
         }
 
         fn upsert_flag(
@@ -569,86 +873,122 @@ pub mod pg {
             Ok(())
         }
 
-        /// Spawn a background thread that polls `feature_flag_changes` and
-        /// invalidates this store's cache whenever a remote replica writes a flag.
+        /// Run one flag mutation in a transaction, record it in the change log,
+        /// and put the new row into the snapshot.
         ///
-        /// Without this, the cache can only be invalidated when the TTL expires.
-        /// Call this once at startup when using `PgFlagStore` in a multi-replica
-        /// deployment:
+        /// `update` must end with `RETURNING {FLAG_COLUMNS}`.
+        fn write(
+            &self,
+            key: &str,
+            mutation: &str,
+            actor: Option<&str>,
+            update: impl FnOnce(&mut diesel::PgConnection) -> QueryResult<FlagRow>,
+        ) -> Result<(), FlagStoreError> {
+            let _ordered = self
+                .shared
+                .write_lock
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let mut conn = self.shared.connect()?;
+            let row = conn
+                .transaction::<FlagRow, diesel::result::Error, _>(|conn| {
+                    Self::upsert_flag(conn, key)?;
+                    let row = update(conn)?;
+                    diesel::sql_query(
+                        "INSERT INTO feature_flag_changes (key, mutation, actor) \
+                         VALUES ($1, $2, $3)",
+                    )
+                    .bind::<diesel::sql_types::Text, _>(key)
+                    .bind::<diesel::sql_types::Text, _>(mutation)
+                    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                        actor.map(str::to_owned),
+                    )
+                    .execute(conn)?;
+                    Self::notify(conn, key)?;
+                    Ok(row)
+                })
+                .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
+            self.shared.apply_local(row.into_config());
+            Ok(())
+        }
+
+        /// Spawn a thread that refreshes the snapshot at once and then on each
+        /// `poll_interval`.
+        ///
+        /// Replicas see remote writes on the next refresh. Call this once at
+        /// startup and share the `Arc` with the app:
         ///
         /// ```rust,ignore
         /// let store = Arc::new(PgFlagStore::new(db_url));
         /// PgFlagStore::spawn_poll_listener(Arc::clone(&store), Duration::from_secs(1));
         /// ```
         ///
-        /// The thread runs indefinitely; the returned handle can be detached.
+        /// The thread stops after all clones of the `Arc` drop.
+        #[allow(
+            clippy::must_use_candidate,
+            reason = "the thread runs detached; callers drop the handle"
+        )]
         pub fn spawn_poll_listener(
-            store: std::sync::Arc<Self>,
-            poll_interval: std::time::Duration,
+            store: Arc<Self>,
+            poll_interval: Duration,
         ) -> std::thread::JoinHandle<()> {
+            let shared = Arc::downgrade(&store.shared);
+            drop(store);
             std::thread::spawn(move || {
-                // Timestamp-based cursor with a small lookback overlap.
-                //
-                // A sequence-ID cursor (WHERE id > last_id) is unsafe because
-                // PostgreSQL sequences allocate IDs before the transaction
-                // commits: transaction T1 (id=10) can commit after T2 (id=11),
-                // so advancing last_id to 11 would permanently miss id=10.
-                //
-                // A timestamp cursor avoids that by including a 5-second
-                // lookback on every poll (OVERLAP_SECS).  Any transaction that
-                // takes longer than 5 seconds to commit will still be missed,
-                // but such long-running writes are far outside the norm.
-                // Invalidating the same key twice is always safe (idempotent).
-                const OVERLAP_SECS: i64 = 5;
-                // Postgres stamps `changed_at` with its own real clock, so the
-                // cursor reads the real clock too.
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "cursor is compared with Postgres changed_at, a real clock"
-                )]
-                let now_secs = || {
-                    i64::try_from(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                    )
-                    .unwrap_or(i64::MAX)
-                };
-                // Start the cursor in the past so we don't replay the entire
-                // historical log: only changes that arrive after the listener
-                // starts need processing (the in-process cache starts empty and
-                // repopulates lazily on first access).
-                let mut last_polled_secs: i64 = now_secs() - OVERLAP_SECS;
-
-                loop {
-                    std::thread::sleep(poll_interval);
-                    // Advance the horizon before the query so concurrent writes
-                    // during the query are captured in the next poll cycle.
-                    let new_horizon = now_secs() - OVERLAP_SECS;
-                    if let Ok(mut conn) = store.connect() {
-                        let rows: Vec<ChangeKeyRow> = diesel::sql_query(
-                            "SELECT DISTINCT key FROM feature_flag_changes \
-                             WHERE changed_at > to_timestamp($1)",
-                        )
-                        .bind::<diesel::sql_types::BigInt, _>(last_polled_secs)
-                        .load::<ChangeKeyRow>(&mut conn)
-                        .unwrap_or_default();
-
-                        for row in rows {
-                            store.invalidate(&row.key);
+                while let Some(shared) = shared.upgrade() {
+                    if let Some(slot) = shared.begin_refresh() {
+                        // `reload` logs and counts its errors. A panic must
+                        // not stop the polls.
+                        let reload = std::panic::AssertUnwindSafe(|| slot.0.reload());
+                        if std::panic::catch_unwind(reload).is_err() {
+                            tracing::warn!("feature flag refresh panicked");
                         }
                     }
-                    last_polled_secs = new_horizon;
+                    let wait = retry_delay(poll_interval, shared.failures.load(Ordering::Relaxed));
+                    drop(shared);
+                    std::thread::sleep(wait);
                 }
             })
         }
-    }
 
-    #[derive(diesel::QueryableByName)]
-    struct ChangeKeyRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        key: String,
+        #[cfg(test)]
+        fn install_for_test(&self, flags: Vec<FlagConfig>) {
+            assert!(self.install(flags, self.write_generation()));
+            self.shared
+                .snapshot
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .checked_at = Some(crate::time::system_instant());
+        }
+
+        #[cfg(test)]
+        fn connect_threads_for_test(&self) -> Vec<std::thread::ThreadId> {
+            self.shared
+                .connect_threads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        #[cfg(test)]
+        fn refreshing_for_test(&self) -> bool {
+            self.shared.refreshing.load(Ordering::Acquire)
+        }
+
+        #[cfg(test)]
+        fn write_generation(&self) -> u64 {
+            self.shared.generation.load(Ordering::Acquire)
+        }
+
+        #[cfg(test)]
+        fn apply_local(&self, flag: FlagConfig) {
+            self.shared.apply_local(flag);
+        }
+
+        #[cfg(test)]
+        fn install(&self, flags: Vec<FlagConfig>, generation: u64) -> bool {
+            self.shared.install(flags, generation)
+        }
     }
 
     #[derive(diesel::QueryableByName)]
@@ -698,90 +1038,55 @@ pub mod pg {
 
     impl FlagStore for PgFlagStore {
         fn get(&self, key: &str) -> Result<Option<FlagConfig>, FlagStoreError> {
-            if let CacheLookup::Hit(v) = self.cached(key) {
-                return Ok(v);
+            if self.shared.is_stale()
+                && let Some(slot) = self.shared.begin_refresh()
+            {
+                match tokio::runtime::Handle::try_current() {
+                    // On a runtime: refresh on the blocking pool, never here.
+                    Ok(_) => {
+                        drop(crate::time::spawn_blocking(move || {
+                            // `reload` logs and counts its errors.
+                            let _ = slot.0.reload();
+                        }));
+                    }
+                    // No runtime: this thread can block.
+                    Err(_) => {
+                        let _ = slot.0.reload();
+                    }
+                }
             }
-            let mut conn = self.connect()?;
-            let result = diesel::sql_query(
-                "SELECT key, description, enabled, rollout_pct, \
-                        actor_allowlist, group_allowlist \
-                 FROM autumn_feature_flags WHERE key = $1",
-            )
-            .bind::<diesel::sql_types::Text, _>(key)
-            .get_result::<FlagRow>(&mut conn)
-            .optional()
-            .map(|r| r.map(FlagRow::into_config))
-            .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
-
-            self.store_cache(key, result.clone());
-            Ok(result)
+            self.shared.read(key)
         }
 
         fn list(&self) -> Result<Vec<FlagConfig>, FlagStoreError> {
-            let mut conn = self.connect()?;
-            diesel::sql_query(
-                "SELECT key, description, enabled, rollout_pct, \
-                        actor_allowlist, group_allowlist \
-                 FROM autumn_feature_flags ORDER BY key",
-            )
-            .load::<FlagRow>(&mut conn)
-            .map(|rows| rows.into_iter().map(FlagRow::into_config).collect())
-            .map_err(|e| FlagStoreError::Backend(e.to_string()))
+            self.shared.load()
+        }
+
+        fn preload(&self) -> Result<(), FlagStoreError> {
+            self.refresh()
         }
 
         fn enable(&self, key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
-            let mut conn = self.connect()?;
-            conn.transaction::<(), diesel::result::Error, _>(|conn| {
-                Self::upsert_flag(conn, key)?;
-                diesel::sql_query(
+            self.write(key, "enabled", actor, |conn| {
+                diesel::sql_query(format!(
                     "UPDATE autumn_feature_flags \
                      SET enabled = true, rollout_pct = 100, updated_at = NOW() \
-                     WHERE key = $1",
-                )
+                     WHERE key = $1 RETURNING {FLAG_COLUMNS}"
+                ))
                 .bind::<diesel::sql_types::Text, _>(key)
-                .execute(conn)?;
-                diesel::sql_query(
-                    "INSERT INTO feature_flag_changes (key, mutation, actor) VALUES ($1, $2, $3)",
-                )
-                .bind::<diesel::sql_types::Text, _>(key)
-                .bind::<diesel::sql_types::Text, _>("enabled")
-                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
-                    actor.map(str::to_owned),
-                )
-                .execute(conn)?;
-                Self::notify(conn, key)?;
-                Ok(())
+                .get_result(conn)
             })
-            .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
-            self.invalidate(key);
-            Ok(())
         }
 
         fn disable(&self, key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
-            let mut conn = self.connect()?;
-            conn.transaction::<(), diesel::result::Error, _>(|conn| {
-                Self::upsert_flag(conn, key)?;
-                diesel::sql_query(
+            self.write(key, "disabled", actor, |conn| {
+                diesel::sql_query(format!(
                     "UPDATE autumn_feature_flags SET enabled = false, updated_at = NOW() \
-                     WHERE key = $1",
-                )
+                     WHERE key = $1 RETURNING {FLAG_COLUMNS}"
+                ))
                 .bind::<diesel::sql_types::Text, _>(key)
-                .execute(conn)?;
-                diesel::sql_query(
-                    "INSERT INTO feature_flag_changes (key, mutation, actor) VALUES ($1, $2, $3)",
-                )
-                .bind::<diesel::sql_types::Text, _>(key)
-                .bind::<diesel::sql_types::Text, _>("disabled")
-                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
-                    actor.map(str::to_owned),
-                )
-                .execute(conn)?;
-                Self::notify(conn, key)?;
-                Ok(())
+                .get_result(conn)
             })
-            .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
-            self.invalidate(key);
-            Ok(())
         }
 
         fn set_rollout(
@@ -791,33 +1096,16 @@ pub mod pg {
             actor: Option<&str>,
         ) -> Result<(), FlagStoreError> {
             let pct = i16::from(pct.min(100));
-            let mut conn = self.connect()?;
-            conn.transaction::<(), diesel::result::Error, _>(|conn| {
-                Self::upsert_flag(conn, key)?;
-                diesel::sql_query(
+            self.write(key, &format!("rollout={pct}"), actor, |conn| {
+                diesel::sql_query(format!(
                     "UPDATE autumn_feature_flags \
                      SET enabled = true, rollout_pct = $2, updated_at = NOW() \
-                     WHERE key = $1",
-                )
+                     WHERE key = $1 RETURNING {FLAG_COLUMNS}"
+                ))
                 .bind::<diesel::sql_types::Text, _>(key)
                 .bind::<diesel::sql_types::SmallInt, _>(pct)
-                .execute(conn)?;
-                let mutation = format!("rollout={pct}");
-                diesel::sql_query(
-                    "INSERT INTO feature_flag_changes (key, mutation, actor) VALUES ($1, $2, $3)",
-                )
-                .bind::<diesel::sql_types::Text, _>(key)
-                .bind::<diesel::sql_types::Text, _>(&mutation)
-                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
-                    actor.map(str::to_owned),
-                )
-                .execute(conn)?;
-                Self::notify(conn, key)?;
-                Ok(())
+                .get_result(conn)
             })
-            .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
-            self.invalidate(key);
-            Ok(())
         }
 
         fn allow_actor(
@@ -826,10 +1114,8 @@ pub mod pg {
             actor_id: &str,
             actor: Option<&str>,
         ) -> Result<(), FlagStoreError> {
-            let mut conn = self.connect()?;
-            conn.transaction::<(), diesel::result::Error, _>(|conn| {
-                Self::upsert_flag(conn, key)?;
-                diesel::sql_query(
+            self.write(key, &format!("allowed_actor={actor_id}"), actor, |conn| {
+                diesel::sql_query(format!(
                     // Re-enabling from kill-switch via allowlist resets rollout_pct to 0
                     // so only listed actors gain access, not the previous global cohort.
                     "UPDATE autumn_feature_flags \
@@ -843,27 +1129,12 @@ pub mod pg {
                              ) t \
                          )::text, \
                          updated_at = NOW() \
-                     WHERE key = $1",
-                )
+                     WHERE key = $1 RETURNING {FLAG_COLUMNS}"
+                ))
                 .bind::<diesel::sql_types::Text, _>(key)
                 .bind::<diesel::sql_types::Text, _>(actor_id)
-                .execute(conn)?;
-                let mutation = format!("allowed_actor={actor_id}");
-                diesel::sql_query(
-                    "INSERT INTO feature_flag_changes (key, mutation, actor) VALUES ($1, $2, $3)",
-                )
-                .bind::<diesel::sql_types::Text, _>(key)
-                .bind::<diesel::sql_types::Text, _>(&mutation)
-                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
-                    actor.map(str::to_owned),
-                )
-                .execute(conn)?;
-                Self::notify(conn, key)?;
-                Ok(())
+                .get_result(conn)
             })
-            .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
-            self.invalidate(key);
-            Ok(())
         }
 
         fn add_group(
@@ -872,10 +1143,8 @@ pub mod pg {
             group: &str,
             actor: Option<&str>,
         ) -> Result<(), FlagStoreError> {
-            let mut conn = self.connect()?;
-            conn.transaction::<(), diesel::result::Error, _>(|conn| {
-                Self::upsert_flag(conn, key)?;
-                diesel::sql_query(
+            self.write(key, &format!("added_group={group}"), actor, |conn| {
+                diesel::sql_query(format!(
                     // Re-enabling from kill-switch via group allowlist resets rollout_pct.
                     "UPDATE autumn_feature_flags \
                      SET enabled = true, \
@@ -888,27 +1157,12 @@ pub mod pg {
                              ) t \
                          )::text, \
                          updated_at = NOW() \
-                     WHERE key = $1",
-                )
+                     WHERE key = $1 RETURNING {FLAG_COLUMNS}"
+                ))
                 .bind::<diesel::sql_types::Text, _>(key)
                 .bind::<diesel::sql_types::Text, _>(group)
-                .execute(conn)?;
-                let mutation = format!("added_group={group}");
-                diesel::sql_query(
-                    "INSERT INTO feature_flag_changes (key, mutation, actor) VALUES ($1, $2, $3)",
-                )
-                .bind::<diesel::sql_types::Text, _>(key)
-                .bind::<diesel::sql_types::Text, _>(&mutation)
-                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
-                    actor.map(str::to_owned),
-                )
-                .execute(conn)?;
-                Self::notify(conn, key)?;
-                Ok(())
+                .get_result(conn)
             })
-            .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
-            self.invalidate(key);
-            Ok(())
         }
 
         fn history(
@@ -917,7 +1171,7 @@ pub mod pg {
             limit: usize,
         ) -> Result<Vec<FlagChangeRecord>, FlagStoreError> {
             let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-            let mut conn = self.connect()?;
+            let mut conn = self.shared.connect()?;
             diesel::sql_query(
                 "SELECT key, mutation, actor, \
                         EXTRACT(EPOCH FROM changed_at)::bigint AS timestamp_secs \
@@ -946,77 +1200,229 @@ pub mod pg {
     mod pg_tests {
         use super::*;
 
+        /// Nothing listens on port 1, so a connect fails at once.
+        const DEAD_URL: &str = "postgres://autumn@127.0.0.1:1/autumn?connect_timeout=2";
+
+        fn enabled(key: &str) -> FlagConfig {
+            let mut flag = FlagConfig::new(key);
+            flag.enabled = true;
+            flag.rollout_pct = 100;
+            flag
+        }
+
+        fn current_thread_runtime() -> tokio::runtime::Runtime {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        }
+
+        /// Wait (on the runtime) until no background refresh runs.
+        async fn settle(store: &PgFlagStore) {
+            for _ in 0..1000 {
+                if !store.refreshing_for_test() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("background refresh did not finish");
+        }
+
+        #[test]
+        fn pg_get_serves_snapshot_when_refresh_fails() {
+            let store = PgFlagStore::with_cache_ttl(DEAD_URL, Duration::ZERO);
+            store.install_for_test(vec![enabled("beta")]);
+
+            // No runtime here, so `get` refreshes on this thread. It fails.
+            assert_eq!(store.get("beta").unwrap(), Some(enabled("beta")));
+            assert_eq!(store.get("absent").unwrap(), None);
+            assert_eq!(store.refresh_errors(), 2);
+        }
+
+        #[test]
+        fn pg_get_within_ttl_does_not_connect() {
+            let store = PgFlagStore::with_cache_ttl(DEAD_URL, Duration::from_secs(60));
+            store.install_for_test(vec![enabled("beta")]);
+            assert_eq!(store.get("beta").unwrap(), Some(enabled("beta")));
+            assert!(store.connect_threads_for_test().is_empty());
+        }
+
+        #[test]
+        fn pg_get_on_current_thread_runtime_never_connects_on_the_worker() {
+            let store = std::sync::Arc::new(PgFlagStore::with_cache_ttl(DEAD_URL, Duration::ZERO));
+            store.install_for_test(vec![enabled("beta")]);
+            let svc = crate::feature_flags::FeatureFlagService::new(store.clone());
+
+            current_thread_runtime().block_on(async {
+                let worker = std::thread::current().id();
+                assert!(svc.is_enabled("beta", Some("user:1")));
+                settle(&store).await;
+
+                let threads = store.connect_threads_for_test();
+                assert!(!threads.is_empty(), "the stale snapshot is refreshed");
+                assert!(
+                    !threads.contains(&worker),
+                    "flag evaluation must not connect on the Tokio worker"
+                );
+            });
+            assert!(store.refresh_errors() >= 1);
+        }
+
+        #[test]
+        fn pg_cold_get_on_runtime_errors_and_loads_in_background() {
+            let store = PgFlagStore::with_cache_ttl(DEAD_URL, Duration::ZERO);
+            current_thread_runtime().block_on(async {
+                let worker = std::thread::current().id();
+                assert!(store.get("beta").is_err(), "no snapshot yet");
+                settle(&store).await;
+                let threads = store.connect_threads_for_test();
+                assert!(!threads.is_empty());
+                assert!(!threads.contains(&worker));
+            });
+        }
+
+        #[test]
+        fn pg_refresh_older_than_a_local_write_is_discarded() {
+            let store = PgFlagStore::with_cache_ttl(DEAD_URL, Duration::from_secs(60));
+            store.install_for_test(vec![]);
+
+            let started = store.write_generation();
+            store.apply_local(enabled("beta"));
+            // A refresh that read the database before the write ends now.
+            assert!(!store.install(vec![FlagConfig::new("beta")], started));
+            assert_eq!(store.get("beta").unwrap(), Some(enabled("beta")));
+
+            assert!(store.install(vec![FlagConfig::new("beta")], store.write_generation()));
+            assert_eq!(store.get("beta").unwrap(), Some(FlagConfig::new("beta")));
+        }
+
+        #[test]
+        fn pg_refresh_reports_backend_error() {
+            let store = PgFlagStore::new(DEAD_URL);
+            assert!(store.refresh().is_err());
+            assert_eq!(store.refresh_errors(), 1);
+            assert!(store.preload().is_err());
+        }
+
+        #[test]
+        fn pg_poll_listener_stops_when_the_store_drops() {
+            let store = std::sync::Arc::new(PgFlagStore::new(DEAD_URL));
+            let handle = PgFlagStore::spawn_poll_listener(
+                std::sync::Arc::clone(&store),
+                Duration::from_millis(10),
+            );
+            drop(store);
+            for _ in 0..1000 {
+                if handle.is_finished() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("poll listener outlived its store");
+        }
+
+        #[test]
+        fn connect_url_gets_a_connect_timeout() {
+            assert_eq!(
+                with_connect_timeout("postgres://h/db"),
+                "postgres://h/db?connect_timeout=5"
+            );
+            assert_eq!(
+                with_connect_timeout("postgresql://h/db?sslmode=require"),
+                "postgresql://h/db?sslmode=require&connect_timeout=5"
+            );
+            assert_eq!(
+                with_connect_timeout("host=db dbname=app"),
+                "host=db dbname=app connect_timeout=5"
+            );
+            // A timeout in the URL stays as it is.
+            assert_eq!(DEAD_URL, with_connect_timeout(DEAD_URL));
+            assert_eq!(
+                with_connect_timeout("host=db connect_timeout = 3"),
+                "host=db connect_timeout = 3"
+            );
+            // The text elsewhere is not the parameter.
+            assert_eq!(
+                with_connect_timeout("postgres://u:connect_timeout@h/db"),
+                "postgres://u:connect_timeout@h/db?connect_timeout=5"
+            );
+            assert_eq!(
+                with_connect_timeout("postgres://h/db?application_name=connect_timeout"),
+                "postgres://h/db?application_name=connect_timeout&connect_timeout=5"
+            );
+            assert_eq!(
+                with_connect_timeout("host=db application_name=connect_timeout"),
+                "host=db application_name=connect_timeout connect_timeout=5"
+            );
+            // Text in a quoted value is not a parameter.
+            assert_eq!(
+                with_connect_timeout("host=db application_name='foo connect_timeout=999'"),
+                "host=db application_name='foo connect_timeout=999' connect_timeout=5"
+            );
+            assert_eq!(
+                with_connect_timeout(r"host=db password='it\'s connect_timeout=1'"),
+                r"host=db password='it\'s connect_timeout=1' connect_timeout=5"
+            );
+            assert_eq!(
+                with_connect_timeout("host=db connect_timeout='7'"),
+                "host=db connect_timeout='7'"
+            );
+        }
+
+        #[test]
+        fn retry_delay_doubles_up_to_the_cap() {
+            let second = Duration::from_secs(1);
+            assert_eq!(retry_delay(second, 0), second);
+            assert_eq!(retry_delay(second, 1), Duration::from_secs(2));
+            assert_eq!(retry_delay(second, 3), Duration::from_secs(8));
+            assert_eq!(retry_delay(second, 40), MAX_RETRY_DELAY);
+            assert_eq!(retry_delay(Duration::ZERO, 5), Duration::ZERO);
+            // A base longer than the cap stays the base.
+            let minute = Duration::from_secs(60);
+            assert_eq!(retry_delay(minute, 4), minute);
+        }
+
+        #[test]
+        fn pg_store_debug_hides_the_database_password() {
+            let store = PgFlagStore::new("postgres://app:s3cret@db/app");
+            assert!(!format!("{store:?}").contains("s3cret"));
+        }
+
+        #[test]
+        fn pg_list_serves_nothing_new_when_the_database_fails() {
+            let store = PgFlagStore::with_cache_ttl(DEAD_URL, Duration::from_secs(60));
+            store.install_for_test(vec![enabled("beta")]);
+            assert!(store.list().is_err());
+            assert_eq!(store.get("beta").unwrap(), Some(enabled("beta")));
+        }
+
         #[test]
         fn pg_store_exposes_database_url() {
             let store = PgFlagStore::new("postgres://localhost/myapp");
-            assert_eq!(store.database_url, "postgres://localhost/myapp");
+            assert_eq!(store.shared.database_url, "postgres://localhost/myapp");
         }
 
         #[test]
         fn pg_store_default_cache_ttl_is_one_second() {
             let store = PgFlagStore::new("postgres://localhost/myapp");
-            assert_eq!(store.cache_ttl, PgFlagStore::DEFAULT_CACHE_TTL);
-        }
-
-        #[test]
-        fn pg_store_cache_miss_on_empty_store() {
-            let store = PgFlagStore::with_cache_ttl("postgres://localhost/myapp", Duration::ZERO);
-            assert_eq!(store.cached("my_flag"), CacheLookup::Miss);
-        }
-
-        #[test]
-        fn pg_store_cache_hit_returns_stored_value() {
-            let store =
-                PgFlagStore::with_cache_ttl("postgres://localhost/myapp", Duration::from_secs(60));
-            store.store_cache("my_flag", Some(FlagConfig::new("my_flag")));
-            assert!(matches!(store.cached("my_flag"), CacheLookup::Hit(Some(_))));
-        }
-
-        #[test]
-        fn pg_store_cache_hit_none_for_absent_flag() {
-            let store =
-                PgFlagStore::with_cache_ttl("postgres://localhost/myapp", Duration::from_secs(60));
-            store.store_cache("absent", None);
-            assert_eq!(store.cached("absent"), CacheLookup::Hit(None));
-        }
-
-        #[test]
-        fn pg_store_cache_expired_returns_miss() {
-            let store = PgFlagStore::with_cache_ttl("postgres://localhost/myapp", Duration::ZERO);
-            store.store_cache("expired", Some(FlagConfig::new("expired")));
-            // TTL = 0 means entries expire immediately.
-            assert_eq!(store.cached("expired"), CacheLookup::Miss);
-        }
-
-        #[test]
-        fn pg_store_invalidate_removes_from_cache() {
-            let store =
-                PgFlagStore::with_cache_ttl("postgres://localhost/myapp", Duration::from_secs(60));
-            store.store_cache("flag", Some(FlagConfig::new("flag")));
-            assert!(matches!(store.cached("flag"), CacheLookup::Hit(Some(_))));
-            store.invalidate("flag");
-            assert_eq!(store.cached("flag"), CacheLookup::Miss);
+            assert_eq!(store.shared.cache_ttl, PgFlagStore::DEFAULT_CACHE_TTL);
         }
 
         #[test]
         fn pg_store_with_cache_ttl_sets_custom_ttl() {
             let ttl = Duration::from_secs(30);
             let store = PgFlagStore::with_cache_ttl("postgres://localhost/myapp", ttl);
-            assert_eq!(store.cache_ttl, ttl);
+            assert_eq!(store.shared.cache_ttl, ttl);
         }
 
         #[test]
-        fn pg_store_clone_has_independent_cache() {
-            // PgFlagStore::clone() creates a fresh instance — it does NOT share the
-            // cache HashMap.  Only Arc<PgFlagStore> shares a single cache.
-            let store =
-                PgFlagStore::with_cache_ttl("postgres://localhost/myapp", Duration::from_secs(60));
-            store.store_cache("cached", Some(FlagConfig::new("cached")));
+        fn pg_store_clone_has_independent_snapshot() {
+            // Only `Arc<PgFlagStore>` shares one snapshot.
+            let store = PgFlagStore::with_cache_ttl(DEAD_URL, Duration::from_secs(60));
+            store.install_for_test(vec![enabled("cached")]);
             let cloned = store.clone();
-            // Clone starts with an empty cache, so this is a Miss.
-            assert_eq!(cloned.cached("cached"), CacheLookup::Miss);
-            // Original still holds its value — confirming the two caches are independent.
-            assert!(matches!(store.cached("cached"), CacheLookup::Hit(Some(_))));
+            assert!(cloned.get("cached").is_err(), "a clone starts empty");
+            assert_eq!(store.get("cached").unwrap(), Some(enabled("cached")));
         }
     }
 }
@@ -1065,10 +1471,135 @@ pub fn rollout_bucket(flag_key: &str, actor_id: &str) -> u8 {
 /// ```rust,ignore
 /// state.insert_extension(FeatureFlagService::new(Arc::new(InMemoryFlagStore::new())));
 /// ```
+///
+/// # Store failures
+///
+/// When the store returns an error, the service uses the last value that it
+/// read for that flag (the last-known value). With no last-known value, it
+/// uses the declared default ([`with_default`](Self::with_default)), or
+/// `false`. Clones share the last-known values and the error count.
 #[derive(Clone)]
 pub struct FeatureFlagService {
     store: Arc<dyn FlagStore>,
     group_resolver: Option<GroupResolver>,
+    defaults: Arc<HashMap<String, bool>>,
+    health: Arc<StoreHealth>,
+}
+
+/// Last-known flag values and store error state, shared by service clones.
+#[derive(Default)]
+struct StoreHealth {
+    known: RwLock<Known>,
+    errors: AtomicU64,
+    /// `true` after a failed read, until a read succeeds.
+    failing: AtomicBool,
+    /// Increments on each write through the service.
+    writes: AtomicU64,
+    /// Held across a service write and its read-back, so generations follow
+    /// the order of the writes.
+    write_order: Mutex<()>,
+}
+
+/// Values and write generations, under one lock.
+#[derive(Default)]
+struct Known {
+    values: HashMap<String, FlagConfig>,
+    /// The generation of the latest write to each key.
+    last_write: HashMap<String, u64>,
+}
+
+impl Known {
+    /// `true` when a write to `key` began after generation `started`.
+    fn written_after(&self, key: &str, started: u64) -> bool {
+        self.last_write
+            .get(key)
+            .is_some_and(|write| *write > started)
+    }
+}
+
+impl StoreHealth {
+    /// The generation to pass to [`remember`](Self::remember). Take it
+    /// before the read.
+    fn read_started(&self) -> u64 {
+        self.writes.load(Ordering::Acquire)
+    }
+
+    /// Start a write's read-back of `key`. Reads of `key` that started
+    /// earlier can no longer replace its last-known value. Returns the
+    /// write's generation.
+    fn begin_write(&self, key: &str) -> u64 {
+        let mut known = self.known.write().unwrap_or_else(PoisonError::into_inner);
+        let write = self.writes.fetch_add(1, Ordering::AcqRel) + 1;
+        known.last_write.insert(key.to_owned(), write);
+        write
+    }
+
+    /// Keep the value that the store returned for `key`, unless a write to
+    /// `key` began after generation `started`: the read can be older than
+    /// the write.
+    ///
+    /// The hot path takes no write lock when the value is the same.
+    fn remember(&self, key: &str, flag: Option<&FlagConfig>, started: u64) {
+        if self.failing.load(Ordering::Relaxed) && self.failing.swap(false, Ordering::AcqRel) {
+            tracing::info!("feature flag store recovered");
+        }
+        let known = self.known.read().unwrap_or_else(PoisonError::into_inner);
+        if known.values.get(key) == flag {
+            return;
+        }
+        drop(known);
+        let mut known = self.known.write().unwrap_or_else(PoisonError::into_inner);
+        if known.written_after(key, started) {
+            return;
+        }
+        match flag {
+            Some(flag) => {
+                known.values.insert(key.to_owned(), flag.clone());
+            }
+            None => {
+                known.values.remove(key);
+            }
+        }
+    }
+
+    /// After write `write` to `key` that the store cannot read back: a
+    /// disable keeps the flag off, and other writes drop the last-known
+    /// value. A newer write to `key` wins.
+    fn forget(&self, key: &str, disabled: bool, write: u64) {
+        let mut known = self.known.write().unwrap_or_else(PoisonError::into_inner);
+        if known.written_after(key, write) {
+            return;
+        }
+        if disabled {
+            known
+                .values
+                .entry(key.to_owned())
+                .or_insert_with(|| FlagConfig::new(key))
+                .enabled = false;
+        } else {
+            known.values.remove(key);
+        }
+    }
+
+    /// Count a failed read and return the last-known value for `key`.
+    fn recall(&self, key: &str, error: &FlagStoreError) -> Option<FlagConfig> {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+        if self.failing.swap(true, Ordering::AcqRel) {
+            tracing::debug!(flag = key, %error, "feature flag store read failed again");
+        } else {
+            tracing::warn!(
+                flag = key,
+                %error,
+                "feature flag store read failed; serving last-known values or declared defaults"
+            );
+        }
+        self.known
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values
+            .get(key)
+            .cloned()
+    }
 }
 
 impl std::fmt::Debug for FeatureFlagService {
@@ -1084,7 +1615,34 @@ impl FeatureFlagService {
         Self {
             store,
             group_resolver: None,
+            defaults: Arc::default(),
+            health: Arc::default(),
         }
+    }
+
+    /// Declare the value of `flag_key` when the store does not hold the flag,
+    /// or cannot read it and no last-known value exists.
+    ///
+    /// Without a declared default, that value is `false`.
+    #[must_use]
+    pub fn with_default(mut self, flag_key: impl Into<String>, default: bool) -> Self {
+        Arc::make_mut(&mut self.defaults).insert(flag_key.into(), default);
+        self
+    }
+
+    /// Number of failed store reads since the service was made.
+    #[must_use]
+    pub fn store_errors(&self) -> u64 {
+        self.health.errors.load(Ordering::Relaxed)
+    }
+
+    /// Load the store before the first read. This can block.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`FlagStoreError`] from the backing store.
+    pub fn preload(&self) -> Result<(), FlagStoreError> {
+        self.store.preload()
     }
 
     /// Attach a group resolver so named-group gates are evaluated.
@@ -1096,13 +1654,22 @@ impl FeatureFlagService {
 
     /// Return `true` if `flag_key` is enabled for `actor_id`.
     ///
-    /// Returns `false` for unknown flags (fail-closed).
+    /// An unknown flag gets its declared default, or `false`. A store error
+    /// gets the last-known value (see [Store failures](Self#store-failures)).
     #[must_use]
     pub fn is_enabled(&self, flag_key: &str, actor_id: Option<&str>) -> bool {
-        let Ok(Some(flag)) = self.store.get(flag_key) else {
-            return false;
+        let started = self.health.read_started();
+        let flag = match self.store.get(flag_key) {
+            Ok(flag) => {
+                self.health.remember(flag_key, flag.as_ref(), started);
+                flag
+            }
+            Err(error) => self.health.recall(flag_key, &error),
         };
-        self.evaluate(&flag, actor_id)
+        flag.map_or_else(
+            || self.defaults.get(flag_key).copied().unwrap_or(false),
+            |flag| self.evaluate(&flag, actor_id),
+        )
     }
 
     fn evaluate(&self, flag: &FlagConfig, actor_id: Option<&str>) -> bool {
@@ -1143,13 +1710,38 @@ impl FeatureFlagService {
         false
     }
 
+    /// Run one store write, then update the last-known value of `flag_key`.
+    ///
+    /// Service writes run one at a time, through their read-back. When the
+    /// store cannot read the flag back, a disable keeps the flag off, and any
+    /// other write drops the last-known value.
+    fn write(
+        &self,
+        flag_key: &str,
+        disabled: bool,
+        op: impl FnOnce(&dyn FlagStore) -> Result<(), FlagStoreError>,
+    ) -> Result<(), FlagStoreError> {
+        let _ordered = self
+            .health
+            .write_order
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        op(self.store.as_ref())?;
+        let started = self.health.begin_write(flag_key);
+        match self.store.get(flag_key) {
+            Ok(flag) => self.health.remember(flag_key, flag.as_ref(), started),
+            Err(_) => self.health.forget(flag_key, disabled, started),
+        }
+        Ok(())
+    }
+
     /// Enable `flag_key` for all actors.
     ///
     /// # Errors
     ///
     /// Propagates [`FlagStoreError`] from the backing store.
     pub fn enable(&self, flag_key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
-        self.store.enable(flag_key, actor)
+        self.write(flag_key, false, |store| store.enable(flag_key, actor))
     }
 
     /// Disable `flag_key` globally.
@@ -1158,7 +1750,7 @@ impl FeatureFlagService {
     ///
     /// Propagates [`FlagStoreError`] from the backing store.
     pub fn disable(&self, flag_key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
-        self.store.disable(flag_key, actor)
+        self.write(flag_key, true, |store| store.disable(flag_key, actor))
     }
 
     /// Set the percent-rollout gate for `flag_key` to `pct` (0–100).
@@ -1172,7 +1764,9 @@ impl FeatureFlagService {
         pct: u8,
         actor: Option<&str>,
     ) -> Result<(), FlagStoreError> {
-        self.store.set_rollout(flag_key, pct, actor)
+        self.write(flag_key, false, |store| {
+            store.set_rollout(flag_key, pct, actor)
+        })
     }
 
     /// Add `actor_id` to the explicit allowlist for `flag_key`.
@@ -1186,7 +1780,9 @@ impl FeatureFlagService {
         actor_id: &str,
         actor: Option<&str>,
     ) -> Result<(), FlagStoreError> {
-        self.store.allow_actor(flag_key, actor_id, actor)
+        self.write(flag_key, false, |store| {
+            store.allow_actor(flag_key, actor_id, actor)
+        })
     }
 
     /// Add `group` to the named-group allowlist for `flag_key`.
@@ -1200,7 +1796,9 @@ impl FeatureFlagService {
         group: &str,
         actor: Option<&str>,
     ) -> Result<(), FlagStoreError> {
-        self.store.add_group(flag_key, group, actor)
+        self.write(flag_key, false, |store| {
+            store.add_group(flag_key, group, actor)
+        })
     }
 
     /// Return all known flags, sorted by key.
@@ -1223,6 +1821,45 @@ impl FeatureFlagService {
         limit: usize,
     ) -> Result<Vec<FlagChangeRecord>, FlagStoreError> {
         self.store.history(flag_key, limit)
+    }
+}
+
+/// Longest time that the app waits for [`FlagStore::preload`]. It covers
+/// the Postgres store's connect and statement timeouts.
+pub(crate) const PRELOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Preload the store of `service` on its own thread, and wait up to `wait`.
+///
+/// The app calls it when it installs the service, in every mode. So later
+/// state initializers, job workers, startup hooks, routes, a static build, a
+/// one-off task and a replay all see stored flags. After `wait`, the load
+/// goes on and the app goes on. A failure logs a warning; it does not stop
+/// the app.
+pub(crate) fn preload_blocking(service: &FeatureFlagService, wait: std::time::Duration) {
+    let service = service.clone();
+    let (done, loaded) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("autumn-flag-preload".to_owned())
+        .spawn(move || {
+            // The receiver can be gone after a timeout.
+            let _ = done.send(service.preload());
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "feature flag preload thread did not start");
+        return;
+    }
+    match loaded.recv_timeout(wait) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "feature flag preload failed; flags use declared defaults");
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => tracing::warn!(
+            ?wait,
+            "feature flag preload is slow; the app continues with declared defaults"
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            tracing::warn!("feature flag preload panicked");
+        }
     }
 }
 
@@ -1839,6 +2476,386 @@ mod tests {
 
         let flags = Flags::from_request_parts(&mut parts, &state).await.unwrap();
         assert_eq!(flags.actor_id.as_deref(), Some("user:123"));
+    }
+
+    // ── Store failure: last-known value and declared default (#3063) ──────
+
+    /// Wraps an in-memory store. The test can make `get` fail or hide a flag.
+    #[derive(Default)]
+    struct ScriptedStore {
+        inner: InMemoryFlagStore,
+        failing: std::sync::atomic::AtomicBool,
+        hidden: std::sync::atomic::AtomicBool,
+        preloads: std::sync::atomic::AtomicUsize,
+        /// `preload` sleeps this long (ms).
+        preload_delay_ms: std::sync::atomic::AtomicU64,
+    }
+
+    impl ScriptedStore {
+        fn fail(&self, on: bool) {
+            self.failing.store(on, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn hide(&self, on: bool) {
+            self.hidden.store(on, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl FlagStore for ScriptedStore {
+        fn get(&self, key: &str) -> Result<Option<FlagConfig>, FlagStoreError> {
+            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(FlagStoreError::Backend("brownout".to_owned()));
+            }
+            if self.hidden.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(None);
+            }
+            self.inner.get(key)
+        }
+        fn list(&self) -> Result<Vec<FlagConfig>, FlagStoreError> {
+            self.inner.list()
+        }
+        fn enable(&self, key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
+            self.inner.enable(key, actor)
+        }
+        fn disable(&self, key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
+            self.inner.disable(key, actor)
+        }
+        fn set_rollout(
+            &self,
+            key: &str,
+            pct: u8,
+            actor: Option<&str>,
+        ) -> Result<(), FlagStoreError> {
+            self.inner.set_rollout(key, pct, actor)
+        }
+        fn allow_actor(
+            &self,
+            key: &str,
+            actor_id: &str,
+            actor: Option<&str>,
+        ) -> Result<(), FlagStoreError> {
+            self.inner.allow_actor(key, actor_id, actor)
+        }
+        fn add_group(
+            &self,
+            key: &str,
+            group: &str,
+            actor: Option<&str>,
+        ) -> Result<(), FlagStoreError> {
+            self.inner.add_group(key, group, actor)
+        }
+        fn history(
+            &self,
+            key: &str,
+            limit: usize,
+        ) -> Result<Vec<FlagChangeRecord>, FlagStoreError> {
+            self.inner.history(key, limit)
+        }
+        fn preload(&self) -> Result<(), FlagStoreError> {
+            let delay = self
+                .preload_delay_ms
+                .load(std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+            self.preloads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failing_store_serves_last_known_value() {
+        let store = Arc::new(ScriptedStore::default());
+        let svc = FeatureFlagService::new(store.clone());
+        store.enable("beta", None).unwrap();
+        assert!(svc.is_enabled("beta", Some("user:1")));
+
+        store.fail(true);
+        assert!(
+            svc.is_enabled("beta", Some("user:1")),
+            "a store error must not turn a known flag off"
+        );
+        assert_eq!(svc.store_errors(), 1);
+    }
+
+    #[test]
+    fn disable_through_the_service_replaces_the_last_known_value() {
+        let store = Arc::new(ScriptedStore::default());
+        let svc = FeatureFlagService::new(store.clone()).with_default("kill", true);
+        svc.enable("kill", None).unwrap();
+        assert!(svc.is_enabled("kill", None));
+
+        // The read after the write fails too.
+        store.fail(true);
+        svc.disable("kill", None).unwrap();
+        assert!(
+            !svc.is_enabled("kill", None),
+            "a successful disable must win over the old last-known value"
+        );
+
+        // The read after the write succeeds.
+        store.fail(false);
+        svc.enable("kill", None).unwrap();
+        svc.disable("kill", None).unwrap();
+        store.fail(true);
+        assert!(!svc.is_enabled("kill", None));
+    }
+
+    #[test]
+    fn read_started_before_a_write_does_not_replace_its_value() {
+        let store = Arc::new(ScriptedStore::default());
+        let svc = FeatureFlagService::new(store.clone());
+        svc.enable("kill", None).unwrap();
+
+        // A read starts and sees the flag on. Then a disable succeeds.
+        let started = svc.health.read_started();
+        let stale = store.get("kill").unwrap();
+        svc.disable("kill", None).unwrap();
+        // The old read ends last.
+        svc.health.remember("kill", stale.as_ref(), started);
+
+        store.fail(true);
+        assert!(
+            !svc.is_enabled("kill", None),
+            "a read that started before a write must not replace its value"
+        );
+    }
+
+    #[test]
+    fn a_write_to_one_flag_keeps_reads_of_other_flags() {
+        let store = Arc::new(ScriptedStore::default());
+        let svc = FeatureFlagService::new(store.clone());
+        store.enable("b", None).unwrap();
+
+        let started = svc.health.read_started();
+        let read = store.get("b").unwrap();
+        svc.enable("a", None).unwrap(); // A write to another flag.
+        svc.health.remember("b", read.as_ref(), started);
+
+        store.fail(true);
+        assert!(svc.is_enabled("b", None), "the read of `b` is still good");
+    }
+
+    #[test]
+    fn an_older_failed_read_back_does_not_undo_a_newer_write() {
+        let svc = make_svc();
+        let mut on = FlagConfig::new("k");
+        on.enabled = true;
+        on.rollout_pct = 100;
+
+        let disable = svc.health.begin_write("k");
+        let enable = svc.health.begin_write("k");
+        svc.health.remember("k", Some(&on), enable);
+        // The older disable's read-back failed; it ends last.
+        svc.health.forget("k", true, disable);
+
+        let error = FlagStoreError::Backend("down".to_owned());
+        assert_eq!(svc.health.recall("k", &error), Some(on));
+    }
+
+    /// `enable` pauses after its write until the test lets it go on.
+    struct PausingStore {
+        inner: ScriptedStore,
+        entered: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl FlagStore for PausingStore {
+        fn get(&self, key: &str) -> Result<Option<FlagConfig>, FlagStoreError> {
+            self.inner.get(key)
+        }
+        fn list(&self) -> Result<Vec<FlagConfig>, FlagStoreError> {
+            self.inner.list()
+        }
+        fn enable(&self, key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
+            self.inner.enable(key, actor)?;
+            self.entered.lock().unwrap().send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+            Ok(())
+        }
+        fn disable(&self, key: &str, actor: Option<&str>) -> Result<(), FlagStoreError> {
+            self.inner.disable(key, actor)
+        }
+        fn set_rollout(
+            &self,
+            key: &str,
+            pct: u8,
+            actor: Option<&str>,
+        ) -> Result<(), FlagStoreError> {
+            self.inner.set_rollout(key, pct, actor)
+        }
+        fn allow_actor(
+            &self,
+            key: &str,
+            actor_id: &str,
+            actor: Option<&str>,
+        ) -> Result<(), FlagStoreError> {
+            self.inner.allow_actor(key, actor_id, actor)
+        }
+        fn add_group(
+            &self,
+            key: &str,
+            group: &str,
+            actor: Option<&str>,
+        ) -> Result<(), FlagStoreError> {
+            self.inner.add_group(key, group, actor)
+        }
+        fn history(
+            &self,
+            key: &str,
+            limit: usize,
+        ) -> Result<Vec<FlagChangeRecord>, FlagStoreError> {
+            self.inner.history(key, limit)
+        }
+    }
+
+    #[test]
+    fn an_older_write_cannot_undo_a_later_disable() {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let store = Arc::new(PausingStore {
+            inner: ScriptedStore::default(),
+            entered: std::sync::Mutex::new(entered_tx),
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let svc = FeatureFlagService::new(store.clone()).with_default("kill", true);
+
+        // An enable writes, then pauses before its read-back.
+        let older = {
+            let svc = svc.clone();
+            std::thread::spawn(move || svc.enable("kill", None).unwrap())
+        };
+        entered.recv().unwrap();
+
+        // A later disable starts. Give it time to finish if nothing orders it.
+        let later = {
+            let svc = svc.clone();
+            std::thread::spawn(move || svc.disable("kill", None).unwrap())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Reads fail from now on. The older enable ends; then the disable.
+        store.inner.fail(true);
+        release.send(()).unwrap();
+        older.join().unwrap();
+        later.join().unwrap();
+
+        assert!(
+            !svc.is_enabled("kill", None),
+            "the later disable must hold during the outage"
+        );
+    }
+
+    #[test]
+    fn failing_store_keeps_a_kill_switch_off() {
+        let store = Arc::new(ScriptedStore::default());
+        let svc = FeatureFlagService::new(store.clone()).with_default("payments", true);
+        store.enable("payments", None).unwrap();
+        store.disable("payments", None).unwrap();
+        assert!(!svc.is_enabled("payments", None));
+
+        store.fail(true);
+        assert!(
+            !svc.is_enabled("payments", None),
+            "the last-known value wins over the declared default"
+        );
+    }
+
+    #[test]
+    fn failing_store_without_last_known_value_serves_declared_default() {
+        let store = Arc::new(ScriptedStore::default());
+        let svc = FeatureFlagService::new(store.clone()).with_default("fail_open", true);
+        store.fail(true);
+        assert!(svc.is_enabled("fail_open", None));
+        assert!(!svc.is_enabled("no_default", None));
+        assert_eq!(svc.store_errors(), 2);
+    }
+
+    #[test]
+    fn unknown_flag_serves_declared_default() {
+        let svc = make_svc().with_default("absent", true);
+        assert!(svc.is_enabled("absent", None));
+        assert!(!svc.is_enabled("other", None));
+        assert_eq!(svc.store_errors(), 0);
+    }
+
+    #[test]
+    fn flag_removed_from_store_forgets_last_known_value() {
+        let store = Arc::new(ScriptedStore::default());
+        let svc = FeatureFlagService::new(store.clone());
+        store.enable("gone", None).unwrap();
+        assert!(svc.is_enabled("gone", None));
+
+        store.hide(true);
+        assert!(!svc.is_enabled("gone", None));
+        store.hide(false);
+        store.fail(true);
+        assert!(
+            !svc.is_enabled("gone", None),
+            "a flag the store reported absent has no last-known value"
+        );
+    }
+
+    #[test]
+    fn service_clones_share_last_known_values() {
+        // The `Flags` extractor clones the service for each request.
+        let store = Arc::new(ScriptedStore::default());
+        let svc = FeatureFlagService::new(store.clone());
+        store.enable("shared", None).unwrap();
+        assert!(svc.is_enabled("shared", None));
+
+        let per_request = svc.clone();
+        store.fail(true);
+        assert!(per_request.is_enabled("shared", None));
+        assert_eq!(svc.store_errors(), 1, "clones share the error count");
+    }
+
+    #[test]
+    fn service_preload_delegates_to_the_store() {
+        let store = Arc::new(ScriptedStore::default());
+        let svc = FeatureFlagService::new(store.clone());
+        svc.preload().unwrap();
+        assert_eq!(store.preloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // The default `preload` does nothing and succeeds.
+        make_svc().preload().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_app_preloads_the_flag_store_at_build() {
+        let store = Arc::new(ScriptedStore::default());
+        let _client = crate::test::TestApp::new()
+            .with_flag_store(Arc::clone(&store))
+            .build();
+        assert_eq!(store.preloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn preload_blocking_waits_for_the_load_up_to_the_limit() {
+        let store = Arc::new(ScriptedStore::default());
+        let svc = FeatureFlagService::new(store.clone());
+        preload_blocking(&svc, std::time::Duration::from_secs(10));
+        assert_eq!(store.preloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // A slow load: the wait ends first, and the load goes on.
+        store
+            .preload_delay_ms
+            .store(300, std::sync::atomic::Ordering::SeqCst);
+        preload_blocking(&svc, std::time::Duration::from_millis(10));
+        assert_eq!(
+            store.preloads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the wait ended before the slow load"
+        );
+    }
+
+    #[test]
+    fn feature_flag_guide_describes_polling_not_listen() {
+        let guide = include_str!("../../docs/guide/feature-flags.md");
+        assert!(
+            !guide.contains("All replicas listening on that channel"),
+            "Autumn does not LISTEN; replicas poll"
+        );
+        assert!(guide.contains("spawn_poll_listener"));
+        assert!(guide.contains("last-known"));
     }
 
     // ── Backend screening on the Postgres-only store ──────────────────────

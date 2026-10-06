@@ -300,6 +300,10 @@ the `autumn_jobs` table. Workers claim a row atomically with
 `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED)`, which prevents any
 two replicas from claiming the same job simultaneously.
 
+Workers poll. There is no `LISTEN`/`NOTIFY` wake-up. A busy worker claims the
+next job at once. An idle worker polls again after 200ms. A new job can wait up
+to 200ms, also when the same process enqueued it. The 200ms interval is fixed.
+
 A claimed job's status is set to `running` with a `claimed_at` timestamp and a
 `claimed_by` worker id. A maintenance loop running inside each worker process
 requeues jobs whose `claimed_at` is older than `jobs.postgres.visibility_timeout_ms`.
@@ -418,6 +422,14 @@ as every other durable backend.
 - Exhausted jobs are dead-lettered.
 - Redis retries are scheduled in Redis before the worker moves on, so a crash
   during the backoff window does not drop the job.
+
+## Cost-aware deferral
+
+Mark a job `#[job(deferrable)]` to let it wait while the cost signal is above
+`[cost] defer_threshold`. The job runs when the signal falls. The runtime never
+drops it. It uses no attempt while it waits. Only the `local` backend defers
+jobs. Other backends run the job and log a warning at boot. See
+[Request Cost and Carbon-Aware Deferral](cost.md).
 
 ## Job priorities
 
