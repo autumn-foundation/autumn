@@ -3281,6 +3281,8 @@ fi
   sidecar='{"name":"sidecar","image":"busybox"}'
   [ -n "$STUB_SIDECAR_SECRET_REF" ] && sidecar='{"name":"sidecar","image":"busybox","env":[{"name":"SIDECAR_DB","secretRef":"database-url"}]}'
   [ -n "$STUB_SIDECAR_REDIS_REF" ] && sidecar='{"name":"sidecar","image":"busybox","env":[{"name":"SIDECAR_REDIS","secretRef":"redis-url"}]}'
+  # A sidecar whose image comes from the same ACR.
+  [ -n "$STUB_SIDECAR_ACR" ] && sidecar='{"name":"sidecar","image":"acr.azurecr.io/side:1"}'
   scale=""
   [ -n "$STUB_SCALE_SECRET_REF" ] && scale=',"scale":{"rules":[{"name":"q","custom":{"type":"azure-queue","auth":[{"secretRef":"'"$STUB_SCALE_SECRET_REF"'","triggerParameter":"connection"}]}}]}'
   [ -n "$STUB_MIN_REPLICAS" ] && scale=',"scale":{"minReplicas":'"$STUB_MIN_REPLICAS"'}'
@@ -3619,6 +3621,7 @@ esac
     /// inputs. [`run_azure_cutover_with_args`] clears them all first.
     #[cfg(unix)]
     const AZ_STUB_FLAGS: &[&str] = &[
+        "STUB_SIDECAR_ACR",
         "STUB_APP_REGISTRY_PASSWORD_REF",
         "STUB_INLINE_STALE",
         "STUB_APP_COPIED_BIG",
@@ -6027,6 +6030,33 @@ esac
                     ("STUB_APP_LEGACY", "1"),
                     ("STUB_APP_REGISTRY_PASSWORD_REF", "1"),
                 ],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{args:?}: {calls}");
+            assert!(!calls.contains("az tags-patch"), "{args:?}: {calls}");
+            assert!(!calls.contains("ingress disable"), "{args:?}: {calls}");
+            assert!(
+                !calls.contains("az rest --method patch"),
+                "{args:?}: {calls}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_when_a_sidecar_pulls_from_the_acr() {
+        // A sidecar pulls its image from the same ACR. Removal drops the
+        // ACR registry entry, so the sidecar could not pull again; the
+        // script stops before any write, in both modes.
+        for args in [&[][..], &["--remove-credentials"][..]] {
+            let Some((status, calls, _)) = run_azure_cutover_with_args(
+                args,
+                "mcr.microsoft.com/k8se/quickstart:latest",
+                "Provisioned",
+                false,
+                0,
+                &[("STUB_APP_LEGACY", "1"), ("STUB_SIDECAR_ACR", "1")],
             ) else {
                 return;
             };
