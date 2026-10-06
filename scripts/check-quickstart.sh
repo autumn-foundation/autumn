@@ -413,8 +413,8 @@ phase_install() {
   fi
 
   echo "installing autumn-cli ${version} from crates.io (README quickstart step 1)"
-  if ! cargo install autumn-cli --version "$version"; then
-    fail "'cargo install autumn-cli --version ${version}' failed — the README-pinned CLI version does not install from crates.io"
+  if ! cargo install autumn-cli --version "$version" --locked; then
+    fail "'cargo install autumn-cli --version ${version} --locked' failed — the README-pinned CLI version does not install from crates.io"
   fi
   command -v autumn >/dev/null || fail "cargo install succeeded but 'autumn' is not on PATH"
   ok "autumn-cli ${version}"

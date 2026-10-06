@@ -50,3 +50,37 @@ No public API, flag or default changes.
 | Failure line | step 1, `cargo install autumn-cli --version 0.8.0` |
 | Time to failure | 4 s (CI), 9 s (local) |
 | Question-log tally | none filed; no users counted, and this report does not claim any |
+
+## 📊 After (local re-run, rustc 1.88.0, fresh CARGO_HOME)
+
+| | Before | After |
+|---|---|---|
+| `cargo install autumn-cli --version 0.8.0` | ✗ at 9 s | — |
+| `cargo install autumn-cli --version 0.8.0 --locked` | — | ✓ 7m33s |
+| `autumn new my-app` + `cargo build` (steps 2–4 equivalent) | skipped | ✓ 2m19s |
+| 1.88.0 leg of the gate | 0 / 9 | install + new + build reproduced green locally; the full 9-step leg (setup, serve, scaffold, migrate) was **not** run here and needs the gate's own run |
+
+The gate workflow only runs on trunk pushes, schedule and dispatch, so the
+after-measurement from the gate itself is the next trunk run, or a
+`workflow_dispatch` on this branch.
+
+Compatibility: docs and a CI script only. No crate, public API or flag is
+touched. `check-docs-versions.sh` and `check-docs-cli.sh` pass.
+
+## Impact floor
+
+Clears bullet 1: a hard failure on the documented path (1.88.0 leg red today).
+
+## Not addressed
+
+Whether a user on a newer-than-1.88 but older-than-latest toolchain hits the
+same wall with future dependency bumps. `--locked` covers it for the shipped
+lockfile; the 0.8.x lockfile itself still pins what it pins.
+
+## 🔬 Reproduce
+
+```bash
+rustup toolchain install 1.88.0 --profile minimal
+cargo +1.88.0 install autumn-cli --version 0.8.0           # ✗ uuid 1.27.0 needs 1.89
+cargo +1.88.0 install autumn-cli --version 0.8.0 --locked  # ✓
+```

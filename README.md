@@ -33,7 +33,7 @@ for that same "ship the app, not the plumbing" shape in Rust.
 
 ```bash
 # Install the published CLI
-cargo install autumn-cli --version 0.8.0
+cargo install autumn-cli --version 0.8.0 --locked
 
 # Local development only, from an Autumn checkout:
 # cargo install --path autumn-cli

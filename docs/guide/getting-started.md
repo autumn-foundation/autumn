@@ -85,7 +85,7 @@ directory.
 To build it from crates.io instead:
 
 ```bash
-cargo install autumn-cli --version 0.8.0
+cargo install autumn-cli --version 0.8.0 --locked
 ```
 
 ### Local development
