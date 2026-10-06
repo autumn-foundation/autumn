@@ -2554,8 +2554,9 @@ impl Analyzer {
         let method = mc.method.to_string();
         if matches!(method.as_str(), "unwrap" | "expect") {
             self.referents_of(&mc.receiver)
-        } else if method == "as_mut"
+        } else if method.starts_with("as_mut")
             || method.ends_with("_mut")
+            || method.contains("_mut_")
             || BORROW_MUT_METHODS.contains(&method.as_str())
         {
             // `groups.entry(k).or_default()`: through the chain.
@@ -3987,7 +3988,11 @@ impl Analyzer {
         let mut first = None;
         // `slots.iter_mut().for_each(|t| …)`: a parameter borrows into the
         // place the receiver borrows.
-        let borrows = self.referents_of(&method.receiver);
+        // `slots.retain(|_, slot| …)` on a plain place: into that place.
+        let mut borrows = self.referents_of(&method.receiver);
+        if borrows.is_empty() {
+            borrows.extend(place_root(&method.receiver));
+        }
         let mut reads = Vec::new();
         for (i, arg) in method.args.iter().enumerate() {
             if i > 0 {
@@ -6269,11 +6274,15 @@ fn pattern_variant(pat: &Pat, shadowed: &[String]) -> Option<(String, String)> {
     (STD.contains(&name.as_str()) && std_owner).then(|| ("std".to_string(), name))
 }
 
-/// Methods that give a `&mut` into their receiver without the `_mut`
-/// suffix: `map.entry(k).or_default()`, `slot.get_or_insert_with(f)`.
+/// Methods that give a `&mut` into their receiver without a `_mut` or
+/// `as_mut` name: `map.entry(k).or_default()`, `slot.get_or_insert_with(f)`,
+/// `deque.make_contiguous()`.
 const BORROW_MUT_METHODS: &[&str] = &[
     "entry",
     "insert",
+    "make_contiguous",
+    "get_or_insert_default",
+    "leak",
     "or_default",
     "or_insert",
     "or_insert_with",
@@ -13283,6 +13292,28 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut slot = None; let target = slot.insert(None); *target = Some(repo); \
                  slot.unwrap().unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: make_contiguous borrows its receiver",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slots = VecDeque::from([None]); let slice = slots.make_contiguous(); \
+                 slice[0] = Some(repo); slots[0].as_ref().unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: as_mut_slice borrows its receiver",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slots = vec![None]; let slice = slots.as_mut_slice(); \
+                 slice[0] = Some(repo); slots[0].as_ref().unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a mutable callback parameter borrows the receiver",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slots = HashMap::new(); slots.insert(0, None); \
+                 slots.retain(|_, slot| { *slot = Some(&repo); true }); \
+                 slots[&0].unwrap().find_all().await?; Ok(0) }",
                 Expect::Unbounded,
             ),
             (
