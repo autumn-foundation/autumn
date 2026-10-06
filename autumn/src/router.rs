@@ -4544,12 +4544,12 @@ where
             .as_ref()
             .and_then(|_| req.headers().get(http::header::ORIGIN).cloned());
 
-        // Build the inner future first, then start the clock, then arm the timer,
-        // so `start` and the deadline measure the same interval. The `from_fn`
-        // form armed both inside an async block, before the downstream `call`
-        // chain ran; here that chain runs during `self.inner.call(req)`, so
-        // capturing `start` earlier would make `elapsed_ms` measure a longer span
-        // than `timeout_ms`.
+        // Start the clock and the deadline together, before the downstream
+        // `call` chain runs, so `start` and the deadline measure the same
+        // interval. The handler sees the deadline during `self.inner.call(req)`
+        // (issue #3058), so synchronous work there counts against it, as it
+        // did in the `from_fn` form, which armed both inside an async block
+        // before that chain ran.
         //
         // `tokio::time::timeout` needs a runtime handle, so this `call` must run
         // inside a Tokio runtime. `tower::timeout::Timeout::call` has the same
@@ -4558,9 +4558,9 @@ where
         //
         // The handler sees the deadline through `Deadline::current()` (issue
         // #3058). The task-local scope costs no allocation.
+        let start = crate::time::ambient_instant();
         let deadline = crate::deadline::Deadline::after(duration);
         let inner = deadline.sync_scope(|| self.inner.call(req));
-        let start = crate::time::ambient_instant();
 
         RequestTimeoutFuture::Bounded {
             inner: tokio::time::timeout_at(deadline.instant(), deadline.scope_future(inner)),
