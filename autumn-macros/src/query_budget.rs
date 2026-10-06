@@ -476,6 +476,7 @@ const ELEMENT_METHODS: &[&str] = &[
     "map_or_else",
     "fold",
     "try_fold",
+    "get_or_insert",
     "get_or_insert_with",
 ];
 
@@ -672,6 +673,7 @@ const OPTION_METHODS: &[&str] = &[
     "take",
     "replace",
     "insert",
+    "get_or_insert",
     "get_or_insert_with",
     "ok_or",
     "ok_or_else",
@@ -705,6 +707,7 @@ const OPTION_REF_METHODS: &[&str] = &[
     "take",
     "replace",
     "insert",
+    "get_or_insert",
     "get_or_insert_with",
     "ok_or",
     "ok_or_else",
@@ -6029,6 +6032,7 @@ fn std_arities(shape: Shape, method: &str) -> &'static [usize] {
         | "for_each"
         | "get"
         | "get_mut"
+        | "get_or_insert"
         | "get_or_insert_with"
         | "inspect"
         | "inspect_err"
@@ -14062,6 +14066,18 @@ mod tests {
                 "an exempt unary operator may give its handle back",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  #[query_exempt(reason = \"identity only\")] let alias = -repo; let _ = alias.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "get_or_insert gives the element",
+                "async fn h(repo: PgPostRepository, mut slot: Option<PgPostRepository>) -> AutumnResult<usize> { \
+                 let alias = slot.get_or_insert(repo); let _ = alias.find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "an exempt unknown container method may give a part",
+                "async fn h(repo: PgPostRepository, mut slot: Option<PgPostRepository>) -> AutumnResult<usize> { \
+                 #[query_exempt(reason = \"ext\")] let alias = slot.custom_ext(repo); let _ = alias.find_all().await?; Ok(0) }",
                 Expect::Unbounded,
             ),
         ]);
