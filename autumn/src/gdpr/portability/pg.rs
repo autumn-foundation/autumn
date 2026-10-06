@@ -413,13 +413,15 @@ impl CapsuleStore for PgCapsuleStore {
                         .map_err(|e| store_error("check deferred constraints", &e))?;
                     // Check every move first: one `setval` that fails after
                     // another one ran would leave a changed sequence.
+                    // Each imported column can own a sequence, not only the key.
                     let mut moves = Vec::new();
                     for (_, _, batch) in &statements {
-                        if let Some(next) =
-                            plan_sequence(conn, &batch.model.table, &batch.model.primary_key)
-                                .await?
-                        {
-                            moves.push(next);
+                        for field in batch.model.fields.iter().filter(|f| !f.generated) {
+                            if let Some(next) =
+                                plan_sequence(conn, &batch.model.table, &field.name).await?
+                            {
+                                moves.push(next);
+                            }
                         }
                     }
                     for (seq, value, table) in moves {
@@ -544,8 +546,9 @@ struct SequencePlan {
     cycle: bool,
 }
 
-/// The `setval` that moves a serial or identity sequence past the imported
-/// keys, as `(sequence, value, table)`, or `None` when no move is needed.
+/// The `setval` that moves the serial or identity sequence of `column` past
+/// the imported values, as `(sequence, value, column)`, or `None` when the
+/// column has no sequence or needs no move.
 ///
 /// # Errors
 ///
@@ -556,19 +559,21 @@ struct SequencePlan {
 async fn plan_sequence(
     conn: &mut AsyncPgConnection,
     table: &str,
-    primary_key: &str,
+    column: &str,
 ) -> Result<Option<(String, i64, String)>, DataCapsuleError> {
     let quoted_table = quote(table)?;
+    // `pg_get_serial_sequence` reads the column name as it is, unquoted.
     let seq: SequenceRow = diesel::sql_query("SELECT pg_get_serial_sequence($1, $2) AS seq")
         .bind::<diesel::sql_types::Text, _>(&quoted_table)
-        .bind::<diesel::sql_types::Text, _>(primary_key)
+        .bind::<diesel::sql_types::Text, _>(column)
         .get_result(conn)
         .await
-        .map_err(|e| store_error(&format!("sequence of {table}"), &e))?;
+        .map_err(|e| store_error(&format!("sequence of {table}.{column}"), &e))?;
     let Some(seq) = seq.seq else {
         return Ok(None);
     };
-    let pk = quote(primary_key)?;
+    let target = format!("{table}.{column}");
+    let pk = quote(column)?;
     // The sequence moves past the imported keys, in its own direction. An
     // unused sequence has no last value: then compare with the value before
     // its start.
@@ -590,13 +595,13 @@ async fn plan_sequence(
     .get_result(conn)
     .await
     .optional()
-    .map_err(|e| store_error(&format!("sequence of {table}"), &e))?;
+    .map_err(|e| store_error(&format!("sequence of {target}"), &e))?;
     let Some(plan) = plan else {
         return Ok(None);
     };
     if plan.cache > 1 {
         return Err(DataCapsuleError::NotConfigured(format!(
-            "the sequence of {table} caches {} values; import needs CACHE 1",
+            "the sequence of {target} caches {} values; import needs CACHE 1",
             plan.cache
         )));
     }
@@ -604,7 +609,7 @@ async fn plan_sequence(
     // key.
     if plan.cycle {
         return Err(DataCapsuleError::NotConfigured(format!(
-            "the sequence of {table} cycles; import needs NO CYCLE"
+            "the sequence of {target} cycles; import needs NO CYCLE"
         )));
     }
     if !plan.needed {
@@ -614,16 +619,16 @@ async fn plan_sequence(
     // would leave the earlier ones in place.
     if !plan.can_update {
         return Err(DataCapsuleError::Store(format!(
-            "the import role has no UPDATE privilege on the sequence of {table}"
+            "the import role has no UPDATE privilege on the sequence of {target}"
         )));
     }
     if plan.target < plan.min || plan.target > plan.max {
         return Err(DataCapsuleError::Conflict(format!(
-            "key {} of {table} is outside its sequence range ({}..{})",
+            "key {} of {target} is outside its sequence range ({}..{})",
             plan.target, plan.min, plan.max
         )));
     }
-    Ok(Some((seq, plan.target, table.to_owned())))
+    Ok(Some((seq, plan.target, target)))
 }
 
 #[cfg(test)]

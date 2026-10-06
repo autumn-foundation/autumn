@@ -201,6 +201,9 @@ capsule directory and to each directory above it.
   wrote. Import needs a blob store with a conditional create
   (`BlobStore::put_if_absent`). `LocalBlobStore` and the S3 backend have one.
   With a store that has none, import of a capsule with blobs fails (`501`).
+- An imported `Blob` value names the target store: import sets its
+  `provider_id` and `etag` to those of the store that now holds the bytes. A
+  plain key string stays as it is.
 
 ## Data accuracy
 

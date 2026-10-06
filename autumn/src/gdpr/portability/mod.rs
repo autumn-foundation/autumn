@@ -60,7 +60,7 @@ use bytes::Bytes;
 
 pub use archive::{CapsuleSigner, VerifyReport, verify_dir};
 #[cfg(feature = "storage")]
-pub use blobs::{collect_blobs, restore_blobs};
+pub use blobs::{collect_blobs, rebind_blobs, restore_blobs};
 pub use model::{
     BlobEntry, CapsuleManifest, CapsuleModel, DATA_CAPSULE_FORMAT, DATA_CAPSULE_FORMAT_VERSION,
     DataCapsuleError, FieldSpec, ModelManifest, Record, Relationship,

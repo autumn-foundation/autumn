@@ -71,8 +71,9 @@ pub async fn collect_blobs(
 /// takes a key after the check, that is also a conflict. Then the function
 /// deletes the blobs that it wrote and keeps the blob of the other writer. A
 /// store without a conditional create gives
-/// [`DataCapsuleError::NotConfigured`]. Call it before [`import_capsule`](super::import_capsule):
-/// then no imported record points at a blob that is not there.
+/// [`DataCapsuleError::NotConfigured`]. Call it, then [`rebind_blobs`], before
+/// [`import_capsule`](super::import_capsule): then no imported record points at
+/// a blob that is not there, or at another store.
 ///
 /// # Errors
 ///
@@ -85,6 +86,63 @@ pub async fn restore_blobs(
 ) -> Result<usize, DataCapsuleError> {
     restore_and_track(capsule, store).await?;
     Ok(capsule.manifest.blobs.len())
+}
+
+/// Point each `storage::Blob` object in the blob columns of `capsule` at
+/// `store`: its `provider_id` and `etag` become those of `store`. Call it
+/// after [`restore_blobs`] and before [`import_capsule`](super::import_capsule).
+///
+/// A plain key string, and a key that the capsule has no bytes for, stay as
+/// they are.
+///
+/// # Errors
+///
+/// [`DataCapsuleError::Conflict`] when a restored blob is gone, or
+/// [`DataCapsuleError::Blob`] when `store` fails.
+pub async fn rebind_blobs(
+    capsule: &mut DataCapsule,
+    store: &dyn BlobStore,
+) -> Result<(), DataCapsuleError> {
+    let restored: BTreeSet<&str> = capsule
+        .manifest
+        .blobs
+        .iter()
+        .map(|b| b.key.as_str())
+        .collect();
+    let mut etags = std::collections::BTreeMap::new();
+    for model in &capsule.manifest.models {
+        for row in capsule.records.get_mut(&model.table).into_iter().flatten() {
+            for column in &model.blob_columns {
+                let Some(serde_json::Value::Object(blob)) = row.get_mut(column) else {
+                    continue;
+                };
+                let Some(key) = blob.get("key").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                if !blob.contains_key("provider_id") || !restored.contains(key) {
+                    continue;
+                }
+                let key = key.to_owned();
+                if !etags.contains_key(&key) {
+                    let etag = match store.head(&key).await {
+                        Ok(Some(meta)) => meta.etag,
+                        Ok(None) | Err(BlobStoreError::NotFound(_)) => {
+                            return Err(DataCapsuleError::Conflict(format!(
+                                "blob {key:?} is gone after the restore"
+                            )));
+                        }
+                        Err(e) => {
+                            return Err(DataCapsuleError::Blob(format!("head {key:?}: {e}")));
+                        }
+                    };
+                    etags.insert(key.clone(), etag);
+                }
+                blob.insert("provider_id".to_owned(), store.provider_id().into());
+                blob.insert("etag".to_owned(), etags[&key].clone().into());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Restore the blobs of `capsule` and give the entries that this call wrote.

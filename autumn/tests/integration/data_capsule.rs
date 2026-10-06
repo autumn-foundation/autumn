@@ -1171,6 +1171,57 @@ mod blobs {
     }
 
     #[tokio::test]
+    async fn import_points_blob_handles_at_the_target_store() {
+        use std::sync::Arc;
+
+        use autumn_web::gdpr::portability::CapsuleService;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_blobs = blob_store(&tmp.path().join("a"));
+        source_blobs
+            .put("avatars/ada.png", "image/png", Bytes::from_static(b"png"))
+            .await
+            .unwrap();
+        let source = CapsuleService::new(models(), Arc::new(store()), signer())
+            .with_blob_store(Arc::new(source_blobs));
+        let root = tmp.path().join("capsule");
+        source.export_to("1", &root).await.unwrap();
+
+        // The target store has another provider id.
+        let target_blobs = Arc::new(
+            LocalBlobStore::new(
+                "target",
+                tmp.path().join("b"),
+                "/_blobs",
+                Duration::from_secs(60),
+                SigningKey::new(b"blob-key".to_vec()),
+                vec![],
+            )
+            .unwrap(),
+        );
+        let records = Arc::new(MemoryCapsuleStore::new().table(
+            "users",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("avatar", "jsonb").nullable(),
+                FieldSpec::new("cv_key", "text").nullable(),
+            ],
+        ));
+        let target = CapsuleService::new(models(), records.clone(), signer())
+            .with_blob_store(target_blobs.clone());
+        target.import_from(&root).await.expect("import");
+
+        let head = target_blobs.head("avatars/ada.png").await.unwrap().unwrap();
+        let rows = records.rows("users");
+        let avatar = &rows[0]["avatar"];
+        assert_eq!(avatar["provider_id"], "target", "{avatar}");
+        assert_eq!(avatar["etag"], json!(head.etag), "{avatar}");
+        assert_eq!(avatar["key"], "avatars/ada.png");
+        // A plain key string stays as it is.
+        assert_eq!(rows[0]["cv_key"], "docs/ada-cv.txt");
+    }
+
+    #[tokio::test]
     async fn a_failed_record_import_removes_the_blobs_it_wrote() {
         use std::sync::Arc;
 
