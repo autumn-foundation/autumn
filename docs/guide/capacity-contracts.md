@@ -60,6 +60,7 @@ deploy. Headroom errs toward admitting; the measured envelope is still recorded
 unscaled.
 
 ```toml
+# capacity.lock
 version = 1
 
 [provenance]

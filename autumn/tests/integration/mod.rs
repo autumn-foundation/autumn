@@ -83,6 +83,7 @@ mod config_deprecation;
 mod config_runtime_drift;
 #[cfg(feature = "constela")]
 mod constela;
+mod cost_metering;
 #[cfg(feature = "acme")]
 mod custom_domain_issuance;
 mod custom_domains;
@@ -406,6 +407,7 @@ mod sim_circuit_breaker_slow_calls;
 mod sim_clock_drain;
 #[cfg(feature = "collab")]
 mod sim_collab_convergence;
+mod sim_cost_deferral;
 mod sim_crash_at;
 mod sim_default_entropy;
 mod sim_delayed_enqueue;
