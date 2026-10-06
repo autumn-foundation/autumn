@@ -160,30 +160,6 @@ where
     }
 }
 
-/// Run `f` and add its CPU time and allocated bytes to the totals.
-fn measure(
-    probe: Option<&dyn AllocationProbe>,
-    cpu: &mut std::time::Duration,
-    allocated: &mut u64,
-    f: impl FnOnce(),
-) {
-    let mut f = Some(f);
-    let mark = crate::cost::cpu_mark();
-    if let Some(probe) = probe {
-        let bytes = probe.measure(&mut || {
-            if let Some(f) = f.take() {
-                f();
-            }
-        });
-        *allocated = allocated.saturating_add(bytes);
-    }
-    // No probe, or a probe that did not call `poll`: run it here.
-    if let Some(f) = f.take() {
-        f();
-    }
-    *cpu = cpu.saturating_add(crate::cost::cpu_since(mark));
-}
-
 pin_project! {
     /// Future made by [`CostService`]. It measures each poll.
     pub struct CostFuture<F> {
@@ -243,7 +219,7 @@ where
         let this = self.project();
         let mut inner = this.inner;
         let mut out = Poll::Pending;
-        measure(this.probe.as_deref(), this.cpu, this.allocated, || {
+        crate::cost::measure_poll(this.probe.as_deref(), this.cpu, this.allocated, || {
             out = inner.as_mut().poll(cx);
         });
         match out {
