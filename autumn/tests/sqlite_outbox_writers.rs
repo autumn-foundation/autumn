@@ -477,6 +477,42 @@ mod sql_webhook_store {
         assert_eq!(sub.consecutive_failures, 0);
     }
 
+    /// A failure of an older attempt is stale and ignored. A replay reset
+    /// (out of the DLQ, back to attempt 1) still applies.
+    #[tokio::test]
+    async fn sql_store_ignores_a_stale_attempt() {
+        let substrate = substrate().await;
+        let store = SqlOutboundWebhookStore::new(substrate.pool());
+        store.ensure_schema().await.unwrap();
+        store
+            .create_subscription(subscription("sub-1"))
+            .await
+            .unwrap();
+        let mut newer = log("l", None, None);
+        newer.attempt = 2;
+        store.log_delivery(newer).await.unwrap();
+        store
+            .log_delivery(log("l", Some(500), Some("500")))
+            .await
+            .unwrap();
+        let stored = store.get_delivery_log("l").await.unwrap().unwrap();
+        assert_eq!((stored.attempt, stored.response_status), (2, None));
+        let sub = store.get_subscription("sub-1").await.unwrap().unwrap();
+        assert_eq!(sub.consecutive_failures, 0);
+
+        let mut dead = log("dead", Some(500), Some("500"));
+        dead.attempt = 3;
+        dead.is_dlq = true;
+        store.log_delivery(dead).await.unwrap();
+        store.log_delivery(log("dead", None, None)).await.unwrap();
+        let stored = store.get_delivery_log("dead").await.unwrap().unwrap();
+        assert_eq!(
+            (stored.attempt, stored.is_dlq),
+            (1, false),
+            "a replay reset applies"
+        );
+    }
+
     #[tokio::test]
     async fn sql_store_counts_failures_like_the_in_memory_store() {
         let substrate = substrate().await;

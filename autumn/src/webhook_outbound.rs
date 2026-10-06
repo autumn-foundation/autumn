@@ -85,21 +85,23 @@ pub struct WebhookDeliveryLog {
 /// `true` when [`OutboundWebhookHandler::log_delivery`] must ignore `new`:
 ///
 /// - `stored` has a 2xx response. A success is final.
-/// - `new` is not a 2xx, and `stored` has an outcome for the same attempt and
-///   the same DLQ flag. `new` comes from a duplicate job. A 2xx always
-///   replaces a failure.
+/// - `new` is not a 2xx and comes from a duplicate job: `stored` has an
+///   outcome for the same attempt and the same DLQ flag, or `stored` is a
+///   later attempt. A replay reset (out of the DLQ, back to a pending
+///   attempt 1) is not stale. A 2xx always replaces a failure.
 #[must_use]
 pub fn log_delivery_ignores(stored: &WebhookDeliveryLog, new: &WebhookDeliveryLog) -> bool {
     let is_success = |log: &WebhookDeliveryLog| {
         log.response_status
             .is_some_and(|status| (200..300).contains(&status))
     };
-    let has_outcome = stored.response_status.is_some() || stored.last_error.is_some();
-    is_success(stored)
-        || (!is_success(new)
-            && has_outcome
-            && stored.attempt == new.attempt
-            && stored.is_dlq == new.is_dlq)
+    let has_outcome =
+        |log: &WebhookDeliveryLog| log.response_status.is_some() || log.last_error.is_some();
+    let repeat =
+        has_outcome(stored) && stored.attempt == new.attempt && stored.is_dlq == new.is_dlq;
+    let leaves_dlq = stored.is_dlq && !new.is_dlq && !has_outcome(new);
+    let stale = new.attempt < stored.attempt && !leaves_dlq;
+    is_success(stored) || (!is_success(new) && (repeat || stale))
 }
 
 /// Pluggable handler interface for outbound webhook subscriptions and delivery logs.
@@ -114,7 +116,7 @@ pub trait OutboundWebhookHandler: Send + Sync + 'static {
     ///
     /// Two jobs can send one delivery (an outbox re-send). Ignore a write
     /// that [`log_delivery_ignores`] names: a write to a 2xx log, or a repeated
-    /// failure of the stored attempt. Then a late duplicate job cannot
+    /// or stale failure. Then a late duplicate job cannot
     /// overwrite a success or count one failure twice.
     fn log_delivery(
         &self,
@@ -1353,6 +1355,47 @@ mod tests {
         assert_eq!(log.response_status, Some(200));
         let sub = store.get_subscription("sub").await.unwrap().unwrap();
         assert_eq!(sub.consecutive_failures, 0);
+    }
+
+    /// A failure of an older attempt is stale and ignored. A replay reset
+    /// (out of the DLQ, back to attempt 1) still applies.
+    #[tokio::test]
+    async fn a_stale_attempt_is_ignored() {
+        let store = InMemoryOutboundWebhookHandler::new();
+        store
+            .create_subscription(sample_subscription(
+                "sub",
+                "http://receiver/hooks",
+                WebhookSubscriptionStatus::Active,
+            ))
+            .await
+            .unwrap();
+        let mut newer = sample_log("log", "sub");
+        newer.attempt = 2;
+        store.log_delivery(newer).await.unwrap();
+        let mut stale = sample_log("log", "sub");
+        stale.response_status = Some(500);
+        stale.last_error = Some("500".to_owned());
+        store.log_delivery(stale.clone()).await.unwrap();
+        let log = store.get_delivery_log("log").await.unwrap().unwrap();
+        assert_eq!((log.attempt, log.response_status), (2, None));
+        let sub = store.get_subscription("sub").await.unwrap().unwrap();
+        assert_eq!(sub.consecutive_failures, 0);
+
+        let mut dead = stale.clone();
+        dead.id = "dead".to_owned();
+        dead.attempt = 3;
+        dead.is_dlq = true;
+        store.log_delivery(dead).await.unwrap();
+        let mut reset = sample_log("dead", "sub");
+        reset.attempt = 1;
+        store.log_delivery(reset).await.unwrap();
+        let log = store.get_delivery_log("dead").await.unwrap().unwrap();
+        assert_eq!(
+            (log.attempt, log.is_dlq),
+            (1, false),
+            "a replay reset applies"
+        );
     }
 
     #[tokio::test]
