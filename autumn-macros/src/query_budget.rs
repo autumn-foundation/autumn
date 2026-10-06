@@ -2789,7 +2789,8 @@ impl Analyzer {
             Expr::Path(p) => {
                 !(p.qself.is_none()
                     && p.path.segments.last().is_some_and(|s| s.ident == "None")
-                    && std_prefix(&p.path))
+                    && std_prefix(&p.path)
+                    && !self.head_shadowed(p, &p.path))
             }
             Expr::Call(c) => {
                 !((self.is_container_constructor(c)
@@ -4297,7 +4298,9 @@ impl Analyzer {
         // names a handle is reported (#1667 review, round two).
         // A name the handler body defines, or a `vec!` that is not std, is
         // the user's macro.
-        let users = self.is_shadowed(mac, &name) || (name == "vec" && !std_prefix(&mac.path));
+        let users = self.is_shadowed(mac, &name)
+            || self.head_shadowed(mac, &mac.path)
+            || (name == "vec" && !std_prefix(&mac.path));
         if INERT_MACROS.contains(&name.as_str()) && !users {
             return Cost::ZERO;
         }
@@ -4803,10 +4806,16 @@ impl Analyzer {
         let Expr::Path(path) = &*call.func else {
             return false;
         };
-        path.path
-            .segments
+        self.head_shadowed(call, &path.path)
+    }
+
+    /// Does the body define or import the first name of `path`, at `node`?
+    /// Only the first name resolves in the body: `mem` in `mem::drop` after
+    /// `use custom as mem;`.
+    fn head_shadowed<T>(&self, node: &T, path: &syn::Path) -> bool {
+        path.segments
             .first()
-            .is_some_and(|s| self.is_shadowed(call, &s.ident.to_string()))
+            .is_some_and(|s| self.is_shadowed(node, &s.ident.to_string()))
     }
 
     /// A std `Some`, `Ok` or `Err` call that the body does not shadow.
@@ -4840,7 +4849,7 @@ impl Analyzer {
     /// The elements of a std `vec!`: bare or under a std path, and not
     /// defined by the handler body.
     fn std_vec(&self, mac: &syn::Macro) -> Option<Vec<Expr>> {
-        (std_prefix(&mac.path) && !self.is_shadowed(mac, "vec"))
+        (std_prefix(&mac.path) && !self.head_shadowed(mac, &mac.path))
             .then(|| vec_elems(mac))
             .flatten()
     }
@@ -4852,7 +4861,7 @@ impl Analyzer {
             return false;
         };
         call_path_name(call)
-            .is_some_and(|n| SAFE_FREE_FNS.contains(&n.as_str()) && !self.is_shadowed(call, &n))
+            .is_some_and(|n| SAFE_FREE_FNS.contains(&n.as_str()) && !self.call_head_shadowed(call))
             && std_prefix(&path.path)
     }
 
@@ -13862,6 +13871,24 @@ mod tests {
                 "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
                  let slot = if flag { use custom::Some; Some(repo) } else { None }; let _ = slot.unwrap().find_all().await?; Ok(0) }",
                 Expect::Unbounded,
+            ),
+            (
+                "a body alias of a std module is not std",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 use custom_helpers as mem; mem::drop(repo); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a body alias named std is not std",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 use custom_helpers as std; std::mem::drop(repo); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: std::mem::drop is std",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 std::mem::drop(repo); Ok(0) }",
+                Expect::Exact(0),
             ),
         ]);
     }
