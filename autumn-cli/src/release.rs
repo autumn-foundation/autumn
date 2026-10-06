@@ -3487,6 +3487,11 @@ case "$1 $2" in
         if [ -n "$STUB_REVISION_REWRITTEN" ] && [[ " $* " != *" --revision app--old "* ]]; then
           template=$(jq -c '.containers |= map(.env = ((.env // []) + [{name: "DB", secretRef: "capp-app"}]))' <<< "$template")
         fi
+        # The same rewrite in an init container of the new revision.
+        if [ -n "$STUB_REVISION_INIT_REWRITTEN" ] && [[ " $* " != *" --revision app--old "* ]]; then
+          template=$(jq -c '.initContainers = [{name: "migrate", image: "mcr.microsoft.com/k8se/quickstart:latest",
+                              env: [{name: "DB", secretRef: "capp-app"}]}]' <<< "$template")
+        fi
         if [ "$query" = properties.template ]; then
           echo "$template"
         else
@@ -3633,6 +3638,7 @@ esac
     const AZ_STUB_FLAGS: &[&str] = &[
         "STUB_ACTIVE_SIDECAR_ACR",
         "STUB_REVISION_REWRITTEN",
+        "STUB_REVISION_INIT_REWRITTEN",
         "STUB_SIDECAR_ACR",
         "STUB_APP_REGISTRY_PASSWORD_REF",
         "STUB_INLINE_STALE",
@@ -6099,10 +6105,24 @@ esac
             return;
         };
         assert!(!status.success(), "{calls}");
-        assert!(
-            calls.contains("--query properties.template.containers"),
-            "{calls}"
-        );
+        assert!(!calls.contains("az ingress-patch external=true"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_rejects_a_revision_with_rewritten_init_container_refs() {
+        // The same rewrite in an init container: the revision cannot start
+        // either, so the check covers init containers too.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_REVISION_INIT_REWRITTEN", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
         assert!(!calls.contains("az ingress-patch external=true"), "{calls}");
     }
 

@@ -956,21 +956,23 @@ done
 # Azure can provision a revision whose secret refs point at a secret the app
 # does not have (azure-container-apps issue 1705: the resource provider
 # rewrites them). Such a revision cannot start. So every secret ref in the
-# revision must name a secret of the app before the script trusts it.
-REVISION_CONTAINERS=$(az containerapp revision show \
+# revision, in its containers and its init containers, must name a secret of
+# the app before the script trusts it.
+REVISION_TEMPLATE=$(az containerapp revision show \
   --name "$AZURE_APP_NAME" \
   --resource-group "$AZURE_RESOURCE_GROUP" \
   --revision "$REVISION" \
-  --query properties.template.containers \
-  --output json) || fail "cannot read the containers of revision $REVISION"
+  --query properties.template \
+  --output json) || fail "cannot read the template of revision $REVISION"
 APP_NOW=$(az containerapp show \
   --name "$AZURE_APP_NAME" \
   --resource-group "$AZURE_RESOURCE_GROUP" \
   --output json) || fail "cannot read the secrets of $AZURE_APP_NAME"
 APP_SECRET_NAMES=$(jq -c '[.properties.configuration.secrets // [] | .[].name]' <<< "$APP_NOW")
 MISSING_REFS=$(jq -r --argjson names "$APP_SECRET_NAMES" '
-  [(. // [])[] | (.env // [])[] | .secretRef // empty | select(IN($names[]) | not)]
-  | unique | join(", ")' <<< "$REVISION_CONTAINERS")
+  [((.containers // []) + (.initContainers // []))[] | (.env // [])[]
+   | .secretRef // empty | select(IN($names[]) | not)]
+  | unique | join(", ")' <<< "$REVISION_TEMPLATE")
 [ -z "$MISSING_REFS" ] \
   || fail "revision $REVISION refers to secret(s) $MISSING_REFS, which $AZURE_APP_NAME does not have. Azure can rewrite secret refs (azure-container-apps issue 1705)."
 

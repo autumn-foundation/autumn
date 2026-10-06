@@ -2073,7 +2073,8 @@ too. If you changed `bootstrap_image`, set
 image. If the first cutover fails, the script removes the credentials. The
 job also has them, but runs only after you set the real image on it.
 Before it trusts a new revision, the script also checks that each secret
-ref in it names a secret of the app: Azure can rewrite these refs
+ref in it, in its containers and init containers, names a secret of the
+app: Azure can rewrite these refs
 ([azure-container-apps#1705](https://github.com/microsoft/azure-container-apps/issues/1705)),
 and such a revision cannot start. External
 ingress stays **disabled** until the new revision runs the real image and is
