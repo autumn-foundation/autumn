@@ -2216,6 +2216,19 @@ impl Analyzer {
             _ => {
                 let kind = self.value_of(init);
                 self.bind_pat(pat, kind);
+                // `let h: Holder = Holder { inner: &repo };` keeps the parts
+                // of the literal, unless the type proves it plain.
+                if let Pat::Type(t) = pat
+                    && let Pat::Ident(id) = &*t.pat
+                    && id.subpat.is_none()
+                {
+                    let name = id.ident.to_string();
+                    let mut binding = self.env.binding(&name);
+                    if binding.kind != Kind::Plain && binding.parts.is_none() {
+                        binding.parts = self.binding_of(init).parts;
+                        self.env.declare(name, binding);
+                    }
+                }
             }
         }
     }
@@ -6206,6 +6219,25 @@ fn local_names(block: &Block) -> Vec<String> {
         }
         fn visit_item_enum(&mut self, e: &'a syn::ItemEnum) {
             self.0.push(e.ident.to_string());
+        }
+        fn visit_item_union(&mut self, u: &'a syn::ItemUnion) {
+            self.0.push(u.ident.to_string());
+        }
+        fn visit_item_trait(&mut self, t: &'a syn::ItemTrait) {
+            self.0.push(t.ident.to_string());
+        }
+        fn visit_item_const(&mut self, c: &'a syn::ItemConst) {
+            self.0.push(c.ident.to_string());
+        }
+        fn visit_item_static(&mut self, st: &'a syn::ItemStatic) {
+            self.0.push(st.ident.to_string());
+        }
+        fn visit_item_mod(&mut self, m: &'a syn::ItemMod) {
+            self.0.push(m.ident.to_string());
+        }
+        fn visit_item_extern_crate(&mut self, c: &'a syn::ItemExternCrate) {
+            let name = c.rename.as_ref().map_or(&c.ident, |(_, rename)| rename);
+            self.0.push(name.to_string());
         }
         fn visit_item_type(&mut self, t: &'a syn::ItemType) {
             self.0.push(t.ident.to_string());
@@ -12846,6 +12878,22 @@ mod tests {
                 Expect::Unbounded,
             ),
             (
+                "guard: a local union with a std name is not plain",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 union Vec { inner: *const PgPostRepository } \
+                 let hidden: Vec = Vec { inner: &repo as *const _ }; \
+                 unsafe { (&*hidden.inner).find_all().await?; } Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a local const with a std variant name is not std",
+                "async fn h(repo: PgPostRepository, x: Option<i64>) -> AutumnResult<usize> { \
+                 const None: Option<i64> = Some(1); \
+                 let _ = match x { std::option::Option::Some(_) if repo.a().await? => (), \
+                 None if repo.b().await? => (), _ => () }; Ok(0) }",
+                Expect::Exact(2),
+            ),
+            (
                 "a parameter type is read outside the body's imports",
                 "async fn h(res: Result<PgPostRepository, AppError>) -> AutumnResult<usize> { \
                  use custom::Result; \
@@ -12857,7 +12905,7 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let hidden: custom::Vec<i64> = custom::Vec { inner: repo, value: 0 }; \
                  hidden.inner.find_all().await?; Ok(0) }",
-                Expect::Unbounded,
+                Expect::Exact(1),
             ),
             (
                 "a std path annotation stays plain",
