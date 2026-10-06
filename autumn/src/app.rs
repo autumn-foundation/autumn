@@ -4501,6 +4501,7 @@ impl AppBuilder {
             if jobs.is_empty() {
                 unused_redis_subsystems.push("jobs");
             }
+            unused_redis_subsystems.extend(crate::redis_health::unused_for_role(role));
             crate::redis_health::register_redis_health_indicators(
                 &config,
                 &state.health_indicator_registry,

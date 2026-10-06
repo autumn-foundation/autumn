@@ -256,10 +256,11 @@ pub(crate) fn redis_subsystems(config: &AutumnConfig) -> Vec<(&'static str, Stri
             &config.jobs.redis.url,
         ),
         (
+            // Not only the global limiter: `#[throttle]` routes build their
+            // own limiter on this backend, also when `enabled = false`. The
+            // backend is `memory` unless the operator selects Redis.
             "rate_limit",
-            config.security.rate_limit.enabled
-                && config.security.rate_limit.backend
-                    == crate::security::config::RateLimitBackend::Redis,
+            config.security.rate_limit.backend == crate::security::config::RateLimitBackend::Redis,
             &config.security.rate_limit.redis.url,
         ),
         (
@@ -302,6 +303,23 @@ pub(crate) fn redis_subsystems(config: &AutumnConfig) -> Vec<(&'static str, Stri
             Some((name, url.to_owned()))
         })
         .collect()
+}
+
+/// The subsystems that a process with `role` does not use. A `worker` serves
+/// no user routes, so it uses no HTTP middleware and no webhook endpoints. It
+/// still publishes to channels and runs jobs.
+pub(crate) const fn unused_for_role(role: crate::config::ProcessRole) -> &'static [&'static str] {
+    if role.serves_http() {
+        &[]
+    } else {
+        &[
+            "idempotency",
+            "rate_limit",
+            "sessions",
+            "submit_token",
+            "webhook_replay",
+        ]
+    }
 }
 
 /// Register a `redis:<subsystem>` indicator for each enabled Redis-backed
@@ -417,9 +435,6 @@ mod tests {
     #[test]
     fn disabled_or_url_less_subsystems_are_skipped() {
         let mut config = AutumnConfig::default();
-        // Rate limiting selects Redis but is off.
-        config.security.rate_limit.backend = crate::security::config::RateLimitBackend::Redis;
-        config.security.rate_limit.redis.url = Some("redis://rate:6379".to_owned());
         // Idempotency selects Redis but is switched off by the operator.
         config.idempotency.enabled = Some(false);
         config.idempotency.backend = crate::config::IdempotencyBackend::Redis;
@@ -430,6 +445,43 @@ mod tests {
         config.session.redis.url = Some("   ".to_owned());
 
         assert!(redis_subsystems(&config).is_empty());
+    }
+
+    #[test]
+    fn rate_limit_on_redis_is_listed_when_the_global_limiter_is_off() {
+        // `#[throttle]` routes build their own limiter on the configured
+        // backend, so they use Redis also when `enabled = false`.
+        let mut config = AutumnConfig::default();
+        config.security.rate_limit.enabled = false;
+        config.security.rate_limit.backend = crate::security::config::RateLimitBackend::Redis;
+        config.security.rate_limit.redis.url = Some("redis://rate:6379".to_owned());
+
+        let names: Vec<_> = redis_subsystems(&config)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["rate_limit"]);
+    }
+
+    #[test]
+    fn worker_role_skips_the_http_only_subsystems() {
+        use crate::config::ProcessRole;
+
+        let skipped = unused_for_role(ProcessRole::Worker);
+        for subsystem in [
+            "idempotency",
+            "rate_limit",
+            "sessions",
+            "submit_token",
+            "webhook_replay",
+        ] {
+            assert!(skipped.contains(&subsystem), "{subsystem}");
+        }
+        // A worker publishes to channels and runs jobs.
+        assert!(!skipped.contains(&"channels"));
+        assert!(!skipped.contains(&"jobs"));
+        assert!(unused_for_role(ProcessRole::Web).is_empty());
+        assert!(unused_for_role(ProcessRole::Combined).is_empty());
     }
 
     #[test]
