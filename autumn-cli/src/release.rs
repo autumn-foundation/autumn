@@ -3594,6 +3594,11 @@ case "$1 $2" in
     if [ -n "$STUB_TMP_MODES" ]; then
       ls -l "$TMPDIR"/azure-cutover.* | sed 's/^/mode /' >> "$STUB_LOG"
     fi
+    # Azure rejects a PATCH that removes tags.
+    if [ -n "$tags_only" ] && [ -n "$STUB_TAGS_CLEAR_FAILS" ] \
+      && jq -e '[.tags[]] | any(. == null)' <<< "$body" > /dev/null; then
+      exit 1
+    fi
     open_patch=""
     if grep -q '"ingress"' <<< "$body"; then
       echo "az ingress-patch external=$(jq -r '.properties.configuration.ingress.external' <<< "$body")" >> "$STUB_LOG"
@@ -3612,6 +3617,8 @@ case "$1 $2" in
     if [ -n "$STUB_INGRESS_DISABLE_FAILS" ] && grep -q "ingress-patch external=true" "$STUB_LOG"; then
       exit 1
     fi
+    # Azure disables ingress, but the response is lost.
+    if [ -n "$STUB_INGRESS_DISABLE_LOST" ]; then exit 1; fi
     ;;
   *) echo "unexpected az call: $*" >&2; exit 2 ;;
 esac
@@ -3647,6 +3654,8 @@ esac
         "STUB_REVISION_INIT_REWRITTEN",
         "STUB_INIT_SECRET_REF",
         "STUB_CUTOVER_LOST",
+        "STUB_TAGS_CLEAR_FAILS",
+        "STUB_INGRESS_DISABLE_LOST",
         "STUB_SIDECAR_ACR",
         "STUB_APP_REGISTRY_PASSWORD_REF",
         "STUB_INLINE_STALE",
@@ -5246,6 +5255,66 @@ esac
                 >= 4,
             "{calls}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_restores_the_ingress_when_the_disable_reports_a_failure() {
+        // The disable can apply although az reports a failure (a lost
+        // response). The script stops before any other write, and sends the
+        // saved (open) ingress back, so the app does not stay offline. In
+        // both modes.
+        for (args, legacy) in [(&[][..], ""), (&["--remove-credentials"][..], "1")] {
+            let mut env = vec![
+                ("STUB_INGRESS_EXTERNAL", "1"),
+                ("STUB_INGRESS_DISABLE_LOST", "1"),
+            ];
+            if !legacy.is_empty() {
+                env.push(("STUB_APP_LEGACY", legacy));
+            }
+            let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+                args,
+                "mcr.microsoft.com/k8se/quickstart:latest",
+                "Provisioned",
+                false,
+                0,
+                &env,
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{args:?}: {calls}");
+            let after_disable = calls
+                .split("az containerapp ingress disable")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{args:?}: {calls}"));
+            assert!(
+                after_disable.contains("az ingress-patch external=true"),
+                "{args:?}: {calls}"
+            );
+            assert!(!bodies.contains("acr.azurecr.io/app:t1"), "{bodies}");
+            assert!(!bodies.contains("AUTUMN_CREDENTIAL_CLEANUP"), "{bodies}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_fails_when_it_cannot_remove_the_recovery_tags() {
+        // The release runs, but the tags with the ingress snapshot and the
+        // copied record stay. A later run would prefer that stale snapshot,
+        // so the run fails and says so. It does not roll the release back.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_TAGS_CLEAR_FAILS", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(calls.contains("az ingress-patch external=true"), "{calls}");
+        assert!(!bodies.contains("AUTUMN_CREDENTIAL_CLEANUP"), "{bodies}");
+        assert!(!bodies.contains("\"type\":\"None\""), "{bodies}");
     }
 
     #[cfg(unix)]

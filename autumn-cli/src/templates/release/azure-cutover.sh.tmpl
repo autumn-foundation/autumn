@@ -430,7 +430,8 @@ save_ingress_tags() {
 
 # Removes the tags with the given prefixes (a JSON array): the ingress
 # snapshot after the ingress is back, and the copied record after a
-# successful cutover.
+# successful cutover. It fails when they stay: a later run prefers the
+# snapshot in the tags, so a stale one would overwrite later changes.
 clear_tags() {
   local tags now
   now=$(az containerapp show \
@@ -441,19 +442,20 @@ clear_tags() {
     | map({(.): null}) | add // {}' <<< "$now")
   [ "$tags" = "{}" ] && return 0
   patch_app "$(jq -cn --argjson app "$APP" --argjson tags "$tags" '{location: $app.location, tags: $tags}')" \
-    && tags_show "$tags" \
-    || echo "::warning::remove the $(jq -r 'map(. + "*") | join(", ")' <<< "$1") tags from $AZURE_APP_NAME" >&2
+    && tags_show "$tags"
 }
 
 # Sends the saved ingress back, as it was, then removes the snapshot tags.
 restore_ingress() {
   [ "$SAVED_INGRESS" = null ] && return 0
-  if set_ingress "$(jq -r '.external // false' <<< "$SAVED_INGRESS")"; then
-    clear_tags '["autumn-ingress-"]'
-  else
+  if ! set_ingress "$(jq -r '.external // false' <<< "$SAVED_INGRESS")"; then
     echo "::error::cannot restore the ingress of $AZURE_APP_NAME. Run the script again, or restore it manually: its autumn-ingress-* tags hold the saved ingress (base64 JSON)." >&2
     return 1
   fi
+  clear_tags '["autumn-ingress-"]' || {
+    echo "::error::the ingress of $AZURE_APP_NAME is back, but its autumn-ingress-* tags stay. Remove them: a later run would send that saved ingress again." >&2
+    return 1
+  }
 }
 
 # Opens external ingress. On a later deploy whose live ingress is open,
@@ -670,7 +672,8 @@ remove_credentials() {
   for _ in $(seq 1 30); do
     sleep 10
     if app_shows "$REMOVED"' and (.tags["autumn-cleanup"] // "") == "'"$marker"'"'; then
-      clear_tags '["autumn-cleanup"]'
+      clear_tags '["autumn-cleanup"]' \
+        || echo "::warning::remove the autumn-cleanup tag from $AZURE_APP_NAME" >&2
       return 0
     fi
   done
@@ -748,17 +751,23 @@ if [ "$MODE" = remove ]; then
   if [ "$(jq -r '.properties.configuration.ingress != null' <<< "$APP")" = true ]; then
     save_ingress_tags \
       || { echo "::error::cannot save the ingress of $AZURE_APP_NAME in its tags" >&2; exit 1; }
+    # A failure can follow an applied disable (a lost response), so the
+    # script sends the saved ingress back, and stops.
     az containerapp ingress disable \
       --name "$AZURE_APP_NAME" \
       --resource-group "$AZURE_RESOURCE_GROUP" \
-      --output none
+      --output none || {
+      echo "::error::cannot disable the ingress of $AZURE_APP_NAME" >&2
+      restore_ingress
+      exit 1
+    }
   fi
   remove_credentials || {
     echo "::error::cannot remove the credentials from $AZURE_APP_NAME. Its ingress stays disabled; the next run restores it from the app's tags." >&2
     exit 1
   }
   restore_ingress || {
-    echo "::error::the credentials are removed from $AZURE_APP_NAME, but its ingress is not back." >&2
+    echo "::error::the credentials are removed from $AZURE_APP_NAME. See the error above." >&2
     exit 1
   }
   echo "removed the credentials from the placeholder app $AZURE_APP_NAME"
@@ -835,10 +844,12 @@ if [ -z "$RELEASED" ]; then
     check_tag_budget "$COPIED_PARTS"
     save_ingress_tags \
       || { echo "::error::cannot save the ingress of $AZURE_APP_NAME in its tags. The script stops before it disables ingress." >&2; exit 1; }
+    # A failure can follow an applied disable (a lost response): the
+    # saved ingress goes back.
     az containerapp ingress disable \
       --name "$AZURE_APP_NAME" \
       --resource-group "$AZURE_RESOURCE_GROUP" \
-      --output none
+      --output none || stop_before_patch "cannot disable the ingress of $AZURE_APP_NAME"
     for _ in $(seq 1 60); do
       REPLICAS=0
       for revision in $PLACEHOLDER_REVISIONS; do
@@ -1109,5 +1120,9 @@ if [ -n "$STALE_REDIS" ]; then
 fi
 # The release runs with its credentials now: no rollback needs the record of
 # what was copied, and the ingress is back.
-clear_tags '["autumn-ingress-", "autumn-copied-"]'
+if ! clear_tags '["autumn-ingress-", "autumn-copied-"]'; then
+  # Not a rollback: the release runs with its credentials.
+  echo "::error::$AZURE_APP_NAME runs $IMAGE, but its autumn-ingress-* and autumn-copied-* tags stay. Remove them: a later run would send that saved ingress again, and a credential removal would use that record." >&2
+  exit 1
+fi
 echo "cutover complete: $AZURE_APP_NAME runs $IMAGE"
