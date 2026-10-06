@@ -30,7 +30,8 @@
 // The durable Postgres job backend (queue claiming, worker/maintenance loops,
 // lifecycle recording, admin paging — everything reachable only from the
 // `start_postgres_runtime` entry point) is Postgres-only and is refused under
-// the `sqlite` feature (SQLite has no LISTEN/NOTIFY or advisory-lock queue).
+// the `sqlite` feature (SQLite has no `FOR UPDATE SKIP LOCKED` or advisory
+// locks).
 // Those helpers therefore become dead in a `--features sqlite` build while the
 // local/redis backends stay live; silence dead-code just for that build rather
 // than cfg-gating dozens of individual pg-only items. No effect on the default
@@ -9017,6 +9018,10 @@ fn record_pg_row_cancel_after_ack(
     record_pg_cancel_after_ack(ack_result, &row.name, &row.id, state)
 }
 
+/// How long an idle Postgres worker waits before it polls for a job again.
+///
+/// The Postgres runtime has no `LISTEN`/`NOTIFY` wake-up. A new job waits
+/// for the next poll. `docs/guide/jobs.md` states this value.
 #[cfg(feature = "db")]
 const PG_WORKER_IDLE_SLEEP: std::time::Duration = std::time::Duration::from_millis(200);
 #[cfg(feature = "db")]
@@ -11113,8 +11118,8 @@ async fn pg_enqueued_and_scheduled_pages(
 
 /// `SQLite` stub for the Postgres job runtime.
 ///
-/// The durable Postgres job backend uses `LISTEN`/`NOTIFY`, `FOR UPDATE SKIP
-/// LOCKED` claiming, and advisory locks — none of which `SQLite` provides — so
+/// The durable Postgres job backend uses `FOR UPDATE SKIP LOCKED` claiming
+/// and advisory locks — `SQLite` provides neither — so
 /// under the `sqlite` feature the runtime pool (`RuntimeConnection`) is a
 /// `SQLite` pool that cannot drive the Postgres worker loops. Refuse a
 /// `jobs.backend = "postgres"` configuration with a clear message instead of
@@ -11132,7 +11137,7 @@ fn start_postgres_runtime(
     let _ = (jobs, state, shutdown, config, run_workers);
     Err(AutumnError::internal_server_error(std::io::Error::other(
         "jobs.backend=postgres is unsupported under the sqlite feature; SQLite has no \
-         LISTEN/NOTIFY or advisory-lock queue. Use jobs.backend=sqlite for a durable queue \
+         FOR UPDATE SKIP LOCKED or advisory locks. Use jobs.backend=sqlite for a durable queue \
          in your own SQLite file, or jobs.backend=local (the default) for the in-process \
          queue.",
     )))
@@ -17938,8 +17943,8 @@ mod tests {
         }
 
         // The sqlite arm of the same call. `start_postgres_runtime` is a stub
-        // under the backend flip — SQLite has no LISTEN/NOTIFY and no
-        // advisory-lock queue — so it refuses regardless of what is configured,
+        // under the backend flip — SQLite has no `FOR UPDATE SKIP LOCKED` and
+        // no advisory locks — so it refuses regardless of what is configured,
         // and this is the only coverage of that refusal.
         #[cfg(feature = "sqlite")]
         #[tokio::test]

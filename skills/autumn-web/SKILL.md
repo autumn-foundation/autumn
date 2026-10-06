@@ -1879,6 +1879,13 @@ backend-conditionally rather than assuming Postgres.
   `from_database_config(&config.database)` returns `None` unless the configured
   primary names Postgres. `.expect()` on it fails at BOOT on a `sqlite://`
   target — pick `InMemoryFlagStore` / `InMemoryConfigStore` on that arm instead.
+- `PgFlagStore` reads an in-memory snapshot and never connects on a Tokio
+  worker (issue #3063). Run `PgFlagStore::spawn_poll_listener` so replicas see
+  changes (they poll; there is no `LISTEN`). Before its first load, `get` on a
+  runtime returns an error: call `refresh()` before you seed flags, and seed
+  only on `Ok(None)`. A store error serves last-known values; set a fallback
+  with `FeatureFlagService::with_default` and register it with
+  `AppBuilder::with_flag_service`.
 - `DatabaseConfig::effective_primary_postgres_url()` is the screen to branch on
   (`effective_primary_url()` returns the target whatever backend it names).
 - `Lock::from_state` returns `LockError::PoolUnavailable` under the `sqlite`
@@ -3170,6 +3177,9 @@ autumn release init --target azure-container-apps   # Terraform scaffold: main.t
 autumn release init --target aws-app-runner      # Fast/minimal AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ECR, App Runner behind a VPC connector, RDS Postgres, Secrets Manager). No CI workflow (#1279); see docs/guide/deployment.md.
 autumn release init --target aws-ecs             # Production AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (VPC, ALB+ACM DNS-validated HTTPS, ECS Fargate w/ circuit-breaker rollback, Application Auto Scaling, RDS, opt-in Redis) + .github/workflows/aws-deploy.yml (#1279); see docs/guide/deployment.md.
 autumn release init --target gcp-cloud-run       # GCP path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (Artifact Registry, Cloud Run, Cloud SQL Postgres behind a VPC connector, Secret Manager, opt-in Memorystore Redis) + .github/workflows/gcp-deploy.yml (#1280); see docs/guide/deployment.md.
+# Release probe paths (#3066): every target sends traffic checks to /ready and liveness to /live, never the /health alias.
+#   Image HEALTHCHECK -> /startup (compose --wait waits for startup; Swarm does not replace containers during a DB outage). ECS ALB target group and App Runner cutover -> /ready.
+#   Cloud Run -> startup probe /ready (its only traffic gate), liveness /live. Azure Container Apps -> startup /startup, readiness /ready, liveness /live. Fly -> /ready + /live.
 autumn migrate new add_widget_archived_at   # collision-free migration dir: prefer this (or `generate migration`) over hand-creating one — see "Migration version collisions" below
 autumn migrate check-collisions             # CI gate: fails if this branch's migration version collides with the default branch, another pushed branch, or the framework's own migrations
 autumn sbom                      # CycloneDX 1.5 SBOM for this source tree, to stdout (deterministic: no timestamp, content-derived serialNumber) (0.8.0, issue #1615)
