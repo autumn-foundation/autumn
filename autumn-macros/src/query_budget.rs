@@ -269,6 +269,9 @@ const OUTPUT_CALLBACKS: &[&str] = &["map_or", "map_or_else", "fold", "try_fold"]
 /// Methods whose result has the receiver's type.
 const SAME_TYPE_METHODS: &[&str] = &["clone", "to_owned"];
 
+/// Methods that give an owned copy of their receiver, not a borrow into it.
+const OWNED_COPY_METHODS: &[&str] = &["to_vec", "to_string"];
+
 /// Constructors that build a carrier and run no code.
 const CONTAINER_CONSTRUCTORS: &[&str] = &["Some", "Ok", "Err"];
 
@@ -2601,7 +2604,18 @@ impl Analyzer {
         } else {
             // `slots.iter_mut().next()`, `it.next()`, `(&raw mut slot).cast()`:
             // a method on a borrow or a pointer may give a borrow into it.
-            self.referents_of(&mc.receiver)
+            // `cell.get()`, `cell.as_ptr()`: a method on a place may give a
+            // pointer into it.
+            // A copy or a scalar does not.
+            let through = self.referents_of(&mc.receiver);
+            let owned = SAME_TYPE_METHODS.contains(&method.as_str())
+                || OWNED_COPY_METHODS.contains(&method.as_str())
+                || SCALAR_METHODS.contains(&method.as_str());
+            if through.is_empty() && !owned {
+                place_root(&mc.receiver).into_iter().collect()
+            } else {
+                through
+            }
         }
     }
 
@@ -13517,6 +13531,36 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut slot = None; let target = std::ptr::from_mut(&mut slot).cast::<Option<PgPostRepository>>(); unsafe { *target = Some(repo); } let _ = slot.unwrap().find_all().await?; Ok(0) }",
                 Expect::Unbounded,
+            ),
+            (
+                "an UnsafeCell pointer points into the cell",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let cell = UnsafeCell::new(None); let ptr = cell.get(); unsafe { *ptr = Some(repo); } let r = unsafe { (&*cell.get()).as_ref().unwrap() }; let _ = r.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a Cell pointer points into the cell",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let cell = Cell::new(None); let ptr = cell.as_ptr(); unsafe { *ptr = Some(repo); } let r = cell.take().unwrap(); let _ = r.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a plain method result on a plain place stays plain",
+                "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
+                 let n = ids.len(); repo.a().await?; Ok(n) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: an owned copy does not point into its source",
+                "async fn h(repo: PgPostRepository, names: Vec<String>) -> AutumnResult<usize> { \
+                 let mut list = names.to_vec(); list.push(repo); render(&names); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: a clone does not point into its source",
+                "async fn h(repo: PgPostRepository, names: Vec<String>) -> AutumnResult<usize> { \
+                 let mut list = names.clone(); list.push(repo); render(&names); Ok(0) }",
+                Expect::Exact(0),
             ),
         ]);
     }
