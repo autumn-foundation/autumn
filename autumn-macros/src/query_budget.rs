@@ -4325,13 +4325,20 @@ impl Analyzer {
 
     /// What `expr` evaluates to.
     fn value_of(&self, expr: &Expr) -> Kind {
-        // Std `drop` gives `()`. A value from a `drop` that took a handle is
-        // a user function's, and may hold it (`let pending = drop(repo);`).
+        // Std `drop` gives `()`. A value from a bare `drop` that took a
+        // handle may be a module-level function's (`let pending =
+        // drop(repo);`). One under a `std` or `core` path is std.
         if let Expr::Call(c) = peel_parens(expr)
             && self.is_std_free_fn(c)
-            && c.args.iter().any(|a| self.expr_carries_handle(a))
         {
-            return Kind::Holder;
+            let rooted = matches!(&*c.func, Expr::Path(p) if p.path.segments.len() > 1
+                && p.path.segments.first().is_some_and(|s| s.ident == "std" || s.ident == "core"));
+            if rooted {
+                return Kind::Plain;
+            }
+            if c.args.iter().any(|a| self.expr_carries_handle(a)) {
+                return Kind::Holder;
+            }
         }
         if self.expr_is_nested(expr) {
             Kind::Nested
@@ -6963,9 +6970,37 @@ fn type_depth(ty: &Type) -> u8 {
 /// Standard and primitive type names that cannot hold a handle unless a
 /// type argument does.
 const PLAIN_STD_TYPES: &[&str] = &[
-    "bool", "char", "str", "String", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16",
-    "u32", "u64", "u128", "usize", "f32", "f64", "Vec", "VecDeque", "Option", "Result", "HashMap",
-    "HashSet", "BTreeMap", "BTreeSet", "Box", "Arc", "Rc",
+    "bool",
+    "char",
+    "str",
+    "String",
+    "i8",
+    "i16",
+    "i32",
+    "i64",
+    "i128",
+    "isize",
+    "u8",
+    "u16",
+    "u32",
+    "u64",
+    "u128",
+    "usize",
+    "f32",
+    "f64",
+    "Vec",
+    "VecDeque",
+    "Option",
+    "Result",
+    "HashMap",
+    "HashSet",
+    "BTreeMap",
+    "BTreeSet",
+    "BinaryHeap",
+    "LinkedList",
+    "Box",
+    "Arc",
+    "Rc",
 ];
 
 /// Is `ty` made only of [`PLAIN_STD_TYPES`], with no `_` left to infer?
@@ -13931,6 +13966,36 @@ mod tests {
                 "async fn h(mut repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
                  let mut rest = repos.split_off(1); let r = rest.pop().unwrap(); let _ = r.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
+            ),
+            (
+                "the result of std::mem::drop is plain",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let done = std::mem::drop(repo); consume(done); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: the result of a bare drop may be a user function's",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let done = drop(repo); consume(done); Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "a BinaryHeap annotation of plain parts is plain",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let ids: BinaryHeap<i64> = repos.as_slice().iter().map(|r| r.id).collect(); render(ids); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "a LinkedList annotation of plain parts is plain",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let ids: LinkedList<i64> = repos.as_slice().iter().map(|r| r.id).collect(); render(ids); Ok(0) }",
+                Expect::Exact(0),
+            ),
+            (
+                "guard: a Vec annotation of plain parts is plain",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let ids: Vec<i64> = repos.as_slice().iter().map(|r| r.id).collect(); render(ids); Ok(0) }",
+                Expect::Exact(0),
             ),
         ]);
     }
