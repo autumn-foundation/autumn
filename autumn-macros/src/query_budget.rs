@@ -3401,11 +3401,7 @@ impl Analyzer {
                 self.bind_init(&l.pat, &l.expr);
                 flow
             }
-            Expr::Range(r) => {
-                let start = r.start.as_deref().map_or(Flow::ZERO, |e| self.expr(e));
-                let end = r.end.as_deref().map_or(Flow::ZERO, |e| self.expr(e));
-                start.then(end)
-            }
+            Expr::Range(r) => self.each(r.start.iter().chain(r.end.iter()).map(|e| &**e)),
             Expr::RawAddr(r) => self.expr(&r.expr),
             Expr::Reference(r) => self.expr(&r.expr),
             Expr::Repeat(r) => self.expr(&r.expr).then(self.expr(&r.len)),
@@ -4121,11 +4117,7 @@ impl Analyzer {
     fn mac(&mut self, mac: &syn::Macro) -> Cost {
         // `vec![a, b]` and `vec![a; n]` are read like an array.
         if let Some(elems) = self.std_vec(mac) {
-            let mut cost = Cost::ZERO;
-            for elem in &elems {
-                cost = cost.then(self.cost_of(elem));
-            }
-            return cost;
+            return self.each(elems.iter()).total();
         }
         if !tokens_mention_any(&mac.tokens, &|name| self.env.is_tracked(name)) {
             return Cost::ZERO;
@@ -13206,6 +13198,38 @@ mod tests {
                  let alias = (|r, _| r)(source.take().unwrap(), { source = None; 0 }); \
                  alias.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
+            ),
+            (
+                "guard: a later vec element does not erase an earlier one",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut source = Some(Ctx { inner: Some(repo) }); \
+                 let wrapped = vec![source.take().unwrap(), { source = None; Ctx { inner: None } }]; \
+                 wrapped[0].inner.as_ref().unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a range end does not erase its start",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut source = Some(Ctx { inner: Some(repo) }); \
+                 let wrapped = (source.take().unwrap())..({ source = None; Ctx { inner: None } }); \
+                 wrapped.start.inner.as_ref().unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a later plain vec element does not erase an earlier read",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut source = Some(repo); \
+                 let wrapped = vec![source.take().unwrap(), { source = None; make() }]; \
+                 wrapped[0].find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a plain range end does not erase its start's read",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut source = Some(repo); \
+                 let wrapped = (source.take().unwrap())..({ source = None; make() }); \
+                 wrapped.start.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
             ),
             (
                 "guard: a borrow moved out by a dereference keeps its owner",
