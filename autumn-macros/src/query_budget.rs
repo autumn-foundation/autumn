@@ -389,6 +389,7 @@ const SCALAR_METHODS: &[&str] = &[
 /// `Option` of a part.
 const CARRIER_METHODS: &[&str] = &[
     "as_mut_slice",
+    "split_off",
     "xor",
     "err",
     "map_err",
@@ -496,6 +497,7 @@ const BOOL_METHODS: &[&str] = &["then", "then_some"];
 const VEC_METHODS: &[&str] = &[
     "len",
     "is_empty",
+    "split_off",
     "capacity",
     "into_iter",
     "as_slice",
@@ -552,6 +554,7 @@ const SLICE_METHODS: &[&str] = &[
 const DEQUE_METHODS: &[&str] = &[
     "len",
     "is_empty",
+    "split_off",
     "capacity",
     "contains",
     "iter",
@@ -579,6 +582,7 @@ const DEQUE_METHODS: &[&str] = &[
 const LIST_METHODS: &[&str] = &[
     "len",
     "is_empty",
+    "split_off",
     "contains",
     "iter",
     "iter_mut",
@@ -1944,6 +1948,9 @@ struct Analyzer {
     /// Names the handler body defines or imports (`macro_rules! vec`, `fn
     /// drop`, `use x::format`). A std name among them is not trusted.
     shadowed: Rc<Vec<String>>,
+    /// The names in scope at each node of the body, by address. A node the
+    /// analysis builds itself is not in it, and reads `shadowed`.
+    scopes: Rc<HashMap<usize, Rc<Vec<String>>>>,
 }
 
 impl Analyzer {
@@ -1960,6 +1967,7 @@ impl Analyzer {
             param_referents_each: Vec::new(),
             closure_params: Vec::new(),
             shadowed: Rc::new(Vec::new()),
+            scopes: Rc::new(item_scopes(&input_fn.block)),
         };
         // The signature reads names from outside the body, so the body's
         // items do not shadow its types.
@@ -2073,7 +2081,7 @@ impl Analyzer {
                 // `Err(e)` on it binds the error. On a carrier, such as a
                 // `Result<(), Db>`, `Err(e)` may be the handle. Only the std
                 // `Err`: a handle type may have its own `Err` variant.
-                let is_err = pattern_variant(pat, &self.shadowed)
+                let is_err = pattern_variant(pat, self.shadowed_at(pat))
                     .is_some_and(|(_, variant)| variant == "Err");
                 let inner = if is_err && kind.is_handle() {
                     Kind::Plain
@@ -3031,8 +3039,9 @@ impl Analyzer {
     // ── Blocks and statements ────────────────────────────────────────
 
     fn block(&mut self, block: &Block) -> Flow {
-        // An item shadows its whole block. A statement also sees the items
-        // of the blocks nested in it: a value can leave such a block.
+        // For a node the analysis builds (not in `scopes`): an item shadows
+        // its whole block, and a statement sees the items of the blocks
+        // nested in it, since a value can leave such a block.
         let outer = Rc::clone(&self.shadowed);
         let mut own = outer.to_vec();
         own.extend(block_items(block));
@@ -3530,7 +3539,7 @@ impl Analyzer {
             let (pat, guard) = crate::parse::arm_pat_and_guard(arm);
             self.env = entry.clone();
             for (earlier, _, after) in &tried {
-                if !patterns_disjoint(earlier, pat, &self.shadowed) {
+                if !patterns_disjoint(earlier, pat, self.shadowed_at(pat)) {
                     self.env.join(after);
                 }
             }
@@ -3551,9 +3560,11 @@ impl Analyzer {
             let prefix = guard_prefix(
                 tried
                     .iter()
-                    .filter(|(earlier, _, _)| !patterns_disjoint(earlier, pat, &self.shadowed))
+                    .filter(|(earlier, _, _)| {
+                        !patterns_disjoint(earlier, pat, self.shadowed_at(pat))
+                    })
                     .map(|(earlier, cost, _)| (*earlier, cost)),
-                &self.shadowed,
+                self.shadowed_at(pat),
             );
             let body = Flow::cost(prefix).then(guard).then(body);
             // A later arm runs after this guard falls through, or after
@@ -4290,7 +4301,7 @@ impl Analyzer {
         // names a handle is reported (#1667 review, round two).
         // A name the handler body defines, or a `vec!` that is not std, is
         // the user's macro.
-        let users = self.is_shadowed(&name) || (name == "vec" && !std_prefix(&mac.path));
+        let users = self.is_shadowed(mac, &name) || (name == "vec" && !std_prefix(&mac.path));
         if INERT_MACROS.contains(&name.as_str()) && !users {
             return Cost::ZERO;
         }
@@ -4578,7 +4589,12 @@ impl Analyzer {
         if held == Kind::Plain {
             return;
         }
+        // `slots.entry(k).or_insert(repo)`: a store through a borrow is a
+        // store into what it borrows, at an unknown depth.
         let Some(root) = place_root(receiver) else {
+            for target in self.referents_of(receiver) {
+                self.raise(target, Kind::Nested);
+            }
             return;
         };
         // `append` and `extend` add the parts of a sequence, an `Option` or a
@@ -4773,8 +4789,16 @@ impl Analyzer {
     /// A copy of the analysis that reads a body. Its own record of closed
     /// scopes keeps the body's handle parameters out of the real one.
     /// Is `name` defined or imported by the handler body?
-    fn is_shadowed(&self, name: &str) -> bool {
-        shadows(&self.shadowed, name)
+    fn is_shadowed<T>(&self, node: &T, name: &str) -> bool {
+        shadows(self.shadowed_at(node), name)
+    }
+
+    /// The names in scope at `node`: its own block and the blocks around
+    /// it.
+    fn shadowed_at<T>(&self, node: &T) -> &[String] {
+        self.scopes
+            .get(&std::ptr::from_ref(node).addr())
+            .map_or(&self.shadowed, |names| names)
     }
 
     /// Does the handler body define or import the first name of `call`'s
@@ -4786,7 +4810,7 @@ impl Analyzer {
         path.path
             .segments
             .first()
-            .is_some_and(|s| self.is_shadowed(&s.ident.to_string()))
+            .is_some_and(|s| self.is_shadowed(call, &s.ident.to_string()))
     }
 
     /// A std `Some`, `Ok` or `Err` call that the body does not shadow.
@@ -4808,10 +4832,11 @@ impl Analyzer {
                 syn::visit::visit_path_segment(self, s);
             }
         }
-        if self.shadowed.is_empty() {
+        let shadowed = self.shadowed_at(ty);
+        if shadowed.is_empty() {
             return false;
         }
-        let mut names = Names(&self.shadowed, false);
+        let mut names = Names(shadowed, false);
         names.visit_type(ty);
         names.1
     }
@@ -4819,7 +4844,7 @@ impl Analyzer {
     /// The elements of a std `vec!`: bare or under a std path, and not
     /// defined by the handler body.
     fn std_vec(&self, mac: &syn::Macro) -> Option<Vec<Expr>> {
-        (std_prefix(&mac.path) && !self.is_shadowed("vec"))
+        (std_prefix(&mac.path) && !self.is_shadowed(mac, "vec"))
             .then(|| vec_elems(mac))
             .flatten()
     }
@@ -4831,7 +4856,7 @@ impl Analyzer {
             return false;
         };
         call_path_name(call)
-            .is_some_and(|n| SAFE_FREE_FNS.contains(&n.as_str()) && !self.is_shadowed(&n))
+            .is_some_and(|n| SAFE_FREE_FNS.contains(&n.as_str()) && !self.is_shadowed(call, &n))
             && std_prefix(&path.path)
     }
 
@@ -4849,6 +4874,7 @@ impl Analyzer {
             param_referents_each: Vec::new(),
             closure_params: Vec::new(),
             shadowed: Rc::clone(&self.shadowed),
+            scopes: Rc::clone(&self.scopes),
         }
     }
 
@@ -5989,6 +6015,7 @@ fn std_arities(shape: Shape, method: &str) -> &'static [usize] {
         | "retain"
         | "skip"
         | "skip_while"
+        | "split_off"
         | "sort_by"
         | "sort_by_key"
         | "sort_unstable_by"
@@ -6528,6 +6555,63 @@ fn std_owner(path: &syn::Path) -> bool {
         .iter()
         .take(n)
         .all(|s| STD_PATH.contains(&s.ident.to_string().as_str()))
+}
+
+/// The names in scope at each call, macro, type and pattern of `body`, by
+/// address: the items of each block around it.
+fn item_scopes(body: &Block) -> HashMap<usize, Rc<Vec<String>>> {
+    struct Scopes {
+        stack: Vec<Rc<Vec<String>>>,
+        map: HashMap<usize, Rc<Vec<String>>>,
+    }
+    impl Scopes {
+        fn record<T>(&mut self, node: &T) {
+            if let Some(top) = self.stack.last() {
+                self.map
+                    .insert(std::ptr::from_ref(node).addr(), Rc::clone(top));
+            }
+        }
+    }
+    impl<'a> Visit<'a> for Scopes {
+        fn visit_block(&mut self, b: &'a Block) {
+            let own = block_items(b);
+            let scope = match self.stack.last() {
+                Some(top) if own.is_empty() => Rc::clone(top),
+                top => Rc::new(
+                    top.map(|t| t.to_vec())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .chain(own)
+                        .collect(),
+                ),
+            };
+            self.stack.push(scope);
+            syn::visit::visit_block(self, b);
+            self.stack.pop();
+        }
+        fn visit_expr_call(&mut self, c: &'a ExprCall) {
+            self.record(c);
+            syn::visit::visit_expr_call(self, c);
+        }
+        fn visit_macro(&mut self, m: &'a syn::Macro) {
+            self.record(m);
+            syn::visit::visit_macro(self, m);
+        }
+        fn visit_type(&mut self, t: &'a Type) {
+            self.record(t);
+            syn::visit::visit_type(self, t);
+        }
+        fn visit_pat(&mut self, p: &'a Pat) {
+            self.record(p);
+            syn::visit::visit_pat(self, p);
+        }
+    }
+    let mut scopes = Scopes {
+        stack: Vec::new(),
+        map: HashMap::new(),
+    };
+    scopes.visit_block(body);
+    scopes.map
 }
 
 /// The names that the items of `block` itself define or import.
@@ -13771,6 +13855,18 @@ mod tests {
                  let slot = { use custom::Some; Some(repo) }; let _ = slot.unwrap().find_all().await?; Ok(0) }",
                 Expect::Unbounded,
             ),
+            (
+                "an import in one branch does not reach its sibling",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let slot = if flag { use custom::Some; None } else { Some(repo) }; let _ = slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: an import reaches its own branch's value",
+                "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
+                 let slot = if flag { use custom::Some; Some(repo) } else { None }; let _ = slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
         ]);
     }
 
@@ -13799,6 +13895,18 @@ mod tests {
                 "guard: a helper handed only plain values gives a plain value",
                 "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
                  let n = count(&ids); repo.a().await?; Ok(n) }",
+                Expect::Exact(1),
+            ),
+            (
+                "an exempt store through an entry reaches its map",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slots = HashMap::new(); #[query_exempt(reason = \"storage only\")] slots.entry(0).or_insert(repo); let _ = slots[&0].find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "split_off gives a Vec of the handles",
+                "async fn h(mut repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let mut rest = repos.split_off(1); let r = rest.pop().unwrap(); let _ = r.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
         ]);
@@ -13835,6 +13943,9 @@ mod tests {
             ("BinaryHeap<PgPostRepository>", "repos.capacity()"),
             ("HashMap<i64, PgPostRepository>", "repos.capacity()"),
             ("HashSet<PgPostRepository>", "repos.capacity()"),
+            ("Vec<PgPostRepository>", "repos.split_off(1)"),
+            ("VecDeque<PgPostRepository>", "repos.split_off(1)"),
+            ("LinkedList<PgPostRepository>", "repos.split_off(1)"),
         ];
         let handler = |ty: &str, call: &str| {
             format!(
