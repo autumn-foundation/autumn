@@ -2067,7 +2067,11 @@ active, the first cutover is not done, also when a real revision is active
 too. If you changed `bootstrap_image`, set
 `AZURE_BOOTSTRAP_IMAGE` (a repository variable for the workflow) to that
 image. If the first cutover fails, the script removes the credentials. The
-job also has them, but runs only after you set the real image on it. External
+job also has them, but runs only after you set the real image on it.
+Before it trusts a new revision, the script also checks that each secret
+ref in it names a secret of the app: Azure can rewrite these refs
+([azure-container-apps#1705](https://github.com/microsoft/azure-container-apps/issues/1705)),
+and such a revision cannot start. External
 ingress stays **disabled** until the new revision runs the real image and is
 the only active revision (#2312). The script saves the ingress before it
 disables it, and sends it back, so custom domains, IP restrictions and CORS
