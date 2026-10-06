@@ -90,10 +90,16 @@ const LOG_COLUMNS: &str = "id, subscription_id, topic, payload, request_headers,
      response_status, response_body, elapsed_ms, attempt, max_attempts, is_dlq, last_error, \
      logged_at";
 
-/// Added to `UPSERT_LOG_SQL` for an outcome: a 2xx log is final, so a late
-/// duplicate job cannot overwrite it.
-const KEEP_SUCCESS_SQL: &str = " WHERE autumn_webhook_deliveries.response_status IS NULL \
-     OR autumn_webhook_deliveries.response_status NOT BETWEEN 200 AND 299";
+/// Added to `UPSERT_LOG_SQL` for an outcome. It skips the writes that
+/// [`log_delivery_ignores`](super::log_delivery_ignores) names: a write to a
+/// 2xx log, and a repeat of the outcome of the stored attempt.
+const SKIP_IGNORED_SQL: &str = " WHERE \
+     (autumn_webhook_deliveries.response_status IS NULL \
+       OR autumn_webhook_deliveries.response_status NOT BETWEEN 200 AND 299) \
+     AND NOT (autumn_webhook_deliveries.attempt = excluded.attempt \
+       AND autumn_webhook_deliveries.is_dlq = excluded.is_dlq \
+       AND (autumn_webhook_deliveries.response_status IS NOT NULL \
+         OR autumn_webhook_deliveries.last_error IS NOT NULL))";
 
 const RESET_FAILURES_SQL: &str = "UPDATE autumn_webhook_subscriptions \
      SET consecutive_failures = 0 WHERE id = $1";
@@ -420,9 +426,9 @@ async fn log_with_outcome(
     use scoped_futures::ScopedFutureExt as _;
     crate::db::scoped_transaction(conn, |conn| {
         async move {
-            let upsert = format!("{UPSERT_LOG_SQL}{KEEP_SUCCESS_SQL}");
+            let upsert = format!("{UPSERT_LOG_SQL}{SKIP_IGNORED_SQL}");
             if write_log_on(conn, log, &upsert).await? == 0 {
-                return Ok(false); // a 2xx log is final
+                return Ok(false); // a final log, or a duplicate outcome
             }
             let failed_now = match outcome(log) {
                 // A 2xx on a `Failed` subscription comes from a replay. It

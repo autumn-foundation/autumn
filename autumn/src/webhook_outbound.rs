@@ -82,6 +82,20 @@ pub struct WebhookDeliveryLog {
     pub timestamp: DateTime<Utc>,
 }
 
+/// `true` when [`OutboundWebhookHandler::log_delivery`] must ignore `new`:
+///
+/// - `stored` has a 2xx response. A success is final.
+/// - `stored` has an outcome for the same attempt and the same DLQ flag. `new`
+///   comes from a duplicate job.
+#[must_use]
+pub fn log_delivery_ignores(stored: &WebhookDeliveryLog, new: &WebhookDeliveryLog) -> bool {
+    let has_outcome = stored.response_status.is_some() || stored.last_error.is_some();
+    stored
+        .response_status
+        .is_some_and(|status| (200..300).contains(&status))
+        || (has_outcome && stored.attempt == new.attempt && stored.is_dlq == new.is_dlq)
+}
+
 /// Pluggable handler interface for outbound webhook subscriptions and delivery logs.
 pub trait OutboundWebhookHandler: Send + Sync + 'static {
     /// Retrieve active subscriptions registered for a specific event topic.
@@ -92,9 +106,10 @@ pub trait OutboundWebhookHandler: Send + Sync + 'static {
 
     /// Log a webhook delivery attempt and handle failure counters/statuses.
     ///
-    /// A log with a 2xx response is final: ignore a later write to it. Two
-    /// jobs can send one delivery (an outbox re-send), and the late one must
-    /// not overwrite the success.
+    /// Two jobs can send one delivery (an outbox re-send). Ignore a write
+    /// that [`log_delivery_ignores`] names: a write to a 2xx log, or a repeat
+    /// of the outcome of the stored attempt. Then a late duplicate job cannot
+    /// overwrite a success or count one failure twice.
     fn log_delivery(
         &self,
         log: WebhookDeliveryLog,
@@ -246,11 +261,9 @@ impl OutboundWebhookHandler for InMemoryOutboundWebhookHandler {
         log: WebhookDeliveryLog,
     ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
         let mut logs = self.logs.write().expect("logs write lock poisoned");
-        // A 2xx log is final: a late duplicate job cannot overwrite it.
         if logs
             .get(&log.id)
-            .and_then(|stored| stored.response_status)
-            .is_some_and(|status| (200..300).contains(&status))
+            .is_some_and(|stored| log_delivery_ignores(stored, &log))
         {
             return Box::pin(async { Ok(()) });
         }
@@ -1294,6 +1307,33 @@ mod tests {
         assert_eq!(log.attempt, 1);
         let sub = store.get_subscription("sub").await.unwrap().unwrap();
         assert_eq!(sub.consecutive_failures, 0);
+    }
+
+    /// Two duplicate jobs that fail one attempt count one failure. A later
+    /// DLQ move of that attempt is still stored.
+    #[tokio::test]
+    async fn a_repeated_failure_of_one_attempt_counts_once() {
+        let store = InMemoryOutboundWebhookHandler::new();
+        store
+            .create_subscription(sample_subscription(
+                "sub",
+                "http://receiver/hooks",
+                WebhookSubscriptionStatus::Active,
+            ))
+            .await
+            .unwrap();
+        let mut failed = sample_log("log", "sub");
+        failed.response_status = Some(500);
+        failed.last_error = Some("500".to_owned());
+        store.log_delivery(failed.clone()).await.unwrap();
+        store.log_delivery(failed.clone()).await.unwrap();
+        let sub = store.get_subscription("sub").await.unwrap().unwrap();
+        assert_eq!(sub.consecutive_failures, 1);
+
+        failed.is_dlq = true;
+        store.log_delivery(failed).await.unwrap();
+        let log = store.get_delivery_log("log").await.unwrap().unwrap();
+        assert!(log.is_dlq, "the DLQ move is stored");
     }
 
     #[tokio::test]

@@ -438,6 +438,31 @@ mod sql_webhook_store {
         assert_eq!(sub.consecutive_failures, 0);
     }
 
+    /// Two duplicate jobs that fail one attempt count one failure. A later
+    /// DLQ move of that attempt is still stored.
+    #[tokio::test]
+    async fn sql_store_counts_a_repeated_failure_once() {
+        let substrate = substrate().await;
+        let store = SqlOutboundWebhookStore::new(substrate.pool());
+        store.ensure_schema().await.unwrap();
+        store
+            .create_subscription(subscription("sub-1"))
+            .await
+            .unwrap();
+        let mut failed = log("l", Some(500), Some("500"));
+        store.log_delivery(failed.clone()).await.unwrap();
+        store.log_delivery(failed.clone()).await.unwrap();
+        let sub = store.get_subscription("sub-1").await.unwrap().unwrap();
+        assert_eq!(sub.consecutive_failures, 1);
+
+        failed.is_dlq = true;
+        store.log_delivery(failed).await.unwrap();
+        assert!(
+            store.get_delivery_log("l").await.unwrap().unwrap().is_dlq,
+            "the DLQ move is stored"
+        );
+    }
+
     #[tokio::test]
     async fn sql_store_counts_failures_like_the_in_memory_store() {
         let substrate = substrate().await;

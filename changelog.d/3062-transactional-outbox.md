@@ -28,6 +28,7 @@
 ### Fixed
 
 - **webhooks:** a second delivery job for a log that already got a `2xx`
-  response no longer sends the webhook again. A `2xx` log is final:
-  `log_delivery` ignores a later write to it, so a late duplicate job cannot
-  overwrite the success.
+  response no longer sends the webhook again. `log_delivery` ignores a write
+  to a `2xx` log and a repeat of the outcome of the stored attempt
+  (`webhook_outbound::log_delivery_ignores`), so a late duplicate job cannot
+  overwrite a success or count one failure twice.

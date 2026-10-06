@@ -1531,8 +1531,14 @@ impl OutboxMailQueue {
     ///
     /// # Errors
     ///
-    /// Returns an error when `state` has no database.
+    /// Returns an error when the outbox is off (no relay sends the mail) or
+    /// `state` has no database.
     pub fn from_state(state: &AppState) -> AutumnResult<Self> {
+        if state.extension::<OutboxRelay>().is_none() {
+            return Err(AutumnError::internal_server_error_msg(
+                "OutboxMailQueue needs the relay; set outbox.enabled = true",
+            ));
+        }
         let pool = mail_pool(state).ok_or_else(|| {
             AutumnError::internal_server_error_msg("OutboxMailQueue needs a database")
         })?;

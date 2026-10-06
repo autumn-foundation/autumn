@@ -833,11 +833,6 @@ mod sqlite {
         handlers.insert("t", |_, _| async { Ok(()) });
         let state = AppState::for_test().with_shards(shards);
         assert!(state.pool().is_none());
-        #[cfg(feature = "mail")]
-        assert!(
-            OutboxMailQueue::from_state(&state).is_ok(),
-            "the mail queue uses the first shard"
-        );
         install(
             &state,
             &OutboxConfig {
@@ -849,6 +844,11 @@ mod sqlite {
         ensure_relay_schema(&state)
             .await
             .expect("schema on the shard");
+        #[cfg(feature = "mail")]
+        assert!(
+            OutboxMailQueue::from_state(&state).is_ok(),
+            "the mail queue uses the first shard"
+        );
         let mut conn = shard.pool().get().await.unwrap();
         Outbox::new(&state)
             .write(&mut conn, "a", "t", &serde_json::json!({}))
@@ -918,6 +918,19 @@ mod sqlite {
             .expect("the relay created the shard tables");
         drop(conn);
         assert_eq!(drain(&state, 10).await.unwrap(), 1);
+    }
+
+    /// With the outbox off, no relay sends a queued mail, so the queue does
+    /// not build.
+    #[cfg(feature = "mail")]
+    #[tokio::test]
+    async fn mail_queue_needs_the_relay() {
+        let substrate = SqliteSubstrate::new().expect("substrate");
+        let state = AppState::for_test().with_pool(substrate.pool());
+        let Err(error) = OutboxMailQueue::from_state(&state) else {
+            panic!("the queue built with no relay");
+        };
+        assert!(error.to_string().contains("outbox.enabled"), "{error}");
     }
 
     #[tokio::test]
