@@ -27,6 +27,8 @@ struct JobAttrs {
     /// Longest time one run may take, in milliseconds (issue #3051).
     /// `None` = use `jobs.default_timeout_ms`.
     timeout_ms: Option<u64>,
+    /// Wait while the cost signal is high (issue #1720).
+    deferrable: bool,
 }
 
 /// Parse a timeout such as `"500ms"`, `"30s"`, `"5m"`, `"1h"`, `"1d"`, or
@@ -58,6 +60,16 @@ fn parse_timeout_ms(text: &str) -> Option<u64> {
         total = total.checked_add(count.checked_mul(unit_ms)?)?;
     }
     (total > 0).then_some(total)
+}
+
+/// Parse a bare flag (`deferrable`) or an explicit `flag = true|false`.
+pub fn parse_flag(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<bool> {
+    if meta.input.peek(syn::Token![=]) {
+        let value: LitBool = meta.value()?.parse()?;
+        Ok(value.value())
+    } else {
+        Ok(true)
+    }
 }
 
 fn parse_basic_arg(
@@ -107,6 +119,8 @@ fn parse_basic_arg(
             ));
         };
         result.timeout_ms = Some(ms);
+    } else if meta.path.is_ident("deferrable") {
+        result.deferrable = parse_flag(meta)?;
     } else {
         return Ok(false);
     }
@@ -242,6 +256,7 @@ fn parse_job_args(attr: TokenStream) -> syn::Result<JobAttrs> {
         version: None,
         upgrade: None,
         timeout_ms: None,
+        deferrable: false,
     };
 
     syn::meta::parser(|meta| {
@@ -254,7 +269,7 @@ fn parse_job_args(attr: TokenStream) -> syn::Result<JobAttrs> {
             Err(meta.error(
                 "unsupported attribute: expected name, max_attempts, backoff_ms, queue, unique, \
                  unique_by, unique_window, unique_for_ms, concurrency, concurrency_key, version, \
-                 upgrade, or timeout",
+                 upgrade, timeout, or deferrable",
             ))
         }
     })
@@ -377,6 +392,11 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         || quote! { ::std::option::Option::None },
         |ms| quote! { ::std::option::Option::Some(::std::time::Duration::from_millis(#ms)) },
     );
+    let mark_deferrable = attrs.deferrable.then(|| {
+        quote! {
+            ::autumn_web::cost::mark_deferrable(::autumn_web::cost::WorkKind::Job, #job_name);
+        }
+    });
 
     // ── Versioned payloads (issue #1205) ─────────────────────────────────────
     // Wrap args in the schema-version envelope only when the job opts in
@@ -501,6 +521,7 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #[doc(hidden)]
         pub fn #companion_name() -> ::autumn_web::job::JobInfo {
+            #mark_deferrable
             ::autumn_web::job::JobInfo {
                 name: #job_name.to_string(),
                 max_attempts: #max_attempts,
@@ -631,6 +652,39 @@ mod tests {
 
         // version >= 2 with an upgrade hook is accepted.
         assert!(parse(quote! { version = 2, upgrade = crate::jobs::up }).is_ok());
+    }
+
+    #[test]
+    fn parses_deferrable_flag() {
+        assert!(!parse(quote! { name = "j" }).expect("parse").deferrable);
+        assert!(parse(quote! { deferrable }).expect("parse").deferrable);
+        assert!(
+            parse(quote! { deferrable = true })
+                .expect("parse")
+                .deferrable
+        );
+        assert!(
+            !parse(quote! { deferrable = false })
+                .expect("parse")
+                .deferrable
+        );
+        assert!(parse(quote! { deferrable = 1 }).is_err());
+    }
+
+    #[test]
+    fn deferrable_job_marks_itself_in_the_info_fn() {
+        let out = job_macro(
+            quote! { deferrable },
+            quote! { async fn rebuild(state: AppState, args: Args) -> AutumnResult<()> { Ok(()) } },
+        )
+        .to_string();
+        assert!(out.contains("mark_deferrable"), "{out}");
+        let out = job_macro(
+            quote! {},
+            quote! { async fn rebuild(state: AppState, args: Args) -> AutumnResult<()> { Ok(()) } },
+        )
+        .to_string();
+        assert!(!out.contains("mark_deferrable"), "{out}");
     }
 
     #[test]

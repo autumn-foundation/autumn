@@ -187,6 +187,42 @@ section.
 **Automation:** `manual` — add `timeout: None` to each hand-written `JobInfo`
 literal. `#[job]` and `JobInfo::new` set it.
 
+### Config: `AutumnConfig` gains a `cost` field
+
+**Why:** Per-request cost records and cost-aware deferral (issue #1720) need
+their own `[cost]` section. `AutumnConfig` has public fields and is not
+`#[non_exhaustive]`, so a new field breaks a struct literal. `Default` and
+`..AutumnConfig::default()` keep working.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::config::AutumnConfig;
+
+let config = AutumnConfig {
+    server: my_server_config,
+    // …every other field spelled out…
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::config::AutumnConfig;
+
+let config = AutumnConfig {
+    server: my_server_config,
+    ..AutumnConfig::default()
+};
+```
+
+The new field is `pub cost: CostConfig`. Its default turns everything off, so an
+app that does not set `[cost]` behaves as before. `CostConfig` is
+`#[non_exhaustive]`: set its fields on a default value.
+
+**Automation:** `manual` — a codemod cannot know which fields a struct literal
+means to leave at their defaults.
+
 ### HTTP client: `retries(n)` no longer retries `POST` and `PATCH`
 
 **Why:** `.retries(n)` also turned on retries for non-idempotent methods. A
