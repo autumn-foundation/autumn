@@ -129,16 +129,20 @@ fn app(substrate: &SqliteSubstrate, calls: &Calls) -> TestApp {
         .idempotent()
         .with_db(substrate.pool())
         .routes(routes![pay])
-        .state_initializer(move |state| state.insert_extension(calls.clone()))
+        .state_initializer(move |state| state.insert_extension(calls))
 }
 
-async fn payments(substrate: &SqliteSubstrate) -> i64 {
-    let mut conn = substrate.pool().get().await.expect("checkout");
-    diesel::sql_query("SELECT COUNT(*) AS n FROM payments")
-        .get_result::<CountRow>(&mut conn)
-        .await
-        .expect("count payments")
-        .n
+/// The number of payment rows. Takes the pool first, so the future is `Send`.
+fn payments(substrate: &SqliteSubstrate) -> impl Future<Output = i64> + Send + use<> {
+    let pool = substrate.pool();
+    async move {
+        let mut conn = pool.get().await.expect("checkout");
+        diesel::sql_query("SELECT COUNT(*) AS n FROM payments")
+            .get_result::<CountRow>(&mut conn)
+            .await
+            .expect("count payments")
+            .n
+    }
 }
 
 async fn send(client: &TestClient, key: &str) -> TestResponse {

@@ -1587,15 +1587,15 @@ impl TxProbe {
         Self::default()
     }
 
+    #[cfg(feature = "db")]
     fn committed(&self) -> bool {
-        #[cfg(feature = "db")]
-        {
-            self.tx.as_ref().is_some_and(IdempotencyTx::committed)
-        }
-        #[cfg(not(feature = "db"))]
-        {
-            false
-        }
+        self.tx.as_ref().is_some_and(IdempotencyTx::committed)
+    }
+
+    #[cfg(not(feature = "db"))]
+    #[allow(clippy::unused_self, reason = "same signature as the db build")]
+    const fn committed(&self) -> bool {
+        false
     }
 }
 
