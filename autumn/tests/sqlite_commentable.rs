@@ -15,6 +15,12 @@
 //! This proves the #2275 refusal, and the plain subtree-removal path it
 //! guards, against a real SQLite connection: no Docker, in-memory database.
 //!
+//! It also proves that a copy of a registered spec finds the repository of
+//! its model (issue #2286).
+//!
+//! It also proves #2284 on `SQLite`: each repository of a model applies its own
+//! soft-delete rule to the parent.
+//!
 //! Only meaningful under `--features sqlite` (same convention as
 //! `sqlite_dependent_destroy.rs`): `cargo test -p autumn-web --features
 //! sqlite --test sqlite_commentable`.
@@ -46,9 +52,27 @@ mod schema {
             comment_count -> Int8,
         }
     }
+
+    autumn_web::reexports::diesel::table! {
+        sqc_audits (id) {
+            id -> Int8,
+            title -> Text,
+            comment_count -> Int8,
+            deleted_at -> Nullable<Timestamp>,
+        }
+    }
+
+    autumn_web::reexports::diesel::table! {
+        sqc_duals (id) {
+            id -> Int8,
+            title -> Text,
+            comment_count -> Int8,
+            deleted_at -> Nullable<Timestamp>,
+        }
+    }
 }
 
-use schema::{sqc_hards, sqc_users};
+use schema::{sqc_audits, sqc_duals, sqc_hards, sqc_users};
 
 #[autumn_web::model(table = "sqc_users")]
 pub struct SqcUser {
@@ -73,6 +97,105 @@ pub struct SqcHard {
 
 #[autumn_web::repository(SqcHard, table = "sqc_hards")]
 pub trait SqcHardRepository {}
+
+// Issue #2286: `deleted_at` is audit data here. The repository does not opt
+// into `soft_delete`, so the column must not hide the row.
+#[autumn_web::model(table = "sqc_audits")]
+#[commentable(by = SqcUser, table = sqc_audit_comments)]
+pub struct SqcAudit {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    #[default]
+    pub comment_count: i64,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(SqcAudit, table = "sqc_audits")]
+pub trait SqcAuditRepository {}
+
+// Issue #2286: these models register equal specs in pairs. A copy of a
+// pair's spec matches no single model. Both pairs use `sqc_audits`.
+mod twins {
+    use super::SqcUser;
+    use super::schema::sqc_audits;
+
+    // Both repositories are plain, so `deleted_at` is audit data.
+    #[autumn_web::model(table = "sqc_audits")]
+    #[commentable(by = SqcUser, table = sqc_twin_comments)]
+    pub struct SqcTwinA {
+        #[id]
+        pub id: i64,
+        pub title: String,
+        #[default]
+        pub comment_count: i64,
+        pub deleted_at: Option<chrono::NaiveDateTime>,
+    }
+
+    #[autumn_web::repository(SqcTwinA, table = "sqc_audits")]
+    pub trait SqcTwinARepository {}
+
+    #[autumn_web::model(table = "sqc_audits")]
+    #[commentable(by = SqcUser, table = sqc_twin_comments)]
+    pub struct SqcTwinB {
+        #[id]
+        pub id: i64,
+        pub title: String,
+        #[default]
+        pub comment_count: i64,
+        pub deleted_at: Option<chrono::NaiveDateTime>,
+    }
+
+    #[autumn_web::repository(SqcTwinB, table = "sqc_audits")]
+    pub trait SqcTwinBRepository {}
+
+    // One repository is plain and one soft-deletes.
+    #[autumn_web::model(table = "sqc_audits")]
+    #[commentable(by = SqcUser, table = sqc_mixed_comments)]
+    pub struct SqcMixedPlain {
+        #[id]
+        pub id: i64,
+        pub title: String,
+        #[default]
+        pub comment_count: i64,
+        pub deleted_at: Option<chrono::NaiveDateTime>,
+    }
+
+    #[autumn_web::repository(SqcMixedPlain, table = "sqc_audits")]
+    pub trait SqcMixedPlainRepository {}
+
+    #[autumn_web::model(table = "sqc_audits")]
+    #[commentable(by = SqcUser, table = sqc_mixed_comments)]
+    pub struct SqcMixedSoft {
+        #[id]
+        pub id: i64,
+        pub title: String,
+        #[default]
+        pub comment_count: i64,
+        pub deleted_at: Option<chrono::NaiveDateTime>,
+    }
+
+    #[autumn_web::repository(SqcMixedSoft, table = "sqc_audits", soft_delete)]
+    pub trait SqcMixedSoftRepository {}
+}
+
+/// #2284: one model, two repositories. Only the first soft-deletes.
+#[autumn_web::model(table = "sqc_duals")]
+#[commentable(by = SqcUser, table = sqc_comments)]
+pub struct SqcDual {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    #[default]
+    pub comment_count: i64,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(SqcDual, table = "sqc_duals", soft_delete)]
+pub trait SqcDualRepository {}
+
+#[autumn_web::repository(SqcDual, table = "sqc_duals")]
+pub trait SqcDualAdminRepository {}
 
 #[derive(QueryableByName)]
 struct CountRow {
@@ -118,6 +241,58 @@ async fn boot_pool(db_name: &str) -> SqlitePool {
          )",
         "CREATE INDEX idx_sqc_hard_comments_target ON sqc_hard_comments (commentable_type, commentable_id)",
         "CREATE INDEX idx_sqc_hard_comments_parent ON sqc_hard_comments (parent_id)",
+        "CREATE TABLE sqc_audits (\
+             id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             title TEXT NOT NULL, \
+             comment_count BIGINT NOT NULL DEFAULT 0, \
+             deleted_at TIMESTAMP\
+         )",
+        "CREATE TABLE sqc_audit_comments (\
+             id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             commentable_type TEXT NOT NULL, \
+             commentable_id BIGINT NOT NULL, \
+             parent_id BIGINT REFERENCES sqc_audit_comments(id), \
+             author_id BIGINT NOT NULL REFERENCES sqc_users(id), \
+             body TEXT NOT NULL, \
+             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+             deleted_at TIMESTAMP\
+         )",
+        "CREATE TABLE sqc_twin_comments (\
+             id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             commentable_type TEXT NOT NULL, \
+             commentable_id BIGINT NOT NULL, \
+             parent_id BIGINT REFERENCES sqc_twin_comments(id), \
+             author_id BIGINT NOT NULL REFERENCES sqc_users(id), \
+             body TEXT NOT NULL, \
+             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+             deleted_at TIMESTAMP\
+         )",
+        "CREATE TABLE sqc_mixed_comments (\
+             id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             commentable_type TEXT NOT NULL, \
+             commentable_id BIGINT NOT NULL, \
+             parent_id BIGINT REFERENCES sqc_mixed_comments(id), \
+             author_id BIGINT NOT NULL REFERENCES sqc_users(id), \
+             body TEXT NOT NULL, \
+             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+             deleted_at TIMESTAMP\
+         )",
+        "CREATE TABLE sqc_duals (\
+             id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             title TEXT NOT NULL, \
+             comment_count BIGINT NOT NULL DEFAULT 0, \
+             deleted_at TIMESTAMP\
+         )",
+        "CREATE TABLE sqc_comments (\
+             id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             commentable_type TEXT NOT NULL, \
+             commentable_id BIGINT NOT NULL, \
+             parent_id BIGINT REFERENCES sqc_comments(id) ON DELETE CASCADE, \
+             author_id BIGINT NOT NULL REFERENCES sqc_users(id), \
+             body TEXT NOT NULL, \
+             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+             deleted_at TIMESTAMP\
+         )",
     ] {
         diesel::sql_query(stmt)
             .execute(&mut *conn)
@@ -156,6 +331,50 @@ async fn seed_hard(pool: &SqlitePool, title: &str) -> i64 {
     count(
         pool,
         "SELECT id AS n FROM sqc_hards ORDER BY id DESC LIMIT 1",
+    )
+    .await
+}
+
+/// A `sqc_audits` row with `deleted_at` set.
+async fn seed_audited(pool: &SqlitePool) -> i64 {
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "INSERT INTO sqc_audits (title, deleted_at) VALUES ('t', CURRENT_TIMESTAMP)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("seed an audited parent");
+    }
+    count(
+        pool,
+        "SELECT id AS n FROM sqc_audits ORDER BY id DESC LIMIT 1",
+    )
+    .await
+}
+
+/// Insert one `sqc_duals` row that is already soft-deleted.
+async fn seed_soft_deleted_dual(pool: &SqlitePool) -> i64 {
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "INSERT INTO sqc_duals (title, deleted_at) VALUES ('gone', CURRENT_TIMESTAMP)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("seed a soft-deleted parent");
+    }
+    count(
+        pool,
+        "SELECT id AS n FROM sqc_duals ORDER BY id DESC LIMIT 1",
+    )
+    .await
+}
+
+async fn dual_counter(pool: &SqlitePool, id: i64) -> i64 {
+    count(
+        pool,
+        &format!("SELECT comment_count AS n FROM sqc_duals WHERE id = {id}"),
     )
     .await
 }
@@ -289,4 +508,174 @@ async fn a_hard_delete_refuses_a_cross_record_graft_on_sqlite() {
     );
     assert_eq!(counter(&pool, mine).await, 0);
     assert_eq!(counter(&pool, other).await, 2);
+}
+
+/// Issue #2286: a copy of the registered spec has a new address. The
+/// registry lookup must still find the model.
+#[test]
+fn a_copied_spec_resolves_to_its_registered_model() {
+    let copy = *SqcAudit::commentable_spec();
+    assert!(
+        !std::ptr::eq(std::ptr::from_ref(&copy), SqcAudit::commentable_spec()),
+        "the copy must have its own address"
+    );
+    assert_eq!(
+        autumn_web::commentable::commentable_model_for_spec(&copy),
+        Some(std::any::type_name::<SqcAudit>()),
+    );
+}
+
+/// Issue #2286: when two models register equal specs, a copy is ambiguous
+/// and matches no model. Each registered reference still matches its own
+/// model.
+#[test]
+fn a_copy_of_a_shared_spec_matches_no_model() {
+    use autumn_web::commentable::commentable_model_for_spec;
+    use twins::{SqcTwinA, SqcTwinB};
+
+    let copy = *SqcTwinA::commentable_spec();
+    assert_eq!(&copy, SqcTwinB::commentable_spec());
+    assert_eq!(
+        commentable_model_for_spec(&copy),
+        None,
+        "a copy must not pick one of two models"
+    );
+    assert_eq!(
+        commentable_model_for_spec(SqcTwinA::commentable_spec()),
+        Some(std::any::type_name::<SqcTwinA>()),
+    );
+    assert_eq!(
+        commentable_model_for_spec(SqcTwinB::commentable_spec()),
+        Some(std::any::type_name::<SqcTwinB>()),
+    );
+}
+
+/// Issue #2286: every public helper must accept a copy of the spec. An
+/// audit `deleted_at` must not hide the parent, because the repository does
+/// not opt into `soft_delete`.
+#[tokio::test]
+async fn a_copied_spec_keeps_the_repository_soft_delete_rule_on_sqlite() {
+    use autumn_web::commentable::{
+        add_comment, comment_thread, delete_comment, recompute_comment_count,
+    };
+
+    let pool = boot_pool("sqc_commentable_copied_spec").await;
+    let author = seed_user(&pool, "ada").await;
+    let target = seed_audited(&pool).await;
+
+    let spec = *SqcAudit::commentable_spec();
+    let kind = SqcAudit::COMMENTABLE_TYPE;
+    let mut conn = pool.get().await.expect("conn");
+
+    let comment = add_comment(
+        &mut conn, &spec, kind, target, author, "hi", None, None, None,
+    )
+    .await
+    .expect("add_comment: an audit deleted_at must not hide the parent");
+    let thread = comment_thread(&mut conn, &spec, kind, target, None, None)
+        .await
+        .expect("comment_thread");
+    assert_eq!(thread.len(), 1);
+    assert_eq!(
+        recompute_comment_count(&mut conn, &spec, kind, target, None, None)
+            .await
+            .expect("recompute_comment_count"),
+        1
+    );
+    assert_eq!(
+        delete_comment(&mut conn, &spec, kind, target, comment.id, None, None)
+            .await
+            .expect("delete_comment"),
+        1
+    );
+}
+
+/// Issue #2286: a copy of a spec that two models share uses the repository
+/// facts of both models. If one repository soft-deletes, the copy filters
+/// `deleted_at`. If no repository soft-deletes, `deleted_at` is audit data.
+#[tokio::test]
+async fn a_copy_of_a_shared_spec_uses_the_facts_of_every_model_on_sqlite() {
+    use autumn_web::commentable::add_comment;
+    use twins::{SqcMixedPlain, SqcTwinA};
+
+    let pool = boot_pool("sqc_commentable_shared_spec").await;
+    let author = seed_user(&pool, "ada").await;
+    let target = seed_audited(&pool).await;
+    let mut conn = pool.get().await.expect("conn");
+
+    let plain = *SqcTwinA::commentable_spec();
+    let kind = SqcTwinA::COMMENTABLE_TYPE;
+    add_comment(
+        &mut conn, &plain, kind, target, author, "hi", None, None, None,
+    )
+    .await
+    .expect("no repository soft-deletes, so the row is live");
+
+    let mixed = *SqcMixedPlain::commentable_spec();
+    let kind = SqcMixedPlain::COMMENTABLE_TYPE;
+    let err = add_comment(
+        &mut conn, &mixed, kind, target, author, "hi", None, None, None,
+    )
+    .await
+    .expect_err("one repository soft-deletes, so the row is hidden");
+    assert_eq!(err.status().as_u16(), 404, "{err}");
+}
+
+/// #2284: a model with a `soft_delete` repository and a plain one. Before,
+/// every helper filtered `deleted_at` if one repository soft-deleted, so the
+/// plain repository got `404` for rows its own finders return. Now each
+/// repository applies its own rule.
+#[tokio::test]
+async fn each_repository_applies_its_own_soft_delete_rule_on_sqlite() {
+    let pool = boot_pool("sqc_commentable_dual").await;
+    let soft = PgSqcDualRepository::with_pool_untracked(pool.clone());
+    let plain = PgSqcDualAdminRepository::with_pool_untracked(pool.clone());
+    let author = seed_user(&pool, "ada").await;
+    let target = seed_soft_deleted_dual(&pool).await;
+
+    // The plain repository sees the row, so its helpers do too.
+    let comment = plain
+        .add_comment(target, author, "still here", None)
+        .await
+        .expect("the plain repository comments on its own row");
+    assert_eq!(dual_counter(&pool, target).await, 1);
+    let thread = plain
+        .comment_thread(target)
+        .await
+        .expect("the plain repository reads the thread");
+    assert_eq!(thread.len(), 1);
+    assert_eq!(
+        plain
+            .recompute_comment_count(target)
+            .await
+            .expect("recompute"),
+        1
+    );
+
+    // The soft-deleting repository does not see the row: every helper is 404.
+    let hidden = "the soft-deleting repository does not see the row";
+    let errors = [
+        soft.add_comment(target, author, "x", None)
+            .await
+            .expect_err(hidden),
+        soft.comment_thread(target).await.expect_err(hidden),
+        soft.delete_comment(target, comment.id)
+            .await
+            .expect_err(hidden),
+        soft.recompute_comment_count(target)
+            .await
+            .expect_err(hidden),
+    ];
+    for err in errors {
+        assert_eq!(err.status().as_u16(), 404, "{err}");
+    }
+
+    assert_eq!(
+        plain
+            .delete_comment(target, comment.id)
+            .await
+            .expect("the plain repository deletes"),
+        1
+    );
+    assert_eq!(dual_counter(&pool, target).await, 0);
 }

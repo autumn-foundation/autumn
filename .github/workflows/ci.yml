@@ -133,6 +133,11 @@ jobs:
         # Kept as its own lane rather than folded into the list above so a
         # `wasmi`-linking build is not forced on every gated-feature Clippy run.
         run: cargo clippy -p autumn-web --features "plugin-sandbox,test-support" --all-targets -- -D warnings
+      - name: Clippy (autumn-web, repl)
+        # `repl` (#2148) is off by default, so no run above compiles
+        # `repl.rs` or the REPL glue that `#[model]` and `#[repository]` emit.
+        # Its own lane, so the Rhai build stays out of the gated list.
+        run: cargo clippy -p autumn-web --features repl --all-targets -- -D warnings
       - name: Panic-free request-path gate
         run: ./scripts/check-panic-gate.sh
       - name: Determinism seam gate
@@ -1133,6 +1138,7 @@ jobs:
             tls,
             acme,
             sla,
+            repl,
           ]
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     steps:
@@ -1440,6 +1446,31 @@ jobs:
           cargo test -p autumn-web --features sla --test integration_tests compile_fail::obligation \
             | tee "${RUNNER_TEMP}/sla-compile-fail.log"
           assert_ran "${RUNNER_TEMP}/sla-compile-fail.log" "obligation_compile_fail_tests"
+      - name: Run REPL-gated tests (console Rhai prompt)
+        if: matrix.lane == 'repl'
+        # `repl` (#2148) is off by default, so the `test` job compiles none of
+        # its suites. Building `integration_tests` with it also compiles the
+        # REPL registration of every `#[model]` and `#[repository]` in that
+        # binary. The Docker tests read a live Postgres table; the bare Docker
+        # sweep does not build `repl`, so they run here only.
+        run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the suite is no longer compiled in"; exit 1; }
+          }
+          cargo test -p autumn-web --features repl --lib repl:: | tee "${RUNNER_TEMP}/repl-lib.log"
+          assert_ran "${RUNNER_TEMP}/repl-lib.log" "autumn-web repl unit tests"
+          # SQLite cannot stop a running statement, so the prompt sets no call
+          # limit there. Only this build compiles that branch.
+          cargo test -p autumn-web --features "repl,sqlite" --lib repl:: \
+            | tee "${RUNNER_TEMP}/repl-sqlite-lib.log"
+          assert_ran "${RUNNER_TEMP}/repl-sqlite-lib.log" "autumn-web repl unit tests on SQLite"
+          cargo test -p autumn-web --features "repl,test-support" --test integration_tests repl_ \
+            -- --include-ignored | tee "${RUNNER_TEMP}/repl-integration.log"
+          assert_ran "${RUNNER_TEMP}/repl-integration.log" "repl integration tests"
+          grep -q 'repl_reads_a_live_table ... ok' "${RUNNER_TEMP}/repl-integration.log" \
+            || { echo "::error::the REPL Docker test did not run"; exit 1; }
 
   # The Docker/testcontainer sweep runs as its own job rather than as the last
   # step of `test` (#1747). As step 16 of that job it inherited a disk already
@@ -1689,6 +1720,14 @@ jobs:
           # migrated table. Only its Chromium smoke runs elsewhere (the
           # publish-gate fleet e2e), so without this line the tier never runs.
           cargo test -p react-graphql --test graphql_api -- --ignored --test-threads=1
+          # examples/escape-hatches: the Docker tests in `hatches` (H1, H2, H3,
+          # H12, H13) and `boot`. `boot` starts the real binary to check the
+          # wiring that `TestApp` cannot reach (pool provider, error pages,
+          # exception filter, env-driven hatches). Testcontainer-managed. The
+          # `hatches` tests share tables; a lock in their `fresh_db` helper
+          # runs them one at a time.
+          cargo test -p escape-hatches --test hatches -- --ignored
+          cargo test -p escape-hatches --test boot -- --ignored
           cargo test -p autumn-cli --test flags -- --ignored
           cargo test -p autumn-cli --test config -- --ignored
           cargo test -p autumn-cli --test experiments -- --ignored
@@ -1737,6 +1776,7 @@ jobs:
             --skip console_playground_target_compiles_with_a_repository_round_trip \
             --skip console_run_exits_non_zero_when_the_database_is_unreachable \
             --skip console_run_surfaces_a_compile_error_in_the_playground \
+            --skip console_repl_runs_and_reports_errors_as_script_errors \
             --skip i18n_scaffold_cargo_checks \
             --skip i18n_scaffold_with_owner_scoped_search_cargo_checks \
             --skip i18n_scaffold_with_state_machine_and_attachment_cargo_checks \
@@ -2407,13 +2447,18 @@ jobs:
           RUSTFLAGS: "--cfg loom_models"
           LOOM_MAX_PREEMPTIONS: "3"
 
-  # Edge capsule conformance (issue #1790). The proof behind AC-2: the
+  # Edge capsule conformance (issue #1790). The proof behind AC-1 to AC-3: the
   # `edge-greeting` fixture is compiled BOTH ways — natively and to a real
   # `wasm32-wasip1` artifact — and a shared request corpus is driven through
   # the native edge lane, the wasm capsule (via the pure-Rust `wasmi` host in
   # `autumn-edge`, so there is no runtime to install), and the full origin app.
   # Status, headers and body bytes are compared; every fallthrough is checked
-  # against the answer the origin actually gives.
+  # against the answer the origin actually gives. A gateway tier puts the
+  # capsule in front of the origin, and a generated tier sends 10,000
+  # requests through every lane. Tier E runs the edge node over real HTTP
+  # against an origin with a simulated distance, and needs a >= 50% lower
+  # median TTFB (the success metric). The last steps run the real
+  # `autumn build`, then `autumn edge serve` and `autumn edge ttfb`.
   #
   # Its own job because it is the only lane that installs a second target, and
   # NOT path-filtered on purpose: byte-identity between the origin and the edge
@@ -2459,6 +2504,45 @@ jobs:
         # `--test-threads=1`: the suite installs a process-global panic hook
         # around the deliberately-panicking `/boom` handler.
         run: cargo test -p edge-greeting --test conformance -- --ignored --test-threads=1 --nocapture
+      - name: autumn build emits the capsule
+        # AC-1: one `autumn build` makes the capsule. `--debug` makes the
+        # native build fast. The capsule is always a release build. The app
+        # has no static routes. Thus this step also proves that an edge-only
+        # app builds without an error.
+        working-directory: examples/edge-greeting
+        run: |
+          cargo run -q -p autumn-cli --bin autumn -- build --debug --edge
+          test -s ../../target/wasm32-wasip1/release/edge-capsule.wasm
+      - name: autumn edge serve and autumn edge ttfb, end to end
+        # AC-3 with no glue: the real CLI puts the capsule in front of the
+        # real origin binary. One host has no distance, so the probe checks
+        # the bytes only (--divergence-only). Tier E checks the speed-up.
+        # The access log must show the edge lane for each probed path: a
+        # fallthrough also sends the origin's bytes.
+        working-directory: examples/edge-greeting
+        run: |
+          wait_for() {
+            for _ in $(seq 1 120); do curl -sf -o /dev/null "$1" && return 0; sleep 1; done
+            echo "::error::$1 did not answer"; return 1
+          }
+          cargo build -q -p edge-greeting --bin edge-greeting
+          ../../target/debug/edge-greeting &
+          wait_for http://127.0.0.1:3000/greet/ci
+          ../../target/debug/autumn edge serve \
+            --capsule ../../target/wasm32-wasip1/release/edge-capsule.wasm \
+            --origin http://127.0.0.1:3000 --listen 127.0.0.1:8787 \
+            --response-header 'access-control-allow-origin: *' > edge-node.log &
+          wait_for http://127.0.0.1:8787/greet/ci
+          ../../target/debug/autumn edge ttfb --divergence-only --rounds 20 \
+            --edge http://127.0.0.1:8787 --origin http://127.0.0.1:3000 \
+            --path /greet/ada --path '/stats?tag=one&tag=two' --path /stats/count
+          for path in /greet/ada /stats /stats/count; do
+            if [ "$(grep -c "^GET $path 200 edge " edge-node.log)" -lt 20 ]; then
+              cat edge-node.log
+              echo "::error::the capsule did not serve GET $path"
+              exit 1
+            fi
+          done
 
   windows-tier1:
     name: Windows Tier 1 journey

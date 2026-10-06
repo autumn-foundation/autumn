@@ -188,7 +188,7 @@ Looking for the API reference instead? That is
 
 ## Developer tools
 
-- [The Data Playground](console.md) — `autumn console`, the pre-wired edit-and-run REPL
+- [The Data Playground](console.md) — `autumn console`, the pre-wired edit-and-run playground, and `--repl`, an interactive Rhai prompt
 - [Dev Request Inspector](dev-inspector.md) — the in-browser view of recent requests
 - [Dev Error Overlay](dev-error-overlay.md) — the error page that shows the failing source line
 - [The Architecture Graph](architecture-graph.md) — `autumn graph impact Post`: what a change touches, as a query
@@ -208,6 +208,7 @@ Looking for the API reference instead? That is
 - [Health Indicators](health-indicators.md) — what `/health` and `/ready` report, and adding your own check
 - [App Metrics](metrics.md) — the metrics Autumn exports, and recording your own
 - [Plugin Metrics Sources](metrics-sources.md) — exporting metrics from a plugin
+- [Request Cost and Carbon-Aware Deferral](cost.md) — per-request CPU, allocation and DB cost by tenant, and deferring background work while a cost signal is high
 - [Error Reporting](error-reporting.md) — sending exceptions to an external tracker
 - [Operator Alerts](operator-alerts.md) — getting paged when the framework detects trouble
 

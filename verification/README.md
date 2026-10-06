@@ -11,6 +11,34 @@ verus verification/tenant_arena.rs
 The runtime correspondence and boundary are recorded in ADR 0012; executable
 tests remain authoritative for unmodeled allocator, HTTP, and concurrency glue.
 
+## CI
+
+`.github/workflows/verus.yml` runs `scripts/verify-verus.sh`, which runs Verus
+on every `verification/*.rs` file. A new spec needs no workflow change. The job
+runs on a change to this directory, to the script, or to the workflow. It also
+runs each Monday. It is not a required check yet, so a failed proof does not
+block a merge. Do not add it to branch protection until it is stable.
+
+Run the same check on your machine:
+
+```sh
+scripts/verify-verus.sh                          # uses `verus` on PATH
+VERUS_BIN=/path/to/verus scripts/verify-verus.sh
+```
+
+## Lease-lock fencing
+
+`lease_fencing.rs` models the `autumn_lease_locks` statements in
+`autumn/src/lock/lease.rs` (issue #3053, ADR 0015). Verify it with:
+
+```sh
+verus verification/lease_fencing.rs
+```
+
+It proves that tokens are unique and strictly increasing per lock name, and
+that a stale write is rejected. It does not prove that holders never overlap;
+the fencing token makes overlap safe.
+
 ## Billing plan gate
 
 `billing_gate.rs` models the plan gate selection in

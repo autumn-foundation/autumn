@@ -124,6 +124,7 @@
 //! | `AUTUMN_JOBS__PIN` | `jobs.pin` | comma-separated queue names |
 //! | `AUTUMN_JOBS__MAX_ATTEMPTS` | `jobs.max_attempts` | `u32` |
 //! | `AUTUMN_JOBS__INITIAL_BACKOFF_MS` | `jobs.initial_backoff_ms` | `u64` |
+//! | `AUTUMN_JOBS__MAX_BACKOFF_MS` | `jobs.max_backoff_ms` | `u64` |
 //! | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` | `String` |
 //! | `AUTUMN_JOBS__REDIS__KEY_PREFIX` | `jobs.redis.key_prefix` | `String` |
 //! | `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` | `jobs.redis.visibility_timeout_ms` | `u64` |
@@ -167,6 +168,11 @@
 //! | `AUTUMN_DEV__INSPECTOR_CAPACITY` | `dev.inspector_capacity` | `usize` |
 //! | `AUTUMN_DEV__INSPECTOR_N_PLUS_ONE_THRESHOLD` | `dev.inspector_n_plus_one_threshold` | `usize` |
 //! | `AUTUMN_OBSERVABILITY__SERVER_TIMING` | `observability.server_timing` | `bool` |
+//! | `AUTUMN_COST__ENABLED` | `cost.enabled` | `bool` |
+//! | `AUTUMN_COST__DEFER_THRESHOLD` | `cost.defer_threshold` | `f64` |
+//! | `AUTUMN_COST__DEFER_RECHECK_SECS` | `cost.defer_recheck_secs` | `u64` |
+//! | `AUTUMN_COST__MAX_TENANTS` | `cost.max_tenants` | `usize` |
+//! | `AUTUMN_COST__SIGNAL_REFRESH_SECS` | `cost.signal_refresh_secs` | `u64` |
 //! | `AUTUMN_COMPRESSION__ENABLED` | `compression.enabled` | `bool` |
 //! | `AUTUMN_STORIES__ENABLED` | `stories.enabled` | `bool` |
 //! | `AUTUMN_AUTH__LOCKOUT__ENABLED` | `auth.lockout.enabled` | `bool` |
@@ -1623,6 +1629,11 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub observability: ObservabilityConfig,
 
+    /// Cost accounting and deferral settings (`[cost]` section in
+    /// `autumn.toml`, issue #1720). See [`CostConfig`] and `docs/guide/cost.md`.
+    #[serde(default)]
+    pub cost: CostConfig,
+
     /// Operator alerts settings (`[alerts]` section in `autumn.toml`).
     ///
     /// Configure an operator email and/or a webhook URL to receive alerts for
@@ -1906,6 +1917,94 @@ impl DeployConfig {
 
         Ok(())
     }
+}
+
+/// Cost accounting settings (`[cost]` section in `autumn.toml`, issue #1720).
+///
+/// `enabled` turns on per-request metering. `defer_threshold` turns on
+/// deferral: deferrable jobs and tasks wait while the
+/// [`CostSignal`](crate::cost::CostSignal) is above it. The two settings are
+/// independent.
+///
+/// ```toml
+/// [cost]
+/// enabled = true
+/// defer_threshold = 400.0   # g/kWh, or your price unit
+/// defer_recheck_secs = 30
+/// max_tenants = 1000
+/// signal_refresh_secs = 5
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
+pub struct CostConfig {
+    /// Meter CPU time, allocated bytes and DB queries for each request.
+    /// Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Deferrable work waits while the cost signal is above this value.
+    /// Default: unset, so work never waits.
+    #[serde(default)]
+    pub defer_threshold: Option<f64>,
+    /// Seconds between two checks of the signal while work waits.
+    /// Default: `30`.
+    #[serde(default = "default_cost_defer_recheck_secs")]
+    pub defer_recheck_secs: u64,
+    /// Most tenant keys that the accountant keeps. More tenants go into the
+    /// `_other` key. Default: `1000`.
+    #[serde(default = "default_cost_max_tenants")]
+    pub max_tenants: usize,
+    /// Seconds between two reads of the `autumn_cost_signal` runtime-config
+    /// key. Default: `5`.
+    #[serde(default = "default_cost_signal_refresh_secs")]
+    pub signal_refresh_secs: u64,
+}
+
+impl CostConfig {
+    /// Check the values.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message that names the bad key.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.defer_recheck_secs == 0 {
+            return Err("cost.defer_recheck_secs must be at least 1".to_owned());
+        }
+        if self.signal_refresh_secs == 0 {
+            return Err("cost.signal_refresh_secs must be at least 1".to_owned());
+        }
+        if let Some(threshold) = self.defer_threshold
+            && !(threshold.is_finite() && threshold >= 0.0)
+        {
+            return Err(format!(
+                "cost.defer_threshold must be a finite number >= 0, got {threshold}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for CostConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            defer_threshold: None,
+            defer_recheck_secs: default_cost_defer_recheck_secs(),
+            max_tenants: default_cost_max_tenants(),
+            signal_refresh_secs: default_cost_signal_refresh_secs(),
+        }
+    }
+}
+
+const fn default_cost_defer_recheck_secs() -> u64 {
+    30
+}
+
+const fn default_cost_max_tenants() -> usize {
+    1000
+}
+
+const fn default_cost_signal_refresh_secs() -> u64 {
+    5
 }
 
 /// Observability configuration (`[observability]` section in `autumn.toml`).
@@ -2249,10 +2348,16 @@ pub struct HttpClientConfig {
     #[serde(default = "default_http_max_retries")]
     pub max_retries: u32,
 
-    /// Maximum Retry-After sleep duration in seconds to accept before clamping.
-    /// Default: 10.
+    /// Cap on a `Retry-After` hint, in seconds. Default: 10. The wait is
+    /// also at most the backoff plus 5 s (issue #3054), so a value above 5
+    /// has no effect.
     #[serde(default = "default_http_max_retry_after_secs")]
     pub max_retry_after_secs: u64,
+
+    /// Cap on the jittered retry backoff in milliseconds. Default: 20 000.
+    /// See [`crate::backoff`].
+    #[serde(default = "default_http_max_backoff_ms")]
+    pub max_backoff_ms: u64,
 
     /// Named base URL aliases, e.g. `stripe = "https://api.stripe.com"`.
     ///
@@ -2280,12 +2385,18 @@ const fn default_http_max_retry_after_secs() -> u64 {
 }
 
 #[cfg(feature = "http-client")]
+const fn default_http_max_backoff_ms() -> u64 {
+    crate::backoff::DEFAULT_HTTP_MAX_BACKOFF_MS
+}
+
+#[cfg(feature = "http-client")]
 impl Default for HttpClientConfig {
     fn default() -> Self {
         Self {
             timeout_secs: default_http_timeout_secs(),
             max_retries: default_http_max_retries(),
             max_retry_after_secs: default_http_max_retry_after_secs(),
+            max_backoff_ms: default_http_max_backoff_ms(),
             base_urls: std::collections::HashMap::new(),
         }
     }
@@ -3489,6 +3600,10 @@ pub struct JobConfig {
     /// Default initial retry backoff in milliseconds.
     #[serde(default = "default_job_backoff_ms")]
     pub initial_backoff_ms: u64,
+    /// Cap on the retry backoff in milliseconds, for every backend.
+    /// Default: 3 600 000 (1 hour). See [`crate::backoff`].
+    #[serde(default = "default_job_max_backoff_ms")]
+    pub max_backoff_ms: u64,
     /// Ordered/weighted list of queues workers drain, highest priority first.
     ///
     /// Unset = a single `default` queue (today's behavior). A TOML array such as
@@ -3533,6 +3648,7 @@ impl Default for JobConfig {
             workers: default_job_workers(),
             max_attempts: default_job_max_attempts(),
             initial_backoff_ms: default_job_backoff_ms(),
+            max_backoff_ms: default_job_max_backoff_ms(),
             queues: JobQueuesConfig::default(),
             pin: Vec::new(),
             fleet: JobFleetConfig::default(),
@@ -3991,6 +4107,10 @@ const fn default_job_max_attempts() -> u32 {
 
 const fn default_job_backoff_ms() -> u64 {
     250
+}
+
+const fn default_job_max_backoff_ms() -> u64 {
+    crate::backoff::DEFAULT_JOB_MAX_BACKOFF_MS
 }
 
 fn default_jobs_redis_prefix() -> String {
@@ -5026,6 +5146,9 @@ impl AutumnConfig {
         // at apply time, so `autumn check` names the key. A cap of 0 would
         // silently drop every labeled sample the app records.
         self.metrics.validate()?;
+        // A zero recheck would spin; a negative threshold keeps deferrable work
+        // waiting for ever, because the runtime-config signal is never below 0.
+        self.cost.validate().map_err(ConfigError::Validation)?;
         // A `[replication]` block that is switched on but cannot ship (no
         // destination, both destinations, no credential indirection) must fail
         // here — so `autumn check` and `autumn doctor` see it too — rather than
@@ -5197,6 +5320,7 @@ impl AutumnConfig {
     /// - `AUTUMN_JOBS__PIN` → `jobs.pin` (comma-separated queue names)
     /// - `AUTUMN_JOBS__MAX_ATTEMPTS` → `jobs.max_attempts` (`u32`)
     /// - `AUTUMN_JOBS__INITIAL_BACKOFF_MS` → `jobs.initial_backoff_ms` (`u64`)
+    /// - `AUTUMN_JOBS__MAX_BACKOFF_MS` → `jobs.max_backoff_ms` (`u64`)
     /// - `AUTUMN_JOBS__REDIS__URL` → `jobs.redis.url` (`String`)
     /// - `AUTUMN_JOBS__REDIS__KEY_PREFIX` → `jobs.redis.key_prefix` (`String`)
     /// - `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` → `jobs.redis.visibility_timeout_ms` (`u64`)
@@ -5267,6 +5391,7 @@ impl AutumnConfig {
         self.apply_idempotency_env_overrides_with_env(env);
         self.apply_dev_env_overrides_with_env(env);
         self.apply_observability_env_overrides_with_env(env);
+        self.apply_cost_env_overrides_with_env(env);
         self.apply_compression_env_overrides_with_env(env);
         self.apply_actuator_env_overrides_with_env(env);
         self.apply_metrics_env_overrides_with_env(env);
@@ -5615,6 +5740,26 @@ impl AutumnConfig {
             env,
             "AUTUMN_COMPRESSION__ENABLED",
             &mut self.compression.enabled,
+        );
+    }
+
+    fn apply_cost_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(env, "AUTUMN_COST__ENABLED", &mut self.cost.enabled);
+        parse_env_option(
+            env,
+            "AUTUMN_COST__DEFER_THRESHOLD",
+            &mut self.cost.defer_threshold,
+        );
+        parse_env(
+            env,
+            "AUTUMN_COST__DEFER_RECHECK_SECS",
+            &mut self.cost.defer_recheck_secs,
+        );
+        parse_env(env, "AUTUMN_COST__MAX_TENANTS", &mut self.cost.max_tenants);
+        parse_env(
+            env,
+            "AUTUMN_COST__SIGNAL_REFRESH_SECS",
+            &mut self.cost.signal_refresh_secs,
         );
     }
 
@@ -6135,6 +6280,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_JOBS__INITIAL_BACKOFF_MS",
             &mut self.jobs.initial_backoff_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__MAX_BACKOFF_MS",
+            &mut self.jobs.max_backoff_ms,
         );
         parse_env_option_string(env, "AUTUMN_JOBS__REDIS__URL", &mut self.jobs.redis.url);
         parse_env_string(
@@ -6998,33 +7148,12 @@ impl AutumnConfig {
     }
 }
 
-/// HTTP server configuration.
-///
-/// Controls which address the server binds to and how graceful shutdown
-/// behaves.
-///
-/// # Defaults
-///
-/// | Field | Default |
-/// |-------|---------|
-/// | `port` | `3000` |
-/// | `host` | `"127.0.0.1"` |
-/// | `shutdown_timeout_secs` | `30` |
-///
-/// # Examples
-///
-/// ```rust
-/// use autumn_web::config::ServerConfig;
-///
-/// let server = ServerConfig::default();
-/// assert_eq!(server.port, 3000);
-/// assert_eq!(server.host, "127.0.0.1");
-/// ```
 /// Per-request timeout configuration.
 ///
 /// Controls how long the server waits for a complete request-response cycle
-/// before returning `408 Request Timeout`. A value of `None` or `0` disables
-/// the timeout (the default, so existing applications are unaffected).
+/// before it returns `503 Service Unavailable`. A value of `None` or `0`
+/// disables the timeout. The default is disabled. The `prod` profile sets
+/// `30000` (30s).
 ///
 /// # `autumn.toml` example
 ///
@@ -7088,6 +7217,28 @@ pub struct UpgradeConfig {
     pub ready_timeout_secs: u64,
 }
 
+/// HTTP server configuration.
+///
+/// Controls which address the server binds to and how graceful shutdown
+/// behaves.
+///
+/// # Defaults
+///
+/// | Field | Default |
+/// |-------|---------|
+/// | `port` | `3000` |
+/// | `host` | `"127.0.0.1"` |
+/// | `shutdown_timeout_secs` | `30` |
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::config::ServerConfig;
+///
+/// let server = ServerConfig::default();
+/// assert_eq!(server.port, 3000);
+/// assert_eq!(server.host, "127.0.0.1");
+/// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     /// Port to listen on. Default: `3000`.
@@ -10758,6 +10909,15 @@ pub struct CircuitBreakerPolicyConfig {
     pub open_duration_secs: Option<u64>,
     /// Number of successful trials required in half-open state to close the breaker.
     pub half_open_trial_count: Option<u64>,
+    /// A call of this many milliseconds or more is slow. `0` turns slow-call
+    /// detection off.
+    pub slow_call_duration_threshold_ms: Option<u64>,
+    /// The breaker opens when the slow-call ratio is this value or more.
+    /// Example: `0.8`.
+    pub slow_call_rate_threshold: Option<f64>,
+    /// What a call cancelled at or after the slow-call threshold counts as:
+    /// `"slow"` or `"failure"`.
+    pub cancelled_call_outcome: Option<crate::circuit_breaker::CancelledCallOutcome>,
 }
 
 impl AutumnConfig {
@@ -10798,6 +10958,22 @@ impl AutumnConfig {
                 .circuit_breaker
                 .defaults
                 .half_open_trial_count,
+        );
+        let defaults = &mut self.resilience.circuit_breaker.defaults;
+        parse_env_option(
+            env,
+            "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__SLOW_CALL_DURATION_THRESHOLD_MS",
+            &mut defaults.slow_call_duration_threshold_ms,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__SLOW_CALL_RATE_THRESHOLD",
+            &mut defaults.slow_call_rate_threshold,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__CANCELLED_CALL_OUTCOME",
+            &mut defaults.cancelled_call_outcome,
         );
     }
 }
@@ -14551,6 +14727,7 @@ path = "/healthz"
             .with("AUTUMN_JOBS__WORKERS", "8")
             .with("AUTUMN_JOBS__MAX_ATTEMPTS", "12")
             .with("AUTUMN_JOBS__INITIAL_BACKOFF_MS", "750")
+            .with("AUTUMN_JOBS__MAX_BACKOFF_MS", "90000")
             .with("AUTUMN_JOBS__REDIS__URL", "redis://jobs:6379/2")
             .with("AUTUMN_JOBS__REDIS__KEY_PREFIX", "myapp:jobs")
             .with("AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS", "45000");
@@ -14561,6 +14738,7 @@ path = "/healthz"
         assert_eq!(config.jobs.workers, 8);
         assert_eq!(config.jobs.max_attempts, 12);
         assert_eq!(config.jobs.initial_backoff_ms, 750);
+        assert_eq!(config.jobs.max_backoff_ms, 90_000);
         assert_eq!(
             config.jobs.redis.url.as_deref(),
             Some("redis://jobs:6379/2")
@@ -15289,6 +15467,67 @@ path = "/healthz"
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.observability.server_timing, Some(false));
         assert!(!server_timing_enabled(&config));
+    }
+
+    #[test]
+    fn cost_section_defaults_and_toml() {
+        let config = AutumnConfig::default();
+        assert!(!config.cost.enabled);
+        assert_eq!(config.cost.defer_threshold, None);
+        assert_eq!(config.cost.defer_recheck_secs, 30);
+        assert_eq!(config.cost.max_tenants, 1000);
+        assert_eq!(config.cost.signal_refresh_secs, 5);
+
+        let config: AutumnConfig =
+            toml::from_str("[cost]\nenabled = true\ndefer_threshold = 400.5\n").expect("parse");
+        assert!(config.cost.enabled);
+        assert_eq!(config.cost.defer_threshold, Some(400.5));
+        assert_eq!(
+            config.cost.defer_recheck_secs, 30,
+            "unset keys keep defaults"
+        );
+    }
+
+    #[test]
+    fn cost_validation_names_the_bad_key() {
+        assert!(CostConfig::default().validate().is_ok());
+        let cost = CostConfig {
+            defer_recheck_secs: 0,
+            ..CostConfig::default()
+        };
+        assert!(cost.validate().unwrap_err().contains("defer_recheck_secs"));
+        let cost = CostConfig {
+            signal_refresh_secs: 0,
+            ..CostConfig::default()
+        };
+        assert!(cost.validate().unwrap_err().contains("signal_refresh_secs"));
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            let cost = CostConfig {
+                defer_threshold: Some(bad),
+                ..CostConfig::default()
+            };
+            assert!(cost.validate().unwrap_err().contains("defer_threshold"));
+        }
+        let mut config = AutumnConfig::default();
+        config.cost.defer_recheck_secs = 0;
+        assert!(config.validate().is_err(), "AutumnConfig::validate runs it");
+    }
+
+    #[test]
+    fn cost_env_overrides_wire_into_dispatcher() {
+        let env = MockEnv::new()
+            .with("AUTUMN_COST__ENABLED", "true")
+            .with("AUTUMN_COST__DEFER_THRESHOLD", "250")
+            .with("AUTUMN_COST__DEFER_RECHECK_SECS", "10")
+            .with("AUTUMN_COST__MAX_TENANTS", "7")
+            .with("AUTUMN_COST__SIGNAL_REFRESH_SECS", "2");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.cost.enabled);
+        assert_eq!(config.cost.defer_threshold, Some(250.0));
+        assert_eq!(config.cost.defer_recheck_secs, 10);
+        assert_eq!(config.cost.max_tenants, 7);
+        assert_eq!(config.cost.signal_refresh_secs, 2);
     }
 
     #[test]
@@ -19170,6 +19409,74 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
                 .defaults
                 .failure_ratio_threshold,
             Some(0.7)
+        );
+    }
+
+    #[test]
+    fn test_resilience_config_parses_slow_call_keys() {
+        let toml_str = r#"
+            [resilience.circuit_breaker.defaults]
+            slow_call_duration_threshold_ms = 2500
+            slow_call_rate_threshold = 0.4
+            cancelled_call_outcome = "failure"
+
+            [resilience.circuit_breaker.hosts."api.github.com"]
+            slow_call_duration_threshold_ms = 0
+        "#;
+        let config: AutumnConfig = toml::from_str(toml_str).unwrap();
+        let cb = &config.resilience.circuit_breaker;
+        assert_eq!(cb.defaults.slow_call_duration_threshold_ms, Some(2500));
+        assert_eq!(cb.defaults.slow_call_rate_threshold, Some(0.4));
+        assert_eq!(
+            cb.defaults.cancelled_call_outcome,
+            Some(crate::circuit_breaker::CancelledCallOutcome::Failure)
+        );
+        let host_cb = cb.hosts.get("api.github.com").unwrap();
+        assert_eq!(host_cb.slow_call_duration_threshold_ms, Some(0));
+        assert!(host_cb.slow_call_rate_threshold.is_none());
+    }
+
+    #[test]
+    fn test_resilience_config_slow_call_env_overrides() {
+        let env = MockEnv::new()
+            .with(
+                "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__SLOW_CALL_DURATION_THRESHOLD_MS",
+                "1500",
+            )
+            .with(
+                "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__SLOW_CALL_RATE_THRESHOLD",
+                "0.25",
+            )
+            .with(
+                "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__CANCELLED_CALL_OUTCOME",
+                "failure",
+            );
+        let mut config = AutumnConfig::default();
+        config.apply_resilience_env_overrides_with_env(&env);
+        let defaults = &config.resilience.circuit_breaker.defaults;
+        assert_eq!(defaults.slow_call_duration_threshold_ms, Some(1500));
+        assert_eq!(defaults.slow_call_rate_threshold, Some(0.25));
+        assert_eq!(
+            defaults.cancelled_call_outcome,
+            Some(crate::circuit_breaker::CancelledCallOutcome::Failure)
+        );
+    }
+
+    #[test]
+    fn test_resilience_config_bad_cancelled_call_outcome_env_is_ignored() {
+        let env = MockEnv::new().with(
+            "AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__CANCELLED_CALL_OUTCOME",
+            "drop",
+        );
+        let mut config = AutumnConfig::default();
+        config.apply_resilience_env_overrides_with_env(&env);
+        assert!(
+            config
+                .resilience
+                .circuit_breaker
+                .defaults
+                .cancelled_call_outcome
+                .is_none()
         );
     }
 

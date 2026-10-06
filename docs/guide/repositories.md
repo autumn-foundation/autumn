@@ -668,8 +668,9 @@ generated write method publishes the model it mutates, and
 [`autumn cache audit`](cache-coherence.md) fails the build when one of them can
 leave a `#[cached]` read stale with no `invalidates(...)` covering the pair. The
 gate proves the *obligation is discharged in source* — that an invalidation edge
-exists and names a real cached read — not that the invalidator runs on every
-write path; see that guide's "What this does not prove".
+exists and names a real cached read. Each generated write calls the invalidator
+after it commits. The gate does not prove that the backend sweep succeeds; see
+that guide's "What this does not prove".
 
 
 Bulk operations are built for maximum performance, with the following built-in safeguards:

@@ -1221,6 +1221,21 @@ impl crate::actuator::ProvideActuatorState for AppState {
             .map(|handle| (*handle).clone())
     }
 
+    fn cost_signal(&self) -> Option<crate::cost::CostSignal> {
+        self.extension::<crate::cost::CostSignal>()
+            .map(|signal| (*signal).clone())
+    }
+
+    fn cost_accountant(&self) -> Option<crate::cost::CostAccountant> {
+        // An accountant that the app inserted meters nothing while `[cost]
+        // enabled` is off, so the endpoint reports metering as off.
+        if !self.config_arc().cost.enabled {
+            return None;
+        }
+        self.extension::<crate::cost::CostAccountant>()
+            .map(|accountant| (*accountant).clone())
+    }
+
     fn deploy_version(&self) -> String {
         self.extension::<crate::canary::CanaryState>().map_or_else(
             || crate::canary::STABLE.to_owned(),

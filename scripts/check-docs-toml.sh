@@ -548,7 +548,11 @@ CARGO_PROFILE_TABLES = {"package", "build-override"}
 # config as `autumn.production.toml.example` and copies it to `/app/autumn.toml`
 # at build time — same schema, so `deployment.md`'s "Customising the production
 # config" fence must be read, not skipped as some other file.
-TOML_FILE_NAME = re.compile(r"\b([A-Za-z0-9_.\-]+\.toml(?:\.example)?)\b")
+#
+# `.lock` is TOML too: `capacity.lock` (the capacity contract) and `Cargo.lock`.
+# Its marker names another file. `[host]` in a capacity contract is one edit from
+# the `[cost]` root (#1720), so the near-miss rule below needs the marker there.
+TOML_FILE_NAME = re.compile(r"\b([A-Za-z0-9_.\-]+\.(?:toml|lock)(?:\.example)?)\b")
 
 # The overlay form is literally `format!("autumn-{profile_name}.toml")`
 # (`config.rs`), and the corpus names a dozen profiles that way — `autumn-dev`,
@@ -1474,6 +1478,8 @@ def self_test():
         # threshold is 1: at 2 this fence is admitted and its five correct
         # sections reported as drift.
         ("capacity-contract root stays skipped", "[provenance]\nhost = 1\n", "no-autumn-section"),
+        # `[host]` is one edit from `[cost]`; the `capacity.lock` marker keeps it out.
+        ("capacity.lock marker names another file", '# capacity.lock\n[host]\nos = "linux"\n', "other-file:capacity.lock"),
         ("version root stays skipped", "[version]\nx = 1\n", "no-autumn-section"),
         ("credentials root stays skipped", '[acme_dns]\napi_token = "x"\n', "no-autumn-section"),
         ("plugin-manifest root stays skipped", "[capabilities]\nnet = false\n", "no-autumn-section"),
