@@ -9055,7 +9055,7 @@ async fn execute_task_result(
             return Err((duration_ms, format_scheduled_task_panic(panic.as_ref())));
         }
     };
-    // Meter the tick as one task run (issue #1720).
+    // Meter the tick (issue #1720).
     let run = crate::cost::WorkRun {
         tenant: None,
         waited,
@@ -9084,6 +9084,10 @@ fn format_scheduled_task_panic(panic: &(dyn Any + Send)) -> String {
 
 /// Run one tick with `tick` as its [`crate::scheduler::current_tick`], and
 /// stop it after `lease_ttl` when one is set.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one tick: its task, schedule, lease and cost wait"
+)]
 async fn execute_task_result_with_optional_lease_ttl(
     state: &AppState,
     handler: crate::task::TaskHandler,
@@ -9237,7 +9241,7 @@ struct CostGate {
     shutdown: tokio_util::sync::CancellationToken,
     /// `true` while the tick waits. The cron loop folds later ticks into it.
     waiting: Option<Arc<std::sync::atomic::AtomicBool>>,
-    /// `true` after the tick waited. The cost meter reads it.
+    /// `true` after the tick waited in a real window. The cost meter reads it.
     waited: std::sync::atomic::AtomicBool,
 }
 
@@ -9255,7 +9259,6 @@ impl CostGate {
         .await
     }
 
-    /// `true` after the tick waited for the cost signal.
     fn waited(&self) -> bool {
         self.waited.load(std::sync::atomic::Ordering::Acquire)
     }

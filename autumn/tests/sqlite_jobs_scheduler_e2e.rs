@@ -2355,6 +2355,10 @@ async fn sqlite_deferrable_job_waits_for_the_cost_signal() {
     let jobs = accountant.snapshot().jobs;
     assert_eq!(jobs.total.runs, 2, "{jobs:?}");
     assert_eq!(jobs.shift.in_window_runs, 0, "{jobs:?}");
+    assert_eq!(
+        jobs.shift.shifted_runs, 1,
+        "the held job is shifted: {jobs:?}"
+    );
 
     shutdown.cancel();
     job::clear_global_job_client();

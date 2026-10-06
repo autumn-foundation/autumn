@@ -168,9 +168,8 @@ pub struct WorkCost {
 impl WorkCost {
     /// Total CPU time, in seconds.
     #[must_use]
-    #[allow(clippy::cast_precision_loss)]
     pub fn cpu_seconds(&self) -> f64 {
-        self.cpu_micros as f64 / 1_000_000.0
+        seconds(self.cpu_micros)
     }
 
     const fn from_totals(cost: TenantCost) -> Self {
@@ -494,8 +493,8 @@ impl CostAccountant {
         shift: Option<Shift>,
     ) {
         let micros = u64::try_from(cpu.as_micros()).unwrap_or(u64::MAX);
-        let mut tables = self.lock();
-        let tables = &mut *tables;
+        let mut guard = self.lock();
+        let tables = &mut *guard;
         let (totals, shifts) = match kind {
             WorkKind::Job => (&mut tables.jobs, &mut tables.job_shift),
             WorkKind::Task => (&mut tables.tasks, &mut tables.task_shift),
@@ -510,6 +509,7 @@ impl CostAccountant {
         if let Some(shift) = shift {
             shifts.add(shift, micros);
         }
+        drop(guard);
     }
 
     /// Copy the current totals.
@@ -644,47 +644,24 @@ impl CostAccountant {
                 &snapshot,
                 "autumn_cost_deferrable_cpu_seconds_total",
                 "CPU seconds of deferrable runs, by window class.",
-                |_runs, cpu| cpu as f64 / 1_000_000.0,
+                |_runs, cpu| seconds(cpu),
             ),
         ]
     }
 }
 
-/// The metric label value of a background kind.
-const fn kind_label(kind: WorkKind) -> &'static str {
-    match kind {
-        WorkKind::Job => "job",
-        WorkKind::Task => "task",
-    }
+/// The background snapshots, with their `kind` label values.
+const fn by_kind(snapshot: &CostSnapshot) -> [(&'static str, &WorkSnapshot); 2] {
+    [("job", &snapshot.jobs), ("task", &snapshot.tasks)]
 }
 
-/// One counter family over job runs and task ticks, with a `kind` label, and
-/// a `tenant` label when `tenant_labels` is `true`.
-fn work_family(
-    snapshot: &CostSnapshot,
-    tenant_labels: bool,
-    name: &str,
-    help: &str,
-    value: fn(&WorkCost) -> f64,
-) -> MetricFamily {
-    let mut samples = Vec::new();
-    for (kind, work) in [
-        (WorkKind::Job, &snapshot.jobs),
-        (WorkKind::Task, &snapshot.tasks),
-    ] {
-        let kind = ("kind".to_owned(), kind_label(kind).to_owned());
-        if tenant_labels {
-            samples.extend(work.tenants.iter().map(|(tenant, cost)| MetricSample {
-                labels: vec![kind.clone(), ("tenant".to_owned(), tenant.clone())],
-                value: value(cost),
-            }));
-        } else {
-            samples.push(MetricSample {
-                labels: vec![kind],
-                value: value(&work.total),
-            });
-        }
-    }
+/// Microseconds to seconds.
+#[allow(clippy::cast_precision_loss)]
+fn seconds(micros: u64) -> f64 {
+    micros as f64 / 1_000_000.0
+}
+
+fn counter(name: &str, help: &str, samples: Vec<MetricSample>) -> MetricFamily {
     MetricFamily {
         name: name.to_owned(),
         help: help.to_owned(),
@@ -693,8 +670,38 @@ fn work_family(
     }
 }
 
-/// One counter family over the deferrable runs, with `kind` and `window`
-/// labels. `value` gets the runs and the CPU microseconds of one class.
+fn label(key: &str, value: &str) -> (String, String) {
+    (key.to_owned(), value.to_owned())
+}
+
+/// One counter over job runs and ticks, with a `kind` label, and a `tenant`
+/// label when `tenant_labels` is `true`.
+fn work_family(
+    snapshot: &CostSnapshot,
+    tenant_labels: bool,
+    name: &str,
+    help: &str,
+    value: fn(&WorkCost) -> f64,
+) -> MetricFamily {
+    let mut samples = Vec::new();
+    for (kind, work) in by_kind(snapshot) {
+        if tenant_labels {
+            samples.extend(work.tenants.iter().map(|(tenant, cost)| MetricSample {
+                labels: vec![label("kind", kind), label("tenant", tenant)],
+                value: value(cost),
+            }));
+        } else {
+            samples.push(MetricSample {
+                labels: vec![label("kind", kind)],
+                value: value(&work.total),
+            });
+        }
+    }
+    counter(name, help, samples)
+}
+
+/// One counter over the deferrable runs, with `kind` and `window` labels.
+/// `value` gets the runs and the CPU microseconds of one class.
 fn shift_family(
     snapshot: &CostSnapshot,
     name: &str,
@@ -702,10 +709,7 @@ fn shift_family(
     value: fn(u64, u64) -> f64,
 ) -> MetricFamily {
     let mut samples = Vec::new();
-    for (kind, work) in [
-        (WorkKind::Job, &snapshot.jobs),
-        (WorkKind::Task, &snapshot.tasks),
-    ] {
+    for (kind, work) in by_kind(snapshot) {
         let shift = work.shift;
         for (window, runs, cpu) in [
             ("shifted", shift.shifted_runs, shift.shifted_cpu_micros),
@@ -716,20 +720,12 @@ fn shift_family(
             ),
         ] {
             samples.push(MetricSample {
-                labels: vec![
-                    ("kind".to_owned(), kind_label(kind).to_owned()),
-                    ("window".to_owned(), window.to_owned()),
-                ],
+                labels: vec![label("kind", kind), label("window", window)],
                 value: value(runs, cpu),
             });
         }
     }
-    MetricFamily {
-        name: name.to_owned(),
-        help: help.to_owned(),
-        kind: MetricKind::Counter,
-        samples,
-    }
+    counter(name, help, samples)
 }
 
 // ── Cost signal ─────────────────────────────────────────────────────
@@ -765,6 +761,8 @@ struct SignalInner {
     recheck_ms: AtomicU64,
     /// `true` until the first value arrives from runtime config.
     pending: std::sync::atomic::AtomicBool,
+    /// Unix ms of the last real high value that deferral saw. `0`: never.
+    last_high_ms: AtomicU64,
 }
 
 /// A point-in-time copy of a [`CostSignal`].
@@ -804,6 +802,7 @@ impl CostSignal {
                 deferrals: AtomicU64::new(0),
                 recheck_ms: AtomicU64::new(DEFAULT_RECHECK_MS),
                 pending: std::sync::atomic::AtomicBool::new(false),
+                last_high_ms: AtomicU64::new(0),
             }),
         };
         signal.set_threshold(threshold);
@@ -918,6 +917,26 @@ impl CostSignal {
             .unwrap_or(u64::MAX)
             .max(MIN_RECHECK_MS);
         self.inner.recheck_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// `true` when the value is above the threshold and not pending: a real
+    /// window, not the wait for the first value.
+    fn is_window(&self) -> bool {
+        self.is_high() && !self.is_pending()
+    }
+
+    /// Note that deferral saw a real window at `now_ms`.
+    fn note_window(&self, now_ms: u64) {
+        if self.is_window() {
+            self.inner.last_high_ms.fetch_max(now_ms, Ordering::Relaxed);
+        }
+    }
+
+    /// `true` when deferral saw a real window at or after `ready_ms`: work
+    /// that was ready then did not run in the window.
+    fn window_since(&self, ready_ms: u64) -> bool {
+        let last = self.inner.last_high_ms.load(Ordering::Relaxed);
+        last != 0 && last >= ready_ms
     }
 
     fn note_deferral(&self) {
@@ -1083,6 +1102,18 @@ pub fn mark_deferrable(kind: WorkKind, name: &str) {
     names.any.store(true, Ordering::Release);
 }
 
+/// `true` when any name of `kind` is deferrable.
+#[cfg(feature = "redis")]
+pub(crate) fn any_deferrable(kind: WorkKind) -> bool {
+    let names = deferrable();
+    names.any.load(Ordering::Acquire)
+        && !names
+            .set(kind)
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+}
+
 /// `true` when the job or task `name` is deferrable.
 #[must_use]
 pub fn is_deferrable(kind: WorkKind, name: &str) -> bool {
@@ -1114,8 +1145,7 @@ pub(crate) fn deferral_signal(
 /// The scheduler calls this after it takes the tick lease, or before it with
 /// a lease that expires. `waiting` is set to `true` when the wait starts. The
 /// caller clears it when the tick no longer needs the reservation. `waited`
-/// is set to `true` when the wait starts, and stays `true`: the cost meter
-/// reads it.
+/// becomes `true` when the tick waits in a real window, and stays `true`.
 pub(crate) async fn wait_while_deferred(
     state: &crate::AppState,
     kind: WorkKind,
@@ -1127,7 +1157,6 @@ pub(crate) async fn wait_while_deferred(
     let Some(signal) = deferral_signal(state, kind, name) else {
         return true;
     };
-    waited.store(true, Ordering::Release);
     signal.note_deferral();
     tracing::info!(
         task = name,
@@ -1139,6 +1168,10 @@ pub(crate) async fn wait_while_deferred(
     }
     let mut resumed = true;
     while signal.is_high() {
+        // The wait for the first value is not a window.
+        if signal.is_window() {
+            waited.store(true, Ordering::Release);
+        }
         tokio::select! {
             () = shutdown.cancelled() => {
                 resumed = false;
@@ -1158,32 +1191,38 @@ pub(crate) fn note_deferral(signal: &CostSignal) {
     signal.note_deferral();
 }
 
-/// The time between two signal checks of the app signal, in milliseconds.
-pub(crate) fn recheck_ms(state: &crate::AppState) -> u64 {
-    state
-        .extension::<CostSignal>()
-        .map_or(DEFAULT_RECHECK_MS, |signal| {
-            u64::try_from(signal.recheck().as_millis()).unwrap_or(DEFAULT_RECHECK_MS)
-        })
+/// `true` while the app signal is high: the durable job backends do not
+/// claim deferrable jobs. Notes a real window for [`held_in_window`].
+#[cfg(any(feature = "db", feature = "redis", test))]
+pub(crate) fn deferring_jobs(state: &crate::AppState) -> bool {
+    let Some(signal) = state.extension::<CostSignal>() else {
+        return false;
+    };
+    if !signal.is_high() {
+        return false;
+    }
+    signal.note_window(clock_ms(state));
+    true
 }
 
-/// The names in `names` that are deferrable jobs, while the app signal is
-/// high. Otherwise empty. The durable job backends do not claim these jobs.
-pub(crate) fn deferred_job_names<'a>(
-    state: &crate::AppState,
-    names: impl IntoIterator<Item = &'a str>,
-) -> Vec<String> {
-    if !state
+/// `true` when a durable job that was ready at `ready_ms` (unix ms) was held
+/// by a real window. The meter then classifies its run as shifted.
+#[cfg(any(feature = "db", feature = "redis", test))]
+pub(crate) fn held_in_window(state: &crate::AppState, ready_ms: u64) -> bool {
+    state
         .extension::<CostSignal>()
-        .is_some_and(|signal| signal.is_high())
-    {
-        return Vec::new();
-    }
-    names
-        .into_iter()
-        .filter(|name| is_deferrable(WorkKind::Job, name))
-        .map(str::to_owned)
-        .collect()
+        .is_some_and(|signal| signal.window_since(ready_ms))
+}
+
+/// `true` when the signal is in a real window, not only pending. A local job
+/// that waits then counts as held.
+pub(crate) fn is_window(signal: &CostSignal) -> bool {
+    signal.is_window()
+}
+
+#[cfg(any(feature = "db", feature = "redis", test))]
+fn clock_ms(state: &crate::AppState) -> u64 {
+    u64::try_from(crate::time::clock_unix_duration(state.clock()).as_millis()).unwrap_or(u64::MAX)
 }
 
 // ── Background lane ─────────────────────────────────────────────────
@@ -1198,13 +1237,28 @@ pub(crate) struct WorkRun {
     pub(crate) waited: bool,
 }
 
-/// The tenant of the current request, to attribute the cost of a job that
-/// the request enqueues.
+tokio::task_local! {
+    /// The enqueuing tenant of an after-commit enqueue. It is for cost only:
+    /// it does not scope repositories, as `CURRENT_TENANT` does.
+    static ENQUEUE_TENANT: Option<String>;
+}
+
+/// The tenant that enqueues a job now, to attribute the job's cost.
 pub(crate) fn enqueuing_tenant() -> Option<String> {
     crate::tenancy::CURRENT_TENANT
         .try_with(Clone::clone)
         .ok()
         .flatten()
+        .or_else(|| ENQUEUE_TENANT.try_with(Clone::clone).ok().flatten())
+}
+
+/// Run `fut` with `tenant` as its enqueuing tenant. An after-commit enqueue
+/// runs in a new task, so it carries the tenant that the request had.
+pub(crate) async fn with_enqueue_tenant<F: std::future::Future>(
+    tenant: Option<String>,
+    fut: F,
+) -> F::Output {
+    ENQUEUE_TENANT.scope(tenant, fut).await
 }
 
 /// The class of a run when it starts. `None` for a run that is not
@@ -1236,24 +1290,47 @@ pub(crate) fn meter_work<F: std::future::Future>(
     run: WorkRun,
     fut: F,
 ) -> MeteredWork<F> {
-    let Some(accountant) = state.extension::<CostAccountant>() else {
-        return MeteredWork::Plain { fut };
-    };
-    let signal = state.extension::<CostSignal>();
-    let shift = shift_class(signal.as_deref(), is_deferrable(kind, name), run.waited);
-    let cell = Arc::new(RequestCostCell::default());
-    MeteredWork::Metered {
-        fut: scope_request(Arc::clone(&cell), fut),
-        meter: WorkMeter {
+    WorkMeter::start(state, kind, name, run).wrap(fut)
+}
+
+impl WorkMeter {
+    /// Start the meter of one run. `None` when the app has no accountant.
+    pub(crate) fn start(
+        state: &crate::AppState,
+        kind: WorkKind,
+        name: &str,
+        run: WorkRun,
+    ) -> Option<Self> {
+        let accountant = state.extension::<CostAccountant>()?;
+        let signal = state.extension::<CostSignal>();
+        Some(Self {
             probe: accountant.allocation_probe().cloned(),
             accountant: (*accountant).clone(),
-            cell,
+            cell: Arc::new(RequestCostCell::default()),
             cpu: Duration::ZERO,
             allocated: 0,
             kind,
             tenant: run.tenant,
-            shift,
-        },
+            shift: shift_class(signal.as_deref(), is_deferrable(kind, name), run.waited),
+        })
+    }
+}
+
+/// Wrap `fut` with an optional meter.
+pub(crate) trait WrapMetered {
+    /// Meter `fut` with this meter, if any.
+    fn wrap<F: std::future::Future>(self, fut: F) -> MeteredWork<F>;
+}
+
+impl WrapMetered for Option<WorkMeter> {
+    fn wrap<F: std::future::Future>(self, fut: F) -> MeteredWork<F> {
+        match self {
+            None => MeteredWork::Plain { fut },
+            Some(meter) => MeteredWork::Metered {
+                fut: scope_request(Arc::clone(&meter.cell), fut),
+                meter,
+            },
+        }
     }
 }
 
@@ -1323,8 +1400,22 @@ pub(crate) fn measure_poll(
     allocated: &mut u64,
     f: impl FnOnce(),
 ) {
+    /// Adds the CPU time on drop, so a poll that panics is counted too.
+    struct CpuGuard<'a> {
+        cpu: &'a mut Duration,
+        mark: CpuMark,
+    }
+    impl Drop for CpuGuard<'_> {
+        fn drop(&mut self) {
+            *self.cpu = self.cpu.saturating_add(cpu_since(self.mark));
+        }
+    }
+
+    let _guard = CpuGuard {
+        cpu,
+        mark: cpu_mark(),
+    };
     let mut f = Some(f);
-    let mark = cpu_mark();
     if let Some(probe) = probe {
         let bytes = probe.measure(&mut || {
             if let Some(f) = f.take() {
@@ -1337,7 +1428,6 @@ pub(crate) fn measure_poll(
     if let Some(f) = f.take() {
         f();
     }
-    *cpu = cpu.saturating_add(cpu_since(mark));
 }
 
 // ── Install ─────────────────────────────────────────────────────────
@@ -2001,18 +2091,59 @@ mod tests {
         assert!(active, "a metered run counts its DB queries");
     }
 
+    /// The durable backends hold work while the signal is high. Only a real
+    /// window (not the wait for the first value) marks held work.
     #[test]
-    fn deferred_job_names_lists_deferrable_names_only_while_high() {
-        mark_deferrable(WorkKind::Job, "cost_unit_names_deferrable");
-        let names = ["cost_unit_names_deferrable", "cost_unit_names_urgent"];
+    fn deferring_jobs_notes_only_a_real_window() {
         let (state, _accountant, signal) = metered_state(Some(1.0));
-        assert!(deferred_job_names(&state, names).is_empty(), "signal low");
+        assert!(!deferring_jobs(&state), "signal low");
+        signal.mark_pending();
+        assert!(deferring_jobs(&state), "a pending signal holds work");
+        assert!(!held_in_window(&state, 0), "pending is not a window");
+
         signal.set(2.0);
-        assert_eq!(
-            deferred_job_names(&state, names),
-            vec!["cost_unit_names_deferrable".to_owned()]
+        assert!(deferring_jobs(&state));
+        let now = clock_ms(&state);
+        assert!(held_in_window(&state, now), "ready before the window");
+        assert!(
+            !held_in_window(&state, now + 60_000),
+            "ready after the window"
         );
-        let bare = crate::AppState::for_test();
-        assert!(deferred_job_names(&bare, names).is_empty(), "no signal");
+        assert!(!deferring_jobs(&crate::AppState::for_test()), "no signal");
+    }
+
+    /// A tick that waits only for the first value did not wait in a window.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_for_the_first_value_is_not_a_window() {
+        mark_deferrable(WorkKind::Task, "cost_unit_pending_wait");
+        let (state, _accountant, signal) = metered_state(Some(1.0));
+        signal.set_recheck(Duration::from_secs(1));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        for (pending, high, want) in [(true, 0.5, false), (false, 5.0, true)] {
+            if pending {
+                signal.mark_pending();
+            } else {
+                signal.set(high);
+            }
+            let waited = AtomicBool::new(false);
+            let fall = async {
+                tokio::time::sleep(Duration::from_millis(1_500)).await;
+                signal.set(0.5);
+            };
+            let (resumed, ()) = tokio::join!(
+                wait_while_deferred(
+                    &state,
+                    WorkKind::Task,
+                    "cost_unit_pending_wait",
+                    &shutdown,
+                    None,
+                    &waited,
+                ),
+                fall
+            );
+            assert!(resumed);
+            assert_eq!(waited.load(Ordering::Acquire), want, "pending = {pending}");
+        }
     }
 }

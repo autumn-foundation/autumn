@@ -98,6 +98,11 @@ async fn window_scenario(
     .await;
     let jobs = accountant.snapshot().jobs;
     assert_eq!(jobs.shift.in_window_runs, 0, "{jobs:?}");
+    assert_eq!(
+        jobs.shift.shifted_runs, 1,
+        "the held job is shifted: {jobs:?}"
+    );
+    assert_eq!(jobs.shift.ratio(), Some(1.0), "{jobs:?}");
 
     shutdown.cancel();
     job::clear_global_job_client();

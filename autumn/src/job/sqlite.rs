@@ -591,7 +591,7 @@ async fn claim_next_job(
     use diesel_async::RunQueryDsl as _;
 
     // One JSON array bind: `SQLite` has no array type.
-    let deferred = serde_json::to_string(deferred).unwrap_or_else(|_| "[]".to_owned());
+    let deferred = super::deferred_names_json(deferred);
     let mut conn = pool.get().await.ok()?;
     // Probe with a read first. The claim is an UPDATE, which opens a write
     // transaction and takes the single writer lock even when it matches
@@ -1236,7 +1236,7 @@ async fn execute_job(
             state.clone(),
             payload,
             final_attempt,
-            crate::cost::WorkRun::default(),
+            super::durable_work_run(state, Some(row.run_at)),
         ),
         job_span,
     )

@@ -358,8 +358,8 @@ async fn sim_cost_shift_tick(_state: AppState) -> AutumnResult<()> {
 }
 
 /// The success metric of issue #1720: during a synthetic high window, at
-/// least 90% of the deferrable CPU moves out of the window. The meter reads
-/// it: every deferred run is `shifted`, none ran `in_window`. Requests in the
+/// least 90% of the deferrable CPU moves out of the window. The meter shows
+/// this: every deferred run is `shifted`, and no run is `in_window`. Requests in the
 /// window are metered as usual.
 #[sim_test]
 async fn sim_deferral_shifts_deferrable_cpu_out_of_the_window(mut sim: Sim) {

@@ -271,3 +271,82 @@ fn metered_all(accountant: &CostAccountant) -> u64 {
     let snapshot = accountant.snapshot();
     snapshot.total.cpu_micros + snapshot.jobs.total.cpu_micros
 }
+
+/// Success-metric probe (issue #1720): metering adds at most 2% to the p99
+/// latency of a request that does 1 ms of CPU work.
+///
+/// Ignored: wall-clock results depend on the machine. Run it manually:
+/// `cargo test -p autumn-web --release --test cost_reconcile -- --ignored`.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "timing-sensitive; run manually in release mode"]
+async fn metering_adds_at_most_two_percent_to_p99() {
+    use autumn_web::middleware::CostLayer;
+    use tower::ServiceExt as _;
+
+    /// Requests in one round. The rounds alternate between the two routers,
+    /// so drift on the machine hits both.
+    const N: usize = 400;
+    const ROUNDS: usize = 10;
+
+    async fn handler() -> String {
+        burn_micros(1_000).to_string()
+    }
+
+    async fn p99_micros(router: &axum::Router) -> u128 {
+        let mut samples = Vec::with_capacity(N);
+        for _ in 0..N {
+            let req = axum::http::Request::builder()
+                .uri("/work")
+                .body(axum::body::Body::empty())
+                .expect("request");
+            let start = std::time::Instant::now();
+            router.clone().oneshot(req).await.expect("response");
+            samples.push(start.elapsed().as_micros());
+        }
+        samples.sort_unstable();
+        samples[N * 99 / 100]
+    }
+
+    let bare = axum::Router::new().route("/work", axum::routing::get(handler));
+    let metered = bare
+        .clone()
+        .layer(CostLayer::new(CostAccountant::new(10), false));
+
+    // Warm-up.
+    p99_micros(&bare).await;
+    p99_micros(&metered).await;
+    let mut bare_p99 = Vec::with_capacity(ROUNDS);
+    let mut metered_p99 = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        bare_p99.push(p99_micros(&bare).await);
+        metered_p99.push(p99_micros(&metered).await);
+    }
+    bare_p99.sort_unstable();
+    metered_p99.sort_unstable();
+    let bare = bare_p99[ROUNDS / 2];
+    let metered = metered_p99[ROUNDS / 2];
+
+    #[allow(clippy::cast_precision_loss)]
+    let overhead = metered as f64 / bare as f64 - 1.0;
+    println!(
+        "median p99: bare {bare} us, metered {metered} us, overhead {:.2}%",
+        overhead * 100.0
+    );
+    assert!(
+        overhead <= 0.02,
+        "metering adds {:.2}% to p99, more than 2%",
+        overhead * 100.0
+    );
+}
+
+/// Spin until this thread used `micros` of CPU.
+fn burn_micros(micros: u64) -> u64 {
+    let target = thread_cpu() + Duration::from_micros(micros);
+    let mut acc = 0_u64;
+    while thread_cpu() < target {
+        for i in 0..100_u64 {
+            acc = std::hint::black_box(acc.wrapping_mul(31).wrapping_add(i));
+        }
+    }
+    acc
+}

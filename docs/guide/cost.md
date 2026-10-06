@@ -2,8 +2,9 @@
 
 Autumn can measure what each request, job run and scheduled tick costs. It
 adds the cost to the total of the tenant that caused it. It can also delay
-background work while a cost signal (carbon intensity or price) is high, and
-it measures how much of that work moved out of the high window.
+background work while a cost signal (carbon intensity or price) is high. It
+measures how much of that work moved out of the *window*: the time while the
+signal is above `defer_threshold`.
 
 This guide covers the first two slices of issue #1720.
 
@@ -34,17 +35,19 @@ The layer does not count:
 With metering on, the runtime also measures each job run (on all jobs
 backends) and each scheduled tick, with the same method. A retry is a new run.
 
-| Run | Tenant key |
+| Work | Tenant key |
 |---|---|
 | Job on the `local` backend | The tenant of the request that enqueued the job. |
 | Job on `postgres`, `redis` or `sqlite` | `_none`. The tenant is not stored in the queue. |
 | Scheduled tick | `_none`. |
 
-The tenant is used only for cost. The job handler does not run in the scope
-of that tenant.
+Autumn uses the tenant only for cost. The job handler does not run in that
+tenant's scope. A job that a request enqueues after its transaction commits
+also goes to that tenant.
 
-A run that stops before it completes (a lease timeout, a shutdown) is
-recorded with the cost that the runtime measured until then.
+If a run stops early (lease timeout, shutdown), the runtime records the cost
+that it measured until then. The cost of a run includes the framework work
+around the handler (job tracking, failure capsules).
 
 ---
 
@@ -120,9 +123,10 @@ For deferrable runs, these counters have a `kind` label and a `window` label
 - `autumn_cost_deferrable_cpu_seconds_total`
 
 These two endpoints are public. With `[actuator] sensitive = false`, each
-counter has one sample for each `kind` (and `window`): the total. With
-`sensitive = true`, the request and work counters have one sample for each
-tenant, with a `tenant` label.
+request counter has one sample. Each work counter has one sample for each
+`kind`. With `sensitive = true`, the request and work counters have one sample
+for each tenant, with a `tenant` label. The deferrable counters have one sample
+for each `kind` and `window`, and never a `tenant` label.
 
 ### `GET /actuator/cost`
 
@@ -147,9 +151,15 @@ This endpoint shows the signal and the total for each tenant. It needs
       "ratio": 1.0
     }
   },
-  "tasks": { "total": { "runs": 0, "cpu_micros": 0, "allocated_bytes": 0, "db_queries": 0 },
-             "tenants": {}, "shift": { "shifted_runs": 0, "shifted_cpu_micros": 0,
-             "in_window_runs": 0, "in_window_cpu_micros": 0, "ratio": null } }
+  "tasks": {
+    "total":   { "runs": 0, "cpu_micros": 0, "allocated_bytes": 0, "db_queries": 0 },
+    "tenants": {},
+    "shift": {
+      "shifted_runs": 0, "shifted_cpu_micros": 0,
+      "in_window_runs": 0, "in_window_cpu_micros": 0,
+      "ratio": null
+    }
+  }
 }
 ```
 
@@ -289,10 +299,9 @@ While the signal is high:
     the queue.
   - `postgres` and `sqlite`: workers do not claim the job. It stays
     `enqueued` in the table. When the signal falls, the next poll claims it.
-  - `redis`: a worker that pops the job parks it in the `blocked` set until
-    the next check, `defer_recheck_secs` later. It does not claim it. The
-    concurrency gauges do not count it, unless the job also has a
-    concurrency limit.
+  - `redis`: a worker that pops the job parks it in the `blocked` set. It
+    does not claim it. When the signal falls, a worker puts it back on its
+    queue. The concurrency gauges do not count it.
 - A deferrable task waits, then runs its tick when the signal falls. Later
   ticks on that replica fold into that one run.
   - On the `postgres` and `sqlite` schedulers the tick claim expires, so the
@@ -306,16 +315,16 @@ counted.
 
 ### Measure the shift
 
-With metering on, the runtime puts each deferrable run into one class when it
-starts:
+With metering on, the runtime classifies a deferrable run when it starts:
 
 | Class | Meaning |
 |---|---|
-| `shifted` | The run waited for the signal, then started while the signal was low. |
+| `shifted` | A window held the run, then the run started while the signal was low. |
 | `in_window` | The run started while the signal was high. |
 
-A deferrable run that did not wait and started while the signal was low is in
-no class: no window held it.
+A deferrable run that no window held, and that started while the signal was
+low, is in no class. The wait for the first runtime-config value is not a
+window.
 
 `shift.ratio` in `/actuator/cost` is `shifted_cpu / (shifted_cpu +
 in_window_cpu)`. When no CPU time is measured, it uses the run counts. It is
@@ -323,8 +332,9 @@ in_window_cpu)`. When no CPU time is measured, it uses the run counts. It is
 a window, for example a job that a worker claimed just before the signal
 rose.
 
-Only `local` jobs and scheduled ticks can be `shifted`. A job on a durable
-backend does not record that it waited. It can be `in_window`.
+A `local` job or a tick was held when it waited in a window. A job on a durable
+backend was held when it was ready (its due time) before the last time a
+worker saw the window.
 
 For a `JobInfo` or `TaskInfo` that you make by hand, call
 `autumn_web::cost::mark_deferrable(WorkKind::Job, "name")`.
@@ -335,6 +345,8 @@ For a `JobInfo` or `TaskInfo` that you make by hand, call
   claimed before the signal rose runs. It counts as `in_window`.
 - On `postgres` and `sqlite`, a large backlog of deferred jobs at the head of
   a queue makes each claim scan past those rows.
+- A local job that waits only for the first runtime-config value, and then
+  waits in a window, is not `shifted`.
 - On the `local` backend, a deferred job is in memory. A restart loses it, as
   it loses any other queued local job.
 - On the `postgres` and `sqlite` schedulers, replicas can resume at
