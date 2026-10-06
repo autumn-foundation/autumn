@@ -2052,8 +2052,9 @@ in one write. A Key Vault secret that you add to the job must use a
 user-assigned identity: the app cannot use the job's system identity, so
 the script stops on such a secret. The job's ACR registry entry must use a
 user-assigned identity too. Do not give a secret, registry or scale rule
-that you add to the app an identity of the migration job: credential
-removal drops those identities, so the script stops on that too. The identity applies to all revisions, so the first cutover
+that you add to the app an identity of the migration job, and do not use a
+job secret as a registry password: credential removal drops those
+identities and secrets, so the script stops on that too. The identity applies to all revisions, so the first cutover
 disables ingress (also the internal route) and waits until the placeholder
 runs no replica. Then nothing can start the placeholder again. Keep
 `min_replicas = 0` until then: the script stops if the template or an active
