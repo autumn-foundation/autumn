@@ -940,7 +940,21 @@ impl Shape {
     }
 }
 
+/// Does `ty` leave a part to inference (`_`)?
+fn type_infers(ty: &Type) -> bool {
+    struct Infers(bool);
+    impl<'a> Visit<'a> for Infers {
+        fn visit_type_infer(&mut self, _: &'a syn::TypeInfer) {
+            self.0 = true;
+        }
+    }
+    let mut infers = Infers(false);
+    infers.visit_type(ty);
+    infers.0
+}
+
 /// What each side of a `Result` type holds, as the parts `Ok` and `Err`.
+/// `None` when a side is left to inference: `Result<_, ()>`.
 fn result_sides(ty: &Type) -> Option<Vec<(String, Kind)>> {
     let Type::Path(path) = ty else {
         return None;
@@ -952,6 +966,7 @@ fn result_sides(ty: &Type) -> Option<Vec<(String, Kind)>> {
         || path.qself.is_some()
         || !std_prefix(&path.path)
         || generic_types(segment).count() != 2
+        || generic_types(segment).any(type_infers)
     {
         return None;
     }
@@ -4361,6 +4376,11 @@ impl Analyzer {
                 )
         };
         match e {
+            // `try { repo }` wraps its tail in a type the macro cannot see:
+            // a value that holds anything is read as nested.
+            Expr::TryBlock(t) => {
+                block_tail(&t.block).is_some_and(|tail| self.value_of(tail) != Kind::Plain)
+            }
             Expr::Path(_) => path_ident(e).is_some_and(|name| self.env.get(&name) == Kind::Nested),
             Expr::Reference(r) => self.expr_is_nested(&r.expr),
             Expr::RawAddr(r) => self.expr_is_nested(&r.expr),
@@ -6237,12 +6257,6 @@ fn ref_mut_names(pat: &Pat) -> Vec<String> {
 /// `Vec<T>` for `Vec::<T>::new()`. `None` when a type is left to inference
 /// (`_`).
 fn constructor_type(e: &Expr) -> Option<Type> {
-    struct Infers(bool);
-    impl<'a> Visit<'a> for Infers {
-        fn visit_type_infer(&mut self, _: &'a syn::TypeInfer) {
-            self.0 = true;
-        }
-    }
     let (path, called) = match peel_parens(e) {
         Expr::Call(call) => match &*call.func {
             Expr::Path(p) => (&p.path, true),
@@ -6269,11 +6283,8 @@ fn constructor_type(e: &Expr) -> Option<Type> {
             _ => None,
         })
         .collect();
-    let mut infers = Infers(false);
-    for ty in &types {
-        infers.visit_type(ty);
-    }
-    if infers.0 {
+    let infers = types.iter().any(|ty| type_infers(ty));
+    if infers {
         return None;
     }
     let name = last.ident.to_string();
@@ -12836,6 +12847,25 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let v: Vec<i64> = vec![1]; render(v); let _ = repo; Ok(0) }",
                 Expect::Exact(0),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn try_block_values_keep_handles() {
+        check_handlers(&[
+            (
+                "guard: a try block's value keeps its handle",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let wrapped: Result<_, ()> = try { repo }; let alias = wrapped?; \
+                 alias.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: an unannotated try block's value keeps its handle",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let wrapped = try { repo }; let alias = wrapped?; alias.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
             ),
         ]);
     }
