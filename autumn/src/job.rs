@@ -1086,6 +1086,29 @@ fn record_recovered_requeue(
     }
 }
 
+/// Record a claim that Redis stale recovery requeued at `new_attempt`.
+/// `immediate` is true when the job is due at once. A delayed requeue is
+/// recorded as enqueued when the `delayed` set promotes it.
+#[cfg(feature = "redis")]
+fn record_redis_recovered_requeue(
+    name: &str,
+    id: &str,
+    new_attempt: u32,
+    error: &str,
+    immediate: bool,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+) {
+    if job_admin.settle_redis_recovered_requeue(id, new_attempt, error, immediate) {
+        state
+            .job_registry
+            .record_retry(name, error, new_attempt.saturating_sub(1));
+    }
+    if immediate {
+        state.job_registry.record_enqueue(name);
+    }
+}
+
 /// Record a run that stopped because its worker lost the claim. The job is
 /// not settled: the worker that holds the claim now owns that.
 ///
@@ -1645,6 +1668,49 @@ impl JobAdminMemoryBackend {
         record.attempt = new_attempt;
         record.last_error = Some(error.to_owned());
         true
+    }
+
+    /// Move a record that Redis stale recovery requeued at `new_attempt` to
+    /// `Enqueued` (`immediate`) or `Retrying` (due later, through the
+    /// `delayed` set).
+    ///
+    /// Returns `true` when the record showed the previous attempt as running:
+    /// this process started it, so the caller balances the registry. A
+    /// record that already shows `new_attempt` or a later one (the
+    /// replacement started here) is left alone.
+    #[cfg(feature = "redis")]
+    fn settle_redis_recovered_requeue(
+        &self,
+        id: &str,
+        new_attempt: u32,
+        error: &str,
+        immediate: bool,
+    ) -> bool {
+        let Ok(mut inner) = self.inner.write() else {
+            return false;
+        };
+        let Some(record) = inner.records.get_mut(id) else {
+            return false;
+        };
+        if record.attempt >= new_attempt {
+            return false;
+        }
+        let balance = record.status == JobAdminStatus::Running
+            && record.attempt.saturating_add(1) == new_attempt;
+        let now = self.clock.now();
+        record.last_error = Some(error.to_owned());
+        if immediate {
+            record.status = JobAdminStatus::Enqueued;
+            record.enqueued_at = Some(now);
+            record.scheduled_for = None;
+            record.started_at = None;
+            record.finished_at = None;
+            record.attempt = new_attempt;
+        } else {
+            record.status = JobAdminStatus::Retrying;
+            record.finished_at = Some(now);
+        }
+        balance
     }
 
     fn record_failure(&self, id: &str, error: String) {
@@ -8596,16 +8662,18 @@ async fn recover_stale_redis_jobs(
         {
             match &action {
                 RedisStaleRecovery::Requeue(requeued) => {
-                    if let Some(error) = requeued.last_error.as_deref() {
-                        state
-                            .job_registry
-                            .record_retry(&requeued.name, error, record.attempt);
-                        job_admin.record_retrying(&requeued.id, error);
-                    }
-                    if due_at_ms.is_none() {
-                        state.job_registry.record_enqueue(&requeued.name);
-                        job_admin.record_requeued(&requeued.id, requeued.attempt);
-                    }
+                    record_redis_recovered_requeue(
+                        &requeued.name,
+                        &requeued.id,
+                        requeued.attempt,
+                        requeued
+                            .last_error
+                            .as_deref()
+                            .unwrap_or("visibility timeout expired"),
+                        due_at_ms.is_none(),
+                        state,
+                        job_admin,
+                    );
                 }
                 RedisStaleRecovery::DeadLetter(dead) => {
                     let error = dead
@@ -24519,6 +24587,83 @@ mod lease_tests {
         );
         let record = admin.snapshot_record_for_test(&id).expect("record");
         assert_eq!(record.attempt, 2);
+    }
+
+    /// Redis stale recovery requeued attempt 1 due at once, and a worker in
+    /// this process claimed attempt 2 before recovery's bookkeeping ran. The
+    /// bookkeeping must not balance attempt 1 again or touch attempt 2.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_recovery_bookkeeping_after_the_replacement_started_counts_nothing() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // attempt 1
+        let (admin, id) = admin_with_running_job(1);
+
+        let decision = record_attempt_start("leased", &id, 2, &state, &admin);
+        assert_eq!(decision, JobAdminStartDecision::Superseded);
+        state.job_registry.record_start("leased"); // attempt 2
+        assert_eq!(in_flight(&state), 1);
+
+        record_redis_recovered_requeue("leased", &id, 2, "expired", true, &state, &admin);
+        assert_eq!(in_flight(&state), 1, "attempt 1 is not balanced twice");
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(
+            record.status,
+            JobAdminStatus::Running,
+            "attempt 2 still runs"
+        );
+        assert_eq!(record.attempt, 2);
+
+        record_lease_lost("leased", &id, 2, &state, &admin);
+        assert_eq!(in_flight(&state), 0, "the replacement's lease loss matches");
+    }
+
+    /// Redis stale recovery of an attempt this process was running balances
+    /// its start once, whether the retry is due at once or later.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_recovery_of_a_local_attempt_balances_it_once() {
+        for immediate in [true, false] {
+            let state = AppState::for_test();
+            state.job_registry.register("leased");
+            state.job_registry.record_start("leased"); // attempt 1
+            let (admin, id) = admin_with_running_job(1);
+
+            record_redis_recovered_requeue("leased", &id, 2, "expired", immediate, &state, &admin);
+            assert_eq!(in_flight(&state), 0, "recovery balanced attempt 1");
+            let record = admin.snapshot_record_for_test(&id).expect("record");
+            if immediate {
+                assert_eq!(record.status, JobAdminStatus::Enqueued);
+                assert_eq!(record.attempt, 2);
+            } else {
+                assert_eq!(record.status, JobAdminStatus::Retrying);
+            }
+
+            record_lease_lost("leased", &id, 1, &state, &admin);
+            assert_eq!(in_flight(&state), 0, "the old worker does not count again");
+        }
+    }
+
+    /// Redis stale recovery of a job this process did not start, or whose
+    /// lease loss it already recorded, leaves `in_flight` alone.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_recovery_leaves_counts_alone_for_a_job_not_running_here() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // some other job of this name
+        let (admin, id) = admin_with_running_job(1);
+        admin.record_retrying(&id, "lease lost"); // already balanced here
+
+        record_redis_recovered_requeue("leased", &id, 2, "expired", true, &state, &admin);
+        assert_eq!(in_flight(&state), 1);
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.status, JobAdminStatus::Enqueued, "the requeue shows");
+        assert_eq!(record.attempt, 2);
+
+        record_redis_recovered_requeue("leased", "unknown-id", 2, "expired", true, &state, &admin);
+        assert_eq!(in_flight(&state), 1);
     }
 
     #[cfg(feature = "db")]
