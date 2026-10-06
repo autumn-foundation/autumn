@@ -1606,23 +1606,43 @@ impl axum::extract::FromRequestParts<crate::AppState> for Client {
 type RedirectValidator = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 tokio::task_local! {
-    /// The last redirect target the pooled client followed during one send.
-    /// An error does not say which host failed after a redirect, so the
-    /// plain path reads it here to charge that host's budget.
-    static FOLLOWED: std::cell::RefCell<Option<String>>;
+    /// The redirect targets the pooled client followed during one send, in
+    /// order. An error does not say which host failed after a redirect, and
+    /// every host on the way gets its refill, so the plain path reads them
+    /// here.
+    static FOLLOWED: std::cell::RefCell<Vec<String>>;
 }
 
-/// Send `req` on the pooled client. Also return the last redirect target the
-/// HTTP stack followed, if any.
+/// Send `req` on the pooled client. Also return the redirect targets the
+/// HTTP stack followed, in order.
 async fn send_tracking_redirects(
     req: reqwest::RequestBuilder,
-) -> (Result<reqwest::Response, reqwest::Error>, Option<String>) {
+) -> (Result<reqwest::Response, reqwest::Error>, Vec<String>) {
     FOLLOWED
-        .scope(std::cell::RefCell::new(None), async {
+        .scope(std::cell::RefCell::new(Vec::new()), async {
             let sent = req.send().await;
-            (sent, FOLLOWED.with(|last| last.borrow_mut().take()))
+            (sent, FOLLOWED.with(std::cell::RefCell::take))
         })
         .await
+}
+
+/// Set `Referer` for a redirect from `previous` to `next`, as reqwest does:
+/// the previous URL without credentials or fragment, and none on an
+/// `https` to `http` hop.
+fn set_referer(headers: &mut HeaderMap, next: &str, previous: &str) {
+    let (Ok(next), Ok(mut referer)) = (url::Url::parse(next), url::Url::parse(previous)) else {
+        return;
+    };
+    if next.scheme() == "http" && referer.scheme() == "https" {
+        headers.remove(reqwest::header::REFERER);
+        return;
+    }
+    let _ = referer.set_username("");
+    let _ = referer.set_password(None);
+    referer.set_fragment(None);
+    if let Ok(value) = HeaderValue::from_str(referer.as_str()) {
+        headers.insert(reqwest::header::REFERER, value);
+    }
 }
 
 /// The hop limit of the plain send path, as in reqwest's default policy.
@@ -1640,7 +1660,7 @@ fn pooled_redirect_policy() -> reqwest::redirect::Policy {
         } else if attempt.previous().len() >= PLAIN_MAX_REDIRECTS {
             attempt.error("too many redirects")
         } else {
-            let _ = FOLLOWED.try_with(|last| *last.borrow_mut() = Some(attempt.url().to_string()));
+            let _ = FOLLOWED.try_with(|hops| hops.borrow_mut().push(attempt.url().to_string()));
             attempt.follow()
         }
     })
@@ -2239,7 +2259,7 @@ impl RequestBuilder {
                     };
                     // Refund only after the body arrived.
                     gate.finish(last_retry, status.as_u16());
-                    gate.record_destination(url_used.as_str());
+                    gate.record_destinations(&followed);
                     let elapsed = crate::time::ambient_instant().saturating_duration_since(start);
                     log_request(
                         self.method.as_str(),
@@ -2265,7 +2285,7 @@ impl RequestBuilder {
                 Err(e) if (e.is_connect() || e.is_timeout()) && !last => {
                     // The HTTP stack may have followed a redirect: charge the
                     // host that failed.
-                    if let Some(url) = &followed {
+                    if let Some(url) = followed.last() {
                         gate.rekey(url);
                     }
                     let wait = self.retry_policy.retry_delay(&*self.entropy, attempt, None);
@@ -2384,7 +2404,7 @@ impl RequestBuilder {
             .ok_or_else(|| ClientError::InvalidUrl(format!("{}: no host", self.url)))?
             .to_owned();
         let max_attempts = self.max_attempts(false);
-        let gate = self.retry_gate(Some(&host));
+        let gate = self.retry_gate(url_host(url.as_str()).as_deref());
         let mut last_retry = None;
         let mut delay = Duration::ZERO;
         for attempt in 0..max_attempts {
@@ -2692,6 +2712,11 @@ impl RequestBuilder {
             }
             // RFC 7231/7538 method+body rewriting before the next hop.
             rewrite_after_redirect(resp.status(), &mut method, &mut body, &mut headers);
+            // The pooled client stands in for reqwest's own redirect
+            // handling, which sets `Referer`.
+            if matches!(hop_client, HopClient::Pooled(_)) {
+                set_referer(&mut headers, &next, &current);
+            }
             current = next;
         }
         unreachable!("redirect loop is bounded by `max` and always returns")
@@ -3048,6 +3073,17 @@ impl RetryGate {
         }
         if let Some((budgets, host)) = self.budgets.as_deref().zip(host) {
             budgets.for_host(&host).record_request();
+        }
+    }
+
+    /// [`record_destination`](Self::record_destination) for each host of a
+    /// redirect chain, once per host.
+    fn record_destinations(&self, urls: &[String]) {
+        let mut seen = std::collections::HashSet::new();
+        for url in urls {
+            if url_host(url).is_some_and(|host| seen.insert(host)) {
+                self.record_destination(url);
+            }
         }
     }
 
@@ -6356,6 +6392,66 @@ mod tests {
             let destination = budgets.for_host(&format!("127.0.0.1:{dead_port}"));
             assert!((origin.available() - full).abs() < f64::EPSILON, "origin");
             assert!(destination.available() < full, "the destination paid");
+        }
+
+        #[tokio::test]
+        async fn a_redirect_under_a_deadline_sets_referer() {
+            let seen = Arc::new(Mutex::new(None));
+            let record = Arc::clone(&seen);
+            let app = axum::Router::new()
+                .route(
+                    "/r",
+                    axum::routing::get(|| async { axum::response::Redirect::temporary("/t") }),
+                )
+                .route(
+                    "/t",
+                    axum::routing::get(move |headers: HeaderMap| async move {
+                        *record.lock().unwrap() = headers
+                            .get(reqwest::header::REFERER)
+                            .map(|value| value.to_str().unwrap().to_owned());
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let origin = format!("http://127.0.0.1:{port}/r");
+            let response = with_deadline(Duration::from_secs(3), Client::new().get(&origin).send())
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            assert_eq!(seen.lock().unwrap().as_deref(), Some(origin.as_str()));
+        }
+
+        #[test]
+        fn referer_drops_credentials_and_is_not_sent_on_a_downgrade() {
+            let mut headers = HeaderMap::new();
+            set_referer(&mut headers, "https://b/x", "https://u:p@a/y#frag");
+            assert_eq!(headers[reqwest::header::REFERER], "https://a/y");
+            set_referer(&mut headers, "http://c/z", "https://b/x");
+            assert!(!headers.contains_key(reqwest::header::REFERER));
+        }
+
+        #[test]
+        fn every_host_of_a_redirect_chain_is_refilled() {
+            let budgets = Arc::new(RetryBudgets::new(&RetryBudgetConfig::default()));
+            let middle = budgets.for_host("b:443");
+            let last = budgets.for_host("c:443");
+            while middle.try_acquire(RetryKind::Transient) {}
+            while last.try_acquire(RetryKind::Transient) {}
+            let (middle_before, last_before) = (middle.available(), last.available());
+            let gate =
+                RetryGate::with_deadline(None, Some(Arc::clone(&budgets)), Some("a:443"), true);
+            gate.record_destinations(&[
+                "https://b/1".to_owned(),
+                "https://c/2".to_owned(),
+                "https://c/3".to_owned(),
+            ]);
+            assert!(middle.available() > middle_before, "the middle host");
+            let one_refill = middle.available() - middle_before;
+            assert!(
+                (last.available() - last_before - one_refill).abs() < f64::EPSILON,
+                "one refill per host"
+            );
         }
 
         #[tokio::test]
