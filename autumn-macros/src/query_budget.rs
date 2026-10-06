@@ -3245,9 +3245,21 @@ impl Analyzer {
             // `ctx += repo`: an overloaded compound assignment may store the
             // right side in the left.
             Expr::Binary(b) if is_compound_assign(&b.op) => {
-                let flow = self.expr(&b.left).then(self.expr(&b.right));
+                // A std number type runs the value first. An overloaded
+                // operator runs the place first. Take both orders.
+                let entry = self.env.clone();
+                let (ledger, errors) = (self.ledger.len(), self.errors.len());
+                let value = self.expr(&b.right);
+                let read = self.env.clone();
+                let value_first = value.then(self.expr(&b.left));
+                self.keep_reads(vec![read]);
+                let after = std::mem::replace(&mut self.env, entry);
+                self.ledger.truncate(ledger);
+                self.errors.truncate(errors);
+                let place_first = self.expr(&b.left).then(self.expr(&b.right));
+                self.env.join(&after);
                 self.store_into(&b.left, "", &[&b.right]);
-                flow
+                value_first.or_worst(place_first)
             }
             Expr::Binary(b) => self.expr(&b.left).then(self.expr(&b.right)),
             Expr::Return(r) => {
@@ -4381,9 +4393,15 @@ impl Analyzer {
             Expr::TryBlock(t) => {
                 block_tail(&t.block).is_some_and(|tail| self.value_of(tail) != Kind::Plain)
             }
+            // `repo..`: a range holds its ends.
+            Expr::Range(r) => [&r.start, &r.end]
+                .into_iter()
+                .flatten()
+                .any(|end| self.value_of(end) != Kind::Plain),
             Expr::Path(_) => path_ident(e).is_some_and(|name| self.env.get(&name) == Kind::Nested),
             Expr::Reference(r) => self.expr_is_nested(&r.expr),
             Expr::RawAddr(r) => self.expr_is_nested(&r.expr),
+            Expr::Cast(c) => self.expr_is_nested(&c.expr),
             Expr::Paren(p) => self.expr_is_nested(&p.expr),
             Expr::Group(g) => self.expr_is_nested(&g.expr),
             // A part of a user value with no recorded parts may itself be a
@@ -4854,6 +4872,7 @@ impl Analyzer {
                 .is_some_and(|i| self.env.get(&i.to_string()).is_handle()),
             Expr::Reference(r) => self.expr_is_handle(&r.expr),
             Expr::RawAddr(r) => self.expr_is_handle(&r.expr),
+            Expr::Cast(c) => self.expr_is_handle(&c.expr),
             Expr::Paren(p) => self.expr_is_handle(&p.expr),
             Expr::Group(g) => self.expr_is_handle(&g.expr),
             // `self.conn().await?`. Only `?` unwraps to the handle: a bare
@@ -5092,6 +5111,7 @@ impl Analyzer {
         match expr {
             Expr::Reference(r) => self.awaited_expr_is_fresh_handle(&r.expr),
             Expr::RawAddr(r) => self.awaited_expr_is_fresh_handle(&r.expr),
+            Expr::Cast(c) => self.awaited_expr_is_fresh_handle(&c.expr),
             Expr::Paren(p) => self.awaited_expr_is_fresh_handle(&p.expr),
             Expr::Group(g) => self.awaited_expr_is_fresh_handle(&g.expr),
             Expr::Await(a) => self.awaited_expr_is_fresh_handle(&a.base),
@@ -5133,6 +5153,7 @@ impl Analyzer {
                 .is_some_and(|i| self.env.get(&i.to_string()) == Kind::LazyDb),
             Expr::Reference(r) => self.expr_is_lazy_db(&r.expr),
             Expr::RawAddr(r) => self.expr_is_lazy_db(&r.expr),
+            Expr::Cast(c) => self.expr_is_lazy_db(&c.expr),
             Expr::Paren(p) => self.expr_is_lazy_db(&p.expr),
             Expr::Group(g) => self.expr_is_lazy_db(&g.expr),
             Expr::Unary(u) => matches!(u.op, syn::UnOp::Deref(_)) && self.expr_is_lazy_db(&u.expr),
@@ -5190,6 +5211,7 @@ impl Analyzer {
             }),
             Expr::Reference(r) => self.expr_is_carrier(&r.expr),
             Expr::RawAddr(r) => self.expr_is_carrier(&r.expr),
+            Expr::Cast(c) => self.expr_is_carrier(&c.expr),
             Expr::Paren(p) => self.expr_is_carrier(&p.expr),
             Expr::Group(g) => self.expr_is_carrier(&g.expr),
             Expr::Array(a) => a.elems.iter().any(holds),
@@ -5275,6 +5297,7 @@ impl Analyzer {
             Expr::Call(c) => c.args.iter().any(|a| self.expr_carries_handle(a)),
             Expr::Reference(r) => self.expr_carries_handle(&r.expr),
             Expr::RawAddr(r) => self.expr_carries_handle(&r.expr),
+            Expr::Cast(c) => self.expr_carries_handle(&c.expr),
             Expr::Paren(p) => self.expr_carries_handle(&p.expr),
             Expr::Group(g) => self.expr_carries_handle(&g.expr),
             // No `Await`/`Try` arms: `expr_is_handle` covers a fresh handle,
@@ -12865,6 +12888,39 @@ mod tests {
                 "guard: an unannotated try block's value keeps its handle",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let wrapped = try { repo }; let alias = wrapped?; alias.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+        ]);
+    }
+
+    #[test]
+    fn compound_assignments_casts_and_ranges() {
+        check_handlers(&[
+            (
+                "guard: a compound assignment may run its value first",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut source = Some(repo); let mut totals = vec![0]; \
+                 totals[{ source = None; 0 }] += source.as_ref().unwrap().count().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a compound assignment may run its place first",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut source = None; let mut totals = vec![Total::default()]; \
+                 totals[{ source = Some(repo); 0 }] += source.unwrap().count().await?; Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a pointer cast keeps the handle",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let ptr = &repo as *const PgPostRepository; \
+                 unsafe { (&*ptr).find_all().await?; } Ok(0) }",
+                Expect::Exact(1),
+            ),
+            (
+                "guard: a range keeps the handle",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let wrapped = repo..; wrapped.start.find_all().await?; Ok(0) }",
                 Expect::Unbounded,
             ),
         ]);
