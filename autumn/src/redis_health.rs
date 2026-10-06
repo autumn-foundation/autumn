@@ -585,10 +585,18 @@ mod tests {
 
     #[tokio::test]
     async fn refused_connection_is_down() {
-        let addr = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-            listener.local_addr().expect("local addr")
-        };
+        // The server closes each connection at once. Not a closed port: on
+        // Windows a connect to a closed loopback port is retried for about
+        // 2 s, so the check times out instead of failing.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
         let indicator = RedisHealthIndicator::new(&format!("redis://{addr}"))
             .expect("valid url")
             .with_timeout(Duration::from_secs(2));

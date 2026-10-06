@@ -6409,13 +6409,22 @@ mod tests {
         crate::job::clear_global_job_client();
     }
 
-    /// A pool whose server refuses connections.
+    /// A pool whose server accepts each connection and closes it at once.
+    ///
+    /// Not a closed port: on Windows a connect to a closed loopback port is
+    /// retried for about 2 s, so the ping times out instead of failing.
     #[cfg(all(feature = "db", not(feature = "sqlite")))]
-    fn refused_pool()
+    async fn refused_pool()
     -> diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection> {
-        let addr = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|listener| listener.local_addr())
-            .expect("free port");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
         let config = crate::config::DatabaseConfig {
             url: Some(format!("postgres://secret_user@{addr}/autumn")),
             pool_size: 1,
@@ -6451,7 +6460,7 @@ mod tests {
     async fn health_db_is_down_without_error_text_when_not_detailed() {
         let mut state = test_state();
         state.health_detailed = false;
-        state.pool = Some(refused_pool());
+        state.pool = Some(refused_pool().await);
 
         let (status, json) = health_json(state).await;
 
@@ -6468,7 +6477,7 @@ mod tests {
     async fn health_db_error_is_shown_when_detailed() {
         let mut state = test_state();
         state.health_detailed = true;
-        state.pool = Some(refused_pool());
+        state.pool = Some(refused_pool().await);
 
         let (status, json) = health_json(state).await;
 
