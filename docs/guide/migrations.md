@@ -200,9 +200,11 @@ run_pending_locked_with_policy(database_url, MIGRATIONS, None, policy)?;
   Non-transactional batches get `lock_timeout=0`.
 - When the server refuses the option (`PgBouncer` can), the CLI runs again
   with only the `PGOPTIONS` it inherited, unchanged.
-- libpq ignores `PGOPTIONS` when `DATABASE_URL` has an `options` parameter.
-  So the CLI takes that parameter out of the URL and uses its value in place
-  of the inherited `PGOPTIONS`, with the timeout added after it.
+- libpq ignores `PGOPTIONS` when `DATABASE_URL` has an `options` parameter,
+  in a `postgres://` URI or a keyword/value string (`host=db options='…'`).
+  So the CLI takes that parameter out of the connection string and uses its
+  value in place of the inherited `PGOPTIONS`, with the timeout added after
+  it.
 
 Run migrations against Postgres directly.
 

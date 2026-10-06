@@ -1864,10 +1864,10 @@ fn run_diesel_with_policy(
     transactional: bool,
     english: bool,
 ) -> Result<(), MigrationError> {
-    // libpq reads `PGOPTIONS` only when the URL has no `options` parameter.
-    // So a URL `options` value is the operator's base. It moves into
-    // `PGOPTIONS`, where the framework options can be added to it.
-    let (database_url, url_options) = split_url_options(database_url);
+    // libpq reads `PGOPTIONS` only when the connection string has no
+    // `options` parameter. So that value is the operator's base. It moves
+    // into `PGOPTIONS`, where the framework options can be added to it.
+    let (database_url, url_options) = split_connection_options(database_url);
     let database_url = database_url.as_str();
     let inherited = url_options
         .or_else(|| std::env::var("PGOPTIONS").ok())
@@ -1905,11 +1905,21 @@ fn run_diesel_with_policy(
     )
 }
 
+/// `database_url` without its `options` parameter, and that parameter's
+/// value. libpq accepts a `postgres://` or `postgresql://` URI, or a
+/// keyword/value string (`host=db options='-c a=1'`); both forms are handled.
+fn split_connection_options(database_url: &str) -> (String, Option<String>) {
+    if database_url.starts_with("postgres://") || database_url.starts_with("postgresql://") {
+        split_url_options(database_url)
+    } else {
+        split_keyword_options(database_url)
+    }
+}
+
 /// `url` without its `options` query parameter, and that parameter's decoded
 /// value. When it appears more than once, the last value wins, as in libpq.
 /// An empty value is still returned: libpq then ignores `PGOPTIONS` too.
-/// A URL with no `options` parameter (or a key/value conninfo string) comes
-/// back unchanged, with `None`.
+/// A URL with no `options` parameter comes back unchanged, with `None`.
 fn split_url_options(url: &str) -> (String, Option<String>) {
     let Some((base, query)) = url.split_once('?') else {
         return (url.to_owned(), None);
@@ -1933,6 +1943,92 @@ fn split_url_options(url: &str) -> (String, Option<String>) {
     } else {
         (format!("{base}?{}", kept.join("&")), options)
     }
+}
+
+/// A keyword/value conninfo string without its `options` pairs, and the
+/// value of the last one, unquoted as libpq reads it. The other pairs are
+/// kept verbatim. A string libpq could not parse comes back unchanged, with
+/// `None`: the connection then fails on its own.
+fn split_keyword_options(conninfo: &str) -> (String, Option<String>) {
+    /// One `keyword = value` pair: the keyword, the unquoted value, and the
+    /// pair's byte range in the string.
+    fn pairs(conninfo: &str) -> Option<Vec<(&str, String, std::ops::Range<usize>)>> {
+        let bytes = conninfo.as_bytes();
+        let mut pairs = Vec::new();
+        let mut i = 0;
+        loop {
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i == bytes.len() {
+                return Some(pairs);
+            }
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let keyword = &conninfo[start..i];
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if keyword.is_empty() || bytes.get(i) != Some(&b'=') {
+                return None;
+            }
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let mut value = Vec::new();
+            if bytes.get(i) == Some(&b'\'') {
+                i += 1;
+                loop {
+                    match bytes.get(i)? {
+                        b'\'' => {
+                            i += 1;
+                            break;
+                        }
+                        b'\\' => {
+                            value.push(*bytes.get(i + 1)?);
+                            i += 2;
+                        }
+                        &b => {
+                            value.push(b);
+                            i += 1;
+                        }
+                    }
+                }
+            } else {
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                    if bytes[i] == b'\\' {
+                        value.push(*bytes.get(i + 1)?);
+                        i += 2;
+                    } else {
+                        value.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            let value = String::from_utf8(value).ok()?;
+            pairs.push((keyword, value, start..i));
+        }
+    }
+
+    let Some(pairs) = pairs(conninfo) else {
+        return (conninfo.to_owned(), None);
+    };
+    let mut options = None;
+    let mut kept: Vec<&str> = Vec::new();
+    for (keyword, value, range) in pairs {
+        if keyword == "options" {
+            options = Some(value);
+        } else {
+            kept.push(&conninfo[range]);
+        }
+    }
+    if options.is_none() {
+        return (conninfo.to_owned(), None);
+    }
+    (kept.join(" "), options)
 }
 
 /// The inherited `PGOPTIONS` a pooler fallback may use. A non-transactional
@@ -5004,9 +5100,42 @@ primary_url = "postgres://prod-s0:5432/app"
             split_url_options("postgres://db/app?sslmode=require"),
             ("postgres://db/app?sslmode=require".to_owned(), None)
         );
+    }
+
+    #[test]
+    fn split_keyword_options_moves_the_options_out_of_the_conninfo() {
         assert_eq!(
-            split_url_options("host=db dbname=app"),
+            split_connection_options(
+                r"host=db password='p?w \' x' options='-c search_path=tenant -c lock_timeout=100' dbname = app"
+            ),
+            (
+                r"host=db password='p?w \' x' dbname = app".to_owned(),
+                Some("-c search_path=tenant -c lock_timeout=100".to_owned())
+            ),
+            "other pairs stay verbatim, a `?` in a value is not a URI query"
+        );
+        assert_eq!(
+            split_connection_options("host=db options=-ca=1 options='-c b=2'"),
+            ("host=db".to_owned(), Some("-c b=2".to_owned())),
+            "the last value wins, as in libpq"
+        );
+        assert_eq!(
+            split_connection_options("host=db options=''"),
+            ("host=db".to_owned(), Some(String::new())),
+            "an empty value still hides PGOPTIONS from libpq"
+        );
+        assert_eq!(
+            split_connection_options("host=db dbname=app"),
             ("host=db dbname=app".to_owned(), None)
+        );
+        assert_eq!(
+            split_connection_options("host=db options='unterminated"),
+            ("host=db options='unterminated".to_owned(), None),
+            "a string libpq cannot parse is left alone"
+        );
+        assert_eq!(
+            split_connection_options("postgresql://db/app?options=-c%20a%3D1"),
+            ("postgresql://db/app".to_owned(), Some("-c a=1".to_owned()))
         );
     }
 
