@@ -20,6 +20,7 @@ async fn sim_ambient_modules_breaker_opens_and_half_opens_in_virtual_time(sim: S
         minimum_sample_count: 2,
         open_duration: Duration::from_secs(3600),
         half_open_trial_count: 1,
+        ..CircuitBreakerPolicy::default()
     };
     let breaker = CircuitBreaker::new("sim-ambient-breaker", policy);
     for _ in 0..2 {
@@ -52,6 +53,7 @@ async fn sim_ambient_modules_global_breakers_stay_on_real_time(sim: Sim) {
         minimum_sample_count: 2,
         open_duration: Duration::from_secs(3600),
         half_open_trial_count: 1,
+        ..CircuitBreakerPolicy::default()
     };
     let breaker = autumn_web::circuit_breaker::global_registry()
         .get_or_create("sim-ambient-global-breaker", policy);

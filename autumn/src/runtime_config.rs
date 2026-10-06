@@ -333,6 +333,11 @@ impl ConfigValidator {
                 let v = value
                     .as_float()
                     .ok_or_else(|| "FloatRange validator applied to non-float value".to_owned())?;
+                // `NaN` compares false with every bound, so it would pass any
+                // range; it is in none.
+                if v.is_nan() {
+                    return Err("value NaN is not a number".to_owned());
+                }
                 if let Some(lo) = min
                     && v < *lo
                 {
@@ -713,7 +718,39 @@ impl ConfigRegistry {
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
+
+    /// Declare the framework cost-signal key, [`COST_SIGNAL_KEY`].
+    ///
+    /// The key is a `Float` with the default `0.0` and must be `>= 0`. Change
+    /// it with `autumn config set autumn_cost_signal <value>`. The app reads
+    /// the new value without a redeploy. See [`crate::cost::CostSignal`].
+    ///
+    /// # Errors
+    ///
+    /// [`RegistryError::DuplicateKey`] when the key is already declared.
+    pub fn define_cost_signal(&mut self) -> Result<(), RegistryError> {
+        self.define(
+            ConfigKeySchema::new(
+                COST_SIGNAL_KEY,
+                ConfigValueType::Float,
+                ConfigValue::Float(0.0),
+            )
+            .description("Live cost signal: carbon g/kWh or price per unit (issue #1720)")
+            .validator(ConfigValidator::FloatRange {
+                min: Some(0.0),
+                // A finite bound keeps `inf` out: the signal ignores a value
+                // that is not finite.
+                max: Some(f64::MAX),
+            }),
+        )
+    }
 }
+
+/// The runtime-config key of the live cost signal (issue #1720).
+///
+/// The value is carbon intensity (g/kWh) or a price per unit. The unit is
+/// your choice. Declare it with [`ConfigRegistry::define_cost_signal`].
+pub const COST_SIGNAL_KEY: &str = "autumn_cost_signal";
 
 fn is_valid_key_name(name: &str) -> bool {
     if name.is_empty() {
@@ -1385,6 +1422,11 @@ impl RuntimeConfigService {
         Self { registry, store }
     }
 
+    /// The registry of declared keys.
+    pub(crate) fn registry(&self) -> &ConfigRegistry {
+        &self.registry
+    }
+
     /// Read the current value for `key`, falling back to the schema default.
     ///
     /// # Errors
@@ -1904,6 +1946,38 @@ mod tests {
             max: Some(1.0),
         };
         v.validate(&ConfigValue::Float(0.5)).unwrap();
+    }
+
+    #[test]
+    fn float_range_rejects_nan() {
+        let v = ConfigValidator::FloatRange {
+            min: Some(0.0),
+            max: None,
+        };
+        v.validate(&ConfigValue::Float(f64::NAN)).unwrap_err();
+    }
+
+    /// The cost signal key accepts only finite values (#1720).
+    #[test]
+    fn cost_signal_key_rejects_values_that_are_not_finite() {
+        let mut registry = ConfigRegistry::new();
+        registry.define_cost_signal().unwrap();
+        let schema = registry.get(COST_SIGNAL_KEY).unwrap();
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            assert!(
+                schema
+                    .validators
+                    .iter()
+                    .any(|v| v.validate(&ConfigValue::Float(bad)).is_err()),
+                "{bad} must be rejected"
+            );
+        }
+        assert!(
+            schema
+                .validators
+                .iter()
+                .all(|v| v.validate(&ConfigValue::Float(520.0)).is_ok())
+        );
     }
 
     #[test]

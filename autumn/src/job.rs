@@ -30,7 +30,8 @@
 // The durable Postgres job backend (queue claiming, worker/maintenance loops,
 // lifecycle recording, admin paging — everything reachable only from the
 // `start_postgres_runtime` entry point) is Postgres-only and is refused under
-// the `sqlite` feature (SQLite has no LISTEN/NOTIFY or advisory-lock queue).
+// the `sqlite` feature (SQLite has no `FOR UPDATE SKIP LOCKED` or advisory
+// locks).
 // Those helpers therefore become dead in a `--features sqlite` build while the
 // local/redis backends stay live; silence dead-code just for that build rather
 // than cfg-gating dozens of individual pg-only items. No effect on the default
@@ -780,6 +781,11 @@ struct QueuedJob {
     attempt: u32,
     max_attempts: u32,
     initial_backoff_ms: u64,
+    /// The tenant of the request that enqueued the job. Used only to
+    /// attribute cost: the handler does not run in this tenant's scope.
+    tenant: Option<String>,
+    /// `true` after the job waited for the cost signal (issue #1720).
+    cost_waited: bool,
     /// W3C `traceparent` serialized at enqueue time.  `None` when the
     /// `telemetry-otlp` feature is disabled or no active span was present.
     #[cfg(feature = "telemetry-otlp")]
@@ -1238,6 +1244,16 @@ impl JobAdminMemoryBackend {
             JobAdminStatus::Canceled => JobAdminStartDecision::Canceled,
             _ => JobAdminStartDecision::AlreadyTransitioned,
         }
+    }
+
+    /// `true` when an operator canceled the job `id`.
+    fn is_canceled(&self, id: &str) -> bool {
+        self.inner.read().is_ok_and(|inner| {
+            inner
+                .records
+                .get(id)
+                .is_some_and(|record| record.status == JobAdminStatus::Canceled)
+        })
     }
 
     fn record_success(&self, id: &str) {
@@ -1944,6 +1960,17 @@ const REDIS_BLOCKED_PROMOTION_INTERVAL: std::time::Duration =
 #[cfg(feature = "redis")]
 const REDIS_CLAIM_SCAN_LIMIT: usize = 8;
 
+/// Score base of a job parked in the blocked zset for the cost signal (issue
+/// #1720). It is above any unix ms, so the timed promotion never moves these
+/// jobs. They go back to their queue when the signal is low.
+#[cfg(feature = "redis")]
+const REDIS_DEFERRED_SCORE_BASE: u64 = 1_000_000_000_000_000;
+
+/// Most deferred jobs that one claim call parks. They do not count toward
+/// `REDIS_CLAIM_SCAN_LIMIT`, so a deferred backlog leaves the queue fast.
+#[cfg(feature = "redis")]
+const REDIS_DEFER_SCAN_LIMIT: usize = 256;
+
 /// Safety TTL on unique locks for the pending/running windows.
 ///
 /// Those locks are normally released by the claim/transition scripts; the TTL
@@ -2235,7 +2262,29 @@ fn build_job_consumer_span(name: &str, attempt: u32) -> tracing::Span {
     tracing::info_span!("job.execute", "otel.kind" = "consumer", job.name = %name, job.attempt = attempt)
 }
 
+/// Run one job attempt, metered as one job run (issue #1720). All job
+/// backends run their handlers through here.
 async fn run_job_handler(
+    name: &str,
+    handler: JobHandler,
+    state: AppState,
+    payload: Value,
+    final_attempt: bool,
+    run: crate::cost::WorkRun,
+) -> JobExecutionOutcome {
+    use crate::cost::WrapMetered as _;
+    crate::cost::WorkMeter::start(&state, crate::cost::WorkKind::Job, name, run)
+        .wrap(run_job_handler_unmetered(
+            name,
+            handler,
+            state,
+            payload,
+            final_attempt,
+        ))
+        .await
+}
+
+async fn run_job_handler_unmetered(
     name: &str,
     handler: JobHandler,
     state: AppState,
@@ -3634,6 +3683,8 @@ impl JobClient {
                     attempt: 1,
                     max_attempts: job_max_attempts,
                     initial_backoff_ms: job_backoff_ms,
+                    tenant: crate::cost::enqueuing_tenant(),
+                    cost_waited: false,
                     #[cfg(feature = "telemetry-otlp")]
                     traceparent,
                     #[cfg(feature = "telemetry-otlp")]
@@ -4076,78 +4127,80 @@ impl JobClient {
                     // shared health signal, for every other enqueuer to
                     // read.
                     let breaker = self.job_queue_breaker();
-                    if breaker.before_call().is_err() {
-                        for row in batch {
-                            if row.due_at.is_some() {
-                                self.registry.record_cancel_scheduled(name);
-                            } else {
-                                self.registry.record_cancel(name);
-                            }
-                            self.registry.forget_pg_job_mark(&row.id);
-                            self.job_admin.record_cancelled(&row.id);
-                            let row_error = AutumnError::service_unavailable(
-                                std::io::Error::other("job queue circuit breaker is open"),
-                            );
-                            fill_enqueue(row.slot, name, row.due_at, row.now, Some(&row_error));
-                            resolved.push((row.result_index, Err(row_error)));
-                        }
-                    } else {
-                        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker);
-                        let insert_result = pg_insert_jobs_many(
-                            pool,
-                            name,
-                            &job_queue,
-                            job_max_attempts,
-                            job_backoff_ms,
-                            unique_window_tag,
-                            concurrency_limit,
-                            &batch,
-                        )
-                        .await;
-                        if insert_result.is_ok() {
-                            guard.success();
-                        } else {
-                            guard.failure();
-                        }
-                        match insert_result {
-                            Ok(inserted_ids) => {
-                                let inserted: std::collections::HashSet<&str> =
-                                    inserted_ids.iter().map(String::as_str).collect();
-                                for row in batch {
-                                    let outcome = if inserted.contains(row.id.as_str()) {
-                                        EnqueueOutcome::Queued
-                                    } else {
-                                        self.record_deduplicated_enqueue(
-                                            name,
-                                            &row.id,
-                                            row.due_at.is_some(),
-                                        );
-                                        EnqueueOutcome::Deduplicated
-                                    };
-                                    fill_enqueue(row.slot, name, row.due_at, row.now, None);
-                                    resolved.push((row.result_index, Ok(outcome)));
+                    match breaker.admit() {
+                        Err(_) => {
+                            for row in batch {
+                                if row.due_at.is_some() {
+                                    self.registry.record_cancel_scheduled(name);
+                                } else {
+                                    self.registry.record_cancel(name);
                                 }
+                                self.registry.forget_pg_job_mark(&row.id);
+                                self.job_admin.record_cancelled(&row.id);
+                                let row_error = AutumnError::service_unavailable(
+                                    std::io::Error::other("job queue circuit breaker is open"),
+                                );
+                                fill_enqueue(row.slot, name, row.due_at, row.now, Some(&row_error));
+                                resolved.push((row.result_index, Err(row_error)));
                             }
-                            Err(error) => {
-                                let message = error.to_string();
-                                for row in batch {
-                                    if row.due_at.is_some() {
-                                        self.registry.record_cancel_scheduled(name);
-                                    } else {
-                                        self.registry.record_cancel(name);
+                        }
+                        Ok(guard) => {
+                            let insert_result = pg_insert_jobs_many(
+                                pool,
+                                name,
+                                &job_queue,
+                                job_max_attempts,
+                                job_backoff_ms,
+                                unique_window_tag,
+                                concurrency_limit,
+                                &batch,
+                            )
+                            .await;
+                            if insert_result.is_ok() {
+                                guard.success();
+                            } else {
+                                guard.failure();
+                            }
+                            match insert_result {
+                                Ok(inserted_ids) => {
+                                    let inserted: std::collections::HashSet<&str> =
+                                        inserted_ids.iter().map(String::as_str).collect();
+                                    for row in batch {
+                                        let outcome = if inserted.contains(row.id.as_str()) {
+                                            EnqueueOutcome::Queued
+                                        } else {
+                                            self.record_deduplicated_enqueue(
+                                                name,
+                                                &row.id,
+                                                row.due_at.is_some(),
+                                            );
+                                            EnqueueOutcome::Deduplicated
+                                        };
+                                        fill_enqueue(row.slot, name, row.due_at, row.now, None);
+                                        resolved.push((row.result_index, Ok(outcome)));
                                     }
-                                    self.registry.forget_pg_job_mark(&row.id);
-                                    self.job_admin.record_cancelled(&row.id);
-                                    let row_error =
-                                        AutumnError::internal_server_error_msg(message.clone());
-                                    fill_enqueue(
-                                        row.slot,
-                                        name,
-                                        row.due_at,
-                                        row.now,
-                                        Some(&row_error),
-                                    );
-                                    resolved.push((row.result_index, Err(row_error)));
+                                }
+                                Err(error) => {
+                                    let message = error.to_string();
+                                    for row in batch {
+                                        if row.due_at.is_some() {
+                                            self.registry.record_cancel_scheduled(name);
+                                        } else {
+                                            self.registry.record_cancel(name);
+                                        }
+                                        self.registry.forget_pg_job_mark(&row.id);
+                                        self.job_admin.record_cancelled(&row.id);
+                                        let row_error =
+                                            AutumnError::internal_server_error_msg(message.clone());
+                                        fill_enqueue(
+                                            row.slot,
+                                            name,
+                                            row.due_at,
+                                            row.now,
+                                            Some(&row_error),
+                                        );
+                                        resolved.push((row.result_index, Err(row_error)));
+                                    }
                                 }
                             }
                         }
@@ -4283,11 +4336,14 @@ impl JobClient {
         // client.enqueue() sees the originating request span even when the callback
         // runs in the after-commit task, which has no request span of its own.
         let enqueue_span = tracing::Span::current();
+        // The callback runs in a new task: carry the tenant for cost.
+        let tenant = crate::cost::enqueuing_tenant();
 
         let mut f_opt = Some(move || {
             let client = client.clone();
             let name = name.clone();
             let payload = payload.clone();
+            let tenant = tenant.clone();
             // Resolve the due instant here, inside the callback, so that an
             // AfterCommitDue::After delay is measured from commit time — using
             // this client's own clock, not the process-global one: an
@@ -4295,7 +4351,7 @@ impl JobClient {
             // committed, and resolving the global handle again here would both
             // take a second `RwLock` round-trip and read a different app's
             // clock in a multi-app test process.
-            async move {
+            crate::cost::with_enqueue_tenant(tenant, async move {
                 match due {
                     AfterCommitDue::At(at) => client.enqueue_due(&name, payload, at).await,
                     // Kept relative rather than resolved to an absolute instant
@@ -4305,7 +4361,7 @@ impl JobClient {
                         client.enqueue_relative(&name, payload, d).await.map(|_| ())
                     }
                 }
-            }
+            })
         });
 
         #[cfg(feature = "db")]
@@ -4410,12 +4466,11 @@ impl JobClient {
     ) -> AutumnResult<EnqueueOutcome> {
         let breaker = self.job_queue_breaker();
 
-        if breaker.before_call().is_err() {
+        let Ok(guard) = breaker.admit() else {
             return Err(AutumnError::service_unavailable(std::io::Error::other(
                 "job queue circuit breaker is open",
             )));
-        }
-        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
+        };
 
         let res = self
             .enqueue_durable_inner(
@@ -4697,12 +4752,11 @@ impl JobClient {
                 },
             );
 
-            if breaker.before_call().is_err() {
+            let Ok(guard) = breaker.admit() else {
                 return Err(AutumnError::service_unavailable(std::io::Error::other(
                     "job queue circuit breaker is open",
                 )));
-            }
-            let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
+            };
 
             let id_for_enqueue = id.clone();
             let payload_for_enqueue = payload.clone();
@@ -4904,6 +4958,10 @@ struct LocalJobCoordinationInner {
     unique_holds: HashMap<String, LocalUniqueHold>,
     running_slots: HashMap<String, u32>,
     waiting: HashMap<String, VecDeque<QueuedJob>>,
+    /// Deferrable jobs that wait for the cost signal to fall (issue #1720).
+    deferred: Vec<QueuedJob>,
+    /// `true` while one task checks `deferred`.
+    deferred_waiter: bool,
 }
 
 struct LocalUniqueHold {
@@ -4995,6 +5053,36 @@ enum LocalSlotDecision {
 }
 
 impl LocalJobCoordination {
+    /// Keep `job` until the cost signal falls. Return `true` when no task
+    /// checks the deferred jobs yet, so the caller must start one.
+    fn defer(&self, job: QueuedJob) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.deferred.push(job);
+        let running = std::mem::replace(&mut inner.deferred_waiter, true);
+        drop(inner);
+        !running
+    }
+
+    /// Take the deferred jobs that may go back on the queue. Return `false` as
+    /// the second value when no job is left; the checking task then stops.
+    fn take_deferred(&self, ready: impl Fn(&QueuedJob) -> bool) -> (Vec<QueuedJob>, bool) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (go, stay): (Vec<_>, Vec<_>) = std::mem::take(&mut inner.deferred)
+            .into_iter()
+            .partition(|job| ready(job));
+        let more = !stay.is_empty();
+        inner.deferred = stay;
+        inner.deferred_waiter = more;
+        drop(inner);
+        (go, more)
+    }
+
     /// Coordination reading TTL expiry from `clock` (the app's injected clock).
     fn with_clock(clock: Arc<dyn crate::time::ClockSource>) -> Self {
         Self {
@@ -5554,7 +5642,7 @@ pub(crate) fn job_retry_delay_ms(state: &AppState, initial_backoff_ms: u64, atte
 
 #[allow(clippy::too_many_lines)]
 async fn execute_local_job(
-    job: QueuedJob,
+    mut job: QueuedJob,
     jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
     tx: &tokio::sync::mpsc::Sender<QueuedJob>,
     state: &AppState,
@@ -5606,6 +5694,32 @@ async fn execute_local_job(
         .await;
         return;
     };
+
+    // Cost gate (issue #1720): a deferrable job waits while the cost signal is
+    // high. It has not started, so it holds no slot and uses no attempt, and
+    // its queued gauge does not change. The runtime keeps it in one deferred
+    // list, and one task checks that list every recheck interval: it puts a
+    // job back on the queue when the signal falls. A canceled job goes back at
+    // once, so the cancel branch below settles it. A canceled job does not
+    // wait. The task stops when the list is empty or the runtime shuts down.
+    if !job_admin.is_canceled(&job.id)
+        && let Some(signal) =
+            crate::cost::deferral_signal(state, crate::cost::WorkKind::Job, &job.name)
+    {
+        crate::cost::note_deferral(&signal);
+        tracing::info!(job = %job.name, value = signal.value(), "cost signal is high; job waits");
+        // The wait for the first signal value is not a window.
+        job.cost_waited = crate::cost::is_window(&signal);
+        if coordination.defer(job) {
+            tokio::spawn(run_deferred_job_waiter(
+                Arc::clone(coordination),
+                signal,
+                job_admin.clone(),
+                tx.clone(),
+            ));
+        }
+        return;
+    }
 
     // Concurrency gate: park the job when its group is saturated. Parked jobs
     // keep their enqueued status and resume when release_slot pops them.
@@ -5688,6 +5802,10 @@ async fn execute_local_job(
         state.clone(),
         job.payload.clone(),
         final_attempt,
+        crate::cost::WorkRun {
+            tenant: job.tenant.clone(),
+            waited: job.cost_waited,
+        },
     );
     let outcome = tracing::Instrument::instrument(f, job_span).await;
     match outcome {
@@ -5755,6 +5873,7 @@ async fn execute_local_job(
                 let traceparent = job.traceparent;
                 #[cfg(feature = "telemetry-otlp")]
                 let tracestate = job.tracestate;
+                let tenant = job.tenant;
                 let delay = job_retry_delay_ms(state, backoff_ms, job.attempt);
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -5769,6 +5888,8 @@ async fn execute_local_job(
                             attempt: job.attempt.saturating_add(1),
                             max_attempts,
                             initial_backoff_ms: backoff_ms,
+                            tenant,
+                            cost_waited: false,
                             #[cfg(feature = "telemetry-otlp")]
                             traceparent,
                             #[cfg(feature = "telemetry-otlp")]
@@ -5811,6 +5932,75 @@ async fn execute_local_job(
     // The concurrency slot frees as soon as the handler is no longer running,
     // including while a retry waits out its backoff.
     finish_local_slot(coordination, concurrency_group.as_ref(), tx, state);
+}
+
+/// The registered deferrable job names while the cost signal is high (issue
+/// #1720). The durable backends do not claim these jobs. Empty otherwise.
+#[cfg(any(feature = "db", feature = "redis"))]
+pub(crate) fn deferred_job_names(
+    state: &AppState,
+    jobs_by_name: &RwLock<HashMap<String, JobInfo>>,
+) -> Vec<String> {
+    if !crate::cost::deferring_jobs(state) {
+        return Vec::new();
+    }
+    jobs_by_name
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keys()
+        .filter(|name| crate::cost::is_deferrable(crate::cost::WorkKind::Job, name))
+        .cloned()
+        .collect()
+}
+
+/// The deferred names as one JSON array, for the Redis and `SQLite` claims.
+#[cfg(any(feature = "sqlite", feature = "redis"))]
+pub(crate) fn deferred_names_json(deferred: &[String]) -> String {
+    if deferred.is_empty() {
+        return "[]".to_owned();
+    }
+    serde_json::to_string(deferred).unwrap_or_else(|_| "[]".to_owned())
+}
+
+/// The cost run of a durable job that was ready at `ready_ms` (unix ms). It
+/// counts as waited when a real window held it (issue #1720).
+#[cfg(any(feature = "db", feature = "redis"))]
+pub(crate) fn durable_work_run(state: &AppState, ready_ms: Option<i64>) -> crate::cost::WorkRun {
+    crate::cost::WorkRun {
+        tenant: None,
+        waited: ready_ms
+            .and_then(|ms| u64::try_from(ms).ok())
+            .is_some_and(|ms| crate::cost::held_in_window(state, ms)),
+    }
+}
+
+/// Check the deferred local jobs every recheck interval (issue #1720). Put a
+/// job back on the queue when the cost signal falls or an operator cancels it.
+async fn run_deferred_job_waiter(
+    coordination: Arc<LocalJobCoordination>,
+    signal: Arc<crate::cost::CostSignal>,
+    job_admin: JobAdminMemoryBackend,
+    sender: tokio::sync::mpsc::Sender<QueuedJob>,
+) {
+    loop {
+        tokio::select! {
+            // The runtime stopped: its queue is gone, as for any queued local
+            // job.
+            () = sender.closed() => return,
+            () = tokio::time::sleep(signal.recheck()) => {}
+        }
+        let low = !signal.is_high();
+        let (ready, more) = coordination.take_deferred(|job| low || job_admin.is_canceled(&job.id));
+        for job in ready {
+            tracing::info!(job = %job.name, "job goes back on the queue");
+            if sender.send(job).await.is_err() {
+                return;
+            }
+        }
+        if !more {
+            return;
+        }
+    }
 }
 
 /// Release a unique hold after a job settles. No-op for TTL-window holds
@@ -6686,6 +6876,16 @@ async fn redis_admin_active_list_page(
         total = total.saturating_add(len);
     }
 
+    // Jobs parked for the cost signal (issue #1720) sort after the
+    // concurrency-parked ones: a blocked rank below this count is a
+    // concurrency park.
+    let concurrency_parked: u64 = redis::cmd("ZCOUNT")
+        .arg(blocked_key)
+        .arg("-inf")
+        .arg(format!("({REDIS_DEFERRED_SCORE_BASE}"))
+        .query_async(connection)
+        .await
+        .map_err(|error| redis_admin_error("read blocked count", &error))?;
     let mut ids: Vec<String> = Vec::new();
     let mut blocked_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (index, local_start, count) in redis_page_spans(&lens, start, per_page) {
@@ -6702,7 +6902,7 @@ async fn redis_admin_active_list_page(
             .await
             .map_err(|error| redis_admin_error("read enqueued page", &error))?;
         let blocked = source.is_blocked();
-        for id in chunk {
+        for (rank, id) in (local_start..).zip(chunk) {
             // The queue and zset reads are not one atomic snapshot, and the
             // queues are read first: a job parked out of a queue in between
             // lands in both slices. (The reverse — promoted out of the zset —
@@ -6711,7 +6911,7 @@ async fn redis_admin_active_list_page(
             if ids.contains(&id) {
                 continue;
             }
-            if blocked {
+            if blocked && rank < concurrency_parked {
                 blocked_ids.insert(id.clone());
             }
             ids.push(id);
@@ -6878,12 +7078,25 @@ async fn push_json_list_item<T: ?Sized + Serialize + Sync>(
     }
 }
 
-#[cfg(feature = "redis")]
-#[allow(clippy::too_many_lines)]
+#[cfg(all(feature = "redis", test))]
 async fn claim_next_redis_job(
     connection: &mut redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
     queue_keys: &[String],
+) -> Result<Option<RedisJobRecord>, redis::RedisError> {
+    claim_next_redis_job_except(connection, worker_config, queue_keys, &[]).await
+}
+
+/// Claim the next job, but park a job named in `deferred` in the blocked zset
+/// (issue #1720). A parked job stays enqueued and keeps its attempt. It goes
+/// back to its queue when the signal is low.
+#[cfg(feature = "redis")]
+#[allow(clippy::too_many_lines)]
+async fn claim_next_redis_job_except(
+    connection: &mut redis::aio::ConnectionManager,
+    worker_config: &RedisWorkerConfig,
+    queue_keys: &[String],
+    deferred: &[String],
 ) -> Result<Option<RedisJobRecord>, redis::RedisError> {
     // Walks the priority-ordered queue list keys (ARGV[9..]) highest first,
     // popping entries until one is claimable. Jobs whose concurrency group is
@@ -6891,7 +7104,9 @@ async fn claim_next_redis_job(
     // and retried via promotion; the scan bound keeps one call from walking an
     // arbitrarily long queue. The concurrency counter INCR is atomic with the
     // claim itself, so two workers can never both observe a free slot for the
-    // last opening in a group.
+    // last opening in a group. A deferred job (the names in the JSON array
+    // after the queue keys) is parked the same way, until the next signal
+    // check.
     const CLAIM_SCRIPT: &str = r"
 local function scope_string(value)
   if value == nil or value == cjson.null then
@@ -6900,21 +7115,39 @@ local function scope_string(value)
   return tostring(value)
 end
 local queue_count = tonumber(ARGV[9])
+local deferred_score = ARGV[10 + queue_count]
+local deferred = {}
+for _, name in ipairs(cjson.decode(ARGV[11 + queue_count])) do
+  deferred[name] = true
+end
+local defer_limit = tonumber(ARGV[12 + queue_count])
 for qi = 1, queue_count do
   local queue_key = ARGV[9 + qi]
-  for attempt = 1, tonumber(ARGV[6]) do
+  local scanned = 0
+  local parked = 0
+  while scanned < tonumber(ARGV[6]) and parked < defer_limit do
     local id = redis.call('RPOP', queue_key)
     if not id then
       break
     end
     local key = KEYS[2] .. id
     local body = redis.call('GET', key)
+    local record = nil
     if body then
-      local ok, record = pcall(cjson.decode, body)
+      local ok, decoded = pcall(cjson.decode, body)
       if not ok then
         redis.call('ZADD', KEYS[1], ARGV[3], id)
         return { id, body }
       end
+      record = decoded
+    end
+    if record and deferred[record['name']] then
+      redis.call('ZADD', KEYS[3], deferred_score, id)
+      parked = parked + 1
+    else
+      scanned = scanned + 1
+    end
+    if record and not deferred[record['name']] then
       local blocked = false
       if record['concurrency_limit'] and record['concurrency_limit'] ~= cjson.null then
         local counter = ARGV[4] .. record['name'] .. ':' .. scope_string(record['concurrency_key'])
@@ -6973,6 +7206,9 @@ return nil
     for queue_key in queue_keys {
         cmd.arg(queue_key);
     }
+    cmd.arg(REDIS_DEFERRED_SCORE_BASE.saturating_add(now_ms))
+        .arg(deferred_names_json(deferred))
+        .arg(REDIS_DEFER_SCAN_LIMIT);
     let response: Option<(String, String)> = cmd.query_async(connection).await?;
 
     let Some((id, body)) = response else {
@@ -7171,8 +7407,32 @@ async fn promote_due_blocked_redis_jobs(
     connection: &mut redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
 ) -> Result<(), redis::RedisError> {
+    let now = now_unix_ms(worker_config.clock.as_ref()).to_string();
+    promote_blocked_redis_range(connection, worker_config, "-inf", &now).await
+}
+
+/// Move the jobs that wait for the cost signal back into their queues (issue
+/// #1720). Call it while the signal is low.
+#[cfg(feature = "redis")]
+async fn promote_deferred_redis_jobs(
+    connection: &mut redis::aio::ConnectionManager,
+    worker_config: &RedisWorkerConfig,
+) -> Result<(), redis::RedisError> {
+    let base = REDIS_DEFERRED_SCORE_BASE.to_string();
+    promote_blocked_redis_range(connection, worker_config, &base, "+inf").await
+}
+
+/// Move up to 64 blocked jobs with a score in `[min, max]` back into their
+/// queues.
+#[cfg(feature = "redis")]
+async fn promote_blocked_redis_range(
+    connection: &mut redis::aio::ConnectionManager,
+    worker_config: &RedisWorkerConfig,
+    min: &str,
+    max: &str,
+) -> Result<(), redis::RedisError> {
     const PROMOTE_BLOCKED_SCRIPT: &str = r"
-local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
+local ids = redis.call('ZRANGEBYSCORE', KEYS[1], ARGV[4], ARGV[1], 'LIMIT', 0, ARGV[2])
 local key_prefix = ARGV[3]
 for _, id in ipairs(ids) do
   if redis.call('ZREM', KEYS[1], id) == 1 then
@@ -7200,25 +7460,31 @@ return #ids
         .arg(2)
         .arg(&worker_config.blocked_key)
         .arg(&worker_config.record_prefix)
-        .arg(now_unix_ms(worker_config.clock.as_ref()))
+        .arg(max)
         .arg(64_usize)
         .arg(&worker_config.key_prefix)
+        .arg(min)
         .query_async(connection)
         .await?;
     Ok(())
 }
 
 /// Publish per-name blocked-on-concurrency gauges from the blocked zset.
+/// Jobs parked for the cost signal are not counted.
 #[cfg(feature = "redis")]
 async fn update_redis_blocked_gauges(
     connection: &mut redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
     state: &AppState,
 ) -> Result<(), redis::RedisError> {
-    let ids: Vec<String> = redis::cmd("ZRANGE")
+    // Jobs parked for the cost signal sit above the concurrency band.
+    let ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
         .arg(&worker_config.blocked_key)
+        .arg("-inf")
+        .arg(format!("({REDIS_DEFERRED_SCORE_BASE}"))
+        .arg("LIMIT")
         .arg(0)
-        .arg(1023)
+        .arg(1024)
         .query_async(connection)
         .await?;
     let mut counts: HashMap<String, u64> = HashMap::new();
@@ -7300,7 +7566,8 @@ fn fold_due_delayed_records(
 /// on every replica — including enqueue-only web replicas that never pop.
 ///
 /// Per-queue `depth` is the exact `LLEN` of each queue list plus any due
-/// (ready-at `<= now`) entries still parked in the delayed ZSET; oldest-waiting
+/// (ready-at `<= now`) entries still parked in the delayed ZSET, plus the jobs
+/// parked for the cost signal (issue #1720); oldest-waiting
 /// age comes from the tail record's enqueue time (enqueue `LPUSH`es to the head
 /// and claim `RPOP`s from the tail, so the tail is the next job to run) and/or
 /// the min due-delayed score. The per-name `queued` tally reads a bounded sample
@@ -7387,8 +7654,78 @@ async fn update_redis_queue_depth_gauges(
     )
     .await?;
 
+    // Jobs parked for the cost signal (issue #1720) are still enqueued.
+    let blocked_key = format!("{key_prefix}:blocked");
+    survey_cost_parked_gauges(
+        connection,
+        &blocked_key,
+        record_prefix,
+        &mut per_queue,
+        &mut per_name,
+    )
+    .await?;
+
     state.job_registry.set_queue_depth_gauges(&per_queue);
     state.job_registry.set_queued_counts(&per_name);
+    Ok(())
+}
+
+/// Fold the jobs parked for the cost signal (the blocked zset band above
+/// `REDIS_DEFERRED_SCORE_BASE`) into the per-queue and per-name tallies. Their
+/// oldest age is their enqueue time. The scan stops at
+/// `REDIS_QUEUE_DEPTH_DUE_SCAN_CAP` and logs a warning.
+#[cfg(feature = "redis")]
+async fn survey_cost_parked_gauges(
+    connection: &mut redis::aio::ConnectionManager,
+    blocked_key: &str,
+    record_prefix: &str,
+    per_queue: &mut HashMap<String, (u64, Option<u64>)>,
+    per_name: &mut HashMap<String, u64>,
+) -> Result<(), redis::RedisError> {
+    let page_size = REDIS_QUEUE_DEPTH_SAMPLE.max(1).cast_unsigned();
+    let mut offset: isize = 0;
+    let mut scanned: usize = 0;
+    loop {
+        let ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
+            .arg(blocked_key)
+            .arg(REDIS_DEFERRED_SCORE_BASE)
+            .arg("+inf")
+            .arg("LIMIT")
+            .arg(offset)
+            .arg(REDIS_QUEUE_DEPTH_SAMPLE)
+            .query_async(connection)
+            .await?;
+        let page_len = ids.len();
+        if !ids.is_empty() {
+            let keys: Vec<String> = ids
+                .iter()
+                .map(|id| redis_record_key(record_prefix, id))
+                .collect();
+            let bodies: Vec<Option<String>> =
+                redis::cmd("MGET").arg(keys).query_async(connection).await?;
+            let records = bodies.into_iter().flatten().filter_map(|body| {
+                serde_json::from_str::<RedisJobRecord>(&body)
+                    .ok()
+                    .map(|record| (record.queue, record.name, record.enqueued_at_ms))
+            });
+            fold_due_delayed_records(records, per_queue, per_name);
+        }
+        scanned = scanned.saturating_add(page_len);
+        if page_len < page_size {
+            break;
+        }
+        // Full final page at the safety bound: stop, and say the depth can be
+        // low, as the due-delayed scan does.
+        if scanned >= REDIS_QUEUE_DEPTH_DUE_SCAN_CAP {
+            tracing::warn!(
+                scanned,
+                cap = REDIS_QUEUE_DEPTH_DUE_SCAN_CAP,
+                "cost-parked queue-depth scan truncated at cap; reported depth may under-count"
+            );
+            break;
+        }
+        offset = offset.saturating_add(REDIS_QUEUE_DEPTH_SAMPLE);
+    }
     Ok(())
 }
 
@@ -8148,11 +8485,20 @@ fn spawn_redis_worker(
                 }
             }
 
-            if blocked_promotion_throttle.take_due(tokio::time::Instant::now())
-                && let Err(error) =
+            if blocked_promotion_throttle.take_due(tokio::time::Instant::now()) {
+                if let Err(error) =
                     promote_due_blocked_redis_jobs(&mut connection, &worker_config).await
-            {
-                tracing::warn!(error = %error, "redis blocked job promotion failed");
+                {
+                    tracing::warn!(error = %error, "redis blocked job promotion failed");
+                }
+                // Jobs parked for the cost signal go back when it is low,
+                // even when this deploy no longer marks them deferrable.
+                if !crate::cost::deferring_jobs(&state)
+                    && let Err(error) =
+                        promote_deferred_redis_jobs(&mut connection, &worker_config).await
+                {
+                    tracing::warn!(error = %error, "redis deferred job promotion failed");
+                }
             }
 
             if worker_config.slots.is_active() {
@@ -8170,7 +8516,14 @@ fn spawn_redis_worker(
                         continue;
                     };
                     let queue_keys = worker_config.queue_keys_for(std::slice::from_ref(queue));
-                    match claim_next_redis_job(&mut connection, &worker_config, &queue_keys).await {
+                    match claim_next_redis_job_except(
+                        &mut connection,
+                        &worker_config,
+                        &queue_keys,
+                        &deferred_job_names(&state, &jobs_by_name),
+                    )
+                    .await
+                    {
                         Ok(Some(record)) => {
                             process_redis_job_record(
                                 &mut connection,
@@ -8209,15 +8562,21 @@ fn spawn_redis_worker(
                 continue;
             }
             let queue_keys = worker_config.queue_keys_for(&order);
-            let claimed =
-                match claim_next_redis_job(&mut connection, &worker_config, &queue_keys).await {
-                    Ok(record) => record,
-                    Err(error) => {
-                        tracing::warn!(error = %error, "redis job worker claim failed");
-                        tokio::time::sleep(idle_sleep).await;
-                        continue;
-                    }
-                };
+            let claimed = match claim_next_redis_job_except(
+                &mut connection,
+                &worker_config,
+                &queue_keys,
+                &deferred_job_names(&state, &jobs_by_name),
+            )
+            .await
+            {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::warn!(error = %error, "redis job worker claim failed");
+                    tokio::time::sleep(idle_sleep).await;
+                    continue;
+                }
+            };
             let Some(record) = claimed else {
                 tokio::time::sleep(idle_sleep).await;
                 continue;
@@ -8514,6 +8873,10 @@ async fn process_redis_job_record(
         state.clone(),
         record.payload.clone(),
         final_attempt,
+        durable_work_run(
+            state,
+            record.enqueued_at_ms.and_then(|ms| i64::try_from(ms).ok()),
+        ),
     );
     match tracing::Instrument::instrument(f, job_span).await {
         JobExecutionOutcome::Succeeded => {
@@ -9017,6 +9380,10 @@ fn record_pg_row_cancel_after_ack(
     record_pg_cancel_after_ack(ack_result, &row.name, &row.id, state)
 }
 
+/// How long an idle Postgres worker waits before it polls for a job again.
+///
+/// The Postgres runtime has no `LISTEN`/`NOTIFY` wake-up. A new job waits
+/// for the next poll. `docs/guide/jobs.md` states this value.
 #[cfg(feature = "db")]
 const PG_WORKER_IDLE_SLEEP: std::time::Duration = std::time::Duration::from_millis(200);
 #[cfg(feature = "db")]
@@ -9698,6 +10065,8 @@ const PG_CLAIM_ADVISORY_LOCK_KEY: i64 = 0x6175_7475_6d6e_6a62; // "autumnjb"
 
 #[cfg(feature = "db")]
 fn pg_claim_sql() -> String {
+    // `$3` is the deferred job names (issue #1720): empty unless the cost
+    // signal is high. Those rows stay enqueued and keep their attempt.
     // `$2` is the worker's ordered queue list for this claim. Restricting to it
     // and ordering by `array_position` drains higher-priority queues first;
     // passing a per-iteration rotation of the list yields weighted draining.
@@ -9719,6 +10088,7 @@ fn pg_claim_sql() -> String {
                  AND running.name = candidate.name \
                  AND running.concurrency_key IS NOT DISTINCT FROM candidate.concurrency_key \
              ) < candidate.concurrency_limit) \
+             AND NOT (candidate.name = ANY($3)) \
            ORDER BY array_position($2::text[], candidate.queue), candidate.run_at ASC \
            LIMIT 1 \
            FOR UPDATE SKIP LOCKED \
@@ -9763,6 +10133,7 @@ fn pg_claim_sql_single_queue() -> String {
                  AND running.name = candidate.name \
                  AND running.concurrency_key IS NOT DISTINCT FROM candidate.concurrency_key \
              ) < candidate.concurrency_limit) \
+             AND NOT (candidate.name = ANY($3)) \
            ORDER BY candidate.run_at ASC \
            LIMIT 1 \
            FOR UPDATE SKIP LOCKED \
@@ -9771,14 +10142,27 @@ fn pg_claim_sql_single_queue() -> String {
     )
 }
 
-#[cfg(feature = "db")]
+#[cfg(all(feature = "db", test))]
 async fn pg_claim_next_job(
     pool: &PgPool,
     worker_id: &str,
     serialize_claims: bool,
     queue_order: &[String],
 ) -> Option<PgJobRow> {
+    pg_claim_next_job_except(pool, worker_id, serialize_claims, queue_order, &[]).await
+}
+
+/// Claim the next ready job, but not a job named in `deferred` (issue #1720).
+#[cfg(feature = "db")]
+async fn pg_claim_next_job_except(
+    pool: &PgPool,
+    worker_id: &str,
+    serialize_claims: bool,
+    queue_order: &[String],
+    deferred: &[String],
+) -> Option<PgJobRow> {
     use diesel::OptionalExtension as _;
+    type Names = diesel::sql_types::Array<diesel::sql_types::Text>;
     use diesel_async::{AsyncConnection as _, RunQueryDsl as _};
 
     let mut conn = pool.get().await.ok()?;
@@ -9788,6 +10172,7 @@ async fn pg_claim_next_job(
     let claimed = if let [only_queue] = queue_order {
         let sql = pg_claim_sql_single_queue();
         let only_queue = only_queue.clone();
+        let deferred = deferred.to_vec();
         if serialize_claims {
             let worker_id = worker_id.to_owned();
             conn.transaction::<Option<PgJobRow>, diesel::result::Error, _>(async move |conn| {
@@ -9798,6 +10183,7 @@ async fn pg_claim_next_job(
                 diesel::sql_query(sql)
                     .bind::<diesel::sql_types::Text, _>(worker_id)
                     .bind::<diesel::sql_types::Text, _>(only_queue)
+                    .bind::<Names, _>(deferred)
                     .get_result::<PgJobRow>(conn)
                     .await
                     .optional()
@@ -9807,6 +10193,7 @@ async fn pg_claim_next_job(
             diesel::sql_query(sql)
                 .bind::<diesel::sql_types::Text, _>(worker_id)
                 .bind::<diesel::sql_types::Text, _>(only_queue)
+                .bind::<Names, _>(deferred)
                 .get_result::<PgJobRow>(&mut *conn)
                 .await
                 .optional()
@@ -9814,6 +10201,7 @@ async fn pg_claim_next_job(
     } else {
         let sql = pg_claim_sql();
         let queue_order = queue_order.to_vec();
+        let deferred = deferred.to_vec();
         if serialize_claims {
             let worker_id = worker_id.to_owned();
             conn.transaction::<Option<PgJobRow>, diesel::result::Error, _>(async move |conn| {
@@ -9824,6 +10212,7 @@ async fn pg_claim_next_job(
                 diesel::sql_query(sql)
                     .bind::<diesel::sql_types::Text, _>(worker_id)
                     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queue_order)
+                    .bind::<Names, _>(deferred)
                     .get_result::<PgJobRow>(conn)
                     .await
                     .optional()
@@ -9833,6 +10222,7 @@ async fn pg_claim_next_job(
             diesel::sql_query(sql)
                 .bind::<diesel::sql_types::Text, _>(worker_id)
                 .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queue_order)
+                .bind::<Names, _>(deferred)
                 .get_result::<PgJobRow>(&mut *conn)
                 .await
                 .optional()
@@ -10376,7 +10766,14 @@ async fn pg_execute_job(
         let _ = job_span.set_parent(cx);
     }
     let final_attempt = is_final_attempt(&attempt, &max_attempts);
-    let f = run_job_handler(&row.name, handler, state.clone(), payload, final_attempt);
+    let f = run_job_handler(
+        &row.name,
+        handler,
+        state.clone(),
+        payload,
+        final_attempt,
+        durable_work_run(state, row.run_at.map(|at| at.timestamp_millis())),
+    );
     match tracing::Instrument::instrument(f, job_span).await {
         JobExecutionOutcome::Succeeded => {
             let ack = pg_ack_success(pool, &row.id, worker_id).await;
@@ -10556,16 +10953,18 @@ async fn pg_worker_loop(
             // configured). The reserved guard is held for the whole job execution
             // and released on drop.
             let order = cursor.next_order();
+            let deferred = deferred_job_names(&state, &jobs_by_name);
             let mut handled = false;
             for queue in order.iter() {
                 let Some(guard) = slots.try_reserve(queue) else {
                     continue;
                 };
-                match pg_claim_next_job(
+                match pg_claim_next_job_except(
                     &pool,
                     &worker_id,
                     serialize_claims,
                     std::slice::from_ref(queue),
+                    &deferred,
                 )
                 .await
                 {
@@ -10601,7 +11000,10 @@ async fn pg_worker_loop(
             }
             continue;
         }
-        match pg_claim_next_job(&pool, &worker_id, serialize_claims, &queue_order).await {
+        let deferred = deferred_job_names(&state, &jobs_by_name);
+        match pg_claim_next_job_except(&pool, &worker_id, serialize_claims, &queue_order, &deferred)
+            .await
+        {
             Some(row) => {
                 let _slot = slots.acquire(&normalize_queue_name(&row.queue));
                 pg_execute_job(row, &jobs_by_name, &pool, &worker_id, &state, &job_admin).await;
@@ -11113,8 +11515,8 @@ async fn pg_enqueued_and_scheduled_pages(
 
 /// `SQLite` stub for the Postgres job runtime.
 ///
-/// The durable Postgres job backend uses `LISTEN`/`NOTIFY`, `FOR UPDATE SKIP
-/// LOCKED` claiming, and advisory locks — none of which `SQLite` provides — so
+/// The durable Postgres job backend uses `FOR UPDATE SKIP LOCKED` claiming
+/// and advisory locks — `SQLite` provides neither — so
 /// under the `sqlite` feature the runtime pool (`RuntimeConnection`) is a
 /// `SQLite` pool that cannot drive the Postgres worker loops. Refuse a
 /// `jobs.backend = "postgres"` configuration with a clear message instead of
@@ -11132,7 +11534,7 @@ fn start_postgres_runtime(
     let _ = (jobs, state, shutdown, config, run_workers);
     Err(AutumnError::internal_server_error(std::io::Error::other(
         "jobs.backend=postgres is unsupported under the sqlite feature; SQLite has no \
-         LISTEN/NOTIFY or advisory-lock queue. Use jobs.backend=sqlite for a durable queue \
+         FOR UPDATE SKIP LOCKED or advisory locks. Use jobs.backend=sqlite for a durable queue \
          in your own SQLite file, or jobs.backend=local (the default) for the in-process \
          queue.",
     )))
@@ -12377,6 +12779,7 @@ mod tests {
             state,
             serde_json::json!({}),
             true,
+            crate::cost::WorkRun::default(),
         )
         .await;
         assert_eq!(
@@ -12434,6 +12837,7 @@ mod tests {
             state,
             serde_json::json!({}),
             true,
+            crate::cost::WorkRun::default(),
         )
         .await;
 
@@ -12503,6 +12907,7 @@ mod tests {
             state,
             serde_json::json!({}),
             true,
+            crate::cost::WorkRun::default(),
         )
         .await;
 
@@ -13041,6 +13446,8 @@ mod tests {
                 attempt: 1,
                 max_attempts: 3,
                 initial_backoff_ms: 1,
+                tenant: None,
+                cost_waited: false,
                 #[cfg(feature = "telemetry-otlp")]
                 traceparent: None,
                 #[cfg(feature = "telemetry-otlp")]
@@ -13102,6 +13509,8 @@ mod tests {
                 attempt: 1,
                 max_attempts: 2,
                 initial_backoff_ms: 1,
+                tenant: None,
+                cost_waited: false,
                 #[cfg(feature = "telemetry-otlp")]
                 traceparent: None,
                 #[cfg(feature = "telemetry-otlp")]
@@ -13165,6 +13574,8 @@ mod tests {
                 attempt: 1,
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                tenant: None,
+                cost_waited: false,
                 #[cfg(feature = "telemetry-otlp")]
                 traceparent: None,
                 #[cfg(feature = "telemetry-otlp")]
@@ -13223,6 +13634,8 @@ mod tests {
                 attempt: 1,
                 max_attempts: 2,
                 initial_backoff_ms: 60_000,
+                tenant: None,
+                cost_waited: false,
                 #[cfg(feature = "telemetry-otlp")]
                 traceparent: None,
                 #[cfg(feature = "telemetry-otlp")]
@@ -14912,6 +15325,111 @@ mod tests {
 
     /// #1186: a job parked in the blocked zset must stay listed on the
     /// enqueued tab instead of blinking out of it every promotion cycle.
+    /// Issue #1720: a deferred job is parked, not claimed. It keeps its
+    /// attempt, the next job on the queue runs, and the admin page lists it
+    /// as enqueued, not as blocked on concurrency. Only the low-signal
+    /// promotion puts it back.
+    #[cfg(feature = "redis")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_admin_lists_a_cost_parked_job_as_enqueued() {
+        use redis::AsyncCommands as _;
+
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let (_container, client) = redis_test_client().await;
+        let prefix = "autumn:test:cost-parked";
+        let worker_config = redis_test_worker_config(prefix, "worker-c", 30_000);
+        let mut connection =
+            new_redis_connection_manager(&client, "test redis cost parked").unwrap();
+        let admin = redis_admin_test_backend_with_queues(
+            &client,
+            &worker_config,
+            vec![worker_config.queue_key.clone()],
+        );
+        let plain = ResolvedJobConstraints::default();
+        redis_enqueue_with_constraints(&client, &worker_config, "c1", "rebuild_index", &plain)
+            .await;
+        redis_enqueue_with_constraints(&client, &worker_config, "c2", "send_email", &plain).await;
+
+        let deferred = vec!["rebuild_index".to_owned()];
+        let claimed = claim_next_redis_job_except(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+            &deferred,
+        )
+        .await
+        .unwrap()
+        .expect("the job behind the deferred one is claimed");
+        assert_eq!(claimed.id, "c2");
+
+        let parked: Vec<(String, u64)> = connection
+            .zrange_withscores(&worker_config.blocked_key, 0, -1)
+            .await
+            .unwrap();
+        assert_eq!(parked.len(), 1, "{parked:?}");
+        assert_eq!(parked[0].0, "c1");
+        assert!(
+            parked[0].1 >= REDIS_DEFERRED_SCORE_BASE,
+            "parked above the timed band"
+        );
+        promote_due_blocked_redis_jobs(&mut connection, &worker_config)
+            .await
+            .unwrap();
+        let queued: u64 = connection.llen(&worker_config.queue_key).await.unwrap();
+        assert_eq!(queued, 0, "the timed promotion does not move it");
+        let body: String = connection
+            .get(redis_record_key(&worker_config.record_prefix, "c1"))
+            .await
+            .unwrap();
+        let record: RedisJobRecord = serde_json::from_str(&body).unwrap();
+        assert_eq!(record.attempt, 1, "a parked job keeps its attempt");
+        assert!(record.claimed_by.is_none(), "a parked job is not claimed");
+
+        let snapshot = admin
+            .snapshot(JobAdminQuery::default())
+            .await
+            .expect("snapshot");
+        let listed = snapshot
+            .enqueued
+            .records
+            .iter()
+            .find(|r| r.id == "c1")
+            .expect("the parked job is listed as enqueued");
+        assert!(!listed.blocked_on_concurrency);
+
+        // The backlog gauges still count it as queued.
+        let state = AppState::for_test().with_profile("dev");
+        state.job_registry().register("rebuild_index");
+        update_redis_queue_depth_gauges(
+            &mut connection,
+            prefix,
+            &["default".to_owned()],
+            &worker_config.delayed_key,
+            &worker_config.record_prefix,
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.job_registry().snapshot()["rebuild_index"].queued, 1);
+        assert_eq!(
+            state.job_registry().snapshot()["rebuild_index"].blocked_on_concurrency,
+            0
+        );
+
+        // The signal is low: the job goes back to its queue.
+        promote_deferred_redis_jobs(&mut connection, &worker_config)
+            .await
+            .unwrap();
+        let queued: Vec<String> = connection
+            .lrange(&worker_config.queue_key, 0, -1)
+            .await
+            .unwrap();
+        assert_eq!(queued, vec!["c1".to_owned()]);
+    }
+
     #[cfg(feature = "redis")]
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires Docker (testcontainers)"]
@@ -16437,6 +16955,7 @@ mod tests {
             state,
             serde_json::json!({}),
             true,
+            crate::cost::WorkRun::default(),
         )
         .await;
         assert_eq!(
@@ -16640,6 +17159,8 @@ mod tests {
             attempt: 1,
             max_attempts: 3,
             initial_backoff_ms: 10,
+            tenant: None,
+            cost_waited: false,
             #[cfg(feature = "telemetry-otlp")]
             traceparent: None,
             #[cfg(feature = "telemetry-otlp")]
@@ -16694,6 +17215,8 @@ mod tests {
             attempt: 1,
             max_attempts: 3,
             initial_backoff_ms: 10,
+            tenant: None,
+            cost_waited: false,
             #[cfg(feature = "telemetry-otlp")]
             traceparent: None,
             #[cfg(feature = "telemetry-otlp")]
@@ -17016,6 +17539,8 @@ mod tests {
                 attempt: 1,
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                tenant: None,
+                cost_waited: false,
                 #[cfg(feature = "telemetry-otlp")]
                 traceparent: None,
                 #[cfg(feature = "telemetry-otlp")]
@@ -17938,8 +18463,8 @@ mod tests {
         }
 
         // The sqlite arm of the same call. `start_postgres_runtime` is a stub
-        // under the backend flip — SQLite has no LISTEN/NOTIFY and no
-        // advisory-lock queue — so it refuses regardless of what is configured,
+        // under the backend flip — SQLite has no `FOR UPDATE SKIP LOCKED` and
+        // no advisory locks — so it refuses regardless of what is configured,
         // and this is the only coverage of that refusal.
         #[cfg(feature = "sqlite")]
         #[tokio::test]
@@ -18359,6 +18884,7 @@ mod tests {
                 minimum_sample_count: 3,
                 open_duration: Duration::from_secs(60),
                 half_open_trial_count: 2,
+                ..crate::circuit_breaker::CircuitBreakerPolicy::default()
             };
             let breaker =
                 crate::circuit_breaker::global_registry().get_or_create("job_queue", policy);
@@ -19902,6 +20428,8 @@ mod tests {
                 attempt: 1,
                 max_attempts: 1,
                 initial_backoff_ms: 0,
+                tenant: None,
+                cost_waited: false,
                 traceparent: Some(
                     "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
                 ),
@@ -20059,6 +20587,8 @@ mod tests {
                     attempt: 1,
                     max_attempts: 1,
                     initial_backoff_ms: 0,
+                    tenant: None,
+                    cost_waited: false,
                     traceparent: Some(
                         "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
                     ),
@@ -20230,6 +20760,7 @@ mod tests {
             minimum_sample_count: 3,
             open_duration: Duration::from_secs(60),
             half_open_trial_count: 2,
+            ..crate::circuit_breaker::CircuitBreakerPolicy::default()
         };
         let breaker = crate::circuit_breaker::global_registry().get_or_create("job_queue", policy);
 
@@ -20603,6 +21134,54 @@ mod tests {
                 .delay_cancelers
                 .contains_key(&id),
             "cancel_enqueued must remove the delay canceler from the map"
+        );
+    }
+
+    fn deferred_test_job(id: &str) -> QueuedJob {
+        QueuedJob {
+            id: id.to_string(),
+            name: "deferred_test".to_string(),
+            queue: "default".to_string(),
+            payload: serde_json::json!({}),
+            attempt: 1,
+            max_attempts: 3,
+            initial_backoff_ms: 10,
+            tenant: None,
+            cost_waited: false,
+            #[cfg(feature = "telemetry-otlp")]
+            traceparent: None,
+            #[cfg(feature = "telemetry-otlp")]
+            tracestate: None,
+        }
+    }
+
+    /// One task checks all deferred jobs, however many there are (#1720).
+    #[test]
+    fn deferred_jobs_share_one_waiter() {
+        let coordination = LocalJobCoordination::default();
+        assert!(
+            coordination.defer(deferred_test_job("a")),
+            "the first job starts the waiter"
+        );
+        assert!(
+            !coordination.defer(deferred_test_job("b")),
+            "later jobs use it"
+        );
+        assert!(!coordination.defer(deferred_test_job("c")));
+
+        let (ready, more) = coordination.take_deferred(|job| job.id == "b");
+        assert_eq!(
+            ready.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            ["b"]
+        );
+        assert!(more, "two jobs still wait");
+
+        let (ready, more) = coordination.take_deferred(|_| true);
+        assert_eq!(ready.len(), 2);
+        assert!(!more, "the waiter stops when no job is left");
+        assert!(
+            coordination.defer(deferred_test_job("d")),
+            "a new job starts a new waiter"
         );
     }
 

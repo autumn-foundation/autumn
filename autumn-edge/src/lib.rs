@@ -103,6 +103,10 @@ pub mod host;
 #[cfg_attr(docsrs, doc(cfg(feature = "host")))]
 pub mod gateway;
 
+#[cfg(feature = "node")]
+#[cfg_attr(docsrs, doc(cfg(feature = "node")))]
+pub mod node;
+
 /// The route macros an edge-safe handler module needs.
 ///
 /// An `#[edge]` module compiles for `wasm32-wasip1`, where `autumn-web` is not
@@ -174,6 +178,12 @@ mod manifest_guard {
     fn no_native_only_runtime_is_a_dependency() {
         for line in dependency_lines() {
             let name = line.split('=').next().unwrap_or_default().trim();
+            // The `node` feature uses tokio, hyper and reqwest. They must
+            // stay optional: a capsule never enables `node`.
+            if matches!(name, "tokio" | "reqwest" | "hyper" | "hyper-util") {
+                assert!(line.contains("optional = true"), "{line}");
+                continue;
+            }
             assert!(
                 !matches!(
                     name,
@@ -182,6 +192,38 @@ mod manifest_guard {
                 "`{name}` cannot compile for wasm32-wasip1; the edge crate must stay free of it"
             );
         }
+    }
+
+    #[test]
+    fn only_the_native_node_feature_enables_a_runtime() {
+        let features: Vec<&str> = MANIFEST
+            .lines()
+            .skip_while(|line| line.trim() != "[features]")
+            .skip(1)
+            .take_while(|line| !line.trim_start().starts_with('['))
+            .filter(|line| {
+                [
+                    "dep:tokio",
+                    "dep:reqwest",
+                    "dep:hyper",
+                    "tokio/",
+                    "reqwest/",
+                    "hyper",
+                    "\"node\"",
+                ]
+                .iter()
+                .any(|needle| line.contains(needle))
+            })
+            .collect();
+        assert_eq!(features.len(), 1, "{features:?}");
+        assert!(
+            features[0].trim_start().starts_with("node = "),
+            "{features:?}"
+        );
+        assert!(
+            MANIFEST.contains("default = []"),
+            "no default feature may pull in a runtime"
+        );
     }
 
     #[test]

@@ -124,6 +124,7 @@ the framework almost certainly already generates or ships it:
 | Shelling out to `wkhtmltopdf`/headless Chrome, or hand-rolling a PDF library, to turn a view into a downloadable invoice/receipt/report | `autumn_web::pdf::Pdf` (`pdf` Cargo feature) — `Pdf::from_markup(markup)` / `Pdf::from_html(html)` + `.filename(...)` / `.inline()`; renders headings/paragraphs/tables/lists/bold/italic with the PDF base-14 fonts, no system browser or embedded fonts required. Test with `TestResponse::assert_pdf_contains(&self, &str)`. See `docs/guide/pdf-downloads.md` (0.7.0) |
 | Hand-written RSS/Atom XML strings for a `/feed.xml` or podcast/blog feed | `feed::Feed::atom(..)` / `feed::Feed::rss(..)` + `feed::FeedEntry` — builds the XML, implements `IntoResponse` with the right `application/atom+xml`/`application/rss+xml` type, XML-escapes text, and `Feed::conditional(&headers)` reuses the `etag` layer for `304`s (0.6.0). See `docs/guide/conditional-get.md` |
 | A hand-rolled `AtomicU64` + a `MetricsSource` impl (or a whole second `prometheus`/`metrics` crate exporter) just to count something in a handler | `autumn_web::metrics` — `metrics::counter("checkout_completed_total").with_label("status", "paid").increment(1)`, plus `gauge`, `histogram` and `timer(..).start()` (a guard that records on drop, so early `?` returns and panics are covered) / `time` / `time_async`. Registers itself on first use and lands on the stock `/actuator/prometheus` and `/actuator/metrics` (`app` key) with zero `AppBuilder` wiring; caps cardinality (100 *labeled* series/instrument, 256 instruments, 8 labels/series by default) instead of leaking series (0.7.0, issue #1378); those three are the `[metrics]` section — `max_series_per_metric` / `max_instruments` / `max_labels_per_series`, plus `AUTUMN_METRICS__*` — so an app with a genuinely larger label space raises them rather than losing series, while the name/value/help-length caps stay fixed. Lowering a cap never evicts a retained series (that would reset a counter); an out-of-range value fails the boot naming the key. `describe_*` and `set_histogram_buckets` do not register anything, so startup calls work in either order; gauges and histograms take `usize`/`u64`/`i64` directly (`set(queue.len())`). `MetricsSource` is still the answer when a subsystem already owns the numbers. See `docs/guide/metrics.md` |
+| Hand-timing handlers with `Instant::now()` to bill tenants, or a cron job that checks a carbon/price API before it runs heavy work | `[cost] enabled = true` meters CPU time, allocated bytes (with an `AllocationProbe`) and DB queries per request, job run and scheduled tick, by tenant: `Server-Timing` `cost-cpu`/`cost-db`, the `autumn_cost_*_total{tenant}` metrics, `autumn_cost_work_*_total{kind}`, `GET /actuator/cost` (sensitive; `jobs.shift.ratio` is the share of deferrable CPU that ran after the window). `#[job(deferrable)]` / `#[scheduled(..., deferrable)]` wait while `CostSignal` is above `[cost] defer_threshold`, then run; never dropped. Set the signal with `CostSignal::set` or the `autumn_cost_signal` runtime-config key (`ConfigRegistry::define_cost_signal`). Jobs defer on every jobs backend. See `docs/guide/cost.md` (issue #1720) |
 | Reproducing a production 500 by copying the request into a test and guessing at the database state it saw | `[failure_capture] enabled = true` writes a redacted **failure capsule** (request + `PostgreSQL` wire traffic + clock readings + outcome, one JSON file) for every caught panic/5xx; `autumn replay <capsule>` re-runs it offline against an in-process stub DB — exit 0 reproduced / 1 mismatch / 2 refused. A capsule also carries every framework effect the run produced — outbound HTTP (webhooks included), job enqueues, cache reads/writes, mail, the resolved tenant and every random draw — and replay serves each from the capsule: no socket is opened, no job is queued, no mail is delivered, and a minted UUID/session id/CSRF token reappears byte-for-byte. A failure *inside a job* records a job-scoped capsule that `autumn replay` dispatches. Capsules are production data: read the security section of `docs/guide/failure-capsules.md` before enabling (0.7.0, #1598; 0.8.0, #1634) |
 | Triaging the same production bug twice because the first fix had no test pinning it | `autumn capsule test <capsule>` converts a capsule into a committed regression test: it copies the capsule's bytes **verbatim** into `tests/capsules/` (so whatever redaction removed stays removed), generates a `#[tokio::test]` beside it, registers both in `tests/integration/mod.rs`, and scaffolds a `capsule_support::router` hook once. The test drives the same replay engine `autumn replay` does and runs under plain `cargo test` with **zero live dependencies** — no network, DB, queue or Docker. `autumn capsule verify` replays the whole committed corpus, which doubles as an upgrade gate: run it against a new Autumn before deploying that version. Job capsules are refused here (no request to drive) — replay those with `autumn replay`. See `docs/guide/failure-capsules.md` (0.8.0, #1634) |
 | Proving a retry path survives "the 3rd DB checkout fails" or "the 2nd `send_invoice` execution fails" with a real-clock test that can only hope for the timing, or with `Chaos` rates that never reproduce the exact failure | `autumn_web::sim::FaultPlan` — an **authored**, seed-deterministic fault scenario attached with `TestApp::with_fault_plan(plan)`: `FaultPlan::from_seed(seed).fail_db_checkout(3).fail_job("send_invoice", 2)` fails exactly those effects through the existing interceptor seams (no app code changes), `only_between(from, to)` gates faults on the injected clock, `random_*_faults(n, 1..=k)` picks ordinals from the seed. `client.fault_outcome().await` returns a serializable `FaultOutcome` (`fired` / `suppressed` / `unfired` / `server_errors` via reporting / `final_state`); `to_json_string()` is byte-identical on every replay of a seed under `#[sim_test]`. Drain jobs with `Sim::run_to_idle` (not `perform_enqueued_jobs`, which bypasses `intercept_execute`). See `docs/guide/simulation-testing.md` → "Authored fault scenarios" (#1680) |
@@ -1879,6 +1880,13 @@ backend-conditionally rather than assuming Postgres.
   `from_database_config(&config.database)` returns `None` unless the configured
   primary names Postgres. `.expect()` on it fails at BOOT on a `sqlite://`
   target — pick `InMemoryFlagStore` / `InMemoryConfigStore` on that arm instead.
+- `PgFlagStore` reads an in-memory snapshot and never connects on a Tokio
+  worker (issue #3063). Run `PgFlagStore::spawn_poll_listener` so replicas see
+  changes (they poll; there is no `LISTEN`). Before its first load, `get` on a
+  runtime returns an error: call `refresh()` before you seed flags, and seed
+  only on `Ok(None)`. A store error serves last-known values; set a fallback
+  with `FeatureFlagService::with_default` and register it with
+  `AppBuilder::with_flag_service`.
 - `DatabaseConfig::effective_primary_postgres_url()` is the screen to branch on
   (`effective_primary_url()` returns the target whatever backend it names).
 - `Lock::from_state` returns `LockError::PoolUnavailable` under the `sqlite`
@@ -2722,6 +2730,33 @@ declares. Every contract failure — missing file, malformed document, a contrac
 measured on a different host class — falls back to *unlimited*, never to a
 ceiling. See `docs/guide/capacity-contracts.md`.
 
+## Resilience: outbound circuit breakers
+
+The HTTP client (per host), durable job enqueue (`job_queue`) and the SMTP
+mailer (`smtp_mailer`) run behind a `CircuitBreaker`. It opens on the failure
+ratio **or** the slow-call ratio (issue #3060):
+
+```toml
+[resilience.circuit_breaker.defaults]
+slow_call_duration_threshold_ms = 60000  # 0 turns slow-call detection off
+slow_call_rate_threshold = 1.0           # open when all calls are slow
+cancelled_call_outcome = "slow"          # or "failure"
+
+[resilience.circuit_breaker.hosts."api.stripe.com"]
+slow_call_duration_threshold_ms = 5000
+slow_call_rate_threshold = 0.5
+```
+
+- A call dropped (for example by a timeout) at or after the threshold counts
+  as slow, or as failed. Dropped earlier, it counts as nothing.
+- Set the threshold below `server.timeouts.request_timeout_ms`, or the timeout
+  cancels a slow call first.
+- Breaker state is per process. Metrics: `autumn_circuit_breaker_slow_calls_total`,
+  `autumn_circuit_breaker_slow_call_ratio` (label `name`).
+- A `CircuitBreakerPolicy` struct literal needs `..CircuitBreakerPolicy::default()`.
+
+See `docs/guide/resilience.md`.
+
 ## Sharding (0.6.0)
 
 Framework-native horizontal sharding: declare `[[database.shards]]` (each a
@@ -3170,6 +3205,9 @@ autumn release init --target azure-container-apps   # Terraform scaffold: main.t
 autumn release init --target aws-app-runner      # Fast/minimal AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ECR, App Runner behind a VPC connector, RDS Postgres, Secrets Manager). No CI workflow (#1279); see docs/guide/deployment.md.
 autumn release init --target aws-ecs             # Production AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (VPC, ALB+ACM DNS-validated HTTPS, ECS Fargate w/ circuit-breaker rollback, Application Auto Scaling, RDS, opt-in Redis) + .github/workflows/aws-deploy.yml (#1279); see docs/guide/deployment.md.
 autumn release init --target gcp-cloud-run       # GCP path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (Artifact Registry, Cloud Run, Cloud SQL Postgres behind a VPC connector, Secret Manager, opt-in Memorystore Redis) + .github/workflows/gcp-deploy.yml (#1280); see docs/guide/deployment.md.
+# Release probe paths (#3066): every target sends traffic checks to /ready and liveness to /live, never the /health alias.
+#   Image HEALTHCHECK -> /startup (compose --wait waits for startup; Swarm does not replace containers during a DB outage). ECS ALB target group and App Runner cutover -> /ready.
+#   Cloud Run -> startup probe /ready (its only traffic gate), liveness /live. Azure Container Apps -> startup /startup, readiness /ready, liveness /live. Fly -> /ready + /live.
 autumn migrate new add_widget_archived_at   # collision-free migration dir: prefer this (or `generate migration`) over hand-creating one — see "Migration version collisions" below
 autumn migrate check-collisions             # CI gate: fails if this branch's migration version collides with the default branch, another pushed branch, or the framework's own migrations
 autumn sbom                      # CycloneDX 1.5 SBOM for this source tree, to stdout (deterministic: no timestamp, content-derived serialNumber) (0.8.0, issue #1615)

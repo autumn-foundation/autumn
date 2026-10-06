@@ -83,6 +83,8 @@ mod config_deprecation;
 mod config_runtime_drift;
 #[cfg(feature = "constela")]
 mod constela;
+mod cost_deferral_durable;
+mod cost_metering;
 #[cfg(feature = "acme")]
 mod custom_domain_issuance;
 mod custom_domains;
@@ -185,6 +187,8 @@ mod job_tracking_route;
 mod job_tracking_stores_integration;
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 mod lease_lock;
+#[cfg(feature = "db")]
+mod list_rows_snapshot;
 #[cfg(all(feature = "ws", feature = "maud", feature = "htmx", feature = "db"))]
 mod live_broadcast;
 mod live_state;
@@ -404,9 +408,11 @@ mod sim_advance_to;
 mod sim_ambient_clock;
 mod sim_ambient_modules;
 mod sim_chaos_clock_skew_monotonic;
+mod sim_circuit_breaker_slow_calls;
 mod sim_clock_drain;
 #[cfg(feature = "collab")]
 mod sim_collab_convergence;
+mod sim_cost_deferral;
 mod sim_crash_at;
 mod sim_default_entropy;
 mod sim_delayed_enqueue;
