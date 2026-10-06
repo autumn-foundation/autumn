@@ -3271,6 +3271,8 @@ fi
   [ -n "$STUB_APP_OWN_IDENTITY" ] && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"/other\":{\"principalId\":\"o\"}}},"
   registries=""
   [ -n "$STUB_APP_LEGACY" ] && [ -z "$STUB_APP_NO_REGISTRY" ] && registries="{\"server\":\"acr.azurecr.io\",\"identity\":\"$id\"}"
+  # An operator registry whose password is a managed secret.
+  [ -n "$STUB_APP_REGISTRY_PASSWORD_REF" ] && registries="${registries:+$registries,}{\"server\":\"other.example.io\",\"username\":\"u\",\"passwordSecretRef\":\"database-url\"}"
   secrets=""
   sid="$id"
   [ -n "$STUB_APP_STALE_SECRET_IDENTITY" ] && sid=/old-id
@@ -3617,6 +3619,7 @@ esac
     /// inputs. [`run_azure_cutover_with_args`] clears them all first.
     #[cfg(unix)]
     const AZ_STUB_FLAGS: &[&str] = &[
+        "STUB_APP_REGISTRY_PASSWORD_REF",
         "STUB_INLINE_STALE",
         "STUB_APP_COPIED_BIG",
         "STUB_INGRESS_DISABLE_FAILS",
@@ -6005,6 +6008,36 @@ esac
         );
         // The value never goes on a command line.
         assert!(!calls.contains("tok-old"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_when_a_registry_password_is_a_managed_secret() {
+        // An operator registry authenticates with a managed secret
+        // (passwordSecretRef). Removal would delete that secret, so the
+        // script stops before any write, in both modes.
+        for args in [&[][..], &["--remove-credentials"][..]] {
+            let Some((status, calls, _)) = run_azure_cutover_with_args(
+                args,
+                "mcr.microsoft.com/k8se/quickstart:latest",
+                "Provisioned",
+                false,
+                0,
+                &[
+                    ("STUB_APP_LEGACY", "1"),
+                    ("STUB_APP_REGISTRY_PASSWORD_REF", "1"),
+                ],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{args:?}: {calls}");
+            assert!(!calls.contains("az tags-patch"), "{args:?}: {calls}");
+            assert!(!calls.contains("ingress disable"), "{args:?}: {calls}");
+            assert!(
+                !calls.contains("az rest --method patch"),
+                "{args:?}: {calls}"
+            );
+        }
     }
 
     #[cfg(unix)]
