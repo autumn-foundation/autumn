@@ -84,6 +84,17 @@
           "provenance": "provable"
         },
         {
+          "path": "/actuator/cost",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
           "path": "/actuator/derivations",
           "method": "GET",
           "name": "actuator",
@@ -576,6 +587,11 @@
         },
         {
           "path": "/actuator/configprops",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/cost",
           "method": "GET",
           "mtls_required": false
         },

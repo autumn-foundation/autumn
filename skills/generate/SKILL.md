@@ -279,14 +279,16 @@ handler returning a `Download` (so `Content-Type: text/csv`,
 **Export CSV** link on the index carrying the current query string, and a
 database-free generated test. The planner auto-enables autumn-web's `csv`
 feature, so the scaffold compiles with no manual edits. The export honours the
-same allowlisted `?sort=`/`?filter[col]=` params as the index via the same
-`ListQuery` + `repo.list` pair (`?page=`/`?size=` are ignored — an export
-spans every page; `?q=` is NOT honoured, since `ListQuery` carries no
-full-text term), reads in `MAX_PAGE_SIZE` batches capped at `MAX_EXPORT_ROWS`
-(10 000), and mirrors the index's security posture exactly: an owner-scoped
-scaffold's export is `#[secured]` and goes through `list_scoped`, never the
-unscoped `list`. It additionally carries `#[throttle(limit = 6, per = "1m",
-key = "ip")]` the index does not — same row set, ~100x the cost per request.
+same allowlisted `?sort=`/`?filter[col]=` params as the index: it reads with
+`repo.list_rows`, which applies the same `ListQuery` allowlist as `repo.list`
+(`?page=`/`?size=` are ignored — an export spans every page; `?q=` is NOT
+honoured, since `ListQuery` carries no full-text term). It reads in ONE
+statement with no `COUNT(*)`, capped at `MAX_EXPORT_ROWS` (10 000), so the
+file comes from one snapshot (issue #2185). It mirrors the index's security
+posture exactly: an owner-scoped scaffold's export is `#[secured]` and goes
+through `list_scoped_rows`, never an unscoped read. It additionally carries
+`#[throttle(limit = 6, per = "1m", key = "ip")]` the index does not: one export
+loads up to 10 000 rows and builds the whole file in memory.
 `NULL` columns become empty cells, not the string `None`, and text columns
 pass through an emitted `csv_text_cell` guard against spreadsheet formula
 injection (numeric/date/bool/enum columns are not guarded — guarding them

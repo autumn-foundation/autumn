@@ -2,6 +2,20 @@ use axum::extract::ConnectInfo;
 use axum::http::Request;
 use std::net::{IpAddr, SocketAddr};
 
+// Clone class (issues #2452, #2929): this `TrustedProxy` is a byte-identical
+// duplicate of the private `crate::security::trusted_proxies::TrustedProxy` —
+// same CIDR parse/contains logic, down to the shift arithmetic. The two were
+// never the same decision made once: `trusted_proxies::TrustedProxy` is the
+// one actually wired into `ProxyResolver`/`TrustedProxiesLayer` and carries
+// the proptest fuzz harness added in #1690 (parse-never-panics, round-trip);
+// this copy has only example-based unit tests and, per an exhaustive grep,
+// zero production callers of its own — `extract_client_ip` below is never
+// invoked from framework code either. Fix a bug in one copy's CIDR matching
+// and the other stays stale unless someone remembers to mirror it by hand.
+// Deprecating or removing this dead copy touches a `pub` surface (semver,
+// changelog, migration guide), so it is a human decision, not a merge an
+// unattended run should make; this comment exists so the next person doesn't
+// mistake it for live code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TrustedProxy {
     pub network: IpAddr,

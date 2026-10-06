@@ -67,6 +67,13 @@ use tower::{Layer, Service};
 use crate::security::config::TrustedProxiesConfig;
 
 /// A parsed trusted-proxy CIDR range or exact IP.
+// Clone class (issues #2452, #2929): `crate::security::proxy::TrustedProxy`
+// is a byte-identical duplicate of this struct's parse/contains logic, kept
+// public with zero production callers of its own. This copy is the one
+// actually wired into `ProxyResolver`/`TrustedProxiesLayer` and the one that
+// carries the proptest fuzz harness (#1690) — a fix here does not reach the
+// sibling copy automatically. See the comment on `proxy::TrustedProxy` for
+// why removing that copy needs a human call rather than an unattended merge.
 #[derive(Debug, Clone, Copy)]
 struct TrustedProxy {
     network: IpAddr,

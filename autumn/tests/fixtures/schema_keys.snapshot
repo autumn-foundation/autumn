@@ -100,6 +100,12 @@ cors.allowed_headers
 cors.allowed_methods
 cors.allowed_origins
 cors.max_age_secs
+cost
+cost.defer_recheck_secs
+cost.defer_threshold
+cost.enabled
+cost.max_tenants
+cost.signal_refresh_secs
 database
 database.auto_migrate
 database.auto_migrate_in_production
