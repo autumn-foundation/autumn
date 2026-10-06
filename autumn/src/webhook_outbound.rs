@@ -91,6 +91,10 @@ pub trait OutboundWebhookHandler: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = AutumnResult<Vec<WebhookSubscription>>> + Send>>;
 
     /// Log a webhook delivery attempt and handle failure counters/statuses.
+    ///
+    /// A log with a 2xx response is final: ignore a later write to it. Two
+    /// jobs can send one delivery (an outbox re-send), and the late one must
+    /// not overwrite the success.
     fn log_delivery(
         &self,
         log: WebhookDeliveryLog,
@@ -242,6 +246,14 @@ impl OutboundWebhookHandler for InMemoryOutboundWebhookHandler {
         log: WebhookDeliveryLog,
     ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
         let mut logs = self.logs.write().expect("logs write lock poisoned");
+        // A 2xx log is final: a late duplicate job cannot overwrite it.
+        if logs
+            .get(&log.id)
+            .and_then(|stored| stored.response_status)
+            .is_some_and(|status| (200..300).contains(&status))
+        {
+            return Box::pin(async { Ok(()) });
+        }
         logs.insert(log.id.clone(), log.clone());
 
         // Manage subscription consecutive failures and auto-disabling state
@@ -1252,6 +1264,38 @@ mod tests {
 
     /// Issue #3062: each retry sends the same `webhook-id`, so a receiver can
     /// drop a duplicate.
+    /// A 2xx log is final. A late failure of a duplicate job does not
+    /// overwrite it or count as a failure.
+    #[tokio::test]
+    async fn a_success_log_is_final() {
+        let store = InMemoryOutboundWebhookHandler::new();
+        store
+            .create_subscription(sample_subscription(
+                "sub",
+                "http://receiver/hooks",
+                WebhookSubscriptionStatus::Active,
+            ))
+            .await
+            .unwrap();
+        let mut ok = sample_log("log", "sub");
+        ok.response_status = Some(200);
+        store.log_delivery(ok).await.unwrap();
+
+        let mut late = sample_log("log", "sub");
+        late.response_status = Some(500);
+        late.last_error = Some("500".to_owned());
+        store.log_delivery(late).await.unwrap();
+        let mut pending = sample_log("log", "sub");
+        pending.attempt = 2;
+        store.log_delivery(pending).await.unwrap();
+
+        let log = store.get_delivery_log("log").await.unwrap().unwrap();
+        assert_eq!(log.response_status, Some(200));
+        assert_eq!(log.attempt, 1);
+        let sub = store.get_subscription("sub").await.unwrap().unwrap();
+        assert_eq!(sub.consecutive_failures, 0);
+    }
+
     #[tokio::test]
     async fn webhook_retries_carry_identical_webhook_id() {
         let state = AppState::for_test();

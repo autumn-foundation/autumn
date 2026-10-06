@@ -410,6 +410,34 @@ mod sql_webhook_store {
         );
     }
 
+    /// A 2xx log is final. A late failure of a duplicate job does not
+    /// overwrite it or count as a failure.
+    #[tokio::test]
+    async fn sql_store_success_log_is_final() {
+        let substrate = substrate().await;
+        let store = SqlOutboundWebhookStore::new(substrate.pool());
+        store.ensure_schema().await.unwrap();
+        store
+            .create_subscription(subscription("sub-1"))
+            .await
+            .unwrap();
+        store.log_delivery(log("l", Some(200), None)).await.unwrap();
+
+        store
+            .log_delivery(log("l", Some(500), Some("500")))
+            .await
+            .unwrap();
+        let mut pending = log("l", None, None);
+        pending.attempt = 2;
+        store.log_delivery(pending).await.unwrap();
+
+        let stored = store.get_delivery_log("l").await.unwrap().unwrap();
+        assert_eq!(stored.response_status, Some(200));
+        assert_eq!(stored.attempt, 1);
+        let sub = store.get_subscription("sub-1").await.unwrap().unwrap();
+        assert_eq!(sub.consecutive_failures, 0);
+    }
+
     #[tokio::test]
     async fn sql_store_counts_failures_like_the_in_memory_store() {
         let substrate = substrate().await;

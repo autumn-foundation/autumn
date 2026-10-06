@@ -90,6 +90,11 @@ const LOG_COLUMNS: &str = "id, subscription_id, topic, payload, request_headers,
      response_status, response_body, elapsed_ms, attempt, max_attempts, is_dlq, last_error, \
      logged_at";
 
+/// Added to `UPSERT_LOG_SQL` for an outcome: a 2xx log is final, so a late
+/// duplicate job cannot overwrite it.
+const KEEP_SUCCESS_SQL: &str = " WHERE autumn_webhook_deliveries.response_status IS NULL \
+     OR autumn_webhook_deliveries.response_status NOT BETWEEN 200 AND 299";
+
 const RESET_FAILURES_SQL: &str = "UPDATE autumn_webhook_subscriptions \
      SET consecutive_failures = 0 WHERE id = $1";
 
@@ -350,7 +355,8 @@ impl SqlOutboundWebhookStore {
 
     async fn write_log(&self, log: &WebhookDeliveryLog) -> AutumnResult<()> {
         let mut conn = self.conn().await?;
-        write_log_on(&mut conn, log).await
+        write_log_on(&mut conn, log, UPSERT_LOG_SQL).await?;
+        Ok(())
     }
 
     async fn update_subscription(&self, query: &str, id: &str) -> AutumnResult<()> {
@@ -377,10 +383,15 @@ impl SqlOutboundWebhookStore {
 }
 
 /// Upsert one delivery log on `conn`.
-async fn write_log_on(conn: &mut RuntimeConnection, log: &WebhookDeliveryLog) -> AutumnResult<()> {
+/// Upsert `log` with `upsert` and return the number of changed rows.
+async fn write_log_on(
+    conn: &mut RuntimeConnection,
+    log: &WebhookDeliveryLog,
+    upsert: &str,
+) -> AutumnResult<usize> {
     let headers =
         serde_json::to_string(&log.request_headers).map_err(|error| db_error("headers", &error))?;
-    diesel::sql_query(sql(UPSERT_LOG_SQL))
+    diesel::sql_query(sql(upsert))
         .bind::<Text, _>(&log.id)
         .bind::<Text, _>(&log.subscription_id)
         .bind::<Text, _>(&log.topic)
@@ -396,8 +407,7 @@ async fn write_log_on(conn: &mut RuntimeConnection, log: &WebhookDeliveryLog) ->
         .bind::<BigInt, _>(log.timestamp.timestamp_millis())
         .execute(conn)
         .await
-        .map_err(|error| db_error("log write", &error))?;
-    Ok(())
+        .map_err(|error| db_error("log write", &error))
 }
 
 /// Write `log` and its failure-counter outcome in one transaction, so the
@@ -410,7 +420,10 @@ async fn log_with_outcome(
     use scoped_futures::ScopedFutureExt as _;
     crate::db::scoped_transaction(conn, |conn| {
         async move {
-            write_log_on(conn, log).await?;
+            let upsert = format!("{UPSERT_LOG_SQL}{KEEP_SUCCESS_SQL}");
+            if write_log_on(conn, log, &upsert).await? == 0 {
+                return Ok(false); // a 2xx log is final
+            }
             let failed_now = match outcome(log) {
                 // A 2xx on a `Failed` subscription comes from a replay. It
                 // reactivates the subscription in this transaction.
