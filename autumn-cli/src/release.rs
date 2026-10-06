@@ -5932,6 +5932,28 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn azure_cutover_script_refuses_removal_while_a_real_revision_is_active() {
+        // During a handoff, a real revision and the placeholder are both
+        // active. The real revision needs the credentials, so standalone
+        // removal stops before any write.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1"), ("STUB_ACTIVE_BOTH", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("az tags-patch"), "{calls}");
+        assert!(!calls.contains("ingress disable"), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn azure_cutover_script_opens_ingress_only_when_the_placeholder_is_inactive() {
         // Provisioned is not ready: Azure keeps the placeholder active until
         // the new revision scales and passes its probes. Ingress then could
