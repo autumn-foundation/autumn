@@ -621,6 +621,28 @@ rollback() {
   echo "::error::rollback failed: remove the identity and secrets from $AZURE_APP_NAME manually" >&2
 }
 
+# The record of copied credentials that a first cutover writes in its PATCH.
+COPIED_RECORD=$(jq -cn --argjson names "$JOB_SECRET_NAMES" --argjson uids "$REMOVE_UIDS" \
+  --argjson copied "$COPIED" '{secrets: ($names + ($copied.secrets // []) | unique), uids: $uids}')
+
+# Azure allows 50 tags on a resource. The operator's tags, the ingress
+# snapshot and the copied record must fit together, so the script checks
+# before any write. $1 is the number of copied-record parts the run keeps.
+check_tag_budget() {
+  local total
+  total=$(jq -n --argjson app "$APP" --argjson saved "$SAVED_INGRESS" --argjson copied_parts "$1" '
+    def parts(x): if x == null then 0 else ((x | tojson | @base64 | length) + 255) / 256 | floor end;
+    ([$app.tags // {} | keys[]
+      | select((startswith("autumn-ingress-") or startswith("autumn-copied-")) | not)] | length)
+    + parts($saved) + $copied_parts')
+  if [ "$total" -gt 50 ]; then
+    echo "::error::$AZURE_APP_NAME needs $total tags (its own, the saved ingress and the record of copied credentials), and Azure allows 50. Remove some tags from the app, and try again." >&2
+    exit 1
+  fi
+}
+COPIED_PARTS=$(jq -n --argjson r "$COPIED_RECORD" '((($r | tojson | @base64 | length) + 255) / 256) | floor')
+EXISTING_COPIED_PARTS=$(jq '[.tags // {} | keys[] | select(startswith("autumn-copied-"))] | length' <<< "$APP")
+
 if [ "$MODE" = remove ]; then
   if [ -n "$RELEASED" ]; then
     echo "::error::$AZURE_APP_NAME runs a real release. It needs its credentials." >&2
@@ -631,6 +653,8 @@ if [ "$MODE" = remove ]; then
     exit 1
   fi
   [ -z "$SHARED_IDENTITY" ] || shared_identity_stop
+  # The removal keeps the existing copied record until stage 2.
+  check_tag_budget "$EXISTING_COPIED_PARTS"
   # The placeholder has credentials until stage 2. Ingress closes for the
   # removal (the tags keep the snapshot) and comes back only after it.
   if [ "$(jq -r '.properties.configuration.ingress != null' <<< "$APP")" = true ]; then
@@ -717,6 +741,7 @@ if [ -z "$RELEASED" ]; then
       restore_ingress
       exit 1
     }
+    check_tag_budget "$COPIED_PARTS"
     save_ingress_tags \
       || { echo "::error::cannot save the ingress of $AZURE_APP_NAME in its tags. The script stops before it disables ingress." >&2; exit 1; }
     az containerapp ingress disable \
@@ -796,10 +821,9 @@ fi
 # earlier interrupted run recorded), so a later rollback can remove it.
 COPIED_TAGS='{}'
 if [ -z "$RELEASED" ]; then
-  COPIED_TAGS=$(jq -cn --argjson app "$APP" --argjson names "$JOB_SECRET_NAMES" \
-    --argjson uids "$REMOVE_UIDS" --argjson copied "$COPIED" '
+  COPIED_TAGS=$(jq -cn --argjson app "$APP" --argjson record "$COPIED_RECORD" '
     [$app.tags // {} | keys[] | select(startswith("autumn-copied-"))] as $old
-    | ({secrets: ($names + ($copied.secrets // []) | unique), uids: $uids} | tojson | @base64) as $b
+    | ($record | tojson | @base64) as $b
     | [range(0; $b | length; 256) as $i | $b[$i:$i + 256]]
     | if length > 40 then error("the record of copied credentials is too large for the tags") else . end
     | (to_entries | map({key: ("autumn-copied-" + (.key | tostring)), value}) | from_entries) as $new
@@ -890,8 +914,10 @@ sole_active "$REVISION" || fail "revision $REVISION did not become the only acti
 # The sole active revision runs the real image, so external ingress can
 # open now. It opens before a restart: a revision scaled to zero needs a
 # request through ingress to start a replica.
-open_ingress || fail "cannot open external ingress"
+# A failed call has an unknown outcome: Azure can apply the PATCH and the
+# answer can be lost. So a rollback treats ingress as open from here on.
 OPENED=1
+open_ingress || fail "cannot open external ingress"
 
 # No new revision: secrets are application-scope, and the running revision
 # reads them only when it starts.

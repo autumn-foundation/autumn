@@ -5793,9 +5793,9 @@ esac
     #[cfg(unix)]
     #[test]
     fn azure_cutover_script_stops_when_the_snapshots_exceed_the_tag_limit() {
-        // Azure allows 50 tags. 49 of the operator's own leave no room for
-        // the ingress snapshot and the copied record, so the script stops
-        // before any write, in both modes.
+        // Azure allows 50 tags. 50 of the operator's own leave no room for
+        // the ingress snapshot (and, on a first cutover, the copied record),
+        // so the script stops before any write, in both modes.
         for args in [&[][..], &["--remove-credentials"][..]] {
             let Some((status, calls, _)) = run_azure_cutover_with_args(
                 args,
@@ -5803,7 +5803,7 @@ esac
                 "Provisioned",
                 false,
                 0,
-                &[("STUB_APP_TAG_COUNT", "49"), ("STUB_APP_LEGACY", "1")],
+                &[("STUB_APP_TAG_COUNT", "50"), ("STUB_APP_LEGACY", "1")],
             ) else {
                 return;
             };
