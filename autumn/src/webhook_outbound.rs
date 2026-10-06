@@ -932,6 +932,11 @@ async fn begin_attempt(
     log: &mut WebhookDeliveryLog,
     is_replay: bool,
 ) -> AutumnResult<bool> {
+    // A replay takes the log out of the DLQ. A new failure that uses the
+    // last attempt puts it back.
+    if is_replay {
+        log.is_dlq = false;
+    }
     if log.response_status.is_none() && log.last_error.is_none() {
         return Ok(true);
     }
@@ -2020,6 +2025,14 @@ mod tests {
         .expect("the replay is delivered");
 
         assert_eq!(mock.call_count(), 1, "the replay sends the request");
+        let log = store
+            .get_delivery_log("log_exhausted")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(log.response_status, Some(200));
+        assert!(!log.is_dlq, "a successful replay leaves the DLQ");
+        assert!(store.get_dlq_logs().await.unwrap().is_empty());
     }
 
     struct CountingReplacementStore {
