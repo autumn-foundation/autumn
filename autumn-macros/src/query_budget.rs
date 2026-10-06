@@ -2322,18 +2322,10 @@ impl Analyzer {
         match init {
             Expr::Paren(p) => self.referents_of(&p.expr),
             Expr::Group(g) => self.referents_of(&g.expr),
-            Expr::Reference(r) if r.mutability.is_some() => {
-                // `&mut *slots.get_mut(0).unwrap()`: a reborrow of a
-                // temporary borrows what the temporary borrows.
-                let Some(root) = place_root(&r.expr) else {
-                    return self.referents_of(place_base(&r.expr));
-                };
-                let through = self.env.binding(&root).referents;
-                if through.is_empty() {
-                    vec![root]
-                } else {
-                    through
-                }
+            Expr::Reference(r) if r.mutability.is_some() => self.place_referents(&r.expr),
+            // `&raw mut slot`: a write through the pointer reaches `slot`.
+            Expr::RawAddr(r) if matches!(r.mutability, syn::PointerMutability::Mut(_)) => {
+                self.place_referents(&r.expr)
             }
             Expr::Path(_) => path_ident(init)
                 .map(|name| self.env.binding(&name).referents)
@@ -2350,7 +2342,13 @@ impl Analyzer {
                 let parts: Vec<&Expr> = match init {
                     Expr::Tuple(t) => t.elems.iter().collect(),
                     Expr::Array(a) => a.elems.iter().collect(),
-                    Expr::Struct(st) => st.fields.iter().map(|f| &f.expr).collect(),
+                    // `Ctx { n: 1, ..base }` keeps what `base` borrows.
+                    Expr::Struct(st) => st
+                        .fields
+                        .iter()
+                        .map(|f| &f.expr)
+                        .chain(st.rest.as_deref())
+                        .collect(),
                     _ => Vec::new(),
                 };
                 let mut all: Vec<String> = parts
@@ -2394,6 +2392,21 @@ impl Analyzer {
                 all
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// The names that a `&mut` or `&raw mut` of `place` points to.
+    fn place_referents(&self, place: &Expr) -> Vec<String> {
+        // `&mut *slots.get_mut(0).unwrap()`: a reborrow of a temporary
+        // borrows what the temporary borrows.
+        let Some(root) = place_root(place) else {
+            return self.referents_of(place_base(place));
+        };
+        let through = self.env.binding(&root).referents;
+        if through.is_empty() {
+            vec![root]
+        } else {
+            through
         }
     }
 
@@ -12574,6 +12587,21 @@ mod tests {
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut slot = None; let refs = Refs { a: &mut slot }; let target = refs.a; \
                  *target = Some(repo); drop(target); slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a raw pointer keeps its owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; let target = &raw mut slot; \
+                 unsafe { *target = Some(repo); } slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a struct update keeps the borrows of its base",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; let base = Ctx { slot: &mut slot, n: 0 }; \
+                 let refs = Ctx { n: 1, ..base }; *refs.slot = Some(repo); drop(refs); \
+                 slot.unwrap().find_all().await?; Ok(0) }",
                 Expect::Unbounded,
             ),
             (
