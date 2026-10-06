@@ -2369,6 +2369,8 @@ impl Analyzer {
             // or a `return`, or any borrow made in it (a local may pass it
             // on).
             Expr::Async(a) => self.block_borrows(&a.block),
+            // `try { &mut slot }`: the same, for the `Ok` value.
+            Expr::TryBlock(t) => self.block_borrows(&t.block),
             // `move || alias`: what the body names or borrows.
             Expr::Closure(c) => self.closure_borrows(c),
             // `vec![&raw mut slot]`, or any macro whose body reads as
@@ -13061,6 +13063,13 @@ mod tests {
     #[test]
     fn try_block_values_keep_handles() {
         check_handlers(&[
+            (
+                "guard: a try block's borrow keeps its owner",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let mut slot = None; let wrapped: Result<_, ()> = try { &mut slot }; \
+                 let target = wrapped?; *target = Some(repo); slot.unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
             (
                 "guard: a try block's value keeps its handle",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
