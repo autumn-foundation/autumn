@@ -732,7 +732,7 @@ fn run_single_target(
     // forks from what a fresh build would produce. Fail fast rather than
     // compounding the drift.
     let dir = std::path::Path::new(migrations_dir);
-    if !validate_checksums_before_apply(database_url, dir) {
+    if !validate_checksums_before_apply(database_url, dir, lock_policy) {
         return false;
     }
 
@@ -752,7 +752,7 @@ fn run_single_target(
     // (framework versions live in the embedded set and are recorded by
     // `run_pending`); it is idempotent (ON CONFLICT DO NOTHING), so recording
     // again after the framework step below is harmless.
-    record_checksums_after_apply(database_url, dir);
+    record_checksums_after_apply(database_url, dir, lock_policy);
 
     let framework_ok = if is_shard {
         run_shard_framework_migrations(database_url, lock_policy)
@@ -811,9 +811,19 @@ fn run_single_target_sqlite(database_url: &str, migrations_dir: &str) -> bool {
 /// Returns `true` when validation passes OR when the checksum table doesn't
 /// yet exist — a fresh database that hasn't run the framework migration
 /// which creates the table is not itself an error.
-fn validate_checksums_before_apply(database_url: &str, migrations_dir: &std::path::Path) -> bool {
-    match autumn_web::migrate::validate_recorded_checksums_against_dir(database_url, migrations_dir)
-    {
+///
+/// The reads run under `lock_policy`, so a lock on the bookkeeping tables
+/// fails fast and is retried instead of blocking (#3057).
+fn validate_checksums_before_apply(
+    database_url: &str,
+    migrations_dir: &std::path::Path,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
+) -> bool {
+    match autumn_web::migrate::validate_recorded_checksums_against_dir_with_policy(
+        database_url,
+        migrations_dir,
+        lock_policy,
+    ) {
         Ok(()) => true,
         Err(e) => {
             eprintln!("\u{274C} {e}");
@@ -826,8 +836,18 @@ fn validate_checksums_before_apply(database_url: &str, migrations_dir: &std::pat
 /// migration that doesn't yet have a stored checksum (issue #1203).
 /// Silent when the migrations dir is unreadable — this backfills the CLI
 /// path when the framework's checksum table wasn't present before.
-fn record_checksums_after_apply(database_url: &str, migrations_dir: &std::path::Path) {
-    match autumn_web::migrate::record_checksums_from_dir(database_url, migrations_dir) {
+///
+/// Runs under `lock_policy`, like the check before the apply.
+fn record_checksums_after_apply(
+    database_url: &str,
+    migrations_dir: &std::path::Path,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
+) {
+    match autumn_web::migrate::record_checksums_from_dir_with_policy(
+        database_url,
+        migrations_dir,
+        lock_policy,
+    ) {
         Ok(0) => {}
         Ok(n) => {
             eprintln!(
