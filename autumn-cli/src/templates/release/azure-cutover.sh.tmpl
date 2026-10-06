@@ -647,7 +647,10 @@ COPIED_PARTS=$(jq -n --argjson r "$COPIED_RECORD" '((($r | tojson | @base64 | le
 EXISTING_COPIED_PARTS=$(jq '[.tags // {} | keys[] | select(startswith("autumn-copied-"))] | length' <<< "$APP")
 
 if [ "$MODE" = remove ]; then
-  if [ -n "$RELEASED" ]; then
+  # Any active real revision needs the credentials, also during a handoff
+  # when a placeholder revision is still active too. (A first-cutover
+  # rollback calls remove_credentials directly, not through this check.)
+  if [ -n "$REAL_ACTIVE" ]; then
     echo "::error::$AZURE_APP_NAME runs a real release. It needs its credentials." >&2
     exit 1
   fi
