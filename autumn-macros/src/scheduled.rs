@@ -14,6 +14,8 @@ struct ScheduledAttrs {
     name: Option<String>,
     tz: Option<String>,
     coordination: Option<String>,
+    /// Wait while the cost signal is high (issue #1720).
+    deferrable: bool,
 }
 
 fn parse_scheduled_args(attr: TokenStream) -> syn::Result<ScheduledAttrs> {
@@ -23,6 +25,7 @@ fn parse_scheduled_args(attr: TokenStream) -> syn::Result<ScheduledAttrs> {
         name: None,
         tz: None,
         coordination: None,
+        deferrable: false,
     };
 
     syn::meta::parser(|meta| {
@@ -46,9 +49,13 @@ fn parse_scheduled_args(attr: TokenStream) -> syn::Result<ScheduledAttrs> {
             let value: LitStr = meta.value()?.parse()?;
             result.coordination = Some(value.value());
             Ok(())
+        } else if meta.path.is_ident("deferrable") {
+            result.deferrable = crate::job::parse_flag(&meta)?;
+            Ok(())
         } else {
-            Err(meta
-                .error("unsupported attribute: expected every, cron, name, tz, or coordination"))
+            Err(meta.error(
+                "unsupported attribute: expected every, cron, name, tz, coordination, or deferrable",
+            ))
         }
     })
     .parse2(attr)?;
@@ -117,6 +124,11 @@ pub fn scheduled_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let task_name_str = task_name;
+    let mark_deferrable = attrs.deferrable.then(|| {
+        quote! {
+            ::autumn_web::cost::mark_deferrable(::autumn_web::cost::WorkKind::Task, #task_name_str);
+        }
+    });
     let coordination_expr = match attrs.coordination.as_deref() {
         None | Some("fleet") => quote! { ::autumn_web::task::TaskCoordination::Fleet },
         Some("per_replica") => quote! { ::autumn_web::task::TaskCoordination::PerReplica },
@@ -154,6 +166,7 @@ pub fn scheduled_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #[doc(hidden)]
         pub fn #companion_name() -> ::autumn_web::task::TaskInfo {
+            #mark_deferrable
             ::autumn_web::task::TaskInfo {
                 name: #task_name_str.to_string(),
                 schedule: #schedule_expr,
@@ -165,5 +178,33 @@ pub fn scheduled_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quote::quote;
+
+    #[test]
+    fn parses_deferrable_flag() {
+        let attrs = parse_scheduled_args(quote! { every = "1m" }).expect("parse");
+        assert!(!attrs.deferrable);
+        let attrs = parse_scheduled_args(quote! { every = "1m", deferrable }).expect("parse");
+        assert!(attrs.deferrable);
+        let attrs = parse_scheduled_args(quote! { cron = "0 * * * * *", deferrable = false })
+            .expect("parse");
+        assert!(!attrs.deferrable);
+    }
+
+    #[test]
+    fn deferrable_task_marks_itself_in_the_info_fn() {
+        let out = scheduled_macro(
+            quote! { every = "1m", deferrable },
+            quote! { async fn sweep(state: AppState) -> AutumnResult<()> { Ok(()) } },
+        )
+        .to_string();
+        assert!(out.contains("mark_deferrable"), "{out}");
+        assert!(out.contains("WorkKind :: Task"), "{out}");
     }
 }

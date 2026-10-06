@@ -25,13 +25,16 @@ autumn-edge = { path = "../../autumn-edge" }
 autumn-web = { path = "../../autumn", features = ["edge"] }
 
 [dev-dependencies]
-# `host` adds the `wasmi`-backed reference host used by the conformance suite.
-# It is additive and native-only: `cargo build --target wasm32-wasip1` never
-# builds dev-dependencies, so no capsule ever links its own interpreter.
-autumn-edge = { path = "../../autumn-edge", features = ["host"] }
+# `node` adds the `wasmi`-backed reference host and the edge node used by the
+# conformance suite. It is additive and native-only: `cargo build --target
+# wasm32-wasip1` never builds dev-dependencies, so no capsule ever links its
+# own interpreter or an HTTP stack.
+autumn-edge = { path = "../../autumn-edge", features = ["node"] }
 # The gateway tier drives the origin `Router` as a plain `tower::Service`.
 axum = { workspace = true }
 http = { workspace = true }
+# Tier E's client for the fallthrough check. Same line as `autumn-edge`.
+reqwest = { version = "0.13", default-features = false }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true, features = ["util"] }

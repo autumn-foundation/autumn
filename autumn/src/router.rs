@@ -5265,6 +5265,22 @@ fn apply_middleware(
     let server_timing_layer = crate::config::server_timing_enabled(config)
         .then(|| crate::middleware::ServerTimingLayer::new(true));
 
+    // Cost metering (#1720). Inner to ServerTiming and LogContext, so the
+    // tenant that Tenancy resolves is readable when the request completes.
+    // Outer to everything that does request work. Its `Server-Timing` metrics
+    // follow the same setting as the ServerTiming layer.
+    let cost_layer = config
+        .cost
+        .enabled
+        .then(|| state.extension::<crate::cost::CostAccountant>())
+        .flatten()
+        .map(|accountant| {
+            crate::middleware::CostLayer::new(
+                (*accountant).clone(),
+                crate::config::server_timing_enabled(config),
+            )
+        });
+
     let tenancy_layer = config.tenancy.enabled.then(|| {
         tracing::debug!("Multi-tenancy middleware enabled");
         axum::middleware::from_fn_with_state(state.clone(), crate::tenancy::tenancy_middleware)
@@ -5283,6 +5299,7 @@ fn apply_middleware(
         RequestIdLayer::with_entropy(state.entropy_arc()),
         crate::middleware::LogContextLayer::new(log_context_filter),
         tower::util::option_layer(server_timing_layer),
+        tower::util::option_layer(cost_layer),
         tower::util::option_layer(access_log_layer),
         capture_layer,
         reporting_layer,
@@ -5416,7 +5433,7 @@ fn apply_middleware(
     //   dev live-reload (dev)   (all applied in build_router_pre_state) ->
     //   Compression -> ShadowMirror -> Metrics -> ExceptionFilter -> ErrorPageContext ->
     //   ReadYourWrites -> Session -> NormalizeBody ->
-    //   RequestId -> LogContext -> ServerTiming -> AccessLog-primary ->
+    //   RequestId -> LogContext -> ServerTiming -> Cost -> AccessLog-primary ->
     //   Reporting -> Timeout -> Tenancy -> TrustedProxies ->
     //   [user layers, non-static build — ONE slot however many are registered] ->
     //   UploadConfig -> BodyLimit -> WebhookReplayCleanup -> LoadShed ->
@@ -6249,9 +6266,25 @@ fn apply_startup_barrier(
         crate::middleware::AccessLogLayer::fallback(config.log.access_log_exclude.clone())
     });
 
+    // Cost fallback (#1720), for the same short-circuit paths. It records only
+    // a response without the primary `CostLayer`'s marker, so a request counts
+    // one time. Inside the Server-Timing fallback, as the primary is.
+    let cost_fallback = config
+        .cost
+        .enabled
+        .then(|| state.extension::<crate::cost::CostAccountant>())
+        .flatten()
+        .map(|accountant| {
+            crate::middleware::CostLayer::fallback(
+                (*accountant).clone(),
+                crate::config::server_timing_enabled(config),
+            )
+        });
+
     router.layer((
         trace_context,
         tower::util::option_layer(server_timing_fallback),
+        tower::util::option_layer(cost_fallback),
         tower::util::option_layer(access_log_fallback),
         StartupBarrierLayer::new(barrier_state),
     ))
