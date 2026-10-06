@@ -230,12 +230,18 @@ REMOVE_UIDS=$(jq -c --argjson job "$JOB_UIDS" --argjson copied "$COPIED" --argjs
 # keeping it would keep vault access on the placeholder. So the script
 # stops before a first cutover (its rollback removes the credentials) or a
 # removal, and names them.
-SHARED_IDENTITY=$(jq -r --argjson app "$APP" --argjson uids "$REMOVE_UIDS" --arg acr "$ACR_LOGIN_SERVER" "$MANAGED_DEF"'
+SHARED_IDENTITY=$(jq -r --argjson app "$APP" --argjson uids "$REMOVE_UIDS" --arg acr "$ACR_LOGIN_SERVER" \
+  --arg name "$AZURE_APP_NAME" "$MANAGED_DEF"'
   ($uids | map(ascii_downcase)) as $lids
   | [(.[] | select(.keyVaultUrl and ((.identity // "" | ascii_downcase) | IN($lids[]))
                and (.name | IN(managed[]) | not)) | "secret " + .name),
      ($app.properties.configuration.registries // [] | .[]
       | select(.server != $acr and ((.identity // "" | ascii_downcase) | IN($lids[]))) | "registry " + .server),
+     # A sidecar or init container that pulls from the ACR needs the ACR
+     # entry, which credential removal drops.
+     ($app.properties.template | ((.containers // []) | map(select(.name != $name))) + (.initContainers // [])
+      | .[] | select((.image // "") | startswith($acr + "/"))
+      | "container " + .name + " (image from " + $acr + ")"),
      ($app.properties.configuration.registries // [] | .[]
       | select((.passwordSecretRef // "") | IN(managed[]))
       | "registry " + .server + " (password secret " + .passwordSecretRef + ")"),
