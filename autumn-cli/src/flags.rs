@@ -93,8 +93,9 @@ const ALLOW_UPDATE_SQL: &str = "UPDATE autumn_feature_flags \
     ), updated_at = NOW() \
     WHERE key = $2;";
 
-// Shared audit-log insert for every mutation below; the DB trigger on this
-// table fans out `NOTIFY autumn_flags, <key>` to running replicas.
+// Shared audit-log insert for every mutation below. A DB trigger sends
+// `NOTIFY autumn_flags, <key>`; running replicas poll and see the change on
+// their next refresh.
 const FLAG_AUDIT_SQL: &str =
     "INSERT INTO feature_flag_changes (key, mutation, actor) VALUES ($1, $2, $3);";
 

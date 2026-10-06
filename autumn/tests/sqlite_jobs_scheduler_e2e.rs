@@ -2197,3 +2197,59 @@ async fn sqlite_release_and_free_frees_only_its_own_row() {
         "B still holds the key"
     );
 }
+
+/// Issue #1720: a deferred tick frees its unrun claim when the cost signal
+/// rises after it took the claim. After the high-cost window, every replica
+/// resumes against that one key, so exactly one runs the tick, however long
+/// the window was.
+#[tokio::test]
+async fn sqlite_a_freed_deferred_tick_runs_on_one_replica() {
+    use chrono::TimeZone as _;
+    use scheduler::SchedulerCoordinator as _;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let clock = autumn_web::time::TickingClock::starting_at(
+        chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+            .single()
+            .expect("valid date"),
+    );
+    let pool = build_sqlite_pool(&tmp);
+    let build = |replica: &str| {
+        scheduler::SqliteLeaseSchedulerCoordinator::new(
+            pool.clone(),
+            replica,
+            "app:scheduler",
+            Duration::from_secs(10),
+            Arc::new(clock.clone()),
+        )
+    };
+    let (a, b) = (build("replica-a"), build("replica-b"));
+    let fleet = TaskCoordination::Fleet;
+    let tick = "nightly:1767225600";
+
+    // A takes the claim, then sees the signal high: it frees the unrun claim.
+    let lease = a
+        .try_acquire("nightly", tick, fleet)
+        .await
+        .expect("acquire")
+        .expect("A leads");
+    lease.release_and_free().await.expect("free");
+
+    // A window longer than the TTL passes. Both replicas then try the tick.
+    clock.advance(Duration::from_secs(600));
+    let a_runs = a
+        .try_acquire("nightly", tick, fleet)
+        .await
+        .expect("acquire")
+        .is_some();
+    let b_runs = b
+        .try_acquire("nightly", tick, fleet)
+        .await
+        .expect("acquire")
+        .is_some();
+    assert!(
+        a_runs ^ b_runs,
+        "exactly one replica runs the tick: a={a_runs} b={b_runs}"
+    );
+}

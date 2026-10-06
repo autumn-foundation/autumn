@@ -1227,13 +1227,21 @@ impl TestApp {
     ///
     /// Mirrors [`crate::app::AppBuilder::with_flag_store`].
     #[must_use]
-    pub fn with_flag_store<S>(mut self, store: S) -> Self
+    pub fn with_flag_store<S>(self, store: S) -> Self
     where
         S: crate::feature_flags::FlagStore,
     {
         use std::sync::Arc;
         let service = crate::feature_flags::FeatureFlagService::new(Arc::new(store) as Arc<_>);
+        self.with_flag_service(service)
+    }
+
+    /// Mirrors [`crate::app::AppBuilder::with_flag_service`]. The build
+    /// preloads the store before the first request.
+    #[must_use]
+    pub fn with_flag_service(mut self, service: crate::feature_flags::FeatureFlagService) -> Self {
         self.state_initializers.push(Box::new(move |state| {
+            crate::feature_flags::preload_blocking(&service, crate::feature_flags::PRELOAD_WAIT);
             state.insert_extension(service);
         }));
         self
@@ -2323,6 +2331,7 @@ impl TestApp {
         for initializer in self.state_initializers {
             initializer(&state);
         }
+        crate::cost::install(&state, &self.config);
 
         // Register the fault plan's 5xx projector alongside the app's own
         // reporters (which keep receiving every event). It goes FIRST in the

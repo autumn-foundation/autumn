@@ -18,7 +18,7 @@ autumn_web::app()
     .await;
 ```
 
-In production, the Postgres-backed store persists assignments across restarts and propagates weight changes via `LISTEN/NOTIFY`:
+In production, the Postgres-backed store persists assignments across restarts. Replicas that run `PgExperimentStore::spawn_poll_listener` poll for weight changes:
 
 ```sh
 autumn migrate          # creates autumn_experiments, autumn_experiment_assignments, etc.

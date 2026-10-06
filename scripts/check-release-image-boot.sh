@@ -523,7 +523,7 @@ run_https_target() {
     -e AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS="*" \
     -e AUTUMN_SERVER__TLS__CERT_PATH=/etc/autumn/tls/cert.pem \
     -e AUTUMN_SERVER__TLS__KEY_PATH=/etc/autumn/tls/key.pem \
-    -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/health \
+    -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/startup \
     -e AUTUMN_HEALTHCHECK_INSECURE=1 \
     "${IMAGE_TAG}"
 

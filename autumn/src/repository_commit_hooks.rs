@@ -27,7 +27,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::Digest as _;
 // `Notify` backs the Postgres kick-worker's coalesced pending flag, and (under
-// `sqlite`) the single-node poll-loop wake used in place of Postgres LISTEN/NOTIFY.
+// `sqlite`) the single-node poll-loop wake.
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
