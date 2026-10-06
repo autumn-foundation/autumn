@@ -6283,6 +6283,13 @@ const BORROW_MUT_METHODS: &[&str] = &[
     "make_contiguous",
     "get_or_insert_default",
     "leak",
+    // A `Mutex` or `RwLock` guard writes into its lock.
+    "lock",
+    "try_lock",
+    "blocking_lock",
+    "write",
+    "try_write",
+    "blocking_write",
     "or_default",
     "or_insert",
     "or_insert_with",
@@ -13314,6 +13321,22 @@ mod tests {
                  let mut slots = HashMap::new(); slots.insert(0, None); \
                  slots.retain(|_, slot| { *slot = Some(&repo); true }); \
                  slots[&0].unwrap().find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a lock guard borrows its lock",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let slots = Mutex::new(None); \
+                 { let mut target = slots.lock().unwrap(); *target = Some(repo); } \
+                 let r = slots.lock().unwrap().clone().unwrap(); r.find_all().await?; Ok(0) }",
+                Expect::Unbounded,
+            ),
+            (
+                "guard: a write guard borrows its lock",
+                "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
+                 let slots = RwLock::new(None); \
+                 { let mut target = slots.write().await; *target = Some(repo); } \
+                 let r = slots.read().await.clone().unwrap(); r.find_all().await?; Ok(0) }",
                 Expect::Unbounded,
             ),
             (
