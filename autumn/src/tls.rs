@@ -793,6 +793,9 @@ pub struct TlsListener {
     /// when set. Until then no TCP connection is accepted, so none can
     /// escape a cap installed after `new` (issue #3065). `None` once sent.
     start: Option<tokio::sync::oneshot::Sender<Option<Arc<tokio::sync::Semaphore>>>>,
+    /// The `max_connections` slots `limit_connections` installed. The first
+    /// `accept` starts the acceptor with them.
+    cap: Option<Arc<tokio::sync::Semaphore>>,
     /// Where `accept` puts the slot of the stream it returns.
     handoff: Option<crate::http_server::SlotHandoff>,
     /// The bound address, captured before `tcp` moved into the acceptor task.
@@ -859,6 +862,7 @@ impl TlsListener {
         Self {
             rx,
             start: Some(start),
+            cap: None,
             handoff: None,
             local_addr,
             shutdown,
@@ -867,17 +871,21 @@ impl TlsListener {
         }
     }
 
-    /// Count at most `max` connections, from TCP accept to close, and start
-    /// the acceptor. Returns where `accept` puts the slot of each stream, for
-    /// the serve loop. `None` when the acceptor already started: the cap can
-    /// no longer cover every connection, so the serve loop keeps its own.
+    /// Count at most `max` connections, from TCP accept to close. The
+    /// acceptor still starts at the first `accept`, so an upgrade successor
+    /// takes no connection before its server runs. Returns where `accept`
+    /// puts the slot of each stream, for the serve loop. `None` when the
+    /// acceptor already started: the cap can no longer cover every
+    /// connection, so the serve loop keeps its own.
     pub(crate) fn limit_connections(
         &mut self,
         max: usize,
     ) -> Option<crate::http_server::SlotHandoff> {
-        let start = self.start.take()?;
+        if self.start.is_none() || self.handoff.is_some() {
+            return None;
+        }
         let max = max.min(tokio::sync::Semaphore::MAX_PERMITS);
-        let _ = start.send(Some(Arc::new(tokio::sync::Semaphore::new(max))));
+        self.cap = Some(Arc::new(tokio::sync::Semaphore::new(max)));
         let handoff = crate::http_server::SlotHandoff::default();
         self.handoff = Some(Arc::clone(&handoff));
         Some(handoff)
@@ -1004,8 +1012,8 @@ impl axum::serve::Listener for TlsListener {
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         if let Some(start) = self.start.take() {
-            // No cap was installed: start the acceptor without one.
-            let _ = start.send(None);
+            // Start the acceptor, with the cap when one was installed.
+            let _ = start.send(self.cap.take());
         }
         if let Some((tls, peer, slot)) = self.rx.recv().await {
             if let Some(handoff) = &self.handoff {
@@ -1670,12 +1678,26 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         assert_eq!(listener.handshakes_in_flight(), 0, "nothing starts early");
         assert!(listener.limit_connections(1).is_some());
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Installing the cap does not start the acceptor: an upgrade successor
+        // installs it before its startup hooks run, and must not take
+        // connections from its predecessor until the server is polled.
         assert_eq!(
             listener.handshakes_in_flight(),
+            0,
+            "the cap alone starts nothing"
+        );
+        let handshakes = Arc::clone(&listener.handshakes);
+        let serving = tokio::spawn(async move {
+            let _ = axum::serve::Listener::accept(&mut listener).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            MAX_CONCURRENT_HANDSHAKES - handshakes.available_permits(),
             1,
             "with max_connections = 1, the second client waits before its handshake"
         );
         shutdown.cancel();
+        serving.abort();
     }
 
     #[tokio::test(flavor = "multi_thread")]
