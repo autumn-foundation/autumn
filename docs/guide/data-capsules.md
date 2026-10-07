@@ -231,10 +231,12 @@ capsule directory and to each directory above it.
   it. No lock can prevent this, so run import in a maintenance window.
 - Import writes blobs before records. It first checks the bytes of each blob
   against its manifest entry, that no two entries share a key, and that each
-  target table has the columns of the capsule, with the same types: a capsule
-  made before you dropped, renamed, retyped, or made a column generated is
-  refused (`400`) before any blob is written. A row column that the manifest
-  does not describe is refused too. If a blob key holds different bytes or
+  target table has the columns of the capsule, with the same types (for a
+  domain, also the same base type) and the same generated status: a capsule
+  made before you dropped, renamed, or retyped a column, or made it generated
+  or ordinary, is refused (`400`) before any blob is written. A row column
+  that the manifest does not describe, and a row without a value in a
+  `NOT NULL` column, are refused too. If a blob key holds different bytes or
   a different MIME type, import stops and writes no blob. If a blob changes
   while import reads it, or another writer takes a key during the import,
   import stops with a conflict (`409`).

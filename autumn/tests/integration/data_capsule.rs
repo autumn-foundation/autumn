@@ -892,6 +892,90 @@ async fn import_refuses_a_column_whose_type_the_target_changed() {
     );
 }
 
+/// `empty_store` with the `users.bio` column replaced by `bio`.
+fn store_with_bio(bio: FieldSpec) -> MemoryCapsuleStore {
+    MemoryCapsuleStore::new()
+        .table(
+            "users",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("email", "text"),
+                bio,
+            ],
+        )
+        .table(
+            "posts",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("author_id", "bigint"),
+                FieldSpec::new("title", "text"),
+                FieldSpec::new("meta", "jsonb").nullable(),
+            ],
+        )
+        .table(
+            "comments",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("author_id", "bigint"),
+                FieldSpec::new("post_id", "bigint"),
+                FieldSpec::new("body", "text"),
+            ],
+        )
+}
+
+#[tokio::test]
+async fn import_refuses_a_domain_whose_base_type_the_target_changed() {
+    // `bio` has the same type name in the target, but it is now a domain
+    // over another type. That type could change the value.
+    let capsule = export_ada(&seeded_store()).await;
+    let mut bio = FieldSpec::new("bio", "text").nullable();
+    bio.base_type = Some("character varying(5)".to_owned());
+    let err = import_capsule(&capsule, registry().capsule_models(), &store_with_bio(bio))
+        .await
+        .expect_err("changed base type");
+    assert!(
+        matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains("users.bio")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn import_refuses_a_column_that_the_target_no_longer_generates() {
+    // `bio` was generated when the capsule was made, so import would skip
+    // it. The target writes it now, and would take a default instead of
+    // the exported value.
+    let mut capsule = export_ada(&seeded_store()).await;
+    for model in &mut capsule.manifest.models {
+        for field in &mut model.fields {
+            if model.table == "users" && field.name == "bio" {
+                field.generated = true;
+            }
+        }
+    }
+    let err = import_capsule(&capsule, registry().capsule_models(), &empty_store())
+        .await
+        .expect_err("no longer generated");
+    assert!(
+        matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains("users.bio")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn import_refuses_a_row_without_a_value_in_a_required_column() {
+    // Export refuses such a row. A capsule built or changed through the
+    // public API can still carry one.
+    let mut capsule = export_ada(&seeded_store()).await;
+    capsule.records.get_mut("users").unwrap()[0].remove("email");
+    let err = import_capsule(&capsule, registry().capsule_models(), &empty_store())
+        .await
+        .expect_err("row without email");
+    assert!(
+        matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains("email")),
+        "{err:?}"
+    );
+}
+
 #[tokio::test]
 async fn import_orders_tables_by_the_current_links_too() {
     // The capsule is from before posts linked to users, so its manifest

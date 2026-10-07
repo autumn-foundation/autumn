@@ -398,6 +398,18 @@ pub(super) fn check_importable<'c>(
                     model.table
                 )));
             }
+            // Import writes NULL for a missing value: a NOT NULL column would
+            // fail there, after the blobs are written.
+            if let Some(field) = model.fields.iter().find(|f| {
+                !f.nullable
+                    && !f.generated
+                    && row.get(&f.name).is_none_or(serde_json::Value::is_null)
+            }) {
+                return Err(DataCapsuleError::InvalidInput(format!(
+                    "a row of {} has no value in the NOT NULL column {:?}",
+                    model.table, field.name
+                )));
+            }
             for column in [&model.primary_key, &model.subject_column] {
                 if row.get(column).and_then(value_key).is_none() {
                     return Err(DataCapsuleError::InvalidInput(format!(
@@ -428,10 +440,12 @@ pub(super) fn check_importable<'c>(
 }
 
 /// Check that each table in `store` has the columns that import writes: the
-/// fields of the capsule, without the generated ones, with the same type, and
-/// that it does not generate them now. A capsule made before a column was
-/// dropped, renamed, or made generated would fail at the insert, after its
-/// blobs are written; one made before a type changed could lose data. Run [`check_importable`] first.
+/// fields of the capsule that are not generated, with the same type and base
+/// type, and that the target generates exactly the columns that the capsule
+/// marks generated. A capsule made before a column was dropped, renamed, or
+/// made generated would fail at the insert, after its blobs are written; one
+/// made before a type changed, or before a column stopped being generated,
+/// could change or lose data. Run [`check_importable`] first.
 pub(super) async fn check_target(
     capsule: &DataCapsule,
     models: &[CapsuleModel],
@@ -442,33 +456,65 @@ pub(super) async fn check_target(
             return Err(DataCapsuleError::UnknownTable(model.table.clone()));
         };
         let described = store.describe(current).await?;
-        for field in model.fields.iter().filter(|f| !f.generated) {
-            // A column that the target now generates takes no value: the
-            // insert would fail too.
-            match described.iter().find(|d| d.name == field.name) {
-                None => {
-                    return Err(DataCapsuleError::InvalidInput(format!(
-                        "{}.{} is in the capsule, but the target table has no such column",
-                        model.table, field.name
-                    )));
-                }
-                Some(target) if target.generated => {
-                    return Err(DataCapsuleError::InvalidInput(format!(
-                        "{}.{} is in the capsule, but the target table generates it",
-                        model.table, field.name
-                    )));
-                }
-                // Another type, or another modifier, can change the value:
-                // `numeric(6, 2)` rounds a `numeric(10, 3)` value.
-                Some(target) if target.data_type != field.data_type => {
-                    return Err(DataCapsuleError::InvalidInput(format!(
-                        "{}.{} is {} in the capsule, but {} in the target table",
-                        model.table, field.name, field.data_type, target.data_type
-                    )));
-                }
-                Some(_) => {}
-            }
+        for field in &model.fields {
+            check_target_column(
+                &model.table,
+                field,
+                described.iter().find(|d| d.name == field.name),
+            )?;
         }
+    }
+    Ok(())
+}
+
+/// Check that `target`, the column of `table` in the target store, takes the
+/// value of `field` from the capsule as it is.
+fn check_target_column(
+    table: &str,
+    field: &FieldSpec,
+    target: Option<&FieldSpec>,
+) -> Result<(), DataCapsuleError> {
+    let refuse = |why: String| {
+        Err(DataCapsuleError::InvalidInput(format!(
+            "{table}.{} is in the capsule, but {why}",
+            field.name
+        )))
+    };
+    let Some(target) = target else {
+        // Import does not write a generated column, so it may be gone.
+        if field.generated {
+            return Ok(());
+        }
+        return refuse("the target table has no such column".to_owned());
+    };
+    // Import writes the columns that the capsule does not mark generated. A
+    // column that the target generates now takes no value, and one that it
+    // no longer generates would get its default instead of the value.
+    if target.generated != field.generated {
+        let now = if target.generated {
+            "generates"
+        } else {
+            "no longer generates"
+        };
+        return refuse(format!("the target table {now} it"));
+    }
+    if field.generated {
+        return Ok(());
+    }
+    // Another type, another modifier, or a domain over another type can
+    // change the value: `numeric(6, 2)` rounds a `numeric(10, 3)` value.
+    if target.data_type != field.data_type || target.base_type != field.base_type {
+        let shown = |f: &FieldSpec| {
+            f.base_type.as_ref().map_or_else(
+                || f.data_type.clone(),
+                |base| format!("{} (over {base})", f.data_type),
+            )
+        };
+        return refuse(format!(
+            "it is {} there and {} in the target table",
+            shown(field),
+            shown(target)
+        ));
     }
     Ok(())
 }
