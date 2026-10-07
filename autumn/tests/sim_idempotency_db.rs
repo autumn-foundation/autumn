@@ -1322,3 +1322,61 @@ async fn late_set_after_release_keeps_the_newer_record() {
         "A's stale write did not replace B's record"
     );
 }
+
+/// The handler outlives its 1 s lock and the row's retention, and the sweep
+/// deletes the row. Its `commit` on the primary then finds no row: that is a
+/// lost key (`409`), not a shard connection (`500`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_after_the_row_is_swept_is_a_conflict() {
+    let substrate = SqliteSubstrate::with_migrations(&[&FRAMEWORK_MIGRATIONS, &APP_MIGRATIONS])
+        .expect("substrate");
+    let store = Arc::new(DbIdempotencyStore::new(
+        substrate.pool(),
+        Duration::from_secs(1),
+    ));
+    let pool = substrate.pool();
+    let handler = move |idem: IdempotencyTx| {
+        let pool = pool.clone();
+        async move {
+            // Outlive the lock; the test deletes the row meanwhile.
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            let mut pooled = pool.get().await.expect("checkout");
+            let conn: &mut RuntimeConnection = &mut pooled;
+            match conn
+                .transaction::<_, autumn_web::AutumnError, _>(async move |conn| {
+                    idem.commit(conn, (StatusCode::CREATED, "paid")).await
+                })
+                .await
+            {
+                Ok(response) => response.into_response(),
+                Err(error) => error.into_response(),
+            }
+        }
+    };
+    let app = axum::Router::new()
+        .route("/pay", axum::routing::post(handler))
+        .layer(
+            IdempotencyLayer::new(store)
+                .with_ttl(Duration::from_secs(1))
+                .with_in_flight_ttl(Duration::from_secs(1)),
+        );
+    let request = Request::builder()
+        .method("POST")
+        .uri("/pay")
+        .header("idempotency-key", "swept")
+        .body(Body::empty())
+        .expect("request");
+
+    let pending = tokio::spawn(app.oneshot(request));
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    {
+        // What the sweep does to an expired, unlocked row.
+        let mut conn = substrate.pool().get().await.expect("checkout");
+        diesel::sql_query("DELETE FROM autumn_idempotency_keys")
+            .execute(&mut conn)
+            .await
+            .expect("sweep");
+    }
+    let response = pending.await.expect("join").expect("infallible");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}

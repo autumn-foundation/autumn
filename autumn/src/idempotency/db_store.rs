@@ -11,7 +11,7 @@
 //! Times are Unix milliseconds from the app clock, so a `Sim` moves them.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -413,6 +413,11 @@ struct TxClaim {
     body_hash: Vec<u8>,
     ttl: Duration,
     committed: AtomicBool,
+    /// A lower bound on this request's lock deadline (Unix ms, app clock):
+    /// taken before the store set the lock, and moved when the lock moves.
+    /// Until then the row cannot be swept, so a missing row means another
+    /// database; after it, a missing row means the key was lost.
+    lock_deadline_ms: AtomicI64,
 }
 
 /// Extractor: write the idempotency record in the handler's transaction.
@@ -448,6 +453,7 @@ impl IdempotencyTx {
         owner: String,
         body_hash: Vec<u8>,
         ttl: Duration,
+        lock_deadline_ms: i64,
     ) -> Self {
         Self {
             claim: Some(Arc::new(TxClaim {
@@ -456,6 +462,7 @@ impl IdempotencyTx {
                 body_hash,
                 ttl,
                 committed: AtomicBool::new(false),
+                lock_deadline_ms: AtomicI64::new(lock_deadline_ms),
             })),
             session: None,
         }
@@ -541,10 +548,11 @@ impl IdempotencyTx {
             // is final; after a crash, the lock TTL frees it. Until then a
             // retry gets `409`, not this record.
             let ttl = ms(claim.ttl);
+            let expires = now_ms().saturating_add(ttl);
             let written = diesel::update(owned_key(&claim))
                 .set((
                     keys::record.eq(Some(encoded)),
-                    keys::expires_at_ms.eq(now_ms().saturating_add(ttl)),
+                    keys::expires_at_ms.eq(expires),
                     keys::ttl_ms.eq(ttl),
                     keys::record_owner.eq(Some(claim.owner.clone())),
                 ))
@@ -561,6 +569,7 @@ impl IdempotencyTx {
                 && session.has_pending_changes().await
             {
                 extend_lock_to_expiry(conn, &claim.storage_key, &claim.owner).await?;
+                claim.lock_deadline_ms.fetch_max(expires, Ordering::Relaxed);
             }
             AtomicBool::store(&claim.committed, true, Ordering::SeqCst);
             Ok(Response::from_parts(parts, Body::from(bytes)))
@@ -707,6 +716,13 @@ async fn claim_error(conn: &mut RuntimeConnection, claim: &TxClaim) -> AutumnErr
         Ok(Some(_)) => AutumnError::conflict_msg(
             "the idempotency key is held by another request; this transaction rolls back",
         ),
+        // Past the lock deadline the sweep may have deleted the row: the
+        // request lost its key, as when another request took it.
+        Ok(None) if now_ms() >= AtomicI64::load(&claim.lock_deadline_ms, Ordering::Relaxed) => {
+            AutumnError::conflict_msg(
+                "the idempotency key expired before this write; this transaction rolls back",
+            )
+        }
         Ok(None) => AutumnError::internal_server_error_msg(
             "the idempotency key is not on this database connection; \
              call IdempotencyTx on a primary `Db` connection, not a shard",

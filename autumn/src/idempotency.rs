@@ -1588,6 +1588,20 @@ async fn lookup_prepared_entry(
     store.get(&prepared.storage_key).await
 }
 
+/// A lower bound on the deadline of a lock taken now for `in_flight_ttl`, in
+/// Unix ms on the app clock: read before the store sets the lock, with the
+/// same 1 s floor for a zero TTL.
+fn lock_deadline_floor_ms(in_flight_ttl: Duration) -> i64 {
+    let ttl = if in_flight_ttl.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        in_flight_ttl
+    };
+    crate::time::ambient_now()
+        .timestamp_millis()
+        .saturating_add(i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX))
+}
+
 /// Acquire the in-flight lock for `key`. A store error counts as "held", so
 /// an outage fails closed with `409` and never runs the handler twice.
 async fn acquire_lock(
@@ -1650,6 +1664,7 @@ impl TxProbe {
         prepared: &mut PreparedIdempotencyRequest,
         owner: &str,
         ttl: Duration,
+        lock_deadline_ms: i64,
     ) -> Self {
         let store: &dyn std::any::Any = store.as_ref();
         if !store.is::<DbIdempotencyStore>() {
@@ -1660,6 +1675,7 @@ impl TxProbe {
             owner.to_owned(),
             prepared.body_hash.clone(),
             ttl,
+            lock_deadline_ms,
         );
         prepared.parts.extensions.insert(tx.clone());
         Self { tx: Some(tx) }
@@ -1671,6 +1687,7 @@ impl TxProbe {
         _prepared: &mut PreparedIdempotencyRequest,
         _owner: &str,
         _ttl: Duration,
+        _lock_deadline_ms: i64,
     ) -> Self {
         Self::default()
     }
@@ -1781,6 +1798,7 @@ where
 
     // ── In-flight check (concurrent duplicate) ─────────────────────────────
     let lock_owner = in_flight_lock_owner(entropy.as_ref());
+    let lock_deadline_ms = lock_deadline_floor_ms(in_flight_ttl);
     if !acquire_lock(
         store.as_ref(),
         &prepared.storage_key,
@@ -1828,7 +1846,7 @@ where
         }
     }
 
-    let probe = TxProbe::attach(&store, &mut prepared, &lock.owner, ttl);
+    let probe = TxProbe::attach(&store, &mut prepared, &lock.owner, ttl, lock_deadline_ms);
     handle_cache_miss(inner, store, ttl, prepared, metrics.as_ref(), lock, probe).await
 }
 

@@ -184,9 +184,9 @@ async fn pay(idem: IdempotencyTx, mut db: Db) -> AutumnResult<axum::response::Re
   does not run again.
 - The stored response is not replayed while the request still holds its
   lock. So a retry never sees a response that is not final.
-- If the in-flight lock expired and another request took the key, `commit`
-  returns `409` and the transaction rolls back. Only one request commits its
-  database writes.
+- If the in-flight lock expired and another request took the key, or the
+  expired key row was deleted, `commit` returns `409` and the transaction
+  rolls back. Only one request commits its database writes.
 - The lock does not fence work outside the database, such as a call to a
   payment provider. Give that call its own idempotency key, for example
   `IdempotencyContext::scoped_key`.
