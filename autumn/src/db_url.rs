@@ -387,16 +387,19 @@ fn identifying_value(value: &str) -> String {
 /// (`invalid percent-encoded token: "p%ss"`), and a scheme scan finds nothing
 /// in that. This redactor knows the target, so it does three things:
 ///
-/// 1. It masks a quoted span that is not part of the [`redact_target`] form of
-///    `url`, or that holds a password from `url`.
-/// 2. It runs [`redact_targets_in_message`].
-/// 3. It masks each password from `url` that is still in the text.
+/// 1. It masks each password from `url` first, so a quote inside a password
+///    cannot split it before step 2.
+/// 2. It masks a quoted span that is not part of the [`redact_target`] form of
+///    `url`.
+/// 3. It runs [`redact_targets_in_message`].
 pub fn redact_driver_error(msg: &str, url: &str) -> String {
     let safe = redact_target(url);
-    let secrets = secrets_in(url);
-    let holds_secret = |text: &str| secrets.iter().any(|secret| text.contains(secret.as_str()));
-    let mut out = String::with_capacity(msg.len());
-    let mut rest = msg;
+    let mut masked = msg.to_owned();
+    for secret in &secrets_in(url) {
+        masked = masked.replace(secret.as_str(), "****");
+    }
+    let mut out = String::with_capacity(masked.len());
+    let mut rest = masked.as_str();
     while let Some(open) = rest.find('"') {
         let after = &rest[open + 1..];
         let Some(close) = after.find('"') else {
@@ -404,7 +407,7 @@ pub fn redact_driver_error(msg: &str, url: &str) -> String {
         };
         let span = &after[..close];
         out.push_str(&rest[..=open]);
-        if span.is_empty() || (safe.contains(span) && !holds_secret(span)) {
+        if span.is_empty() || safe.contains(span) {
             out.push_str(span);
         } else {
             out.push_str("****");
@@ -413,11 +416,7 @@ pub fn redact_driver_error(msg: &str, url: &str) -> String {
         rest = &after[close + 1..];
     }
     out.push_str(rest);
-    let mut out = redact_targets_in_message(&out);
-    for secret in &secrets {
-        out = out.replace(secret.as_str(), "****");
-    }
-    out
+    redact_targets_in_message(&out)
 }
 
 /// The passwords in a target, raw and percent-decoded, longest first: the
@@ -810,6 +809,11 @@ mod tests {
         // A keyword/value password is masked wherever it shows.
         let out = redact_driver_error("failed near hunter2", "host=db password=hunter2");
         assert!(!out.contains("hunter2"), "{out}");
+
+        // A quote inside the password must not split it before it is masked.
+        let url = r#"postgres://app:p"secret@host/db"#;
+        let out = redact_driver_error(r#"invalid: "postgres://app:p"secret@host/db""#, url);
+        assert!(!out.contains("secret"), "{out}");
 
         // One secret inside another: the longer one is masked first.
         let out = redact_driver_error(
