@@ -71,7 +71,9 @@ Exclude password hashes, tokens, and internal flags. Import cannot restore an
 excluded column, so the column must accept `NULL` or have a default. An
 exclusion holds for import too: a capsule made before you excluded a column
 still holds it, and import refuses that capsule (`400`) rather than write the
-column, or a blob it names, back.
+column, or a blob it names, back. The same holds when you change the subject
+column or the key of a model: a capsule made before the change is refused
+(`400`), since it no longer holds what the model scopes to one subject.
 
 **Check blob ownership.** Export copies each blob that a blob column names. If
 users can write a blob key into a row, make sure that the key belongs to the
@@ -224,7 +226,8 @@ capsule directory and to each directory above it.
   key, the import succeeds and the other insert fails with a duplicate key.
   The same holds for a blob that another writer replaces after import checks
   it. No lock can prevent this, so run import in a maintenance window.
-- Import writes blobs before records. If a blob key holds different bytes or
+- Import writes blobs before records. It first checks the bytes of each blob
+  against its manifest entry. If a blob key holds different bytes or
   a different MIME type, import stops and writes no blob. If a blob changes
   while import reads it, or another writer takes a key during the import,
   import stops with a conflict (`409`).

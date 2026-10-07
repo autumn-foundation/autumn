@@ -273,8 +273,9 @@ pub async fn export_subject(
 /// [`DataCapsuleError::UnknownTable`], [`DataCapsuleError::RelationshipCycle`],
 /// [`DataCapsuleError::UnsupportedFormat`],
 /// [`DataCapsuleError::InvalidInput`] for a record that names a blob the
-/// capsule does not hold, or for a column that the model now excludes, or an
-/// error from `store` (for example
+/// capsule does not hold, for a column that the model now excludes, or for a
+/// table whose subject column or key the model has changed, or an error from
+/// `store` (for example
 /// [`DataCapsuleError::Conflict`]).
 pub async fn import_capsule(
     capsule: &DataCapsule,
@@ -329,6 +330,22 @@ pub(super) fn check_importable<'c>(
             .iter()
             .find(|m| m.table == model.table)
             .ok_or_else(|| DataCapsuleError::UnknownTable(model.table.clone()))?;
+        // The subject column scopes the records, and import writes by the
+        // key. A capsule of another scope or key is not one of this model:
+        // it could restore a part of what the model now holds for a subject.
+        if model.subject_column != current.subject_column
+            || model.primary_key != current.primary_key
+        {
+            return Err(DataCapsuleError::InvalidInput(format!(
+                "{} in the capsule has subject column {:?} and key {:?}, but the model now \
+                 has {:?} and {:?}",
+                model.table,
+                model.subject_column,
+                model.primary_key,
+                current.subject_column,
+                current.primary_key
+            )));
+        }
         // A capsule from before the app excluded a column still holds it, for
         // example a password hash. The exclusion holds for import too: the
         // column, and a blob it names, must not be written back.

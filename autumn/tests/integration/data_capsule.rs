@@ -721,6 +721,40 @@ async fn import_refuses_a_column_that_the_model_now_excludes() {
 }
 
 #[tokio::test]
+async fn import_refuses_a_capsule_of_another_subject_scope_or_key() {
+    // The capsule holds the posts of one author. After the app scopes posts
+    // by another column, or keys users by another column, it is no longer a
+    // capsule of the current models.
+    fn changed(table: &str, change: impl Fn(&mut CapsuleModel)) -> Vec<CapsuleModel> {
+        let mut models = registry().capsule_models().to_vec();
+        models
+            .iter_mut()
+            .filter(|m| m.table == table)
+            .for_each(change);
+        models
+    }
+    let capsule = export_ada(&seeded_store()).await;
+    for (table, models) in [
+        (
+            "posts",
+            changed("posts", |m| m.subject_column = "id".to_owned()),
+        ),
+        (
+            "users",
+            changed("users", |m| m.primary_key = "email".to_owned()),
+        ),
+    ] {
+        let err = import_capsule(&capsule, &models, &empty_store())
+            .await
+            .expect_err("changed model");
+        assert!(
+            matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains(table)),
+            "{table}: {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn import_rejects_a_relationship_cycle() {
     let models = [
         CapsuleModel::new("users", "id").belongs_to("id", "comments"),
@@ -872,6 +906,52 @@ mod blobs {
             users.contains(&format!("href=\"../../blobs/{sha}\" download")),
             "{users}"
         );
+    }
+
+    #[tokio::test]
+    async fn restore_checks_the_bytes_of_every_entry_before_it_writes() {
+        // A capsule built or changed through the public API can carry bytes
+        // that its entry does not describe. Restore must refuse it before it
+        // writes a blob, since a failed restore keeps what it wrote.
+        let tmp = tempfile::tempdir().unwrap();
+        let source_blobs = blob_store(&tmp.path().join("a"));
+        source_blobs
+            .put("avatars/ada.png", "image/png", Bytes::from_static(b"png"))
+            .await
+            .unwrap();
+        source_blobs
+            .put("docs/ada-cv.txt", "text/plain", Bytes::from_static(b"cv"))
+            .await
+            .unwrap();
+        let mut capsule = export_subject(&models(), &store(), "1").await.unwrap();
+        collect_blobs(&mut capsule, &source_blobs)
+            .await
+            .expect("collect");
+        let cv = capsule
+            .manifest
+            .blob("docs/ada-cv.txt")
+            .unwrap()
+            .sha256
+            .clone();
+        capsule.blobs.insert(cv, Bytes::from_static(b"vc"));
+
+        let target_blobs = blob_store(&tmp.path().join("b"));
+        let err = restore_blobs(&capsule, &target_blobs)
+            .await
+            .expect_err("bytes that the entry does not describe");
+        assert!(
+            matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains("docs/ada-cv.txt")),
+            "{err:?}"
+        );
+        for key in ["avatars/ada.png", "docs/ada-cv.txt"] {
+            assert!(
+                matches!(
+                    target_blobs.get(key).await,
+                    Err(BlobStoreError::NotFound(_))
+                ),
+                "{key}"
+            );
+        }
     }
 
     #[tokio::test]

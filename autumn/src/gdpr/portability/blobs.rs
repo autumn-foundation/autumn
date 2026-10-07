@@ -152,19 +152,27 @@ fn is_sha256(etag: &str) -> bool {
 ///
 /// # Errors
 ///
-/// [`DataCapsuleError::Conflict`] for a key with different bytes or MIME type, or
-/// [`DataCapsuleError::Blob`] when the capsule has no bytes for an entry or
-/// `store` fails.
+/// [`DataCapsuleError::Conflict`] for a key with different bytes or MIME type,
+/// [`DataCapsuleError::InvalidInput`] for an entry that does not describe its
+/// bytes, or [`DataCapsuleError::Blob`] when the capsule has no bytes for an
+/// entry or `store` fails.
 pub async fn restore_blobs(
     capsule: &DataCapsule,
     store: &dyn BlobStore,
 ) -> Result<usize, DataCapsuleError> {
-    let mut to_write = Vec::new();
+    // A failed restore keeps what it wrote, so check every entry against its
+    // bytes before the first key is read or written.
+    let mut entries = Vec::with_capacity(capsule.manifest.blobs.len());
     for entry in &capsule.manifest.blobs {
         let bytes = capsule
             .blobs
             .get(&entry.sha256)
             .ok_or_else(|| DataCapsuleError::Blob(format!("no bytes for blob {:?}", entry.key)))?;
+        super::archive::check_blob_entry(entry, bytes)?;
+        entries.push((entry, bytes));
+    }
+    let mut to_write = Vec::new();
+    for (entry, bytes) in entries {
         if !check_existing(store, entry).await? {
             to_write.push((entry, bytes));
         }

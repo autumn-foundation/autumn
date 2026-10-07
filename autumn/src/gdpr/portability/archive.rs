@@ -19,8 +19,8 @@ use sha2::{Digest, Sha256};
 
 use super::DataCapsule;
 use super::model::{
-    CapsuleManifest, DATA_CAPSULE_FORMAT, DATA_CAPSULE_FORMAT_VERSION, DataCapsuleError, Record,
-    check_model_names, record_file,
+    BlobEntry, CapsuleManifest, DATA_CAPSULE_FORMAT, DATA_CAPSULE_FORMAT_VERSION, DataCapsuleError,
+    Record, check_model_names, record_file,
 };
 use super::root::Root;
 use crate::security::config::{ResolvedSigningKeys, SigningSecretConfig};
@@ -114,6 +114,20 @@ pub struct VerifyReport {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+/// Check that `blob` describes `bytes`: their SHA-256 and their length.
+///
+/// A capsule built or changed through the public API can carry an entry that
+/// does not describe its bytes.
+pub(super) fn check_blob_entry(blob: &BlobEntry, bytes: &[u8]) -> Result<(), DataCapsuleError> {
+    if sha256_hex(bytes) != blob.sha256 || bytes.len() as u64 != blob.byte_size {
+        return Err(DataCapsuleError::InvalidInput(format!(
+            "blob {:?}: the entry gives SHA-256 {} and {} bytes, which do not match its bytes",
+            blob.key, blob.sha256, blob.byte_size
+        )));
+    }
+    Ok(())
 }
 
 fn to_json<T: Serialize + ?Sized>(file: &str, value: &T) -> Result<Vec<u8>, DataCapsuleError> {
@@ -218,16 +232,9 @@ impl DataCapsule {
             let bytes = self.blobs.get(&blob.sha256).ok_or_else(|| {
                 DataCapsuleError::Blob(format!("no bytes for blob {:?}", blob.key))
             })?;
-            // A capsule built or changed through the public API can carry an
-            // entry that does not describe its bytes. Signed, it would fail
+            // Signed, an entry that does not describe its bytes would fail
             // its own verify.
-            if sha256_hex(bytes) != blob.sha256 || bytes.len() as u64 != blob.byte_size {
-                return Err(DataCapsuleError::InvalidInput(format!(
-                    "blob {:?}: the entry gives SHA-256 {} and {} bytes, which do not match \
-                     its bytes",
-                    blob.key, blob.sha256, blob.byte_size
-                )));
-            }
+            check_blob_entry(blob, bytes)?;
             if seen.insert(blob.sha256.as_str()) {
                 files.push((blob.file(), bytes.to_vec()));
             }
