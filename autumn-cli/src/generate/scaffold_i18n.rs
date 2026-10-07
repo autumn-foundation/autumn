@@ -126,6 +126,17 @@ impl ViewLabels {
         self.used.borrow().clone()
     }
 
+    /// Ship `key = ftl` in the catalog for a message the framework looks up
+    /// itself, so no generated view references it. `autumn i18n check` exempts
+    /// these keys from its unused report.
+    pub(super) fn framework_key(&self, key: &str, ftl: &str) {
+        if self.enabled {
+            self.used
+                .borrow_mut()
+                .insert(key.to_owned(), ftl.to_owned());
+        }
+    }
+
     /// Record `key = ftl` and return the `t!` invocation for it.
     fn record(&self, key: &str, ftl: &str, args: &[(&str, &str)]) -> String {
         self.used

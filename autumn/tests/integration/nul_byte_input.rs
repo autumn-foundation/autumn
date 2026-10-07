@@ -235,6 +235,9 @@ mod docker {
 
         assert!(is_nul_byte_violation(&err), "got: {err}");
         assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(err.to_string(), autumn_web::error::NUL_BYTE_REJECTED_MESSAGE);
+        assert_eq!(
+            err.to_string(),
+            autumn_web::error::NUL_BYTE_REJECTED_MESSAGE
+        );
     }
 }

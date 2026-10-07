@@ -9,9 +9,7 @@
 //! ```
 
 use autumn_web::authorization::{BoxFuture, Policy, PolicyContext};
-use autumn_web::prelude::*;
 use autumn_web::test::TestApp;
-use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -152,7 +150,9 @@ async fn update_names_the_field_that_carried_the_nul() {
             .send()
             .await;
         assert_eq!(created.status, StatusCode::CREATED, "{path}");
-        let id = created.json::<serde_json::Value>()["id"].as_i64().expect("id");
+        let id = created.json::<serde_json::Value>()["id"]
+            .as_i64()
+            .expect("id");
 
         let response = client
             .put(&format!("{path}/{id}"))

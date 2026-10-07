@@ -736,6 +736,10 @@ fn load_locale_keys(dir: &Path) -> BTreeMap<String, BTreeSet<String>> {
 
 // ── Report assembly ───────────────────────────────────────────────────────
 
+/// Keys the framework looks up at runtime. No source file names them, so they
+/// are never reported unused. Keep in step with `autumn_web::form`.
+const FRAMEWORK_KEYS: &[&str] = &["common.error.nul_character"];
+
 /// Build the per-locale report from the referenced keys, the defined keys per
 /// locale, and the resolved fallback chain. Pure — unit-tested directly.
 #[must_use]
@@ -847,6 +851,7 @@ pub fn build_report(
             let unused: Vec<String> = keys
                 .iter()
                 .filter(|k| !k.starts_with('-') && !scan.referenced.contains(*k))
+                .filter(|k| !FRAMEWORK_KEYS.contains(&k.as_str()))
                 .filter(|k| !dynamic_prefixes.iter().any(|p| k.starts_with(p)))
                 .cloned()
                 .collect();
@@ -2199,6 +2204,20 @@ mod tests {
             en.unused
         );
         assert!(!report.has_warnings());
+    }
+
+    #[test]
+    fn framework_keys_are_not_reported_unused() {
+        // The framework looks `common.error.nul_character` up at runtime, so no
+        // source file names it. It must not fail `--strict`.
+        let scan = scan_with(&["nav.home"]);
+        let mut per_locale = BTreeMap::new();
+        per_locale.insert(
+            "en".to_owned(),
+            keys(&["nav.home", "common.error.nul_character", "footer.old"]),
+        );
+        let report = build_report(&scan, &cfg("en", &[]), &per_locale);
+        assert_eq!(report.locales[0].unused, vec!["footer.old".to_owned()]);
     }
 
     #[cfg(unix)]

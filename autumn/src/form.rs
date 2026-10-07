@@ -360,6 +360,53 @@ impl<T: Serialize> Changeset<T> {
 /// than accusing the author of anything.
 pub const NUL_CHARACTER_FIELD_ERROR: &str = "Cannot contain the NUL character (0x00)";
 
+/// Catalog key for [`NUL_CHARACTER_FIELD_ERROR`] in a localized app.
+///
+/// When the request carries an `i18n` bundle, [`ChangesetForm`] and
+/// [`crate::nested_form::NestedChangesetForm`] look this key up in the request
+/// locale. A missing key keeps the English [`NUL_CHARACTER_FIELD_ERROR`].
+/// `autumn generate --i18n` scaffolds add the key to their catalog.
+pub const NUL_CHARACTER_MESSAGE_KEY: &str = "common.error.nul_character";
+
+/// The NUL field message for this request, and the request back.
+///
+/// Resolves the locale before the body is read. Without an `i18n` bundle in
+/// the request extensions, this is [`NUL_CHARACTER_FIELD_ERROR`].
+#[cfg(feature = "i18n")]
+pub(crate) async fn nul_field_message<S: Send + Sync>(
+    req: Request,
+    state: &S,
+) -> (Request, String) {
+    use axum::extract::FromRequestParts as _;
+
+    let Some(bundle) = req
+        .extensions()
+        .get::<std::sync::Arc<crate::i18n::Bundle>>()
+        .cloned()
+    else {
+        return (req, NUL_CHARACTER_FIELD_ERROR.to_owned());
+    };
+    let (mut parts, body) = req.into_parts();
+    let message = match crate::i18n::Locale::from_request_parts(&mut parts, state).await {
+        Ok(locale) => bundle.lookup(locale.tag(), NUL_CHARACTER_MESSAGE_KEY),
+        Err(never) => match never {},
+    };
+    (
+        Request::from_parts(parts, body),
+        message.unwrap_or_else(|| NUL_CHARACTER_FIELD_ERROR.to_owned()),
+    )
+}
+
+/// The NUL field message for this request, and the request back.
+#[cfg(not(feature = "i18n"))]
+#[allow(clippy::unused_async)]
+pub(crate) async fn nul_field_message<S: Send + Sync>(
+    req: Request,
+    _state: &S,
+) -> (Request, String) {
+    (req, NUL_CHARACTER_FIELD_ERROR.to_owned())
+}
+
 /// Submitted names that carry framework plumbing rather than form data.
 ///
 /// No template renders an error against one of these, so a
@@ -798,6 +845,7 @@ where
             .get::<crate::security::SubmitFormField>()
             .map_or_else(|| "_submit_token".to_owned(), |f| f.0.clone());
 
+        let (req, nul_message) = nul_field_message(req, state).await;
         let (data, nul_fields) = decode_form_body::<T, S>(req, state).await?;
 
         let mut changeset = data.into_changeset();
@@ -815,7 +863,7 @@ where
             {
                 continue;
             }
-            changeset.add_error(field, NUL_CHARACTER_FIELD_ERROR);
+            changeset.add_error(field, nul_message.as_str());
         }
 
         Ok(Self {

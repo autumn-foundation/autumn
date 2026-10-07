@@ -1064,8 +1064,8 @@ impl<E: std::error::Error + 'static> std::error::Error for NulByteRejected<E> {
 }
 
 /// Whether `err` carries a Postgres rejection of an embedded NUL byte
-/// (SQLSTATE `22021`, issue #2423) — malformed *client* input rather than a
-/// server bug.
+/// (SQLSTATE `22021` for text, `22P05` for `JSONB`; issues #2423, #2439) —
+/// malformed *client* input rather than a server bug.
 ///
 /// A `TEXT`/`VARCHAR` column cannot hold `0x00`, so a value carrying one is
 /// refused at `INSERT`/`UPDATE` time no matter how it arrived. The blanket
@@ -2077,6 +2077,8 @@ mod tests {
 
         // ── Naming the field (#2439) ────────────────────────────────────────
 
+        // Both traits must be in scope for autoref resolution.
+        #[allow(unused_imports)]
         use crate::error::{
             __name_nul_fields, MaybeJsonBody, MaybeJsonBodyFallback as _,
             MaybeJsonBodyViaSerialize as _, nul_byte_json_fields,
@@ -2149,6 +2151,8 @@ mod tests {
             assert!(!err.has_field_errors());
         }
 
+        // The extra `&` is what makes autoref pick the right branch.
+        #[allow(clippy::needless_borrow)]
         #[test]
         fn only_serializable_payloads_expose_a_json_body() {
             #[derive(serde::Serialize)]

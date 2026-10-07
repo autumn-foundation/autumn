@@ -591,13 +591,23 @@ if let Err(err) = repo.save(&new_post).await
 }
 ```
 
-This is a backstop, not the mechanism: rejecting at the form boundary is what
-gives the author something actionable. Two limits come with that. The 422 names
-no field — nothing at the database boundary knows which one the byte came from,
-so `errors` is empty unless you fold it in yourself as above. And classification
-is by server message, anchored on the `: 0x00` the encoding rejection ends with;
-a NUL smuggled into a `JSONB` column fails with a different message entirely
-(`unsupported Unicode escape sequence`, SQLSTATE `22P05`) and is not classified.
+This is a backstop. The form boundary is the main defense, because it gives
+the author a message they can act on.
+
+The generated `#[repository(api = ...)]` create and update handlers name the
+field. The `422` has an `errors[]` entry for each string that holds a NUL byte.
+Nested names use dots and brackets: `address.street`, `items[1].sku`. The
+handler finds the byte in the payload, because Postgres does not say which
+column held it. A payload type without `Serialize` keeps an empty `errors[]`.
+In your own handler, call `autumn_web::error::nul_byte_json_fields` on the
+JSON body.
+
+A NUL in a `JSONB` string fails with a different message (`unsupported Unicode
+escape sequence`, SQLSTATE `22P05`). The classifier matches that message and
+its detail exactly, and gives the same `422`.
+
+Classification uses the server message. A server that translates the message
+keeps the `500`. That is the safe direction.
 
 ### When you would rather clean than reject
 
@@ -623,11 +633,21 @@ one using `validate_on_update = fetch`, persists the raw patch and throws the
 normalized draft away — so an `update` through either of those still sends the
 NUL to Postgres and still fails the write, now as a 422 rather than a 500.
 
-The message is a fixed English string. Unlike a scaffold's `common.error.taken`,
-it is recorded inside the extractor, before any handler holds a `Locale`, so
-there is nowhere to look up a translation. A localized app that needs a
-localized message can rewrite it from the handler by matching
-`NUL_CHARACTER_FIELD_ERROR` in `changeset.errors()`.
+### Localize the message
+
+With the `i18n` feature, the form extractors read the `Arc<Bundle>` from the
+request extensions. They resolve the request locale and look up
+`common.error.nul_character` (`autumn_web::form::NUL_CHARACTER_MESSAGE_KEY`).
+Add the key to each catalog:
+
+```text
+common.error.nul_character = No puede contener el carácter NUL (0x00)
+```
+
+If there is no bundle, or the key is missing, the message is
+`NUL_CHARACTER_FIELD_ERROR` in English. A missing key does not record a miss. `autumn generate --i18n` adds the English entry to `en.ftl`, and
+`autumn i18n check` does not report it unused. The API `422` message stays in
+English, because no locale is available there.
 
 ---
 
