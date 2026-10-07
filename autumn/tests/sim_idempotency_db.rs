@@ -1408,3 +1408,71 @@ async fn lock_ttl_starts_after_pool_checkout() {
         "a's lock is still live"
     );
 }
+
+/// The handler records a step, then returns `500` (not stored), so its lock
+/// is released. The recovery point then lives the 1 s TTL from the release,
+/// not until the 3 s lock deadline plus the TTL: a retry at 1.5 s starts over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn released_recovery_point_keeps_the_configured_ttl() {
+    let substrate = SqliteSubstrate::with_migrations(&[&FRAMEWORK_MIGRATIONS, &APP_MIGRATIONS])
+        .expect("substrate");
+    let calls = Calls::default();
+    let store = Arc::new(DbIdempotencyStore::new(
+        substrate.pool(),
+        Duration::from_secs(1),
+    ));
+    let pool = substrate.pool();
+    let handler_calls = calls.clone();
+    let handler = move |idem: IdempotencyTx| {
+        let pool = pool.clone();
+        let calls = handler_calls.clone();
+        async move {
+            let first = calls.get() == 0;
+            calls.add();
+            let mut pooled = pool.get().await.expect("checkout");
+            let conn: &mut RuntimeConnection = &mut pooled;
+            if let Some(point) = idem.recovery_point(conn).await.expect("recovery point") {
+                return (StatusCode::OK, format!("resumed after {point}"));
+            }
+            if first {
+                let step = idem.clone();
+                conn.transaction::<_, autumn_web::AutumnError, _>(async move |conn| {
+                    step.set_recovery_point(conn, "charged").await
+                })
+                .await
+                .expect("transaction");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "failed".to_owned());
+            }
+            (StatusCode::OK, "started over".to_owned())
+        }
+    };
+    let app = axum::Router::new()
+        .route("/step", axum::routing::post(handler))
+        .layer(
+            IdempotencyLayer::new(store)
+                .with_ttl(Duration::from_secs(1))
+                .with_in_flight_ttl(Duration::from_secs(3)),
+        );
+
+    let first = app
+        .clone()
+        .oneshot(step("charge", "A"))
+        .await
+        .expect("infallible");
+    assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let retry = app
+        .clone()
+        .oneshot(step("charge", "A"))
+        .await
+        .expect("infallible");
+    let body = axum::body::to_bytes(retry.into_body(), 1024)
+        .await
+        .expect("body");
+    assert_eq!(
+        &body[..],
+        b"started over",
+        "the recovery point expired with its TTL"
+    );
+}
