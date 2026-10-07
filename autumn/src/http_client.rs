@@ -3484,6 +3484,16 @@ async fn send_one(
         )
     };
 
+    // `true` when a wait of `wait` reaches the hop deadline, so no retry
+    // can start after it.
+    let reaches_hop_deadline = |wait: Duration| {
+        deadline.is_some_and(|d| {
+            crate::time::ambient_instant()
+                .checked_add(wait)
+                .is_none_or(|resume| resume >= d)
+        })
+    };
+
     let mut delay = Duration::ZERO;
     for attempt in 0..max_attempts {
         let last = attempt + 1 == max_attempts;
@@ -3548,13 +3558,8 @@ async fn send_one(
                     );
                     // A wait (hinted or not) that reaches the deadline cannot
                     // retry in time, so this response is the final outcome.
-                    let wait_reaches_deadline = deadline.is_some_and(|d| {
-                        crate::time::ambient_instant()
-                            .checked_add(next)
-                            .is_none_or(|resume| resume >= d)
-                    });
                     let kind = retry_kind(status.as_u16());
-                    if !wait_reaches_deadline && gate.allow(kind, next) {
+                    if !reaches_hop_deadline(next) && gate.allow(kind, next) {
                         delay = next;
                         last_retry = Some(kind);
                         continue;
@@ -3593,7 +3598,8 @@ async fn send_one(
             Err(e) if (e.is_connect() || e.is_timeout()) && !last => {
                 let wait =
                     retry_policy.retry_delay(entropy, retries_before.saturating_add(attempt), None);
-                if !gate.allow(RetryKind::Transient, wait) {
+                // No retry fits in the hop, so none is charged.
+                if reaches_hop_deadline(wait) || !gate.allow(RetryKind::Transient, wait) {
                     return Err(ClientError::Request(e.without_url()));
                 }
                 delay = wait;
@@ -6805,6 +6811,48 @@ mod tests {
                 result.map(|response| response.status().as_u16()).ok(),
                 Some(502),
                 "the last response, not a deadline error"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_transport_retry_past_the_hop_deadline_is_not_charged() {
+            let app = axum::Router::new().route(
+                "/hang",
+                axum::routing::get(|| async {
+                    std::future::pending::<()>().await;
+                    ""
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let host = format!("127.0.0.1:{port}");
+            let budgets = Arc::new(RetryBudgets::new(&RetryBudgetConfig::default()));
+            let gate =
+                RetryGate::with_deadline(None, Some(Arc::clone(&budgets)), Some(&host), true);
+            // The attempt uses up the hop: no retry can follow it.
+            let result = send_one(
+                &reqwest::Client::new(),
+                &Method::GET,
+                &format!("http://{host}/hang"),
+                &HeaderMap::new(),
+                None,
+                &RetryPolicy::default(),
+                &crate::entropy::SeededEntropy::new(1),
+                false,
+                Some(crate::time::ambient_instant() + Duration::from_millis(200)),
+                false,
+                &gate,
+                false,
+                None,
+            )
+            .await;
+            assert!(result.is_err(), "{result:?}");
+            let full = f64::from(RetryBudgetConfig::default().capacity);
+            let available = budgets.for_host(&host).available();
+            assert!(
+                (full - available).abs() < f64::EPSILON,
+                "no tokens for a retry that cannot run: {available}"
             );
         }
 

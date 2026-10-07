@@ -225,20 +225,11 @@ where
             ) {
                 status = StatusCode::SERVICE_UNAVAILABLE;
             }
-            // The request deadline stopped the upstream call (#3058).
-            if matches!(
-                any_err.downcast_ref::<crate::http_client::ClientError>(),
-                Some(crate::http_client::ClientError::DeadlineExceeded)
-            ) {
-                status = StatusCode::GATEWAY_TIMEOUT;
-            }
         }
 
-        // `deadline::bounded` stopped a call at the request deadline (#3058).
-        if any_err
-            .downcast_ref::<crate::deadline::DeadlineExceeded>()
-            .is_some()
-        {
+        // The request deadline stopped an upstream call or a
+        // `deadline::bounded` call (#3058), here or in a wrapped error.
+        if chain_has_deadline_stop(&err, false) {
             status = StatusCode::GATEWAY_TIMEOUT;
         }
 
@@ -1419,24 +1410,30 @@ impl AutumnError {
     /// [`crate::deadline::DeadlineExceeded`], or a framework call such as a
     /// database connection wait that the deadline cut.
     fn is_deadline_stop(&self) -> bool {
-        if self
-            .inner
-            .downcast_ref::<crate::deadline::DeadlineStopped>()
-            .is_some()
-        {
-            return true;
-        }
+        chain_has_deadline_stop(self.inner.as_ref(), true)
+    }
+}
+
+/// `true` when `err`, or an error in its `source()` chain, is a request
+/// deadline stop (issue #3058). With `with_stopped`, a framework
+/// [`crate::deadline::DeadlineStopped`] counts too; it is left out of the
+/// status mapping because its caller already chose the status.
+fn chain_has_deadline_stop(err: &(dyn std::error::Error + 'static), with_stopped: bool) -> bool {
+    std::iter::successors(Some(err), |err| err.source()).any(|err| {
         #[cfg(feature = "http-client")]
         if matches!(
-            self.inner.downcast_ref::<crate::http_client::ClientError>(),
+            err.downcast_ref::<crate::http_client::ClientError>(),
             Some(crate::http_client::ClientError::DeadlineExceeded)
         ) {
             return true;
         }
-        self.inner
-            .downcast_ref::<crate::deadline::DeadlineExceeded>()
+        err.downcast_ref::<crate::deadline::DeadlineExceeded>()
             .is_some()
-    }
+            || (with_stopped
+                && err
+                    .downcast_ref::<crate::deadline::DeadlineStopped>()
+                    .is_some())
+    })
 }
 
 impl IntoResponse for AutumnError {
@@ -1535,6 +1532,49 @@ mod tests {
         assert_eq!(
             marked(std::io::Error::other("boom").into()),
             (StatusCode::INTERNAL_SERVER_ERROR, false)
+        );
+    }
+
+    /// A handler's own error that wraps a deadline stop.
+    #[derive(Debug, thiserror::Error)]
+    #[error("lookup failed")]
+    struct Wrapped(#[source] Box<dyn std::error::Error + Send + Sync>);
+
+    #[test]
+    fn a_wrapped_deadline_stop_is_a_504_marked_as_cancelled() {
+        let response =
+            AutumnError::from(Wrapped(Box::new(crate::deadline::DeadlineExceeded))).into_response();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            response
+                .extensions()
+                .get::<crate::router::RequestDeadlineCancelled>()
+                .is_some()
+        );
+        #[cfg(feature = "http-client")]
+        {
+            let response = AutumnError::from(Wrapped(Box::new(
+                crate::http_client::ClientError::DeadlineExceeded,
+            )))
+            .into_response();
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            assert!(
+                response
+                    .extensions()
+                    .get::<crate::router::RequestDeadlineCancelled>()
+                    .is_some()
+            );
+        }
+        let response = AutumnError::service_unavailable(Wrapped(Box::new(
+            crate::deadline::DeadlineStopped("db wait"),
+        )))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response
+                .extensions()
+                .get::<crate::router::RequestDeadlineCancelled>()
+                .is_some()
         );
     }
 

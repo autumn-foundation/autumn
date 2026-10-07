@@ -52,9 +52,9 @@ These framework calls use the deadline:
 | `Db` extractor | The wait for a pool connection stops at the deadline (`503`). A query that is already running is not cut at the deadline: `database.statement_timeout` (`30s` under `prod`) bounds it. |
 
 When a handler returns `ClientError::DeadlineExceeded` or
-`deadline::DeadlineExceeded`, the `504` is treated like a request the timeout
-cancelled: the session layer does not save the session changes the handler
-made.
+`deadline::DeadlineExceeded`, or its own error with one of them as a
+`source()`, the `504` is treated like a request the timeout cancelled: the
+session layer does not save the session changes the handler made.
 
 A task that you start with `tokio::spawn` does not get the deadline. Give it
 one with `Deadline::scope`. To stop any other call at the deadline, for
