@@ -634,13 +634,19 @@ pub fn can_set_lc_messages(database_url: &str) -> bool {
 /// batch without `-c lock_timeout=0` (after a pooler refused the option): a
 /// role or database default would cancel `CREATE INDEX CONCURRENTLY` and
 /// leave an INVALID index. `false` when the value cannot be read.
+///
+/// A value that came from this connection's own startup options
+/// (`PGOPTIONS`, or `options` in the URL) does not count: `pg_settings.source`
+/// is `client` then, and the fallback runs without those options, under the
+/// role or database default.
 #[doc(hidden)]
 #[must_use]
 pub fn server_lock_timeout_is_off(database_url: &str) -> bool {
     let result: Result<String, MigrationError> = with_migration_connection!(database_url, |conn| {
         use diesel::RunQueryDsl as _;
         diesel::select(diesel::dsl::sql::<diesel::sql_types::Text>(
-            "current_setting('lock_timeout')",
+            "(SELECT CASE WHEN source = 'client' THEN 'client' ELSE setting END \
+             FROM pg_settings WHERE name = 'lock_timeout')",
         ))
         .get_result::<String>(conn)
         .map_err(|e| MigrationError::Migration(e.to_string()))
@@ -5952,10 +5958,22 @@ mod tests {
         assert!(off, "a fresh database has no lock_timeout");
 
         set_database_lock_timeout(&url, "100ms").await;
-        let off = crate::time::spawn_blocking(move || server_lock_timeout_is_off(&url))
+        let probe_url = url.clone();
+        let off = crate::time::spawn_blocking(move || server_lock_timeout_is_off(&probe_url))
             .await
             .expect("join");
         assert!(!off, "a database default of 100ms is not off");
+
+        // A `0` the connection asked for itself does not hide the default.
+        let sep = if url.contains('?') { '&' } else { '?' };
+        let with_options = format!("{url}{sep}options=-c%20lock_timeout%3D0");
+        let off = crate::time::spawn_blocking(move || server_lock_timeout_is_off(&with_options))
+            .await
+            .expect("join");
+        assert!(
+            !off,
+            "lock_timeout=0 from startup options is not the server default"
+        );
     }
 
     /// AC: once the blocking transaction ends, a retry applies the migration.
