@@ -176,6 +176,16 @@ scan_manifest() {
       }
       return out
     }
+    # Whether a header names a table that can hold dependencies or features:
+    # `[features]`, `[target.…]`, or a path with a dependencies segment. Read
+    # by segment, so `[package.metadata.features-x]` is not one.
+    function is_dep_or_feature_header(h) {
+      gsub(SQ, "", h)
+      gsub(/"/, "", h)
+      gsub(/[ \t]*\.[ \t]*/, ".", h)
+      return h ~ /^\[[ \t]*(features[ \t]*\]|target\.)/ \
+          || h ~ /(^\[[ \t]*|\.)(dependencies|dev-dependencies|build-dependencies)[ \t]*(\.|\])/
+    }
     # The value of a string of hex digits, or -1 if one is not a hex digit.
     function hex_value(h,   i, d, v) {
       if (h == "") return -1
@@ -342,7 +352,7 @@ scan_manifest() {
       if (line ~ /^\[/) {
         # A unicode escape left in a dependency or feature header is a
         # non-ASCII one, which the rules cannot read. Hand pass 2 a marker.
-        if (has_unicode_escape(line) && line ~ /(dependencies|features|target)/) {
+        if (has_unicode_escape(line) && is_dep_or_feature_header(line)) {
           entry_line = FNR; section = line; return ESCAPED_HEADER
         }
         # A header ends any entry. It carries no string values, so every
@@ -1045,6 +1055,19 @@ EOF
 text = "\u00e9t\u00e9"
 EOF
   check_pass "an escape in a metadata header is not an edge" header_metadata_escape
+
+  make_case header_metadata_word_escape <<'EOF'
+[package.metadata."features\u00e9"]
+text = "x"
+EOF
+  check_pass "a metadata header that holds a keyword and an escape is not an edge" header_metadata_word_escape
+
+  make_case header_dep_nonascii <<'EOF'
+[dependencies."w\u00e9bb"]
+package = "autumn-web"
+features = ["sqlite"]
+EOF
+  check_fail "a non-ASCII escape in a dependency header fails closed" header_dep_nonascii
 
   make_case root_metadata_escape <<'EOF'
 package.metadata.banner = "\u0068ello"
