@@ -70,11 +70,15 @@ add any of the following. Each is a Harvest concern:
 - Dependency graphs between jobs: "run B after A succeeds", batches with
   completion callbacks, fan-out/fan-in.
 
-### 2. A job is one unit of work, delivered at least once
+### 2. A job is one unit of work, retried from the top
 
 The job contract stays: a job has not run, is running, or has finished
 (succeeded or dead-lettered). A retry starts the handler again from the top,
-so a handler must be idempotent. Work that makes that contract more reliable
+so a handler must be idempotent. Once a durable backend (`postgres`, `redis`,
+`sqlite`) has persisted a job, it is delivered at least once. The `local`
+backend and `enqueue_after_commit` are best-effort and can lose a job on a
+crash or restart, as the jobs guide documents. Either way the framework keeps
+no position inside the handler. Work that makes that contract more reliable
 or more operable is in scope, for example:
 
 - delayed and transactional enqueue;

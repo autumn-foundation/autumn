@@ -1794,7 +1794,9 @@ step-checkpoint tables, durable sleep inside a handler, signals, compensation,
 or "run B after A" job dependencies. The test from
 `docs/adr/0016-durable-workflows-live-in-harvest.md`: if the framework must
 remember *where inside the work* it got to, it is Harvest's; otherwise it can
-be a job feature. Jobs stay one unit of work, delivered at least once.
+be a job feature. Jobs stay one unit of work, retried from the top (at least
+once on the durable backends; `local` and `enqueue_after_commit` can lose a
+job on a crash).
 
 `autumn-admin-plugin` includes `/admin/jobs` for inspecting, retrying,
 discarding, and canceling framework jobs. `GET /actuator/jobs` exposes

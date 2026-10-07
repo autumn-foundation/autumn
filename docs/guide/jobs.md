@@ -109,8 +109,12 @@ Autumn Harvest is for durable workflows with history and stronger orchestration
 semantics — heavier than a one-shot timer. Delayed `#[job]` fills the gap
 between "now" and "durable workflow".
 
-A job is one unit of work, delivered at least once: a retry runs the handler
-again from the top, so make it idempotent. If the framework would have to
+A job is one unit of work: a retry runs the handler again from the top, so
+make it idempotent. The durable backends (`postgres`, `redis`, `sqlite`)
+deliver a persisted job at least once. The `local` backend and
+`enqueue_after_commit` can lose one on a crash or restart (see
+[Backend selection](#backend-selection-autumntoml) and
+[`enqueue_after_commit`](#enqueue_after_commit--any-backend)). If the framework would have to
 remember *where inside the work* it got to — per-step checkpoints, a durable
 sleep mid-handler, signals, compensation, "run B after A" dependencies — that is
 a workflow, and Autumn core deliberately leaves it to Harvest

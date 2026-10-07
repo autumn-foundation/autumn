@@ -15,9 +15,10 @@ repository. This page is only a pointer.
 Use Autumn's built-in background work first:
 
 - `#[scheduled]` for recurring work on a cron or fixed interval.
-- `#[job]` for one unit of work, delivered at least once, now or later
-  (`enqueue`, `enqueue_in`, `enqueue_at`, `enqueue_in_tx`). See the
-  [jobs guide](guide/jobs.md).
+- `#[job]` for one unit of work, now or later (`enqueue`, `enqueue_in`,
+  `enqueue_at`, `enqueue_in_tx`), retried from the top on failure. The durable
+  backends deliver it at least once. See the [jobs guide](guide/jobs.md) for
+  each backend's guarantee.
 
 Reach for Harvest when the framework must remember *where inside the work* it
 got to: multi-step workflows with per-step history, durable timers in the
