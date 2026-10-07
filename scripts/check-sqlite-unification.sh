@@ -54,10 +54,11 @@
 # It is a manifest gate, not a build: ~2 seconds, self-testing. Two layers:
 #   - The SCAN reads every manifest with the awk lexer below. It needs no
 #     toolchain and also covers crates outside the workspace.
-#   - The RESOLVER asks `cargo metadata` which features cargo resolves for the
-#     workspace. Cargo parses the TOML, so no spelling can slip past it. It
-#     needs cargo and jq; without them it is skipped, unless
-#     SQLITE_GATE_REQUIRE_RESOLVE=1 (CI sets it).
+#   - The RESOLVER reads `cargo metadata` for the workspace: the features
+#     cargo resolves today, and each member's declared edges and feature
+#     chains, optional or target-only ones too. Cargo parses the TOML, so no
+#     spelling can slip past it. It needs cargo and jq; without them it is
+#     skipped, unless SQLITE_GATE_REQUIRE_RESOLVE=1 (CI sets it).
 #
 # Deliberately scans EVERY `Cargo.toml` under the root, including crates the
 # root workspace excludes (fuzz targets, benchmark harnesses, `src-tauri`).
@@ -176,14 +177,29 @@ scan_manifest() {
     # significant to the value patterns (`"sqlite"`, `package = "autumn-web"`,
     # the `"dep/sqlite"` forwarding paths).
     function unquote_key(entry,   i, key, tail) {
-      i = index(entry, "=")
+      i = assign_index(entry)
       if (i == 0) return entry
       key = substr(entry, 1, i - 1)
       tail = substr(entry, i)
       gsub(SQ, "", key)
       gsub(/"/, "", key)
+      # A quoted key can hold `=`: target."cfg(target_os = linux)".
+      # Drop it, so the rules split the entry at the real assignment.
+      gsub(/=/, "", key)
       gsub(/[ \t]*\.[ \t]*/, ".", key)
       return key tail
+    }
+    # The index of the assignment `=`: the first one outside quotes.
+    function assign_index(s,   i, c, q) {
+      q = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (q == "\"" && c == "\\") { i++; continue }
+        if (q != "") { if (c == q) q = ""; continue }
+        if (c == "\"" || c == SQ) { q = c; continue }
+        if (c == "=") return i
+      }
+      return 0
     }
 
     # TOML multi-line strings (three double or three single quotes) can span
@@ -582,9 +598,9 @@ gate_check() {
   return 0
 }
 
-# The authoritative check: ask cargo which features it resolves. Prints one
-# line per flip crate that resolves with `sqlite` on; returns 2 if cargo or jq
-# cannot run. The scan above reads TOML by hand and can miss a spelling that
+# The authoritative check: ask cargo. Prints one line per violation in what
+# cargo resolves or in what a workspace member declares; returns 2 if cargo or
+# jq cannot run. The scan above reads TOML by hand and can miss a spelling that
 # cargo accepts. The resolver cannot. It covers workspace members only, so
 # the scan stays for the crates outside the workspace.
 resolve_check() {
@@ -592,10 +608,35 @@ resolve_check() {
   command -v cargo >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 2
   meta="$(cd "$root" && cargo metadata --format-version 1 2>/dev/null)" || return 2
   jq -r --arg flip "$FLIP_CRATES" '
-    (.packages | map({key: .id, value: .name}) | from_entries) as $name
-    | .resolve.nodes[]
-    | select(($name[.id] | test("^(" + $flip + ")$")) and (.features | index("sqlite")))
-    | "\($name[.id]) resolves with the `sqlite` feature on"
+    def flip: test("^(" + $flip + ")$");
+    # The local features that reach the seed set, the seed set included.
+    def closure($f):
+      def grow: . as $r
+        | ([$f | to_entries[] | select(any(.value[]; . as $v | any($r[]; . == $v))) | .key]
+           + $r | unique);
+      until(grow == .; grow);
+    (.packages | map({key: .id, value: .}) | from_entries) as $pkg
+    # 1. What cargo resolves today.
+    | ( .resolve.nodes[]
+        | select(($pkg[.id].name | flip) and (.features | index("sqlite")))
+        | "\($pkg[.id].name) resolves with the `sqlite` feature on" ),
+    # 2. What each workspace member declares, also on an optional or
+    #    target-only edge that is off today. Cargo has decoded every spelling.
+      ( .workspace_members[] | $pkg[.] as $p
+        | ( $p.dependencies[]
+            | select((.name | flip) and (.features | index("sqlite")))
+            | "\($p.name): its dependency on \(.name) enables `sqlite`" ),
+          ( [$p.dependencies[] | select(.name | flip) | (.rename // .name)] as $aliases
+            | ($p.features // {}) as $f
+            | [$f | to_entries[]
+                | select(any(.value[]; . as $v
+                    | any($aliases[]; $v == (. + "/sqlite") or $v == (. + "?/sqlite"))))
+                | .key] as $direct
+            | (if ($p.name | flip) then $direct + ["sqlite"] else $direct end | unique) as $seed
+            | ( $seed | closure($f) | .[] | select(. != "sqlite")
+                | "\($p.name): feature `\(.)` enables `sqlite`" ),
+              ( select(($direct | index("sqlite")) and (($p.name | flip) | not))
+                | "\($p.name): feature `sqlite` forwards the flip from a crate that does not own it" ) ) )
   ' <<<"$meta" || return 2
 }
 
@@ -626,7 +667,7 @@ explicit invocation instead:
 See the \`sqlite = [...]\` comment in autumn/Cargo.toml." ;;
   esac
 
-  echo "==> asking cargo which features it resolves"
+  echo "==> asking cargo what the workspace resolves and declares"
   local findings rstatus=0
   findings="$(resolve_check "$root")" || rstatus=$?
   if (( rstatus != 0 )); then
@@ -635,10 +676,10 @@ See the \`sqlite = [...]\` comment in autumn/Cargo.toml." ;;
     echo "note: cargo or jq not available; resolver check skipped"
   elif [[ -n "$findings" ]]; then
     printf '%s\n' "$findings"
-    die "cargo resolves the \`sqlite\` backend flip for the workspace. Find the
-edge with: cargo tree -e features -i autumn-web"
+    die "cargo metadata shows an edge to the \`sqlite\` backend flip. Find it
+with: cargo tree -e features -i autumn-web"
   else
-    echo "OK: cargo resolves no flip crate with \`sqlite\` on."
+    echo "OK: cargo metadata shows no edge to the \`sqlite\` backend flip."
   fi
 }
 
@@ -1011,6 +1052,11 @@ target."cfg(unix)".dependencies.autumn-web = { version = "0.7", features = ["sql
 EOF
   check_fail "a target dependency spelled as a root-level dotted key" target_root_dotted
 
+  make_case target_cfg_eq <<'EOF'
+target.'cfg(target_os = "linux")'.dependencies.autumn-web = { path = "../autumn", optional = true, features = ["sqlite"] }
+EOF
+  check_fail "a dotted target key whose cfg holds an equals sign" target_cfg_eq
+
   make_case root_features <<'EOF'
 features = { default = ["autumn-web/sqlite"] }
 
@@ -1192,6 +1238,27 @@ EOF
       pass+=1
     else
       echo "  FAIL: resolver layer — a resolved \`sqlite\` feature not caught"
+    fi
+    # An optional edge that is off by default: nothing RESOLVES `sqlite`, but
+    # the declared edge enables it once the dependency is on.
+    make_resolve_case resolve_optional '[target."cfg(unix)".dependencies]
+autumn-web = { path = "../web", optional = true, features = ["sqlite"] }'
+    total+=1
+    if [[ -n "$(resolve_check "$tmp/resolve_optional" 2>/dev/null)" ]]; then
+      pass+=1
+    else
+      echo "  FAIL: resolver layer — an optional declared edge not caught"
+    fi
+    make_resolve_case resolve_chain 'web = { package = "autumn-web", path = "../web", optional = true }
+
+[features]
+extra = ["embedded"]
+embedded = ["web?/sqlite"]'
+    total+=1
+    if [[ -n "$(resolve_check "$tmp/resolve_chain" 2>/dev/null)" ]]; then
+      pass+=1
+    else
+      echo "  FAIL: resolver layer — a feature chain to the flip not caught"
     fi
     make_resolve_case resolve_pass 'autumn-web = { path = "../web" }'
     total+=1
