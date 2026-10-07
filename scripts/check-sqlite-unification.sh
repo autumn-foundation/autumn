@@ -429,7 +429,9 @@ scan_manifest() {
       i = index(e, "=")
       key = (i > 0) ? substr(e, 1, i - 1) : e
       if (key ~ /(^|\.)features[ \t]*$/) return (e ~ /"sqlite"/)
-      if (!match(e, /features[ \t]*=[ \t]*\[[^]]*\]/)) return 0
+      # The key may be quoted (`"features" = [...]`); quote style is already
+      # normalized to double quotes.
+      if (!match(e, /"?features"?[ \t]*=[ \t]*\[[^]]*\]/)) return 0
       return (substr(e, RSTART, RLENGTH) ~ /"sqlite"/)
     }
     # The value of a `key = "value"` entry.
@@ -1150,6 +1152,12 @@ EOF
 autumn-web = { path = "sqlite", branch = "sqlite" }
 EOF
   check_pass "sqlite outside the features list is not an edge" sqlite_elsewhere
+
+  make_case quoted_inline_features <<'EOF'
+[dependencies]
+autumn-web = { version = "0.8", "features" = ["sqlite"] }
+EOF
+  check_fail "a quoted features key inside an inline table" quoted_inline_features
 
   make_case root_metadata <<'EOF'
 package.metadata.dependencies.autumn-web = { features = ["sqlite"] }
