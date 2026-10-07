@@ -718,8 +718,6 @@ where
     }
 }
 
-/// Measure the replica lag with `measure` and record the result.
-#[cfg(feature = "db")]
 /// The longest a replica lag query may run: the lag limit, at least 1 s.
 #[cfg(feature = "db")]
 pub(crate) fn replica_lag_query_budget(max_lag: std::time::Duration) -> std::time::Duration {
@@ -777,6 +775,8 @@ pub(crate) async fn refresh_replica_lag_bounded<M, F>(
     refresh_replica_lag_with(probes, std::future::ready(measured)).await;
 }
 
+/// Measure the replica lag with `measure` and record the result.
+#[cfg(feature = "db")]
 pub(crate) async fn refresh_replica_lag_with<Fut>(probes: &ProbeState, measure: Fut)
 where
     Fut: std::future::Future<Output = Result<std::time::Duration, String>>,
