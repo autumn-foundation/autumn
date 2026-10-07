@@ -428,7 +428,8 @@ const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 /// `Sink` the same way, so `split()` works.
 ///
 /// - A message over `max_message_bytes` sends close code `1009`. The stream
-///   then yields the error and ends. Any other receive error also ends it.
+///   then yields the error and ends. Any other receive error also ends it,
+///   and so does a send error.
 /// - Every `ping_interval_ms` the socket sends a ping while the handler
 ///   reads. The pong is not given to the handler.
 /// - When no complete message arrives for `idle_timeout_ms`, the socket
@@ -625,6 +626,19 @@ impl WebSocket {
         self.note_writer(cx, poll)
     }
 
+    /// A send error ends the socket (tungstenite does not recover), so
+    /// release it, also while the handler keeps the sink and nothing polls
+    /// the stream.
+    fn settle_send_error(
+        &mut self,
+        poll: Poll<Result<(), axum::Error>>,
+    ) -> Poll<Result<(), axum::Error>> {
+        if matches!(poll, Poll::Ready(Err(_))) {
+            self.finish();
+        }
+        poll
+    }
+
     /// Keep the waker of a `Sink` call that returned `Pending`.
     fn note_writer<T>(&mut self, cx: &Context<'_>, poll: Poll<T>) -> Poll<T> {
         if poll.is_pending() {
@@ -780,12 +794,17 @@ impl futures::Sink<Message> for WebSocket {
             Ok(socket) => Pin::new(socket).poll_ready(cx),
             Err(error) => return Poll::Ready(Err(error)),
         };
+        let poll = self.settle_send_error(poll);
         self.note_writer(cx, poll)
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
         let close = matches!(item, Message::Close(_));
-        Pin::new(self.socket()?).start_send(item)?;
+        let sent = Pin::new(self.socket()?).start_send(item);
+        if sent.is_err() {
+            self.finish();
+        }
+        sent?;
         if close && self.close_deadline.is_none() {
             self.close_deadline = Some(Box::pin(tokio::time::sleep(CLOSE_FLUSH_TIMEOUT)));
         }
@@ -800,6 +819,7 @@ impl futures::Sink<Message> for WebSocket {
         if self.close_deadline.is_some() {
             return self.settle_close(cx, poll);
         }
+        let poll = self.settle_send_error(poll);
         self.note_writer(cx, poll)
     }
 

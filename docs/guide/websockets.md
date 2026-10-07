@@ -165,9 +165,10 @@ idle timeout. A handler that does long work between reads gets no pings
 during that work, so a quiet client can reach the idle timeout.
 
 When the socket ends (a close the server sends, a Close message or
-`close()` from the handler, the peer's close, or a receive error), it closes
-its transport and frees its `max_connections` slot. This also occurs when a `split()` sink half is still
-alive in another task. A later send on that half returns an error.
+`close()` from the handler, the peer's close, a receive error, or a send
+error), it closes its transport and frees its `max_connections` slot. This
+also occurs when a `split()` half is still alive in another task. A later
+send on a sink half returns an error.
 
 The actuator `tasks/stream` socket does not use these limits.
 

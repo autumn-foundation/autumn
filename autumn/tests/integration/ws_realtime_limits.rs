@@ -84,6 +84,24 @@ async fn sink_send_close() -> impl WsHandler {
     }
 }
 
+/// A `split()` handler whose writer keeps sending and ignores send errors,
+/// and keeps its sink. Nothing polls the reader, so only the send error can
+/// tell the socket that the peer is gone.
+#[ws("/sink-error")]
+async fn sink_error() -> impl WsHandler {
+    |socket: WebSocket| async move {
+        let (mut sink, stream) = socket.split();
+        tokio::spawn(async move {
+            loop {
+                let _ = sink.send(Message::Text("tick".into())).await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let _stream = stream;
+        std::future::pending::<()>().await;
+    }
+}
+
 /// A handler on the axum socket. It keeps the hold for the socket's life.
 #[get("/raw")]
 async fn raw(ws: autumn_web::ws::WebSocketUpgrade) -> axum::response::Response {
@@ -104,7 +122,8 @@ async fn serve_with(configure: impl FnOnce(&mut AutumnConfig)) -> SocketAddr {
             raw,
             split_writer,
             sink_close,
-            sink_send_close
+            sink_send_close,
+            sink_error
         ])
         .build()
         .into_router();
@@ -440,6 +459,30 @@ async fn a_sent_close_message_releases_the_socket() {
         assert!(
             tokio::time::Instant::now() < deadline,
             "the closed socket still holds the slot"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_send_error_releases_the_socket() {
+    let addr = serve_with(|c| c.realtime.max_connections = Some(1)).await;
+    let (client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/sink-error"))
+        .await
+        .expect("first socket");
+    // The peer goes away. The handler keeps sending and keeps both halves.
+    drop(client);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if tokio_tungstenite::connect_async(format!("ws://{addr}/sink-error"))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a socket whose send failed still holds the slot"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
