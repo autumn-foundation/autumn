@@ -10,8 +10,8 @@
 //! machinery so feed pollers get a `304 Not Modified` on the unchanged-content
 //! path instead of re-downloading an unchanged feed.
 //!
-//! A date before year 0000 or after year 9999 is clamped to the nearest limit,
-//! because RFC 3339, RFC 2822 and HTTP dates have a 4-digit year.
+//! RFC 3339, RFC 2822 and HTTP dates have a 4-digit year. The feed clamps a
+//! date before year 0000 or after year 9999 to the nearest limit.
 //!
 //! ```
 //! use autumn_web::feed::{Feed, FeedEntry};
@@ -194,6 +194,9 @@ impl Feed {
 
     /// The newest timestamp across the feed: the explicit channel `updated` if
     /// set, otherwise the maximum `updated`/`published` across entries.
+    ///
+    /// The value is not clamped. [`Feed::conditional`] clamps the
+    /// `Last-Modified` header to years 0000–9999.
     #[must_use]
     pub fn last_updated(&self) -> Option<DateTime<Utc>> {
         if let Some(updated) = self.updated {
@@ -602,7 +605,11 @@ mod proptests {
         /// date parses back as the input clamped to years 0000–9999.
         #[test]
         fn render_clamps_any_date(
-            secs in DateTime::<Utc>::MIN_UTC.timestamp()..=DateTime::<Utc>::MAX_UTC.timestamp(),
+            // Half the cases stay in years 0000–9999, where the date must not change.
+            secs in prop_oneof![
+                -62_167_219_200_i64..=253_402_300_799,
+                DateTime::<Utc>::MIN_UTC.timestamp()..=DateTime::<Utc>::MAX_UTC.timestamp(),
+            ],
             rss in any::<bool>(),
         ) {
             let dt = DateTime::from_timestamp(secs, 0).unwrap();
