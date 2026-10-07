@@ -4468,11 +4468,12 @@ pub struct RequestTimeoutService<S> {
 }
 
 impl<S> RequestTimeoutService<S> {
-    /// The deadline that applies to `req`, or `None` when it is exempt.
+    /// The deadline that applies to `req`, or `None` when it is exempt. The
+    /// flag is `true` when the caller's deadline header set it.
     ///
     /// Uses borrowed lookups throughout so an exempt or deadline-free route
     /// allocates nothing.
-    fn deadline_for<B>(&self, req: &Request<B>) -> Option<Duration> {
+    fn deadline_for<B>(&self, req: &Request<B>) -> Option<(Duration, bool)> {
         // Internal `autumn build` / ISR regeneration renders drive a
         // `#[static_get]` route directly via `oneshot` and tag the request with
         // `RenderDeadlineExempt` (there is no client connection whose deadline
@@ -4508,7 +4509,10 @@ impl<S> RequestTimeoutService<S> {
             .then(|| req.headers().get(crate::deadline::DEADLINE_HEADER))
             .flatten()
             .and_then(crate::deadline::parse_header);
-        Some(caller_deadline.map_or(route_deadline, |caller| caller.min(route_deadline)))
+        Some(match caller_deadline {
+            Some(caller) if caller < route_deadline => (caller, true),
+            _ => (route_deadline, false),
+        })
     }
 }
 
@@ -4528,7 +4532,7 @@ where
     }
 
     fn call(&mut self, req: Request<axum::body::Body>) -> Self::Future {
-        let Some(duration) = self.deadline_for(&req) else {
+        let Some((duration, from_caller)) = self.deadline_for(&req) else {
             // Exempt (disabled route, or global off with a non-Override route)
             // — no timer and no allocation on this hot path.
             return RequestTimeoutFuture::Unbounded {
@@ -4569,6 +4573,21 @@ where
         // The handler sees the deadline through `Deadline::current()` (issue
         // #3058). The task-local scope costs no allocation.
         let start = crate::time::ambient_instant();
+        // A caller deadline of 0 leaves no time. `timeout_at` polls the
+        // handler before it checks the timer, so a handler that is ready at
+        // once would still run; answer with the timeout response instead.
+        if from_caller && duration.is_zero() {
+            return RequestTimeoutFuture::Elapsed {
+                response: Some(deadline_exceeded_response(
+                    &self.settings,
+                    duration,
+                    matched_path.as_deref(),
+                    request_id.as_ref(),
+                    cors_origin.as_ref(),
+                    start,
+                )),
+            };
+        }
         let deadline = crate::deadline::Deadline::after(duration);
         let inner = deadline.sync_scope(|| self.inner.call(req));
 

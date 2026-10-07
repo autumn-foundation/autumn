@@ -183,13 +183,17 @@ pub(crate) struct DeadlineStopped(pub(crate) &'static str);
 
 /// Run `future`, but stop it at the current deadline.
 ///
-/// With no deadline set, this runs `future` to the end.
+/// With no deadline set, this runs `future` to the end. Past the deadline,
+/// `future` is not polled at all.
 ///
 /// # Errors
 ///
 /// [`DeadlineExceeded`] when the deadline passes first.
 pub async fn bounded<F: Future>(future: F) -> Result<F::Output, DeadlineExceeded> {
     match Deadline::current() {
+        // `timeout_at` polls the future before it checks the timer, so a
+        // future that is ready at once would still run.
+        Some(deadline) if deadline.is_expired() => Err(DeadlineExceeded),
         Some(deadline) => tokio::time::timeout_at(deadline.instant(), future)
             .await
             .map_err(|_elapsed| DeadlineExceeded),
@@ -200,6 +204,20 @@ pub async fn bounded<F: Future>(future: F) -> Result<F::Output, DeadlineExceeded
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_does_not_poll_work_past_the_deadline() {
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let deadline = Deadline::after(Duration::from_millis(1));
+        tokio::time::advance(Duration::from_millis(5)).await;
+        let result = deadline
+            .scope(bounded(async {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            }))
+            .await;
+        assert_eq!(result, Err(DeadlineExceeded));
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn remaining_counts_down_to_zero() {

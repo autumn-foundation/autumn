@@ -337,6 +337,33 @@ async fn inbound_deadline_header_shortens_the_route_deadline() {
         .assert_status(503);
 }
 
+static FAST_MUTATIONS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[post("/fast-mutation")]
+async fn fast_mutation() -> &'static str {
+    FAST_MUTATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    "done"
+}
+
+#[tokio::test]
+async fn a_zero_inbound_deadline_does_not_run_the_handler() {
+    let client = TestApp::new()
+        .routes(routes![fast_mutation])
+        .config(with_deadline_header(5_000))
+        .build();
+    client
+        .post("/fast-mutation")
+        .header("x-autumn-deadline-ms", "0")
+        .send()
+        .await
+        .assert_status(503);
+    assert_eq!(
+        FAST_MUTATIONS.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the caller had no time left, so the handler must not run"
+    );
+}
+
 #[tokio::test]
 async fn inbound_deadline_header_cannot_extend_the_route_deadline() {
     let client = TestApp::new()
