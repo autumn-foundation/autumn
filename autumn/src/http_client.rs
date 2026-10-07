@@ -2257,13 +2257,14 @@ impl RequestBuilder {
                     guard.failure();
                 }
             }
-            // The caller ran out of time, not the upstream (issue #3058): a
-            // cancelled call, which counts only past the slow-call threshold.
-            Err(ClientError::DeadlineExceeded) => drop(guard),
-            // A local throttle reject says nothing about the host. Dropping
-            // the guard records nothing for a fast call, and frees a
-            // half-open slot.
-            Err(ClientError::ThrottledLocally { .. }) => drop(guard),
+            // Neither says anything about the host. The caller ran out of
+            // time (issue #3058): a cancelled call, which counts only past the
+            // slow-call threshold. A local throttle reject (#3068): dropping
+            // the guard records nothing for a fast call and frees a half-open
+            // slot.
+            Err(ClientError::DeadlineExceeded | ClientError::ThrottledLocally { .. }) => {
+                drop(guard);
+            }
             Err(_) => {
                 guard.failure();
             }
@@ -2343,32 +2344,10 @@ impl RequestBuilder {
             if attempt > 0 {
                 tokio::time::sleep(delay).await;
             }
-            if gate.expired() {
-                return Err(ClientError::DeadlineExceeded);
-            }
-            // A throttled attempt ends the call, retry or not. It is asked
-            // before `check`, so a throttled attempt refills no budget.
-            let ticket = self.throttle_attempt(None)?;
-            gate.check()?;
+            // A throttled attempt ends the call, retry or not.
+            let ticket = self.begin_attempt(&gate, None)?;
             let last = attempt + 1 == max_attempts;
-            let timeout = gate.attempt_timeout(self.retry_policy.request_timeout);
-
-            let mut req = self.client.request(self.method.clone(), &self.url);
-            if gate.deadline.is_some()
-                && let Some(timeout) = timeout
-            {
-                req = req.timeout(timeout);
-            }
-
-            // Inject W3C trace context headers from the active span.
-            req = inject_trace_context(req);
-            // Caller-supplied headers may override or extend trace headers.
-            req = with_caller_headers(req, &gate, timeout, &self.extra_headers);
-
-            if let Some(body) = &self.body {
-                req = req.body(body.clone());
-            }
-
+            let req = self.plain_attempt(&gate);
             let (sent, followed) = send_tracking_redirects(req).await;
             // Each host that served a redirect gets its refill, even when
             // the send or the body fails later.
@@ -2543,6 +2522,41 @@ impl RequestBuilder {
         }
     }
 
+    /// Start one attempt: stop at the deadline, ask the throttle, then let
+    /// the gate record the attempt. The throttle is asked before
+    /// [`RetryGate::check`], so a throttled attempt refills no budget.
+    fn begin_attempt(
+        &self,
+        gate: &RetryGate,
+        host: Option<&str>,
+    ) -> Result<Option<ThrottleTicket>, ClientError> {
+        if gate.expired() {
+            return Err(ClientError::DeadlineExceeded);
+        }
+        let ticket = self.throttle_attempt(host)?;
+        gate.check()?;
+        Ok(ticket)
+    }
+
+    /// The request of one plain-path attempt: the attempt timeout under a
+    /// deadline, the trace context, then the caller's headers, which may
+    /// override or extend the trace headers.
+    fn plain_attempt(&self, gate: &RetryGate) -> reqwest::RequestBuilder {
+        let timeout = gate.attempt_timeout(self.retry_policy.request_timeout);
+        let mut req = self.client.request(self.method.clone(), &self.url);
+        if gate.deadline.is_some()
+            && let Some(timeout) = timeout
+        {
+            req = req.timeout(timeout);
+        }
+        req = inject_trace_context(req);
+        req = with_caller_headers(req, gate, timeout, &self.extra_headers);
+        if let Some(body) = &self.body {
+            req = req.body(body.clone());
+        }
+        req
+    }
+
     /// Ask the throttle for one attempt (issue #3068). `host` is the throttle
     /// key; `None` takes it from the URL. Returns `Ok(None)` without a
     /// throttle, and [`ClientError::ThrottledLocally`] when it rejects.
@@ -2629,12 +2643,7 @@ impl RequestBuilder {
             if attempt > 0 {
                 tokio::time::sleep(delay).await;
             }
-            if gate.expired() {
-                return Err(ClientError::DeadlineExceeded);
-            }
-            // Asked before `check`, so a throttled attempt refills no budget.
-            let ticket = self.throttle_attempt(Some(&host))?;
-            gate.check()?;
+            let ticket = self.begin_attempt(&gate, Some(&host))?;
             let last = attempt + 1 == max_attempts;
             let timeout = gate.attempt_timeout(self.retry_policy.request_timeout);
             let deadline_header = gate.header(timeout, &self.extra_headers);
