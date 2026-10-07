@@ -1199,7 +1199,7 @@ async fn renew_claim(
 }
 
 /// Start renewing `row`'s claim for `worker_id`.
-fn lease_heartbeat(
+async fn lease_heartbeat(
     pool: &SqlitePool,
     row: &SqliteJobRow,
     claimed_at: tokio::time::Instant,
@@ -1211,13 +1211,14 @@ fn lease_heartbeat(
     let job_id = row.id.clone();
     let worker_id = worker_id.to_owned();
     let clock = state.clock_arc();
-    LeaseHeartbeat::spawn(claimed_at, visibility_timeout_ms, move || {
+    LeaseHeartbeat::start(claimed_at, visibility_timeout_ms, move || {
         let pool = pool.clone();
         let clock = Arc::clone(&clock);
         let job_id = job_id.clone();
         let worker_id = worker_id.clone();
         async move { renew_claim(&pool, clock.as_ref(), &job_id, &worker_id).await }
     })
+    .await
 }
 
 /// Run one claimed job and settle its row.
@@ -1313,7 +1314,8 @@ async fn execute_job(
         worker_id,
         state,
         visibility_timeout_ms,
-    );
+    )
+    .await;
     let bounds = ExecutionBounds {
         timeout,
         lease_lost: Some(heartbeat.lost_token()),

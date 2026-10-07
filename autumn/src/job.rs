@@ -914,6 +914,14 @@ fn lease_heartbeat_interval(visibility_timeout_ms: u64) -> std::time::Duration {
         .max(std::time::Duration::from_millis(1))
 }
 
+/// How long a worker keeps running without a successful renewal: two thirds
+/// of the visibility timeout, so it stops before another worker can recover
+/// the claim.
+#[cfg(any(feature = "db", feature = "redis"))]
+fn lease_give_up_after(visibility_timeout_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(visibility_timeout_ms.saturating_mul(2) / 3)
+}
+
 /// Result of one claim renewal.
 #[cfg(any(feature = "db", feature = "redis"))]
 #[derive(Debug)]
@@ -941,6 +949,56 @@ struct LeaseHeartbeat {
 
 #[cfg(any(feature = "db", feature = "redis"))]
 impl LeaseHeartbeat {
+    /// Start the heartbeat for a claim sent at `claimed_at`, before the
+    /// handler runs.
+    ///
+    /// When the claim and the run setup took a third of the lease or more,
+    /// the first renewal is already due. It runs here, before the handler is
+    /// first polled: if the claim is gone, the lost token is cancelled on
+    /// return, so `bound_run` never starts the handler while another worker
+    /// may run the job.
+    async fn start<R, F>(
+        claimed_at: tokio::time::Instant,
+        visibility_timeout_ms: u64,
+        mut renew: R,
+    ) -> Self
+    where
+        R: FnMut() -> F + Send + 'static,
+        F: Future<Output = LeaseRenewal> + Send + 'static,
+    {
+        let interval = lease_heartbeat_interval(visibility_timeout_ms);
+        let started = tokio::time::Instant::now();
+        if started < crate::time_math::saturating_tokio_deadline(claimed_at, interval) {
+            return Self::spawn(claimed_at, visibility_timeout_ms, renew);
+        }
+        let give_up_at = crate::time_math::saturating_tokio_deadline(
+            claimed_at,
+            lease_give_up_after(visibility_timeout_ms),
+        );
+        let renewal = tokio::select! {
+            biased;
+            renewal = renew() => Some(renewal),
+            () = tokio::time::sleep_until(give_up_at) => None,
+        };
+        match renewal {
+            Some(LeaseRenewal::Renewed) => Self::spawn(started, visibility_timeout_ms, renew),
+            Some(LeaseRenewal::Failed(error)) if tokio::time::Instant::now() < give_up_at => {
+                tracing::warn!(error = %error, "job lease renewal failed; retrying");
+                Self::spawn(claimed_at, visibility_timeout_ms, renew)
+            }
+            _ => {
+                tracing::warn!("job lease lost before the handler started; not running it");
+                let lost = tokio_util::sync::CancellationToken::new();
+                lost.cancel();
+                Self {
+                    lost,
+                    stop: tokio_util::sync::CancellationToken::new(),
+                    task: None,
+                }
+            }
+        }
+    }
+
     /// Call `renew` every third of `visibility_timeout_ms`, counting from
     /// `claimed_at`: an instant taken just before the claim was sent.
     ///
@@ -959,8 +1017,7 @@ impl LeaseHeartbeat {
         F: Future<Output = LeaseRenewal> + Send + 'static,
     {
         let interval = lease_heartbeat_interval(visibility_timeout_ms);
-        let give_up_after =
-            std::time::Duration::from_millis(visibility_timeout_ms.saturating_mul(2) / 3);
+        let give_up_after = lease_give_up_after(visibility_timeout_ms);
         let lost = tokio_util::sync::CancellationToken::new();
         let stop = tokio_util::sync::CancellationToken::new();
         let task = tokio::spawn({
@@ -8959,7 +9016,7 @@ async fn renew_redis_claim(
 
 /// Start renewing `record`'s claim.
 #[cfg(feature = "redis")]
-fn redis_lease_heartbeat(
+async fn redis_lease_heartbeat(
     connection: &redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
     record: &RedisJobRecord,
@@ -8971,7 +9028,7 @@ fn redis_lease_heartbeat(
     let unique_lock_key = worker_config.unique_lock_key_for(record);
     let record = record.clone();
     let visibility_timeout_ms = worker_config.visibility_timeout_ms;
-    LeaseHeartbeat::spawn(claimed_at, visibility_timeout_ms, move || {
+    LeaseHeartbeat::start(claimed_at, visibility_timeout_ms, move || {
         let mut connection = connection.clone();
         let processing_key = processing_key.clone();
         let record_key = record_key.clone();
@@ -8989,6 +9046,7 @@ fn redis_lease_heartbeat(
             .await
         }
     })
+    .await
 }
 
 #[cfg(feature = "redis")]
@@ -9565,7 +9623,7 @@ async fn process_redis_job_record(
         let _ = job_span.set_parent(cx);
     }
     let final_attempt = is_final_attempt(&record.attempt, &record.max_attempts);
-    let heartbeat = redis_lease_heartbeat(connection, worker_config, &record, claimed_at);
+    let heartbeat = redis_lease_heartbeat(connection, worker_config, &record, claimed_at).await;
     let bounds = ExecutionBounds {
         timeout,
         lease_lost: Some(heartbeat.lost_token()),
@@ -11433,7 +11491,7 @@ async fn pg_renew_claim(pool: &PgPool, job_id: &str, worker_id: &str) -> LeaseRe
 
 /// Start renewing `row`'s claim for `worker_id`.
 #[cfg(feature = "db")]
-fn pg_lease_heartbeat(
+async fn pg_lease_heartbeat(
     pool: &PgPool,
     row: &PgJobRow,
     claimed_at: tokio::time::Instant,
@@ -11443,12 +11501,13 @@ fn pg_lease_heartbeat(
     let pool = pool.clone();
     let job_id = row.id.clone();
     let worker_id = worker_id.to_owned();
-    LeaseHeartbeat::spawn(claimed_at, visibility_timeout_ms, move || {
+    LeaseHeartbeat::start(claimed_at, visibility_timeout_ms, move || {
         let pool = pool.clone();
         let job_id = job_id.clone();
         let worker_id = worker_id.clone();
         async move { pg_renew_claim(&pool, &job_id, &worker_id).await }
     })
+    .await
 }
 
 /// Execute one claimed job and ack/nack based on the outcome.
@@ -11538,7 +11597,8 @@ async fn pg_execute_job(
         let _ = job_span.set_parent(cx);
     }
     let final_attempt = is_final_attempt(&attempt, &max_attempts);
-    let heartbeat = pg_lease_heartbeat(pool, &row, claimed_at, worker_id, visibility_timeout_ms);
+    let heartbeat =
+        pg_lease_heartbeat(pool, &row, claimed_at, worker_id, visibility_timeout_ms).await;
     let bounds = ExecutionBounds {
         timeout,
         lease_lost: Some(heartbeat.lost_token()),
@@ -25184,6 +25244,91 @@ mod lease_tests {
             lost.is_cancelled(),
             "the give-up time counts from the claim"
         );
+        heartbeat.stop().await;
+    }
+
+    /// The claim and the run setup took longer than a third of the lease, so
+    /// the first renewal is already due when the heartbeat starts. If the
+    /// claim is gone, the handler must not run at all: another worker may
+    /// already run the job.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn an_overdue_lost_claim_stops_the_handler_before_it_runs() {
+        let claimed_at = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = LeaseHeartbeat::start(claimed_at, 300, {
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { LeaseRenewal::Lost }
+            }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "renewed before returning");
+        assert!(heartbeat.lost_token().is_cancelled());
+
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bounds = ExecutionBounds {
+            timeout: None,
+            lease_lost: Some(heartbeat.lost_token()),
+        };
+        let signals = crate::job_tracking::RunSignals::default();
+        let handler = {
+            let ran = Arc::clone(&ran);
+            async move {
+                ran.store(true, Ordering::SeqCst);
+            }
+        };
+        let ended = bound_run(handler, &bounds, &signals).await;
+        assert!(matches!(ended, BoundedRun::LeaseLost));
+        assert!(!ran.load(Ordering::SeqCst), "the handler never ran");
+        heartbeat.stop().await;
+    }
+
+    /// An overdue renewal that succeeds lets the run go ahead and anchors the
+    /// next renewal at its own start.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn an_overdue_claim_is_renewed_before_the_handler_runs() {
+        let claimed_at = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = LeaseHeartbeat::start(claimed_at, 300, {
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { LeaseRenewal::Renewed }
+            }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "renewed before returning");
+        assert!(!heartbeat.lost_token().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "next one an interval later"
+        );
+        heartbeat.stop().await;
+    }
+
+    /// A claim that is not yet due for renewal costs no round trip at start.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn a_fresh_claim_starts_without_a_renewal() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = LeaseHeartbeat::start(tokio::time::Instant::now(), 300, {
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { LeaseRenewal::Renewed }
+            }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         heartbeat.stop().await;
     }
 
