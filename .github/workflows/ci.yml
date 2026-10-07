@@ -2414,6 +2414,16 @@ jobs:
             --test sim_chaos_crash \
             --test sim_outbox_crash \
             --test sqlite_outbox_writers
+      - name: Run the multi-replica sim suites (issue #3067)
+        # Several replicas on one sim clock and one SQLite database. Single
+        # threaded, like the `sim_` lane of the `test` job: `sim_fleet_trace`
+        # compares two traces byte for byte, and `tracing` caches callsite
+        # interest for the whole process.
+        run: |
+          cargo test -p autumn-web --features "sqlite,test-support" \
+            --test sim_replicas \
+            --test sim_fleet_trace \
+            -- --test-threads=1
       - name: Run the sqlite mail-chaos suite (W5.a, issue #1797)
         # `sim_chaos_mail` and `sim_outbox_mail` (#3062) need the `mail`
         # feature for the mail interceptor/transport surface, so they run as
@@ -2452,17 +2462,24 @@ jobs:
   # break IS caught and shrunk: that's the `sim_sweep_driver` DoD suite in the
   # sqlite-runtime job above, not this job (which must always stay green).
   # Structured like the `loom` job below: its own bounded, standalone step.
+  #
+  # Issue #3067: built with `sqlite`, the sweep also runs the framework's own
+  # jobs, scheduler and lock scenarios across replicas under seeded faults,
+  # and runs the first `AUTUMN_SIM_TRACE_CHECKS` seeds twice to compare their
+  # traces. A failure prints a replay command for its seed and scenario.
   sim-sweep:
     name: Sim sweep (sim-testing)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
       - name: Run the sim-sweep seed sweep
-        run: cargo run -p autumn-web --release --features sim-testing --bin sim-sweep
+        run: cargo run -p autumn-web --release --features "sim-testing,sqlite" --bin sim-sweep
         env:
           AUTUMN_SIM_SEEDS: "512"
+          AUTUMN_SIM_TRACE_CHECKS: "32"
 
   # Genuine loom model checks: the loom_models test binary uses loom::sync::*
   # unconditionally, so loom::model() exhaustively explores thread interleavings

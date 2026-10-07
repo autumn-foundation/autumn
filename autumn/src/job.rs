@@ -1030,7 +1030,9 @@ impl LeaseHeartbeat {
                 let mut next_attempt =
                     crate::time_math::saturating_tokio_deadline(last_renewed, interval);
                 loop {
+                    // Biased, stop first: a sim replays the branch order.
                     tokio::select! {
+                        biased;
                         () = stop.cancelled() => return,
                         () = tokio::time::sleep_until(next_attempt) => {}
                     }
@@ -1041,16 +1043,28 @@ impl LeaseHeartbeat {
                     // The give-up time also bounds a renewal that stalls.
                     let give_up_at =
                         crate::time_math::saturating_tokio_deadline(last_renewed, give_up_after);
+                    // The renewal stays outside the select: `select!` drops
+                    // the losing futures before it runs a branch, and
+                    // diesel-async panics when it drops a `SQLite` query in
+                    // flight on a current-thread runtime.
+                    let mut renewing = Box::pin(renew());
                     // Biased: a renewal that completes at the give-up time counts.
                     let renewal = tokio::select! {
                         biased;
-                        () = stop.cancelled() => return,
-                        renewal = renew() => renewal,
+                        () = stop.cancelled() => None,
+                        renewal = &mut renewing => Some(renewal),
                         () = tokio::time::sleep_until(give_up_at) => {
                             tracing::warn!("job lease renewal stalled too long; stopping the job");
                             lost.cancel();
-                            return;
+                            None
                         }
+                    };
+                    let Some(renewal) = renewal else {
+                        // Let the renewal in flight end on its own task. A
+                        // late renewal can only delay the recovery of a run
+                        // that stopped.
+                        tokio::spawn(renewing);
+                        return;
                     };
                     match renewal {
                         LeaseRenewal::Renewed => last_renewed = started,
@@ -5921,9 +5935,11 @@ pub(crate) fn start_local_runtime_inner(
     if run_workers {
         let buffer = Arc::clone(&buffer);
         let shutdown = shutdown.clone();
-        tokio::spawn(async move {
+        crate::sim::spawn_app_task(state, async move {
             loop {
                 tokio::select! {
+                    // Fixed branch order, so a sim replays it (#3067).
+                    biased;
                     () = shutdown.cancelled() => break,
                     maybe = rx.recv() => {
                         match maybe {
@@ -5947,7 +5963,7 @@ pub(crate) fn start_local_runtime_inner(
         let slots = Arc::clone(&slots);
         let mut cursor = schedule.cursor();
 
-        tokio::spawn(async move {
+        crate::sim::spawn_app_task(&state.clone(), async move {
             loop {
                 // Register interest before checking so an enqueue that lands
                 // between the pop attempt and the await is never lost.
@@ -6005,6 +6021,8 @@ pub(crate) fn start_local_runtime_inner(
                     }
                 }
                 tokio::select! {
+                    // Fixed branch order, so a sim replays it (#3067).
+                    biased;
                     () = shutdown.cancelled() => break,
                     () = notified => {}
                 }
@@ -10271,9 +10289,11 @@ struct PgEnqueuedCounts {
 ///
 /// Claims that expire together (handlers that hung on one dependency) must
 /// not all run again at once (issue #3054). The SQL draws a per-row jitter in
-/// `[0, min(cap, initial_backoff_ms * 2^(attempt-1))]` with the database's
-/// own `random()`, as the recovery updates many rows in one statement. The
-/// cap is clamped like a relative enqueue, so the SQL cannot overflow.
+/// `[0, min(cap, initial_backoff_ms * 2^(attempt-1))]`, as the recovery
+/// updates many rows in one statement. Postgres uses its own `random()`.
+/// `SQLite` mixes the row id with one draw from the app's entropy, so a sim
+/// replays it (issue #3067). The cap is clamped like a relative enqueue, so
+/// the SQL cannot overflow.
 #[cfg(feature = "db")]
 pub(crate) fn stale_requeue_cap_ms(state: &AppState) -> i64 {
     let cap = state
@@ -25209,6 +25229,38 @@ mod lease_tests {
             lost.is_cancelled(),
             "a stalled renewal must not keep the run alive past the give-up time"
         );
+        heartbeat.stop().await;
+    }
+
+    /// A renewal in flight at the give-up time must not be dropped. diesel-async
+    /// panics when it drops a `SQLite` query in flight on a current-thread
+    /// runtime, and `select!` drops the losing futures before it runs a
+    /// branch. The panic then came before `lost.cancel()`, so the run went on
+    /// without a claim and a peer ran the job again (found by the #3067 sweep).
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_gives_up_without_dropping_a_renewal_in_flight() {
+        /// Panics when dropped before it finishes, as diesel-async does.
+        struct InFlight(bool);
+        impl Drop for InFlight {
+            fn drop(&mut self) {
+                assert!(self.0, "a renewal in flight was dropped");
+            }
+        }
+        let heartbeat = LeaseHeartbeat::spawn(tokio::time::Instant::now(), 300, || async {
+            let mut query = InFlight(false);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            query.0 = true;
+            LeaseRenewal::Failed("slow".to_owned())
+        });
+        let lost = heartbeat.lost_token();
+        tokio::time::sleep(Duration::from_millis(210)).await;
+        assert!(
+            lost.is_cancelled(),
+            "the heartbeat stops the run at the give-up time"
+        );
+        // Let the renewal end on its own.
+        tokio::time::sleep(Duration::from_secs(1)).await;
         heartbeat.stop().await;
     }
 

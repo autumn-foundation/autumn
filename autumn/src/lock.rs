@@ -1196,7 +1196,10 @@ mod sqlite_impl {
         key: i64,
         name: String,
         owner: String,
-        renew: Option<tokio::task::JoinHandle<()>>,
+        /// Stops the renewal task. It stops at its next sleep, not in the
+        /// middle of a query. diesel-async can block a thread on a query that a
+        /// task drops in flight.
+        renew: Option<tokio_util::sync::CancellationToken>,
         released: bool,
     }
 
@@ -1231,18 +1234,25 @@ mod sqlite_impl {
             key: i64,
             owner: &str,
             lease_ttl: Duration,
-        ) -> Option<tokio::task::JoinHandle<()>> {
+        ) -> Option<tokio_util::sync::CancellationToken> {
             use diesel_async::RunQueryDsl as _;
 
             tokio::runtime::Handle::try_current().ok()?;
+            let stop = tokio_util::sync::CancellationToken::new();
+            let stopped = stop.clone();
             let pool = pool.clone();
             let clock = Arc::clone(clock);
             let owner = owner.to_owned();
             let every = (lease_ttl / RENEW_DIVISOR).max(MIN_LOCK_POLL_INTERVAL);
             let ttl_ms = i64::try_from(lease_ttl.as_millis()).unwrap_or(i64::MAX);
-            Some(tokio::spawn(async move {
+            tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(every).await;
+                    tokio::select! {
+                        // Fixed branch order, so a sim replays it (#3067).
+                        biased;
+                        () = stopped.cancelled() => return,
+                        () = tokio::time::sleep(every) => {}
+                    }
                     let Ok(mut conn) = pool.get().await else {
                         continue;
                     };
@@ -1277,7 +1287,8 @@ mod sqlite_impl {
                         }
                     }
                 }
-            }))
+            });
+            Some(stop)
         }
 
         /// The lock's name.
@@ -1301,7 +1312,7 @@ mod sqlite_impl {
         pub async fn release(mut self) -> Result<(), LockError> {
             self.released = true;
             if let Some(renew) = self.renew.take() {
-                renew.abort();
+                renew.cancel();
             }
             let deleted = delete_owned(&self.pool, self.key, &self.owner).await?;
             if deleted == 0 {
@@ -1328,7 +1339,7 @@ mod sqlite_impl {
     impl Drop for LockGuard {
         fn drop(&mut self) {
             if let Some(renew) = self.renew.take() {
-                renew.abort();
+                renew.cancel();
             }
             if self.released {
                 return;

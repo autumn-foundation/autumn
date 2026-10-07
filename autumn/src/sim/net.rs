@@ -191,6 +191,16 @@ impl SimNet {
         self.lock().stream = SeededEntropy::shared(seed ^ NET_STREAM_SALT);
     }
 
+    /// Serve `host` with `router` from now on (a mounted replica, #3067).
+    pub(crate) fn insert_host(&self, host: &str, router: axum::Router) {
+        self.lock().hosts.insert(canonical_host(host), router);
+    }
+
+    /// Stop serving `host` (a killed replica). Calls to it then fail.
+    pub(crate) fn remove_host(&self, host: &str) {
+        self.lock().hosts.remove(&canonical_host(host));
+    }
+
     /// The router that serves `host`, if any.
     pub(crate) fn service(&self, host: &str) -> Option<axum::Router> {
         self.lock().hosts.get(&canonical_host(host)).cloned()
