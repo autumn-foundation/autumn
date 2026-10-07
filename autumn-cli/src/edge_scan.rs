@@ -217,6 +217,7 @@ const ORIGIN_ONLY_EXTRACTORS: &[(&str, &str)] = &[
     ("ShardedReadDb", "a database"),
     ("Shards", "a database"),
     ("CrossShard", "a database"),
+    ("Outbox", "a database"),
     ("Events", "app state"),
     ("Notifications", "app state"),
     ("Presence", "app state"),

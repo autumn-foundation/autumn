@@ -10,6 +10,10 @@ keying strategies (#794), and the same `429 Too Many Requests` response shape
 
 ## The global limiter
 
+The limiter is off in every profile, `prod` included (#3057). A limit keyed by
+IP address can block all clients behind one proxy, so configure
+`[security.trusted_proxies]` first. Then turn the limiter on.
+
 Enable in `autumn.toml`:
 
 ```toml

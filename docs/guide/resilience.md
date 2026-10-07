@@ -207,7 +207,7 @@ Unavailable` + `Retry-After` — a brownout instead of a blackout.
 ```toml
 # autumn.toml
 [server]
-max_concurrent_requests = 256   # unset by default (unlimited)
+max_concurrent_requests = 256   # prod default: pool size × 32, at least 256; 0 = off
 ```
 
 Override at runtime with `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS`. A

@@ -633,14 +633,64 @@ impl autumn_web::plugin::Plugin for RedisCachePlugin {
 
             state.set_cache(Arc::new(cache));
             tracing::info!("RedisCache registered as global application cache");
+            register_cache_health_indicator(&state, &config);
             Ok(())
         })
+    }
+}
+
+/// Register the `redis:cache` `PING` indicator (issue #3059), with the
+/// `[health]` rules of the built-in Redis indicators. The framework does not
+/// register it, because only this plugin installs the Redis cache.
+fn register_cache_health_indicator(
+    state: &autumn_web::AppState,
+    config: &autumn_web::config::AutumnConfig,
+) {
+    let Some(url) = config.cache.redis.url.as_deref() else {
+        return;
+    };
+    // Share the app's connection to this URL with the built-in indicators.
+    match autumn_web::redis_health::RedisHealthIndicator::shared(state, url) {
+        Ok(indicator) => {
+            let indicator = indicator.configured(&config.health);
+            let group = autumn_web::actuator::HealthIndicator::group(&indicator);
+            if let Err(error) = state.health_indicator_registry().register(
+                "redis:cache",
+                group,
+                Arc::new(indicator),
+            ) {
+                tracing::warn!("{error}");
+            }
+        }
+        Err(error) => tracing::warn!(error = %error, "redis:cache health indicator not registered"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_health_indicator_follows_the_health_config() {
+        let state = autumn_web::AppState::for_test();
+        let mut config = autumn_web::config::AutumnConfig::default();
+        config.cache.redis.url = Some("redis://127.0.0.1:1".to_owned());
+        config.health.redis_readiness = true;
+
+        register_cache_health_indicator(&state, &config);
+
+        assert!(state.health_indicator_registry().contains("redis:cache"));
+    }
+
+    #[test]
+    fn no_cache_health_indicator_without_a_url() {
+        let state = autumn_web::AppState::for_test();
+        let config = autumn_web::config::AutumnConfig::default();
+
+        register_cache_health_indicator(&state, &config);
+
+        assert!(!state.health_indicator_registry().contains("redis:cache"));
+    }
     use autumn_web::cache::{get_cached, insert_cached};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use testcontainers::runners::AsyncRunner;

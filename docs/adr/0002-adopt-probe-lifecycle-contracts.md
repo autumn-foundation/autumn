@@ -59,10 +59,13 @@ database is a readiness problem first, not a liveness problem.
 It should return `200 OK` only when all required serving dependencies are ready.
 That includes, when configured:
 
-- database connectivity or pool availability
+- database connectivity (a `SELECT 1` ping since #3059; pool availability is
+  not a readiness signal)
 - startup hook completion
 - migration gate completion if the app is configured to wait for migrations
-- required external state backends such as Redis-backed sessions
+- required external state backends such as Redis-backed sessions, when
+  `health.redis_readiness = true` (since #3059 the built-in Redis indicators
+  are health-only by default)
 - registered custom readiness checks
 
 During graceful shutdown, `/ready` must flip to `503` before the server begins
@@ -211,3 +214,11 @@ plugin hooks are earlier in the list and run last.
   can set it to `0` to disable the delay (not recommended in production).
 - `autumn_shutdown_aborted_requests_total` is now an observable SLI for
   deploy quality.
+
+### Addendum (#3059)
+
+Primary readiness is a cached `SELECT 1` on a dedicated connection, not pool
+availability. A busy pool is load, not failure: pool saturation made busy
+replicas leave rotation in turn. The built-in Redis indicators are
+health-only by default, because all replicas share Redis. See
+[Health Indicators](../guide/health-indicators.md#fail-open-on-shared-dependencies).
