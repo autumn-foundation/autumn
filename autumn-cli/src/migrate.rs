@@ -1950,6 +1950,7 @@ fn run_diesel_with_policy(
                             dir,
                             copy.path(),
                             lock_policy.lock_timeout,
+                            english,
                             &non_transactional_versions(dir).into_iter().collect(),
                         )
                         .map_err(|e| {
@@ -1979,17 +1980,25 @@ fn run_diesel_with_policy(
 
 /// Copy the migration directories in `src` into `dst`. Each transactional
 /// migration's `up.sql` starts with `SET LOCAL lock_timeout = <ms>;`, which
-/// `diesel` runs inside that migration's transaction. Versions in
-/// `non_transactional` are copied unchanged.
+/// `diesel` runs inside that migration's transaction. With `english` (the
+/// role may set `lc_messages`), it also sets `lc_messages = 'C'`, so the
+/// retry can read a lock timeout. Versions in `non_transactional` are copied
+/// unchanged.
 fn copy_with_lock_timeout(
     src: &Path,
     dst: &Path,
     lock_timeout: std::time::Duration,
+    english: bool,
     non_transactional: &std::collections::HashSet<String>,
 ) -> std::io::Result<()> {
     let ms = u64::try_from(lock_timeout.as_millis())
         .unwrap_or(u64::MAX)
         .min(i32::MAX.unsigned_abs().into());
+    let header = if english {
+        format!("SET LOCAL lock_timeout = {ms};\nSET LOCAL lc_messages = 'C';\n")
+    } else {
+        format!("SET LOCAL lock_timeout = {ms};\n")
+    };
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
@@ -2006,10 +2015,7 @@ fn copy_with_lock_timeout(
             }
             if transactional && file.file_name() == "up.sql" {
                 let body = std::fs::read_to_string(file.path())?;
-                std::fs::write(
-                    target.join("up.sql"),
-                    format!("SET LOCAL lock_timeout = {ms};\n{body}"),
-                )?;
+                std::fs::write(target.join("up.sql"), format!("{header}{body}"))?;
             } else {
                 std::fs::copy(file.path(), target.join(file.file_name()))?;
             }
@@ -2202,9 +2208,9 @@ fn non_transactional_versions(dir: &Path) -> Vec<String> {
 }
 
 /// The pending migration versions in `dir`, in version order. `Ok(None)`
-/// when they cannot be read. The read runs under `lock_policy`, so a lock on
-/// `__diesel_schema_migrations` fails fast and is retried; a lock that
-/// outlasts the retries is an error, not an unknown pending set.
+/// when the migrations directory cannot be read. The read runs under
+/// `lock_policy`, so a lock on `__diesel_schema_migrations` fails fast and is
+/// retried; a database error is returned, not treated as an unknown set.
 fn pending_versions(
     database_url: &str,
     dir: &Path,
@@ -2230,14 +2236,13 @@ fn pending_versions(
             )
         },
     );
-    match read {
-        Ok(mut pending) => {
-            pending.sort();
-            Ok(Some(pending))
-        }
-        Err(e @ MigrationError::LockContention { .. }) => Err(e),
-        Err(_) => Ok(None),
-    }
+    // Any read error stops the run. A lock timeout in a server language
+    // the retry cannot read is a plain `Migration` error, and an unknown
+    // pending set would run with the timeout off.
+    read.map(|mut pending| {
+        pending.sort();
+        Some(pending)
+    })
 }
 
 /// `pending` split into runs of the same kind, in order. `true` marks a run
@@ -5285,6 +5290,7 @@ primary_url = "postgres://prod-s0:5432/app"
             src.path(),
             dst.path(),
             std::time::Duration::from_secs(5),
+            false,
             &non_transactional,
         )
         .expect("copy");
@@ -5306,6 +5312,24 @@ primary_url = "postgres://prod-s0:5432/app"
             "SELECT 1;\n"
         );
         assert!(!dst.path().join("README").exists());
+
+        // When the role may set `lc_messages`, the copy asks for English
+        // messages too, so the retry can read a lock timeout.
+        let english = tempfile::TempDir::new().expect("english");
+        copy_with_lock_timeout(
+            src.path(),
+            english.path(),
+            std::time::Duration::from_secs(5),
+            true,
+            &non_transactional,
+        )
+        .expect("copy");
+        assert_eq!(
+            std::fs::read_to_string(english.path().join("2026-01-01-000000_add_column/up.sql"))
+                .expect("read"),
+            "SET LOCAL lock_timeout = 5000;\nSET LOCAL lc_messages = 'C';\n\
+             ALTER TABLE t ADD COLUMN c INT;\n"
+        );
     }
 
     #[test]
