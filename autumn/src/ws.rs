@@ -686,27 +686,35 @@ impl WebSocket {
         })
     }
 
-    /// Send a due ping and flush it. Errors surface on the next read or send.
-    fn poll_ping(&mut self, cx: &mut Context<'_>) {
+    /// Send a due ping and flush it. A send or flush error is returned: the
+    /// transport failed, so the caller ends the socket, also while the read
+    /// side waits for a message that cannot come.
+    fn poll_ping(&mut self, cx: &mut Context<'_>) -> Option<axum::Error> {
         use futures::Sink as _;
-        let Some(inner) = self.inner.as_mut() else {
-            return;
-        };
+        let inner = self.inner.as_mut()?;
         if self.ping_due {
             match Pin::new(&mut *inner).poll_ready(cx) {
                 Poll::Ready(Ok(())) => {
                     let ping = Message::Ping(axum::body::Bytes::from_static(PING_PAYLOAD));
-                    self.flush_due = Pin::new(&mut *inner).start_send(ping).is_ok();
+                    if let Err(error) = Pin::new(&mut *inner).start_send(ping) {
+                        return Some(error);
+                    }
+                    self.flush_due = true;
                     self.ping_due = false;
                 }
-                Poll::Ready(Err(_)) => self.ping_due = false,
+                Poll::Ready(Err(error)) => return Some(error),
                 Poll::Pending => {}
             }
         }
-        if self.flush_due && Pin::new(inner).poll_flush(cx).is_ready() {
-            self.flush_due = false;
+        if self.flush_due {
+            match Pin::new(inner).poll_flush(cx) {
+                Poll::Ready(Ok(())) => self.flush_due = false,
+                Poll::Ready(Err(error)) => return Some(error),
+                Poll::Pending => {}
+            }
         }
         self.wake_writer();
+        None
     }
 }
 
@@ -779,7 +787,10 @@ impl futures::Stream for WebSocket {
                 // Poll the reset timer, so it wakes this task again.
                 let _ = sleep.as_mut().poll(cx);
             }
-            this.poll_ping(cx);
+            if let Some(error) = this.poll_ping(cx) {
+                this.finish();
+                return Poll::Ready(Some(Err(error)));
+            }
             this.reader_waker = Some(cx.waker().clone());
             return Poll::Pending;
         }
