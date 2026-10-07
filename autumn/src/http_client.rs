@@ -1225,9 +1225,13 @@ pub struct Client {
 }
 
 /// The app-wide client-side throttle, so that every `Client::from_state`
-/// shares one set of per-host counts (issue #3068).
+/// shares one set of per-host counts (issue #3068). `config` is the setting
+/// it was built from.
 #[derive(Clone)]
-pub(crate) struct SharedThrottle(pub(crate) Arc<crate::admission::AdaptiveThrottle>);
+pub(crate) struct SharedThrottle {
+    throttle: Arc<crate::admission::AdaptiveThrottle>,
+    config: crate::config::AdaptiveThrottleConfig,
+}
 
 /// Put the app-wide throttle in `state` when `[http.client.adaptive_throttle]`
 /// is on.
@@ -1235,9 +1239,33 @@ pub(crate) fn install_shared_throttle(
     state: &crate::AppState,
     config: &crate::config::HttpClientConfig,
 ) {
-    if let Some(throttle) = throttle_from_config(config) {
-        state.insert_extension(SharedThrottle(throttle));
+    let _ = shared_throttle(state, config);
+}
+
+/// The app-wide throttle for the effective `config`, or `None` when it is
+/// off. A `state_initializer` can replace the config after boot. If the
+/// shared throttle was built from other settings, or there is none, a new
+/// one replaces it, so that all clients share counts for the settings in
+/// force.
+fn shared_throttle(
+    state: &crate::AppState,
+    config: &crate::config::HttpClientConfig,
+) -> Option<Arc<crate::admission::AdaptiveThrottle>> {
+    let settings = config.adaptive_throttle;
+    if !settings.enabled {
+        return None;
     }
+    if let Some(shared) = state.extension::<SharedThrottle>()
+        && shared.config == settings
+    {
+        return Some(Arc::clone(&shared.throttle));
+    }
+    let throttle = throttle_from_config(config)?;
+    state.insert_extension(SharedThrottle {
+        throttle: Arc::clone(&throttle),
+        config: settings,
+    });
+    Some(throttle)
 }
 
 /// A new throttle for `config`, or `None` when it is off.
@@ -1408,6 +1436,10 @@ impl Client {
             }
         });
 
+        // One throttle for the whole app, so per-host counts add up.
+        let throttle = config
+            .as_ref()
+            .and_then(|cfg| shared_throttle(state, &cfg.client));
         let mut client = match (config, shared) {
             (Some(cfg), Some(inner)) => Self::from_config_with_inner(inner, &cfg.client),
             (Some(cfg), None) => Self::from_config(&cfg.client),
@@ -1421,14 +1453,7 @@ impl Client {
             client = client.with_mock(ext.0.clone());
         }
         client.sim_net = state.extension::<crate::sim::SimNet>();
-        // One throttle for the whole app, so per-host counts add up. The
-        // effective config decides whether it is on: a `state_initializer`
-        // can replace the config after boot.
-        if client.throttle.is_some()
-            && let Some(shared) = state.extension::<SharedThrottle>()
-        {
-            client.throttle = Some(Arc::clone(&shared.0));
-        }
+        client.throttle = throttle;
         // Retry jitter and the automatic key are not made again on capsule
         // replay, so they must not go on the capsule's random tape.
         let entropy = state.entropy_arc();
@@ -3544,6 +3569,37 @@ mod tests {
             "local rejects must not open the breaker"
         );
         crate::circuit_breaker::global_registry().clear();
+    }
+
+    /// Regression (#3183 review): a `state_initializer` that replaces the
+    /// config after boot gets one shared throttle for the new settings.
+    #[test]
+    fn from_state_shares_a_throttle_built_from_the_effective_config() {
+        let state = crate::AppState::for_test();
+        let boot = HttpClientConfig::default();
+        install_shared_throttle(&state, &boot);
+        assert!(state.extension::<SharedThrottle>().is_none(), "off at boot");
+        assert!(Client::from_state(&state).throttle.is_none());
+
+        let mut replaced = crate::config::HttpConfig::default();
+        replaced.client.adaptive_throttle.enabled = true;
+        state.insert_extension(replaced.clone());
+        let a = Client::from_state(&state)
+            .throttle
+            .expect("on after replace");
+        let b = Client::from_state(&state)
+            .throttle
+            .expect("on after replace");
+        assert!(Arc::ptr_eq(&a, &b), "clients share one throttle");
+
+        replaced.client.adaptive_throttle.k = 3.0;
+        state.insert_extension(replaced.clone());
+        let c = Client::from_state(&state).throttle.expect("still on");
+        assert!(!Arc::ptr_eq(&a, &c), "new settings build a new throttle");
+
+        replaced.client.adaptive_throttle.enabled = false;
+        state.insert_extension(replaced);
+        assert!(Client::from_state(&state).throttle.is_none(), "off again");
     }
 
     #[test]
