@@ -2901,6 +2901,41 @@ The rollback flag file lives at `tmp/autumn-canary-rollback.json`. A controller
 that cannot exec into the replica can write it directly. The flag is sticky
 across restarts — clear it with `autumn canary promote` once traffic has moved.
 
+## SLOs, deploy bake and Kubernetes (issue #3069)
+
+Declare SLOs in `autumn.toml`. The app does not read them at run time.
+
+```toml
+[[slo]]
+name = "availability"     # lowercase letters, digits, '-'
+objective = 99.9          # percent, at most 4 decimals
+sli = "availability"      # or "latency" (needs threshold_ms, a bucket bound)
+# route = "/api/orders/{id}"
+```
+
+```bash
+autumn slo generate --selector 'job="shop"'   # writes deploy/slo/ (6 files)
+autumn slo generate --check                   # CI: fail on drift
+```
+
+The files are Prometheus burn-rate rules and alerts (14.4x over 1h/5m, 6x over
+6h/30m, 1x over 3d/6h), a `PrometheusRule`, a Grafana dashboard, an Argo
+Rollouts `AnalysisTemplate`, Flagger `MetricTemplate`s and Helm values. Route
+and latency SLOs read the request-duration histogram (issue #3064).
+
+Bake each host after its cutover; roll it back on a 5xx or latency breach or a
+restart (off by default):
+
+```toml
+[deploy.bake]
+duration_secs = 300   # or: autumn deploy up --bake-secs 300
+```
+
+Kubernetes: `autumn release init --target kubernetes` writes a Helm chart
+(`deploy/helm/`, set `trustedHosts`) and a Kustomize base with probes, a
+`preStop` hook, a safe grace period, a PDB, and opt-in Argo Rollouts or Flagger
+canaries. See `docs/guide/slo.md` and `docs/guide/kubernetes.md`.
+
 ## Shadow (differential) deploys
 
 Canary decides from **cohort metrics** over traffic the new build really serves.
