@@ -876,6 +876,7 @@ impl TlsListener {
         max: usize,
     ) -> Option<crate::http_server::SlotHandoff> {
         let start = self.start.take()?;
+        let max = max.min(tokio::sync::Semaphore::MAX_PERMITS);
         let _ = start.send(Some(Arc::new(tokio::sync::Semaphore::new(max))));
         let handoff = crate::http_server::SlotHandoff::default();
         self.handoff = Some(Arc::clone(&handoff));

@@ -7391,12 +7391,17 @@ impl HttpServerConfig {
     /// Smallest `max_header_bytes` the server accepts.
     pub const MIN_HEADER_BYTES: usize = 8192;
 
+    /// Largest `max_connections` the server accepts: the most permits a
+    /// Tokio semaphore can hold.
+    pub const MAX_CONNECTIONS: usize = tokio::sync::Semaphore::MAX_PERMITS;
+
     /// Reject values the server cannot use.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError::Validation`] when `max_header_bytes` is below
-    /// [`Self::MIN_HEADER_BYTES`] or `http2_max_concurrent_streams` is `0`.
+    /// [`Self::MIN_HEADER_BYTES`], `http2_max_concurrent_streams` is `0`, or
+    /// `max_connections` is above [`Self::MAX_CONNECTIONS`].
     pub fn validate(&self) -> Result<(), ConfigError> {
         if let Some(bytes) = self.max_header_bytes
             && bytes < Self::MIN_HEADER_BYTES
@@ -7410,6 +7415,14 @@ impl HttpServerConfig {
             return Err(ConfigError::Validation(
                 "server.http.http2_max_concurrent_streams must be greater than zero".to_owned(),
             ));
+        }
+        if let Some(max) = self.max_connections
+            && max > Self::MAX_CONNECTIONS
+        {
+            return Err(ConfigError::Validation(format!(
+                "server.http.max_connections must be {} or less (got {max})",
+                Self::MAX_CONNECTIONS
+            )));
         }
         Ok(())
     }
@@ -19690,7 +19703,13 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         assert!(err.contains("http2_max_concurrent_streams"), "{err}");
 
         let mut config = AutumnConfig::default();
+        config.server.http.max_connections = Some(usize::MAX);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("server.http.max_connections"), "{err}");
+
+        let mut config = AutumnConfig::default();
         config.server.http.max_header_bytes = Some(HttpServerConfig::MIN_HEADER_BYTES);
+        config.server.http.max_connections = Some(HttpServerConfig::MAX_CONNECTIONS);
         config.validate().unwrap();
     }
 

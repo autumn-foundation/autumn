@@ -74,7 +74,12 @@ impl From<&HttpServerConfig> for HttpLimits {
                 .filter(|v| *v > 0)
                 .map(|v| v.max(HttpServerConfig::MIN_HEADER_BYTES)),
             http2_max_concurrent_streams: config.http2_max_concurrent_streams,
-            max_connections: config.max_connections.filter(|v| *v > 0),
+            // `validate` rejects a value above the semaphore limit; clamp
+            // for a config that skipped `validate`.
+            max_connections: config
+                .max_connections
+                .filter(|v| *v > 0)
+                .map(|v| v.min(HttpServerConfig::MAX_CONNECTIONS)),
         }
     }
 }
@@ -173,7 +178,7 @@ impl HttpLimits {
     fn slots(&self, listener_takes_slots: bool) -> Option<Arc<Semaphore>> {
         self.max_connections
             .filter(|_| !listener_takes_slots)
-            .map(|n| Arc::new(Semaphore::new(n)))
+            .map(|n| Arc::new(Semaphore::new(n.min(Semaphore::MAX_PERMITS))))
     }
 }
 
@@ -1327,6 +1332,18 @@ mod tests {
             .uri("/ws")
             .body(axum::body::Body::empty())
             .unwrap()
+    }
+
+    #[test]
+    fn a_huge_connection_cap_does_not_panic() {
+        // `Semaphore::new` panics above `MAX_PERMITS`. `HttpLimits` is public,
+        // so a value that skipped config validation must still be safe.
+        let limits = HttpLimits {
+            max_connections: Some(usize::MAX),
+            ..HttpLimits::default()
+        };
+        let slots = limits.slots(false).expect("a cap is set");
+        assert_eq!(slots.available_permits(), Semaphore::MAX_PERMITS);
     }
 
     fn idle_timers() -> Arc<ConnTimers> {
