@@ -2671,6 +2671,9 @@ impl RequestBuilder {
         // did not have.
         let retries_left = matches!(hop_client, HopClient::Pooled(_))
             .then(|| AtomicU32::new(self.max_attempts(is_half_open).saturating_sub(1)));
+        // Hosts refilled for this chain: the first one already was.
+        let mut refilled: std::collections::HashSet<String> =
+            url_host(&self.url).into_iter().collect();
         for hop in 0.. {
             // Pin only applies to the first hop's original target.
             let resolve = if hop == 0 {
@@ -2697,7 +2700,7 @@ impl RequestBuilder {
             let hop_gate = if hop == 0 {
                 gate
             } else {
-                hop_gate = gate.for_hop(&current);
+                hop_gate = gate.for_hop(&current, &mut refilled);
                 &hop_gate
             };
             let resp = send_one(
@@ -2816,6 +2819,9 @@ impl RequestBuilder {
         let mut method = self.method.clone();
         let mut headers = self.extra_headers.clone();
         let mut body = self.body.clone();
+        // Hosts refilled for this chain: the first one already was.
+        let mut refilled: std::collections::HashSet<String> =
+            url_host(&self.url).into_iter().collect();
         for hop in 0.. {
             let remaining_for_lookup = deadline_remaining_or_timeout(deadline, &current)
                 .map_err(|error| gate.classify(error))?;
@@ -2849,7 +2855,7 @@ impl RequestBuilder {
             let hop_gate = if hop == 0 {
                 gate
             } else {
-                hop_gate = gate.for_hop(&current);
+                hop_gate = gate.for_hop(&current, &mut refilled);
                 &hop_gate
             };
             let resp = send_one(
@@ -3120,13 +3126,25 @@ impl RetryGate {
 
     /// The gate of a redirect hop to `url`: the same deadline, and the
     /// budget of the hop's host.
-    fn for_hop(&self, url: &str) -> Self {
-        Self::with_deadline(
-            self.deadline,
-            self.budgets.clone(),
-            url_host(url).as_deref(),
-            self.send_header,
-        )
+    ///
+    /// The hop's host gets its first-attempt refill only when it is not in
+    /// `refilled`, so a host that a chain visits again is credited once.
+    fn for_hop(&self, url: &str, refilled: &mut std::collections::HashSet<String>) -> Self {
+        let mut hop = Self {
+            deadline: self.deadline,
+            budgets: self.budgets.clone(),
+            budget: self.budget.clone(),
+            host: self.host.clone(),
+            send_header: self.send_header,
+        };
+        hop.rekey(url);
+        if url_host(url).is_some_and(|host| refilled.insert(host))
+            && !hop.expired()
+            && let Some(budget) = &hop.budget
+        {
+            budget.record_request();
+        }
+        hop
     }
 
     /// The error of a failed body read: [`ClientError::DeadlineExceeded`] for
@@ -6987,7 +7005,7 @@ mod tests {
                 Some("origin:443"),
                 true,
             );
-            let hop = origin.for_hop("https://target/x");
+            let hop = origin.for_hop("https://target/x", &mut std::collections::HashSet::new());
             assert!(Arc::ptr_eq(
                 hop.budget.as_ref().unwrap(),
                 &budgets.for_host("target:443")
@@ -6996,6 +7014,32 @@ mod tests {
                 hop.budget.as_ref().unwrap(),
                 origin.budget.as_ref().unwrap()
             ));
+        }
+
+        #[test]
+        fn a_redirect_chain_refills_each_host_once() {
+            let budgets = Arc::new(RetryBudgets::new(&RetryBudgetConfig::default()));
+            let origin_budget = budgets.for_host("a:443");
+            let target_budget = budgets.for_host("b:443");
+            while origin_budget.try_acquire(RetryKind::Transient) {}
+            while target_budget.try_acquire(RetryKind::Transient) {}
+            let origin =
+                RetryGate::with_deadline(None, Some(Arc::clone(&budgets)), Some("a:443"), true);
+            let after_first = origin_budget.available();
+            let mut refilled = std::collections::HashSet::from(["a:443".to_owned()]);
+            // a -> b -> a -> b
+            let _ = origin.for_hop("https://b/1", &mut refilled);
+            let after_b = target_budget.available();
+            let _ = origin.for_hop("https://a/2", &mut refilled);
+            let _ = origin.for_hop("https://b/3", &mut refilled);
+            assert!(
+                (origin_budget.available() - after_first).abs() < f64::EPSILON,
+                "the origin is not credited again"
+            );
+            assert!(
+                (target_budget.available() - after_b).abs() < f64::EPSILON,
+                "the target is credited once"
+            );
         }
 
         #[test]
