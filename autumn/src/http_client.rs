@@ -2265,15 +2265,9 @@ impl RequestBuilder {
                 None => exchange.await,
             };
             match &outcome {
-                Ok(response) => {
-                    span.record("http.response.status_code", response.status.as_u16());
-                }
-                Err(SimAttemptError::Transient(_)) => {
-                    span.record("error.type", "network");
-                }
-                Err(SimAttemptError::Fatal(_)) => {
-                    span.record("error.type", "request");
-                }
+                Ok(response) => record_attempt_status(&span, response.status.as_u16()),
+                Err(SimAttemptError::Transient(_)) => record_attempt_error(&span, "network"),
+                Err(SimAttemptError::Fatal(_)) => record_attempt_error(&span, "request"),
             }
             drop(span);
             let response = match outcome {
@@ -2776,12 +2770,9 @@ async fn serve_sim_host(
         let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
         builder = builder.header(reqwest::header::HOST, authority);
     }
-    // Trace context first, as on the real send path. A caller header of the
-    // same name wins.
-    for (name, value) in trace_context_headers() {
-        if !request.extra_headers.contains_key(name.as_str()) {
-            builder = builder.header(name, value);
-        }
+    // Trace context first, as on the real send path. A caller header wins.
+    for (name, value) in trace_headers_to_send(trace_context_headers(), &request.extra_headers) {
+        builder = builder.header(name, value);
     }
     // The real client sends a `Content-Length` for a known-size body. A
     // caller header of the same name wins.
@@ -3300,6 +3291,7 @@ fn client_attempt_span(method: &Method, url: &str, attempt: u32) -> tracing::Spa
         http.request.resend_count = tracing::field::Empty,
         http.response.status_code = tracing::field::Empty,
         error.type = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
     );
     // The conventions leave `resend_count` unset on the first attempt.
     if attempt > 0 {
@@ -3315,6 +3307,21 @@ fn client_attempt_span(method: &Method, url: &str, attempt: u32) -> tracing::Spa
     span
 }
 
+/// Record the response status on an attempt span. A 4xx or 5xx status sets
+/// the span status to `ERROR`, as the HTTP client conventions require.
+fn record_attempt_status(span: &tracing::Span, status: u16) {
+    span.record("http.response.status_code", status);
+    if status >= 400 {
+        span.record("otel.status_code", "ERROR");
+    }
+}
+
+/// Record a failed attempt: the error class and the `ERROR` span status.
+fn record_attempt_error(span: &tracing::Span, kind: &'static str) {
+    span.record("error.type", kind);
+    span.record("otel.status_code", "ERROR");
+}
+
 /// Read the response body inside the attempt `span`, so the span covers the
 /// body transfer. A read failure sets `error.type = "body"`.
 async fn read_body_in_span(
@@ -3325,7 +3332,7 @@ async fn read_body_in_span(
 
     let body = response.bytes().instrument(span.clone()).await;
     if body.is_err() {
-        span.record("error.type", "body");
+        record_attempt_error(span, "body");
     }
     body
 }
@@ -3343,9 +3350,7 @@ async fn send_in_span(
 
     let sent = request.send().instrument(span.clone()).await;
     match &sent {
-        Ok(response) => {
-            span.record("http.response.status_code", response.status().as_u16());
-        }
+        Ok(response) => record_attempt_status(span, response.status().as_u16()),
         Err(error) => {
             let kind = if error.is_timeout() {
                 "timeout"
@@ -3354,26 +3359,46 @@ async fn send_in_span(
             } else {
                 "request"
             };
-            span.record("error.type", kind);
+            record_attempt_error(span, kind);
         }
     }
     sent
 }
 
-/// Inject the W3C trace-context headers of the active span. Skip a name that
-/// `caller_headers` holds: `RequestBuilder::header` appends, so if not, the
-/// request sends both values.
+/// Inject the W3C trace-context headers of the active span, except the ones
+/// that [`trace_headers_to_send`] drops for `caller_headers`.
 fn inject_trace_context(
     builder: reqwest::RequestBuilder,
     caller_headers: &HeaderMap,
 ) -> reqwest::RequestBuilder {
     let mut builder = builder;
-    for (name, value) in trace_context_headers() {
-        if !caller_headers.contains_key(name.as_str()) {
-            builder = builder.header(name, value);
-        }
+    for (name, value) in trace_headers_to_send(trace_context_headers(), caller_headers) {
+        builder = builder.header(name, value);
     }
     builder
+}
+
+/// The injected trace headers to send. Skip a name that `caller_headers`
+/// holds: `RequestBuilder::header` appends, so if not, the request sends both
+/// values.
+///
+/// `traceparent` and `tracestate` are one W3C context. When the caller sets
+/// either one, skip both, so the request never mixes two contexts.
+fn trace_headers_to_send(
+    injected: Vec<(String, HeaderValue)>,
+    caller_headers: &HeaderMap,
+) -> Vec<(String, HeaderValue)> {
+    const W3C_PAIR: [&str; 2] = ["traceparent", "tracestate"];
+    let caller_has_context = W3C_PAIR
+        .iter()
+        .any(|name| caller_headers.contains_key(*name));
+    injected
+        .into_iter()
+        .filter(|(name, _)| {
+            let paired = caller_has_context && W3C_PAIR.contains(&name.as_str());
+            !paired && !caller_headers.contains_key(name.as_str())
+        })
+        .collect()
 }
 
 /// Add the current request's id as `x-request-id` (issue #3064). Do nothing
@@ -4371,6 +4396,36 @@ mod tests {
         assert_eq!(headers.get("x-request-id").unwrap(), "mine");
     }
 
+    /// `traceparent` and `tracestate` are one W3C context. A caller value for
+    /// either one drops both injected headers, so the request never mixes two
+    /// contexts.
+    #[test]
+    fn caller_trace_header_drops_the_whole_injected_pair() {
+        let injected = || {
+            vec![
+                ("traceparent".to_owned(), HeaderValue::from_static("ours-p")),
+                ("tracestate".to_owned(), HeaderValue::from_static("ours-s")),
+                ("baggage".to_owned(), HeaderValue::from_static("ours-b")),
+            ]
+        };
+        let names = |caller: &[&'static str]| {
+            let mut headers = HeaderMap::new();
+            for name in caller {
+                headers.insert(*name, HeaderValue::from_static("mine"));
+            }
+            let mut sent: Vec<String> = trace_headers_to_send(injected(), &headers)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            sent.sort();
+            sent
+        };
+        assert_eq!(names(&[]), ["baggage", "traceparent", "tracestate"]);
+        assert_eq!(names(&["traceparent"]), ["baggage"]);
+        assert_eq!(names(&["tracestate"]), ["baggage"]);
+        assert_eq!(names(&["baggage"]), ["traceparent", "tracestate"]);
+    }
+
     #[test]
     fn caller_trace_header_suppresses_the_injected_one() {
         let mut caller = HeaderMap::new();
@@ -4632,6 +4687,26 @@ mod tests {
                 Some("body"),
                 "custom={custom_path}: {spans:?}"
             );
+            assert_eq!(
+                spans[0].get("otel.status_code").map(String::as_str),
+                Some("ERROR"),
+                "custom={custom_path}: {spans:?}"
+            );
+
+            // A 4xx response is an error span too.
+            fields.spans.lock().unwrap().clear();
+            let mut missing = Client::new().get(format!("http://{addr}/missing"));
+            if custom_path {
+                missing = missing.no_redirect();
+            }
+            assert_eq!(missing.send().await.unwrap().status().as_u16(), 404);
+            let spans: Vec<_> = fields.spans.lock().unwrap().values().cloned().collect();
+            assert_eq!(spans.len(), 1, "custom={custom_path}: {spans:?}");
+            assert_eq!(
+                spans[0].get("otel.status_code").map(String::as_str),
+                Some("ERROR"),
+                "custom={custom_path}: {spans:?}"
+            );
         }
 
         crate::circuit_breaker::global_registry().clear();
@@ -4685,6 +4760,13 @@ mod tests {
                 .map(String::as_str),
             Some("200")
         );
+        // A 5xx attempt is an error span; a 2xx attempt has no status.
+        assert_eq!(
+            attempts[0].get("otel.status_code").map(String::as_str),
+            Some("ERROR"),
+            "{attempts:?}"
+        );
+        assert_eq!(attempts[1].get("otel.status_code"), None, "{attempts:?}");
     }
 
     // A 429 attempt span ends before the `Retry-After` sleep, so its duration

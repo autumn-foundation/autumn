@@ -153,9 +153,10 @@ does not apply to it.
 `http_client` opens one `http.client.request` span (kind `CLIENT`) for each
 attempt. Each attempt is a new span. `http.request.resend_count` is set from
 the second attempt. The `traceparent` header of each attempt names the span
-of that attempt. The span holds the URL path, not the query, because a query
-can hold secrets. A path can also hold a secret, for example a webhook token.
-Your trace backend receives it.
+of that attempt. A `4xx` or `5xx` response, or a failed attempt, sets the
+span status to `ERROR`. The span holds the URL path, not the query, because a
+query can hold secrets. A path can also hold a secret, for example a webhook
+token. Your trace backend receives it.
 
 ### Trace IDs in logs
 
