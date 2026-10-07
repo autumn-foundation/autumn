@@ -1786,6 +1786,16 @@ Use built-in jobs and tasks before reaching for a workflow engine:
 | `#[task]` + `.one_off_tasks()` | Operator-invoked CLI work via `autumn task` |
 | Autumn Harvest | Durable multi-step workflows, activity retries, timers, and dedicated runners |
 
+Autumn Harvest is a shipped, separate engine
+([`autumn-foundation/autumn-harvest`](https://github.com/autumn-foundation/autumn-harvest),
+wired in with `autumn-harvest-plugin`), not a roadmap item. Do not propose
+workflow primitives for Autumn core: no `#[workflow]`/`#[step]` macros,
+step-checkpoint tables, durable sleep inside a handler, signals, compensation,
+or "run B after A" job dependencies. The test from
+`docs/adr/0016-durable-workflows-live-in-harvest.md`: if the framework must
+remember *where inside the work* it got to, it is Harvest's; otherwise it can
+be a job feature. Jobs stay one unit of work, delivered at least once.
+
 `autumn-admin-plugin` includes `/admin/jobs` for inspecting, retrying,
 discarding, and canceling framework jobs. `GET /actuator/jobs` exposes
 lower-level counters.
