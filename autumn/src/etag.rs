@@ -166,7 +166,7 @@ impl ETag {
 fn fields_match<'a>(tag: &str, fields: impl IntoIterator<Item = Option<&'a str>>) -> bool {
     let (mut star, mut tags, mut matched) = (false, false, false);
     for field in fields {
-        match field.map(str::trim) {
+        match field.map(|f| f.trim_matches(OWS)) {
             Some("*") => star = true,
             Some("") => {}
             Some(list) => {
@@ -179,6 +179,9 @@ fn fields_match<'a>(tag: &str, fields: impl IntoIterator<Item = Option<&'a str>>
     if star { !tags } else { matched }
 }
 
+/// HTTP optional whitespace (RFC 9110 §5.6.3): only SP and HTAB.
+const OWS: [char; 2] = [' ', '\t'];
+
 /// Reads a header value as UTF-8. Unlike `to_str`, this keeps obs-text.
 fn header_str(value: &HeaderValue) -> Option<&str> {
     std::str::from_utf8(value.as_bytes()).ok()
@@ -190,7 +193,6 @@ fn header_str(value: &HeaderValue) -> Option<&str> {
 /// so it never matches. The parser also accepts a tag without quotes,
 /// because some clients send this form.
 fn entity_tags(list: &str) -> impl Iterator<Item = Option<&str>> {
-    const OWS: [char; 2] = [' ', '\t'];
     let mut rest = list;
     std::iter::from_fn(move || {
         rest = rest.trim_start_matches(|c| OWS.contains(&c) || c == ',');
@@ -2052,6 +2054,14 @@ mod tests {
         headers.append(IF_NONE_MATCH, HeaderValue::from_static("*"));
         headers.append(IF_NONE_MATCH, HeaderValue::from_static(" * "));
         assert!(fresh_when(&headers, ETag::strong("zzz")).is_fresh());
+    }
+
+    #[test]
+    fn star_with_non_http_whitespace_is_not_a_wildcard() {
+        let mut headers = HeaderMap::new();
+        let value = HeaderValue::from_bytes("\u{a0}*\u{a0}".as_bytes()).unwrap();
+        headers.insert(IF_NONE_MATCH, value);
+        assert!(!fresh_when(&headers, ETag::strong("zzz")).is_fresh());
     }
 
     #[tokio::test]
