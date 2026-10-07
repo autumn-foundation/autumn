@@ -1,6 +1,7 @@
 ### Fixed
 
-- **etag:** `If-None-Match` parsing now keeps a comma inside a quoted tag
-  (issue #3080). Before, a tag such as `"a,b"` never got a `304`, and a
-  different tag `"a"` got a false `304`. A malformed list member now never
-  matches. `EtagLayer` now parses each `If-None-Match` field alone.
+- **etag:** The `If-None-Match` parser no longer splits a quoted tag at a
+  comma (issue #3080). A response with the `ETag` `"a,b"` now gets a `304`
+  when the request sends `"a,b"`. A response with the `ETag` `"a"` no longer
+  gets a false `304` for that request. A malformed member, such as `"abc`,
+  does not match. `*` matches only when no `If-None-Match` field has a tag.
