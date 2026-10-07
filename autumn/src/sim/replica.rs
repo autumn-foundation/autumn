@@ -283,10 +283,7 @@ mod tests {
         let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
         let base = TickingClock::starting_at(epoch);
         let elapsed: Arc<dyn ClockSource> = Arc::new(base.clone());
-        (
-            base.clone(),
-            NodeClock::new(elapsed, epoch, spec.resolve(0)),
-        )
+        (base, NodeClock::new(elapsed, epoch, spec.resolve(0)))
     }
 
     #[test]
