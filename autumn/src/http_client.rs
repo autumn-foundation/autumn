@@ -1657,7 +1657,8 @@ fn pooled_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
         if Deadline::current().is_some() {
             attempt.stop()
-        } else if attempt.previous().len() >= PLAIN_MAX_REDIRECTS {
+        } else if attempt.previous().len() > PLAIN_MAX_REDIRECTS {
+            // `previous` holds the first URL too, as in reqwest's own limit.
             attempt.error("too many redirects")
         } else {
             let _ = FOLLOWED.try_with(|hops| hops.borrow_mut().push(attempt.url().to_string()));
@@ -6757,6 +6758,44 @@ mod tests {
                 .await;
             assert!(result.is_err(), "{result:?}");
             assert!(drained.available() > before, "the target got its refill");
+        }
+
+        #[tokio::test]
+        async fn ten_redirects_are_followed_with_and_without_a_deadline() {
+            // `/r/{n}` redirects to `/r/{n - 1}`; `/r/0` answers.
+            let app = axum::Router::new().route(
+                "/r/{n}",
+                axum::routing::get(
+                    |axum::extract::Path(n): axum::extract::Path<u32>| async move {
+                        use axum::response::IntoResponse;
+                        if n == 0 {
+                            "done".into_response()
+                        } else {
+                            axum::response::Redirect::temporary(&format!("/r/{}", n - 1))
+                                .into_response()
+                        }
+                    },
+                ),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let ten = format!("http://127.0.0.1:{port}/r/10");
+            let eleven = format!("http://127.0.0.1:{port}/r/11");
+
+            let plain = Client::new().get(&ten).send().await.unwrap();
+            assert_eq!(plain.status().as_u16(), 200, "as reqwest's own limit");
+            let timed = with_deadline(Duration::from_secs(3), Client::new().get(&ten).send())
+                .await
+                .unwrap();
+            assert_eq!(timed.status().as_u16(), 200);
+
+            assert!(Client::new().get(&eleven).send().await.is_err());
+            assert!(
+                with_deadline(Duration::from_secs(3), Client::new().get(&eleven).send())
+                    .await
+                    .is_err()
+            );
         }
 
         #[tokio::test]
