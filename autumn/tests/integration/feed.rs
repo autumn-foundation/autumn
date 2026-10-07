@@ -275,8 +275,8 @@ fn empty_feed_renders_deterministically() {
     assert_eq!(mk().etag().header_value(), mk().etag().header_value());
 }
 
-// Issue #3093: a date outside years 0000–9999 must not panic. The feed
-// clamps it to the nearest limit, so every date has a 4-digit year.
+// Issue #3093: an out-of-range date must not panic. The feed clamps it to
+// the nearest limit: years 0000–9999 for Atom, 1900–9999 for RSS and HTTP.
 
 fn feed_with_date(format: FeedFormat, year: i32) -> Feed {
     let date = Utc.with_ymd_and_hms(year, 1, 1, 0, 0, 0).unwrap();
@@ -292,7 +292,8 @@ fn rss_clamps_out_of_range_years() {
     for (year, expected) in [
         (10_000, "Fri, 31 Dec 9999 23:59:59 +0000"),
         (262_000, "Fri, 31 Dec 9999 23:59:59 +0000"),
-        (-1, "Sat, 1 Jan 0000 00:00:00 +0000"),
+        (-1, "Mon, 1 Jan 1900 00:00:00 +0000"),
+        (1899, "Mon, 1 Jan 1900 00:00:00 +0000"),
     ] {
         let xml = feed_with_date(FeedFormat::Rss, year).render();
         assert!(
@@ -331,8 +332,10 @@ fn atom_clamps_out_of_range_years() {
 fn in_range_years_are_not_changed() {
     let atom = feed_with_date(FeedFormat::Atom, 9999).render();
     assert!(atom.contains("<published>9999-01-01T00:00:00Z</published>"));
-    let rss = feed_with_date(FeedFormat::Rss, 0).render();
-    assert!(rss.contains("<pubDate>Sat, 1 Jan 0000 00:00:00 +0000</pubDate>"));
+    let atom = feed_with_date(FeedFormat::Atom, 0).render();
+    assert!(atom.contains("<published>0000-01-01T00:00:00Z</published>"));
+    let rss = feed_with_date(FeedFormat::Rss, 1900).render();
+    assert!(rss.contains("<pubDate>Mon, 1 Jan 1900 00:00:00 +0000</pubDate>"));
 }
 
 #[tokio::test]
@@ -348,7 +351,7 @@ async fn out_of_range_year_does_not_panic_the_response_paths() {
 async fn conditional_clamps_last_modified() {
     for (year, expected) in [
         (10_000, "Fri, 31 Dec 9999 23:59:59 GMT"),
-        (-1, "Sat, 01 Jan 0000 00:00:00 GMT"),
+        (-1, "Mon, 01 Jan 1900 00:00:00 GMT"),
     ] {
         let resp = feed_with_date(FeedFormat::Rss, year).conditional(&HeaderMap::new());
         assert_eq!(resp.status(), StatusCode::OK);

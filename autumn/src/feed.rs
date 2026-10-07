@@ -602,7 +602,8 @@ mod proptests {
         }
 
         /// Issue #3093: any `DateTime<Utc>` renders without a panic, and each
-        /// date parses back as the input clamped to years 0000–9999.
+        /// date parses back as the input clamped to years 0000–9999 (Atom) or
+        /// 1900–9999 (RSS).
         #[test]
         fn render_clamps_any_date(
             // Half the cases stay in years 0000–9999, where the date must not change.
@@ -621,8 +622,9 @@ mod proptests {
             .entry(FeedEntry::new("i", "t", "https://example.com/1").published(dt));
 
             let out = feed.render();
+            let min_year = if rss { 1900 } else { 0 };
             let expected = dt.clamp(
-                Utc.with_ymd_and_hms(0, 1, 1, 0, 0, 0).unwrap(),
+                Utc.with_ymd_and_hms(min_year, 1, 1, 0, 0, 0).unwrap(),
                 Utc.with_ymd_and_hms(9999, 12, 31, 23, 59, 59).unwrap(),
             );
             let (open, close) = if rss {
