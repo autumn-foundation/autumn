@@ -219,6 +219,9 @@ run_pending_locked_with_policy(database_url, MIGRATIONS, None, policy)?;
   value in place of the inherited `PGOPTIONS`, with the timeout added after
   it.
 
+`autumn migrate down` does not use the lock timeout yet: a rollback waits for
+its locks as before.
+
 Run migrations against Postgres directly.
 
 ---

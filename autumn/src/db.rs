@@ -246,9 +246,14 @@ pub(crate) fn scope_background_tx_timeouts<S: DbState, F: std::future::Future>(
 /// Generated repositories call it through `__private`.
 #[doc(hidden)]
 pub fn note_route_statement_timeout(parts: &axum::http::request::Parts) {
-    let Some(timeout) = parts.extensions.get::<StatementTimeout>() else {
-        return;
-    };
+    if let Some(timeout) = parts.extensions.get::<StatementTimeout>() {
+        note_statement_timeout(*timeout);
+    }
+}
+
+/// Record a route's [`StatementTimeout`] for the request's transactions, for
+/// a handler that receives the extension itself (the offline-sync routes).
+pub(crate) fn note_statement_timeout(timeout: StatementTimeout) {
     let ms = pg_timeout_ms(Some(timeout.0));
     let _ = REQUEST_TX_TIMEOUTS.try_with(|cell| {
         cell.lock()

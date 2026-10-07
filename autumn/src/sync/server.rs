@@ -1187,7 +1187,14 @@ fn sync_tx_set_local() -> Option<String> {
 }
 
 /// The request's `SET LOCAL` timeout batch, read in the route handler's task.
-fn request_tx_set_local() -> Option<String> {
+/// A route's `StatementTimeout` replaces the statement value, as it does for
+/// `Db` and generated repositories.
+fn request_tx_set_local(
+    route_timeout: Option<axum::Extension<crate::db::StatementTimeout>>,
+) -> Option<String> {
+    if let Some(axum::Extension(timeout)) = route_timeout {
+        crate::db::note_statement_timeout(timeout);
+    }
     crate::db::TxTimeouts::current().and_then(crate::db::TxTimeouts::set_local_sql)
 }
 
@@ -1751,7 +1758,9 @@ where
         .route(
             "/push",
             post(
-                move |scope: Option<SyncScope>, Json(request): Json<PushRequest>| {
+                move |route_timeout: Option<axum::Extension<crate::db::StatementTimeout>>,
+                      scope: Option<SyncScope>,
+                      Json(request): Json<PushRequest>| {
                     let backend = Arc::clone(&push_backend);
                     let resolver = Arc::clone(&resolver);
                     async move {
@@ -1769,7 +1778,7 @@ where
                             )
                                 .into_response();
                         }
-                        let set_local = request_tx_set_local();
+                        let set_local = request_tx_set_local(route_timeout);
                         let result = crate::time::spawn_blocking(move || {
                             with_sync_tx_set_local(set_local, || {
                                 backend.apply_push(scope.as_str(), &request, resolver.as_ref())
@@ -1784,7 +1793,9 @@ where
         .route(
             "/pull",
             get(
-                move |scope: Option<SyncScope>, Query(query): Query<PullQuery>| {
+                move |route_timeout: Option<axum::Extension<crate::db::StatementTimeout>>,
+                      scope: Option<SyncScope>,
+                      Query(query): Query<PullQuery>| {
                     let backend = Arc::clone(&backend);
                     async move {
                         let Ok(scope) = request_scope(scope, require_scope) else {
@@ -1792,7 +1803,7 @@ where
                         };
                         let limit = query.limit.clamp(1, MAX_PULL_LIMIT);
                         let session_start = query.session_start();
-                        let set_local = request_tx_set_local();
+                        let set_local = request_tx_set_local(route_timeout);
                         let result = crate::time::spawn_blocking(move || {
                             with_sync_tx_set_local(set_local, || {
                                 backend.pull_since(
@@ -1842,7 +1853,7 @@ mod tests {
     async fn sync_calls_get_the_request_tx_timeouts() {
         let timeouts = crate::db::TxTimeouts::new(Some(std::time::Duration::from_secs(30)), None);
         let set_local = timeouts
-            .scope(async { super::request_tx_set_local() })
+            .scope(async { super::request_tx_set_local(None) })
             .await;
         assert_eq!(set_local, timeouts.set_local_sql());
 
@@ -1854,9 +1865,25 @@ mod tests {
         assert_eq!(seen, timeouts.set_local_sql());
         assert_eq!(super::sync_tx_set_local(), None, "cleared after the call");
         assert_eq!(
-            super::request_tx_set_local(),
+            super::request_tx_set_local(None),
             None,
             "nothing outside a scope"
+        );
+    }
+
+    /// A route's `StatementTimeout` replaces the request default, as it does
+    /// for `Db` and generated repositories.
+    #[tokio::test]
+    async fn a_route_statement_timeout_reaches_sync_calls() {
+        let defaults = crate::db::TxTimeouts::new(Some(std::time::Duration::from_secs(30)), None);
+        let route = crate::db::StatementTimeout(std::time::Duration::from_secs(90));
+        let set_local = defaults
+            .scope_request(async { super::request_tx_set_local(Some(axum::Extension(route))) })
+            .await;
+        assert_eq!(
+            set_local,
+            crate::db::TxTimeouts::new(Some(std::time::Duration::from_secs(90)), None)
+                .set_local_sql()
         );
     }
 
