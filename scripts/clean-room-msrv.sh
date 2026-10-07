@@ -22,6 +22,7 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/autumn-clean-room.XXXXXX")"
 export CARGO_HOME="$work/cargo-home"
 export QUICKSTART_STATE_DIR="$work/state"
 export RUSTUP_TOOLCHAIN="$msrv"
+export PATH="$CARGO_HOME/bin:$PATH"  # a pristine CARGO_HOME has no bin/ on PATH yet
 rustup toolchain install "$msrv" --profile minimal >/dev/null 2>&1 || true
 
 phases=("$@")
