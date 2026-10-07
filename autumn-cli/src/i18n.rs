@@ -736,8 +736,9 @@ fn load_locale_keys(dir: &Path) -> BTreeMap<String, BTreeSet<String>> {
 
 // ── Report assembly ───────────────────────────────────────────────────────
 
-/// Keys the framework looks up at runtime. No source file names them, so they
-/// are never reported unused. Keep in step with `autumn_web::form`.
+/// Keys that the framework looks up at runtime. No source file names them.
+/// `autumn i18n check` never reports them as unused. Keep this list the same
+/// as the keys in `autumn_web::form`.
 const FRAMEWORK_KEYS: &[&str] = &["common.error.nul_character"];
 
 /// Build the per-locale report from the referenced keys, the defined keys per
@@ -2208,7 +2209,7 @@ mod tests {
 
     #[test]
     fn framework_keys_are_not_reported_unused() {
-        // The framework looks `common.error.nul_character` up at runtime, so no
+        // The framework looks up `common.error.nul_character` at runtime. No
         // source file names it. It must not fail `--strict`.
         let scan = scan_with(&["nav.home"]);
         let mut per_locale = BTreeMap::new();

@@ -1161,9 +1161,10 @@ fn pg_message_is_nul_rejection(message: &str) -> bool {
 ///
 /// Postgres refuses `\u0000` inside a JSON string with the message
 /// `unsupported Unicode escape sequence` and the detail
-/// `\u0000 cannot be converted to text.` Neither text holds client input, so
-/// both must match exactly. Checked on a live Postgres 16 server. A locale that
-/// translates either text keeps its `500`, the safe direction.
+/// `\u0000 cannot be converted to text.` A client can echo text into a message,
+/// so the message and the detail must both match exactly. A Postgres 16 server
+/// returned these texts. If a locale translates either text, the error stays a
+/// `500`. This is safe.
 #[cfg(feature = "db")]
 fn pg_error_is_jsonb_nul_rejection(info: &dyn diesel::result::DatabaseErrorInformation) -> bool {
     info.message() == "unsupported Unicode escape sequence"
@@ -1172,10 +1173,10 @@ fn pg_error_is_jsonb_nul_rejection(info: &dyn diesel::result::DatabaseErrorInfor
 
 /// Paths of the string values in `body` that hold a NUL character.
 ///
-/// Names use the form keys `ChangesetForm` reports: `title`, `address.street`,
-/// `items[1].sku`. Use it in a handler to name the field after
+/// Each path uses the field names that `ChangesetForm` reports: `title`,
+/// `address.street`, `items[1].sku`. Call it in a handler after
 /// [`is_nul_byte_violation`] is true. The generated `#[repository(api = ...)]`
-/// write handlers do this for you.
+/// write handlers call it for you.
 ///
 /// # Examples
 ///
@@ -1214,11 +1215,13 @@ pub fn nul_byte_json_fields(body: &serde_json::Value) -> Vec<String> {
     out
 }
 
-/// Name the field of a NUL rejection, so the `422` carries an `errors[]` entry.
+/// Add the field name to a NUL rejection. The `422` then has an `errors[]`
+/// entry.
 ///
-/// Postgres does not say which column held the byte, so the generated write
+/// Postgres does not say which column held the byte. The generated write
 /// handlers look for it in the payload. `body` runs only for a NUL rejection.
-/// Any other error, and a NUL that is not found, pass through unchanged.
+/// Other errors pass through unchanged. A NUL that is not found also passes
+/// through unchanged.
 ///
 /// Not part of the stable API — used only by macro-generated code.
 #[cfg(feature = "db")]
@@ -1248,11 +1251,12 @@ pub fn __name_nul_fields(
     err
 }
 
-// A write payload need not implement `Serialize` (a hand-written `NewModel`
-// may not), so the handlers pick the JSON view with autoref specialization,
-// like `validation::MaybeValidate`.
+// A write payload can lack `Serialize`, for example a hand-written `NewModel`.
+// The handlers pick the JSON view with autoref specialization, as
+// `validation::MaybeValidate` does.
 
-/// Wrapper for the autoref specialization in [`__name_nul_fields`] callers.
+/// Wrapper for autoref specialization. Generated code uses it with
+/// [`__name_nul_fields`].
 ///
 /// Not part of the stable API — used only by macro-generated code.
 #[cfg(feature = "db")]
@@ -1929,7 +1933,7 @@ mod tests {
             assert_eq!(err.to_string(), crate::error::NUL_BYTE_REJECTED_MESSAGE);
         }
 
-        /// The message alone is prose. It must not classify without the detail.
+        /// The message alone must not classify. The detail must also match.
         #[test]
         fn jsonb_message_without_the_nul_detail_stays_500() {
             let err: AutumnError = unknown_db_error(PG_JSONB_NUL_MESSAGE).into();
@@ -1942,7 +1946,7 @@ mod tests {
             assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
         }
 
-        /// A client controls echoed text, so the pair must match exactly.
+        /// A client can echo text into a message. The pair must match exactly.
         #[test]
         fn echoed_jsonb_text_does_not_classify() {
             let err: AutumnError = unknown_db_error_with_detail(
@@ -2151,7 +2155,7 @@ mod tests {
             assert!(!err.has_field_errors());
         }
 
-        // The extra `&` is what makes autoref pick the right branch.
+        // The extra `&` makes autoref pick the right branch.
         #[allow(clippy::needless_borrow)]
         #[test]
         fn only_serializable_payloads_expose_a_json_body() {

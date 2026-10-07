@@ -546,9 +546,10 @@ pub(crate) fn emit_api_handlers(config: &RepoConfig, inputs: &ApiInputs<'_>) -> 
         }
     };
 
-    // #2439: Postgres cannot say which column held a NUL byte, so a NUL
-    // rejection from a write names the payload field that carried it. Runs on
-    // the error path only. A payload without `Serialize` keeps the empty list.
+    // #2439: Postgres does not say which column held a NUL byte. After a NUL
+    // rejection, look for the byte in the payload and name that field. This
+    // code runs on the error path only. A payload without `Serialize` gets an
+    // empty list.
     let name_nul_new = quote! {
         |err| {
             #[allow(unused_imports)]

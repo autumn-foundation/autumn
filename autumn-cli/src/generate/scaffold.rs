@@ -1300,8 +1300,8 @@ fn plan_scaffold_with_options_impl(
         // rather than a runtime miss. `labels.used_keys()` is the exact set the render
         // emitted — no more, which `autumn i18n check` would flag as unused, and no fewer.
         let autumn_toml_path_for_i18n = project_root.join("autumn.toml");
-        // #2439: `ChangesetForm` looks this key up itself (the same key as
-        // `autumn_web::form::NUL_CHARACTER_MESSAGE_KEY`).
+        // #2439: `ChangesetForm` looks up this key. It is the same key as
+        // `autumn_web::form::NUL_CHARACTER_MESSAGE_KEY`.
         labels.framework_key(
             "common.error.nul_character",
             "Cannot contain the NUL character (0x00)",
@@ -26403,8 +26403,8 @@ exempt_paths = [
         assert!(routes.contains("const UNIQUE_CONSTRAINTS"), "{routes}");
     }
 
-    /// #2439: the framework resolves the NUL field error from the bundle, so an
-    /// `--i18n` scaffold ships the catalog entry. No view references it.
+    /// #2439: the framework reads the NUL field error from the bundle. An
+    /// `--i18n` scaffold ships the catalog entry. No view uses it.
     #[test]
     fn i18n_scaffold_ships_the_nul_message_key() {
         let tmp = project_with_main(default_main());
@@ -26530,7 +26530,7 @@ exempt_paths = [
 
     /// AC4/AC7: every referenced key exists in the emitted `en.ftl`, and the
     /// file carries no key the views never reference (which `autumn i18n check`
-    /// would report as unused), except the one the framework looks up itself.
+    /// would report as unused), except the one key that the framework looks up.
     #[test]
     fn i18n_en_ftl_matches_the_referenced_key_set_exactly() {
         let tmp = project_with_main(default_main());
@@ -26555,7 +26555,7 @@ exempt_paths = [
             missing.is_empty(),
             "keys referenced but not defined in en.ftl: {missing:?}\n{ftl}"
         );
-        // The one key no view names: the framework looks it up (#2439).
+        // The framework looks up this key. No view names it (#2439).
         let unused: Vec<_> = defined.difference(&referenced).collect();
         assert_eq!(
             unused,

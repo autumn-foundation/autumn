@@ -364,11 +364,11 @@ pub const NUL_CHARACTER_FIELD_ERROR: &str = "Cannot contain the NUL character (0
 ///
 /// When the request carries an `i18n` bundle, [`ChangesetForm`] and
 /// [`crate::nested_form::NestedChangesetForm`] look this key up in the request
-/// locale. A missing key keeps the English [`NUL_CHARACTER_FIELD_ERROR`].
+/// locale. If the key is missing, the message stays [`NUL_CHARACTER_FIELD_ERROR`].
 /// `autumn generate --i18n` scaffolds add the key to their catalog.
 pub const NUL_CHARACTER_MESSAGE_KEY: &str = "common.error.nul_character";
 
-/// The NUL field message for this request, and the request back.
+/// Returns the request and the NUL field message for it.
 ///
 /// Resolves the locale before the body is read. Without an `i18n` bundle in
 /// the request extensions, this is [`NUL_CHARACTER_FIELD_ERROR`].
@@ -397,7 +397,8 @@ pub(crate) async fn nul_field_message<S: Send + Sync>(
     )
 }
 
-/// The NUL field message for this request, and the request back.
+/// Returns the request and the NUL field message for it. Without the `i18n`
+/// feature, the message is always English.
 #[cfg(not(feature = "i18n"))]
 #[allow(clippy::unused_async)]
 pub(crate) async fn nul_field_message<S: Send + Sync>(

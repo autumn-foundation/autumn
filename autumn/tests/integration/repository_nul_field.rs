@@ -1,6 +1,6 @@
 //! #2439 — the generated API `422` for an embedded NUL names the field.
 //!
-//! Postgres reports a NUL in `TEXT` without a column, so the generated write
+//! Postgres reports a NUL in `TEXT` without a column. The generated write
 //! handlers look for the byte in the payload. Covers the plain and the
 //! policy-backed handlers, create and update.
 //!
@@ -161,5 +161,12 @@ async fn update_names_the_field_that_carried_the_nul() {
             .await;
         assert_eq!(response.status, StatusCode::UNPROCESSABLE_ENTITY, "{path}");
         assert_eq!(error_fields(&response), ["title"], "{path}");
+
+        let clean = client
+            .put(&format!("{path}/{id}"))
+            .json(&serde_json::json!({"title": "fine"}))
+            .send()
+            .await;
+        assert_eq!(clean.status, StatusCode::OK, "{path}");
     }
 }

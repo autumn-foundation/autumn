@@ -514,7 +514,8 @@ where
     decode_nested_with_nul_message(pairs, crate::form::NUL_CHARACTER_FIELD_ERROR)
 }
 
-/// [`decode_nested_urlencoded`] with the message recorded for a NUL byte.
+/// Like [`decode_nested_urlencoded`], but the caller sets the message for a NUL
+/// byte.
 fn decode_nested_with_nul_message<P, C>(
     pairs: &[(String, String)],
     nul_message: &str,
@@ -650,7 +651,7 @@ enum ChildRow<C> {
 ///
 /// `nul_fields` names the subfields of this row whose submitted value carried
 /// a NUL byte (#2423); the values in `subfields` have already been cleaned, so
-/// this only decides what to say about them, with `nul_message`.
+/// this function only sets the message for them, from `nul_message`.
 fn decode_child_row<C: NestedChild>(
     subfields: &[(String, String)],
     nul_fields: &[String],

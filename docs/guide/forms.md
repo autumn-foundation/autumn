@@ -591,23 +591,23 @@ if let Err(err) = repo.save(&new_post).await
 }
 ```
 
-This is a backstop. The form boundary is the main defense, because it gives
-the author a message they can act on.
+This is a backstop. The form boundary is the main defense. It gives the author
+a message they can use.
 
 The generated `#[repository(api = ...)]` create and update handlers name the
 field. The `422` has an `errors[]` entry for each string that holds a NUL byte.
 Nested names use dots and brackets: `address.street`, `items[1].sku`. The
-handler finds the byte in the payload, because Postgres does not say which
-column held it. A payload type without `Serialize` keeps an empty `errors[]`.
+Postgres does not say which column held the byte. The handler looks for it in
+the payload. A payload type without `Serialize` keeps an empty `errors[]`.
 In your own handler, call `autumn_web::error::nul_byte_json_fields` on the
 JSON body.
 
-A NUL in a `JSONB` string fails with a different message (`unsupported Unicode
-escape sequence`, SQLSTATE `22P05`). The classifier matches that message and
-its detail exactly, and gives the same `422`.
+Postgres rejects a NUL in a `JSONB` string with a different message
+(`unsupported Unicode escape sequence`, SQLSTATE `22P05`). The classifier
+matches that message and its detail exactly. It returns the same `422`.
 
-Classification uses the server message. A server that translates the message
-keeps the `500`. That is the safe direction.
+Classification uses the server message. If the server translates the message,
+the error stays a `500`. This is safe.
 
 ### When you would rather clean than reject
 
@@ -645,9 +645,12 @@ common.error.nul_character = No puede contener el carácter NUL (0x00)
 ```
 
 If there is no bundle, or the key is missing, the message is
-`NUL_CHARACTER_FIELD_ERROR` in English. A missing key does not record a miss. `autumn generate --i18n` adds the English entry to `en.ftl`, and
-`autumn i18n check` does not report it unused. The API `422` message stays in
-English, because no locale is available there.
+`NUL_CHARACTER_FIELD_ERROR` in English. A missing key does not record a miss.
+
+`autumn generate --i18n` adds the English entry to `en.ftl`. `autumn i18n check`
+does not report the key as unused.
+
+The API `422` message stays in English. No locale is available there.
 
 ---
 
