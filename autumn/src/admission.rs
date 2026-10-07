@@ -261,6 +261,12 @@ fn share_permille(class: &'static str, value: f64) -> Result<u16, AdmissionConfi
         reason = "value is in 0.0..=1.0, so the product is in 0..=1000"
     )]
     let permille = (value * f64::from(PERMILLE)).floor() as u16;
+    // A positive share below 1‰ must not become 0, which means "always shed".
+    let permille = if value > 0.0 {
+        permille.max(1)
+    } else {
+        permille
+    };
     Ok(permille.min(PERMILLE))
 }
 
@@ -1185,6 +1191,14 @@ mod tests {
             shares.threshold(Criticality::Sheddable, usize::MAX),
             usize::MAX / 2
         );
+    }
+
+    /// Regression (#3183 review): a positive share below 1‰ keeps a slot.
+    #[test]
+    fn a_tiny_positive_share_is_not_zero() {
+        let shares = PartitionShares::new(1.0, 0.0009).unwrap();
+        assert_eq!(shares.threshold(Criticality::Sheddable, 100), 1);
+        assert_eq!(shares.threshold(Criticality::Sheddable, 1), 1);
     }
 
     #[test]

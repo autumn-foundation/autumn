@@ -126,7 +126,10 @@ the limiter. Deadline headers are the scope of issue #3058.
   `autumn_admission_limit` gauge shows its value.
 - After a long latency increase, the Gradient2 limit can stay low for
   minutes. Use `vegas` when that is a problem.
-- The `/mcp` envelope admits every tool call as `default`.
+- The `/mcp` envelope admits a tool call as `default`, before it knows the
+  tool. The dispatch then checks the tool route's class, so a `sheddable`
+  tool is shed at its share. A `critical` tool gets no extra headroom at the
+  envelope.
 
 ## Evidence
 

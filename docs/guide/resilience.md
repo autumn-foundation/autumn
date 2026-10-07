@@ -291,8 +291,9 @@ The HTTP client sends the class downstream in `X-Autumn-Criticality` when it
 is not `default`. A server reads that header only when
 `trust_criticality_header = true`. Set it only when you trust all callers, or
 when an edge proxy removes or sets the header. If you do not, a public client
-can set its requests to `critical`. The `/mcp` endpoint admits every tool call
-as `default`.
+can set its requests to `critical`. The `/mcp` endpoint admits a tool call as
+`default`. Then it checks the class of the tool's route, so a `sheddable` tool
+is shed at its share. A `critical` tool gets no extra headroom at `/mcp`.
 
 The handler can read the class with
 `autumn_web::admission::current_criticality()`. A task that the handler

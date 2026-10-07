@@ -246,6 +246,7 @@ pub struct LoadShedService<S> {
 
 impl<S> LoadShedService<S> {
     /// Whether `req` bypasses admission control entirely (probes/actuator).
+    /// Whether `req` is on a probe or actuator path.
     fn is_exempt<B>(&self, req: &Request<B>) -> bool {
         let path = req.uri().path();
         let prefix_matched = health_prefix_matches(
@@ -260,7 +261,24 @@ impl<S> LoadShedService<S> {
                 .probe_paths
                 .iter()
                 .any(|probe| probe == path)
-            || req.extensions().get::<LoadShedExempt>().is_some()
+    }
+
+    /// Shed `req` as class `criticality`: count it and build the `503`.
+    fn shed<B, F>(&self, req: &Request<B>, criticality: Criticality) -> LoadShedFuture<F> {
+        self.layer.metrics.record_request_shed_for(criticality);
+        // Capture the request Origin before it's dropped, so a
+        // mirrored CORS response can echo it back (see with_cors).
+        let cors_origin = self
+            .layer
+            .cors
+            .as_ref()
+            .and_then(|_| req.headers().get(http::header::ORIGIN).cloned());
+        LoadShedFuture::ShortCircuit {
+            response: Some(build_shed_response(
+                self.layer.cors.as_deref(),
+                cors_origin.as_ref(),
+            )),
+        }
     }
 }
 
@@ -284,6 +302,22 @@ where
                 guard: None,
             };
         }
+        if req.extensions().get::<LoadShedExempt>().is_some() {
+            // An outer admission (the `/mcp` envelope) already counted this
+            // request, as `default`. Check the class of the route it reaches
+            // now. The in-flight count includes this request's own slot, so a
+            // fresh request would pass only if `in_flight <= threshold`.
+            if let Some(&criticality) = req.extensions().get::<Criticality>()
+                && self.layer.in_flight.load(Ordering::Acquire)
+                    > self.layer.shares.threshold(criticality, limit)
+            {
+                return self.shed(&req, criticality);
+            }
+            return LoadShedFuture::Forward {
+                inner: self.inner.call(req),
+                guard: None,
+            };
+        }
 
         let criticality = req
             .extensions()
@@ -295,20 +329,7 @@ where
         let mut current = in_flight.load(Ordering::Acquire);
         loop {
             if current >= threshold {
-                self.layer.metrics.record_request_shed_for(criticality);
-                // Capture the request Origin before it's dropped, so a
-                // mirrored CORS response can echo it back (see with_cors).
-                let cors_origin = self
-                    .layer
-                    .cors
-                    .as_ref()
-                    .and_then(|_| req.headers().get(http::header::ORIGIN).cloned());
-                return LoadShedFuture::ShortCircuit {
-                    response: Some(build_shed_response(
-                        self.layer.cors.as_deref(),
-                        cors_origin.as_ref(),
-                    )),
-                };
+                return self.shed(&req, criticality);
             }
             // `current < threshold` is checked immediately above, so the bump is
             // exact; `saturating_add` only guards the theoretical `usize::MAX`
@@ -1050,6 +1071,61 @@ mod tests {
         gate.notify_waiters();
         assert_eq!(exempt_fut.await.unwrap(), axum::http::StatusCode::OK);
         assert_eq!(held.await.unwrap(), axum::http::StatusCode::OK);
+    }
+
+    /// Regression (#3183 review): an MCP `tools/call` replay is already
+    /// counted at the envelope as `default`. The replay must still be shed
+    /// when its route's class is over its share.
+    #[tokio::test]
+    async fn exempt_replay_is_rechecked_against_its_class() {
+        use crate::admission::Criticality;
+        // Limit 2, sheddable share 0.5: one slot for sheddable.
+        let layer = LoadShedLayer::new(2, MetricsCollector::new());
+        let gate = Arc::new(Notify::new());
+        let entered = Arc::new(StdAtomicUsize::new(0));
+        let app = make_blocking_app(layer, gate.clone(), entered.clone());
+
+        // One ordinary request in flight, then the envelope's own slot: the
+        // replay below sees in_flight = 2 (simulated by a second holder).
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let app = app.clone();
+            held.push(tokio::spawn(async move {
+                app.oneshot(request("/block", Some(Criticality::Critical)))
+                    .await
+                    .unwrap()
+                    .status()
+            }));
+        }
+        wait_for_entered(&entered, 2).await;
+
+        let replay = |c| {
+            let mut req = request("/work", Some(c));
+            req.extensions_mut().insert(LoadShedExempt);
+            req
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(replay(Criticality::Sheddable))
+                .await
+                .unwrap()
+                .status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "a sheddable tool over its share is shed"
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(replay(Criticality::Critical))
+                .await
+                .unwrap()
+                .status(),
+            axum::http::StatusCode::OK,
+            "a critical tool at the limit is not shed again"
+        );
+        gate.notify_waiters();
+        for h in held {
+            assert_eq!(h.await.unwrap(), axum::http::StatusCode::OK);
+        }
     }
 
     // ── Probe / actuator exemption ────────────────────────────────────────
