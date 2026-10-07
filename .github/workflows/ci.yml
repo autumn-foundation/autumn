@@ -1225,6 +1225,7 @@ jobs:
         run: |
           cargo test -p autumn-web --features i18n --lib i18n::
           cargo test -p autumn-web --features "i18n,test-support" --test integration_tests translatable
+          cargo test -p autumn-web --features "i18n,test-support" --test integration_tests nul_message_i18n
       - name: Run plugin-sandbox tests (untrusted-plugin containment)
         if: matrix.lane == 'plugin-sandbox'
         # `plugin-sandbox` is not a default feature, so `cargo test --workspace`
