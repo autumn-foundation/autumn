@@ -3083,8 +3083,11 @@ mod tests {
             include_str!("templates/Dockerfile.tmpl"),
             include_str!("templates/Dockerfile.api.tmpl"),
         ] {
+            // `lines()` drops the `\r` of a CRLF checkout on Windows.
             assert!(
-                dockerfile.contains("RUN cargo build --release\n"),
+                dockerfile
+                    .lines()
+                    .any(|line| line == "RUN cargo build --release"),
                 "the image build changed; change POSTURE_AUDIT_FLAGS with it"
             );
         }
