@@ -59,8 +59,12 @@ fn echo_deadline() -> axum::Router {
     )
 }
 
-/// Calls the upstream. A client error becomes a `502` with the error text,
-/// so the test can see that the client stopped, not the timeout layer.
+/// Calls the upstream. A client error becomes a `502` with the error text.
+///
+/// The client stops at the route deadline, the same instant as the timeout
+/// layer. The layer does not poll a handler past its deadline, so the caller
+/// gets the layer's `503`, and the handler does not run on with the client
+/// error. The `scope_alone` tests below show the client stopping by itself.
 #[get("/call", timeout_ms = 5000)]
 async fn call(client: Client) -> (axum::http::StatusCode, String) {
     match client.get("http://upstream/work").send().await {
@@ -133,8 +137,8 @@ async fn sim_deadline_stops_a_hanging_upstream_at_the_route_timeout(mut sim: Sim
     assert!(elapsed <= ROUTE_TIMEOUT + EPSILON, "took {elapsed:?}");
     assert_eq!(
         response.status.as_u16(),
-        502,
-        "the client must fail first: {}",
+        503,
+        "the timeout layer answers at the deadline: {}",
         response.text()
     );
     let starts = starts.lock().unwrap().clone();
@@ -158,7 +162,7 @@ async fn sim_deadline_retries_only_inside_the_route_timeout(mut sim: Sim) {
     let elapsed = begin.elapsed();
 
     assert!(elapsed <= ROUTE_TIMEOUT + EPSILON, "took {elapsed:?}");
-    assert_eq!(response.status.as_u16(), 502, "{}", response.text());
+    assert_eq!(response.status.as_u16(), 503, "{}", response.text());
     let starts = starts.lock().unwrap().clone();
     assert!(starts.len() >= 2, "the client retries: {starts:?}");
     for start in &starts {

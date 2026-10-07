@@ -28,8 +28,10 @@ async fn export() -> &'static str {
 }
 ```
 
-When the timeout starts, Autumn sets a `Deadline` for the handler task. Read
-it with `autumn_web::deadline::Deadline::current()`:
+When the timeout starts, Autumn sets a `Deadline` for the handler task. Once
+the deadline passes, the handler is not polled again: work that wakes at or
+after the deadline does not run, and the caller gets the timeout `503`. Read
+the deadline with `autumn_web::deadline::Deadline::current()`:
 
 ```rust
 use autumn_web::deadline::Deadline;
