@@ -1242,6 +1242,9 @@ pub(crate) fn install_shared_throttle(
     let _ = shared_throttle(state, config);
 }
 
+/// Serializes the replacement of the shared throttle.
+static THROTTLE_REPLACE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The app-wide throttle for the effective `config`, or `None` when it is
 /// off. A `state_initializer` can replace the config after boot. If the
 /// shared throttle was built from other settings, or there is none, a new
@@ -1255,10 +1258,22 @@ fn shared_throttle(
     if !settings.enabled {
         return None;
     }
-    if let Some(shared) = state.extension::<SharedThrottle>()
-        && shared.config == settings
-    {
-        return Some(Arc::clone(&shared.throttle));
+    let current = || {
+        state
+            .extension::<SharedThrottle>()
+            .filter(|shared| shared.config == settings)
+            .map(|shared| Arc::clone(&shared.throttle))
+    };
+    if let Some(throttle) = current() {
+        return Some(throttle);
+    }
+    // Replace under a lock and check again, so that concurrent first calls
+    // after a config change share one throttle. Only this slow path locks.
+    let _guard = THROTTLE_REPLACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(throttle) = current() {
+        return Some(throttle);
     }
     let throttle = throttle_from_config(config)?;
     state.insert_extension(SharedThrottle {
@@ -3600,6 +3615,29 @@ mod tests {
         replaced.client.adaptive_throttle.enabled = false;
         state.insert_extension(replaced);
         assert!(Client::from_state(&state).throttle.is_none(), "off again");
+    }
+
+    /// Regression (#3183 review): concurrent first calls after a config
+    /// change share one throttle.
+    #[test]
+    fn concurrent_first_calls_share_one_throttle() {
+        let state = crate::AppState::for_test();
+        let mut config = crate::config::HttpConfig::default();
+        config.client.adaptive_throttle.enabled = true;
+        state.insert_extension(config);
+        let throttles: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| Client::from_state(&state).throttle.expect("on")))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("thread"))
+                .collect()
+        });
+        assert!(
+            throttles.iter().all(|t| Arc::ptr_eq(t, &throttles[0])),
+            "every client must share the one throttle"
+        );
     }
 
     #[test]

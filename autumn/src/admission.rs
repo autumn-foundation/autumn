@@ -503,6 +503,17 @@ impl Gradient2 {
         if long / short > 2.0 {
             self.long_rtt.value = long * 0.95;
         }
+        // A window with a drop (a `504`, an inner error, a deadline cancel)
+        // backs off at the largest step and adds no queue allowance. Netflix
+        // Gradient2 ignores drops; fast failures would then grow the limit.
+        if sample.dropped {
+            let target = self.estimated * 0.5;
+            let next = self
+                .estimated
+                .mul_add(1.0 - self.smoothing, target * self.smoothing);
+            self.estimated = self.bounds.clamp_f64(next);
+            return self.limit();
+        }
         // An app that uses less than half the limit tells nothing about it.
         if usize_to_f64(sample.in_flight) < self.estimated / 2.0 {
             return self.limit();
@@ -1321,6 +1332,28 @@ mod tests {
             }
         }
         assert!(limit < 100, "the limit drifted up to {limit}");
+    }
+
+    /// Regression (#3183 review): fast failures must not grow the limit.
+    #[test]
+    fn gradient2_backs_off_on_a_window_with_drops() {
+        let mut g = Gradient2::new(bounds(1, 1000, 100));
+        let mut clock = Duration::ZERO;
+        let mut limit = 100;
+        for _ in 0..5 {
+            for _ in 0..10 {
+                clock += Duration::from_millis(100);
+                limit = g.update(Sample {
+                    dropped: true,
+                    at: clock,
+                    ..sample(1, 10)
+                });
+            }
+        }
+        assert!(
+            limit < 70,
+            "five dropped windows must cut the limit: {limit}"
+        );
     }
 
     #[test]

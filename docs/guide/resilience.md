@@ -249,8 +249,9 @@ initial_limit = 20
 # max_limit defaults to the static ceiling, else 1000.
 ```
 
-- `gradient2` compares the latest RTT with a long-term average. After a long
-  latency increase, its limit can stay low for minutes.
+- `gradient2` compares the latest RTT with a long-term average. A window with
+  a drop (a `504` or a cancel at the request deadline) backs the limit off.
+  After a long latency increase, its limit can stay low for minutes.
 - `vegas` estimates the queue from the lowest RTT seen. It finds the new
   capacity faster.
 - `aimd` backs off by 10% on a `504`, on a cancel at the request deadline,
