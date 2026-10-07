@@ -1756,6 +1756,14 @@ Frequently used env keys:
 | `AUTUMN_JOBS__SQLITE__POLL_INTERVAL_MS` | `jobs.sqlite.poll_interval_ms` |
 | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` |
 | `AUTUMN_JOBS__REDIS__DEAD_LETTER_LIMIT` | `jobs.redis.dead_letter_limit` (default 10 000; `0` = unbounded) |
+| `AUTUMN_OUTBOX__ENABLED` | `outbox.enabled` (default `false`; transactional outbox relay) |
+| `AUTUMN_OUTBOX__POLL_INTERVAL_MS` | `outbox.poll_interval_ms` (default 500) |
+| `AUTUMN_OUTBOX__BATCH_SIZE` | `outbox.batch_size` (default 100) |
+| `AUTUMN_OUTBOX__MAX_ATTEMPTS` | `outbox.max_attempts` (default 10) |
+| `AUTUMN_OUTBOX__INITIAL_BACKOFF_MS` | `outbox.initial_backoff_ms` (default 1000) |
+| `AUTUMN_OUTBOX__MAX_BACKOFF_MS` | `outbox.max_backoff_ms` (default 300000) |
+| `AUTUMN_OUTBOX__LEASE_MS` | `outbox.lease_ms` (default 60000) |
+| `AUTUMN_OUTBOX__RETENTION_MS` | `outbox.retention_ms` (default 7 days) |
 | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` (`in_process` / `postgres` / `sqlite`) |
 | `AUTUMN_SECURITY__SIGNING_SECRET` | `security.signing_secret.secret` |
 | `AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API` | `security.allow_unauthorized_repository_api` |
@@ -1764,7 +1772,41 @@ Frequently used env keys:
 | `AUTUMN_MAIL__ALLOW_IN_PROCESS_DELIVER_LATER_IN_PRODUCTION` | `mail.allow_in_process_deliver_later_in_production` |
 | `AUTUMN_STORAGE__BACKEND` | `storage.backend` |
 | `AUTUMN_CACHE__BACKEND` | `cache.backend` |
+| `AUTUMN_HEALTH__CACHE_TTL_MS` | `health.cache_ttl_ms` (default `1000`; `0` = no cache) (#3059) |
+| `AUTUMN_HEALTH__PING_TIMEOUT_MS` | `health.ping_timeout_ms` (default `2000`; `0` refused) (#3059) |
+| `AUTUMN_HEALTH__DB_READINESS` | `health.db_readiness` (default `true`) (#3059) |
+| `AUTUMN_HEALTH__REDIS_READINESS` | `health.redis_readiness` (default `false`) (#3059) |
 | `AUTUMN_OBSERVABILITY__SERVER_TIMING` | `observability.server_timing` (0.6.0) — bool; `Server-Timing` response header opt-in. Defaults on in `dev`/`development`, off elsewhere. See `docs/guide/observability/server-timing.md`. |
+
+### `[health]` — readiness pings and result cache (#3059)
+
+`/ready`, `/health` and the `db` component of `/actuator/health` send
+`SELECT 1` to the primary on one dedicated connection outside the pool. Pool
+saturation is **not** a readiness signal: do not write a health indicator that
+reads `pool.status()`. To shed load, set `server.max_concurrent_requests`.
+
+```toml
+[health]
+cache_ttl_ms = 1000      # one refresh per window; probers share it; 0 = off
+ping_timeout_ms = 2000   # a late DB/Redis ping is DOWN; keep below the probe timeout
+db_readiness = true      # false: a failed primary ping does not gate /ready
+redis_readiness = false  # true: redis:<subsystem> indicators gate /ready
+```
+
+- The read replica and `db:shard:<name>` use the same ping.
+- Each subsystem that runs on Redis (channels, idempotency, jobs, rate_limit,
+  sessions, submit_token, webhook_replay) gets a `redis:<subsystem>` indicator
+  (feature `redis`); `RedisCachePlugin` adds `redis:cache`. It is health-only
+  by default, because all replicas share Redis. For another Redis, register
+  `autumn_web::redis_health::RedisHealthIndicator::new(url)?.configured(&config.health)`
+  with `.health_indicator(name, Arc::new(..))`. A plugin that has the
+  `AppState` uses `RedisHealthIndicator::shared(&state, url)` instead, so it
+  shares the app's one `PING` connection per URL.
+- Registered indicators are cached too
+  (`HealthIndicatorRegistry::set_cache_ttl`). In a `TestApp` test that flips an
+  indicator and reads it again at once, set `health.cache_ttl_ms = 0`.
+- The DB error text appears only when `health.detailed = true`.
+- See `docs/guide/health-indicators.md` ("Fail open on shared dependencies").
 
 ### `[cluster]` — embedded clustering (0.7.0, #1762)
 

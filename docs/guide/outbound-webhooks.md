@@ -6,12 +6,14 @@ Autumn has first-class support for outbound signed webhook delivery, allowing yo
 
 The outbound webhook subsystem consists of five core components:
 1. **`WebhookSubscription`**: Represents a consumer's registered endpoint, signing secret, the event topics they are interested in, and their active status.
-2. **`OutboundWebhookStore`**: A pluggable trait for persisting subscriptions and tracking delivery attempts. There is no default — `OutboundWebhookPlugin::new(store)` takes the store as a required argument, so you always choose one explicitly. `InMemoryOutboundWebhookStore` ships with the framework, but it is process-local AND unbounded: its subscriptions and delivery logs are lost on restart, are not shared between replicas, and accumulate with no cap or eviction for as long as the process runs. It is for tests and local development. Any long-running app needs a durable shared implementation of the trait. (`OutboundWebhookStore` and `InMemoryOutboundWebhookStore` are aliases kept for compatibility; the current names are `OutboundWebhookHandler` and `InMemoryOutboundWebhookHandler`.)
-3. **`WebhookOutboundManager`**: The central coordinator available via `AppState` extensions, providing the `.dispatch()` method, which writes a delivery-log row per subscription and then enqueues the delivery job. The two steps are ordered, not atomic: no transaction spans the pluggable store and the job queue, so a crash between them can leave a logged event that was never enqueued. This is not an outbox guarantee, and it cannot be turned into one by reconciling after the fact — a *successful* enqueue writes no marker on the log row, so a row that was enqueued is indistinguishable from one whose process died first. A sweeper over those rows must either re-enqueue (duplicating deliveries) or skip (dropping them); it cannot tell which is correct. **Implementing the trait does not close this window.** `OutboundWebhookHandler` exposes storage methods only; `dispatch()` calls `log_delivery` and performs the enqueue *afterwards*, outside the trait, so no implementation can bring the enqueue into its own transaction. Closing the window inside the manager would require a framework change. Three more facts bear on any attempt to build a stronger guarantee on top of this, and all three are easy to get wrong:
+2. **`OutboundWebhookStore`**: A pluggable trait for persisting subscriptions and tracking delivery attempts. There is no default — `OutboundWebhookPlugin::new(store)` takes the store as a required argument, so you always choose one explicitly. `InMemoryOutboundWebhookStore` ships with the framework, but it is process-local AND unbounded: its subscriptions and delivery logs are lost on restart, are not shared between replicas, and accumulate with no cap or eviction for as long as the process runs. It is for tests and local development. Any long-running app needs a durable shared implementation of the trait, for example the built-in `SqlOutboundWebhookStore` (see §2). (`OutboundWebhookStore` and `InMemoryOutboundWebhookStore` are aliases kept for compatibility; the current names are `OutboundWebhookHandler` and `InMemoryOutboundWebhookHandler`.)
+3. **`WebhookOutboundManager`**: The central coordinator available via `AppState` extensions, providing the `.dispatch()` method, which writes a delivery-log row per subscription and then enqueues the delivery job. The two steps are ordered, not atomic: no transaction spans the pluggable store and the job queue, so a crash between them can leave a logged event that was never enqueued. This is not an outbox guarantee, and it cannot be turned into one by reconciling after the fact — a *successful* enqueue writes no marker on the log row, so a row that was enqueued is indistinguishable from one whose process died first. A sweeper over those rows must either re-enqueue (duplicating deliveries) or skip (dropping them); it cannot tell which is correct. **Implementing the trait does not close this window.** `OutboundWebhookHandler` exposes storage methods only; `dispatch()` calls `log_delivery` and performs the enqueue *afterwards*, outside the trait, so no implementation can bring the enqueue into its own transaction. To close the window, write the dispatch to the transactional outbox with `dispatch_in_tx` (see below). Three more facts bear on any attempt to build a stronger guarantee on top of this, and all three are easy to get wrong:
 
 - **A successful `dispatch()` does not mean the delivery is durable.** On the default `jobs.backend = "local"` the job queue is in-process and explicitly non-durable — a crashed process loses the queue — so `Ok` means only "handed to a queue that may not survive a restart". A durable job backend (`postgres` or `redis`) *and* a durable `OutboundWebhookHandler` are both preconditions for reasoning about loss at all.
-- **Autumn transmits no stable event or delivery identifier.** Nothing Autumn sends distinguishes a first attempt from a retry of the same event: the `Autumn-Signature` header's `t=` timestamp is recomputed on every attempt but is neither unique nor stable — it is a whole-second `Utc::now().timestamp()`, and nothing spaces the attempts far enough apart to guarantee it differs. Full jitter can put a retry 0-1000 ms after the failure (see *Retries* below), so two attempts can fall in the same second and produce a byte-identical signature. No header or envelope field carries an event or delivery ID. (Other headers may be present — under `telemetry-otlp` the shared HTTP client injects W3C `traceparent`/`tracestate`.) If a receiver must deduplicate, the application has to mint a stable ID, put it in the payload, and reuse it verbatim on every retry.
-- **Retries can duplicate an event only after the job is enqueued.** Before that point the loss window above applies, so `dispatch()` is neither at-least-once nor at-most-once on its own. Idempotent receivers protect you from duplicates; nothing here protects you from loss.
+- **Each delivery has a stable, signed id.** Autumn sends the Standard Webhooks headers `webhook-id`, `webhook-timestamp` and `webhook-signature`. `webhook-id` is the delivery log id. Every retry of one delivery sends the same `webhook-id`, so a receiver can drop a copy. `webhook-signature` signs the id, the timestamp and the body, so a replay with a new id fails the check. Autumn calculates the `Autumn-Signature` `t=` value again for each attempt. Do not use it to find copies. (Other headers can be present. Under `telemetry-otlp`, the shared HTTP client adds W3C `traceparent`/`tracestate`.)
+- **Retries can duplicate an event only after the job is enqueued.** Before that point the loss window above applies, so `dispatch()` is neither at-least-once nor at-most-once on its own. Idempotent receivers protect you from duplicates. The outbox (below) protects you from loss between commit and dispatch.
+
+**To prevent loss between commit and dispatch, use the outbox.** `manager.dispatch_in_tx(&state, conn, topic, &payload)` (or `outbox.dispatch_webhook`) writes the dispatch to `autumn_outbox` on your transaction connection. The relay calls `dispatch` after commit, and sends again until the enqueue works. The delivery id comes from the outbox message id and the subscription id. A second relay send skips a delivery that has a result. Before the first result, it can enqueue the delivery again, with the same `webhook-id`. Delivery after the enqueue depends on the job backend and the store. See [Transactional Outbox and Inbox](outbox.md).
 
 This page deliberately stops short of prescribing an exactly-once design. Getting one right depends on the job backend, the handler implementation, and how the application sequences its own transaction against `dispatch()` — and each of those changes the answer. If you need that guarantee, treat the points above as the constraints to design against, and take the design itself to the maintainers rather than inferring it from this page. One case is handled for you, on the default path only: when `dispatch()` falls back to enqueuing the `autumn_webhook_delivery` job and that enqueue fails, the log row is marked `is_dlq` and can be replayed from the DLQ endpoints below. If a `WebhookDelegateExt` is installed, `dispatch()` hands the delivery to that delegate *instead* of enqueuing, and a delegate error is returned to the caller without marking the row — so a failed delegated delivery never appears in the DLQ, and an operator looking there will not find it.
 4. **`autumn_webhook_delivery` Job**: A resilient background job that handles HTTP POST delivery, computes payload signatures, executes retries, and handles deactivations.
@@ -51,6 +53,21 @@ Autumn ships `InMemoryOutboundWebhookStore`—a thread-safe, in-memory implement
 
 **It is also unbounded.** Subscriptions and delivery logs are held in plain hash maps with no capacity limit and no eviction. A retry does *not* add a row — the job reuses the original log id and `log_delivery` replaces that entry in place, advancing its `attempt` counter, so only the latest attempt of each delivery is retained and the actuator shows that rather than a per-attempt history. What does grow is dispatches: each one inserts a row per matching subscription, and nothing ever removes them. Memory therefore grows with dispatch volume for the lifetime of the process. Use it for tests and local development. A long-running app of any kind needs a durable implementation of the trait, as does anything with more than one replica or that must survive a deploy.
 
+### Durable store: `SqlOutboundWebhookStore`
+
+`SqlOutboundWebhookStore` keeps subscriptions and delivery logs in the app database (Postgres or SQLite). They survive a restart, and all replicas see them. It counts failures as the in-memory store does.
+
+```rust
+use autumn_web::webhook_outbound::OutboundWebhookPlugin;
+
+// A store on the app pool. At startup it creates the tables if they do not exist.
+let app = autumn_web::app().plugin(OutboundWebhookPlugin::sql());
+```
+
+To use another pool, build the store yourself: `OutboundWebhookPlugin::new(Arc::new(SqlOutboundWebhookStore::new(pool)))`, and call `ensure_schema` (or apply `WEBHOOK_SCHEMA_SQL` before the deploy).
+
+The tables are `autumn_webhook_subscriptions` and `autumn_webhook_deliveries`. The `secret` column holds each signing secret. Limit read access to it. Nothing deletes delivery logs for you: call `purge_deliveries_before(cutoff)` on a schedule. It keeps DLQ logs.
+
 ---
 
 ## 3. Stripe-Style Payload Signing
@@ -63,6 +80,18 @@ Autumn-Signature: t=1778930400,v1=a1b2c3d4e5f6...
 
 * **`t`**: The Unix epoch timestamp of the delivery dispatch.
 * **`v1`**: The computed HMAC-SHA256 hex signature of the string `{timestamp}.{raw_body}`.
+
+Each request also carries:
+
+```http
+webhook-id: 0b6f1c2e-6a8e-4d0a-9d55-6c1b2f6a7e10
+webhook-timestamp: 1778930400
+webhook-signature: v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4=
+```
+
+* **`webhook-id`**: The delivery id. It is the same on every retry. Store it, and drop a request whose id you already processed.
+* **`webhook-timestamp`**: The same value as `t`.
+* **`webhook-signature`**: `v1,` and the base64 HMAC-SHA256 of `{webhook-id}.{webhook-timestamp}.{raw_body}` ([Standard Webhooks](https://www.standardwebhooks.com/)). For a `whsec_` secret, the key is the base64-decoded part after the prefix, as the spec says. For another secret, the key is its raw bytes. Standard Webhooks libraries verify it when the secret uses the `whsec_` form.
 
 ### Verification (Consumer side)
 The consumer receives the header, extracts `t` and `v1`, concatenates `t` and the raw request body bytes with a `.`, computes the HMAC-SHA256 using their registered secret, and compares it securely with `v1` to prevent timing attacks.

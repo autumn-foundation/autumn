@@ -19,6 +19,7 @@ mod templates {
     pub const AZURE_TFVARS_EXAMPLE: &str =
         include_str!("templates/release/terraform.tfvars.example.tmpl");
     pub const AZURE_DEPLOY_WORKFLOW: &str = include_str!("templates/release/azure-deploy.yml.tmpl");
+    pub const AZURE_CUTOVER_SCRIPT: &str = include_str!("templates/release/azure-cutover.sh.tmpl");
 
     pub const AWS_APP_RUNNER_MAIN_TF: &str =
         include_str!("templates/release/aws-app-runner-main.tf.tmpl");
@@ -751,6 +752,7 @@ fn planned_files(target: Target) -> Vec<(&'static str, &'static str)> {
                 ".github/workflows/azure-deploy.yml",
                 templates::AZURE_DEPLOY_WORKFLOW,
             ));
+            files.push(("azure-cutover.sh", templates::AZURE_CUTOVER_SCRIPT));
         }
         Target::AwsAppRunner => {
             files.push(("main.tf", templates::AWS_APP_RUNNER_MAIN_TF));
@@ -2058,6 +2060,7 @@ previous_secrets = []
             "outputs.tf",
             "terraform.tfvars.example",
             ".github/workflows/azure-deploy.yml",
+            "azure-cutover.sh",
         ] {
             assert!(
                 dir.join(name).is_file(),
@@ -2674,7 +2677,7 @@ previous_secrets = []
         // revision, but a brand-new ACR has none yet, so Terraform points
         // both at a public placeholder and then ignores further image
         // changes so a later `terraform apply` doesn't revert a live
-        // `az containerapp update`/job deploy back to the placeholder.
+        // cutover or job deploy back to the placeholder.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2723,7 +2726,7 @@ previous_secrets = []
     }
 
     #[test]
-    fn main_tf_wires_redis_url_into_container_app_when_enabled() {
+    fn azure_cutover_wires_redis_url_when_the_job_has_it() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2732,29 +2735,25 @@ previous_secrets = []
             content.contains("azurerm_key_vault_secret\" \"redis_url\""),
             "main.tf must store the Redis connection string in Key Vault: {content}"
         );
-        // Autumn's actual config path is `[cache.redis] url` (env:
-        // AUTUMN_CACHE__REDIS__URL, double underscore before URL) — not
-        // AUTUMN_CACHE__REDIS_URL, which Autumn never reads.
+        // The cutover sets the env vars (#2314). Autumn's config path is
+        // `[cache.redis] url` (env: AUTUMN_CACHE__REDIS__URL, double
+        // underscore before URL). Without AUTUMN_CACHE__BACKEND=redis,
+        // Autumn keeps its in-memory cache and never reads the URL.
+        let script = fs::read_to_string(dir.join("azure-cutover.sh")).unwrap();
         assert!(
-            content.contains("AUTUMN_CACHE__REDIS__URL"),
-            "main.tf must wire AUTUMN_CACHE__REDIS__URL into the Container App \
-             when enable_redis_cache is true: {content}"
+            script.contains(r#"{name: "AUTUMN_CACHE__BACKEND", value: "redis"}"#)
+                && script.contains(r#"{name: "AUTUMN_CACHE__REDIS__URL", secretRef: "redis-url"}"#),
+            "the cutover must select the Redis backend and wire its URL: {script}"
         );
         assert!(
-            !content.contains("AUTUMN_CACHE__REDIS_URL\""),
-            "main.tf must not use the single-underscore variant, which Autumn ignores: {content}"
-        );
-        // Without selecting the backend, Autumn stays on its default
-        // in-memory cache and never reads the URL at all.
-        assert!(
-            content.contains("name  = \"AUTUMN_CACHE__BACKEND\"")
-                || content.contains("name = \"AUTUMN_CACHE__BACKEND\""),
-            "main.tf must set AUTUMN_CACHE__BACKEND=redis so Autumn actually selects the \
-             Redis cache backend: {content}"
+            script.contains(
+                r#"any(($job.properties.configuration.secrets // [])[]; .name == "redis-url")"#
+            ),
+            "the cutover must set the Redis env vars only when the job has redis-url: {script}"
         );
         assert!(
-            content.contains("value = \"redis\""),
-            "AUTUMN_CACHE__BACKEND must be set to \"redis\": {content}"
+            !script.contains("AUTUMN_CACHE__REDIS_URL"),
+            "the cutover must not use the single-underscore variant, which Autumn ignores: {script}"
         );
     }
 
@@ -2909,13 +2908,10 @@ previous_secrets = []
 
     #[test]
     fn azure_bootstrap_keeps_external_ingress_disabled_until_first_deploy() {
-        // Between `terraform apply` and the first real-image cutover, an
-        // inbound request to the public FQDN must not be able to start the
-        // bootstrap placeholder revision with production secret refs and the
-        // Key Vault-capable managed identity attached. `min_replicas = 0`
-        // only permits scale-to-zero; it does not stop the HTTP scale rule
-        // waking the placeholder on traffic — so external ingress itself
-        // stays disabled until the cutover opens it (#2312).
+        // Between `terraform apply` and the first real-image cutover, no
+        // inbound request may start the bootstrap placeholder revision.
+        // `min_replicas = 0` does not stop the HTTP scale rule from waking
+        // it, so external ingress stays disabled until the cutover (#2312).
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
@@ -2941,25 +2937,3921 @@ previous_secrets = []
              placeholder with production secrets: {ingress_block}"
         );
 
-        // The cutover opens ingress once the real image is serving — after
-        // the image update, never before.
+        // The cutover script opens ingress after the real image is set.
+        // azure_cutover_opens_ingress_only_after_the_real_revision_is_provisioned
+        // pins the order.
+        let script = fs::read_to_string(dir.join("azure-cutover.sh")).unwrap();
+        assert!(
+            script.contains("open_ingress"),
+            "the cutover must enable external ingress: {script}"
+        );
+        // `ingress enable` builds a new ingress object, which drops custom
+        // domains, IP restrictions and CORS.
+        assert!(
+            !script.contains("az containerapp ingress enable"),
+            "the cutover must restore the saved ingress, not rebuild it: {script}"
+        );
+    }
+
+    /// The `azurerm_container_app.this` block of a generated main.tf.
+    fn azure_app_block(main_tf: &str) -> &str {
+        main_tf
+            .split("resource \"azurerm_container_app\" \"this\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("main.tf must declare azurerm_container_app.this")
+    }
+
+    #[test]
+    fn azure_bootstrap_app_has_no_production_secrets_or_identity() {
+        // #2314: the public bootstrap image must not get the secret refs or
+        // the Key Vault-capable identity. Ingress and replica count are not
+        // a guarantee.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        // A Windows checkout gives main.tf CRLF line endings.
+        let content = fs::read_to_string(dir.join("main.tf"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let app = azure_app_block(&content);
+        for forbidden in [
+            "identity {",
+            "registry {",
+            "secret {",
+            "\"secret\"",
+            "secret_name",
+            "azurerm_user_assigned_identity",
+            "azurerm_key_vault",
+        ] {
+            assert!(
+                !app.contains(forbidden),
+                "the bootstrap app must not contain `{forbidden}`: {app}"
+            );
+        }
+
+        // The cutover attaches these outside Terraform. A later
+        // `terraform apply` must not strip them from the live app.
+        let lifecycle = app
+            .split_once("ignore_changes = [")
+            .and_then(|(_, rest)| rest.split_once("\n    ]"))
+            .expect("the app must declare lifecycle.ignore_changes")
+            .0;
+        for ignored in [
+            "identity",
+            "registry",
+            "secret",
+            "template[0].container[0].env",
+        ] {
+            assert!(
+                lifecycle.contains(ignored),
+                "the app lifecycle must ignore `{ignored}`: {lifecycle}"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_migrate_job_carries_the_full_app_secret_set() {
+        // The cutover copies the job's secret refs to the app. A job with
+        // only the database URL would deploy an app with no signing secret.
+        // Versionless IDs let a Terraform secret rotation reach the app.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        // A Windows checkout gives main.tf CRLF line endings.
+        let content = fs::read_to_string(dir.join("main.tf"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let job = content
+            .split_once("resource \"azurerm_container_app_job\" \"migrate\"")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .expect("main.tf must declare the migration job")
+            .0;
+        for secret in [
+            "azurerm_key_vault_secret.database_url.versionless_id",
+            "azurerm_key_vault_secret.signing_secret.versionless_id",
+            "azurerm_key_vault_secret.redis_url[0].versionless_id",
+        ] {
+            assert!(
+                job.contains(secret),
+                "the migration job must reference {secret}: {job}"
+            );
+        }
+        assert!(
+            job.contains("manual_trigger_config"),
+            "the job must run only when CI starts it: {job}"
+        );
+    }
+
+    #[test]
+    fn azure_target_scaffolds_the_cutover_script() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        let files = init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        assert!(files.iter().any(|f| f == "azure-cutover.sh"));
+        let script = fs::read_to_string(dir.join("azure-cutover.sh")).unwrap();
+        assert!(script.starts_with("#!/usr/bin/env bash\n"));
+        assert!(script.contains("set -euo pipefail"));
+        assert!(
+            !script.contains("{{"),
+            "no template placeholder may reach the script: {script}"
+        );
+    }
+
+    #[test]
+    fn azure_cutover_attaches_credentials_and_image_in_one_write() {
+        // #2314: separate `identity assign` / `secret set` calls apply to
+        // every revision, so the placeholder would hold the identity until
+        // the image update lands. One merge-PATCH sets all of it at once.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let script = fs::read_to_string(dir.join("azure-cutover.sh")).unwrap();
+        for split in [
+            "az containerapp identity assign",
+            "az containerapp registry set",
+            "az containerapp secret set",
+            "az containerapp update",
+        ] {
+            assert!(
+                !script.contains(split),
+                "`{split}` is a separate write; use the one PATCH: {script}"
+            );
+        }
+        assert_eq!(
+            script.matches("az rest --method patch").count(),
+            1,
+            "every write must go through patch_app(): {script}"
+        );
+        let patch = script
+            .split_once("PATCH=$(")
+            .and_then(|(_, rest)| rest.split_once("\n')"))
+            .expect("the script must build the cutover PATCH body")
+            .0;
+        for field in [
+            "userAssignedIdentities",
+            "registries:",
+            "secrets: $secrets",
+            "template: {containers: $containers}",
+        ] {
+            assert!(
+                patch.contains(field),
+                "the cutover PATCH must set `{field}`: {patch}"
+            );
+        }
+        let containers = script
+            .split_once("CONTAINERS=$(")
+            .and_then(|(_, rest)| rest.split_once("\n')"))
+            .expect("the script must build the new containers")
+            .0;
+        for field in [
+            ".image = $image",
+            ".[$i] |= ",
+            "AUTUMN_DATABASE__PRIMARY_URL",
+            "AUTUMN_SECURITY__SIGNING_SECRET",
+            "AUTUMN_CACHE__BACKEND",
+            "AUTUMN_CACHE__REDIS__URL",
+        ] {
+            assert!(
+                containers.contains(field),
+                "the new containers must set `{field}`: {containers}"
+            );
+        }
+        // A Key Vault secret stays a ref; only an inline secret has a value.
+        assert!(patch.contains("map(secret_ref)"), "{patch}");
+        assert!(
+            script.contains(
+                "def secret_ref: if .keyVaultUrl then {name, keyVaultUrl, identity} else {name, value} end;"
+            ),
+            "secrets must stay Key Vault secret refs: {script}"
+        );
+    }
+
+    #[test]
+    fn azure_cutover_opens_ingress_only_after_the_real_revision_is_provisioned() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let script = fs::read_to_string(dir.join("azure-cutover.sh")).unwrap();
+        let patch_at = script
+            .find("patch_app \"$PATCH\"")
+            .expect("the script must send the cutover PATCH");
+        // The cutover's wait is the last one; remove_credentials() has its own.
+        let provisioned_at = script
+            .rfind("Provisioned)")
+            .expect("the script must wait for the new revision");
+        let ready_at = script
+            .find("[ -n \"$READY\" ] || fail")
+            .expect("a timeout must fail the cutover");
+        let enable_at = script
+            .rfind("\nopen_ingress")
+            .expect("the script must open external ingress");
+        assert!(patch_at < provisioned_at && provisioned_at < ready_at && ready_at < enable_at);
+        assert!(script.contains("set_ingress true"));
+        assert!(
+            script.contains("\"$REVISION_IMAGE\" = \"$IMAGE\""),
+            "ingress must open only when the new revision runs the real image: {script}"
+        );
+    }
+
+    #[test]
+    fn azure_cutover_keeps_secret_values_off_the_command_line() {
+        // `secret list --show-values` returns plaintext values. A process
+        // argument is visible in /proc/*/cmdline, so they go through a file.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let script = fs::read_to_string(dir.join("azure-cutover.sh")).unwrap();
+        assert!(
+            !script.contains("--argjson app_secrets"),
+            "secret values must not be a jq argument: {script}"
+        );
+        assert!(
+            script.contains("--show-values \\\n  --output json > \"$APP_SECRETS\""),
+            "secret values must go to a file: {script}"
+        );
+        assert!(
+            script.contains("--body \"@$BODY\""),
+            "a PATCH body must go to az from a file: {script}"
+        );
+    }
+
+    #[test]
+    fn azure_cutover_rolls_back_a_failed_first_cutover() {
+        // A failed first cutover leaves the placeholder as the active
+        // revision. It must not keep the identity or the secret refs.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let script = fs::read_to_string(dir.join("azure-cutover.sh")).unwrap();
+        let rollback = script
+            .split_once("rollback() {")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .expect("the script must define rollback()")
+            .0;
+        assert!(
+            rollback.contains("remove_credentials"),
+            "rollback must remove the credentials: {rollback}"
+        );
+        let remove = script
+            .split_once("remove_credentials() {")
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .expect("the script must define remove_credentials()")
+            .0;
+        for field in [
+            "type: \"None\"",
+            "if . == {} then {($u): null} else . end) | add // {}) as $drop",
+            "select((.identity // \"\" | ascii_downcase) | IN($lids[]) | not)",
+            "IN(managed[]) | not",
+            "\"AUTUMN_DATABASE__PRIMARY_URL\", \"AUTUMN_SECURITY__SIGNING_SECRET\"",
+            "patch_app",
+        ] {
+            assert!(
+                remove.contains(field),
+                "remove_credentials must set `{field}`: {remove}"
+            );
+        }
+        // The managed set: every job secret and the three generated ones.
+        assert!(
+            script.contains(
+                r#"'. + ["database-url", "signing-secret", "redis-url"]
+  + ($copied.secrets // [] | map(select(type == "string"))) | unique' <<< "$JOB_SECRET_NAMES""#
+            ),
+            "{script}"
+        );
+        assert!(
+            rollback.contains("[ -n \"$RELEASED\" ] && return"),
+            "rollback must skip a later deploy, whose old revision is a real release: {rollback}"
+        );
+        assert!(
+            script.contains("fail() {\n  echo \"::error::$1\" >&2\n  rollback\n  exit 1\n}"),
+            "fail() must roll back, then exit non-zero: {script}"
+        );
+    }
+
+    /// A stub `az` for [`run_azure_cutover`]. It logs each call and each
+    /// PATCH body. Its TSV output matches knack: a list of scalars prints one
+    /// value per line, and a nested list prints one tab-separated row.
+    #[cfg(unix)]
+    const AZ_STUB: &str = r#"#!/usr/bin/env bash
+id=/subscriptions/s/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id
+tsv() { case "$query" in "[["*) local IFS=$'\t'; echo "$*" ;; *) printf '%s\n' "$@" ;; esac; }
+prev=""; query=""; body=""
+for arg in "$@"; do
+  [ "$prev" = "--query" ] && query="$arg"
+  [ "$prev" = "--body" ] && body="$(cat "${arg#@}")"
+  prev="$arg"
+done
+# A PATCH that sets only tags (the ingress snapshot) logs as tags-patch
+# with its body, and stays out of the PATCH bodies.
+tags_only=""
+if [ "$1 $2" = "rest --method" ] && jq -e 'keys - ["location", "tags"] == []' <<< "$body" > /dev/null 2>&1; then
+  tags_only=1
+  echo "az tags-patch $body" >> "$STUB_LOG"
+else
+  echo "az $*" >> "$STUB_LOG"
+fi
+# The app as the GET shows it before any PATCH.
+  env='{"name":"AUTUMN_PROFILE","value":"prod"}'
+  # An operator env var with a plain value (not a secret ref).
+  [ -n "$STUB_PLAIN_ENV" ] && env="$env"',{"name":"PARTNER_KEY","value":"plain-value-7f3a"}'
+  refs=',{"name":"AUTUMN_DATABASE__PRIMARY_URL","secretRef":"database-url"},{"name":"AUTUMN_SECURITY__SIGNING_SECRET","secretRef":"signing-secret"}'
+  [ -n "$STUB_APP_ENV_FULL$STUB_APP_LEGACY" ] && [ -z "$STUB_APP_TEMPLATE_CLEAN" ] && env="$env$refs"
+  [ -n "$STUB_APP_REDIS" ] && env="$env"',{"name":"AUTUMN_CACHE__BACKEND","value":"redis"},{"name":"AUTUMN_CACHE__REDIS__URL","secretRef":"redis-url"}'
+  # A secret that the operator added to the job, and an env var that uses it.
+  [ -n "$STUB_JOB_CUSTOM_KV" ] && [ -n "$STUB_APP_LEGACY" ] && env="$env"',{"name":"QUEUE_KEY","secretRef":"queue-key"}'
+  # A placeholder app made by the old template has the job's credentials.
+  legacy=""
+  # The app's own system identity, from before any cutover.
+  [ -n "$STUB_APP_SYSTEM_IDENTITY" ] && legacy="\"identity\":{\"type\":\"SystemAssigned\",\"principalId\":\"s\"},"
+  [ -n "$STUB_APP_LEGACY" ] && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"$id\":{\"principalId\":\"p\"}}},"
+  # The cutover of an older run also attached the identity of a custom job
+  # secret.
+  [ -n "$STUB_APP_LEGACY" ] && { [ "${STUB_JOB_CUSTOM_KV_IDENTITY:-}" = /kv-id-2 ] || [ -n "$STUB_APP_COPIED" ]; } \
+    && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"$id\":{\"principalId\":\"p\"},\"/kv-id-2\":{\"principalId\":\"q\"}}},"
+  # An identity that the operator added to the placeholder.
+  [ -n "$STUB_APP_OWN_IDENTITY" ] && legacy="\"identity\":{\"type\":\"UserAssigned\",\"userAssignedIdentities\":{\"/other\":{\"principalId\":\"o\"}}},"
+  registries=""
+  [ -n "$STUB_APP_LEGACY" ] && [ -z "$STUB_APP_NO_REGISTRY" ] && registries="{\"server\":\"acr.azurecr.io\",\"identity\":\"$id\"}"
+  # An operator registry whose password is a managed secret.
+  # STUB_APP_REGISTRY_PASSWORD_REF=redis-url: the password is redis-url.
+  password_ref=database-url
+  [ "$STUB_APP_REGISTRY_PASSWORD_REF" = redis-url ] && password_ref=redis-url
+  [ -n "$STUB_APP_REGISTRY_PASSWORD_REF" ] && registries="${registries:+$registries,}{\"server\":\"other.example.io\",\"username\":\"u\",\"passwordSecretRef\":\"$password_ref\"}"
+  secrets=""
+  sid="$id"
+  [ -n "$STUB_APP_STALE_SECRET_IDENTITY" ] && sid=/old-id
+  [ -n "$STUB_APP_LEGACY" ] && secrets="{\"name\":\"database-url\",\"keyVaultUrl\":\"https://kv/secrets/database-url\",\"identity\":\"$sid\"},{\"name\":\"signing-secret\",\"keyVaultUrl\":\"https://kv/secrets/signing-secret\",\"identity\":\"$sid\"}"
+  [ -n "$STUB_APP_LEGACY" ] && [ -n "$STUB_JOB_CUSTOM_KV" ] && secrets="$secrets,{\"name\":\"queue-key\",\"keyVaultUrl\":\"https://kv/secrets/queue-key\",\"identity\":\"$sid\"}"
+  sidecar='{"name":"sidecar","image":"busybox"}'
+  [ -n "$STUB_SIDECAR_SECRET_REF" ] && sidecar='{"name":"sidecar","image":"busybox","env":[{"name":"SIDECAR_DB","secretRef":"database-url"}]}'
+  [ -n "$STUB_SIDECAR_REDIS_REF" ] && sidecar='{"name":"sidecar","image":"busybox","env":[{"name":"SIDECAR_REDIS","secretRef":"redis-url"}]}'
+  # A sidecar whose image comes from the same ACR.
+  [ -n "$STUB_SIDECAR_ACR" ] && sidecar='{"name":"sidecar","image":"acr.azurecr.io/side:1"}'
+  scale=""
+  [ -n "$STUB_SCALE_SECRET_REF" ] && scale=',"scale":{"rules":[{"name":"q","custom":{"type":"azure-queue","auth":[{"secretRef":"'"$STUB_SCALE_SECRET_REF"'","triggerParameter":"connection"}]}}]}'
+  [ -n "$STUB_MIN_REPLICAS" ] && scale=',"scale":{"minReplicas":'"$STUB_MIN_REPLICAS"'}'
+  # An HTTP scale rule that authenticates with the job's identity.
+  [ -n "$STUB_APP_SCALE_IDENTITY" ] && scale=',"scale":{"rules":[{"name":"h","http":{"metadata":{"concurrentRequests":"10"},"identity":"'"$id"'"}}]}'
+  # A placeholder has closed ingress; a real release has open ingress. Both
+  # have a custom domain that the cutover must keep.
+  external=false
+  case "$STUB_OLD_IMAGE" in acr.azurecr.io/*) external=true ;; esac
+  [ -n "$STUB_INGRESS_INTERNAL" ] && external=false
+  [ -n "$STUB_INGRESS_EXTERNAL" ] && external=true
+  ingress="{\"external\":$external,\"targetPort\":3000,\"transport\":\"http\",\"fqdn\":\"app.example.internal\",\"customDomains\":[{\"name\":\"www.example.com\"}]}"
+  # An interrupted first cutover can leave ingress disabled.
+  [ -n "$STUB_INGRESS_NONE" ] && ingress=null
+  # Terraform can make a new, plain ingress after such a stop.
+  [ -n "$STUB_INGRESS_PLAIN" ] && ingress='{"external":false,"targetPort":3000,"transport":"http"}'
+  [ "$STUB_INGRESS_PLAIN" = external ] && ingress='{"external":true,"targetPort":3000,"transport":"http"}'
+  # The snapshot that an interrupted first cutover saved in the app's tags.
+  tags='{"team":"web"}'
+  # A large record of copied credentials from an interrupted run, in many
+  # parts.
+  if [ -n "$STUB_APP_COPIED_BIG" ]; then
+    tags=$(jq -cn --argjson n "$STUB_APP_COPIED_BIG" '
+      {secrets: [range(0; $n) | "secret-name-\(.)-padding-padding"], uids: []}
+      | tojson | @base64 | . as $b
+      | [range(0; length; 256) as $i | $b[$i:$i + 256]]
+      | to_entries | map({key: ("autumn-copied-" + (.key | tostring)), value}) | from_entries')
+  fi
+  # Many tags of the operator's own.
+  if [ -n "$STUB_APP_TAG_COUNT" ]; then
+    tags=$(jq -cn --argjson n "$STUB_APP_TAG_COUNT" '[range(0; $n) | {key: "t\(.)", value: "x"}] | from_entries')
+  fi
+  if [ -n "$STUB_APP_COPIED" ]; then
+    tags=$(jq -cn '{secrets: ["queue-key"], uids: ["/kv-id-2"]} | tojson | @base64
+      | {"autumn-copied-0": ., team: "web"}')
+  fi
+  if [ -n "$STUB_SAVED_INGRESS_TAGS" ]; then
+    saved_external=false
+    [ "$STUB_SAVED_INGRESS_TAGS" = external ] && saved_external=true
+    tags=$(jq -cn --argjson ext "$saved_external" '{external: $ext, targetPort: 3000, transport: "http",
+                    customDomains: [{name: "www.example.com"}]}
+      | tojson | @base64 | . as $b
+      | [range(0; length; 256) as $i | $b[$i:$i + 256]]
+      | to_entries | map({key: ("autumn-ingress-" + (.key | tostring)), value})
+      | from_entries + {team: "web"}')
+  fi
+  containers="{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]},$sidecar"
+  # An operator can put a sidecar before the app container.
+  [ -n "$STUB_SIDECAR_FIRST" ] && containers="$sidecar,{\"name\":\"app\",\"image\":\"$STUB_OLD_IMAGE\",\"env\":[$env]}"
+  # An init container env var can also refer to a managed secret.
+  init=""
+  # STUB_INIT_SECRET_REF=redis-url: the ref names redis-url instead.
+  init_ref=database-url
+  [ "$STUB_INIT_SECRET_REF" = redis-url ] && init_ref=redis-url
+  [ -n "$STUB_INIT_SECRET_REF" ] && init=',"initContainers":[{"name":"migrate","image":"busybox","env":[{"name":"INIT_DB","secretRef":"'"$init_ref"'"}]}]'
+  app="{\"id\":\"/subscriptions/s/app\",\"location\":\"westeurope\",\"tags\":$tags,$legacy\"properties\":{\"provisioningState\":\"Succeeded\",\"latestRevisionName\":\"app--old\",\"configuration\":{\"ingress\":$ingress,\"registries\":[$registries],\"secrets\":[$secrets]},\"template\":{\"containers\":[$containers]$init$scale}}}"
+# An older placeholder whose credentials use an identity that the job no
+# longer uses.
+[ -n "$STUB_APP_LEGACY_ID" ] && app="${app//$id/$STUB_APP_LEGACY_ID}"
+case "$1 $2" in
+  "containerapp job")
+    secret() { echo "{\"name\":\"$1\",\"keyVaultUrl\":\"https://kv/secrets/$1\",\"identity\":\"${2:-$id}\"}"; }
+    secrets="$(secret database-url),$(secret signing-secret)"
+    [ -n "$STUB_REDIS" ] && secrets="$secrets,$(secret redis-url)"
+    [ -n "$STUB_JOB_NO_SECRETS" ] && secrets=""
+    [ -n "$STUB_JOB_CUSTOM_KV" ] && secrets="$secrets,$(secret queue-key "${STUB_JOB_CUSTOM_KV_IDENTITY:-}")"
+    # An inline secret that the operator added: job show omits its value,
+    # and `job secret list --show-values` returns it.
+    if [ -n "$STUB_JOB_INLINE_SECRET" ]; then
+      if [ "$3" = secret ]; then
+        secrets="$secrets,{\"name\":\"api-token\",\"value\":\"tok\"}"
+      else
+        secrets="$secrets,{\"name\":\"api-token\"}"
+      fi
+    fi
+    if [ "$3" = secret ]; then
+      echo "[$secrets]"
+      exit 0
+    fi
+    registries="{\"server\":\"acr.azurecr.io\",\"identity\":\"$id\"}"
+    # The job pulls from the ACR with its system identity.
+    [ -n "$STUB_JOB_ACR_SYSTEM" ] && registries='{"server":"acr.azurecr.io","identity":"system"}'
+    # An operator-added registry listed before the ACR.
+    [ -n "$STUB_JOB_EXTRA_REGISTRY" ] && registries="{\"server\":\"other.example.io\",\"identity\":\"/other-id\"},$registries"
+    echo "{\"properties\":{\"configuration\":{\"registries\":[$registries],\"secrets\":[$secrets]}}}"
+    ;;
+  "containerapp show")
+    if [ -z "$query" ]; then
+      # A GET shows the app state with each PATCH merged in. Like ARM after
+      # a 202, the first STUB_PATCH_PENDING reads after a PATCH still show
+      # the state before it.
+      state="$STUB_LOG.state"
+      [ -f "$state" ] || echo "$app" > "$state"
+      if [ -f "$STUB_LOG.unapplied" ]; then
+        if [ "$(cat "$STUB_LOG.pending")" -le 0 ]; then
+          jq -cs '.[0] * .[1]' "$state" "$STUB_LOG.unapplied" > "$state.new"
+          mv "$state.new" "$state"
+          rm "$STUB_LOG.unapplied"
+        else
+          echo $(( $(cat "$STUB_LOG.pending") - 1 )) > "$STUB_LOG.pending"
+        fi
+      fi
+      cat "$state"
+    elif [ "$query" = properties.configuration.ingress.fqdn ]; then
+      echo app.example.internal
+    else
+      # STUB_STATUS_SEQ scripts the status reads, one per read, as
+      # state:revision. Then the reads are as usual.
+      if [ -n "$STUB_STATUS_SEQ" ]; then
+        [ -f "$STUB_LOG.seq" ] || echo "$STUB_STATUS_SEQ" > "$STUB_LOG.seq"
+        read -r next rest < "$STUB_LOG.seq" || true
+        if [ -n "$next" ]; then
+          echo "$rest" > "$STUB_LOG.seq"
+          tsv "${next%%:*}" "${next#*:}"
+          exit 0
+        fi
+      fi
+      # Each PATCH with a template makes a new revision.
+      n=$(grep -c '"template"' "$STUB_LOG.bodies" 2>/dev/null || true)
+      latest="app--old"
+      [ -n "$STUB_LATEST_FAILED" ] && latest="$STUB_LATEST_FAILED"
+      [ "${n:-0}" -gt 0 ] && latest="app--new$n"
+      tsv Succeeded "${STUB_LATEST:-$latest}"
+    fi
+    ;;
+  "containerapp revision")
+    # The active revision. After a canceled first cutover, the template has
+    # the real image while the placeholder revision stays active.
+    # After a PATCH with a template, the new revision is active. The old one
+    # stays active for the first STUB_ACTIVE_LAG reads, like Azure while the
+    # new revision scales and passes its probes.
+    if [ "$3" = list ]; then
+      n=$(grep -c '"template"' "$STUB_LOG.bodies" 2>/dev/null || true)
+      if [ "${n:-0}" -eq 0 ]; then
+        # Azure can list no active revision during a handoff. The first
+        # STUB_ACTIVE_EMPTY_FIRST reads are empty ("always": every read).
+        if [ -n "$STUB_ACTIVE_EMPTY_FIRST" ]; then
+          [ -f "$STUB_LOG.empty" ] || echo "$STUB_ACTIVE_EMPTY_FIRST" > "$STUB_LOG.empty"
+          left=$(cat "$STUB_LOG.empty")
+          if [ "$left" = always ]; then exit 0; fi
+          if [ "$left" -gt 0 ]; then
+            echo $((left - 1)) > "$STUB_LOG.empty"
+            exit 0
+          fi
+        fi
+        # A handoff: the placeholder and a real revision that is not ready
+        # yet are both active.
+        if [ -n "$STUB_ACTIVE_BOTH" ]; then
+          printf 'app--old\t%s\napp--half\tacr.azurecr.io/app:t1\n' "$STUB_OLD_IMAGE"
+          exit 0
+        fi
+        # An interrupted run made the latest revision; the old one stays
+        # active for the first STUB_ACTIVE_LAG reads.
+        if [ -n "$STUB_ACTIVE_LAG" ] && [ -n "$STUB_LATEST" ]; then
+          [ -f "$STUB_LOG.lag" ] || echo "$STUB_ACTIVE_LAG" > "$STUB_LOG.lag"
+          lag=$(cat "$STUB_LOG.lag")
+          if [ "$lag" -gt 0 ]; then
+            echo $((lag - 1)) > "$STUB_LOG.lag"
+            printf 'app--old\t%s\n' "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}"
+            [ -n "$STUB_TWO_PLACEHOLDERS" ] && printf 'app--old2\t%s\n' "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}"
+            exit 0
+          fi
+          printf '%s\t%s\n' "$STUB_LATEST" "$STUB_OLD_IMAGE"
+          exit 0
+        fi
+        printf 'app--old\t%s\n' "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}"
+        exit 0
+      fi
+      # Azure can list no active revision during the handoff.
+      [ -n "$STUB_ACTIVE_EMPTY" ] && exit 0
+      [ -f "$STUB_LOG.lag" ] || echo "${STUB_ACTIVE_LAG:-0}" > "$STUB_LOG.lag"
+      lag=$(cat "$STUB_LOG.lag")
+      if [ "$lag" -gt 0 ]; then
+        echo $((lag - 1)) > "$STUB_LOG.lag"
+        printf 'app--old\t%s\n' "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}"
+      fi
+      printf '%s\t%s\n' "${STUB_LATEST:-app--new$n}" "$STUB_OLD_IMAGE"
+      exit 0
+    fi
+    case "$query" in
+      # The template of the active (old) revision runs the active image.
+      # With STUB_ACTIVE_SCALE_REF, its scale rule still refers to a
+      # managed secret that the template no longer has.
+      properties.template|properties.template.containers)
+        has_refs=false
+        [ -n "$STUB_ACTIVE_HAS_REFS" ] && has_refs=true
+        # The second placeholder still refers to the secrets; the first not.
+        [ -n "$STUB_TWO_PLACEHOLDERS" ] && [[ " $* " == *" --revision app--old2 "* ]] && has_refs=true
+        template=$(jq -c --arg image "${STUB_ACTIVE_IMAGE:-$STUB_OLD_IMAGE}" --argjson refs "[${refs#,}]" \
+          --argjson has_refs "$has_refs" --arg scale_ref "${STUB_ACTIVE_SCALE_REF:-}" \
+          --arg scale_id "${STUB_ACTIVE_SCALE_IDENTITY:+$id}" '
+          .properties.template
+          | .containers |= map(if .name == "app"
+                               then .image = $image | (if $has_refs then .env += $refs else . end)
+                               else . end)
+          | if $scale_ref == "" then .
+            else .scale = {rules: [{name: "q", custom: {type: "azure-queue",
+                   auth: [{secretRef: "database-url", triggerParameter: "connection"}]}}]} end
+          | if $scale_id == "" then .
+            else .scale = {rules: [{name: "h", http: {metadata: {concurrentRequests: "10"},
+                   identity: $scale_id}}]} end' <<< "$app")
+        # The active placeholder revision still has a sidecar from the ACR,
+        # which the template no longer has.
+        if [ -n "$STUB_ACTIVE_SIDECAR_ACR" ] && [[ " $* " == *" --revision app--old "* ]]; then
+          template=$(jq -c '.containers |= map(if .name == "sidecar" then .image = "acr.azurecr.io/side:1" else . end)' <<< "$template")
+        fi
+        # Azure can rewrite the secret refs of a new revision to a secret that
+        # does not exist (azure-container-apps issue 1705).
+        if [ -n "$STUB_REVISION_REWRITTEN" ] && [[ " $* " != *" --revision app--old "* ]]; then
+          template=$(jq -c '.containers |= map(.env = ((.env // []) + [{name: "DB", secretRef: "capp-app"}]))' <<< "$template")
+        fi
+        # The same rewrite in an init container of the new revision.
+        if [ -n "$STUB_REVISION_INIT_REWRITTEN" ] && [[ " $* " != *" --revision app--old "* ]]; then
+          template=$(jq -c '.initContainers = [{name: "migrate", image: "mcr.microsoft.com/k8se/quickstart:latest",
+                              env: [{name: "DB", secretRef: "capp-app"}]}]' <<< "$template")
+        fi
+        if [ "$query" = properties.template ]; then
+          echo "$template"
+        else
+          jq -c '.containers' <<< "$template"
+        fi
+        ;;
+      properties.active) echo false ;;
+      # The scale rules of an active revision. An operator can remove a
+      # custom rule from the template while the old revision stays active.
+      properties.template.scale)
+        rules=null
+        [ -n "$STUB_ACTIVE_SCALE_RULE" ] && rules='[{"name":"q","custom":{"type":"azure-queue"}}]'
+        echo "{\"minReplicas\":${STUB_ACTIVE_MIN_REPLICAS:-0},\"rules\":$rules}"
+        ;;
+      # The placeholder image provisions, except a revision that the test
+      # names as failed.
+      properties.provisioningState)
+        if [ -n "$STUB_LATEST_FAILED" ] && [[ " $* " == *" --revision $STUB_LATEST_FAILED "* ]]; then
+          echo "${STUB_LATEST_STATE:-Failed}"
+        else
+          echo Provisioned
+        fi
+        ;;
+      *) tsv "$STUB_REVISION_STATE" acr.azurecr.io/app:t1 ;;
+    esac
+    ;;
+  "containerapp secret")
+    list=$(
+    [ -n "$STUB_APP_LEGACY_ID" ] && id="$STUB_APP_LEGACY_ID"
+    # An operator secret on the app that uses the job's identity.
+    if [ -n "$STUB_APP_SHARED_SECRET" ]; then
+      shared=",{\"name\":\"ops-key\",\"keyVaultUrl\":\"https://kv/secrets/ops-key\",\"identity\":\"$id\"}"
+      if [ -n "$STUB_APP_LEGACY" ]; then
+        echo "[{\"name\":\"api-key\",\"value\":\"user-value\"},{\"name\":\"database-url\",\"keyVaultUrl\":\"https://kv/secrets/database-url\",\"identity\":\"$id\"},{\"name\":\"signing-secret\",\"keyVaultUrl\":\"https://kv/secrets/signing-secret\",\"identity\":\"$id\"}$shared]"
+      else
+        echo "[{\"name\":\"api-key\",\"value\":\"user-value\"}$shared]"
+      fi
+    elif [ -n "$STUB_APP_REDIS" ]; then
+      echo "[{\"name\":\"api-key\",\"value\":\"user-value\"},{\"name\":\"redis-url\",\"keyVaultUrl\":\"https://kv/secrets/redis-url\",\"identity\":\"$id\"}]"
+    elif [ -n "$STUB_APP_LEGACY" ]; then
+      custom=""
+      [ -n "$STUB_JOB_CUSTOM_KV" ] && custom=",{\"name\":\"queue-key\",\"keyVaultUrl\":\"https://kv/secrets/queue-key\",\"identity\":\"$id\"}"
+      # An interrupted first cutover copied queue-key (on /kv-id-2); the job
+      # no longer has it.
+      [ -n "$STUB_APP_COPIED" ] && custom=",{\"name\":\"queue-key\",\"keyVaultUrl\":\"https://kv/secrets/queue-key\",\"identity\":\"/kv-id-2\"}"
+      echo "[{\"name\":\"api-key\",\"value\":\"user-value\"},{\"name\":\"database-url\",\"keyVaultUrl\":\"https://kv/secrets/database-url\",\"identity\":\"$id\"},{\"name\":\"signing-secret\",\"keyVaultUrl\":\"https://kv/secrets/signing-secret\",\"identity\":\"$id\"}$custom]"
+    else
+      echo '[{"name":"api-key","value":"user-value"}]'
+    fi
+    )
+    # The job's inline secret was rotated: the app has the old value until
+    # the PATCH with the new one applies, and then for STUB_INLINE_STALE
+    # more reads.
+    if [ -n "$STUB_JOB_INLINE_SECRET" ]; then
+      value=tok-old
+      if grep -q '"value":"tok"' "$STUB_LOG.bodies" 2>/dev/null; then
+        [ -f "$STUB_LOG.inline" ] || echo "${STUB_INLINE_STALE:-0}" > "$STUB_LOG.inline"
+        left=$(cat "$STUB_LOG.inline")
+        if [ "$left" -gt 0 ]; then
+          echo $((left - 1)) > "$STUB_LOG.inline"
+        else
+          value=tok
+        fi
+      fi
+      list=$(jq -c --arg v "$value" '. + [{name: "api-token", value: $v}]' <<< "$list")
+    fi
+    echo "$list"
+    ;;
+  "containerapp replica")
+    if [ -n "$query" ]; then
+      echo "${STUB_REPLICAS:-0}"
+    elif ! grep -q "revision restart" "$STUB_LOG"; then
+      if [ -n "$STUB_RESTART_FROM_ZERO" ]; then echo '[]'; exit 0; fi
+      # A new revision at zero replicas: none starts until a request comes
+      # in (never: none starts at all).
+      if [ -n "$STUB_NEW_FROM_ZERO" ] && { [ "$STUB_NEW_FROM_ZERO" = never ] || ! grep -q "^curl " "$STUB_LOG"; }; then
+        echo '[]'; exit 0
+      fi
+      echo '[{"name":"r-old","properties":{"runningState":"Running","containers":[{"ready":true}]}}]'
+    elif [ -n "$STUB_RESTART_FROM_ZERO" ] && { [ "$STUB_RESTART_FROM_ZERO" = never ] || ! grep -q "^curl " "$STUB_LOG"; }; then
+      # Scaled to zero: no replica starts until a request comes in.
+      echo '[]'
+    else
+      # After a restart, the old replica stays for the first
+      # STUB_RESTART_STALE reads. The new one is ready unless
+      # STUB_RESTART_UNREADY is set.
+      [ -f "$STUB_LOG.stale" ] || echo "${STUB_RESTART_STALE:-0}" > "$STUB_LOG.stale"
+      stale=$(cat "$STUB_LOG.stale")
+      if [ "$stale" -gt 0 ]; then
+        echo $((stale - 1)) > "$STUB_LOG.stale"
+        echo '[{"name":"r-old","properties":{"runningState":"Running","containers":[{"ready":true}]}}]'
+      else
+        ready=true
+        [ -n "$STUB_RESTART_UNREADY" ] && ready=false
+        echo "[{\"name\":\"r-new\",\"properties\":{\"runningState\":\"Running\",\"containers\":[{\"ready\":$ready}]}}]"
+      fi
+    fi
+    ;;
+  "rest --method")
+    # The modes of the script's temp files at the time of the PATCH.
+    if [ -n "$STUB_TMP_MODES" ]; then
+      ls -ld "$TMPDIR"/azure-cutover.* | sed 's/^/mode /' >> "$STUB_LOG"
+    fi
+    # Azure rejects a PATCH that removes tags.
+    if [ -n "$tags_only" ] && [ -n "$STUB_TAGS_CLEAR_FAILS" ] \
+      && jq -e '[.tags[]] | any(. == null)' <<< "$body" > /dev/null; then
+      exit 1
+    fi
+    open_patch=""
+    if grep -q '"ingress"' <<< "$body"; then
+      echo "az ingress-patch external=$(jq -r '.properties.configuration.ingress.external' <<< "$body")" >> "$STUB_LOG"
+      jq -e '.properties.configuration.ingress.external == true' <<< "$body" > /dev/null && open_patch=1
+    fi
+    [ -n "$tags_only" ] || echo "$body" >> "$STUB_LOG.bodies"
+    echo "$body" > "$STUB_LOG.unapplied"
+    echo "${STUB_PATCH_PENDING:-0}" > "$STUB_LOG.pending"
+    # Azure accepts the PATCH that opens ingress, but the response is lost.
+    if [ -n "$open_patch" ] && [ -n "$STUB_INGRESS_OPEN_LOST" ]; then exit 1; fi
+    # Azure accepts the cutover PATCH, but the response is lost.
+    if [ -n "$STUB_CUTOVER_LOST" ] && grep -q '"acr.azurecr.io/app:t1"' <<< "$body"; then exit 1; fi
+    ;;
+  "containerapp ingress")
+    # The disable fails once this run has opened ingress.
+    if [ -n "$STUB_INGRESS_DISABLE_FAILS" ] && grep -q "ingress-patch external=true" "$STUB_LOG"; then
+      exit 1
+    fi
+    # Azure disables ingress, but the response is lost.
+    if [ -n "$STUB_INGRESS_DISABLE_LOST" ]; then exit 1; fi
+    ;;
+  *) echo "unexpected az call: $*" >&2; exit 2 ;;
+esac
+"#;
+
+    /// Runs the generated azure-cutover.sh against [`AZ_STUB`]. Returns the
+    /// exit status, the `az` call log and the PATCH bodies. `None` when
+    /// `jq` is not installed.
+    #[cfg(unix)]
+    fn run_azure_cutover(
+        old_image: &str,
+        revision_state: &str,
+        redis: bool,
+        placeholder_replicas: u32,
+        extra_env: &[(&str, &str)],
+    ) -> Option<(std::process::ExitStatus, String, String)> {
+        run_azure_cutover_with_args(
+            &[],
+            old_image,
+            revision_state,
+            redis,
+            placeholder_replicas,
+            extra_env,
+        )
+    }
+
+    /// Every flag that [`AZ_STUB`] reads, plus the script's optional
+    /// inputs. [`run_azure_cutover_with_args`] clears them all first.
+    #[cfg(unix)]
+    const AZ_STUB_FLAGS: &[&str] = &[
+        "STUB_ACTIVE_SIDECAR_ACR",
+        "STUB_REVISION_REWRITTEN",
+        "STUB_REVISION_INIT_REWRITTEN",
+        "STUB_INIT_SECRET_REF",
+        "STUB_CUTOVER_LOST",
+        "STUB_TAGS_CLEAR_FAILS",
+        "STUB_PLAIN_ENV",
+        "STUB_NEW_FROM_ZERO",
+        "STUB_INGRESS_DISABLE_LOST",
+        "STUB_SIDECAR_ACR",
+        "STUB_APP_REGISTRY_PASSWORD_REF",
+        "STUB_INLINE_STALE",
+        "STUB_APP_COPIED_BIG",
+        "STUB_INGRESS_DISABLE_FAILS",
+        "STUB_INGRESS_OPEN_LOST",
+        "STUB_APP_TAG_COUNT",
+        "STUB_APP_LEGACY_ID",
+        "STUB_TWO_PLACEHOLDERS",
+        "STUB_APP_COPIED",
+        "STUB_ACTIVE_SCALE_IDENTITY",
+        "STUB_APP_SCALE_IDENTITY",
+        "STUB_JOB_ACR_SYSTEM",
+        "STUB_APP_SHARED_SECRET",
+        "STUB_LATEST",
+        "STUB_STATUS_SEQ",
+        "STUB_SIDECAR_FIRST",
+        "STUB_INGRESS_PLAIN",
+        "STUB_LATEST_STATE",
+        "STUB_APP_SYSTEM_IDENTITY",
+        "STUB_MIN_REPLICAS",
+        "STUB_ACTIVE_MIN_REPLICAS",
+        "STUB_JOB_CUSTOM_KV_IDENTITY",
+        "STUB_SAVED_INGRESS_TAGS",
+        "STUB_JOB_CUSTOM_KV",
+        "STUB_ACTIVE_EMPTY_FIRST",
+        "STUB_TMP_MODES",
+        "STUB_JOB_INLINE_SECRET",
+        "STUB_ACTIVE_SCALE_REF",
+        "STUB_ACTIVE_BOTH",
+        "STUB_INGRESS_NONE",
+        "STUB_RESTART_FROM_ZERO",
+        "STUB_ACTIVE_SCALE_RULE",
+        "STUB_JOB_NO_SECRETS",
+        "STUB_ACTIVE_EMPTY",
+        "STUB_RESTART_STALE",
+        "STUB_RESTART_UNREADY",
+        "STUB_APP_ENV_FULL",
+        "STUB_APP_LEGACY",
+        "STUB_APP_REDIS",
+        "STUB_APP_NO_REGISTRY",
+        "STUB_APP_OWN_IDENTITY",
+        "STUB_APP_STALE_SECRET_IDENTITY",
+        "STUB_SIDECAR_SECRET_REF",
+        "STUB_SCALE_SECRET_REF",
+        "STUB_ACTIVE_IMAGE",
+        "STUB_ACTIVE_LAG",
+        "STUB_APP_TEMPLATE_CLEAN",
+        "STUB_ACTIVE_HAS_REFS",
+        "STUB_SIDECAR_REDIS_REF",
+        "STUB_LATEST_FAILED",
+        "STUB_INGRESS_INTERNAL",
+        "STUB_INGRESS_EXTERNAL",
+        "STUB_JOB_EXTRA_REGISTRY",
+        "AZURE_BOOTSTRAP_IMAGE",
+        "STUB_PATCH_PENDING",
+    ];
+
+    /// [`run_azure_cutover`] with script arguments. With
+    /// `--remove-credentials`, the script gets no `IMAGE_TAG`.
+    #[cfg(unix)]
+    fn run_azure_cutover_with_args(
+        args: &[&str],
+        old_image: &str,
+        revision_state: &str,
+        redis: bool,
+        placeholder_replicas: u32,
+        extra_env: &[(&str, &str)],
+    ) -> Option<(std::process::ExitStatus, String, String)> {
+        use std::os::unix::fs::PermissionsExt;
+        if std::process::Command::new("jq")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: jq is not installed");
+            return None;
+        }
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        // STUB_NO_CURL: a host without curl.
+        let no_curl = extra_env.iter().any(|(name, _)| *name == "STUB_NO_CURL");
+        for (name, body) in [
+            ("az", AZ_STUB),
+            ("sleep", "#!/bin/sh\nexit 0\n"),
+            (
+                "curl",
+                "#!/bin/sh\necho \"curl $*\" >> \"$STUB_LOG\"\nexit 0\n",
+            ),
+        ] {
+            if no_curl && name == "curl" {
+                continue;
+            }
+            let path = bin.join(name);
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let log = tmp.path().join("az.log");
+        let system_path = std::env::var("PATH").unwrap_or_default();
+        // STUB_JQ_ARGS: a jq shim logs the arguments of each jq call (as
+        // `jq <args>`) to the az log, then runs the real jq.
+        if extra_env.iter().any(|(name, _)| *name == "STUB_JQ_ARGS") {
+            let real = std::env::split_paths(&system_path)
+                .map(|dir| dir.join("jq"))
+                .find(|path| path.is_file())
+                .expect("jq on PATH");
+            let path = bin.join("jq");
+            fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\nprintf 'jq %s\\n' \"$*\" >> \"$STUB_LOG\"\nexec '{}' \"$@\"\n",
+                    real.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = if no_curl {
+            // The host's tools, without its curl, as links in one directory.
+            let host = tmp.path().join("host");
+            fs::create_dir_all(&host).unwrap();
+            for dir in std::env::split_paths(&system_path) {
+                let Ok(entries) = fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let link = host.join(entry.file_name());
+                    if entry.file_name() != "curl" && !link.exists() {
+                        let _ = std::os::unix::fs::symlink(entry.path(), link);
+                    }
+                }
+            }
+            format!("{}:{}", bin.display(), host.display())
+        } else {
+            format!("{}:{system_path}", bin.display())
+        };
+        let mut command = std::process::Command::new("bash");
+        command
+            .arg(dir.join("azure-cutover.sh"))
+            .args(args)
+            .env("PATH", path)
+            .env("STUB_LOG", &log)
+            .env("STUB_OLD_IMAGE", old_image)
+            .env("STUB_REVISION_STATE", revision_state)
+            .env("STUB_REPLICAS", placeholder_replicas.to_string())
+            .env("AZURE_APP_NAME", "app")
+            .env("AZURE_RESOURCE_GROUP", "rg")
+            .env("AZURE_MIGRATE_JOB_NAME", "job")
+            .env("ACR_LOGIN_SERVER", "acr.azurecr.io")
+            .env("IMAGE_TAG", "t1");
+        // A stub flag from the caller's environment must not leak in.
+        for name in AZ_STUB_FLAGS {
+            command.env_remove(name);
+        }
+        if args.contains(&"--remove-credentials") {
+            command.env_remove("IMAGE_TAG");
+        }
+        command.envs(extra_env.iter().copied());
+        if redis {
+            command.env("STUB_REDIS", "1");
+        } else {
+            command.env_remove("STUB_REDIS");
+        }
+        let status = command.output().expect("run azure-cutover.sh").status;
+        let read = |path: &std::path::Path| fs::read_to_string(path).unwrap_or_default();
+        Some((status, read(&log), read(&log.with_extension("log.bodies"))))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_before_any_call_without_curl() {
+        // A restart of a revision scaled to zero needs a request to start a
+        // replica. Without curl, the script stops before it changes
+        // anything, in both modes.
+        for args in [&[][..], &["--remove-credentials"][..]] {
+            let Some((status, calls, _)) = run_azure_cutover_with_args(
+                args,
+                "acr.azurecr.io/app:t0",
+                "Provisioned",
+                false,
+                0,
+                &[("STUB_NO_CURL", "1")],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{args:?}: {calls}");
+            assert!(calls.is_empty(), "{args:?}: {calls}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_keeps_env_values_out_of_jq_arguments() {
+        // The app JSON holds the plain env values of its containers. A
+        // process's arguments are visible to other users, so no jq call may
+        // get that JSON (or a part of it) as an argument. In both modes, and
+        // on a rollback.
+        for (args, state, legacy) in [
+            (&[][..], "Provisioned", ""),
+            (&[][..], "Failed", ""),
+            (&["--remove-credentials"][..], "Provisioned", "1"),
+        ] {
+            let mut env = vec![("STUB_JQ_ARGS", "1"), ("STUB_PLAIN_ENV", "1")];
+            if !legacy.is_empty() {
+                env.push(("STUB_APP_LEGACY", legacy));
+            }
+            let Some((_, calls, bodies)) = run_azure_cutover_with_args(
+                args,
+                "mcr.microsoft.com/k8se/quickstart:latest",
+                state,
+                false,
+                0,
+                &env,
+            ) else {
+                return;
+            };
+            assert!(calls.contains("\njq "), "{args:?}: {calls}");
+            assert!(bodies.contains("plain-value-7f3a"), "{args:?}: {bodies}");
+            let leaked: Vec<&str> = calls
+                .lines()
+                .filter(|line| line.starts_with("jq ") && line.contains("plain-value-7f3a"))
+                .collect();
+            assert!(leaked.is_empty(), "{args:?} {state}: {leaked:#?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_wakes_a_new_revision_scaled_to_zero() {
+        // The old revision had no replica, so the new one becomes the only
+        // active revision without one. Provisioned does not show that the
+        // new image starts: after ingress opens, the script sends a request
+        // and waits for a ready replica.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_NEW_FROM_ZERO", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let after_open = calls
+            .split("az ingress-patch external=true")
+            .nth(1)
+            .unwrap_or_else(|| panic!("{calls}"));
+        assert!(
+            after_open.contains(
+                "curl --silent --output /dev/null --max-time 10 https://app.example.internal/"
+            ),
+            "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_fails_when_a_new_revision_never_starts() {
+        // A later deploy whose new revision never gets a ready replica is not
+        // done. The release before it had the credentials, so nothing rolls
+        // back.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_NEW_FROM_ZERO", "never")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!bodies.contains("AUTUMN_CREDENTIAL_CLEANUP"), "{bodies}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_sends_one_patch_then_opens_ingress() {
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            true,
+            0,
+            &[],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "the cutover must succeed: {calls}");
+        let replicas_at = calls
+            .find("az containerapp replica list")
+            .unwrap_or_else(|| panic!("the first cutover must check the placeholder: {calls}"));
+        // The cutover PATCH, then the saved ingress with external access.
+        assert_eq!(
+            calls.matches("az rest --method patch").count(),
+            2,
+            "{calls}"
+        );
+        let patch_at = calls.find("az rest --method patch").unwrap();
+        let ingress_at = calls
+            .find("az ingress-patch external=true")
+            .unwrap_or_else(|| panic!("the cutover must open ingress: {calls}"));
+        assert!(replicas_at < patch_at && patch_at < ingress_at, "{calls}");
+        // Without ingress, nothing can start the placeholder again between
+        // the replica check and the PATCH.
+        let disable_at = calls
+            .find("az containerapp ingress disable")
+            .unwrap_or_else(|| panic!("the first cutover must disable ingress: {calls}"));
+        assert!(disable_at < replicas_at, "{calls}");
+        assert!(
+            !calls.contains("revision restart"),
+            "a new revision needs no restart: {calls}"
+        );
+        for field in [
+            "\"userAssignedIdentities\"",
+            "\"registries\"",
+            "\"signing-secret\"",
+            "\"redis-url\"",
+            "\"acr.azurecr.io/app:t1\"",
+            "\"AUTUMN_PROFILE\"",
+            "\"AUTUMN_CACHE__BACKEND\"",
+            "\"api-key\"",
+            "\"sidecar\"",
+            "\"location\":\"westeurope\"",
+        ] {
+            assert!(
+                bodies.contains(field),
+                "the PATCH must carry {field}: {bodies}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_rolls_back_a_failed_first_cutover() {
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Failed",
+            false,
+            0,
+            &[],
+        ) else {
+            return;
+        };
+        assert!(
+            !status.success(),
+            "a failed revision must fail the cutover: {calls}"
+        );
+        // The cutover, then the rollback: a template without the secret
+        // refs, the credential removal, then the saved ingress.
+        assert_eq!(
+            calls.matches("az rest --method patch").count(),
+            4,
+            "{calls}"
+        );
+        assert!(
+            !calls.contains("ingress-patch external=true"),
+            "ingress must stay closed: {calls}"
+        );
+        let rollback = credentials_body(&bodies);
+        assert!(
+            rollback.contains("\"type\":\"None\""),
+            "the rollback must remove the job's identity: {rollback}"
+        );
+        assert!(
+            !rollback.contains("signing-secret") && !rollback.contains("database-url"),
+            "the rollback must remove the job's secret refs: {rollback}"
+        );
+        assert!(
+            rollback.contains("\"api-key\""),
+            "the rollback must keep the secrets that the operator added: {rollback}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_keeps_credentials_when_a_later_deploy_fails() {
+        // The old revision of a later deploy is a real release. It needs
+        // its identity and secret refs.
+        let Some((status, calls, _)) =
+            run_azure_cutover("acr.azurecr.io/app:t0", "Failed", false, 0, &[])
+        else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert_eq!(
+            calls.matches("az rest --method patch").count(),
+            1,
+            "{calls}"
+        );
+        assert!(!calls.contains("ingress-patch external=true"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_for_the_placeholder_to_stop() {
+        // The identity is app-wide. Azure keeps the old revision active
+        // until the new one is ready. A running placeholder replica would
+        // get the identity, so the first cutover must not PATCH.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            1,
+            &[],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(
+            !calls.contains("az rest --method patch")
+                || calls.matches("az rest --method patch").count()
+                    == calls.matches("az ingress-patch").count(),
+            "no credentials while the placeholder runs: {calls}"
+        );
+        assert!(!calls.contains("ingress-patch external=true"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_restores_ingress_when_the_placeholder_does_not_stop() {
+        // The script disabled ingress. If it stops there, the app must get
+        // its saved ingress back (custom domains too). Else a retry saves
+        // no ingress, and the settings are lost.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            1,
+            &[("STUB_INGRESS_EXTERNAL", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let disable_at = calls.find("ingress disable").expect("disable");
+        let restore_at = calls
+            .find("az ingress-patch external=true")
+            .unwrap_or_else(|| panic!("the script must restore the saved ingress: {calls}"));
+        assert!(disable_at < restore_at, "{calls}");
+        assert!(bodies.contains("www.example.com"), "{bodies}");
+        for field in ["userAssignedIdentities", "secrets", "template"] {
+            assert!(!bodies.contains(field), "no credentials: {bodies}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_out_a_stale_failed_state() {
+        // After a 202, the GET can still show the failed earlier update and
+        // the old revision. That is not this update.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_STATUS_SEQ", "Failed:app--old Canceled:app--old")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_out_a_stale_failed_state_before_a_restart() {
+        // A same-tag retry makes no new revision, so the revision name
+        // cannot tell a stale state from a new one.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_LATEST", "app--old"),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_STATUS_SEQ", "Failed:app--old"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(calls.contains("revision restart"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_needs_the_new_revision_in_the_active_list() {
+        // An empty active list does not show that the new revision serves.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_ACTIVE_EMPTY", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_for_the_restarted_revision() {
+        // A restart only starts new replicas. The deploy is done when the
+        // old replicas are gone and a new one is ready.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_LATEST", "app--old"),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_RESTART_STALE", "2"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let restart_at = calls.find("revision restart").expect("restart");
+        assert!(
+            calls[restart_at..].matches("replica list").count() >= 3,
+            "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_fails_when_the_restarted_revision_is_not_ready() {
+        // New secrets that break the start must not turn the deploy green.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_LATEST", "app--old"),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_RESTART_UNREADY", "1"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(calls.contains("revision restart"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_wakes_a_revision_restarted_from_zero() {
+        // Scaled to zero, the restart starts no replica. The script sends a
+        // request to start one, and waits until it is ready.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_LATEST", "app--old"),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_RESTART_FROM_ZERO", "1"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let restart_at = calls.find("revision restart").expect("restart");
+        assert!(
+            calls[restart_at..].contains("curl ") && calls.contains("app.example.internal"),
+            "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_fails_when_no_replica_starts_after_the_restart() {
+        // No ready replica, no proof that the app starts with the new
+        // secrets. Zero replicas before the restart is no exception.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_LATEST", "app--old"),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_RESTART_FROM_ZERO", "never"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_keeps_the_first_cutover_while_a_placeholder_is_active() {
+        // During a handoff, the placeholder and a real revision are both
+        // active. The app is not released yet: the first-cutover safeguards
+        // apply to the placeholder revision only.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_ACTIVE_BOTH", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(calls.contains("ingress disable"), "{calls}");
+        assert!(
+            calls.contains("--revision app--old --query length(@)"),
+            "{calls}"
+        );
+        assert!(!calls.contains("--revision app--half --query"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_opens_ingress_before_it_wakes_a_restarted_revision() {
+        // A first cutover stopped after the handoff, before ingress opened.
+        // The retry restarts the revision. Without ingress, no request can
+        // start a replica, so the script opens ingress first.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_LATEST", "app--old"),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_INGRESS_NONE", "1"),
+                ("STUB_RESTART_FROM_ZERO", "1"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let open_at = calls
+            .find("az ingress-patch external=true")
+            .unwrap_or_else(|| panic!("the script must open ingress: {calls}"));
+        let curl_at = calls.find("curl ").expect("a wake request");
+        assert!(open_at < curl_at, "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_keeps_the_value_of_an_inline_job_secret() {
+        // `job show` omits secret values. The PATCH replaces the secrets
+        // array, so an inline job secret must keep its value.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_JOB_INLINE_SECRET", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(calls.contains("az containerapp job secret list"), "{calls}");
+        assert!(
+            bodies.contains(r#"{"name":"api-token","value":"tok"}"#),
+            "{bodies}"
+        );
+        // The value never goes on a command line.
+        assert!(!calls.contains("tok\""), "{calls}");
+    }
+
+    #[test]
+    fn azure_sidecars_in_main_tf_do_not_refer_to_managed_secrets() {
+        // Terraform does not manage the app's secrets, and --without-redis
+        // removes redis-url. A sidecar env var in main.tf that refers to one
+        // would come back on the next terraform apply.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let main_tf = fs::read_to_string(dir.join("main.tf")).unwrap();
+        assert!(
+            main_tf.contains("A sidecar in this file must not"),
+            "{main_tf}"
+        );
+        let docs = fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/guide/deployment.md"),
+        )
+        .unwrap();
+        let docs = docs.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            docs.contains("remove that env var from `main.tf` first"),
+            "the Redis off steps must cover a sidecar ref in main.tf"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_reads_the_active_revisions_again_when_none_is_listed() {
+        // During a handoff, Azure can list no active revision. That says
+        // nothing about a real release, so the script reads the list again.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_ACTIVE_EMPTY_FIRST", "2")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let disable_at = calls.find("ingress disable").expect("first cutover");
+        assert!(
+            calls[..disable_at]
+                .matches("az containerapp revision list")
+                .count()
+                >= 3,
+            "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_when_no_active_revision_is_listed() {
+        // Without an active revision, the script cannot tell a placeholder
+        // from a real release. It stops before any write, in both modes.
+        for args in [&[][..], &["--remove-credentials"][..]] {
+            let Some((status, calls, _)) = run_azure_cutover_with_args(
+                args,
+                "acr.azurecr.io/app:t0",
+                "Provisioned",
+                false,
+                0,
+                &[
+                    ("STUB_ACTIVE_EMPTY_FIRST", "always"),
+                    ("STUB_APP_LEGACY", "1"),
+                ],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{args:?}: {calls}");
+            assert!(!calls.contains("ingress disable"), "{args:?}: {calls}");
+            assert!(
+                !calls.contains("az rest --method patch"),
+                "{args:?}: {calls}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_keeps_the_filtered_job_secrets_private() {
+        // With --without-redis, the script filters the job's secrets, which
+        // hold inline values. Every temp file must stay readable by the
+        // owner only, and so must the directory of the jq values.
+        let tmpdir = TempDir::new().unwrap();
+        let tmpdir_path = tmpdir.path().to_str().unwrap().to_string();
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--without-redis"],
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            true,
+            0,
+            &[
+                ("STUB_JOB_INLINE_SECRET", "1"),
+                ("STUB_TMP_MODES", "1"),
+                ("TMPDIR", &tmpdir_path),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let modes: Vec<&str> = calls.lines().filter(|l| l.starts_with("mode ")).collect();
+        assert!(!modes.is_empty(), "{calls}");
+        assert!(
+            modes.iter().any(|line| line.starts_with("mode drwx------")),
+            "{calls}"
+        );
+        for line in modes {
+            assert!(
+                line.starts_with("mode -rw-------") || line.starts_with("mode drwx------"),
+                "{line}\n{calls}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_every_job_secret_from_the_placeholder() {
+        // The operator added queue-key to the migration job, so the cutover
+        // copied it to the app. --remove-credentials must remove it and the
+        // env var that uses it, like the three generated secrets.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1"), ("STUB_JOB_CUSTOM_KV", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let stage1 = bodies
+            .lines()
+            .find(|line| line.contains("\"template\""))
+            .unwrap_or_else(|| panic!("a stage 1 PATCH: {bodies}"));
+        assert!(!stage1.contains("queue-key"), "{stage1}");
+        let stage2 = bodies
+            .lines()
+            .find(|line| line.contains("\"secrets\""))
+            .unwrap_or_else(|| panic!("a stage 2 PATCH: {bodies}"));
+        assert!(!stage2.contains("queue-key"), "{stage2}");
+        assert!(
+            stage2.contains("api-key"),
+            "the app's own secret stays: {stage2}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_saves_the_ingress_in_tags_before_it_disables_it() {
+        // A runner that dies after the disable loses the shell variable.
+        // The app's tags keep the snapshot; after ingress opens, the script
+        // removes them and keeps the operator's own tags.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_INGRESS_EXTERNAL", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let tags: Vec<&str> = calls
+            .lines()
+            .filter(|line| line.starts_with("az tags-patch "))
+            .collect();
+        assert!(tags.len() >= 2, "{calls}");
+        assert!(tags[0].contains("\"autumn-ingress-0\":\""), "{calls}");
+        let disable_at = calls.find("ingress disable").expect("disable");
+        let save_at = calls.find("az tags-patch ").unwrap();
+        assert!(save_at < disable_at, "{calls}");
+        let last = tags.last().unwrap();
+        assert!(last.contains("\"autumn-ingress-0\":null"), "{calls}");
+        assert!(!last.contains("team"), "{calls}");
+        assert!(!bodies.contains("autumn-ingress"), "{bodies}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_restores_the_ingress_from_tags_after_an_interruption() {
+        // An earlier first cutover disabled ingress and stopped. The retry
+        // finds no ingress, but the tags hold the snapshot with the custom
+        // domain, so the script sends that back.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_INGRESS_NONE", "1"), ("STUB_SAVED_INGRESS_TAGS", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let open = bodies
+            .lines()
+            .find(|line| line.contains("\"external\":true"))
+            .unwrap_or_else(|| panic!("the script must open ingress: {bodies}"));
+        assert!(open.contains("www.example.com"), "{open}");
+        let last = calls
+            .lines()
+            .rfind(|line| line.starts_with("az tags-patch "))
+            .unwrap_or_default();
+        assert!(last.contains("\"autumn-ingress-0\":null"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_opens_a_missing_ingress_on_a_released_app() {
+        // A first cutover stopped after the real revision took over, before
+        // ingress came back. The snapshot in the tags says external, but the
+        // live app has no ingress: the retry must open it.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_INGRESS_NONE", "1"),
+                ("STUB_SAVED_INGRESS_TAGS", "external"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(calls.contains("az ingress-patch external=true"), "{calls}");
+        let open = bodies
+            .lines()
+            .find(|line| line.contains("\"external\":true"))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(open.contains("www.example.com"), "{open}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_restores_the_tagged_ingress_over_a_plain_open_one() {
+        // A first cutover stopped after the real revision took over, before
+        // ingress came back, and terraform apply then made a plain, open
+        // ingress. The live ingress is external, but the tags still hold the
+        // full snapshot (with the custom domain): the retry sends it back
+        // before it removes the tags.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_INGRESS_PLAIN", "external"),
+                ("STUB_SAVED_INGRESS_TAGS", "external"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(calls.contains("az ingress-patch external=true"), "{calls}");
+        let open = bodies
+            .lines()
+            .find(|line| line.contains("\"external\":true"))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(open.contains("www.example.com"), "{open}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_for_the_tagged_ingress_before_clearing_its_tags() {
+        // As above, but the first reads after the PATCH still show the plain
+        // ingress, which is open already. The script must wait until the app
+        // shows the saved ingress (with the custom domain) before it removes
+        // the tags: until then, the tags are the only copy.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_INGRESS_PLAIN", "external"),
+                ("STUB_SAVED_INGRESS_TAGS", "external"),
+                ("STUB_PATCH_PENDING", "2"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let after_open = calls
+            .split("az ingress-patch external=true")
+            .nth(1)
+            .unwrap_or_else(|| panic!("{calls}"));
+        let before_clear = after_open.split("az tags-patch").next().unwrap_or_default();
+        // Two stale reads, then the read that shows the saved ingress.
+        assert!(
+            before_clear
+                .matches("az containerapp show --name app --resource-group rg --output json")
+                .count()
+                >= 3,
+            "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_on_min_replicas_above_zero() {
+        // With min_replicas above zero, Azure starts the placeholder again
+        // after the zero-replica check, and it would get the credentials.
+        // The template and each active placeholder revision count.
+        for flag in ["STUB_MIN_REPLICAS", "STUB_ACTIVE_MIN_REPLICAS"] {
+            let Some((status, calls, _)) = run_azure_cutover(
+                "mcr.microsoft.com/k8se/quickstart:latest",
+                "Provisioned",
+                false,
+                0,
+                &[(flag, "1")],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{flag}: {calls}");
+            assert!(!calls.contains("ingress disable"), "{flag}: {calls}");
+            assert!(!calls.contains("az rest --method patch"), "{flag}: {calls}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_assigns_every_identity_of_the_job_secrets() {
+        // A Key Vault job secret can use another user-assigned identity. The
+        // app needs each one to read the secret.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_JOB_CUSTOM_KV", "1"),
+                ("STUB_JOB_CUSTOM_KV_IDENTITY", "/kv-id-2"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let cutover = bodies
+            .lines()
+            .find(|line| line.contains("\"template\""))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(cutover.contains("\"/kv-id-2\":{}"), "{cutover}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_every_identity_of_the_job_secrets() {
+        // --remove-credentials drops the identity of a custom job secret too.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_JOB_CUSTOM_KV", "1"),
+                ("STUB_JOB_CUSTOM_KV_IDENTITY", "/kv-id-2"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let stage2 = bodies
+            .lines()
+            .find(|line| line.contains("\"identity\":{"))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        // No identity stays, so the type goes to None; /kv-id-2 is not kept.
+        assert!(!stage2.contains("\"/kv-id-2\":{}"), "{stage2}");
+        assert!(stage2.contains("\"type\":\"None\""), "{stage2}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_forces_a_fresh_revision_after_a_canceled_one() {
+        // A canceled revision never provisions, like a failed one. A retry
+        // with the same tag must make a fresh revision.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_LATEST_FAILED", "app--old"),
+                ("STUB_LATEST_STATE", "Canceled"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(bodies.contains("AUTUMN_FORCE_REVISION"), "{bodies}");
+        assert!(!calls.contains("revision restart"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_rollback_keeps_a_system_identity_that_was_there() {
+        // The app had its own system identity before the cutover. The
+        // cutover never turns it on, and the rollback keeps it.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Failed",
+            false,
+            0,
+            &[
+                ("STUB_JOB_CUSTOM_KV", "1"),
+                ("STUB_JOB_CUSTOM_KV_IDENTITY", "/kv-id-2"),
+                ("STUB_APP_SYSTEM_IDENTITY", "1"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let removal = bodies
+            .lines()
+            .rfind(|line| line.contains("\"identity\":{") && !line.contains("\"template\""))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(removal.contains("SystemAssigned"), "{removal}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_prefers_the_ingress_snapshot_in_tags() {
+        // After a stop, terraform apply made a plain ingress again. The tags
+        // still hold the full snapshot (with the custom domain), and that
+        // one goes back.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_INGRESS_PLAIN", "1"),
+                ("STUB_SAVED_INGRESS_TAGS", "1"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let open = bodies
+            .lines()
+            .find(|line| line.contains("\"external\":true"))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(open.contains("www.example.com"), "{open}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_retries_after_a_canceled_cleanup_revision() {
+        // A canceled clean revision never provisions, like a failed one.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_APP_TEMPLATE_CLEAN", "1"),
+                ("STUB_ACTIVE_HAS_REFS", "1"),
+                ("STUB_LATEST_FAILED", "app--clean"),
+                ("STUB_LATEST_STATE", "Canceled"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let first = bodies.lines().next().unwrap_or_default();
+        assert!(first.contains("AUTUMN_CREDENTIAL_CLEANUP"), "{bodies}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_rejects_a_job_secret_on_the_system_identity() {
+        // The job's system identity has the vault access; the app's system
+        // identity is another principal and has none. The secret cannot
+        // move to the app, so the script stops before any write.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_JOB_CUSTOM_KV", "1"),
+                ("STUB_JOB_CUSTOM_KV_IDENTITY", "system"),
+                ("STUB_INGRESS_EXTERNAL", "1"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("ingress disable"), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+        assert!(!calls.contains("az tags-patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_when_an_operator_secret_shares_the_job_identity() {
+        // An operator secret on the app uses the job's identity. Removal
+        // would drop that identity and break the secret, and keeping the
+        // identity would keep vault access on the placeholder. So both a
+        // first cutover (its rollback) and --remove-credentials stop before
+        // any write.
+        for args in [&[][..], &["--remove-credentials"][..]] {
+            let Some((status, calls, _)) = run_azure_cutover_with_args(
+                args,
+                "mcr.microsoft.com/k8se/quickstart:latest",
+                "Provisioned",
+                false,
+                0,
+                &[("STUB_APP_SHARED_SECRET", "1"), ("STUB_APP_LEGACY", "1")],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{args:?}: {calls}");
+            assert!(!calls.contains("ingress disable"), "{args:?}: {calls}");
+            assert!(
+                !calls.contains("az rest --method patch"),
+                "{args:?}: {calls}"
+            );
+            assert!(!calls.contains("az tags-patch"), "{args:?}: {calls}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_when_a_scale_rule_uses_the_job_identity() {
+        // A scale rule can authenticate with an identity. Removal would drop
+        // the job identity under it, so the script stops before any write.
+        for args in [&[][..], &["--remove-credentials"][..]] {
+            let Some((status, calls, _)) = run_azure_cutover_with_args(
+                args,
+                "mcr.microsoft.com/k8se/quickstart:latest",
+                "Provisioned",
+                false,
+                0,
+                &[("STUB_APP_SCALE_IDENTITY", "1"), ("STUB_APP_LEGACY", "1")],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{args:?}: {calls}");
+            assert!(!calls.contains("ingress disable"), "{args:?}: {calls}");
+            assert!(
+                !calls.contains("az rest --method patch"),
+                "{args:?}: {calls}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_rejects_a_system_acr_identity() {
+        // "system" is not a user-assigned identity ID, and the app's system
+        // identity has no AcrPull. The script stops before any write, on a
+        // first cutover and on a later deploy.
+        for old_image in [
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "acr.azurecr.io/app:t0",
+        ] {
+            let Some((status, calls, bodies)) = run_azure_cutover(
+                old_image,
+                "Provisioned",
+                false,
+                0,
+                &[("STUB_JOB_ACR_SYSTEM", "1")],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{old_image}: {calls}");
+            assert!(!calls.contains("ingress disable"), "{old_image}: {calls}");
+            assert!(
+                !calls.contains("az rest --method patch"),
+                "{old_image}: {calls}"
+            );
+            assert!(!bodies.contains("\"system\":{}"), "{bodies}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_checks_the_job_before_it_disables_ingress() {
+        // Without secrets on the job, the cutover cannot run. The script
+        // stops before it changes the ingress.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_JOB_NO_SECRETS", "1"), ("STUB_INGRESS_EXTERNAL", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("ingress disable"), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_when_the_app_container_is_not_first() {
+        // main.tf ignores the env of the first container only. With a sidecar
+        // first, a later `terraform apply` would remove the secret env vars
+        // from the app container. The script stops before any change.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_SIDECAR_FIRST", "1"), ("STUB_INGRESS_EXTERNAL", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("ingress disable"), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_reads_the_app_image_by_name() {
+        // The active revisions and the new revision are read by the name of
+        // the app container, not by position.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(
+            calls.matches("containers[?name=='app']").count() >= 2,
+            "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_without_an_app_container() {
+        // With two containers and none named after the app, the script
+        // cannot tell which one to deploy. It stops before any change.
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
+        let script = fs::read_to_string(dir.join("azure-cutover.sh")).unwrap();
+        let check = script
+            .find("no container named")
+            .unwrap_or_else(|| panic!("the script must check the app container: {script}"));
+        let disable = script.find("ingress disable").unwrap();
+        assert!(check < disable, "{script}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_fails_fast_when_this_update_fails() {
+        // A failed state after a new revision, or after the update was in
+        // progress, is this update. The script stops without the timeout.
+        for seq in ["Failed:app--new1", "InProgress:app--old Failed:app--old"] {
+            let Some((status, calls, _)) = run_azure_cutover(
+                "acr.azurecr.io/app:t0",
+                "Provisioned",
+                false,
+                0,
+                &[("STUB_STATUS_SEQ", seq)],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{seq}: {calls}");
+            assert_eq!(
+                calls.matches("latestRevisionName").count(),
+                seq.split(' ').count(),
+                "{seq}: {calls}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_syncs_config_on_a_same_tag_redeploy() {
+        // A Redis toggle followed by a redeploy of the same tag must still
+        // send the job's secrets and env vars to the app.
+        let Some((status, calls, bodies)) =
+            run_azure_cutover("acr.azurecr.io/app:t1", "Provisioned", true, 0, &[])
+        else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert_eq!(
+            calls.matches("az rest --method patch").count(),
+            1,
+            "{calls}"
+        );
+        assert!(bodies.contains("\"redis-url\""), "{bodies}");
+        // The placeholder check counts replicas; the readiness check of the
+        // new revision lists them.
+        assert!(
+            !calls.contains("--query length(@)"),
+            "a later deploy has no placeholder to check: {calls}"
+        );
+        assert!(
+            !calls.contains("ingress disable"),
+            "a later deploy keeps serving: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_forces_a_fresh_revision_after_a_failed_one() {
+        // A later deploy's revision failed: the old revision still serves,
+        // but the template has the failed image and env. A retry with the
+        // same tag must make a fresh revision, not wait on the failed one.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_LATEST_FAILED", "app--old"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(bodies.contains("AUTUMN_FORCE_REVISION"), "{bodies}");
+        assert!(
+            !calls.contains("revision restart"),
+            "a fresh revision needs no restart: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_for_a_new_revision_when_same_tag_config_changes() {
+        // The env changes, so Azure makes a new revision. While Azure still
+        // reports the old revision, the cutover must not succeed.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            true,
+            0,
+            &[("STUB_LATEST", "app--old")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("ingress-patch external=true"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_accepts_the_current_revision_when_nothing_changes() {
+        // Same tag, same env: Azure makes no new revision.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_LATEST", "app--old"), ("STUB_APP_ENV_FULL", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        // Secrets are application-scope: a change makes no new revision,
+        // and the running revision reads them only when it restarts.
+        let restart_at = calls
+            .find("az containerapp revision restart")
+            .unwrap_or_else(|| panic!("the current revision must restart: {calls}"));
+        assert!(
+            calls[restart_at..].contains("--revision app--old"),
+            "{calls}"
+        );
+        // The ingress is open already, so the script sends no ingress PATCH.
+        assert!(!calls.contains("az ingress-patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_legacy_credentials_from_the_placeholder() {
+        // An app made by the old template has the job's identity, registry
+        // and secrets. Terraform ignores them now, so it cannot remove them.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        // The active revision refers to the secrets. Azure's order: deploy
+        // a revision without the refs, wait until the old one is inactive,
+        // then delete the secrets.
+        // The ingress restore after the removal is not a credential PATCH.
+        let patches: Vec<&str> = bodies
+            .lines()
+            .filter(|line| !line.contains("\"ingress\""))
+            .collect();
+        assert_eq!(patches.len(), 2, "{bodies}");
+        assert!(patches[0].contains("\"template\""), "{}", patches[0]);
+        assert!(!patches[0].contains("\"secrets\""), "{}", patches[0]);
+        assert!(!patches[1].contains("\"template\""), "{}", patches[1]);
+        let first_patch = calls.find("az rest --method patch").unwrap();
+        let second_patch = calls.rfind("az rest --method patch").unwrap();
+        assert!(
+            calls[first_patch..second_patch].contains("az containerapp revision list"),
+            "the old revision must stop first: {calls}"
+        );
+        assert!(!calls.contains("ingress-patch external=true"), "{calls}");
+        assert!(bodies.contains("\"type\":\"None\""), "{bodies}");
+        assert!(bodies.contains("\"registries\":[]"), "{bodies}");
+        for kept in [
+            "\"api-key\"",
+            "\"AUTUMN_PROFILE\"",
+            "\"sidecar\"",
+            "\"location\":\"westeurope\"",
+        ] {
+            assert!(
+                bodies.contains(kept),
+                "the PATCH must keep {kept}: {bodies}"
+            );
+        }
+        for removed in [
+            "database-url",
+            "signing-secret",
+            "AUTUMN_DATABASE__PRIMARY_URL",
+            "AUTUMN_SECURITY__SIGNING_SECRET",
+        ] {
+            assert!(
+                !bodies.contains(removed),
+                "the PATCH must remove {removed}: {bodies}"
+            );
+        }
+    }
+
+    /// The PATCH body that removes the credentials: the last one that sets
+    /// an identity.
+    #[cfg(unix)]
+    fn credentials_body(bodies: &str) -> &str {
+        bodies
+            .lines()
+            .rfind(|body| body.contains("\"identity\""))
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_keeps_the_ingress_settings_on_the_first_cutover() {
+        // `az containerapp ingress enable` builds a new ingress object and
+        // drops custom domains. The script sends the saved ingress back.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let ingress = bodies
+            .lines()
+            .find(|body| body.contains("\"ingress\""))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(ingress.contains("\"www.example.com\""), "{ingress}");
+        assert!(ingress.contains("\"external\":true"), "{ingress}");
+        assert!(!ingress.contains("fqdn"), "fqdn is read-only: {ingress}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_leaves_open_ingress_alone_on_a_later_deploy() {
+        let Some((status, calls, bodies)) =
+            run_azure_cutover("acr.azurecr.io/app:t0", "Provisioned", false, 0, &[])
+        else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(!bodies.contains("\"ingress\""), "{bodies}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_until_the_ingress_is_external() {
+        // The ingress is internal-only. A stale GET still shows it after the
+        // PATCH, so the script must wait until it shows external = true.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_INGRESS_INTERNAL", "1"), ("STUB_PATCH_PENDING", "2")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let ingress_at = calls
+            .find("az ingress-patch external=true")
+            .unwrap_or_else(|| panic!("{calls}"));
+        assert!(
+            calls[ingress_at..]
+                .matches("az containerapp show --name app --resource-group rg --output json")
+                .count()
+                >= 3,
+            "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_on_a_custom_scale_rule_before_the_first_cutover() {
+        // Without ingress, only a custom scale rule can start the placeholder
+        // again. Then zero replicas is no proof, so the script stops first.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_SCALE_SECRET_REF", "queue-connection")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+        assert!(!calls.contains("ingress disable"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_checks_the_scale_rules_of_the_active_revision() {
+        // The template has only the HTTP rule now, but the active placeholder
+        // revision still has the custom rule. That rule can start it again.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_ACTIVE_SCALE_RULE", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(
+            calls.contains("--revision app--old --query properties.template.scale --output json"),
+            "{calls}"
+        );
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+        assert!(!calls.contains("ingress disable"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_uses_the_acr_registry_identity() {
+        // The job lists an operator-added registry before the ACR. The app
+        // must get the identity of the ACR registry.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_JOB_EXTRA_REGISTRY", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let cutover = bodies.lines().next().unwrap_or_default();
+        assert!(!cutover.contains("/other-id"), "{cutover}");
+        assert!(
+            cutover.contains("\"server\":\"acr.azurecr.io\",\"identity\":\"/subscriptions/s/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id\""),
+            "{cutover}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_rollback_keeps_external_ingress_that_was_open() {
+        // The placeholder had external ingress before the cutover. The
+        // rollback restores it as it was.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Failed",
+            false,
+            0,
+            &[("STUB_INGRESS_EXTERNAL", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let last = bodies.lines().last().unwrap_or_default();
+        assert!(last.contains("\"external\":true"), "{last}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_rollback_waits_for_its_own_cleanup_before_the_ingress() {
+        // Azure accepted the cutover PATCH, but the response was lost, and
+        // the first reads after each PATCH still show the state before it:
+        // the placeholder without credentials. That state does not prove
+        // that the cleanup applied. The rollback waits until the app shows
+        // the marker of its own cleanup PATCH, and only then sends the saved
+        // (open) ingress back.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_INGRESS_EXTERNAL", "1"),
+                ("STUB_CUTOVER_LOST", "1"),
+                ("STUB_PATCH_PENDING", "3"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let before_open = calls
+            .split("az ingress-patch external=true")
+            .next()
+            .unwrap_or_default();
+        assert!(before_open.len() < calls.len(), "{calls}");
+        let after_cleanup = before_open
+            .rsplit("az rest --method patch")
+            .nth(1)
+            .unwrap_or_else(|| panic!("{calls}"));
+        // Three stale reads, then the read that shows the cleanup.
+        assert!(
+            after_cleanup
+                .matches("az containerapp show --name app --resource-group rg --output json")
+                .count()
+                >= 4,
+            "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_restores_the_ingress_when_the_disable_reports_a_failure() {
+        // The disable can apply although az reports a failure (a lost
+        // response). The script stops before any other write, and sends the
+        // saved (open) ingress back, so the app does not stay offline. In
+        // both modes.
+        for (args, legacy) in [(&[][..], ""), (&["--remove-credentials"][..], "1")] {
+            let mut env = vec![
+                ("STUB_INGRESS_EXTERNAL", "1"),
+                ("STUB_INGRESS_DISABLE_LOST", "1"),
+            ];
+            if !legacy.is_empty() {
+                env.push(("STUB_APP_LEGACY", legacy));
+            }
+            let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+                args,
+                "mcr.microsoft.com/k8se/quickstart:latest",
+                "Provisioned",
+                false,
+                0,
+                &env,
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{args:?}: {calls}");
+            let after_disable = calls
+                .split("az containerapp ingress disable")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{args:?}: {calls}"));
+            assert!(
+                after_disable.contains("az ingress-patch external=true"),
+                "{args:?}: {calls}"
+            );
+            assert!(!bodies.contains("acr.azurecr.io/app:t1"), "{bodies}");
+            assert!(!bodies.contains("AUTUMN_CREDENTIAL_CLEANUP"), "{bodies}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_fails_when_it_cannot_remove_the_recovery_tags() {
+        // The release runs, but the tags with the ingress snapshot and the
+        // copied record stay. A later run would prefer that stale snapshot,
+        // so the run fails and says so. It does not roll the release back.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_TAGS_CLEAR_FAILS", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(calls.contains("az ingress-patch external=true"), "{calls}");
+        assert!(!bodies.contains("AUTUMN_CREDENTIAL_CLEANUP"), "{bodies}");
+        assert!(!bodies.contains("\"type\":\"None\""), "{bodies}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_restores_the_ingress_after_a_failed_first_cutover() {
+        // The first cutover disabled ingress. After the rollback removed the
+        // credentials, the saved ingress (still closed) comes back.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Failed",
+            false,
+            0,
+            &[],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let last = bodies.lines().last().unwrap_or_default();
+        assert!(last.contains("\"ingress\""), "{bodies}");
+        assert!(last.contains("\"external\":false"), "{last}");
+        assert!(last.contains("\"www.example.com\""), "{last}");
+        assert!(!calls.contains("ingress-patch external=true"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_for_activation_on_an_interrupted_retry() {
+        // An earlier first cutover made the real revision but was cut off
+        // before it became active. The same-tag retry must still wait until
+        // it is the only active one before ingress opens.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_ENV_FULL", "1"),
+                (
+                    "STUB_ACTIVE_IMAGE",
+                    "mcr.microsoft.com/k8se/quickstart:latest",
+                ),
+                ("STUB_LATEST", "app--real"),
+                ("STUB_ACTIVE_LAG", "2"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let patch_at = calls.find("az rest --method patch").unwrap();
+        let ingress_at = calls
+            .find("az ingress-patch external=true")
+            .unwrap_or_else(|| panic!("{calls}"));
+        assert!(
+            calls[patch_at..ingress_at]
+                .matches("az containerapp revision list")
+                .count()
+                >= 2,
+            "the retry must wait until the real revision is the only active one: {calls}"
+        );
+    }
+
+    /// The `az` calls after the first PATCH that read the full app.
+    #[cfg(unix)]
+    fn full_reads_after_patch(calls: &str) -> usize {
+        let patch_at = calls.find("az rest --method patch").unwrap_or(calls.len());
+        calls[patch_at..]
+            .matches("az containerapp show --name app --resource-group rg --output json")
+            .count()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_until_the_credentials_are_gone() {
+        // A PATCH can return 202 Accepted, and a GET can still show the old
+        // Succeeded state. The script must check that the change applied.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1"), ("STUB_PATCH_PENDING", "2")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(full_reads_after_patch(&calls) >= 3, "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_restarts_only_after_the_patch_applies() {
+        // A restart before the PATCH applies would keep the old secrets.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_LATEST", "app--old"),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_PATCH_PENDING", "2"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let restart_at = calls.find("revision restart").expect("restart");
+        assert!(full_reads_after_patch(&calls[..restart_at]) >= 3, "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_checks_the_registry_before_a_restart() {
+        // The stale GET already has the identity and secret names, but not
+        // the registry. A restart then could not pull the private image.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_LATEST", "app--old"),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_APP_NO_REGISTRY", "1"),
+                ("STUB_PATCH_PENDING", "2"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let restart_at = calls.find("revision restart").expect("restart");
+        assert!(full_reads_after_patch(&calls[..restart_at]) >= 3, "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_checks_the_secret_identity_before_a_restart() {
+        // The stale GET has the right secret names and Key Vault URLs, but
+        // an old identity. Key Vault refs need the right identity.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_LATEST", "app--old"),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_APP_STALE_SECRET_IDENTITY", "1"),
+                ("STUB_PATCH_PENDING", "2"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let restart_at = calls.find("revision restart").expect("restart");
+        assert!(full_reads_after_patch(&calls[..restart_at]) >= 3, "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_using_redis_before_terraform_removes_it() {
+        // To turn Redis off, the app must stop using it while the cache
+        // and the job's redis-url still exist. Terraform deletes them after.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--without-redis"],
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            true,
+            0,
+            &[("STUB_APP_REDIS", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let patches: Vec<&str> = bodies.lines().collect();
+        assert_eq!(patches.len(), 2, "{bodies}");
+        assert!(!patches[0].contains("AUTUMN_CACHE__"), "{}", patches[0]);
+        assert!(
+            patches[0].contains("\"redis-url\""),
+            "the old revision still uses redis-url: {}",
+            patches[0]
+        );
+        assert!(!patches[1].contains("\"redis-url\""), "{}", patches[1]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_sidecar_redis_refs_without_redis() {
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--without-redis"],
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            true,
+            0,
+            &[("STUB_APP_REDIS", "1"), ("STUB_SIDECAR_REDIS_REF", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let patches: Vec<&str> = bodies.lines().collect();
+        assert_eq!(patches.len(), 2, "{bodies}");
+        assert!(!patches[0].contains("SIDECAR_REDIS"), "{}", patches[0]);
+        assert!(!patches[1].contains("\"redis-url\""), "{}", patches[1]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_init_container_redis_refs_without_redis() {
+        // An init container env var refers to redis-url. The cutover removes
+        // it like a sidecar's, and keeps the init container.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--without-redis"],
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            true,
+            0,
+            &[
+                ("STUB_APP_REDIS", "1"),
+                ("STUB_INIT_SECRET_REF", "redis-url"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let patches: Vec<&str> = bodies.lines().collect();
+        assert_eq!(patches.len(), 2, "{bodies}");
+        assert!(!patches[0].contains("INIT_DB"), "{}", patches[0]);
+        assert!(patches[0].contains("\"migrate\""), "{}", patches[0]);
+        assert!(!patches[1].contains("\"redis-url\""), "{}", patches[1]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_without_redis_on_a_scale_rule_ref() {
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--without-redis"],
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            true,
+            0,
+            &[
+                ("STUB_APP_REDIS", "1"),
+                ("STUB_SCALE_SECRET_REF", "redis-url"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_without_redis_on_a_registry_password_ref() {
+        // A registry uses redis-url as its password. Removing the secret
+        // would break the registry, so the script stops before any write.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--without-redis"],
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            true,
+            0,
+            &[
+                ("STUB_APP_REDIS", "1"),
+                ("STUB_APP_REGISTRY_PASSWORD_REF", "redis-url"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_until_redis_url_is_gone() {
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_REDIS", "1"), ("STUB_PATCH_PENDING", "2")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let second_patch_at = calls.rfind("az rest --method patch").unwrap();
+        assert!(
+            full_reads_after_patch(&calls[second_patch_at..]) >= 3,
+            "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_redis_url_after_the_old_revision_stops() {
+        // Redis is off now. The old revision still refers to redis-url, so
+        // the secret stays until that revision is inactive.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_REDIS", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let patches: Vec<&str> = bodies.lines().collect();
+        assert_eq!(patches.len(), 2, "{bodies}");
+        assert!(patches[0].contains("\"redis-url\""), "{}", patches[0]);
+        assert!(
+            !patches[0].contains("AUTUMN_CACHE__REDIS__URL"),
+            "{}",
+            patches[0]
+        );
+        assert!(!patches[1].contains("\"redis-url\""), "{}", patches[1]);
+        assert!(patches[1].contains("\"signing-secret\""), "{}", patches[1]);
+        let first_patch_at = calls.find("az rest --method patch").unwrap();
+        let second_patch_at = calls.rfind("az rest --method patch").unwrap();
+        assert!(
+            calls[first_patch_at..second_patch_at].contains("az containerapp revision list"),
+            "the script must check the active revisions: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_sidecar_refs_before_the_secrets() {
+        // A sidecar env var also refers to a managed secret. Stage 1 must
+        // remove every reference, or Azure cannot delete the secret.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1"), ("STUB_SIDECAR_SECRET_REF", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let stage1 = bodies.lines().next().unwrap_or_default();
+        assert!(!stage1.contains("database-url"), "{stage1}");
+        assert!(stage1.contains("\"sidecar\""), "{stage1}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_init_container_refs_before_the_secrets() {
+        // An init container env var also refers to a managed secret. Stage 1
+        // removes it like a container's, and keeps the init container.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1"), ("STUB_INIT_SECRET_REF", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let stage1 = bodies.lines().next().unwrap_or_default();
+        assert!(!stage1.contains("database-url"), "{stage1}");
+        assert!(stage1.contains("\"migrate\""), "{stage1}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_on_a_scale_rule_secret_ref() {
+        // The script cannot remove a scale rule's secret ref by itself
+        // without changing what the app does. It stops before any write.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_SCALE_SECRET_REF", "database-url"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_credentials_after_a_canceled_first_cutover() {
+        // The template has the real image, but the placeholder revision is
+        // still the active one.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                (
+                    "STUB_ACTIVE_IMAGE",
+                    "mcr.microsoft.com/k8se/quickstart:latest",
+                ),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_deletes_secrets_only_when_no_other_revision_is_active() {
+        // After a canceled first cutover, the latest revision is the failed
+        // one, but the placeholder is the active one. Stage 2 must wait
+        // until only the stage 1 revision is active.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                (
+                    "STUB_ACTIVE_IMAGE",
+                    "mcr.microsoft.com/k8se/quickstart:latest",
+                ),
+                ("STUB_ACTIVE_LAG", "2"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let first_patch = calls.find("az rest --method patch").unwrap();
+        let second_patch = calls.rfind("az rest --method patch").unwrap();
+        assert!(first_patch < second_patch, "{calls}");
+        assert!(
+            calls[first_patch..second_patch]
+                .matches("az containerapp revision list")
+                .count()
+                >= 3,
+            "stage 2 must wait until the old revision is inactive: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_cleans_up_from_the_active_placeholder_template() {
+        // After a canceled first cutover, the app template has the real
+        // image, but the active revision runs the placeholder. Stage 1 must
+        // deploy the placeholder: the real image cannot start without its
+        // signing secret.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                (
+                    "STUB_ACTIVE_IMAGE",
+                    "mcr.microsoft.com/k8se/quickstart:latest",
+                ),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let stage1 = bodies.lines().next().unwrap_or_default();
+        assert!(
+            stage1.contains("\"mcr.microsoft.com/k8se/quickstart:latest\""),
+            "{stage1}"
+        );
+        assert!(!stage1.contains("acr.azurecr.io/app:t1"), "{stage1}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_retries_an_interrupted_credential_removal() {
+        // An earlier --remove-credentials run sent its stage 1 PATCH: the
+        // template is clean, but the active revision still refers to the
+        // secrets. The retry must wait for the clean revision first.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_APP_TEMPLATE_CLEAN", "1"),
+                ("STUB_ACTIVE_HAS_REFS", "1"),
+                ("STUB_LATEST", "app--clean"),
+                ("STUB_ACTIVE_LAG", "3"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        // The ingress restore after the removal is not a credential PATCH.
+        let credential: Vec<&str> = bodies
+            .lines()
+            .filter(|line| !line.contains("\"ingress\""))
+            .collect();
+        assert_eq!(credential.len(), 1, "{bodies}");
+        assert!(!credential[0].contains("\"template\""), "{bodies}");
+        let patch_at = calls.find("az rest --method patch").unwrap();
+        assert!(
+            calls[..patch_at]
+                .matches("az containerapp revision list")
+                .count()
+                >= 4,
+            "stage 2 must wait until the clean revision is the only active one: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_for_a_scale_rule_ref_on_the_active_revision() {
+        // The operator removed the secret ref from the scale rule. The
+        // template is clean, but the active placeholder revision still has
+        // the ref, so Azure cannot delete the secret yet. Stage 1 must wait
+        // until the clean revision is the only active one.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_APP_TEMPLATE_CLEAN", "1"),
+                ("STUB_ACTIVE_SCALE_REF", "1"),
+                ("STUB_LATEST", "app--clean"),
+                ("STUB_ACTIVE_LAG", "3"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(
+            calls.contains("--revision app--old --query properties.template --output json"),
+            "{calls}"
+        );
+        let patch_at = calls.find("az rest --method patch").unwrap();
+        assert!(
+            calls[..patch_at]
+                .matches("az containerapp revision list")
+                .count()
+                >= 4,
+            "stage 2 must wait until the clean revision is the only active one: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_for_a_scale_rule_identity_on_the_active_revision() {
+        // The operator removed the scale rule that uses the job identity.
+        // The template is clean, but the active placeholder revision still
+        // has the rule. Stage 2 must wait until the clean revision is the
+        // only active one before it removes the identity.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_APP_TEMPLATE_CLEAN", "1"),
+                ("STUB_ACTIVE_SCALE_IDENTITY", "1"),
+                ("STUB_LATEST", "app--clean"),
+                ("STUB_ACTIVE_LAG", "3"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let patch_at = calls.find("az rest --method patch").unwrap();
+        assert!(
+            calls[..patch_at]
+                .matches("az containerapp revision list")
+                .count()
+                >= 4,
+            "stage 2 must wait until the clean revision is the only active one: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_closes_ingress_while_it_removes_credentials() {
+        // An older placeholder with credentials can have open ingress. The
+        // removal disables ingress first (after it saves it in the tags),
+        // and sends it back only after the credentials are gone.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1"), ("STUB_INGRESS_EXTERNAL", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let save_at = calls.find("az tags-patch ").expect("save");
+        let disable_at = calls.find("ingress disable").expect("disable");
+        let first_patch = calls.find("az rest --method patch").expect("patch");
+        let restore_at = calls
+            .find("az ingress-patch external=true")
+            .expect("restore");
+        assert!(save_at < disable_at && disable_at < first_patch, "{calls}");
+        assert!(
+            calls.rfind("az rest --method patch").unwrap() < restore_at,
+            "{calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_keeps_ingress_closed_when_the_removal_fails() {
+        // A failed removal leaves credentials on the app, so ingress stays
+        // disabled; the tags keep the snapshot for the next run.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_INGRESS_EXTERNAL", "1"),
+                ("STUB_SCALE_SECRET_REF", "database-url"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(calls.contains("ingress disable"), "{calls}");
+        assert!(!calls.contains("az ingress-patch external=true"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_records_the_copied_credentials_for_a_rollback() {
+        // The first cutover records what it copies in tags, in the same
+        // PATCH; a successful cutover removes them again.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let cutover = bodies
+            .lines()
+            .find(|line| line.contains("\"template\""))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(cutover.contains("\"autumn-copied-0\":\""), "{cutover}");
+        let last = calls
+            .lines()
+            .rfind(|line| line.starts_with("az tags-patch "))
+            .unwrap_or_default();
+        assert!(last.contains("\"autumn-copied-0\":null"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_the_recorded_credentials() {
+        // An interrupted first cutover copied queue-key on /kv-id-2, and the
+        // job no longer has them. The tags still name them, so the removal
+        // takes them off too.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1"), ("STUB_APP_COPIED", "1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let stage2 = bodies
+            .lines()
+            .rfind(|line| line.contains("\"secrets\""))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(!stage2.contains("queue-key"), "{stage2}");
+        assert!(!stage2.contains("\"/kv-id-2\":{}"), "{stage2}");
+        assert!(stage2.contains("\"autumn-copied-0\":null"), "{stage2}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_removes_a_legacy_identity_of_the_managed_credentials() {
+        // The older placeholder's managed secrets and ACR entry use /old-id,
+        // which the job no longer uses. That identity can still read the
+        // vault, so the removal drops it with its ACR entry.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1"), ("STUB_APP_LEGACY_ID", "/old-id")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let stage2 = bodies
+            .lines()
+            .rfind(|line| line.contains("\"secrets\""))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(!stage2.contains("\"/old-id\":{}"), "{stage2}");
+        assert!(stage2.contains("\"registries\":[]"), "{stage2}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_closes_ingress_again_before_a_rollback() {
+        // A first-cutover retry takes the restart path and opens ingress.
+        // If the restart fails, the rollback must close ingress again
+        // before it changes the template back to the placeholder.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                (
+                    "STUB_ACTIVE_IMAGE",
+                    "mcr.microsoft.com/k8se/quickstart:latest",
+                ),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_LATEST", "app--old"),
+                ("STUB_RESTART_UNREADY", "1"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let restart_at = calls.find("revision restart").expect("restart");
+        let after = &calls[restart_at..];
+        let disable_at = after
+            .find("ingress disable")
+            .unwrap_or_else(|| panic!("the rollback must close ingress: {calls}"));
+        if let Some(patch_at) = after.find("az rest --method patch") {
+            assert!(disable_at < patch_at, "{calls}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_reads_every_active_placeholder_before_cleanup() {
+        // Two placeholder revisions are active; only the second one still
+        // refers to the secrets. Stage 1 must wait for the clean revision.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_APP_TEMPLATE_CLEAN", "1"),
+                ("STUB_TWO_PLACEHOLDERS", "1"),
+                ("STUB_LATEST", "app--clean"),
+                ("STUB_ACTIVE_LAG", "3"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(
+            calls.contains("--revision app--old2 --query properties.template --output json"),
+            "{calls}"
+        );
+        let patch_at = calls.find("az rest --method patch").unwrap();
+        assert!(
+            calls[..patch_at]
+                .matches("az containerapp revision list")
+                .count()
+                >= 4,
+            "stage 2 must wait until the clean revision is the only active one: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_rollback_closes_ingress_after_a_lost_open_response() {
+        // Azure accepts the PATCH that opens ingress, but the script gets no
+        // answer. The outcome is unknown, so a rollback must close ingress
+        // again before it brings the placeholder template back.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_INGRESS_OPEN_LOST", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let open_at = calls
+            .find("az ingress-patch external=true")
+            .expect("an open");
+        let after = &calls[open_at..];
+        let disable_at = after
+            .find("ingress disable")
+            .unwrap_or_else(|| panic!("the rollback must close ingress: {calls}"));
+        let patch_at = after[1..]
+            .find("az rest --method patch")
+            .map_or(usize::MAX, |i| i + 1);
+        assert!(disable_at < patch_at, "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_when_the_snapshots_exceed_the_tag_limit() {
+        // Azure allows 50 tags. 50 of the operator's own leave no room for
+        // the ingress snapshot (and, on a first cutover, the copied record),
+        // so the script stops before any write, in both modes.
+        for args in [&[][..], &["--remove-credentials"][..]] {
+            let Some((status, calls, _)) = run_azure_cutover_with_args(
+                args,
+                "mcr.microsoft.com/k8se/quickstart:latest",
+                "Provisioned",
+                false,
+                0,
+                &[("STUB_APP_TAG_COUNT", "50"), ("STUB_APP_LEGACY", "1")],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{args:?}: {calls}");
+            assert!(!calls.contains("az tags-patch"), "{args:?}: {calls}");
+            assert!(!calls.contains("ingress disable"), "{args:?}: {calls}");
+            assert!(
+                !calls.contains("az rest --method patch"),
+                "{args:?}: {calls}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_fits_the_snapshots_into_the_tag_limit() {
+        // 48 own tags, one ingress part and one copied part: 50 tags fit.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_TAG_COUNT", "48")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_rollback_stops_when_ingress_cannot_close() {
+        // The restart failed after this run opened ingress, and the disable
+        // fails too. Stage 1 would put the placeholder behind open ingress
+        // while the identity is still attached, so the rollback stops.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                (
+                    "STUB_ACTIVE_IMAGE",
+                    "mcr.microsoft.com/k8se/quickstart:latest",
+                ),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_LATEST", "app--old"),
+                ("STUB_RESTART_UNREADY", "1"),
+                ("STUB_INGRESS_DISABLE_FAILS", "1"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let restart_at = calls.find("revision restart").expect("restart");
+        let after = &calls[restart_at..];
+        let disable_at = after.find("ingress disable").expect("a disable");
+        assert!(
+            !after[disable_at..].contains("az rest --method patch"),
+            "no rollback PATCH after a failed disable: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_fails_when_ingress_does_not_come_back_after_removal() {
+        // The credentials are gone, but the ingress PATCH fails. The app is
+        // unreachable, so the run must not report success.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_INGRESS_EXTERNAL", "1"),
+                ("STUB_INGRESS_OPEN_LOST", "1"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(calls.contains("az ingress-patch external=true"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_writes_a_copied_record_of_more_than_40_parts() {
+        // A large copied record (over 40 parts) still fits the 50-tag
+        // budget. The cutover writes it, instead of stopping after ingress
+        // is disabled.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_COPIED_BIG", "250")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let cutover = bodies
+            .lines()
+            .find(|line| line.contains("\"template\""))
+            .unwrap_or_else(|| panic!("{bodies}"));
+        assert!(cutover.contains("\"autumn-copied-40\""), "{cutover}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_refuses_removal_while_a_real_revision_is_active() {
+        // During a handoff, a real revision and the placeholder are both
+        // active. The real revision needs the credentials, so standalone
+        // removal stops before any write.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1"), ("STUB_ACTIVE_BOTH", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("az tags-patch"), "{calls}");
+        assert!(!calls.contains("ingress disable"), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_waits_for_a_rotated_inline_secret_before_a_restart() {
+        // The job's inline secret got a new value; image and env stay. The
+        // app GET has no secret values, so it looks applied at once. The
+        // script must see the new value in the secret list before it
+        // restarts the revision.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t1",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_LATEST", "app--old"),
+                ("STUB_APP_ENV_FULL", "1"),
+                ("STUB_JOB_INLINE_SECRET", "1"),
+                ("STUB_INLINE_STALE", "3"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let patch_at = calls.find("az rest --method patch").expect("a PATCH");
+        let restart_at = calls.find("revision restart").expect("a restart");
+        assert!(
+            calls[patch_at..restart_at]
+                .matches("az containerapp secret list")
+                .count()
+                >= 4,
+            "the restart must wait for the new value: {calls}"
+        );
+        // The value never goes on a command line.
+        assert!(!calls.contains("tok-old"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_when_a_registry_password_is_a_managed_secret() {
+        // An operator registry authenticates with a managed secret
+        // (passwordSecretRef). Removal would delete that secret, so the
+        // script stops before any write, in both modes.
+        for args in [&[][..], &["--remove-credentials"][..]] {
+            let Some((status, calls, _)) = run_azure_cutover_with_args(
+                args,
+                "mcr.microsoft.com/k8se/quickstart:latest",
+                "Provisioned",
+                false,
+                0,
+                &[
+                    ("STUB_APP_LEGACY", "1"),
+                    ("STUB_APP_REGISTRY_PASSWORD_REF", "1"),
+                ],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{args:?}: {calls}");
+            assert!(!calls.contains("az tags-patch"), "{args:?}: {calls}");
+            assert!(!calls.contains("ingress disable"), "{args:?}: {calls}");
+            assert!(
+                !calls.contains("az rest --method patch"),
+                "{args:?}: {calls}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_when_a_sidecar_pulls_from_the_acr() {
+        // A sidecar pulls its image from the same ACR. Removal drops the
+        // ACR registry entry, so the sidecar could not pull again; the
+        // script stops before any write, in both modes.
+        for args in [&[][..], &["--remove-credentials"][..]] {
+            let Some((status, calls, _)) = run_azure_cutover_with_args(
+                args,
+                "mcr.microsoft.com/k8se/quickstart:latest",
+                "Provisioned",
+                false,
+                0,
+                &[("STUB_APP_LEGACY", "1"), ("STUB_SIDECAR_ACR", "1")],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{args:?}: {calls}");
+            assert!(!calls.contains("az tags-patch"), "{args:?}: {calls}");
+            assert!(!calls.contains("ingress disable"), "{args:?}: {calls}");
+            assert!(
+                !calls.contains("az rest --method patch"),
+                "{args:?}: {calls}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_rejects_a_revision_with_rewritten_secret_refs() {
+        // Azure can provision a revision whose secret refs point at a secret
+        // the app does not have. The script checks the new revision's env
+        // before it trusts it: a first cutover fails and rolls back, and
+        // ingress never opens.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_REVISION_REWRITTEN", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("az ingress-patch external=true"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_rejects_a_revision_with_rewritten_init_container_refs() {
+        // The same rewrite in an init container: the revision cannot start
+        // either, so the check covers init containers too.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_REVISION_INIT_REWRITTEN", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("az ingress-patch external=true"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_stops_when_an_active_placeholder_has_an_acr_sidecar() {
+        // The template no longer has the ACR sidecar, but the active
+        // placeholder revision does, and stage 1 starts from that revision.
+        // The script stops before any write, in both modes.
+        for args in [&[][..], &["--remove-credentials"][..]] {
+            let Some((status, calls, _)) = run_azure_cutover_with_args(
+                args,
+                "mcr.microsoft.com/k8se/quickstart:latest",
+                "Provisioned",
+                false,
+                0,
+                &[("STUB_APP_LEGACY", "1"), ("STUB_ACTIVE_SIDECAR_ACR", "1")],
+            ) else {
+                return;
+            };
+            assert!(!status.success(), "{args:?}: {calls}");
+            assert!(!calls.contains("az tags-patch"), "{args:?}: {calls}");
+            assert!(!calls.contains("ingress disable"), "{args:?}: {calls}");
+            assert!(
+                !calls.contains("az rest --method patch"),
+                "{args:?}: {calls}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_opens_ingress_only_when_the_placeholder_is_inactive() {
+        // Provisioned is not ready: Azure keeps the placeholder active until
+        // the new revision scales and passes its probes. Ingress then could
+        // wake the placeholder, which now has the identity and secrets.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_ACTIVE_LAG", "2")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let patch_at = calls.find("az rest --method patch").unwrap();
+        let ingress_at = calls
+            .find("az ingress-patch external=true")
+            .unwrap_or_else(|| panic!("{calls}"));
+        assert!(
+            calls[patch_at..ingress_at]
+                .matches("az containerapp revision list")
+                .count()
+                >= 3,
+            "ingress must wait until the new revision is the only active one: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_retries_after_a_failed_cleanup_revision() {
+        // An earlier run sent the stage 1 PATCH, and its clean revision
+        // failed. The template is clean, so the retry must force a fresh
+        // revision instead of waiting on the failed one forever.
+        let Some((status, calls, bodies)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Provisioned",
+            false,
+            0,
+            &[
+                ("STUB_APP_LEGACY", "1"),
+                ("STUB_APP_TEMPLATE_CLEAN", "1"),
+                ("STUB_ACTIVE_HAS_REFS", "1"),
+                ("STUB_LATEST_FAILED", "app--clean"),
+            ],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        // The ingress restore after the removal is not a credential PATCH.
+        let patches: Vec<&str> = bodies
+            .lines()
+            .filter(|line| !line.contains("\"ingress\""))
+            .collect();
+        assert_eq!(patches.len(), 2, "{bodies}");
+        assert!(
+            patches[0].contains("AUTUMN_CREDENTIAL_CLEANUP"),
+            "the template must change, so Azure makes a new revision: {}",
+            patches[0]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_reports_a_later_deploy_only_when_it_serves() {
+        // Provisioned is not ready. Until the new revision is the only active
+        // one, the old image still serves, so the deploy is not done yet.
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_ACTIVE_LAG", "2")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        let patch_at = calls.find("az rest --method patch").unwrap();
+        assert!(
+            calls[patch_at..]
+                .matches("az containerapp revision list")
+                .count()
+                >= 3,
+            "a later deploy must wait until the new revision is the only active one: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_keeps_credentials_on_a_release_from_another_registry() {
+        // A real release can come from GHCR or Docker Hub. Only the bootstrap
+        // image is the placeholder.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "ghcr.io/acme/app:v1",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_treats_a_release_from_another_registry_as_released() {
+        let Some((status, calls, _)) =
+            run_azure_cutover("ghcr.io/acme/app:v1", "Provisioned", false, 0, &[])
+        else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(
+            !calls.contains("ingress disable"),
+            "a real release keeps serving: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_honors_a_custom_bootstrap_image() {
+        let Some((status, calls, _)) = run_azure_cutover(
+            "example.io/placeholder:1",
+            "Provisioned",
+            false,
+            0,
+            &[("AZURE_BOOTSTRAP_IMAGE", "example.io/placeholder:1")],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(calls.contains("ingress disable"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_retries_a_canceled_first_cutover_as_a_first_cutover() {
+        let Some((status, calls, _)) = run_azure_cutover(
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[(
+                "STUB_ACTIVE_IMAGE",
+                "mcr.microsoft.com/k8se/quickstart:latest",
+            )],
+        ) else {
+            return;
+        };
+        assert!(status.success(), "{calls}");
+        assert!(calls.contains("ingress disable"), "{calls}");
+        assert!(
+            calls.contains("replica list --name app --resource-group rg --revision app--old"),
+            "the script must wait for the active placeholder revision: {calls}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_keeps_credentials_on_a_released_app() {
+        // A real release needs its credentials.
+        let Some((status, calls, _)) = run_azure_cutover_with_args(
+            &["--remove-credentials"],
+            "acr.azurecr.io/app:t0",
+            "Provisioned",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        assert!(!calls.contains("az rest --method patch"), "{calls}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_rollback_removes_the_job_identity_next_to_an_own_one() {
+        // The pre-cutover app has only its own identity. Merge-patch keeps
+        // an omitted key, so the rollback must set the job identity to null.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Failed",
+            false,
+            0,
+            &[("STUB_APP_OWN_IDENTITY", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let rollback = credentials_body(&bodies);
+        assert!(
+            rollback.contains(
+                "\"/subscriptions/s/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id\":null"
+            ),
+            "the rollback must remove the job identity: {rollback}"
+        );
+        assert!(
+            rollback.contains("\"/other\":{}"),
+            "the rollback must keep the own identity: {rollback}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn azure_cutover_script_rollback_removes_legacy_credentials() {
+        // A failed first cutover of an app made by the old template must
+        // not put the job's credentials back.
+        let Some((status, calls, bodies)) = run_azure_cutover(
+            "mcr.microsoft.com/k8se/quickstart:latest",
+            "Failed",
+            false,
+            0,
+            &[("STUB_APP_LEGACY", "1")],
+        ) else {
+            return;
+        };
+        assert!(!status.success(), "{calls}");
+        let rollback = credentials_body(&bodies);
+        assert!(rollback.contains("\"type\":\"None\""), "{rollback}");
+        assert!(
+            !rollback.contains("signing-secret")
+                && !rollback.contains("AUTUMN_DATABASE__PRIMARY_URL"),
+            "{rollback}"
+        );
+    }
+
+    #[test]
+    fn azure_workflow_runs_the_cutover_script_after_migrations() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::AzureContainerApps, false).unwrap();
         let workflow = fs::read_to_string(dir.join(".github/workflows/azure-deploy.yml")).unwrap();
-        // Match the invocation (with its line continuation), not the bare
-        // text an earlier concurrency comment also contains.
-        let update_at = workflow
-            .find("az containerapp update \\")
-            .expect("workflow must cut over via az containerapp update");
-        let enable_at = workflow
-            .find("az containerapp ingress enable")
-            .expect("workflow must enable external ingress at cutover");
+        let migrate_at = workflow
+            .find("az containerapp job start \\")
+            .expect("workflow must start the migration job");
+        let cutover_at = workflow
+            .find("run: bash azure-cutover.sh")
+            .expect("workflow must run the cutover script");
+        assert!(migrate_at < cutover_at);
         assert!(
-            enable_at > update_at,
-            "ingress must open AFTER the real image is deployed, not before: {workflow}"
+            workflow.contains("AZURE_BOOTSTRAP_IMAGE: ${{ vars.AZURE_BOOTSTRAP_IMAGE }}"),
+            "the workflow must pass a custom bootstrap image: {workflow}"
         );
-        assert!(
-            workflow.contains("--type external"),
-            "the cutover must open external (public) ingress: {workflow}"
-        );
+        let cutover_step = &workflow[cutover_at..];
+        let cutover_step = cutover_step
+            .split("\n      - name:")
+            .next()
+            .unwrap_or(cutover_step);
+        for split in [
+            "az containerapp identity assign",
+            "az containerapp registry set",
+            "az containerapp secret set",
+            "az containerapp update \\",
+            "az containerapp ingress enable",
+        ] {
+            assert!(
+                !workflow.contains(split),
+                "only azure-cutover.sh may write the app: {split}"
+            );
+        }
+        for var in [
+            "AZURE_APP_NAME:",
+            "AZURE_RESOURCE_GROUP:",
+            "AZURE_MIGRATE_JOB_NAME:",
+            "ACR_LOGIN_SERVER:",
+            "IMAGE_TAG:",
+        ] {
+            assert!(
+                cutover_step.contains(var),
+                "the cutover step must pass {var}: {cutover_step}"
+            );
+        }
     }
 
     #[test]
@@ -3223,9 +7115,8 @@ previous_secrets = []
             "azure-deploy.yml must push to the Azure Container Registry: {content}"
         );
         assert!(
-            content.contains("az containerapp update")
-                || content.contains("containerapps-deploy-action"),
-            "azure-deploy.yml must deploy the new image to the Container App: {content}"
+            content.contains("run: bash azure-cutover.sh"),
+            "azure-deploy.yml must deploy the new image with the cutover script: {content}"
         );
     }
 
@@ -3380,15 +7271,12 @@ previous_secrets = []
             "azure-deploy.yml must reference the migration job by its Terraform output: {content}"
         );
 
-        // Match the actual invocations (with their line-continuation
-        // backslash), not just the bare phrase — an explanatory comment
-        // elsewhere (e.g. about concurrency) may legitimately mention
-        // "az containerapp update" in prose without a trailing "\".
+        // Match the actual invocations, not prose in a comment.
         let job_pos = content
             .find("az containerapp job start \\")
             .expect("migration job start must be present");
         let deploy_pos = content
-            .find("az containerapp update \\")
+            .find("run: bash azure-cutover.sh")
             .expect("deploy step must be present");
         assert!(
             job_pos < deploy_pos,
@@ -3539,7 +7427,7 @@ previous_secrets = []
     fn azure_workflow_serializes_overlapping_runs() {
         // Two overlapping runs (e.g. two rapid tag pushes, or a tag push
         // racing a manual dispatch) must not interleave: the older run's
-        // later `az containerapp update` could execute after the newer one
+        // later cutover (`azure-cutover.sh`) could run after the newer one
         // and roll production back.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
@@ -3607,7 +7495,7 @@ previous_secrets = []
             .find("az containerapp job start \\")
             .expect("migration job start must be present");
         let deploy_pos = content
-            .find("az containerapp update \\")
+            .find("run: bash azure-cutover.sh")
             .expect("deploy step must be present");
         assert!(
             guard_pos < job_pos && job_pos < deploy_pos,

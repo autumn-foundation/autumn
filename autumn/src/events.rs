@@ -176,7 +176,7 @@ pub struct EventRecorder {
 }
 
 impl EventRecorder {
-    fn record(&self, event_name: &'static str, payload: Value) {
+    pub(crate) fn record(&self, event_name: &'static str, payload: Value) {
         self.events
             .lock()
             .expect("event recorder lock poisoned")
@@ -264,6 +264,28 @@ impl Events {
             payload,
         )
         .await
+    }
+
+    /// Publish through the transactional outbox, on the connection of the
+    /// open transaction (issue #3062).
+    ///
+    /// Durable listeners run only if the transaction commits, and a crash
+    /// after commit cannot drop them. Needs `outbox.enabled = true`. See
+    /// [`Outbox::publish`](crate::outbox::Outbox::publish).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the event does not serialize or the outbox
+    /// insert fails.
+    #[cfg(feature = "db")]
+    pub async fn publish_in_tx<E: Event>(
+        &self,
+        conn: &mut crate::db::RuntimeConnection,
+        event: E,
+    ) -> AutumnResult<()> {
+        crate::outbox::Outbox::new(&self.state)
+            .publish(conn, &event)
+            .await
     }
 }
 
@@ -367,7 +389,11 @@ async fn dispatch(
 /// log-correlated. It also ties the listeners to the publish future's lifecycle,
 /// so cancelling the request (timeout, disconnect) cancels the listeners instead
 /// of leaving detached tasks running after the response is abandoned.
-async fn run_sync_listeners(state: &AppState, listeners: &[ListenerInfo], payload: &Value) {
+pub(crate) async fn run_sync_listeners(
+    state: &AppState,
+    listeners: &[ListenerInfo],
+    payload: &Value,
+) {
     use futures::FutureExt as _;
 
     let runs = listeners

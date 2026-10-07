@@ -3984,17 +3984,20 @@ fn build_load_shed_layer(
     config: &AutumnConfig,
     state: &AppState,
 ) -> Option<crate::middleware::LoadShedLayer> {
-    // The ceiling is either hand-set or sourced from the committed capacity
-    // contract (#1733). `resolve_admission_limit` owns that precedence — and
-    // owns failing *open* on every contract problem, so a stale or missing
-    // lockfile can never shed every request on the way up.
-    let resolved = crate::capacity::resolve_configured_admission_limit(
+    // The ceiling is either hand-set, sourced from the committed capacity
+    // contract (#1733), or the profile default (`prod`, #3057).
+    // `resolve_admission_limit_with_default` owns that precedence — and owns
+    // falling back to the profile default (never to a lower ceiling) on every
+    // contract problem, so a stale or missing lockfile can never shed every
+    // request on the way up.
+    let resolved = crate::capacity::resolve_configured_admission_limit_with_default(
         config.server.max_concurrent_requests,
         config.server.capacity_contract.as_deref(),
+        config.profile_admission_default(),
     );
     let limit = resolved.limit()?;
-    if matches!(resolved, crate::capacity::AdmissionLimit::Contract(_)) {
-        tracing::info!(
+    match resolved {
+        crate::capacity::AdmissionLimit::Contract(_) => tracing::info!(
             limit,
             source = resolved.source(),
             contract = config
@@ -4003,7 +4006,14 @@ fn build_load_shed_layer(
                 .as_deref()
                 .unwrap_or_default(),
             "admission control sourced from the committed capacity contract"
-        );
+        ),
+        crate::capacity::AdmissionLimit::ProfileDefault(_) => tracing::info!(
+            limit,
+            source = resolved.source(),
+            "admission control uses the profile default ceiling; set \
+             server.max_concurrent_requests to tune it, or 0 to turn it off"
+        ),
+        _ => {}
     }
     // Mirror CORS headers onto a shed 503 the same way the timeout middleware
     // does for the main stack (`mirror_cors = true` there): this layer sits
@@ -5270,6 +5280,23 @@ fn apply_middleware(
         axum::middleware::from_fn_with_state(state.clone(), crate::tenancy::tenancy_middleware)
     });
 
+    // `SET LOCAL` timeouts for transactions a handler opens on a connection of
+    // its own, such as a generated repository (#3057). `Db::tx` scopes its own
+    // values. A route's `StatementTimeout` reaches this scope through the
+    // extractors (`db::note_route_statement_timeout`), so the layer is on even
+    // when no global timeout is set.
+    #[cfg(all(feature = "db", not(feature = "sqlite")))]
+    let tx_timeouts_layer = {
+        let timeouts = crate::db::TxTimeouts::from_config(&config.database);
+        Some(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                timeouts.scope_request(next.run(req))
+            },
+        ))
+    };
+    #[cfg(not(all(feature = "db", not(feature = "sqlite"))))]
+    let tx_timeouts_layer: Option<tower::layer::util::Identity> = None;
+
     // `security_headers` is applied later as the framework's outermost layer, by
     // `build_router_pre_state` after the gate, so a gate short-circuit still
     // carries HSTS/CSP/nosniff. RequestId stays here, inner to session, so the
@@ -5289,6 +5316,7 @@ fn apply_middleware(
         reporting_layer,
         tower::util::option_layer(timeout_layer),
         tower::util::option_layer(tenancy_layer),
+        tower::util::option_layer(tx_timeouts_layer),
         build_trusted_proxies_layer(config),
     );
 
@@ -6880,6 +6908,35 @@ mod tests {
         AppState {
             profile: Some("test".into()),
             ..AppState::test_default()
+        }
+    }
+
+    // ── #3057: the prod profile turns load shedding on ───────────────────────
+
+    #[test]
+    fn prod_profile_installs_the_load_shed_layer() {
+        let mut config = AutumnConfig {
+            profile: Some("prod".into()),
+            ..AutumnConfig::default()
+        };
+        assert!(build_load_shed_layer(&config, &test_state()).is_some());
+
+        // `0` turns it off.
+        config.server.max_concurrent_requests = Some(0);
+        assert!(build_load_shed_layer(&config, &test_state()).is_none());
+    }
+
+    #[test]
+    fn other_profiles_leave_load_shedding_off() {
+        for profile in ["dev", "staging"] {
+            let config = AutumnConfig {
+                profile: Some(profile.into()),
+                ..AutumnConfig::default()
+            };
+            assert!(
+                build_load_shed_layer(&config, &test_state()).is_none(),
+                "{profile}"
+            );
         }
     }
 

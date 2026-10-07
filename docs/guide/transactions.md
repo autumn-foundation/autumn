@@ -162,6 +162,34 @@ attributes):
   want to serialize writers explicitly with `SELECT … FOR UPDATE` and avoid
   wasted retry work.
 
+## Timeouts inside a transaction
+
+When `database.statement_timeout` or `database.idle_in_transaction_timeout` is
+set, each outermost framework transaction starts with:
+
+```sql
+SET LOCAL statement_timeout = 30000;
+SET LOCAL idle_in_transaction_session_timeout = 60000
+```
+
+This covers `db.tx`, `db.tx_with`, `db.tx_immediate`, and repository writes in
+a request, a `#[scheduled]` task, a job, an after-commit callback, and the
+`offline-sync` push and pull. A task you start yourself with `tokio::spawn`
+does not inherit them: a repository used there keeps the session
+`statement_timeout` it sets on checkout, but not the `SET LOCAL` pair. Await
+the repository call in the handler, or use `db.tx` inside the task. A
+transaction opened with diesel's `AsyncConnection::transaction` on a
+connection taken from the pool directly is not covered either. That includes
+the `autumn-billing` database store (`DbBillingStore`), so its webhook and
+dunning writes keep the role or database defaults. A savepoint keeps the outer values. A transaction pooler
+(`PgBouncer` in transaction mode) keeps a `SET LOCAL`, but drops a session
+`SET`. The `prod` profile sets `30s` and `60s` (#3057). A route's
+`StatementTimeout` extension replaces the statement value for the
+transactions of that request. An unset statement timeout is sent as `0`, the
+same value `Db` and repositories set for the session when none is configured.
+An unset idle timeout is sent as `DEFAULT`, so a role or database default
+stays in effect. When neither value is set, no extra statement is sent.
+
 ## Nesting policy
 
 Nested `Db::tx` / `Db::tx_with` calls are **rejected at runtime**:

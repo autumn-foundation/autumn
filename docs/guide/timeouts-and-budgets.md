@@ -49,7 +49,7 @@ These framework calls use the deadline:
 | Call | What it does with the time left |
 |---|---|
 | Outbound `Client` | Each attempt uses `min(timeout_secs, time left)`. It does not start a retry, a backoff or a `Retry-After` wait that the time left cannot hold. When the deadline stops the call, it returns `ClientError::DeadlineExceeded` (`504` through `?`). The circuit breaker counts it as a cancelled call, not a failure: nothing, unless the call ran past the slow-call threshold. |
-| `Db` extractor | The wait for a pool connection stops at the deadline (`503`). `statement_timeout` does not change, because it stays on the pooled connection. |
+| `Db` extractor | The wait for a pool connection stops at the deadline (`503`). A query that is already running is not cut at the deadline: `database.statement_timeout` (`30s` under `prod`) bounds it. |
 
 When a handler returns `ClientError::DeadlineExceeded` or
 `deadline::DeadlineExceeded`, the `504` is treated like a request the timeout

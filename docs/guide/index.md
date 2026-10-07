@@ -128,6 +128,7 @@ Looking for the API reference instead? That is
 - [One-Off Tasks](tasks.md) — `#[task]` and `autumn task`, for work you run by hand
 - [Multi-Replica Scheduled Tasks](scheduled-multi-replica.md) — running a cron job exactly once across several replicas
 - [Events and Listeners](events.md) — `#[event]` / `#[listener]`, for decoupling one action from its consequences
+- [Transactional Outbox and Inbox](outbox.md) — sending work after commit without losing it, and dropping the copies
 - [Distributed Locks](distributed-locks.md) — making sure only one process does a thing at a time
 
 ## Realtime and messaging

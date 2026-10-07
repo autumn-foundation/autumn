@@ -945,7 +945,8 @@ impl Sim {
     ///
     /// Returns [`SimStall`] when the drain never sees 64 quiet rounds in a row
     /// within 2048 rounds. A round is quiet when no job starts, no scheduled
-    /// tick fires, no commit hook drains and the task count does not change.
+    /// tick fires, no commit hook or outbox message drains and the task count
+    /// does not change.
     /// A single long-running job, or a task that loops without spawning,
     /// does not count as work.
     pub async fn try_run_to_idle(&self) -> Result<(), SimStall> {
@@ -996,6 +997,22 @@ impl Sim {
                     crate::test::drain_ready_repository_commit_hooks(pool, MAX_DRAIN_STEPS).await;
                 if hooks_drained > 0 {
                     note_drain_progress();
+                }
+            }
+
+            // Fourth source: the transactional outbox (issue #3062). The same
+            // claim → handle → mark path the relay worker runs, worker-free.
+            #[cfg(feature = "db")]
+            if let Some(state) = self
+                .app
+                .try_client()
+                .map(crate::test::TestClient::state)
+                .filter(|state| state.extension::<crate::outbox::OutboxRelay>().is_some())
+            {
+                match crate::outbox::drain(state, MAX_DRAIN_STEPS).await {
+                    Ok(0) => {}
+                    Ok(_) => note_drain_progress(),
+                    Err(error) => tracing::warn!(%error, "sim outbox drain failed"),
                 }
             }
 

@@ -84,7 +84,9 @@ Environment overrides address shards positionally:
 
 Pool sizes multiply across shards (N shards × pool_size + control +
 replicas). Startup logs the aggregate as `total_max_connections` —
-check it against your Postgres `max_connections` budget.
+check it against your Postgres `max_connections` budget. The readiness
+pings add one connection for each primary and each replica. The log does not
+count them.
 
 ## Handlers
 
