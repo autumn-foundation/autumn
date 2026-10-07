@@ -137,6 +137,22 @@ scan_manifest() {
       }
       return depth <= 0
     }
+    # Whether `s` holds a unicode escape. Only a basic string has escapes:
+    # TOML reads a backslash in a literal string as a backslash.
+    function has_unicode_escape(s,   i, c, q) {
+      q = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (q == "\"" && c == "\\") {
+          if (substr(s, i + 1, 1) ~ /[uU]/) return 1
+          i++
+          continue
+        }
+        if (q != "") { if (c == q) q = ""; continue }
+        if (c == "\"" || c == SQ) q = c
+      }
+      return 0
+    }
     # TOML literal strings are as valid as basic ones, so match against a copy
     # with the quotes normalized rather than writing every pattern twice.
     function normalize_quotes(s) { gsub(SQ, "\"", s); return s }
@@ -203,8 +219,15 @@ scan_manifest() {
     function ml_text(   t) {
       t = ml_buf
       sub(/^\n/, "", t)
-      if (ml == "\"\"\"") gsub(/\\\n[ \t\n]*/, "", t)
+      if (ml == "\"\"\"") {
+        gsub(/\\\n[ \t\n]*/, "", t)
+        # Keep a real unicode escape, so the fail-closed rule still sees it:
+        # drop escaped backslashes, then park each remaining `\u` / `\U`.
+        gsub(/\\\\/, "", t)
+        gsub(/\\[uU]/, "\001u", t)
+      }
       gsub(/["\\#{}\[\]]/, "", t)
+      gsub("\001", "\\", t)
       gsub(SQ, "", t)
       gsub(/\n/, " ", t)
       return t
@@ -414,9 +437,9 @@ scan_manifest() {
 
       # ── 0. Spellings the rules below do not read: fail closed ─────────
       # A TOML unicode escape can spell any name, so the rules cannot read
-      # it. An odd run of backslashes before `u` or `U` is an escape.
+      # it.
       if ((is_dep_table() || dep_section_crate() != "" || section == "[features]" || loose) \
-          && entry ~ /(^|[^\\])(\\\\)*\\[uU]/) {
+          && has_unicode_escape(entry)) {
         report("a unicode escape in a dependency or feature entry cannot be checked; write it plainly")
         next
       }
@@ -820,6 +843,25 @@ EOF
 autumn-web = { version = "0.7", features = ["\u0073qlite"] }
 EOF
   check_fail "a unicode escape in a dependency entry fails closed" unicode_escape
+
+  make_case multiline_unicode <<'EOF'
+[dependencies]
+autumn-web = { version = "0.7", features = ["""\u0073qlite"""] }
+EOF
+  check_fail "a unicode escape in a multi-line basic string fails closed" multiline_unicode
+
+  # TOML does not process escapes in a literal string, so this is a path.
+  make_case literal_backslash <<'EOF'
+[dependencies]
+autumn-web = { path = 'C:\users\foo\autumn', features = ["db"] }
+EOF
+  check_pass "a backslash-u in a literal string is not an escape" literal_backslash
+
+  make_case basic_escaped_backslash <<'EOF'
+[dependencies]
+autumn-web = { path = "C:\\users\\foo", features = ["db"] }
+EOF
+  check_pass "an escaped backslash before u is not an escape" basic_escaped_backslash
 
   make_case spaced_header <<'EOF'
 [ dependencies ]
