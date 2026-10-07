@@ -1195,3 +1195,79 @@ async fn late_set_does_not_overwrite_the_owners_record() {
         "A's late set did not overwrite B's record"
     );
 }
+
+/// The layer keeps responses for 3 s; the store default is 1 s. The first
+/// request records a step and crashes. A retry takes the key late, near the
+/// end of the row's retention, and crashes too. The row must then live the
+/// layer's 3 s past the new lock, not the store's 1 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_point_keeps_the_layer_ttl_on_takeover() {
+    let substrate = SqliteSubstrate::with_migrations(&[&FRAMEWORK_MIGRATIONS, &APP_MIGRATIONS])
+        .expect("substrate");
+    let calls = Calls::default();
+    let store = Arc::new(DbIdempotencyStore::new(
+        substrate.pool(),
+        Duration::from_secs(1),
+    ));
+    let pool = substrate.pool();
+    let handler_calls = calls.clone();
+    // Run 1 records a step and hangs. Run 2 hangs at once. Run 3 resumes.
+    let handler = move |idem: IdempotencyTx| {
+        let pool = pool.clone();
+        let calls = handler_calls.clone();
+        async move {
+            let run = calls.get();
+            calls.add();
+            if run == 1 {
+                std::future::pending::<()>().await;
+            }
+            let mut pooled = pool.get().await.expect("checkout");
+            let conn: &mut RuntimeConnection = &mut pooled;
+            if let Some(point) = idem.recovery_point(conn).await.expect("recovery point") {
+                return format!("resumed after {point}");
+            }
+            let step = idem.clone();
+            conn.transaction::<_, autumn_web::AutumnError, _>(async move |conn| {
+                step.set_recovery_point(conn, "charged").await
+            })
+            .await
+            .expect("transaction");
+            drop(pooled);
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    };
+    let app = axum::Router::new()
+        .route("/step", axum::routing::post(handler))
+        .layer(
+            IdempotencyLayer::new(store)
+                .with_ttl(Duration::from_secs(3))
+                .with_in_flight_ttl(Duration::from_secs(1)),
+        );
+    let crash = |app: axum::Router| async move {
+        let dropped =
+            tokio::time::timeout(Duration::from_millis(300), app.oneshot(step("charge", "A")))
+                .await;
+        assert!(dropped.is_err(), "the attempt is dropped");
+    };
+
+    // Run 1 at 0 s: lock to 1 s, row kept to 1 + 3 = 4 s.
+    crash(app.clone()).await;
+    // Run 2 at about 3.5 s: lock to 4.5 s. Kept to 4.5 + 3 = 7.5 s, not 5.5 s.
+    tokio::time::sleep(Duration::from_millis(3_200)).await;
+    crash(app.clone()).await;
+    assert_eq!(calls.get(), 2, "both attempts ran the handler");
+    // Run 3 at about 6 s, after the 5.5 s a store-default retention allows.
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    let third = tokio::time::timeout(
+        Duration::from_secs(5),
+        app.clone().oneshot(step("charge", "A")),
+    )
+    .await
+    .expect("the third request resumes rather than re-running the step")
+    .expect("infallible");
+    let body = axum::body::to_bytes(third.into_body(), 1024)
+        .await
+        .expect("body");
+    assert_eq!(&body[..], b"resumed after charged");
+}

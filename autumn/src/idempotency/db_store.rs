@@ -308,10 +308,22 @@ impl IdempotencyStore for DbIdempotencyStore {
             // expired. A recovery point stays for the next owner: the row
             // lives one TTL past the new lock, or longer if it already did,
             // so a crash of this owner too leaves it for the one after.
-            let crash_expires = until.saturating_add(ms(self.default_ttl));
-            let taken_expiry =
-                diesel::dsl::case_when(keys::expires_at_ms.gt(crash_expires), keys::expires_at_ms)
-                    .otherwise(crash_expires);
+            // The row's own TTL (the layer's, stored with a recovery point
+            // or record); the store default when the row has none.
+            let default_ttl = ms(self.default_ttl);
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "a SQL expression, evaluated by the database"
+            )]
+            let crash_expires = || {
+                diesel::dsl::case_when(keys::ttl_ms.gt(0), keys::ttl_ms + until)
+                    .otherwise(default_ttl.saturating_add(until))
+            };
+            let taken_expiry = diesel::dsl::case_when(
+                keys::expires_at_ms.gt(crash_expires()),
+                keys::expires_at_ms,
+            )
+            .otherwise(crash_expires());
             let upsert = diesel::insert_into(keys::autumn_idempotency_keys)
                 .values((
                     keys::storage_key.eq(key),
@@ -573,6 +585,8 @@ impl IdempotencyTx {
                 .set((
                     keys::recovery_point.eq(Some(point)),
                     keys::recovery_body_hash.eq(Some(claim.body_hash.clone())),
+                    // The layer's TTL, for a later owner that takes the row over.
+                    keys::ttl_ms.eq(ms(claim.ttl)),
                 ))
                 .execute(conn)
                 .await?;

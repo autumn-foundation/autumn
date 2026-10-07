@@ -542,15 +542,15 @@ impl MemoryIdempotencyStore {
         body_hash: Vec<u8>,
         ttl: Duration,
     ) {
-        // Another owner's live lock: its response wins.
-        let held_by_another = self
+        // Another owner's live lock: its response wins. Keep the guard until
+        // the entry is in, so no `try_lock` can take the key in between.
+        let in_flight = self
             .in_flight
             .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(key)
-            .is_some_and(|lock| {
-                lock.owner != owner && lock.expires_at > crate::time::ambient_instant()
-            });
+            .unwrap_or_else(PoisonError::into_inner);
+        let held_by_another = in_flight.get(key).is_some_and(|lock| {
+            lock.owner != owner && lock.expires_at > crate::time::ambient_instant()
+        });
         if held_by_another {
             return;
         }
@@ -561,6 +561,7 @@ impl MemoryIdempotencyStore {
         };
         let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
         entries.insert(key.to_owned(), entry);
+        drop(in_flight);
         // Periodically evict expired entries to bound memory growth for
         // long-running processes. O(N) scan is amortised over every 128 writes.
         let n = self.write_count.fetch_add(1, Ordering::Relaxed);
