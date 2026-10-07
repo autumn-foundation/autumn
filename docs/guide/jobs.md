@@ -102,12 +102,28 @@ autumn_web::job::enqueue_at_after_commit("publish_post", args, when).await?;
 |-------------------------------------------------|------------------------------|
 | **Recurring** work on a cron / fixed interval   | `#[scheduled]`               |
 | **One-shot** "run once, later" timer            | delayed `#[job]` (`enqueue_in` / `enqueue_at`) |
-| **Durable multi-step** orchestration, long-horizon timers, history | Autumn Harvest |
+| **Durable multi-step** orchestration, long-horizon timers, history | [Autumn Harvest](../autumn-workflow-architecture.md) (`autumn-harvest-plugin`) |
 
 `#[scheduled]` is for repeating tasks; it does not do one-shot future work.
 Autumn Harvest is for durable workflows with history and stronger orchestration
 semantics — heavier than a one-shot timer. Delayed `#[job]` fills the gap
 between "now" and "durable workflow".
+
+A job is one unit of work: a retry runs the handler again from the top, so
+make it idempotent. The durable backends (`postgres`, `redis`, `sqlite`)
+deliver a persisted job at least once. The `local` backend and
+`enqueue_after_commit` can lose one on a crash or restart (see
+[Backend selection](#backend-selection-autumntoml) and
+[`enqueue_after_commit`](#enqueue_after_commit--any-backend)). If the framework would have to
+remember *where inside the work* it got to — per-step checkpoints, a durable
+sleep mid-handler, signals, compensation, "run B after A" dependencies — that is
+a workflow, and Autumn core deliberately leaves it to Harvest
+([ADR-0016](../adr/0016-durable-workflows-live-in-harvest.md)). A job may still
+enqueue a follow-up job from its own body. When an app write and a workflow
+start must commit together, use Harvest's transactional outbox
+(`enqueue_workflow_start_outbox`) on the same connection, the way
+[`enqueue_in_tx`](#enqueue_in_tx--enqueue_on_conn--postgres-backend-only) works
+for jobs.
 
 ### Admin dashboard
 
