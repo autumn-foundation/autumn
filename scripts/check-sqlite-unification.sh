@@ -43,8 +43,8 @@
 #      chain (issue #2571).
 #   5. A dependency spelled as a dotted key at the root or under `[target]`
 #      (`dependencies.autumn-web = { … }`) is an edge too.
-#   6. A unicode escape in a dependency or feature entry fails closed: the
-#      rules cannot read it.
+#   6. A unicode escape in a basic string of a dependency or feature entry,
+#      or of a table header, fails closed: the rules cannot read it.
 #
 # The lexer folds TOML multi-line strings to one-line strings that keep their
 # text, so a bracket in one does not move the scan out of step, and
@@ -95,6 +95,7 @@ scan_manifest() {
       SQ = sprintf("%c", 39)   # a literal single quote, unwritable inline here
       pkg = ""
       ml = ""
+      ESCAPED_HEADER = sprintf("%c", 1) "escaped-header"
       defines_flip_sqlite = 0
     }
 
@@ -274,6 +275,9 @@ scan_manifest() {
       gsub(/^[ \t]+|[ \t]+$/, "", line)
       if (line == "") return ""
       if (line ~ /^\[/) {
+        # A unicode escape in a header can spell a dependency name, and the
+        # rules cannot read it. Hand pass 2 a marker to report.
+        if (has_unicode_escape(line)) { entry_line = FNR; section = line; return ESCAPED_HEADER }
         # A header ends any entry. It carries no string values, so every
         # quote in it is key-quoting (`[dependencies."autumn-web"]`,
         # `[target."cfg(unix)".dependencies]`); strip them so the section
@@ -369,8 +373,7 @@ scan_manifest() {
         sub(/".*$/, "", pkg)
       }
       # Record each feature, by any name cargo accepts, and the LOCAL features
-      # it enables. Pass 2 resolves
-      # the chains, after every alias is known.
+      # it enables. Pass 2 resolves the chains, after every alias is known.
       if (section == "[features]" && norm ~ /^[^= \t][^=]*=/) {
         fkey = norm
         sub(/[ \t]*=.*$/, "", fkey)
@@ -440,6 +443,10 @@ scan_manifest() {
     {
       entry = feed($0)
       if (entry == "") next
+      if (entry == ESCAPED_HEADER) {
+        report("a unicode escape in a table header cannot be checked; write it plainly")
+        next
+      }
       norm = normalize_quotes(entry)
       mentions_sqlite = (norm ~ /"sqlite"/)
       forwards = forwards_flip(norm)
@@ -877,6 +884,12 @@ EOF
 autumn-web = { path = "C:\\users\\foo", features = ["db"] }
 EOF
   check_pass "an escaped backslash before u is not an escape" basic_escaped_backslash
+
+  make_case header_unicode <<'EOF'
+[dependencies."autumn\u002dweb"]
+features = ["sqlite"]
+EOF
+  check_fail "a unicode escape in a table header fails closed" header_unicode
 
   make_case spaced_header <<'EOF'
 [ dependencies ]
