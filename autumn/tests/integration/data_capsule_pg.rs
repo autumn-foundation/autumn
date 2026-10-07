@@ -24,6 +24,7 @@ use testcontainers_modules::postgres::Postgres;
 
 const SCHEMA: &str = r"
 CREATE DOMAIN amount AS NUMERIC(40, 20);
+CREATE DOMAIN amounts AS amount[];
 CREATE DOMAIN cash AS MONEY;
 CREATE TABLE users (
     id BIGSERIAL PRIMARY KEY,
@@ -31,6 +32,7 @@ CREATE TABLE users (
     balance NUMERIC(30, 12) NOT NULL,
     credit amount,
     credits amount[],
+    ledger amounts,
     fee MONEY,
     tip cash,
     fees MONEY[],
@@ -63,17 +65,18 @@ CREATE TABLE comments (
 ";
 
 const SEED: &str = r#"
-INSERT INTO users (email, balance, credit, credits, fee, tip, fees, grid, ranks, offs, ratio, created_at, born, avatar, prefs, tags, uid, active)
+INSERT INTO users (email, balance, credit, credits, ledger, fee, tip, fees, grid, ranks, offs, ratio, created_at, born, avatar, prefs, tags, uid, active)
 VALUES
   ('Ada@Example.com', 12345678901234567.123456789012, 98765432109876543210.01234567890123456789,
    ARRAY[98765432109876543210.01234567890123456789, 0.10000000000000000001]::amount[],
+   ARRAY[12345678901234567890.98765432109876543210]::amounts,
    1234567.89, 12.5, ARRAY[1.5, 2000]::money[], ARRAY[[1.5, 2], [3, NULL]]::money[],
    '[0:2]={1,2,3}', '[0:1]={1.5,2}',
    0.30000000000000004,
    '2026-01-02 03:04:05.123456+00', '1815-12-10', '\x00ff10'::bytea,
    '{"theme": "dark", "n": [1, 2.5, {"deep": null}]}', ARRAY['a', 'b "q"', 'ü'],
    'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', true),
-  ('bob@example.com', 1, NULL, NULL, NULL, NULL, '{}', NULL, '{4,5}', NULL, NULL, '2026-01-01 00:00:00+00', NULL, NULL, NULL, NULL,
+  ('bob@example.com', 1, NULL, NULL, NULL, NULL, NULL, '{}', NULL, '{4,5}', NULL, NULL, '2026-01-01 00:00:00+00', NULL, NULL, NULL, NULL,
    'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12', false);
 INSERT INTO posts (author_id, parent_id, title, score) VALUES
   (1, NULL, 'First <post>', 3.14159),
@@ -488,7 +491,7 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
     let mut admin = PgConnection::establish(&format!("{base}/postgres")).expect("connect");
     for db in [
         "target", "busy", "deferred", "capped", "cached", "cycled", "stepped", "wide", "offpath",
-        "limited",
+        "limited", "blind",
     ] {
         admin
             .batch_execute(&format!("CREATE DATABASE {db}"))
@@ -503,7 +506,7 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
         .expect("source");
     for db in [
         "target", "busy", "deferred", "capped", "cached", "cycled", "stepped", "wide", "offpath",
-        "limited",
+        "limited", "blind",
     ] {
         PgConnection::establish(&format!("{base}/{db}"))
             .expect("connect")
@@ -724,6 +727,38 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
     )
     .await;
     assert_eq!(last, "unused");
+
+    // A role with `UPDATE` but neither `SELECT` nor `USAGE` on a sequence may
+    // see no last value, as if the sequence were unused. This one is at 1000:
+    // import must not move it back to the imported key 500.
+    PgConnection::establish(&format!("{base}/blind"))
+        .expect("connect")
+        .batch_execute(
+            "SELECT setval('notes_id_seq', 1000); \
+             CREATE ROLE blind LOGIN PASSWORD 'blind'; \
+             GRANT USAGE ON SCHEMA public TO blind; \
+             GRANT SELECT, INSERT ON ledger, notes TO blind; \
+             GRANT SELECT, USAGE, UPDATE ON SEQUENCE ledger_id_seq, notes_ticket_seq TO blind; \
+             GRANT UPDATE ON SEQUENCE notes_id_seq TO blind;",
+        )
+        .expect("grants");
+    let blind_url = format!(
+        "{}/blind",
+        base.replace("postgres:postgres@", "blind:blind@")
+    );
+    let err = import_capsule(&capsule, &models, &PgCapsuleStore::new(pool(&blind_url)))
+        .await
+        .expect_err("no SELECT or USAGE on notes_id_seq");
+    assert!(matches!(err, DataCapsuleError::Store(_)), "{err:?}");
+    // The plan checks the privilege itself: some Postgres versions give no
+    // last value here instead of an error.
+    assert!(err.to_string().contains("SELECT or USAGE"), "{err}");
+    let last = text(
+        &pool(&format!("{base}/blind")),
+        "SELECT pg_sequence_last_value('notes_id_seq')::text AS value",
+    )
+    .await;
+    assert_eq!(last, "1000");
 
     drop(container);
 }

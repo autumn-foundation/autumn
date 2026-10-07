@@ -199,6 +199,9 @@ capsule directory and to each directory above it.
   with `CACHE` above 1 is refused (`501`): other sessions can hold cached
   values that an imported key can take. A `CYCLE` sequence is refused
   (`501`) too: after its last value, it starts again at an imported key.
+- The import role needs `UPDATE` on each sequence it moves, and `SELECT` or
+  `USAGE` to read where the sequence is. Without them, import stops before
+  it moves any sequence.
 - **Import when no other writer uses the tables.** Another session can take a
   value from a sequence and insert its row later. If the capsule holds that
   key, the import succeeds and the other insert fails with a duplicate key.

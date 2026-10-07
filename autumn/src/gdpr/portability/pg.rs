@@ -153,21 +153,29 @@ async fn describe_table(
 ) -> Result<Vec<Column>, DataCapsuleError> {
     let rows: Vec<ColumnRow> = diesel::sql_query(
         // `information_schema.columns.is_generated` exists on every version;
-        // `pg_attribute.attgenerated` only from Postgres 12. For an array,
-        // the chain starts at the element type: an array of a domain has the
-        // base type of that domain, with `[]`.
+        // `pg_attribute.attgenerated` only from Postgres 12. The base type
+        // follows the domain chain of the column type. When that chain ends
+        // at an array, it follows the chain of the element type too and keeps
+        // `[]`: `amount[]`, and a domain over `amount[]`, are `numeric[]`.
+        // Postgres has one array type per element type, so one level is all.
         "SELECT a.attname::text AS name, \
                 format_type(a.atttypid, a.atttypmod) AS data_type, \
-                (WITH RECURSIVE chain(oid, base, kind) AS ( \
-                     SELECT e.oid, e.typbasetype, e.typtype FROM pg_type e \
-                     WHERE e.oid = CASE WHEN t.typtype <> 'd' AND t.typcategory = 'A' \
-                                        THEN t.typelem ELSE t.oid END \
+                (WITH RECURSIVE outer_chain(oid, base, kind, category, elem) AS ( \
+                     SELECT t.oid, t.typbasetype, t.typtype, t.typcategory, t.typelem \
+                     UNION ALL \
+                     SELECT b.oid, b.typbasetype, b.typtype, b.typcategory, b.typelem \
+                     FROM outer_chain c JOIN pg_type b ON b.oid = c.base WHERE c.kind = 'd'), \
+                 outer_base AS (SELECT * FROM outer_chain WHERE kind <> 'd' LIMIT 1), \
+                 elem_chain(oid, base, kind) AS ( \
+                     SELECT e.oid, e.typbasetype, e.typtype \
+                     FROM outer_base o JOIN pg_type e ON e.oid = o.elem WHERE o.category = 'A' \
                      UNION ALL \
                      SELECT b.oid, b.typbasetype, b.typtype \
-                     FROM chain c JOIN pg_type b ON b.oid = c.base WHERE c.kind = 'd') \
-                 SELECT format_type(oid, NULL) || \
-                        CASE WHEN t.typtype <> 'd' AND t.typcategory = 'A' THEN '[]' ELSE '' END \
-                 FROM chain WHERE kind <> 'd' LIMIT 1) AS base_type, \
+                     FROM elem_chain c JOIN pg_type b ON b.oid = c.base WHERE c.kind = 'd') \
+                 SELECT COALESCE( \
+                     (SELECT format_type(oid, NULL) || '[]' FROM elem_chain \
+                      WHERE kind <> 'd' LIMIT 1), \
+                     (SELECT format_type(oid, NULL) FROM outer_base))) AS base_type, \
                 format_type(a.atttypid, NULL) AS plain_type, \
                 NOT a.attnotnull AS nullable, \
                 COALESCE(c.is_generated = 'ALWAYS', false) AS generated \
@@ -528,6 +536,7 @@ fn insert_sql(batch: &ImportBatch<'_>) -> Result<String, DataCapsuleError> {
     ))
 }
 
+#[allow(clippy::struct_excessive_bools)] // independent checks, one per column of the plan query
 #[derive(diesel::QueryableByName)]
 struct SequencePlan {
     /// The outermost imported key on the path of the sequence.
@@ -541,6 +550,8 @@ struct SequencePlan {
     max: i64,
     #[diesel(sql_type = diesel::sql_types::Bool)]
     needed: bool,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    can_read: bool,
     #[diesel(sql_type = diesel::sql_types::Bool)]
     can_update: bool,
     #[diesel(sql_type = diesel::sql_types::Bool)]
@@ -584,13 +595,16 @@ async fn plan_sequence(
     // `key - start` and `start - inc` can leave the bigint range.
     let plan: Option<SequencePlan> = diesel::sql_query(format!(
         "SELECT s.m AS target, s.cache, s.min, s.max, s.cycle, CASE WHEN s.inc > 0 \
-           THEN s.m > COALESCE(pg_sequence_last_value($1::regclass), s.start::numeric - s.inc) \
-           ELSE s.m < COALESCE(pg_sequence_last_value($1::regclass), s.start::numeric - s.inc) END AS needed, \
-           has_sequence_privilege($1::regclass, 'UPDATE') AS can_update \
+           THEN s.m > COALESCE(s.last, s.start::numeric - s.inc) \
+           ELSE s.m < COALESCE(s.last, s.start::numeric - s.inc) END AS needed, \
+           s.can_read, has_sequence_privilege($1::regclass, 'UPDATE') AS can_update \
          FROM (SELECT CASE WHEN q.seqincrement > 0 \
                         THEN MAX(t.{pk}) FILTER (WHERE mod(t.{pk}::numeric - q.seqstart, q.seqincrement) = 0) \
                         ELSE MIN(t.{pk}) FILTER (WHERE mod(t.{pk}::numeric - q.seqstart, q.seqincrement) = 0) \
                       END::bigint AS m, \
+                      has_sequence_privilege($1::regclass, 'SELECT, USAGE') AS can_read, \
+                      CASE WHEN has_sequence_privilege($1::regclass, 'SELECT, USAGE') \
+                        THEN pg_sequence_last_value($1::regclass) END AS last, \
                       q.seqincrement AS inc, q.seqstart AS start, q.seqcache AS cache, \
                       q.seqmin AS min, q.seqmax AS max, q.seqcycle AS cycle \
                FROM {quoted_table} t CROSS JOIN pg_sequence q \
@@ -607,6 +621,15 @@ async fn plan_sequence(
     let Some(plan) = plan else {
         return Ok(None);
     };
+    // Without `SELECT` or `USAGE` the last value is hidden (an error, or
+    // `NULL` on some versions). A used sequence would then look unused, and
+    // `setval` could move it back onto values it already made.
+    if !plan.can_read {
+        return Err(DataCapsuleError::Store(format!(
+            "the import role has no SELECT or USAGE privilege on the sequence of {target}: \
+             import cannot read its last value"
+        )));
+    }
     if plan.cache > 1 {
         return Err(DataCapsuleError::NotConfigured(format!(
             "the sequence of {target} caches {} values; import needs CACHE 1",
