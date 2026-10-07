@@ -57,6 +57,7 @@
 //! | `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS` | `server.timeouts.request_timeout_ms` | `u64` |
 //! | `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS` | `server.max_concurrent_requests` | `usize` |
 //! | `AUTUMN_SERVER__CAPACITY_CONTRACT` | `server.capacity_contract` | `String` |
+//! | `AUTUMN_SERVER__STRICT_CONFIG` | `server.strict_config` | `bool` |
 //! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
 //! | `AUTUMN_DATABASE__PRIMARY_URL` | `database.primary_url` | `String` |
 //! | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` | `String` |
@@ -68,6 +69,10 @@
 //! | `AUTUMN_DATABASE__STARTUP_WAIT_SECS` | `database.startup_wait_secs` | `u64` |
 //! | `AUTUMN_DATABASE__AUTO_MIGRATE` | `database.auto_migrate` | `Option<bool>` |
 //! | `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` | `database.auto_migrate_in_production` | `bool` |
+//! | `AUTUMN_DATABASE__STATEMENT_TIMEOUT` | `database.statement_timeout` | duration (`"30s"`, ms); empty clears |
+//! | `AUTUMN_DATABASE__IDLE_IN_TRANSACTION_TIMEOUT` | `database.idle_in_transaction_timeout` | duration; empty clears |
+//! | `AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT` | `database.migration_lock_timeout` | duration; empty is ignored |
+//! | `AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES` | `database.migration_lock_retries` | `u32` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__NAME` | `database.shards[i].name` | `String` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__PRIMARY_URL` | `database.shards[i].primary_url` | `String` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__SLOTS` | `database.shards[i].slots` | CSV of indices / `A-B` ranges |
@@ -558,8 +563,13 @@ ranges = ["127.0.0.0/8", "::1/128"]
 "#,
         )
         .expect("valid dev toml"),
-        "prod" => toml::from_str(
-            r#"
+        "prod" => {
+            #[cfg_attr(
+                feature = "sqlite",
+                allow(unused_mut, reason = "only the Postgres build adds to it")
+            )]
+            let mut prod: toml::Value = toml::from_str(
+                r#"
 [log]
 level = "info"
 format = "Json"
@@ -570,6 +580,8 @@ environment = "production"
 [server]
 host = "0.0.0.0"
 shutdown_timeout_secs = 30
+# Prod: a misspelled key fails the boot (#3057).
+strict_config = true
 
 [server.timeouts]
 request_timeout_ms = 30_000
@@ -587,8 +599,24 @@ enabled = true
 [session]
 secure = true
 "#,
-        )
-        .expect("valid prod toml"),
+            )
+            .expect("valid prod toml");
+            // SQLite cannot enforce these, and it refuses to boot with a
+            // `statement_timeout` set, so they are Postgres-only defaults.
+            #[cfg(not(feature = "sqlite"))]
+            deep_merge(
+                &mut prod,
+                toml::from_str(
+                    r#"
+[database]
+statement_timeout = "30s"
+idle_in_transaction_timeout = "60s"
+"#,
+                )
+                .expect("valid prod database toml"),
+            );
+            prod
+        }
         _ => toml::Value::Table(toml::map::Map::new()), // Custom profiles get no smart defaults
     }
 }
@@ -4215,6 +4243,24 @@ impl AutumnConfig {
     pub fn validate_push(&self) -> Result<(), crate::push::PushError> {
         self.push.load_vapid_key().map(|_| ())
     }
+
+    /// The load-shedding ceiling the profile supplies when
+    /// `server.max_concurrent_requests` is unset and no capacity contract
+    /// applies (#3057).
+    ///
+    /// `prod` returns the primary pool size times
+    /// [`PROD_REQUESTS_PER_POOL_CONNECTION`], and at least
+    /// [`PROD_MIN_ADMISSION_LIMIT`]. Other profiles return `None` (no
+    /// ceiling). Set `server.max_concurrent_requests = 0` to turn shedding off.
+    #[must_use]
+    pub fn profile_admission_default(&self) -> Option<usize> {
+        matches!(self.profile.as_deref(), Some("prod" | "production")).then(|| {
+            self.database
+                .effective_primary_pool_size()
+                .saturating_mul(PROD_REQUESTS_PER_POOL_CONNECTION)
+                .max(PROD_MIN_ADMISSION_LIMIT)
+        })
+    }
 }
 
 impl AutumnConfig {
@@ -4796,10 +4842,8 @@ impl AutumnConfig {
         // Layer 6: env var overrides (highest priority)
         config.apply_env_overrides_with_env(env);
 
-        let is_strict_env = env
-            .var("AUTUMN_SERVER__STRICT_CONFIG")
-            .is_ok_and(|v| v == "true" || v == "1");
-        if config.server.strict_config || is_strict_env {
+        // Env overrides already applied `AUTUMN_SERVER__STRICT_CONFIG`.
+        if config.server.strict_config {
             let enforce_all = config.server.strict_config_enforce_all
                 || env
                     .var("AUTUMN_SERVER__STRICT_CONFIG_ENFORCE_ALL")
@@ -5900,6 +5944,11 @@ impl AutumnConfig {
             "AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS",
             &mut self.server.max_concurrent_requests,
         );
+        parse_env_bool(
+            env,
+            "AUTUMN_SERVER__STRICT_CONFIG",
+            &mut self.server.strict_config,
+        );
         parse_env_option_string(
             env,
             "AUTUMN_SERVER__CAPACITY_CONTRACT",
@@ -6010,6 +6059,31 @@ impl AutumnConfig {
             env,
             "AUTUMN_DATABASE__DIRECTORY_SHARD_ROUTER",
             &mut self.database.directory_shard_router,
+        );
+        parse_env_option_duration(
+            env,
+            "AUTUMN_DATABASE__STATEMENT_TIMEOUT",
+            &mut self.database.statement_timeout,
+        );
+        parse_env_option_duration(
+            env,
+            "AUTUMN_DATABASE__IDLE_IN_TRANSACTION_TIMEOUT",
+            &mut self.database.idle_in_transaction_timeout,
+        );
+        // An empty value is ignored here, as `autumn migrate` ignores it.
+        let mut lock_timeout = Some(self.database.migration_lock_timeout);
+        parse_env_option_duration(
+            env,
+            "AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT",
+            &mut lock_timeout,
+        );
+        if let Some(timeout) = lock_timeout {
+            self.database.migration_lock_timeout = timeout;
+        }
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES",
+            &mut self.database.migration_lock_retries,
         );
         self.apply_shard_env_overrides(env);
     }
@@ -7283,6 +7357,9 @@ pub struct ServerConfig {
     pub host: String,
 
     /// Exit startup if any unknown config keys are found in autumn.toml/profiles.
+    ///
+    /// The `prod` profile sets `true` (#3057). Override via
+    /// `AUTUMN_SERVER__STRICT_CONFIG`.
     #[serde(default)]
     pub strict_config: bool,
 
@@ -7344,9 +7421,10 @@ pub struct ServerConfig {
     pub unix_socket: Option<String>,
 
     /// Ceiling on concurrent in-flight requests (admission control / load
-    /// shedding). `None` or `0` (the default) disables the ceiling — today's
-    /// unlimited behavior — so no existing application silently changes
-    /// throughput.
+    /// shedding). `0` disables the ceiling. `None` (the default) uses the
+    /// capacity contract, then the profile default: primary pool size ×
+    /// [`PROD_REQUESTS_PER_POOL_CONNECTION`] under `prod` (#3057), no ceiling
+    /// under other profiles.
     ///
     /// Once this many requests are admitted and still in flight, additional
     /// requests receive an immediate `503 Service Unavailable` with a
@@ -7380,9 +7458,9 @@ pub struct ServerConfig {
     ///
     /// An explicit `max_concurrent_requests` always wins, and every failure
     /// along the contract path (missing file, malformed document, a contract
-    /// measured on a different host class) degrades to *unlimited* with a
-    /// warning rather than to a ceiling — see
-    /// [`capacity::resolve_admission_limit`](crate::capacity::resolve_admission_limit).
+    /// measured on a different host class) degrades to the profile default
+    /// (unlimited outside `prod`) with a warning — see
+    /// [`capacity::resolve_admission_limit_with_default`](crate::capacity::resolve_admission_limit_with_default).
     ///
     /// Configured via `AUTUMN_SERVER__CAPACITY_CONTRACT`.
     #[serde(default)]
@@ -8956,9 +9034,48 @@ pub struct DatabaseConfig {
     #[serde(default)]
     pub auto_migrate_in_production: bool,
 
-    /// Optional database statement timeout.
+    /// Optional database statement timeout. `"0s"` disables it.
+    ///
+    /// Set as a session `SET` on checkout, and again as `SET LOCAL` at the
+    /// start of each framework transaction, so a transaction pooler such as
+    /// `PgBouncer` cannot drop it. The `prod` profile sets `30s` (#3057).
+    ///
+    /// Override via `AUTUMN_DATABASE__STATEMENT_TIMEOUT`.
     #[serde(deserialize_with = "deserialize_option_duration", default)]
     pub statement_timeout: Option<std::time::Duration>,
+
+    /// Optional `idle_in_transaction_session_timeout`. `"0s"` disables it.
+    ///
+    /// Set as `SET LOCAL` at the start of each framework transaction. Postgres
+    /// ends a session that stays idle in an open transaction for longer than
+    /// this. The `prod` profile sets `60s` (#3057).
+    ///
+    /// Override via `AUTUMN_DATABASE__IDLE_IN_TRANSACTION_TIMEOUT`.
+    #[serde(deserialize_with = "deserialize_option_duration", default)]
+    pub idle_in_transaction_timeout: Option<std::time::Duration>,
+
+    /// Postgres `lock_timeout` for the migration session. Default: `5s`.
+    /// `"0s"` disables it.
+    ///
+    /// A migration that waits longer than this for a table lock fails, and
+    /// the migrator retries it (see [`Self::migration_lock_retries`]). This
+    /// stops a DDL statement that queues behind a long transaction from
+    /// blocking all traffic on that table (#3057).
+    ///
+    /// Override via `AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT`.
+    #[serde(
+        deserialize_with = "deserialize_duration",
+        default = "default_migration_lock_timeout"
+    )]
+    pub migration_lock_timeout: std::time::Duration,
+
+    /// Retries after a migration fails on `migration_lock_timeout`.
+    /// Default: `5`. `0` disables the retry. Each retry waits a jittered,
+    /// exponential delay.
+    ///
+    /// Override via `AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES`.
+    #[serde(default = "default_migration_lock_retries")]
+    pub migration_lock_retries: u32,
 
     /// Slow query threshold. Default: `500ms`.
     #[serde(
@@ -10270,6 +10387,22 @@ fn parse_env_option<T: std::str::FromStr>(env: &dyn Env, key: &str, target: &mut
     }
 }
 
+/// Parse a duration env var (`"30s"`, `"500ms"`, or bare milliseconds).
+/// An empty value clears the target.
+fn parse_env_option_duration(env: &dyn Env, key: &str, target: &mut Option<std::time::Duration>) {
+    if let Ok(val) = env.var(key) {
+        let val = val.trim();
+        if val.is_empty() {
+            *target = None;
+        } else {
+            match parse_duration_str(val) {
+                Ok(d) => *target = Some(d),
+                Err(e) => eprintln!("Warning: {key}={val:?} is not valid ({e}), ignoring"),
+            }
+        }
+    }
+}
+
 fn parse_env_string(env: &dyn Env, key: &str, target: &mut String) {
     if let Ok(val) = env.var(key) {
         *target = val;
@@ -10350,6 +10483,29 @@ const fn default_prestop_grace() -> u64 {
 const fn default_pool_size() -> usize {
     10
 }
+
+const fn default_migration_lock_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(5)
+}
+
+const fn default_migration_lock_retries() -> u32 {
+    5
+}
+
+/// Admitted requests per primary pool connection in the `prod` load-shedding
+/// ceiling (#3057). The ceiling is `primary pool size × this value`, and at
+/// least [`PROD_MIN_ADMISSION_LIMIT`].
+///
+/// Requests above the pool size wait for a connection, and a long queue only
+/// adds latency before the `connect_timeout_secs` failure. 32 waiters per
+/// connection is a high, safe ceiling. Tune it with
+/// `server.max_concurrent_requests` or a capacity contract.
+pub const PROD_REQUESTS_PER_POOL_CONNECTION: usize = 32;
+
+/// The lowest `prod` load-shedding ceiling (#3057). A small primary pool (a
+/// sharded app, or an app that does not use its database much) must not shed
+/// normal traffic.
+pub const PROD_MIN_ADMISSION_LIMIT: usize = 256;
 
 const fn default_max_connections_warn_threshold() -> usize {
     100
@@ -10606,6 +10762,9 @@ impl Default for DatabaseConfig {
             auto_migrate: None,
             auto_migrate_in_production: false,
             statement_timeout: None,
+            idle_in_transaction_timeout: None,
+            migration_lock_timeout: default_migration_lock_timeout(),
+            migration_lock_retries: default_migration_lock_retries(),
             slow_query_threshold: default_slow_query_threshold(),
             shards: Vec::new(),
             directory_shard_router: false,
@@ -12269,13 +12428,14 @@ mod tests {
     }
 
     // When strict_config is OFF, behavior is unchanged: `[media]` is tolerated
-    // even with no roots registered (non-strict never ran the check).
+    // even with no roots registered (non-strict never ran the check). `prod`
+    // turns strict_config on (#3057), so the test turns it off explicitly.
     #[test]
     fn non_strict_config_tolerates_media_root_without_registration() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(
             temp.path().join("autumn.toml"),
-            "[media]\nqueue = \"media\"\n",
+            "[server]\nstrict_config = false\n\n[media]\nqueue = \"media\"\n",
         )
         .unwrap();
 
@@ -19492,6 +19652,214 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             config.server.timeouts.request_timeout_ms.is_none(),
             "dev profile must not enable a request timeout by default"
         );
+    }
+
+    // ── #3057: prod protections ────────────────────────────────────────────
+
+    /// Load `autumn.toml` (body `toml`) under `profile` with extra env vars.
+    fn load_3057(profile: &str, toml: &str, vars: &[(&str, &str)]) -> AutumnConfig {
+        try_load_3057(profile, toml, vars).expect("config loads")
+    }
+
+    fn try_load_3057(
+        profile: &str,
+        toml: &str,
+        vars: &[(&str, &str)],
+    ) -> Result<AutumnConfig, ConfigError> {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("autumn.toml"), toml).unwrap();
+        let mut env: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        env.insert("AUTUMN_ENV".to_owned(), profile.to_owned());
+        env.insert(
+            "AUTUMN_MANIFEST_DIR".to_owned(),
+            temp.path().to_str().unwrap().to_owned(),
+        );
+        AutumnConfig::load_with_env(&FakeEnv(env))
+    }
+
+    #[test]
+    fn prod_profile_enables_strict_config() {
+        assert!(load_3057("prod", "", &[]).server.strict_config);
+        assert!(!load_3057("dev", "", &[]).server.strict_config);
+    }
+
+    #[test]
+    fn prod_profile_rejects_misspelled_timeout_key() {
+        let toml = "[database]\nstatment_timeout = \"5s\"\n";
+        let err = try_load_3057("prod", toml, &[]).expect_err("typo must fail in prod");
+        assert!(format!("{err:?}").contains("statment_timeout"), "{err:?}");
+        assert!(try_load_3057("dev", toml, &[]).is_ok());
+    }
+
+    #[test]
+    fn prod_strict_config_opt_out() {
+        let toml = "[server]\nstrict_config = false\n[database]\nstatment_timeout = \"5s\"\n";
+        assert!(!load_3057("prod", toml, &[]).server.strict_config);
+        let toml = "[database]\nstatment_timeout = \"5s\"\n";
+        let env = [("AUTUMN_SERVER__STRICT_CONFIG", "false")];
+        assert!(!load_3057("prod", toml, &env).server.strict_config);
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn prod_profile_sets_database_timeouts() {
+        let config = load_3057("prod", "", &[]);
+        assert_eq!(
+            config.database.statement_timeout,
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(
+            config.database.idle_in_transaction_timeout,
+            Some(std::time::Duration::from_secs(60))
+        );
+    }
+
+    /// `SQLite` cannot enforce these timeouts and refuses to boot with one set.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn prod_profile_leaves_database_timeouts_off_on_sqlite() {
+        let config = load_3057("prod", "", &[]);
+        assert_eq!(config.database.statement_timeout, None);
+        assert_eq!(config.database.idle_in_transaction_timeout, None);
+    }
+
+    #[test]
+    fn dev_profile_leaves_database_timeouts_off() {
+        let config = load_3057("dev", "", &[]);
+        assert_eq!(config.database.statement_timeout, None);
+        assert_eq!(config.database.idle_in_transaction_timeout, None);
+    }
+
+    #[test]
+    fn prod_database_timeouts_opt_out_via_toml() {
+        let toml = "[database]\nstatement_timeout = \"0s\"\nidle_in_transaction_timeout = \"0s\"\n";
+        let config = load_3057("prod", toml, &[]);
+        assert_eq!(
+            config.database.statement_timeout,
+            Some(std::time::Duration::ZERO)
+        );
+        assert_eq!(
+            config.database.idle_in_transaction_timeout,
+            Some(std::time::Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn database_timeouts_env_overrides() {
+        let env = [
+            ("AUTUMN_DATABASE__STATEMENT_TIMEOUT", "0"),
+            ("AUTUMN_DATABASE__IDLE_IN_TRANSACTION_TIMEOUT", "15s"),
+        ];
+        let config = load_3057("prod", "", &env);
+        assert_eq!(
+            config.database.statement_timeout,
+            Some(std::time::Duration::ZERO)
+        );
+        assert_eq!(
+            config.database.idle_in_transaction_timeout,
+            Some(std::time::Duration::from_secs(15))
+        );
+        // An empty value clears the setting.
+        let env = [("AUTUMN_DATABASE__STATEMENT_TIMEOUT", "")];
+        assert_eq!(load_3057("prod", "", &env).database.statement_timeout, None);
+    }
+
+    #[test]
+    fn migration_lock_defaults_apply_to_every_profile() {
+        for profile in ["dev", "prod", "staging"] {
+            let db = load_3057(profile, "", &[]).database;
+            assert_eq!(
+                db.migration_lock_timeout,
+                std::time::Duration::from_secs(5),
+                "{profile}"
+            );
+            assert_eq!(db.migration_lock_retries, 5, "{profile}");
+        }
+    }
+
+    #[test]
+    fn migration_lock_opt_out() {
+        let toml = "[database]\nmigration_lock_timeout = \"0s\"\nmigration_lock_retries = 0\n";
+        let db = load_3057("prod", toml, &[]).database;
+        assert_eq!(db.migration_lock_timeout, std::time::Duration::ZERO);
+        assert_eq!(db.migration_lock_retries, 0);
+        let env = [
+            ("AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT", "2s"),
+            ("AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES", "1"),
+        ];
+        let db = load_3057("prod", "", &env).database;
+        assert_eq!(db.migration_lock_timeout, std::time::Duration::from_secs(2));
+        assert_eq!(db.migration_lock_retries, 1);
+        // An empty env value keeps the file value, as `autumn migrate` does.
+        let toml = "[database]\nmigration_lock_timeout = \"0s\"\n";
+        let env = [("AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT", "")];
+        let db = load_3057("prod", toml, &env).database;
+        assert_eq!(db.migration_lock_timeout, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn prod_profile_admission_default_is_pool_size_times_k() {
+        let config = load_3057("prod", "[database]\npool_size = 20\n", &[]);
+        assert_eq!(
+            config.profile_admission_default(),
+            Some(20 * PROD_REQUESTS_PER_POOL_CONNECTION)
+        );
+        // The primary role size wins over the shared default.
+        let config = load_3057(
+            "prod",
+            "[database]\npool_size = 20\nprimary_pool_size = 9\n",
+            &[],
+        );
+        assert_eq!(
+            config.profile_admission_default(),
+            Some(9 * PROD_REQUESTS_PER_POOL_CONNECTION)
+        );
+        // A small pool still gets the floor.
+        let config = load_3057("prod", "[database]\nprimary_pool_size = 2\n", &[]);
+        assert_eq!(
+            config.profile_admission_default(),
+            Some(PROD_MIN_ADMISSION_LIMIT)
+        );
+        assert_eq!(load_3057("dev", "", &[]).profile_admission_default(), None);
+        assert_eq!(
+            load_3057("staging", "", &[]).profile_admission_default(),
+            None
+        );
+    }
+
+    #[test]
+    fn prod_profile_admission_default_resolves_to_a_ceiling() {
+        let config = load_3057("prod", "", &[]);
+        let limit = crate::capacity::resolve_configured_admission_limit_with_default(
+            config.server.max_concurrent_requests,
+            config.server.capacity_contract.as_deref(),
+            config.profile_admission_default(),
+        );
+        assert_eq!(
+            limit,
+            crate::capacity::AdmissionLimit::ProfileDefault(
+                default_pool_size() * PROD_REQUESTS_PER_POOL_CONNECTION
+            )
+        );
+    }
+
+    #[test]
+    fn prod_admission_default_opt_out() {
+        for (toml, env) in [
+            ("[server]\nmax_concurrent_requests = 0\n", vec![]),
+            ("", vec![("AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS", "0")]),
+        ] {
+            let config = load_3057("prod", toml, &env);
+            let limit = crate::capacity::resolve_configured_admission_limit_with_default(
+                config.server.max_concurrent_requests,
+                config.server.capacity_contract.as_deref(),
+                config.profile_admission_default(),
+            );
+            assert_eq!(limit, crate::capacity::AdmissionLimit::Unlimited);
+        }
     }
 
     #[test]

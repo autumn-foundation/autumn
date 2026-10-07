@@ -1836,6 +1836,7 @@ impl Shards {
             pool_name: &format!("shard:{}:{role}", shard.name()),
             shard: Some(shard.name()),
             statement_timeout: ctx.statement_timeout,
+            idle_in_transaction_timeout: ctx.idle_in_transaction_timeout,
             // Tag the route metric with the shard so per-shard latency
             // separates in /actuator/metrics.
             route_key: ctx
@@ -2834,6 +2835,7 @@ mod tests {
         let shard = shard_with_sized_replica(ReplicaFallback::Primary);
         shard.runtime().mark_replica_connection_ready();
         let ctx = crate::db::RequestDbContext {
+            idle_in_transaction_timeout: None,
             statement_timeout: None,
             route_key: Some("GET /notes".to_owned()),
             metrics: None,
@@ -2864,6 +2866,7 @@ mod tests {
         Shards {
             set,
             ctx: crate::db::RequestDbContext {
+                idle_in_transaction_timeout: None,
                 statement_timeout: None,
                 route_key: Some("GET /test".to_owned()),
                 metrics: None,
@@ -2894,6 +2897,7 @@ mod tests {
                 .expect("build")
                 .expect("configured"),
             ctx: crate::db::RequestDbContext {
+                idle_in_transaction_timeout: None,
                 statement_timeout: None,
                 route_key: None,
                 metrics: None,
@@ -3166,6 +3170,7 @@ mod tests {
         let set = shard_set(&["shard0"]);
         let shard = set.get(ShardId(0)).expect("shard");
         let ctx = crate::db::RequestDbContext {
+            idle_in_transaction_timeout: None,
             statement_timeout: Some(std::time::Duration::from_secs(3)),
             route_key: Some("GET /test".to_owned()),
             metrics: None,
@@ -3219,6 +3224,7 @@ mod tests {
         // admin CrossShard<R> extractor can construct the repo without a header.
         let set = shard_set(&["shard0", "shard1"]);
         let ctx = crate::db::RequestDbContext {
+            idle_in_transaction_timeout: None,
             statement_timeout: Some(std::time::Duration::from_millis(1500)),
             route_key: Some("GET /admin".to_owned()),
             metrics: None,
@@ -3244,6 +3250,7 @@ mod tests {
         let set = shard_set(&["shard0"]);
         let shard = set.get(ShardId(0)).expect("shard");
         let ctx = crate::db::RequestDbContext {
+            idle_in_transaction_timeout: None,
             statement_timeout: None,
             route_key: None,
             metrics: None,
@@ -3262,6 +3269,7 @@ mod tests {
         let set = shard_set(&["shard0"]);
         let shard = set.get(ShardId(0)).expect("shard");
         let ctx = crate::db::RequestDbContext {
+            idle_in_transaction_timeout: None,
             statement_timeout: Some(std::time::Duration::from_secs(u64::MAX / 1_000)),
             route_key: None,
             metrics: None,
@@ -3356,6 +3364,7 @@ mod tests {
                 .expect("build")
                 .expect("configured"),
             ctx: crate::db::RequestDbContext {
+                idle_in_transaction_timeout: None,
                 statement_timeout: None,
                 route_key: None,
                 metrics: None,

@@ -303,7 +303,18 @@ pub fn run(
         MigrateAction::Run => {
             // Resolve the effective startup wait (--wait flag > config > 0).
             let wait = resolve_startup_wait(wait_override, config_table.as_ref());
-            run_all_targets(&targets, &migrations_dir, with_maintenance, wait);
+            // Same env as target resolution: the real env over the `.env` overlay.
+            let lock_policy = resolve_migration_lock_policy_from_sources(
+                |key| autumn_web::config::Env::var(&env, key),
+                config_table.as_ref(),
+            );
+            run_all_targets(
+                &targets,
+                &migrations_dir,
+                with_maintenance,
+                wait,
+                lock_policy,
+            );
         }
         MigrateAction::Status => {
             // `show_status` shells out to `diesel migration list`, and the
@@ -545,6 +556,7 @@ fn run_all_targets(
     migrations_dir: &str,
     with_maintenance: bool,
     wait: std::time::Duration,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
 ) {
     let mut completed: Vec<&str> = Vec::new();
     for (label, url) in targets {
@@ -553,7 +565,7 @@ fn run_all_targets(
         // the shard-required framework migrations (version history + commit
         // hook queue), not the full control-plane schema.
         let is_shard = label.starts_with("shard:");
-        if run_single_target(url, migrations_dir, is_shard, wait) {
+        if run_single_target(url, migrations_dir, is_shard, wait, lock_policy) {
             completed.push(label);
             eprintln!();
         } else {
@@ -634,6 +646,7 @@ fn run_single_target(
     migrations_dir: &str,
     is_shard: bool,
     wait: std::time::Duration,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
 ) -> bool {
     use autumn_web::migrate::{DEFAULT_LOCK_WAIT_TIMEOUT, hold_migration_lock, wait_for_database};
 
@@ -719,32 +732,12 @@ fn run_single_target(
     // forks from what a fresh build would produce. Fail fast rather than
     // compounding the drift.
     let dir = std::path::Path::new(migrations_dir);
-    if !validate_checksums_before_apply(database_url, dir) {
+    if !validate_checksums_before_apply(database_url, dir, lock_policy) {
         return false;
     }
 
-    eprintln!("  Running pending migrations...\n");
-    let status = Command::new("diesel")
-        .args(["migration", "run", "--migration-dir"])
-        .arg(dir)
-        .env("DATABASE_URL", database_url)
-        .status();
-
-    match status {
-        Ok(s) if s.success() => {
-            eprintln!("\n\u{2713} Migrations applied successfully.");
-        }
-        Ok(_) => {
-            eprintln!(
-                "\n\u{274C} Migration failed in {}. Check the error output above.",
-                dir.display()
-            );
-            return false;
-        }
-        Err(e) => {
-            eprintln!("\u{274C} Failed to run diesel migration run: {e}");
-            return false;
-        }
+    if !run_user_migrations(database_url, dir, lock_policy) {
+        return false;
     }
 
     // Record the USER-migration checksums NOW — immediately after the user
@@ -759,12 +752,12 @@ fn run_single_target(
     // (framework versions live in the embedded set and are recorded by
     // `run_pending`); it is idempotent (ON CONFLICT DO NOTHING), so recording
     // again after the framework step below is harmless.
-    record_checksums_after_apply(database_url, dir);
+    record_checksums_after_apply(database_url, dir, lock_policy);
 
     let framework_ok = if is_shard {
-        run_shard_framework_migrations(database_url)
+        run_shard_framework_migrations(database_url, lock_policy)
     } else {
-        run_framework_migrations(database_url)
+        run_framework_migrations(database_url, lock_policy)
     };
     if !framework_ok {
         return false;
@@ -818,9 +811,19 @@ fn run_single_target_sqlite(database_url: &str, migrations_dir: &str) -> bool {
 /// Returns `true` when validation passes OR when the checksum table doesn't
 /// yet exist — a fresh database that hasn't run the framework migration
 /// which creates the table is not itself an error.
-fn validate_checksums_before_apply(database_url: &str, migrations_dir: &std::path::Path) -> bool {
-    match autumn_web::migrate::validate_recorded_checksums_against_dir(database_url, migrations_dir)
-    {
+///
+/// The reads run under `lock_policy`, so a lock on the bookkeeping tables
+/// fails fast and is retried instead of blocking (#3057).
+fn validate_checksums_before_apply(
+    database_url: &str,
+    migrations_dir: &std::path::Path,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
+) -> bool {
+    match autumn_web::migrate::validate_recorded_checksums_against_dir_with_policy(
+        database_url,
+        migrations_dir,
+        lock_policy,
+    ) {
         Ok(()) => true,
         Err(e) => {
             eprintln!("\u{274C} {e}");
@@ -833,8 +836,18 @@ fn validate_checksums_before_apply(database_url: &str, migrations_dir: &std::pat
 /// migration that doesn't yet have a stored checksum (issue #1203).
 /// Silent when the migrations dir is unreadable — this backfills the CLI
 /// path when the framework's checksum table wasn't present before.
-fn record_checksums_after_apply(database_url: &str, migrations_dir: &std::path::Path) {
-    match autumn_web::migrate::record_checksums_from_dir(database_url, migrations_dir) {
+///
+/// Runs under `lock_policy`, like the check before the apply.
+fn record_checksums_after_apply(
+    database_url: &str,
+    migrations_dir: &std::path::Path,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
+) {
+    match autumn_web::migrate::record_checksums_from_dir_with_policy(
+        database_url,
+        migrations_dir,
+        lock_policy,
+    ) {
         Ok(0) => {}
         Ok(n) => {
             eprintln!(
@@ -1395,6 +1408,19 @@ fn deep_merge_toml(base: &mut toml::Table, overlay: toml::Table) {
 ///
 /// Returns `None` when no URL can be resolved, leaving the caller to decide how
 /// to report the failure (the `autumn db` commands surface their own message).
+/// The migration lock policy for `profile`, resolved as `autumn migrate`
+/// resolves it: env and project `.env`, then `autumn.toml`, then the defaults.
+pub fn resolve_migration_lock_policy(
+    profile: Option<&str>,
+) -> autumn_web::migrate::MigrationLockPolicy {
+    use autumn_web::config::Env as _;
+
+    let effective = effective_profile(profile);
+    let config_table = read_autumn_toml_table_with_profile(Some(&effective));
+    let env = os_env_with_dotenv_or_exit();
+    resolve_migration_lock_policy_from_sources(|key| env.var(key), config_table.as_ref())
+}
+
 pub fn resolve_primary_url(profile: Option<&str>) -> Option<String> {
     use autumn_web::config::Env as _;
 
@@ -1593,6 +1619,731 @@ where
         })
 }
 
+/// Resolve the migration lock policy (#3057): env, then `autumn.toml`, then
+/// the `[database]` defaults. An invalid value warns and is ignored.
+pub fn resolve_migration_lock_policy_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+) -> autumn_web::migrate::MigrationLockPolicy
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    let mut warnings = Vec::new();
+    let policy = resolve_migration_lock_policy_with_warnings(env_var, table, &mut warnings);
+    for warning in warnings {
+        eprintln!("  Warning: {warning}");
+    }
+    policy
+}
+
+/// [`resolve_migration_lock_policy_from_sources`], with each invalid value
+/// pushed to `warnings` instead of printed.
+fn resolve_migration_lock_policy_with_warnings<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+    warnings: &mut Vec<String>,
+) -> autumn_web::migrate::MigrationLockPolicy
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    let mut policy = autumn_web::migrate::MigrationLockPolicy::default();
+    let db = table
+        .and_then(|t| t.get("database"))
+        .and_then(toml::Value::as_table);
+
+    let toml_timeout = db
+        .and_then(|db| db.get("migration_lock_timeout"))
+        .and_then(|value| {
+            let parsed = match value {
+                toml::Value::String(text) => autumn_web::config::parse_duration_str(text).ok(),
+                toml::Value::Integer(ms) => u64::try_from(*ms)
+                    .ok()
+                    .map(std::time::Duration::from_millis),
+                _ => None,
+            };
+            if parsed.is_none() {
+                warnings.push(format!(
+                    "`database.migration_lock_timeout = {value}` is not a valid duration; \
+                     using the default."
+                ));
+            }
+            parsed
+        });
+    let env_timeout = env_var("AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT")
+        .ok()
+        .filter(|text| !text.trim().is_empty())
+        .and_then(|text| {
+            let parsed = autumn_web::config::parse_duration_str(text.trim()).ok();
+            if parsed.is_none() {
+                warnings.push(format!(
+                    "AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT={text:?} is not a valid duration; \
+                     ignoring it."
+                ));
+            }
+            parsed
+        });
+    if let Some(timeout) = env_timeout.or(toml_timeout) {
+        policy.lock_timeout = timeout;
+    }
+
+    let toml_retries = db
+        .and_then(|db| db.get("migration_lock_retries"))
+        .and_then(|value| {
+            let parsed = value.as_integer().and_then(|n| u32::try_from(n).ok());
+            if parsed.is_none() {
+                warnings.push(format!(
+                    "`database.migration_lock_retries = {value}` is not a valid count; \
+                     using the default."
+                ));
+            }
+            parsed
+        });
+    let env_retries = env_var("AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES")
+        .ok()
+        .and_then(|text| {
+            let parsed = text.trim().parse::<u32>().ok();
+            if parsed.is_none() {
+                warnings.push(format!(
+                    "AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES={text:?} is not a valid count; \
+                     ignoring it."
+                ));
+            }
+            parsed
+        });
+    if let Some(retries) = env_retries.or(toml_retries) {
+        policy.retries = retries;
+    }
+    policy
+}
+
+/// The `PGOPTIONS` value for the `diesel` subprocess: `existing` plus
+/// `-c lock_timeout=<ms>`. A zero timeout is sent too, so an inherited role
+/// or database default is turned off.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "`None` means no PGOPTIONS for the child; callers set it after a pooler refusal"
+)]
+fn diesel_pgoptions(existing: Option<&str>, lock_timeout: std::time::Duration) -> Option<String> {
+    let existing = existing.map(str::trim).filter(|e| !e.is_empty());
+    let ms = u64::try_from(lock_timeout.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(i32::MAX.unsigned_abs().into());
+    let option = format!("-c lock_timeout={ms}");
+    Some(match existing {
+        Some(existing) => format!("{existing} {option}"),
+        None => option,
+    })
+}
+
+/// `existing` without any `lock_timeout` option (`-c lock_timeout=…`,
+/// `-clock_timeout=…`, `--lock_timeout=…`). `None` when nothing is left.
+fn strip_lock_timeout(existing: Option<&str>) -> Option<String> {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut tokens = existing.unwrap_or_default().split_whitespace().peekable();
+    while let Some(token) = tokens.next() {
+        if token == "-c"
+            && tokens
+                .peek()
+                .is_some_and(|next| next.starts_with("lock_timeout="))
+        {
+            tokens.next();
+        } else if !token.starts_with("-clock_timeout=") && !token.starts_with("--lock_timeout=") {
+            kept.push(token);
+        }
+    }
+    (!kept.is_empty()).then(|| kept.join(" "))
+}
+
+/// The `PGOPTIONS` the `diesel` subprocess gets. When a pending migration is
+/// non-transactional, the session gets `lock_timeout=0`, and any inherited
+/// `lock_timeout` option is removed. `english` adds `lc_messages=C`, so the
+/// retry can read the lock-timeout message.
+fn child_pgoptions(
+    inherited: Option<&str>,
+    lock_timeout: std::time::Duration,
+    non_transactional_pending: bool,
+    english: bool,
+) -> Option<String> {
+    let options = if non_transactional_pending {
+        diesel_pgoptions(
+            strip_lock_timeout(inherited).as_deref(),
+            std::time::Duration::ZERO,
+        )
+    } else {
+        diesel_pgoptions(inherited, lock_timeout)
+    };
+    if english {
+        options.map(|options| format!("{options} -c lc_messages=C"))
+    } else {
+        options
+    }
+}
+
+/// Run the user migrations through the `diesel` CLI, with `lock_timeout` and
+/// a jittered retry (#3057). Returns whether they applied.
+///
+/// `PGOPTIONS` sets the timeout for the whole `diesel` session. So when a
+/// non-transactional migration (`CREATE INDEX CONCURRENTLY`) is pending, the
+/// pending set runs in batches of one kind: transactional batches get the
+/// timeout, non-transactional ones get `lock_timeout=0`.
+fn run_user_migrations(
+    database_url: &str,
+    dir: &Path,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
+) -> bool {
+    eprintln!("  Running pending migrations...\n");
+    // Ask for English server messages only when the role may set them.
+    let english = autumn_web::migrate::can_set_lc_messages(database_url);
+    let non_transactional: std::collections::HashSet<String> =
+        non_transactional_versions(dir).into_iter().collect();
+    let pending = if non_transactional.is_empty() {
+        Ok(None)
+    } else {
+        pending_versions(database_url, dir, lock_policy)
+    };
+    let outcome = match pending {
+        Err(e) => Err(e),
+        Ok(Some(pending)) if pending.iter().any(|v| non_transactional.contains(v)) => {
+            run_diesel_in_batches(
+                database_url,
+                dir,
+                lock_policy,
+                &migration_batches(&pending, &non_transactional),
+                english,
+            )
+        }
+        // All pending migrations are transactional.
+        Ok(Some(_)) => run_diesel_with_policy(database_url, dir, lock_policy, true, english),
+        // No non-transactional migration exists, or the pending set is
+        // unknown: then the timeout stays off when one exists.
+        Ok(None) => run_diesel_with_policy(
+            database_url,
+            dir,
+            lock_policy,
+            non_transactional.is_empty(),
+            english,
+        ),
+    };
+
+    match outcome {
+        Ok(()) => {
+            eprintln!("\n\u{2713} Migrations applied successfully.");
+            true
+        }
+        Err(MigrationError::Migration(_)) => {
+            eprintln!(
+                "\n\u{274C} Migration failed in {}. Check the error output above.",
+                dir.display()
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("\u{274C} {e}");
+            false
+        }
+    }
+}
+
+/// Run each batch from a temporary directory that holds only its migrations.
+fn run_diesel_in_batches(
+    database_url: &str,
+    dir: &Path,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
+    batches: &[(bool, Vec<String>)],
+    english: bool,
+) -> Result<(), MigrationError> {
+    for (transactional, versions) in batches {
+        if !transactional {
+            eprintln!(
+                "  {} has run_in_transaction = false; running it without lock_timeout.",
+                versions.join(", ")
+            );
+        }
+        let batch_dir = tempfile::TempDir::new().map_err(|e| {
+            MigrationError::Migration(format!("could not create a migration batch directory: {e}"))
+        })?;
+        copy_migration_subset(dir, batch_dir.path(), versions).map_err(|e| {
+            MigrationError::Migration(format!("could not copy migrations for a batch: {e}"))
+        })?;
+        run_diesel_with_policy(
+            database_url,
+            batch_dir.path(),
+            lock_policy,
+            *transactional,
+            english,
+        )?;
+    }
+    Ok(())
+}
+
+/// Run `diesel migration run` on `dir` with the retry loop. A transactional
+/// run gets the policy timeout in `PGOPTIONS`, any other run `lock_timeout=0`.
+fn run_diesel_with_policy(
+    database_url: &str,
+    dir: &Path,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
+    transactional: bool,
+    english: bool,
+) -> Result<(), MigrationError> {
+    // libpq reads `PGOPTIONS` only when the connection string has no
+    // `options` parameter. So that value is the operator's base. It moves
+    // into `PGOPTIONS`, where the framework options can be added to it.
+    let (database_url, url_options) = split_connection_options(database_url);
+    let database_url = database_url.as_str();
+    let inherited = url_options
+        .or_else(|| std::env::var("PGOPTIONS").ok())
+        .filter(|options| !options.trim().is_empty());
+    let mut pgoptions = child_pgoptions(
+        inherited.as_deref(),
+        lock_policy.lock_timeout,
+        !transactional,
+        english,
+    );
+    // After a pooler fallback, transactional migrations run from a copy that
+    // sets the timeout inside each migration's own transaction.
+    let mut fallback_dir: Option<tempfile::TempDir> = None;
+    autumn_web::migrate::retry_on_lock_timeout(
+        lock_policy,
+        |delay| {
+            eprintln!(
+                "  A migration timed out waiting for a table lock; retrying in {}ms\u{2026}",
+                delay.as_millis()
+            );
+            std::thread::sleep(delay);
+        },
+        || {
+            let run_dir = fallback_dir.as_ref().map_or(dir, tempfile::TempDir::path);
+            match run_diesel_migrations_once(database_url, run_dir, pgoptions.as_deref()) {
+                Err(MigrationError::Migration(text)) if startup_options_rejected(&text) => {
+                    let base = pooler_fallback_base(inherited.as_deref(), transactional);
+                    let Some(fallback) = pooler_fallback(pgoptions.as_deref(), base.as_deref())
+                    else {
+                        return Err(MigrationError::Migration(text));
+                    };
+                    // The fallback cannot send `lock_timeout=0`. A role or
+                    // database default would then cancel `CREATE INDEX
+                    // CONCURRENTLY` and leave an INVALID index, so a
+                    // non-transactional batch runs only when the server default
+                    // is already off.
+                    if !pooler_fallback_is_safe(transactional, || {
+                        autumn_web::migrate::server_lock_timeout_is_off(database_url)
+                    }) {
+                        return Err(MigrationError::Migration(format!(
+                            "{text}\nThe server refused PGOPTIONS (a pooler such as PgBouncer?), so \
+                         lock_timeout=0 cannot be sent, and the role or database sets a \
+                         nonzero lock_timeout. A run_in_transaction = false migration \
+                         (CREATE INDEX CONCURRENTLY) would be cancelled and leave an INVALID \
+                         index. Run migrations against Postgres directly, or set \
+                         lock_timeout = 0 for the migration role."
+                        )));
+                    }
+                    pgoptions = fallback;
+                    if transactional {
+                        // A transaction pooler drops a startup option but keeps a
+                        // `SET LOCAL` for the transaction that issued it.
+                        let copy = tempfile::TempDir::new().map_err(|e| {
+                        MigrationError::Migration(format!(
+                            "could not create a migration directory for the pooler fallback: {e}"
+                        ))
+                    })?;
+                        copy_with_lock_timeout(
+                            dir,
+                            copy.path(),
+                            lock_policy.lock_timeout,
+                            english,
+                            &non_transactional_versions(dir).into_iter().collect(),
+                        )
+                        .map_err(|e| {
+                            MigrationError::Migration(format!(
+                                "could not copy migrations for the pooler fallback: {e}"
+                            ))
+                        })?;
+                        fallback_dir = Some(copy);
+                        eprintln!(
+                            "  The server refused PGOPTIONS (a pooler such as PgBouncer?); running \
+                         again with lock_timeout set inside each migration's transaction."
+                        );
+                    } else {
+                        eprintln!(
+                            "  The server refused PGOPTIONS (a pooler such as PgBouncer?); running \
+                         again without it (the server lock_timeout is already 0)."
+                        );
+                    }
+                    let run_dir = fallback_dir.as_ref().map_or(dir, tempfile::TempDir::path);
+                    run_diesel_migrations_once(database_url, run_dir, pgoptions.as_deref())
+                }
+                other => other,
+            }
+        },
+    )
+}
+
+/// Copy the migration directories in `src` into `dst`. Each transactional
+/// migration's `up.sql` starts with `SET LOCAL lock_timeout = <ms>;`, which
+/// `diesel` runs inside that migration's transaction. With `english` (the
+/// role may set `lc_messages`), it also sets `lc_messages = 'C'`, so the
+/// retry can read a lock timeout. Versions in `non_transactional` are copied
+/// unchanged.
+fn copy_with_lock_timeout(
+    src: &Path,
+    dst: &Path,
+    lock_timeout: std::time::Duration,
+    english: bool,
+    non_transactional: &std::collections::HashSet<String>,
+) -> std::io::Result<()> {
+    let ms = u64::try_from(lock_timeout.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(i32::MAX.unsigned_abs().into());
+    let header = if english {
+        format!("SET LOCAL lock_timeout = {ms};\nSET LOCAL lc_messages = 'C';\n")
+    } else {
+        format!("SET LOCAL lock_timeout = {ms};\n")
+    };
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let transactional = !non_transactional.contains(&migration_dir_version(&name));
+        let target = dst.join(&name);
+        std::fs::create_dir_all(&target)?;
+        for file in std::fs::read_dir(entry.path())? {
+            let file = file?;
+            if !file.file_type()?.is_file() {
+                continue;
+            }
+            if transactional && file.file_name() == "up.sql" {
+                let body = std::fs::read_to_string(file.path())?;
+                std::fs::write(target.join("up.sql"), format!("{header}{body}"))?;
+            } else {
+                std::fs::copy(file.path(), target.join(file.file_name()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `database_url` without its `options` parameter, and that parameter's
+/// value. libpq accepts a `postgres://` or `postgresql://` URI, or a
+/// keyword/value string (`host=db options='-c a=1'`); both forms are handled.
+fn split_connection_options(database_url: &str) -> (String, Option<String>) {
+    if database_url.starts_with("postgres://") || database_url.starts_with("postgresql://") {
+        split_url_options(database_url)
+    } else {
+        split_keyword_options(database_url)
+    }
+}
+
+/// `url` without its `options` query parameter, and that parameter's decoded
+/// value. When it appears more than once, the last value wins, as in libpq.
+/// An empty value is still returned: libpq then ignores `PGOPTIONS` too.
+/// A URL with no `options` parameter comes back unchanged, with `None`.
+fn split_url_options(url: &str) -> (String, Option<String>) {
+    let Some((base, query)) = url.split_once('?') else {
+        return (url.to_owned(), None);
+    };
+    let mut options = None;
+    let mut kept: Vec<&str> = Vec::new();
+    for pair in query.split('&') {
+        match pair.strip_prefix("options=") {
+            Some(value) => {
+                options = Some(
+                    percent_encoding::percent_decode_str(value)
+                        .decode_utf8_lossy()
+                        .into_owned(),
+                );
+            }
+            None => kept.push(pair),
+        }
+    }
+    if kept.is_empty() {
+        (base.to_owned(), options)
+    } else {
+        (format!("{base}?{}", kept.join("&")), options)
+    }
+}
+
+/// A keyword/value conninfo string without its `options` pairs, and the
+/// value of the last one, unquoted as libpq reads it. The other pairs are
+/// kept verbatim. A string libpq could not parse comes back unchanged, with
+/// `None`: the connection then fails on its own.
+fn split_keyword_options(conninfo: &str) -> (String, Option<String>) {
+    /// One `keyword = value` pair: the keyword, the unquoted value, and the
+    /// pair's byte range in the string.
+    fn pairs(conninfo: &str) -> Option<Vec<(&str, String, std::ops::Range<usize>)>> {
+        let bytes = conninfo.as_bytes();
+        let mut pairs = Vec::new();
+        let mut i = 0;
+        loop {
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i == bytes.len() {
+                return Some(pairs);
+            }
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let keyword = &conninfo[start..i];
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if keyword.is_empty() || bytes.get(i) != Some(&b'=') {
+                return None;
+            }
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let mut value = Vec::new();
+            if bytes.get(i) == Some(&b'\'') {
+                i += 1;
+                loop {
+                    match bytes.get(i)? {
+                        b'\'' => {
+                            i += 1;
+                            break;
+                        }
+                        b'\\' => {
+                            value.push(*bytes.get(i + 1)?);
+                            i += 2;
+                        }
+                        &b => {
+                            value.push(b);
+                            i += 1;
+                        }
+                    }
+                }
+            } else {
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                    if bytes[i] == b'\\' {
+                        value.push(*bytes.get(i + 1)?);
+                        i += 2;
+                    } else {
+                        value.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            let value = String::from_utf8(value).ok()?;
+            pairs.push((keyword, value, start..i));
+        }
+    }
+
+    let Some(pairs) = pairs(conninfo) else {
+        return (conninfo.to_owned(), None);
+    };
+    let mut options = None;
+    let mut kept: Vec<&str> = Vec::new();
+    for (keyword, value, range) in pairs {
+        if keyword == "options" {
+            options = Some(value);
+        } else {
+            kept.push(&conninfo[range]);
+        }
+    }
+    if options.is_none() {
+        return (conninfo.to_owned(), None);
+    }
+    (kept.join(" "), options)
+}
+
+/// Whether a batch may run again without its startup options. A
+/// transactional batch may: it runs from a copy whose migrations set
+/// `SET LOCAL lock_timeout` themselves (`copy_with_lock_timeout`). A
+/// non-transactional one may only when the server default is already off
+/// (`server_lock_timeout_is_off`, asked only then): outside a transaction, a
+/// pooler can send each statement to a different server connection, so a
+/// `SET` in the file would not reach the `CREATE INDEX CONCURRENTLY`.
+fn pooler_fallback_is_safe(
+    transactional: bool,
+    server_lock_timeout_is_off: impl FnOnce() -> bool,
+) -> bool {
+    transactional || server_lock_timeout_is_off()
+}
+
+/// The inherited `PGOPTIONS` a pooler fallback may use. A non-transactional
+/// run drops any inherited `lock_timeout`, so `CREATE INDEX CONCURRENTLY` is
+/// never cancelled; the operator's other settings stay.
+fn pooler_fallback_base(inherited: Option<&str>, transactional: bool) -> Option<String> {
+    if transactional {
+        inherited.map(str::to_owned)
+    } else {
+        strip_lock_timeout(inherited)
+    }
+}
+
+/// The `PGOPTIONS` to run with after a pooler refused `current`: the
+/// inherited value, unchanged, so the operator's own settings (such as
+/// `search_path`) stay. `None` when `current` is already the inherited value,
+/// so there is nothing to fall back from.
+#[allow(
+    clippy::option_option,
+    reason = "outer None: no fallback; inner None: run with no PGOPTIONS"
+)]
+fn pooler_fallback(current: Option<&str>, inherited: Option<&str>) -> Option<Option<String>> {
+    (current != inherited).then(|| inherited.map(str::to_owned))
+}
+
+/// Versions of the migrations in `dir` with `run_in_transaction = false`.
+///
+/// `lock_timeout` must not reach these. `CREATE INDEX CONCURRENTLY` waits for
+/// older transactions, and a timeout would cancel it and leave an INVALID
+/// index.
+fn non_transactional_versions(dir: &Path) -> Vec<String> {
+    let Ok(source) = diesel_migrations::FileBasedMigrations::from_path(dir) else {
+        return Vec::new();
+    };
+    let Ok(migrations) = diesel::migration::MigrationSource::<diesel::pg::Pg>::migrations(&source)
+    else {
+        return Vec::new();
+    };
+    migrations
+        .iter()
+        .filter(|m| !m.metadata().run_in_transaction())
+        .map(|m| m.name().version().to_string())
+        .collect()
+}
+
+/// The pending migration versions in `dir`, in version order. `Ok(None)`
+/// when the migrations directory cannot be read. The read runs under
+/// `lock_policy`, so a lock on `__diesel_schema_migrations` fails fast and is
+/// retried; a database error is returned, not treated as an unknown set.
+fn pending_versions(
+    database_url: &str,
+    dir: &Path,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
+) -> Result<Option<Vec<String>>, MigrationError> {
+    let Ok(source) = diesel_migrations::FileBasedMigrations::from_path(dir) else {
+        return Ok(None);
+    };
+    let read = autumn_web::migrate::retry_on_lock_timeout(
+        lock_policy,
+        |delay| {
+            eprintln!(
+                "  Reading the pending migrations timed out on a table lock; retrying in {}ms\u{2026}",
+                delay.as_millis()
+            );
+            std::thread::sleep(delay);
+        },
+        || {
+            autumn_web::migrate::pending_migrations_with_lock_timeout(
+                database_url,
+                source.clone(),
+                lock_policy.lock_timeout,
+            )
+        },
+    );
+    // Any read error stops the run. A lock timeout in a server language
+    // the retry cannot read is a plain `Migration` error, and an unknown
+    // pending set would run with the timeout off.
+    read.map(|mut pending| {
+        pending.sort();
+        Some(pending)
+    })
+}
+
+/// `pending` split into runs of the same kind, in order. `true` marks a run
+/// of transactional migrations, which get the `lock_timeout`.
+fn migration_batches(
+    pending: &[String],
+    non_transactional: &std::collections::HashSet<String>,
+) -> Vec<(bool, Vec<String>)> {
+    let mut batches: Vec<(bool, Vec<String>)> = Vec::new();
+    for version in pending {
+        let transactional = !non_transactional.contains(version);
+        match batches.last_mut() {
+            Some((kind, versions)) if *kind == transactional => versions.push(version.clone()),
+            _ => batches.push((transactional, vec![version.clone()])),
+        }
+    }
+    batches
+}
+
+/// The diesel version of a migration directory name:
+/// `2026-01-02-000000_name` gives `20260102000000`.
+fn migration_dir_version(name: &str) -> String {
+    name.split('_').next().unwrap_or(name).replace('-', "")
+}
+
+/// Copy the migration directories of `versions` from `src` into `dst`.
+fn copy_migration_subset(src: &Path, dst: &Path, versions: &[String]) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !entry.file_type()?.is_dir() || !versions.contains(&migration_dir_version(&name)) {
+            continue;
+        }
+        let target = dst.join(&name);
+        std::fs::create_dir_all(&target)?;
+        for file in std::fs::read_dir(entry.path())? {
+            let file = file?;
+            if file.file_type()?.is_file() {
+                std::fs::copy(file.path(), target.join(file.file_name()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether the server (or a pooler such as `PgBouncer`) refused the
+/// `options` startup parameter that `PGOPTIONS` sends.
+fn startup_options_rejected(stderr: &str) -> bool {
+    stderr.contains("unsupported startup parameter")
+}
+
+/// Run `diesel migration run` once. Its stderr goes to this process's stderr
+/// and is also kept, so the caller can tell a lock timeout from other errors.
+fn run_diesel_migrations_once(
+    database_url: &str,
+    dir: &Path,
+    pgoptions: Option<&str>,
+) -> Result<(), MigrationError> {
+    use std::io::{BufRead as _, Write as _};
+    let mut command = Command::new("diesel");
+    command
+        .args(["migration", "run", "--migration-dir"])
+        .arg(dir)
+        .env("DATABASE_URL", database_url)
+        .stderr(std::process::Stdio::piped());
+    // Set the value, or remove an inherited one: `None` must not let the
+    // parent's `PGOPTIONS` through.
+    match pgoptions {
+        Some(options) => command.env("PGOPTIONS", options),
+        None => command.env_remove("PGOPTIONS"),
+    };
+    let mut child = command.spawn().map_err(|e| {
+        MigrationError::Connection(format!("failed to run diesel migration run: {e}"))
+    })?;
+    let mut captured = String::new();
+    if let Some(stderr) = child.stderr.take() {
+        // Read bytes, not `lines()`: a localized server message can be invalid
+        // UTF-8, and the pipe must be drained to the end.
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let text = String::from_utf8_lossy(&line);
+                    let _ = write!(std::io::stderr(), "{text}");
+                    captured.push_str(&text);
+                }
+            }
+        }
+    }
+    match child.wait() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => Err(MigrationError::Migration(captured)),
+        Err(e) => Err(MigrationError::Connection(format!(
+            "failed to wait for diesel migration run: {e}"
+        ))),
+    }
+}
+
 /// Resolve the effective startup wait: the `--wait` CLI flag (if given) wins;
 /// otherwise fall back to the merged config table (env > toml > 0).
 ///
@@ -1636,10 +2387,15 @@ fn check_diesel_cli() {
     }
 }
 
-fn run_framework_migrations(database_url: &str) -> bool {
+fn run_framework_migrations(
+    database_url: &str,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
+) -> bool {
     eprintln!("  Running pending Autumn framework migrations...\n");
 
-    match run_framework_migrations_inner(database_url, autumn_web::migrate::run_pending) {
+    match run_framework_migrations_inner(database_url, |url, migrations| {
+        autumn_web::migrate::run_pending_with_policy(url, migrations, lock_policy)
+    }) {
         Ok(result) if result.applied.is_empty() => {
             eprintln!("\n\u{2713} Framework migrations are up to date.");
             true
@@ -1675,13 +2431,15 @@ where
 /// In production this delegates to
 /// [`autumn_web::migrate::run_pending_shard_framework_migrations`]; the inner
 /// helper takes a closure so the dispatch can be tested without a live database.
-fn run_shard_framework_migrations(database_url: &str) -> bool {
+fn run_shard_framework_migrations(
+    database_url: &str,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
+) -> bool {
     eprintln!("  Running pending Autumn shard framework migrations...\n");
 
-    match run_shard_framework_migrations_inner(
-        database_url,
-        autumn_web::migrate::run_pending_shard_framework_migrations,
-    ) {
+    match run_shard_framework_migrations_inner(database_url, |url| {
+        autumn_web::migrate::run_pending_shard_framework_migrations_with_policy(url, lock_policy)
+    }) {
         Ok(result) if result.applied.is_empty() => {
             eprintln!("\n\u{2713} Shard framework migrations are up to date.");
             true
@@ -4262,6 +5020,407 @@ primary_url = "postgres://prod-s0:5432/app"
             Some(&table),
         );
         assert_eq!(secs, 30, "bad env value should fall back to toml");
+    }
+
+    // ── migration lock policy (#3057) ────────────────────────────────────────
+
+    fn db_table(entries: &[(&str, toml::Value)]) -> toml::Table {
+        let mut db = toml::Table::new();
+        for (key, value) in entries {
+            db.insert((*key).to_owned(), value.clone());
+        }
+        let mut table = toml::Table::new();
+        table.insert("database".to_owned(), toml::Value::Table(db));
+        table
+    }
+
+    #[test]
+    fn migration_lock_policy_defaults() {
+        assert_eq!(
+            resolve_migration_lock_policy_from_sources(no_env, None),
+            autumn_web::migrate::MigrationLockPolicy::default()
+        );
+    }
+
+    #[test]
+    fn migration_lock_policy_from_toml() {
+        let table = db_table(&[
+            ("migration_lock_timeout", toml::Value::String("2s".into())),
+            ("migration_lock_retries", toml::Value::Integer(1)),
+        ]);
+        let policy = resolve_migration_lock_policy_from_sources(no_env, Some(&table));
+        assert_eq!(policy.lock_timeout, std::time::Duration::from_secs(2));
+        assert_eq!(policy.retries, 1);
+        // A bare integer is milliseconds, as in `autumn.toml` elsewhere.
+        let table = db_table(&[("migration_lock_timeout", toml::Value::Integer(750))]);
+        let policy = resolve_migration_lock_policy_from_sources(no_env, Some(&table));
+        assert_eq!(policy.lock_timeout, std::time::Duration::from_millis(750));
+    }
+
+    #[test]
+    fn invalid_toml_migration_lock_values_are_reported() {
+        let table = db_table(&[
+            (
+                "migration_lock_timeout",
+                toml::Value::String("5secondsx".into()),
+            ),
+            ("migration_lock_retries", toml::Value::Integer(-1)),
+        ]);
+        let mut warnings = Vec::new();
+        let policy =
+            resolve_migration_lock_policy_with_warnings(no_env, Some(&table), &mut warnings);
+        assert_eq!(policy, autumn_web::migrate::MigrationLockPolicy::default());
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("migration_lock_timeout"),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings[1].contains("migration_lock_retries"),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn migration_lock_policy_env_overrides_toml() {
+        let table = db_table(&[
+            ("migration_lock_timeout", toml::Value::String("2s".into())),
+            ("migration_lock_retries", toml::Value::Integer(1)),
+        ]);
+        let policy = resolve_migration_lock_policy_from_sources(
+            |key| match key {
+                "AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT"
+                | "AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES" => Ok("0".to_owned()),
+                _ => Err(std::env::VarError::NotPresent),
+            },
+            Some(&table),
+        );
+        assert_eq!(policy.lock_timeout, std::time::Duration::ZERO);
+        assert_eq!(policy.retries, 0);
+    }
+
+    #[test]
+    fn non_transactional_versions_reads_metadata() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for (name, metadata) in [
+            ("2026-01-01-000000_plain", None),
+            (
+                "2026-01-02-000000_concurrent_index",
+                Some("run_in_transaction = false\n"),
+            ),
+        ] {
+            let migration = dir.path().join(name);
+            std::fs::create_dir_all(&migration).unwrap();
+            std::fs::write(migration.join("up.sql"), "SELECT 1;").unwrap();
+            std::fs::write(migration.join("down.sql"), "SELECT 1;").unwrap();
+            if let Some(metadata) = metadata {
+                std::fs::write(migration.join("metadata.toml"), metadata).unwrap();
+            }
+        }
+        assert_eq!(
+            non_transactional_versions(dir.path()),
+            vec!["20260102000000".to_owned()]
+        );
+    }
+
+    #[test]
+    fn migration_batches_group_runs_of_the_same_kind() {
+        let pending = ["1", "2", "3", "4", "5"].map(str::to_owned).to_vec();
+        let non_transactional = std::iter::once("3".to_owned()).collect();
+        assert_eq!(
+            migration_batches(&pending, &non_transactional),
+            vec![
+                (true, vec!["1".to_owned(), "2".to_owned()]),
+                (false, vec!["3".to_owned()]),
+                (true, vec!["4".to_owned(), "5".to_owned()]),
+            ]
+        );
+        assert_eq!(
+            migration_batches(&pending[..2], &non_transactional),
+            vec![(true, vec!["1".to_owned(), "2".to_owned()])]
+        );
+        assert!(migration_batches(&[], &non_transactional).is_empty());
+    }
+
+    #[test]
+    fn copy_migration_subset_keeps_only_the_named_versions() {
+        let src = tempfile::TempDir::new().unwrap();
+        for name in ["2026-01-01-000000_one", "2026-01-02-000000_two"] {
+            let dir = src.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("up.sql"), name).unwrap();
+            std::fs::write(dir.join("down.sql"), "SELECT 1;").unwrap();
+        }
+        let dst = tempfile::TempDir::new().unwrap();
+        copy_migration_subset(src.path(), dst.path(), &["20260102000000".to_owned()]).unwrap();
+        let copied: Vec<String> = std::fs::read_dir(dst.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(copied, vec!["2026-01-02-000000_two".to_owned()]);
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("2026-01-02-000000_two/up.sql")).unwrap(),
+            "2026-01-02-000000_two"
+        );
+    }
+
+    #[test]
+    fn pooler_fallback_base_strips_lock_timeout_for_non_transactional_runs() {
+        let inherited = Some("-c search_path=tenant -c lock_timeout=9000");
+        assert_eq!(
+            pooler_fallback_base(inherited, true).as_deref(),
+            Some("-c search_path=tenant -c lock_timeout=9000")
+        );
+        assert_eq!(
+            pooler_fallback_base(inherited, false).as_deref(),
+            Some("-c search_path=tenant")
+        );
+        assert_eq!(pooler_fallback_base(None, false), None);
+    }
+
+    #[test]
+    fn pooler_fallback_keeps_the_inherited_options() {
+        let inherited = Some("-c search_path=tenant");
+        let composed = Some("-c search_path=tenant -c lock_timeout=5000");
+        // The framework's own options go; the operator's stay.
+        assert_eq!(
+            pooler_fallback(composed, inherited),
+            Some(Some("-c search_path=tenant".to_owned()))
+        );
+        assert_eq!(pooler_fallback(composed, None), Some(None));
+        // Nothing was added, so there is nothing to fall back from.
+        assert_eq!(pooler_fallback(inherited, inherited), None);
+    }
+
+    #[test]
+    fn rejected_startup_options_are_detected() {
+        assert!(startup_options_rejected(
+            "FATAL:  unsupported startup parameter: options"
+        ));
+        assert!(!startup_options_rejected(
+            "canceling statement due to lock timeout"
+        ));
+    }
+
+    #[test]
+    fn diesel_pgoptions_adds_lock_timeout() {
+        let five = std::time::Duration::from_secs(5);
+        assert_eq!(
+            diesel_pgoptions(None, five).as_deref(),
+            Some("-c lock_timeout=5000")
+        );
+        assert_eq!(
+            diesel_pgoptions(Some("-c search_path=app"), five).as_deref(),
+            Some("-c search_path=app -c lock_timeout=5000")
+        );
+        // `0` is sent too, so an inherited default is turned off.
+        assert_eq!(
+            diesel_pgoptions(None, std::time::Duration::ZERO).as_deref(),
+            Some("-c lock_timeout=0")
+        );
+        assert_eq!(
+            diesel_pgoptions(Some("-c search_path=app"), std::time::Duration::ZERO).as_deref(),
+            Some("-c search_path=app -c lock_timeout=0")
+        );
+    }
+
+    #[test]
+    fn strip_lock_timeout_removes_every_spelling() {
+        assert_eq!(
+            strip_lock_timeout(Some(
+                "-c search_path=app -c lock_timeout=5000 -clock_timeout=1 --lock_timeout=2"
+            ))
+            .as_deref(),
+            Some("-c search_path=app")
+        );
+        assert_eq!(strip_lock_timeout(Some("-c lock_timeout=5000")), None);
+        assert_eq!(strip_lock_timeout(None), None);
+    }
+
+    #[test]
+    fn split_url_options_moves_the_url_options_out_of_the_url() {
+        assert_eq!(
+            split_url_options(
+                "postgres://u:p@db:5432/app?sslmode=require&options=-c%20search_path%3Dtenant"
+            ),
+            (
+                "postgres://u:p@db:5432/app?sslmode=require".to_owned(),
+                Some("-c search_path=tenant".to_owned())
+            )
+        );
+        assert_eq!(
+            split_url_options("postgres://db/app?options=-c%20a%3D1&options=-c%20b%3D2"),
+            ("postgres://db/app".to_owned(), Some("-c b=2".to_owned())),
+            "the last value wins, as in libpq"
+        );
+        assert_eq!(
+            split_url_options("postgres://db/app?options="),
+            ("postgres://db/app".to_owned(), Some(String::new())),
+            "an empty value still hides PGOPTIONS from libpq"
+        );
+        assert_eq!(
+            split_url_options("postgres://db/app?sslmode=require"),
+            ("postgres://db/app?sslmode=require".to_owned(), None)
+        );
+    }
+
+    #[test]
+    fn the_pooler_fallback_copy_sets_lock_timeout_in_each_transactional_migration() {
+        let src = tempfile::TempDir::new().expect("src");
+        for (name, up) in [
+            (
+                "2026-01-01-000000_add_column",
+                "ALTER TABLE t ADD COLUMN c INT;\n",
+            ),
+            (
+                "2026-01-02-000000_index",
+                "CREATE INDEX CONCURRENTLY i ON t (c);\n",
+            ),
+        ] {
+            let dir = src.path().join(name);
+            std::fs::create_dir_all(&dir).expect("dir");
+            std::fs::write(dir.join("up.sql"), up).expect("up");
+            std::fs::write(dir.join("down.sql"), "SELECT 1;\n").expect("down");
+        }
+        std::fs::write(src.path().join("README"), "not a migration").expect("file");
+        let dst = tempfile::TempDir::new().expect("dst");
+        let non_transactional = std::iter::once("20260102000000".to_owned()).collect();
+
+        copy_with_lock_timeout(
+            src.path(),
+            dst.path(),
+            std::time::Duration::from_secs(5),
+            false,
+            &non_transactional,
+        )
+        .expect("copy");
+
+        let read = |name: &str, file: &str| {
+            std::fs::read_to_string(dst.path().join(name).join(file)).expect("read")
+        };
+        assert_eq!(
+            read("2026-01-01-000000_add_column", "up.sql"),
+            "SET LOCAL lock_timeout = 5000;\nALTER TABLE t ADD COLUMN c INT;\n"
+        );
+        assert_eq!(
+            read("2026-01-02-000000_index", "up.sql"),
+            "CREATE INDEX CONCURRENTLY i ON t (c);\n",
+            "a non-transactional migration is copied unchanged"
+        );
+        assert_eq!(
+            read("2026-01-01-000000_add_column", "down.sql"),
+            "SELECT 1;\n"
+        );
+        assert!(!dst.path().join("README").exists());
+
+        // When the role may set `lc_messages`, the copy asks for English
+        // messages too, so the retry can read a lock timeout.
+        let english = tempfile::TempDir::new().expect("english");
+        copy_with_lock_timeout(
+            src.path(),
+            english.path(),
+            std::time::Duration::from_secs(5),
+            true,
+            &non_transactional,
+        )
+        .expect("copy");
+        assert_eq!(
+            std::fs::read_to_string(english.path().join("2026-01-01-000000_add_column/up.sql"))
+                .expect("read"),
+            "SET LOCAL lock_timeout = 5000;\nSET LOCAL lc_messages = 'C';\n\
+             ALTER TABLE t ADD COLUMN c INT;\n"
+        );
+    }
+
+    #[test]
+    fn a_non_transactional_fallback_needs_the_server_timeout_off() {
+        assert!(pooler_fallback_is_safe(true, || panic!("not asked")));
+        assert!(pooler_fallback_is_safe(false, || true));
+        assert!(!pooler_fallback_is_safe(false, || false));
+    }
+
+    #[test]
+    fn split_keyword_options_moves_the_options_out_of_the_conninfo() {
+        assert_eq!(
+            split_connection_options(
+                r"host=db password='p?w \' x' options='-c search_path=tenant -c lock_timeout=100' dbname = app"
+            ),
+            (
+                r"host=db password='p?w \' x' dbname = app".to_owned(),
+                Some("-c search_path=tenant -c lock_timeout=100".to_owned())
+            ),
+            "other pairs stay verbatim, a `?` in a value is not a URI query"
+        );
+        assert_eq!(
+            split_connection_options("host=db options=-ca=1 options='-c b=2'"),
+            ("host=db".to_owned(), Some("-c b=2".to_owned())),
+            "the last value wins, as in libpq"
+        );
+        assert_eq!(
+            split_connection_options("host=db options=''"),
+            ("host=db".to_owned(), Some(String::new())),
+            "an empty value still hides PGOPTIONS from libpq"
+        );
+        assert_eq!(
+            split_connection_options("host=db dbname=app"),
+            ("host=db dbname=app".to_owned(), None)
+        );
+        assert_eq!(
+            split_connection_options("host=db options='unterminated"),
+            ("host=db options='unterminated".to_owned(), None),
+            "a string libpq cannot parse is left alone"
+        );
+        assert_eq!(
+            split_connection_options("postgresql://db/app?options=-c%20a%3D1"),
+            ("postgresql://db/app".to_owned(), Some("-c a=1".to_owned()))
+        );
+    }
+
+    /// libpq ignores `PGOPTIONS` when the URL has `options`, so the URL value
+    /// is the base the framework options join.
+    #[test]
+    fn url_options_keep_the_framework_lock_timeout() {
+        let five = std::time::Duration::from_secs(5);
+        let (_, url_options) = split_url_options(
+            "postgres://db/app?options=-c%20search_path%3Dtenant%20-c%20lock_timeout%3D100",
+        );
+        assert_eq!(
+            child_pgoptions(url_options.as_deref(), five, false, true).as_deref(),
+            Some("-c search_path=tenant -c lock_timeout=100 -c lock_timeout=5000 -c lc_messages=C"),
+            "a later -c wins, so the policy timeout applies"
+        );
+        assert_eq!(
+            child_pgoptions(url_options.as_deref(), five, true, false).as_deref(),
+            Some("-c search_path=tenant -c lock_timeout=0"),
+            "a non-transactional run drops the URL's lock_timeout"
+        );
+    }
+
+    #[test]
+    fn child_pgoptions_never_sends_lock_timeout_to_a_non_transactional_run() {
+        let five = std::time::Duration::from_secs(5);
+        let inherited = Some("-c search_path=app -c lock_timeout=9000");
+        assert_eq!(
+            child_pgoptions(inherited, five, true, false).as_deref(),
+            Some("-c search_path=app -c lock_timeout=0")
+        );
+        assert_eq!(
+            child_pgoptions(inherited, five, false, false).as_deref(),
+            Some("-c search_path=app -c lock_timeout=9000 -c lock_timeout=5000")
+        );
+    }
+
+    #[test]
+    fn child_pgoptions_asks_for_english_messages_when_allowed() {
+        let five = std::time::Duration::from_secs(5);
+        assert_eq!(
+            child_pgoptions(None, five, false, true).as_deref(),
+            Some("-c lock_timeout=5000 -c lc_messages=C")
+        );
+        assert_eq!(
+            child_pgoptions(None, five, true, true).as_deref(),
+            Some("-c lock_timeout=0 -c lc_messages=C")
+        );
     }
 
     #[test]

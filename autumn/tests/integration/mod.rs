@@ -233,6 +233,8 @@ mod middleware_stack_depth;
 mod middleware_stack_order;
 #[cfg(feature = "db")]
 mod migrate_checksum_proptest;
+// Reads migrate.rs and ci.yml as text; needs no feature.
+mod migration_lock_timeout_ci_coverage;
 #[cfg(feature = "db")]
 mod model_counter_cache;
 #[cfg(feature = "db")]
@@ -484,6 +486,7 @@ mod translatable_model;
 #[cfg(feature = "i18n")]
 mod translatable_request;
 mod tx_isolation_retry_integration;
+mod tx_local_timeouts;
 #[cfg(feature = "db")]
 mod validate_merged_model;
 #[cfg(feature = "db")]

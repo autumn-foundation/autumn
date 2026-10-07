@@ -256,6 +256,11 @@ until the next marker replaces it. A checkout with no capture scope sends the
 *clearing* form, so background work can never be attributed to whoever held the
 connection last.
 
+A framework transaction opens with the `SET LOCAL statement_timeout` /
+`SET LOCAL idle_in_transaction_session_timeout` pair (#3057). The recorder
+treats that exact pair as housekeeping too, so a capsule recorded under `prod`
+timeouts replays where the timeouts differ.
+
 A capsule also carries the connection's **memo**: the session prologue it was
 born with, the `Parse`/`Describe` metadata for statements it had already
 prepared, and its `pg_catalog` lookups. Without that, the second request served

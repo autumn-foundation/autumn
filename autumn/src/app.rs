@@ -7126,6 +7126,7 @@ impl AppBuilder {
 
         // Writable targets only: the control primary, then each shard primary.
         let control_url = config.database.effective_primary_url().map(str::to_owned);
+        let lock_policy = crate::migrate::MigrationLockPolicy::from_config(&config.database);
         let shard_targets: Vec<(String, String)> = config
             .database
             .shards
@@ -7224,6 +7225,7 @@ impl AppBuilder {
                             url,
                             crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
                             "control",
+                            lock_policy,
                         );
                     }
                 }
@@ -7241,6 +7243,7 @@ impl AppBuilder {
                         url,
                         crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
                         label,
+                        lock_policy,
                     );
                 }
             }
@@ -9126,10 +9129,12 @@ async fn execute_task_result_with_optional_lease_ttl(
     tick: crate::scheduler::ScheduledTick,
     waited: bool,
 ) -> Result<u64, (u64, String)> {
-    let run = crate::scheduler::with_tick(
-        tick,
-        execute_task_result(state, handler, start, name, schedule, waited),
-    );
+    let run = execute_task_result(state, handler, start, name, schedule, waited);
+    // A scheduled task runs outside any request, so its framework
+    // transactions get the configured timeouts from here (#3057).
+    #[cfg(feature = "db")]
+    let run = crate::db::scope_background_tx_timeouts(state, run);
+    let run = crate::scheduler::with_tick(tick, run);
     let Some(lease_ttl) = lease_ttl else {
         return run.await;
     };
@@ -11780,11 +11785,8 @@ async fn resolve_shard_set(
                     })
                     .find(|url| crate::db::sqlite_target_is_shared_cache(url))
                     .unwrap_or_default();
-                crate::db::reject_sqlite_statement_timeout(
-                    config.database.statement_timeout,
-                    target,
-                )
-                .map_err(|e| format!("Failed to create shard pools: {e}"))?;
+                crate::db::reject_sqlite_unsupported_timeouts(&config.database, target)
+                    .map_err(|e| format!("Failed to create shard pools: {e}"))?;
             }
             crate::sharding::build_shard_set(&config.database, topologies, router)
         }
@@ -11875,7 +11877,7 @@ async fn setup_database(
             .migration_url()
             .or_else(|| config.database.effective_primary_url())
             .unwrap_or_default();
-        crate::db::reject_sqlite_statement_timeout(config.database.statement_timeout, target)
+        crate::db::reject_sqlite_unsupported_timeouts(&config.database, target)
             .map_err(|e| format!("Failed to create database pool: {e}"))?;
     }
 
@@ -11979,7 +11981,12 @@ async fn setup_database(
     #[allow(clippy::question_mark)]
     if runtime_boot
         && crate::derivation::has_derivation_descriptors()
-        && let Err(e) = start_derivation_backfill(topology.as_ref(), shards.as_ref()).await
+        && let Err(e) = start_derivation_backfill(
+            topology.as_ref(),
+            shards.as_ref(),
+            crate::db::TxTimeouts::from_config(&config.database),
+        )
+        .await
     {
         #[cfg(feature = "managed-pg")]
         crate::managed_pg::emergency_stop_async().await;
@@ -12070,10 +12077,15 @@ const BOOT_BACKFILL_BATCHES: usize = 8;
 /// spawned for a target whose reconcile failed: the sweep reads the state the
 /// reconcile writes, so sweeping after a failed reconcile would work from a
 /// stale answer.
+///
+/// `timeouts` are the app's configured transaction timeouts. This runs at
+/// boot, outside any request, so the reconcile and the backfill batches get
+/// them from here (#3057).
 #[cfg(feature = "db")]
 async fn start_derivation_backfill(
     topology: Option<&crate::db::DatabaseTopology>,
     shards: Option<&crate::sharding::ShardSet>,
+    timeouts: crate::db::TxTimeouts,
 ) -> Result<(), String> {
     // No connection needed, so a collision is caught before any data is touched.
     crate::derivation::check_registered_derivations()
@@ -12104,7 +12116,10 @@ async fn start_derivation_backfill(
                 continue;
             }
         };
-        match crate::derivation::ensure_derivations(&mut conn).await {
+        match timeouts
+            .scope(crate::derivation::ensure_derivations(&mut conn))
+            .await
+        {
             Ok(enqueued) => {
                 if !enqueued.is_empty() {
                     tracing::info!(
@@ -12125,7 +12140,7 @@ async fn start_derivation_backfill(
             }
         }
         drop(conn);
-        spawn_derivation_backfill(label, pool);
+        spawn_derivation_backfill(label, pool, timeouts);
     }
     Ok(())
 }
@@ -12139,7 +12154,11 @@ async fn start_derivation_backfill(
 /// cooperate: each batch locks the derivation's state row, so they take turns on
 /// one sweep instead of racing.
 #[cfg(feature = "db")]
-fn spawn_derivation_backfill(label: String, pool: crate::db::Pool<crate::db::RuntimeConnection>) {
+fn spawn_derivation_backfill(
+    label: String,
+    pool: crate::db::Pool<crate::db::RuntimeConnection>,
+    timeouts: crate::db::TxTimeouts,
+) {
     tokio::spawn(async move {
         let options = crate::derivation::BackfillOptions {
             max_batches: Some(BOOT_BACKFILL_BATCHES),
@@ -12160,7 +12179,10 @@ fn spawn_derivation_backfill(label: String, pool: crate::db::Pool<crate::db::Run
                     return;
                 }
             };
-            let report = match crate::derivation::run_backfill(&mut conn, &options).await {
+            let report = match timeouts
+                .scope(crate::derivation::run_backfill(&mut conn, &options))
+                .await
+            {
                 Ok(report) => report,
                 Err(error) => {
                     tracing::warn!(%error, database = %label, "derivation backfill failed");
@@ -12223,8 +12245,14 @@ fn apply_pending_or_exit(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
     target: &str,
+    lock_policy: crate::migrate::MigrationLockPolicy,
 ) -> usize {
-    match crate::migrate::run_pending_locked(database_url, migrations, None) {
+    match crate::migrate::run_pending_locked_with_policy(
+        database_url,
+        migrations,
+        None,
+        lock_policy,
+    ) {
         Ok(result) => result.applied.len(),
         Err(error) => {
             let reason = match error {
@@ -12232,6 +12260,9 @@ fn apply_pending_or_exit(
                     "could not connect to the database"
                 }
                 crate::migrate::MigrationError::Migration(_) => "a migration failed to apply",
+                crate::migrate::MigrationError::LockContention { .. } => {
+                    "a migration timed out on a table lock on every attempt"
+                }
                 _ => "migration error",
             };
             eprintln!("autumn migrate: {reason} (target {target})");
@@ -12589,6 +12620,7 @@ async fn run_startup_migrations(
     let profile = config.profile.clone();
     let auto_migrate = config.database.auto_migrate;
     let auto_in_prod = config.database.auto_migrate_in_production;
+    let lock_policy = crate::migrate::MigrationLockPolicy::from_config(&config.database);
     // Computed once, on the FINAL registered set (after `setup_database`'s own
     // fold added any shard-required sets), so a version collision between ANY
     // two registered sources is resolved automatically rather than causing
@@ -12653,6 +12685,7 @@ async fn run_startup_migrations(
                     auto_in_prod,
                     crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
                     "control",
+                    lock_policy,
                 );
             }
             // The shard directory table lives on the control plane only, so it
@@ -12668,6 +12701,7 @@ async fn run_startup_migrations(
                         &disambiguated,
                     ),
                     "control",
+                    lock_policy,
                 );
             }
             // The shard-map guard table also lives on the control plane only. It
@@ -12688,6 +12722,7 @@ async fn run_startup_migrations(
                         &disambiguated,
                     ),
                     "control",
+                    lock_policy,
                 );
             }
         }
@@ -12709,6 +12744,7 @@ async fn run_startup_migrations(
                     auto_in_prod,
                     crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
                     target,
+                    lock_policy,
                 );
             }
         }
@@ -16461,15 +16497,18 @@ mod tests {
             "the migrate one-shot must not start the server"
         );
 
-        // The per-target applier reuses `run_pending_locked` (the exact engine
-        // `auto_migrate` drives — no duplicated migration logic) and exits
+        // The per-target applier reuses `run_pending_locked_with_policy` (the
+        // exact engine `auto_migrate` drives — no duplicated migration logic) and exits
         // non-zero on failure so a bad migration aborts before cutover (AC-3).
         let helper_start = source
             .find("fn apply_pending_or_exit(")
             .expect("apply_pending_or_exit exists");
-        let helper = &source[helper_start..helper_start + 1200];
+        let helper_end = source[helper_start..]
+            .find("\n}\n")
+            .map_or(source.len(), |end| helper_start + end);
+        let helper = &source[helper_start..helper_end];
         assert!(
-            helper.contains("crate::migrate::run_pending_locked("),
+            helper.contains("crate::migrate::run_pending_locked_with_policy("),
             "must reuse the shared locked applier, not duplicate migration logic"
         );
         assert!(
