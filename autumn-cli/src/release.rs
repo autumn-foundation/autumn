@@ -47,6 +47,37 @@ mod templates {
     pub const GCP_CLOUD_RUN_TFVARS_EXAMPLE: &str =
         include_str!("templates/release/gcp-cloud-run-terraform.tfvars.example.tmpl");
     pub const GCP_DEPLOY_WORKFLOW: &str = include_str!("templates/release/gcp-deploy.yml.tmpl");
+
+    // Kubernetes: a Helm chart and a Kustomize base (issue #3069).
+    pub const HELM_CHART: &str = include_str!("templates/release/kubernetes/helm/Chart.yaml.tmpl");
+    pub const HELM_VALUES: &str =
+        include_str!("templates/release/kubernetes/helm/values.yaml.tmpl");
+    pub const HELM_IGNORE: &str =
+        include_str!("templates/release/kubernetes/helm/.helmignore.tmpl");
+    pub const HELM_HELPERS: &str =
+        include_str!("templates/release/kubernetes/helm/templates/_helpers.tpl.tmpl");
+    pub const HELM_DEPLOYMENT: &str =
+        include_str!("templates/release/kubernetes/helm/templates/deployment.yaml.tmpl");
+    pub const HELM_ROLLOUT: &str =
+        include_str!("templates/release/kubernetes/helm/templates/rollout.yaml.tmpl");
+    pub const HELM_CANARY: &str =
+        include_str!("templates/release/kubernetes/helm/templates/canary.yaml.tmpl");
+    pub const HELM_SERVICE: &str =
+        include_str!("templates/release/kubernetes/helm/templates/service.yaml.tmpl");
+    pub const HELM_PDB: &str =
+        include_str!("templates/release/kubernetes/helm/templates/pdb.yaml.tmpl");
+    pub const HELM_SERVICE_MONITOR: &str =
+        include_str!("templates/release/kubernetes/helm/templates/servicemonitor.yaml.tmpl");
+    pub const HELM_NOTES: &str =
+        include_str!("templates/release/kubernetes/helm/templates/NOTES.txt.tmpl");
+    pub const KUSTOMIZATION: &str =
+        include_str!("templates/release/kubernetes/kustomize/kustomization.yaml.tmpl");
+    pub const KUSTOMIZE_DEPLOYMENT: &str =
+        include_str!("templates/release/kubernetes/kustomize/deployment.yaml.tmpl");
+    pub const KUSTOMIZE_SERVICE: &str =
+        include_str!("templates/release/kubernetes/kustomize/service.yaml.tmpl");
+    pub const KUSTOMIZE_PDB: &str =
+        include_str!("templates/release/kubernetes/kustomize/pdb.yaml.tmpl");
 }
 
 /// First `autumn-cli` release that ships the issue #1615 supply-chain surface:
@@ -187,6 +218,7 @@ pub enum Target {
     AwsAppRunner,
     AwsEcs,
     GcpCloudRun,
+    Kubernetes,
 }
 
 impl std::str::FromStr for Target {
@@ -199,9 +231,11 @@ impl std::str::FromStr for Target {
             "aws-app-runner" => Ok(Self::AwsAppRunner),
             "aws-ecs" => Ok(Self::AwsEcs),
             "gcp-cloud-run" => Ok(Self::GcpCloudRun),
+            "kubernetes" => Ok(Self::Kubernetes),
             other => Err(format!(
                 "unknown target '{other}'; expected 'fly', 'docker-compose', \
-                 'azure-container-apps', 'aws-app-runner', 'aws-ecs', or 'gcp-cloud-run'"
+                 'azure-container-apps', 'aws-app-runner', 'aws-ecs', 'gcp-cloud-run', \
+                 or 'kubernetes'"
             )),
         }
     }
@@ -309,6 +343,17 @@ pub fn run(action: ReleaseAction) {
                     println!(
                         "  See docs/guide/deployment.md and docs/guide/signing-secrets.md for the full walkthrough."
                     );
+                    if target == Target::Kubernetes {
+                        println!();
+                        println!("  Kubernetes:");
+                        println!("       helm upgrade --install {project_name} deploy/helm");
+                        println!("     or");
+                        println!("       kubectl apply -k deploy/kustomize/base");
+                        println!(
+                            "     Run `autumn slo generate` for SLO alerts and canary analysis. \
+                             See docs/guide/kubernetes.md."
+                        );
+                    }
                 }
                 Err(e) => {
                     eprintln!("Error: {e}");
@@ -716,6 +761,7 @@ fn render_for_cli(
     let rendered = template
         .replace("{{worker_service}}", worker_service)
         .replace("{{app_role_env}}", web_role_env)
+        .replace("{{k8s_name}}", &k8s_name(project_name))
         .replace("{{project_name}}", project_name)
         .replace(
             "{{rust_version}}",
@@ -789,9 +835,65 @@ fn planned_files(target: Target) -> Vec<(&'static str, &'static str)> {
                 templates::GCP_DEPLOY_WORKFLOW,
             ));
         }
+        Target::Kubernetes => files.extend(KUBERNETES_FILES),
         Target::Default => {}
     }
     files
+}
+
+/// The Kubernetes target's files: a Helm chart and a Kustomize base (#3069).
+const KUBERNETES_FILES: [(&str, &str); 15] = [
+    ("deploy/helm/Chart.yaml", templates::HELM_CHART),
+    ("deploy/helm/values.yaml", templates::HELM_VALUES),
+    ("deploy/helm/.helmignore", templates::HELM_IGNORE),
+    (
+        "deploy/helm/templates/_helpers.tpl",
+        templates::HELM_HELPERS,
+    ),
+    (
+        "deploy/helm/templates/deployment.yaml",
+        templates::HELM_DEPLOYMENT,
+    ),
+    (
+        "deploy/helm/templates/rollout.yaml",
+        templates::HELM_ROLLOUT,
+    ),
+    ("deploy/helm/templates/canary.yaml", templates::HELM_CANARY),
+    (
+        "deploy/helm/templates/service.yaml",
+        templates::HELM_SERVICE,
+    ),
+    ("deploy/helm/templates/pdb.yaml", templates::HELM_PDB),
+    (
+        "deploy/helm/templates/servicemonitor.yaml",
+        templates::HELM_SERVICE_MONITOR,
+    ),
+    ("deploy/helm/templates/NOTES.txt", templates::HELM_NOTES),
+    (
+        "deploy/kustomize/base/kustomization.yaml",
+        templates::KUSTOMIZATION,
+    ),
+    (
+        "deploy/kustomize/base/deployment.yaml",
+        templates::KUSTOMIZE_DEPLOYMENT,
+    ),
+    (
+        "deploy/kustomize/base/service.yaml",
+        templates::KUSTOMIZE_SERVICE,
+    ),
+    ("deploy/kustomize/base/pdb.yaml", templates::KUSTOMIZE_PDB),
+];
+
+/// A DNS-1123 name for Kubernetes objects: lowercase, `-` for `_`, at most
+/// 53 characters (the Helm release-name limit).
+fn k8s_name(project_name: &str) -> String {
+    let name: String = project_name
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .take(53)
+        .collect();
+    name.trim_matches('-').to_owned()
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -7918,12 +8020,12 @@ esac
 
     #[test]
     fn parse_target_unknown_is_error() {
-        assert!("kubernetes".parse::<Target>().is_err());
+        assert!("nomad".parse::<Target>().is_err());
     }
 
     #[test]
     fn parse_target_unknown_error_mentions_all_targets() {
-        let err = "kubernetes".parse::<Target>().unwrap_err();
+        let err = "nomad".parse::<Target>().unwrap_err();
         for name in [
             "fly",
             "docker-compose",
@@ -7931,6 +8033,7 @@ esac
             "aws-app-runner",
             "aws-ecs",
             "gcp-cloud-run",
+            "kubernetes",
         ] {
             assert!(err.contains(name), "error must mention '{name}': {err}");
         }
@@ -10880,7 +10983,7 @@ esac
 
     /// Every release target. Add a new `Target` here and in
     /// `probe_expectations`, which has no wildcard arm.
-    const ALL_TARGETS: [Target; 7] = [
+    const ALL_TARGETS: [Target; 8] = [
         Target::Default,
         Target::Fly,
         Target::DockerCompose,
@@ -10888,6 +10991,7 @@ esac
         Target::AwsAppRunner,
         Target::AwsEcs,
         Target::GcpCloudRun,
+        Target::Kubernetes,
     ];
 
     /// The probes each target must render, as `(file, block marker, needle)`.
@@ -10934,6 +11038,15 @@ esac
                 ("main.tf", "startup_probe {", r#"path = "/startup""#),
                 ("main.tf", "readiness_probe {", r#"path = "/ready""#),
                 ("main.tf", "liveness_probe {", r#"path = "/live""#),
+            ],
+            Target::Kubernetes => &[
+                DOCKER_HEALTHCHECK,
+                (KUSTOMIZE_DEPLOYMENT, "startupProbe:", "path: /startup"),
+                (KUSTOMIZE_DEPLOYMENT, "readinessProbe:", "path: /ready"),
+                (KUSTOMIZE_DEPLOYMENT, "livenessProbe:", "path: /live"),
+                (HELM_VALUES, "probes:", "startupPath: /startup"),
+                (HELM_VALUES, "probes:", "readyPath: /ready"),
+                (HELM_VALUES, "probes:", "livePath: /live"),
             ],
         }
     }
@@ -11051,5 +11164,182 @@ esac
                 );
             }
         }
+    }
+
+    // ── kubernetes target (issue #3069) ──────────────────────────────────────
+
+    const KUSTOMIZE_DEPLOYMENT: &str = "deploy/kustomize/base/deployment.yaml";
+    const HELM_VALUES: &str = "deploy/helm/values.yaml";
+
+    fn kubernetes_file(files: &[(String, String)], name: &str) -> String {
+        files
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("kubernetes target must generate {name}"))
+            .1
+            .clone()
+    }
+
+    #[test]
+    fn kubernetes_parses_from_the_cli_name() {
+        assert_eq!("kubernetes".parse::<Target>(), Ok(Target::Kubernetes));
+        assert!(!is_terraform_target(Target::Kubernetes));
+    }
+
+    #[test]
+    fn kubernetes_target_writes_a_helm_chart_and_a_kustomize_base() {
+        let names: Vec<_> = render_target(Target::Kubernetes, false)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for expected in [
+            "Dockerfile",
+            "deploy/helm/Chart.yaml",
+            "deploy/helm/values.yaml",
+            "deploy/helm/.helmignore",
+            "deploy/helm/templates/_helpers.tpl",
+            "deploy/helm/templates/deployment.yaml",
+            "deploy/helm/templates/rollout.yaml",
+            "deploy/helm/templates/canary.yaml",
+            "deploy/helm/templates/service.yaml",
+            "deploy/helm/templates/pdb.yaml",
+            "deploy/helm/templates/servicemonitor.yaml",
+            "deploy/helm/templates/NOTES.txt",
+            "deploy/kustomize/base/kustomization.yaml",
+            KUSTOMIZE_DEPLOYMENT,
+            "deploy/kustomize/base/service.yaml",
+            "deploy/kustomize/base/pdb.yaml",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing {expected}: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kubernetes_names_are_dns_safe() {
+        assert_eq!(k8s_name("My_App"), "my-app");
+        assert_eq!(k8s_name("app_"), "app");
+        assert_eq!(k8s_name(&"a".repeat(80)).len(), 53);
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my_shop");
+        init(&dir, "my_shop", false, Target::Kubernetes, false).unwrap();
+        let chart = fs::read_to_string(dir.join("deploy/helm/Chart.yaml")).unwrap();
+        assert!(chart.contains("\nname: my-shop\n"), "{chart}");
+        let pdb = fs::read_to_string(dir.join("deploy/kustomize/base/pdb.yaml")).unwrap();
+        assert!(pdb.contains("name: my-shop\n"), "{pdb}");
+    }
+
+    /// The raw templates use only the placeholders that
+    /// `scripts/check-k8s-manifests.sh` replaces before `helm lint`.
+    #[test]
+    fn kubernetes_templates_use_only_placeholders_the_ci_check_knows() {
+        for (name, template) in planned_files(Target::Kubernetes)
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("deploy/"))
+        {
+            let mut rest = template;
+            while let Some(start) = rest.find("{{") {
+                let after = &rest[start + 2..];
+                let end = after.find("}}").unwrap_or(after.len());
+                let token = &after[..end];
+                if token.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                    assert!(
+                        token == "k8s_name" || token == "project_name",
+                        "{name}: unknown placeholder {{{{{token}}}}}"
+                    );
+                }
+                rest = &after[end..];
+            }
+        }
+        for (name, content) in render_target(Target::Kubernetes, false) {
+            assert!(
+                !content.contains("{{k8s_name}}"),
+                "{name} kept a placeholder"
+            );
+            assert!(
+                !content.contains("{{project_name}}"),
+                "{name} kept a placeholder"
+            );
+        }
+    }
+
+    #[test]
+    fn kubernetes_grace_period_is_longer_than_the_drain_window() {
+        let files = render_target(Target::Kubernetes, false);
+        let deployment = kubernetes_file(&files, KUSTOMIZE_DEPLOYMENT);
+        let number_after = |needle: &str| -> u64 {
+            let at = deployment
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing:\n{deployment}"));
+            deployment[at + needle.len()..]
+                .trim_start_matches(|c: char| !c.is_ascii_digit())
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap()
+        };
+        let grace = number_after("terminationGracePeriodSeconds:");
+        let pre_stop = number_after("command: [\"sleep\",");
+        let prestop_grace = number_after("AUTUMN_SERVER__PRESTOP_GRACE_SECS\n");
+        let shutdown = number_after("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS\n");
+        assert!(
+            grace > pre_stop + prestop_grace + shutdown,
+            "grace {grace} must exceed {pre_stop} + {prestop_grace} + {shutdown}"
+        );
+        assert_eq!(grace, 50);
+
+        let helpers = kubernetes_file(&files, "deploy/helm/templates/_helpers.tpl");
+        assert!(helpers.contains(
+            "add $s.preStopSleepSeconds $s.prestopGraceSeconds $s.shutdownTimeoutSeconds $s.bufferSeconds"
+        ));
+        assert!(helpers.contains("fail \"shutdown.bufferSeconds must be 1 or more"));
+        assert!(
+            helpers.contains("terminationGracePeriodSeconds: {{ include \"app.gracePeriod\" . }}")
+        );
+        assert!(helpers.contains("AUTUMN_SERVER__PRESTOP_GRACE_SECS"));
+        assert!(helpers.contains("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS"));
+        assert!(helpers.contains("preStop:"));
+    }
+
+    #[test]
+    fn kubernetes_manifests_have_a_pod_disruption_budget() {
+        let files = render_target(Target::Kubernetes, false);
+        for name in [
+            "deploy/helm/templates/pdb.yaml",
+            "deploy/kustomize/base/pdb.yaml",
+        ] {
+            let pdb = kubernetes_file(&files, name);
+            assert!(pdb.contains("kind: PodDisruptionBudget"), "{name}");
+            assert!(pdb.contains("maxUnavailable:"), "{name}");
+        }
+        let kustomization = kubernetes_file(&files, "deploy/kustomize/base/kustomization.yaml");
+        assert!(kustomization.contains("- pdb.yaml"), "{kustomization}");
+    }
+
+    /// The chart reads the keys that `autumn slo generate` writes to
+    /// deploy/slo/helm-values.yaml.
+    #[test]
+    fn kubernetes_chart_wires_rollout_analysis_to_the_slo_templates() {
+        let files = render_target(Target::Kubernetes, false);
+        let values = kubernetes_file(&files, HELM_VALUES);
+        for key in ["templateName:", "maxBurnRate: 14.4", "metricTemplates:"] {
+            assert!(values.contains(key), "values.yaml needs analysis {key}");
+        }
+        let rollout = kubernetes_file(&files, "deploy/helm/templates/rollout.yaml");
+        assert!(rollout.contains("kind: Rollout"));
+        assert!(rollout.contains(".Values.analysis.templateName"));
+        assert!(rollout.contains("name: canary-hash"));
+        assert!(rollout.contains("podTemplateHashValue: Latest"));
+        let helpers = kubernetes_file(&files, "deploy/helm/templates/_helpers.tpl");
+        assert!(helpers.contains("fieldPath: metadata.labels['rollouts-pod-template-hash']"));
+        let canary = kubernetes_file(&files, "deploy/helm/templates/canary.yaml");
+        assert!(canary.contains("kind: Canary"));
+        assert!(canary.contains("range .Values.analysis.metricTemplates"));
+        assert!(canary.contains("max: {{ $.Values.analysis.maxBurnRate }}"));
+        let deployment = kubernetes_file(&files, "deploy/helm/templates/deployment.yaml");
+        assert!(deployment.contains("fail \"set rollout.enabled or flagger.enabled, not both\""));
     }
 }

@@ -1,0 +1,134 @@
+{{/*
+The full name: the release name, plus the chart name when it is not part of it.
+*/}}
+{{- define "app.fullname" -}}
+{{- if contains .Chart.Name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name .Chart.Name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "app.labels" -}}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{ include "app.selectorLabels" . }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end -}}
+
+{{- define "app.selectorLabels" -}}
+app.kubernetes.io/name: {{ .Chart.Name }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+{{/*
+The drain window and the grace period. Kubernetes kills the pod at the end of
+terminationGracePeriodSeconds, so it must be longer than the drain window.
+*/}}
+{{- define "app.gracePeriod" -}}
+{{- $s := .Values.shutdown -}}
+{{- if lt (int $s.bufferSeconds) 1 -}}
+{{- fail "shutdown.bufferSeconds must be 1 or more, so the grace period is longer than the drain window" -}}
+{{- end -}}
+{{- add $s.preStopSleepSeconds $s.prestopGraceSeconds $s.shutdownTimeoutSeconds $s.bufferSeconds -}}
+{{- end -}}
+
+{{/*
+The pod template. The Deployment and the Rollout share it.
+*/}}
+{{- define "app.podTemplate" -}}
+metadata:
+  labels:
+    {{- include "app.selectorLabels" . | nindent 4 }}
+  {{- if .Values.metrics.annotations }}
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/path: /actuator/prometheus
+    prometheus.io/port: {{ .Values.containerPort | quote }}
+  {{- end }}
+spec:
+  {{- with .Values.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  terminationGracePeriodSeconds: {{ include "app.gracePeriod" . }}
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: app
+      image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      ports:
+        - name: http
+          containerPort: {{ .Values.containerPort }}
+          protocol: TCP
+      env:
+        - name: AUTUMN_SERVER__HOST
+          value: "0.0.0.0"
+        - name: AUTUMN_SERVER__PORT
+          value: {{ .Values.containerPort | quote }}
+        - name: AUTUMN_SERVER__PRESTOP_GRACE_SECS
+          value: {{ .Values.shutdown.prestopGraceSeconds | quote }}
+        - name: AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS
+          value: {{ .Values.shutdown.shutdownTimeoutSeconds | quote }}
+        {{- if .Values.rollout.enabled }}
+        # The pod-template hash becomes the `version` metric label. The
+        # AnalysisTemplate from `autumn slo generate` selects the canary by it.
+        - name: AUTUMN_DEPLOY_VERSION
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['rollouts-pod-template-hash']
+        {{- end }}
+        {{- with .Values.env }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.envFrom }}
+      envFrom:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      startupProbe:
+        httpGet:
+          path: {{ .Values.probes.startupPath }}
+          port: http
+        periodSeconds: 2
+        failureThreshold: 60
+      livenessProbe:
+        httpGet:
+          path: {{ .Values.probes.livePath }}
+          port: http
+        periodSeconds: 10
+        failureThreshold: 3
+      readinessProbe:
+        httpGet:
+          path: {{ .Values.probes.readyPath }}
+          port: http
+        periodSeconds: 2
+        failureThreshold: 1
+      lifecycle:
+        preStop:
+          exec:
+            command: ["sleep", "{{ .Values.shutdown.preStopSleepSeconds }}"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      {{- with .Values.resources }}
+      resources:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- with .Values.nodeSelector }}
+  nodeSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.affinity }}
+  affinity:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.tolerations }}
+  tolerations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end -}}

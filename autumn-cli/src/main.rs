@@ -67,6 +67,7 @@ mod serve;
 mod service;
 mod setup;
 mod shard;
+mod slo;
 mod starters;
 mod task;
 mod test_cmd;
@@ -1896,6 +1897,13 @@ enum Commands {
     /// Fire a synthetic operator alert through configured delivery channels.
     #[command(subcommand)]
     Alert(AlertCommands),
+
+    /// Turn the `[[slo]]` tables in autumn.toml into monitoring files.
+    ///
+    /// Writes Prometheus burn-rate rules, a Grafana dashboard, and Argo
+    /// Rollouts and Flagger analysis templates. See docs/guide/slo.md.
+    #[command(subcommand)]
+    Slo(SloCommands),
     /// Issue and revoke API bearer tokens backed by the `api_tokens` table.
     ///
     /// Requires the `api_tokens` table to exist. Run `autumn migrate` first;
@@ -3517,6 +3525,35 @@ enum AlertCommands {
 }
 
 #[derive(Subcommand)]
+enum SloCommands {
+    /// Generate Prometheus rules, a Grafana dashboard and analysis templates.
+    ///
+    /// Reads the `[[slo]]` tables in autumn.toml (issue #3069). The output is
+    /// deterministic, so you can commit it and check it in CI with `--check`.
+    Generate(SloGenerateArgs),
+}
+
+#[derive(clap::Args)]
+struct SloGenerateArgs {
+    /// Directory for the generated files.
+    #[arg(long, value_name = "DIR", default_value = slo::DEFAULT_OUT_DIR)]
+    out_dir: PathBuf,
+    /// Application name for labels and object names. Default: `[deploy]
+    /// app_name`, then the package name.
+    #[arg(long, value_name = "NAME")]
+    app: Option<String>,
+    /// Extra label matchers for every query, for example 'job="shop"'.
+    #[arg(long, value_name = "MATCHERS")]
+    selector: Option<String>,
+    /// Prometheus address in the analysis templates.
+    #[arg(long, value_name = "URL", default_value = slo::DEFAULT_PROMETHEUS_URL)]
+    prometheus_url: String,
+    /// Compare with the files in --out-dir; write nothing. Exit 1 on drift.
+    #[arg(long)]
+    check: bool,
+}
+
+#[derive(Subcommand)]
 enum WebhookCommands {
     /// Send a simulated webhook request with a generated HMAC signature.
     Sim {
@@ -3790,12 +3827,18 @@ enum ReleaseCommands {
     ///                                   .github/workflows/gcp-deploy.yml (Artifact
     ///                                   Registry + Cloud Run + Cloud SQL behind a VPC
     ///                                   connector, opt-in Memorystore Redis).
+    /// --target kubernetes             : also emits a Helm chart (deploy/helm/) and a
+    ///                                   Kustomize base (deploy/kustomize/base/) with
+    ///                                   /startup, /live and /ready probes, a `preStop`
+    ///                                   hook, a grace period longer than the drain
+    ///                                   window, a `PodDisruptionBudget`, and opt-in
+    ///                                   Argo Rollouts or Flagger canaries.
     Init {
         /// Overwrite existing files instead of erroring on collision.
         #[arg(long)]
         force: bool,
         /// Deployment target: fly | docker-compose | azure-container-apps | aws-app-runner |
-        /// aws-ecs | gcp-cloud-run (omit for bare Dockerfile).
+        /// aws-ecs | gcp-cloud-run | kubernetes (omit for bare Dockerfile).
         #[arg(long, value_name = "TARGET")]
         target: Option<String>,
         /// Scaffold a separate worker-role service in the generated
@@ -3870,6 +3913,13 @@ enum DeployCommands {
         /// inspected before anything else moves.
         #[arg(long)]
         no_rollback: bool,
+
+        /// Bake each host for this many seconds after its cutover, and roll it
+        /// back when the error rate or latency is too high (issue #3069).
+        ///
+        /// Overrides `[deploy.bake] duration_secs`. `0` turns the bake off.
+        #[arg(long, value_name = "SECS")]
+        bake_secs: Option<u64>,
     },
 
     /// Report every configured host's deploy state, read-only (issue #1621).
@@ -5182,6 +5232,13 @@ fn run_command(command: Commands) {
             event,
         }) => webhook::run_sim(&provider, &url, &secret, &payload, event.as_deref()),
         Commands::Alert(AlertCommands::Test { channel }) => alert::run_test(channel.as_deref()),
+        Commands::Slo(SloCommands::Generate(args)) => slo::run_generate(&slo::GenerateArgs {
+            out_dir: args.out_dir,
+            app: args.app,
+            selector: args.selector,
+            prometheus_url: args.prometheus_url,
+            check: args.check,
+        }),
         Commands::Console {
             profile,
             package,
@@ -6332,11 +6389,16 @@ fn run_deploy_command(cmd: &DeployCommands) {
                 ..deploy::DeployOptions::default()
             },
         ),
-        DeployCommands::Up { only, no_rollback } => (
+        DeployCommands::Up {
+            only,
+            no_rollback,
+            bake_secs,
+        } => (
             deploy::DeployAction::Up,
             deploy::DeployOptions {
                 only: only.clone(),
                 no_rollback: *no_rollback,
+                bake_secs: *bake_secs,
                 ..deploy::DeployOptions::default()
             },
         ),
@@ -7229,6 +7291,56 @@ mod tests {
     fn parse_setup_with_force() {
         let cli = Cli::try_parse_from(["autumn", "setup", "--force"]).unwrap();
         assert!(matches!(cli.command, Commands::Setup { force: true }));
+    }
+
+    #[test]
+    fn parse_deploy_up_bake_secs() {
+        let cli = Cli::try_parse_from(["autumn", "deploy", "up"]).unwrap();
+        let Commands::Deploy(DeployCommands::Up { bake_secs, .. }) = cli.command else {
+            panic!("expected deploy up");
+        };
+        assert_eq!(bake_secs, None);
+        let cli = Cli::try_parse_from(["autumn", "deploy", "up", "--bake-secs", "300"]).unwrap();
+        let Commands::Deploy(DeployCommands::Up { bake_secs, .. }) = cli.command else {
+            panic!("expected deploy up");
+        };
+        assert_eq!(bake_secs, Some(300));
+        assert!(Cli::try_parse_from(["autumn", "deploy", "up", "--bake-secs", "-1"]).is_err());
+    }
+
+    #[test]
+    fn parse_slo_generate_defaults_and_flags() {
+        let cli = Cli::try_parse_from(["autumn", "slo", "generate"]).unwrap();
+        let Commands::Slo(SloCommands::Generate(args)) = cli.command else {
+            panic!("expected slo generate");
+        };
+        assert_eq!(args.out_dir, PathBuf::from("deploy/slo"));
+        assert_eq!(args.prometheus_url, slo::DEFAULT_PROMETHEUS_URL);
+        assert!(args.app.is_none() && args.selector.is_none() && !args.check);
+
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "slo",
+            "generate",
+            "--out-dir",
+            "ops/slo",
+            "--app",
+            "shop",
+            "--selector",
+            "job=\"shop\"",
+            "--prometheus-url",
+            "http://prom:9090",
+            "--check",
+        ])
+        .unwrap();
+        let Commands::Slo(SloCommands::Generate(args)) = cli.command else {
+            panic!("expected slo generate");
+        };
+        assert_eq!(args.out_dir, PathBuf::from("ops/slo"));
+        assert_eq!(args.app.as_deref(), Some("shop"));
+        assert_eq!(args.selector.as_deref(), Some("job=\"shop\""));
+        assert_eq!(args.prometheus_url, "http://prom:9090");
+        assert!(args.check);
     }
 
     #[test]

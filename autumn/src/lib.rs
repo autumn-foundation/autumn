@@ -736,6 +736,7 @@ pub mod repl;
 pub mod runtime_config;
 #[cfg(feature = "seed")]
 pub mod seed;
+pub mod slo;
 
 // ── #1343 AC4: fake-seeder registration forwarding ──────────────────────────
 //

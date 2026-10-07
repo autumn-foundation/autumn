@@ -827,6 +827,7 @@ Halt and **freeze** instead of compensating: every host is left exactly as it is
 — including the ones already on the new release — and named in the final state
 table, so you can inspect the failure before anything else moves. Use it when you
 would rather diagnose a half-rolled fleet than automatically reverse it.
+A failed [bake](#bake-roll-back-on-post-cutover-metrics) is frozen the same way.
 
 #### Topologies a fleet deploy refuses
 
@@ -943,6 +944,68 @@ post-cutover failure prints the same message as before.
 
 `autumn deploy --help` was also rewritten, and `up`/`rollback` gained `--only`
 and `--no-rollback`; no existing flag changed meaning.
+
+### Bake: roll back on post-cutover metrics
+
+The `/ready` gate catches a release that does not start. It does not catch a
+release that starts and then fails real requests. The bake catches that: after
+each host cuts over, `autumn deploy up` samples the new release and rolls it
+back on a bad result (issue #3069).
+
+The bake is off by default. Turn it on in `autumn.toml`:
+
+```toml
+[deploy.bake]
+duration_secs = 300      # bake each host for 5 minutes (0: off)
+interval_secs = 10       # sample every 10 s
+min_requests = 20        # give no verdict on fewer new responses
+# max_error_rate = 0.01  # default: from [[slo]], else 0.05
+# max_p99_ms = 500       # default: from [[slo]], else no latency check
+```
+
+Or for one deploy:
+
+```bash
+autumn deploy up --bake-secs 300
+```
+
+How it works:
+
+1. The bake runs `curl` on the host against the new release's slot port. It
+   reads `/actuator/metrics` (under your `[actuator] prefix`).
+2. The first sample is the baseline. Each later sample covers the responses
+   since the baseline.
+3. The bake fails when the 5xx ratio or the latency is above the limit, when a
+   counter goes down (the process restarted), or when a sample fails.
+4. Fewer than `min_requests` new responses never fail the bake. A quiet host
+   passes with a warning.
+
+The limits come from your [SLOs](slo.md#bake-and-roll-back) when you do not set
+them. The 5xx limit is the 14.4× burn rate of the strictest all-routes
+availability SLO: 1.44 % for a 99.9 % objective.
+
+The output shows the limits, then one line for each sample:
+
+```text
+bake for 300 s, sample every 10 s; roll back when the 5xx ratio is above 1.44% (after 20 responses; limits from SLO availability at 14.4x burn)
+
+bake 10/300 s: 212 responses, 0 5xx, p99 41 ms
+bake 20/300 s: 431 responses, 37 5xx, p99 44 ms
+
+❌ bake failed: 37 of 431 responses were 5xx (8.5847%), above the limit of 1.44%
+```
+
+What happens next:
+
+| Deploy | Result |
+|---|---|
+| One host | The host rolls back to the previous release. The command exits non-zero with `the bake failed on <host>`. |
+| A fleet | The rollout halts at that host, with the step `bake`. Every host on the new release rolls back, newest first. The remaining hosts are not touched. |
+| `--no-rollback` | The new release stays live. The command exits non-zero and tells you to run `autumn deploy rollback`. |
+| A first deploy | No bake. There is no previous release to roll back to. |
+
+The rollback restores binaries only. A migration that already ran stays
+applied, as for every other automatic rollback.
 
 ### Rollback
 

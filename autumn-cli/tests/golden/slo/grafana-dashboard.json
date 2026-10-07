@@ -1,0 +1,405 @@
+{
+  "uid": "autumn-slo-shop",
+  "title": "shop SLOs",
+  "tags": [
+    "autumn",
+    "slo"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "1m",
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "availability — objective 99.9% (non-5xx responses, all routes)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "SLI (30d)",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1 - autumn_slo:sli_error:ratio_rate30d{app=\"shop\",slo=\"availability\"}",
+          "legendFormat": "SLI",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 3
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Error budget left (30d)",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1 - autumn_slo:sli_error:ratio_rate30d{app=\"shop\",slo=\"availability\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"availability\"})",
+          "legendFormat": "budget left",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Burn rate",
+      "description": "1 spends the budget in exactly 30 days. A page fires at 14.4x (1h and 5m) and at 6x (6h and 30m).",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "autumn_slo:sli_error:ratio_rate1h{app=\"shop\",slo=\"availability\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"availability\"})",
+          "legendFormat": "1h",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "autumn_slo:sli_error:ratio_rate6h{app=\"shop\",slo=\"availability\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"availability\"})",
+          "legendFormat": "6h",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "autumn_slo:sli_error:ratio_rate3d{app=\"shop\",slo=\"availability\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"availability\"})",
+          "legendFormat": "3d",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "row",
+      "title": "checkout — objective 99.5% (non-5xx responses, route /api/orders)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "SLI (30d)",
+      "description": "Customers can place orders.",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 10
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1 - autumn_slo:sli_error:ratio_rate30d{app=\"shop\",slo=\"checkout\"}",
+          "legendFormat": "SLI",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 3
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Error budget left (30d)",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 10
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1 - autumn_slo:sli_error:ratio_rate30d{app=\"shop\",slo=\"checkout\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"checkout\"})",
+          "legendFormat": "budget left",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Burn rate",
+      "description": "1 spends the budget in exactly 30 days. A page fires at 14.4x (1h and 5m) and at 6x (6h and 30m).",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 10
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "autumn_slo:sli_error:ratio_rate1h{app=\"shop\",slo=\"checkout\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"checkout\"})",
+          "legendFormat": "1h",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "autumn_slo:sli_error:ratio_rate6h{app=\"shop\",slo=\"checkout\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"checkout\"})",
+          "legendFormat": "6h",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "autumn_slo:sli_error:ratio_rate3d{app=\"shop\",slo=\"checkout\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"checkout\"})",
+          "legendFormat": "3d",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "row",
+      "title": "orders-latency — objective 99% (requests faster than 250 ms, route /api/orders)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      }
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "SLI (30d)",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 19
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1 - autumn_slo:sli_error:ratio_rate30d{app=\"shop\",slo=\"orders-latency\"}",
+          "legendFormat": "SLI",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 3
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Error budget left (30d)",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 19
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1 - autumn_slo:sli_error:ratio_rate30d{app=\"shop\",slo=\"orders-latency\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"orders-latency\"})",
+          "legendFormat": "budget left",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Burn rate",
+      "description": "1 spends the budget in exactly 30 days. A page fires at 14.4x (1h and 5m) and at 6x (6h and 30m).",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 19
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "autumn_slo:sli_error:ratio_rate1h{app=\"shop\",slo=\"orders-latency\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"orders-latency\"})",
+          "legendFormat": "1h",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "autumn_slo:sli_error:ratio_rate6h{app=\"shop\",slo=\"orders-latency\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"orders-latency\"})",
+          "legendFormat": "6h",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "autumn_slo:sli_error:ratio_rate3d{app=\"shop\",slo=\"orders-latency\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"orders-latency\"})",
+          "legendFormat": "3d",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        }
+      }
+    }
+  ]
+}

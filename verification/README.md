@@ -59,3 +59,18 @@ The model does not include plan lookup, status rules or the grace period.
 The integration test `gate_matches_the_any_row_oracle_for_every_pair_of_rows`
 covers those parts with the default config. The test
 `require_breaks_an_event_time_tie_by_row_id` covers the tie on `id`.
+
+## Deploy bake verdict
+
+`bake_verdict.rs` models `judge` in `autumn-cli/src/deploy/bake.rs`
+(issue #3069, ADR 0016). Verify it with:
+
+```sh
+verus verification/bake_verdict.rs
+```
+
+It proves that thin traffic never rolls back, that a counter reset always
+rolls back, that the error gate is monotonic in the error count, and that a
+pass is sound. The executable `judge` is verified against the spec, with the
+same `u128` arithmetic as the runtime. The property test
+`judge_matches_the_verus_model` checks that the runtime agrees with the spec.

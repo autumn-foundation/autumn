@@ -897,6 +897,9 @@ AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS=60
 
 ### Kubernetes / ECS configuration
 
+`autumn release init --target kubernetes` writes a Helm chart and a Kustomize
+base with these settings. See [Kubernetes](kubernetes.md).
+
 Wire `prestop_grace_secs` to your `preStop` hook and termination grace period:
 
 ```yaml

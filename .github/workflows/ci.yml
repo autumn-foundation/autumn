@@ -800,6 +800,33 @@ jobs:
         # the admin plugin proves a real, non-trivial consumer of it.
         run: cargo check -p autumn-admin-plugin --all-targets
 
+  k8s-manifests:
+    name: Kubernetes manifests (helm lint, kubeconform)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Cache the pinned Kubernetes tools
+        uses: actions/cache@v6
+        with:
+          path: target/k8s-tools
+          key: k8s-tools-${{ hashFiles('scripts/check-k8s-manifests.sh') }}
+      - name: Lint the Helm chart, the Kustomize base and the SLO files
+        # Issue #3069. `autumn release init --target kubernetes` writes a Helm
+        # chart and a Kustomize base. `autumn slo generate` writes Prometheus
+        # rules and Argo Rollouts / Flagger templates. This job checks them
+        # with the real tools:
+        #
+        #   helm lint --strict, and helm template | kubeconform -strict, for
+        #   the default values and each opt-in mode (Argo Rollouts, Flagger,
+        #   ServiceMonitor); kustomize build | kubeconform -strict;
+        #   kubeconform on the golden CRD objects; and promtool check/test
+        #   rules on the golden rules, with an injected 5xx spike.
+        #
+        # No Rust toolchain: the script renders the templates itself. A Rust
+        # test keeps its placeholder list complete. The script downloads
+        # pinned tool versions and checks their SHA-256. Self-test first.
+        run: ./scripts/check-k8s-manifests.sh --self-test && ./scripts/check-k8s-manifests.sh
+
   migration-collisions:
     name: Diesel migration version collisions
     runs-on: ubuntu-latest
