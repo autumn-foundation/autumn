@@ -41,9 +41,15 @@
 #   4. Rules 2 and 3 follow chains of local features: `default = ["embedded"]`
 #      with `embedded = ["sqlite"]` is the same flip. The report shows the
 #      chain (issue #2571).
+#   5. A dependency spelled as a dotted key at the root or under `[target]`
+#      (`dependencies.autumn-web = { … }`) is an edge too.
+#   6. A unicode escape in a dependency or feature entry fails closed: the
+#      rules cannot read it.
 #
-# The lexer folds TOML multi-line strings, so a bracket or quote in one does
-# not move the scan out of step (issue #2571).
+# The lexer folds TOML multi-line strings to one-line strings that keep their
+# text, so a bracket in one does not move the scan out of step, and
+# `features = ["""sqlite"""]` still reads as "sqlite" (issue #2571). It also
+# accepts the whitespace TOML allows in headers and dotted keys.
 #
 # It is a manifest gate, not a build: no toolchain, ~1 second, self-testing.
 #
@@ -99,7 +105,7 @@ scan_manifest() {
     # array. Getting either wrong desynchronizes the section tracker for the
     # rest of the file, which fails OPEN.
     # A backslash escapes the next character inside a BASIC string ("…") and
-    # is literal inside a literal string ('…'). Reading `\"` as the end of a
+    # is literal inside a literal string (SQ…SQ). Reading `\"` as the end of a
     # string desynchronizes everything after it: a `[` in ordinary package
     # metadata then reads as structural, the entry assembler swallows the
     # following dependency, and the scan fails OPEN.
@@ -149,19 +155,22 @@ scan_manifest() {
       tail = substr(entry, i)
       gsub(SQ, "", key)
       gsub(/"/, "", key)
+      gsub(/[ \t]*\.[ \t]*/, ".", key)
       return key tail
     }
 
     # TOML multi-line strings (three double or three single quotes) can span
-    # lines and hold any bracket or quote. Fold each one to an empty string ""
-    # so the per-line helpers above never see its content. `ml` holds the
-    # open delimiter across lines; "" when none is open.
+    # lines and hold any bracket or quote. Fold each one to a one-line basic
+    # string that keeps its text, so a value such as `"""sqlite"""` still
+    # reads as "sqlite". `ml` holds the open delimiter across lines, "" when
+    # none is open; `ml_buf` holds the text read so far.
     function fold_multiline(s,   i, c, q, out, d, j) {
       out = ""; q = ""; i = 1
       if (ml != "") {
         j = ml_close(s, 1)
-        if (j == 0) return ""
-        out = "\"\""
+        if (j == 0) { ml_buf = ml_buf "\n" s; return "" }
+        ml_buf = ml_buf "\n" substr(s, 1, j - 4)
+        out = "\"" ml_text() "\""
         ml = ""
         i = j
       }
@@ -174,8 +183,9 @@ scan_manifest() {
         if (d == "\"\"\"" || d == SQ SQ SQ) {
           ml = d
           j = ml_close(s, i + 3)
-          out = out "\"\""
-          if (j == 0) return out
+          if (j == 0) { ml_buf = substr(s, i + 3); return out }
+          ml_buf = substr(s, i + 3, j - 3 - (i + 3))
+          out = out "\"" ml_text() "\""
           ml = ""
           i = j - 1
           continue
@@ -184,6 +194,20 @@ scan_manifest() {
         out = out c
       }
       return out
+    }
+    # The text of the open multi-line string, made safe for a one-line basic
+    # string. TOML drops a newline right after the opening delimiter, and in
+    # a basic string a backslash at line end joins the next line. Quotes,
+    # backslashes, comment marks and brackets go, so the text cannot change
+    # the structure around it.
+    function ml_text(   t) {
+      t = ml_buf
+      sub(/^\n/, "", t)
+      if (ml == "\"\"\"") gsub(/\\\n[ \t\n]*/, "", t)
+      gsub(/["\\#{}\[\]]/, "", t)
+      gsub(SQ, "", t)
+      gsub(/\n/, " ", t)
+      return t
     }
     # Index just past the delimiter that closes `ml`, from `start`; 0 when
     # this line does not close it. A run of up to five quotes closes with its
@@ -210,6 +234,14 @@ scan_manifest() {
       sub(/\r$/, "", line)              # a CRLF checkout must not blind the gate
       line = fold_multiline(line)
       line = strip_comment(line)
+      if (ml != "") {
+        # A multi-line string is still open: hold the entry until it closes.
+        if (pending == "") {
+          gsub(/^[ \t]+|[ \t]+$/, "", line)
+          pending = line; entry_line = FNR
+        } else pending = pending " " line
+        return ""
+      }
       if (pending != "") {
         pending = pending " " line
         if (!balanced(pending)) return ""
@@ -226,6 +258,10 @@ scan_manifest() {
         section = line
         gsub(SQ, "", section)
         gsub(/"/, "", section)
+        # TOML allows whitespace around the dots and inside the brackets.
+        gsub(/[ \t]*\.[ \t]*/, ".", section)
+        gsub(/^\[[ \t]+/, "[", section)
+        gsub(/[ \t]+\]$/, "]", section)
         return ""
       }
       if (!balanced(line)) { pending = line; entry_line = FNR; return "" }
@@ -374,6 +410,32 @@ scan_manifest() {
       norm = normalize_quotes(entry)
       mentions_sqlite = (norm ~ /"sqlite"/)
       forwards = forwards_flip(norm)
+      loose = (section == "" || section ~ /^\[target(\.[^]]*)?\]$/)
+
+      # ── 0. Spellings the rules below do not read: fail closed ─────────
+      # A TOML unicode escape can spell any name, so the rules cannot read
+      # it. An odd run of backslashes before `u` or `U` is an escape.
+      if ((is_dep_table() || dep_section_crate() != "" || section == "[features]" || loose) \
+          && entry ~ /(^|[^\\])(\\\\)*\\[uU]/) {
+        report("a unicode escape in a dependency or feature entry cannot be checked; write it plainly")
+        next
+      }
+      # A dependency or feature table spelled as a dotted key, at the root or
+      # under `[target]`: `dependencies.autumn-web = { … }`.
+      if (loose) {
+        key = norm
+        sub(/[ \t]*=.*$/, "", key)
+        if (key ~ /(^|\.)(dependencies|dev-dependencies|build-dependencies)(\.|$)/ && mentions_sqlite \
+            && (norm ~ ("(^|\\.)(" flip ")(\\.|[ \t]*=)") \
+                || norm ~ ("package[ \t]*=[ \t]*\"(" flip ")\""))) {
+          report("dependency edge enables the `sqlite` backend flip")
+          next
+        }
+        if (key ~ /(^|\.)features(\.|$)/ && forwards) {
+          report("a dotted `features` key forwards the `sqlite` backend flip")
+          next
+        }
+      }
 
       # ── 1. A dependency edge that enables the flip ────────────────────
       if (is_dep_table() && mentions_sqlite) {
@@ -728,6 +790,65 @@ autumn-web = { version = "0.7", features = ["sqlite"] }
 autumn-web = { version = "0.7", features = ["db"] }
 EOF
   check_pass "an edge spelled inside a multi-line string is not an edge" multiline_text
+
+  # A multi-line string can BE the value. Folding must keep its text.
+  make_case multiline_value <<'EOF'
+[dependencies]
+autumn-web = { version = "0.7", features = ["""sqlite"""] }
+EOF
+  check_fail "a multi-line string value is read" multiline_value
+
+  make_case multiline_value_span <<'EOF'
+[dependencies]
+autumn-web = { version = "0.7", features = [
+"""
+sqlite""",
+] }
+EOF
+  check_fail "a multi-line string value that spans lines is read" multiline_value_span
+
+  make_case multiline_package <<'EOF'
+[dependencies.web]
+package = '''autumn-web'''
+features = ["sqlite"]
+EOF
+  check_fail "a multi-line literal package name is read" multiline_package
+
+  # Fail closed on spellings the rules do not decode or anchor on.
+  make_case unicode_escape <<'EOF'
+[dependencies]
+autumn-web = { version = "0.7", features = ["\u0073qlite"] }
+EOF
+  check_fail "a unicode escape in a dependency entry fails closed" unicode_escape
+
+  make_case spaced_header <<'EOF'
+[ dependencies ]
+autumn-web . features = ["sqlite"]
+EOF
+  check_fail "whitespace inside a header and a dotted key" spaced_header
+
+  make_case root_dotted <<'EOF'
+[package]
+name = "consumer"
+EOF
+  # A root-level dotted key must come before any header.
+  printf 'dependencies.autumn-web = { version = "0.7", features = ["sqlite"] }\n[package]\nname = "consumer"\n' \
+    >"$tmp/root_dotted/Cargo.toml"
+  check_fail "a dependency spelled as a root-level dotted key" root_dotted
+
+  make_case target_dotted <<'EOF'
+[target]
+"cfg(unix)".dependencies.autumn-web = { version = "0.7", features = ["sqlite"] }
+EOF
+  check_fail "a target dependency spelled as a dotted key" target_dotted
+
+  make_case root_features <<'EOF'
+features = { default = ["autumn-web/sqlite"] }
+
+[package]
+name = "consumer"
+EOF
+  check_fail "a features table spelled inline at the root" root_features
 
   # A chain of local features reaches the flip in two hops (#2571).
   make_case default_chain <<'EOF'
