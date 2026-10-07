@@ -80,7 +80,7 @@ pub async fn collect_blobs(
 /// is an MD5 or a multipart tag: it shows a change between the two heads,
 /// not a mismatch with the bytes. When the read sees two versions, read
 /// again once, then give up. A store without etags shows only a change of
-/// the MIME type.
+/// the MIME type or the size.
 pub(super) async fn read_one_version(
     store: &dyn BlobStore,
     key: &str,
@@ -97,7 +97,9 @@ pub(super) async fn read_one_version(
         let after = head(store, key).await?;
         let sha256 = hex::encode(Sha256::digest(&bytes));
         let same = match (&before, &after) {
-            (Some(a), Some(b)) => a.etag == b.etag && a.content_type == b.content_type,
+            (Some(a), Some(b)) => {
+                a.etag == b.etag && a.content_type == b.content_type && a.byte_size == b.byte_size
+            }
             (None, None) => true,
             _ => false,
         };

@@ -1027,6 +1027,12 @@ mod blobs {
         /// An S3-like etag (not a SHA-256) that changes on every `head`.
         shifting_etag: Option<&'static str>,
         heads: std::sync::atomic::AtomicUsize,
+        /// Another writer replaces this key, with the same MIME type but
+        /// other bytes, just after the first `get` reads it.
+        swapped_on_get: Option<&'static str>,
+        swaps: std::sync::atomic::AtomicUsize,
+        /// The store keeps no etags.
+        no_etags: bool,
         plain: bool,
     }
 
@@ -1083,7 +1089,21 @@ mod blobs {
             self.inner.put_stream(key, content_type, data)
         }
         fn get<'a>(&'a self, key: &'a str) -> BlobFuture<'a, Bytes> {
-            self.inner.get(key)
+            Box::pin(async move {
+                let bytes = self.inner.get(key).await?;
+                if Some(key) == self.odd.swapped_on_get
+                    && self
+                        .odd
+                        .swaps
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        == 0
+                {
+                    self.inner
+                        .put(key, "image/png", Bytes::from_static(b"\x89PNG, but newer"))
+                        .await?;
+                }
+                Ok(bytes)
+            })
         }
         fn delete<'a>(&'a self, key: &'a str) -> BlobFuture<'a, ()> {
             self.inner.delete(key)
@@ -1092,6 +1112,9 @@ mod blobs {
             Box::pin(async move {
                 let meta = self.inner.head(key).await?;
                 Ok(meta.map(|mut meta| {
+                    if self.odd.no_etags {
+                        meta.etag = None;
+                    }
                     if Some(key) == self.odd.loses_mime {
                         "application/octet-stream".clone_into(&mut meta.content_type);
                     }
@@ -1143,6 +1166,39 @@ mod blobs {
             .await
             .expect_err("bytes and metadata of two versions");
         assert!(matches!(err, DataCapsuleError::Conflict(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn export_sees_a_replacement_of_another_size_without_etags() {
+        // The store keeps no etags, and the blob is replaced with bytes of
+        // the same MIME type but another size while export reads it. The
+        // sizes of the two heads differ: export must read again, and keep
+        // the bytes that the store holds now.
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = blob_store(&tmp.path().join("a"));
+        inner
+            .put(
+                "avatars/ada.png",
+                "image/png",
+                Bytes::from_static(b"\x89PNG"),
+            )
+            .await
+            .unwrap();
+        let blobs = OddStore {
+            inner,
+            odd: Odd {
+                swapped_on_get: Some("avatars/ada.png"),
+                no_etags: true,
+                ..Odd::default()
+            },
+        };
+        let mut capsule = export_subject(&models(), &store(), "1").await.unwrap();
+        collect_blobs(&mut capsule, &blobs).await.expect("collect");
+        let entry = capsule.manifest.blob("avatars/ada.png").unwrap();
+        assert_eq!(
+            capsule.blobs[&entry.sha256],
+            Bytes::from_static(b"\x89PNG, but newer")
+        );
     }
 
     #[tokio::test]
