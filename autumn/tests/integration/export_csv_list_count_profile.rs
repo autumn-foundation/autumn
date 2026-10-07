@@ -1,23 +1,16 @@
 //! Ledger findings harness for the generated `list()` repository method
-//! (`autumn-macros/src/repository.rs`, `list_impl_method`), driven through the
-//! exact page-fetch loop `autumn-cli`'s scaffold generator emits for every
-//! `GET /{plural}/export.csv` handler (`autumn-cli/src/generate/scaffold.rs`
-//! ~6104-6158).
+//! (`autumn-macros-repository/src/repository.rs`, `list_impl_method`), driven
+//! through the page-fetch loop that `autumn-cli`'s scaffold generator emitted
+//! for `GET /{plural}/export.csv` BEFORE issue #2185.
 //!
-//! That generator's own doc comment already names the cost qualitatively:
-//! "`list` runs a filtered `COUNT(*)` before each page, so a full export is
-//! ~100 page queries AND ~100 whole-result-set counts... The counts are pure
-//! waste here: this loop never reads `total_elements`". This harness puts a
-//! measured number on that claim against a production-shaped fixture, via
-//! `pg_stat_statements`, and shows the cost is worse than "redundant" — the
-//! `COUNT(*)` query carries no `LIMIT`, so it re-scans the *entire filtered
-//! result set* on every single page, not just its own page's slice.
+//! That loop called `list` once per `MAX_PAGE_SIZE` page, and `list` runs a
+//! filtered `COUNT(*)` before each page. This harness measures that cost with
+//! `pg_stat_statements` against a production-shaped fixture. The `COUNT(*)`
+//! has no `LIMIT`, so it scans the whole filtered result set on every page.
 //!
-//! This is a **findings issue** harness, not a before/after fix: the fix
-//! (a count-free listing method) is a new, additive method on the generated
-//! repository trait — every repository the `#[repository]` macro emits, not
-//! one call site — which the Ledger process treats as a human design
-//! decision, not a "smallest change that moves the counter".
+//! It is now the BASELINE. Since #2185 the export calls the count-free
+//! `list_rows` once (see `list_rows_snapshot.rs`). Keep this harness to
+//! compare the two shapes; it does not describe current generator output.
 //!
 //! **Requires Docker.** CI runs it in the Docker-dependent sweep
 //! (`-- --ignored`, see CLAUDE.md). Run manually with:
@@ -96,13 +89,9 @@ pub struct LedgerExportOrder {
 #[autumn_web::repository(LedgerExportOrder, table = "ledger_export_orders")]
 pub trait LedgerExportOrderRepository {}
 
-/// Mirrors `autumn-cli/src/generate/scaffold.rs`'s `export_csv` template
-/// exactly (loop shape, batch size, cap, truncation check) but reads from the
-/// generated `list()` method directly rather than through a compiled
-/// scaffolded HTTP app — same generated code path, since `list()` is produced
-/// by the same `#[repository]` macro either way and this harness's model
-/// declares no fields the generator's template does not already handle
-/// (plain `String`/`i64`/`Option<String>` columns).
+/// The pre-#2185 `export_csv` loop (loop shape, batch size, cap, truncation
+/// check), reading from the generated `list()` method directly rather than
+/// through a compiled scaffolded HTTP app.
 const MAX_EXPORT_ROWS: usize = 10_000;
 
 async fn run_export_loop(
