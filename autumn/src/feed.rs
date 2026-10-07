@@ -10,6 +10,9 @@
 //! machinery so feed pollers get a `304 Not Modified` on the unchanged-content
 //! path instead of re-downloading an unchanged feed.
 //!
+//! A date before year 0000 or after year 9999 is clamped to the nearest limit,
+//! because RFC 3339, RFC 2822 and HTTP dates have a 4-digit year.
+//!
 //! ```
 //! use autumn_web::feed::{Feed, FeedEntry};
 //! use chrono::{TimeZone, Utc};
@@ -235,7 +238,7 @@ impl Feed {
         let content_type = self.content_type();
         let body = self.render();
         let etag = hash_etag(&body);
-        let last_modified = self.last_updated();
+        let last_modified = self.last_updated().map(clamp_year);
         let mut headers = request_headers.clone();
         headers.remove(http::header::IF_MODIFIED_SINCE);
         fresh_when(&headers, etag)
@@ -408,12 +411,24 @@ const fn fallback_timestamp() -> DateTime<Utc> {
     DateTime::from_timestamp(0, 0).expect("unix epoch is a valid timestamp")
 }
 
+/// Clamp a date into years 0000–9999. RFC 3339, RFC 2822 and HTTP dates have a
+/// 4-digit year, and `to_rfc2822` panics outside that range (issue #3093).
+fn clamp_year(dt: DateTime<Utc>) -> DateTime<Utc> {
+    // 0000-01-01T00:00:00Z
+    const MIN: DateTime<Utc> =
+        DateTime::from_timestamp(-62_167_219_200, 0).expect("year 0 is valid");
+    // 9999-12-31T23:59:59Z
+    const MAX: DateTime<Utc> =
+        DateTime::from_timestamp(253_402_300_799, 0).expect("year 9999 is valid");
+    dt.clamp(MIN, MAX)
+}
+
 fn rfc3339(dt: DateTime<Utc>) -> String {
-    dt.to_rfc3339_opts(SecondsFormat::Secs, true)
+    clamp_year(dt).to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 fn rfc2822(dt: DateTime<Utc>) -> String {
-    dt.to_rfc2822()
+    clamp_year(dt).to_rfc2822()
 }
 
 /// XML-escape a text value: `&`, `<`, `>`, `"`, `'`. Characters outside the
