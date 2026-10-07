@@ -10803,6 +10803,47 @@ fn replica_lag_check_interval(max_lag: std::time::Duration) -> std::time::Durati
     )
 }
 
+/// Measure the replica lag once and record it. One step of the monitor.
+#[cfg(feature = "db")]
+async fn sample_replica_lag(
+    replica: &diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
+    probes: &crate::probe::ProbeState,
+    max_lag: std::time::Duration,
+    budget: std::time::Duration,
+) {
+    match replica.get().await {
+        Ok(conn) => {
+            crate::probe::refresh_replica_lag_bounded(probes, conn, budget, |conn| {
+                Box::pin(crate::db::measure_replica_lag(conn, max_lag))
+            })
+            .await;
+        }
+        // A full pool is not a stale replica. Keep the last sample: it ages
+        // out on its own (see `ProbeState::replica_status`).
+        Err(error) => tracing::debug!(
+            target: "autumn::db",
+            error = %crate::db_url::redact_targets_in_message(&error.to_string()),
+            "replica lag check skipped: no replica connection"
+        ),
+    }
+}
+
+#[cfg(all(feature = "db", feature = "test-support"))]
+impl AppState {
+    /// Take one replica lag sample, as the background monitor does. For
+    /// tests that do not run the monitor. Does nothing without a replica
+    /// pool or `database.replica_max_lag_ms`.
+    #[doc(hidden)]
+    pub async fn sample_replica_lag_for_test(&self) {
+        let (Some(replica), Some(max_lag)) = (self.replica_pool(), self.probes().replica_max_lag())
+        else {
+            return;
+        };
+        let budget = crate::probe::replica_lag_query_budget(max_lag);
+        sample_replica_lag(replica, self.probes(), max_lag, budget).await;
+    }
+}
+
 /// Measure the replica lag until `shutdown`. `None` when there is no replica
 /// or no `database.replica_max_lag_ms`.
 #[cfg(feature = "db")]
@@ -10819,21 +10860,7 @@ fn spawn_replica_lag_monitor(
     let budget = crate::probe::replica_lag_query_budget(max_lag);
     Some(tokio::spawn(async move {
         loop {
-            match replica.get().await {
-                Ok(conn) => {
-                    crate::probe::refresh_replica_lag_bounded(&probes, conn, budget, |conn| {
-                        Box::pin(crate::db::measure_replica_lag(conn, max_lag))
-                    })
-                    .await;
-                }
-                // A full pool is not a stale replica. Keep the last sample: it
-                // ages out on its own (see `ProbeState::replica_status`).
-                Err(error) => tracing::debug!(
-                    target: "autumn::db",
-                    error = %crate::db_url::redact_targets_in_message(&error.to_string()),
-                    "replica lag check skipped: no replica connection"
-                ),
-            }
+            sample_replica_lag(&replica, &probes, max_lag, budget).await;
             tokio::select! {
                 () = tokio::time::sleep(interval) => {}
                 () = shutdown.cancelled() => break,

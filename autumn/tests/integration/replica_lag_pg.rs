@@ -1,8 +1,8 @@
 //! Replica lag query on a real Postgres (issue #3065).
 //!
 //! **Requires Docker.** A plain Postgres is not in recovery, so its lag is
-//! `0` and reads go to the "replica" pool. This proves the lag SQL runs and
-//! that `/ready` records the result.
+//! `0` and reads go to the "replica" pool. This proves the lag SQL runs, the
+//! background monitor records the result, and `/ready` reports it.
 
 #![cfg(all(feature = "db", not(feature = "sqlite")))]
 
@@ -28,7 +28,7 @@ fn pool(url: &str, max_size: usize) -> Pool<AsyncPgConnection> {
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
-async fn ready_measures_zero_lag_on_a_server_not_in_recovery() {
+async fn the_monitor_measures_zero_lag_on_a_server_not_in_recovery() {
     let container = Postgres::default()
         .start()
         .await
@@ -44,6 +44,8 @@ async fn ready_measures_zero_lag_on_a_server_not_in_recovery() {
     probes.configure_replica_dependency(ReplicaFallback::FailReadiness);
     probes.configure_replica_max_lag(Some(Duration::from_secs(1)));
     probes.mark_startup_complete();
+    // `/ready` reports the last sample; the background monitor takes it.
+    state.sample_replica_lag_for_test().await;
 
     let response = autumn_web::probe::ready_handler(State(state.clone()))
         .await
