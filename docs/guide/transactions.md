@@ -177,7 +177,11 @@ a request, a `#[scheduled]` task, a job, an after-commit callback, and the
 `offline-sync` push and pull. A task you start yourself with `tokio::spawn`
 does not inherit them: a repository used there keeps the session
 `statement_timeout` it sets on checkout, but not the `SET LOCAL` pair. Await
-the repository call in the handler, or use `db.tx` inside the task. A savepoint keeps the outer values. A transaction pooler
+the repository call in the handler, or use `db.tx` inside the task. A
+transaction opened with diesel's `AsyncConnection::transaction` on a
+connection taken from the pool directly is not covered either. That includes
+the `autumn-billing` database store (`DbBillingStore`), so its webhook and
+dunning writes keep the role or database defaults. A savepoint keeps the outer values. A transaction pooler
 (`PgBouncer` in transaction mode) keeps a `SET LOCAL`, but drops a session
 `SET`. The `prod` profile sets `30s` and `60s` (#3057). A route's
 `StatementTimeout` extension replaces the statement value for the
