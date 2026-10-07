@@ -3050,6 +3050,23 @@ struct RetryGate {
     /// [`check`](Self::check) that finds time left, so a request that never
     /// starts an attempt refills nothing.
     refill_pending: AtomicBool,
+    /// The tokens [`allow`](Self::allow) took for a retry that has not
+    /// started. The next [`check`](Self::check) that lets the retry run keeps
+    /// them; a send cancelled in the backoff gives them back on drop.
+    pending_retry: std::sync::Mutex<Option<(Arc<RetryBudget>, RetryKind)>>,
+}
+
+impl Drop for RetryGate {
+    fn drop(&mut self) {
+        let pending = self
+            .pending_retry
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((budget, kind)) = pending {
+            budget.release(kind);
+        }
+    }
 }
 
 impl RetryGate {
@@ -3076,6 +3093,7 @@ impl RetryGate {
             host: host.map(str::to_owned),
             send_header,
             refill_pending: AtomicBool::new(true),
+            pending_retry: std::sync::Mutex::new(None),
         }
     }
 
@@ -3134,6 +3152,7 @@ impl RetryGate {
             host: self.host.clone(),
             send_header: self.send_header,
             refill_pending: AtomicBool::new(false),
+            pending_retry: std::sync::Mutex::new(None),
         };
         hop.rekey(url);
         if url_host(url).is_some_and(|host| refilled.insert(host)) {
@@ -3169,6 +3188,11 @@ impl RetryGate {
         if self.expired() {
             return Err(ClientError::DeadlineExceeded);
         }
+        // The retry starts, so it keeps its tokens.
+        self.pending_retry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         if self.refill_pending.swap(false, Ordering::Relaxed)
             && let Some(budget) = &self.budget
         {
@@ -3194,7 +3218,7 @@ impl RetryGate {
 
     /// `true` when a retry of `kind` can start after `wait`. It must have at
     /// least [`MIN_ATTEMPT`] left after the wait, and it takes tokens from the
-    /// budget.
+    /// budget. The tokens come back if the retry never starts.
     fn allow(&self, kind: RetryKind, wait: Duration) -> bool {
         if self
             .deadline
@@ -3202,9 +3226,17 @@ impl RetryGate {
         {
             return false;
         }
-        self.budget
-            .as_ref()
-            .is_none_or(|budget| budget.try_acquire(kind))
+        let Some(budget) = &self.budget else {
+            return true;
+        };
+        if !budget.try_acquire(kind) {
+            return false;
+        }
+        *self
+            .pending_retry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((Arc::clone(budget), kind));
+        true
     }
 
     /// Give back the tokens of the last retry when the final `status` is a
@@ -6758,6 +6790,29 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_retry_cancelled_during_its_backoff_gives_its_tokens_back() {
+            let (url, hits) = counting(Some(502), &[]).await;
+            let host = url_host(&url).unwrap();
+            // The first retry waits 100 % 101 = 100 ms.
+            let mut client = Client::new();
+            client.entropy = Arc::new(FixedDraw(100));
+            let budget = client.retry.budgets.clone().unwrap().for_host(&host);
+            let cancelled = tokio::time::timeout(
+                Duration::from_millis(50),
+                client.get(&url).retries(3).send(),
+            )
+            .await;
+            assert!(cancelled.is_err(), "cancelled in the backoff");
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            let full = f64::from(RetryBudgetConfig::default().capacity);
+            assert!(
+                (budget.available() - full).abs() < f64::EPSILON,
+                "no retry ran, so none is paid for: {}",
+                budget.available()
+            );
+        }
+
+        #[tokio::test]
         async fn a_redirect_hop_continues_the_chain_backoff() {
             use axum::response::IntoResponse;
             let origin_hits = Arc::new(AtomicU32::new(0));
@@ -7499,8 +7554,11 @@ mod tests {
                 host: None,
                 send_header: true,
                 refill_pending: AtomicBool::new(false),
+                pending_retry: std::sync::Mutex::new(None),
             };
             assert!(gate.allow(RetryKind::Transient, Duration::ZERO));
+            // The retry starts.
+            gate.check().unwrap();
             gate.finish(Some(RetryKind::Transient), 500);
             assert!((budget.available() - 486.0).abs() < f64::EPSILON);
             gate.finish(Some(RetryKind::Transient), 200);
