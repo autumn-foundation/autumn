@@ -560,7 +560,8 @@ impl Number {
 /// Where the scan is inside the current head.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum HeadPosition {
-    /// No byte of the head yet (CRLF between messages does not count).
+    /// No byte of the request line yet. A CRLF between messages starts the
+    /// head timer but not the request line.
     #[default]
     Before,
     RequestLine,
@@ -612,12 +613,14 @@ impl H1Scan {
                     bytes = &bytes[1..];
                     if matches!(self.state, H1State::Head) && self.position == HeadPosition::Before
                     {
-                        // hyper skips CRLF between messages.
+                        // The first byte after an idle period starts the head
+                        // timer, also a CRLF: hyper skips it, but a client must
+                        // not stall after it with only the idle timeout.
+                        head_since.get_or_insert_with(Instant::now);
                         if byte == b'\r' || byte == b'\n' {
                             continue;
                         }
                         self.position = HeadPosition::RequestLine;
-                        head_since.get_or_insert_with(Instant::now);
                     }
                     if byte == b'\n' {
                         self.on_line(head_since);
@@ -1210,8 +1213,6 @@ mod tests {
     #[test]
     fn http1_head_opens_at_the_first_byte_and_closes_at_the_blank_line() {
         let mut state = state();
-        state.scan(b"\r\n"); // a stray CRLF does not start a head
-        assert!(state.header_block_since.is_none());
         state.scan(b"POST /x HTTP/1.1\r\nHost: t\r\n");
         assert!(state.header_block_since.is_some());
         state.scan(b"Content-Length: 12\r\n\r\n");
@@ -1220,6 +1221,27 @@ mod tests {
         assert!(state.header_block_since.is_none());
         state.scan(b"GET /next");
         assert!(state.header_block_since.is_some(), "a pipelined head");
+    }
+
+    #[test]
+    fn http1_a_crlf_between_messages_starts_the_head_timer() {
+        let mut state = state();
+        state.scan(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+        assert!(state.header_block_since.is_none(), "head complete");
+        // hyper skips the CRLF, but it is the first byte after the idle
+        // period: a client that stalls after it gets the head timeout.
+        state.scan(b"\r\n");
+        let since = state
+            .header_block_since
+            .expect("the CRLF starts the head timer");
+        state.scan(b"GET /2 HTTP/1.1\r\n");
+        assert_eq!(
+            state.header_block_since,
+            Some(since),
+            "more bytes do not restart it"
+        );
+        state.scan(b"Host: t\r\n\r\n");
+        assert!(state.header_block_since.is_none(), "head complete");
     }
 
     #[test]
