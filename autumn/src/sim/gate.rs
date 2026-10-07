@@ -442,9 +442,11 @@ mod tests {
     /// operation on the one blocking thread skips the gate.
     #[test]
     fn sim_gate_a_query_turn_left_open_does_not_leak() {
-        let mut turn = super::QueryTurn::default();
-        turn.start();
-        drop(turn);
+        {
+            // The connection goes away with its turn still open.
+            let mut turn = super::QueryTurn::default();
+            turn.start();
+        }
         assert_eq!(super::DEPTH.with(std::cell::Cell::get), 0);
     }
 
