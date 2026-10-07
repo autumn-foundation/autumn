@@ -83,8 +83,8 @@ fetch() {
 
 install_tools() {
   mkdir -p "${tools_dir}/schemas" "${work}/bin"
-  if [[ -z "${HELM:-}${KUBECONFORM:-}${KUSTOMIZE:-}${PROMTOOL:-}" ]] \
-    && [[ "$(uname -sm)" != "Linux x86_64" ]]; then
+  if [[ "$(uname -sm)" != "Linux x86_64" ]] \
+    && [[ -z "${HELM:-}" || -z "${KUBECONFORM:-}" || -z "${KUSTOMIZE:-}" || -z "${PROMTOOL:-}" ]]; then
     fail "the pinned tools are linux-amd64 only; set HELM, KUBECONFORM, KUSTOMIZE and PROMTOOL"
   fi
   local tgz
@@ -188,7 +188,9 @@ main() {
     "argo-rollouts::--set rollout.enabled=true --set analysis.templateName=demo-app-slo"
     "flagger::--set flagger.enabled=true -f ${golden}/helm-values.yaml"
     "pod-monitor::--set metrics.podMonitor.enabled=true"
-    "flagger-pod-monitor::--set flagger.enabled=true --set metrics.podMonitor.enabled=true --set flagger.provider=nginx -f ${golden}/helm-values.yaml"
+    "flagger-pod-monitor::--set flagger.enabled=true --set metrics.podMonitor.enabled=true --set flagger.provider=nginx --set flagger.ingressRef.apiVersion=networking.k8s.io/v1 --set flagger.ingressRef.kind=Ingress --set flagger.ingressRef.name=demo -f ${golden}/helm-values.yaml"
+    "flagger-gatewayapi::--set flagger.enabled=true --set flagger.provider=gatewayapi:v1 --set flagger.service.gatewayRefs[0].name=public -f ${golden}/helm-values.yaml"
+    "pod-annotations::--set podAnnotations.prometheus\\.io/port=9000 --set podAnnotations.team=web"
   )
   local mode name args
   for mode in "${modes[@]}"; do
@@ -215,6 +217,12 @@ main() {
 
   grep -q 'kind: PodMonitor' "${work}/flagger-pod-monitor.yaml" \
     || fail "Flagger mode has no PodMonitor"
+  grep -q 'prometheus.io/scrape' "${work}/default.yaml" \
+    || fail "the default pod has no scrape annotations"
+  grep -q 'jobLabel: app.kubernetes.io/instance' "${work}/pod-monitor.yaml" \
+    || fail "the PodMonitor does not set job to the release name"
+  grep -q 'prometheus.io/port: "9000"' "${work}/pod-annotations.yaml" \
+    || fail "podAnnotations do not override the scrape annotations"
   if grep -q 'prometheus.io/scrape' "${work}/pod-monitor.yaml"; then
     fail "a pod with a PodMonitor also has scrape annotations"
   fi

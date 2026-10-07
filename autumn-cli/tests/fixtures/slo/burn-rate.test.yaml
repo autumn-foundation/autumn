@@ -25,12 +25,12 @@ tests:
       - expr: autumn_slo:sli_error:ratio_rate5m{slo="availability"}
         eval_time: 50m
         exp_samples:
-          - labels: 'autumn_slo:sli_error:ratio_rate5m{app="shop",job="shop",slo="availability"}'
+          - labels: 'autumn_slo:sli_error:ratio_rate5m{app="shop",job="shop",slo="availability",slo_scope="c2ec12d7"}'
             value: 0
       - expr: autumn_slo:objective:ratio{slo="availability"}
         eval_time: 50m
         exp_samples:
-          - labels: 'autumn_slo:objective:ratio{app="shop",job="shop",slo="availability"}'
+          - labels: 'autumn_slo:objective:ratio{app="shop",job="shop",slo="availability",slo_scope="c2ec12d7"}'
             value: 0.999
     alert_rule_test:
       # Before the spike: no alert.
@@ -43,6 +43,7 @@ tests:
           - exp_labels:
               app: shop
               job: shop
+              slo_scope: c2ec12d7
               slo: availability
               severity: page
               long_window: 1h
@@ -53,6 +54,7 @@ tests:
           - exp_labels:
               app: shop
               job: shop
+              slo_scope: c2ec12d7
               slo: availability
               severity: ticket
               long_window: 3d
@@ -63,6 +65,7 @@ tests:
           - exp_labels:
               app: shop
               job: shop
+              slo_scope: c2ec12d7
               slo: availability
               severity: page
               long_window: 6h
@@ -87,6 +90,7 @@ tests:
           - exp_labels:
               app: shop
               job: shop
+              slo_scope: c2ec12d7
               slo: availability
               severity: page
               long_window: 1h
@@ -97,6 +101,7 @@ tests:
           - exp_labels:
               app: shop
               job: shop
+              slo_scope: c2ec12d7
               slo: availability
               severity: ticket
               long_window: 3d
@@ -107,6 +112,7 @@ tests:
           - exp_labels:
               app: shop
               job: shop
+              slo_scope: c2ec12d7
               slo: availability
               severity: page
               long_window: 6h
@@ -121,6 +127,7 @@ tests:
           - exp_labels:
               app: shop
               job: shop
+              slo_scope: c2ec12d7
               slo: availability
               severity: ticket
               long_window: 3d
@@ -131,6 +138,7 @@ tests:
           - exp_labels:
               app: shop
               job: shop
+              slo_scope: c2ec12d7
               slo: availability
               severity: page
               long_window: 6h
@@ -166,6 +174,7 @@ tests:
           - exp_labels:
               app: shop
               job: shop
+              slo_scope: c2ec12d7
               slo: latency
               severity: ticket
               long_window: 3d
@@ -180,6 +189,7 @@ tests:
           - exp_labels:
               app: shop
               job: shop
+              slo_scope: c2ec12d7
               slo: latency
               severity: page
               long_window: 1h
@@ -190,6 +200,7 @@ tests:
           - exp_labels:
               app: shop
               job: shop
+              slo_scope: c2ec12d7
               slo: latency
               severity: ticket
               long_window: 3d
@@ -200,6 +211,7 @@ tests:
           - exp_labels:
               app: shop
               job: shop
+              slo_scope: c2ec12d7
               slo: latency
               severity: page
               long_window: 6h
@@ -207,3 +219,42 @@ tests:
             exp_annotations:
               summary: "shop SLO latency burns its error budget at 6x or more"
               description: "Objective 95% (requests faster than 1000 ms, all routes). The error ratio is above 0.3 over 6h and 30m."
+
+  # No 5xx series at all: `or vector(0)` keeps the bad rate at 0, so the 3d
+  # ratio is exactly 0. Latency uses the Prometheus 2 form le="1" and the
+  # route SLO its le="0.25" bucket. All requests are fast: no alert.
+  - interval: 1m
+    input_series:
+      - series: 'autumn_http_responses_total{job="shop",status="2xx"}'
+        values: '0+1000x120'
+      - series: 'autumn_http_request_duration_seconds_count{job="shop",route="/api/orders/{id}",status_class="2xx"}'
+        values: '0+1000x120'
+      - series: 'autumn_http_request_duration_seconds_bucket{job="shop",route="/api/orders/{id}",status_class="2xx",le="0.25"}'
+        values: '0+1000x120'
+      - series: 'autumn_http_request_duration_seconds_bucket{job="shop",route="/api/orders/{id}",status_class="2xx",le="1"}'
+        values: '0+1000x120'
+    promql_expr_test:
+      - expr: autumn_slo:sli_bad:rate5m{slo="availability"}
+        eval_time: 60m
+        exp_samples:
+          - labels: 'autumn_slo:sli_bad:rate5m{app="shop",job="shop",slo="availability",slo_scope="c2ec12d7"}'
+            value: 0
+      - expr: autumn_slo:sli_error:ratio_rate3d{slo="availability"}
+        eval_time: 60m
+        exp_samples:
+          - labels: 'autumn_slo:sli_error:ratio_rate3d{app="shop",job="shop",slo="availability",slo_scope="c2ec12d7"}'
+            value: 0
+      - expr: autumn_slo:sli_error:ratio_rate1h{slo="latency"}
+        eval_time: 60m
+        exp_samples:
+          - labels: 'autumn_slo:sli_error:ratio_rate1h{app="shop",job="shop",slo="latency",slo_scope="c2ec12d7"}'
+            value: 0
+      - expr: autumn_slo:sli_error:ratio_rate1h{slo="orders-latency"}
+        eval_time: 60m
+        exp_samples:
+          - labels: 'autumn_slo:sli_error:ratio_rate1h{app="shop",job="shop",slo="orders-latency",slo_scope="c2ec12d7"}'
+            value: 0
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: AutumnSloErrorBudgetBurn
+        exp_alerts: []

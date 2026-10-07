@@ -880,10 +880,12 @@ const KUBERNETES_FILES: [(&str, &str); 15] = [
 /// `_`, so the command uses [`k8s_name`].
 fn kubernetes_next_steps(project_name: &str) -> String {
     format!(
-        "\n  Kubernetes:\n       helm upgrade --install {} deploy/helm\n     or, with your \
-         overlay of the base:\n       kubectl apply -k <your-overlay>\n     Run `autumn slo \
-         generate` for SLO alerts and canary analysis. See docs/guide/kubernetes.md.",
-        k8s_name(project_name)
+        "\n  Kubernetes:\n     Push the image to your registry. Then:\n       helm upgrade \
+         --install {name} deploy/helm --set image.repository=<registry>/{name} --set \
+         image.tag=<tag>\n     or, with your overlay of the base:\n       kubectl apply -k \
+         <your-overlay>\n     Run `autumn slo generate` for SLO alerts and canary analysis. See \
+         docs/guide/kubernetes.md.",
+        name = k8s_name(project_name)
     )
 }
 

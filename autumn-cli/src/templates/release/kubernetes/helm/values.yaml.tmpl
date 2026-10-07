@@ -99,9 +99,12 @@ flagger:
   # Flagger's default. With the plain kubernetes provider, Flagger does a
   # blue/green test, not a weighted canary.
   provider: ""
-  # The Ingress for an ingress provider, for example
+  # The Ingress for an ingress provider (nginx, contour, ...), for example
   # {apiVersion: networking.k8s.io/v1, kind: Ingress, name: shop}.
   ingressRef: {}
+  # Extra Canary spec.service fields for a mesh or Gateway API provider, for
+  # example gatewayRefs (gatewayapi) or hosts and gateways (istio).
+  service: {}
   # Flagger webhooks, for example a load test. A canary with no traffic gives
   # no metric values, and Flagger fails it.
   webhooks: []

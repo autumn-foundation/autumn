@@ -38,12 +38,17 @@ const RAW_WINDOWS: [&str; 4] = ["5m", "30m", "1h", "6h"];
 const ANALYSIS_WINDOW: &str = "5m";
 
 /// Label names that the generated queries and rules own.
-const RESERVED_LABELS: [&str; 8] = [
+const RESERVED_LABELS: [&str; 13] = [
     "__name__",
+    "alertname",
     "app",
-    "slo",
     "le",
+    "long_window",
     "route",
+    "severity",
+    "short_window",
+    "slo",
+    "slo_scope",
     "status",
     "status_class",
     "version",
@@ -116,20 +121,31 @@ pub fn generate(slos: &[Slo], options: &GenerateOptions) -> Result<Generated, St
         .map(Matcher::render)
         .collect::<Vec<_>>()
         .join(",");
-    // An equality matcher becomes a rule label too, so two environments that
-    // share one Prometheus do not write the same recorded series.
+    // `slo_scope` names the selector. Every recorded series carries it, and
+    // every consumer matches it exactly, so two rule sets for one app (for
+    // example staging and prod on one Prometheus) never read or write each
+    // other's series. An equality matcher also becomes a plain label, so an
+    // alert can be routed on it.
+    let scope = format!("{:08x}", fnv1a(&selector) & 0xffff_ffff);
     let rule_labels: Vec<(String, String)> = matchers
         .iter()
-        .filter(|m| m.op == "=" && !m.value.contains('\\'))
-        .map(|m| (m.name.clone(), m.value.clone()))
+        .filter(|m| m.op == "=")
+        .map(|m| (m.name.clone(), unescape(&m.value)))
         .collect();
-    let own = std::iter::once(format!("app=\"{app}\""))
-        .chain(rule_labels.iter().map(|(k, v)| format!("{k}=\"{v}\"")))
+    let own = [format!("app=\"{app}\""), format!("slo_scope=\"{scope}\"")]
+        .into_iter()
+        .chain(
+            matchers
+                .iter()
+                .filter(|m| m.op == "=")
+                .map(|m| format!("{}=\"{}\"", m.name, m.value)),
+        )
         .collect::<Vec<_>>()
         .join(",");
     let ctx = Context {
         app,
         selector,
+        scope,
         rule_labels,
         own,
         prometheus_url: options.prometheus_url.clone(),
@@ -171,6 +187,8 @@ struct Context {
     app: String,
     /// The `--selector` matchers, normalized. Empty when not set.
     selector: String,
+    /// A hash of `selector`, as the `slo_scope` label.
+    scope: String,
     /// Labels on every recorded series: the equality matchers.
     rule_labels: Vec<(String, String)>,
     /// Matchers that select this app's recorded series, without `slo`.
@@ -209,6 +227,29 @@ pub fn kube_name(raw: &str) -> Result<String, String> {
              lowercase letters, digits or '-', starting with a letter"
         ))
     }
+}
+
+/// FNV-1a: a hash that is stable across builds and platforms.
+fn fnv1a(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// Undo the `\"` and `\\` escapes of a matcher value, for a YAML label.
+fn unescape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// One label matcher from `--selector`.
@@ -286,8 +327,15 @@ fn parse_selector(raw: &str) -> Result<Vec<Matcher>, String> {
         if value.contains("{{") || value.contains("}}") {
             return fail("a value must not contain {{ or }}");
         }
-        if value.chars().any(char::is_control) {
-            return fail("a value must not contain control characters");
+        if !value.chars().all(|c| c == ' ' || c.is_ascii_graphic()) {
+            return fail("a value must hold printable ASCII only");
+        }
+        if op == "="
+            && matchers
+                .iter()
+                .any(|m: &Matcher| m.op == "=" && m.name == name)
+        {
+            return fail(&format!("the label {name} has two = matchers"));
         }
         matchers.push(Matcher { name, op, value });
         if i < chars.len() && chars[i] != ',' && chars[i] != ' ' {
@@ -341,7 +389,7 @@ fn series(metric: &str, matchers: &[&str]) -> String {
 #[must_use]
 pub fn le_matcher(threshold_ms: u64) -> String {
     let le = format_decimal(threshold_ms, 3);
-    if threshold_ms % 1_000 == 0 {
+    if threshold_ms.is_multiple_of(1_000) {
         format!("le=~\"{le}(\\\\.0)?\"")
     } else {
         format!("le=\"{le}\"")
@@ -461,6 +509,7 @@ fn render_groups(out: &mut String, slos: &[Slo], ctx: &Context, indent: usize) {
             let _ = writeln!(out, "{pad}        labels:");
             let _ = writeln!(out, "{pad}          app: {}", yaml_str(&ctx.app));
             let _ = writeln!(out, "{pad}          slo: {}", yaml_str(&slo.name));
+            let _ = writeln!(out, "{pad}          slo_scope: {}", yaml_str(&ctx.scope));
             for (key, value) in &ctx.rule_labels {
                 let _ = writeln!(out, "{pad}          {key}: {}", yaml_str(value));
             }
@@ -675,13 +724,27 @@ fn render_flagger(slos: &[Slo], ctx: &Context) -> String {
     out
 }
 
+/// The output directory for a comment in a committed file: relative and
+/// normalized, or a placeholder for an absolute path, so `--check` does not
+/// depend on where the command ran.
+fn comment_dir(out_dir: &str) -> String {
+    let dir = out_dir.trim_start_matches("./").trim_end_matches('/');
+    if dir.is_empty() {
+        ".".to_owned()
+    } else if Path::new(dir).is_absolute() || dir.contains(':') {
+        "<out-dir>".to_owned()
+    } else {
+        dir.to_owned()
+    }
+}
+
 fn render_helm_values(slos: &[Slo], ctx: &Context) -> String {
     let mut out = String::new();
     header(&mut out);
     let _ = writeln!(
         out,
         "# Use it with: helm upgrade --install {app} deploy/helm -f {out_dir}/helm-values.yaml",
-        out_dir = ctx.out_dir.trim_end_matches('/'),
+        out_dir = comment_dir(&ctx.out_dir),
         app = ctx.app
     );
     out.push_str("analysis:\n");
@@ -899,18 +962,16 @@ fn slo_panels(slo: &Slo, ctx: &Context, y: u32, first_id: u32) -> [Panel; 4] {
     ]
 }
 
-/// A Grafana UID: at most 40 characters. A long app name keeps a prefix and
-/// adds a hash of the whole name, so two long names do not collide.
-fn dashboard_uid(app: &str) -> String {
+/// A Grafana UID: at most 40 characters. With a selector, or with a long app
+/// name, it adds a hash, so two rule sets or two long names do not collide.
+fn dashboard_uid(app: &str, selector: &str) -> String {
     let uid = format!("autumn-slo-{app}");
-    if uid.len() <= 40 {
+    if uid.len() <= 40 && selector.is_empty() {
         return uid;
     }
-    // FNV-1a: stable across builds and platforms.
-    let hash = uid.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-    });
-    format!("{}-{:08x}", &uid[..31], hash & 0xffff_ffff)
+    let hash = fnv1a(&format!("{uid}\n{selector}")) & 0xffff_ffff;
+    let keep = uid.len().min(31);
+    format!("{}-{hash:08x}", &uid[..keep])
 }
 
 fn render_dashboard(slos: &[Slo], ctx: &Context) -> String {
@@ -920,8 +981,12 @@ fn render_dashboard(slos: &[Slo], ctx: &Context) -> String {
         .flat_map(|(slo, index)| slo_panels(slo, ctx, index * 9, index * 4 + 1))
         .collect();
     let dashboard = Dashboard {
-        uid: dashboard_uid(&ctx.app),
-        title: format!("{} SLOs", ctx.app),
+        uid: dashboard_uid(&ctx.app, &ctx.selector),
+        title: if ctx.selector.is_empty() {
+            format!("{} SLOs", ctx.app)
+        } else {
+            format!("{} SLOs ({})", ctx.app, ctx.selector)
+        },
         tags: vec!["autumn", "slo"],
         timezone: "browser",
         schema_version: 39,

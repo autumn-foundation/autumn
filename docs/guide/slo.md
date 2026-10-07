@@ -110,10 +110,15 @@ date.
 > **Set `--selector` when one Prometheus scrapes more than one app.** Without
 > it, the queries add the series of every app together.
 
-Each `=` matcher in `--selector` also becomes a label on the recorded series
-and the alerts. Two environments of one app can then share one Prometheus:
-generate one rule set for each, with `namespace="staging"` and
-`namespace="prod"`.
+Each recorded series and alert has a `slo_scope` label: a hash of the
+`--selector` text. Every query that reads a recorded series matches it. Two
+rule sets for one app (for example staging and prod on one Prometheus) then
+never read or write each other's series. Each `=` matcher in `--selector` also
+becomes a plain label, so you can route alerts on it. The dashboard UID and
+title include the selector too.
+
+`--selector` values hold printable ASCII only. The generator rejects the label
+names it sets itself, such as `slo`, `severity` and `slo_scope`.
 
 ---
 
@@ -127,10 +132,12 @@ For each SLO, the rules record:
 - the error ratio over 5m, 30m, 1h, 6h, 3d and 30d, as
   `autumn_slo:sli_error:ratio_rate<window>`.
 
-Every recorded series has the labels `app`, `slo` and the `--selector` `=`
-labels. The 3d and 30d ratios add up the recorded 5m rates with
-`sum_over_time`, so they load few samples. They need 30 days of Prometheus
-retention. With less, the 30-day panels cover less time.
+Every recorded series has the labels `app`, `slo`, `slo_scope` and the
+`--selector` `=` labels. The 3d and 30d ratios add up the recorded 5m rates
+with `sum_over_time`, so they load few samples. They need 30 days of
+Prometheus retention. With less, the 30-day panels cover less time. They also
+lose the events of a gap in rule evaluation longer than 5 minutes. Keep the
+rule evaluation interval at 5 minutes or less.
 
 Three alerts follow the Google SRE workbook. All three are named
 `AutumnSloErrorBudgetBurn`:
@@ -203,7 +210,8 @@ helm upgrade --install shop deploy/helm \
 
 The chart puts each template in the `Canary` analysis with
 `thresholdRange.max: 14.4`. Flagger needs traffic to judge a canary. Set
-`flagger.provider` and `flagger.ingressRef` for your ingress or mesh. Add a load
+`flagger.provider`, and `flagger.ingressRef` or `flagger.service` for your
+ingress, mesh or gateway. Add a load
 test in `flagger.webhooks` when your app has little traffic.
 
 ---

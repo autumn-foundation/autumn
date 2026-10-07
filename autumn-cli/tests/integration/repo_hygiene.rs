@@ -9550,8 +9550,9 @@ fn ci_lints_the_kubernetes_manifests_and_slo_files() {
     let script = std::fs::read_to_string(root.join("scripts/check-k8s-manifests.sh"))
         .expect("read scripts/check-k8s-manifests.sh");
     assert!(
-        !script.contains("CRDs-catalog/main") && !script.contains("kubernetes-json-schema/master"),
-        "schemas must come from pinned commits"
+        script.contains("kubernetes-json-schema/${K8S_SCHEMA_COMMIT}/")
+            && script.contains("CRDs-catalog/${CRD_CATALOG_COMMIT}/"),
+        "schemas must come from the pinned commits"
     );
     for needle in [
         "lint --strict",

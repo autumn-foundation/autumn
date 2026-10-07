@@ -54,16 +54,19 @@ The pod template. The Deployment and the Rollout share it.
 metadata:
   labels:
     {{- include "app.selectorLabels" . | nindent 4 }}
-  {{- $scrape := and .Values.metrics.annotations (not .Values.metrics.podMonitor.enabled) }}
-  {{- if or $scrape .Values.podAnnotations }}
+  {{- $annotations := dict }}
+  {{- if and .Values.metrics.annotations (not .Values.metrics.podMonitor.enabled) }}
+  {{- $_ := set $annotations "prometheus.io/scrape" "true" }}
+  {{- $_ := set $annotations "prometheus.io/path" .Values.metrics.path }}
+  {{- $_ := set $annotations "prometheus.io/port" (toString .Values.containerPort) }}
+  {{- end }}
+  {{- /* podAnnotations win, so a key is never written two times. */}}
+  {{- $annotations = mustMergeOverwrite $annotations (.Values.podAnnotations | default dict) }}
+  {{- with $annotations }}
   annotations:
-    {{- if $scrape }}
-    prometheus.io/scrape: "true"
-    prometheus.io/path: {{ .Values.metrics.path | quote }}
-    prometheus.io/port: {{ .Values.containerPort | quote }}
-    {{- end }}
-    {{- with .Values.podAnnotations }}
-    {{- toYaml . | nindent 4 }}
+    {{- /* Annotation values must be strings, also when --set gives a number. */}}
+    {{- range $key, $value := . }}
+    {{ $key }}: {{ $value | toString | quote }}
     {{- end }}
   {{- end }}
 spec:

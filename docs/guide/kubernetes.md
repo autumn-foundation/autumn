@@ -93,7 +93,9 @@ With prometheus-operator, set `metrics.podMonitor.enabled=true` to render a
 `PodMonitor`. The chart then removes the annotations, so Prometheus does not
 scrape a pod two times. Set `metrics.podMonitor.labels` to the labels your
 Prometheus selects on, for example `release: kube-prometheus-stack`. A
-`PodMonitor` finds the Flagger primary and canary pods too.
+`PodMonitor` finds the Flagger primary and canary pods too. It sets the `job`
+label to the release name, so use `--selector 'job="<release>"'` with
+`autumn slo generate`.
 
 Keep `/actuator/*` off the public internet. Block it at your Ingress.
 
@@ -113,9 +115,11 @@ The Argo Rollouts canary has no traffic router, so the weight is a pod count.
 With 2 replicas, `setWeight: 20` and `setWeight: 50` each give 1 canary pod
 (about 33 % of the traffic). Use more replicas for finer steps.
 
-Flagger needs a traffic source to shift weight. Set `flagger.provider` (for
-example `nginx`) and `flagger.ingressRef`. With the plain `kubernetes`
-provider, Flagger does a blue/green test. A canary with no traffic gives no
+Flagger needs a traffic source to shift weight. Set `flagger.provider`. For
+an ingress provider (for example `nginx`), also set `flagger.ingressRef`. For a
+mesh or the Gateway API, put the provider fields (for example `gatewayRefs`)
+in `flagger.service`. With the plain `kubernetes` provider, Flagger does a
+blue/green test. A canary with no traffic gives no
 metric values, and Flagger fails it. Add a load test in `flagger.webhooks`
 when your app has little traffic.
 

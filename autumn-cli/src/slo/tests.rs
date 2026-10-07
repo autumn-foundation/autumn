@@ -67,6 +67,11 @@ fn file<'a>(generated: &'a Generated, name: &str) -> &'a str {
         .contents
 }
 
+/// The `slo_scope` of the fixture selector.
+fn shop_scope() -> String {
+    format!("{:08x}", fnv1a(r#"job="shop""#) & 0xffff_ffff)
+}
+
 fn golden_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/slo")
 }
@@ -166,7 +171,10 @@ fn long_windows_sum_the_recorded_5m_rates() {
     assert!(rules.contains("- record: autumn_slo:sli_bad:rate5m"));
     assert!(rules.contains("- record: autumn_slo:sli_total:rate5m"));
     assert!(rules.contains(
-        r#"sum_over_time(autumn_slo:sli_bad:rate5m{app="shop",job="shop",slo="availability"}[30d])"#
+        &format!(
+            r#"sum_over_time(autumn_slo:sli_bad:rate5m{{app="shop",slo_scope="{}",job="shop",slo="availability"}}[30d])"#,
+            shop_scope()
+        )
     ));
     assert!(!rules.contains("[30d]))"), "no raw rate over 30 days");
     assert!(!rules.contains("[3d]))"), "no raw rate over 3 days");
@@ -192,10 +200,16 @@ fn burn_thresholds_are_exact_for_99_9() {
     assert_eq!(thresholds, vec!["0.0144", "0.006", "0.001"]);
     let rules = file(&fixture(), "prometheus-rules.yaml").to_owned();
     assert!(rules.contains(
-        "autumn_slo:sli_error:ratio_rate1h{app=\"shop\",job=\"shop\",slo=\"availability\"} > 0.0144"
+        &format!(
+            r#"autumn_slo:sli_error:ratio_rate1h{{app="shop",slo_scope="{}",job="shop",slo="availability"}} > 0.0144"#,
+            shop_scope()
+        )
     ));
     assert!(rules.contains(
-        "autumn_slo:sli_error:ratio_rate3d{app=\"shop\",job=\"shop\",slo=\"availability\"} > 0.001"
+        &format!(
+            r#"autumn_slo:sli_error:ratio_rate3d{{app="shop",slo_scope="{}",job="shop",slo="availability"}} > 0.001"#,
+            shop_scope()
+        )
     ));
 }
 
@@ -270,7 +284,12 @@ fn consumers_read_only_defined_recording_rules() {
 fn the_dashboard_has_four_panels_per_slo() {
     let dashboard: serde_json::Value =
         serde_json::from_str(file(&fixture(), "grafana-dashboard.json")).expect("json");
-    assert_eq!(dashboard["uid"], "autumn-slo-shop");
+    let uid = dashboard["uid"].as_str().expect("uid");
+    assert!(
+        uid.starts_with("autumn-slo-shop-") && uid.len() <= 40,
+        "{uid}"
+    );
+    assert_eq!(dashboard["title"], "shop SLOs (job=\"shop\")");
     assert_eq!(dashboard["panels"].as_array().expect("panels").len(), 16);
     let ids: std::collections::BTreeSet<_> = dashboard["panels"]
         .as_array()
@@ -283,11 +302,16 @@ fn the_dashboard_has_four_panels_per_slo() {
 
 #[test]
 fn long_app_names_get_distinct_dashboard_uids() {
-    let a = dashboard_uid(&format!("{}-one", "x".repeat(40)));
-    let b = dashboard_uid(&format!("{}-two", "x".repeat(40)));
+    let a = dashboard_uid(&format!("{}-one", "x".repeat(40)), "");
+    let b = dashboard_uid(&format!("{}-two", "x".repeat(40)), "");
     assert_eq!(a.len(), 40);
     assert_ne!(a, b);
-    assert_eq!(dashboard_uid("shop"), "autumn-slo-shop");
+    assert_eq!(dashboard_uid("shop", ""), "autumn-slo-shop");
+    // Two rule sets for one app get two dashboards.
+    assert_ne!(
+        dashboard_uid("shop", r#"namespace="prod""#),
+        dashboard_uid("shop", r#"namespace="staging""#)
+    );
 }
 
 #[test]
@@ -384,6 +408,10 @@ fn a_bad_selector_is_rejected() {
         "route=\"/x\"",
         "job=\"{{args.x}}\"",
         "1job=\"x\"",
+        "severity=\"x\"",
+        "slo_scope=\"x\"",
+        "job=\"a\",job=\"b\"",
+        "job=\"a\u{2028}b\"",
     ] {
         let mut options = fixture_options();
         options.selector = Some(bad.to_owned());
@@ -406,6 +434,69 @@ fn the_selector_is_parsed_and_normalized() {
         ]
     );
     assert_eq!(parse_selector("").expect("empty"), Vec::new());
+}
+
+#[test]
+fn rule_sets_with_different_selectors_never_share_series() {
+    let slos = slo::validate(&fixture_configs()).expect("valid");
+    let render = |selector: Option<&str>| {
+        let mut options = fixture_options();
+        options.selector = selector.map(str::to_owned);
+        file(
+            &generate(&slos, &options).expect("generate"),
+            "prometheus-rules.yaml",
+        )
+        .to_owned()
+    };
+    let scope_of = |rules: &str| {
+        rules
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("slo_scope: "))
+            .expect("scope")
+            .to_owned()
+    };
+    let prod = render(None);
+    let staging = render(Some(r#"namespace="staging""#));
+    assert_ne!(scope_of(&prod), scope_of(&staging));
+    // Every consumer of a recorded series matches the scope.
+    for rules in [&prod, &staging] {
+        let scope = scope_of(rules);
+        for line in rules
+            .lines()
+            .filter(|l| l.contains("autumn_slo:") && l.contains('{'))
+        {
+            assert!(line.contains(&format!("slo_scope={scope}")), "{line}");
+        }
+    }
+}
+
+#[test]
+fn equality_values_are_unescaped_for_labels() {
+    let slos = slo::validate(&fixture_configs()).expect("valid");
+    let mut options = fixture_options();
+    options.selector = Some(r#"team="a\"b""#.to_owned());
+    let rules = file(
+        &generate(&slos, &options).expect("generate"),
+        "prometheus-rules.yaml",
+    )
+    .to_owned();
+    assert!(
+        rules.contains(r#"team: "a\"b""#),
+        "the YAML label is unescaped"
+    );
+    assert!(
+        rules.contains(r#"team="a\"b""#),
+        "the PromQL matcher stays escaped"
+    );
+}
+
+#[test]
+fn the_comment_dir_is_relative_and_normalized() {
+    assert_eq!(comment_dir("deploy/slo"), "deploy/slo");
+    assert_eq!(comment_dir("./deploy/slo/"), "deploy/slo");
+    assert_eq!(comment_dir("/home/ci/work/deploy/slo"), "<out-dir>");
+    assert_eq!(comment_dir("C:\\work\\slo"), "<out-dir>");
+    assert_eq!(comment_dir("./"), ".");
 }
 
 #[test]

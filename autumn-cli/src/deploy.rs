@@ -3826,6 +3826,18 @@ fn resolve_bake_policy(
     }
     let slos =
         autumn_web::slo::validate(&config.slo).map_err(|e| DeployError::Config(e.to_string()))?;
+    // The prod profile rejects a request whose Host is not trusted, and
+    // `127.0.0.1` is not trusted there. With no trusted host to send, every
+    // sample would fail and every deploy would roll back.
+    let prod = matches!(config.profile.as_deref(), Some("prod" | "production"));
+    let hosts = &config.security.trusted_hosts.hosts;
+    if prod && bake::host_header(hosts).is_none() && !hosts.iter().any(|h| h.trim() == "*") {
+        return Err(DeployError::Config(
+            "the bake needs a trusted host in the prod profile: add your domain to \
+             [security.trusted_hosts] hosts, or turn the bake off"
+                .to_owned(),
+        ));
+    }
     bake::resolve_policy(&bake_config, &slos, flag).map_err(DeployError::Config)
 }
 
@@ -4411,6 +4423,22 @@ where
                         executor,
                     ) {
                         if single {
+                            // A rolled-back rebind still serves the new release
+                            // on the old port, so it bakes first.
+                            if matches!(rebind_err, exec::PublicPortRebindError::RolledBack { .. })
+                                && let BakeStep::Fail(bake_error) = bake_host(
+                                    input,
+                                    index,
+                                    single,
+                                    host_plan,
+                                    cfg,
+                                    &state.slots,
+                                    executor,
+                                )
+                            {
+                                eprintln!("\u{26A0}\u{FE0F}  {rebind_err}");
+                                return Err(bake_error);
+                            }
                             return Err(DeployError::Exec(rebind_err.to_string()));
                         }
                         match rebind_err {
@@ -4509,6 +4537,15 @@ where
                 // fleet classifier decides this, so the two paths cannot diverge.
                 outcomes[index] = fleet::classify_host_outcome(&err);
                 if single {
+                    // A housekeeping failure leaves the new release serving, so it
+                    // bakes first. A failed bake is the error that matters.
+                    if matches!(outcomes[index], fleet::HostOutcome::Degraded { .. })
+                        && let BakeStep::Fail(bake_error) =
+                            bake_host(input, index, single, host_plan, cfg, &state.slots, executor)
+                    {
+                        eprintln!("\u{26A0}\u{FE0F}  {err}");
+                        return Err(bake_error);
+                    }
                     let message = fleet::single_host_schema_note(&plan, &outcomes).map_or_else(
                         || err.to_string(),
                         |note| format!("{err}\n\u{26A0}\u{FE0F}  {note}"),
@@ -14168,6 +14205,75 @@ mod tests {
         run_up_with(&input, |cfg| Ok(recorder.executor(cfg))).expect("first deploy passes");
 
         assert!(recorder.index_of("web-a", bake::SAMPLE_LABEL).is_none());
+    }
+
+    #[test]
+    fn the_bake_in_prod_needs_a_trusted_host() {
+        let mut config = AutumnConfig {
+            profile: Some("prod".to_owned()),
+            ..AutumnConfig::default()
+        };
+        assert!(matches!(
+            resolve_bake_policy(&config, Some(30)),
+            Err(DeployError::Config(message)) if message.contains("[security.trusted_hosts]")
+        ));
+        // No bake, no check.
+        assert!(resolve_bake_policy(&config, None).expect("off").is_none());
+        config.security.trusted_hosts.hosts = vec!["app.example.com".to_owned()];
+        assert!(
+            resolve_bake_policy(&config, Some(30))
+                .expect("ok")
+                .is_some()
+        );
+        config.security.trusted_hosts.hosts = vec!["*".to_owned()];
+        assert!(
+            resolve_bake_policy(&config, Some(30))
+                .expect("ok")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_degraded_single_host_bakes_and_reports_the_bake() {
+        let fleet = fleet_of(&["web-a"]);
+        let recorder = script_redeploy(fleet::test_support::FleetRecorder::new(), "web-a")
+            .fail("web-a", "record-proxy-options");
+        let recorder = script_compensation(recorder, "web-a", "present");
+        let recorder = script_bake(recorder, "web-a", &SPIKED_BAKE);
+        let fixture = FleetFixture::new();
+        let policy = bake_policy();
+        let input = FleetUpInput {
+            bake: Some(&policy),
+            ..fixture.input(&fleet)
+        };
+
+        let err = run_up_with(&input, |cfg| Ok(recorder.executor(cfg))).expect_err("fails");
+
+        assert!(
+            matches!(err, DeployError::BakeFailed { result, .. } if result == BAKE_ROLLED_BACK),
+            "{err:?}"
+        );
+        assert!(recorder.index_of("web-a", "restart-previous").is_some());
+    }
+
+    #[test]
+    fn a_degraded_single_host_with_a_good_bake_keeps_the_housekeeping_error() {
+        let fleet = fleet_of(&["web-a"]);
+        let recorder = script_redeploy(fleet::test_support::FleetRecorder::new(), "web-a")
+            .fail("web-a", "record-proxy-options");
+        let recorder = script_bake(recorder, "web-a", &HEALTHY_BAKE);
+        let fixture = FleetFixture::new();
+        let policy = bake_policy();
+        let input = FleetUpInput {
+            bake: Some(&policy),
+            ..fixture.input(&fleet)
+        };
+
+        let err = run_up_with(&input, |cfg| Ok(recorder.executor(cfg))).expect_err("fails");
+
+        assert!(matches!(err, DeployError::Exec(_)), "{err:?}");
+        assert!(recorder.index_of("web-a", bake::SAMPLE_LABEL).is_some());
+        assert!(recorder.index_of("web-a", "restart-previous").is_none());
     }
 
     #[test]

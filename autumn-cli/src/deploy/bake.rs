@@ -25,7 +25,7 @@
 // of this bin crate, so clippy calls each `pub(crate)` redundant.
 #![allow(clippy::redundant_pub_crate)]
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 use autumn_web::config::DeployBakeConfig;
 use autumn_web::slo::{PPM, ROLLBACK_BURN_TENTHS, Sli, Slo, format_decimal, max_error_ppm};
@@ -346,12 +346,14 @@ fn take_sample<E: DeployExecutor>(
             .map_err(|e| e.to_string())
             .and_then(|output| parse_sample(&output.stdout))
     };
-    match attempt(sleep_secs) {
-        Ok(sample) => Ok((sample, 1)),
-        Err(_) => attempt(0)
-            .map(|sample| (sample, 2))
-            .map_err(Breach::Unreachable),
-    }
+    attempt(sleep_secs).map_or_else(
+        |_| {
+            attempt(0)
+                .map(|sample| (sample, 2))
+                .map_err(Breach::Unreachable)
+        },
+        |sample| Ok((sample, 1)),
+    )
 }
 
 /// The result of a bake.
@@ -370,13 +372,14 @@ pub(crate) fn run<E: DeployExecutor>(
     executor: &E,
     progress: &mut dyn FnMut(&str),
 ) -> BakeOutcome {
-    let (baseline, attempts) = match take_sample(executor, target, 0) {
+    let (baseline, _) = match take_sample(executor, target, 0) {
         Ok(sample) => sample,
         Err(breach) => return BakeOutcome::Breached(breach),
     };
-    // The app counts a metric request after it answers it, so the next
-    // sample includes every request the bake has made so far.
-    let mut own_requests = attempts;
+    // The app counts a metric request after it answers it. A failed baseline
+    // attempt is already in the baseline counters, so only the successful
+    // baseline request falls in the window.
+    let mut own_requests = 1;
     let interval = policy.interval_secs.max(1);
     let mut elapsed = 0;
     let mut responses = 0;
@@ -536,11 +539,14 @@ const fn quantile_for(objective_ppm: u32) -> Quantile {
 impl BakePolicy {
     /// One line that describes the policy, for the operator.
     pub(crate) fn describe(&self) -> String {
-        let latency: String = self
-            .latency
-            .iter()
-            .map(|g| format!(" or {} latency is above {} ms", g.quantile, g.max_ms))
-            .collect();
+        let mut latency = String::new();
+        for gate in &self.latency {
+            let _ = write!(
+                latency,
+                " or {} latency is above {} ms",
+                gate.quantile, gate.max_ms
+            );
+        }
         format!(
             "bake for {} s, sample every {} s; roll back when the 5xx ratio is above {}%{latency} \
              (after {} responses; limits from {})",
@@ -750,23 +756,24 @@ mod tests {
 
         /// `spec_judge` from `verification/bake_verdict.rs`, over `i128`.
         fn model(
-            b: Sample,
-            n: Sample,
+            base: Sample,
+            now: Sample,
             own: u64,
             latency_over: bool,
-            p: &BakePolicy,
+            policy: &BakePolicy,
         ) -> &'static str {
-            let restarted = matches!((b.restarts, n.restarts), (Some(x), Some(y)) if x != y);
-            if restarted || n.responses < b.responses || n.errors < b.errors {
+            let restarted = matches!((base.restarts, now.restarts), (Some(x), Some(y)) if x != y);
+            if restarted || now.responses < base.responses || now.errors < base.errors {
                 return "restart";
             }
-            let dr = (i128::from(n.responses) - i128::from(b.responses) - i128::from(own)).max(0);
-            let de = i128::from(n.errors) - i128::from(b.errors);
-            if dr < i128::from(p.min_requests) {
+            let dr =
+                (i128::from(now.responses) - i128::from(base.responses) - i128::from(own)).max(0);
+            let de = i128::from(now.errors) - i128::from(base.errors);
+            if dr < i128::from(policy.min_requests) {
                 return "few";
             }
             if de >= i128::from(MIN_BREACH_ERRORS)
-                && de * 1_000_000 > i128::from(p.max_error_ppm) * dr
+                && de * 1_000_000 > i128::from(policy.max_error_ppm) * dr
             {
                 return "errors";
             }
@@ -1043,6 +1050,24 @@ mod tests {
         assert!(
             shells[2].starts_with("curl "),
             "the retry does not sleep: {shells:?}"
+        );
+    }
+
+    #[test]
+    fn a_retried_baseline_subtracts_only_its_successful_request() {
+        let mut p = policy();
+        p.duration_secs = 10;
+        let exec = RecordingExecutor::new()
+            .failing_on_occurrence(SAMPLE_LABEL, 1)
+            .with_stdout_on_occurrence(SAMPLE_LABEL, 2, sample_stdout(0, 0, 1, 0))
+            .with_stdout_on_occurrence(SAMPLE_LABEL, 3, sample_stdout(21, 0, 1, 0));
+        // 21 new responses, less 1 metric request: exactly min_requests.
+        assert_eq!(
+            run(&p, &TARGET, &exec, &mut |_| {}),
+            BakeOutcome::Passed {
+                responses: 20,
+                judged: true,
+            }
         );
     }
 

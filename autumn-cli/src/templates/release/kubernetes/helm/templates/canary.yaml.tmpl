@@ -20,6 +20,9 @@ spec:
   service:
     port: {{ .Values.service.port }}
     targetPort: http
+    {{- with .Values.flagger.service }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
   analysis:
     interval: {{ .Values.flagger.interval }}
     threshold: {{ .Values.flagger.threshold }}

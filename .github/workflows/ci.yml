@@ -824,7 +824,7 @@ jobs:
         #
         #   helm lint --strict, and helm template | kubeconform -strict, for
         #   the default values and each opt-in mode (Argo Rollouts, Flagger,
-        #   ServiceMonitor); kustomize build | kubeconform -strict;
+        #   PodMonitor); kustomize build | kubeconform -strict;
         #   kubeconform on the golden CRD objects; and promtool check/test
         #   rules on the golden rules, with an injected 5xx spike.
         #
