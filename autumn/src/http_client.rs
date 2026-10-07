@@ -86,6 +86,14 @@ pub enum ClientError {
     /// The outbound circuit breaker is open.
     #[error("outbound circuit breaker is open")]
     CircuitBreakerOpen,
+    /// The client-side adaptive throttle rejected the attempt locally,
+    /// because the host rejected too many recent attempts (issue #3068).
+    /// See `[http.client.adaptive_throttle]`.
+    #[error("outbound request to {host} throttled locally: the host rejects too many requests")]
+    ThrottledLocally {
+        /// The host (`host` or `host:port`).
+        host: String,
+    },
     /// The capsule recorded a transport failure for this call, and replay
     /// reproduced it (#1634).
     ///
@@ -714,6 +722,7 @@ const fn http_error_kind(error: &ClientError) -> crate::capsule::schema::HttpErr
         ClientError::Json(_) => Kind::Json,
         ClientError::NoMock(..) => Kind::NoMock,
         ClientError::CircuitBreakerOpen => Kind::CircuitBreakerOpen,
+        ClientError::ThrottledLocally { .. } => Kind::ThrottledLocally,
         ClientError::SsrfBlocked(_) => Kind::SsrfBlocked,
         ClientError::TooManyRedirects(_) => Kind::TooManyRedirects,
         ClientError::RedirectRejected(_) => Kind::RedirectRejected,
@@ -739,6 +748,15 @@ fn rebuild_client_error(
     use crate::capsule::schema::HttpErrorKind as Kind;
     match kind {
         Some(Kind::CircuitBreakerOpen) => ClientError::CircuitBreakerOpen,
+        Some(Kind::ThrottledLocally) => text
+            .strip_prefix("outbound request to ")
+            .and_then(|rest| rest.split_once(" throttled locally"))
+            .map_or_else(
+                || ClientError::ReplayedRequestFailure(text.clone()),
+                |(host, _)| ClientError::ThrottledLocally {
+                    host: host.to_owned(),
+                },
+            ),
         Some(Kind::SsrfBlocked) => {
             ClientError::SsrfBlocked(strip_prefix_payload(&text, "SSRF policy blocked address: "))
         }
@@ -1202,6 +1220,37 @@ pub struct Client {
     /// Source of retry jitter. `from_state` uses the app's entropy, so a sim
     /// seed replays the same delays.
     entropy: Arc<dyn crate::entropy::Entropy>,
+    /// Client-side adaptive throttle (issue #3068). `None` when off.
+    throttle: Option<Arc<crate::admission::AdaptiveThrottle>>,
+}
+
+/// The app-wide client-side throttle, so that every `Client::from_state`
+/// shares one set of per-host counts (issue #3068).
+#[derive(Clone)]
+pub(crate) struct SharedThrottle(pub(crate) Arc<crate::admission::AdaptiveThrottle>);
+
+/// Put the app-wide throttle in `state` when `[http.client.adaptive_throttle]`
+/// is on.
+pub(crate) fn install_shared_throttle(
+    state: &crate::AppState,
+    config: &crate::config::HttpClientConfig,
+) {
+    if let Some(throttle) = throttle_from_config(config) {
+        state.insert_extension(SharedThrottle(throttle));
+    }
+}
+
+/// A new throttle for `config`, or `None` when it is off.
+fn throttle_from_config(
+    config: &crate::config::HttpClientConfig,
+) -> Option<Arc<crate::admission::AdaptiveThrottle>> {
+    let t = config.adaptive_throttle;
+    t.enabled.then(|| {
+        Arc::new(crate::admission::AdaptiveThrottle::new(
+            t.k,
+            Duration::from_secs(t.window_secs),
+        ))
+    })
 }
 
 /// The entropy a client without app state uses.
@@ -1242,6 +1291,7 @@ impl Client {
             resilience_config: None,
             sim_net: None,
             entropy: os_entropy(),
+            throttle: None,
         }
     }
 
@@ -1285,6 +1335,7 @@ impl Client {
             resilience_config: None,
             sim_net: None,
             entropy: os_entropy(),
+            throttle: throttle_from_config(config),
         }
     }
 
@@ -1302,6 +1353,7 @@ impl Client {
             resilience_config: None,
             sim_net: None,
             entropy: os_entropy(),
+            throttle: None,
         }
     }
 
@@ -1369,6 +1421,14 @@ impl Client {
             client = client.with_mock(ext.0.clone());
         }
         client.sim_net = state.extension::<crate::sim::SimNet>();
+        // One throttle for the whole app, so per-host counts add up. The
+        // effective config decides whether it is on: a `state_initializer`
+        // can replace the config after boot.
+        if client.throttle.is_some()
+            && let Some(shared) = state.extension::<SharedThrottle>()
+        {
+            client.throttle = Some(Arc::clone(&shared.0));
+        }
         // Retry jitter and the automatic key are not made again on capsule
         // replay, so they must not go on the capsule's random tape.
         let entropy = state.entropy_arc();
@@ -1400,6 +1460,7 @@ impl Client {
             resilience_config: self.resilience_config.clone(),
             sim_net: self.sim_net.clone(),
             entropy: self.entropy.clone(),
+            throttle: self.throttle.clone(),
         }
     }
 
@@ -1416,6 +1477,7 @@ impl Client {
             resilience_config: self.resilience_config.clone(),
             sim_net: self.sim_net.clone(),
             entropy: self.entropy.clone(),
+            throttle: self.throttle.clone(),
         }
     }
 
@@ -1451,6 +1513,8 @@ impl Client {
             breaker_scoped: false,
             sim_net: self.sim_net.clone(),
             entropy: self.entropy.clone(),
+            throttle: self.throttle.clone(),
+            criticality: None,
         }
     }
 
@@ -1614,9 +1678,22 @@ pub struct RequestBuilder {
     sim_net: Option<Arc<crate::sim::SimNet>>,
     /// Source of retry jitter and of the automatic `Idempotency-Key`.
     entropy: Arc<dyn crate::entropy::Entropy>,
+    /// Client-side adaptive throttle (issue #3068).
+    throttle: Option<Arc<crate::admission::AdaptiveThrottle>>,
+    /// The criticality to send. `None` sends the inbound request's.
+    criticality: Option<crate::admission::Criticality>,
 }
 
 impl RequestBuilder {
+    /// Send this criticality in the `X-Autumn-Criticality` header (issue
+    /// #3068). Without this call, the client sends the criticality of the
+    /// inbound request that it serves, if any.
+    #[must_use]
+    pub const fn criticality(mut self, criticality: crate::admission::Criticality) -> Self {
+        self.criticality = Some(criticality);
+        self
+    }
+
     /// Append a request header.
     ///
     /// Headers named `authorization`, `cookie`, or `set-cookie` are accepted
@@ -1974,6 +2051,7 @@ impl RequestBuilder {
         // After the capture tee, so a capsule records the caller's headers
         // only and replays without a random key.
         self.ensure_idempotency_key();
+        self.ensure_criticality_header();
 
         // A sim network serves every send path, so nothing reaches the real
         // network. Like mocks, it bypasses the process-global breaker.
@@ -1996,7 +2074,18 @@ impl RequestBuilder {
         // its doc comment).
         if self.needs_custom_path() {
             if self.breaker_scoped {
-                return self.send_custom_breaker_guarded().await;
+                // Like the breaker, the throttle keeps per-host state, so it
+                // covers only `breaker_scoped` custom calls: a small, durable
+                // host set. Unscoped custom calls go to user-supplied URLs,
+                // and one entry per host would grow without bound. The
+                // custom path retries inside `send_one`, so the throttle
+                // counts the call once, not each attempt.
+                let ticket = self.throttle_attempt(None)?;
+                let res = self.send_custom_breaker_guarded().await;
+                if let Some(ticket) = ticket {
+                    ticket.record(matches!(&res, Ok(r) if throttle_accepts(r.status.as_u16())));
+                }
+                return res;
             }
             return self.send_custom(false).await;
         }
@@ -2020,6 +2109,10 @@ impl RequestBuilder {
                     guard.failure();
                 }
             }
+            // A local throttle reject says nothing about the host. Dropping
+            // the guard records nothing for a fast call, and frees a
+            // half-open slot.
+            Err(ClientError::ThrottledLocally { .. }) => drop(guard),
             Err(_) => {
                 guard.failure();
             }
@@ -2072,6 +2165,9 @@ impl RequestBuilder {
                 tokio::time::sleep(delay).await;
             }
 
+            // A throttled attempt ends the call, retry or not.
+            let ticket = self.throttle_attempt(None)?;
+
             let mut req = self.client.request(self.method.clone(), &self.url);
 
             // Inject W3C trace context headers from the active span.
@@ -2086,7 +2182,11 @@ impl RequestBuilder {
                 req = req.body(body.clone());
             }
 
-            match req.send().await {
+            let outcome = req.send().await;
+            if let Some(ticket) = ticket {
+                ticket.record(matches!(&outcome, Ok(r) if throttle_accepts(r.status().as_u16())));
+            }
+            match outcome {
                 Ok(resp) => {
                     let status = resp.status();
                     let headers = resp.headers().clone();
@@ -2156,6 +2256,50 @@ impl RequestBuilder {
         }
     }
 
+    /// Add the `X-Autumn-Criticality` header (issue #3068): the value set by
+    /// [`Self::criticality`], else the inbound request's when it is not
+    /// `default` (a missing header means `default`, so the client does not
+    /// send it to every host). A header that the caller set wins.
+    fn ensure_criticality_header(&mut self) {
+        if self
+            .extra_headers
+            .contains_key(crate::admission::CRITICALITY_HEADER)
+        {
+            return;
+        }
+        let inbound = crate::admission::current_criticality()
+            .filter(|c| *c != crate::admission::Criticality::Default);
+        if let Some(c) = self.criticality.or(inbound) {
+            self.extra_headers.insert(
+                HeaderName::from_static(crate::admission::CRITICALITY_HEADER),
+                HeaderValue::from_static(c.as_str()),
+            );
+        }
+    }
+
+    /// Ask the throttle for one attempt (issue #3068). `host` is the throttle
+    /// key; `None` takes it from the URL. Returns `Ok(None)` without a
+    /// throttle, and [`ClientError::ThrottledLocally`] when it rejects.
+    fn throttle_attempt(&self, host: Option<&str>) -> Result<Option<ThrottleTicket>, ClientError> {
+        let Some(throttle) = &self.throttle else {
+            return Ok(None);
+        };
+        let Some(host) = host.map(str::to_owned).or_else(|| throttle_host(&self.url)) else {
+            return Ok(None);
+        };
+        let now = crate::time::ambient_instant();
+        if throttle.admit(&host, now, || self.entropy.next_u64()) {
+            Ok(Some(ThrottleTicket {
+                throttle: Arc::clone(throttle),
+                host,
+                recorded: false,
+            }))
+        } else {
+            tracing::debug!(host = %host, "outbound request throttled locally");
+            Err(ClientError::ThrottledLocally { host })
+        }
+    }
+
     /// How many attempts the retry policy allows for this request.
     const fn max_attempts(&self, suppress_retries: bool) -> u32 {
         if suppress_retries {
@@ -2218,6 +2362,7 @@ impl RequestBuilder {
                 tokio::time::sleep(delay).await;
             }
             let last = attempt + 1 == max_attempts;
+            let ticket = self.throttle_attempt(Some(&host))?;
             let exchange = self.sim_attempt(net, &host, &url);
             let outcome = match self.retry_policy.request_timeout {
                 Some(limit) => {
@@ -2231,6 +2376,9 @@ impl RequestBuilder {
                 }
                 None => exchange.await,
             };
+            if let Some(ticket) = ticket {
+                ticket.record(matches!(&outcome, Ok(r) if throttle_accepts(r.status.as_u16())));
+            }
             let response = match outcome {
                 Ok(response) => response,
                 // A drop or a timeout is transient, like a real connect or
@@ -2806,6 +2954,48 @@ fn build_oneshot_client(
     builder.build().map_err(ClientError::Request)
 }
 
+/// One attempt that the throttle let through. [`Self::record`] counts the
+/// outcome. A ticket dropped without an outcome (the caller cancelled the
+/// call) counts as an accept: the host did not reject it.
+struct ThrottleTicket {
+    throttle: Arc<crate::admission::AdaptiveThrottle>,
+    host: String,
+    recorded: bool,
+}
+
+impl ThrottleTicket {
+    fn record(mut self, accepted: bool) {
+        self.recorded = true;
+        self.throttle
+            .record(&self.host, crate::time::ambient_instant(), accepted);
+    }
+}
+
+impl Drop for ThrottleTicket {
+    fn drop(&mut self) {
+        if !self.recorded {
+            self.throttle
+                .record(&self.host, crate::time::ambient_instant(), true);
+        }
+    }
+}
+
+/// `false` for the statuses a host uses to reject for overload.
+const fn throttle_accepts(status: u16) -> bool {
+    !matches!(status, 429 | 503)
+}
+
+/// The throttle key of `url`: `host`, or `host:port` with an explicit port.
+fn throttle_host(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    Some(
+        parsed
+            .port()
+            .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}")),
+    )
+}
+
 /// Send a single request through `client` (no manual redirect following — the
 /// client's redirect policy governs that) with the same transient-error and
 /// 429/5xx retry behaviour as the shared path, and collect the [`Response`].
@@ -3289,6 +3479,87 @@ impl opentelemetry::propagation::Injector for TraceHeaderInjector<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #3068: a capsule replays a local throttle reject as the same
+    /// variant, so a handler that matches it takes the same branch.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn throttled_locally_round_trips_through_a_capsule() {
+        let err = ClientError::ThrottledLocally {
+            host: "api.example.com:8443".to_owned(),
+        };
+        let kind = http_error_kind(&err);
+        assert_eq!(
+            kind,
+            crate::capsule::schema::HttpErrorKind::ThrottledLocally
+        );
+        match rebuild_client_error(Some(kind), err.to_string()) {
+            ClientError::ThrottledLocally { host } => assert_eq!(host, "api.example.com:8443"),
+            other => panic!("rebuilt as {other:?}"),
+        }
+    }
+
+    /// Regression (#3068 review): a local throttle reject says nothing about
+    /// the host, so it must not count as a circuit-breaker failure.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn throttled_calls_do_not_open_the_circuit_breaker() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        // 429 is a reject for the throttle, but a success for the breaker.
+        let app = axum::Router::new().route(
+            "/x",
+            axum::routing::get(|| async { axum::http::StatusCode::TOO_MANY_REQUESTS }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut config = HttpClientConfig::default();
+        config.adaptive_throttle.enabled = true;
+        let client = Client::from_config(&config);
+        let url = format!("http://{addr}/x");
+        let mut throttled = 0;
+        for _ in 0..200 {
+            match client.get(&url).no_retry().send().await {
+                Err(ClientError::ThrottledLocally { .. }) => throttled += 1,
+                Ok(r) => assert_eq!(r.status().as_u16(), 429),
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert!(
+            throttled > 50,
+            "the throttle must reject locally: {throttled}"
+        );
+        let breaker = crate::circuit_breaker::global_registry().get_or_create(
+            &addr.to_string(),
+            crate::circuit_breaker::CircuitBreakerPolicy::default(),
+        );
+        assert_eq!(
+            breaker.state(),
+            crate::circuit_breaker::CircuitState::Closed,
+            "local rejects must not open the breaker"
+        );
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    #[test]
+    fn throttle_host_keeps_an_explicit_port() {
+        assert_eq!(
+            throttle_host("https://a.example/x").as_deref(),
+            Some("a.example")
+        );
+        assert_eq!(
+            throttle_host("http://a.example:8080/x").as_deref(),
+            Some("a.example:8080")
+        );
+        assert_eq!(throttle_host("not a url"), None);
+        assert!(throttle_accepts(200) && throttle_accepts(500));
+        assert!(!throttle_accepts(429) && !throttle_accepts(503));
+    }
     use crate::config::HttpClientConfig;
 
     // RED-PHASE TEST 1: Client can be constructed with defaults.
@@ -3589,6 +3860,7 @@ mod tests {
             max_retry_after_secs: 10,
             max_backoff_ms: 20_000,
             base_urls: std::collections::HashMap::new(),
+            adaptive_throttle: crate::config::AdaptiveThrottleConfig::default(),
         };
         let client = Client::from_config(&config);
         assert_eq!(client.retry_policy.max_retries, 1);
@@ -3670,6 +3942,7 @@ mod tests {
             max_retry_after_secs: 10,
             max_backoff_ms: 20_000,
             base_urls,
+            adaptive_throttle: crate::config::AdaptiveThrottleConfig::default(),
         };
         let client = Client::from_config(&config);
         let stripe = client.named("stripe");
@@ -3715,6 +3988,7 @@ mod tests {
             max_retry_after_secs: 10,
             max_backoff_ms: 20_000,
             base_urls,
+            adaptive_throttle: crate::config::AdaptiveThrottleConfig::default(),
         };
         let client = Client::from_config(&config);
 

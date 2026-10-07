@@ -233,3 +233,69 @@ Key properties:
 See [ADR 0009](../adr/0009-adopt-overload-protection-load-shedding.md) for
 the full design rationale and how this differs from rate limiting and
 per-request timeouts.
+
+### Adaptive limit
+
+A static ceiling is correct for one latency only. When a dependency slows
+down, it admits too much work. Set `mode = "adaptive"` to let the limit follow
+measured latency:
+
+```toml
+[server.admission]
+mode = "adaptive"          # "static" (default) or "adaptive"
+algorithm = "gradient2"    # "gradient2" (default), "vegas" or "aimd"
+min_limit = 8
+initial_limit = 20
+# max_limit defaults to the static ceiling, else 1000.
+```
+
+- `gradient2` compares the latest RTT with a long-term average. After a long
+  latency increase, its limit can stay low for minutes.
+- `vegas` estimates the queue from the lowest RTT seen. It finds the new
+  capacity faster.
+- `aimd` backs off by 10% on a `504`, on a cancel at the request deadline,
+  or on an RTT above `latency_threshold_ms` (default 1000). It adds 1 when a
+  request used at least half the limit.
+
+The limiter ignores responses whose latency does not show capacity: `4xx`,
+`503`, routes with `timeout = "off"`, and requests that the client cancels.
+The `autumn_admission_limit` gauge shows the current limit. Probes stay
+exempt.
+
+### Criticality
+
+Mark a route with its class. Under overload, the server rejects `sheddable`
+routes first and `critical` routes last:
+
+```rust,ignore
+#[get("/reports/export", criticality = "sheddable")]
+async fn export() -> &'static str { "..." }
+
+#[post("/checkout", criticality = "critical")]
+async fn checkout() -> &'static str { "..." }
+```
+
+Each class can fill a share of the limit. `critical` always gets the full
+limit:
+
+```toml
+[server.admission.partitions]
+default = 1.0     # set below 1.0 to keep headroom for `critical`
+sheddable = 0.5
+```
+
+The defaults change nothing for routes without a criticality. The
+`autumn_admission_shed_total{criticality="..."}` counter shows what was shed.
+
+The HTTP client sends the class downstream in `X-Autumn-Criticality` when it
+is not `default`. A server reads that header only when
+`trust_criticality_header = true`. Set it only when you trust all callers, or
+when an edge proxy removes or sets the header. If you do not, a public client
+can set its requests to `critical`. The `/mcp` endpoint admits every tool call
+as `default`.
+
+The handler can read the class with
+`autumn_web::admission::current_criticality()`. A task that the handler
+spawns does not see it.
+
+See [ADR 0016](../adr/0016-adaptive-admission-control.md).

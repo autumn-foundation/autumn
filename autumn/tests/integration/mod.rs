@@ -411,11 +411,15 @@ mod sharding_commit_hooks;
 #[cfg(feature = "db")]
 mod sharding_integration;
 mod signed_webhooks;
+mod sim_adaptive_admission;
+mod sim_admission_criticality;
 mod sim_advance_to;
 mod sim_ambient_clock;
 mod sim_ambient_modules;
 mod sim_chaos_clock_skew_monotonic;
 mod sim_circuit_breaker_slow_calls;
+#[cfg(feature = "http-client")]
+mod sim_client_throttle;
 mod sim_clock_drain;
 #[cfg(feature = "collab")]
 mod sim_collab_convergence;

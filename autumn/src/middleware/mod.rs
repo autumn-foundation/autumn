@@ -22,6 +22,7 @@
 
 pub(crate) mod access_log;
 pub(crate) mod cost;
+pub(crate) mod criticality;
 pub(crate) mod dev;
 pub(crate) mod error_page_filter;
 pub(crate) mod exception_filter;
@@ -49,7 +50,7 @@ pub use method_override::{
     MethodOverrideRejection, MethodOverrideService, OverriddenMethod,
     method_override_rejection_filter,
 };
-pub use metrics::{MetricsCollector, MetricsLayer};
+pub use metrics::{AdmissionSnapshot, MetricsCollector, MetricsLayer};
 pub use request_id::{RequestId, RequestIdLayer};
 pub use server_timing::{ServerTimingEmitted, ServerTimingLayer, ServerTimingService};
 #[cfg(feature = "telemetry-otlp")]
