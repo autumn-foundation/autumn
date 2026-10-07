@@ -223,6 +223,26 @@ async fn wait_for_slot(
     }
 }
 
+/// How a step of setting up a connection ended.
+enum Step<T> {
+    Done(T),
+    Shutdown,
+    TimedOut,
+}
+
+/// Run `step`, unless the server shuts down or `deadline` passes first.
+async fn race_step<T>(
+    step: impl std::future::Future<Output = T>,
+    deadline: Option<Instant>,
+    shutdown: &watch::Sender<()>,
+) -> Step<T> {
+    tokio::select! {
+        value = step => Step::Done(value),
+        () = shutdown.closed() => Step::Shutdown,
+        () = sleep_until(deadline) => Step::TimedOut,
+    }
+}
+
 /// The slot the listener put in `handoff` for the stream it returned.
 fn take_handoff(handoff: Option<&SlotHandoff>) -> Option<Slot> {
     handoff?
@@ -289,27 +309,20 @@ where
         let timers = limits
             .has_timers()
             .then(|| Arc::new(ConnTimers::new(&limits)));
-        let make = async {
-            make_service
-                .ready()
-                .await
-                .unwrap_or_else(|err| match err {});
-            make_service
-                .call(IncomingStream {
-                    io: &io,
-                    remote_addr,
-                })
-                .await
-                .unwrap_or_else(|err| match err {})
-        };
-        let head_deadline = timers
-            .as_ref()
-            .and_then(|t| t.deadline_and_expiry())
-            .map(|(deadline, _)| deadline);
-        let service = tokio::select! {
-            service = make => service,
-            () = signal_tx.closed() => break,
-            () = sleep_until(head_deadline) => continue,
+        let head = timers.as_ref().and_then(|t| t.deadline(None));
+        match race_step(make_service.ready(), head, &signal_tx).await {
+            Step::Done(ready) => drop(ready.unwrap_or_else(|err| match err {})),
+            Step::Shutdown => break,
+            Step::TimedOut => continue,
+        }
+        let call = make_service.call(IncomingStream {
+            io: &io,
+            remote_addr,
+        });
+        let service = match race_step(call, head, &signal_tx).await {
+            Step::Done(service) => service.unwrap_or_else(|err| match err {}),
+            Step::Shutdown => break,
+            Step::TimedOut => continue,
         };
         let service = Tracked {
             inner: service,
@@ -342,13 +355,7 @@ where
             let mut grace_until: Option<Instant> = None;
             loop {
                 let shutting_down = grace_until.is_some();
-                // A slow head closes at once. An idle close waits for the grace.
-                let deadline = timers.as_ref().and_then(|t| t.deadline_and_expiry()).map(
-                    |(deadline, expiry)| match (expiry, grace_until) {
-                        (Expiry::Idle, Some(grace)) => deadline.max(grace),
-                        _ => deadline,
-                    },
-                );
+                let deadline = timers.as_ref().and_then(|t| t.deadline(grace_until));
                 tokio::select! {
                     _ = conn.as_mut() => break,
                     () = &mut signal_closed, if !shutting_down => {
@@ -895,6 +902,16 @@ impl ConnTimers {
                 };
             }
         });
+    }
+
+    /// When the connection must close. A slow head closes at once. During a
+    /// shutdown grace (`grace_until`), an idle close waits for the grace.
+    fn deadline(&self, grace_until: Option<Instant>) -> Option<Instant> {
+        self.deadline_and_expiry()
+            .map(|(deadline, expiry)| match (expiry, grace_until) {
+                (Expiry::Idle, Some(grace)) => deadline.max(grace),
+                _ => deadline,
+            })
     }
 
     fn deadline_and_expiry(&self) -> Option<(Instant, Expiry)> {
