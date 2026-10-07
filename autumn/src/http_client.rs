@@ -3473,16 +3473,15 @@ async fn send_one(
                 {
                     let hint = retry_hint(status.as_u16(), &headers);
                     let next = retry_policy.retry_delay(entropy, attempt, hint);
-                    // A server-hinted wait that reaches the deadline cannot
+                    // A wait (hinted or not) that reaches the deadline cannot
                     // retry in time, so this response is the final outcome.
-                    let hint_reaches_deadline = hint.is_some()
-                        && deadline.is_some_and(|d| {
-                            crate::time::ambient_instant()
-                                .checked_add(next)
-                                .is_none_or(|resume| resume >= d)
-                        });
+                    let wait_reaches_deadline = deadline.is_some_and(|d| {
+                        crate::time::ambient_instant()
+                            .checked_add(next)
+                            .is_none_or(|resume| resume >= d)
+                    });
                     let kind = retry_kind(status.as_u16());
-                    if !hint_reaches_deadline && gate.allow(kind, next) {
+                    if !wait_reaches_deadline && gate.allow(kind, next) {
                         delay = next;
                         last_retry = Some(kind);
                         continue;
@@ -6638,6 +6637,37 @@ mod tests {
             .unwrap();
             assert_eq!(response.status().as_u16(), 503, "as without a deadline");
             assert_eq!(target_hits.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn a_backoff_past_the_hop_deadline_returns_the_response() {
+            let (url, _hits) = counting(Some(502), &[]).await;
+            let policy = RetryPolicy {
+                max_retries: 20,
+                ..RetryPolicy::default()
+            };
+            let gate = RetryGate::with_deadline(None, None, None, true);
+            let result = send_one(
+                &reqwest::Client::new(),
+                &Method::GET,
+                &url,
+                &HeaderMap::new(),
+                None,
+                &policy,
+                &crate::entropy::SeededEntropy::new(1),
+                false,
+                Some(crate::time::ambient_instant() + Duration::from_millis(300)),
+                false,
+                &gate,
+                false,
+                None,
+            )
+            .await;
+            assert_eq!(
+                result.map(|response| response.status().as_u16()).ok(),
+                Some(502),
+                "the last response, not a deadline error"
+            );
         }
 
         #[tokio::test]
