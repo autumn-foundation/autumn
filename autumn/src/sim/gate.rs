@@ -172,25 +172,37 @@ pub fn give_ups() -> u64 {
 pub struct SimSeat(Mutex<Option<Arc<Gate>>>);
 
 impl SimSeat {
-    /// Count the sim on this thread's sim runtime. A second call does nothing.
+    /// Count the sim on this thread's sim runtime. A second call on the same
+    /// runtime does nothing. The thread keeps the gate of a runtime it
+    /// dropped, so a call on a new runtime moves the seat to its gate.
     pub fn take(&self) {
+        let Some(gate) = runtime_gate() else {
+            return;
+        };
         let mut seat = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if seat.is_none()
-            && let Some(gate) = runtime_gate()
-        {
-            gate.lock().sims += 1;
-            *seat = Some(gate);
+        if seat.as_ref().is_some_and(|held| Arc::ptr_eq(held, &gate)) {
+            return;
         }
+        gate.lock().sims += 1;
+        let old = seat.replace(gate);
+        drop(seat);
+        if let Some(old) = old {
+            Self::release(&old);
+        }
+    }
+
+    fn release(gate: &Gate) {
+        let mut state = gate.lock();
+        state.sims = state.sims.saturating_sub(1);
+        drop(state);
+        gate.turn.notify_all();
     }
 
     /// Remove the sim from the count it took. A second call does nothing.
     pub fn leave(&self) {
         let gate = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
         if let Some(gate) = gate {
-            let mut state = gate.lock();
-            state.sims = state.sims.saturating_sub(1);
-            drop(state);
-            gate.turn.notify_all();
+            Self::release(&gate);
         }
     }
 }
@@ -451,6 +463,21 @@ mod tests {
             assert_eq!(super::live_sims(), 2);
             drop(inner);
             assert_eq!(super::live_sims(), 1);
+            drop(sim);
+            assert_eq!(super::live_sims(), 0);
+        });
+    }
+
+    /// A sim built after one sim runtime and before the next moves its seat
+    /// to the new runtime's gate when it is anchored.
+    #[test]
+    fn sim_gate_moves_a_sim_to_the_gate_of_a_new_runtime() {
+        drop(runtime().unwrap());
+        let sim = crate::sim::Sim::from_seed(1);
+        let rt = runtime().unwrap();
+        rt.block_on(async {
+            sim.anchor();
+            assert_eq!(super::live_sims(), 1, "the sim counts on the new gate");
             drop(sim);
             assert_eq!(super::live_sims(), 0);
         });
