@@ -40,7 +40,9 @@
 #   3. No `default` feature list enables `sqlite`, bare or forwarded.
 #   4. Rules 2 and 3 follow chains of local features: `default = ["embedded"]`
 #      with `embedded = ["sqlite"]` is the same flip. The report shows the
-#      chain (issue #2571).
+#      chain (issue #2571). They read all three spellings of the table:
+#      `[features]`, root `features.default = [...]` keys, and a root inline
+#      `features = { ... }` table.
 #   5. A dependency spelled as a dotted key at the root or under `[target]`
 #      (`dependencies.autumn-web = { … }`) is an edge too.
 #   6. The lexer decodes ASCII unicode escapes, so `"\u0073qlite"` reads as
@@ -50,7 +52,9 @@
 # The lexer folds TOML multi-line strings to one-line strings that keep their
 # text, so a bracket in one does not move the scan out of step, and
 # `features = ["""sqlite"""]` still reads as "sqlite" (issue #2571). It also
-# accepts the whitespace TOML allows in headers and dotted keys.
+# accepts the whitespace TOML allows in headers and dotted keys. A dot inside a
+# quoted key segment (`target."x.y"`) stays part of the name, and only the real
+# `features` field of an inline table counts.
 #
 # It is a manifest gate, not a build: ~2 seconds, self-testing. Two layers:
 #   - The SCAN reads every manifest with the awk lexer below. It needs no
@@ -104,6 +108,9 @@ scan_manifest() {
       pkg = ""
       ml = ""
       ESCAPED_HEADER = sprintf("%c", 1) "escaped-header"
+      # Stands in for a dot inside a quoted key segment, which is part of the
+      # name: target."x.y" is one segment.
+      DOTPH = sprintf("%c", 2)
       # A dependency or feature name, as cargo accepts it once its quotes are
       # gone: any run without a dot, blank, `=`, quote, slash, `?` or bracket.
       NAME = "[^]. \t=\"/?[]+"
@@ -224,18 +231,30 @@ scan_manifest() {
     # the first `=`. Only the key is touched — quotes inside the value stay
     # significant to the value patterns (`"sqlite"`, `package = "autumn-web"`,
     # the `"dep/sqlite"` forwarding paths).
-    function unquote_key(entry,   i, key, tail) {
+    function unquote_key(entry,   i) {
       i = assign_index(entry)
       if (i == 0) return entry
-      key = substr(entry, 1, i - 1)
-      tail = substr(entry, i)
-      gsub(SQ, "", key)
-      gsub(/"/, "", key)
-      # A quoted key can hold `=`: target."cfg(target_os = linux)".
-      # Drop it, so the rules split the entry at the real assignment.
-      gsub(/=/, "", key)
-      gsub(/[ \t]*\.[ \t]*/, ".", key)
-      return key tail
+      return unquote_path(substr(entry, 1, i - 1)) substr(entry, i)
+    }
+    # A dotted key path with its quotes removed. Inside a quoted segment, a
+    # dot becomes DOTPH and an `=` or an escape goes, so the rules split the
+    # path and the entry only where TOML does. Blanks around a dot go too.
+    function unquote_path(s,   i, c, q, out) {
+      q = ""; out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (q == "\"" && c == "\\") { i++; continue }
+        if (q != "") {
+          if (c == q) q = ""
+          else if (c == ".") out = out DOTPH
+          else if (c != "=") out = out c
+          continue
+        }
+        if (c == "\"" || c == SQ) { q = c; continue }
+        out = out c
+      }
+      gsub(/[ \t]*\.[ \t]*/, ".", out)
+      return out
     }
     # The index of the assignment `=`: the first one outside quotes.
     function assign_index(s,   i, c, q) {
@@ -359,11 +378,8 @@ scan_manifest() {
         # quote in it is key-quoting (`[dependencies."autumn-web"]`,
         # `[target."cfg(unix)".dependencies]`); strip them so the section
         # matchers work off one spelling.
-        section = line
-        gsub(SQ, "", section)
-        gsub(/"/, "", section)
-        # TOML allows whitespace around the dots and inside the brackets.
-        gsub(/[ \t]*\.[ \t]*/, ".", section)
+        section = unquote_path(line)
+        # TOML allows whitespace inside the brackets too.
         gsub(/^\[[ \t]+/, "[", section)
         gsub(/[ \t]+\]$/, "]", section)
         return ""
@@ -426,13 +442,76 @@ scan_manifest() {
     # counts: `path = "sqlite"` is not a feature. In the dotted and section
     # forms the key is `features` and the value is the list.
     function features_name_sqlite(e,   i, key) {
-      i = index(e, "=")
-      key = (i > 0) ? substr(e, 1, i - 1) : e
-      if (key ~ /(^|\.)features[ \t]*$/) return (e ~ /"sqlite"/)
-      # The key may be quoted (`"features" = [...]`); quote style is already
-      # normalized to double quotes.
-      if (!match(e, /"?features"?[ \t]*=[ \t]*\[[^]]*\]/)) return 0
-      return (substr(e, RSTART, RLENGTH) ~ /"sqlite"/)
+      i = assign_index(e)
+      if (i == 0) return 0
+      key = substr(e, 1, i - 1)
+      gsub(/[ \t]+$/, "", key)
+      if (key ~ /(^|\.)features$/) return list_has_sqlite(substr(e, i + 1))
+      return list_has_sqlite(inline_field(e, "features"))
+    }
+    # Whether a TOML list names "sqlite", in either quote style.
+    function list_has_sqlite(v) {
+      return (v ~ ("[\"" SQ "]sqlite[\"" SQ "]"))
+    }
+    # Split `s` at each `sep` outside quotes and brackets, into out[1..n].
+    function split_top(s, sep, out,   i, c, q, depth, n, start) {
+      n = 0; q = ""; depth = 0; start = 1
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (q == "\"" && c == "\\") { i++; continue }
+        if (q != "") { if (c == q) q = ""; continue }
+        if (c == "\"" || c == SQ) q = c
+        else if (c == "[" || c == "{") depth++
+        else if (c == "]" || c == "}") depth--
+        else if (c == sep && depth == 0) { out[++n] = substr(s, start, i - start); start = i + 1 }
+      }
+      out[++n] = substr(s, start)
+      return n
+    }
+    # The fields of the inline table that is the value of entry `e`, as
+    # `key = value` strings with unquoted keys, in out[1..n]; 0 if the value is
+    # not an inline table.
+    function inline_fields(e, out,   i, body, n, parts, p, m) {
+      i = assign_index(e)
+      if (i == 0) return 0
+      body = substr(e, i + 1)
+      sub(/^[ \t]+/, "", body)
+      sub(/[ \t]+$/, "", body)
+      if (substr(body, 1, 1) != "{" || substr(body, length(body), 1) != "}") return 0
+      n = split_top(substr(body, 2, length(body) - 2), ",", parts)
+      m = 0
+      for (p = 1; p <= n; p++) {
+        if (assign_index(parts[p]) == 0) continue
+        out[++m] = unquote_key(parts[p])
+        sub(/^[ \t]+/, "", out[m])
+      }
+      return m
+    }
+    # The value of field `name` in the inline table that is the value of `e`.
+    function inline_field(e, name,   n, f, k, i, fields) {
+      n = inline_fields(e, fields)
+      for (k = 1; k <= n; k++) {
+        i = assign_index(fields[k])
+        f = substr(fields[k], 1, i - 1)
+        gsub(/[ \t]+$/, "", f)
+        if (f == name) return substr(fields[k], i + 1)
+      }
+      return ""
+    }
+    # The feature entries (`name = [...]`) that entry `e` defines, in
+    # out[1..n]. The table has three spellings: a `[features]` table, root
+    # dotted keys (`features.default = [...]`), and a root inline table
+    # (`features = { default = [...] }`).
+    function feature_entries(e, out,   i, k) {
+      i = assign_index(e)
+      if (i == 0) return 0
+      if (section == "[features]") { out[1] = e; return 1 }
+      if (section != "") return 0
+      k = substr(e, 1, i - 1)
+      gsub(/[ \t]+$/, "", k)
+      if (k ~ /^features\.[^.]+$/) { out[1] = substr(e, 10); return 1 }
+      if (k == "features") return inline_fields(e, out)
+      return 0
     }
     # The value of a `key = "value"` entry.
     function quoted_value(entry,   value) {
@@ -473,18 +552,18 @@ scan_manifest() {
       entry = feed($0)
       if (entry == "") next
       norm = normalize_quotes(entry)
-      if (section == "[package]" && norm ~ /^name[ \t]*=/) {
-        pkg = norm
-        sub(/^name[ \t]*=[ \t]*"/, "", pkg)
-        sub(/".*$/, "", pkg)
+      if ((section == "[package]" && norm ~ /^name[ \t]*=/) \
+          || (section == "" && norm ~ /^package\.name[ \t]*=/)) {
+        pkg = quoted_value(norm)
       }
       # Record each feature, by any name cargo accepts, and the LOCAL features
       # it enables. Pass 2 resolves the chains, after every alias is known.
-      if (section == "[features]" && norm ~ /^[^= \t][^=]*=/) {
-        fkey = norm
+      nfe = feature_entries(norm, fe)
+      for (f = 1; f <= nfe; f++) {
+        fkey = fe[f]
         sub(/[ \t]*=.*$/, "", fkey)
-        feat_entry[fkey] = norm
-        refs = norm
+        feat_entry[fkey] = fe[f]
+        refs = fe[f]
         sub(/^[^=]*=/, "", refs)
         feat_refs[fkey] = ""
         while (match(refs, /"[^"]*"/)) {
@@ -551,7 +630,7 @@ scan_manifest() {
         next
       }
       norm = normalize_quotes(entry)
-      mentions_sqlite = features_name_sqlite(norm)
+      mentions_sqlite = features_name_sqlite(entry)
       forwards = forwards_flip(norm)
       loose = (section == "" || section ~ /^\[target(\.[^]]*)?\]$/)
 
@@ -577,10 +656,6 @@ scan_manifest() {
                 || (dep in alias_of && alias_of[dep] ~ ("^(" flip ")$")) \
                 || norm ~ ("package[ \t]*=[ \t]*\"(" flip ")\""))) {
           report("dependency edge enables the `sqlite` backend flip")
-          next
-        }
-        if (section == "" && key ~ /^features(\.|$)/ && forwards) {
-          report("a dotted `features` key forwards the `sqlite` backend flip")
           next
         }
       }
@@ -614,9 +689,11 @@ scan_manifest() {
       }
 
       # ── 2 & 3. A feature that forwards or defaults into the flip ──────
-      if (section == "[features]") {
-        key = norm
+      nfe = feature_entries(norm, fe)
+      for (f = 1; f <= nfe; f++) {
+        key = fe[f]
         sub(/[ \t]*=.*$/, "", key)
+        forwards = forwards_flip(fe[f])
         if (key == "default" && (key in reach)) {
           report("`default` enables the `sqlite` backend flip (" chain(key) ")")
         } else if (forwards && key != "sqlite") {
@@ -1174,6 +1251,61 @@ EOF
 target.'cfg(target_os = "linux")'.dependencies.autumn-web = { path = "../autumn", optional = true, features = ["sqlite"] }
 EOF
   check_fail "a dotted target key whose cfg holds an equals sign" target_cfg_eq
+
+  # A dot inside a quoted key segment is part of the name, not a separator.
+  make_case target_quoted_dot <<'EOF'
+target."x.y".dependencies.autumn-web = { version = "0.7", features = ["sqlite"] }
+EOF
+  check_fail "a quoted target name that holds a dot" target_quoted_dot
+
+  make_case header_quoted_dot <<'EOF'
+[target."x.y".dependencies]
+autumn-web = { version = "0.7", features = ["sqlite"] }
+EOF
+  check_fail "a quoted target name with a dot in a header" header_quoted_dot
+
+  # The features table spelled as root dotted keys, or as an inline table,
+  # is the same table: chains and the default rule apply.
+  make_case root_features_default <<'EOF'
+package.name = "autumn-web"
+features.default = ["sqlite"]
+features.sqlite = []
+EOF
+  check_fail "a root dotted default that enables the flip" root_features_default
+
+  make_case root_features_chain <<'EOF'
+package.name = "autumn-cli"
+features.default = ["embedded"]
+features.embedded = ["sqlite"]
+features.sqlite = ["autumn-web/sqlite"]
+EOF
+  check_fail "a root dotted feature chain to the flip" root_features_chain
+
+  make_case root_features_owner <<'EOF'
+package.name = "autumn-cli"
+features.default = ["postgres"]
+features.sqlite = ["autumn-web/sqlite"]
+EOF
+  check_pass "the owner opt-in spelled as root dotted keys" root_features_owner
+
+  make_case inline_features_default <<'EOF'
+package.name = "autumn-web"
+features = { default = ["tls", "sqlite"], sqlite = [], tls = [] }
+EOF
+  check_fail "an inline features table whose default enables the flip" inline_features_default
+
+  # Only the real `features` field of an inline table counts.
+  make_case path_holds_features <<'EOF'
+[dependencies]
+autumn-web = { path = 'features = ["sqlite"]' }
+EOF
+  check_pass "features text inside a path is not a feature" path_holds_features
+
+  make_case apostrophe_elsewhere <<'EOF'
+[dependencies]
+autumn-web = { path = "it's", features = ["sqlite"] }
+EOF
+  check_fail "an apostrophe in another value does not hide the features list" apostrophe_elsewhere
 
   make_case root_features <<'EOF'
 features = { default = ["autumn-web/sqlite"] }
