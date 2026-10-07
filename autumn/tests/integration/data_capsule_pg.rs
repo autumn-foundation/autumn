@@ -487,7 +487,7 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
     let base = format!("postgres://postgres:postgres@{host}:{port}");
     let mut admin = PgConnection::establish(&format!("{base}/postgres")).expect("connect");
     for db in [
-        "target", "busy", "deferred", "capped", "cached", "cycled", "stepped", "limited",
+        "target", "busy", "deferred", "capped", "cached", "cycled", "stepped", "wide", "limited",
     ] {
         admin
             .batch_execute(&format!("CREATE DATABASE {db}"))
@@ -501,7 +501,7 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
         ))
         .expect("source");
     for db in [
-        "target", "busy", "deferred", "capped", "cached", "cycled", "stepped", "limited",
+        "target", "busy", "deferred", "capped", "cached", "cycled", "stepped", "wide", "limited",
     ] {
         PgConnection::establish(&format!("{base}/{db}"))
             .expect("connect")
@@ -647,6 +647,26 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
         .expect("import");
     let next = text(
         &stepped,
+        "INSERT INTO notes (owner) VALUES (2) RETURNING id::text AS value",
+    )
+    .await;
+    assert_eq!(next, "501");
+
+    // A sequence that starts at the smallest bigint: `key - start` and
+    // `start - inc` do not fit a bigint, so the plan computes in numeric.
+    let wide = pool(&format!("{base}/wide"));
+    PgConnection::establish(&format!("{base}/wide"))
+        .expect("connect")
+        .batch_execute(
+            "ALTER SEQUENCE notes_id_seq AS bigint \
+             MINVALUE -9223372036854775808 START WITH -9223372036854775808",
+        )
+        .expect("wide");
+    import_capsule(&capsule, &models, &PgCapsuleStore::new(wide.clone()))
+        .await
+        .expect("import");
+    let next = text(
+        &wide,
         "INSERT INTO notes (owner) VALUES (2) RETURNING id::text AS value",
     )
     .await;

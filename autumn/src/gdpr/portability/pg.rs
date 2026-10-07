@@ -583,14 +583,15 @@ async fn plan_sequence(
     // those at or before the outermost key: the next value is then on the
     // same path, past every key. With `INCREMENT BY 2` from 1 and key 500,
     // that is 499, and the next value 501. An unused sequence has no last
-    // value: then compare with the value before its start.
+    // value: then compare with the value before its start. The arithmetic is
+    // in numeric: `key - start` and `start - inc` can leave the bigint range.
     let plan: Option<SequencePlan> = diesel::sql_query(format!(
         "SELECT a.m AS key, a.target, a.cache, a.min, a.max, a.cycle, CASE WHEN a.inc > 0 \
-           THEN a.target > COALESCE(pg_sequence_last_value($1::regclass), a.start - a.inc) \
-           ELSE a.target < COALESCE(pg_sequence_last_value($1::regclass), a.start - a.inc) END AS needed, \
+           THEN a.target > COALESCE(pg_sequence_last_value($1::regclass), a.start::numeric - a.inc) \
+           ELSE a.target < COALESCE(pg_sequence_last_value($1::regclass), a.start::numeric - a.inc) END AS needed, \
            has_sequence_privilege($1::regclass, 'UPDATE') AS can_update \
          FROM (SELECT s.*, \
-                      (s.start + floor((s.m - s.start)::numeric / s.inc) * s.inc)::bigint AS target \
+                      (s.start + floor((s.m::numeric - s.start) / s.inc) * s.inc)::bigint AS target \
          FROM (SELECT CASE WHEN q.seqincrement > 0 THEN MAX(t.{pk}) ELSE MIN(t.{pk}) END::bigint AS m, \
                       q.seqincrement AS inc, q.seqstart AS start, q.seqcache AS cache, \
                       q.seqmin AS min, q.seqmax AS max, q.seqcycle AS cycle \
