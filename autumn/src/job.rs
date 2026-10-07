@@ -138,6 +138,10 @@ pub struct JobInfo {
     /// chokepoints (including the transactional free functions) can wrap by
     /// looking the version up from the registry.
     pub version: u32,
+    /// Maximum duration of one run (issue #3051). A slower run fails and
+    /// retries like any other failure. `None` uses `jobs.default_timeout_ms`.
+    /// When that is `0`, there is no limit.
+    pub timeout: Option<std::time::Duration>,
     /// The async function that executes the job logic.
     pub handler: JobHandler,
 }
@@ -159,6 +163,7 @@ impl JobInfo {
             uniqueness: None,
             concurrency: None,
             version: 1,
+            timeout: None,
             handler,
         }
     }
@@ -800,11 +805,422 @@ enum JobExecutionOutcome {
     Succeeded,
     Failed(String),
     Panicked(String),
+    /// The worker lost its claim and stopped the handler (issue #3051).
+    /// Another worker owns the job now, so this worker must not settle it.
+    LeaseLost,
+}
+
+/// Limits on one job run (issue #3051).
+#[derive(Clone, Default)]
+pub(crate) struct ExecutionBounds {
+    /// Fail the run when it takes longer than this.
+    pub(crate) timeout: Option<std::time::Duration>,
+    /// Cancelled when the worker loses its claim on the job.
+    pub(crate) lease_lost: Option<tokio_util::sync::CancellationToken>,
+}
+
+/// How a bounded run ended.
+enum BoundedRun<T> {
+    Finished(T),
+    TimedOut(std::time::Duration),
+    LeaseLost,
+}
+
+/// Poll `run` until it finishes, its timeout expires, or the lease is lost.
+///
+/// On a timeout or a lost lease, the run future is dropped and `signals` is
+/// cancelled, so work the handler spawned can stop too.
+async fn bound_run<F: Future>(
+    run: F,
+    bounds: &ExecutionBounds,
+    signals: &crate::job_tracking::RunSignals,
+) -> BoundedRun<F::Output> {
+    let lease_lost = async {
+        match &bounds.lease_lost {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    let timeout = async {
+        match bounds.timeout {
+            Some(limit) => {
+                tokio::time::sleep(limit).await;
+                limit
+            }
+            None => std::future::pending().await,
+        }
+    };
+    // Lease loss first: when the claim is gone, stop at once.
+    let ended = tokio::select! {
+        biased;
+        () = lease_lost => BoundedRun::LeaseLost,
+        output = run => BoundedRun::Finished(output),
+        limit = timeout => BoundedRun::TimedOut(limit),
+    };
+    match &ended {
+        BoundedRun::Finished(_) => {}
+        BoundedRun::TimedOut(_) => signals.cancel(),
+        BoundedRun::LeaseLost => signals.mark_lease_lost(),
+    }
+    ended
+}
+
+/// Failure message for a run that exceeded its timeout.
+fn job_timeout_message(limit: std::time::Duration) -> String {
+    format!("job timed out after {}ms", limit.as_millis())
+}
+
+/// Shortest visibility timeout a durable backend uses. The heartbeat renews
+/// every third of it, so this keeps renewals at least 10ms apart. A shorter
+/// configured value is raised to this one.
+#[cfg(any(feature = "db", feature = "redis"))]
+const MIN_VISIBILITY_TIMEOUT_MS: u64 = 30;
+
+/// The visibility timeout a durable backend uses for both stale recovery and
+/// the heartbeat: the configured value, but not less than
+/// [`MIN_VISIBILITY_TIMEOUT_MS`]. Both use the same value, so the first renewal
+/// always comes inside the lease.
+#[cfg(any(feature = "db", feature = "redis"))]
+fn effective_visibility_timeout_ms(configured: u64) -> u64 {
+    configured.max(MIN_VISIBILITY_TIMEOUT_MS)
+}
+
+/// [`effective_visibility_timeout_ms`] for a runtime start, with a warning
+/// when the configured value was too short.
+#[cfg(any(feature = "db", feature = "redis"))]
+fn runtime_visibility_timeout_ms(backend: &str, configured: u64) -> u64 {
+    let effective = effective_visibility_timeout_ms(configured);
+    if effective != configured {
+        tracing::warn!(
+            backend,
+            configured_ms = configured,
+            effective_ms = effective,
+            "job visibility timeout is too short; using the minimum"
+        );
+    }
+    effective
+}
+
+/// Error recorded when a worker loses its claim on a running job.
+#[cfg(any(feature = "db", feature = "redis"))]
+const LEASE_LOST_ERROR: &str = "job lease lost; another worker owns the job";
+
+/// How often a worker renews its claim: a third of the visibility timeout.
+/// Runtimes pass [`effective_visibility_timeout_ms`], so this is at least 10ms.
+/// The 1ms floor only keeps `tokio::time::interval` from panicking on zero.
+#[cfg(any(feature = "db", feature = "redis"))]
+fn lease_heartbeat_interval(visibility_timeout_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(visibility_timeout_ms / 3)
+        .max(std::time::Duration::from_millis(1))
+}
+
+/// How long a worker keeps running without a successful renewal: two thirds
+/// of the visibility timeout, so it stops before another worker can recover
+/// the claim.
+#[cfg(any(feature = "db", feature = "redis"))]
+const fn lease_give_up_after(visibility_timeout_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(visibility_timeout_ms.saturating_mul(2) / 3)
+}
+
+/// Result of one claim renewal.
+#[cfg(any(feature = "db", feature = "redis"))]
+#[derive(Debug)]
+enum LeaseRenewal {
+    /// The worker still holds the claim, and its expiry moved forward.
+    Renewed,
+    /// The worker no longer holds the claim.
+    Lost,
+    /// The renewal did not complete. The heartbeat tries again.
+    Failed(String),
+}
+
+/// Renews a durable job's claim while the job runs (issue #3051).
+///
+/// The heartbeat is its own task. On a multi-thread runtime, a handler that
+/// blocks its thread does not stop the heartbeat. The heartbeat stops when
+/// [`Self::stop`] runs, when the value is dropped, or when the process stops.
+/// Thus crash recovery continues to work.
+#[cfg(any(feature = "db", feature = "redis"))]
+struct LeaseHeartbeat {
+    lost: tokio_util::sync::CancellationToken,
+    stop: tokio_util::sync::CancellationToken,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(any(feature = "db", feature = "redis"))]
+impl LeaseHeartbeat {
+    /// Start the heartbeat for a claim sent at `claimed_at`, before the
+    /// handler runs.
+    ///
+    /// When the claim and the run setup took a third of the lease or more,
+    /// the first renewal is already due. It runs here, before the handler is
+    /// first polled: if the claim is gone, the lost token is cancelled on
+    /// return, so `bound_run` never starts the handler while another worker
+    /// may run the job.
+    async fn start<R, F>(
+        claimed_at: tokio::time::Instant,
+        visibility_timeout_ms: u64,
+        mut renew: R,
+    ) -> Self
+    where
+        R: FnMut() -> F + Send + 'static,
+        F: Future<Output = LeaseRenewal> + Send + 'static,
+    {
+        let interval = lease_heartbeat_interval(visibility_timeout_ms);
+        let started = tokio::time::Instant::now();
+        if started < crate::time_math::saturating_tokio_deadline(claimed_at, interval) {
+            return Self::spawn(claimed_at, visibility_timeout_ms, renew);
+        }
+        let give_up_at = crate::time_math::saturating_tokio_deadline(
+            claimed_at,
+            lease_give_up_after(visibility_timeout_ms),
+        );
+        let renewal = tokio::select! {
+            biased;
+            renewal = renew() => Some(renewal),
+            () = tokio::time::sleep_until(give_up_at) => None,
+        };
+        match renewal {
+            Some(LeaseRenewal::Renewed) => Self::spawn(started, visibility_timeout_ms, renew),
+            Some(LeaseRenewal::Failed(error)) if tokio::time::Instant::now() < give_up_at => {
+                tracing::warn!(error = %error, "job lease renewal failed; retrying");
+                Self::spawn(claimed_at, visibility_timeout_ms, renew)
+            }
+            _ => {
+                tracing::warn!("job lease lost before the handler started; not running it");
+                let lost = tokio_util::sync::CancellationToken::new();
+                lost.cancel();
+                Self {
+                    lost,
+                    stop: tokio_util::sync::CancellationToken::new(),
+                    task: None,
+                }
+            }
+        }
+    }
+
+    /// Call `renew` every third of `visibility_timeout_ms`, counting from
+    /// `claimed_at`: an instant taken just before the claim was sent.
+    ///
+    /// A `Lost` result cancels the lost token and ends the heartbeat. A
+    /// `Failed` result is logged and tried again. When no renewal succeeds
+    /// for two thirds of the visibility timeout, the heartbeat also cancels
+    /// the lost token: another worker can recover the claim soon, so this
+    /// worker must stop first.
+    fn spawn<R, F>(
+        claimed_at: tokio::time::Instant,
+        visibility_timeout_ms: u64,
+        mut renew: R,
+    ) -> Self
+    where
+        R: FnMut() -> F + Send + 'static,
+        F: Future<Output = LeaseRenewal> + Send + 'static,
+    {
+        let interval = lease_heartbeat_interval(visibility_timeout_ms);
+        let give_up_after = lease_give_up_after(visibility_timeout_ms);
+        let lost = tokio_util::sync::CancellationToken::new();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn({
+            let lost = lost.clone();
+            let stop = stop.clone();
+            async move {
+                // The claim's deadline counts from when the worker sent the
+                // claim, which can be well before this task starts.
+                let mut last_renewed = claimed_at;
+                let mut next_attempt =
+                    crate::time_math::saturating_tokio_deadline(last_renewed, interval);
+                loop {
+                    tokio::select! {
+                        () = stop.cancelled() => return,
+                        () = tokio::time::sleep_until(next_attempt) => {}
+                    }
+                    let started = tokio::time::Instant::now();
+                    // Attempts start one interval apart. A slow renewal does
+                    // not push the next one toward the give-up time.
+                    next_attempt = crate::time_math::saturating_tokio_deadline(started, interval);
+                    // The give-up time also bounds a renewal that stalls.
+                    let give_up_at =
+                        crate::time_math::saturating_tokio_deadline(last_renewed, give_up_after);
+                    // Biased: a renewal that completes at the give-up time counts.
+                    let renewal = tokio::select! {
+                        biased;
+                        () = stop.cancelled() => return,
+                        renewal = renew() => renewal,
+                        () = tokio::time::sleep_until(give_up_at) => {
+                            tracing::warn!("job lease renewal stalled too long; stopping the job");
+                            lost.cancel();
+                            return;
+                        }
+                    };
+                    match renewal {
+                        LeaseRenewal::Renewed => last_renewed = started,
+                        LeaseRenewal::Lost => {
+                            lost.cancel();
+                            return;
+                        }
+                        LeaseRenewal::Failed(error) => {
+                            if last_renewed.elapsed() >= give_up_after {
+                                tracing::warn!(
+                                    error = %error,
+                                    "job lease renewal failed too long; stopping the job"
+                                );
+                                lost.cancel();
+                                return;
+                            }
+                            tracing::warn!(error = %error, "job lease renewal failed; retrying");
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            lost,
+            stop,
+            task: Some(task),
+        }
+    }
+
+    /// Token that is cancelled when the claim is lost.
+    fn lost_token(&self) -> tokio_util::sync::CancellationToken {
+        self.lost.clone()
+    }
+
+    /// Run `settle` (the ack or nack) while the heartbeat still renews the
+    /// claim, then stop it. A settle that stalls past the lease must not let
+    /// stale recovery requeue a job whose handler already finished. A renewal
+    /// that lands after the settle matches no claim, so it changes nothing.
+    async fn stop_after<F: Future>(self, settle: F) -> F::Output {
+        let settled = settle.await;
+        self.stop().await;
+        settled
+    }
+
+    /// Stop renewing and wait for the heartbeat task to end.
+    async fn stop(mut self) {
+        self.stop.cancel();
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+#[cfg(any(feature = "db", feature = "redis"))]
+impl Drop for LeaseHeartbeat {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
+/// Record that a durable worker starts `attempt`. When it replaces an
+/// earlier attempt this process still showed as running, balance that
+/// attempt's start here: recovery and the old worker's lease loss then see a
+/// newer attempt and count nothing (see `record_lease_lost`).
+#[cfg(any(feature = "db", feature = "redis"))]
+fn record_attempt_start(
+    name: &str,
+    id: &str,
+    attempt: u32,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+) -> JobAdminStartDecision {
+    let decision = job_admin.try_record_start(id, attempt);
+    if decision == JobAdminStartDecision::Superseded {
+        state.job_registry.record_retry(
+            name,
+            "visibility timeout expired",
+            attempt.saturating_sub(1),
+        );
+    }
+    decision
+}
+
+/// Record a row that Postgres or `SQLite` stale recovery requeued at
+/// `new_attempt`. When this process was running the previous attempt, this
+/// balances its start, so a later lease loss of either attempt is counted
+/// once (see `record_lease_lost`).
+#[cfg(feature = "db")]
+fn record_recovered_requeue(
+    name: &str,
+    id: &str,
+    new_attempt: u32,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+) {
+    const ERROR: &str = "visibility timeout expired";
+    if job_admin.settle_recovered_requeue(id, new_attempt, ERROR) {
+        state
+            .job_registry
+            .record_retry(name, ERROR, new_attempt.saturating_sub(1));
+    }
+}
+
+/// Record a claim that Redis stale recovery requeued at `new_attempt`.
+/// `immediate` is true when the job is due at once. A delayed requeue is
+/// recorded as enqueued when the `delayed` set promotes it.
+#[cfg(feature = "redis")]
+fn record_redis_recovered_requeue(
+    name: &str,
+    id: &str,
+    new_attempt: u32,
+    error: &str,
+    immediate: bool,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+) {
+    let settled = job_admin.settle_redis_recovered_requeue(id, new_attempt, error, immediate);
+    if settled == RedisRecoveredRequeue::BalancePrevious {
+        state
+            .job_registry
+            .record_retry(name, error, new_attempt.saturating_sub(1));
+    }
+    // A replacement that started here already took the job off the queue.
+    if immediate && settled != RedisRecoveredRequeue::ReplacementStarted {
+        state.job_registry.record_enqueue(name);
+    }
+}
+
+/// What Redis stale recovery's requeue changed in this process's admin
+/// record.
+#[cfg(feature = "redis")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedisRecoveredRequeue {
+    /// The record showed the previous attempt running: this process started
+    /// it, so the caller balances the registry.
+    BalancePrevious,
+    /// The record was moved on, or this process has none. Nothing to balance.
+    Requeued,
+    /// The record already shows the new attempt or a later one: the
+    /// replacement started here and was left alone.
+    ReplacementStarted,
+}
+
+/// Record a run that stopped because its worker lost the claim. The job is
+/// not settled: the worker that holds the claim now owns that.
+///
+/// Stale recovery in this process can have recorded the job already, and a
+/// replacement attempt can be running. So this records only while this
+/// process's admin record still shows `attempt` as running.
+#[cfg(any(feature = "db", feature = "redis"))]
+fn record_lease_lost(
+    name: &str,
+    id: &str,
+    attempt: u32,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+) {
+    tracing::warn!(job = %name, job_id = %id, "{LEASE_LOST_ERROR}; handler stopped");
+    if job_admin.settle_lease_lost(id, attempt, LEASE_LOST_ERROR) {
+        // Balances this worker's `record_start`.
+        state.job_registry.record_retry(name, LEASE_LOST_ERROR, 0);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JobAdminStartDecision {
     Started,
+    /// Started, and replaced an earlier attempt this process still showed as
+    /// running. The caller balances that attempt's start.
+    Superseded,
     Canceled,
     Missing,
     AlreadyTransitioned,
@@ -1241,6 +1657,21 @@ impl JobAdminMemoryBackend {
                 record.attempt = attempt;
                 JobAdminStartDecision::Started
             }
+            // A newer attempt starts while this process still shows an older
+            // one as running (stale recovery requeued it here or elsewhere)
+            // or as retrying (its lease was lost). Durable backends only.
+            JobAdminStatus::Running | JobAdminStatus::Retrying if record.attempt < attempt => {
+                let superseded = record.status == JobAdminStatus::Running;
+                record.status = JobAdminStatus::Running;
+                record.started_at = Some(self.clock.now());
+                record.finished_at = None;
+                record.attempt = attempt;
+                if superseded {
+                    JobAdminStartDecision::Superseded
+                } else {
+                    JobAdminStartDecision::Started
+                }
+            }
             JobAdminStatus::Canceled => JobAdminStartDecision::Canceled,
             _ => JobAdminStartDecision::AlreadyTransitioned,
         }
@@ -1281,6 +1712,103 @@ impl JobAdminMemoryBackend {
         record.status = JobAdminStatus::Retrying;
         record.finished_at = Some(self.clock.now());
         record.last_error = Some(error.to_owned());
+    }
+
+    /// Move a running record to `Retrying` after its worker lost the claim.
+    ///
+    /// Returns `true` when the caller must also balance the registry: the
+    /// record showed `attempt` as running, or this process has no record.
+    /// Returns `false` when stale recovery or a later attempt already moved
+    /// the record on.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    fn settle_lease_lost(&self, id: &str, attempt: u32, error: &str) -> bool {
+        let Ok(mut inner) = self.inner.write() else {
+            return false;
+        };
+        let Some(record) = inner.records.get_mut(id) else {
+            return true;
+        };
+        if record.status != JobAdminStatus::Running || record.attempt != attempt {
+            return false;
+        }
+        record.status = JobAdminStatus::Retrying;
+        record.finished_at = Some(self.clock.now());
+        record.last_error = Some(error.to_owned());
+        true
+    }
+
+    /// Move a record that stale recovery requeued to `Enqueued` at
+    /// `new_attempt`, so the replacement attempt can start.
+    ///
+    /// Returns `true` when the record showed the previous attempt as running:
+    /// this process started it, so the caller balances the registry. A
+    /// missing record, or one already moved on, returns `false`.
+    #[cfg(feature = "db")]
+    fn settle_recovered_requeue(&self, id: &str, new_attempt: u32, error: &str) -> bool {
+        let Ok(mut inner) = self.inner.write() else {
+            return false;
+        };
+        let Some(record) = inner.records.get_mut(id) else {
+            return false;
+        };
+        if record.status != JobAdminStatus::Running
+            || record.attempt.saturating_add(1) != new_attempt
+        {
+            return false;
+        }
+        record.status = JobAdminStatus::Enqueued;
+        record.enqueued_at = Some(self.clock.now());
+        record.started_at = None;
+        record.finished_at = None;
+        record.attempt = new_attempt;
+        record.last_error = Some(error.to_owned());
+        true
+    }
+
+    /// Move a record that Redis stale recovery requeued at `new_attempt` to
+    /// `Enqueued` (`immediate`) or `Retrying` (due later, through the
+    /// `delayed` set).
+    ///
+    /// A record that already shows `new_attempt` or a later one (the
+    /// replacement started here) is left alone.
+    #[cfg(feature = "redis")]
+    fn settle_redis_recovered_requeue(
+        &self,
+        id: &str,
+        new_attempt: u32,
+        error: &str,
+        immediate: bool,
+    ) -> RedisRecoveredRequeue {
+        let Ok(mut inner) = self.inner.write() else {
+            return RedisRecoveredRequeue::Requeued;
+        };
+        let Some(record) = inner.records.get_mut(id) else {
+            return RedisRecoveredRequeue::Requeued;
+        };
+        if record.attempt >= new_attempt {
+            return RedisRecoveredRequeue::ReplacementStarted;
+        }
+        let settled = if record.status == JobAdminStatus::Running
+            && record.attempt.saturating_add(1) == new_attempt
+        {
+            RedisRecoveredRequeue::BalancePrevious
+        } else {
+            RedisRecoveredRequeue::Requeued
+        };
+        let now = self.clock.now();
+        record.last_error = Some(error.to_owned());
+        if immediate {
+            record.status = JobAdminStatus::Enqueued;
+            record.enqueued_at = Some(now);
+            record.scheduled_for = None;
+            record.started_at = None;
+            record.finished_at = None;
+            record.attempt = new_attempt;
+        } else {
+            record.status = JobAdminStatus::Retrying;
+            record.finished_at = Some(now);
+        }
+        settled
     }
 
     fn record_failure(&self, id: &str, error: String) {
@@ -1547,6 +2075,11 @@ impl JobAdminMemoryBackend {
     #[cfg(test)]
     fn record_failure_for_test(&self, id: &str, error: &str) {
         self.record_failure(id, error.to_owned());
+    }
+
+    #[cfg(test)]
+    fn snapshot_record_for_test(&self, id: &str) -> Option<JobAdminStoredRecord> {
+        self.inner.read().ok()?.records.get(id).cloned()
     }
 }
 
@@ -1979,6 +2512,25 @@ const REDIS_DEFER_SCAN_LIMIT: usize = 256;
 #[cfg(feature = "redis")]
 const REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS: u64 = 86_400_000;
 
+/// TTL for a `running`-window unique lock while its job holds a claim: the
+/// crash backstop, or twice the visibility timeout when that is longer. The
+/// claim and each renewal set it, so the lock outlives the claim it guards
+/// even when the first renewal comes after the backstop (issue #3051).
+///
+/// Capped at ten years, so the Lua number stays an integer `PEXPIRE` accepts.
+#[cfg(feature = "redis")]
+const fn redis_running_lock_ttl_ms(visibility_timeout_ms: u64) -> u64 {
+    const MAX_TTL_MS: u64 = 10 * 365 * 86_400_000;
+    let claim_ttl = visibility_timeout_ms.saturating_mul(2);
+    if claim_ttl > MAX_TTL_MS {
+        MAX_TTL_MS
+    } else if claim_ttl > REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS {
+        claim_ttl
+    } else {
+        REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS
+    }
+}
+
 #[cfg(feature = "redis")]
 fn redis_unique_lock_key(unique_prefix: &str, name: &str, unique_key: &str) -> String {
     format!("{unique_prefix}{name}:{unique_key}")
@@ -2270,6 +2822,7 @@ async fn run_job_handler(
     state: AppState,
     payload: Value,
     final_attempt: bool,
+    bounds: ExecutionBounds,
     run: crate::cost::WorkRun,
 ) -> JobExecutionOutcome {
     use crate::cost::WrapMetered as _;
@@ -2280,6 +2833,7 @@ async fn run_job_handler(
             state,
             payload,
             final_attempt,
+            bounds,
         ))
         .await
 }
@@ -2290,6 +2844,7 @@ async fn run_job_handler_unmetered(
     state: AppState,
     payload: Value,
     final_attempt: bool,
+    bounds: ExecutionBounds,
 ) -> JobExecutionOutcome {
     // A job is a second entry point into the application, so a failure in one
     // gets the same capsule a failing request does (#1634). The scope wraps
@@ -2322,12 +2877,29 @@ async fn run_job_handler_unmetered(
             &payload_for_capsule,
             settings,
             filter,
-            run_job_handler_inner(name, handler, state, tracked_key, payload, final_attempt),
+            run_job_handler_inner(
+                name,
+                handler,
+                state,
+                tracked_key,
+                payload,
+                final_attempt,
+                bounds,
+            ),
             |outcome| job_capsule_outcome(outcome, final_attempt),
         )
         .await;
     }
-    run_job_handler_inner(name, handler, state, tracked_key, payload, final_attempt).await
+    run_job_handler_inner(
+        name,
+        handler,
+        state,
+        tracked_key,
+        payload,
+        final_attempt,
+        bounds,
+    )
+    .await
 }
 
 /// The capsule outcome a finished job execution records, or `None` when there
@@ -2351,7 +2923,7 @@ fn job_capsule_outcome(
     final_attempt: bool,
 ) -> Option<crate::capsule::CapsuleOutcome> {
     match outcome {
-        JobExecutionOutcome::Succeeded => None,
+        JobExecutionOutcome::Succeeded | JobExecutionOutcome::LeaseLost => None,
         JobExecutionOutcome::Failed(_) if !final_attempt => None,
         JobExecutionOutcome::Failed(message) => Some(crate::capsule::CapsuleOutcome::Status {
             // A job has no HTTP status; 500 is the outcome shape a capsule
@@ -2376,6 +2948,7 @@ async fn run_job_handler_inner(
     tracked_key: Option<String>,
     payload: Value,
     final_attempt: bool,
+    bounds: ExecutionBounds,
 ) -> JobExecutionOutcome {
     // A job run is work a sim drain must see (issue #2967).
     crate::sim::note_drain_progress();
@@ -2395,6 +2968,8 @@ async fn run_job_handler_inner(
         },
         None => crate::job_tracking::JobContext::none(),
     };
+    let signals = crate::job_tracking::RunSignals::default();
+    let ctx = ctx.with_run(signals.clone());
 
     // Make this job's app the ambient event context so a job (or durable event
     // listener) that calls the free `events::publish` dispatches against its own
@@ -2438,18 +3013,25 @@ async fn run_job_handler_inner(
             // get the configured timeouts from here (#3057).
             #[cfg(feature = "db")]
             let execution = crate::db::scope_background_tx_timeouts(&tx_timeout_state, execution);
-            match crate::job_tracking::scope(
+            let scoped = crate::job_tracking::scope(
                 ctx.clone(),
                 crate::events::scope_event_app(event_app, execution),
-            )
-            .await
-            {
-                Ok(Ok(())) => JobExecutionOutcome::Succeeded,
+            );
+            match bound_run(scoped, &bounds, &signals).await {
+                BoundedRun::Finished(Ok(Ok(()))) => JobExecutionOutcome::Succeeded,
                 // `message`, not `Display`: this string is persisted in a
                 // failure capsule and compared byte for byte on replay, so
                 // it must not move when `Display` gains the field list.
-                Ok(Err(error)) => JobExecutionOutcome::Failed(error.message()),
-                Err(panic) => JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
+                BoundedRun::Finished(Ok(Err(error))) => {
+                    JobExecutionOutcome::Failed(error.message())
+                }
+                BoundedRun::Finished(Err(panic)) => {
+                    JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref()))
+                }
+                BoundedRun::TimedOut(limit) => {
+                    JobExecutionOutcome::Failed(job_timeout_message(limit))
+                }
+                BoundedRun::LeaseLost => JobExecutionOutcome::LeaseLost,
             }
         }
         Err(panic) => JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
@@ -2469,10 +3051,9 @@ async fn run_job_handler_inner(
                 ctx.settle_failure(crate::job_tracking::GENERIC_FAILURE_MESSAGE)
                     .await;
             }
-            JobExecutionOutcome::Failed(_) => {
-                // A retry is pending; leave the record running so progress
-                // persists across attempts.
-            }
+            // A retry is pending, or another worker owns the job now. Leave
+            // the record running so progress persists across attempts.
+            JobExecutionOutcome::Failed(_) | JobExecutionOutcome::LeaseLost => {}
         }
     }
 
@@ -4841,6 +5422,7 @@ pub fn start_runtime(
     config: &crate::config::JobConfig,
     run_workers: bool,
 ) -> AutumnResult<()> {
+    let jobs = apply_default_timeout(jobs, config.default_timeout_ms);
     validate_unique_job_names(&jobs).map_err(|error| {
         AutumnError::internal_server_error(std::io::Error::other(format!(
             "invalid jobs configuration: {error}"
@@ -4928,6 +5510,18 @@ pub fn start_runtime(
             Ok(())
         }
     }
+}
+
+/// Give each job with no `#[job(timeout)]` the `jobs.default_timeout_ms`
+/// limit. `0` means no limit.
+fn apply_default_timeout(mut jobs: Vec<JobInfo>, default_timeout_ms: u64) -> Vec<JobInfo> {
+    if default_timeout_ms > 0 {
+        for job in &mut jobs {
+            job.timeout
+                .get_or_insert_with(|| std::time::Duration::from_millis(default_timeout_ms));
+        }
+    }
+    jobs
 }
 
 /// Process-local uniqueness holds and concurrency slots for the local backend.
@@ -5666,9 +6260,11 @@ async fn execute_local_job(
                 info.initial_backoff_ms,
                 info.uniqueness.clone(),
                 info.concurrency.clone(),
+                info.timeout,
             )
         });
-    let Some((handler, info_max_attempts, info_backoff_ms, uniqueness, concurrency)) = maybe_info
+    let Some((handler, info_max_attempts, info_backoff_ms, uniqueness, concurrency, timeout)) =
+        maybe_info
     else {
         if job_admin.try_record_start(&job.id, job.attempt) == JobAdminStartDecision::Canceled {
             state.job_registry.record_cancel(&job.name);
@@ -5802,12 +6398,18 @@ async fn execute_local_job(
         let _ = job_span.set_parent(cx);
     }
     let final_attempt = is_final_attempt(&job.attempt, &max_attempts);
+    // The local queue has no claim, so only the timeout bounds the run.
+    let bounds = ExecutionBounds {
+        timeout,
+        lease_lost: None,
+    };
     let f = run_job_handler(
         &job.name,
         handler,
         state.clone(),
         job.payload.clone(),
         final_attempt,
+        bounds,
         crate::cost::WorkRun {
             tenant: job.tenant.clone(),
             waited: job.cost_waited,
@@ -5815,6 +6417,8 @@ async fn execute_local_job(
     );
     let outcome = tracing::Instrument::instrument(f, job_span).await;
     match outcome {
+        // No claim on this queue, so no lost lease.
+        JobExecutionOutcome::LeaseLost => {}
         JobExecutionOutcome::Succeeded => {
             state.job_registry.record_success(&job.name);
             job_admin.record_success(&job.id);
@@ -6096,6 +6700,7 @@ fn clear_redis_claim(record: &mut RedisJobRecord) {
     record.claimed_at_ms = None;
 }
 
+/// Test model of a claim. Production sets the deadline from Redis `TIME`.
 #[cfg(all(feature = "redis", test))]
 fn claim_redis_record(
     mut record: RedisJobRecord,
@@ -6143,16 +6748,15 @@ fn prepare_redis_panic_dead_letter(
     record
 }
 
+/// Build the recovery for a claimed record. The caller found the record past
+/// its deadline; the recovery script checks that again on the Redis server
+/// clock before it applies anything (issue #3051).
 #[cfg(feature = "redis")]
 fn recover_stale_redis_record(
     mut record: RedisJobRecord,
     now_ms: u64,
-    visibility_timeout_ms: u64,
 ) -> Option<RedisStaleRecovery> {
     let claimed_at_ms = record.claimed_at_ms?;
-    if claimed_at_ms.saturating_add(visibility_timeout_ms) > now_ms {
-        return None;
-    }
 
     let claimed_by = record
         .claimed_by
@@ -7113,7 +7717,15 @@ async fn claim_next_redis_job_except(
     // last opening in a group. A deferred job (the names in the JSON array
     // after the queue keys) is parked the same way, until the next signal
     // check.
+    // The claim deadline (the processing-set score) is Redis server time plus
+    // ARGV[3], the visibility timeout. Worker clocks never set or read it
+    // (issue #3051). `replicate_commands` lets the script write after `TIME`
+    // on Redis before 7; on Redis 7 it does nothing.
     const CLAIM_SCRIPT: &str = r"
+redis.replicate_commands()
+local server_time = redis.call('TIME')
+local deadline = tonumber(server_time[1]) * 1000
+  + math.floor(tonumber(server_time[2]) / 1000) + tonumber(ARGV[3])
 local function scope_string(value)
   if value == nil or value == cjson.null then
     return ''
@@ -7142,7 +7754,7 @@ for qi = 1, queue_count do
     if body then
       local ok, decoded = pcall(cjson.decode, body)
       if not ok then
-        redis.call('ZADD', KEYS[1], ARGV[3], id)
+        redis.call('ZADD', KEYS[1], deadline, id)
         return { id, body }
       end
       record = decoded
@@ -7182,7 +7794,7 @@ for qi = 1, queue_count do
         record['finished_at_ms'] = nil
         local updated = cjson.encode(record)
         redis.call('SET', key, updated)
-        redis.call('ZADD', KEYS[1], ARGV[3], id)
+        redis.call('ZADD', KEYS[1], deadline, id)
         return { id, updated }
       end
     end
@@ -7192,7 +7804,6 @@ return nil
 ";
 
     let now_ms = now_unix_ms(worker_config.clock.as_ref());
-    let deadline_ms = now_ms.saturating_add(worker_config.visibility_timeout_ms);
     let blocked_due_ms = now_ms.saturating_add(REDIS_CONCURRENCY_REQUEUE_DELAY_MS);
     let mut cmd = redis::cmd("EVAL");
     cmd.arg(CLAIM_SCRIPT)
@@ -7202,12 +7813,14 @@ return nil
         .arg(&worker_config.blocked_key)
         .arg(&worker_config.worker_id)
         .arg(now_ms)
-        .arg(deadline_ms)
+        .arg(worker_config.visibility_timeout_ms)
         .arg(&worker_config.concurrency_prefix)
         .arg(blocked_due_ms)
         .arg(REDIS_CLAIM_SCAN_LIMIT)
         .arg(&worker_config.unique_prefix)
-        .arg(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
+        .arg(redis_running_lock_ttl_ms(
+            worker_config.visibility_timeout_ms,
+        ))
         .arg(queue_keys.len());
     for queue_key in queue_keys {
         cmd.arg(queue_key);
@@ -8158,6 +8771,7 @@ async fn dead_letter_redis_job(
 
 #[cfg(feature = "redis")]
 const STALE_REDIS_RECOVERY_SCRIPT: &str = r"
+redis.replicate_commands()
 -- Removes the oldest entries above `limit`, at most `batch` per call, so one
 -- call never blocks Redis for a long backlog. Returns the number removed.
 -- A limit of 0 keeps all entries.
@@ -8199,6 +8813,17 @@ if record['claimed_by'] ~= ARGV[2] then
   return {0, 0}
 end
 if record['claimed_at_ms'] ~= tonumber(ARGV[3]) then
+  return {0, 0}
+end
+-- Stale only when the claim deadline is past on the Redis server clock. A
+-- heartbeat can move the deadline after the caller read the processing set.
+local deadline = redis.call('ZSCORE', KEYS[1], ARGV[1])
+if not deadline then
+  return {0, 0}
+end
+local server_time = redis.call('TIME')
+local now = tonumber(server_time[1]) * 1000 + math.floor(tonumber(server_time[2]) / 1000)
+if tonumber(deadline) > now then
   return {0, 0}
 end
 redis.call('ZREM', KEYS[1], ARGV[1])
@@ -8315,6 +8940,115 @@ async fn apply_stale_redis_recovery(
     Ok(status == 1)
 }
 
+/// Redis server time in Unix milliseconds.
+#[cfg(feature = "redis")]
+async fn redis_server_time_ms(
+    connection: &mut redis::aio::ConnectionManager,
+) -> Result<u64, redis::RedisError> {
+    let (secs, micros): (u64, u64) = redis::cmd("TIME").query_async(connection).await?;
+    Ok(secs.saturating_mul(1_000).saturating_add(micros / 1_000))
+}
+
+/// Move a claim deadline forward if `ARGV[2]`/`ARGV[3]` still hold the claim.
+/// The new deadline is Redis server time plus `ARGV[4]`. A `running`-window
+/// unique lock (`KEYS[3]`) that this job holds gets the `ARGV[5]` TTL again
+/// (`redis_running_lock_ttl_ms`), as at the claim, so it outlives a claim the
+/// heartbeat keeps.
+#[cfg(feature = "redis")]
+const RENEW_REDIS_CLAIM_SCRIPT: &str = r"
+redis.replicate_commands()
+local body = redis.call('GET', KEYS[2])
+if not body then
+  return 0
+end
+local ok, record = pcall(cjson.decode, body)
+if not ok then
+  return 0
+end
+if record['claimed_by'] ~= ARGV[2] or record['claimed_at_ms'] ~= tonumber(ARGV[3]) then
+  return 0
+end
+if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then
+  return 0
+end
+local server_time = redis.call('TIME')
+local now = tonumber(server_time[1]) * 1000 + math.floor(tonumber(server_time[2]) / 1000)
+redis.call('ZADD', KEYS[1], 'XX', now + tonumber(ARGV[4]), ARGV[1])
+if record['unique_window'] == 'running' and redis.call('GET', KEYS[3]) == ARGV[1] then
+  redis.call('PEXPIRE', KEYS[3], tonumber(ARGV[5]))
+end
+return 1
+";
+
+/// Renew `record`'s claim: move its deadline in the processing set forward,
+/// and refresh the TTL of the `running`-window unique lock it holds.
+#[cfg(feature = "redis")]
+async fn renew_redis_claim(
+    connection: &mut redis::aio::ConnectionManager,
+    processing_key: &str,
+    record_key: &str,
+    unique_lock_key: &str,
+    record: &RedisJobRecord,
+    visibility_timeout_ms: u64,
+) -> LeaseRenewal {
+    let Some((claimed_by, claimed_at_ms)) = expected_claim_args(record) else {
+        return LeaseRenewal::Lost;
+    };
+    let renewed: Result<i64, redis::RedisError> = redis::cmd("EVAL")
+        .arg(RENEW_REDIS_CLAIM_SCRIPT)
+        .arg(3)
+        .arg(processing_key)
+        .arg(record_key)
+        .arg(unique_lock_key)
+        .arg(&record.id)
+        .arg(claimed_by)
+        .arg(claimed_at_ms)
+        .arg(visibility_timeout_ms)
+        .arg(redis_running_lock_ttl_ms(visibility_timeout_ms))
+        .query_async(connection)
+        .await;
+    match renewed {
+        Ok(1) => LeaseRenewal::Renewed,
+        Ok(_) => LeaseRenewal::Lost,
+        Err(error) => LeaseRenewal::Failed(format!("redis claim renewal failed: {error}")),
+    }
+}
+
+/// Start renewing `record`'s claim.
+#[cfg(feature = "redis")]
+async fn redis_lease_heartbeat(
+    connection: &redis::aio::ConnectionManager,
+    worker_config: &RedisWorkerConfig,
+    record: &RedisJobRecord,
+    claimed_at: tokio::time::Instant,
+) -> LeaseHeartbeat {
+    let connection = connection.clone();
+    let processing_key = worker_config.processing_key.clone();
+    let record_key = redis_record_key(&worker_config.record_prefix, &record.id);
+    let unique_lock_key = worker_config.unique_lock_key_for(record);
+    let record = record.clone();
+    let visibility_timeout_ms = worker_config.visibility_timeout_ms;
+    LeaseHeartbeat::start(claimed_at, visibility_timeout_ms, move || {
+        let mut connection = connection.clone();
+        let processing_key = processing_key.clone();
+        let record_key = record_key.clone();
+        let unique_lock_key = unique_lock_key.clone();
+        let record = record.clone();
+        async move {
+            renew_redis_claim(
+                &mut connection,
+                &processing_key,
+                &record_key,
+                &unique_lock_key,
+                &record,
+                visibility_timeout_ms,
+            )
+            .await
+        }
+    })
+    .await
+}
+
 #[cfg(feature = "redis")]
 async fn recover_stale_redis_jobs(
     connection: &mut redis::aio::ConnectionManager,
@@ -8322,10 +9056,12 @@ async fn recover_stale_redis_jobs(
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
 ) -> Result<(), redis::RedisError> {
+    // Compare claim deadlines to Redis server time, not the worker clock: a
+    // worker with a fast clock must not see live claims as expired.
     let stale_ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
         .arg(&worker_config.processing_key)
         .arg("-inf")
-        .arg(now_unix_ms(worker_config.clock.as_ref()))
+        .arg(redis_server_time_ms(connection).await?)
         .arg("LIMIT")
         .arg(0)
         .arg(64)
@@ -8363,9 +9099,7 @@ async fn recover_stale_redis_jobs(
             continue;
         };
         let now_ms = now_unix_ms(worker_config.clock.as_ref());
-        let Some(action) =
-            recover_stale_redis_record(record.clone(), now_ms, worker_config.visibility_timeout_ms)
-        else {
+        let Some(action) = recover_stale_redis_record(record.clone(), now_ms) else {
             continue;
         };
         // Claims that expire together (handlers that hung on one dependency)
@@ -8391,16 +9125,18 @@ async fn recover_stale_redis_jobs(
         {
             match &action {
                 RedisStaleRecovery::Requeue(requeued) => {
-                    if let Some(error) = requeued.last_error.as_deref() {
-                        state
-                            .job_registry
-                            .record_retry(&requeued.name, error, record.attempt);
-                        job_admin.record_retrying(&requeued.id, error);
-                    }
-                    if due_at_ms.is_none() {
-                        state.job_registry.record_enqueue(&requeued.name);
-                        job_admin.record_requeued(&requeued.id, requeued.attempt);
-                    }
+                    record_redis_recovered_requeue(
+                        &requeued.name,
+                        &requeued.id,
+                        requeued.attempt,
+                        requeued
+                            .last_error
+                            .as_deref()
+                            .unwrap_or("visibility timeout expired"),
+                        due_at_ms.is_none(),
+                        state,
+                        job_admin,
+                    );
                 }
                 RedisStaleRecovery::DeadLetter(dead) => {
                     let error = dead
@@ -8522,6 +9258,8 @@ fn spawn_redis_worker(
                         continue;
                     };
                     let queue_keys = worker_config.queue_keys_for(std::slice::from_ref(queue));
+                    // The claim deadline starts inside the claim script.
+                    let claimed_at = tokio::time::Instant::now();
                     match claim_next_redis_job_except(
                         &mut connection,
                         &worker_config,
@@ -8534,6 +9272,7 @@ fn spawn_redis_worker(
                             process_redis_job_record(
                                 &mut connection,
                                 record,
+                                claimed_at,
                                 &jobs_by_name,
                                 &state,
                                 &job_admin,
@@ -8568,6 +9307,8 @@ fn spawn_redis_worker(
                 continue;
             }
             let queue_keys = worker_config.queue_keys_for(&order);
+            // The claim deadline starts inside the claim script.
+            let claimed_at = tokio::time::Instant::now();
             let claimed = match claim_next_redis_job_except(
                 &mut connection,
                 &worker_config,
@@ -8596,6 +9337,7 @@ fn spawn_redis_worker(
             process_redis_job_record(
                 &mut connection,
                 record,
+                claimed_at,
                 &jobs_by_name,
                 &state,
                 &job_admin,
@@ -8794,12 +9536,15 @@ async fn dead_letter_invalid_redis_job(
 async fn process_redis_job_record(
     connection: &mut redis::aio::ConnectionManager,
     mut record: RedisJobRecord,
+    claimed_at: tokio::time::Instant,
     jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
     worker_config: &RedisWorkerConfig,
 ) {
-    if job_admin.try_record_start(&record.id, record.attempt) == JobAdminStartDecision::Canceled {
+    if record_attempt_start(&record.name, &record.id, record.attempt, state, job_admin)
+        == JobAdminStartDecision::Canceled
+    {
         state.job_registry.record_cancel(&record.name);
         job_admin.record_cancelled(&record.id);
         let _ = ack_redis_success(connection, worker_config, &record).await;
@@ -8817,11 +9562,16 @@ async fn process_redis_job_record(
         let guard = jobs_by_name
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard
-            .get(&record.name)
-            .map(|info| (info.handler, info.max_attempts, info.initial_backoff_ms))
+        guard.get(&record.name).map(|info| {
+            (
+                info.handler,
+                info.max_attempts,
+                info.initial_backoff_ms,
+                info.timeout,
+            )
+        })
     };
-    let Some((handler, info_max_attempts, info_backoff_ms)) = maybe_info else {
+    let Some((handler, info_max_attempts, info_backoff_ms, timeout)) = maybe_info else {
         dead_letter_invalid_redis_job(
             connection,
             worker_config,
@@ -8873,62 +9623,76 @@ async fn process_redis_job_record(
         let _ = job_span.set_parent(cx);
     }
     let final_attempt = is_final_attempt(&record.attempt, &record.max_attempts);
+    let heartbeat = redis_lease_heartbeat(connection, worker_config, &record, claimed_at).await;
+    let bounds = ExecutionBounds {
+        timeout,
+        lease_lost: Some(heartbeat.lost_token()),
+    };
     let f = run_job_handler(
         &record.name,
         handler,
         state.clone(),
         record.payload.clone(),
         final_attempt,
+        bounds,
         durable_work_run(
             state,
             record.enqueued_at_ms.and_then(|ms| i64::try_from(ms).ok()),
         ),
     );
-    match tracing::Instrument::instrument(f, job_span).await {
-        JobExecutionOutcome::Succeeded => {
-            match ack_redis_success(connection, worker_config, &record).await {
-                Ok(true) => {
-                    state.job_registry.record_success(&record.name);
-                    job_admin.record_success(&record.id);
+    let outcome = tracing::Instrument::instrument(f, job_span).await;
+    heartbeat
+        .stop_after(async {
+        match outcome {
+            JobExecutionOutcome::LeaseLost => {
+                record_lease_lost(&record.name, &record.id, record.attempt, state, job_admin);
+            }
+            JobExecutionOutcome::Succeeded => {
+                match ack_redis_success(connection, worker_config, &record).await {
+                    Ok(true) => {
+                        state.job_registry.record_success(&record.name);
+                        job_admin.record_success(&record.id);
+                    }
+                    Ok(false) => tracing::warn!(
+                        job = %record.name,
+                        job_id = %record.id,
+                        "redis job success ack skipped because claim changed"
+                    ),
+                    Err(error) => tracing::warn!(
+                        job = %record.name,
+                        job_id = %record.id,
+                        error = %error,
+                        "redis job success ack failed"
+                    ),
                 }
-                Ok(false) => tracing::warn!(
-                    job = %record.name,
-                    job_id = %record.id,
-                    "redis job success ack skipped because claim changed"
-                ),
-                Err(error) => tracing::warn!(
-                    job = %record.name,
-                    job_id = %record.id,
-                    error = %error,
-                    "redis job success ack failed"
-                ),
+            }
+            JobExecutionOutcome::Failed(error) => {
+                settle_failed_redis_job(
+                    connection,
+                    worker_config,
+                    state,
+                    &record,
+                    error,
+                    "failed",
+                    job_admin,
+                )
+                .await;
+            }
+            JobExecutionOutcome::Panicked(error) => {
+                tracing::error!(job = %record.name, error = %error, "redis job handler panicked");
+                dead_letter_panicked_redis_job(
+                    connection,
+                    worker_config,
+                    state,
+                    &record,
+                    error,
+                    job_admin,
+                )
+                .await;
             }
         }
-        JobExecutionOutcome::Failed(error) => {
-            settle_failed_redis_job(
-                connection,
-                worker_config,
-                state,
-                &record,
-                error,
-                "failed",
-                job_admin,
-            )
-            .await;
-        }
-        JobExecutionOutcome::Panicked(error) => {
-            tracing::error!(job = %record.name, error = %error, "redis job handler panicked");
-            dead_letter_panicked_redis_job(
-                connection,
-                worker_config,
-                state,
-                &record,
-                error,
-                job_admin,
-            )
-            .await;
-        }
-    }
+        })
+        .await;
 }
 
 #[cfg(feature = "redis")]
@@ -9138,7 +9902,10 @@ fn start_redis_runtime(
                 unique_prefix: unique_prefix.clone(),
                 concurrency_prefix: concurrency_prefix.clone(),
                 worker_id: format!("{}:{}", std::process::id(), state.entropy().uuid_v4()),
-                visibility_timeout_ms: config.redis.visibility_timeout_ms,
+                visibility_timeout_ms: runtime_visibility_timeout_ms(
+                    "redis",
+                    config.redis.visibility_timeout_ms,
+                ),
                 default_attempts: config.max_attempts,
                 default_backoff: config.initial_backoff_ms,
                 retry_promotion_interval,
@@ -9196,6 +9963,7 @@ fn record_pg_lifecycle_after_ack(
     ack_applied: bool,
     job_name: &str,
     job_id: &str,
+    attempt: u32,
     lifecycle: PgLifecycleRecord<'_>,
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
@@ -9205,35 +9973,24 @@ fn record_pg_lifecycle_after_ack(
         // The recovery task already transitioned the row in the database:
         // - non-terminal attempts are requeued (attempt < max_attempts)
         // - terminal attempts are dead-lettered (attempt >= max_attempts)
-        // Mirror whichever outcome the worker intended so /actuator metrics stay
-        // consistent with the database row.
-        if let PgLifecycleRecord::Failure { error } = lifecycle {
-            // Terminal failure whose ack no longer applies: stale-claim recovery already
-            // transitioned this row out from under the worker, and recovery — not this
-            // resuming worker — owns the dead-letter accounting for `!ack_applied` rows.
-            //   * Final attempt: `pg_recover_stale_claims` flipped the row to `failed`
-            //     and already called `record_failure(.., dead_letter=true)` plus
-            //     `notify_dead_lettered_job`. Recording again would double the
-            //     `/actuator/jobs` failure and dead-letter counters and fire a second,
-            //     dedup-suppressed alert for one DB row.
-            //   * Non-final panic or unknown-type dead-letter: recovery requeued the row
-            //     instead. It is still alive, so no dead-letter is owed yet; the real
-            //     terminal outcome is recorded when it next runs.
-            // Either way, record no failure, dead-letter, or alert here. Still balance
-            // this worker's own `record_start` so the process-local `in_flight` gauge does
-            // not leak — `record_retry` decrements `in_flight` without touching the
-            // failure counters — and settle this job_id's admin record to Failed. Admin
-            // state is keyed per job_id and untouched by the maintenance loop, so this is
-            // the single, non-duplicated update that moves it out of Running.
+        //
+        // Recovery owns the dead-letter accounting (failure counters, alert),
+        // so record none here. This worker's own `record_start` is balanced
+        // once: only while this process's admin record still shows this
+        // attempt as running (issue #3051). Recovery in this process, or a
+        // replacement attempt that started here, already moved the record on
+        // and owns the count (see `record_lease_lost`). Recovery in another
+        // process leaves it, so it is balanced here: `record_retry` decrements
+        // `in_flight` without touching the failure counters.
+        let error = match lifecycle {
+            PgLifecycleRecord::Failure { error } => error,
+            _ => "visibility timeout expired",
+        };
+        if job_admin.settle_lease_lost(job_id, attempt, error) {
             state.job_registry.record_retry(job_name, error, 0);
-            job_admin.record_failure(job_id, error.to_owned());
-        } else {
-            // Non-terminal or successful outcome: decrement in_flight and
-            // mark as retrying; the row is already back in the queue.
-            state
-                .job_registry
-                .record_retry(job_name, "visibility timeout expired", 0);
-            job_admin.record_retrying(job_id, "visibility timeout expired");
+            if matches!(lifecycle, PgLifecycleRecord::Failure { .. }) {
+                job_admin.record_failure(job_id, error.to_owned());
+            }
         }
         return false;
     }
@@ -9294,10 +10051,12 @@ fn record_pg_lifecycle_after_ack(
 }
 
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
 fn record_pg_lifecycle_ack_result(
     ack_result: AutumnResult<bool>,
     job_name: &str,
     job_id: &str,
+    attempt: u32,
     outcome: &str,
     lifecycle: PgLifecycleRecord<'_>,
     state: &AppState,
@@ -9306,7 +10065,7 @@ fn record_pg_lifecycle_ack_result(
     match ack_result {
         Ok(applied) => {
             let recorded = record_pg_lifecycle_after_ack(
-                applied, job_name, job_id, lifecycle, state, job_admin,
+                applied, job_name, job_id, attempt, lifecycle, state, job_admin,
             );
             if !recorded {
                 tracing::warn!(
@@ -9340,8 +10099,9 @@ fn record_pg_row_lifecycle_ack_result(
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
 ) -> bool {
+    let attempt = u32::try_from(row.attempt).unwrap_or(0);
     record_pg_lifecycle_ack_result(
-        ack_result, &row.name, &row.id, outcome, lifecycle, state, job_admin,
+        ack_result, &row.name, &row.id, attempt, outcome, lifecycle, state, job_admin,
     )
 }
 
@@ -10570,6 +11330,8 @@ struct PgStaleRecoveryRow {
     payload: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     status: String,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    attempt: i32,
 }
 
 /// Recover jobs whose visibility timeout has expired.
@@ -10578,7 +11340,12 @@ struct PgStaleRecoveryRow {
 /// concurrent maintenance tasks from multiple replicas each recover disjoint
 /// sets of stale jobs.
 #[cfg(feature = "db")]
-async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, state: &AppState) {
+async fn pg_recover_stale_claims(
+    pool: &PgPool,
+    visibility_timeout_ms: u64,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+) {
     use diesel_async::RunQueryDsl as _;
 
     let Ok(mut conn) = pool.get().await else {
@@ -10640,7 +11407,7 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
            FOR UPDATE SKIP LOCKED \
            LIMIT 100 \
          ) \
-         RETURNING id, name, payload::TEXT AS payload, status",
+         RETURNING id, name, payload::TEXT AS payload, status, attempt",
     )
     .bind::<diesel::sql_types::BigInt, _>(i64::try_from(visibility_timeout_ms).unwrap_or(i64::MAX))
     .bind::<diesel::sql_types::BigInt, _>(stale_requeue_cap_ms(state))
@@ -10654,6 +11421,12 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
     // expiry even though it will never run again.
     match rows {
         Ok(rows) => {
+            for row in &rows {
+                if row.status != "failed" {
+                    let attempt = u32::try_from(row.attempt).unwrap_or(0);
+                    record_recovered_requeue(&row.name, &row.id, attempt, state, job_admin);
+                }
+            }
             for row in rows.into_iter().filter(|row| row.status == "failed") {
                 // A crashed worker never resumes to observe its ack returning
                 // `Ok(false)`, so `record_pg_lifecycle_after_ack` never fires the
@@ -10670,6 +11443,9 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
                     "visibility timeout expired".to_owned(),
                     true,
                 );
+                // Also tells a lease-lost worker in this process that the job
+                // is already recorded (see `record_lease_lost`).
+                job_admin.record_failure(&row.id, "visibility timeout expired".to_owned());
                 crate::alerts::notify_dead_lettered_job(
                     state,
                     &row.name,
@@ -10689,21 +11465,70 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
     }
 }
 
+/// Move a running job's claim expiry forward, if this worker still holds it.
+#[cfg(feature = "db")]
+async fn pg_renew_claim(pool: &PgPool, job_id: &str, worker_id: &str) -> LeaseRenewal {
+    use diesel_async::RunQueryDsl as _;
+
+    let mut conn = match pool.get().await {
+        Ok(conn) => conn,
+        Err(error) => return LeaseRenewal::Failed(format!("pg pool error: {error}")),
+    };
+    match diesel::sql_query(
+        "UPDATE autumn_jobs SET claimed_at = NOW() \
+         WHERE id = $1 AND claimed_by = $2 AND status = 'running'",
+    )
+    .bind::<diesel::sql_types::Text, _>(job_id)
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .execute(&mut *conn)
+    .await
+    {
+        Ok(0) => LeaseRenewal::Lost,
+        Ok(_) => LeaseRenewal::Renewed,
+        Err(error) => LeaseRenewal::Failed(format!("pg claim renewal failed: {error}")),
+    }
+}
+
+/// Start renewing `row`'s claim for `worker_id`.
+#[cfg(feature = "db")]
+async fn pg_lease_heartbeat(
+    pool: &PgPool,
+    row: &PgJobRow,
+    claimed_at: tokio::time::Instant,
+    worker_id: &str,
+    visibility_timeout_ms: u64,
+) -> LeaseHeartbeat {
+    let pool = pool.clone();
+    let job_id = row.id.clone();
+    let worker_id = worker_id.to_owned();
+    LeaseHeartbeat::start(claimed_at, visibility_timeout_ms, move || {
+        let pool = pool.clone();
+        let job_id = job_id.clone();
+        let worker_id = worker_id.clone();
+        async move { pg_renew_claim(&pool, &job_id, &worker_id).await }
+    })
+    .await
+}
+
 /// Execute one claimed job and ack/nack based on the outcome.
 #[cfg(feature = "db")]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn pg_execute_job(
     row: PgJobRow,
+    claimed_at: tokio::time::Instant,
     jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
     pool: &PgPool,
     worker_id: &str,
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
+    visibility_timeout_ms: u64,
 ) {
     let attempt = u32::try_from(row.attempt).unwrap_or(0);
     let max_attempts = u32::try_from(row.max_attempts).unwrap_or(1);
 
-    if job_admin.try_record_start(&row.id, attempt) == JobAdminStartDecision::Canceled {
+    if record_attempt_start(&row.name, &row.id, attempt, state, job_admin)
+        == JobAdminStartDecision::Canceled
+    {
         let delay_ms = sql_row_retry_delay_ms(state, row.initial_backoff_ms, row.attempt);
         let ack = pg_nack_failure(
             pool,
@@ -10738,15 +11563,15 @@ async fn pg_execute_job(
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&row.name)
-        .map(|info| (info.handler, info.uniqueness.clone()));
+        .map(|info| (info.handler, info.uniqueness.clone(), info.timeout));
     let pending_unique_key = job_info_snapshot
         .as_ref()
-        .and_then(|(_, uniqueness)| uniqueness.as_ref())
+        .and_then(|(_, uniqueness, _)| uniqueness.as_ref())
         .filter(|unique| unique.window == JobUniquenessWindow::Pending)
         .map(|unique| job_unique_key(unique, &payload));
-    let handler_opt = job_info_snapshot.map(|(handler, _)| handler);
+    let handler_opt = job_info_snapshot.map(|(handler, _, timeout)| (handler, timeout));
 
-    let Some(handler) = handler_opt else {
+    let Some((handler, timeout)) = handler_opt else {
         // Dead-letter immediately: no handler will ever exist on this process,
         // so requeueing (pg_nack_failure) would cause every worker to
         // repeatedly claim and discard the job until attempts are exhausted.
@@ -10772,20 +11597,57 @@ async fn pg_execute_job(
         let _ = job_span.set_parent(cx);
     }
     let final_attempt = is_final_attempt(&attempt, &max_attempts);
+    let heartbeat =
+        pg_lease_heartbeat(pool, &row, claimed_at, worker_id, visibility_timeout_ms).await;
+    let bounds = ExecutionBounds {
+        timeout,
+        lease_lost: Some(heartbeat.lost_token()),
+    };
     let f = run_job_handler(
         &row.name,
         handler,
         state.clone(),
         payload,
         final_attempt,
+        bounds,
         durable_work_run(state, row.run_at.map(|at| at.timestamp_millis())),
     );
-    match tracing::Instrument::instrument(f, job_span).await {
+    let outcome = tracing::Instrument::instrument(f, job_span).await;
+    heartbeat
+        .stop_after(pg_settle_outcome(
+            outcome,
+            &row,
+            pool,
+            worker_id,
+            state,
+            job_admin,
+            pending_unique_key.as_deref(),
+        ))
+        .await;
+}
+
+/// Write a finished attempt back to `autumn_jobs` and record it.
+#[cfg(feature = "db")]
+async fn pg_settle_outcome(
+    outcome: JobExecutionOutcome,
+    row: &PgJobRow,
+    pool: &PgPool,
+    worker_id: &str,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+    pending_unique_key: Option<&str>,
+) {
+    let attempt = u32::try_from(row.attempt).unwrap_or(0);
+    let max_attempts = u32::try_from(row.max_attempts).unwrap_or(1);
+    match outcome {
+        JobExecutionOutcome::LeaseLost => {
+            record_lease_lost(&row.name, &row.id, attempt, state, job_admin);
+        }
         JobExecutionOutcome::Succeeded => {
             let ack = pg_ack_success(pool, &row.id, worker_id).await;
             record_pg_row_lifecycle_ack_result(
                 ack,
-                &row,
+                row,
                 "success",
                 PgLifecycleRecord::Success,
                 state,
@@ -10816,12 +11678,12 @@ async fn pg_execute_job(
                 &row.id,
                 worker_id,
                 &error,
-                &row,
-                pending_unique_key.as_deref(),
+                row,
+                pending_unique_key,
                 delay_ms,
             )
             .await;
-            record_pg_row_lifecycle_ack_result(ack, &row, "failure", lifecycle, state, job_admin);
+            record_pg_row_lifecycle_ack_result(ack, row, "failure", lifecycle, state, job_admin);
         }
         // Panics dead-letter immediately regardless of remaining attempts,
         // matching the local and redis backend behaviour.
@@ -10829,7 +11691,7 @@ async fn pg_execute_job(
             tracing::error!(job = %row.name, error = %error, "postgres job handler panicked");
             let ack = pg_ack_dead_letter(pool, &row.id, worker_id, &error).await;
             let lifecycle = PgLifecycleRecord::Failure { error: &error };
-            record_pg_row_lifecycle_ack_result(ack, &row, "panic", lifecycle, state, job_admin);
+            record_pg_row_lifecycle_ack_result(ack, row, "panic", lifecycle, state, job_admin);
         }
     }
 }
@@ -10843,6 +11705,7 @@ async fn pg_maintenance_loop(
     pool: PgPool,
     visibility_timeout_ms: u64,
     state: AppState,
+    job_admin: JobAdminMemoryBackend,
     survey_blocked: bool,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
@@ -10853,7 +11716,7 @@ async fn pg_maintenance_loop(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                pg_recover_stale_claims(&pool, visibility_timeout_ms, &state).await;
+                pg_recover_stale_claims(&pool, visibility_timeout_ms, &state, &job_admin).await;
                 if survey_blocked {
                     pg_update_concurrency_blocked_gauges(&pool, &state).await;
                 }
@@ -10946,6 +11809,7 @@ async fn pg_worker_loop(
     serialize_claims: bool,
     schedule: QueueSchedule,
     slots: Arc<QueueSlots>,
+    visibility_timeout_ms: u64,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     let mut cursor = schedule.cursor();
@@ -10965,6 +11829,8 @@ async fn pg_worker_loop(
                 let Some(guard) = slots.try_reserve(queue) else {
                     continue;
                 };
+                // The claim stamps `claimed_at` inside the claim query.
+                let claimed_at = tokio::time::Instant::now();
                 match pg_claim_next_job_except(
                     &pool,
                     &worker_id,
@@ -10975,8 +11841,17 @@ async fn pg_worker_loop(
                 .await
                 {
                     Some(row) => {
-                        pg_execute_job(row, &jobs_by_name, &pool, &worker_id, &state, &job_admin)
-                            .await;
+                        pg_execute_job(
+                            row,
+                            claimed_at,
+                            &jobs_by_name,
+                            &pool,
+                            &worker_id,
+                            &state,
+                            &job_admin,
+                            visibility_timeout_ms,
+                        )
+                        .await;
                         drop(guard);
                         handled = true;
                         break;
@@ -11007,12 +11882,24 @@ async fn pg_worker_loop(
             continue;
         }
         let deferred = deferred_job_names(&state, &jobs_by_name);
+        // The claim stamps `claimed_at` inside the claim query.
+        let claimed_at = tokio::time::Instant::now();
         match pg_claim_next_job_except(&pool, &worker_id, serialize_claims, &queue_order, &deferred)
             .await
         {
             Some(row) => {
                 let _slot = slots.acquire(&normalize_queue_name(&row.queue));
-                pg_execute_job(row, &jobs_by_name, &pool, &worker_id, &state, &job_admin).await;
+                pg_execute_job(
+                    row,
+                    claimed_at,
+                    &jobs_by_name,
+                    &pool,
+                    &worker_id,
+                    &state,
+                    &job_admin,
+                    visibility_timeout_ms,
+                )
+                .await;
                 if shutdown.is_cancelled() {
                     break;
                 }
@@ -11661,19 +12548,22 @@ fn start_postgres_runtime(
         return Ok(());
     }
 
-    let visibility_timeout_ms = config.postgres.visibility_timeout_ms;
+    let visibility_timeout_ms =
+        runtime_visibility_timeout_ms("postgres", config.postgres.visibility_timeout_ms);
     let worker_count = config.workers.max(1);
 
     // Single maintenance task shared across all workers.
     {
         let pool = pool.clone();
         let state = state.clone();
+        let job_admin = job_admin.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
             pg_maintenance_loop(
                 pool,
                 visibility_timeout_ms,
                 state,
+                job_admin,
                 serialize_claims,
                 shutdown,
             )
@@ -11700,6 +12590,7 @@ fn start_postgres_runtime(
                 serialize_claims,
                 schedule,
                 slots,
+                visibility_timeout_ms,
                 shutdown,
             )
             .await;
@@ -12785,6 +13676,7 @@ mod tests {
             state,
             serde_json::json!({}),
             true,
+            ExecutionBounds::default(),
             crate::cost::WorkRun::default(),
         )
         .await;
@@ -12843,6 +13735,7 @@ mod tests {
             state,
             serde_json::json!({}),
             true,
+            ExecutionBounds::default(),
             crate::cost::WorkRun::default(),
         )
         .await;
@@ -12913,6 +13806,7 @@ mod tests {
             state,
             serde_json::json!({}),
             true,
+            ExecutionBounds::default(),
             crate::cost::WorkRun::default(),
         )
         .await;
@@ -13070,6 +13964,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -13113,6 +14008,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -13171,6 +14067,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -13215,6 +14112,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -13393,6 +14291,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -13436,6 +14335,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: panicking_handler,
+                timeout: None,
             },
         );
         let jobs_by_name = Arc::new(RwLock::new(jobs));
@@ -13499,6 +14399,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: always_fail_handler,
+                timeout: None,
             },
         );
         let jobs_by_name = Arc::new(RwLock::new(jobs));
@@ -13564,6 +14465,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: always_fail_handler,
+                timeout: None,
             },
         );
         let jobs_by_name = Arc::new(RwLock::new(jobs));
@@ -13624,6 +14526,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: always_fail_handler,
+                timeout: None,
             },
         );
         let jobs_by_name = Arc::new(RwLock::new(jobs));
@@ -13757,6 +14660,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: redis_counting_success_handler,
+                timeout: None,
             },
             JobInfo {
                 version: 1,
@@ -13767,6 +14671,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: redis_counting_success_handler,
+                timeout: None,
             },
         ];
 
@@ -13783,6 +14688,7 @@ mod tests {
             uniqueness: None,
             concurrency: None,
             handler: redis_counting_success_handler,
+            timeout: None,
         }];
         assert_eq!(
             redis_retry_promotion_interval_ms(60_000, &slow_jobs),
@@ -13871,8 +14777,8 @@ mod tests {
         record.claimed_by = Some("worker-a".to_string());
         record.claimed_at_ms = Some(10_000);
 
-        let action = recover_stale_redis_record(record, 45_000, 30_000)
-            .expect("expired claim should be recovered");
+        let action =
+            recover_stale_redis_record(record, 45_000).expect("expired claim should be recovered");
 
         let RedisStaleRecovery::Requeue(record) = action else {
             panic!("stale nonterminal claim should requeue");
@@ -13896,8 +14802,8 @@ mod tests {
         record.claimed_by = Some("worker-a".to_string());
         record.claimed_at_ms = Some(10_000);
 
-        let action = recover_stale_redis_record(record, 45_000, 30_000)
-            .expect("expired claim should be recovered");
+        let action =
+            recover_stale_redis_record(record, 45_000).expect("expired claim should be recovered");
 
         let RedisStaleRecovery::DeadLetter(record) = action else {
             panic!("stale terminal claim should dead-letter");
@@ -13943,6 +14849,27 @@ mod tests {
                 >= 1,
             "stale-recovery dead-letter script should remove trimmed per-id metadata"
         );
+    }
+
+    /// Issues #3051 and #3055: the caller decodes `{status, trimmed}`, so a
+    /// bare `return 0` (as the server-time check once had) fails to decode and
+    /// turns "the claim is still live" into a Redis error.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_stale_recovery_script_returns_a_pair_on_every_path() {
+        let (_, body) = STALE_REDIS_RECOVERY_SCRIPT
+            .split_once("-- Every return is {status, number of trimmed dead letters}.")
+            .expect("the script marks where its own returns start");
+        for line in body
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("return"))
+        {
+            assert!(
+                line.starts_with("return {"),
+                "stale-recovery returns must be a pair, found `{line}`"
+            );
+        }
     }
 
     /// Issue #3055: a limit of `0` (or less) must keep every dead record.
@@ -14067,6 +14994,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler,
+                timeout: None,
             },
         )])))
     }
@@ -14511,6 +15439,7 @@ mod tests {
         process_redis_job_record(
             &mut connection,
             record,
+            tokio::time::Instant::now(),
             &redis_jobs_by_name(redis_counting_success_handler, 2),
             &state,
             &job_admin,
@@ -14563,6 +15492,7 @@ mod tests {
         process_redis_job_record(
             &mut connection,
             first,
+            tokio::time::Instant::now(),
             &jobs,
             &state,
             &job_admin,
@@ -14596,6 +15526,7 @@ mod tests {
         process_redis_job_record(
             &mut connection,
             second,
+            tokio::time::Instant::now(),
             &jobs,
             &state,
             &job_admin,
@@ -14641,6 +15572,7 @@ mod tests {
         process_redis_job_record(
             &mut connection,
             record,
+            tokio::time::Instant::now(),
             &redis_jobs_by_name(panicking_handler, 3),
             &state,
             &job_admin,
@@ -14820,6 +15752,7 @@ mod tests {
             process_redis_job_record(
                 &mut connection,
                 record,
+                tokio::time::Instant::now(),
                 &jobs,
                 state,
                 &job_admin,
@@ -15096,6 +16029,22 @@ mod tests {
 
     #[cfg(feature = "redis")]
     #[test]
+    fn redis_running_lock_ttl_outlives_the_claim() {
+        assert_eq!(
+            redis_running_lock_ttl_ms(30_000),
+            REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS
+        );
+        let four_days = 4 * 86_400_000;
+        assert_eq!(redis_running_lock_ttl_ms(four_days), 2 * four_days);
+        assert_eq!(
+            redis_running_lock_ttl_ms(u64::MAX),
+            10 * 365 * 86_400_000,
+            "capped so PEXPIRE accepts it"
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
     fn redis_delayed_unique_lock_ttl_extends_for_long_delays() {
         // Helper mirroring the exact formula in RedisClient::enqueue so we
         // can test it without a live Redis connection.
@@ -15229,6 +16178,122 @@ mod tests {
         // TTL locks expire by time; requeues neither re-acquire nor refresh.
         record.unique_window = Some("ttl".to_string());
         assert_eq!(redis_requeue_unique_action(&record), "");
+    }
+
+    /// The claim gives a `running`-window unique lock the 24 h backstop TTL.
+    /// The heartbeat keeps a claim alive past that, so each renewal must
+    /// refresh the lock too, or an equal job could start alongside it.
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_claim_renewal_refreshes_the_running_window_lock() {
+        let (_container, client) = redis_test_client().await;
+        let worker_config = redis_test_worker_config("renew-lock", "worker-1", 30_000);
+        let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
+        let constraints = ResolvedJobConstraints {
+            unique_key: Some("invoice-7".to_string()),
+            unique_window: Some(JobUniquenessWindow::Running),
+            concurrency_limit: None,
+            concurrency_scope: None,
+        };
+        assert_eq!(
+            redis_enqueue_with_constraints(
+                &client,
+                &worker_config,
+                "r1",
+                "send_invoice",
+                &constraints
+            )
+            .await,
+            EnqueueOutcome::Queued
+        );
+        let record = claim_next_redis_job(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("claimed");
+        let lock_key = worker_config.unique_lock_key_for(&record);
+        let record_key = redis_record_key(&worker_config.record_prefix, &record.id);
+        let renew = |connection: &mut redis::aio::ConnectionManager, visibility_timeout_ms: u64| {
+            let mut connection = connection.clone();
+            let (processing_key, record_key, lock_key, record) = (
+                worker_config.processing_key.clone(),
+                record_key.clone(),
+                lock_key.clone(),
+                record.clone(),
+            );
+            async move {
+                renew_redis_claim(
+                    &mut connection,
+                    &processing_key,
+                    &record_key,
+                    &lock_key,
+                    &record,
+                    visibility_timeout_ms,
+                )
+                .await
+            }
+        };
+        let pttl = |connection: &mut redis::aio::ConnectionManager| {
+            let mut connection = connection.clone();
+            let lock_key = lock_key.clone();
+            async move {
+                redis::cmd("PTTL")
+                    .arg(&lock_key)
+                    .query_async::<i64>(&mut connection)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // The job has run almost 24 h: its lock is about to expire.
+        let _: () = redis::cmd("PEXPIRE")
+            .arg(&lock_key)
+            .arg(1_000)
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(matches!(
+            renew(&mut connection, 30_000).await,
+            LeaseRenewal::Renewed
+        ));
+        let ttl = pttl(&mut connection).await;
+        assert!(
+            ttl > 1_000,
+            "the renewal must refresh the running-window lock; PTTL {ttl}"
+        );
+
+        // A visibility timeout past the 24 h backstop: the first renewal
+        // comes after a third of it, so the lock must outlive the claim.
+        let long_visibility_ms: u64 = 4 * 86_400_000;
+        assert!(matches!(
+            renew(&mut connection, long_visibility_ms).await,
+            LeaseRenewal::Renewed
+        ));
+        let ttl = pttl(&mut connection).await;
+        assert!(
+            u64::try_from(ttl).unwrap_or(0) > long_visibility_ms,
+            "the lock must outlive a long claim; PTTL {ttl}"
+        );
+
+        // A lock that another job holds now is not this claim's to extend.
+        let _: () = redis::cmd("SET")
+            .arg(&lock_key)
+            .arg("someone-else")
+            .arg("PX")
+            .arg(1_000)
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(matches!(
+            renew(&mut connection, 30_000).await,
+            LeaseRenewal::Renewed
+        ));
+        let ttl = pttl(&mut connection).await;
+        assert!(ttl <= 1_000, "another job's lock is left alone; PTTL {ttl}");
     }
 
     #[cfg(feature = "redis")]
@@ -15833,6 +16898,7 @@ mod tests {
         process_redis_job_record(
             &mut connection,
             claimed,
+            tokio::time::Instant::now(),
             &jobs,
             &state,
             &job_admin,
@@ -16337,6 +17403,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -16389,6 +17456,7 @@ mod tests {
                     uniqueness: None,
                     concurrency: None,
                     handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                    timeout: None,
                 },
                 JobInfo {
                     version: 1,
@@ -16399,6 +17467,7 @@ mod tests {
                     uniqueness: None,
                     concurrency: None,
                     handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                    timeout: None,
                 },
             ],
             &state,
@@ -16563,6 +17632,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -16607,6 +17677,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -16961,6 +18032,7 @@ mod tests {
             state,
             serde_json::json!({}),
             true,
+            ExecutionBounds::default(),
             crate::cost::WorkRun::default(),
         )
         .await;
@@ -17708,6 +18780,7 @@ mod tests {
                 Ok(false),
                 "slow_success",
                 &job_id,
+                1,
                 "success",
                 PgLifecycleRecord::Success,
                 &state,
@@ -17737,6 +18810,7 @@ mod tests {
                 Ok(true),
                 "slow_success",
                 &job_id,
+                1,
                 "success",
                 PgLifecycleRecord::Success,
                 &state,
@@ -17772,6 +18846,7 @@ mod tests {
                 Ok(false),
                 "slow_failure",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Failure {
                     error: "visibility timeout expired"
@@ -17862,6 +18937,7 @@ mod tests {
                 Ok(true),
                 "slow_failure",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Failure {
                     error: "worker failed"
@@ -17897,6 +18973,7 @@ mod tests {
                 Ok(true),
                 "slow_retry",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Retry {
                     error: "try again",
@@ -17946,6 +19023,7 @@ mod tests {
                 Ok(true),
                 "slow_retry",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Retry {
                     error: "try again",
@@ -17990,6 +19068,7 @@ mod tests {
                 Ok(true),
                 "fast_retry",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Retry {
                     error: "try again",
@@ -18050,6 +19129,7 @@ mod tests {
                 Ok(true),
                 "racer",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Retry {
                     error: "try again",
@@ -18113,6 +19193,7 @@ mod tests {
                 Ok(true),
                 "slow_retry",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Retry {
                     error: "try again",
@@ -18158,6 +19239,7 @@ mod tests {
                 Err(AutumnError::internal_server_error_msg("ack failed")),
                 "slow_success",
                 &job_id,
+                1,
                 "success",
                 PgLifecycleRecord::Success,
                 &state,
@@ -18186,6 +19268,7 @@ mod tests {
                 Ok(false),
                 "evicted_job",
                 &job_id,
+                1,
                 "success",
                 PgLifecycleRecord::Success,
                 &state,
@@ -18234,6 +19317,7 @@ mod tests {
                 Ok(false),
                 "terminal_job",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Failure {
                     error: "handler timed out"
@@ -18308,6 +19392,7 @@ mod tests {
                 Ok(false),
                 "slow_resumer",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Failure {
                     error: "handler returned error"
@@ -18450,6 +19535,7 @@ mod tests {
                     uniqueness: None,
                     concurrency: None,
                     handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                    timeout: None,
                 }],
                 &state,
                 &shutdown,
@@ -19121,7 +20207,13 @@ mod tests {
             )).await;
 
             // Recover stale claims with a 1-second timeout
-            pg_recover_stale_claims(&pool, 1_000, &AppState::for_test()).await;
+            pg_recover_stale_claims(
+                &pool,
+                1_000,
+                &AppState::for_test(),
+                &JobAdminMemoryBackend::new(),
+            )
+            .await;
 
             let row = pg_fetch_by_id(&pool, &job_id).await.unwrap();
             assert_eq!(
@@ -20104,7 +21196,13 @@ mod tests {
 
             // Stale recovery dead-letters the final attempt, which must free
             // both the unique key and the concurrency slot.
-            pg_recover_stale_claims(&pool, 10, &AppState::for_test()).await;
+            pg_recover_stale_claims(
+                &pool,
+                10,
+                &AppState::for_test(),
+                &JobAdminMemoryBackend::new(),
+            )
+            .await;
             let recovered = pg_fetch_by_id(&pool, "crash-1").await.unwrap();
             assert_eq!(recovered.status, "failed");
 
@@ -20188,7 +21286,7 @@ mod tests {
             assert_eq!(row.id, "pg-crash-1");
             tokio::time::sleep(Duration::from_millis(50)).await;
 
-            pg_recover_stale_claims(&pool, 10, &state).await;
+            pg_recover_stale_claims(&pool, 10, &state, &JobAdminMemoryBackend::new()).await;
             let recovered = pg_fetch_by_id(&pool, "pg-crash-1").await.unwrap();
             assert_eq!(recovered.status, "failed");
 
@@ -20577,6 +21675,7 @@ mod tests {
                     uniqueness: None,
                     concurrency: None,
                     handler: |_state, _payload| Box::pin(async { Ok(()) }),
+                    timeout: None,
                 },
             );
             let jobs_by_name = Arc::new(RwLock::new(jobs));
@@ -21469,6 +22568,7 @@ mod tests {
                 }),
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -21985,6 +23085,7 @@ mod uniqueness_concurrency_tests {
             }),
             concurrency: None,
             handler,
+            timeout: None,
         }
     }
 
@@ -22550,6 +23651,7 @@ mod uniqueness_concurrency_tests {
                 }),
                 concurrency: None,
                 handler: unique_by_handler,
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -22631,6 +23733,7 @@ mod uniqueness_concurrency_tests {
                     key: None,
                 }),
                 handler: concurrency_probe_handler,
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -22716,6 +23819,7 @@ mod uniqueness_concurrency_tests {
                     key: Some("account_id".to_string()),
                 }),
                 handler: keyed_concurrency_handler,
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -22787,6 +23891,7 @@ mod uniqueness_concurrency_tests {
                 }),
                 concurrency: None,
                 handler: keyed_fail_or_slow_handler,
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -22903,6 +24008,7 @@ mod uniqueness_concurrency_tests {
                 }),
                 concurrency: None,
                 handler: pending_retry_handler,
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -23000,6 +24106,7 @@ mod uniqueness_concurrency_tests {
                 }),
                 concurrency: None,
                 handler: dropped_pending_retry_handler,
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -23091,6 +24198,7 @@ mod uniqueness_concurrency_tests {
                     key: None,
                 }),
                 handler: slot_release_failing_handler,
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -23166,6 +24274,7 @@ mod uniqueness_concurrency_tests {
                     uniqueness: None,
                     concurrency: None,
                     handler: priority_low_handler,
+                    timeout: None,
                 },
                 JobInfo {
                     version: 1,
@@ -23176,6 +24285,7 @@ mod uniqueness_concurrency_tests {
                     uniqueness: None,
                     concurrency: None,
                     handler: priority_urgent_handler,
+                    timeout: None,
                 },
             ],
             &state,
@@ -23348,6 +24458,7 @@ mod queue_schedule_tests {
                 uniqueness: None,
                 concurrency: None,
                 handler,
+                timeout: None,
             },
         );
         let registry = Arc::new(RwLock::new(jobs));
@@ -23380,6 +24491,7 @@ mod queue_schedule_tests {
             uniqueness: None,
             concurrency: None,
             handler,
+            timeout: None,
         }];
         let cfg = JobQueuesConfig::strict_list(["critical"]);
 
@@ -23889,5 +25001,927 @@ default = 1
             "critical's reserved slot was stolen by the flood {} time(s)",
             critical_failures.load(Ordering::SeqCst)
         );
+    }
+}
+
+/// Claim lease and execution timeout (issue #3051).
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn heartbeat_interval_is_a_third_of_the_visibility_timeout() {
+        assert_eq!(lease_heartbeat_interval(30_000), Duration::from_secs(10));
+        assert_eq!(lease_heartbeat_interval(300), Duration::from_millis(100));
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn effective_visibility_timeout_keeps_three_renewals_inside_the_lease() {
+        assert_eq!(effective_visibility_timeout_ms(30_000), 30_000);
+        assert_eq!(
+            effective_visibility_timeout_ms(MIN_VISIBILITY_TIMEOUT_MS),
+            30
+        );
+        for configured in [0, 1, 5, 29] {
+            assert_eq!(
+                effective_visibility_timeout_ms(configured),
+                MIN_VISIBILITY_TIMEOUT_MS
+            );
+        }
+        for configured in [0, 1, 5, 29, 30, 31, 100, 30_000] {
+            let lease = effective_visibility_timeout_ms(configured);
+            let interval = lease_heartbeat_interval(lease);
+            assert!(
+                interval >= Duration::from_millis(10),
+                "no hot loop at {configured}"
+            );
+            assert!(
+                interval * 3 <= Duration::from_millis(lease),
+                "first renewal inside the lease at {configured}"
+            );
+        }
+    }
+
+    /// A heartbeat whose renewals return `results` in order, then `Renewed`.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    fn scripted_heartbeat(
+        results: Vec<fn() -> LeaseRenewal>,
+        calls: Arc<AtomicUsize>,
+    ) -> LeaseHeartbeat {
+        let results = Arc::new(results);
+        // 300ms visibility: renew every 100ms, give up after 200ms of failures.
+        LeaseHeartbeat::spawn(tokio::time::Instant::now(), 300, move || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            let result = results.get(n).map_or(LeaseRenewal::Renewed, |f| f());
+            async move { result }
+        })
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_renews_on_its_interval_until_stopped() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = scripted_heartbeat(Vec::new(), Arc::clone(&calls));
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "one renewal per interval");
+        let lost = heartbeat.lost_token();
+        heartbeat.stop().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "no renewal after stop");
+        assert!(!lost.is_cancelled(), "a stop is not a lost lease");
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_cancels_the_lost_token_when_the_claim_is_gone() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = scripted_heartbeat(
+            vec![|| LeaseRenewal::Renewed, || LeaseRenewal::Lost],
+            Arc::clone(&calls),
+        );
+        let lost = heartbeat.lost_token();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            lost.is_cancelled(),
+            "the second renewal found the claim gone"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the heartbeat ends on loss"
+        );
+        heartbeat.stop().await;
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_retries_a_failed_renewal_without_losing_the_lease() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = scripted_heartbeat(
+            vec![|| LeaseRenewal::Failed("db down".to_owned())],
+            Arc::clone(&calls),
+        );
+        let lost = heartbeat.lost_token();
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(
+            !lost.is_cancelled(),
+            "one failed renewal is not a lost lease"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "the heartbeat keeps trying"
+        );
+        heartbeat.stop().await;
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_gives_up_when_renewals_fail_for_two_thirds_of_the_timeout() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = scripted_heartbeat(
+            vec![|| LeaseRenewal::Failed("db down".to_owned()), || {
+                LeaseRenewal::Failed("db down".to_owned())
+            }],
+            Arc::clone(&calls),
+        );
+        let lost = heartbeat.lost_token();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            lost.is_cancelled(),
+            "no renewal for 200ms of a 300ms timeout: another worker can take the job"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "the heartbeat ends");
+        heartbeat.stop().await;
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_keeps_renewing_until_the_settle_finishes() {
+        // A settle (ack/nack) that stalls past the lease, as on a reconnect
+        // or an exhausted pool. Stale recovery must not see the claim expire
+        // while the worker is still writing the result.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = scripted_heartbeat(Vec::new(), Arc::clone(&calls));
+        let lost = heartbeat.lost_token();
+        let settled = heartbeat
+            .stop_after(async {
+                tokio::time::sleep(Duration::from_millis(1_000)).await;
+                "settled"
+            })
+            .await;
+        assert_eq!(settled, "settled");
+        assert!(
+            calls.load(Ordering::SeqCst) >= 9,
+            "renewals continue through a 1s settle on a 300ms lease, got {}",
+            calls.load(Ordering::SeqCst)
+        );
+        assert!(!lost.is_cancelled());
+        let after = calls.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            after,
+            "no renewal after the settle"
+        );
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_keeps_a_lease_whose_renewals_are_slow_but_succeed() {
+        // Each renewal takes 90ms of the 100ms interval. Attempts must start
+        // one interval apart, not one interval after the last one finished,
+        // or the give-up time (two thirds of 300ms from the last renewal's
+        // start) passes while the next renewal is in flight.
+        let heartbeat = LeaseHeartbeat::spawn(tokio::time::Instant::now(), 300, || async {
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            LeaseRenewal::Renewed
+        });
+        let lost = heartbeat.lost_token();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !lost.is_cancelled(),
+            "slow renewals that all succeed must not stop the job"
+        );
+        heartbeat.stop().await;
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_gives_up_while_a_renewal_stalls() {
+        // A renewal that never returns, as on a pool wait or a reconnect.
+        let heartbeat = LeaseHeartbeat::spawn(
+            tokio::time::Instant::now(),
+            300,
+            std::future::pending::<LeaseRenewal>,
+        );
+        let lost = heartbeat.lost_token();
+        tokio::time::sleep(Duration::from_millis(190)).await;
+        assert!(!lost.is_cancelled(), "inside two thirds of the timeout");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            lost.is_cancelled(),
+            "a stalled renewal must not keep the run alive past the give-up time"
+        );
+        heartbeat.stop().await;
+    }
+
+    /// The claim's deadline starts when the backend writes the claim, before
+    /// the heartbeat starts. The renewals and the give-up time must count from
+    /// the claim, not from the spawn, or a slow claim round trip lets the
+    /// lease expire before the first renewal.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_counts_from_the_claim_not_from_its_start() {
+        let claimed_at = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(90)).await;
+
+        // 300ms visibility: first renewal 100ms after the claim, give up
+        // 200ms after it.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = LeaseHeartbeat::spawn(claimed_at, 300, {
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<LeaseRenewal>()
+            }
+        });
+        let lost = heartbeat.lost_token();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the first renewal comes one interval after the claim"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            lost.is_cancelled(),
+            "the give-up time counts from the claim"
+        );
+        heartbeat.stop().await;
+    }
+
+    /// The claim and the run setup took longer than a third of the lease, so
+    /// the first renewal is already due when the heartbeat starts. If the
+    /// claim is gone, the handler must not run at all: another worker may
+    /// already run the job.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn an_overdue_lost_claim_stops_the_handler_before_it_runs() {
+        let claimed_at = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = LeaseHeartbeat::start(claimed_at, 300, {
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { LeaseRenewal::Lost }
+            }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "renewed before returning");
+        assert!(heartbeat.lost_token().is_cancelled());
+
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bounds = ExecutionBounds {
+            timeout: None,
+            lease_lost: Some(heartbeat.lost_token()),
+        };
+        let signals = crate::job_tracking::RunSignals::default();
+        let handler = {
+            let ran = Arc::clone(&ran);
+            async move {
+                ran.store(true, Ordering::SeqCst);
+            }
+        };
+        let ended = bound_run(handler, &bounds, &signals).await;
+        assert!(matches!(ended, BoundedRun::LeaseLost));
+        assert!(!ran.load(Ordering::SeqCst), "the handler never ran");
+        heartbeat.stop().await;
+    }
+
+    /// An overdue renewal that succeeds lets the run go ahead and anchors the
+    /// next renewal at its own start.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn an_overdue_claim_is_renewed_before_the_handler_runs() {
+        let claimed_at = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = LeaseHeartbeat::start(claimed_at, 300, {
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { LeaseRenewal::Renewed }
+            }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "renewed before returning");
+        assert!(!heartbeat.lost_token().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "next one an interval later"
+        );
+        heartbeat.stop().await;
+    }
+
+    /// A claim that is not yet due for renewal costs no round trip at start.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn a_fresh_claim_starts_without_a_renewal() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = LeaseHeartbeat::start(tokio::time::Instant::now(), 300, {
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { LeaseRenewal::Renewed }
+            }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        heartbeat.stop().await;
+    }
+
+    fn admin_with_running_job(attempt: u32) -> (JobAdminMemoryBackend, String) {
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        let id = admin.record_enqueue_for_test("leased", serde_json::json!({}), attempt, 3);
+        admin.record_start_for_test(&id, attempt);
+        (admin, id)
+    }
+
+    fn in_flight(state: &AppState) -> u64 {
+        state
+            .job_registry
+            .snapshot()
+            .get("leased")
+            .map_or(0, |status| status.in_flight)
+    }
+
+    #[cfg(feature = "redis")]
+    fn queued(state: &AppState) -> u64 {
+        state
+            .job_registry
+            .snapshot()
+            .get("leased")
+            .map_or(0, |status| status.queued)
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn lease_loss_settles_accounting_once_when_this_attempt_still_runs() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased");
+        let (admin, id) = admin_with_running_job(1);
+
+        record_lease_lost("leased", &id, 1, &state, &admin);
+
+        assert_eq!(in_flight(&state), 0, "balances this worker's start");
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.status, JobAdminStatus::Retrying);
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn lease_loss_does_not_repeat_what_recovery_already_recorded() {
+        // Recovery in this process already moved the job on: a requeue to
+        // attempt 2 that a sibling worker then started.
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // the old attempt
+        let (admin, id) = admin_with_running_job(1);
+        state
+            .job_registry
+            .record_retry("leased", "visibility timeout expired", 1);
+        admin.record_retrying(&id, "visibility timeout expired");
+        admin.record_requeued(&id, 2);
+        state.job_registry.record_start("leased"); // the replacement
+        admin.record_start_for_test(&id, 2);
+
+        record_lease_lost("leased", &id, 1, &state, &admin);
+
+        assert_eq!(in_flight(&state), 1, "the replacement is still in flight");
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(
+            record.status,
+            JobAdminStatus::Running,
+            "replacement keeps its status"
+        );
+        assert_eq!(record.attempt, 2);
+
+        // A dead letter recorded by recovery is not overwritten either.
+        let (admin, id) = admin_with_running_job(1);
+        admin.record_failure_for_test(&id, "visibility timeout expired");
+        record_lease_lost("leased", &id, 1, &state, &admin);
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.status, JobAdminStatus::Failed);
+    }
+
+    /// Stale recovery requeues a job this process was running; the old
+    /// worker then loses its lease; the replacement starts here and also
+    /// loses its lease. Each start must be balanced exactly once.
+    #[cfg(feature = "db")]
+    #[test]
+    fn requeue_recovery_then_two_lease_losses_balance_in_flight() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // attempt 1
+        let (admin, id) = admin_with_running_job(1);
+
+        record_recovered_requeue("leased", &id, 2, &state, &admin);
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.status, JobAdminStatus::Enqueued);
+        assert_eq!(record.attempt, 2);
+        assert_eq!(in_flight(&state), 0, "recovery balanced attempt 1");
+
+        record_lease_lost("leased", &id, 1, &state, &admin);
+        assert_eq!(in_flight(&state), 0, "the old worker does not count again");
+
+        state.job_registry.record_start("leased"); // attempt 2
+        assert_eq!(
+            admin.try_record_start(&id, 2),
+            JobAdminStartDecision::Started
+        );
+        record_lease_lost("leased", &id, 2, &state, &admin);
+        assert_eq!(in_flight(&state), 0, "the replacement's start is balanced");
+    }
+
+    /// The replacement attempt starts after recovery's database requeue but
+    /// before its bookkeeping, or recovery ran in another process. Each start
+    /// must still be balanced exactly once.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn replacement_start_before_recovery_bookkeeping_balances_both_starts() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // attempt 1
+        let (admin, id) = admin_with_running_job(1);
+
+        let decision = record_attempt_start("leased", &id, 2, &state, &admin);
+        assert_eq!(decision, JobAdminStartDecision::Superseded);
+        state.job_registry.record_start("leased"); // attempt 2
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.status, JobAdminStatus::Running);
+        assert_eq!(record.attempt, 2);
+        assert_eq!(
+            in_flight(&state),
+            1,
+            "attempt 1 is balanced, attempt 2 runs"
+        );
+
+        #[cfg(feature = "db")]
+        record_recovered_requeue("leased", &id, 2, &state, &admin);
+        record_lease_lost("leased", &id, 1, &state, &admin);
+        assert_eq!(
+            in_flight(&state),
+            1,
+            "late bookkeeping for attempt 1 counts nothing"
+        );
+
+        record_lease_lost("leased", &id, 2, &state, &admin);
+        assert_eq!(in_flight(&state), 0, "the replacement's start is balanced");
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn replacement_start_after_an_old_lease_loss_is_recorded() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // attempt 1
+        let (admin, id) = admin_with_running_job(1);
+        record_lease_lost("leased", &id, 1, &state, &admin);
+        assert_eq!(in_flight(&state), 0);
+
+        let decision = record_attempt_start("leased", &id, 2, &state, &admin);
+        assert_eq!(decision, JobAdminStartDecision::Started);
+        state.job_registry.record_start("leased"); // attempt 2
+        record_lease_lost("leased", &id, 2, &state, &admin);
+        assert_eq!(in_flight(&state), 0, "the replacement's start is balanced");
+    }
+
+    /// The handler finished, but stale recovery took the claim first, so the
+    /// ack or nack applies to nothing. Recovery in this process already moved
+    /// the record on; the old worker must not count its start again.
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_lost_ack_after_recovery_counts_nothing_again() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // attempt 1
+        let (admin, id) = admin_with_running_job(1);
+        record_recovered_requeue("leased", &id, 2, &state, &admin);
+        assert_eq!(in_flight(&state), 0);
+
+        record_pg_lifecycle_ack_result(
+            Ok(false),
+            "leased",
+            &id,
+            1,
+            "success",
+            PgLifecycleRecord::Success,
+            &state,
+            &admin,
+        );
+        assert_eq!(in_flight(&state), 0, "attempt 1 is not balanced twice");
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.status, JobAdminStatus::Enqueued);
+        assert_eq!(record.attempt, 2);
+
+        // The replacement started here: a late terminal nack for attempt 1
+        // leaves it alone.
+        state.job_registry.record_start("leased");
+        record_attempt_start("leased", &id, 2, &state, &admin);
+        record_pg_lifecycle_ack_result(
+            Ok(false),
+            "leased",
+            &id,
+            1,
+            "failure",
+            PgLifecycleRecord::Failure { error: "boom" },
+            &state,
+            &admin,
+        );
+        assert_eq!(in_flight(&state), 1, "the replacement is still in flight");
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.status, JobAdminStatus::Running);
+        assert_eq!(record.attempt, 2);
+    }
+
+    /// `tokio::time::sleep` clamps a deadline past `Instant`'s range to its
+    /// far future, so an enormous timeout must not panic.
+    #[tokio::test(start_paused = true)]
+    async fn an_oversized_timeout_acts_as_a_distant_deadline() {
+        let bounds = ExecutionBounds {
+            timeout: Some(Duration::from_millis(u64::MAX)),
+            lease_lost: None,
+        };
+        let signals = crate::job_tracking::RunSignals::default();
+        let ended = bound_run(async { 7 }, &bounds, &signals).await;
+        assert!(
+            matches!(ended, BoundedRun::Finished(7)),
+            "no overflow panic"
+        );
+    }
+
+    #[test]
+    fn a_start_for_the_same_or_an_older_attempt_changes_nothing() {
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        let id = admin.record_enqueue_for_test("leased", serde_json::json!({}), 2, 3);
+        admin.record_start_for_test(&id, 2);
+        assert_eq!(
+            admin.try_record_start(&id, 2),
+            JobAdminStartDecision::AlreadyTransitioned
+        );
+        assert_eq!(
+            admin.try_record_start(&id, 1),
+            JobAdminStartDecision::AlreadyTransitioned
+        );
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.attempt, 2);
+    }
+
+    /// Redis stale recovery requeued attempt 1 due at once, and a worker in
+    /// this process claimed attempt 2 before recovery's bookkeeping ran. The
+    /// bookkeeping must not balance attempt 1 again or touch attempt 2.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_recovery_bookkeeping_after_the_replacement_started_counts_nothing() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // attempt 1
+        let (admin, id) = admin_with_running_job(1);
+
+        let decision = record_attempt_start("leased", &id, 2, &state, &admin);
+        assert_eq!(decision, JobAdminStartDecision::Superseded);
+        state.job_registry.record_start("leased"); // attempt 2
+        assert_eq!(in_flight(&state), 1);
+        let queued_before = queued(&state);
+
+        record_redis_recovered_requeue("leased", &id, 2, "expired", true, &state, &admin);
+        assert_eq!(in_flight(&state), 1, "attempt 1 is not balanced twice");
+        assert_eq!(
+            queued(&state),
+            queued_before,
+            "the replacement already left the queue: no enqueue is recorded"
+        );
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(
+            record.status,
+            JobAdminStatus::Running,
+            "attempt 2 still runs"
+        );
+        assert_eq!(record.attempt, 2);
+
+        record_lease_lost("leased", &id, 2, &state, &admin);
+        assert_eq!(in_flight(&state), 0, "the replacement's lease loss matches");
+    }
+
+    /// Redis stale recovery of an attempt this process was running balances
+    /// its start once, whether the retry is due at once or later.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_recovery_of_a_local_attempt_balances_it_once() {
+        for immediate in [true, false] {
+            let state = AppState::for_test();
+            state.job_registry.register("leased");
+            state.job_registry.record_start("leased"); // attempt 1
+            let (admin, id) = admin_with_running_job(1);
+
+            let queued_before = queued(&state);
+            record_redis_recovered_requeue("leased", &id, 2, "expired", immediate, &state, &admin);
+            assert_eq!(in_flight(&state), 0, "recovery balanced attempt 1");
+            assert_eq!(
+                queued(&state),
+                queued_before + u64::from(immediate),
+                "an immediate requeue is queued; a delayed one waits for promotion"
+            );
+            let record = admin.snapshot_record_for_test(&id).expect("record");
+            if immediate {
+                assert_eq!(record.status, JobAdminStatus::Enqueued);
+                assert_eq!(record.attempt, 2);
+            } else {
+                assert_eq!(record.status, JobAdminStatus::Retrying);
+            }
+
+            record_lease_lost("leased", &id, 1, &state, &admin);
+            assert_eq!(in_flight(&state), 0, "the old worker does not count again");
+        }
+    }
+
+    /// Redis stale recovery of a job this process did not start, or whose
+    /// lease loss it already recorded, leaves `in_flight` alone.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_recovery_leaves_counts_alone_for_a_job_not_running_here() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // some other job of this name
+        let (admin, id) = admin_with_running_job(1);
+        admin.record_retrying(&id, "lease lost"); // already balanced here
+
+        record_redis_recovered_requeue("leased", &id, 2, "expired", true, &state, &admin);
+        assert_eq!(in_flight(&state), 1);
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.status, JobAdminStatus::Enqueued, "the requeue shows");
+        assert_eq!(record.attempt, 2);
+
+        record_redis_recovered_requeue("leased", "unknown-id", 2, "expired", true, &state, &admin);
+        assert_eq!(in_flight(&state), 1);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn requeue_recovery_leaves_counts_alone_for_a_job_started_elsewhere() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // some other job of this name
+        let (admin, id) = admin_with_running_job(1);
+        admin.record_retrying(&id, "earlier failure"); // not running here
+
+        record_recovered_requeue("leased", &id, 2, &state, &admin);
+        assert_eq!(in_flight(&state), 1);
+        record_recovered_requeue("leased", "unknown-id", 2, &state, &admin);
+        assert_eq!(in_flight(&state), 1);
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn lease_loss_balances_in_flight_when_this_process_has_no_admin_record() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased");
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+
+        record_lease_lost("leased", "enqueued-elsewhere", 1, &state, &admin);
+
+        assert_eq!(in_flight(&state), 0);
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_heartbeat_stops_it() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        drop(scripted_heartbeat(Vec::new(), Arc::clone(&calls)));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a dropped heartbeat never renews"
+        );
+    }
+
+    static TIMEOUT_SEEN: AtomicUsize = AtomicUsize::new(0);
+    static LEASE_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Spawn work that records how the run was stopped in `seen`: 1 for a
+    /// timeout, 10 for a lost lease. Then hang.
+    async fn hang_and_watch(seen: &'static AtomicUsize) -> AutumnResult<()> {
+        let ctx = crate::job_tracking::JobContext::current();
+        assert!(!ctx.is_cancelled() && !ctx.lease_lost());
+        // Work the handler spawned outlives the handler future.
+        tokio::spawn(async move {
+            ctx.cancelled().await;
+            seen.fetch_add(if ctx.lease_lost() { 10 } else { 1 }, Ordering::SeqCst);
+        });
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+
+    fn timeout_watch_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(hang_and_watch(&TIMEOUT_SEEN))
+    }
+
+    fn lease_watch_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(hang_and_watch(&LEASE_SEEN))
+    }
+
+    fn quick_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_run_over_its_timeout_fails_and_cancels_spawned_work() {
+        let outcome = run_job_handler(
+            "hang",
+            timeout_watch_handler,
+            AppState::for_test().with_profile("dev"),
+            serde_json::json!({}),
+            false,
+            ExecutionBounds {
+                timeout: Some(Duration::from_millis(250)),
+                lease_lost: None,
+            },
+            crate::cost::WorkRun::default(),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            JobExecutionOutcome::Failed("job timed out after 250ms".to_owned())
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            TIMEOUT_SEEN.load(Ordering::SeqCst),
+            1,
+            "timeout, not lease loss"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_lease_stops_the_run_and_flags_the_context() {
+        let lost = tokio_util::sync::CancellationToken::new();
+        let run = tokio::spawn(run_job_handler(
+            "hang",
+            lease_watch_handler,
+            AppState::for_test().with_profile("dev"),
+            serde_json::json!({}),
+            false,
+            ExecutionBounds {
+                timeout: None,
+                lease_lost: Some(lost.clone()),
+            },
+            crate::cost::WorkRun::default(),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        lost.cancel();
+        let outcome = run.await.expect("run task");
+        assert_eq!(outcome, JobExecutionOutcome::LeaseLost);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            LEASE_SEEN.load(Ordering::SeqCst),
+            10,
+            "lease loss is flagged"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_run_inside_its_bounds_succeeds() {
+        let outcome = run_job_handler(
+            "quick",
+            quick_handler,
+            AppState::for_test().with_profile("dev"),
+            serde_json::json!({}),
+            true,
+            ExecutionBounds {
+                timeout: Some(Duration::from_secs(1)),
+                lease_lost: Some(tokio_util::sync::CancellationToken::new()),
+            },
+            crate::cost::WorkRun::default(),
+        )
+        .await;
+        assert_eq!(outcome, JobExecutionOutcome::Succeeded);
+    }
+
+    #[test]
+    fn a_context_outside_a_run_is_never_cancelled() {
+        let ctx = crate::job_tracking::JobContext::current();
+        assert!(!ctx.lease_lost());
+        assert!(!ctx.is_cancelled());
+    }
+
+    #[test]
+    fn default_timeout_fills_only_jobs_with_no_timeout() {
+        let mut own = JobInfo::new("own", 1, 1, quick_handler);
+        own.timeout = Some(Duration::from_secs(5));
+        let jobs = vec![own, JobInfo::new("plain", 1, 1, quick_handler)];
+
+        let unchanged = apply_default_timeout(jobs.clone(), 0);
+        assert_eq!(unchanged[1].timeout, None, "0 means no limit");
+
+        let applied = apply_default_timeout(jobs, 2_000);
+        assert_eq!(
+            applied[0].timeout,
+            Some(Duration::from_secs(5)),
+            "own timeout wins"
+        );
+        assert_eq!(applied[1].timeout, Some(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn lease_lost_is_never_a_capsule_outcome() {
+        #[cfg(feature = "reporting")]
+        assert!(job_capsule_outcome(&JobExecutionOutcome::LeaseLost, true).is_none());
+    }
+
+    static LOCAL_HUNG_RUNS: AtomicUsize = AtomicUsize::new(0);
+    static LOCAL_AFTER_RAN: AtomicUsize = AtomicUsize::new(0);
+
+    /// The timeout also bounds the local backend: a hung job fails, retries,
+    /// and frees the only worker for the next job.
+    #[tokio::test]
+    async fn local_backend_times_out_a_hung_job_and_frees_the_worker() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        LOCAL_HUNG_RUNS.store(0, Ordering::SeqCst);
+        LOCAL_AFTER_RAN.store(0, Ordering::SeqCst);
+
+        let mut hung = JobInfo::new("local_hung", 2, 1, |_state, _payload| {
+            Box::pin(async move {
+                LOCAL_HUNG_RUNS.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+        });
+        hung.timeout = Some(Duration::from_millis(100));
+        let after = JobInfo::new("local_after", 1, 1, |_state, _payload| {
+            Box::pin(async move {
+                LOCAL_AFTER_RAN.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let config = crate::config::JobConfig {
+            workers: 1,
+            ..Default::default()
+        };
+        start_runtime(vec![hung, after], &state, &shutdown, &config, true)
+            .expect("local runtime starts");
+
+        enqueue("local_hung", serde_json::json!({}))
+            .await
+            .expect("enqueue");
+        enqueue("local_after", serde_json::json!({}))
+            .await
+            .expect("enqueue");
+
+        let dead_letters = || {
+            state
+                .job_registry
+                .snapshot()
+                .get("local_hung")
+                .map_or(0, |status| status.dead_letters)
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while (LOCAL_AFTER_RAN.load(Ordering::SeqCst) < 1 || dead_letters() < 1)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            LOCAL_AFTER_RAN.load(Ordering::SeqCst),
+            1,
+            "the worker was freed"
+        );
+        assert_eq!(
+            LOCAL_HUNG_RUNS.load(Ordering::SeqCst),
+            2,
+            "the timeout was retried"
+        );
+        let status = state
+            .job_registry
+            .snapshot()
+            .get("local_hung")
+            .cloned()
+            .expect("registered");
+        assert_eq!(status.dead_letters, 1, "the last attempt dead-letters");
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("timed out")),
+            "{status:?}"
+        );
+
+        shutdown.cancel();
+        clear_global_job_client();
     }
 }

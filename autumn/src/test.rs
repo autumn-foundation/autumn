@@ -4786,6 +4786,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: cleanup_probe_job,
+                timeout: None,
             }])
         }
     }

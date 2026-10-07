@@ -94,6 +94,7 @@ async fn test_reddit_registration_triggers_outbound_webhook() {
         uniqueness: None,
         concurrency: None,
         handler: autumn_web::webhook_outbound::deliver_webhook_job,
+        timeout: None,
     });
     job::start_runtime(jobs, state, &shutdown, &config, true).unwrap();
 

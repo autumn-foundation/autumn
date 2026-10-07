@@ -134,6 +134,7 @@
 //! | `AUTUMN_JOBS__MAX_ATTEMPTS` | `jobs.max_attempts` | `u32` |
 //! | `AUTUMN_JOBS__INITIAL_BACKOFF_MS` | `jobs.initial_backoff_ms` | `u64` |
 //! | `AUTUMN_JOBS__MAX_BACKOFF_MS` | `jobs.max_backoff_ms` | `u64` |
+//! | `AUTUMN_JOBS__DEFAULT_TIMEOUT_MS` | `jobs.default_timeout_ms` | `u64` |
 //! | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` | `String` |
 //! | `AUTUMN_JOBS__REDIS__KEY_PREFIX` | `jobs.redis.key_prefix` | `String` |
 //! | `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` | `jobs.redis.visibility_timeout_ms` | `u64` |
@@ -3725,6 +3726,11 @@ pub struct JobConfig {
     /// Default: 3 600 000 (1 hour). See [`crate::backoff`].
     #[serde(default = "default_job_max_backoff_ms")]
     pub max_backoff_ms: u64,
+    /// Maximum time in milliseconds for one run of a job that has no
+    /// `#[job(timeout)]` (issue #3051). A slower run fails and retries. `0`
+    /// (the default) sets no limit.
+    #[serde(default)]
+    pub default_timeout_ms: u64,
     /// Ordered/weighted list of queues workers drain, highest priority first.
     ///
     /// Unset = a single `default` queue (today's behavior). A TOML array such as
@@ -3770,6 +3776,7 @@ impl Default for JobConfig {
             max_attempts: default_job_max_attempts(),
             initial_backoff_ms: default_job_backoff_ms(),
             max_backoff_ms: default_job_max_backoff_ms(),
+            default_timeout_ms: 0,
             queues: JobQueuesConfig::default(),
             pin: Vec::new(),
             fleet: JobFleetConfig::default(),
@@ -5465,6 +5472,7 @@ impl AutumnConfig {
     /// - `AUTUMN_JOBS__MAX_ATTEMPTS` → `jobs.max_attempts` (`u32`)
     /// - `AUTUMN_JOBS__INITIAL_BACKOFF_MS` → `jobs.initial_backoff_ms` (`u64`)
     /// - `AUTUMN_JOBS__MAX_BACKOFF_MS` → `jobs.max_backoff_ms` (`u64`)
+    /// - `AUTUMN_JOBS__DEFAULT_TIMEOUT_MS` → `jobs.default_timeout_ms` (`u64`)
     /// - `AUTUMN_JOBS__REDIS__URL` → `jobs.redis.url` (`String`)
     /// - `AUTUMN_JOBS__REDIS__KEY_PREFIX` → `jobs.redis.key_prefix` (`String`)
     /// - `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` → `jobs.redis.visibility_timeout_ms` (`u64`)
@@ -5536,6 +5544,7 @@ impl AutumnConfig {
         self.apply_cache_env_overrides_with_env(env);
         self.apply_channels_env_overrides_with_env(env);
         self.apply_jobs_env_overrides_with_env(env);
+        self.apply_outbox_env_overrides_with_env(env);
         self.apply_scheduler_env_overrides_with_env(env);
         self.apply_retention_env_overrides_with_env(env);
         self.apply_role_env_overrides_with_env(env);
@@ -6490,6 +6499,11 @@ impl AutumnConfig {
             "AUTUMN_JOBS__MAX_BACKOFF_MS",
             &mut self.jobs.max_backoff_ms,
         );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__DEFAULT_TIMEOUT_MS",
+            &mut self.jobs.default_timeout_ms,
+        );
         parse_env_option_string(env, "AUTUMN_JOBS__REDIS__URL", &mut self.jobs.redis.url);
         parse_env_string(
             env,
@@ -6531,6 +6545,9 @@ impl AutumnConfig {
             "AUTUMN_JOBS__TRACKING__ROUTE_ENABLED",
             &mut self.jobs.tracking.route_enabled,
         );
+    }
+
+    fn apply_outbox_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_bool(env, "AUTUMN_OUTBOX__ENABLED", &mut self.outbox.enabled);
         parse_env(
             env,
@@ -15147,6 +15164,21 @@ path = "/healthz"
         );
         assert_eq!(config.jobs.redis.key_prefix, "myapp:jobs");
         assert_eq!(config.jobs.redis.visibility_timeout_ms, 45_000);
+    }
+
+    /// `jobs.default_timeout_ms` defaults to `0` (no limit) and reads from
+    /// TOML and the environment (issue #3051).
+    #[test]
+    fn jobs_default_timeout_ms_defaults_to_zero_and_overrides() {
+        assert_eq!(AutumnConfig::default().jobs.default_timeout_ms, 0);
+
+        let config: AutumnConfig = toml::from_str("[jobs]\ndefault_timeout_ms = 30000\n").unwrap();
+        assert_eq!(config.jobs.default_timeout_ms, 30_000);
+
+        let env = MockEnv::new().with("AUTUMN_JOBS__DEFAULT_TIMEOUT_MS", "1500");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.jobs.default_timeout_ms, 1_500);
     }
 
     // ── [retention] unified framework-owned data retention (issue #1605) ──

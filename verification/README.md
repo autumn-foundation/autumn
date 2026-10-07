@@ -8,6 +8,12 @@ extended Rust dialect. Verify the tenant arena spine with:
 verus verification/tenant_arena.rs
 ```
 
+The durable job claim lease (issue #3051, ADR 0016) has its own model:
+
+```sh
+verus verification/job_lease.rs
+```
+
 The runtime correspondence and boundary are recorded in ADR 0012; executable
 tests remain authoritative for unmodeled allocator, HTTP, and concurrency glue.
 

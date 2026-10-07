@@ -144,6 +144,49 @@ Every breaking change carries this label — `scripts/check-migration-guides.sh`
 fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
+### Jobs: `JobInfo` has a new `timeout` field
+
+**Why:** A job can now set the longest time one run may take (issue #3051).
+`JobInfo` carries it as `timeout: Option<Duration>`.
+
+**Before (`0.8`):**
+
+```rust
+let info = JobInfo {
+    name: "export".to_string(),
+    max_attempts: 3,
+    initial_backoff_ms: 250,
+    queue: "default".to_string(),
+    uniqueness: None,
+    concurrency: None,
+    version: 1,
+    handler: export_handler,
+};
+```
+
+**After (`0.9`):**
+
+```rust
+let info = JobInfo {
+    name: "export".to_string(),
+    max_attempts: 3,
+    initial_backoff_ms: 250,
+    queue: "default".to_string(),
+    uniqueness: None,
+    concurrency: None,
+    version: 1,
+    timeout: None, // or Some(Duration::from_secs(30))
+    handler: export_handler,
+};
+```
+
+Code that uses `#[job]` or `JobInfo::new` does not change. `JobConfig` also
+has a new `default_timeout_ms` field: see the struct-literal note in the next
+section.
+
+**Automation:** `manual` — add `timeout: None` to each hand-written `JobInfo`
+literal. `#[job]` and `JobInfo::new` set it.
+
 ### Config: `AutumnConfig` gains a `cost` field
 
 **Why:** Per-request cost records and cost-aware deferral (issue #1720) need
@@ -202,8 +245,9 @@ client.post(url).retries(2).retry_non_idempotent().send().await?;
 ```
 
 If you build a `RetryPolicy`, `HttpClientConfig` or `JobConfig` with a
-struct literal, add the new field (`max_backoff`, `max_backoff_ms`), or end
-the literal with `..Default::default()`.
+struct literal, add the new fields (`max_backoff`, `max_backoff_ms`, and on
+`JobConfig` also `default_timeout_ms`), or end the literal with
+`..Default::default()`.
 
 **Automation:** `manual` — the fix adds a call only where you want `POST` or
 `PATCH` retried. A codemod cannot know which calls are safe to repeat.
@@ -510,7 +554,8 @@ single most valuable section of the guide — keep it factual and short.
 |---------------------------|------------------|-----|
 | `error[E0432]: unresolved import \`autumn_web::foo\`` | module reorganized | `use autumn_web::<new path>;` |
 | `error[E0061]: this function takes 2 arguments but 1 was supplied` | `App::run` added a parameter | see [Breaking changes › {Area}] |
-| `error[E0063]: missing field \`max_backoff\`` (or `max_backoff_ms`) | a `RetryPolicy`, `HttpClientConfig` or `JobConfig` literal | add the field, or `..Default::default()` |
+| `error[E0063]: missing field \`max_backoff\`` (or `max_backoff_ms`, `default_timeout_ms`) | a `RetryPolicy`, `HttpClientConfig` or `JobConfig` literal | add the field, or `..Default::default()` |
+| `error[E0063]: missing field \`timeout\`` | a `JobInfo` literal | add `timeout: None` |
 | `error[E0061]: this function takes 6 arguments but 5 arguments were supplied` | a direct call to `autumn_web::commentable::comment_thread` (or `add_comment`, `delete_comment`, `recompute_comment_count`) | add `None` as the last argument; see [Commentable](#commentable-the-runtime-helpers-take-soft_delete-optionbool) |
 
 ## Configuration changes
@@ -525,6 +570,9 @@ If nothing changed, delete this section.
   HTTP client's retry backoff.
 - New: `[jobs] max_backoff_ms` and `AUTUMN_JOBS__MAX_BACKOFF_MS` (default
   `3600000`, 1 h). The cap on job retry backoff for every backend.
+- New: `[jobs] default_timeout_ms` and `AUTUMN_JOBS__DEFAULT_TIMEOUT_MS`
+  (default `0`, no limit). The longest one run of a job without
+  `#[job(timeout)]` may take (issue #3051).
 - **Resilience (issue #3060):** new keys `slow_call_duration_threshold_ms`
   (default `60000`, `0` turns detection off), `slow_call_rate_threshold`
   (default `1.0`) and `cancelled_call_outcome` (default `"slow"`) under
@@ -542,6 +590,15 @@ Changes that still compile but behave differently at runtime. Examples:
 
 If nothing changed, delete this section.
 
+- **Jobs: a hung handler keeps its claim (#3051).** Durable workers renew each
+  claim while the job runs. Before, a hung handler lost its claim after the
+  visibility timeout, and a second worker ran the job again. Now the claim
+  stays until the process stops. Set `#[job(timeout = "...")]` or
+  `jobs.default_timeout_ms` on a job that can hang.
+- **Jobs: Redis claim deadlines use the Redis server clock (#3051).** During a
+  rolling deploy, an old worker still compares deadlines to its own clock. An
+  old worker whose clock runs ahead of Redis can requeue a live job. Keep
+  worker clocks in sync (NTP) during the deploy.
 - Retries use full jitter (issue #3054). The delay before retry `n` is a
   random value in `[0, min(cap, base * 2^n)]`. Before, the HTTP client and the
   `postgres`, `redis` and `sqlite` job backends used the exact value
