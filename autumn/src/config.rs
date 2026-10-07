@@ -5544,6 +5544,7 @@ impl AutumnConfig {
         self.apply_cache_env_overrides_with_env(env);
         self.apply_channels_env_overrides_with_env(env);
         self.apply_jobs_env_overrides_with_env(env);
+        self.apply_outbox_env_overrides_with_env(env);
         self.apply_scheduler_env_overrides_with_env(env);
         self.apply_retention_env_overrides_with_env(env);
         self.apply_role_env_overrides_with_env(env);
@@ -6544,6 +6545,9 @@ impl AutumnConfig {
             "AUTUMN_JOBS__TRACKING__ROUTE_ENABLED",
             &mut self.jobs.tracking.route_enabled,
         );
+    }
+
+    fn apply_outbox_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_bool(env, "AUTUMN_OUTBOX__ENABLED", &mut self.outbox.enabled);
         parse_env(
             env,
