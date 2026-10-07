@@ -284,21 +284,33 @@ where
         };
         let permit = permit.or_else(|| take_handoff(handoff.as_ref()));
 
-        make_service
-            .ready()
-            .await
-            .unwrap_or_else(|err| match err {});
-        let service = make_service
-            .call(IncomingStream {
-                io: &io,
-                remote_addr,
-            })
-            .await
-            .unwrap_or_else(|err| match err {});
-
+        // The head timer runs from accept, so a make-service that is slow to
+        // get ready cannot hold the connection (and its slot) past it.
         let timers = limits
             .has_timers()
             .then(|| Arc::new(ConnTimers::new(&limits)));
+        let make = async {
+            make_service
+                .ready()
+                .await
+                .unwrap_or_else(|err| match err {});
+            make_service
+                .call(IncomingStream {
+                    io: &io,
+                    remote_addr,
+                })
+                .await
+                .unwrap_or_else(|err| match err {})
+        };
+        let head_deadline = timers
+            .as_ref()
+            .and_then(|t| t.deadline_and_expiry())
+            .map(|(deadline, _)| deadline);
+        let service = tokio::select! {
+            service = make => service,
+            () = signal_tx.closed() => break,
+            () = sleep_until(head_deadline) => continue,
+        };
         let service = Tracked {
             inner: service,
             timers: timers.clone(),

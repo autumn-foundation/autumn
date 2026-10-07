@@ -442,3 +442,70 @@ fn limits_resolve_from_config_with_zero_as_off() {
         }
     );
 }
+
+/// A make-service that never becomes ready.
+#[derive(Clone)]
+struct NeverReady;
+
+impl<'a> tower::Service<autumn_web::http_server::IncomingStream<'a, TcpListener>> for NeverReady {
+    type Response = Router;
+    type Error = std::convert::Infallible;
+    type Future = std::future::Ready<Result<Router, std::convert::Infallible>>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Pending
+    }
+
+    fn call(
+        &mut self,
+        _conn: autumn_web::http_server::IncomingStream<'a, TcpListener>,
+    ) -> Self::Future {
+        std::future::ready(Ok(Router::new()))
+    }
+}
+
+#[tokio::test]
+async fn header_read_timeout_covers_a_make_service_that_is_not_ready() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve(
+        listener,
+        NeverReady,
+        HttpLimits {
+            header_read_timeout: ms(200),
+            max_connections: Some(1),
+            ..HttpLimits::default()
+        },
+        std::future::pending(),
+    ));
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    // The connection holds the only slot. The head timeout runs from accept.
+    let elapsed = time_until_closed(&mut stream, Duration::from_secs(3)).await;
+    assert!(elapsed < Duration::from_secs(2), "closed after {elapsed:?}");
+}
+
+#[tokio::test]
+async fn shutdown_does_not_wait_for_a_make_service_that_is_not_ready() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(serve(
+        listener,
+        NeverReady,
+        HttpLimits::default(),
+        async move {
+            let _ = stopped.await;
+        },
+    ));
+    let _stream = TcpStream::connect(addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("serve returns after the signal")
+        .unwrap()
+        .unwrap();
+}
