@@ -330,10 +330,16 @@ fn is_host_key(key: &str) -> bool {
     key.eq_ignore_ascii_case("host") || key.eq_ignore_ascii_case("hostaddr")
 }
 
-/// A host value may also hold an IPv6 address: `::1`, `[::1]`.
+/// A host value may also hold IP addresses (`::1`, `[::1]`, `10.0.0.1`). Each
+/// comma-separated item must then parse as one, so `token:hunter2` does not
+/// pass.
 fn is_host_token(value: &str) -> bool {
-    value.chars().all(|c| {
-        c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ',' | '/' | ':' | '[' | ']')
+    value.split(',').all(|item| {
+        let item = item
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or(item);
+        item.parse::<std::net::IpAddr>().is_ok() || is_simple_token(item)
     })
 }
 
@@ -837,6 +843,19 @@ mod tests {
         assert_eq!(
             redact_target("postgres://db/app?application_name=a:b"),
             "postgres://db/app?application_name=****"
+        );
+        // Only a real IP address may hold `:`.
+        assert_eq!(
+            redact_target("postgres://db/app?hostaddr=token:hunter2"),
+            "postgres://db/app?hostaddr=****"
+        );
+        assert_eq!(
+            redact_target("postgres://db/app?host=db1:x,[::1]"),
+            "postgres://db/app?host=****"
+        );
+        assert_eq!(
+            redact_target("postgres://db/app?host=[::1],10.0.0.1"),
+            "postgres://db/app?host=[::1],10.0.0.1"
         );
     }
 
