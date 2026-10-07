@@ -264,7 +264,10 @@ impl CapsuleService {
             no_blob_store(capsule)?;
             return import_capsule(capsule, &self.models, self.store.as_ref()).await;
         };
-        // A failed import keeps the blobs: see `restore_blobs`.
+        // A failed import keeps the blobs (see `restore_blobs`), so check
+        // first what can be checked without the store: a capsule that can
+        // never be imported must leave no blob behind.
+        super::check_importable(capsule, &self.models)?;
         super::blobs::restore_blobs(capsule, blobs.as_ref()).await?;
         let mut rebound = capsule.clone();
         super::blobs::rebind_blobs(&mut rebound, blobs.as_ref()).await?;

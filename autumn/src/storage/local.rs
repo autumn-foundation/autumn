@@ -93,12 +93,18 @@ struct LocalInner {
     signing_key: SigningKey,
     /// Former signing keys accepted during a rotation grace window.
     previous_signing_keys: Vec<SigningKey>,
-    /// One lock per blob path. A write holds it from the moment its bytes
-    /// land at the path until its sidecar is in place, so two writers of one
-    /// key in this process cannot mix the bytes of one with the metadata of
-    /// the other. Writers in other processes do not take it.
-    commit_locks: std::sync::Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>,
 }
+
+/// One lock per blob path, for every `LocalBlobStore` in this process. A write
+/// holds it from the moment its bytes land at the path until its sidecar is in
+/// place, so two writers of one key cannot mix the bytes of one with the
+/// metadata of the other, even through two stores on one root. Writers in
+/// other processes do not take it: this store serves one process (use the S3
+/// backend for more), and the checks in `commit_meta` keep the bytes right
+/// for them, at worst without their MIME type.
+static COMMIT_LOCKS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(std::sync::Mutex::default);
 
 impl LocalBlobStore {
     /// Create a new local store rooted at `root`.
@@ -145,21 +151,24 @@ impl LocalBlobStore {
                 default_expiry,
                 signing_key,
                 previous_signing_keys,
-                commit_locks: std::sync::Mutex::default(),
             }),
         })
     }
 
-    /// Take the commit lock of `path`. See `LocalInner::commit_locks`.
+    /// Take the commit lock of `path`. See `COMMIT_LOCKS`.
     async fn lock_path(&self, path: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+        // Two stores can name one root in two ways: key the lock on the
+        // canonical root.
+        let key = path.strip_prefix(&self.inner.root).map_or_else(
+            |_| path.to_path_buf(),
+            |rest| self.inner.canonical_root.join(rest),
+        );
         let lock = {
-            let mut locks = self
-                .inner
-                .commit_locks
+            let mut locks = COMMIT_LOCKS
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             locks.retain(|_, lock| lock.strong_count() > 0);
-            let slot = locks.entry(path.to_path_buf()).or_default();
+            let slot = locks.entry(key).or_default();
             let lock = slot
                 .upgrade()
                 .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
@@ -1441,6 +1450,39 @@ mod tests {
             vec![],
         )
         .unwrap()
+    }
+
+    /// Two stores on one root in one process race like two writers of one
+    /// store: the commit lock must cover both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_sidecar_describes_the_bytes_after_racing_writes_of_two_stores() {
+        let dir = temp_root();
+        let (first, second) = (store(dir.path()), store(dir.path()));
+        for round in 0..300 {
+            first.delete("k.bin").await.unwrap();
+            let (a, b) = (first.clone(), second.clone());
+            let ours = tokio::spawn(async move {
+                a.put_if_absent("k.bin", "image/png", Bytes::from(format!("ours {round}")))
+                    .await
+            });
+            let theirs = tokio::spawn(async move {
+                b.put(
+                    "k.bin",
+                    "text/plain",
+                    Bytes::from(format!("theirs {round}")),
+                )
+                .await
+            });
+            ours.await.unwrap().unwrap();
+            theirs.await.unwrap().unwrap();
+            let (bytes, meta) = first.get_with_meta("k.bin").await.unwrap();
+            let meta = meta.unwrap_or_else(|| panic!("round {round}: no sidecar"));
+            assert_eq!(
+                meta.etag.as_deref(),
+                Some(sha256_hex(&bytes).as_str()),
+                "round {round}"
+            );
+        }
     }
 
     /// A `put_if_absent` and a `put` race on one key. Whichever wins, the

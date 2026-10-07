@@ -503,6 +503,22 @@ async fn export_refuses_a_column_that_the_store_does_not_describe() {
 }
 
 #[tokio::test]
+async fn verify_streams_a_huge_record_file() {
+    // A signed record file swapped for a sparse 256 MiB one: verify hashes it
+    // as a stream and reports the change, without a 256 MiB buffer.
+    let (_dir, root) = written().await;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.join("records/users.json"))
+        .unwrap()
+        .set_len(256 << 20)
+        .unwrap();
+    let err = verify_dir(&root, &signer()).expect_err("changed");
+    assert!(matches!(err, DataCapsuleError::Integrity(_)), "{err:?}");
+    assert!(err.to_string().contains("records/users.json"), "{err}");
+}
+
+#[tokio::test]
 async fn verify_refuses_metadata_larger_than_a_capsule_needs() {
     // Valid JSON with 1 MiB of trailing spaces: it parses, so only a size
     // limit stops it, before the whole file is in memory.
@@ -1128,6 +1144,50 @@ mod blobs {
         assert!(matches!(err, DataCapsuleError::Conflict(_)), "{err:?}");
         assert!(err.to_string().contains("old-s3"), "{err}");
         assert!(capsule.manifest.blobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn import_checks_the_capsule_before_it_writes_a_blob() {
+        // The target does not know the table. The import can never succeed,
+        // so it must not leave the subject's blobs in the target store.
+        use std::sync::Arc;
+
+        use autumn_web::gdpr::portability::CapsuleService;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_blobs = blob_store(&tmp.path().join("a"));
+        source_blobs
+            .put("avatars/ada.png", "image/png", Bytes::from_static(b"png"))
+            .await
+            .unwrap();
+        source_blobs
+            .put("docs/ada-cv.txt", "text/plain", Bytes::from_static(b"cv"))
+            .await
+            .unwrap();
+        let source = CapsuleService::new(models(), Arc::new(store()), signer())
+            .with_blob_store(Arc::new(source_blobs));
+        let root = tmp.path().join("capsule");
+        source.export_to("1", &root).await.unwrap();
+
+        let target_blobs = Arc::new(blob_store(&tmp.path().join("b")));
+        let other = MemoryCapsuleStore::new().table("other", vec![FieldSpec::new("id", "bigint")]);
+        let target = CapsuleService::new(
+            vec![CapsuleModel::new("other", "id")],
+            Arc::new(other),
+            signer(),
+        )
+        .with_blob_store(target_blobs.clone());
+        let err = target.import_from(&root).await.expect_err("unknown table");
+        assert!(matches!(err, DataCapsuleError::UnknownTable(_)), "{err:?}");
+        for key in ["avatars/ada.png", "docs/ada-cv.txt"] {
+            assert!(
+                matches!(
+                    target_blobs.get(key).await,
+                    Err(BlobStoreError::NotFound(_))
+                ),
+                "{key}"
+            );
+        }
     }
 
     #[tokio::test]

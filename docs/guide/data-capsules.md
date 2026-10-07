@@ -106,8 +106,10 @@ workspace member, so it reads its own `autumn.toml` and `.env`.
 
 On a profile that is not `dev` or `test`, `import` needs `--force`. Add
 `--json` to get the raw report. `verify` uses the signer of an installed
-`CapsuleService`, if the app has one. `verify` does not open the database or
-run a migration.
+`CapsuleService`, if the app has one. `verify` runs no migration, and the
+built-in pools never connect; an app's own `with_pool_provider` runs as it does
+for export and import. `verify` hashes each file as a stream, so a huge file in
+a capsule from anyone costs no memory.
 
 ## Use the actuator
 

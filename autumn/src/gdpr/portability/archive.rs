@@ -272,7 +272,7 @@ impl DataCapsule {
     ///
     /// The errors of [`verify_dir`], or a record file that is not valid.
     pub fn read_dir(dir: &Path, signer: &CapsuleSigner) -> Result<Self, DataCapsuleError> {
-        let (manifest, mut contents) = load_verified(dir, signer)?;
+        let (manifest, mut contents) = load_verified(dir, signer, true)?;
         let mut records = BTreeMap::new();
         for model in &manifest.models {
             let bytes = contents.remove(&model.file).ok_or_else(|| {
@@ -350,7 +350,7 @@ fn prepare_empty_dir(dir: &Path) -> Result<bool, DataCapsuleError> {
 /// [`DataCapsuleError::Integrity`] for a check that fails,
 /// [`DataCapsuleError::UnsupportedFormat`] for an unknown format, or an I/O error.
 pub fn verify_dir(dir: &Path, signer: &CapsuleSigner) -> Result<VerifyReport, DataCapsuleError> {
-    let (manifest, _) = load_verified(dir, signer)?;
+    let (manifest, _) = load_verified(dir, signer, false)?;
     Ok(VerifyReport {
         subject: manifest.subject.clone(),
         files_checked: manifest.files.len() as u64,
@@ -358,13 +358,16 @@ pub fn verify_dir(dir: &Path, signer: &CapsuleSigner) -> Result<VerifyReport, Da
     })
 }
 
-/// Verify `dir`. Give the manifest and the bytes of the record and blob files.
+/// Verify `dir`. Give the manifest and, with `keep`, the bytes of the record
+/// and blob files.
 ///
-/// The function reads each file one time, so the bytes it gives are the bytes
-/// it verified.
+/// Each file is hashed as a stream, so a huge file in a capsule from anyone
+/// costs no memory. A kept file is read again, capped at the size that was
+/// hashed, and hashed again: the bytes it gives are the bytes it verified.
 fn load_verified(
     dir: &Path,
     signer: &CapsuleSigner,
+    keep: bool,
 ) -> Result<(CapsuleManifest, BTreeMap<String, Vec<u8>>), DataCapsuleError> {
     // Open the directory one time, without following a link. List the files
     // before any read: a link or a device file fails here, so no read
@@ -428,15 +431,19 @@ fn load_verified(
             "file is not in the manifest: {extra}"
         )));
     }
+    let changed = |rel: &str| DataCapsuleError::Integrity(format!("file is changed: {rel}"));
     let mut contents = BTreeMap::new();
     for (rel, expected) in &manifest.files {
-        let bytes = root.read(rel)?;
-        if sha256_hex(&bytes) != *expected {
-            return Err(DataCapsuleError::Integrity(format!(
-                "file is changed: {rel}"
-            )));
+        let mut hasher = Sha256::new();
+        let size = root.read_chunks(rel, u64::MAX, &mut |piece| hasher.update(piece))?;
+        if hex::encode(hasher.finalize()) != *expected {
+            return Err(changed(rel));
         }
-        if wanted.contains(rel) {
+        if keep && wanted.contains(rel) {
+            let bytes = root.read_at_most(rel, size).map_err(|_| changed(rel))?;
+            if sha256_hex(&bytes) != *expected {
+                return Err(changed(rel));
+            }
             contents.insert(rel.clone(), bytes);
         }
     }

@@ -19,6 +19,32 @@ fn check_depth(dir: &str) -> Result<(), DataCapsuleError> {
     Ok(())
 }
 
+/// Read `file` in pieces into `chunk`, and give its length. A file never
+/// sits in memory whole: a huge one fails after `max` bytes.
+fn feed(
+    rel: &str,
+    file: std::fs::File,
+    max: u64,
+    chunk: &mut dyn FnMut(&[u8]),
+) -> Result<u64, DataCapsuleError> {
+    use std::io::Read as _;
+
+    let mut file = file.take(max.saturating_add(1));
+    let mut buf = vec![0_u8; 64 << 10];
+    let mut total = 0_u64;
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| DataCapsuleError::io(rel, e))?;
+        if n == 0 {
+            return Ok(total);
+        }
+        total += n as u64;
+        too_large(rel, total, max)?;
+        chunk(&buf[..n]);
+    }
+}
+
 /// Fail when a file of `size` bytes is larger than `max`.
 fn too_large(rel: &str, size: u64, max: u64) -> Result<(), DataCapsuleError> {
     if size > max {
@@ -34,7 +60,7 @@ pub(super) use imp::Root;
 #[cfg(unix)]
 mod imp {
     use std::collections::BTreeSet;
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
     use std::path::Path;
 
@@ -113,6 +139,7 @@ mod imp {
             Ok(current)
         }
 
+        #[cfg(test)]
         pub(in crate::gdpr::portability) fn read(
             &self,
             rel: &str,
@@ -127,6 +154,14 @@ mod imp {
             rel: &str,
             max: u64,
         ) -> Result<Vec<u8>, DataCapsuleError> {
+            let mut bytes = Vec::new();
+            self.read_chunks(rel, max, &mut |piece| bytes.extend_from_slice(piece))?;
+            Ok(bytes)
+        }
+
+        /// Open `rel` without following a link, as a regular file of at most
+        /// `max` bytes.
+        fn open_regular(&self, rel: &str, max: u64) -> Result<std::fs::File, DataCapsuleError> {
             let mut segments: Vec<&str> = rel.split('/').collect();
             let name = segments
                 .pop()
@@ -141,13 +176,19 @@ mod imp {
                 )));
             }
             too_large(rel, u64::try_from(stat.st_size).unwrap_or(u64::MAX), max)?;
-            let mut bytes = Vec::new();
-            std::fs::File::from(fd)
-                .take(max.saturating_add(1))
-                .read_to_end(&mut bytes)
-                .map_err(|e| DataCapsuleError::io(rel, e))?;
-            too_large(rel, bytes.len() as u64, max)?;
-            Ok(bytes)
+            Ok(std::fs::File::from(fd))
+        }
+
+        /// Feed `rel` to `chunk` in pieces, and give its length. Fails when it
+        /// has more than `max` bytes, before the read and during it.
+        pub(in crate::gdpr::portability) fn read_chunks(
+            &self,
+            rel: &str,
+            max: u64,
+            chunk: &mut dyn FnMut(&[u8]),
+        ) -> Result<u64, DataCapsuleError> {
+            let file = self.open_regular(rel, max)?;
+            super::feed(rel, file, max, chunk)
         }
 
         pub(in crate::gdpr::portability) fn list_regular_files(
@@ -359,6 +400,7 @@ mod imp {
             })
         }
 
+        #[cfg(test)]
         pub(in crate::gdpr::portability) fn read(
             &self,
             rel: &str,
@@ -373,8 +415,19 @@ mod imp {
             rel: &str,
             max: u64,
         ) -> Result<Vec<u8>, DataCapsuleError> {
-            use std::io::Read as _;
+            let mut bytes = Vec::new();
+            self.read_chunks(rel, max, &mut |piece| bytes.extend_from_slice(piece))?;
+            Ok(bytes)
+        }
 
+        /// Feed `rel` to `chunk` in pieces, and give its length. Fails when it
+        /// has more than `max` bytes, before the read and during it.
+        pub(in crate::gdpr::portability) fn read_chunks(
+            &self,
+            rel: &str,
+            max: u64,
+            chunk: &mut dyn FnMut(&[u8]),
+        ) -> Result<u64, DataCapsuleError> {
             let path = rel.split('/').fold(self.path.clone(), |p, s| p.join(s));
             let meta = std::fs::symlink_metadata(&path).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
@@ -389,12 +442,8 @@ mod imp {
                 )));
             }
             super::too_large(rel, meta.len(), max)?;
-            let mut bytes = Vec::new();
-            std::fs::File::open(&path)
-                .and_then(|file| file.take(max.saturating_add(1)).read_to_end(&mut bytes))
-                .map_err(|e| DataCapsuleError::io(&path, e))?;
-            super::too_large(rel, bytes.len() as u64, max)?;
-            Ok(bytes)
+            let file = std::fs::File::open(&path).map_err(|e| DataCapsuleError::io(&path, e))?;
+            super::feed(rel, file, max, chunk)
         }
 
         /// Make the root owner-only and check that it is empty.

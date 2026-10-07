@@ -272,6 +272,32 @@ pub async fn import_capsule(
     models: &[CapsuleModel],
     store: &dyn CapsuleStore,
 ) -> Result<ImportSummary, DataCapsuleError> {
+    let order = check_importable(capsule, models)?;
+    let batches: Vec<ImportBatch<'_>> = order
+        .iter()
+        .map(|model| ImportBatch::new(model, capsule.records(&model.table)))
+        .collect();
+    store.insert_all(&batches).await?;
+    let tables: Vec<TableCount> = batches
+        .iter()
+        .map(|b| TableCount {
+            table: b.model.table.clone(),
+            records: b.records.len() as u64,
+        })
+        .collect();
+    let records = tables.iter().map(|t| t.records).sum();
+    Ok(ImportSummary { tables, records })
+}
+
+/// The checks of [`import_capsule`] that need no store: the format, the
+/// models, the blob references, and an import order. Gives that order.
+///
+/// `CapsuleService` runs them before it writes a blob, so a capsule that can
+/// never be imported leaves no blob behind.
+pub(super) fn check_importable<'c>(
+    capsule: &'c DataCapsule,
+    models: &[CapsuleModel],
+) -> Result<Vec<&'c ModelManifest>, DataCapsuleError> {
     let manifest = &capsule.manifest;
     if manifest.format != DATA_CAPSULE_FORMAT
         || manifest.format_version != DATA_CAPSULE_FORMAT_VERSION
@@ -309,21 +335,7 @@ pub async fn import_capsule(
             }
         }
     }
-    let order = import_order(&manifest.models)?;
-    let batches: Vec<ImportBatch<'_>> = order
-        .iter()
-        .map(|model| ImportBatch::new(model, capsule.records(&model.table)))
-        .collect();
-    store.insert_all(&batches).await?;
-    let tables: Vec<TableCount> = batches
-        .iter()
-        .map(|b| TableCount {
-            table: b.model.table.clone(),
-            records: b.records.len() as u64,
-        })
-        .collect();
-    let records = tables.iter().map(|t| t.records).sum();
-    Ok(ImportSummary { tables, records })
+    import_order(&manifest.models)
 }
 
 /// Sort models so that each `belongs_to` target comes first.
