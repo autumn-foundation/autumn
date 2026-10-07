@@ -486,6 +486,13 @@ fn shell_release_scripts_are_lf_normalized() {
         attributes.contains("*.sh text eol=lf"),
         ".gitattributes must force LF checkout for shell scripts so release gates run under bash"
     );
+    // A `*.sh.tmpl` template does not match `*.sh`. `autumn release init`
+    // writes it out as a bash script, so a CRLF checkout on Windows would
+    // ship a script that bash cannot run (#2314).
+    assert!(
+        attributes.contains("autumn-cli/src/templates/**/*.sh.tmpl text eol=lf"),
+        ".gitattributes must force LF checkout for scaffolded shell script templates"
+    );
 
     let scripts_dir = root.join("scripts");
     for entry in std::fs::read_dir(&scripts_dir)
@@ -1801,6 +1808,48 @@ fn deployment_guide_references_build_and_boot_gate() {
         doc.contains("release-image-boot"),
         "deployment.md must reference the `release-image-boot` CI gate as the proof \
          behind the documented 10-minute deploy promise",
+    );
+}
+
+#[test]
+fn azure_walkthrough_runs_the_cutover_script_after_migrations() {
+    // #2314: main.tf keeps credentials off the placeholder app. The manual
+    // walkthrough must attach them with the scaffolded script, which sets
+    // them and the real image in one write.
+    let doc_path = workspace_root().join("docs/guide/deployment.md");
+    let doc = std::fs::read_to_string(&doc_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", doc_path.display()));
+    let section = |heading: &str| -> String {
+        doc.split(heading)
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .unwrap_or_else(|| panic!("deployment.md must have a `{heading}` section"))
+            .to_owned()
+    };
+    let azure = section("## Deploy to Azure Container Apps");
+    let migrate_at = azure
+        .find("az containerapp job start \\")
+        .expect("the Azure walkthrough must run the migration job");
+    let cutover_at = azure
+        .find("bash azure-cutover.sh")
+        .expect("the Azure walkthrough must run the cutover script");
+    assert!(
+        migrate_at < cutover_at,
+        "the Azure walkthrough must migrate before the cutover"
+    );
+    for split in [
+        "az containerapp identity assign",
+        "az containerapp secret set",
+        "az containerapp update \\",
+    ] {
+        assert!(
+            !azure.contains(split),
+            "the Azure walkthrough must not use the separate write `{split}`"
+        );
+    }
+    assert!(
+        !section("## Deploy to GCP Cloud Run").contains("az containerapp"),
+        "Azure commands must stay out of the GCP section"
     );
 }
 

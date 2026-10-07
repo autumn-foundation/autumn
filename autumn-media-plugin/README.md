@@ -90,6 +90,18 @@ autumn_web::app()
     .await;
 ```
 
+Both primitives are off by default. If you enable neither, the plugin installs
+no routes, extensions or jobs. It logs a warning.
+
+| Builder call | Installs |
+|---|---|
+| `with_broadcast()` | `MediaMtxClient` and `MediaUrls` extensions |
+| `with_rooms()` | Room routes, `RoomService` and the room reaper |
+| Either one | `MediaStorage`, `MediaWorkflows` and the encode jobs |
+
+The retention sweep also starts if you set `recordings_root`. If the storage
+config is not valid, the plugin installs no storage, workflows, jobs or sweep.
+
 ### Migrating from Arroyo
 
 `MediaConfig::from_arroyo_env()` maps an existing Arroyo deployment's `ARROYO_*`

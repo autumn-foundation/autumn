@@ -43,6 +43,12 @@ Production-safe expectations:
 The framework warns if the `prod` profile still uses in-memory sessions without
 `session.allow_memory_in_production = true`.
 
+The `prod` profile also turns on overload and database protections: load
+shedding, a `30s` statement timeout, a `60s` idle-in-transaction timeout, and
+`strict_config`. See
+[Production Protections](../cloud-native.md#production-protections) for the
+values and the opt-outs.
+
 ## `autumn.toml` Sections That Matter First
 
 The new scaffold keeps `autumn.toml` short, but the first sections worth

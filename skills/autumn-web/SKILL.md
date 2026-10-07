@@ -2702,12 +2702,13 @@ null git provenance because the Docker build context excludes `.git` (tracked in
 ## Resilience: load shedding (0.6.0)
 
 Admission control caps concurrent in-flight requests; excess is shed
-immediately with `503` + `Retry-After` before the handler runs. Disabled by
-default:
+immediately with `503` + `Retry-After` before the handler runs. Off by
+default, except in the `prod` profile: there the ceiling is primary pool
+size × 32, at least 256 (#3057):
 
 ```toml
 [server]
-max_concurrent_requests = 256   # unset/0 = unlimited
+max_concurrent_requests = 256   # 0 = unlimited; unset = profile default
 ```
 
 Probes (`/health`, `/live`, `/ready`, `/startup`, actuator) are never shed;
@@ -3205,7 +3206,7 @@ autumn console                   # data playground: scaffolds src/bin/playground
 autumn console --force           # regenerate the playground from the template (never overwritten otherwise)
 autumn console --scaffold-only   # scaffold + wire Cargo.toml, then stop
 autumn console --repl            # interactive Rhai prompt: PostRepository::find_all() / find_by_id(id) / count()
-autumn release init --target azure-container-apps   # Terraform scaffold: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ACR, Container Apps, Postgres Flexible Server, Key Vault-backed secrets, opt-in Redis) + .github/workflows/azure-deploy.yml (#1278). Same --force/collision guard as the fly/docker-compose targets; see docs/guide/deployment.md.
+autumn release init --target azure-container-apps   # Terraform scaffold: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ACR, Container Apps, Postgres Flexible Server, Key Vault-backed secrets, opt-in Redis) + .github/workflows/azure-deploy.yml (#1278) + azure-cutover.sh, which attaches the identity and secret refs with the real image (#2314). Same --force/collision guard as the fly/docker-compose targets; see docs/guide/deployment.md.
 autumn release init --target aws-app-runner      # Fast/minimal AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ECR, App Runner behind a VPC connector, RDS Postgres, Secrets Manager). No CI workflow (#1279); see docs/guide/deployment.md.
 autumn release init --target aws-ecs             # Production AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (VPC, ALB+ACM DNS-validated HTTPS, ECS Fargate w/ circuit-breaker rollback, Application Auto Scaling, RDS, opt-in Redis) + .github/workflows/aws-deploy.yml (#1279); see docs/guide/deployment.md.
 autumn release init --target gcp-cloud-run       # GCP path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (Artifact Registry, Cloud Run, Cloud SQL Postgres behind a VPC connector, Secret Manager, opt-in Memorystore Redis) + .github/workflows/gcp-deploy.yml (#1280); see docs/guide/deployment.md.

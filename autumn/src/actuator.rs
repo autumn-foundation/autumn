@@ -325,6 +325,17 @@ pub trait ProvideActuatorState {
         &self,
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>;
 
+    /// Returns the probe state that holds the cached primary database ping.
+    ///
+    /// `/actuator/health` uses this state to share one ping cache with
+    /// `/ready`. The default returns `None`. Then each request opens a new
+    /// connection and pings the primary with a 2 s limit. Override this
+    /// method to return the same state as `ProvideProbeState::probes`.
+    #[cfg(feature = "db")]
+    fn probe_state(&self) -> Option<&crate::probe::ProbeState> {
+        None
+    }
+
     /// Returns the configured shard set, used to expose per-shard pool
     /// metrics in the `/actuator/metrics` endpoint. Defaults to `None`.
     #[cfg(feature = "db")]
@@ -2557,13 +2568,50 @@ pub struct HealthRunResult {
     pub output: HealthCheckOutput,
 }
 
-type IndicatorList = Vec<(String, IndicatorGroup, Arc<dyn HealthIndicator>)>;
+/// One registered indicator and its result cache.
+#[derive(Clone)]
+struct IndicatorEntry {
+    name: String,
+    group: IndicatorGroup,
+    indicator: Arc<dyn HealthIndicator>,
+    cache: Arc<crate::health_cache::SingleFlightCache<HealthCheckOutput>>,
+}
+
+impl IndicatorEntry {
+    /// Run the check with its timeout, or return the cached result.
+    async fn run(self) -> HealthRunResult {
+        let indicator = Arc::clone(&self.indicator);
+        let output = self
+            .cache
+            .get_or_refresh(
+                move || async move { run_with_timeout(indicator.as_ref()).await },
+                || {
+                    let mut details = HashMap::new();
+                    details.insert("panicked".to_owned(), serde_json::Value::Bool(true));
+                    HealthCheckOutput::down().with_details(details)
+                },
+            )
+            .await;
+        HealthRunResult {
+            name: self.name,
+            group: self.group,
+            output,
+        }
+    }
+}
+
+#[derive(Default)]
+struct IndicatorList {
+    entries: Vec<IndicatorEntry>,
+    cache_ttl: std::time::Duration,
+}
 
 /// Registry of named [`HealthIndicator`] implementations.
 ///
 /// Populated by [`crate::app::AppBuilder::health_indicator`] and stored on
 /// [`crate::AppState`]. Provides duplicate-registration detection at startup
-/// and per-indicator timeout enforcement at request time.
+/// and per-indicator timeout enforcement at request time. Results can be
+/// cached for a short TTL (see [`Self::set_cache_ttl`]).
 #[derive(Clone, Default)]
 pub struct HealthIndicatorRegistry {
     inner: Arc<RwLock<IndicatorList>>,
@@ -2594,14 +2642,38 @@ impl HealthIndicatorRegistry {
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if inner.iter().any(|(n, _, _)| n == &name) {
+        if inner.entries.iter().any(|entry| entry.name == name) {
             return Err(format!(
                 "HealthIndicator '{name}' is already registered; skipping duplicate"
             ));
         }
-        inner.push((name, group, indicator));
+        let cache = Arc::new(crate::health_cache::SingleFlightCache::new(inner.cache_ttl));
+        inner.entries.push(IndicatorEntry {
+            name,
+            group,
+            indicator,
+            cache,
+        });
         drop(inner);
         Ok(())
+    }
+
+    /// Set how long one indicator result stays valid. Zero (the default for
+    /// [`Self::new`]) turns the cache off. Applies to indicators registered
+    /// before and after this call.
+    ///
+    /// When a result is stale, one caller runs the check and the other
+    /// callers wait for its result (single-flight). A timed-out result is
+    /// cached too, so a hung dependency is not called again by each prober.
+    pub fn set_cache_ttl(&self, ttl: std::time::Duration) {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.cache_ttl = ttl;
+        for entry in &inner.entries {
+            entry.cache.set_ttl(ttl);
+        }
     }
 
     /// Returns `true` when no indicators have been registered.
@@ -2610,6 +2682,7 @@ impl HealthIndicatorRegistry {
         self.inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
             .is_empty()
     }
 
@@ -2625,8 +2698,18 @@ impl HealthIndicatorRegistry {
         self.inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
             .iter()
-            .any(|(registered, _, _)| registered == name)
+            .any(|entry| entry.name == name)
+    }
+
+    /// Clone the entries so the read lock is released before async work.
+    fn entries(&self) -> Vec<IndicatorEntry> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .clone()
     }
 
     /// Run all registered indicators (both groups) with per-indicator timeouts.
@@ -2634,23 +2717,8 @@ impl HealthIndicatorRegistry {
     /// All indicators execute **concurrently**; total wall time is bounded by
     /// the slowest single indicator rather than N × timeout.
     pub async fn run_all(&self) -> Vec<HealthRunResult> {
-        let entries = self
-            .inner
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-
-        let mut results = futures::future::join_all(entries.into_iter().map(
-            |(name, group, indicator)| async move {
-                let output = run_with_timeout(indicator.as_ref()).await;
-                HealthRunResult {
-                    name,
-                    group,
-                    output,
-                }
-            },
-        ))
-        .await;
+        let mut results =
+            futures::future::join_all(self.entries().into_iter().map(IndicatorEntry::run)).await;
 
         for breaker in crate::circuit_breaker::global_registry().all_breakers() {
             let state = breaker.state();
@@ -2689,25 +2757,11 @@ impl HealthIndicatorRegistry {
     /// All indicators execute **concurrently**; total wall time is bounded by
     /// the slowest single indicator rather than N × timeout.
     pub async fn run_readiness(&self) -> Vec<HealthRunResult> {
-        // Clone the full list to release the read lock before async work begins.
-        let entries = self
-            .inner
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-
         futures::future::join_all(
-            entries
+            self.entries()
                 .into_iter()
-                .filter(|(_, g, _)| *g == IndicatorGroup::Readiness)
-                .map(|(name, group, indicator)| async move {
-                    let output = run_with_timeout(indicator.as_ref()).await;
-                    HealthRunResult {
-                        name,
-                        group,
-                        output,
-                    }
-                }),
+                .filter(|entry| entry.group == IndicatorGroup::Readiness)
+                .map(IndicatorEntry::run),
         )
         .await
     }
@@ -2795,6 +2849,8 @@ struct DatabaseCheck {
     pool_size: u64,
     active_connections: u64,
     idle_connections: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 fn build_health_components(
@@ -2827,12 +2883,16 @@ fn build_health_components(
         let details = detailed
             .then(|| {
                 db_check.map(|d| {
-                    serde_json::json!({
+                    let mut details = serde_json::json!({
                         "status": d.status,
                         "pool_size": d.pool_size,
                         "active_connections": d.active_connections,
                         "idle_connections": d.idle_connections,
-                    })
+                    });
+                    if let Some(error) = &d.error {
+                        details["error"] = serde_json::json!(error);
+                    }
+                    details
                 })
             })
             .flatten();
@@ -2854,29 +2914,32 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
     let detailed = state.health_detailed();
 
     // ── built-in db component ────────────────────────────────────
-    let (db_component_status, db_check) = {
+    let db_component = async {
         #[cfg(feature = "db")]
         {
-            #[allow(clippy::option_if_let_else)]
             if let Some(pool) = state.pool() {
+                // Readiness is a `SELECT 1` on the primary, not pool
+                // saturation (#3059). Pool numbers stay as details.
+                let primary = match state.probe_state() {
+                    Some(probes) => probes.check_primary_db(pool).await,
+                    None => crate::probe::ProbeState::check_primary_db_uncached(pool).await,
+                };
                 let status = pool.status();
-                let available = status.available as u64;
                 let size = status.max_size as u64;
-                let waiting = status.waiting as u64;
-                let idle = available;
-                let active = size.saturating_sub(available);
-
-                let healthy = available > 0 || waiting == 0;
-                let db_status = if healthy {
+                let idle = status.available as u64;
+                let db_status = if primary.up {
                     HealthStatus::Up
                 } else {
                     HealthStatus::Down
                 };
                 let db_check = Some(DatabaseCheck {
-                    status: if healthy { "ok" } else { "down" },
+                    status: if primary.up { "ok" } else { "down" },
                     pool_size: size,
-                    active_connections: active,
+                    active_connections: size.saturating_sub(idle),
                     idle_connections: idle,
+                    // The error can name the host or the user. `checks` is
+                    // always in the body, so show it only when detailed.
+                    error: primary.error.filter(|_| detailed),
                 });
                 (Some(db_status), db_check)
             } else {
@@ -2890,11 +2953,17 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
     };
 
     // ── registered custom indicators ───────────────────────────
-    let indicator_results = if let Some(registry) = state.health_indicator_registry() {
-        registry.run_all().await
-    } else {
-        Vec::new()
+    let indicators = async {
+        if let Some(registry) = state.health_indicator_registry() {
+            registry.run_all().await
+        } else {
+            Vec::new()
+        }
     };
+
+    // Run both at the same time: the wall time is the slower one, not the sum.
+    let ((db_component_status, db_check), indicator_results) =
+        tokio::join!(db_component, indicators);
 
     // ── aggregate status ────────────────────────────────────────
     let mut all_statuses: Vec<HealthStatus> =
@@ -6743,6 +6812,86 @@ mod tests {
         crate::job::clear_global_job_client();
     }
 
+    /// A pool whose server accepts each connection and closes it at once.
+    ///
+    /// Not a closed port: on Windows a connect to a closed loopback port is
+    /// retried for about 2 s, so the ping times out instead of failing.
+    #[cfg(all(feature = "db", not(feature = "sqlite")))]
+    async fn refused_pool()
+    -> diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
+        let config = crate::config::DatabaseConfig {
+            url: Some(format!("postgres://secret_user@{addr}/autumn")),
+            pool_size: 1,
+            connect_timeout_secs: 1,
+            ..Default::default()
+        };
+        crate::db::create_pool(&config)
+            .expect("valid pool config")
+            .expect("pool url is set")
+    }
+
+    #[cfg(all(feature = "db", not(feature = "sqlite")))]
+    async fn health_json(state: TestActuatorState) -> (StatusCode, serde_json::Value) {
+        let resp = actuator_router(true)
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[cfg(all(feature = "db", not(feature = "sqlite")))]
+    #[tokio::test]
+    async fn health_db_is_down_without_error_text_when_not_detailed() {
+        let mut state = test_state();
+        state.health_detailed = false;
+        state.pool = Some(refused_pool().await);
+
+        let (status, json) = health_json(state).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["components"]["db"]["status"], "DOWN");
+        assert_eq!(json["checks"]["database"]["status"], "down");
+        // The error text can name the host or the user: not for a public body.
+        assert!(json["checks"]["database"].get("error").is_none(), "{json}");
+        assert!(!json.to_string().contains("secret_user"), "{json}");
+    }
+
+    #[cfg(all(feature = "db", not(feature = "sqlite")))]
+    #[tokio::test]
+    async fn health_db_error_is_shown_when_detailed() {
+        let mut state = test_state();
+        state.health_detailed = true;
+        state.pool = Some(refused_pool().await);
+
+        let (status, json) = health_json(state).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let error = json["checks"]["database"]["error"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(error.starts_with("primary connection failed"), "{json}");
+        assert_eq!(json["components"]["db"]["details"]["error"], error);
+    }
+
     #[tokio::test]
     async fn actuator_health_returns_ok() {
         let app = actuator_router(true).with_state(test_state());
@@ -10439,6 +10588,99 @@ mod health_indicator_tests {
         let results = registry.run_readiness().await;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "probe_check");
+    }
+
+    /// Counts checks. Each check waits `delay`.
+    struct CountingIndicator {
+        calls: std::sync::atomic::AtomicUsize,
+        delay: std::time::Duration,
+    }
+
+    impl CountingIndicator {
+        fn new(delay: std::time::Duration) -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                delay,
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl HealthIndicator for CountingIndicator {
+        fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(self.delay).await;
+                HealthCheckOutput::up()
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_runs_check_each_indicator_once_per_ttl() {
+        let registry = HealthIndicatorRegistry::new();
+        registry.set_cache_ttl(std::time::Duration::from_secs(1));
+        let indicator = CountingIndicator::new(std::time::Duration::from_millis(20));
+        registry
+            .register("svc", IndicatorGroup::Readiness, indicator.clone())
+            .unwrap();
+
+        let runs: Vec<_> = (0..32)
+            .map(|i| {
+                let registry = registry.clone();
+                tokio::spawn(async move {
+                    if i % 2 == 0 {
+                        registry.run_readiness().await
+                    } else {
+                        registry.run_all().await
+                    }
+                })
+            })
+            .collect();
+        for run in runs {
+            let results = run.await.unwrap();
+            let svc = results.iter().find(|r| r.name == "svc").unwrap();
+            assert_eq!(svc.output.status, HealthStatus::Up);
+        }
+        assert_eq!(indicator.calls(), 1);
+
+        tokio::time::advance(std::time::Duration::from_millis(1_001)).await;
+        registry.run_readiness().await;
+        assert_eq!(indicator.calls(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn new_registry_does_not_cache() {
+        let registry = HealthIndicatorRegistry::new();
+        let indicator = CountingIndicator::new(std::time::Duration::ZERO);
+        registry
+            .register("svc", IndicatorGroup::Readiness, indicator.clone())
+            .unwrap();
+
+        registry.run_readiness().await;
+        registry.run_readiness().await;
+
+        assert_eq!(indicator.calls(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_result_is_cached_too() {
+        let registry = HealthIndicatorRegistry::new();
+        registry.set_cache_ttl(std::time::Duration::from_secs(1));
+        let indicator = CountingIndicator::new(std::time::Duration::from_secs(3_600));
+        registry
+            .register("svc", IndicatorGroup::Readiness, indicator.clone())
+            .unwrap();
+
+        let first = registry.run_readiness().await;
+        let second = registry.run_readiness().await;
+
+        assert_eq!(first[0].output.status, HealthStatus::Unknown);
+        assert_eq!(second[0].output.status, HealthStatus::Unknown);
+        assert_eq!(indicator.calls(), 1);
     }
 
     #[tokio::test]
