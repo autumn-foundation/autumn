@@ -288,6 +288,39 @@ A struct literal of `autumn_web::config::CircuitBreakerPolicyConfig` needs
 
 **Automation:** `manual` - each struct literal needs a value for the new
 fields, and the choice changes when the breaker opens.
+
+### Media: `MediaPlugin` installs only the primitives you enable
+
+**Why:** The docs said both primitives are off by default, but `build`
+installed storage, the encode jobs and the retention sweep for every plugin.
+`with_broadcast()` did nothing. Issue #1974.
+
+**Before (`{X.Y}`):**
+
+```rust
+// Storage, encode jobs and the retention sweep installed.
+autumn_web::app().plugin(MediaPlugin::new().config(media).recordings_root("recordings"))
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+// Enable the primitive you use. Broadcast also installs MediaMtxClient and MediaUrls.
+autumn_web::app().plugin(
+    MediaPlugin::new()
+        .config(media)
+        .with_broadcast()
+        .recordings_root("recordings"),
+)
+```
+
+With no primitive, the plugin installs no routes, extensions or jobs, and logs
+a warning. `extension::<MediaWorkflows>()` then returns `None`, jobs on the
+`media` queue have no handler, and the retention sweep does not start.
+
+**Automation:** `manual` — this is a runtime behavior change. The code still
+compiles, so a codemod cannot know which primitive your app uses.
+
 ### Feature flags: `PgFlagStore::get` errors before the first load
 
 **Why:** `get` connected to the database on the request thread, and a store
