@@ -427,8 +427,11 @@ async fn export_rejects_an_exclusion_that_names_no_column() {
 
 #[tokio::test]
 async fn export_rejects_blob_and_relationship_columns_that_name_no_column() {
-    // A typo must not give a capsule without its blobs or its links.
+    // A typo must not give a capsule without its blobs, its links, or its
+    // records.
     for (model, typo) in [
+        (CapsuleModel::new("users", "idd"), "idd"),
+        (CapsuleModel::new("users", "id").primary_key("uid"), "uid"),
         (CapsuleModel::new("users", "id").blob("avatarr"), "avatarr"),
         (
             CapsuleModel::new("posts", "author_id").belongs_to("authr_id", "users"),
@@ -658,6 +661,7 @@ mod blobs {
         local::SigningKey,
     };
     use bytes::Bytes;
+    use sha2::{Digest as _, Sha256};
 
     use super::*;
 
@@ -821,6 +825,7 @@ mod blobs {
         loses_mime: Option<&'static str>,
         vanishing: Option<&'static str>,
         replaced_after: Option<&'static str>,
+        stale_meta: Option<&'static str>,
         plain: bool,
     }
 
@@ -889,6 +894,10 @@ mod blobs {
                     if Some(key) == self.odd.loses_mime {
                         "application/octet-stream".clone_into(&mut meta.content_type);
                     }
+                    // The metadata of the bytes before a replacement.
+                    if Some(key) == self.odd.stale_meta {
+                        meta.etag = Some(hex::encode(Sha256::digest(b"old bytes")));
+                    }
                     meta
                 }))
             })
@@ -900,6 +909,32 @@ mod blobs {
         ) -> BlobFuture<'a, String> {
             self.inner.presigned_url(key, expires_in)
         }
+    }
+
+    #[tokio::test]
+    async fn export_refuses_blob_metadata_of_other_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = blob_store(&tmp.path().join("a"));
+        inner
+            .put(
+                "avatars/ada.png",
+                "image/png",
+                Bytes::from_static(b"\x89PNG"),
+            )
+            .await
+            .unwrap();
+        let blobs = OddStore {
+            inner,
+            odd: Odd {
+                stale_meta: Some("avatars/ada.png"),
+                ..Odd::default()
+            },
+        };
+        let mut capsule = export_subject(&models(), &store(), "1").await.unwrap();
+        let err = collect_blobs(&mut capsule, &blobs)
+            .await
+            .expect_err("bytes and metadata of two versions");
+        assert!(matches!(err, DataCapsuleError::Conflict(_)), "{err:?}");
     }
 
     #[tokio::test]

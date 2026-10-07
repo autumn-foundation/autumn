@@ -58,15 +58,19 @@ autumn_web::app()
 - `blob(column)` marks a column that holds a `Blob` or a blob key.
 - `exclude(column)` keeps a column out of the capsule.
 
+Every column that a model names must be in the table: the subject column, the
+key, and each link, blob, and excluded column. A typo fails the export
+(`400`), so a capsule never lacks records, blobs, or links.
+
 **Exclude all secrets.** Export copies every column that you do not exclude.
-Exclude password hashes, tokens, and internal flags. If an excluded column is
-not in the table (for example, a typo), export fails. Import cannot restore an
+Exclude password hashes, tokens, and internal flags. Import cannot restore an
 excluded column, so the column must accept `NULL` or have a default.
 
 **Check blob ownership.** Export copies each blob that a blob column names. If
 users can write a blob key into a row, make sure that the key belongs to the
 subject. If a record holds a blob key and no blob store is configured, export
-fails.
+fails. If a blob changes while export reads it, export fails with a conflict
+(`409`): run it again.
 
 ## Set the signing secret
 

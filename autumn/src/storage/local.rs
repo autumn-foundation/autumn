@@ -7,8 +7,9 @@
 //! Suitable for `dev`, single-replica deployments, and integration
 //! tests. Multi-replica production should use the `S3` backend.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 #[cfg(test)]
 use std::time::SystemTime;
 use std::time::{Duration, UNIX_EPOCH};
@@ -92,6 +93,11 @@ struct LocalInner {
     signing_key: SigningKey,
     /// Former signing keys accepted during a rotation grace window.
     previous_signing_keys: Vec<SigningKey>,
+    /// One lock per blob path. A write holds it from the moment its bytes
+    /// land at the path until its sidecar is in place, so two writers of one
+    /// key in this process cannot mix the bytes of one with the metadata of
+    /// the other. Writers in other processes do not take it.
+    commit_locks: std::sync::Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl LocalBlobStore {
@@ -139,8 +145,28 @@ impl LocalBlobStore {
                 default_expiry,
                 signing_key,
                 previous_signing_keys,
+                commit_locks: std::sync::Mutex::default(),
             }),
         })
+    }
+
+    /// Take the commit lock of `path`. See `LocalInner::commit_locks`.
+    async fn lock_path(&self, path: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self
+                .inner
+                .commit_locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            let slot = locks.entry(path.to_path_buf()).or_default();
+            let lock = slot
+                .upgrade()
+                .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
+            *slot = Arc::downgrade(&lock);
+            lock
+        };
+        lock.lock_owned().await
     }
 
     /// Borrow the configured mount path.
@@ -261,6 +287,7 @@ impl BlobStore for LocalBlobStore {
                 let _ = tokio::fs::remove_file(&tmp_path).await;
                 return Err(BlobStoreError::io(err));
             }
+            let _commit = self.lock_path(&path).await;
             if let Err(err) = atomic_replace(&tmp_path, &path).await {
                 let _ = tokio::fs::remove_file(&tmp_path).await;
                 return Err(BlobStoreError::io(err));
@@ -318,6 +345,7 @@ impl BlobStore for LocalBlobStore {
                 let _ = tokio::fs::remove_file(&tmp_path).await;
                 return Err(BlobStoreError::io(err));
             }
+            let _commit = self.lock_path(&path).await;
             let linked = tokio::fs::hard_link(&tmp_path, &path).await;
             match linked {
                 Ok(()) => {}
@@ -406,6 +434,7 @@ impl BlobStore for LocalBlobStore {
 
             match result {
                 Ok((byte_size, etag)) => {
+                    let _commit = self.lock_path(&path).await;
                     if let Err(err) = atomic_replace(&tmp_path, &path).await {
                         let _ = tokio::fs::remove_file(&tmp_path).await;
                         return Err(BlobStoreError::io(err));
@@ -519,6 +548,7 @@ impl BlobStore for LocalBlobStore {
             // (now-missing) key returns `None` from the metadata-stat
             // call before the sidecar is even read, and a future `put`
             // overwrites the sidecar atomically.
+            let _commit = self.lock_path(&path).await;
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -1103,8 +1133,10 @@ async fn write_meta_sidecar(blob_path: &std::path::Path, meta: &StoredBlobMeta) 
 /// than misrepresent the MIME.
 /// Write the sidecar of a blob that `put_if_absent` linked from `tmp_path`.
 ///
-/// `Ok(false)` when another writer replaced the blob first: its metadata
-/// stays. When the blob is replaced during the write, this call removes the
+/// The caller holds the commit lock of `path`, so no writer in this process
+/// runs between the checks and the write. The checks are for writers in
+/// other processes. `Ok(false)` when another writer replaced the blob first:
+/// its metadata stays. When the blob is replaced during the write, this call removes the
 /// sidecar while it is still its own. A reader then gets the default MIME
 /// type, never a wrong one.
 async fn commit_meta(
@@ -1395,6 +1427,45 @@ mod tests {
             vec![],
         )
         .unwrap()
+    }
+
+    /// A `put_if_absent` and a `put` race on one key. Whichever wins, the
+    /// sidecar must describe the bytes in place.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_sidecar_describes_the_bytes_after_racing_writes() {
+        let dir = temp_root();
+        let s = store(dir.path());
+        for round in 0..300 {
+            s.delete("k.bin").await.unwrap();
+            let (a, b) = (s.clone(), s.clone());
+            let ours = tokio::spawn(async move {
+                a.put_if_absent("k.bin", "image/png", Bytes::from(format!("ours {round}")))
+                    .await
+            });
+            let theirs = tokio::spawn(async move {
+                b.put(
+                    "k.bin",
+                    "text/plain",
+                    Bytes::from(format!("theirs {round}")),
+                )
+                .await
+            });
+            ours.await.unwrap().unwrap();
+            theirs.await.unwrap().unwrap();
+            let (bytes, meta) = s.get_with_meta("k.bin").await.unwrap();
+            let meta = meta.unwrap_or_else(|| panic!("round {round}: no sidecar"));
+            assert_eq!(
+                meta.etag.as_deref(),
+                Some(sha256_hex(&bytes).as_str()),
+                "round {round}"
+            );
+            let want = if bytes.starts_with(b"ours") {
+                "image/png"
+            } else {
+                "text/plain"
+            };
+            assert_eq!(meta.content_type, want, "round {round}");
+        }
     }
 
     #[tokio::test]

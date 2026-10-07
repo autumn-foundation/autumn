@@ -149,8 +149,8 @@ fn check_models(models: &[CapsuleModel]) -> Result<(), DataCapsuleError> {
 /// # Errors
 ///
 /// [`DataCapsuleError::InvalidInput`] for an empty subject, a duplicate
-/// model, or an excluded, blob, or relationship column that the table does not
-/// have,
+/// model, or a subject, primary-key, excluded, blob, or relationship column
+/// that the table does not have,
 /// [`DataCapsuleError::InvalidName`] for an unsafe name, or an error from
 /// `store`.
 pub async fn export_subject(
@@ -177,10 +177,11 @@ pub async fn export_subject(
     let mut records = BTreeMap::new();
     for (model, (mut fields, mut rows)) in models.iter().zip(data) {
         // Fail closed: a typo must not export a secret column, or give a
-        // capsule without its blobs or links.
-        let configured = model
-            .excluded
-            .iter()
+        // capsule without its records, blobs or links. A custom store can
+        // give an empty result for a subject column that does not exist.
+        let configured = [&model.subject_column, &model.primary_key]
+            .into_iter()
+            .chain(&model.excluded)
             .chain(&model.blob_columns)
             .chain(model.relationships.iter().map(|r| &r.column));
         for name in configured {

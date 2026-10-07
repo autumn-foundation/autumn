@@ -36,20 +36,10 @@ pub async fn collect_blobs(
         if capsule.manifest.blob(&key).is_some() {
             continue;
         }
-        let bytes = match store.get(&key).await {
-            Ok(bytes) => bytes,
-            Err(BlobStoreError::NotFound(_)) => {
-                tracing::warn!(blob_key = %key, "capsule export: blob is missing, skipped");
-                continue;
-            }
-            Err(e) => return Err(DataCapsuleError::Blob(format!("get {key:?}: {e}"))),
+        let Some((bytes, sha256, content_type)) = read_one_version(store, &key).await? else {
+            tracing::warn!(blob_key = %key, "capsule export: blob is missing, skipped");
+            continue;
         };
-        let content_type = match store.head(&key).await {
-            Ok(Some(meta)) => meta.content_type,
-            Ok(None) | Err(BlobStoreError::NotFound(_)) => "application/octet-stream".to_owned(),
-            Err(e) => return Err(DataCapsuleError::Blob(format!("head {key:?}: {e}"))),
-        };
-        let sha256 = hex::encode(Sha256::digest(&bytes));
         capsule.manifest.blobs.push(BlobEntry {
             key,
             sha256: sha256.clone(),
@@ -59,6 +49,48 @@ pub async fn collect_blobs(
         capsule.blobs.insert(sha256, bytes);
     }
     Ok(())
+}
+
+/// The bytes, their hex SHA-256 and their MIME type, all of one version of
+/// `key`, or `None` when `key` is not in `store`.
+///
+/// `get` and `head` are two calls, and another writer can replace the blob
+/// between them. When `head` gives an etag that is not the SHA-256 of the
+/// bytes, the two calls saw two versions: read again once, then give up.
+async fn read_one_version(
+    store: &dyn BlobStore,
+    key: &str,
+) -> Result<Option<(bytes::Bytes, String, String)>, DataCapsuleError> {
+    for _ in 0..2 {
+        let bytes = match store.get(key).await {
+            Ok(bytes) => bytes,
+            Err(BlobStoreError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(DataCapsuleError::Blob(format!("get {key:?}: {e}"))),
+        };
+        let sha256 = hex::encode(Sha256::digest(&bytes));
+        let meta = match store.head(key).await {
+            Ok(meta) => meta,
+            Err(BlobStoreError::NotFound(_)) => None,
+            Err(e) => return Err(DataCapsuleError::Blob(format!("head {key:?}: {e}"))),
+        };
+        // A store without etags, or with etags that are not a SHA-256 (an
+        // S3 multipart etag, for example), cannot show a mismatch.
+        let etag = meta.as_ref().and_then(|m| m.etag.as_deref());
+        if etag.is_some_and(|etag| is_sha256(etag) && !etag.eq_ignore_ascii_case(&sha256)) {
+            continue;
+        }
+        let content_type =
+            meta.map_or_else(|| "application/octet-stream".to_owned(), |m| m.content_type);
+        return Ok(Some((bytes, sha256, content_type)));
+    }
+    Err(DataCapsuleError::Conflict(format!(
+        "blob {key:?} changed while export read it"
+    )))
+}
+
+/// `true` for 64 hex digits.
+fn is_sha256(etag: &str) -> bool {
+    etag.len() == 64 && etag.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Write the blobs of `capsule` to `store`, each under its original key.
