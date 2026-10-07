@@ -3759,7 +3759,11 @@ fn run_up(
     // the `[[slo]]` tables.
     let bake_policy = resolve_bake_policy(config, options.bake_secs)?;
     if let Some(policy) = &bake_policy {
-        eprintln!("{}\n", policy.describe());
+        eprintln!("{}", policy.describe());
+        for warning in &policy.warnings {
+            eprintln!("\u{26A0}\u{FE0F}  {warning}");
+        }
+        eprintln!();
     }
     let metrics_path = bake::metrics_path(&config.actuator.prefix);
     let bake_host = bake::host_header(&config.security.trusted_hosts.hosts);
@@ -13825,6 +13829,7 @@ mod tests {
             max_error_ppm: 14_400,
             latency: Vec::new(),
             source: "test".to_owned(),
+            warnings: Vec::new(),
         }
     }
 

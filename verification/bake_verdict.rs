@@ -42,13 +42,19 @@ pub open spec fn window_responses(b: SampleView, n: SampleView, own: u64) -> int
     }
 }
 
-pub open spec fn delta_errors(b: SampleView, n: SampleView) -> int {
-    n.errors - b.errors
+/// New 5xx, less the bake's `failed` own requests (a failed own request can
+/// be a 5xx), never below 0.
+pub open spec fn delta_errors(b: SampleView, n: SampleView, failed: u64) -> int {
+    if n.errors - b.errors >= failed {
+        n.errors - b.errors - failed
+    } else {
+        0
+    }
 }
 
 /// Enough errors, and the error ratio is above `max_error_ppm / 1e6`.
-pub open spec fn error_breach(b: SampleView, n: SampleView, own: u64, p: PolicyView) -> bool {
-    delta_errors(b, n) >= p.min_errors && delta_errors(b, n) * 1_000_000 > p.max_error_ppm
+pub open spec fn error_breach(b: SampleView, n: SampleView, own: u64, failed: u64, p: PolicyView) -> bool {
+    delta_errors(b, n, failed) >= p.min_errors && delta_errors(b, n, failed) * 1_000_000 > p.max_error_ppm
         * window_responses(b, n, own)
 }
 
@@ -57,6 +63,7 @@ pub open spec fn spec_judge(
     b: SampleView,
     n: SampleView,
     own: u64,
+    failed: u64,
     latency_over: bool,
     p: PolicyView,
 ) -> Verdict {
@@ -64,7 +71,7 @@ pub open spec fn spec_judge(
         Verdict::Restarted
     } else if window_responses(b, n, own) < p.min_requests {
         Verdict::TooFewRequests
-    } else if error_breach(b, n, own, p) {
+    } else if error_breach(b, n, own, failed, p) {
         Verdict::ErrorRate
     } else if latency_over {
         Verdict::Latency
@@ -83,10 +90,16 @@ pub open spec fn rolls_back(v: Verdict) -> bool {
 
 /// The runtime decision, with the same overflow-free arithmetic as
 /// `bake::judge` (u128 products of u64 values, saturating subtraction).
-pub fn judge(b: SampleView, n: SampleView, own: u64, latency_over: bool, p: PolicyView) -> (v:
-    Verdict)
+pub fn judge(
+    b: SampleView,
+    n: SampleView,
+    own: u64,
+    failed: u64,
+    latency_over: bool,
+    p: PolicyView,
+) -> (v: Verdict)
     ensures
-        v == spec_judge(b, n, own, latency_over, p),
+        v == spec_judge(b, n, own, failed, latency_over, p),
 {
     if n.restarts != b.restarts || n.responses < b.responses || n.errors < b.errors {
         return Verdict::Restarted;
@@ -97,7 +110,12 @@ pub fn judge(b: SampleView, n: SampleView, own: u64, latency_over: bool, p: Poli
     } else {
         0
     };
-    let errors = n.errors - b.errors;
+    let raw_errors = n.errors - b.errors;
+    let errors = if raw_errors >= failed {
+        raw_errors - failed
+    } else {
+        0
+    };
     if requests < p.min_requests {
         return Verdict::TooFewRequests;
     }
@@ -110,9 +128,9 @@ pub fn judge(b: SampleView, n: SampleView, own: u64, latency_over: bool, p: Poli
             requests <= 0xffff_ffff_ffff_ffffu64,
     ;
     let rhs = (p.max_error_ppm as u128) * (requests as u128);
-    assert(lhs == delta_errors(b, n) * 1_000_000) by (nonlinear_arith)
+    assert(lhs == delta_errors(b, n, failed) * 1_000_000) by (nonlinear_arith)
         requires
-            errors == delta_errors(b, n),
+            errors == delta_errors(b, n, failed),
             lhs == errors * 1_000_000,
     ;
     assert(rhs == p.max_error_ppm * window_responses(b, n, own)) by (nonlinear_arith)
@@ -134,6 +152,7 @@ proof fn lemma_thin_traffic_never_rolls_back(
     b: SampleView,
     n: SampleView,
     own: u64,
+    failed: u64,
     latency_over: bool,
     p: PolicyView,
 )
@@ -141,7 +160,7 @@ proof fn lemma_thin_traffic_never_rolls_back(
         !restarted(b, n),
         window_responses(b, n, own) < p.min_requests,
     ensures
-        !rolls_back(spec_judge(b, n, own, latency_over, p)),
+        !rolls_back(spec_judge(b, n, own, failed, latency_over, p)),
 {
 }
 
@@ -150,13 +169,14 @@ proof fn lemma_restart_always_rolls_back(
     b: SampleView,
     n: SampleView,
     own: u64,
+    failed: u64,
     latency_over: bool,
     p: PolicyView,
 )
     requires
         restarted(b, n),
     ensures
-        rolls_back(spec_judge(b, n, own, latency_over, p)),
+        rolls_back(spec_judge(b, n, own, failed, latency_over, p)),
 {
 }
 
@@ -166,14 +186,15 @@ proof fn lemma_too_few_errors_no_error_breach(
     b: SampleView,
     n: SampleView,
     own: u64,
+    failed: u64,
     latency_over: bool,
     p: PolicyView,
 )
     requires
         !restarted(b, n),
-        delta_errors(b, n) < p.min_errors,
+        delta_errors(b, n, failed) < p.min_errors,
     ensures
-        spec_judge(b, n, own, latency_over, p) != Verdict::ErrorRate,
+        spec_judge(b, n, own, failed, latency_over, p) != Verdict::ErrorRate,
 {
 }
 
@@ -183,6 +204,7 @@ proof fn lemma_error_breach_is_monotonic(
     n1: SampleView,
     n2: SampleView,
     own: u64,
+    failed: u64,
     latency_over: bool,
     p: PolicyView,
 )
@@ -191,14 +213,14 @@ proof fn lemma_error_breach_is_monotonic(
         n2.responses == n1.responses,
         n2.restarts == n1.restarts,
         n2.errors >= n1.errors,
-        spec_judge(b, n1, own, latency_over, p) == Verdict::ErrorRate,
+        spec_judge(b, n1, own, failed, latency_over, p) == Verdict::ErrorRate,
     ensures
-        spec_judge(b, n2, own, latency_over, p) == Verdict::ErrorRate,
+        spec_judge(b, n2, own, failed, latency_over, p) == Verdict::ErrorRate,
 {
-    assert(delta_errors(b, n2) * 1_000_000 >= delta_errors(b, n1) * 1_000_000)
+    assert(delta_errors(b, n2, failed) * 1_000_000 >= delta_errors(b, n1, failed) * 1_000_000)
         by (nonlinear_arith)
         requires
-            delta_errors(b, n2) >= delta_errors(b, n1),
+            delta_errors(b, n2, failed) >= delta_errors(b, n1, failed),
     ;
 }
 
@@ -207,15 +229,16 @@ proof fn lemma_pass_is_sound(
     b: SampleView,
     n: SampleView,
     own: u64,
+    failed: u64,
     latency_over: bool,
     p: PolicyView,
 )
     requires
-        spec_judge(b, n, own, latency_over, p) == Verdict::Pass,
+        spec_judge(b, n, own, failed, latency_over, p) == Verdict::Pass,
     ensures
         !restarted(b, n),
         window_responses(b, n, own) >= p.min_requests,
-        !error_breach(b, n, own, p),
+        !error_breach(b, n, own, failed, p),
         !latency_over,
 {
 }

@@ -86,6 +86,8 @@ pub(crate) struct BakePolicy {
     pub latency: Vec<LatencyGate>,
     /// Where the limits come from, for the operator.
     pub source: String,
+    /// Limits of the bake that the operator must know.
+    pub warnings: Vec<String>,
 }
 
 /// The p50, p95 and p99 latency of the app, in milliseconds.
@@ -190,16 +192,18 @@ pub(crate) const fn window_responses(baseline: &Sample, now: &Sample, own_reques
         .saturating_sub(own_requests)
 }
 
+/// The bake's own metric requests that a sample can count. They are not
+/// traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Own {
+    /// All the bake's requests since the baseline.
+    pub requests: u64,
+    /// The failed ones (a retried sample). A failed request can be a 5xx.
+    pub failed: u64,
+}
+
 /// Judge `now` against the bake `baseline`. The Verus model is `spec_judge`.
-///
-/// `own_requests` is the number of the bake's own metric requests that `now`
-/// can count. They are not traffic.
-pub(crate) fn judge(
-    baseline: &Sample,
-    now: &Sample,
-    own_requests: u64,
-    policy: &BakePolicy,
-) -> Verdict {
+pub(crate) fn judge(baseline: &Sample, now: &Sample, own: Own, policy: &BakePolicy) -> Verdict {
     let restarted = match (baseline.restarts, now.restarts) {
         (Some(before), Some(after)) => after != before,
         _ => false,
@@ -207,8 +211,10 @@ pub(crate) fn judge(
     if restarted || now.responses < baseline.responses || now.errors < baseline.errors {
         return Verdict::Breach(Breach::Restarted);
     }
-    let responses = window_responses(baseline, now, own_requests);
-    let errors = now.errors - baseline.errors;
+    let responses = window_responses(baseline, now, own.requests);
+    // A failed own request may be a 5xx. Leave it out; at worst this hides one
+    // app error for each retried sample, which only delays a rollback.
+    let errors = (now.errors - baseline.errors).saturating_sub(own.failed);
     if responses < policy.min_requests {
         return Verdict::TooFewRequests;
     }
@@ -380,6 +386,7 @@ pub(crate) fn run<E: DeployExecutor>(
     // attempt is already in the baseline counters, so only the successful
     // baseline request falls in the window.
     let mut own_requests = 1;
+    let mut own_failed = 0;
     let interval = policy.interval_secs.max(1);
     let mut elapsed = 0;
     let mut responses = 0;
@@ -391,14 +398,20 @@ pub(crate) fn run<E: DeployExecutor>(
             Ok(sample) => sample,
             Err(breach) => return BakeOutcome::Breached(breach),
         };
-        // A retried sample can count its own first attempt.
-        let own = own_requests + attempts - 1;
+        // A retried sample can count its own failed first attempt.
+        own_failed += attempts - 1;
+        let own = Own {
+            requests: own_requests + attempts - 1,
+            failed: own_failed,
+        };
         own_requests += attempts;
-        responses = window_responses(&baseline, &now, own);
+        responses = window_responses(&baseline, &now, own.requests);
         progress(&format!(
             "bake {elapsed}/{} s: {responses} responses, {} 5xx, p99 {} ms",
             policy.duration_secs,
-            now.errors.saturating_sub(baseline.errors),
+            now.errors
+                .saturating_sub(baseline.errors)
+                .saturating_sub(own.failed),
             now.latency.p99,
         ));
         match judge(&baseline, &now, own, policy) {
@@ -479,6 +492,7 @@ pub(crate) fn resolve_policy(
         DEFAULT_MAX_ERROR_PPM
     };
 
+    let mut warnings = Vec::new();
     let latency = if let Some(max_ms) = config.max_p99_ms {
         sources.push("[deploy.bake] max_p99_ms".to_owned());
         vec![LatencyGate {
@@ -496,8 +510,21 @@ pub(crate) fn resolve_policy(
             else {
                 continue;
             };
+            let (quantile, exact) = quantile_for(slo.budget_ppm());
+            if !exact {
+                warnings.push(format!(
+                    "SLO {}: at the {}x rollback burn rate, more than {}% of requests may be \
+                     slow. The bake reads p99 only, so it does not see a smaller slow share.",
+                    slo.name,
+                    format_decimal(u64::from(ROLLBACK_BURN_TENTHS), 1),
+                    percent(u128::from(autumn_web::slo::max_error_ppm(
+                        slo.budget_ppm(),
+                        ROLLBACK_BURN_TENTHS
+                    ))),
+                ));
+            }
             let gate = LatencyGate {
-                quantile: quantile_for(slo.objective_ppm),
+                quantile,
                 max_ms: threshold_ms,
             };
             match gates.iter_mut().find(|(g, _)| g.quantile == gate.quantile) {
@@ -520,19 +547,25 @@ pub(crate) fn resolve_policy(
         max_error_ppm,
         latency,
         source: sources.join(", "),
+        warnings,
     }))
 }
 
-/// The quantile that a latency objective maps to. `/actuator/metrics` has
-/// only p50, p95 and p99, so this takes the highest one at or below the
-/// objective.
-const fn quantile_for(objective_ppm: u32) -> Quantile {
-    if objective_ppm >= 990_000 {
-        Quantile::P99
-    } else if objective_ppm >= 950_000 {
-        Quantile::P95
+/// The quantile that gates a latency SLO with `budget_ppm`.
+///
+/// At the rollback burn rate (14.4×), a share `f` of requests may be slow.
+/// The gate is the quantile whose tail is the largest one at or below `f`, so
+/// the bake never misses a burn above 14.4×. `/actuator/metrics` has only
+/// p50, p95 and p99. When `f` is below 1 %, p99 is the best it has, and the
+/// second value is `false`: the bake cannot see the whole burn.
+fn quantile_for(budget_ppm: u32) -> (Quantile, bool) {
+    let slow_ppm = max_error_ppm(budget_ppm, ROLLBACK_BURN_TENTHS);
+    if slow_ppm >= 500_000 {
+        (Quantile::P50, true)
+    } else if slow_ppm >= 50_000 {
+        (Quantile::P95, true)
     } else {
-        Quantile::P50
+        (Quantile::P99, slow_ppm >= 10_000)
     }
 }
 
@@ -576,6 +609,14 @@ mod tests {
                 max_ms: 250,
             }],
             source: "test".to_owned(),
+            warnings: Vec::new(),
+        }
+    }
+
+    const fn own(requests: u64) -> Own {
+        Own {
+            requests,
+            failed: 0,
         }
     }
 
@@ -617,30 +658,30 @@ mod tests {
 
     #[test]
     fn judge_passes_healthy_traffic() {
-        let v = judge(&sample(100, 0, 0), &sample(200, 1, 100), 0, &policy());
+        let v = judge(&sample(100, 0, 0), &sample(200, 1, 100), own(0), &policy());
         assert_eq!(v, Verdict::Pass);
     }
 
     #[test]
     fn judge_waits_for_enough_traffic() {
         // 19 new responses, all 5xx: still no verdict.
-        let v = judge(&sample(100, 0, 0), &sample(119, 19, 900), 0, &policy());
+        let v = judge(&sample(100, 0, 0), &sample(119, 19, 900), own(0), &policy());
         assert_eq!(v, Verdict::TooFewRequests);
     }
 
     #[test]
     fn judge_does_not_count_its_own_requests() {
         // 25 new responses, but 6 are the bake's own metric requests.
-        let v = judge(&sample(0, 0, 0), &sample(25, 0, 0), 6, &policy());
+        let v = judge(&sample(0, 0, 0), &sample(25, 0, 0), own(6), &policy());
         assert_eq!(v, Verdict::TooFewRequests);
-        let v = judge(&sample(0, 0, 0), &sample(25, 0, 0), 5, &policy());
+        let v = judge(&sample(0, 0, 0), &sample(25, 0, 0), own(5), &policy());
         assert_eq!(v, Verdict::Pass);
     }
 
     #[test]
     fn judge_flags_an_error_spike() {
         // 10 % 5xx against a 1.44 % limit.
-        let v = judge(&sample(100, 0, 0), &sample(200, 10, 10), 0, &policy());
+        let v = judge(&sample(100, 0, 0), &sample(200, 10, 10), own(0), &policy());
         assert_eq!(
             v,
             Verdict::Breach(Breach::ErrorRate {
@@ -654,9 +695,9 @@ mod tests {
     #[test]
     fn one_error_alone_never_breaches() {
         // 1 of 20 is 5 %, above 1.44 %, but one bad request is not a trend.
-        let v = judge(&sample(0, 0, 0), &sample(20, 1, 0), 0, &policy());
+        let v = judge(&sample(0, 0, 0), &sample(20, 1, 0), own(0), &policy());
         assert_eq!(v, Verdict::Pass);
-        let v = judge(&sample(0, 0, 0), &sample(20, 2, 0), 0, &policy());
+        let v = judge(&sample(0, 0, 0), &sample(20, 2, 0), own(0), &policy());
         assert!(
             matches!(v, Verdict::Breach(Breach::ErrorRate { .. })),
             "{v:?}"
@@ -668,18 +709,18 @@ mod tests {
         let mut p = policy();
         p.max_error_ppm = 20_000; // 2 %
         assert_eq!(
-            judge(&sample(0, 0, 0), &sample(100, 2, 0), 0, &p),
+            judge(&sample(0, 0, 0), &sample(100, 2, 0), own(0), &p),
             Verdict::Pass
         );
         assert!(matches!(
-            judge(&sample(0, 0, 0), &sample(99, 2, 0), 0, &p),
+            judge(&sample(0, 0, 0), &sample(99, 2, 0), own(0), &p),
             Verdict::Breach(Breach::ErrorRate { .. })
         ));
     }
 
     #[test]
     fn judge_flags_slow_latency_on_each_gate() {
-        let v = judge(&sample(0, 0, 0), &sample(100, 0, 251), 0, &policy());
+        let v = judge(&sample(0, 0, 0), &sample(100, 0, 251), own(0), &policy());
         assert_eq!(
             v,
             Verdict::Breach(Breach::Latency {
@@ -697,7 +738,7 @@ mod tests {
             },
         );
         assert_eq!(
-            judge(&sample(0, 0, 0), &sample(100, 0, 1), 0, &p),
+            judge(&sample(0, 0, 0), &sample(100, 0, 1), own(0), &p),
             Verdict::Breach(Breach::Latency {
                 quantile: Quantile::P50,
                 ms: 1,
@@ -706,35 +747,35 @@ mod tests {
         );
         p.latency.clear();
         assert_eq!(
-            judge(&sample(0, 0, 0), &sample(100, 0, 9_999), 0, &p),
+            judge(&sample(0, 0, 0), &sample(100, 0, 9_999), own(0), &p),
             Verdict::Pass
         );
     }
 
     #[test]
     fn judge_flags_a_restart() {
-        let v = judge(&sample(500, 3, 0), &sample(10, 0, 0), 0, &policy());
+        let v = judge(&sample(500, 3, 0), &sample(10, 0, 0), own(0), &policy());
         assert_eq!(v, Verdict::Breach(Breach::Restarted));
-        let v = judge(&sample(500, 3, 0), &sample(600, 2, 0), 0, &policy());
+        let v = judge(&sample(500, 3, 0), &sample(600, 2, 0), own(0), &policy());
         assert_eq!(v, Verdict::Breach(Breach::Restarted));
         // systemd restarted the unit, and the counters grew again.
         let mut after = sample(900, 3, 0);
         after.restarts = Some(1);
         assert_eq!(
-            judge(&sample(500, 3, 0), &after, 0, &policy()),
+            judge(&sample(500, 3, 0), &after, own(0), &policy()),
             Verdict::Breach(Breach::Restarted)
         );
         // An unknown restart count is not a restart.
         after.restarts = None;
         assert_eq!(
-            judge(&sample(500, 3, 0), &after, 0, &policy()),
+            judge(&sample(500, 3, 0), &after, own(0), &policy()),
             Verdict::Pass
         );
     }
 
     #[test]
     fn judge_checks_errors_before_latency() {
-        let v = judge(&sample(0, 0, 0), &sample(100, 50, 9_999), 0, &policy());
+        let v = judge(&sample(0, 0, 0), &sample(100, 50, 9_999), own(0), &policy());
         assert!(
             matches!(v, Verdict::Breach(Breach::ErrorRate { .. })),
             "{v:?}"
@@ -746,7 +787,7 @@ mod tests {
         let mut p = policy();
         p.max_error_ppm = PPM;
         p.latency.clear();
-        let v = judge(&sample(0, 0, 0), &sample(u64::MAX, u64::MAX, 0), 0, &p);
+        let v = judge(&sample(0, 0, 0), &sample(u64::MAX, u64::MAX, 0), own(0), &p);
         assert_eq!(v, Verdict::Pass);
     }
 
@@ -759,6 +800,7 @@ mod tests {
             base: Sample,
             now: Sample,
             own: u64,
+            failed: u64,
             latency_over: bool,
             policy: &BakePolicy,
         ) -> &'static str {
@@ -768,7 +810,7 @@ mod tests {
             }
             let dr =
                 (i128::from(now.responses) - i128::from(base.responses) - i128::from(own)).max(0);
-            let de = i128::from(now.errors) - i128::from(base.errors);
+            let de = (i128::from(now.errors) - i128::from(base.errors) - i128::from(failed)).max(0);
             if dr < i128::from(policy.min_requests) {
                 return "few";
             }
@@ -799,7 +841,7 @@ mod tests {
             fn judge_matches_the_verus_model(
                 b_r in 0u64..10_000, b_e in 0u64..100,
                 n_r in 0u64..20_000, n_e in 0u64..2_000,
-                own in 0u64..50, lat in 0u64..1_000, max_ppm in 0u32..=PPM,
+                own in 0u64..50, failed in 0u64..5, lat in 0u64..1_000, max_ppm in 0u32..=PPM,
                 min in 0u64..200, gate in proptest::option::of(0u64..1_000),
                 b_restarts in proptest::option::of(0u64..3),
                 n_restarts in proptest::option::of(0u64..3),
@@ -818,7 +860,11 @@ mod tests {
                 let mut n = sample(n_r, n_e, lat);
                 n.restarts = n_restarts;
                 let latency_over = gate.is_some_and(|max| lat > max);
-                prop_assert_eq!(name(&judge(&b, &n, own, &p)), model(b, n, own, latency_over, &p));
+                let mine = Own { requests: own, failed };
+                prop_assert_eq!(
+                    name(&judge(&b, &n, mine, &p)),
+                    model(b, n, own, failed, latency_over, &p)
+                );
             }
         }
     }
@@ -1072,6 +1118,25 @@ mod tests {
     }
 
     #[test]
+    fn a_retried_sample_does_not_count_its_failed_request_as_an_app_error() {
+        let mut p = policy();
+        p.duration_secs = 20;
+        // Each sample's first attempt fails with a 5xx from /actuator/metrics.
+        // The app counts that 5xx, so the retry sees one more error each time.
+        let exec = RecordingExecutor::new()
+            .with_stdout_on_occurrence(SAMPLE_LABEL, 1, sample_stdout(0, 0, 1, 0))
+            .failing_on_occurrence(SAMPLE_LABEL, 2)
+            .with_stdout_on_occurrence(SAMPLE_LABEL, 3, sample_stdout(100, 1, 1, 0))
+            .failing_on_occurrence(SAMPLE_LABEL, 4)
+            .with_stdout_on_occurrence(SAMPLE_LABEL, 5, sample_stdout(200, 2, 1, 0));
+        let outcome = run(&p, &TARGET, &exec, &mut |_| {});
+        assert!(
+            matches!(outcome, BakeOutcome::Passed { judged: true, .. }),
+            "the bake's own failed requests are not app errors: {outcome:?}"
+        );
+    }
+
+    #[test]
     fn two_failed_samples_in_a_row_breach() {
         let exec = RecordingExecutor::new()
             .with_stdout_on_occurrence(SAMPLE_LABEL, 1, sample_stdout(0, 0, 1, 0))
@@ -1190,9 +1255,9 @@ mod tests {
     #[test]
     fn latency_slos_set_one_gate_per_quantile() {
         let slos = [
-            slo("slow", 99.0, SliKind::Latency, None, Some(500)),
-            slo("slower", 99.5, SliKind::Latency, None, Some(1_000)),
-            slo("fast", 95.0, SliKind::Latency, None, Some(100)),
+            slo("slow", 99.9, SliKind::Latency, None, Some(500)),
+            slo("slower", 99.95, SliKind::Latency, None, Some(1_000)),
+            slo("fast", 99.0, SliKind::Latency, None, Some(100)),
             slo("route", 99.9, SliKind::Latency, Some("/x"), Some(5)),
         ];
         let p = resolve_policy(&on(60), &slos, None)
@@ -1212,15 +1277,19 @@ mod tests {
             ]
         );
         assert!(p.source.contains("SLO fast, SLO slow"), "{}", p.source);
+        // 99.95 % allows 0.72 % slow requests at 14.4x: below what p99 sees.
+        assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
+        assert!(p.warnings[0].starts_with("SLO slower:"), "{:?}", p.warnings);
     }
 
     #[test]
-    fn the_quantile_follows_the_objective() {
+    fn the_quantile_follows_the_rollback_burn() {
+        // The share of slow requests at 14.4x: 1.44 %, 14.4 %, 28.8 %, 72 %, 100 %.
         for (objective, quantile) in [
             (99.9, Quantile::P99),
-            (99.0, Quantile::P99),
+            (99.0, Quantile::P95),
             (98.0, Quantile::P95),
-            (95.0, Quantile::P95),
+            (95.0, Quantile::P50),
             (90.0, Quantile::P50),
         ] {
             let p = resolve_policy(
@@ -1231,7 +1300,18 @@ mod tests {
             .expect("ok")
             .expect("on");
             assert_eq!(p.latency[0].quantile, quantile, "{objective}");
+            assert!(p.warnings.is_empty(), "{objective}: {:?}", p.warnings);
         }
+        // 99.99 %: 0.144 % slow at 14.4x, which p99 cannot see.
+        let p = resolve_policy(
+            &on(60),
+            &[slo("l", 99.99, SliKind::Latency, None, Some(250))],
+            None,
+        )
+        .expect("ok")
+        .expect("on");
+        assert_eq!(p.latency[0].quantile, Quantile::P99);
+        assert!(p.warnings[0].contains("0.144%"), "{:?}", p.warnings);
     }
 
     #[test]

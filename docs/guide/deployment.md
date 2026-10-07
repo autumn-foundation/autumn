@@ -976,7 +976,8 @@ How it works:
    `[security.trusted_hosts]` entry as the `Host` header, because the `prod`
    profile rejects `127.0.0.1`.
 2. The first sample is the baseline. Each later sample counts the responses
-   since the baseline. The bake does not count its own metric requests.
+   since the baseline. The bake does not count its own metric requests, and
+   it does not count a failed one as a 5xx.
 3. Each sample also reads the systemd restart count of the slot unit.
 4. The bake fails when one of these occurs:
    - The 5xx ratio is above the limit, with at least 2 new 5xx responses.

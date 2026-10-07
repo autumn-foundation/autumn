@@ -242,9 +242,12 @@ The limits:
 - **5xx ratio.** `max_error_rate` when you set it. Otherwise the 14.4× burn
   rate of the strictest all-routes availability SLO. Otherwise 5 %.
 - **Latency.** `max_p99_ms` when you set it. Otherwise one limit for each
-  all-routes latency SLO, on the p99, p95 or p50 that matches its objective.
-  When two SLOs map to one quantile, the smaller limit wins. Otherwise no
-  latency check.
+  all-routes latency SLO. At the 14.4× burn rate, a share of requests may be
+  slow: 1.44 % for 99.9 %. The bake checks the p99, p95 or p50 whose tail is
+  the largest one at or below that share, so it does not miss a faster burn.
+  Below 1 % (an objective above 99.93 %), p99 is the best it has, and
+  `autumn deploy up` prints a warning. When two SLOs map to one quantile, the
+  smaller limit wins. Otherwise no latency check.
 
 The bake rolls the host back when the 5xx ratio or the latency is above the
 limit, when the process restarts, or when `/actuator/metrics` does not answer
