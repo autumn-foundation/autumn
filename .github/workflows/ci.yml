@@ -156,7 +156,10 @@ jobs:
         # globally, so one such edge swaps `db::RuntimeConnection` for every
         # consumer in the graph. Until this gate, that invariant was prose plus
         # the `sqlite`-excluding feature lists below, and nothing read the
-        # manifests. No toolchain, ~1 second, self-testing.
+        # manifests. ~2 seconds, self-testing. The resolver layer asks
+        # `cargo metadata` what cargo resolves, so it is required here.
+        env:
+          SQLITE_GATE_REQUIRE_RESOLVE: "1"
         run: ./scripts/check-sqlite-unification.sh
       - name: Example binary-name collision gate
         # Two workspace members producing the same binary file name break the

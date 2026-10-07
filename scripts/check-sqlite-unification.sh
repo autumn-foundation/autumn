@@ -51,7 +51,13 @@
 # `features = ["""sqlite"""]` still reads as "sqlite" (issue #2571). It also
 # accepts the whitespace TOML allows in headers and dotted keys.
 #
-# It is a manifest gate, not a build: no toolchain, ~1 second, self-testing.
+# It is a manifest gate, not a build: ~2 seconds, self-testing. Two layers:
+#   - The SCAN reads every manifest with the awk lexer below. It needs no
+#     toolchain and also covers crates outside the workspace.
+#   - The RESOLVER asks `cargo metadata` which features cargo resolves for the
+#     workspace. Cargo parses the TOML, so no spelling can slip past it. It
+#     needs cargo and jq; without them it is skipped, unless
+#     SQLITE_GATE_REQUIRE_RESOLVE=1 (CI sets it).
 #
 # Deliberately scans EVERY `Cargo.toml` under the root, including crates the
 # root workspace excludes (fuzz targets, benchmark harnesses, `src-tauri`).
@@ -576,6 +582,23 @@ gate_check() {
   return 0
 }
 
+# The authoritative check: ask cargo which features it resolves. Prints one
+# line per flip crate that resolves with `sqlite` on; returns 2 if cargo or jq
+# cannot run. The scan above reads TOML by hand and can miss a spelling that
+# cargo accepts. The resolver cannot. It covers workspace members only, so
+# the scan stays for the crates outside the workspace.
+resolve_check() {
+  local root="$1" meta
+  command -v cargo >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 2
+  meta="$(cd "$root" && cargo metadata --format-version 1 2>/dev/null)" || return 2
+  jq -r --arg flip "$FLIP_CRATES" '
+    (.packages | map({key: .id, value: .name}) | from_entries) as $name
+    | .resolve.nodes[]
+    | select(($name[.id] | test("^(" + $flip + ")$")) and (.features | index("sqlite")))
+    | "\($name[.id]) resolves with the `sqlite` feature on"
+  ' <<<"$meta" || return 2
+}
+
 run_real_check() {
   local root status=0
   root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -602,6 +625,21 @@ explicit invocation instead:
 
 See the \`sqlite = [...]\` comment in autumn/Cargo.toml." ;;
   esac
+
+  echo "==> asking cargo which features it resolves"
+  local findings rstatus=0
+  findings="$(resolve_check "$root")" || rstatus=$?
+  if (( rstatus != 0 )); then
+    [[ "${SQLITE_GATE_REQUIRE_RESOLVE-}" == 1 ]] &&
+      die "the resolver check could not run (cargo metadata or jq failed)"
+    echo "note: cargo or jq not available; resolver check skipped"
+  elif [[ -n "$findings" ]]; then
+    printf '%s\n' "$findings"
+    die "cargo resolves the \`sqlite\` backend flip for the workspace. Find the
+edge with: cargo tree -e features -i autumn-web"
+  else
+    echo "OK: cargo resolves no flip crate with \`sqlite\` on."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1131,6 +1169,43 @@ EOF
     pass+=1
   else
     echo "  FAIL: an empty tree must not report OK (status $status)"
+  fi
+
+  # The resolver layer, on a tiny path-only workspace. It needs cargo and jq;
+  # without them the cases are skipped, unless the caller requires them.
+  if command -v cargo >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    make_resolve_case() {
+      local dir="$tmp/$1" edge="$2"
+      mkdir -p "$dir/web/src" "$dir/consumer/src"
+      : >"$dir/web/src/lib.rs"
+      : >"$dir/consumer/src/lib.rs"
+      printf '[workspace]\nmembers = ["web", "consumer"]\nresolver = "2"\n' >"$dir/Cargo.toml"
+      printf '[package]\nname = "autumn-web"\nversion = "0.0.0"\nedition = "2021"\n\n[features]\nsqlite = []\n' \
+        >"$dir/web/Cargo.toml"
+      printf '[package]\nname = "consumer"\nversion = "0.0.0"\nedition = "2021"\n\n[dependencies]\n%s\n' \
+        "$edge" >"$dir/consumer/Cargo.toml"
+    }
+    # A spelling the scan does not read; cargo does.
+    make_resolve_case resolve_fail '"autumn\u002dweb" = { path = "../web", features = ["sqlite"] }'
+    total+=1
+    if [[ -n "$(resolve_check "$tmp/resolve_fail" 2>/dev/null)" ]]; then
+      pass+=1
+    else
+      echo "  FAIL: resolver layer — a resolved \`sqlite\` feature not caught"
+    fi
+    make_resolve_case resolve_pass 'autumn-web = { path = "../web" }'
+    total+=1
+    local out rstatus=0
+    out="$(resolve_check "$tmp/resolve_pass" 2>/dev/null)" || rstatus=$?
+    if [[ -z "$out" && "$rstatus" == 0 ]]; then
+      pass+=1
+    else
+      echo "  FAIL: resolver layer — a clean workspace rejected (status $rstatus)"
+    fi
+  elif [[ "${SQLITE_GATE_REQUIRE_RESOLVE-}" == 1 ]]; then
+    die "the resolver layer needs cargo and jq, and SQLITE_GATE_REQUIRE_RESOLVE=1"
+  else
+    echo "  note: cargo or jq not found; resolver self-test skipped"
   fi
 
   echo "self-test: $pass/$total passed"
