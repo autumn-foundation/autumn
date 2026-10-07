@@ -138,11 +138,15 @@ impl<L: Listener> IncomingStream<'_, L> {
 /// After `signal`, the loop stops accepting, asks every connection to shut
 /// down gracefully, and returns when all connections have closed.
 ///
+/// With `max_connections` set and a `tls::TlsListener` (the `tls` feature),
+/// a connection counts from TCP accept, so the cap also covers TLS
+/// handshakes in flight.
+///
 /// # Errors
 ///
 /// Never returns an error today. The `io::Result` matches `axum::serve`.
 pub async fn serve<L, M, S, F>(
-    listener: L,
+    mut listener: L,
     make_service: M,
     limits: HttpLimits,
     signal: F,
@@ -164,7 +168,24 @@ where
     S::Future: Send,
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    serve_with_handoff(listener, make_service, limits, None, signal).await
+    let handoff = tls_handoff(&mut listener, &limits);
+    serve_with_handoff(listener, make_service, limits, handoff, signal).await
+}
+
+/// A `tls::TlsListener` takes the `max_connections` slots before TCP
+/// accept, as `App::run` sets it up, so a connection counts during its
+/// handshake too. Other listeners leave the slots to the serve loop.
+#[cfg(feature = "tls")]
+fn tls_handoff<L: Listener>(listener: &mut L, limits: &HttpLimits) -> Option<SlotHandoff> {
+    let max = limits.max_connections?;
+    (listener as &mut dyn std::any::Any)
+        .downcast_mut::<crate::tls::TlsListener>()?
+        .limit_connections(max)
+}
+
+#[cfg(not(feature = "tls"))]
+const fn tls_handoff<L>(_listener: &mut L, _limits: &HttpLimits) -> Option<SlotHandoff> {
+    None
 }
 
 /// Where a listener that accepts in the background (TLS) puts the

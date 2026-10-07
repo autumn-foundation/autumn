@@ -1678,6 +1678,49 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         shutdown.cancel();
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_public_serve_caps_tls_connections_before_the_handshake() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = write_temp(dir.path(), "c.pem", CERT_PEM);
+        let key = write_temp(dir.path(), "k.pem", KEY_PEM);
+        let provider = crypto_provider();
+        let certified = load_certified_key(&cert, &key, &provider, now()).unwrap();
+        let config =
+            build_server_config(provider, Arc::new(ReloadableCertResolver::new(certified)))
+                .unwrap();
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let listener = TlsListener::new(
+            tcp,
+            config,
+            std::time::Duration::from_secs(30),
+            shutdown.clone(),
+        );
+        let handshakes = Arc::clone(&listener.handshakes);
+        let limits = crate::http_server::HttpLimits {
+            max_connections: Some(1),
+            ..crate::http_server::HttpLimits::default()
+        };
+        let signal = shutdown.clone();
+        tokio::spawn(crate::http_server::serve(
+            listener,
+            axum::Router::new().into_make_service(),
+            limits,
+            async move { signal.cancelled().await },
+        ));
+        // Two clients that never send a ClientHello.
+        let _first = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _second = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            MAX_CONCURRENT_HANDSHAKES - handshakes.available_permits(),
+            1,
+            "with max_connections = 1, the public serve must not start a second handshake"
+        );
+        shutdown.cancel();
+    }
+
     #[tokio::test]
     async fn the_connection_cap_applies_before_the_tls_handshake() {
         let dir = tempfile::tempdir().unwrap();
