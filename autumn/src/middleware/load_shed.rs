@@ -304,8 +304,8 @@ where
         }
         if req.extensions().get::<LoadShedExempt>().is_some() {
             // An outer admission (the `/mcp` envelope) already counted this
-            // request, as `default`. Check the class of the route it reaches
-            // now. The in-flight count includes this request's own slot, so a
+            // request, as `critical`, before it knew the route. Check the
+            // class of the route it reaches now. The in-flight count includes this request's own slot, so a
             // fresh request would pass only if `in_flight <= threshold`.
             if let Some(&criticality) = req.extensions().get::<Criticality>()
                 && self.layer.in_flight.load(Ordering::Acquire)

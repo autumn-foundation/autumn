@@ -966,7 +966,13 @@ fn build_router_pre_state(
             // a second, independently-counting layer — see that call site's
             // comment. `None` (the default) is a no-op, matching direct routes.
             if let Some(load_shed) = mcp_load_shed_layer {
-                mcp_router = mcp_router.layer(load_shed);
+                // The envelope does not know the tool yet, so it admits as
+                // `critical` (up to the full limit). The `tools/call` replay
+                // then checks the tool route's own class (#3068), so a
+                // `default` or `sheddable` tool is still shed at its share.
+                mcp_router = mcp_router
+                    .layer(load_shed)
+                    .layer(axum::Extension(crate::admission::Criticality::Critical));
             }
             // Stamp `ResolvedClientIdentity` on the *outer* `/mcp` request too. The
             // MCP route is merged after `apply_middleware`, so the centralized

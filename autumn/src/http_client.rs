@@ -2114,18 +2114,7 @@ impl RequestBuilder {
         // its doc comment).
         if self.needs_custom_path() {
             if self.breaker_scoped {
-                // Like the breaker, the throttle keeps per-host state, so it
-                // covers only `breaker_scoped` custom calls: a small, durable
-                // host set. Unscoped custom calls go to user-supplied URLs,
-                // and one entry per host would grow without bound. The
-                // custom path retries inside `send_one`, so the throttle
-                // counts the call once, not each attempt.
-                let ticket = self.throttle_attempt(None)?;
-                let res = self.send_custom_breaker_guarded().await;
-                if let Some(ticket) = ticket {
-                    ticket.record(matches!(&res, Ok(r) if throttle_accepts(r.status.as_u16())));
-                }
-                return res;
+                return self.send_custom_breaker_guarded().await;
             }
             return self.send_custom(false).await;
         }
@@ -2172,6 +2161,20 @@ impl RequestBuilder {
         let Ok(guard) = breaker.admit() else {
             return Err(ClientError::CircuitBreakerOpen);
         };
+        // Like the breaker, the throttle keeps per-host state, so on the
+        // custom path it covers only `breaker_scoped` calls: a small, durable
+        // host set. Unscoped custom calls go to user-supplied URLs, and one
+        // entry per host would grow without bound. The ticket is taken after
+        // the breaker admits, so a fail-fast `CircuitBreakerOpen` call never
+        // reaches the throttle. `send_one` retries inside, so the throttle
+        // counts the call once. A local reject leaves the breaker neutral.
+        let ticket = match self.throttle_attempt(None) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                drop(guard);
+                return Err(error);
+            }
+        };
         // Mirrors the
         // plain-path breaker block's own `is_half_open` (passed to
         // `send_inner` to force a single attempt): a half-open probe is a
@@ -2182,6 +2185,9 @@ impl RequestBuilder {
         // review, round 10).
         let is_half_open = breaker.state() == crate::circuit_breaker::CircuitState::HalfOpen;
         let res = self.send_custom(is_half_open).await;
+        if let Some(ticket) = ticket {
+            ticket.record(matches!(&res, Ok(r) if throttle_accepts(r.status.as_u16())));
+        }
         match &res {
             Ok(resp) if resp.status().as_u16() < 500 => guard.success(),
             _ => guard.failure(),
@@ -4212,6 +4218,62 @@ mod tests {
         let res = client.post(url).ssrf_safe().breaker_scoped().send().await;
         assert!(matches!(res, Err(ClientError::CircuitBreakerOpen)));
 
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    /// Regression (#3183 review): a fail-fast `CircuitBreakerOpen` call on
+    /// the breaker-scoped custom path never reaches the host, so the
+    /// throttle must not count it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn open_breaker_calls_are_not_charged_to_the_throttle() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        let mut rc = crate::config::ResilienceConfig::default();
+        rc.circuit_breaker.defaults.failure_ratio_threshold = Some(0.5);
+        rc.circuit_breaker.defaults.minimum_sample_count = Some(3);
+        rc.circuit_breaker.defaults.open_duration_secs = Some(10);
+        let rc = Arc::new(rc);
+        let url = "http://127.0.0.1:1/blocked";
+
+        // Trip the breaker with a client that has no throttle.
+        let plain = Client {
+            resilience_config: Some(Arc::clone(&rc)),
+            ..Client::new()
+        };
+        for _ in 0..3 {
+            let _ = plain.post(url).ssrf_safe().breaker_scoped().send().await;
+        }
+
+        let throttle = Arc::new(crate::admission::AdaptiveThrottle::new(
+            2.0,
+            Duration::from_secs(120),
+        ));
+        let throttled = Client {
+            resilience_config: Some(rc),
+            throttle: Some(Arc::clone(&throttle)),
+            ..Client::new()
+        };
+        for _ in 0..50 {
+            let res = throttled
+                .post(url)
+                .ssrf_safe()
+                .breaker_scoped()
+                .send()
+                .await;
+            assert!(
+                matches!(res, Err(ClientError::CircuitBreakerOpen)),
+                "an open breaker fails fast, not through the throttle: {res:?}"
+            );
+        }
+        assert!(
+            throttle.reject_probability("127.0.0.1:1", crate::time::ambient_instant())
+                < f64::EPSILON,
+            "fail-fast calls must not be counted"
+        );
         crate::circuit_breaker::global_registry().clear();
     }
 
