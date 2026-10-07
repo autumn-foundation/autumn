@@ -3521,12 +3521,13 @@ async fn send_one(
         )
     };
 
-    // `true` when a wait of `wait` reaches the hop deadline, so no retry
-    // can start after it.
+    // `true` when a wait of `wait` leaves less than `MIN_ATTEMPT` before the
+    // hop deadline, so no retry can run after it. `RetryGate::allow` keeps
+    // the same margin before the request deadline.
     let reaches_hop_deadline = |wait: Duration| {
         deadline.is_some_and(|d| {
             crate::time::ambient_instant()
-                .checked_add(wait)
+                .checked_add(wait.saturating_add(MIN_ATTEMPT))
                 .is_none_or(|resume| resume >= d)
         })
     };
@@ -6968,6 +6969,36 @@ mod tests {
                 (full - available).abs() < f64::EPSILON,
                 "no tokens for a retry that cannot run: {available}"
             );
+        }
+
+        #[tokio::test]
+        async fn a_retry_needs_a_minimum_attempt_before_the_hop_deadline() {
+            let (url, hits) = counting(Some(502), &[]).await;
+            let gate = RetryGate::with_deadline(None, None, None, true);
+            // The 100 ms backoff ends before the hop deadline, but leaves less
+            // than `MIN_ATTEMPT` for the retry.
+            let result = send_one(
+                &reqwest::Client::new(),
+                &Method::GET,
+                &url,
+                &HeaderMap::new(),
+                None,
+                &RetryPolicy::default(),
+                &FixedDraw(100),
+                false,
+                Some(crate::time::ambient_instant() + Duration::from_millis(105)),
+                false,
+                &gate,
+                false,
+                None,
+            )
+            .await;
+            assert_eq!(
+                result.map(|response| response.status().as_u16()).ok(),
+                Some(502),
+                "the response, not a retry that cannot run"
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
         }
 
         #[tokio::test]
