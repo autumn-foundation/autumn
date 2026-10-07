@@ -2514,7 +2514,7 @@ impl AppBuilder {
     /// use std::time::Duration;
     /// use autumn_web::feature_flags::pg::PgFlagStore;
     ///
-    /// // `None` when the primary target is not Postgres.
+    /// // `None` when no primary target is set, or it is not Postgres.
     /// let store = Arc::new(
     ///     PgFlagStore::from_database_config(&config.database).expect("a Postgres target"),
     /// );
@@ -2620,7 +2620,7 @@ impl AppBuilder {
     /// use std::time::Duration;
     /// use autumn_web::experiments::pg::PgExperimentStore;
     ///
-    /// // `None` when the primary target is not Postgres.
+    /// // `None` when no primary target is set, or it is not Postgres.
     /// let store = Arc::new(
     ///     PgExperimentStore::from_database_config(&config.database).expect("a Postgres target"),
     /// );

@@ -633,7 +633,10 @@ pub mod pg {
                 .map_err(FlagStoreError::Backend)?;
             // libpq quotes the target in its error, so redact it.
             let mut conn = diesel::PgConnection::establish(&self.connect_url).map_err(|e| {
-                FlagStoreError::Backend(crate::db_url::redact_targets_in_message(&e.to_string()))
+                FlagStoreError::Backend(crate::db_url::redact_driver_error(
+                    &e.to_string(),
+                    &self.database_url,
+                ))
             })?;
             conn.batch_execute(&format!("SET statement_timeout = {STATEMENT_TIMEOUT_MS}"))
                 .map_err(|e| FlagStoreError::Backend(e.to_string()))?;
@@ -2932,5 +2935,10 @@ mod tests {
             .expect_err("a malformed target fails")
             .to_string();
         assert!(!err.contains("hunter2"), "the driver error leaks: {err}");
+
+        // libpq can quote only the decoded password.
+        let store = pg::PgFlagStore::new("postgres://app:p%ss@localhost:1/db");
+        let err = store.refresh().expect_err("a bad escape fails").to_string();
+        assert!(!err.contains("p%ss"), "the driver error leaks: {err}");
     }
 }

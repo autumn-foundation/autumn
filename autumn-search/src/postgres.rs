@@ -598,6 +598,7 @@ impl PostgresSearchStore {
     }
 
     fn pool(&self) -> SearchResult<&RuntimePool> {
+        require_postgres_runtime()?;
         self.pool.get().ok_or_else(|| {
             SearchError::Backend(
                 "the search store has no database pool; is `database.primary_url` configured?"
@@ -1079,11 +1080,35 @@ fn bind_all(mut query: BoxedQuery<'_>, binds: impl IntoIterator<Item = Bound>) -
     query
 }
 
+/// Refuse every use of this store on a `SQLite` build of autumn-web.
+///
+/// The store sends Postgres SQL. An app can build it and install a `SQLite`
+/// pool without the plugin, so the check sits on the pool accessor too
+/// (#2539 §5).
+#[allow(
+    clippy::unnecessary_wraps,
+    clippy::missing_const_for_fn,
+    reason = "the SQLite arm of `backend_select!` returns an error"
+)]
+fn require_postgres_runtime() -> SearchResult<()> {
+    autumn_web::backend_select! {
+        pg => { Ok(()) },
+        sqlite => {
+            Err(SearchError::Backend(
+                "PostgresSearchStore needs the Postgres backend, but this build of autumn-web \
+                 uses SQLite (`--features sqlite`)"
+                    .to_owned(),
+            ))
+        },
+    }
+}
+
 /// Bind an id list as a Postgres `BIGINT[]`.
 ///
-/// `SQLite` has no array type. The plugin refuses this store at boot on a
-/// `SQLite` build, so that arm does not run. It binds the ids as JSON text to
-/// keep the bind count correct and the crate free of panics.
+/// `SQLite` has no array type. The store refuses every query on a `SQLite`
+/// build ([`require_postgres_runtime`]), so that arm does not run. It binds
+/// the ids as JSON text to keep the bind count correct and the crate free of
+/// panics.
 fn bind_ids(query: BoxedQuery<'_>, values: Vec<i64>) -> BoxedQuery<'_> {
     autumn_web::backend_select! {
         pg => { query.bind::<diesel::sql_types::Array<BigInt>, _>(values) },
@@ -2016,6 +2041,22 @@ mod tests {
         SearchIndexField::new("body", 'B'),
     ];
 
+    // An app can use the store without the plugin. On a SQLite build, every
+    // query is refused before it reaches the pool (#2539 §5).
+    #[test]
+    fn the_store_needs_the_postgres_backend() {
+        let result = require_postgres_runtime();
+        autumn_web::backend_select! {
+            pg => {
+                assert!(result.is_ok(), "{result:?}");
+            },
+            sqlite => {
+                let message = result.expect_err("refused on SQLite").to_string();
+                assert!(message.contains("SQLite"), "{message}");
+            },
+        }
+    }
+
     fn definition() -> IndexDefinition {
         IndexDefinition::new("articles", "english", FIELDS, Some("body"), false)
     }
@@ -2731,10 +2772,12 @@ mod tests {
         let Err(error) = store.pool() else {
             panic!("a store with no installed pool must not report one");
         };
-        assert!(
-            error.to_string().contains("database.primary_url"),
-            "{error}"
-        );
+        // On SQLite, the backend refusal comes first (#2539 §5).
+        let expected = autumn_web::backend_select! {
+            pg => { "database.primary_url" },
+            sqlite => { "SQLite" },
+        };
+        assert!(error.to_string().contains(expected), "{error}");
         assert!(store.vector_mode().is_none());
     }
 

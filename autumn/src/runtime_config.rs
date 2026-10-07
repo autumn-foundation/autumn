@@ -1120,8 +1120,12 @@ pub mod pg {
             crate::db_url::require_postgres_target(&self.database_url, "PgConfigStore")
                 .map_err(ConfigStoreError::Backend)?;
             // libpq quotes the target in its error, so redact it.
-            diesel::PgConnection::establish(&self.database_url)
-                .map_err(|e| store_error(crate::db_url::redact_targets_in_message(&e.to_string())))
+            diesel::PgConnection::establish(&self.database_url).map_err(|e| {
+                store_error(crate::db_url::redact_driver_error(
+                    &e.to_string(),
+                    &self.database_url,
+                ))
+            })
         }
 
         fn cached_raw(&self, key: &str) -> CachedRawLookup {
@@ -2687,5 +2691,13 @@ mod tests {
             .expect_err("a malformed target fails")
             .to_string();
         assert!(!err.contains("hunter2"), "the driver error leaks: {err}");
+
+        // libpq can quote only the decoded password.
+        let store = pg::PgConfigStore::new("postgres://app:p%ss@localhost:1/db");
+        let err = store
+            .get_raw("key")
+            .expect_err("a bad escape fails")
+            .to_string();
+        assert!(!err.contains("p%ss"), "the driver error leaks: {err}");
     }
 }

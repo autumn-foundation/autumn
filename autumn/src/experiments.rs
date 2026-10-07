@@ -1681,8 +1681,9 @@ pub mod pg {
                 .map_err(ExperimentStoreError::Backend)?;
             // libpq quotes the target in its error, so redact it.
             diesel::PgConnection::establish(&self.database_url).map_err(|e| {
-                ExperimentStoreError::Backend(crate::db_url::redact_targets_in_message(
+                ExperimentStoreError::Backend(crate::db_url::redact_driver_error(
                     &e.to_string(),
+                    &self.database_url,
                 ))
             })
         }
@@ -3039,5 +3040,13 @@ mod tests {
             .expect_err("a malformed target fails")
             .to_string();
         assert!(!err.contains("hunter2"), "the driver error leaks: {err}");
+
+        // libpq can quote only the decoded password.
+        let store = pg::PgExperimentStore::new("postgres://app:p%ss@localhost:1/db");
+        let err = store
+            .get("exp")
+            .expect_err("a bad escape fails")
+            .to_string();
+        assert!(!err.contains("p%ss"), "the driver error leaks: {err}");
     }
 }

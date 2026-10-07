@@ -390,12 +390,16 @@ pub fn backfill_request_from_env(
     ))
 }
 
-/// Parse [`BACKFILL_ENV`]. `None` means "no backfill requested".
 /// Refuse [`SearchPlugin::postgres`] on a `SQLite` build of autumn-web.
 ///
 /// The Postgres store runs `tsvector`, `pgvector` and advisory-lock SQL, and
 /// the runtime pool is `SQLite` under the flip. Boot stops here with a clear
 /// message, not at the first index write (#2539 §5).
+#[allow(
+    clippy::unnecessary_wraps,
+    clippy::missing_const_for_fn,
+    reason = "the SQLite arm of `backend_select!` returns an error"
+)]
 fn require_postgres_backend() -> Result<(), autumn_web::AutumnError> {
     autumn_web::backend_select! {
         pg => { Ok(()) },
@@ -409,6 +413,7 @@ fn require_postgres_backend() -> Result<(), autumn_web::AutumnError> {
     }
 }
 
+/// Parse [`BACKFILL_ENV`]. `None` means "no backfill requested".
 fn parse_backfill_target(raw: &str) -> Option<BackfillTarget> {
     let target = raw.trim();
     if target.is_empty() {
@@ -487,6 +492,11 @@ impl Plugin for SearchPlugin {
                         "autumn-search: {message}"
                     )));
                 }
+                // A build mismatch, not a search outage: refuse it even when
+                // `enabled = false`.
+                if postgres.is_some() {
+                    require_postgres_backend()?;
+                }
                 // Install the client FIRST, and unconditionally. A handler
                 // that resolves the extension must find one whether or not
                 // search is enabled — a disabled client answers every call
@@ -530,7 +540,6 @@ impl Plugin for SearchPlugin {
                     }
 
                     if let Some(store) = &postgres {
-                        require_postgres_backend()?;
                         let pool = state.pool().cloned().ok_or_else(|| {
                             autumn_web::AutumnError::internal_server_error_msg(
                                 "SearchPlugin::postgres() needs a database pool; configure \
