@@ -54,38 +54,60 @@ pub async fn collect_blobs(
 /// The bytes, their hex SHA-256 and their MIME type, all of one version of
 /// `key`, or `None` when `key` is not in `store`.
 ///
-/// `get` and `head` are two calls, and another writer can replace the blob
-/// between them. When `head` gives an etag that is not the SHA-256 of the
-/// bytes, the two calls saw two versions: read again once, then give up.
-async fn read_one_version(
+/// `get` and `head` are separate calls, and another writer can replace the
+/// blob between them. So read `head`, `get`, and `head` again. The read holds
+/// one version when both heads are the same, and when an etag that is a
+/// SHA-256 (as on `LocalBlobStore`) is the SHA-256 of the bytes. An S3 etag
+/// is an MD5 or a multipart tag: it shows a change between the two heads,
+/// not a mismatch with the bytes. When the read sees two versions, read
+/// again once, then give up. A store without etags shows only a change of
+/// the MIME type.
+pub(super) async fn read_one_version(
     store: &dyn BlobStore,
     key: &str,
 ) -> Result<Option<(bytes::Bytes, String, String)>, DataCapsuleError> {
     for _ in 0..2 {
+        let before = head(store, key).await?;
         let bytes = match store.get(key).await {
             Ok(bytes) => bytes,
+            // Gone since the first head: read again.
+            Err(BlobStoreError::NotFound(_)) if before.is_some() => continue,
             Err(BlobStoreError::NotFound(_)) => return Ok(None),
             Err(e) => return Err(DataCapsuleError::Blob(format!("get {key:?}: {e}"))),
         };
+        let after = head(store, key).await?;
         let sha256 = hex::encode(Sha256::digest(&bytes));
-        let meta = match store.head(key).await {
-            Ok(meta) => meta,
-            Err(BlobStoreError::NotFound(_)) => None,
-            Err(e) => return Err(DataCapsuleError::Blob(format!("head {key:?}: {e}"))),
+        let same = match (&before, &after) {
+            (Some(a), Some(b)) => a.etag == b.etag && a.content_type == b.content_type,
+            (None, None) => true,
+            _ => false,
         };
-        // A store without etags, or with etags that are not a SHA-256 (an
-        // S3 multipart etag, for example), cannot show a mismatch.
-        let etag = meta.as_ref().and_then(|m| m.etag.as_deref());
-        if etag.is_some_and(|etag| is_sha256(etag) && !etag.eq_ignore_ascii_case(&sha256)) {
+        let etag = after.as_ref().and_then(|m| m.etag.as_deref());
+        let matches =
+            !etag.is_some_and(|etag| is_sha256(etag) && !etag.eq_ignore_ascii_case(&sha256));
+        if !(same && matches) {
             continue;
         }
         let content_type =
-            meta.map_or_else(|| "application/octet-stream".to_owned(), |m| m.content_type);
+            after.map_or_else(|| "application/octet-stream".to_owned(), |m| m.content_type);
         return Ok(Some((bytes, sha256, content_type)));
     }
     Err(DataCapsuleError::Conflict(format!(
-        "blob {key:?} changed while export read it"
+        "blob {key:?} changed while it was read"
     )))
+}
+
+/// The metadata of `key`. Export writes `application/octet-stream` for a
+/// blob without metadata, so `None` here gets that default too.
+async fn head(
+    store: &dyn BlobStore,
+    key: &str,
+) -> Result<Option<crate::storage::BlobMeta>, DataCapsuleError> {
+    match store.head(key).await {
+        Ok(meta) => Ok(meta),
+        Err(BlobStoreError::NotFound(_)) => Ok(None),
+        Err(e) => Err(DataCapsuleError::Blob(format!("head {key:?}: {e}"))),
+    }
 }
 
 /// `true` for 64 hex digits.
@@ -233,17 +255,15 @@ pub(super) async fn restore_and_track<'c>(
 /// right after the create, and a store can keep the bytes but lose the MIME
 /// type.
 async fn verify_created(store: &dyn BlobStore, entry: &BlobEntry) -> Result<(), DataCapsuleError> {
-    match store.get(&entry.key).await {
-        Ok(bytes) if hex::encode(Sha256::digest(&bytes)) == entry.sha256 => {}
-        Ok(_) | Err(BlobStoreError::NotFound(_)) => {
+    let content_type = match read_one_version(store, &entry.key).await? {
+        Some((_, sha256, content_type)) if sha256 == entry.sha256 => content_type,
+        Some(_) | None => {
             return Err(DataCapsuleError::Conflict(format!(
                 "blob {:?} changed during the import",
                 entry.key
             )));
         }
-        Err(e) => return Err(DataCapsuleError::Blob(format!("get {:?}: {e}", entry.key))),
-    }
-    let content_type = stored_content_type(store, entry).await?;
+    };
     if content_type == entry.content_type {
         Ok(())
     } else {
@@ -284,18 +304,17 @@ async fn check_existing(
     store: &dyn BlobStore,
     entry: &BlobEntry,
 ) -> Result<bool, DataCapsuleError> {
-    let existing = match store.get(&entry.key).await {
-        Ok(existing) => existing,
-        Err(BlobStoreError::NotFound(_)) => return Ok(false),
-        Err(e) => return Err(DataCapsuleError::Blob(format!("get {:?}: {e}", entry.key))),
+    // The bytes and the MIME type must come from one version: a writer that
+    // replaces the blob between two reads must not pass as this blob.
+    let Some((_, sha256, content_type)) = read_one_version(store, &entry.key).await? else {
+        return Ok(false);
     };
-    if hex::encode(Sha256::digest(&existing)) != entry.sha256 {
+    if sha256 != entry.sha256 {
         return Err(DataCapsuleError::Conflict(format!(
             "blob {:?} exists with different bytes",
             entry.key
         )));
     }
-    let content_type = stored_content_type(store, entry).await?;
     if content_type != entry.content_type {
         return Err(DataCapsuleError::Conflict(format!(
             "blob {:?} exists with MIME type {content_type:?}, not {:?}",
@@ -303,18 +322,4 @@ async fn check_existing(
         )));
     }
     Ok(true)
-}
-
-/// The MIME type that `store` keeps for `entry.key`. Export writes
-/// `application/octet-stream` when a blob has no metadata, so use the same
-/// default.
-async fn stored_content_type(
-    store: &dyn BlobStore,
-    entry: &BlobEntry,
-) -> Result<String, DataCapsuleError> {
-    match store.head(&entry.key).await {
-        Ok(Some(meta)) => Ok(meta.content_type),
-        Ok(None) | Err(BlobStoreError::NotFound(_)) => Ok("application/octet-stream".to_owned()),
-        Err(e) => Err(DataCapsuleError::Blob(format!("head {:?}: {e}", entry.key))),
-    }
 }

@@ -487,7 +487,7 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
     let base = format!("postgres://postgres:postgres@{host}:{port}");
     let mut admin = PgConnection::establish(&format!("{base}/postgres")).expect("connect");
     for db in [
-        "target", "busy", "deferred", "capped", "cached", "cycled", "limited",
+        "target", "busy", "deferred", "capped", "cached", "cycled", "stepped", "limited",
     ] {
         admin
             .batch_execute(&format!("CREATE DATABASE {db}"))
@@ -501,7 +501,7 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
         ))
         .expect("source");
     for db in [
-        "target", "busy", "deferred", "capped", "cached", "cycled", "limited",
+        "target", "busy", "deferred", "capped", "cached", "cycled", "stepped", "limited",
     ] {
         PgConnection::establish(&format!("{base}/{db}"))
             .expect("connect")
@@ -634,6 +634,23 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
         0,
         "the import rolls back"
     );
+
+    // A sequence that steps by 2 makes 1, 3, 5, ... up to 501. The imported key
+    // 500 is not on that path: the next value must be 501, not 502.
+    let stepped = pool(&format!("{base}/stepped"));
+    PgConnection::establish(&format!("{base}/stepped"))
+        .expect("connect")
+        .batch_execute("ALTER SEQUENCE notes_id_seq INCREMENT BY 2 MAXVALUE 501")
+        .expect("step");
+    import_capsule(&capsule, &models, &PgCapsuleStore::new(stepped.clone()))
+        .await
+        .expect("import");
+    let next = text(
+        &stepped,
+        "INSERT INTO notes (owner) VALUES (2) RETURNING id::text AS value",
+    )
+    .await;
+    assert_eq!(next, "501");
 
     // A role that may move the `ledger` sequence but not the `notes` one:
     // the import must fail before the first `setval`.

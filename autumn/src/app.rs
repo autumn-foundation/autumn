@@ -8820,8 +8820,11 @@ fn emit_data_capsule_report(
 ///
 /// The pools are lazy: verify does not connect and runs no migration. An
 /// initializer still sees `pool()` and `shards()`, for example to build a
-/// routed `CapsuleService`.
-#[cfg(all(feature = "db", not(feature = "sqlite")))]
+/// routed `CapsuleService`. On SQLite this matters too: an app there installs
+/// its own `CapsuleService`, often from `pool()`. A SQLite pool opens (and
+/// can create) its file only at the first connection, which verify never
+/// makes.
+#[cfg(feature = "db")]
 fn verify_database_parts(
     config: &AutumnConfig,
     shard_router: Option<Arc<dyn crate::sharding::ShardRouter>>,
@@ -8835,18 +8838,6 @@ fn verify_database_parts(
         .ok()
         .flatten();
     (topology, shards)
-}
-
-/// A SQLite pool can create its file, so verify gives no database state.
-#[cfg(feature = "sqlite")]
-fn verify_database_parts(
-    _config: &AutumnConfig,
-    _shard_router: Option<Arc<dyn crate::sharding::ShardRouter>>,
-) -> (
-    Option<crate::db::DatabaseTopology>,
-    Option<crate::sharding::ShardSet>,
-) {
-    (None, None)
 }
 
 #[cfg(test)]
@@ -8873,6 +8864,20 @@ mod data_capsule_mode_tests {
         let (topology, shards) = verify_database_parts(&config, None);
         assert!(topology.is_some(), "a lazy control pool");
         assert_eq!(shards.map(|s| s.len()), Some(1), "the configured shard");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn verify_gives_sqlite_initializers_a_lazy_pool_without_a_file() {
+        // An initializer can build its `CapsuleService` from `pool()`. The
+        // pool must not open the database: SQLite would create the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.db");
+        let mut config = AutumnConfig::default();
+        config.database.url = Some(format!("sqlite://{}", path.display()));
+        let (topology, _) = verify_database_parts(&config, None);
+        assert!(topology.is_some(), "a lazy pool");
+        assert!(!path.exists(), "verify creates no database file");
     }
 
     #[test]

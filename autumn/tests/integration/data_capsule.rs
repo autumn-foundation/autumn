@@ -826,6 +826,9 @@ mod blobs {
         vanishing: Option<&'static str>,
         replaced_after: Option<&'static str>,
         stale_meta: Option<&'static str>,
+        /// An S3-like etag (not a SHA-256) that changes on every `head`.
+        shifting_etag: Option<&'static str>,
+        heads: std::sync::atomic::AtomicUsize,
         plain: bool,
     }
 
@@ -898,6 +901,13 @@ mod blobs {
                     if Some(key) == self.odd.stale_meta {
                         meta.etag = Some(hex::encode(Sha256::digest(b"old bytes")));
                     }
+                    if Some(key) == self.odd.shifting_etag {
+                        let n = self
+                            .odd
+                            .heads
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        meta.etag = Some(format!("\"{n:032x}\""));
+                    }
                     meta
                 }))
             })
@@ -934,6 +944,71 @@ mod blobs {
         let err = collect_blobs(&mut capsule, &blobs)
             .await
             .expect_err("bytes and metadata of two versions");
+        assert!(matches!(err, DataCapsuleError::Conflict(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn export_refuses_a_blob_whose_etag_changes_during_the_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = blob_store(&tmp.path().join("a"));
+        inner
+            .put(
+                "avatars/ada.png",
+                "image/png",
+                Bytes::from_static(b"\x89PNG"),
+            )
+            .await
+            .unwrap();
+        let blobs = OddStore {
+            inner,
+            odd: Odd {
+                shifting_etag: Some("avatars/ada.png"),
+                ..Odd::default()
+            },
+        };
+        let mut capsule = export_subject(&models(), &store(), "1").await.unwrap();
+        let err = collect_blobs(&mut capsule, &blobs)
+            .await
+            .expect_err("a new version on every read");
+        assert!(matches!(err, DataCapsuleError::Conflict(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_an_existing_blob_that_changes_during_the_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = blob_store(&tmp.path().join("a"));
+        source
+            .put(
+                "avatars/ada.png",
+                "image/png",
+                Bytes::from_static(b"\x89PNG"),
+            )
+            .await
+            .unwrap();
+        let mut capsule = export_subject(&models(), &store(), "1").await.unwrap();
+        collect_blobs(&mut capsule, &source).await.unwrap();
+
+        // The target has the same bytes and MIME type, but a new version on
+        // every read: the check cannot know which version it saw.
+        let inner = blob_store(&tmp.path().join("b"));
+        inner
+            .put(
+                "avatars/ada.png",
+                "image/png",
+                Bytes::from_static(b"\x89PNG"),
+            )
+            .await
+            .unwrap();
+        let target = OddStore {
+            inner,
+            odd: Odd {
+                shifting_etag: Some("avatars/ada.png"),
+                ..Odd::default()
+            },
+        };
+        let err = restore_blobs(&capsule, &target)
+            .await
+            .expect_err("a new version on every read");
         assert!(matches!(err, DataCapsuleError::Conflict(_)), "{err:?}");
     }
 

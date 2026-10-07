@@ -187,7 +187,8 @@ capsule directory and to each directory above it.
   record.
 - Import skips generated columns.
 - Import moves each serial or identity sequence past the imported keys, in
-  the direction of the sequence. It does this only after all inserts and
+  the direction of the sequence and on its step: with `INCREMENT BY 2` from 1
+  and key 500, the next value is 501. It does this only after all inserts and
   deferred constraints succeed, and after it checks every move, so a failed
   import does not change a sequence.
 - A key outside the range of its sequence is a conflict (`409`). A sequence
@@ -197,10 +198,12 @@ capsule directory and to each directory above it.
 - **Import when no other writer uses the tables.** Another session can take a
   value from a sequence and insert its row later. If the capsule holds that
   key, the import succeeds and the other insert fails with a duplicate key.
-  No lock can prevent this, so run import in a maintenance window.
+  The same holds for a blob that another writer replaces after import checks
+  it. No lock can prevent this, so run import in a maintenance window.
 - Import writes blobs before records. If the record import fails, import
   removes the blobs that it wrote. If a blob key holds different bytes or a
-  different MIME type, import stops and writes no blob. If another writer
+  different MIME type, import stops and writes no blob. If a blob changes
+  while import reads it, import stops with a conflict (`409`). If another writer
   takes a key during the import, import stops and deletes the blobs that it
   wrote. Import needs a blob store with a conditional create
   (`BlobStore::put_if_absent`). `LocalBlobStore` and the S3 backend have one.
