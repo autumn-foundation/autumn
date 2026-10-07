@@ -309,14 +309,7 @@ pub(super) fn check_importable<'c>(
     models: &[CapsuleModel],
 ) -> Result<Vec<&'c ModelManifest>, DataCapsuleError> {
     let manifest = &capsule.manifest;
-    if manifest.format != DATA_CAPSULE_FORMAT
-        || manifest.format_version != DATA_CAPSULE_FORMAT_VERSION
-    {
-        return Err(DataCapsuleError::UnsupportedFormat(format!(
-            "{} version {}",
-            manifest.format, manifest.format_version
-        )));
-    }
+    archive::check_format(manifest)?;
     check_models(models)?;
     for model in &manifest.models {
         check_model_names(
@@ -366,6 +359,19 @@ pub(super) fn check_importable<'c>(
                     "{}.{column} is excluded from capsules, but the capsule holds it",
                     model.table
                 )));
+            }
+        }
+        // Export refuses a row without a value in its key or subject column.
+        // A capsule built or changed through the public API can still carry
+        // one.
+        for row in capsule.records(&model.table) {
+            for column in [&model.primary_key, &model.subject_column] {
+                if row.get(column).and_then(value_key).is_none() {
+                    return Err(DataCapsuleError::InvalidInput(format!(
+                        "a row of {} has no value in {column:?}",
+                        model.table
+                    )));
+                }
             }
         }
         // Export skips a blob that its store does not have, but the record

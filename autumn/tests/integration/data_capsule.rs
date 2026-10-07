@@ -192,6 +192,29 @@ async fn write_dir_produces_records_manifest_signature_and_viewer() {
 }
 
 #[tokio::test]
+async fn write_dir_refuses_a_format_that_this_build_does_not_read() {
+    // A capsule built or changed through the public API can name another
+    // format or version. Signed, it would fail its own verify.
+    let tmp = tempfile::tempdir().unwrap();
+    for change in [
+        |c: &mut DataCapsule| c.manifest.format = "other-capsule".to_owned(),
+        |c: &mut DataCapsule| c.manifest.format_version += 1,
+    ] {
+        let mut capsule = export_ada(&seeded_store()).await;
+        change(&mut capsule);
+        let root = tmp.path().join("capsule");
+        let err = capsule
+            .write_dir(&root, &signer())
+            .expect_err("unsupported format");
+        assert!(
+            matches!(err, DataCapsuleError::UnsupportedFormat(_)),
+            "{err:?}"
+        );
+        assert!(!root.exists());
+    }
+}
+
+#[tokio::test]
 async fn write_dir_refuses_a_directory_that_is_not_empty() {
     let capsule = export_ada(&seeded_store()).await;
     let dir = tempfile::tempdir().unwrap();
@@ -755,6 +778,23 @@ async fn import_refuses_a_capsule_of_another_subject_scope_or_key() {
 }
 
 #[tokio::test]
+async fn import_refuses_a_row_without_its_key_or_subject() {
+    // Export refuses such a row. A capsule built or changed through the
+    // public API can still carry one, and import must refuse it too.
+    for (table, column) in [("posts", "author_id"), ("users", "id")] {
+        let mut capsule = export_ada(&seeded_store()).await;
+        capsule.records.get_mut(table).unwrap()[0].remove(column);
+        let err = import_capsule(&capsule, registry().capsule_models(), &empty_store())
+            .await
+            .expect_err("row without its key or subject");
+        assert!(
+            matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains(table)),
+            "{table}.{column}: {err:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn import_rejects_a_relationship_cycle() {
     let models = [
         CapsuleModel::new("users", "id").belongs_to("id", "comments"),
@@ -788,12 +828,10 @@ async fn import_fails_and_writes_nothing_on_a_key_conflict() {
 
 #[tokio::test]
 async fn read_dir_rejects_an_unknown_format_version() {
-    let capsule = export_ada(&seeded_store()).await;
-    let mut future = capsule;
-    future.manifest.format_version = 99;
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("capsule");
-    future.write_dir(&root, &signer()).unwrap();
+    // A capsule of a later build: `write_dir` refuses that version, so sign
+    // it by hand.
+    let (_dir, root) = written().await;
+    resign(&root, |m| m["format_version"] = json!(99));
     let err = DataCapsule::read_dir(&root, &signer()).expect_err("version");
     assert!(
         matches!(err, DataCapsuleError::UnsupportedFormat(_)),

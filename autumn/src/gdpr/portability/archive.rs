@@ -116,6 +116,19 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// Check that this build reads the format and version of `manifest`.
+pub(super) fn check_format(manifest: &CapsuleManifest) -> Result<(), DataCapsuleError> {
+    if manifest.format != DATA_CAPSULE_FORMAT
+        || manifest.format_version != DATA_CAPSULE_FORMAT_VERSION
+    {
+        return Err(DataCapsuleError::UnsupportedFormat(format!(
+            "{} version {}",
+            manifest.format, manifest.format_version
+        )));
+    }
+    Ok(())
+}
+
 /// Check that `blob` describes `bytes`: their SHA-256 and their length.
 ///
 /// A capsule built or changed through the public API can carry an entry that
@@ -171,9 +184,14 @@ impl DataCapsule {
     ///
     /// # Errors
     ///
-    /// [`DataCapsuleError::NotEmpty`] when `dir` has content, an I/O error, or an
-    /// unsafe name in the manifest.
+    /// [`DataCapsuleError::NotEmpty`] when `dir` has content,
+    /// [`DataCapsuleError::UnsupportedFormat`] for a format or version that
+    /// this build does not read, an I/O error, or an unsafe name in the
+    /// manifest.
     pub fn write_dir(&self, dir: &Path, signer: &CapsuleSigner) -> Result<(), DataCapsuleError> {
+        // A capsule built or changed through the public API can name another
+        // format. Signed, it would fail its own verify.
+        check_format(&self.manifest)?;
         let created = prepare_empty_dir(dir)?;
         // Write through a handle: the path can change after the check.
         let root = match Root::open(dir) {
@@ -405,14 +423,7 @@ fn load_verified(
         ));
     }
     let manifest: CapsuleManifest = from_json(MANIFEST_FILE, &manifest_bytes)?;
-    if manifest.format != DATA_CAPSULE_FORMAT
-        || manifest.format_version != DATA_CAPSULE_FORMAT_VERSION
-    {
-        return Err(DataCapsuleError::UnsupportedFormat(format!(
-            "{} version {}",
-            manifest.format, manifest.format_version
-        )));
-    }
+    check_format(&manifest)?;
     check_manifest_refs(&manifest)?;
 
     let wanted: BTreeSet<String> = manifest
