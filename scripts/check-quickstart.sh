@@ -131,6 +131,11 @@ readme_cli_version() {
   sed -n 's/^cargo install autumn-cli --version \([0-9][0-9A-Za-z.+-]*\).*$/\1/p' "$repo_root/README.md" | head -n 1
 }
 
+# Flags the README puts after the pinned version (e.g. `--locked`).
+readme_cli_flags() {
+  sed -n 's/^cargo install autumn-cli --version [0-9][0-9A-Za-z.+-]* *\(.*\)$/\1/p' "$repo_root/README.md" | head -n 1
+}
+
 # ── Pre-release detection (crates.io sparse index) ───────────────────────────
 #
 # During a release window the README is bumped to a new version BEFORE that
@@ -413,8 +418,15 @@ phase_install() {
   fi
 
   echo "installing autumn-cli ${version} from crates.io (README quickstart step 1)"
-  if ! cargo install autumn-cli --version "$version"; then
-    fail "'cargo install autumn-cli --version ${version}' failed — the README-pinned CLI version does not install from crates.io"
+  # Run the README's command verbatim, flags included: the README pins
+  # `--locked` so the install uses the lockfile the published crate was tested
+  # with, not whatever a dependency released since (uuid 1.27.0 raised its
+  # rust-version to 1.89 and broke the unlocked install on the advertised MSRV).
+  local flags
+  flags="$(readme_cli_flags)"
+  # shellcheck disable=SC2086 # intentional word-splitting of the README's flags
+  if ! cargo install autumn-cli --version "$version" $flags; then
+    fail "'cargo install autumn-cli --version ${version} ${flags}' failed — the README-pinned CLI version does not install from crates.io"
   fi
   command -v autumn >/dev/null || fail "cargo install succeeded but 'autumn' is not on PATH"
   ok "autumn-cli ${version}"
