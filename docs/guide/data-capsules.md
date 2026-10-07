@@ -70,7 +70,10 @@ excluded column, so the column must accept `NULL` or have a default.
 users can write a blob key into a row, make sure that the key belongs to the
 subject. If a record holds a blob key and no blob store is configured, export
 fails. If a blob changes while export reads it, export fails with a conflict
-(`409`): run it again.
+(`409`): run it again. A `Blob` value names its store (`provider_id`). If it
+names another store than the configured one, for example after a switch of
+backend, export fails with a conflict (`409`): the same key in the new store
+can hold other bytes.
 
 ## Set the signing secret
 
@@ -187,8 +190,9 @@ capsule directory and to each directory above it.
   record.
 - Import skips generated columns.
 - Import moves each serial or identity sequence past the imported keys, in
-  the direction of the sequence and on its step: with `INCREMENT BY 2` from 1
-  and key 500, the next value is 501. It does this only after all inserts and
+  the direction of the sequence. A sequence makes only `start + k * step`, so
+  only keys on that path count: with `INCREMENT BY 3` from 1, key 500 is not
+  a value it makes and does not move it. It does this only after all inserts and
   deferred constraints succeed, and after it checks every move, so a failed
   import does not change a sequence.
 - A key outside the range of its sequence is a conflict (`409`). A sequence

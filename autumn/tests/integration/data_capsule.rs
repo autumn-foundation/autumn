@@ -1013,6 +1013,42 @@ mod blobs {
     }
 
     #[tokio::test]
+    async fn export_refuses_a_blob_handle_of_another_store() {
+        // After a switch of backend, a row can still hold a handle of the
+        // old store. The same key in the new store can hold other bytes.
+        let tmp = tempfile::tempdir().unwrap();
+        let blobs = blob_store(&tmp.path().join("a"));
+        blobs
+            .put("avatars/ada.png", "image/png", Bytes::from_static(b"png"))
+            .await
+            .unwrap();
+        let records = MemoryCapsuleStore::new().table(
+            "users",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("avatar", "jsonb").nullable(),
+                FieldSpec::new("cv_key", "text").nullable(),
+            ],
+        );
+        records.insert(
+            "users",
+            json!({
+                "id": 1,
+                "avatar": {"provider_id": "old-s3", "key": "avatars/ada.png",
+                           "content_type": "image/png", "byte_size": 3},
+                "cv_key": null,
+            }),
+        );
+        let mut capsule = export_subject(&models(), &records, "1").await.unwrap();
+        let err = collect_blobs(&mut capsule, &blobs)
+            .await
+            .expect_err("a handle of another store");
+        assert!(matches!(err, DataCapsuleError::Conflict(_)), "{err:?}");
+        assert!(err.to_string().contains("old-s3"), "{err}");
+        assert!(capsule.manifest.blobs.is_empty());
+    }
+
+    #[tokio::test]
     async fn restore_does_not_overwrite_a_blob_written_during_the_import() {
         let tmp = tempfile::tempdir().unwrap();
         let source_blobs = blob_store(&tmp.path().join("a"));

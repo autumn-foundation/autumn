@@ -16,6 +16,9 @@ use crate::storage::{BlobStore, BlobStoreError};
 ///
 /// # Errors
 ///
+/// [`DataCapsuleError::Conflict`] when a `Blob` names another store than
+/// `store` (its `provider_id`), or when a blob changes while it is read.
+///
 /// [`DataCapsuleError::Blob`] when `store` fails for a reason other than "not
 /// found".
 pub async fn collect_blobs(
@@ -26,6 +29,22 @@ pub async fn collect_blobs(
     for model in &capsule.manifest.models {
         for row in capsule.records(&model.table) {
             for column in &model.blob_columns {
+                // A `Blob` names its store. After a switch of backend, a row
+                // can hold a handle of the old store, and the same key in
+                // `store` can hold other bytes: never export those.
+                let provider = row
+                    .get(column)
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|blob| blob.get("provider_id"))
+                    .and_then(serde_json::Value::as_str);
+                if let Some(provider) = provider.filter(|p| *p != store.provider_id()) {
+                    return Err(DataCapsuleError::Conflict(format!(
+                        "{}.{column} holds a blob of store {provider:?}, but the blob store is \
+                         {:?}",
+                        model.table,
+                        store.provider_id()
+                    )));
+                }
                 if let Some(key) = row.get(column).and_then(blob_key) {
                     keys.insert(key.to_owned());
                 }

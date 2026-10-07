@@ -7545,7 +7545,9 @@ impl AppBuilder {
     /// All modes boot the app's state initializers, which install the
     /// [`crate::gdpr::GdprRegistry`] and any `CapsuleService`. Export and
     /// import also use the database and the blob store. Verify uses only the
-    /// signer: it does not open the database or run a migration.
+    /// signer: it runs no migration, and its built-in pools never connect. It
+    /// still builds the pools as the other modes do, with the app's own pool
+    /// provider, so an initializer can install its `CapsuleService`.
     #[allow(clippy::too_many_lines)]
     async fn run_data_capsule_mode(self, mode: DataCapsuleMode) {
         let Self {
@@ -7592,8 +7594,8 @@ impl AppBuilder {
         // A capsule holds personal data: use the same secret rules as a server.
         fail_fast_on_invalid_signing_secret(&config);
 
-        // Verify skips the database: it runs no migration. It keeps the blob
-        // store, so an initializer that builds a service from it still works.
+        // Verify runs no migration. It keeps the pools and the blob store, so
+        // an initializer that builds a service from them still works.
         #[cfg(feature = "db")]
         let verify = mode == DataCapsuleMode::Verify;
 
@@ -7610,7 +7612,14 @@ impl AppBuilder {
 
         #[cfg(feature = "db")]
         let (topology, shards) = if verify {
-            verify_database_parts(&config, shard_router)
+            verify_database_parts(
+                &config,
+                pool_provider_factory,
+                shard_provider_factory,
+                shard_router,
+                directory_shard_router,
+            )
+            .await
         } else {
             match setup_database(
                 &config,
@@ -8818,25 +8827,44 @@ fn emit_data_capsule_report(
 
 /// The database state that verify gives to the state initializers.
 ///
-/// The pools are lazy: verify does not connect and runs no migration. An
-/// initializer still sees `pool()` and `shards()`, for example to build a
-/// routed `CapsuleService`. On SQLite this matters too: an app there installs
-/// its own `CapsuleService`, often from `pool()`. A SQLite pool opens (and
-/// can create) its file only at the first connection, which verify never
-/// makes.
+/// Verify runs no migration. It builds the pools as export and import do,
+/// with the app's `with_pool_provider` and `with_shard_provider` when it has
+/// them, so an initializer sees the same `pool()` and `shards()`, for example
+/// to build its own `CapsuleService`. The built-in pools are lazy: they
+/// connect, and a SQLite pool creates its file, only at the first checkout,
+/// which verify never makes. A provider that fails gives no state: verify then
+/// falls back to the signer of the configuration.
 #[cfg(feature = "db")]
-fn verify_database_parts(
+async fn verify_database_parts(
     config: &AutumnConfig,
+    pool_provider: Option<PoolProviderFactory>,
+    shard_provider: Option<ShardProviderFactory>,
     shard_router: Option<Arc<dyn crate::sharding::ShardRouter>>,
+    directory_shard_router: bool,
 ) -> (
     Option<crate::db::DatabaseTopology>,
     Option<crate::sharding::ShardSet>,
 ) {
-    let topology = crate::db::create_topology(&config.database).ok().flatten();
-    let router = shard_router.unwrap_or_else(|| Arc::new(crate::sharding::HashShardRouter));
-    let shards = crate::sharding::create_shard_set(&config.database, router)
-        .ok()
-        .flatten();
+    let topology = match pool_provider {
+        Some(factory) => factory(config.database.clone()).await,
+        None => crate::db::create_topology(&config.database),
+    }
+    .ok()
+    .flatten();
+    let use_directory_router = shard_router.is_none()
+        && (directory_shard_router || config.database.directory_shard_router);
+    // No invalidation listener: verify opens no connection of its own.
+    let shards = resolve_shard_set(
+        config,
+        shard_router,
+        shard_provider,
+        use_directory_router,
+        false,
+        topology.as_ref(),
+    )
+    .await
+    .ok()
+    .flatten();
     (topology, shards)
 }
 
@@ -8845,8 +8873,8 @@ mod data_capsule_mode_tests {
     use super::*;
 
     #[cfg(all(feature = "db", not(feature = "sqlite")))]
-    #[test]
-    fn verify_gives_initializers_lazy_pools_and_shards() {
+    #[tokio::test]
+    async fn verify_gives_initializers_lazy_pools_and_shards() {
         // A state initializer can build a routed store from `shards()`, so
         // verify keeps the shape of the state. The pools must not connect:
         // nothing listens on port 9.
@@ -8861,23 +8889,45 @@ mod data_capsule_mode_tests {
             replica_pool_size: None,
             replica_fallback: None,
         }];
-        let (topology, shards) = verify_database_parts(&config, None);
+        let (topology, shards) = verify_database_parts(&config, None, None, None, false).await;
         assert!(topology.is_some(), "a lazy control pool");
         assert_eq!(shards.map(|s| s.len()), Some(1), "the configured shard");
     }
 
     #[cfg(feature = "sqlite")]
-    #[test]
-    fn verify_gives_sqlite_initializers_a_lazy_pool_without_a_file() {
+    #[tokio::test]
+    async fn verify_gives_sqlite_initializers_a_lazy_pool_without_a_file() {
         // An initializer can build its `CapsuleService` from `pool()`. The
         // pool must not open the database: SQLite would create the file.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app.db");
         let mut config = AutumnConfig::default();
         config.database.url = Some(format!("sqlite://{}", path.display()));
-        let (topology, _) = verify_database_parts(&config, None);
+        let (topology, _) = verify_database_parts(&config, None, None, None, false).await;
         assert!(topology.is_some(), "a lazy pool");
         assert!(!path.exists(), "verify creates no database file");
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn verify_uses_the_pool_provider_of_the_app() {
+        // The app has no database URL: only its `with_pool_provider` knows
+        // the pool, as on export and import. Verify must ask it too.
+        let dir = tempfile::tempdir().unwrap();
+        let url = if cfg!(feature = "sqlite") {
+            format!("sqlite://{}", dir.path().join("app.db").display())
+        } else {
+            "postgres://u:p@127.0.0.1:9/none".to_owned()
+        };
+        let provider: PoolProviderFactory = Box::new(move |mut database| {
+            Box::pin(async move {
+                database.url = Some(url);
+                crate::db::create_topology(&database)
+            })
+        });
+        let config = AutumnConfig::default();
+        let (topology, _) = verify_database_parts(&config, Some(provider), None, None, false).await;
+        assert!(topology.is_some(), "the topology of the provider");
     }
 
     #[test]

@@ -487,7 +487,8 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
     let base = format!("postgres://postgres:postgres@{host}:{port}");
     let mut admin = PgConnection::establish(&format!("{base}/postgres")).expect("connect");
     for db in [
-        "target", "busy", "deferred", "capped", "cached", "cycled", "stepped", "wide", "limited",
+        "target", "busy", "deferred", "capped", "cached", "cycled", "stepped", "wide", "offpath",
+        "limited",
     ] {
         admin
             .batch_execute(&format!("CREATE DATABASE {db}"))
@@ -501,7 +502,8 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
         ))
         .expect("source");
     for db in [
-        "target", "busy", "deferred", "capped", "cached", "cycled", "stepped", "wide", "limited",
+        "target", "busy", "deferred", "capped", "cached", "cycled", "stepped", "wide", "offpath",
+        "limited",
     ] {
         PgConnection::establish(&format!("{base}/{db}"))
             .expect("connect")
@@ -635,12 +637,15 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
         "the import rolls back"
     );
 
-    // A sequence that steps by 2 makes 1, 3, 5, ... up to 501. The imported key
-    // 500 is not on that path: the next value must be 501, not 502.
+    // A sequence that steps by 2 from 2 makes 2, 4, ... up to 502. The imported
+    // key 500 is on that path: the next value is 502.
     let stepped = pool(&format!("{base}/stepped"));
     PgConnection::establish(&format!("{base}/stepped"))
         .expect("connect")
-        .batch_execute("ALTER SEQUENCE notes_id_seq INCREMENT BY 2 MAXVALUE 501")
+        .batch_execute(
+            "ALTER SEQUENCE notes_id_seq INCREMENT BY 2 MINVALUE 2 START WITH 2 RESTART WITH 2 \
+             MAXVALUE 502",
+        )
         .expect("step");
     import_capsule(&capsule, &models, &PgCapsuleStore::new(stepped.clone()))
         .await
@@ -650,7 +655,25 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
         "INSERT INTO notes (owner) VALUES (2) RETURNING id::text AS value",
     )
     .await;
-    assert_eq!(next, "501");
+    assert_eq!(next, "502");
+
+    // A sequence that steps by 3 from 1 makes 1, 4, ..., 499 up to 500. The
+    // imported key 500 is not on that path, so no value it makes can take it:
+    // the sequence stays where it is, and does not run out after 499.
+    let offpath = pool(&format!("{base}/offpath"));
+    PgConnection::establish(&format!("{base}/offpath"))
+        .expect("connect")
+        .batch_execute("ALTER SEQUENCE notes_id_seq INCREMENT BY 3 MAXVALUE 500")
+        .expect("step");
+    import_capsule(&capsule, &models, &PgCapsuleStore::new(offpath.clone()))
+        .await
+        .expect("import");
+    let next = text(
+        &offpath,
+        "INSERT INTO notes (owner) VALUES (2) RETURNING id::text AS value",
+    )
+    .await;
+    assert_eq!(next, "1");
 
     // A sequence that starts at the smallest bigint: `key - start` and
     // `start - inc` do not fit a bigint, so the plan computes in numeric.

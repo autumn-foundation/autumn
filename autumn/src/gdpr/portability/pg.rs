@@ -530,10 +530,7 @@ fn insert_sql(batch: &ImportBatch<'_>) -> Result<String, DataCapsuleError> {
 
 #[derive(diesel::QueryableByName)]
 struct SequencePlan {
-    /// The outermost imported key.
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
-    key: i64,
-    /// The new last value: on the path of the sequence, at or before `key`.
+    /// The outermost imported key on the path of the sequence.
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     target: i64,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -578,28 +575,29 @@ async fn plan_sequence(
     };
     let target = format!("{table}.{column}");
     let pk = quote(column)?;
-    // The sequence moves past the imported keys, in its own direction. Its
-    // values are `start + k * inc`, so the new last value is the last one of
-    // those at or before the outermost key: the next value is then on the
-    // same path, past every key. With `INCREMENT BY 2` from 1 and key 500,
-    // that is 499, and the next value 501. An unused sequence has no last
-    // value: then compare with the value before its start. The arithmetic is
-    // in numeric: `key - start` and `start - inc` can leave the bigint range.
+    // The sequence makes only `start + k * inc`, so only a key on that path
+    // can be a value it makes. The sequence moves to the outermost such key,
+    // in its own direction. A key off the path (500 for `INCREMENT BY 3` from
+    // 1) needs no move: moving to the path value before it would only use up
+    // values that are still free. An unused sequence has no last value: then
+    // compare with the value before its start. The arithmetic is in numeric:
+    // `key - start` and `start - inc` can leave the bigint range.
     let plan: Option<SequencePlan> = diesel::sql_query(format!(
-        "SELECT a.m AS key, a.target, a.cache, a.min, a.max, a.cycle, CASE WHEN a.inc > 0 \
-           THEN a.target > COALESCE(pg_sequence_last_value($1::regclass), a.start::numeric - a.inc) \
-           ELSE a.target < COALESCE(pg_sequence_last_value($1::regclass), a.start::numeric - a.inc) END AS needed, \
+        "SELECT s.m AS target, s.cache, s.min, s.max, s.cycle, CASE WHEN s.inc > 0 \
+           THEN s.m > COALESCE(pg_sequence_last_value($1::regclass), s.start::numeric - s.inc) \
+           ELSE s.m < COALESCE(pg_sequence_last_value($1::regclass), s.start::numeric - s.inc) END AS needed, \
            has_sequence_privilege($1::regclass, 'UPDATE') AS can_update \
-         FROM (SELECT s.*, \
-                      (s.start + floor((s.m::numeric - s.start) / s.inc) * s.inc)::bigint AS target \
-         FROM (SELECT CASE WHEN q.seqincrement > 0 THEN MAX(t.{pk}) ELSE MIN(t.{pk}) END::bigint AS m, \
+         FROM (SELECT CASE WHEN q.seqincrement > 0 \
+                        THEN MAX(t.{pk}) FILTER (WHERE mod(t.{pk}::numeric - q.seqstart, q.seqincrement) = 0) \
+                        ELSE MIN(t.{pk}) FILTER (WHERE mod(t.{pk}::numeric - q.seqstart, q.seqincrement) = 0) \
+                      END::bigint AS m, \
                       q.seqincrement AS inc, q.seqstart AS start, q.seqcache AS cache, \
                       q.seqmin AS min, q.seqmax AS max, q.seqcycle AS cycle \
                FROM {quoted_table} t CROSS JOIN pg_sequence q \
                WHERE q.seqrelid = $1::regclass \
                GROUP BY q.seqincrement, q.seqstart, q.seqcache, q.seqmin, q.seqmax, \
                         q.seqcycle) s \
-         WHERE s.m IS NOT NULL) a"
+         WHERE s.m IS NOT NULL"
     ))
     .bind::<diesel::sql_types::Text, _>(&seq)
     .get_result(conn)
@@ -632,10 +630,10 @@ async fn plan_sequence(
             "the import role has no UPDATE privilege on the sequence of {target}"
         )));
     }
-    if plan.key < plan.min || plan.key > plan.max {
+    if plan.target < plan.min || plan.target > plan.max {
         return Err(DataCapsuleError::Conflict(format!(
             "key {} of {target} is outside its sequence range ({}..{})",
-            plan.key, plan.min, plan.max
+            plan.target, plan.min, plan.max
         )));
     }
     Ok(Some((seq, plan.target, target)))
