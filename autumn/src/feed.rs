@@ -489,6 +489,7 @@ mod proptests {
     //! Property-based invariants for XML escaping and feed rendering. `escape`
     //! is private, so it is exercised in-crate here.
     use super::*;
+    use chrono::TimeZone as _;
     use proptest::prelude::*;
 
     /// Reverse the five entities `escape` emits. `&amp;` is decoded LAST so a
@@ -580,6 +581,41 @@ mod proptests {
             // (RSS) — the injected copy in the body must not add another.
             let expected_close = usize::from(!rss);
             prop_assert_eq!(out.matches("</feed>").count(), expected_close);
+        }
+
+        /// Issue #3093: any `DateTime<Utc>` renders without a panic, and each
+        /// date parses back as the input clamped to years 0000–9999.
+        #[test]
+        fn render_clamps_any_date(
+            secs in DateTime::<Utc>::MIN_UTC.timestamp()..=DateTime::<Utc>::MAX_UTC.timestamp(),
+            rss in any::<bool>(),
+        ) {
+            let dt = DateTime::from_timestamp(secs, 0).unwrap();
+            let feed = if rss {
+                Feed::rss("t", "https://example.com/", "https://example.com/feed.xml")
+            } else {
+                Feed::atom("t", "https://example.com/", "https://example.com/feed.xml")
+            }
+            .entry(FeedEntry::new("i", "t", "https://example.com/1").published(dt));
+
+            let out = feed.render();
+            let expected = dt.clamp(
+                Utc.with_ymd_and_hms(0, 1, 1, 0, 0, 0).unwrap(),
+                Utc.with_ymd_and_hms(9999, 12, 31, 23, 59, 59).unwrap(),
+            );
+            let (open, close) = if rss {
+                ("<pubDate>", "</pubDate>")
+            } else {
+                ("<published>", "</published>")
+            };
+            let start = out.find(open).unwrap() + open.len();
+            let text = &out[start..start + out[start..].find(close).unwrap()];
+            let parsed = if rss {
+                DateTime::parse_from_rfc2822(text)
+            } else {
+                DateTime::parse_from_rfc3339(text)
+            };
+            prop_assert_eq!(parsed.map(|d| d.to_utc()), Ok(expected), "{}", text);
         }
     }
 }

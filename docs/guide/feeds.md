@@ -108,6 +108,10 @@ When an entry sets both `content` and `summary`, RSS prefers `content` for its
 to a deterministic epoch timestamp so the rendered bytes stay stable across
 renders.
 
+RFC 3339, RFC 2822 and HTTP dates have a 4-digit year. A date before year 0000
+or after year 9999 is clamped to `0000-01-01T00:00:00Z` or
+`9999-12-31T23:59:59Z`. The feed does not panic, and strict readers accept it.
+
 ## Serving a feed from a handler
 
 `Feed` implements `IntoResponse`, so a handler can return it directly. The
