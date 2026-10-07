@@ -51,6 +51,11 @@ These framework calls use the deadline:
 | Outbound `Client` | Each attempt uses `min(timeout_secs, time left)`. It does not start a retry, a backoff or a `Retry-After` wait that the time left cannot hold. When the deadline stops the call, it returns `ClientError::DeadlineExceeded` (`504` through `?`). The circuit breaker counts it as a cancelled call, not a failure: nothing, unless the call ran past the slow-call threshold. |
 | `Db` extractor | The wait for a pool connection stops at the deadline (`503`). `statement_timeout` does not change, because it stays on the pooled connection. |
 
+When a handler returns `ClientError::DeadlineExceeded` or
+`deadline::DeadlineExceeded`, the `504` is treated like a request the timeout
+cancelled: the session layer does not save the session changes the handler
+made.
+
 A task that you start with `tokio::spawn` does not get the deadline. Give it
 one with `Deadline::scope`. To stop any other call at the deadline, for
 example a Redis call, use `autumn_web::deadline::bounded`:

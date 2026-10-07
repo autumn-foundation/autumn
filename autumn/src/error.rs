@@ -1413,8 +1413,27 @@ fn server_error_detail(status: StatusCode) -> String {
     }
 }
 
+impl AutumnError {
+    /// `true` when the request deadline stopped the work behind this error
+    /// (issue #3058): a `ClientError::DeadlineExceeded` or a
+    /// [`crate::deadline::DeadlineExceeded`] that the handler returned.
+    fn is_deadline_stop(&self) -> bool {
+        #[cfg(feature = "http-client")]
+        if matches!(
+            self.inner.downcast_ref::<crate::http_client::ClientError>(),
+            Some(crate::http_client::ClientError::DeadlineExceeded)
+        ) {
+            return true;
+        }
+        self.inner
+            .downcast_ref::<crate::deadline::DeadlineExceeded>()
+            .is_some()
+    }
+}
+
 impl IntoResponse for AutumnError {
     fn into_response(self) -> Response {
+        let deadline_stop = self.is_deadline_stop();
         let message = self.inner.to_string();
         let (status, problem_type) = self.rendered_problem();
 
@@ -1459,6 +1478,14 @@ impl IntoResponse for AutumnError {
                 .extensions_mut()
                 .insert(crate::idempotency::IdempotencyCacheCommittedErrorResponse);
         }
+        // A handler the deadline stopped may leave partial session state,
+        // as one the timeout layer cancelled would, so the session layer
+        // must not save it.
+        if deadline_stop {
+            response
+                .extensions_mut()
+                .insert(crate::router::RequestDeadlineCancelled);
+        }
         response.extensions_mut().insert(error_info);
         response
     }
@@ -1468,6 +1495,33 @@ impl IntoResponse for AutumnError {
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    #[test]
+    fn a_deadline_stop_is_marked_as_cancelled() {
+        let marked = |error: AutumnError| {
+            let response = error.into_response();
+            (
+                response.status(),
+                response
+                    .extensions()
+                    .get::<crate::router::RequestDeadlineCancelled>()
+                    .is_some(),
+            )
+        };
+        assert_eq!(
+            marked(crate::deadline::DeadlineExceeded.into()),
+            (StatusCode::GATEWAY_TIMEOUT, true)
+        );
+        #[cfg(feature = "http-client")]
+        assert_eq!(
+            marked(crate::http_client::ClientError::DeadlineExceeded.into()),
+            (StatusCode::GATEWAY_TIMEOUT, true)
+        );
+        assert_eq!(
+            marked(std::io::Error::other("boom").into()),
+            (StatusCode::INTERNAL_SERVER_ERROR, false)
+        );
+    }
 
     #[cfg(feature = "http-client")]
     #[test]
