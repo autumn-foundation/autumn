@@ -2577,7 +2577,11 @@ impl RequestBuilder {
         // One gate for the whole send, across redirect hops. The request
         // deadline also makes the one-shot client timeout shorter.
         let gate = self.retry_gate(url_host(&self.url).as_deref());
-        gate.check()?;
+        // Only the deadline here: the first-attempt refill waits for
+        // `send_one`, after DNS and address checks that may stop the call.
+        if gate.expired() {
+            return Err(ClientError::DeadlineExceeded);
+        }
         let timeout = gate
             .attempt_timeout(self.retry_policy.request_timeout)
             .unwrap_or_else(|| Duration::from_secs(30));
@@ -3098,7 +3102,8 @@ impl RetryGate {
     /// that paid for the retry.
     fn record_destination(&self, url: &str) {
         let host = url_host(url);
-        if host.is_none() || host == self.host || self.expired() {
+        // No deadline check: the HTTP stack only lists a host it sent to.
+        if host.is_none() || host == self.host {
             return;
         }
         if let Some((budgets, host)) = self.budgets.as_deref().zip(host) {
@@ -7333,6 +7338,49 @@ mod tests {
             let open = RetryGate::start(None, None, true);
             let error = open.classify(ClientError::InvalidUrl("dns".into()));
             assert!(matches!(error, ClientError::InvalidUrl(_)));
+        }
+
+        #[tokio::test]
+        async fn a_rejected_ssrf_safe_host_is_not_refilled() {
+            let client = Client::new();
+            let budget = client
+                .retry
+                .budgets
+                .clone()
+                .unwrap()
+                .for_host("127.0.0.1:80");
+            while budget.try_acquire(RetryKind::Transient) {}
+            let empty = budget.available();
+            // Loopback is refused before any HTTP attempt.
+            let result = client.get_ssrf_safe("http://127.0.0.1/").send().await;
+            assert!(result.is_err(), "{result:?}");
+            assert!(
+                (budget.available() - empty).abs() < f64::EPSILON,
+                "no refill without an attempt: {}",
+                budget.available()
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_followed_redirect_host_is_refilled_after_the_deadline() {
+            let budgets = Arc::new(RetryBudgets::new(&RetryBudgetConfig::default()));
+            let target = budgets.for_host("t:80");
+            while target.try_acquire(RetryKind::Transient) {}
+            let empty = target.available();
+            let gate = RetryGate::with_deadline(
+                Some(Deadline::after(Duration::from_millis(1))),
+                Some(budgets),
+                Some("o:80"),
+                true,
+            );
+            // The redirect was followed, then the deadline passed.
+            tokio::time::advance(Duration::from_millis(5)).await;
+            let mut seen = std::collections::HashSet::from(["o:80".to_owned()]);
+            gate.record_destinations(&["http://t/".to_owned()], &mut seen);
+            assert!(
+                target.available() > empty,
+                "the target's attempt started, so it is refilled"
+            );
         }
 
         #[tokio::test(start_paused = true)]

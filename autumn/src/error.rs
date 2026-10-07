@@ -227,12 +227,6 @@ where
             }
         }
 
-        // The request deadline stopped an upstream call or a
-        // `deadline::bounded` call (#3058), here or in a wrapped error.
-        if chain_has_deadline_stop(&err, false) {
-            status = StatusCode::GATEWAY_TIMEOUT;
-        }
-
         // A failed service-to-service call (#1755) is a dependency fault, not
         // a client one, so `?` on one in a handler produces 502 rather than
         // blaming the caller for an upstream 404.
@@ -306,6 +300,14 @@ where
                 .is_some()
         {
             status = StatusCode::SERVICE_UNAVAILABLE;
+        }
+
+        // The request deadline stopped an upstream call or a
+        // `deadline::bounded` call (#3058), here or in a wrapped error. Last,
+        // so it wins over a wrapper's own status (a typed service call's
+        // `WireError::Transport` is a 502).
+        if chain_has_deadline_stop(&err, false) {
+            status = StatusCode::GATEWAY_TIMEOUT;
         }
 
         Self {
@@ -1576,6 +1578,16 @@ mod tests {
                 .get::<crate::router::RequestDeadlineCancelled>()
                 .is_some()
         );
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn a_service_call_the_deadline_stopped_is_a_504() {
+        let error = AutumnError::from(crate::wire::WireError::Transport {
+            endpoint: "users.get",
+            source: crate::http_client::ClientError::DeadlineExceeded,
+        });
+        assert_eq!(error.status(), StatusCode::GATEWAY_TIMEOUT);
     }
 
     #[cfg(feature = "http-client")]
