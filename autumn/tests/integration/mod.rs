@@ -351,6 +351,8 @@ mod repository_audit_actor;
 #[cfg(feature = "db")]
 mod repository_authorization;
 #[cfg(feature = "db")]
+mod repository_nul_field;
+#[cfg(feature = "db")]
 mod repository_bulk_operations;
 #[cfg(feature = "db")]
 mod repository_commit_hooks_claim_ack_profile;
