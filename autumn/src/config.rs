@@ -6106,6 +6106,20 @@ impl AutumnConfig {
         apply_deploy_env_overrides(&mut self.deploy, env);
     }
 
+    /// `database.replica_max_lag_ms` and `database.warn_on_pooler` (issue #3065).
+    fn apply_replica_lag_and_pooler_env_overrides(&mut self, env: &dyn Env) {
+        parse_env_option(
+            env,
+            "AUTUMN_DATABASE__REPLICA_MAX_LAG_MS",
+            &mut self.database.replica_max_lag_ms,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_DATABASE__WARN_ON_POOLER",
+            &mut self.database.warn_on_pooler,
+        );
+    }
+
     fn apply_database_env_overrides_with_env(&mut self, env: &dyn Env) {
         if let Ok(val) = env.var("AUTUMN_DATABASE__URL") {
             self.database.url = Some(val);
@@ -6151,16 +6165,7 @@ impl AutumnConfig {
             "AUTUMN_DATABASE__PIN_AFTER_WRITE_SECS",
             &mut self.database.pin_after_write_secs,
         );
-        parse_env_option(
-            env,
-            "AUTUMN_DATABASE__REPLICA_MAX_LAG_MS",
-            &mut self.database.replica_max_lag_ms,
-        );
-        parse_env_bool(
-            env,
-            "AUTUMN_DATABASE__WARN_ON_POOLER",
-            &mut self.database.warn_on_pooler,
-        );
+        self.apply_replica_lag_and_pooler_env_overrides(env);
         parse_env(
             env,
             "AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS",
