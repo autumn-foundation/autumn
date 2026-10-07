@@ -105,6 +105,8 @@ cargo build -q --locked -p autumn-cli --bin autumn
 # locally commonly set (again mirroring check-sbom.sh).
 CLI="${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-$root/target}}/debug/autumn"
 [ -x "$CLI" ] || die "the autumn CLI did not build at $CLI"
+# Absolute, because the base rebuild below runs it from another directory.
+CLI="$(cd "$(dirname "$CLI")" && pwd)/$(basename "$CLI")"
 
 failed=0
 

@@ -25,7 +25,8 @@
 
 - **routes:** `routes posture` refuses a manifest that lists one route twice.
   Before, it merged the two entries. A merge cannot show two alternative
-  guards, and it can hide a widening.
+  guards, and it can hide a widening. A v3 or v4 baseline that lists a health
+  probe beside the user route that replaced it still reads, as the user route.
 - **routes:** the route dump no longer lists a built-in health probe that a
   user route replaces, or any probe when `health.enabled = false`. The router
   does not mount these probes.

@@ -220,7 +220,7 @@ pub struct CsrfDimension {
     pub entries: Vec<CsrfEntry>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CsrfEntry {
     pub path: String,
     pub method: String,
@@ -283,7 +283,7 @@ pub struct MtlsDimension {
 }
 
 /// One route's declared mTLS requirement.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct MtlsEntry {
     pub path: String,
     pub method: String,
@@ -465,6 +465,9 @@ impl PostureManifest {
                 found: manifest.schema_version,
             });
         }
+        if manifest.schema_version < 5 {
+            drop_legacy_probe_rows(&mut manifest.dimensions);
+        }
         // No app mounts one method on one path twice (Axum panics), so a
         // duplicate row is a corrupt manifest. A merge of two rows cannot show
         // two alternative guards, and it can hide a widening (#2472).
@@ -603,6 +606,39 @@ impl PostureManifest {
     pub fn posture_digest(&self) -> String {
         hex_digest(self.projection().as_bytes())
     }
+}
+
+/// Remove the one duplicate that a pre-v5 emitter wrote.
+///
+/// Before v5, the dump listed a built-in health probe even when a user route
+/// replaced it. The router mounted only the user route. So a `framework` row
+/// beside a non-framework row with the same key is removed, and a csrf or
+/// mtls row that exactly copies an earlier row is removed. Any other
+/// duplicate stays, and parsing refuses it.
+fn drop_legacy_probe_rows(d: &mut Dimensions) {
+    let owned: BTreeSet<RouteKey> = d
+        .routes
+        .entries
+        .iter()
+        .filter(|e| e.classification != "framework")
+        .map(RouteEntry::key)
+        .collect();
+    d.routes
+        .entries
+        .retain(|e| e.classification != "framework" || !owned.contains(&e.key()));
+    dedup_exact(&mut d.csrf.entries);
+    dedup_exact(&mut d.mtls.entries);
+}
+
+/// Keep the first of rows that are exactly equal.
+fn dedup_exact<T: PartialEq>(rows: &mut Vec<T>) {
+    let mut kept: Vec<T> = Vec::with_capacity(rows.len());
+    for row in rows.drain(..) {
+        if !kept.contains(&row) {
+            kept.push(row);
+        }
+    }
+    *rows = kept;
 }
 
 /// Refuse a dimension that lists one `(path, method)` more than once.
@@ -813,6 +849,47 @@ mod tests {
         // The same path on another method is another route.
         let post = r#"{"path":"/a/{id}","method":"POST","classification":"gated"}"#;
         assert!(PostureManifest::parse(&manifest(&format!("{gated},{post}")), "m.json").is_ok());
+    }
+
+    /// Before v5, the dump listed the built-in `GET /health` beside a user
+    /// route that replaced it (the router never mounted the probe). Such a
+    /// committed baseline must still read, as the user route alone.
+    #[test]
+    fn a_pre_v5_probe_row_beside_its_user_route_is_dropped() {
+        let doc = |version: u32| {
+            format!(
+                r#"{{"schema_version":{version},"dimensions":{{
+                  "routes":{{"entries":[
+                    {{"path":"/health","method":"GET","classification":"public"}},
+                    {{"path":"/health","method":"GET","classification":"framework"}}]}},
+                  "mtls":{{"mode":"required","entries":[
+                    {{"path":"/health","method":"GET","mtls_required":true}},
+                    {{"path":"/health","method":"GET","mtls_required":true}}]}}
+                }}}}"#
+            )
+        };
+        for version in [3, 4] {
+            let m = PostureManifest::parse(&doc(version), "m.json").expect("legacy baseline reads");
+            assert_eq!(m.dimensions.routes.entries.len(), 1);
+            assert_eq!(m.dimensions.routes.entries[0].classification, "public");
+            assert_eq!(m.dimensions.mtls.entries.len(), 1);
+        }
+        // The fixed emitter never writes it, so v5 stays strict.
+        assert!(PostureManifest::parse(&doc(5), "m.json").is_err());
+    }
+
+    /// Only that one known pattern is forgiven. Two user rows, or two rows
+    /// that differ, are still refused in an old manifest.
+    #[test]
+    fn other_pre_v5_duplicates_are_still_refused() {
+        let routes = r#"{"schema_version":4,"dimensions":{"routes":{"entries":[
+            {"path":"/a","method":"GET","classification":"public"},
+            {"path":"/a","method":"GET","classification":"gated","roles":["admin"]}]}}}"#;
+        assert!(PostureManifest::parse(routes, "m.json").is_err());
+        let mtls = r#"{"schema_version":4,"dimensions":{"mtls":{"mode":"required","entries":[
+            {"path":"/a","method":"GET","mtls_required":true},
+            {"path":"/a","method":"GET","mtls_required":false}]}}}"#;
+        assert!(PostureManifest::parse(mtls, "m.json").is_err());
     }
 
     #[test]
