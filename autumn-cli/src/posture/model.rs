@@ -97,6 +97,11 @@ pub struct PostureManifest {
     pub build: BuildConfig,
     #[serde(default)]
     pub dimensions: Dimensions,
+    /// Route rows a pre-v5 emitter wrote by mistake. The diff does not see
+    /// them, but the digest does, so a digest a release recorded still
+    /// matches.
+    #[serde(skip)]
+    pub legacy_rows: Vec<RouteEntry>,
 }
 
 /// The Cargo build a manifest describes. A missing field reads as the dev
@@ -466,7 +471,7 @@ impl PostureManifest {
             });
         }
         if manifest.schema_version < 5 {
-            drop_legacy_probe_rows(&mut manifest.dimensions);
+            manifest.legacy_rows = drop_legacy_probe_rows(&mut manifest.dimensions);
         }
         // No app mounts one method on one path twice (Axum panics), so a
         // duplicate row is a corrupt manifest. A merge of two rows cannot show
@@ -522,7 +527,13 @@ impl PostureManifest {
         if !self.build.is_default() {
             lines.push(format!("build\t{}", self.build.canonical()));
         }
-        for r in &self.dimensions.routes.entries {
+        for r in self
+            .dimensions
+            .routes
+            .entries
+            .iter()
+            .chain(&self.legacy_rows)
+        {
             let roles: Vec<String> = r.role_set().into_iter().collect();
             let scopes: Vec<String> = r.scope_set().into_iter().collect();
             lines.push(format!(
@@ -608,14 +619,15 @@ impl PostureManifest {
     }
 }
 
-/// Remove the one duplicate that a pre-v5 emitter wrote.
+/// Remove the one duplicate that a pre-v5 emitter wrote, and return the
+/// route rows it removed.
 ///
 /// Before v5, the dump listed a built-in health probe even when a user route
 /// replaced it. The router mounted only the user route. So a `framework` row
 /// beside a non-framework row with the same key is removed, and a csrf or
 /// mtls row that exactly copies an earlier row is removed. Any other
 /// duplicate stays, and parsing refuses it.
-fn drop_legacy_probe_rows(d: &mut Dimensions) {
+fn drop_legacy_probe_rows(d: &mut Dimensions) -> Vec<RouteEntry> {
     let owned: BTreeSet<RouteKey> = d
         .routes
         .entries
@@ -623,11 +635,14 @@ fn drop_legacy_probe_rows(d: &mut Dimensions) {
         .filter(|e| e.classification != "framework")
         .map(RouteEntry::key)
         .collect();
-    d.routes
-        .entries
-        .retain(|e| e.classification != "framework" || !owned.contains(&e.key()));
+    let (dropped, kept) = std::mem::take(&mut d.routes.entries)
+        .into_iter()
+        .partition(|e| e.classification == "framework" && owned.contains(&e.key()));
+    d.routes.entries = kept;
+    // Exact copies project to one line each, so the digest does not change.
     dedup_exact(&mut d.csrf.entries);
     dedup_exact(&mut d.mtls.entries);
+    dropped
 }
 
 /// Keep the first of rows that are exactly equal.
@@ -876,6 +891,23 @@ mod tests {
         }
         // The fixed emitter never writes it, so v5 stays strict.
         assert!(PostureManifest::parse(&doc(5), "m.json").is_err());
+    }
+
+    /// A release recorded the digest of the manifest as written, both rows
+    /// included. The cleanup is for the diff only, so `posture verify` still
+    /// matches that recorded digest.
+    #[test]
+    fn a_dropped_legacy_row_stays_in_the_digest() {
+        let json = r#"{"schema_version":4,"dimensions":{"routes":{"entries":[
+            {"path":"/health","method":"GET","classification":"public"},
+            {"path":"/health","method":"GET","classification":"framework"}]}}}"#;
+        let m = PostureManifest::parse(json, "m.json").expect("legacy baseline reads");
+        assert_eq!(m.dimensions.routes.entries.len(), 1);
+        assert_eq!(
+            m.projection(),
+            "route\t/health\tGET\tframework\troles=0:\tscopes=0:\tpolicy=false\n\
+             route\t/health\tGET\tpublic\troles=0:\tscopes=0:\tpolicy=false"
+        );
     }
 
     /// Only that one known pattern is forgiven. Two user rows, or two rows
