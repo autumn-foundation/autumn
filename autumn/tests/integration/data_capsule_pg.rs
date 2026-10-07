@@ -491,7 +491,7 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
     let mut admin = PgConnection::establish(&format!("{base}/postgres")).expect("connect");
     for db in [
         "target", "busy", "deferred", "capped", "cached", "cycled", "stepped", "wide", "offpath",
-        "limited", "blind", "locked",
+        "limited", "blind", "locked", "stray",
     ] {
         admin
             .batch_execute(&format!("CREATE DATABASE {db}"))
@@ -506,7 +506,7 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
         .expect("source");
     for db in [
         "target", "busy", "deferred", "capped", "cached", "cycled", "stepped", "wide", "offpath",
-        "limited", "blind", "locked",
+        "limited", "blind", "locked", "stray",
     ] {
         PgConnection::establish(&format!("{base}/{db}"))
             .expect("connect")
@@ -727,6 +727,27 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
     )
     .await;
     assert_eq!(last, "unused");
+
+    // The target already has a row with key 1001, inserted by hand past the
+    // sequence's MAXVALUE. The import's own keys are in range: the plan must
+    // look only at them, so that row does not block the import.
+    let stray = pool(&format!("{base}/stray"));
+    PgConnection::establish(&format!("{base}/stray"))
+        .expect("connect")
+        .batch_execute(
+            "ALTER SEQUENCE notes_id_seq MAXVALUE 600; \
+             INSERT INTO notes (id, owner, body, ticket) VALUES (1001, 9, 'old', 9999)",
+        )
+        .expect("stray row");
+    import_capsule(&capsule, &models, &PgCapsuleStore::new(stray.clone()))
+        .await
+        .expect("import");
+    let next = text(
+        &stray,
+        "INSERT INTO notes (owner) VALUES (2) RETURNING id::text AS value",
+    )
+    .await;
+    assert_eq!(next, "501");
 
     // Two imports of one sequence must not plan at once: each sees only its
     // own rows, and the later `setval` could move the sequence back. Import

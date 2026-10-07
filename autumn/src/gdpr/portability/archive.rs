@@ -218,6 +218,16 @@ impl DataCapsule {
             let bytes = self.blobs.get(&blob.sha256).ok_or_else(|| {
                 DataCapsuleError::Blob(format!("no bytes for blob {:?}", blob.key))
             })?;
+            // A capsule built or changed through the public API can carry an
+            // entry that does not describe its bytes. Signed, it would fail
+            // its own verify.
+            if sha256_hex(bytes) != blob.sha256 || bytes.len() as u64 != blob.byte_size {
+                return Err(DataCapsuleError::InvalidInput(format!(
+                    "blob {:?}: the entry gives SHA-256 {} and {} bytes, which do not match \
+                     its bytes",
+                    blob.key, blob.sha256, blob.byte_size
+                )));
+            }
             if seen.insert(blob.sha256.as_str()) {
                 files.push((blob.file(), bytes.to_vec()));
             }

@@ -59,10 +59,12 @@ autumn_web::app()
 - `exclude(column)` keeps a column out of the capsule.
 
 Every column that a model names must be in the table: the subject column, the
-key, and each link, blob, and excluded column. A typo fails the export
-(`400`), so a capsule never lacks records, blobs, or links. The other way
-round, a custom `CapsuleStore` must give only the columns that it describes:
-a row with another column fails the export (`400`).
+key, and each link, blob, and excluded column, and the target column of a
+link to a model in the same export. A typo fails the export (`400`), so a
+capsule never lacks records, blobs, or links. The other way round, a custom
+`CapsuleStore` must give only the columns that it describes, and a value in
+the key and subject column of every row: any other row fails the export
+(`400`).
 
 **Exclude all secrets.** Export copies every column that you do not exclude.
 Exclude password hashes, tokens, and internal flags. Import cannot restore an
@@ -194,7 +196,8 @@ capsule directory and to each directory above it.
   record.
 - Import skips generated columns.
 - Import moves each serial or identity sequence past the imported keys, in
-  the direction of the sequence. A sequence makes only `start + k * step`, so
+  the direction of the sequence. Only the imported keys count, not the rows
+  that the table had before. A sequence makes only `start + k * step`, so
   only keys on that path count: with `INCREMENT BY 3` from 1, key 500 is not
   a value it makes and does not move it. It does this only after all inserts and
   deferred constraints succeed, and after it checks every move, so a failed

@@ -70,7 +70,7 @@ pub use pg::PgCapsuleStore;
 pub use service::{CapsuleDirectory, CapsuleService, ExportReport};
 pub use store::{CapsuleFuture, CapsuleStore, ImportBatch, MemoryCapsuleStore, ModelData};
 
-use model::{check_model_names, record_file};
+use model::{check_model_names, record_file, value_key};
 
 /// The data of one subject, in memory.
 #[derive(Debug, Clone, PartialEq)]
@@ -175,6 +175,7 @@ pub async fn export_subject(
     }
     let mut manifest = CapsuleManifest::new(subject);
     let mut records = BTreeMap::new();
+    let mut described: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for (model, (mut fields, mut rows)) in models.iter().zip(data) {
         // Fail closed: a typo must not export a secret column, or give a
         // capsule without its records, blobs or links. A custom store can
@@ -202,7 +203,21 @@ pub async fn export_subject(
                     model.table
                 )));
             }
+            // The viewer anchors a record at its key, and import writes both
+            // columns: a row needs a value in each.
+            for column in [&model.primary_key, &model.subject_column] {
+                if row.get(column).and_then(value_key).is_none() {
+                    return Err(DataCapsuleError::InvalidInput(format!(
+                        "the store gave a row of {} without a value in {column:?}",
+                        model.table
+                    )));
+                }
+            }
         }
+        described.insert(
+            model.table.as_str(),
+            fields.iter().map(|f| f.name.clone()).collect(),
+        );
         fields.retain(|f| !model.excluded.contains(&f.name));
         for row in &mut rows {
             row.retain(|column, _| !model.excluded.contains(column));
@@ -218,6 +233,20 @@ pub async fn export_subject(
             file: record_file(&model.table),
         });
         records.insert(model.table.clone(), rows);
+    }
+    // A link to a model in this export must name a column of that model:
+    // a typo would lose the links in the viewer.
+    for model in models {
+        for rel in &model.relationships {
+            if let Some(columns) = described.get(rel.target.as_str())
+                && !columns.contains(&rel.target_column)
+            {
+                return Err(DataCapsuleError::InvalidInput(format!(
+                    "{}.{} links to {}.{:?}, but {} has no such column",
+                    model.table, rel.column, rel.target, rel.target_column, rel.target
+                )));
+            }
+        }
     }
     Ok(DataCapsule {
         manifest,

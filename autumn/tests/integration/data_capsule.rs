@@ -447,6 +447,40 @@ async fn export_rejects_blob_and_relationship_columns_that_name_no_column() {
 }
 
 #[tokio::test]
+async fn export_refuses_a_link_to_a_column_that_the_target_lacks() {
+    let models = [
+        CapsuleModel::new("users", "id"),
+        CapsuleModel::new("posts", "author_id").references("author_id", "users", "idd"),
+    ];
+    let err = export_subject(&models, &seeded_store(), "1")
+        .await
+        .expect_err("a typo in the target column");
+    assert!(matches!(err, DataCapsuleError::InvalidInput(_)), "{err:?}");
+    assert!(err.to_string().contains("idd"), "{err}");
+}
+
+#[tokio::test]
+async fn export_refuses_a_row_without_its_key() {
+    // A custom store can give a row without its key, or with a null key:
+    // the viewer has no anchor for it, and import would write NULL.
+    for row in [json!({"owner": 1}), json!({"id": null, "owner": 1})] {
+        let store = MemoryCapsuleStore::new().table(
+            "notes",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("owner", "bigint"),
+            ],
+        );
+        store.insert("notes", row);
+        let err = export_subject(&[CapsuleModel::new("notes", "owner")], &store, "1")
+            .await
+            .expect_err("a row without its key");
+        assert!(matches!(err, DataCapsuleError::InvalidInput(_)), "{err:?}");
+        assert!(err.to_string().contains("\"id\""), "{err}");
+    }
+}
+
+#[tokio::test]
 async fn export_refuses_a_column_that_the_store_does_not_describe() {
     // A store that gives a column outside its own description would put it in
     // the capsule, but not in the manifest or the viewer.
@@ -1125,6 +1159,37 @@ mod blobs {
         assert!(matches!(err, DataCapsuleError::InvalidInput(_)), "{err:?}");
         assert!(err.to_string().contains("docs/ada-cv.txt"), "{err}");
         assert!(target.rows("users").is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_refuses_a_blob_entry_that_does_not_match_its_bytes() {
+        // A capsule built or changed through the public API must not be signed
+        // when its blob entry does not describe its bytes: it would not verify.
+        let tmp = tempfile::tempdir().unwrap();
+        let blobs = blob_store(&tmp.path().join("a"));
+        blobs
+            .put("avatars/ada.png", "image/png", Bytes::from_static(b"png"))
+            .await
+            .unwrap();
+        blobs
+            .put("docs/ada-cv.txt", "text/plain", Bytes::from_static(b"cv"))
+            .await
+            .unwrap();
+        let mut capsule = export_subject(&models(), &store(), "1").await.unwrap();
+        collect_blobs(&mut capsule, &blobs).await.unwrap();
+
+        let mut wrong_size = capsule.clone();
+        wrong_size.manifest.blobs[0].byte_size += 1;
+        let mut wrong_bytes = capsule.clone();
+        let sha = wrong_bytes.manifest.blobs[0].sha256.clone();
+        wrong_bytes.blobs.insert(sha, Bytes::from_static(b"other"));
+        for (n, capsule) in [wrong_size, wrong_bytes].into_iter().enumerate() {
+            let root = tmp.path().join(format!("capsule-{n}"));
+            let err = capsule
+                .write_dir(&root, &signer())
+                .expect_err("entry and bytes disagree");
+            assert!(matches!(err, DataCapsuleError::InvalidInput(_)), "{err:?}");
+        }
     }
 
     #[tokio::test]

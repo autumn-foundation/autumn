@@ -428,7 +428,13 @@ impl CapsuleStore for PgCapsuleStore {
                             if let Some(seq) =
                                 serial_sequence(conn, &batch.model.table, &field.name).await?
                             {
-                                owned.push((seq, batch.model.table.as_str(), field.name.as_str()));
+                                let keys = imported_keys(batch.records, &field.name);
+                                owned.push((
+                                    seq,
+                                    batch.model.table.as_str(),
+                                    field.name.as_str(),
+                                    keys,
+                                ));
                             }
                         }
                     }
@@ -438,7 +444,7 @@ impl CapsuleStore for PgCapsuleStore {
                     // order, so two imports cannot hold each other's lock.
                     owned.sort_unstable();
                     owned.dedup_by(|a, b| a.0 == b.0);
-                    for (seq, _, _) in &owned {
+                    for (seq, _, _, _) in &owned {
                         diesel::sql_query(
                             "SELECT pg_advisory_xact_lock(hashtextextended(\
                              'autumn.capsule.sequence:' || $1::regclass::oid::text, 0))",
@@ -449,8 +455,8 @@ impl CapsuleStore for PgCapsuleStore {
                         .map_err(|e| store_error(&format!("lock sequence {seq}"), &e))?;
                     }
                     let mut moves = Vec::new();
-                    for (seq, table, column) in &owned {
-                        if let Some(next) = plan_sequence(conn, table, column, seq).await? {
+                    for (seq, table, column, keys) in &owned {
+                        if let Some(next) = plan_sequence(conn, table, column, seq, keys).await? {
                             moves.push(next);
                         }
                     }
@@ -580,6 +586,19 @@ struct SequencePlan {
     cycle: bool,
 }
 
+/// The integer values of `column` in the imported rows.
+fn imported_keys(records: &[Record], column: &str) -> Vec<i64> {
+    records
+        .iter()
+        .filter_map(|row| {
+            let value = row.get(column)?;
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+        })
+        .collect()
+}
+
 /// The serial or identity sequence of `table.column`, if it has one.
 async fn serial_sequence(
     conn: &mut AsyncPgConnection,
@@ -611,39 +630,41 @@ async fn plan_sequence(
     table: &str,
     column: &str,
     seq: &str,
+    keys: &[i64],
 ) -> Result<Option<(String, i64, String)>, DataCapsuleError> {
-    let quoted_table = quote(table)?;
     let seq = seq.to_owned();
     let target = format!("{table}.{column}");
-    let pk = quote(column)?;
     // The sequence makes only `start + k * inc`, so only a key on that path
     // can be a value it makes. The sequence moves to the outermost such key,
     // in its own direction. A key off the path (500 for `INCREMENT BY 3` from
     // 1) needs no move: moving to the path value before it would only use up
     // values that are still free. An unused sequence has no last value: then
     // compare with the value before its start. The arithmetic is in numeric:
-    // `key - start` and `start - inc` can leave the bigint range.
-    let plan: Option<SequencePlan> = diesel::sql_query(format!(
+    // `key - start` and `start - inc` can leave the bigint range. Only the
+    // imported keys count: a row that the target had before, even one outside
+    // the sequence range, is not this import's to check.
+    let plan: Option<SequencePlan> = diesel::sql_query(
         "SELECT s.m AS target, s.cache, s.min, s.max, s.cycle, CASE WHEN s.inc > 0 \
            THEN s.m > COALESCE(s.last, s.start::numeric - s.inc) \
            ELSE s.m < COALESCE(s.last, s.start::numeric - s.inc) END AS needed, \
            s.can_read, has_sequence_privilege($1::regclass, 'UPDATE') AS can_update \
          FROM (SELECT CASE WHEN q.seqincrement > 0 \
-                        THEN MAX(t.{pk}) FILTER (WHERE mod(t.{pk}::numeric - q.seqstart, q.seqincrement) = 0) \
-                        ELSE MIN(t.{pk}) FILTER (WHERE mod(t.{pk}::numeric - q.seqstart, q.seqincrement) = 0) \
+                        THEN MAX(k.v) FILTER (WHERE mod(k.v::numeric - q.seqstart, q.seqincrement) = 0) \
+                        ELSE MIN(k.v) FILTER (WHERE mod(k.v::numeric - q.seqstart, q.seqincrement) = 0) \
                       END::bigint AS m, \
                       has_sequence_privilege($1::regclass, 'SELECT, USAGE') AS can_read, \
                       CASE WHEN has_sequence_privilege($1::regclass, 'SELECT, USAGE') \
                         THEN pg_sequence_last_value($1::regclass) END AS last, \
                       q.seqincrement AS inc, q.seqstart AS start, q.seqcache AS cache, \
                       q.seqmin AS min, q.seqmax AS max, q.seqcycle AS cycle \
-               FROM {quoted_table} t CROSS JOIN pg_sequence q \
+               FROM unnest($2::bigint[]) AS k(v) CROSS JOIN pg_sequence q \
                WHERE q.seqrelid = $1::regclass \
                GROUP BY q.seqincrement, q.seqstart, q.seqcache, q.seqmin, q.seqmax, \
                         q.seqcycle) s \
-         WHERE s.m IS NOT NULL"
-    ))
+         WHERE s.m IS NOT NULL",
+    )
     .bind::<diesel::sql_types::Text, _>(&seq)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(keys)
     .get_result(conn)
     .await
     .optional()
