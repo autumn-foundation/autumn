@@ -68,6 +68,22 @@ async fn sink_close() -> impl WsHandler {
     }
 }
 
+/// A `split()` handler whose writer sends a Close message and keeps its sink,
+/// while the reader stays parked (the client never sends).
+#[ws("/sink-send-close")]
+async fn sink_send_close() -> impl WsHandler {
+    |socket: WebSocket| async move {
+        let (mut sink, mut stream) = socket.split();
+        tokio::spawn(async move {
+            let _ = sink.send(Message::Close(None)).await;
+            let _sink = sink;
+            std::future::pending::<()>().await;
+        });
+        while let Some(Ok(_)) = stream.next().await {}
+        std::future::pending::<()>().await;
+    }
+}
+
 /// A handler on the axum socket. It keeps the hold for the socket's life.
 #[get("/raw")]
 async fn raw(ws: autumn_web::ws::WebSocketUpgrade) -> axum::response::Response {
@@ -83,7 +99,13 @@ async fn serve_with(configure: impl FnOnce(&mut AutumnConfig)) -> SocketAddr {
     configure(&mut config);
     let router = TestApp::new()
         .config(config)
-        .routes(routes![limited, raw, split_writer, sink_close])
+        .routes(routes![
+            limited,
+            raw,
+            split_writer,
+            sink_close,
+            sink_send_close
+        ])
         .build()
         .into_router();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -387,6 +409,29 @@ async fn a_sink_side_close_releases_the_socket() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         if tokio_tungstenite::connect_async(format!("ws://{addr}/sink-close"))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the closed socket still holds the slot"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sent_close_message_releases_the_socket() {
+    let addr = serve_with(|c| c.realtime.max_connections = Some(1)).await;
+    // This client never reads, so it never answers the close frame.
+    let (_silent, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/sink-send-close"))
+        .await
+        .expect("first socket");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if tokio_tungstenite::connect_async(format!("ws://{addr}/sink-send-close"))
             .await
             .is_ok()
         {

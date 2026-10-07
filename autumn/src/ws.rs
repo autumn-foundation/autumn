@@ -459,6 +459,11 @@ pub struct WebSocket {
     /// The waker of a parked `poll_next`. A sink-side close ends the socket,
     /// and the reader must then see the end.
     reader_waker: Option<std::task::Waker>,
+    /// Set when the handler sends a Close frame (or calls `close()`). When
+    /// that flush ends the socket is done, also when the peer never answers.
+    /// The deadline bounds the flush: a peer that does not read cannot keep
+    /// the socket.
+    close_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     /// Released when the socket drops.
     hold: ConnectionHold,
 }
@@ -503,6 +508,7 @@ impl WebSocket {
             done: false,
             writer_waker: None,
             reader_waker: None,
+            close_deadline: None,
             hold,
         }
     }
@@ -595,6 +601,28 @@ impl WebSocket {
         if let Some(waker) = self.writer_waker.take() {
             waker.wake();
         }
+    }
+
+    /// A Close frame the handler sent is being flushed. When the flush ends
+    /// (or fails, or takes over [`CLOSE_FLUSH_TIMEOUT`]), the socket is done:
+    /// release it, also while a `split()` half lives on.
+    fn settle_close(
+        &mut self,
+        cx: &mut Context<'_>,
+        poll: Poll<Result<(), axum::Error>>,
+    ) -> Poll<Result<(), axum::Error>> {
+        if poll.is_ready() {
+            self.finish();
+            return poll;
+        }
+        let deadline = self
+            .close_deadline
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(CLOSE_FLUSH_TIMEOUT)));
+        if deadline.as_mut().poll(cx).is_ready() {
+            self.finish();
+            return Poll::Ready(Ok(()));
+        }
+        self.note_writer(cx, poll)
     }
 
     /// Keep the waker of a `Sink` call that returned `Pending`.
@@ -756,7 +784,12 @@ impl futures::Sink<Message> for WebSocket {
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
-        Pin::new(self.socket()?).start_send(item)
+        let close = matches!(item, Message::Close(_));
+        Pin::new(self.socket()?).start_send(item)?;
+        if close && self.close_deadline.is_none() {
+            self.close_deadline = Some(Box::pin(tokio::time::sleep(CLOSE_FLUSH_TIMEOUT)));
+        }
+        Ok(())
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -764,6 +797,9 @@ impl futures::Sink<Message> for WebSocket {
             Ok(socket) => Pin::new(socket).poll_flush(cx),
             Err(error) => return Poll::Ready(Err(error)),
         };
+        if self.close_deadline.is_some() {
+            return self.settle_close(cx, poll);
+        }
         self.note_writer(cx, poll)
     }
 
@@ -773,12 +809,7 @@ impl futures::Sink<Message> for WebSocket {
             Some(socket) => Pin::new(socket).poll_close(cx),
             None => return Poll::Ready(Ok(())),
         };
-        if poll.is_ready() {
-            // The close frame is sent (or the send failed): the socket is
-            // done. Release it, also while a `split()` half lives on.
-            self.finish();
-        }
-        self.note_writer(cx, poll)
+        self.settle_close(cx, poll)
     }
 }
 
