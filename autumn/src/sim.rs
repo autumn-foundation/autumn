@@ -60,8 +60,8 @@
 //!   siblings, which follow the sim clock.
 //! - **Replicas (issue #3067).** [`Sim::mount_replica`] mounts several apps on
 //!   one clock, each with its own [`Replica`] clock (offset, drift, steps).
-//!   [`Sim::db_link`] faults one replica's database session and writes.
-//!   [`Sim::run_for`] moves time one event at a time. [`runtime`] gates
+//!   `Sim::db_link` (with `sqlite`) faults one replica's database session
+//!   and writes. [`Sim::run_for`] moves time one event at a time. [`runtime`] gates
 //!   database work, so a seed replays it. [`mod@trace`] compares two runs of
 //!   one seed.
 //!
