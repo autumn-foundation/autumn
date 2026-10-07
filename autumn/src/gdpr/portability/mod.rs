@@ -396,9 +396,9 @@ pub(super) fn check_importable<'c>(
 }
 
 /// Check that each table in `store` has the columns that import writes: the
-/// fields of the capsule, without the generated ones. A capsule made before a
-/// column was dropped or renamed would fail at the insert, after its blobs are
-/// written. Run [`check_importable`] first.
+/// fields of the capsule, without the generated ones, and that it does not
+/// generate them now. A capsule made before a column was dropped, renamed, or
+/// made generated would fail at the insert, after its blobs are written. Run [`check_importable`] first.
 pub(super) async fn check_target(
     capsule: &DataCapsule,
     models: &[CapsuleModel],
@@ -409,16 +409,24 @@ pub(super) async fn check_target(
             return Err(DataCapsuleError::UnknownTable(model.table.clone()));
         };
         let described = store.describe(current).await?;
-        if let Some(field) = model
-            .fields
-            .iter()
-            .filter(|f| !f.generated)
-            .find(|f| !described.iter().any(|d| d.name == f.name))
-        {
-            return Err(DataCapsuleError::InvalidInput(format!(
-                "{}.{} is in the capsule, but the target table has no such column",
-                model.table, field.name
-            )));
+        for field in model.fields.iter().filter(|f| !f.generated) {
+            // A column that the target now generates takes no value: the
+            // insert would fail too.
+            match described.iter().find(|d| d.name == field.name) {
+                None => {
+                    return Err(DataCapsuleError::InvalidInput(format!(
+                        "{}.{} is in the capsule, but the target table has no such column",
+                        model.table, field.name
+                    )));
+                }
+                Some(target) if target.generated => {
+                    return Err(DataCapsuleError::InvalidInput(format!(
+                        "{}.{} is in the capsule, but the target table generates it",
+                        model.table, field.name
+                    )));
+                }
+                Some(_) => {}
+            }
         }
     }
     Ok(())

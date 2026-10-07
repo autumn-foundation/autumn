@@ -795,6 +795,47 @@ async fn import_refuses_a_row_without_its_key_or_subject() {
 }
 
 #[tokio::test]
+async fn import_refuses_a_column_that_the_target_now_generates() {
+    // The target computes `bio` now. Import would write the column and fail
+    // after its blobs are written, so it must refuse the capsule first.
+    let capsule = export_ada(&seeded_store()).await;
+    let target = MemoryCapsuleStore::new()
+        .table(
+            "users",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("email", "text"),
+                FieldSpec::new("bio", "text").nullable().generated(),
+            ],
+        )
+        .table(
+            "posts",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("author_id", "bigint"),
+                FieldSpec::new("title", "text"),
+                FieldSpec::new("meta", "jsonb").nullable(),
+            ],
+        )
+        .table(
+            "comments",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("author_id", "bigint"),
+                FieldSpec::new("post_id", "bigint"),
+                FieldSpec::new("body", "text"),
+            ],
+        );
+    let err = import_capsule(&capsule, registry().capsule_models(), &target)
+        .await
+        .expect_err("generated column");
+    assert!(
+        matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains("users.bio")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
 async fn import_rejects_a_relationship_cycle() {
     let models = [
         CapsuleModel::new("users", "id").belongs_to("id", "comments"),
@@ -2060,6 +2101,65 @@ mod blobs {
         assert_eq!(avatar["key"], "avatars/ada.png");
         // A plain key string stays as it is.
         assert_eq!(rows[0]["cv_key"], "docs/ada-cv.txt");
+    }
+
+    #[tokio::test]
+    async fn import_points_a_handle_without_a_provider_at_the_target_store() {
+        // A capsule written through the public API can hold a `Blob` object
+        // without `provider_id`. Its bytes are restored, so its handle must
+        // name the target store too.
+        use std::sync::Arc;
+
+        use autumn_web::gdpr::portability::CapsuleService;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_blobs = blob_store(&tmp.path().join("a"));
+        source_blobs
+            .put("avatars/ada.png", "image/png", Bytes::from_static(b"png"))
+            .await
+            .unwrap();
+        source_blobs
+            .put("docs/ada-cv.txt", "text/plain", Bytes::from_static(b"cv"))
+            .await
+            .unwrap();
+        let source = CapsuleService::new(models(), Arc::new(store()), signer())
+            .with_blob_store(Arc::new(source_blobs));
+        let exported = tmp.path().join("exported");
+        source.export_to("1", &exported).await.unwrap();
+        let mut capsule = DataCapsule::read_dir(&exported, &signer()).unwrap();
+        capsule.records.get_mut("users").unwrap()[0]["avatar"]
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_id");
+        let root = tmp.path().join("capsule");
+        capsule.write_dir(&root, &signer()).unwrap();
+
+        let target_blobs = Arc::new(
+            LocalBlobStore::new(
+                "target",
+                tmp.path().join("b"),
+                "/_blobs",
+                Duration::from_secs(60),
+                SigningKey::new(b"blob-key".to_vec()),
+                vec![],
+            )
+            .unwrap(),
+        );
+        let records = Arc::new(MemoryCapsuleStore::new().table(
+            "users",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("avatar", "jsonb").nullable(),
+                FieldSpec::new("cv_key", "text").nullable(),
+            ],
+        ));
+        let target = CapsuleService::new(models(), records.clone(), signer())
+            .with_blob_store(target_blobs.clone());
+        target.import_from(&root).await.expect("import");
+        let rows = records.rows("users");
+        let avatar = &rows[0]["avatar"];
+        assert_eq!(avatar["provider_id"], "target", "{avatar}");
+        assert_eq!(avatar["key"], "avatars/ada.png");
     }
 
     #[tokio::test]

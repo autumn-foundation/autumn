@@ -220,7 +220,8 @@ pub async fn restore_blobs(
 /// after [`restore_blobs`] and before [`import_capsule`](super::import_capsule).
 ///
 /// A plain key string, and a key that the capsule has no bytes for, stay as
-/// they are.
+/// they are. An object with a restored key gets these fields even when it
+/// has no `provider_id`.
 ///
 /// # Errors
 ///
@@ -246,7 +247,10 @@ pub async fn rebind_blobs(
                 let Some(key) = blob.get("key").and_then(serde_json::Value::as_str) else {
                     continue;
                 };
-                if !blob.contains_key("provider_id") || !restored.contains(key) {
+                // An object without `provider_id` (a capsule written through
+                // the public API) is a handle too: its bytes are restored, so
+                // it must name the target store.
+                if !restored.contains(key) {
                     continue;
                 }
                 let key = key.to_owned();
