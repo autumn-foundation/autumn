@@ -2315,7 +2315,9 @@ impl TestApp {
                 tracing::warn!("{e}");
             }
         }
-
+        // Mirror production `build_state`: the `[health]` cache TTL, ping
+        // time limit and database readiness gate.
+        state.apply_health_config(&self.config.health);
         // Mirror production `AppBuilder` wiring: surface each configured shard's
         // replica readiness as a `db:shard:<name>` indicator so `/ready`
         // refreshes shard replica health (gating `fail_readiness` shards and
@@ -2325,6 +2327,7 @@ impl TestApp {
             crate::sharding::register_shard_health_indicators(
                 set,
                 &state.health_indicator_registry,
+                self.config.health.ping_timeout(),
             );
         }
 
@@ -2370,6 +2373,22 @@ impl TestApp {
         for job in &self.jobs {
             state.job_registry.register(&job.name);
         }
+
+        // Mirror production `AppBuilder` wiring: one `redis:<subsystem>`
+        // PING indicator per Redis-backed subsystem (#3059). Here, the job set
+        // is final (durable listeners are jobs too). `TestApp` always uses
+        // in-process channels, and with no jobs no job runtime starts.
+        #[cfg(feature = "redis")]
+        crate::redis_health::register_redis_health_indicators(
+            &self.config,
+            &state.health_indicator_registry,
+            &crate::redis_health::app_pingers(&state),
+            if self.jobs.is_empty() {
+                &["channels", "jobs"]
+            } else {
+                &["channels"]
+            },
+        );
 
         let job_runtime = if self.jobs.is_empty() {
             None
