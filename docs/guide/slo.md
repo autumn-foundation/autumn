@@ -192,7 +192,8 @@ passes the canary hash to the template:
 ```bash
 kubectl apply -f deploy/slo/argo-analysis-template.yaml
 helm upgrade --install shop deploy/helm \
-  -f deploy/slo/helm-values.yaml --set rollout.enabled=true
+  -f deploy/slo/helm-values.yaml --set rollout.enabled=true \
+  --set 'trustedHosts[0]=shop.example.com'
 ```
 
 A metric passes when there is no data yet. It fails after two results above
@@ -209,7 +210,8 @@ one late scrape does not empty the result. Scrape at least every 30 s.
 ```bash
 kubectl apply -f deploy/slo/flagger-metric-templates.yaml
 helm upgrade --install shop deploy/helm \
-  -f deploy/slo/helm-values.yaml --set flagger.enabled=true
+  -f deploy/slo/helm-values.yaml --set flagger.enabled=true \
+  --set 'trustedHosts[0]=shop.example.com'
 ```
 
 The chart puts each template in the `Canary` analysis with

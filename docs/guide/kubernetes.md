@@ -138,7 +138,8 @@ templates, and pass `deploy/slo/helm-values.yaml` to Helm:
 autumn slo generate --app shop
 kubectl apply -f deploy/slo/argo-analysis-template.yaml
 helm upgrade --install shop deploy/helm \
-  -f deploy/slo/helm-values.yaml --set rollout.enabled=true
+  -f deploy/slo/helm-values.yaml --set rollout.enabled=true \
+  --set 'trustedHosts[0]=shop.example.com'
 ```
 
 The values set `analysis.templateName`, `analysis.metricTemplates` and
@@ -166,8 +167,9 @@ The `Kubernetes manifests` job in this repository runs
 Run the same check on your own chart:
 
 ```bash
-helm lint --strict deploy/helm
-helm template shop deploy/helm | kubeconform -strict -summary
+helm lint --strict deploy/helm --set 'trustedHosts[0]=shop.example.com'
+helm template shop deploy/helm --set 'trustedHosts[0]=shop.example.com' \
+  | kubeconform -strict -summary
 ```
 
 Object names are at most 55 characters, so Flagger can add `-primary` or

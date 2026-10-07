@@ -424,11 +424,17 @@ pub(crate) fn run<E: DeployExecutor>(
 }
 
 /// The `/actuator/metrics` path for an `[actuator] prefix`. It matches the
-/// app's own prefix rules: trim, one leading `/`, no trailing `/`.
+/// app's own prefix rules: trim, add a leading `/` when it is missing, drop trailing `/`.
 pub(crate) fn metrics_path(prefix: &str) -> String {
-    let trimmed = prefix.trim().trim_matches('/');
-    if trimmed.is_empty() {
-        "/metrics".to_owned()
+    // The same rules as `normalize_actuator_prefix` and `actuator_route_path`
+    // in autumn-web: trailing `/` go, leading `/` stay.
+    let trimmed = prefix.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        return "/metrics".to_owned();
+    }
+    let trimmed = trimmed.trim_end_matches('/');
+    if trimmed.starts_with('/') {
+        format!("{trimmed}/metrics")
     } else {
         format!("/{trimmed}/metrics")
     }
@@ -977,6 +983,9 @@ mod tests {
         assert_eq!(metrics_path(" /ops/ "), "/ops/metrics");
         assert_eq!(metrics_path("/"), "/metrics");
         assert_eq!(metrics_path(""), "/metrics");
+        // The app keeps repeated leading slashes (`normalize_actuator_prefix`).
+        assert_eq!(metrics_path("//ops"), "//ops/metrics");
+        assert_eq!(metrics_path("ops//"), "/ops/metrics");
     }
 
     #[test]
