@@ -71,6 +71,9 @@ pub struct GenerateOptions {
     pub prometheus_url: String,
     /// The output directory, for the usage comment in `helm-values.yaml`.
     pub out_dir: String,
+    /// Extra `NAME=VALUE` labels on the `PrometheusRule` object, so that a
+    /// Prometheus `ruleSelector` finds it.
+    pub rule_labels: Vec<String>,
 }
 
 /// One generated file.
@@ -107,6 +110,7 @@ pub fn generate(slos: &[Slo], options: &GenerateOptions) -> Result<Generated, St
     }
     let app = kube_name(&options.app)?;
     let matchers = parse_selector(options.selector.as_deref().unwrap_or(""))?;
+    let object_labels = parse_rule_labels(&options.rule_labels)?;
     for slo in slos {
         let name = metric_template_name(&app, slo);
         if name.len() > 63 {
@@ -147,6 +151,7 @@ pub fn generate(slos: &[Slo], options: &GenerateOptions) -> Result<Generated, St
         selector,
         scope,
         rule_labels,
+        object_labels,
         own,
         prometheus_url: options.prometheus_url.clone(),
         out_dir: options.out_dir.clone(),
@@ -191,6 +196,8 @@ struct Context {
     scope: String,
     /// Labels on every recorded series: the equality matchers.
     rule_labels: Vec<(String, String)>,
+    /// `--rule-label` labels for the `PrometheusRule` object, sorted.
+    object_labels: Vec<(String, String)>,
     /// Matchers that select this app's recorded series, without `slo`.
     own: String,
     prometheus_url: String,
@@ -251,6 +258,60 @@ fn unescape(value: &str) -> String {
         }
     }
     out
+}
+
+/// The labels that `object_labels` sets itself.
+const OWN_OBJECT_LABELS: [&str; 2] = ["app.kubernetes.io/name", "app.kubernetes.io/managed-by"];
+
+/// A Kubernetes label name or value: at most 63 letters, digits, `-`, `_`
+/// or `.`, with a letter or digit at each end.
+fn is_label_segment(text: &str) -> bool {
+    text.len() <= 63
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && text.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && text.ends_with(|c: char| c.is_ascii_alphanumeric())
+}
+
+/// Parse `--rule-label NAME=VALUE`. The key is a Kubernetes label key: an
+/// optional DNS prefix and `/`, then a name. The value may be empty.
+fn parse_rule_labels(raw: &[String]) -> Result<Vec<(String, String)>, String> {
+    let mut labels = std::collections::BTreeMap::new();
+    for item in raw {
+        let fail = |why: &str| Err(format!("--rule-label {item:?} is not valid: {why}"));
+        let Some((key, value)) = item.split_once('=') else {
+            return fail("give NAME=VALUE");
+        };
+        let (prefix, name) = key
+            .split_once('/')
+            .map_or((None, key), |(p, n)| (Some(p), n));
+        let prefix_ok = prefix.is_none_or(|p| {
+            p.len() <= 253
+                && p.split('.').all(|part| {
+                    !part.is_empty()
+                        && part.len() <= 63
+                        && part
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                        && !part.starts_with('-')
+                        && !part.ends_with('-')
+                })
+        });
+        if !prefix_ok || !is_label_segment(name) {
+            return fail("the name is not a Kubernetes label key");
+        }
+        if !value.is_empty() && !is_label_segment(value) {
+            return fail("the value is not a Kubernetes label value");
+        }
+        if OWN_OBJECT_LABELS.contains(&key) {
+            return fail("the generator sets this label");
+        }
+        if labels.insert(key.to_owned(), value.to_owned()).is_some() {
+            return fail("the label is given twice");
+        }
+    }
+    Ok(labels.into_iter().collect())
 }
 
 /// One label matcher from `--selector`.
@@ -638,6 +699,9 @@ fn render_prometheus_rule(slos: &[Slo], ctx: &Context) -> String {
     out.push_str("apiVersion: monitoring.coreos.com/v1\nkind: PrometheusRule\nmetadata:\n");
     let _ = writeln!(out, "  name: {}", yaml_str(&format!("{}-slo", ctx.app)));
     object_labels(&mut out, &ctx.app);
+    for (key, value) in &ctx.object_labels {
+        let _ = writeln!(out, "    {key}: {}", yaml_str(value));
+    }
     out.push_str("spec:\n");
     render_groups(&mut out, slos, ctx, 2);
     out
@@ -1042,6 +1106,8 @@ pub struct GenerateArgs {
     pub selector: Option<String>,
     /// Prometheus address for the analysis templates.
     pub prometheus_url: String,
+    /// `NAME=VALUE` labels for the `PrometheusRule` object.
+    pub rule_labels: Vec<String>,
     /// Compare with the files on disk; write nothing.
     pub check: bool,
 }
@@ -1072,6 +1138,7 @@ pub fn execute(
         selector: args.selector.clone(),
         prometheus_url: args.prometheus_url.clone(),
         out_dir: args.out_dir.display().to_string(),
+        rule_labels: args.rule_labels.clone(),
     };
     let generated = generate(&slos, &options)?;
     if args.check {

@@ -106,6 +106,7 @@ date.
 | `--out-dir DIR` | `deploy/slo` | The output directory. |
 | `--app NAME` | `[deploy] app_name`, then the package name, then `app` | The `app` label and the Kubernetes object names. |
 | `--selector MATCHERS` | none | Extra label matchers for every query, for example `'job="shop",namespace="prod"'`. Each value is in double quotes. |
+| `--rule-label NAME=VALUE` | none | A label on the `PrometheusRule` object. Set it when Prometheus selects rules with a `ruleSelector`, for example `release=kube-prometheus-stack`. Repeat it for more labels. |
 | `--prometheus-url URL` | `http://prometheus.monitoring.svc:9090` | The Prometheus address in the analysis templates. |
 | `--check` | off | Compare only. |
 

@@ -50,6 +50,7 @@ fn fixture_options() -> GenerateOptions {
         selector: Some("job=\"shop\"".to_owned()),
         prometheus_url: DEFAULT_PROMETHEUS_URL.to_owned(),
         out_dir: DEFAULT_OUT_DIR.to_owned(),
+        rule_labels: Vec::new(),
     }
 }
 
@@ -236,6 +237,60 @@ fn rule_files_are_valid_yaml_with_three_alerts_per_slo() {
         serde_yaml::from_str(file(&generated, "prometheus-rule.yaml")).expect("yaml");
     assert_eq!(crd["kind"], "PrometheusRule");
     assert_eq!(crd["spec"]["groups"], rules["groups"]);
+}
+
+/// `--rule-label` lets a Prometheus `ruleSelector` find the `PrometheusRule`.
+#[test]
+fn rule_labels_go_on_the_prometheus_rule_object_only() {
+    let slos = slo::validate(&fixture_configs()).expect("valid");
+    let mut options = fixture_options();
+    options.rule_labels = vec![
+        "release=kube-prometheus-stack".to_owned(),
+        "example.com/team=payments".to_owned(),
+    ];
+    let generated = generate(&slos, &options).expect("generate");
+    let crd: serde_yaml::Value =
+        serde_yaml::from_str(file(&generated, "prometheus-rule.yaml")).expect("yaml");
+    let labels = &crd["metadata"]["labels"];
+    assert_eq!(labels["release"], "kube-prometheus-stack");
+    assert_eq!(labels["example.com/team"], "payments");
+    assert_eq!(labels["app.kubernetes.io/managed-by"], "autumn");
+    // Sorted, so the output does not depend on the flag order.
+    let text = file(&generated, "prometheus-rule.yaml");
+    assert!(
+        text.find("example.com/team").expect("team") < text.find("release:").expect("release"),
+        "{text}"
+    );
+    options.rule_labels.reverse();
+    assert_eq!(generate(&slos, &options).expect("generate"), generated);
+    // The plain rule file has no Kubernetes object, so no labels.
+    assert!(!file(&generated, "prometheus-rules.yaml").contains("kube-prometheus-stack"));
+}
+
+#[test]
+fn a_bad_rule_label_is_rejected() {
+    let slos = slo::validate(&fixture_configs()).expect("valid");
+    for bad in [
+        "release",
+        "=x",
+        "release=a b",
+        "release=-x",
+        "Bad Key=x",
+        "/x=y",
+        "a/b/c=d",
+        &format!("release={}", "x".repeat(64)),
+        &format!("{}=x", "k".repeat(64)),
+        "app.kubernetes.io/managed-by=me",
+        "app.kubernetes.io/name=other",
+        "release=a,release=b",
+    ] {
+        let mut options = fixture_options();
+        options.rule_labels = bad.split(',').map(str::to_owned).collect();
+        assert!(generate(&slos, &options).is_err(), "{bad:?}");
+    }
+    let mut options = fixture_options();
+    options.rule_labels = vec!["release=".to_owned()];
+    assert!(generate(&slos, &options).is_ok(), "an empty value is valid");
 }
 
 /// Every recording rule that another file reads exists in the rule file.
@@ -589,6 +644,7 @@ fn args(dir: &Path, check: bool) -> GenerateArgs {
         app: Some("shop".to_owned()),
         selector: Some("job=\"shop\"".to_owned()),
         prometheus_url: DEFAULT_PROMETHEUS_URL.to_owned(),
+        rule_labels: Vec::new(),
         check,
     }
 }

@@ -3548,6 +3548,11 @@ struct SloGenerateArgs {
     /// Prometheus address in the analysis templates.
     #[arg(long, value_name = "URL", default_value = slo::DEFAULT_PROMETHEUS_URL)]
     prometheus_url: String,
+    /// A label on the `PrometheusRule` object, for a Prometheus
+    /// `ruleSelector`, for example 'release=kube-prometheus-stack'. Repeat it
+    /// for more labels.
+    #[arg(long, value_name = "NAME=VALUE")]
+    rule_label: Vec<String>,
     /// Compare with the files in --out-dir; write nothing. Exit 1 on drift.
     #[arg(long)]
     check: bool,
@@ -5237,6 +5242,7 @@ fn run_command(command: Commands) {
             app: args.app,
             selector: args.selector,
             prometheus_url: args.prometheus_url,
+            rule_labels: args.rule_label,
             check: args.check,
         }),
         Commands::Console {
@@ -7330,6 +7336,10 @@ mod tests {
             "job=\"shop\"",
             "--prometheus-url",
             "http://prom:9090",
+            "--rule-label",
+            "release=kps",
+            "--rule-label",
+            "team=pay",
             "--check",
         ])
         .unwrap();
@@ -7338,6 +7348,7 @@ mod tests {
         };
         assert_eq!(args.out_dir, PathBuf::from("ops/slo"));
         assert_eq!(args.app.as_deref(), Some("shop"));
+        assert_eq!(args.rule_label, ["release=kps", "team=pay"]);
         assert_eq!(args.selector.as_deref(), Some("job=\"shop\""));
         assert_eq!(args.prometheus_url, "http://prom:9090");
         assert!(args.check);
