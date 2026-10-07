@@ -153,7 +153,7 @@ impl ETag {
     /// Returns `true` if one raw `If-None-Match` field matches this `ETag`.
     #[cfg(test)]
     fn matches_if_none_match(&self, if_none_match: &str) -> bool {
-        fields_match(&self.tag, [Some(if_none_match)])
+        fields_match(Some(&self.tag), [Some(if_none_match)])
     }
 }
 
@@ -162,8 +162,9 @@ impl ETag {
 /// Uses weak comparison (RFC 9110 §8.8.3.2). It parses each field
 /// separately, so a malformed field cannot hide a match in a different
 /// field. `*` matches only when no field has a tag (RFC 9110 §13.1.2).
-/// `None` is a field that is not UTF-8.
-fn fields_match<'a>(tag: &str, fields: impl IntoIterator<Item = Option<&'a str>>) -> bool {
+/// A `None` field is not UTF-8. A `None` tag is a current `ETag` that
+/// the parser cannot read: only `*` matches it.
+fn fields_match<'a>(tag: Option<&str>, fields: impl IntoIterator<Item = Option<&'a str>>) -> bool {
     let (mut star, mut tags, mut matched) = (false, false, false);
     for field in fields {
         match field.map(|f| f.trim_matches(OWS)) {
@@ -171,7 +172,8 @@ fn fields_match<'a>(tag: &str, fields: impl IntoIterator<Item = Option<&'a str>>
             Some("") => {}
             Some(list) => {
                 tags = true;
-                matched = matched || entity_tags(list).any(|t| t == Some(tag));
+                matched =
+                    matched || tag.is_some_and(|tag| entity_tags(list).any(|t| t == Some(tag)));
             }
             None => tags = true,
         }
@@ -179,14 +181,15 @@ fn fields_match<'a>(tag: &str, fields: impl IntoIterator<Item = Option<&'a str>>
     if star { !tags } else { matched }
 }
 
-/// Returns the tag of an `ETag` value. The value must hold exactly one
-/// valid entity-tag. If not, the result is `None`.
+/// Returns the tag of a response `ETag` value (RFC 9110 §8.8.3).
+///
+/// The value must be exactly one quoted entity-tag. This parser is strict:
+/// it does not accept a list, a stray comma, or a tag without quotes.
 fn single_tag(value: &str) -> Option<&str> {
-    let mut tags = entity_tags(value);
-    match (tags.next(), tags.next()) {
-        (Some(Some(tag)), None) => Some(tag),
-        _ => None,
-    }
+    let value = value.trim_matches(OWS);
+    let quoted = value.strip_prefix("W/").unwrap_or(value);
+    let tag = quoted.strip_prefix('"')?.strip_suffix('"')?;
+    (!tag.contains('"')).then_some(tag)
 }
 
 /// HTTP optional whitespace (RFC 9110 §5.6.3): only SP and HTAB.
@@ -529,7 +532,7 @@ pub fn fresh_when<E: IntoETag>(request_headers: &HeaderMap, etag: E) -> FreshWhe
 
 fn check_if_none_match(headers: &HeaderMap, etag: &ETag) -> bool {
     fields_match(
-        &etag.tag,
+        Some(&etag.tag),
         headers.get_all(IF_NONE_MATCH).iter().map(header_str),
     )
 }
@@ -969,12 +972,10 @@ async fn apply_etag(response: Response<Body>, if_none_match: &[HeaderValue]) -> 
     // If the handler already set an ETag, check If-None-Match against it
     // before buffering the body.
     if let Some(existing_etag) = response.headers().get(ETAG).cloned() {
-        // An unreadable or malformed handler ETag never gives a 304.
+        // An unreadable or malformed handler ETag matches only `*`.
         let tag = header_str(&existing_etag).and_then(single_tag);
-        if let Some(tag) = tag
-            && fields_match(tag, if_none_match.iter().map(header_str))
-        {
-            let candidate_etag = ETag::strong(tag.to_owned());
+        if fields_match(tag, if_none_match.iter().map(header_str)) {
+            let candidate_etag = ETag::strong(tag.unwrap_or_default().to_owned());
             let (parts, _body) = response.into_parts();
             let mut not_modified = not_modified_response(&candidate_etag, None);
             copy_304_headers(&parts.headers, &mut not_modified);
@@ -1055,7 +1056,7 @@ async fn apply_etag(response: Response<Body>, if_none_match: &[HeaderValue]) -> 
         ETag::weak(format!("{:016x}", hasher.finish()))
     };
 
-    if fields_match(&etag.tag, if_none_match.iter().map(header_str)) {
+    if fields_match(Some(&etag.tag), if_none_match.iter().map(header_str)) {
         let mut not_modified = not_modified_response(&etag, None);
         copy_304_headers(&parts.headers, &mut not_modified);
         not_modified.headers_mut().remove(SET_COOKIE);
@@ -2100,6 +2101,34 @@ mod tests {
     async fn etag_layer_multi_value_handler_etag_never_304s() {
         let status = layer_status(r#""a", "b""#, &[r#""a""#]).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn etag_layer_handler_etag_with_stray_comma_never_304s() {
+        for etag in [r#""a","#, r#","a""#] {
+            assert_eq!(layer_status(etag, &[r#""a""#]).await, StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn etag_layer_star_matches_unreadable_handler_etag() {
+        let svc = EtagLayer::new().layer(tower::service_fn(|_req: Request<Body>| async {
+            Ok::<_, std::convert::Infallible>(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(ETAG, HeaderValue::from_bytes(b"\"\xff\"").unwrap())
+                    .body(Body::from("body"))
+                    .unwrap(),
+            )
+        }));
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(IF_NONE_MATCH, "*")
+            .body(Body::empty())
+            .unwrap();
+        let status = svc.oneshot(req).await.unwrap().status();
+        assert_eq!(status, StatusCode::NOT_MODIFIED);
     }
 
     #[tokio::test]
