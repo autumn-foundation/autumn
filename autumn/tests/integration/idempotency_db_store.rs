@@ -99,6 +99,11 @@ async fn db_store_lock_record_and_expiry() {
         .set("k", record("done"), b"hash".to_vec(), ttl)
         .await
         .expect("set");
+    assert!(
+        store.get("k").await.expect("get").is_none(),
+        "hidden while b still holds the key"
+    );
+    store.unlock("k", "b").await.expect("unlock");
     let entry = store.get("k").await.expect("get").expect("record");
     assert_eq!(entry.record.body, b"done");
     assert_eq!(entry.body_hash, b"hash");

@@ -207,7 +207,21 @@ impl IdempotencyStore for DbIdempotencyStore {
     ) -> IdempotencyFuture<'a, ()> {
         Box::pin(async move {
             let bytes = StoredEntry::encode(record, body_hash)?;
-            let expires = after(ttl);
+            let now = now_ms();
+            let ttl_ms = ms(ttl);
+            let expires = now.saturating_add(ttl_ms);
+            // An existing row keeps its lock: it may be a newer owner's, and
+            // the caller releases its own with `unlock`. While a lock is live,
+            // the record stays one TTL past it, so a crash before `unlock`
+            // still leaves a record to replay; `unlock` then resets the
+            // expiry to `ttl_ms` from the release.
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "a SQL expression, evaluated by the database"
+            )]
+            let held_expiry = keys::locked_until_ms + ttl_ms;
+            let expiry = diesel::dsl::case_when(keys::locked_until_ms.gt(now), held_expiry)
+                .otherwise(expires);
             let mut conn = self.conn().await?;
             diesel::insert_into(keys::autumn_idempotency_keys)
                 .values((
@@ -216,14 +230,14 @@ impl IdempotencyStore for DbIdempotencyStore {
                     keys::locked_by.eq(None::<String>),
                     keys::locked_until_ms.eq(0),
                     keys::expires_at_ms.eq(expires),
+                    keys::ttl_ms.eq(ttl_ms),
                 ))
                 .on_conflict(keys::storage_key)
                 .do_update()
                 .set((
                     keys::record.eq(Some(&bytes)),
-                    keys::locked_by.eq(None::<String>),
-                    keys::locked_until_ms.eq(0),
-                    keys::expires_at_ms.eq(expires),
+                    keys::expires_at_ms.eq(expiry),
+                    keys::ttl_ms.eq(ttl_ms),
                 ))
                 .execute(&mut conn)
                 .await

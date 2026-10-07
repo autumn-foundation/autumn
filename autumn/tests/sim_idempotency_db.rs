@@ -899,3 +899,130 @@ async fn short_ttl_failed_release_still_replays() {
     assert_eq!(calls.get(), 1, "the handler does not run again");
     assert_eq!(payments(&substrate).await, 1);
 }
+
+/// A record with an empty body, for store-level tests.
+const fn store_record(status: u16) -> autumn_web::idempotency::IdempotencyRecord {
+    autumn_web::idempotency::IdempotencyRecord {
+        status,
+        headers: Vec::new(),
+        body: Vec::new(),
+        metadata: Vec::new(),
+    }
+}
+
+/// A store over a fresh substrate, with a 1 s default TTL.
+fn bare_store() -> (SqliteSubstrate, DbIdempotencyStore) {
+    let substrate = SqliteSubstrate::with_migrations(&[&FRAMEWORK_MIGRATIONS, &APP_MIGRATIONS])
+        .expect("substrate");
+    let store = DbIdempotencyStore::new(substrate.pool(), Duration::from_secs(1));
+    (substrate, store)
+}
+
+/// A request outlives its lock, a retry takes the key, then the first
+/// request's late `set` lands. The retry still holds the key: a third request
+/// is refused, even after the short response TTL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_set_keeps_a_newer_owners_lock() {
+    use autumn_web::idempotency::IdempotencyStore as _;
+    let (_substrate, store) = bare_store();
+    let key = "late-set";
+    assert!(
+        store
+            .try_lock(key, "a", Duration::from_millis(300))
+            .await
+            .unwrap()
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        store
+            .try_lock(key, "b", Duration::from_secs(10))
+            .await
+            .unwrap()
+    );
+
+    store
+        .set(
+            key,
+            store_record(201),
+            Vec::new(),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert!(
+        !store
+            .try_lock(key, "c", Duration::from_secs(10))
+            .await
+            .unwrap(),
+        "the retry still holds the key"
+    );
+    assert!(
+        store.get(key).await.unwrap().is_none(),
+        "a record behind a live lock is not replayed"
+    );
+}
+
+/// The owner stores its record and crashes before `unlock`. The record stays
+/// until one TTL after the lock frees, so a retry replays it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_then_crash_keeps_the_record_past_the_lock() {
+    use autumn_web::idempotency::IdempotencyStore as _;
+    let (_substrate, store) = bare_store();
+    let key = "set-crash";
+    assert!(
+        store
+            .try_lock(key, "a", Duration::from_secs(2))
+            .await
+            .unwrap()
+    );
+    store
+        .set(key, store_record(201), Vec::new(), Duration::from_secs(1))
+        .await
+        .unwrap();
+    // No unlock: the request crashed.
+    tokio::time::sleep(Duration::from_millis(2_300)).await;
+
+    let entry = store
+        .get(key)
+        .await
+        .unwrap()
+        .expect("record replays after the lock frees");
+    assert_eq!(entry.record.status, 201);
+}
+
+/// After `set` and a normal `unlock`, the record lives the configured TTL from
+/// the release, not from the end of the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_then_unlock_keeps_the_configured_ttl() {
+    use autumn_web::idempotency::IdempotencyStore as _;
+    let (_substrate, store) = bare_store();
+    let key = "set-unlock";
+    assert!(
+        store
+            .try_lock(key, "a", Duration::from_secs(5))
+            .await
+            .unwrap()
+    );
+    store
+        .set(
+            key,
+            store_record(201),
+            Vec::new(),
+            Duration::from_millis(300),
+        )
+        .await
+        .unwrap();
+    store.unlock(key, "a").await.unwrap();
+    assert!(
+        store.get(key).await.unwrap().is_some(),
+        "replays after release"
+    );
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        store.get(key).await.unwrap().is_none(),
+        "the record expires one TTL after the release"
+    );
+}
