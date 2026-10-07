@@ -1160,6 +1160,10 @@ dispatched if the transaction commits. Works with every job backend.
 This is not crash-safe delivery. If the process exits after the transaction
 commits but before the callback runs, no job may be recorded. Use this for
 rollback coordination across backends, not as a durable outbox substitute.
+For a crash-safe enqueue on the Redis or SQLite backend, use
+`outbox.enqueue_job(conn, "name", &args)` in the transaction. The relay
+enqueues the job after commit. The `local` backend still loses the job in a
+crash. See [Transactional Outbox and Inbox](outbox.md).
 
 ```rust,no_run
 use autumn_web::prelude::*;

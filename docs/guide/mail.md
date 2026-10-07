@@ -290,7 +290,12 @@ imply durable delivery on their own. The framework provides two paths:
    single-process deployments, but it is not durable: a process restart, pod
    eviction, or deploy can drop the email after the request has already
    returned success.
-2. **Durable backend via [`MailDeliveryQueue`].** Implement the trait once
+2. **The framework outbox.** Set `outbox.enabled = true`. If you set no
+   queue, `deliver_later` writes the mail to the `autumn_outbox` table, and
+   the relay sends it. The mail survives a restart. To write it in your
+   transaction, call `outbox.deliver_mail(conn, mail)`. See
+   [Transactional Outbox and Inbox](outbox.md).
+3. **Durable backend via [`MailDeliveryQueue`].** Implement the trait once
    for your queue of choice (DB outbox row, Redis stream, Harvest job, etc.)
    and register it via [`AppBuilder::with_mail_delivery_queue`] before
    `.run()`:

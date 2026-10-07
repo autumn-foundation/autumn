@@ -58,9 +58,19 @@ async fn main() {
 ```
 
 Both primitives are **off by default** — `MediaPlugin::new()` with neither
-`with_broadcast()` nor `with_rooms()` mounts nothing. A rooms-only app calls
-just `.with_rooms()`; a broadcast-only app (e.g. a one-to-many streaming site)
-calls just `.with_broadcast()`.
+`with_broadcast()` nor `with_rooms()` installs no routes, extensions or jobs,
+and logs a warning. A
+rooms-only app calls just `.with_rooms()`; a broadcast-only app (e.g. a
+one-to-many streaming site) calls just `.with_broadcast()`.
+
+| Builder call | Installs |
+|---|---|
+| `with_broadcast()` | `MediaMtxClient` and `MediaUrls` extensions |
+| `with_rooms()` | Room routes, `RoomService` and the room reaper |
+| Either one | `MediaStorage`, `MediaWorkflows` and the encode jobs |
+
+The retention sweep also starts if you set `recordings_root`. If the storage
+config is not valid, the plugin installs no storage, workflows, jobs or sweep.
 
 ### Builder options
 
@@ -279,8 +289,10 @@ heartbeats nor polls for a full idle TTL loses its signaling record (its live
 
 ### `MediaMtxClient` and `MediaUrls`
 
-`with_broadcast()` wires the storage/encode surface. Two transport helpers
-resolve from a `MediaMtxConfig`:
+`with_broadcast()` installs both transport helpers as `AppState` extensions,
+built from `config.mediamtx`. Get them in a handler with
+`state.extension::<MediaMtxClient>()`. You can also build them yourself from a
+`MediaMtxConfig`:
 
 - **`MediaUrls::from_config(&config.mediamtx)`** builds every browser-facing and
   server-side URL a broadcast needs — `rtmp_ingest_url(key)`,
@@ -317,7 +329,8 @@ When a `recordings_root` is configured, the plugin spawns a background sweep
 that deletes source recordings older than `retention_days` (0 disables it). Set
 the root explicitly with `.recordings_root(...)` — without it, no sweep runs.
 `MediaConfig::from_arroyo_env()` wires the root automatically from
-`ARROYO_RECORDINGS_ROOT`.
+`ARROYO_RECORDINGS_ROOT`. The sweep starts only if you enable a primitive and
+the storage config is valid.
 
 ## See also
 

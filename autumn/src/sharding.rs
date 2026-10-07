@@ -1321,64 +1321,101 @@ pub fn build_shard_set(
 /// details.
 pub(crate) struct ShardHealthIndicator {
     shard: Shard,
+    /// Pings on dedicated connections, so a busy shard pool is not a failed
+    /// shard (#3059). No own cache: the indicator registry caches.
+    primary_ping: crate::db_ping::DbPingCheck,
+    replica_ping: crate::db_ping::DbPingCheck,
+    /// Time limit of one ping (`health.ping_timeout_ms`).
+    ping_timeout: std::time::Duration,
 }
 
 impl ShardHealthIndicator {
-    pub(crate) const fn new(shard: Shard) -> Self {
-        Self { shard }
+    pub(crate) fn new(shard: Shard, ping_timeout: std::time::Duration) -> Self {
+        let primary_ping = crate::db_ping::DbPingCheck::new("primary");
+        let replica_ping = crate::db_ping::DbPingCheck::new("replica");
+        for ping in [&primary_ping, &replica_ping] {
+            ping.configure(std::time::Duration::ZERO, ping_timeout);
+        }
+        Self {
+            shard,
+            primary_ping,
+            replica_ping,
+            ping_timeout,
+        }
     }
 
     async fn refresh_replica_readiness(&self) {
         let Some(replica_pool) = self.shard.replica_pool() else {
             return;
         };
-        // Connectivity goes through the deadpool pool (cheap, reused
-        // connections) and runs on every probe; the parity comparison
-        // opens fresh connections to both roles and is throttled.
-        match replica_pool.get().await {
-            Ok(mut conn) => {
-                let alive = crate::db::probe_connection_alive(&mut conn).await;
-                drop(conn);
-                match alive {
-                    Ok(()) => {
-                        self.shard.runtime().mark_replica_connection_ready();
-                        if self.shard.runtime().parity_check_due()
-                            && let Some((primary_url, replica_url)) =
-                                self.shard.runtime().migration_check()
-                        {
-                            let readiness =
-                                crate::migrate::check_replica_migration_readiness_blocking(
-                                    primary_url,
-                                    replica_url,
-                                )
-                                .await;
-                            if readiness.is_ready() {
-                                self.shard.runtime().mark_replica_migrations_ready();
-                            } else if let Some(detail) = readiness.detail() {
-                                self.shard.runtime().mark_replica_migrations_unready(detail);
-                            }
-                        }
-                    }
-                    Err(error) => self
-                        .shard
-                        .runtime()
-                        .mark_replica_connection_unready(format!(
-                            "replica connection failed: {error}"
-                        )),
+        let status = self.replica_ping.check(replica_pool).await;
+        if !status.up {
+            self.shard.runtime().mark_replica_connection_unready(
+                status
+                    .error
+                    .unwrap_or_else(|| "replica ping failed".to_owned()),
+            );
+            return;
+        }
+        self.shard.runtime().mark_replica_connection_ready();
+        // The parity comparison opens new connections to both roles, so it
+        // is throttled.
+        if self.shard.runtime().parity_check_due()
+            && let Some((primary_url, replica_url)) = self.shard.runtime().migration_check()
+        {
+            self.record_parity(
+                crate::migrate::check_replica_migration_readiness_blocking(
+                    primary_url,
+                    replica_url,
+                ),
+                PARITY_TIMEOUT,
+            )
+            .await;
+        }
+    }
+
+    /// Run the parity comparison with its own time limit, and record the
+    /// result. A comparison that does not finish in time marks the replica
+    /// migrations unready (fail closed): the throttle already claimed this
+    /// window, so the old result must not stay in use.
+    async fn record_parity(
+        &self,
+        check: impl std::future::Future<Output = crate::migrate::ReplicaMigrationReadiness>,
+        timeout: std::time::Duration,
+    ) {
+        match tokio::time::timeout(timeout, check).await {
+            Ok(readiness) if readiness.is_ready() => {
+                self.shard.runtime().mark_replica_migrations_ready();
+            }
+            Ok(readiness) => {
+                if let Some(detail) = readiness.detail() {
+                    self.shard.runtime().mark_replica_migrations_unready(detail);
                 }
             }
-            Err(error) => self
+            Err(_elapsed) => self
                 .shard
                 .runtime()
-                .mark_replica_connection_unready(format!("replica connection failed: {error}")),
+                .mark_replica_migrations_unready(format!(
+                    "replica migration parity check timed out after {} ms",
+                    timeout.as_millis()
+                )),
         }
     }
 }
 
+/// Time limit for the throttled migration parity comparison. It opens new
+/// connections to both roles, so it gets more time than a ping.
+const PARITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl crate::actuator::HealthIndicator for ShardHealthIndicator {
     fn check(&self) -> futures::future::BoxFuture<'_, crate::actuator::HealthCheckOutput> {
         Box::pin(async move {
-            self.refresh_replica_readiness().await;
+            // Ping both roles at the same time: the wall time is the slower
+            // ping, not the sum.
+            let ((), primary) = tokio::join!(
+                self.refresh_replica_readiness(),
+                self.primary_ping.check(self.shard.primary_pool())
+            );
 
             let mut details = HashMap::new();
             let status = self.shard.primary_pool().status();
@@ -1414,25 +1451,10 @@ impl crate::actuator::HealthIndicator for ShardHealthIndicator {
             // (like the replica connectivity check above) and gate `/ready` on
             // it so load balancers stop routing to an instance that cannot
             // reach a shard primary.
-            let primary_ok = match self.shard.primary_pool().get().await {
-                Ok(mut conn) => match crate::db::probe_connection_alive(&mut conn).await {
-                    Ok(()) => true,
-                    Err(error) => {
-                        details.insert(
-                            "primary_detail".to_owned(),
-                            serde_json::json!(format!("primary connection failed: {error}")),
-                        );
-                        false
-                    }
-                },
-                Err(error) => {
-                    details.insert(
-                        "primary_detail".to_owned(),
-                        serde_json::json!(format!("primary connection failed: {error}")),
-                    );
-                    false
-                }
-            };
+            let primary_ok = primary.up;
+            if let Some(error) = primary.error {
+                details.insert("primary_detail".to_owned(), serde_json::json!(error));
+            }
             details.insert("primary_ready".to_owned(), serde_json::json!(primary_ok));
 
             // `read_pool()` is `None` exactly when the replica is unready under
@@ -1446,6 +1468,14 @@ impl crate::actuator::HealthIndicator for ShardHealthIndicator {
             output.with_details(details)
         })
     }
+
+    /// The ping time limit, plus the parity time limit, plus a margin. A
+    /// late ping or parity check then reports its own result, not the
+    /// registry's `UNKNOWN` timeout result.
+    fn timeout_ms(&self) -> u64 {
+        let limit = self.ping_timeout + PARITY_TIMEOUT + std::time::Duration::from_millis(500);
+        u64::try_from(limit.as_millis()).unwrap_or(u64::MAX)
+    }
 }
 
 /// Register one `db:shard:<name>` readiness indicator per configured
@@ -1453,13 +1483,14 @@ impl crate::actuator::HealthIndicator for ShardHealthIndicator {
 pub(crate) fn register_shard_health_indicators(
     set: &ShardSet,
     registry: &crate::actuator::HealthIndicatorRegistry,
+    ping_timeout: std::time::Duration,
 ) {
     for shard in set.iter() {
         let name = format!("db:shard:{}", shard.name());
         if let Err(error) = registry.register(
             name,
             crate::actuator::IndicatorGroup::Readiness,
-            Arc::new(ShardHealthIndicator::new(shard.clone())),
+            Arc::new(ShardHealthIndicator::new(shard.clone(), ping_timeout)),
         ) {
             tracing::warn!("{error}");
         }
@@ -1805,6 +1836,7 @@ impl Shards {
             pool_name: &format!("shard:{}:{role}", shard.name()),
             shard: Some(shard.name()),
             statement_timeout: ctx.statement_timeout,
+            idle_in_transaction_timeout: ctx.idle_in_transaction_timeout,
             // Tag the route metric with the shard so per-shard latency
             // separates in /actuator/metrics.
             route_key: ctx
@@ -2803,6 +2835,7 @@ mod tests {
         let shard = shard_with_sized_replica(ReplicaFallback::Primary);
         shard.runtime().mark_replica_connection_ready();
         let ctx = crate::db::RequestDbContext {
+            idle_in_transaction_timeout: None,
             statement_timeout: None,
             route_key: Some("GET /notes".to_owned()),
             metrics: None,
@@ -2833,6 +2866,7 @@ mod tests {
         Shards {
             set,
             ctx: crate::db::RequestDbContext {
+                idle_in_transaction_timeout: None,
                 statement_timeout: None,
                 route_key: Some("GET /test".to_owned()),
                 metrics: None,
@@ -2863,6 +2897,7 @@ mod tests {
                 .expect("build")
                 .expect("configured"),
             ctx: crate::db::RequestDbContext {
+                idle_in_transaction_timeout: None,
                 statement_timeout: None,
                 route_key: None,
                 metrics: None,
@@ -2967,11 +3002,37 @@ mod tests {
 
     #[cfg(not(feature = "sqlite"))]
     #[tokio::test]
+    async fn parity_check_timeout_fails_closed() {
+        let shard = shard_with_unreachable_replica(ReplicaFallback::FailReadiness);
+        let indicator = ShardHealthIndicator::new(shard, std::time::Duration::from_secs(2));
+
+        indicator
+            .record_parity(std::future::pending(), std::time::Duration::from_millis(10))
+            .await;
+
+        let detail = indicator.shard.runtime().detail().unwrap_or_default();
+        assert!(detail.contains("parity check timed out"), "{detail}");
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    #[tokio::test]
+    async fn shard_indicator_uses_the_configured_ping_timeout() {
+        use crate::actuator::HealthIndicator as _;
+
+        let shard = shard_with_unreachable_replica(ReplicaFallback::FailReadiness);
+        let indicator = ShardHealthIndicator::new(shard, std::time::Duration::from_millis(700));
+
+        // 700 ms ping + 5 s parity + 500 ms margin.
+        assert_eq!(indicator.timeout_ms(), 6_200);
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    #[tokio::test]
     async fn shard_indicator_gates_readiness_for_fail_readiness_replica() {
         use crate::actuator::HealthIndicator as _;
 
         let shard = shard_with_unreachable_replica(ReplicaFallback::FailReadiness);
-        let indicator = ShardHealthIndicator::new(shard);
+        let indicator = ShardHealthIndicator::new(shard, crate::health_cache::DEFAULT_PING_TIMEOUT);
         let output = indicator.check().await;
 
         assert!(
@@ -2995,7 +3056,7 @@ mod tests {
         // + dead-replica fallback path needs a live primary and is exercised by
         // the `read_pool`/`read_route` fallback tests above, not the indicator.)
         let shard = shard_with_unreachable_replica(ReplicaFallback::Primary);
-        let indicator = ShardHealthIndicator::new(shard);
+        let indicator = ShardHealthIndicator::new(shard, crate::health_cache::DEFAULT_PING_TIMEOUT);
         let output = indicator.check().await;
 
         assert!(
@@ -3023,7 +3084,9 @@ mod tests {
             .expect("configured");
         let shard = set.get(ShardId(0)).expect("shard").clone();
 
-        let output = ShardHealthIndicator::new(shard).check().await;
+        let output = ShardHealthIndicator::new(shard, crate::health_cache::DEFAULT_PING_TIMEOUT)
+            .check()
+            .await;
 
         assert!(
             !output.status.is_healthy(),
@@ -3039,9 +3102,17 @@ mod tests {
         let set = shard_set(&["alpha", "beta"]);
         let registry = crate::actuator::HealthIndicatorRegistry::new();
 
-        register_shard_health_indicators(&set, &registry);
+        register_shard_health_indicators(
+            &set,
+            &registry,
+            crate::health_cache::DEFAULT_PING_TIMEOUT,
+        );
         // Re-registration is ignored with a warning rather than panicking.
-        register_shard_health_indicators(&set, &registry);
+        register_shard_health_indicators(
+            &set,
+            &registry,
+            crate::health_cache::DEFAULT_PING_TIMEOUT,
+        );
 
         let results = registry.run_all().await;
         // run_all also appends process-global results (e.g. circuit
@@ -3099,6 +3170,7 @@ mod tests {
         let set = shard_set(&["shard0"]);
         let shard = set.get(ShardId(0)).expect("shard");
         let ctx = crate::db::RequestDbContext {
+            idle_in_transaction_timeout: None,
             statement_timeout: Some(std::time::Duration::from_secs(3)),
             route_key: Some("GET /test".to_owned()),
             metrics: None,
@@ -3152,6 +3224,7 @@ mod tests {
         // admin CrossShard<R> extractor can construct the repo without a header.
         let set = shard_set(&["shard0", "shard1"]);
         let ctx = crate::db::RequestDbContext {
+            idle_in_transaction_timeout: None,
             statement_timeout: Some(std::time::Duration::from_millis(1500)),
             route_key: Some("GET /admin".to_owned()),
             metrics: None,
@@ -3177,6 +3250,7 @@ mod tests {
         let set = shard_set(&["shard0"]);
         let shard = set.get(ShardId(0)).expect("shard");
         let ctx = crate::db::RequestDbContext {
+            idle_in_transaction_timeout: None,
             statement_timeout: None,
             route_key: None,
             metrics: None,
@@ -3195,6 +3269,7 @@ mod tests {
         let set = shard_set(&["shard0"]);
         let shard = set.get(ShardId(0)).expect("shard");
         let ctx = crate::db::RequestDbContext {
+            idle_in_transaction_timeout: None,
             statement_timeout: Some(std::time::Duration::from_secs(u64::MAX / 1_000)),
             route_key: None,
             metrics: None,
@@ -3289,6 +3364,7 @@ mod tests {
                 .expect("build")
                 .expect("configured"),
             ctx: crate::db::RequestDbContext {
+                idle_in_transaction_timeout: None,
                 statement_timeout: None,
                 route_key: None,
                 metrics: None,
