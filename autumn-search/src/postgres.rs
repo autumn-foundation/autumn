@@ -1083,8 +1083,8 @@ fn bind_all(mut query: BoxedQuery<'_>, binds: impl IntoIterator<Item = Bound>) -
 /// Refuse every use of this store on a `SQLite` build of autumn-web.
 ///
 /// The store sends Postgres SQL. An app can build it and install a `SQLite`
-/// pool without the plugin, so the check sits on the pool accessor too
-/// (#2539 §5).
+/// pool without the plugin, so every trait method checks first, before any
+/// early return, and the pool accessor checks too (#2539 §5).
 #[allow(
     clippy::unnecessary_wraps,
     clippy::missing_const_for_fn,
@@ -1131,6 +1131,7 @@ impl SearchBackend for PostgresSearchStore {
 
     fn write_watermark(&self) -> BoxFuture<'_, SearchResult<Option<String>>> {
         Box::pin(async move {
+            require_postgres_runtime()?;
             // The DATABASE's clock, not the process's. `updated_at` is set by
             // `NOW()` server-side, so comparing it against an app-side
             // timestamp would be at the mercy of clock skew between however
@@ -1151,7 +1152,10 @@ impl SearchBackend for PostgresSearchStore {
         documents: &'a [IndexedDocument],
         watermark: Option<&'a str>,
     ) -> BoxFuture<'a, SearchResult<()>> {
-        Box::pin(async move { self.write_documents(definition, documents, watermark).await })
+        Box::pin(async move {
+            require_postgres_runtime()?;
+            self.write_documents(definition, documents, watermark).await
+        })
     }
 
     fn ensure_index<'a>(
@@ -1159,6 +1163,7 @@ impl SearchBackend for PostgresSearchStore {
         definition: &'a IndexDefinition,
     ) -> BoxFuture<'a, SearchResult<()>> {
         Box::pin(async move {
+            require_postgres_runtime()?;
             checked(definition)?;
             let mut conn = self.conn().await?;
 
@@ -1224,7 +1229,10 @@ impl SearchBackend for PostgresSearchStore {
         definition: &'a IndexDefinition,
         documents: &'a [IndexedDocument],
     ) -> BoxFuture<'a, SearchResult<()>> {
-        Box::pin(async move { self.write_documents(definition, documents, None).await })
+        Box::pin(async move {
+            require_postgres_runtime()?;
+            self.write_documents(definition, documents, None).await
+        })
     }
 
     fn delete<'a>(
@@ -1233,6 +1241,7 @@ impl SearchBackend for PostgresSearchStore {
         ids: &'a [i64],
     ) -> BoxFuture<'a, SearchResult<()>> {
         Box::pin(async move {
+            require_postgres_runtime()?;
             checked(definition)?;
             // `IN ()` is a syntax error, so an empty slice must never reach SQL.
             if ids.is_empty() {
@@ -1303,6 +1312,7 @@ impl SearchBackend for PostgresSearchStore {
 
     fn clear<'a>(&'a self, definition: &'a IndexDefinition) -> BoxFuture<'a, SearchResult<()>> {
         Box::pin(async move {
+            require_postgres_runtime()?;
             checked(definition)?;
             let mut conn = self.conn().await?;
             // Documents and ledger in one statement, for the same reason `delete` uses
@@ -1344,6 +1354,7 @@ impl SearchBackend for PostgresSearchStore {
         query: &'a KeywordQuery,
     ) -> BoxFuture<'a, SearchResult<Page<SearchHit>>> {
         Box::pin(async move {
+            require_postgres_runtime()?;
             checked(definition)?;
             // Fail closed: a blank query and an impossible filter both return
             // an empty page having issued NO query — never a full scan.
@@ -1427,6 +1438,7 @@ impl SearchBackend for PostgresSearchStore {
         query: &'a VectorQuery,
     ) -> BoxFuture<'a, SearchResult<Vec<SearchHit>>> {
         Box::pin(async move {
+            require_postgres_runtime()?;
             checked(definition)?;
             if !definition.supports_vector_search() {
                 return Err(SearchError::VectorUnsupported {
@@ -1554,6 +1566,7 @@ impl SearchBackend for PostgresSearchStore {
         filter: &'a SearchFilter,
     ) -> BoxFuture<'a, SearchResult<Option<Vec<f32>>>> {
         Box::pin(async move {
+            require_postgres_runtime()?;
             checked(definition)?;
             // A record the filter excludes reads back as absent — this is a
             // query like any other, and the seed id is caller-supplied.
@@ -1755,6 +1768,7 @@ impl DocumentSource for PostgresSearchStore {
         ids: &'a [i64],
     ) -> BoxFuture<'a, SearchResult<Vec<SearchDocument>>> {
         Box::pin(async move {
+            require_postgres_runtime()?;
             checked(definition)?;
             if ids.is_empty() {
                 return Ok(Vec::new());
@@ -1770,6 +1784,7 @@ impl DocumentSource for PostgresSearchStore {
         limit: usize,
     ) -> BoxFuture<'a, SearchResult<Vec<SearchDocument>>> {
         Box::pin(async move {
+            require_postgres_runtime()?;
             checked(definition)?;
             self.load_documents(definition, Selection::After { after, limit })
                 .await
@@ -2059,6 +2074,23 @@ mod tests {
 
     fn definition() -> IndexDefinition {
         IndexDefinition::new("articles", "english", FIELDS, Some("body"), false)
+    }
+
+    // A short-circuit (an empty id list here) must not hide the backend
+    // mismatch on SQLite (#2539 review).
+    #[tokio::test]
+    async fn an_early_return_does_not_skip_the_backend_check() {
+        let store = PostgresSearchStore::new(None);
+        let result = store.delete(&definition(), &[]).await;
+        autumn_web::backend_select! {
+            pg => {
+                assert!(result.is_ok(), "{result:?}");
+            },
+            sqlite => {
+                let message = result.expect_err("refused on SQLite").to_string();
+                assert!(message.contains("SQLite"), "{message}");
+            },
+        }
     }
 
     fn doc(id: i64) -> IndexedDocument {

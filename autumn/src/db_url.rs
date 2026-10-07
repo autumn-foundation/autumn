@@ -233,9 +233,10 @@ pub fn redact_target(url: &str) -> String {
 }
 
 /// One path-shaped token: no `=` (no key/value pair), no `@` (no userinfo), no
-/// `?` (no query) and no whitespace (not a keyword/value string).
+/// `?` (no query), no `#` (no fragment) and no whitespace (not a keyword/value
+/// string).
 fn is_bare_path(url: &str) -> bool {
-    !url.is_empty() && !url.contains(['=', '@', '?']) && !url.contains(char::is_whitespace)
+    !url.is_empty() && !url.contains(['=', '@', '?', '#']) && !url.contains(char::is_whitespace)
 }
 
 /// Mask userinfo and drop non-diagnostic parameters in a `SQLite` target.
@@ -821,6 +822,9 @@ mod tests {
         assert_eq!(redact_target("x:password=hunter2"), "****");
         assert_eq!(redact_target(r"C:\data\pw=hunter2.db"), "****");
         assert_eq!(redact_target(r"C:\data\app.db"), r"C:\data\app.db");
+        // A fragment is never a path.
+        assert_eq!(redact_target("x:app#hunter2"), "****");
+        assert_eq!(redact_target("/var/lib/app.db#hunter2"), "****");
     }
 
     #[test]

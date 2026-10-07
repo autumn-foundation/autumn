@@ -371,6 +371,16 @@ scan_manifest() {
       }
       return 0
     }
+    # Whether the `features` list of an entry names "sqlite". Only that list
+    # counts: `path = "sqlite"` is not a feature. In the dotted and section
+    # forms the key is `features` and the value is the list.
+    function features_name_sqlite(e,   i, key) {
+      i = index(e, "=")
+      key = (i > 0) ? substr(e, 1, i - 1) : e
+      if (key ~ /(^|\.)features[ \t]*$/) return (e ~ /"sqlite"/)
+      if (!match(e, /features[ \t]*=[ \t]*\[[^]]*\]/)) return 0
+      return (substr(e, RSTART, RLENGTH) ~ /"sqlite"/)
+    }
     # The value of a `key = "value"` entry.
     function quoted_value(entry,   value) {
       value = entry
@@ -488,7 +498,7 @@ scan_manifest() {
         next
       }
       norm = normalize_quotes(entry)
-      mentions_sqlite = (norm ~ /"sqlite"/)
+      mentions_sqlite = features_name_sqlite(norm)
       forwards = forwards_flip(norm)
       loose = (section == "" || section ~ /^\[target(\.[^]]*)?\]$/)
 
@@ -1040,6 +1050,13 @@ package = "autumn-web"
 features = ["sqlite"]
 EOF
   check_fail "a quoted non-ASCII alias in a section header" section_unicode_alias
+
+  # `sqlite` outside the `features` list is not a feature.
+  make_case sqlite_elsewhere <<'EOF'
+[dependencies]
+autumn-web = { path = "sqlite", branch = "sqlite" }
+EOF
+  check_pass "sqlite outside the features list is not an edge" sqlite_elsewhere
 
   make_case root_metadata <<'EOF'
 package.metadata.dependencies.autumn-web = { features = ["sqlite"] }
