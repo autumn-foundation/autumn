@@ -141,6 +141,9 @@ retry_ratio = 0.1       # default: 10 % of requests can retry
 
 The cost values are the AWS SDK values. The 10 % limit is from Google SRE.
 
+Startup rejects a cost of `0` and a `retry_ratio` outside `0.0..=1.0`. With
+`enabled = false`, these values are not used, so they are not checked.
+
 ## `Retry-After` on a timeout `503`
 
 A request that passes its deadline gets a `503` with a `Retry-After` header.

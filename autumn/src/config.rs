@@ -2496,12 +2496,16 @@ const fn default_retry_budget_retry_ratio() -> f64 {
 #[cfg(feature = "http-client")]
 impl RetryBudgetConfig {
     /// Reject a ratio outside `0.0..=1.0` and a cost of zero, which would
-    /// allow unlimited retries.
+    /// allow unlimited retries. A disabled budget uses none of these values,
+    /// so it is not checked.
     ///
     /// # Errors
     ///
     /// [`ConfigError::Validation`] that names the bad key.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
         if !(0.0..=1.0).contains(&self.retry_ratio) {
             return Err(ConfigError::Validation(format!(
                 "http.client.retry_budget.retry_ratio must be in 0.0..=1.0, got {}",
@@ -20040,6 +20044,17 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         config.http.client.retry_budget.retry_ratio = 0.1;
         config.http.client.retry_budget.transient_cost = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn a_disabled_retry_budget_is_not_validated() {
+        let mut config = AutumnConfig::default();
+        config.http.client.retry_budget.enabled = false;
+        config.http.client.retry_budget.transient_cost = 0;
+        config.http.client.retry_budget.throttling_cost = 0;
+        config.http.client.retry_budget.retry_ratio = 2.0;
+        assert!(config.validate().is_ok(), "{:?}", config.validate());
     }
 
     #[cfg(feature = "http-client")]
