@@ -74,8 +74,6 @@ extern crate self as autumn_web;
 #[cfg(feature = "maud")]
 pub mod a11y;
 pub mod actuator;
-/// Adaptive admission control: request criticality, partition shares and
-/// latency-driven concurrency limits (issue #3068).
 pub mod admission;
 pub mod aggregate;
 /// Operator alerts for built-in failure conditions.

@@ -4477,7 +4477,15 @@ fn build_request_timeout_settings(
         .values()
         .flat_map(std::collections::HashMap::values)
         .any(|t| matches!(t, crate::route::RouteTimeout::Override(_)));
-    if global.is_none() && !has_override {
+    // Adaptive admission must see `timeout = "off"` routes, to skip their
+    // latency samples (#3068).
+    let has_off_for_admission = config.server.admission.mode
+        == crate::config::AdmissionMode::Adaptive
+        && route_timeouts
+            .values()
+            .flat_map(std::collections::HashMap::values)
+            .any(|t| matches!(t, crate::route::RouteTimeout::Disabled));
+    if global.is_none() && !has_override && !has_off_for_admission {
         return None;
     }
     if let Some(duration) = global {
@@ -5037,9 +5045,9 @@ fn apply_middleware(
     #[cfg(feature = "maud")] error_page_renderer: Option<SharedRenderer>,
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
     route_timeouts: RouteTimeoutTable,
-    // Sets the `Criticality` extension and task-local (#3068). `None` when no
+    // Sets the `Criticality` extension and task-local (#3068). Passive when no
     // route sets a criticality and the header is not trusted.
-    criticality_layer: Option<crate::middleware::criticality::CriticalityLayer>,
+    criticality_layer: crate::middleware::criticality::CriticalityLayer,
     // Built once by the caller (`build_router_pre_state`) and cloned into the
     // late-mounted `/mcp` envelope too, so both ingress surfaces admit
     // against the SAME shared in-flight counter — constructing a second
@@ -5130,8 +5138,9 @@ fn apply_middleware(
         // branch that forwards straight to the inner service: no allocation and
         // no extra nesting level.
         // Request criticality (#3068). Outer to load shedding, which reads the
-        // `Criticality` extension that this layer sets.
-        tower::util::option_layer(criticality_layer),
+        // `Criticality` extension that this layer sets. Always installed: an
+        // outer user layer can set the class. Passive when nothing does.
+        criticality_layer,
         tower::util::option_layer(load_shed_layer),
         // Maintenance mode (shared construction with the late-mounted `/mcp`
         // envelope — see `build_maintenance_layer`).
@@ -14240,8 +14249,37 @@ mod trusted_host_tests {
         );
         assert!(
             build_route_criticality_table(&[], &[], &AutumnConfig::default()).is_empty(),
-            "no criticality routes: empty table, so no layer"
+            "no criticality routes: empty table, so a passive layer"
         );
+    }
+
+    /// Regression (#3183 review): with the global timeout off, a table of only
+    /// `timeout = "off"` routes still installs the timeout service under
+    /// adaptive admission, so those routes get `InboundDeadline::Off` and give
+    /// no latency sample.
+    #[test]
+    fn timeout_off_only_routes_install_the_service_for_adaptive_admission() {
+        let mut by_method = std::collections::HashMap::new();
+        by_method.insert(http::Method::GET, crate::route::RouteTimeout::Disabled);
+        let mut table = std::collections::HashMap::new();
+        table.insert("/poll".to_owned(), by_method);
+        let table: RouteTimeoutTable = Arc::new(table);
+        let build = |config: &AutumnConfig| {
+            build_request_timeout_settings(
+                config,
+                crate::middleware::MetricsCollector::new(),
+                table.clone(),
+                false,
+            )
+            .is_some()
+        };
+
+        let mut config = AutumnConfig::default();
+        config.server.timeouts.request_timeout_ms = None;
+        assert!(!build(&config), "static admission: nothing to do");
+
+        config.server.admission.mode = crate::config::AdmissionMode::Adaptive;
+        assert!(build(&config), "adaptive admission needs the Off marker");
     }
 
     /// Codex review (P1): `Router::nest("/{locale}", ...)` mounts each locale

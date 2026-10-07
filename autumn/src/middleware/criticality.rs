@@ -12,8 +12,9 @@
 //! valid. Otherwise it comes from the route's `criticality = "..."`
 //! attribute, else it is `default`.
 //!
-//! The router installs this layer only when a route sets a criticality or
-//! the header is trusted, so other apps pay nothing.
+//! The router always installs this layer. When no route sets a criticality
+//! and the header is not trusted, it is passive: it scopes only a request
+//! that an outer layer tagged, and passes other requests through unchanged.
 
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate".
@@ -32,9 +33,12 @@
     )
 )]
 
+use std::future::Future;
+use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use axum::http::Request;
+use pin_project_lite::pin_project;
 use tower::{Layer, Service};
 
 use crate::admission::{CRITICALITY_HEADER, Criticality};
@@ -48,16 +52,17 @@ pub struct CriticalityLayer {
 }
 
 impl CriticalityLayer {
-    /// The layer for a route table, or `None` when the table is empty and the
-    /// header is not trusted (nothing to do).
-    pub(crate) fn from_table(
-        table: RouteAttrTable<Criticality>,
-        trust_header: bool,
-    ) -> Option<Self> {
-        (trust_header || !table.is_empty()).then_some(Self {
+    /// The layer for a route table.
+    pub(crate) const fn from_table(table: RouteAttrTable<Criticality>, trust_header: bool) -> Self {
+        Self {
             table,
             trust_header,
-        })
+        }
+    }
+
+    /// `true` when no route sets a class and the header is not trusted.
+    fn is_passive(&self) -> bool {
+        !self.trust_header && self.table.is_empty()
     }
 
     fn resolve<B>(&self, req: &Request<B>) -> Criticality {
@@ -107,16 +112,55 @@ where
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = tokio::task::futures::TaskLocalFuture<Criticality, S::Future>;
+    type Future = CriticalityFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
     fn call(&mut self, mut req: Request<B>) -> Self::Future {
+        if self.layer.is_passive() && req.extensions().get::<Criticality>().is_none() {
+            // Nothing sets a class: no extension, no task-local scope.
+            return CriticalityFuture::Plain {
+                inner: self.inner.call(req),
+            };
+        }
         let criticality = self.layer.resolve(&req);
         req.extensions_mut().insert(criticality);
-        crate::admission::scope_criticality(criticality, self.inner.call(req))
+        CriticalityFuture::Scoped {
+            inner: crate::admission::scope_criticality(criticality, self.inner.call(req)),
+        }
+    }
+}
+
+pin_project! {
+    /// Future of [`CriticalityService`]: the inner future, in the
+    /// [`Criticality`] scope when the request has a class.
+    ///
+    /// A hand-written enum, so `futures` is not part of the public API.
+    #[project = CriticalityFutureProj]
+    pub enum CriticalityFuture<F> {
+        /// No class: the inner future, unchanged.
+        Plain {
+            #[pin]
+            inner: F,
+        },
+        /// The inner future in the request's criticality scope.
+        Scoped {
+            #[pin]
+            inner: tokio::task::futures::TaskLocalFuture<Criticality, F>,
+        },
+    }
+}
+
+impl<F: Future> Future for CriticalityFuture<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.project() {
+            CriticalityFutureProj::Plain { inner } => inner.poll(cx),
+            CriticalityFutureProj::Scoped { inner } => inner.poll(cx),
+        }
     }
 }
 
@@ -158,10 +202,27 @@ mod tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
-    #[test]
-    fn empty_table_without_header_trust_installs_nothing() {
-        assert!(CriticalityLayer::from_table(Arc::new(HashMap::new()), false).is_none());
-        assert!(CriticalityLayer::from_table(Arc::new(HashMap::new()), true).is_some());
+    #[tokio::test]
+    async fn passive_layer_passes_untagged_requests_through() {
+        let layer = CriticalityLayer::from_table(Arc::new(HashMap::new()), false);
+        assert_eq!(call(layer, "/other", Some("critical")).await, "None/None");
+    }
+
+    /// Regression (#3183 review): with no route table and no header trust, a
+    /// class that an outer layer sets still scopes the handler task, so
+    /// outbound calls send it.
+    #[tokio::test]
+    async fn passive_layer_scopes_a_class_from_an_outer_layer() {
+        let layer = CriticalityLayer::from_table(Arc::new(HashMap::new()), false);
+        let app = Router::new().route("/other", get(echo)).layer(layer);
+        let mut req = Request::builder()
+            .uri("/other")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(Criticality::Sheddable);
+        let resp = app.oneshot(req).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&bytes[..], b"Some(Sheddable)/Some(Sheddable)");
     }
 
     #[tokio::test]
@@ -169,8 +230,7 @@ mod tests {
         let layer = CriticalityLayer::from_table(
             table("/batch/{id}", http::Method::GET, Criticality::Sheddable),
             false,
-        )
-        .unwrap();
+        );
         assert_eq!(
             call(layer.clone(), "/batch/7", None).await,
             "Some(Sheddable)/Some(Sheddable)"
@@ -187,8 +247,7 @@ mod tests {
         let layer = CriticalityLayer::from_table(
             table("/batch/{id}", http::Method::GET, Criticality::Sheddable),
             false,
-        )
-        .unwrap();
+        );
         assert_eq!(
             call(layer, "/batch/7", Some("critical")).await,
             "Some(Sheddable)/Some(Sheddable)"
@@ -200,8 +259,7 @@ mod tests {
         let layer = CriticalityLayer::from_table(
             table("/batch/{id}", http::Method::GET, Criticality::Sheddable),
             true,
-        )
-        .unwrap();
+        );
         let app = Router::new().route("/batch/{id}", get(echo)).layer(layer);
         let mut req = Request::builder()
             .uri("/batch/1")
@@ -219,8 +277,7 @@ mod tests {
         let layer = CriticalityLayer::from_table(
             table("/batch/{id}", http::Method::GET, Criticality::Sheddable),
             true,
-        )
-        .unwrap();
+        );
         assert_eq!(
             call(layer.clone(), "/batch/7", Some("Critical")).await,
             "Some(Critical)/Some(Critical)"

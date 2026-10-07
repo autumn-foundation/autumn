@@ -3645,9 +3645,11 @@ mod tests {
         config.client.adaptive_throttle.enabled = true;
         state.insert_extension(config);
         let throttles: Vec<_> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..8)
-                .map(|_| scope.spawn(|| Client::from_state(&state).throttle.expect("on")))
-                .collect();
+            // Spawn all threads before the first join, so the calls overlap.
+            let mut handles = Vec::with_capacity(8);
+            for _ in 0..8 {
+                handles.push(scope.spawn(|| Client::from_state(&state).throttle.expect("on")));
+            }
             handles
                 .into_iter()
                 .map(|h| h.join().expect("thread"))
