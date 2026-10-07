@@ -1786,6 +1786,18 @@ Use built-in jobs and tasks before reaching for a workflow engine:
 | `#[task]` + `.one_off_tasks()` | Operator-invoked CLI work via `autumn task` |
 | Autumn Harvest | Durable multi-step workflows, activity retries, timers, and dedicated runners |
 
+Autumn Harvest is a shipped, separate engine
+([`autumn-foundation/autumn-harvest`](https://github.com/autumn-foundation/autumn-harvest),
+wired in with `autumn-harvest-plugin`), not a roadmap item. Do not propose
+workflow primitives for Autumn core: no `#[workflow]`/`#[step]` macros,
+step-checkpoint tables, durable sleep inside a handler, signals, compensation,
+or "run B after A" job dependencies. The test from
+`docs/adr/0016-durable-workflows-live-in-harvest.md`: if the framework must
+remember *where inside the work* it got to, it is Harvest's; otherwise it can
+be a job feature. Jobs stay one unit of work, retried from the top (at least
+once on the durable backends; `local` and `enqueue_after_commit` can lose a
+job on a crash).
+
 `autumn-admin-plugin` includes `/admin/jobs` for inspecting, retrying,
 discarding, and canceling framework jobs. `GET /actuator/jobs` exposes
 lower-level counters.
@@ -1795,6 +1807,14 @@ Job attributes beyond `name`/`max_attempts`/`backoff_ms` (0.5.0):
 `unique_window = "running"|"pending"`, `unique_for_ms = N` (debounce),
 `concurrency = N` + `concurrency_key = "field"` caps simultaneous runs. A
 coalesced enqueue is a no-op `Ok(())`.
+
+Claim leases and timeouts (unreleased, #3051): durable workers renew each
+claim every third of the visibility timeout. While renewals succeed, a long job
+does not run on a second worker. If the claim is lost, the worker stops the
+handler. With `#[job(timeout = "30s")]` (or `jobs.default_timeout_ms`; `0` = no
+limit), a run that takes longer fails and retries. Spawned work checks
+`JobContext::is_cancelled()` / `lease_lost()` or awaits `cancelled()`. Redis
+claim deadlines use Redis `TIME`.
 
 **(0.6.0)** jobs additions:
 
@@ -3235,7 +3255,7 @@ autumn console                   # data playground: scaffolds src/bin/playground
 autumn console --force           # regenerate the playground from the template (never overwritten otherwise)
 autumn console --scaffold-only   # scaffold + wire Cargo.toml, then stop
 autumn console --repl            # interactive Rhai prompt: PostRepository::find_all() / find_by_id(id) / count()
-autumn release init --target azure-container-apps   # Terraform scaffold: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ACR, Container Apps, Postgres Flexible Server, Key Vault-backed secrets, opt-in Redis) + .github/workflows/azure-deploy.yml (#1278). Same --force/collision guard as the fly/docker-compose targets; see docs/guide/deployment.md.
+autumn release init --target azure-container-apps   # Terraform scaffold: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ACR, Container Apps, Postgres Flexible Server, Key Vault-backed secrets, opt-in Redis) + .github/workflows/azure-deploy.yml (#1278) + azure-cutover.sh, which attaches the identity and secret refs with the real image (#2314). Same --force/collision guard as the fly/docker-compose targets; see docs/guide/deployment.md.
 autumn release init --target aws-app-runner      # Fast/minimal AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (ECR, App Runner behind a VPC connector, RDS Postgres, Secrets Manager). No CI workflow (#1279); see docs/guide/deployment.md.
 autumn release init --target aws-ecs             # Production AWS path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (VPC, ALB+ACM DNS-validated HTTPS, ECS Fargate w/ circuit-breaker rollback, Application Auto Scaling, RDS, opt-in Redis) + .github/workflows/aws-deploy.yml (#1279); see docs/guide/deployment.md.
 autumn release init --target gcp-cloud-run       # GCP path: main.tf/variables.tf/outputs.tf/terraform.tfvars.example (Artifact Registry, Cloud Run, Cloud SQL Postgres behind a VPC connector, Secret Manager, opt-in Memorystore Redis) + .github/workflows/gcp-deploy.yml (#1280); see docs/guide/deployment.md.

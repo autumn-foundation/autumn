@@ -24,8 +24,42 @@ struct JobAttrs {
     version: Option<u32>,
     /// Optional payload-upgrade hook `fn(u32, Value) -> Result<Value, E>`.
     upgrade: Option<syn::Path>,
+    /// Longest time one run may take, in milliseconds (issue #3051).
+    /// `None` = use `jobs.default_timeout_ms`.
+    timeout_ms: Option<u64>,
     /// Wait while the cost signal is high (issue #1720).
     deferrable: bool,
+}
+
+/// Parse a timeout such as `"500ms"`, `"30s"`, `"5m"`, `"1h"`, `"1d"`, or
+/// `"1m 30s"` to milliseconds. Units: `ms`, `s`, `m`, `h`, `d`. Spaces between
+/// parts are allowed. Returns `None` for bad syntax, zero, or overflow.
+fn parse_timeout_ms(text: &str) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut rest = text.trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    while !rest.is_empty() {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        let count: u64 = rest[..digits].parse().ok()?;
+        rest = &rest[digits..];
+        let unit_len = rest.bytes().take_while(u8::is_ascii_alphabetic).count();
+        let unit_ms: u64 = match &rest[..unit_len] {
+            "ms" => 1,
+            "s" => 1_000,
+            "m" => 60_000,
+            "h" => 3_600_000,
+            "d" => 86_400_000,
+            _ => return None,
+        };
+        rest = rest[unit_len..].trim_start();
+        total = total.checked_add(count.checked_mul(unit_ms)?)?;
+    }
+    (total > 0).then_some(total)
 }
 
 /// Parse a bare flag (`deferrable`) or an explicit `flag = true|false`.
@@ -75,6 +109,16 @@ fn parse_basic_arg(
     } else if meta.path.is_ident("upgrade") {
         let value: syn::Path = meta.value()?.parse()?;
         result.upgrade = Some(value);
+    } else if meta.path.is_ident("timeout") {
+        let value: LitStr = meta.value()?.parse()?;
+        let Some(ms) = parse_timeout_ms(&value.value()) else {
+            return Err(syn::Error::new(
+                value.span(),
+                "timeout must be a positive duration such as \"500ms\", \"30s\", \"5m\", \
+                 \"1h\", \"1d\", or \"1m 30s\"",
+            ));
+        };
+        result.timeout_ms = Some(ms);
     } else if meta.path.is_ident("deferrable") {
         result.deferrable = parse_flag(meta)?;
     } else {
@@ -211,6 +255,7 @@ fn parse_job_args(attr: TokenStream) -> syn::Result<JobAttrs> {
         concurrency_key: None,
         version: None,
         upgrade: None,
+        timeout_ms: None,
         deferrable: false,
     };
 
@@ -224,7 +269,7 @@ fn parse_job_args(attr: TokenStream) -> syn::Result<JobAttrs> {
             Err(meta.error(
                 "unsupported attribute: expected name, max_attempts, backoff_ms, queue, unique, \
                  unique_by, unique_window, unique_for_ms, concurrency, concurrency_key, version, \
-                 upgrade, or deferrable",
+                 upgrade, timeout, or deferrable",
             ))
         }
     })
@@ -343,6 +388,10 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let queue = attrs.queue.clone().unwrap_or_else(|| "default".to_string());
     let uniqueness = uniqueness_tokens(&attrs);
     let concurrency = concurrency_tokens(&attrs);
+    let timeout = attrs.timeout_ms.map_or_else(
+        || quote! { ::std::option::Option::None },
+        |ms| quote! { ::std::option::Option::Some(::std::time::Duration::from_millis(#ms)) },
+    );
     let mark_deferrable = attrs.deferrable.then(|| {
         quote! {
             ::autumn_web::cost::mark_deferrable(::autumn_web::cost::WorkKind::Job, #job_name);
@@ -481,6 +530,7 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 uniqueness: #uniqueness,
                 concurrency: #concurrency,
                 version: #version,
+                timeout: #timeout,
                 handler: |state: ::autumn_web::AppState, payload: ::autumn_web::reexports::serde_json::Value| {
                     Box::pin(async move {
                         #decode_args
@@ -510,6 +560,59 @@ mod tests {
         assert_eq!(attrs.backoff_ms, Some(10));
         assert_eq!(attrs.unique, None);
         assert!(attrs.concurrency.is_none());
+    }
+
+    #[test]
+    fn parses_timeout_attr_to_milliseconds() {
+        let attrs = parse(quote! { timeout = "1m30s" }).expect("parse");
+        assert_eq!(attrs.timeout_ms, Some(90_000));
+        let attrs = parse(quote! { timeout = "250ms" }).expect("parse");
+        assert_eq!(attrs.timeout_ms, Some(250));
+        let attrs = parse(quote! { timeout = "1d 2h" }).expect("parse");
+        assert_eq!(attrs.timeout_ms, Some(93_600_000));
+        assert!(
+            parse(quote! { max_attempts = 3 })
+                .expect("parse")
+                .timeout_ms
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_a_bad_timeout() {
+        for bad in ["", "30", "0s", "5x", "s", "1.5s", "99999999999999999999h"] {
+            let Err(error) = parse(quote! { timeout = #bad }) else {
+                panic!("timeout = {bad:?} must be rejected");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("timeout must be a positive duration"),
+                "unexpected error for {bad:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn emits_the_timeout_into_job_info() {
+        let tokens = job_macro(
+            quote! { timeout = "2s" },
+            quote! { async fn slow(state: AppState, args: Args) -> AutumnResult<()> { Ok(()) } },
+        )
+        .to_string();
+        assert!(
+            tokens.contains("timeout : :: std :: option :: Option :: Some (:: std :: time :: Duration :: from_millis (2000u64))"),
+            "{tokens}"
+        );
+        let tokens = job_macro(
+            quote! {},
+            quote! { async fn quick(state: AppState, args: Args) -> AutumnResult<()> { Ok(()) } },
+        )
+        .to_string();
+        assert!(
+            tokens.contains("timeout : :: std :: option :: Option :: None"),
+            "{tokens}"
+        );
     }
 
     #[test]

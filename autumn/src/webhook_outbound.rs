@@ -54,7 +54,7 @@ impl std::fmt::Display for WebhookSubscriptionStatus {
 }
 
 /// A registered webhook subscription targeting a consumer endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookSubscription {
     pub id: String,
     pub target_url: String,
@@ -65,7 +65,7 @@ pub struct WebhookSubscription {
 }
 
 /// A structured log of an outbound webhook delivery attempt.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookDeliveryLog {
     pub id: String,
     pub subscription_id: String,
@@ -82,6 +82,46 @@ pub struct WebhookDeliveryLog {
     pub timestamp: DateTime<Utc>,
 }
 
+/// `true` when [`OutboundWebhookHandler::log_delivery`] must ignore `new`:
+///
+/// - `stored` has a 2xx response. A success is final.
+/// - `new` is not a 2xx and comes from a duplicate job: `stored` has an
+///   outcome for the same attempt and the same DLQ flag, or `stored` is a
+///   later attempt. A replay reset (out of the DLQ, back to a pending
+///   attempt 1) is not stale. A 2xx always replaces a failure.
+#[must_use]
+pub fn log_delivery_ignores(stored: &WebhookDeliveryLog, new: &WebhookDeliveryLog) -> bool {
+    let is_success = |log: &WebhookDeliveryLog| {
+        log.response_status
+            .is_some_and(|status| (200..300).contains(&status))
+    };
+    let has_outcome =
+        |log: &WebhookDeliveryLog| log.response_status.is_some() || log.last_error.is_some();
+    let repeat =
+        has_outcome(stored) && stored.attempt == new.attempt && stored.is_dlq == new.is_dlq;
+    let leaves_dlq = stored.is_dlq && !new.is_dlq && !has_outcome(new);
+    let stale = new.attempt < stored.attempt && !leaves_dlq;
+    is_success(stored) || (!is_success(new) && (repeat || stale))
+}
+
+/// `true` when `new` is a failure that `stored` already counted: `stored` has
+/// an outcome for the same attempt. A DLQ move of a failed attempt is stored,
+/// but it is not a new failure.
+#[must_use]
+pub fn log_delivery_repeats_failure(
+    stored: Option<&WebhookDeliveryLog>,
+    new: &WebhookDeliveryLog,
+) -> bool {
+    let is_success = new
+        .response_status
+        .is_some_and(|status| (200..300).contains(&status));
+    !is_success
+        && stored.is_some_and(|stored| {
+            (stored.response_status.is_some() || stored.last_error.is_some())
+                && stored.attempt == new.attempt
+        })
+}
+
 /// Pluggable handler interface for outbound webhook subscriptions and delivery logs.
 pub trait OutboundWebhookHandler: Send + Sync + 'static {
     /// Retrieve active subscriptions registered for a specific event topic.
@@ -91,6 +131,12 @@ pub trait OutboundWebhookHandler: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = AutumnResult<Vec<WebhookSubscription>>> + Send>>;
 
     /// Log a webhook delivery attempt and handle failure counters/statuses.
+    ///
+    /// Two jobs can send one delivery (an outbox re-send). Ignore a write
+    /// that [`log_delivery_ignores`] names: a write to a 2xx log, or a repeated
+    /// or stale failure. Then a late duplicate job cannot
+    /// overwrite a success or count one failure twice. Do not count a failure
+    /// that [`log_delivery_repeats_failure`] names, for example a DLQ move.
     fn log_delivery(
         &self,
         log: WebhookDeliveryLog,
@@ -146,6 +192,11 @@ pub trait OutboundWebhookHandler: Send + Sync + 'static {
 
 /// Legacy alias for backward compatibility.
 pub use OutboundWebhookHandler as OutboundWebhookStore;
+
+#[cfg(feature = "db")]
+mod sql_store;
+#[cfg(feature = "db")]
+pub use sql_store::{SqlOutboundWebhookStore, WEBHOOK_SCHEMA_SQL};
 
 /// Bounded, thread-safe, process-local in-memory implementation of the outbound webhook handler.
 #[derive(Debug, Default)]
@@ -237,6 +288,13 @@ impl OutboundWebhookHandler for InMemoryOutboundWebhookHandler {
         log: WebhookDeliveryLog,
     ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send>> {
         let mut logs = self.logs.write().expect("logs write lock poisoned");
+        if logs
+            .get(&log.id)
+            .is_some_and(|stored| log_delivery_ignores(stored, &log))
+        {
+            return Box::pin(async { Ok(()) });
+        }
+        let counted = log_delivery_repeats_failure(logs.get(&log.id), &log);
         logs.insert(log.id.clone(), log.clone());
 
         // Manage subscription consecutive failures and auto-disabling state
@@ -244,25 +302,20 @@ impl OutboundWebhookHandler for InMemoryOutboundWebhookHandler {
             .subscriptions
             .write()
             .expect("subscriptions write lock poisoned");
-        if let Some(sub) = subs.get_mut(&log.subscription_id) {
-            let is_active = sub.status == WebhookSubscriptionStatus::Active;
-            if is_active {
-                if let Some(status) = log.response_status {
-                    if (200..300).contains(&status) {
-                        sub.consecutive_failures = 0;
-                    } else {
-                        sub.consecutive_failures = sub.consecutive_failures.saturating_add(1);
-                        if sub.consecutive_failures >= 50 {
-                            sub.status = WebhookSubscriptionStatus::Failed;
-                            tracing::warn!(subscription_id = %sub.id, "Webhook subscription auto-disabled due to 50 consecutive failures");
-                        }
-                    }
-                } else if log.last_error.is_some() {
-                    sub.consecutive_failures = sub.consecutive_failures.saturating_add(1);
-                    if sub.consecutive_failures >= 50 {
-                        sub.status = WebhookSubscriptionStatus::Failed;
-                        tracing::warn!(subscription_id = %sub.id, "Webhook subscription auto-disabled due to 50 consecutive failures");
-                    }
+        if let Some(sub) = subs.get_mut(&log.subscription_id)
+            && sub.status == WebhookSubscriptionStatus::Active
+        {
+            let is_success = log
+                .response_status
+                .is_some_and(|status| (200..300).contains(&status));
+            let is_failure = log.response_status.is_some() || log.last_error.is_some();
+            if is_success {
+                sub.consecutive_failures = 0;
+            } else if is_failure && !counted {
+                sub.consecutive_failures = sub.consecutive_failures.saturating_add(1);
+                if sub.consecutive_failures >= 50 {
+                    sub.status = WebhookSubscriptionStatus::Failed;
+                    tracing::warn!(subscription_id = %sub.id, "Webhook subscription auto-disabled due to 50 consecutive failures");
                 }
             }
         }
@@ -434,6 +487,55 @@ impl WebhookOutboundManager {
         topic: &str,
         payload: &T,
     ) -> AutumnResult<()> {
+        self.dispatch_inner(state, topic, payload, None).await
+    }
+
+    /// Dispatch through the transactional outbox, on the connection of the
+    /// open transaction. Returns the outbox message id.
+    ///
+    /// The relay calls [`dispatch`](Self::dispatch) after commit. See
+    /// [`Outbox::dispatch_webhook`](crate::outbox::Outbox::dispatch_webhook).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutumnError`] if serialization or the outbox insert fails.
+    #[cfg(feature = "db")]
+    pub async fn dispatch_in_tx<T: Serialize + Sync + ?Sized>(
+        &self,
+        state: &AppState,
+        conn: &mut crate::db::RuntimeConnection,
+        topic: &str,
+        payload: &T,
+    ) -> AutumnResult<String> {
+        crate::outbox::Outbox::new(state)
+            .dispatch_webhook(conn, topic, payload)
+            .await
+    }
+
+    /// Dispatch for outbox message `message_id`.
+    ///
+    /// Each delivery id comes from the message id and the subscription id.
+    /// A second call for one message skips each delivery that has a result.
+    /// It enqueues a delivery with no result again, with the same id.
+    #[cfg(feature = "db")]
+    pub(crate) async fn dispatch_for_message(
+        &self,
+        state: &AppState,
+        message_id: &str,
+        topic: &str,
+        payload: &serde_json::Value,
+    ) -> AutumnResult<()> {
+        self.dispatch_inner(state, topic, payload, Some(message_id))
+            .await
+    }
+
+    async fn dispatch_inner<T: Serialize + Sync + ?Sized>(
+        &self,
+        state: &AppState,
+        topic: &str,
+        payload: &T,
+        message_id: Option<&str>,
+    ) -> AutumnResult<()> {
         let serialized = serde_json::to_string(payload).map_err(|e| {
             AutumnError::internal_server_error_msg(format!("failed to serialize payload: {e}"))
         })?;
@@ -445,8 +547,25 @@ impl WebhookOutboundManager {
                 continue;
             }
 
-            let log_id = state.entropy().uuid_v4().to_string();
-            let log = WebhookDeliveryLog {
+            // A relay re-send finds the log of its first send. If a delivery
+            // attempt started, the job exists: skip. If not, the first send
+            // can have stopped before the enqueue: enqueue again. The copy
+            // has the same `webhook-id`, so the receiver can drop it.
+            let mut existing = None;
+            let log_id = match message_id {
+                Some(message_id) => {
+                    let log_id = delivery_id_for_message(message_id, &sub.id);
+                    if let Some(log) = self.handler.get_delivery_log(&log_id).await? {
+                        if log.response_status.is_some() || log.last_error.is_some() || log.is_dlq {
+                            continue;
+                        }
+                        existing = Some(log);
+                    }
+                    log_id
+                }
+                None => state.entropy().uuid_v4().to_string(),
+            };
+            let log = existing.clone().unwrap_or_else(|| WebhookDeliveryLog {
                 id: log_id.clone(),
                 subscription_id: sub.id.clone(),
                 topic: topic.to_owned(),
@@ -460,10 +579,12 @@ impl WebhookOutboundManager {
                 is_dlq: false,
                 last_error: None,
                 timestamp: crate::time::ambient_now(),
-            };
+            });
 
             // Register the initial attempt in local storage
-            if let Err(e) = self.handler.log_delivery(log.clone()).await {
+            if existing.is_none()
+                && let Err(e) = self.handler.log_delivery(log.clone()).await
+            {
                 errors.push(e);
                 continue;
             }
@@ -485,17 +606,15 @@ impl WebhookOutboundManager {
                         .enqueue("autumn_webhook_delivery", job_payload)
                         .await
                     {
-                        errors.push(
-                            self.record_delivery_enqueue_failure(log, e.to_string())
-                                .await,
-                        );
+                        errors.push(self.enqueue_failed(log, e.to_string(), message_id).await);
                     }
                 } else {
                     errors.push(
-                        self.record_delivery_enqueue_failure(
+                        self.enqueue_failed(
                             log,
                             "Global job client is unavailable; fallback webhook delivery job not enqueued"
                                 .to_owned(),
+                            message_id,
                         )
                         .await,
                     );
@@ -508,6 +627,21 @@ impl WebhookOutboundManager {
         }
 
         Ok(())
+    }
+
+    /// An enqueue failed. From the outbox, keep the log pending and return
+    /// the error: the relay sends the message again, and the next send
+    /// enqueues the delivery. Else, move the log to the DLQ.
+    async fn enqueue_failed(
+        &self,
+        log: WebhookDeliveryLog,
+        message: String,
+        message_id: Option<&str>,
+    ) -> AutumnError {
+        if message_id.is_some() {
+            return AutumnError::internal_server_error_msg(message);
+        }
+        self.record_delivery_enqueue_failure(log, message).await
     }
 
     async fn record_delivery_enqueue_failure(
@@ -531,6 +665,21 @@ impl WebhookOutboundManager {
     }
 }
 
+/// A delivery id made from an outbox message and a subscription. It has the
+/// same UUID format as a random delivery id.
+fn delivery_id_for_message(message_id: &str, subscription_id: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::new()
+        .chain_update(b"autumn.webhook.delivery\0")
+        .chain_update(message_id.as_bytes())
+        .chain_update(b"\0")
+        .chain_update(subscription_id.as_bytes())
+        .finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    crate::entropy::uuid_v4_from_bytes(bytes).to_string()
+}
+
 fn install_outbound_webhook_manager(
     state: &AppState,
     store: Arc<dyn OutboundWebhookHandler>,
@@ -544,8 +693,31 @@ fn install_outbound_webhook_manager(
     state.insert_extension(manager);
 }
 
+/// The `webhook-signature` value of the Standard Webhooks spec: `v1,` and the
+/// base64 HMAC-SHA256 of `{id}.{timestamp}.{body}`.
+///
+/// The spec keys the HMAC with the base64 part of a `whsec_` secret. Other
+/// secrets key it with their raw bytes.
+fn standard_webhooks_signature(secret: &str, id: &str, timestamp: i64, body: &str) -> String {
+    use base64::Engine as _;
+    use hmac::Mac as _;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let key = secret
+        .strip_prefix("whsec_")
+        .and_then(|encoded| engine.decode(encoded).ok())
+        .unwrap_or_else(|| secret.as_bytes().to_vec());
+    let mut mac =
+        hmac::Hmac::<sha2::Sha256>::new_from_slice(&key).expect("HMAC accepts a key of any length");
+    mac.update(format!("{id}.{timestamp}.{body}").as_bytes());
+    format!("v1,{}", engine.encode(mac.finalize().into_bytes()))
+}
+
 /// Asynchronous background job that delivers a webhook payload (legacy fallback).
-#[allow(clippy::redundant_closure_for_method_calls, clippy::too_many_lines)]
+#[allow(
+    clippy::redundant_closure_for_method_calls,
+    clippy::too_many_lines,
+    clippy::must_use_candidate
+)]
 pub fn deliver_webhook_job(
     state: AppState,
     payload: serde_json::Value,
@@ -592,6 +764,17 @@ pub fn deliver_webhook_job(
                 AutumnError::not_found_msg(format!("delivery log {log_id} not found"))
             })?;
 
+            // A second job for a delivered log (an outbox re-send can enqueue
+            // one) must not send again.
+            if !is_replay
+                && log
+                    .response_status
+                    .is_some_and(|status| (200..300).contains(&status))
+            {
+                tracing::debug!(log_id = %log_id, "webhook delivery already succeeded; skipping");
+                return Ok(());
+            }
+
             if !begin_attempt(&manager, &mut log, is_replay).await? {
                 return Ok(());
             }
@@ -634,9 +817,19 @@ pub fn deliver_webhook_job(
         );
         let signature_header = format!("t={timestamp},v1={signature}");
 
+        // Standard Webhooks headers (issue #3062). `webhook-id` is the log
+        // id. Job retries use the same log, so each attempt sends the same
+        // id. `webhook-signature` signs the id too, so a replay with a new id
+        // fails the check.
         let mut request_headers = HashMap::new();
         request_headers.insert("Content-Type".to_owned(), "application/json".to_owned());
-        request_headers.insert("Autumn-Signature".to_owned(), signature_header.clone());
+        request_headers.insert("Autumn-Signature".to_owned(), signature_header);
+        request_headers.insert("webhook-id".to_owned(), log.id.clone());
+        request_headers.insert("webhook-timestamp".to_owned(), timestamp.to_string());
+        request_headers.insert(
+            "webhook-signature".to_owned(),
+            standard_webhooks_signature(&sub.secret, &log.id, timestamp, &log.payload),
+        );
 
         let start = crate::time::ambient_monotonic();
         // `target_url` is a subscriber-chosen destination, not one the app
@@ -652,15 +845,19 @@ pub fn deliver_webhook_job(
         // capsule *recording* of the attempt — all handled inside
         // `send_recorded` itself, not layered on here. See
         // docs/security/2026-09-03-webhook-ssrf/README.md.
-        let req = manager
+        let mut req = manager
             .client
             .named(&sub.target_url)
             .post(&sub.target_url)
             .ssrf_safe()
-            .breaker_scoped()
-            .header("Content-Type", "application/json")
-            .header("Autumn-Signature", signature_header)
-            .text_body(log.payload.clone());
+            .breaker_scoped();
+        // Send exactly the headers the log records.
+        let mut header_names: Vec<&String> = request_headers.keys().collect();
+        header_names.sort();
+        for name in header_names {
+            req = req.header(name, &request_headers[name]);
+        }
+        let req = req.text_body(log.payload.clone());
 
         let response = req.send().await;
         let elapsed = u64::try_from(
@@ -735,6 +932,11 @@ async fn begin_attempt(
     log: &mut WebhookDeliveryLog,
     is_replay: bool,
 ) -> AutumnResult<bool> {
+    // A replay takes the log out of the DLQ. A new failure that uses the
+    // last attempt puts it back.
+    if is_replay {
+        log.is_dlq = false;
+    }
     if log.response_status.is_none() && log.last_error.is_none() {
         return Ok(true);
     }
@@ -825,9 +1027,17 @@ async fn handle_delivery_failure(
 
 /// `AppBuilder` plugin for outbound signed webhook delivery infrastructure.
 pub struct OutboundWebhookPlugin {
-    store: Arc<dyn OutboundWebhookHandler>,
+    store: StoreSource,
     initial_backoff_ms: u64,
     max_attempts: u32,
+}
+
+/// Where the plugin gets its store.
+enum StoreSource {
+    Given(Arc<dyn OutboundWebhookHandler>),
+    /// A [`SqlOutboundWebhookStore`] on the app pool.
+    #[cfg(feature = "db")]
+    AppDatabase,
 }
 
 impl OutboundWebhookPlugin {
@@ -835,7 +1045,21 @@ impl OutboundWebhookPlugin {
     #[must_use]
     pub fn new(store: Arc<dyn OutboundWebhookHandler>) -> Self {
         Self {
-            store,
+            store: StoreSource::Given(store),
+            initial_backoff_ms: 1000,
+            max_attempts: DEFAULT_WEBHOOK_MAX_ATTEMPTS,
+        }
+    }
+
+    /// A plugin with a durable [`SqlOutboundWebhookStore`] on the app
+    /// database. At startup it creates the tables if they do not exist.
+    /// `TestApp` runs no startup hook: call
+    /// [`SqlOutboundWebhookStore::ensure_schema`] in the test.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub const fn sql() -> Self {
+        Self {
+            store: StoreSource::AppDatabase,
             initial_backoff_ms: 1000,
             max_attempts: DEFAULT_WEBHOOK_MAX_ATTEMPTS,
         }
@@ -860,19 +1084,45 @@ impl OutboundWebhookPlugin {
 
 impl crate::plugin::Plugin for OutboundWebhookPlugin {
     fn build(self, app: crate::app::AppBuilder) -> crate::app::AppBuilder {
-        let store = self.store;
         let initial_backoff_ms = self.initial_backoff_ms;
         let max_attempts = self.max_attempts;
-
-        app.state_initializer(move |state| {
-            install_outbound_webhook_manager(
-                state,
-                store.clone(),
-                initial_backoff_ms,
-                max_attempts,
-            );
-        })
-        .jobs(vec![crate::job::JobInfo {
+        let app = match self.store {
+            StoreSource::Given(store) => app.state_initializer(move |state| {
+                install_outbound_webhook_manager(
+                    state,
+                    store.clone(),
+                    initial_backoff_ms,
+                    max_attempts,
+                );
+            }),
+            #[cfg(feature = "db")]
+            StoreSource::AppDatabase => app
+                .state_initializer(move |state| {
+                    if let Some(pool) = state.pool() {
+                        install_outbound_webhook_manager(
+                            state,
+                            Arc::new(SqlOutboundWebhookStore::new(pool.clone())),
+                            initial_backoff_ms,
+                            max_attempts,
+                        );
+                    } else {
+                        tracing::error!(
+                            "OutboundWebhookPlugin::sql needs a database; webhooks are off"
+                        );
+                    }
+                })
+                .on_startup(|state| async move {
+                    match state.pool() {
+                        Some(pool) => {
+                            SqlOutboundWebhookStore::new(pool.clone())
+                                .ensure_schema()
+                                .await
+                        }
+                        None => Ok(()),
+                    }
+                }),
+        };
+        app.jobs(vec![crate::job::JobInfo {
             name: "autumn_webhook_delivery".to_string(),
             // The job engine runs the retries. Two job attempts per delivery
             // attempt leave room for store errors, which use a job attempt
@@ -884,6 +1134,7 @@ impl crate::plugin::Plugin for OutboundWebhookPlugin {
             concurrency: None,
             version: 1,
             handler: deliver_webhook_job,
+            timeout: None,
         }])
     }
 }
@@ -1051,6 +1302,347 @@ mod tests {
             .expect("subscription should remain stored");
         assert_eq!(updated_sub.status, WebhookSubscriptionStatus::Active);
         assert_eq!(updated_sub.consecutive_failures, 0);
+    }
+
+    /// Issue #3062: each retry sends the same `webhook-id`, so a receiver can
+    /// drop a duplicate.
+    /// A 2xx log is final. A late failure of a duplicate job does not
+    /// overwrite it or count as a failure.
+    #[tokio::test]
+    async fn a_success_log_is_final() {
+        let store = InMemoryOutboundWebhookHandler::new();
+        store
+            .create_subscription(sample_subscription(
+                "sub",
+                "http://receiver/hooks",
+                WebhookSubscriptionStatus::Active,
+            ))
+            .await
+            .unwrap();
+        let mut ok = sample_log("log", "sub");
+        ok.response_status = Some(200);
+        store.log_delivery(ok).await.unwrap();
+
+        let mut late = sample_log("log", "sub");
+        late.response_status = Some(500);
+        late.last_error = Some("500".to_owned());
+        store.log_delivery(late).await.unwrap();
+        let mut pending = sample_log("log", "sub");
+        pending.attempt = 2;
+        store.log_delivery(pending).await.unwrap();
+
+        let log = store.get_delivery_log("log").await.unwrap().unwrap();
+        assert_eq!(log.response_status, Some(200));
+        assert_eq!(log.attempt, 1);
+        let sub = store.get_subscription("sub").await.unwrap().unwrap();
+        assert_eq!(sub.consecutive_failures, 0);
+    }
+
+    /// Two duplicate jobs that fail one attempt count one failure. A later
+    /// DLQ move of that attempt is still stored.
+    #[tokio::test]
+    async fn a_repeated_failure_of_one_attempt_counts_once() {
+        let store = InMemoryOutboundWebhookHandler::new();
+        store
+            .create_subscription(sample_subscription(
+                "sub",
+                "http://receiver/hooks",
+                WebhookSubscriptionStatus::Active,
+            ))
+            .await
+            .unwrap();
+        let mut failed = sample_log("log", "sub");
+        failed.response_status = Some(500);
+        failed.last_error = Some("500".to_owned());
+        store.log_delivery(failed.clone()).await.unwrap();
+        store.log_delivery(failed.clone()).await.unwrap();
+        let sub = store.get_subscription("sub").await.unwrap().unwrap();
+        assert_eq!(sub.consecutive_failures, 1);
+
+        failed.is_dlq = true;
+        store.log_delivery(failed).await.unwrap();
+        let log = store.get_delivery_log("log").await.unwrap().unwrap();
+        assert!(log.is_dlq, "the DLQ move is stored");
+        let sub = store.get_subscription("sub").await.unwrap().unwrap();
+        assert_eq!(
+            sub.consecutive_failures, 1,
+            "a DLQ move is not a new failure"
+        );
+
+        // A 2xx of the same attempt replaces a failure.
+        let mut lost = sample_log("other", "sub");
+        lost.response_status = Some(500);
+        lost.last_error = Some("500".to_owned());
+        store.log_delivery(lost.clone()).await.unwrap();
+        lost.response_status = Some(200);
+        lost.last_error = None;
+        store.log_delivery(lost).await.unwrap();
+        let log = store.get_delivery_log("other").await.unwrap().unwrap();
+        assert_eq!(log.response_status, Some(200));
+        let sub = store.get_subscription("sub").await.unwrap().unwrap();
+        assert_eq!(sub.consecutive_failures, 0);
+    }
+
+    /// A failure of an older attempt is stale and ignored. A replay reset
+    /// (out of the DLQ, back to attempt 1) still applies.
+    #[tokio::test]
+    async fn a_stale_attempt_is_ignored() {
+        let store = InMemoryOutboundWebhookHandler::new();
+        store
+            .create_subscription(sample_subscription(
+                "sub",
+                "http://receiver/hooks",
+                WebhookSubscriptionStatus::Active,
+            ))
+            .await
+            .unwrap();
+        let mut newer = sample_log("log", "sub");
+        newer.attempt = 2;
+        store.log_delivery(newer).await.unwrap();
+        let mut stale = sample_log("log", "sub");
+        stale.response_status = Some(500);
+        stale.last_error = Some("500".to_owned());
+        store.log_delivery(stale.clone()).await.unwrap();
+        let log = store.get_delivery_log("log").await.unwrap().unwrap();
+        assert_eq!((log.attempt, log.response_status), (2, None));
+        let sub = store.get_subscription("sub").await.unwrap().unwrap();
+        assert_eq!(sub.consecutive_failures, 0);
+
+        let mut dead = stale.clone();
+        dead.id = "dead".to_owned();
+        dead.attempt = 3;
+        dead.is_dlq = true;
+        store.log_delivery(dead).await.unwrap();
+        let mut reset = sample_log("dead", "sub");
+        reset.attempt = 1;
+        store.log_delivery(reset).await.unwrap();
+        let log = store.get_delivery_log("dead").await.unwrap().unwrap();
+        assert_eq!(
+            (log.attempt, log.is_dlq),
+            (1, false),
+            "a replay reset applies"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_retries_carry_identical_webhook_id() {
+        let state = AppState::for_test();
+        let store = Arc::new(InMemoryOutboundWebhookHandler::new());
+        let registry = Arc::new(MockRegistry::new());
+        let mock = mock_builder(registry.clone(), "http://mock-receiver/webhooks/flaky")
+            .post("/webhooks/flaky")
+            .respond_with(500, serde_json::json!({ "error": "down" }));
+        state.insert_extension(HttpMockRegistryExt(registry));
+        install_outbound_webhook_manager(&state, store.clone(), 1, DEFAULT_WEBHOOK_MAX_ATTEMPTS);
+
+        let sub = sample_subscription(
+            "sub_flaky",
+            "http://mock-receiver/webhooks/flaky",
+            WebhookSubscriptionStatus::Active,
+        );
+        store.create_subscription(sub).await.unwrap();
+        store
+            .replace_delivery_log(sample_log("log_flaky", "sub_flaky"))
+            .await
+            .unwrap();
+
+        let mut ids = Vec::new();
+        for attempt in 1..=3_u32 {
+            let result =
+                deliver_webhook_job(state.clone(), serde_json::json!({ "log_id": "log_flaky" }))
+                    .await;
+            assert!(result.is_err(), "a 500 asks the job runtime to retry");
+            let log = store.get_delivery_log("log_flaky").await.unwrap().unwrap();
+            assert_eq!(log.attempt, attempt);
+            let id = log
+                .request_headers
+                .get("webhook-id")
+                .cloned()
+                .expect("every attempt sends webhook-id");
+            let timestamp = log
+                .request_headers
+                .get("webhook-timestamp")
+                .expect("every attempt sends webhook-timestamp");
+            let signature = &log.request_headers["Autumn-Signature"];
+            assert!(signature.starts_with(&format!("t={timestamp},")));
+            ids.push(id);
+        }
+
+        mock.expect_called(3);
+        assert!(ids.iter().all(|id| id == "log_flaky"), "ids: {ids:?}");
+    }
+
+    /// Issue #3062: a relay re-send of one outbox message makes no second
+    /// delivery once an attempt started, and enqueues again before that.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn outbox_resend_reuses_the_delivery_id() {
+        let state = AppState::for_test();
+        let store = Arc::new(InMemoryOutboundWebhookHandler::new());
+        install_outbound_webhook_manager(&state, store.clone(), 1, DEFAULT_WEBHOOK_MAX_ATTEMPTS);
+        let delegated = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let delegate: WebhookDelegate = {
+            let delegated = delegated.clone();
+            Arc::new(move |_, _, log| {
+                delegated.lock().unwrap().push(log.id);
+                Box::pin(async { Ok(()) })
+            })
+        };
+        state.insert_extension(WebhookDelegateExt(delegate));
+        store
+            .create_subscription(sample_subscription(
+                "sub_outbox",
+                "http://mock-receiver/hook",
+                WebhookSubscriptionStatus::Active,
+            ))
+            .await
+            .unwrap();
+        let manager = state.extension::<WebhookOutboundManager>().unwrap();
+        let payload = serde_json::json!({ "order_id": "ord_1" });
+
+        for _ in 0..2 {
+            manager
+                .dispatch_for_message(&state, "msg-1", "orders.created", &payload)
+                .await
+                .unwrap();
+        }
+        let ids = delegated.lock().unwrap().clone();
+        assert_eq!(ids.len(), 2, "no attempt yet: enqueue again");
+        assert_eq!(
+            ids[0], ids[1],
+            "one delivery id per message and subscription"
+        );
+        assert_eq!(ids[0], delivery_id_for_message("msg-1", "sub_outbox"));
+        assert_eq!(store.get_delivery_logs().await.unwrap().len(), 1);
+
+        let mut log = store.get_delivery_log(&ids[0]).await.unwrap().unwrap();
+        log.response_status = Some(200);
+        store.replace_delivery_log(log).await.unwrap();
+        manager
+            .dispatch_for_message(&state, "msg-1", "orders.created", &payload)
+            .await
+            .unwrap();
+        assert_eq!(
+            delegated.lock().unwrap().len(),
+            2,
+            "an attempt started: skip"
+        );
+
+        manager
+            .dispatch_for_message(&state, "msg-2", "orders.created", &payload)
+            .await
+            .unwrap();
+        assert_ne!(
+            delegated.lock().unwrap()[2],
+            ids[0],
+            "a new message gets a new id"
+        );
+    }
+
+    /// The test vector of the Standard Webhooks spec.
+    #[test]
+    fn webhook_signature_matches_the_standard_webhooks_vector() {
+        assert_eq!(
+            standard_webhooks_signature(
+                "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw",
+                "msg_p5jXN8AQM9LWM0D4loKWxJek",
+                1_614_265_330,
+                r#"{"test": 2432232314}"#,
+            ),
+            "v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE="
+        );
+        // A secret without the prefix signs with its raw bytes.
+        assert_ne!(
+            standard_webhooks_signature("raw-secret", "id", 1, "{}"),
+            standard_webhooks_signature("other-secret", "id", 1, "{}")
+        );
+    }
+
+    /// A second job for a delivered log (an outbox re-send) sends nothing.
+    #[tokio::test]
+    async fn duplicate_job_after_success_does_not_send_again() {
+        let state = AppState::for_test();
+        let store = Arc::new(InMemoryOutboundWebhookHandler::new());
+        let registry = Arc::new(MockRegistry::new());
+        let mock = mock_builder(registry.clone(), "http://mock-receiver/webhooks/once")
+            .post("/webhooks/once")
+            .respond_with(200, serde_json::json!({ "ok": true }));
+        state.insert_extension(HttpMockRegistryExt(registry));
+        install_outbound_webhook_manager(&state, store.clone(), 1, DEFAULT_WEBHOOK_MAX_ATTEMPTS);
+        store
+            .create_subscription(sample_subscription(
+                "sub_once",
+                "http://mock-receiver/webhooks/once",
+                WebhookSubscriptionStatus::Active,
+            ))
+            .await
+            .unwrap();
+        store
+            .replace_delivery_log(sample_log("log_once", "sub_once"))
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            deliver_webhook_job(state.clone(), serde_json::json!({ "log_id": "log_once" }))
+                .await
+                .unwrap();
+        }
+        mock.expect_called(1);
+        let log = store.get_delivery_log("log_once").await.unwrap().unwrap();
+        assert_eq!(log.attempt, 1);
+        assert!(log.request_headers["webhook-signature"].starts_with("v1,"));
+    }
+
+    /// From the outbox, a failed enqueue keeps the log pending, so the next
+    /// relay send enqueues it. Outside the outbox, it goes to the DLQ.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn outbox_enqueue_failure_stays_retryable() {
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+        let state = AppState::for_test();
+        let store = Arc::new(InMemoryOutboundWebhookHandler::new());
+        install_outbound_webhook_manager(&state, store.clone(), 1, DEFAULT_WEBHOOK_MAX_ATTEMPTS);
+        store
+            .create_subscription(sample_subscription(
+                "sub_retry",
+                "http://mock-receiver/hook",
+                WebhookSubscriptionStatus::Active,
+            ))
+            .await
+            .unwrap();
+        let manager = state.extension::<WebhookOutboundManager>().unwrap();
+        let payload = serde_json::json!({ "order_id": "ord_1" });
+
+        // No job client: the enqueue fails.
+        assert!(
+            manager
+                .dispatch_for_message(&state, "msg-r", "orders.created", &payload)
+                .await
+                .is_err()
+        );
+        let id = delivery_id_for_message("msg-r", "sub_retry");
+        let log = store.get_delivery_log(&id).await.unwrap().unwrap();
+        assert!(
+            !log.is_dlq && log.last_error.is_none(),
+            "the log stays pending"
+        );
+
+        // The relay sends again; now the enqueue works.
+        let delegated = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let delegate: WebhookDelegate = {
+            let delegated = delegated.clone();
+            Arc::new(move |_, _, log| {
+                delegated.lock().unwrap().push(log.id);
+                Box::pin(async { Ok(()) })
+            })
+        };
+        state.insert_extension(WebhookDelegateExt(delegate));
+        manager
+            .dispatch_for_message(&state, "msg-r", "orders.created", &payload)
+            .await
+            .unwrap();
+        assert_eq!(*delegated.lock().unwrap(), [id]);
     }
 
     #[tokio::test]
@@ -1434,6 +2026,14 @@ mod tests {
         .expect("the replay is delivered");
 
         assert_eq!(mock.call_count(), 1, "the replay sends the request");
+        let log = store
+            .get_delivery_log("log_exhausted")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(log.response_status, Some(200));
+        assert!(!log.is_dlq, "a successful replay leaves the DLQ");
+        assert!(store.get_dlq_logs().await.unwrap().is_empty());
     }
 
     struct CountingReplacementStore {

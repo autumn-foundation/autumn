@@ -198,6 +198,7 @@ idempotency.redis.url
 idempotency.ttl_secs
 jobs
 jobs.backend
+jobs.default_timeout_ms
 jobs.fleet
 jobs.fleet.declared_queues
 jobs.fleet.manifest
@@ -259,6 +260,15 @@ observability.server_timing
 openapi
 openapi.enabled
 openapi.path
+outbox
+outbox.batch_size
+outbox.enabled
+outbox.initial_backoff_ms
+outbox.lease_ms
+outbox.max_attempts
+outbox.max_backoff_ms
+outbox.poll_interval_ms
+outbox.retention_ms
 push
 push.private_key
 push.public_key

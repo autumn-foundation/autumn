@@ -177,6 +177,7 @@ mod ingress_named_futures;
 mod inline_broadcast_prefetch;
 mod inspector_integration;
 mod isr_coordination;
+mod job_lease_heartbeat;
 mod job_recorder_integration;
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 mod job_retry_jitter_pg;
@@ -269,6 +270,8 @@ mod offline_sync_store;
 mod openapi;
 #[cfg(feature = "openapi")]
 mod openapi_export;
+#[cfg(feature = "db")]
+mod outbox_pg;
 mod pagination;
 mod pagination_cursor_proptest;
 mod path_helpers;

@@ -1093,14 +1093,17 @@ pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   **maximum** (the worst reachable path).
 /// * A loop whose body issues a query is **unbounded**, unless the iterable
 ///   has a literal compile-time bound (`for _ in 0..3`), in which case the
-///   body cost is multiplied.
+///   body cost is multiplied. A path that leaves the loop is paid once.
 /// * A method chain rooted at a `Db` / repository handle is **one** query,
 ///   however many builder methods (`on_primary()`, `scoped()`, …) it carries.
 /// * `.preload(rows, Post::preload().author().tags())` costs **one query per
 ///   association** — the batched `WHERE ... IN (...)` loads.
-/// * Anything opaque — a helper function handed the handle, a macro body that
-///   names it, a closure that may run per element — is **reported**, never
-///   assumed query-free.
+/// * A path that leaves early (`return`, `break`, `continue`) does not include
+///   the cost of the code it skips.
+/// * Anything opaque — a helper function or associated function handed the
+///   handle (`Post::published(&mut db)`), a macro body that names it, a
+///   closure that may run per element — is **reported**, never assumed
+///   query-free.
 ///
 /// # Escape hatches
 ///

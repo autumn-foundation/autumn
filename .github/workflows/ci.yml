@@ -1626,6 +1626,17 @@ jobs:
           )
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/redis-dead-letter-limit.log" \
             || { echo "::error::no redis dead-letter limit tests ran — the ci.yml filter no longer matches"; exit 1; }
+          # The Redis claim-renewal test (#3051) is `--lib` for the same
+          # reason: it drives the crate-private renewal script directly.
+          (
+            set -o pipefail
+            cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
+              --ignored --test-threads=1 \
+              job::tests::redis_claim_renewal_ \
+              | tee "${RUNNER_TEMP}/redis-claim-renewal.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/redis-claim-renewal.log" \
+            || { echo "::error::no redis claim-renewal tests ran — the ci.yml filter no longer matches"; exit 1; }
           # The Postgres relative-delay clock-skew regression (#2111 follow-up)
           # also lives in the `--lib` module (it drives crate-private types:
           # PgDueAt, pg_enqueue_job_at, pg_enqueue_on_conn_at), so it needs its
@@ -2400,14 +2411,18 @@ jobs:
             --test confidential_repository_bidx \
             --test sim_sqlite_substrate \
             --test sim_sqlite_integration \
-            --test sim_chaos_crash
+            --test sim_chaos_crash \
+            --test sim_outbox_crash \
+            --test sqlite_outbox_writers
       - name: Run the sqlite mail-chaos suite (W5.a, issue #1797)
-        # `sim_chaos_mail` needs the `mail` feature for the mail
-        # interceptor/transport surface, so it runs as its own invocation to
-        # avoid widening the feature set of the other sqlite tests above.
+        # `sim_chaos_mail` and `sim_outbox_mail` (#3062) need the `mail`
+        # feature for the mail interceptor/transport surface, so they run as
+        # their own invocation to avoid widening the feature set of the other
+        # sqlite tests above.
         run: |
           cargo test -p autumn-web --features "sqlite,test-support,mail" \
-            --test sim_chaos_mail
+            --test sim_chaos_mail \
+            --test sim_outbox_mail
       - name: Run the sim op-driver DoD suite (W6 PR2, issue #1797)
         # `sim_op_driver` needs the `sim-testing` feature (`proptest` as a
         # library dependency) — runs as its own invocation to avoid widening

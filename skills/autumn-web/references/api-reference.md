@@ -1149,6 +1149,9 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   `[jobs.queues]` weight table; tracked jobs (`job::enqueue_tracked`,
   `enqueue_tracked_for`, `TrackedJobHandle`, optional third `JobContext`
   handler arg, `GET /_autumn/jobs/{token}`, `jobs.tracking.*` config).
+- Unreleased (#3051): `timeout = "30s"` key and `jobs.default_timeout_ms`;
+  durable claims renew on a heartbeat; `JobContext::lease_lost()`,
+  `is_cancelled()`, `cancelled()`.
 
 ## Distributed locks (0.6.0)
 
@@ -1744,10 +1747,19 @@ Frequently used env keys:
 | `AUTUMN_CHANNELS__BACKEND` | `channels.backend` |
 | `AUTUMN_CHANNELS__REPLAY_BUFFER` | `channels.replay_buffer` (0.6.0) |
 | `AUTUMN_JOBS__BACKEND` | `jobs.backend` (`local` / `postgres` / `redis` / `sqlite`) |
+| `AUTUMN_JOBS__DEFAULT_TIMEOUT_MS` | `jobs.default_timeout_ms` (`0` = no limit) |
 | `AUTUMN_JOBS__SQLITE__VISIBILITY_TIMEOUT_MS` | `jobs.sqlite.visibility_timeout_ms` |
 | `AUTUMN_JOBS__SQLITE__POLL_INTERVAL_MS` | `jobs.sqlite.poll_interval_ms` |
 | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` |
 | `AUTUMN_JOBS__REDIS__DEAD_LETTER_LIMIT` | `jobs.redis.dead_letter_limit` (default 10 000; `0` = unbounded) |
+| `AUTUMN_OUTBOX__ENABLED` | `outbox.enabled` (default `false`; transactional outbox relay) |
+| `AUTUMN_OUTBOX__POLL_INTERVAL_MS` | `outbox.poll_interval_ms` (default 500) |
+| `AUTUMN_OUTBOX__BATCH_SIZE` | `outbox.batch_size` (default 100) |
+| `AUTUMN_OUTBOX__MAX_ATTEMPTS` | `outbox.max_attempts` (default 10) |
+| `AUTUMN_OUTBOX__INITIAL_BACKOFF_MS` | `outbox.initial_backoff_ms` (default 1000) |
+| `AUTUMN_OUTBOX__MAX_BACKOFF_MS` | `outbox.max_backoff_ms` (default 300000) |
+| `AUTUMN_OUTBOX__LEASE_MS` | `outbox.lease_ms` (default 60000) |
+| `AUTUMN_OUTBOX__RETENTION_MS` | `outbox.retention_ms` (default 7 days) |
 | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` (`in_process` / `postgres` / `sqlite`) |
 | `AUTUMN_SECURITY__SIGNING_SECRET` | `security.signing_secret.secret` |
 | `AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API` | `security.allow_unauthorized_repository_api` |

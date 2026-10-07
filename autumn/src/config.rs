@@ -145,6 +145,7 @@
 //! | `AUTUMN_JOBS__MAX_ATTEMPTS` | `jobs.max_attempts` | `u32` |
 //! | `AUTUMN_JOBS__INITIAL_BACKOFF_MS` | `jobs.initial_backoff_ms` | `u64` |
 //! | `AUTUMN_JOBS__MAX_BACKOFF_MS` | `jobs.max_backoff_ms` | `u64` |
+//! | `AUTUMN_JOBS__DEFAULT_TIMEOUT_MS` | `jobs.default_timeout_ms` | `u64` |
 //! | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` | `String` |
 //! | `AUTUMN_JOBS__REDIS__KEY_PREFIX` | `jobs.redis.key_prefix` | `String` |
 //! | `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` | `jobs.redis.visibility_timeout_ms` | `u64` |
@@ -152,6 +153,14 @@
 //! | `AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS` | `jobs.postgres.visibility_timeout_ms` | `u64` |
 //! | `AUTUMN_JOBS__TRACKING__TTL_SECS` | `jobs.tracking.ttl_secs` | `u64` |
 //! | `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` | `jobs.tracking.route_enabled` | `bool` |
+//! | `AUTUMN_OUTBOX__ENABLED` | `outbox.enabled` | `bool` |
+//! | `AUTUMN_OUTBOX__POLL_INTERVAL_MS` | `outbox.poll_interval_ms` | `u64` |
+//! | `AUTUMN_OUTBOX__BATCH_SIZE` | `outbox.batch_size` | `usize` |
+//! | `AUTUMN_OUTBOX__MAX_ATTEMPTS` | `outbox.max_attempts` | `u32` |
+//! | `AUTUMN_OUTBOX__INITIAL_BACKOFF_MS` | `outbox.initial_backoff_ms` | `u64` |
+//! | `AUTUMN_OUTBOX__MAX_BACKOFF_MS` | `outbox.max_backoff_ms` | `u64` |
+//! | `AUTUMN_OUTBOX__LEASE_MS` | `outbox.lease_ms` | `u64` |
+//! | `AUTUMN_OUTBOX__RETENTION_MS` | `outbox.retention_ms` | `u64` |
 //! | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` | `in_process` / `postgres` / `sqlite` |
 //! | `AUTUMN_RETENTION__SWEEP_INTERVAL` | `retention.sweep_interval` | duration `String` |
 //! | `AUTUMN_RETENTION__JOB_HISTORY` | `retention.job_history` | duration `String` |
@@ -1517,6 +1526,10 @@ pub struct AutumnConfig {
     /// Background job backend and runtime settings.
     #[serde(default)]
     pub jobs: JobConfig,
+
+    /// Transactional outbox relay settings (issue #3062).
+    #[serde(default)]
+    pub outbox: OutboxConfig,
 
     /// Scheduled task coordination backend settings.
     #[serde(default)]
@@ -3691,6 +3704,83 @@ fn default_openapi_path() -> String {
     "/openapi.json".to_owned()
 }
 
+/// Transactional outbox relay configuration (issue #3062).
+///
+/// See `docs/guide/outbox.md`. The relay runs only when `enabled` is `true`
+/// and the app has a database.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct OutboxConfig {
+    /// Start the relay, create the tables at boot, and send `deliver_later`
+    /// mail through the outbox. Default `false`.
+    pub enabled: bool,
+    /// Wait between relay polls when no message is ready. Default `500`.
+    pub poll_interval_ms: u64,
+    /// Messages one relay claims per poll. Default `100`.
+    pub batch_size: usize,
+    /// Attempts before a message goes to the dead letters. Default `10`.
+    pub max_attempts: u32,
+    /// First retry delay. Each retry doubles it, with jitter. Default `1000`.
+    pub initial_backoff_ms: u64,
+    /// Upper limit of the retry delay. Default `300000` (5 minutes).
+    pub max_backoff_ms: u64,
+    /// How long a claim stays valid. After a crash, the message is sent again
+    /// when the claim expires. Default `60000`.
+    pub lease_ms: u64,
+    /// Age after which the relay deletes sent messages and inbox entries.
+    /// Default `604800000` (7 days).
+    pub retention_ms: u64,
+}
+
+impl OutboxConfig {
+    /// Check the values the relay needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] when `batch_size`, `max_attempts`
+    /// or `lease_ms` is zero, or `max_backoff_ms` is smaller than
+    /// `initial_backoff_ms`. With a zero lease, a claim ends at once and the
+    /// relay sends nothing.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (key, value) in [
+            (
+                "batch_size",
+                u64::try_from(self.batch_size).unwrap_or(u64::MAX),
+            ),
+            ("max_attempts", u64::from(self.max_attempts)),
+            ("lease_ms", self.lease_ms),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "outbox.{key} must be greater than zero"
+                )));
+            }
+        }
+        if self.max_backoff_ms < self.initial_backoff_ms {
+            return Err(ConfigError::Validation(
+                "outbox.max_backoff_ms must not be smaller than outbox.initial_backoff_ms"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for OutboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval_ms: 500,
+            batch_size: 100,
+            max_attempts: 10,
+            initial_backoff_ms: 1_000,
+            max_backoff_ms: 300_000,
+            lease_ms: 60_000,
+            retention_ms: 604_800_000,
+        }
+    }
+}
+
 /// Background job runtime configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct JobConfig {
@@ -3716,6 +3806,11 @@ pub struct JobConfig {
     /// Default: 3 600 000 (1 hour). See [`crate::backoff`].
     #[serde(default = "default_job_max_backoff_ms")]
     pub max_backoff_ms: u64,
+    /// Maximum time in milliseconds for one run of a job that has no
+    /// `#[job(timeout)]` (issue #3051). A slower run fails and retries. `0`
+    /// (the default) sets no limit.
+    #[serde(default)]
+    pub default_timeout_ms: u64,
     /// Ordered/weighted list of queues workers drain, highest priority first.
     ///
     /// Unset = a single `default` queue (today's behavior). A TOML array such as
@@ -3761,6 +3856,7 @@ impl Default for JobConfig {
             max_attempts: default_job_max_attempts(),
             initial_backoff_ms: default_job_backoff_ms(),
             max_backoff_ms: default_job_max_backoff_ms(),
+            default_timeout_ms: 0,
             queues: JobQueuesConfig::default(),
             pin: Vec::new(),
             fleet: JobFleetConfig::default(),
@@ -5236,6 +5332,7 @@ impl AutumnConfig {
         self.realtime.validate()?;
         self.cors.validate()?;
         self.scheduler.validate()?;
+        self.outbox.validate()?;
         // #1605: reject an unparseable or zero retention window at boot rather
         // than silently skipping the dataset it names — a policy an operator
         // believes is enforced but isn't is worse than no policy.
@@ -5464,12 +5561,23 @@ impl AutumnConfig {
     /// - `AUTUMN_JOBS__MAX_ATTEMPTS` → `jobs.max_attempts` (`u32`)
     /// - `AUTUMN_JOBS__INITIAL_BACKOFF_MS` → `jobs.initial_backoff_ms` (`u64`)
     /// - `AUTUMN_JOBS__MAX_BACKOFF_MS` → `jobs.max_backoff_ms` (`u64`)
+    /// - `AUTUMN_JOBS__DEFAULT_TIMEOUT_MS` → `jobs.default_timeout_ms` (`u64`)
     /// - `AUTUMN_JOBS__REDIS__URL` → `jobs.redis.url` (`String`)
     /// - `AUTUMN_JOBS__REDIS__KEY_PREFIX` → `jobs.redis.key_prefix` (`String`)
     /// - `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` → `jobs.redis.visibility_timeout_ms` (`u64`)
     /// - `AUTUMN_JOBS__REDIS__DEAD_LETTER_LIMIT` → `jobs.redis.dead_letter_limit` (`usize`, `0` = unbounded)
     /// - `AUTUMN_JOBS__TRACKING__TTL_SECS` → `jobs.tracking.ttl_secs` (`u64`)
     /// - `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` → `jobs.tracking.route_enabled` (`bool`)
+    ///
+    /// # Outbox (issue #3062)
+    /// - `AUTUMN_OUTBOX__ENABLED` → `outbox.enabled` (`bool`)
+    /// - `AUTUMN_OUTBOX__POLL_INTERVAL_MS` → `outbox.poll_interval_ms` (`u64`)
+    /// - `AUTUMN_OUTBOX__BATCH_SIZE` → `outbox.batch_size` (`usize`)
+    /// - `AUTUMN_OUTBOX__MAX_ATTEMPTS` → `outbox.max_attempts` (`u32`)
+    /// - `AUTUMN_OUTBOX__INITIAL_BACKOFF_MS` → `outbox.initial_backoff_ms` (`u64`)
+    /// - `AUTUMN_OUTBOX__MAX_BACKOFF_MS` → `outbox.max_backoff_ms` (`u64`)
+    /// - `AUTUMN_OUTBOX__LEASE_MS` → `outbox.lease_ms` (`u64`)
+    /// - `AUTUMN_OUTBOX__RETENTION_MS` → `outbox.retention_ms` (`u64`)
     ///
     /// # Retention (issue #1605)
     /// - `AUTUMN_RETENTION__SWEEP_INTERVAL` → `retention.sweep_interval` (duration `String`)
@@ -5526,6 +5634,7 @@ impl AutumnConfig {
         self.apply_channels_env_overrides_with_env(env);
         self.apply_realtime_env_overrides_with_env(env);
         self.apply_jobs_env_overrides_with_env(env);
+        self.apply_outbox_env_overrides_with_env(env);
         self.apply_scheduler_env_overrides_with_env(env);
         self.apply_retention_env_overrides_with_env(env);
         self.apply_role_env_overrides_with_env(env);
@@ -6545,6 +6654,11 @@ impl AutumnConfig {
             "AUTUMN_JOBS__MAX_BACKOFF_MS",
             &mut self.jobs.max_backoff_ms,
         );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__DEFAULT_TIMEOUT_MS",
+            &mut self.jobs.default_timeout_ms,
+        );
         parse_env_option_string(env, "AUTUMN_JOBS__REDIS__URL", &mut self.jobs.redis.url);
         parse_env_string(
             env,
@@ -6585,6 +6699,41 @@ impl AutumnConfig {
             env,
             "AUTUMN_JOBS__TRACKING__ROUTE_ENABLED",
             &mut self.jobs.tracking.route_enabled,
+        );
+    }
+
+    fn apply_outbox_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(env, "AUTUMN_OUTBOX__ENABLED", &mut self.outbox.enabled);
+        parse_env(
+            env,
+            "AUTUMN_OUTBOX__POLL_INTERVAL_MS",
+            &mut self.outbox.poll_interval_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_OUTBOX__BATCH_SIZE",
+            &mut self.outbox.batch_size,
+        );
+        parse_env(
+            env,
+            "AUTUMN_OUTBOX__MAX_ATTEMPTS",
+            &mut self.outbox.max_attempts,
+        );
+        parse_env(
+            env,
+            "AUTUMN_OUTBOX__INITIAL_BACKOFF_MS",
+            &mut self.outbox.initial_backoff_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_OUTBOX__MAX_BACKOFF_MS",
+            &mut self.outbox.max_backoff_ms,
+        );
+        parse_env(env, "AUTUMN_OUTBOX__LEASE_MS", &mut self.outbox.lease_ms);
+        parse_env(
+            env,
+            "AUTUMN_OUTBOX__RETENTION_MS",
+            &mut self.outbox.retention_ms,
         );
     }
 
@@ -15306,6 +15455,21 @@ path = "/healthz"
         assert_eq!(config.jobs.redis.visibility_timeout_ms, 45_000);
     }
 
+    /// `jobs.default_timeout_ms` defaults to `0` (no limit) and reads from
+    /// TOML and the environment (issue #3051).
+    #[test]
+    fn jobs_default_timeout_ms_defaults_to_zero_and_overrides() {
+        assert_eq!(AutumnConfig::default().jobs.default_timeout_ms, 0);
+
+        let config: AutumnConfig = toml::from_str("[jobs]\ndefault_timeout_ms = 30000\n").unwrap();
+        assert_eq!(config.jobs.default_timeout_ms, 30_000);
+
+        let env = MockEnv::new().with("AUTUMN_JOBS__DEFAULT_TIMEOUT_MS", "1500");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.jobs.default_timeout_ms, 1_500);
+    }
+
     // ── [retention] unified framework-owned data retention (issue #1605) ──
 
     #[test]
@@ -15530,6 +15694,76 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.jobs.redis.dead_letter_limit, 250);
+    }
+
+    #[test]
+    fn outbox_validate_rejects_zero_values() {
+        assert!(OutboxConfig::default().validate().is_ok());
+        for config in [
+            OutboxConfig {
+                lease_ms: 0,
+                ..OutboxConfig::default()
+            },
+            OutboxConfig {
+                max_attempts: 0,
+                ..OutboxConfig::default()
+            },
+            OutboxConfig {
+                batch_size: 0,
+                ..OutboxConfig::default()
+            },
+        ] {
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("must be greater than zero"), "{error}");
+        }
+        let error = OutboxConfig {
+            initial_backoff_ms: 300_000,
+            max_backoff_ms: 1_000,
+            ..OutboxConfig::default()
+        }
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("max_backoff_ms"), "{error}");
+    }
+
+    #[test]
+    fn outbox_defaults_parse_and_env_overrides() {
+        let defaults = AutumnConfig::default().outbox;
+        assert!(!defaults.enabled, "the outbox is off by default");
+        assert_eq!(defaults, OutboxConfig::default());
+        assert_eq!(defaults.max_attempts, 10);
+
+        let config: AutumnConfig =
+            toml::from_str("[outbox]\nenabled = true\nlease_ms = 5000\n").expect("outbox");
+        assert!(config.outbox.enabled);
+        assert_eq!(config.outbox.lease_ms, 5_000);
+        assert_eq!(config.outbox.batch_size, 100, "unset keys keep defaults");
+
+        let env = MockEnv::new()
+            .with("AUTUMN_OUTBOX__ENABLED", "true")
+            .with("AUTUMN_OUTBOX__POLL_INTERVAL_MS", "50")
+            .with("AUTUMN_OUTBOX__BATCH_SIZE", "7")
+            .with("AUTUMN_OUTBOX__MAX_ATTEMPTS", "3")
+            .with("AUTUMN_OUTBOX__INITIAL_BACKOFF_MS", "20")
+            .with("AUTUMN_OUTBOX__MAX_BACKOFF_MS", "200")
+            .with("AUTUMN_OUTBOX__LEASE_MS", "900")
+            .with("AUTUMN_OUTBOX__RETENTION_MS", "1000");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.outbox,
+            OutboxConfig {
+                enabled: true,
+                poll_interval_ms: 50,
+                batch_size: 7,
+                max_attempts: 3,
+                initial_backoff_ms: 20,
+                max_backoff_ms: 200,
+                lease_ms: 900,
+                retention_ms: 1_000,
+            }
+        );
     }
 
     #[test]

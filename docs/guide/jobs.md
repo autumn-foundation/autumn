@@ -102,12 +102,28 @@ autumn_web::job::enqueue_at_after_commit("publish_post", args, when).await?;
 |-------------------------------------------------|------------------------------|
 | **Recurring** work on a cron / fixed interval   | `#[scheduled]`               |
 | **One-shot** "run once, later" timer            | delayed `#[job]` (`enqueue_in` / `enqueue_at`) |
-| **Durable multi-step** orchestration, long-horizon timers, history | Autumn Harvest |
+| **Durable multi-step** orchestration, long-horizon timers, history | [Autumn Harvest](../autumn-workflow-architecture.md) (`autumn-harvest-plugin`) |
 
 `#[scheduled]` is for repeating tasks; it does not do one-shot future work.
 Autumn Harvest is for durable workflows with history and stronger orchestration
 semantics — heavier than a one-shot timer. Delayed `#[job]` fills the gap
 between "now" and "durable workflow".
+
+A job is one unit of work: a retry runs the handler again from the top, so
+make it idempotent. The durable backends (`postgres`, `redis`, `sqlite`)
+deliver a persisted job at least once. The `local` backend and
+`enqueue_after_commit` can lose one on a crash or restart (see
+[Backend selection](#backend-selection-autumntoml) and
+[`enqueue_after_commit`](#enqueue_after_commit--any-backend)). If the framework would have to
+remember *where inside the work* it got to — per-step checkpoints, a durable
+sleep mid-handler, signals, compensation, "run B after A" dependencies — that is
+a workflow, and Autumn core deliberately leaves it to Harvest
+([ADR-0016](../adr/0016-durable-workflows-live-in-harvest.md)). A job may still
+enqueue a follow-up job from its own body. When an app write and a workflow
+start must commit together, use Harvest's transactional outbox
+(`enqueue_workflow_start_outbox`) on the same connection, the way
+[`enqueue_in_tx`](#enqueue_in_tx--enqueue_on_conn--postgres-backend-only) works
+for jobs.
 
 ### Admin dashboard
 
@@ -124,6 +140,7 @@ workers = 2
 max_attempts = 5
 initial_backoff_ms = 250
 max_backoff_ms = 3600000   # cap on the jittered retry backoff (default: 1 h)
+default_timeout_ms = 0   # 0 = no limit
 
 [jobs.postgres]
 # Reuses the configured [database] pool. No extra URL needed.
@@ -305,18 +322,20 @@ next job at once. An idle worker polls again after 200ms. A new job can wait up
 to 200ms, also when the same process enqueued it. The 200ms interval is fixed.
 
 A claimed job's status is set to `running` with a `claimed_at` timestamp and a
-`claimed_by` worker id. A maintenance loop running inside each worker process
-requeues jobs whose `claimed_at` is older than `jobs.postgres.visibility_timeout_ms`.
-Recovered stale claims consume another attempt and record a `last_error`
-explaining the visibility timeout.
+`claimed_by` worker id. While the job runs, the worker renews `claimed_at` (see
+[Claim leases and timeouts](#claim-leases-and-timeouts)). A maintenance loop
+running inside each worker process requeues jobs whose `claimed_at` is older
+than `jobs.postgres.visibility_timeout_ms`. That happens only when the worker
+stopped renewing, for example after a crash. Recovered stale claims consume
+another attempt and record a `last_error` explaining the visibility timeout.
 
 If a job exhausts `max_attempts`, its status is set to `failed`; it is no longer
 retried.
 
 Because the backend provides at-least-once delivery, handlers must be idempotent.
-A slow worker that outlives the visibility timeout can overlap with a recovered
-retry, so external side effects should use natural idempotency keys such as the
-job id, a domain aggregate id, or a provider idempotency token.
+If the worker crashes after a side effect and before the ack, the job runs
+again. Use an idempotency key for each external side effect: the job id, a
+domain aggregate id, or a provider idempotency token.
 
 ## Redis delivery semantics
 
@@ -325,15 +344,18 @@ durable record, queued by id, atomically claimed into an in-flight set, and
 acked only after the handler returns `Ok(())`.
 
 If a worker crashes after claiming a job, the record remains in Redis. Another
-worker requeues the stale claim after `jobs.redis.visibility_timeout_ms`.
+worker requeues the stale claim after `jobs.redis.visibility_timeout_ms`. A
+live worker renews its claim, so this does not happen to a slow job. Claim
+deadlines use the Redis server clock (`TIME`). A worker with a skewed clock
+does not see a live claim as expired. The scripts need Redis 3.2 or later.
 Recovered stale claims consume another attempt and retain a `last_error`
 explaining the visibility timeout. If the job has exhausted `max_attempts`, it
 is moved to the dead-letter list instead of being requeued.
 
-Because Redis uses at-least-once delivery, handlers must be idempotent. A worker
-that is slow beyond the visibility timeout can overlap with a recovered retry,
-so external side effects should use natural idempotency keys such as the job id,
-domain aggregate id, or provider idempotency token.
+Because Redis uses at-least-once delivery, handlers must be idempotent. If the
+worker crashes after a side effect and before the ack, the job runs again. Use
+an idempotency key for each external side effect: the job id, a domain
+aggregate id, or a provider idempotency token.
 
 ### Redis dead-letter retention
 
@@ -386,7 +408,8 @@ the single-host analog of `FOR UPDATE SKIP LOCKED`. Two workers can never claim
 one row.
 
 A claimed row is `running` with a `claimed_at` timestamp and a `claimed_by`
-worker id. A maintenance loop re-enqueues rows whose `claimed_at` is older than
+worker id. The worker renews `claimed_at` while the job runs. A maintenance loop
+re-enqueues rows whose `claimed_at` is older than
 `jobs.sqlite.visibility_timeout_ms`, at start and on an interval, so a crash
 mid-job loses nothing. A recovered claim consumes another attempt and records a
 `last_error`. A job that exhausts `max_attempts` becomes `failed` and is not
@@ -406,6 +429,75 @@ migrations are Postgres SQL. Nothing to run by hand.
 
 Because delivery is at-least-once, handlers must be idempotent — the same rule
 as every other durable backend.
+
+## Claim leases and timeouts
+
+A durable worker (`postgres`, `redis`, `sqlite`) holds a lease on each job it
+runs. A heartbeat renews the lease every third of the visibility timeout. Thus,
+while renewals succeed, a long job does not run again on a second worker. The
+minimum visibility timeout is 30ms. A worker uses 30ms if the configured value
+is shorter, and logs a warning.
+
+- **Crash.** The heartbeat stops with the process. After the visibility
+  timeout, another worker recovers the job and runs it again.
+- **Lost lease.** If a renewal finds that the worker no longer holds the claim,
+  the worker stops the handler. It does not ack, retry, or fail the job. The
+  worker that holds the claim now owns the job.
+- **Failed renewal.** If a renewal fails (for example, a database error), the
+  worker logs the error and tries again. The handler continues. If no renewal
+  succeeds for two thirds of the visibility timeout, the worker stops the
+  handler as for a lost lease. Another worker can recover the job soon after.
+
+> **Warning:** with no timeout, a hung handler keeps its claim until the
+> process stops, because the heartbeat continues to renew it. Set a timeout on
+> a job that can hang.
+
+Set a timeout to stop a handler that hangs:
+
+```rust
+#[job(timeout = "30s", max_attempts = 3)]
+async fn export_report(state: AppState, args: ExportArgs) -> AutumnResult<()> {
+    // ...
+    Ok(())
+}
+```
+
+`timeout` accepts `ms`, `s`, `m`, `h`, and `d` units, for example `"500ms"`
+or `"1m 30s"`. A job with no `timeout` uses `jobs.default_timeout_ms`. `0`, the
+default, means no limit. A run that exceeds its timeout fails with
+`job timed out after <n>ms` and retries like any other failure. The worker is
+free for the next job at once. The timeout applies on every backend, `local`
+too. The timeout stops a handler only at an `.await`. A handler that blocks its
+thread does not stop.
+
+When the worker stops a run (lost lease or timeout), it drops the handler
+future. Work that the handler spawned continues, so check the signal there:
+
+```rust
+#[job(timeout = "10m")]
+async fn crunch(state: AppState, args: CrunchArgs) -> AutumnResult<()> {
+    let ctx = autumn_web::job::JobContext::current();
+    let _ = tokio::task::spawn_blocking(move || {
+        for chunk in args.chunks() {
+            if ctx.is_cancelled() {
+                return; // lease lost or timeout: stop here
+            }
+            process(chunk);
+        }
+    })
+    .await;
+    Ok(())
+}
+```
+
+- `JobContext::lease_lost()` is `true` after the worker lost its claim.
+- `JobContext::is_cancelled()` is `true` after a lost lease or a timeout.
+- `JobContext::cancelled()` waits for either.
+
+An operator cancel from the dashboard does not set these. It applies only to a
+job that did not start.
+
+[ADR 0016](../adr/0016-durable-job-claim-lease.md) records the design.
 
 ## Retry/backoff and dead letters
 
@@ -1084,6 +1176,10 @@ dispatched if the transaction commits. Works with every job backend.
 This is not crash-safe delivery. If the process exits after the transaction
 commits but before the callback runs, no job may be recorded. Use this for
 rollback coordination across backends, not as a durable outbox substitute.
+For a crash-safe enqueue on the Redis or SQLite backend, use
+`outbox.enqueue_job(conn, "name", &args)` in the transaction. The relay
+enqueues the job after commit. The `local` backend still loses the job in a
+crash. See [Transactional Outbox and Inbox](outbox.md).
 
 ```rust,no_run
 use autumn_web::prelude::*;
