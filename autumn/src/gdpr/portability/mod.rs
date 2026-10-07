@@ -228,7 +228,15 @@ pub async fn export_subject(
             subject_column: model.subject_column.clone(),
             fields,
             relationships: model.relationships.clone(),
-            blob_columns: model.blob_columns.clone(),
+            // An excluded column holds nothing in the capsule. Declaring it
+            // a blob column would make the capsule hold a column that the
+            // model excludes, which import refuses.
+            blob_columns: model
+                .blob_columns
+                .iter()
+                .filter(|c| !model.excluded.contains(c))
+                .cloned()
+                .collect(),
             record_count: rows.len() as u64,
             file: record_file(&model.table),
         });
@@ -345,9 +353,10 @@ pub(super) fn check_importable<'c>(
         }
         // Export skips a blob that its store does not have, but the record
         // still names it. Such a record would point at nothing, or at other
-        // bytes that the target keeps under that key.
+        // bytes that the target keeps under that key. A column that the app
+        // marked as a blob after the export holds keys too.
         for row in capsule.records(&model.table) {
-            for column in &model.blob_columns {
+            for column in blob_columns(model, current) {
                 if let Some(key) = row.get(column).and_then(viewer::blob_key)
                     && manifest.blob(key).is_none()
                 {
@@ -360,6 +369,32 @@ pub(super) fn check_importable<'c>(
         }
     }
     import_order(&manifest.models)
+}
+
+/// The blob columns of `model` in a capsule: those of its manifest, and those
+/// that `current`, the model of the app now, marks as blobs and does not
+/// exclude.
+fn blob_columns<'a>(model: &'a ModelManifest, current: &'a CapsuleModel) -> Vec<&'a String> {
+    let mut columns: Vec<&String> = model.blob_columns.iter().collect();
+    for column in &current.blob_columns {
+        if !current.excluded.contains(column) && !columns.contains(&column) {
+            columns.push(column);
+        }
+    }
+    columns
+}
+
+/// Add the blob columns of `models` to the manifest of `capsule`, so that a
+/// restore rebinds the handles in a column that the app marked as a blob
+/// after the export. Run [`check_importable`] first.
+#[cfg(feature = "storage")]
+pub(super) fn adopt_blob_columns(capsule: &mut DataCapsule, models: &[CapsuleModel]) {
+    for model in &mut capsule.manifest.models {
+        if let Some(current) = models.iter().find(|m| m.table == model.table) {
+            let columns: Vec<String> = blob_columns(model, current).into_iter().cloned().collect();
+            model.blob_columns = columns;
+        }
+    }
 }
 
 /// Sort models so that each `belongs_to` target comes first.

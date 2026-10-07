@@ -78,8 +78,12 @@ users can write a blob key into a row, make sure that the key belongs to the
 subject. If a record holds a blob key and no blob store is configured, export
 fails. A blob that the store does not have is skipped with a warning, but its
 record still names it: import then fails (`400`) rather than write a record
-that points at nothing, or at other bytes under the same key. If a blob changes while export reads it, export fails with a conflict
-(`409`): run it again. A `Blob` value names its store (`provider_id`). If it
+that points at nothing, or at other bytes under the same key. Import checks
+the blob columns of the app as it is now too: a capsule made before you
+marked a column as a blob holds its keys, but not their blobs, so it fails
+the same way. An excluded blob column is not a blob column of the capsule. If
+a blob changes while export reads it, export fails with a conflict (`409`):
+run it again. A `Blob` value names its store (`provider_id`). If it
 names another store than the configured one (for example after a switch of
 backend), or no store, export fails with a conflict (`409`): the same key in
 the new store can hold other bytes. Only a plain key string names no store.

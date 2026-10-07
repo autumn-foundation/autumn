@@ -270,6 +270,7 @@ impl CapsuleService {
         super::check_importable(capsule, &self.models)?;
         super::blobs::restore_blobs(capsule, blobs.as_ref()).await?;
         let mut rebound = capsule.clone();
+        super::adopt_blob_columns(&mut rebound, &self.models);
         super::blobs::rebind_blobs(&mut rebound, blobs.as_ref()).await?;
         import_capsule(&rebound, &self.models, self.store.as_ref()).await
     }
