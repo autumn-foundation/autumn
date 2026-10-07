@@ -91,12 +91,40 @@ pub trait ProvideProbeState {
 }
 
 /// Shared probe lifecycle state stored in `AppState`.
+///
+/// Clones share all state, also the cached database pings and their
+/// connections. A new `ProbeState` caches a ping result for 1 s and gives a
+/// ping 2 s. Call [`Self::configure_db_check`] to change this.
 #[derive(Clone, Debug, Default)]
 pub struct ProbeState {
     startup_complete: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
     #[cfg(feature = "db")]
     replica_dependency: Arc<RwLock<ReplicaDependency>>,
+    #[cfg(feature = "db")]
+    db_checks: Arc<DbChecks>,
+}
+
+/// Ping checks of the database roles, shared by all clones of a
+/// [`ProbeState`].
+#[cfg(feature = "db")]
+#[derive(Debug)]
+struct DbChecks {
+    primary: DbPingCheck,
+    replica: DbPingCheck,
+    /// When `false`, a failed primary ping does not fail `/ready`.
+    primary_gates_readiness: AtomicBool,
+}
+
+#[cfg(feature = "db")]
+impl Default for DbChecks {
+    fn default() -> Self {
+        Self {
+            primary: DbPingCheck::new("primary"),
+            replica: DbPingCheck::new("replica"),
+            primary_gates_readiness: AtomicBool::new(true),
+        }
+    }
 }
 
 #[cfg(feature = "db")]
@@ -207,6 +235,9 @@ impl Default for ReplicaDependency {
     }
 }
 
+#[cfg(feature = "db")]
+use crate::db_ping::{DbPingCheck, DbPingStatus, DbPool};
+
 impl ProbeState {
     /// Create a probe state that starts in pending-startup mode.
     #[must_use]
@@ -277,6 +308,80 @@ impl ProbeState {
             lag_started: None,
             lag_detail: None,
         };
+    }
+
+    /// Configure the database readiness pings (primary and read replica).
+    ///
+    /// `cache_ttl` is how long one ping result stays valid. Zero turns the
+    /// cache off. `timeout` is the time limit for one ping. A ping that does
+    /// not finish in time counts as `DOWN`.
+    #[cfg(feature = "db")]
+    pub fn configure_db_check(&self, cache_ttl: std::time::Duration, timeout: std::time::Duration) {
+        self.db_checks.primary.configure(cache_ttl, timeout);
+        self.db_checks.replica.configure(cache_ttl, timeout);
+    }
+
+    /// Set whether a failed primary database ping fails `/ready`. Default:
+    /// `true`. When `false`, `/actuator/health` still reports the `db`
+    /// component as `DOWN`.
+    #[cfg(feature = "db")]
+    pub fn set_db_readiness(&self, gate: bool) {
+        self.db_checks
+            .primary_gates_readiness
+            .store(gate, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "db")]
+    fn primary_gates_readiness(&self) -> bool {
+        self.db_checks
+            .primary_gates_readiness
+            .load(Ordering::Relaxed)
+    }
+
+    /// A probe state whose primary ping is `ping`. For tests.
+    #[cfg(all(test, feature = "db"))]
+    pub(crate) fn with_primary_ping(ping: Arc<dyn crate::db_ping::DbPing>) -> Self {
+        Self {
+            db_checks: Arc::new(DbChecks {
+                primary: DbPingCheck::with_ping("primary", ping),
+                ..DbChecks::default()
+            }),
+            ..Self::default()
+        }
+    }
+
+    /// A probe state whose primary and replica pings are fakes. For tests.
+    #[cfg(all(test, feature = "db"))]
+    pub(crate) fn with_db_pings(
+        primary: Arc<dyn crate::db_ping::DbPing>,
+        replica: Arc<dyn crate::db_ping::DbPing>,
+    ) -> Self {
+        Self {
+            db_checks: Arc::new(DbChecks {
+                primary: DbPingCheck::with_ping("primary", primary),
+                replica: DbPingCheck::with_ping("replica", replica),
+                ..DbChecks::default()
+            }),
+            ..Self::default()
+        }
+    }
+
+    /// Ping the primary of `pool`, or return the cached result.
+    #[cfg(feature = "db")]
+    pub(crate) async fn check_primary_db(&self, pool: &DbPool) -> DbPingStatus {
+        self.db_checks.primary.check(pool).await
+    }
+
+    /// Ping the primary of `pool` once, with no cache. For a state that has
+    /// no [`ProbeState`]. Each call opens a new connection.
+    #[cfg(feature = "db")]
+    pub(crate) async fn check_primary_db_uncached(pool: &DbPool) -> DbPingStatus {
+        let check = DbPingCheck::new("primary");
+        check.configure(
+            std::time::Duration::ZERO,
+            crate::health_cache::DEFAULT_PING_TIMEOUT,
+        );
+        check.check(pool).await
     }
 
     /// Store URLs needed to retry replica migration readiness checks.
@@ -631,6 +736,8 @@ pub(crate) struct ProbeResponse {
     #[cfg(feature = "db")]
     #[serde(skip_serializing_if = "Option::is_none")]
     replica: Option<ReplicaStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    database: Option<DatabaseStatus>,
 }
 
 /// The replica state the detailed `/ready` body reports (issue #3065).
@@ -648,6 +755,14 @@ pub struct ReplicaStatus {
     pub detail: Option<String>,
 }
 
+/// Primary database ping result in a detailed `/ready` body.
+#[derive(Serialize)]
+pub(crate) struct DatabaseStatus {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 #[derive(Serialize)]
 pub(crate) struct PoolStatus {
     size: u64,
@@ -655,28 +770,25 @@ pub(crate) struct PoolStatus {
     waiting: u64,
 }
 
+/// Replica policy readiness and pool statistics.
+///
+/// Pool saturation does not affect readiness: a busy replica can still serve
+/// requests. To shed load, set `server.max_concurrent_requests`.
 #[allow(clippy::missing_const_for_fn, unused_variables)]
 fn dependency_readiness<S: ProvideProbeState>(state: &S) -> (bool, Option<PoolStatus>) {
     #[cfg(feature = "db")]
     {
         let replica_ready_for_policy = state.probes().replica_allows_readiness();
-        let (pool_ready, pool_status) = state.pool().map_or((true, None), |pool| {
+        let pool_status = state.pool().map(|pool| {
             let status = pool.status();
-            let available = status.available as u64;
-            let size = status.max_size as u64;
-            let waiting = status.waiting as u64;
-
-            (
-                available > 0 || waiting == 0,
-                Some(PoolStatus {
-                    size,
-                    available,
-                    waiting,
-                }),
-            )
+            PoolStatus {
+                size: status.max_size as u64,
+                available: status.available as u64,
+                waiting: status.waiting as u64,
+            }
         });
 
-        (pool_ready && replica_ready_for_policy, pool_status)
+        (replica_ready_for_policy, pool_status)
     }
 
     #[cfg(not(feature = "db"))]
@@ -698,34 +810,18 @@ async fn refresh_replica_readiness<S: ProvideProbeState + Sync>(state: &S) {
         return;
     };
 
-    match replica_pool.get().await {
-        Ok(mut conn) => {
-            let alive = crate::db::probe_connection_alive(&mut conn).await;
-            match state.probes().replica_max_lag().filter(|_| alive.is_ok()) {
-                Some(max_lag) => {
-                    refresh_replica_lag_bounded(
-                        state.probes(),
-                        conn,
-                        replica_lag_query_budget(max_lag),
-                        |conn| Box::pin(crate::db::measure_replica_lag(conn, max_lag)),
-                    )
-                    .await;
-                }
-                None => drop(conn),
-            }
-            match alive {
-                Ok(()) => {
-                    state.probes().mark_replica_connection_ready();
-                    refresh_replica_migration_readiness(state).await;
-                }
-                Err(error) => state
-                    .probes()
-                    .mark_replica_connection_unready(format!("replica connection failed: {error}")),
-            }
-        }
-        Err(error) => state
-            .probes()
-            .mark_replica_connection_unready(format!("replica connection failed: {error}")),
+    // A cached ping on a dedicated connection. A busy replica pool does not
+    // make the replica unready (#3059).
+    let status = state.probes().db_checks.replica.check(replica_pool).await;
+    if status.up {
+        state.probes().mark_replica_connection_ready();
+        refresh_replica_migration_readiness(state).await;
+    } else {
+        state.probes().mark_replica_connection_unready(
+            status
+                .error
+                .unwrap_or_else(|| "replica ping failed".to_owned()),
+        );
     }
 }
 
@@ -846,7 +942,7 @@ pub(crate) fn apply_replica_lag_sample(
 fn probe_response<S: ProvideProbeState>(
     state: &S,
     kind: ProbeKind,
-    indicator_ready: bool,
+    checks_ready: bool,
 ) -> (StatusCode, Json<ProbeResponse>) {
     let startup_complete = state.probes().is_startup_complete();
     let shutting_down = state.probes().is_shutting_down();
@@ -857,7 +953,7 @@ fn probe_response<S: ProvideProbeState>(
         ProbeKind::Startup if startup_complete => (StatusCode::OK, "ok"),
         ProbeKind::Startup => (StatusCode::SERVICE_UNAVAILABLE, "starting"),
         ProbeKind::Ready
-            if startup_complete && !shutting_down && dependencies_ready && indicator_ready =>
+            if startup_complete && !shutting_down && dependencies_ready && checks_ready =>
         {
             (StatusCode::OK, "ok")
         }
@@ -889,20 +985,16 @@ fn probe_response<S: ProvideProbeState>(
         } else {
             None
         },
+        database: None,
     };
 
     (status_code, Json(body))
 }
 
-/// Return `true` when the `/ready` response will be 503 regardless of indicator
-/// results — avoids running potentially slow indicators unnecessarily.
-fn already_degraded<S: ProvideProbeState>(state: &S) -> bool {
-    let probes = state.probes();
-    !probes.is_startup_complete() || probes.is_shutting_down() || !dependency_readiness(state).0
-}
-
 /// Run all readiness-group [`HealthIndicator`]s and return `false` if any are
 /// `Down` or `OutOfService`.
+///
+/// [`HealthIndicator`]: crate::actuator::HealthIndicator
 async fn check_readiness_indicators<S: ProvideProbeState + Sync>(state: &S) -> bool {
     let Some(registry) = state.health_indicator_registry() else {
         return true;
@@ -911,6 +1003,63 @@ async fn check_readiness_indicators<S: ProvideProbeState + Sync>(state: &S) -> b
     let statuses: Vec<crate::actuator::HealthStatus> =
         results.iter().map(|r| r.output.status).collect();
     crate::actuator::HealthIndicatorRegistry::aggregate_status(&statuses).is_healthy()
+}
+
+/// Ping the primary database (cached). `None` when no pool is configured.
+#[cfg(feature = "db")]
+async fn check_primary_db<S: ProvideProbeState + Sync>(state: &S) -> Option<DbPingStatus> {
+    let pool = state.pool()?;
+    Some(state.probes().check_primary_db(pool).await)
+}
+
+/// Build the readiness response for `/ready` and `/health`.
+async fn readiness<S: ProvideProbeState + Sync>(state: &S) -> (StatusCode, Json<ProbeResponse>) {
+    // Before startup completes and while draining, `/ready` is `503` whatever
+    // the checks report. Do not run the slow ones.
+    let probes = state.probes();
+    if !probes.is_startup_complete() || probes.is_shutting_down() {
+        #[cfg(feature = "db")]
+        refresh_replica_readiness(state).await;
+        return probe_response(state, ProbeKind::Ready, true);
+    }
+
+    #[cfg(feature = "db")]
+    {
+        // Run all checks at the same time: the wall time is one ping budget,
+        // not the sum.
+        // With `health.db_readiness = false` the primary ping does not gate
+        // `/ready`, so do not wait for it: a hung primary must not delay the
+        // probe. `/actuator/health` still reports it.
+        let primary_gates = state.probes().primary_gates_readiness();
+        let primary_check = async {
+            if primary_gates {
+                check_primary_db(state).await
+            } else {
+                None
+            }
+        };
+        let ((), primary, indicators_ready) = tokio::join!(
+            refresh_replica_readiness(state),
+            primary_check,
+            check_readiness_indicators(state)
+        );
+        let primary_ready = primary.as_ref().is_none_or(|status| status.up);
+        let (code, Json(mut body)) =
+            probe_response(state, ProbeKind::Ready, primary_ready && indicators_ready);
+        if state.health_detailed() {
+            body.database = primary.map(|status| DatabaseStatus {
+                status: if status.up { "ok" } else { "down" },
+                error: status.error,
+            });
+        }
+        (code, Json(body))
+    }
+
+    #[cfg(not(feature = "db"))]
+    {
+        let indicators_ready = check_readiness_indicators(state).await;
+        probe_response(state, ProbeKind::Ready, indicators_ready)
+    }
 }
 
 /// `GET /live`
@@ -924,15 +1073,7 @@ pub async fn live_handler<S: ProvideProbeState + Send + Sync + 'static>(
 pub async fn ready_handler<S: ProvideProbeState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> impl IntoResponse {
-    #[cfg(feature = "db")]
-    refresh_replica_readiness(&state).await;
-    // Skip slow indicator checks when the probe will be 503 regardless.
-    let indicator_ready = if already_degraded(&state) {
-        true
-    } else {
-        check_readiness_indicators(&state).await
-    };
-    probe_response(&state, ProbeKind::Ready, indicator_ready)
+    readiness(&state).await
 }
 
 /// `GET /startup`
@@ -946,14 +1087,7 @@ pub async fn startup_handler<S: ProvideProbeState + Send + Sync + 'static>(
 pub(crate) async fn readiness_response<S: ProvideProbeState + Sync>(
     state: &S,
 ) -> (StatusCode, Json<ProbeResponse>) {
-    #[cfg(feature = "db")]
-    refresh_replica_readiness(state).await;
-    let indicator_ready = if already_degraded(state) {
-        true
-    } else {
-        check_readiness_indicators(state).await
-    };
-    probe_response(state, ProbeKind::Ready, indicator_ready)
+    readiness(state).await
 }
 
 #[cfg(test)]
@@ -1553,6 +1687,397 @@ mod tests {
             assert!(probes.replica_lag_ok());
             assert_eq!(pool.status().size, 1);
             assert_eq!(pool.status().available, 1, "back in the pool");
+        }
+    }
+
+    // ── Primary database readiness (#3059) ───────────────────────
+
+    #[cfg(feature = "db")]
+    mod primary_db {
+        use super::*;
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        /// Counts pings. Each ping waits `delay`, then returns `result`.
+        struct FakePing {
+            calls: AtomicUsize,
+            delay: Duration,
+            result: Result<(), String>,
+        }
+
+        impl FakePing {
+            fn new(delay: Duration, result: Result<(), String>) -> Arc<Self> {
+                Arc::new(Self {
+                    calls: AtomicUsize::new(0),
+                    delay,
+                    result,
+                })
+            }
+
+            fn calls(&self) -> usize {
+                self.calls.load(Ordering::SeqCst)
+            }
+        }
+
+        impl crate::db_ping::DbPing for FakePing {
+            fn ping(
+                self: Arc<Self>,
+                _pool: DbPool,
+                _budget: Duration,
+            ) -> futures::future::BoxFuture<'static, Result<(), String>> {
+                Box::pin(async move {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(self.delay).await;
+                    self.result.clone()
+                })
+            }
+        }
+
+        struct DbProbeState {
+            probes: ProbeState,
+            pool: DbPool,
+            replica: Option<DbPool>,
+        }
+
+        impl ProvideProbeState for DbProbeState {
+            fn probes(&self) -> &ProbeState {
+                &self.probes
+            }
+
+            fn health_detailed(&self) -> bool {
+                true
+            }
+
+            fn profile(&self) -> &'static str {
+                "test"
+            }
+
+            fn uptime_display(&self) -> String {
+                String::new()
+            }
+
+            fn pool(&self) -> Option<&DbPool> {
+                Some(&self.pool)
+            }
+
+            fn replica_pool(&self) -> Option<&DbPool> {
+                self.replica.as_ref()
+            }
+        }
+
+        /// A pool that never connects. Fake pings do not use it.
+        fn idle_pool(url: &str) -> DbPool {
+            #[cfg(feature = "sqlite")]
+            let url = {
+                let _ = url;
+                "sqlite::memory:"
+            };
+            let config = crate::config::DatabaseConfig {
+                url: Some(url.to_owned()),
+                pool_size: 1,
+                // Long pool waits: a test that fills the pool keeps it full.
+                connect_timeout_secs: 30,
+                ..Default::default()
+            };
+            crate::db::create_pool(&config)
+                .expect("pool config is valid")
+                .expect("pool url is set")
+        }
+
+        fn state_with(ping: Arc<dyn crate::db_ping::DbPing>) -> DbProbeState {
+            let probes = ProbeState::with_primary_ping(ping);
+            probes.mark_startup_complete();
+            DbProbeState {
+                probes,
+                pool: idle_pool("postgres://autumn@127.0.0.1:1/unused"),
+                replica: None,
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn ready_is_ok_when_primary_answers() {
+            let ping = FakePing::new(Duration::ZERO, Ok(()));
+            let state = state_with(ping.clone());
+
+            let (status, Json(body)) = readiness_response(&state).await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body.status, "ok");
+            assert_eq!(ping.calls(), 1);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn ready_is_degraded_when_primary_ping_fails() {
+            let ping = FakePing::new(Duration::ZERO, Err("connection refused".to_owned()));
+            let state = state_with(ping);
+
+            let (status, Json(body)) = readiness_response(&state).await;
+
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            let database = body.database.expect("detailed body reports the database");
+            assert_eq!(database.status, "down");
+            assert!(
+                database
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("connection refused")),
+                "error: {:?}",
+                database.error
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn ready_is_degraded_within_timeout_when_primary_hangs() {
+            let ping = FakePing::new(Duration::from_secs(3_600), Ok(()));
+            let state = state_with(ping);
+            state
+                .probes
+                .configure_db_check(Duration::from_secs(1), Duration::from_millis(250));
+
+            let started = tokio::time::Instant::now();
+            let (status, Json(body)) = readiness_response(&state).await;
+
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(started.elapsed(), Duration::from_millis(250));
+            let error = body.database.and_then(|d| d.error).unwrap_or_default();
+            assert!(error.contains("timed out"), "error: {error}");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn concurrent_probes_ping_primary_at_most_once_per_window() {
+            let ping = FakePing::new(Duration::from_millis(20), Ok(()));
+            let state = Arc::new(state_with(ping.clone()));
+            state
+                .probes
+                .configure_db_check(Duration::from_secs(1), Duration::from_secs(2));
+
+            let burst = || {
+                let tasks: Vec<_> = (0..64)
+                    .map(|_| {
+                        let state = Arc::clone(&state);
+                        tokio::spawn(async move { readiness_response(&*state).await.0 })
+                    })
+                    .collect();
+                async move {
+                    for task in tasks {
+                        assert_eq!(task.await.unwrap(), StatusCode::OK);
+                    }
+                }
+            };
+
+            burst().await;
+            assert_eq!(ping.calls(), 1, "one ping for the first window");
+
+            tokio::time::advance(Duration::from_millis(500)).await;
+            burst().await;
+            assert_eq!(ping.calls(), 1, "still inside the first window");
+
+            tokio::time::advance(Duration::from_millis(600)).await;
+            burst().await;
+            assert_eq!(ping.calls(), 2, "one ping for the second window");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn zero_ttl_pings_primary_on_every_probe() {
+            let ping = FakePing::new(Duration::ZERO, Ok(()));
+            let state = state_with(ping.clone());
+            state
+                .probes
+                .configure_db_check(Duration::ZERO, Duration::from_secs(2));
+
+            for _ in 0..3 {
+                let _ = readiness_response(&state).await;
+            }
+
+            assert_eq!(ping.calls(), 3);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn primary_and_replica_pings_run_at_the_same_time() {
+            let primary = FakePing::new(Duration::from_millis(400), Ok(()));
+            let replica = FakePing::new(Duration::from_millis(400), Ok(()));
+            let probes = ProbeState::with_db_pings(primary.clone(), replica.clone());
+            probes.mark_startup_complete();
+            probes.configure_replica_dependency(crate::config::ReplicaFallback::FailReadiness);
+            let state = DbProbeState {
+                probes,
+                pool: idle_pool("postgres://autumn@127.0.0.1:1/unused"),
+                replica: Some(idle_pool("postgres://autumn@127.0.0.1:1/replica")),
+            };
+
+            let started = tokio::time::Instant::now();
+            let (status, _) = readiness_response(&state).await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(primary.calls(), 1);
+            assert_eq!(replica.calls(), 1);
+            // One ping budget, not two: the pings do not wait for each other.
+            assert_eq!(started.elapsed(), Duration::from_millis(400));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn ready_does_not_ping_primary_while_draining() {
+            let ping = FakePing::new(Duration::ZERO, Ok(()));
+            let state = state_with(ping.clone());
+            state.probes.begin_draining();
+
+            let (status, _) = readiness_response(&state).await;
+
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(ping.calls(), 0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn db_readiness_off_does_not_ping_or_wait_for_the_primary() {
+            // A hung primary must not delay `/ready` past the probe timeout of
+            // the platform when the ping does not gate it.
+            let ping = FakePing::new(Duration::from_secs(3_600), Ok(()));
+            let state = state_with(ping.clone());
+            state.probes.set_db_readiness(false);
+
+            let started = tokio::time::Instant::now();
+            let (status, Json(body)) = readiness_response(&state).await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(started.elapsed(), Duration::ZERO);
+            assert!(body.database.is_none());
+            assert_eq!(ping.calls(), 0);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn clones_share_one_ping_cache() {
+            let ping = FakePing::new(Duration::ZERO, Ok(()));
+            let state = state_with(ping.clone());
+            let clone = DbProbeState {
+                probes: state.probes.clone(),
+                pool: state.pool.clone(),
+                replica: None,
+            };
+
+            let _ = readiness_response(&state).await;
+            let _ = readiness_response(&clone).await;
+
+            assert_eq!(ping.calls(), 1);
+        }
+
+        #[cfg(feature = "sqlite")]
+        #[tokio::test]
+        async fn sqlite_dedicated_ping_is_up_and_does_not_use_the_pool() {
+            let probes = ProbeState::ready_for_test();
+            probes.configure_db_check(Duration::ZERO, Duration::from_secs(5));
+            let state = DbProbeState {
+                probes,
+                pool: idle_pool("sqlite::memory:"),
+                replica: None,
+            };
+
+            let (status, _) = readiness_response(&state).await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(state.pool.status().size, 0, "the ping is not in the pool");
+        }
+
+        /// Accepts TCP connections and never answers: a database that is
+        /// down with no reset and no reply.
+        #[cfg(not(feature = "sqlite"))]
+        async fn black_hole() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind black hole");
+            let addr = listener.local_addr().expect("local addr");
+            let task = tokio::spawn(async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    // Hold the socket open and never answer.
+                    tokio::spawn(async move {
+                        let _socket = socket;
+                        std::future::pending::<()>().await;
+                    });
+                }
+            });
+            (addr, task)
+        }
+
+        #[cfg(not(feature = "sqlite"))]
+        #[tokio::test]
+        async fn ready_is_ok_when_pool_is_saturated_and_primary_answers() {
+            // A pool of 1 whose only slot hangs in connect, and one request
+            // that waits for a slot: `available == 0` and `waiting > 0`. The
+            // old rule `available > 0 || waiting == 0` gave `503` here.
+            let (addr, server) = black_hole().await;
+            let ping = FakePing::new(Duration::ZERO, Ok(()));
+            let probes = ProbeState::with_primary_ping(ping);
+            probes.mark_startup_complete();
+            let state = DbProbeState {
+                probes,
+                pool: idle_pool(&format!("postgres://autumn@{addr}/autumn")),
+                replica: None,
+            };
+            let holders: Vec<_> = (0..2)
+                .map(|_| {
+                    let pool = state.pool.clone();
+                    tokio::spawn(async move { drop(pool.get().await) })
+                })
+                .collect();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while state.pool.status().waiting == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("a request waits for a connection");
+            assert_eq!(state.pool.status().available, 0);
+
+            let (status, _) = readiness_response(&state).await;
+
+            assert_eq!(status, StatusCode::OK);
+            for holder in holders {
+                holder.abort();
+            }
+            server.abort();
+        }
+
+        #[cfg(not(feature = "sqlite"))]
+        #[tokio::test]
+        async fn dedicated_ping_is_down_within_timeout_when_primary_hangs() {
+            let (addr, server) = black_hole().await;
+            let probes = ProbeState::ready_for_test();
+            probes.configure_db_check(Duration::ZERO, Duration::from_millis(300));
+            let state = DbProbeState {
+                probes,
+                pool: idle_pool(&format!("postgres://autumn@{addr}/autumn")),
+                replica: None,
+            };
+
+            let started = std::time::Instant::now();
+            let (status, _) = readiness_response(&state).await;
+            let elapsed = started.elapsed();
+
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                elapsed < Duration::from_millis(300) + Duration::from_secs(3),
+                "took {elapsed:?}"
+            );
+            server.abort();
+        }
+
+        #[cfg(not(feature = "sqlite"))]
+        #[tokio::test]
+        async fn dedicated_ping_is_down_when_primary_refuses() {
+            let addr = {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+                listener.local_addr().expect("local addr")
+            };
+            let probes = ProbeState::ready_for_test();
+            probes.configure_db_check(Duration::ZERO, Duration::from_secs(2));
+            let state = DbProbeState {
+                probes,
+                pool: idle_pool(&format!("postgres://autumn@{addr}/autumn")),
+                replica: None,
+            };
+
+            let (status, _) = readiness_response(&state).await;
+
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         }
     }
 }

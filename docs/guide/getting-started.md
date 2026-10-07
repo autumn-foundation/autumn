@@ -1226,7 +1226,8 @@ Autumn resolves configuration in five layers, each overriding the last:
 host = "127.0.0.1"           # default
 port = 3000                  # default
 shutdown_timeout_secs = 30   # default, seconds to drain in-flight requests
-# max_concurrent_requests = 256 # unset by default; sheds excess with a 503
+# max_concurrent_requests = 256 # prod: pool size × 32 (min 256); 0 = off; excess gets a 503
+# strict_config = true       # prod default: an unknown key stops the boot
 
 [server.timeouts]
 # Per-request wall-clock deadline. The prod profile enables 30s automatically.
@@ -1251,6 +1252,10 @@ pool_size = 10               # default, max connections per role
 # replica_pool_size = 5
 replica_fallback = "fail_readiness"  # or "primary"
 connect_timeout_secs = 5     # default
+# statement_timeout = "30s"  # prod default; "0s" = off
+# idle_in_transaction_timeout = "60s" # prod default; "0s" = off
+# migration_lock_timeout = "5s"       # default; "0s" = off
+# migration_lock_retries = 5          # default
 # auto_migrate = false       # dev auto-applies; other profiles opt in
 
 [log]
