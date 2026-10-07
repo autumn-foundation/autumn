@@ -87,3 +87,22 @@ Verus checks the executable `judge` in the file against the spec, with the
 same `u128` arithmetic as the runtime. The runtime `judge` is separate code.
 The property test `judge_matches_the_verus_model` checks it against a Rust
 copy of `spec_judge`.
+
+## Admission partitions
+
+`admission_partitions.rs` models the criticality thresholds in
+`autumn/src/admission.rs` and the admission check in
+`autumn/src/middleware/load_shed.rs` (issue #3068, ADR 0016). Verify it with:
+
+```sh
+verus verification/admission_partitions.rs
+```
+
+It proves that the thresholds are nested (`sheddable <= default <= critical =
+limit`). Thus, if the server rejects a higher class, it also rejects every
+lower class, and no class is admitted at or above the limit. It also proves
+that the `u128` threshold product cannot overflow, and that the AIMD update
+keeps the limit in `min..=max`. The AIMD model rounds the back-off up; the
+runtime rounds it down. The clamp makes the property true for both. The model
+does not include the floating-point algorithms. Unit tests and sim tests
+examine them.
