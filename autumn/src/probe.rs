@@ -122,6 +122,10 @@ struct ReplicaDependency {
     /// When `lag` was measured. The sample ages: a monitor that stops (a hung
     /// query, a full pool) cannot keep an old "fresh" sample alive.
     lag_at: Option<tokio::time::Instant>,
+    /// When the measurement behind the current lag state started. Probes
+    /// overlap (the monitor and `/ready`), so a result whose measurement
+    /// started earlier is older, and it is dropped.
+    lag_started: Option<tokio::time::Instant>,
     /// Why the lag is unknown.
     lag_detail: Option<String>,
 }
@@ -197,6 +201,7 @@ impl Default for ReplicaDependency {
             max_lag: None,
             lag: None,
             lag_at: None,
+            lag_started: None,
             lag_detail: None,
         }
     }
@@ -269,6 +274,7 @@ impl ProbeState {
             max_lag: dependency.max_lag,
             lag: None,
             lag_at: None,
+            lag_started: None,
             lag_detail: None,
         };
     }
@@ -466,8 +472,10 @@ impl ProbeState {
             .replica_dependency
             .write()
             .expect("replica dependency lock poisoned");
+        let now = tokio::time::Instant::now();
         dependency.lag = Some(lag);
-        dependency.lag_at = Some(tokio::time::Instant::now());
+        dependency.lag_at = Some(now);
+        dependency.lag_started = Some(now);
         dependency.lag_detail = None;
     }
 
@@ -485,7 +493,41 @@ impl ProbeState {
             .expect("replica dependency lock poisoned");
         dependency.lag = None;
         dependency.lag_at = None;
+        dependency.lag_started = Some(tokio::time::Instant::now());
         dependency.lag_detail = Some(detail.into());
+    }
+
+    /// Record the result of a lag measurement that started at `started`.
+    /// `false` when a newer measurement is already recorded: the result is
+    /// older, and it is dropped.
+    #[cfg(feature = "db")]
+    fn record_replica_lag_sample(
+        &self,
+        started: tokio::time::Instant,
+        result: Result<std::time::Duration, String>,
+    ) -> bool {
+        let mut dependency = self
+            .replica_dependency
+            .write()
+            .expect("replica dependency lock poisoned");
+        if dependency.lag_started.is_some_and(|newer| started < newer) {
+            return false;
+        }
+        dependency.lag_started = Some(started);
+        match result {
+            Ok(lag) => {
+                dependency.lag = Some(lag);
+                // The sample ages from when it was measured.
+                dependency.lag_at = Some(started);
+                dependency.lag_detail = None;
+            }
+            Err(error) => {
+                dependency.lag = None;
+                dependency.lag_at = None;
+                dependency.lag_detail = Some(format!("replica lag check failed: {error}"));
+            }
+        }
+        true
     }
 
     /// The last measured replica lag.
@@ -758,6 +800,7 @@ pub(crate) async fn refresh_replica_lag_bounded<M, F>(
         Box<dyn std::future::Future<Output = Result<std::time::Duration, String>> + Send + 'c>,
     >,
 {
+    let started = tokio::time::Instant::now();
     let mut guard = DiscardUnlessFinished(Some(conn));
     let Some(conn) = guard.0.as_mut() else {
         return;
@@ -772,19 +815,21 @@ pub(crate) async fn refresh_replica_lag_bounded<M, F>(
                 result
             },
         );
-    refresh_replica_lag_with(probes, std::future::ready(measured)).await;
+    apply_replica_lag_sample(probes, started, measured);
 }
 
-/// Measure the replica lag with `measure` and record the result.
+/// Record a lag measurement that started at `started`, and log a change
+/// between fresh and stale. An older measurement than the recorded one is
+/// dropped.
 #[cfg(feature = "db")]
-pub(crate) async fn refresh_replica_lag_with<Fut>(probes: &ProbeState, measure: Fut)
-where
-    Fut: std::future::Future<Output = Result<std::time::Duration, String>>,
-{
+pub(crate) fn apply_replica_lag_sample(
+    probes: &ProbeState,
+    started: tokio::time::Instant,
+    measured: Result<std::time::Duration, String>,
+) {
     let was_fresh = probes.replica_lag_ok();
-    match measure.await {
-        Ok(lag) => probes.record_replica_lag(lag),
-        Err(error) => probes.mark_replica_lag_unknown(format!("replica lag check failed: {error}")),
+    if !probes.record_replica_lag_sample(started, measured) {
+        return;
     }
     let fresh = probes.replica_lag_ok();
     if was_fresh && !fresh {
@@ -1046,7 +1091,11 @@ mod tests {
         probes.mark_replica_ready();
         probes.configure_replica_max_lag(Some(std::time::Duration::from_millis(500)));
 
-        refresh_replica_lag_with(probes, async { Ok(std::time::Duration::from_millis(900)) }).await;
+        apply_replica_lag_sample(
+            probes,
+            tokio::time::Instant::now(),
+            Ok(std::time::Duration::from_millis(900)),
+        );
         assert_eq!(
             probes.replica_lag(),
             Some(std::time::Duration::from_millis(900))
@@ -1054,11 +1103,19 @@ mod tests {
         assert!(!probes.should_route_reads_to_replica());
         assert!(probes.should_fallback_reads_to_primary());
 
-        refresh_replica_lag_with(probes, async { Err("no route to host".to_owned()) }).await;
+        apply_replica_lag_sample(
+            probes,
+            tokio::time::Instant::now(),
+            Err("no route to host".to_owned()),
+        );
         assert_eq!(probes.replica_lag(), None);
         assert!(!probes.should_route_reads_to_replica());
 
-        refresh_replica_lag_with(probes, async { Ok(std::time::Duration::ZERO) }).await;
+        apply_replica_lag_sample(
+            probes,
+            tokio::time::Instant::now(),
+            Ok(std::time::Duration::ZERO),
+        );
         assert!(probes.should_route_reads_to_replica());
     }
 
@@ -1096,6 +1153,41 @@ mod tests {
         probes.record_replica_lag(std::time::Duration::ZERO);
         // The monitor's floor interval is 250 ms, above the 100 ms limit.
         tokio::time::advance(std::time::Duration::from_millis(300)).await;
+        assert!(probes.should_route_reads_to_replica());
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test(start_paused = true)]
+    async fn an_older_lag_measurement_does_not_overwrite_a_newer_one() {
+        let probes = ProbeState::default();
+        probes.configure_replica_dependency(crate::config::ReplicaFallback::FailReadiness);
+        probes.mark_replica_ready();
+        probes.configure_replica_max_lag(Some(std::time::Duration::from_secs(1)));
+        // Two probes overlap: the earlier one is slow and finishes last.
+        let earlier = tokio::time::Instant::now();
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        let later = tokio::time::Instant::now();
+        apply_replica_lag_sample(&probes, later, Ok(std::time::Duration::from_secs(30)));
+        assert!(
+            !probes.should_route_reads_to_replica(),
+            "the replica is stale"
+        );
+        apply_replica_lag_sample(&probes, earlier, Ok(std::time::Duration::ZERO));
+        assert!(
+            !probes.should_route_reads_to_replica(),
+            "an older measurement must not route reads back to a stale replica"
+        );
+        assert_eq!(
+            probes.replica_lag(),
+            Some(std::time::Duration::from_secs(30))
+        );
+        // A newer measurement still applies.
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        apply_replica_lag_sample(
+            &probes,
+            tokio::time::Instant::now(),
+            Ok(std::time::Duration::ZERO),
+        );
         assert!(probes.should_route_reads_to_replica());
     }
 
