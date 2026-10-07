@@ -1857,7 +1857,7 @@ mod tests {
             .await;
         assert_eq!(set_local, timeouts.set_local_sql());
 
-        let seen = tokio::task::spawn_blocking(move || {
+        let seen = crate::time::spawn_blocking(move || {
             super::with_sync_tx_set_local(set_local, super::sync_tx_set_local)
         })
         .await
