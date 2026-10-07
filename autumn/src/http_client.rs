@@ -3692,8 +3692,9 @@ fn redirect_location(
 ///
 /// If `current`'s origin (scheme + host + port, per [`url::Url::origin`])
 /// differs from the `original` request URL's origin, the `Authorization`,
-/// `Cookie`, and `Proxy-Authorization` headers are removed from `headers` so
-/// they are never forwarded to a cross-origin target (credential leak).
+/// `Cookie`, `Cookie2`, `Proxy-Authorization` and `WWW-Authenticate` headers
+/// are removed from `headers` so they are never forwarded to a cross-origin
+/// target (credential leak).
 /// Because the caller threads a single mutable `headers` map across hops, once
 /// these headers are stripped on any hop they stay stripped for the remainder
 /// of the chain — the safe, conservative behaviour.
@@ -3705,9 +3706,12 @@ fn strip_sensitive_headers_if_cross_origin(
     let current_url =
         url::Url::parse(current).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
     if current_url.origin() != original.origin() {
+        // The set reqwest's own redirect handling removes.
         headers.remove(reqwest::header::AUTHORIZATION);
         headers.remove(reqwest::header::COOKIE);
+        headers.remove("cookie2");
         headers.remove(reqwest::header::PROXY_AUTHORIZATION);
+        headers.remove(reqwest::header::WWW_AUTHENTICATE);
     }
     Ok(())
 }
@@ -6700,6 +6704,56 @@ mod tests {
             }
             fn fill_bytes(&self, dest: &mut [u8]) {
                 dest.fill(0);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_cross_origin_redirect_under_a_deadline_strips_what_reqwest_strips() {
+            let seen: Arc<std::sync::Mutex<Option<HeaderMap>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            let slot = Arc::clone(&seen);
+            let target = super::spawn(axum::Router::new().route(
+                "/dst",
+                axum::routing::get(move |headers: HeaderMap| {
+                    let slot = Arc::clone(&slot);
+                    async move {
+                        *slot.lock().unwrap() = Some(headers);
+                        "ok"
+                    }
+                }),
+            ))
+            .await;
+            let target_port = target.port();
+            let origin = super::spawn(axum::Router::new().route(
+                "/",
+                axum::routing::get(move || async move {
+                    super::redirect_302(format!("http://127.0.0.1:{target_port}/dst"))
+                }),
+            ))
+            .await;
+            let response = with_deadline(
+                Duration::from_secs(3),
+                Client::new()
+                    .get(format!("http://127.0.0.1:{}/", origin.port()))
+                    .header("authorization", "secret")
+                    .header("cookie", "a=b")
+                    .header("cookie2", "c=d")
+                    .header("proxy-authorization", "Basic zzz")
+                    .header("www-authenticate", "Basic realm=x")
+                    .send(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            let headers = seen.lock().unwrap().clone().expect("target reached");
+            for name in [
+                "authorization",
+                "cookie",
+                "cookie2",
+                "proxy-authorization",
+                "www-authenticate",
+            ] {
+                assert!(headers.get(name).is_none(), "{name} reached the target");
             }
         }
 
