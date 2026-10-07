@@ -1,16 +1,27 @@
 //! Same-seed trace check of the framework scenarios (issue #3067).
 //!
 //! Its own binary: `tracing` caches callsite interest for the whole process,
-//! so a test on another thread can hide events from a capture. Run it with
+//! so a test on another thread can hide events from a capture. For the same
+//! reason, each test holds `serial` while it runs. Run it with
 //! `cargo test -p autumn-web --features "sqlite,test-support" --test sim_fleet_trace`.
 
 #![cfg(all(feature = "sqlite", feature = "test-support"))]
 
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
 use autumn_web::sim::fleet::{self, FleetOutcome};
+
+/// One test at a time: a capture on one thread must not see another test
+/// change the process-wide callsite interest of `tracing`.
+fn serial() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Each scenario replays the same trace for the same seed.
 #[test]
 fn sim_fleet_scenarios_replay_the_same_trace() {
+    let _serial = serial();
     for scenario in fleet::SCENARIOS {
         for seed in [0_u64, 1, 0x3067] {
             let first = fleet::run(scenario, seed)
@@ -28,6 +39,7 @@ fn sim_fleet_scenarios_replay_the_same_trace() {
 /// Another seed gives another run.
 #[test]
 fn sim_fleet_seeds_change_the_run() {
+    let _serial = serial();
     let traces: Vec<_> = (0..4)
         .map(|seed| fleet::run("jobs", seed).expect("jobs"))
         .collect();
@@ -41,6 +53,7 @@ fn sim_fleet_seeds_change_the_run() {
 /// seeds.
 #[test]
 fn sim_fleet_sweep_passes_and_is_not_vacuous() {
+    let _serial = serial();
     match fleet::sweep(0..24, fleet::SCENARIOS, 2) {
         FleetOutcome::Passed { runs } => assert_eq!(runs, 24 * 3),
         other => panic!("{other:?}"),
@@ -49,6 +62,7 @@ fn sim_fleet_sweep_passes_and_is_not_vacuous() {
 
 #[test]
 fn sim_fleet_scenarios_fail_loudly_on_a_bad_name() {
+    let _serial = serial();
     let error = fleet::run("no-such-scenario", 0).expect_err("unknown");
     assert!(error.contains("no-such-scenario"), "{error}");
 }

@@ -317,6 +317,19 @@ pub struct Sim {
     gate_seat: gate::SimSeat,
 }
 
+/// The name a replica has as a network host. Two replica names with one key
+/// would share one `SimNet` host, so they cannot both be mounted.
+fn replica_host_key(name: &str) -> String {
+    #[cfg(feature = "http-client")]
+    {
+        net::canonical_host(name)
+    }
+    #[cfg(not(feature = "http-client"))]
+    {
+        name.to_ascii_lowercase()
+    }
+}
+
 /// One named replica: its spec, its clock, and its app while it is alive.
 struct ReplicaSlot {
     name: String,
@@ -630,7 +643,9 @@ impl Sim {
     ///
     /// # Panics
     ///
-    /// Panics if a replica with this name is already mounted. Use
+    /// Panics if a replica with this name is already mounted. A name that
+    /// is the same host name, such as one that differs only in case, is the
+    /// same name. Use
     /// [`restart_replica`](Sim::restart_replica) to mount it again.
     pub fn mount_replica(
         &mut self,
@@ -638,11 +653,18 @@ impl Sim {
         app: crate::test::TestApp,
     ) -> &crate::test::TestClient {
         let replica = replica.into();
-        assert!(
-            self.replica_index(replica.name()).is_none(),
-            "replica `{}` is already mounted; use `restart_replica` to mount it again",
-            replica.name()
-        );
+        let key = replica_host_key(replica.name());
+        if let Some(slot) = self
+            .replicas
+            .iter()
+            .find(|slot| replica_host_key(&slot.name) == key)
+        {
+            panic!(
+                "replica `{}` is already mounted as `{}`; use `restart_replica` to mount it again",
+                replica.name(),
+                slot.name
+            );
+        }
         let clock = replica::NodeClock::new(
             Arc::clone(&self.ambient) as Arc<dyn crate::time::ClockSource>,
             sim_epoch(),

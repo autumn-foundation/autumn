@@ -117,6 +117,19 @@ async fn sim_replica_clock_step_moves_one_replica_only(mut sim: Sim) {
     );
 }
 
+/// Replica names are network host names, so two names that only differ in
+/// case are one replica name.
+#[test]
+#[should_panic(expected = "already mounted")]
+fn sim_replica_names_that_differ_only_in_case_clash() {
+    let runtime = autumn_web::sim::runtime().expect("sim runtime");
+    runtime.block_on(async {
+        let mut sim = Sim::from_seed(1);
+        sim.mount_replica("Payments", TestApp::new());
+        sim.mount_replica("payments", TestApp::new());
+    });
+}
+
 #[test]
 fn sim_seeded_replica_clocks_replay_from_the_seed_and_stay_in_bounds() {
     let draw = |seed: u64| {
