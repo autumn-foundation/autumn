@@ -53,7 +53,8 @@ pub struct HttpLimits {
     pub header_read_timeout: Option<Duration>,
     /// Maximum idle time with no request in flight.
     pub keep_alive_timeout: Option<Duration>,
-    /// Maximum request head size, in bytes.
+    /// Maximum request head size, in bytes. A value below
+    /// [`HttpServerConfig::MIN_HEADER_BYTES`] is raised to it.
     pub max_header_bytes: Option<usize>,
     /// Maximum concurrent HTTP/2 streams per connection.
     pub http2_max_concurrent_streams: Option<u32>,
@@ -94,6 +95,9 @@ impl HttpLimits {
         // CONNECT protocol for HTTP/2 WebSockets, as `axum::serve` sets it.
         builder.http2().enable_connect_protocol();
         if let Some(bytes) = self.max_header_bytes {
+            // hyper panics below the minimum. The config path clamps already;
+            // a value built by hand skipped that.
+            let bytes = bytes.max(HttpServerConfig::MIN_HEADER_BYTES);
             builder.http1().max_buf_size(bytes);
             builder
                 .http2()
@@ -1344,6 +1348,18 @@ mod tests {
         };
         let slots = limits.slots(false).expect("a cap is set");
         assert_eq!(slots.available_permits(), Semaphore::MAX_PERMITS);
+    }
+
+    #[test]
+    fn a_small_header_limit_does_not_panic() {
+        // hyper's `max_buf_size` panics below its minimum. `HttpLimits` is
+        // public, so a value that skipped config validation must still be
+        // safe: it is raised to the minimum.
+        let limits = HttpLimits {
+            max_header_bytes: Some(4096),
+            ..HttpLimits::default()
+        };
+        let _ = limits.builder();
     }
 
     fn idle_timers() -> Arc<ConnTimers> {
