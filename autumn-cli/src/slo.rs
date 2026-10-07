@@ -813,7 +813,12 @@ fn comment_dir(out_dir: &str) -> String {
     let dir = out_dir.trim_start_matches("./").trim_end_matches('/');
     if dir.is_empty() {
         ".".to_owned()
-    } else if Path::new(dir).is_absolute() || dir.contains(':') {
+    } else if Path::new(dir).is_absolute()
+        // `Path::is_absolute` depends on the host OS: on Windows `/home/x` is
+        // relative. Treat any rooted or drive path as absolute everywhere.
+        || dir.starts_with(['/', '\\'])
+        || dir.contains(':')
+    {
         "<out-dir>".to_owned()
     } else {
         dir.to_owned()

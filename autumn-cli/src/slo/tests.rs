@@ -584,6 +584,8 @@ fn the_comment_dir_is_relative_and_normalized() {
     assert_eq!(comment_dir("./deploy/slo/"), "deploy/slo");
     assert_eq!(comment_dir("/home/ci/work/deploy/slo"), "<out-dir>");
     assert_eq!(comment_dir("C:\\work\\slo"), "<out-dir>");
+    // Rooted on every OS, not only where `Path::is_absolute` says so.
+    assert_eq!(comment_dir("\\work\\slo"), "<out-dir>");
     assert_eq!(comment_dir("./"), ".");
 }
 

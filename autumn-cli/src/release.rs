@@ -11241,9 +11241,10 @@ esac
         let dir = make_project(&tmp, "my_shop");
         init(&dir, "my_shop", false, Target::Kubernetes, false).unwrap();
         let chart = fs::read_to_string(dir.join("deploy/helm/Chart.yaml")).unwrap();
-        assert!(chart.contains("\nname: my-shop\n"), "{chart}");
+        // Compare whole lines: a Windows checkout gives the templates CRLF.
+        assert!(chart.lines().any(|l| l == "name: my-shop"), "{chart}");
         let pdb = fs::read_to_string(dir.join("deploy/kustomize/base/pdb.yaml")).unwrap();
-        assert!(pdb.contains("name: my-shop\n"), "{pdb}");
+        assert!(pdb.lines().any(|l| l.trim() == "name: my-shop"), "{pdb}");
     }
 
     /// The raw templates use only the placeholders that
