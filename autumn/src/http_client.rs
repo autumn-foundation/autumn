@@ -2217,14 +2217,8 @@ impl RequestBuilder {
 
             // Inject W3C trace context headers from the active span.
             req = inject_trace_context(req);
-            if let Some(value) = gate.header(timeout, &self.extra_headers) {
-                req = req.header(DEADLINE_HEADER, value);
-            }
-
-            // Apply caller-supplied headers (may override or extend trace headers).
-            for (name, value) in &self.extra_headers {
-                req = req.header(name.clone(), value.clone());
-            }
+            // Caller-supplied headers may override or extend trace headers.
+            req = with_caller_headers(req, &gate, timeout, &self.extra_headers);
 
             if let Some(body) = &self.body {
                 req = req.body(body.clone());
@@ -3216,14 +3210,48 @@ impl RetryGate {
     }
 
     /// The [`DEADLINE_HEADER`] value for an attempt with `timeout`. `None`
-    /// with no deadline, or when the caller set the header.
+    /// with no deadline.
+    ///
+    /// A value the caller set is kept when it is shorter, so the header never
+    /// says more than the time left. When this returns a value, the caller's
+    /// own copy of the header is not sent.
     fn header(&self, timeout: Option<Duration>, caller: &HeaderMap) -> Option<HeaderValue> {
-        if !self.send_header || self.deadline.is_none() || caller.contains_key(DEADLINE_HEADER) {
-            return None;
+        self.deadline?;
+        let left = u64::try_from(timeout?.as_millis()).unwrap_or(u64::MAX);
+        match caller.get(DEADLINE_HEADER) {
+            Some(value) => {
+                let theirs = crate::deadline::parse_header(value).map_or(u64::MAX, |d| {
+                    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+                });
+                Some(HeaderValue::from(left.min(theirs)))
+            }
+            None if self.send_header => Some(HeaderValue::from(left)),
+            None => None,
         }
-        let millis = u64::try_from(timeout?.as_millis()).unwrap_or(u64::MAX);
-        Some(HeaderValue::from(millis))
     }
+}
+
+/// Add the [`DEADLINE_HEADER`] for an attempt with `timeout`, then the
+/// caller's headers. The caller's own deadline header is left out when the
+/// gate sends one, which is never longer than the caller's.
+fn with_caller_headers(
+    mut req: reqwest::RequestBuilder,
+    gate: &RetryGate,
+    timeout: Option<Duration>,
+    caller: &HeaderMap,
+) -> reqwest::RequestBuilder {
+    let deadline_value = gate.header(timeout, caller);
+    let sends_deadline = deadline_value.is_some();
+    if let Some(value) = deadline_value {
+        req = req.header(DEADLINE_HEADER, value);
+    }
+    for (name, value) in caller {
+        if sends_deadline && name == DEADLINE_HEADER {
+            continue;
+        }
+        req = req.header(name.clone(), value.clone());
+    }
+    req
 }
 
 // ── Custom send-path helpers (redirect / pin / SSRF-safe) ─────────────────────
@@ -3263,6 +3291,7 @@ async fn serve_sim_host(
             builder = builder.header(name, value);
         }
     }
+    let sends_deadline = deadline_header.is_some();
     if let Some(value) = deadline_header {
         builder = builder.header(DEADLINE_HEADER, value);
     }
@@ -3276,6 +3305,9 @@ async fn serve_sim_host(
         builder = builder.header(reqwest::header::CONTENT_LENGTH, body.len());
     }
     for (name, value) in &request.extra_headers {
+        if sends_deadline && name == DEADLINE_HEADER {
+            continue;
+        }
         builder = builder.header(name, value);
     }
     let body = request.body.clone().unwrap_or_default();
@@ -3470,12 +3502,7 @@ async fn send_one(
             req = req.timeout(timeout);
         }
         req = inject_trace_context(req);
-        if let Some(value) = gate.header(attempt_timeout, extra_headers) {
-            req = req.header(DEADLINE_HEADER, value);
-        }
-        for (name, value) in extra_headers {
-            req = req.header(name.clone(), value.clone());
-        }
+        req = with_caller_headers(req, gate, attempt_timeout, extra_headers);
         if let Some(body) = body {
             req = req.body(body.clone());
         }
@@ -6814,6 +6841,54 @@ mod tests {
                     .await
                     .is_err()
             );
+        }
+
+        #[tokio::test]
+        async fn a_caller_deadline_header_is_capped_at_the_time_left() {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let record = Arc::clone(&seen);
+            let app = axum::Router::new().route(
+                "/x",
+                axum::routing::get(move |headers: HeaderMap| async move {
+                    let values: Vec<String> = headers
+                        .get_all(DEADLINE_HEADER)
+                        .iter()
+                        .map(|value| value.to_str().unwrap().to_owned())
+                        .collect();
+                    record.lock().unwrap().push(values);
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let url = format!("http://127.0.0.1:{port}/x");
+
+            // A larger caller value is cut to the time left.
+            let send = Client::new()
+                .get(&url)
+                .header(DEADLINE_HEADER, "5000")
+                .send();
+            with_deadline(Duration::from_secs(1), send).await.unwrap();
+            // A smaller caller value is kept.
+            let send = Client::new()
+                .get(&url)
+                .header(DEADLINE_HEADER, "200")
+                .send();
+            with_deadline(Duration::from_secs(3), send).await.unwrap();
+            // With no deadline, the caller's value goes as is.
+            Client::new()
+                .get(&url)
+                .header(DEADLINE_HEADER, "5000")
+                .send()
+                .await
+                .unwrap();
+
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 3);
+            assert_eq!(seen[0].len(), 1, "one header: {seen:?}");
+            assert!(seen[0][0].parse::<u64>().unwrap() <= 1_000, "{seen:?}");
+            assert_eq!(seen[1], vec!["200".to_owned()]);
+            assert_eq!(seen[2], vec!["5000".to_owned()]);
         }
 
         #[tokio::test]
