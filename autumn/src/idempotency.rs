@@ -435,10 +435,16 @@ pub trait IdempotencyStore: std::any::Any + Send + Sync {
     /// Return the entry for `key`, or `None` if there is none or it expired.
     fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>>;
 
-    /// Store the response for `key` for `ttl`.
+    /// Store the response for `key` for `ttl`, as the lock `owner`.
+    ///
+    /// While another owner holds a live lock on `key`, do nothing: an attempt
+    /// that outlived its lock must not replace the response of the request
+    /// that holds the key now. The holder itself, or a key with no live lock,
+    /// is written.
     fn set<'a>(
         &'a self,
         key: &'a str,
+        owner: &'a str,
         record: IdempotencyRecord,
         body_hash: Vec<u8>,
         ttl: Duration,
@@ -528,7 +534,26 @@ impl MemoryIdempotencyStore {
         entry.filter(|e| e.expires_at > crate::time::ambient_instant())
     }
 
-    fn set_now(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {
+    fn set_now(
+        &self,
+        key: &str,
+        owner: &str,
+        record: IdempotencyRecord,
+        body_hash: Vec<u8>,
+        ttl: Duration,
+    ) {
+        // Another owner's live lock: its response wins.
+        let held_by_another = self
+            .in_flight
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .is_some_and(|lock| {
+                lock.owner != owner && lock.expires_at > crate::time::ambient_instant()
+            });
+        if held_by_another {
+            return;
+        }
         let entry = IdempotencyEntry {
             record,
             body_hash,
@@ -596,11 +621,12 @@ impl IdempotencyStore for MemoryIdempotencyStore {
     fn set<'a>(
         &'a self,
         key: &'a str,
+        owner: &'a str,
         record: IdempotencyRecord,
         body_hash: Vec<u8>,
         ttl: Duration,
     ) -> IdempotencyFuture<'a, ()> {
-        self.set_now(key, record, body_hash, ttl);
+        self.set_now(key, owner, record, body_hash, ttl);
         ready(())
     }
 
@@ -755,16 +781,32 @@ mod redis_store {
         fn set<'a>(
             &'a self,
             key: &'a str,
+            owner: &'a str,
             record: IdempotencyRecord,
             body_hash: Vec<u8>,
             ttl: Duration,
         ) -> IdempotencyFuture<'a, ()> {
+            let lock_key = self.lock_key(key);
             let redis_key = self.entry_key(key);
             let mut conn = self.connection.clone();
             Box::pin(async move {
                 let bytes = StoredEntry::encode(record, body_hash)?;
-                conn.set_ex::<_, _, ()>(&redis_key, bytes, ttl.as_secs().max(1))
-                    .await
+                // One script: write unless another owner holds the lock.
+                let written: redis::RedisResult<i32> = redis::Script::new(
+                    "local holder = redis.call('GET', KEYS[1]) \
+                     if holder and holder ~= ARGV[1] then return 0 end \
+                     redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3]) \
+                     return 1",
+                )
+                .key(&lock_key)
+                .key(&redis_key)
+                .arg(owner)
+                .arg(bytes)
+                .arg(ttl.as_secs().max(1))
+                .invoke_async(&mut conn)
+                .await;
+                written
+                    .map(drop)
                     .map_err(|e| backend_error("persist idempotency entry", &e))
             })
         }
@@ -1320,7 +1362,13 @@ impl DeferredIdempotencyCommit {
         for (storage_key, record) in writes {
             if let Err(error) = state
                 .store
-                .set(&storage_key, record, state.body_hash.clone(), state.ttl)
+                .set(
+                    &storage_key,
+                    &state.lock.owner,
+                    record,
+                    state.body_hash.clone(),
+                    state.ttl,
+                )
                 .await
             {
                 tracing::error!(
@@ -1751,6 +1799,18 @@ where
     handle_cache_miss(inner, store, ttl, prepared, metrics.as_ref(), lock, probe).await
 }
 
+/// Take what the handler left for the cache in its response extensions: the
+/// replay metadata, and whether a committed error response is to be cached.
+fn take_replay_markers(extensions: &mut axum::http::Extensions) -> (Vec<(String, Vec<u8>)>, bool) {
+    let replay_metadata = extensions
+        .remove::<IdempotencyReplayMetadata>()
+        .map_or_else(Vec::new, IdempotencyReplayMetadata::into_entries);
+    let cache_committed_error = extensions
+        .remove::<IdempotencyCacheCommittedErrorResponse>()
+        .is_some();
+    (replay_metadata, cache_committed_error)
+}
+
 async fn handle_cache_miss<S>(
     mut inner: S,
     store: Arc<dyn IdempotencyStore>,
@@ -1815,14 +1875,7 @@ where
 
     // The handler stored the record in its own transaction, with its mutation.
     let committed_in_tx = probe.committed(&store).await;
-    let replay_metadata = resp_parts
-        .extensions
-        .remove::<IdempotencyReplayMetadata>()
-        .map_or_else(Vec::new, IdempotencyReplayMetadata::into_entries);
-    let cache_committed_error = resp_parts
-        .extensions
-        .remove::<IdempotencyCacheCommittedErrorResponse>()
-        .is_some();
+    let (replay_metadata, cache_committed_error) = take_replay_markers(&mut resp_parts.extensions);
 
     // Cache successful 2xx/3xx responses and explicit "mutation committed"
     // errors; store before unlocking so concurrent duplicates still see a
@@ -1865,7 +1918,10 @@ where
         }
         if committed_in_tx {
             // Nothing to write: the record committed with the mutation.
-        } else if let Err(error) = store.set(&storage_key, record, body_hash, ttl).await {
+        } else if let Err(error) = store
+            .set(&storage_key, &lock.owner, record, body_hash, ttl)
+            .await
+        {
             tracing::error!(
                 idempotency.key = %idempotency_key,
                 error = %error,
@@ -2057,6 +2113,24 @@ mod tests {
     use std::sync::Mutex;
     use tower::ServiceExt;
 
+    /// A late `set` from an owner whose lock another owner took writes
+    /// nothing; the holder's own `set` is written.
+    #[test]
+    fn memory_set_skips_while_another_owner_holds_the_key() {
+        let store = MemoryIdempotencyStore::new(Duration::from_secs(60));
+        let record = |status| IdempotencyRecord {
+            status,
+            headers: Vec::new(),
+            body: Vec::new(),
+            metadata: Vec::new(),
+        };
+        assert!(store.try_lock_now("k", "b", Duration::from_secs(60)));
+        store.set_now("k", "a", record(500), Vec::new(), Duration::from_secs(60));
+        assert!(store.get_now("k").is_none(), "a does not hold the key");
+        store.set_now("k", "b", record(201), Vec::new(), Duration::from_secs(60));
+        assert_eq!(store.get_now("k").expect("b's record").record.status, 201);
+    }
+
     /// W3 (issue #1797): the in-flight lock owner id is minted from the injected
     /// entropy source, so a fixed seed reproduces the exact lock-owner stream.
     #[test]
@@ -2112,6 +2186,7 @@ mod tests {
         fn set<'a>(
             &'a self,
             key: &'a str,
+            _owner: &'a str,
             _record: IdempotencyRecord,
             _body_hash: Vec<u8>,
             _ttl: Duration,
@@ -2167,7 +2242,13 @@ mod tests {
             body: b"ok".to_vec(),
             metadata: Vec::new(),
         };
-        store.set_now("k", record, b"body-hash".to_vec(), Duration::from_secs(60));
+        store.set_now(
+            "k",
+            "",
+            record,
+            b"body-hash".to_vec(),
+            Duration::from_secs(60),
+        );
         let fetched = store.get_now("k");
         assert!(
             fetched.is_some(),
@@ -2352,7 +2433,7 @@ mod tests {
 
         // Both of these overflow `Instant + Duration` on the underlying clock.
         for extreme in [Duration::from_secs(u64::MAX), Duration::MAX] {
-            store.set_now("extreme-ttl-key", record.clone(), Vec::new(), extreme);
+            store.set_now("extreme-ttl-key", "", record.clone(), Vec::new(), extreme);
             // Entry must be retrievable and (far-future) unexpired.
             assert!(
                 store.get_now("extreme-ttl-key").is_some(),

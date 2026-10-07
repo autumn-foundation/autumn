@@ -201,6 +201,7 @@ impl IdempotencyStore for DbIdempotencyStore {
     fn set<'a>(
         &'a self,
         key: &'a str,
+        owner: &'a str,
         record: IdempotencyRecord,
         body_hash: Vec<u8>,
         ttl: Duration,
@@ -223,7 +224,7 @@ impl IdempotencyStore for DbIdempotencyStore {
             let expiry = diesel::dsl::case_when(keys::locked_until_ms.gt(now), held_expiry)
                 .otherwise(expires);
             let mut conn = self.conn().await?;
-            diesel::insert_into(keys::autumn_idempotency_keys)
+            let upsert = diesel::insert_into(keys::autumn_idempotency_keys)
                 .values((
                     keys::storage_key.eq(key),
                     keys::record.eq(Some(&bytes)),
@@ -238,10 +239,19 @@ impl IdempotencyStore for DbIdempotencyStore {
                     keys::record.eq(Some(&bytes)),
                     keys::expires_at_ms.eq(expiry),
                     keys::ttl_ms.eq(ttl_ms),
-                ))
-                .execute(&mut conn)
-                .await
-                .map_err(|e| db_error("store idempotency record", e))?;
+                ));
+            // Another owner's live lock: its response wins, so write nothing.
+            // `ON CONFLICT … DO UPDATE … WHERE`: the `WHERE` reads the existing row.
+            diesel::query_dsl::methods::FilterDsl::filter(
+                upsert,
+                keys::locked_until_ms
+                    .le(now)
+                    .or(keys::locked_by.is_null())
+                    .or(keys::locked_by.eq(owner)),
+            )
+            .execute(&mut conn)
+            .await
+            .map_err(|e| db_error("store idempotency record", e))?;
             self.sweep(&mut conn).await;
             Ok(())
         })

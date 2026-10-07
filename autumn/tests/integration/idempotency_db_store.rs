@@ -96,7 +96,7 @@ async fn db_store_lock_record_and_expiry() {
         "no record yet"
     );
     store
-        .set("k", record("done"), b"hash".to_vec(), ttl)
+        .set("k", "b", record("done"), b"hash".to_vec(), ttl)
         .await
         .expect("set");
     assert!(
@@ -115,6 +115,7 @@ async fn db_store_lock_record_and_expiry() {
     store
         .set(
             "short",
+            "",
             record("gone"),
             Vec::new(),
             Duration::from_millis(1),

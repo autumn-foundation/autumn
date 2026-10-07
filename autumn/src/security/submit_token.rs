@@ -685,7 +685,7 @@ async fn cache_consumed_token_response(
                 // success.
                 if let Err(error) = settings
                     .store
-                    .set(key, record, Vec::new(), settings.ttl)
+                    .set(key, owner, record, Vec::new(), settings.ttl)
                     .await
                 {
                     tracing::error!(
@@ -1225,6 +1225,7 @@ mod tests {
         store
             .set(
                 &key,
+                "",
                 IdempotencyRecord {
                     status: 200,
                     headers: Vec::new(),
@@ -1461,6 +1462,7 @@ mod tests {
         fn set<'a>(
             &'a self,
             _key: &'a str,
+            _owner: &'a str,
             _record: IdempotencyRecord,
             _body_hash: Vec<u8>,
             _ttl: Duration,
@@ -1717,11 +1719,12 @@ mod tests {
         fn set<'a>(
             &'a self,
             key: &'a str,
+            owner: &'a str,
             record: IdempotencyRecord,
             body_hash: Vec<u8>,
             ttl: Duration,
         ) -> IdempotencyFuture<'a, ()> {
-            self.inner.set(key, record, body_hash, ttl)
+            self.inner.set(key, owner, record, body_hash, ttl)
         }
 
         fn try_lock<'a>(
@@ -1864,12 +1867,13 @@ mod tests {
         fn set<'a>(
             &'a self,
             key: &'a str,
+            owner: &'a str,
             record: IdempotencyRecord,
             body_hash: Vec<u8>,
             ttl: Duration,
         ) -> IdempotencyFuture<'a, ()> {
             *self.set_ttl.lock().unwrap() = Some(ttl);
-            self.inner.set(key, record, body_hash, ttl)
+            self.inner.set(key, owner, record, body_hash, ttl)
         }
 
         fn try_lock<'a>(

@@ -426,9 +426,11 @@ impl IdempotencyStore for MyStore {
         Box::pin(async move { /* ... */ })
     }
 
+    /// Write nothing while another owner holds a live lock on `key`.
     fn set<'a>(
         &'a self,
         key: &'a str,
+        owner: &'a str,
         record: IdempotencyRecord,
         body_hash: Vec<u8>,
         ttl: Duration,

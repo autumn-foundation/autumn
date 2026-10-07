@@ -943,6 +943,7 @@ async fn late_set_keeps_a_newer_owners_lock() {
     store
         .set(
             key,
+            "a",
             store_record(201),
             Vec::new(),
             Duration::from_millis(50),
@@ -978,7 +979,13 @@ async fn set_then_crash_keeps_the_record_past_the_lock() {
             .unwrap()
     );
     store
-        .set(key, store_record(201), Vec::new(), Duration::from_secs(1))
+        .set(
+            key,
+            "a",
+            store_record(201),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
         .await
         .unwrap();
     // No unlock: the request crashed.
@@ -1008,6 +1015,7 @@ async fn set_then_unlock_keeps_the_configured_ttl() {
     store
         .set(
             key,
+            "a",
             store_record(201),
             Vec::new(),
             Duration::from_millis(300),
@@ -1120,7 +1128,7 @@ async fn zero_ttl_record_expires_on_release() {
             .unwrap()
     );
     store
-        .set(key, store_record(201), Vec::new(), Duration::ZERO)
+        .set(key, "a", store_record(201), Vec::new(), Duration::ZERO)
         .await
         .unwrap();
     store.unlock(key, "a").await.unwrap();
@@ -1135,5 +1143,55 @@ async fn zero_ttl_record_expires_on_release() {
             .await
             .unwrap(),
         "the key starts over"
+    );
+}
+
+/// A outlives its lock and B takes the key. B stores its response, then A's
+/// late `set` arrives before B releases. B's response is the one replayed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_set_does_not_overwrite_the_owners_record() {
+    use autumn_web::idempotency::IdempotencyStore as _;
+    let (_substrate, store) = bare_store();
+    let key = "late-overwrite";
+    assert!(
+        store
+            .try_lock(key, "a", Duration::from_millis(300))
+            .await
+            .unwrap()
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        store
+            .try_lock(key, "b", Duration::from_secs(10))
+            .await
+            .unwrap()
+    );
+
+    store
+        .set(
+            key,
+            "b",
+            store_record(201),
+            Vec::new(),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    store
+        .set(
+            key,
+            "a",
+            store_record(500),
+            Vec::new(),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    store.unlock(key, "b").await.unwrap();
+
+    let entry = store.get(key).await.unwrap().expect("B's record");
+    assert_eq!(
+        entry.record.status, 201,
+        "A's late set did not overwrite B's record"
     );
 }

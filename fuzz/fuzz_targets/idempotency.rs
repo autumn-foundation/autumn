@@ -66,7 +66,7 @@ fuzz_target!(|data: &[u8]| {
         metadata: Vec::new(),
     };
     // set() computes an expiry deadline from `ttl` — the overflow site.
-    let _ = now(store.set(&key, record, body.to_vec(), ttl));
+    let _ = now(store.set(&key, "fuzz", record, body.to_vec(), ttl));
     let _ = now(store.get(&key));
     // The in-flight lock path computes a deadline from the same TTL.
     let _ = now(store.try_lock(&key, "fuzz", ttl));

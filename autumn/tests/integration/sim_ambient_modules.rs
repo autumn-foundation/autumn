@@ -88,7 +88,7 @@ async fn sim_ambient_modules_idempotency_ttl_runs_on_into_the_next_sim(sim: Sim)
     let first = Sim::from_seed(sim.seed.wrapping_add(1));
     first.advance(Duration::from_secs(3600)).await;
     store
-        .set("k", idempotency_record(), b"hash".to_vec(), minute)
+        .set("k", "", idempotency_record(), b"hash".to_vec(), minute)
         .await
         .unwrap();
     assert!(store.try_lock("lock", "a", minute).await.unwrap());
@@ -119,7 +119,7 @@ async fn sim_ambient_modules_idempotency_ttl_runs_on_after_a_nested_sim(sim: Sim
     let inner = Sim::from_seed(sim.seed.wrapping_add(1));
     inner.advance(Duration::from_secs(3600)).await;
     store
-        .set("k", idempotency_record(), b"hash".to_vec(), minute)
+        .set("k", "", idempotency_record(), b"hash".to_vec(), minute)
         .await
         .unwrap();
     assert!(store.try_lock("lock", "a", minute).await.unwrap());

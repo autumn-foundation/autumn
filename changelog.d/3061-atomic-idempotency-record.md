@@ -2,11 +2,12 @@
 
 - **Breaking:** `IdempotencyStore` is async ([migration guide](docs/migrations/next.md)).
   Each method returns an `IdempotencyFuture` and a `Result` (issue #3061). The
-  trait has four methods: `get`, `set`, `try_lock(key, owner, ttl)` and
-  `unlock(key, owner)`. `try_get`, `try_set`, `try_lock_owned` and
-  `unlock_owned` are removed. The Redis store does not call `block_in_place`,
-  so it works on a current-thread runtime and does not hold a Tokio worker
-  while it waits for Redis.
+  trait has four methods: `get`, `set(key, owner, …)`,
+  `try_lock(key, owner, ttl)` and `unlock(key, owner)`. `set` writes nothing
+  while another owner holds a live lock on the key. `try_get`, `try_set`,
+  `try_lock_owned` and `unlock_owned` are removed. The Redis store does not
+  call `block_in_place`, so it works on a current-thread runtime and does not
+  hold a Tokio worker while it waits for Redis.
 - **Breaking:** `idempotency.in_flight_ttl_secs` defaults to `60`, not `86400`
   ([migration guide](docs/migrations/next.md)). `IdempotencyLayer::new` uses
   60 s too, not the response TTL. When the record write fails after the

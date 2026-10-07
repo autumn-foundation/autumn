@@ -1305,6 +1305,7 @@ impl IdempotencyStore for SecondSetFailsStore {
     fn set<'a>(
         &'a self,
         key: &'a str,
+        owner: &'a str,
         record: autumn_web::idempotency::IdempotencyRecord,
         body_hash: Vec<u8>,
         ttl: Duration,
@@ -1314,7 +1315,7 @@ impl IdempotencyStore for SecondSetFailsStore {
                 Err(IdempotencyStoreError::backend("forced alias write failure"))
             });
         }
-        self.inner.set(key, record, body_hash, ttl)
+        self.inner.set(key, owner, record, body_hash, ttl)
     }
 
     fn try_lock<'a>(
@@ -1959,7 +1960,13 @@ async fn test_ttl_eviction() {
         metadata: vec![],
     };
     store
-        .set("evict-key", record, vec![0u8; 8], Duration::from_millis(1))
+        .set(
+            "evict-key",
+            "",
+            record,
+            vec![0u8; 8],
+            Duration::from_millis(1),
+        )
         .await
         .unwrap();
 
@@ -2513,6 +2520,7 @@ impl autumn_web::idempotency::IdempotencyStore for FailingLookupStore {
     fn set<'a>(
         &'a self,
         _key: &'a str,
+        _owner: &'a str,
         _record: autumn_web::idempotency::IdempotencyRecord,
         _body_hash: Vec<u8>,
         _ttl: Duration,
@@ -2585,6 +2593,7 @@ impl autumn_web::idempotency::IdempotencyStore for FailingPersistenceStore {
     fn set<'a>(
         &'a self,
         _key: &'a str,
+        _owner: &'a str,
         _record: autumn_web::idempotency::IdempotencyRecord,
         _body_hash: Vec<u8>,
         _ttl: Duration,
@@ -2667,6 +2676,7 @@ fn test_default_store_ttl_trait_impl() {
         }
         fn set<'a>(
             &'a self,
+            _: &'a str,
             _: &'a str,
             _: IdempotencyRecord,
             _: Vec<u8>,

@@ -33,6 +33,7 @@ impl IdempotencyStore for SetFailsStore {
     fn set<'a>(
         &'a self,
         _key: &'a str,
+        _owner: &'a str,
         _record: IdempotencyRecord,
         _body_hash: Vec<u8>,
         _ttl: Duration,
