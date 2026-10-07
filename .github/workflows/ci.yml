@@ -1632,6 +1632,17 @@ jobs:
           )
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/redis-dead-letter-limit.log" \
             || { echo "::error::no redis dead-letter limit tests ran — the ci.yml filter no longer matches"; exit 1; }
+          # The Redis claim-renewal test (#3051) is `--lib` for the same
+          # reason: it drives the crate-private renewal script directly.
+          (
+            set -o pipefail
+            cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
+              --ignored --test-threads=1 \
+              job::tests::redis_claim_renewal_ \
+              | tee "${RUNNER_TEMP}/redis-claim-renewal.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/redis-claim-renewal.log" \
+            || { echo "::error::no redis claim-renewal tests ran — the ci.yml filter no longer matches"; exit 1; }
           # The Postgres relative-delay clock-skew regression (#2111 follow-up)
           # also lives in the `--lib` module (it drives crate-private types:
           # PgDueAt, pg_enqueue_job_at, pg_enqueue_on_conn_at), so it needs its

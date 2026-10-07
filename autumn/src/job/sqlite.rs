@@ -54,7 +54,11 @@ use std::sync::{Arc, RwLock};
 
 use serde_json::Value;
 
-use super::{DEFAULT_JOB_ADMIN_HISTORY_LIMIT, JobExecutionOutcome, QueueLimits};
+use super::{
+    DEFAULT_JOB_ADMIN_HISTORY_LIMIT, ExecutionBounds, JobExecutionOutcome, LeaseHeartbeat,
+    LeaseRenewal, QueueLimits, record_attempt_start, record_lease_lost,
+    runtime_visibility_timeout_ms,
+};
 use super::{
     EnqueueOutcome, JobAdminBackend, JobAdminBackendEntry, JobAdminFuture, JobAdminMemoryBackend,
     JobAdminPage, JobAdminQuery, JobAdminRecord, JobAdminSnapshot, JobAdminStartDecision,
@@ -797,7 +801,12 @@ async fn dead_letter_on(
 ///
 /// This is what makes a crash mid-job recoverable: the worker is gone, but the
 /// row is still there.
-async fn recover_stale_claims(pool: &SqlitePool, visibility_timeout_ms: u64, state: &AppState) {
+async fn recover_stale_claims(
+    pool: &SqlitePool,
+    visibility_timeout_ms: u64,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+) {
     use diesel_async::RunQueryDsl as _;
 
     let Ok(mut conn) = pool.get().await else {
@@ -846,7 +855,7 @@ async fn recover_stale_claims(pool: &SqlitePool, visibility_timeout_ms: u64, sta
            SELECT id FROM autumn_jobs \
            WHERE status = '{STATUS_RUNNING}' AND claimed_at IS NOT NULL AND claimed_at <= ? \
            LIMIT {STALE_RECOVERY_BATCH}) \
-         RETURNING id, name, status, payload"
+         RETURNING id, name, status, payload, attempt"
     );
     // A per-row jitter, so claims that expire together do not all run again
     // at once (issue #3054). See `stale_requeue_cap_ms`.
@@ -877,6 +886,9 @@ async fn recover_stale_claims(pool: &SqlitePool, visibility_timeout_ms: u64, sta
                 "visibility timeout expired".to_owned(),
                 true,
             );
+            // Also tells a lease-lost worker in this process that the job is
+            // already recorded (see `record_lease_lost`).
+            job_admin.record_failure(&row.id, "visibility timeout expired".to_owned());
             crate::alerts::notify_dead_lettered_job(
                 state,
                 &row.name,
@@ -902,6 +914,8 @@ async fn recover_stale_claims(pool: &SqlitePool, visibility_timeout_ms: u64, sta
             // No gauge write here: the row is back in the table and the depth
             // survey publishes it absolutely on its next pass. Postgres does
             // the same.
+            let attempt = u32::try_from(row.attempt).unwrap_or(0);
+            super::record_recovered_requeue(&row.name, &row.id, attempt, state, job_admin);
         }
     }
 }
@@ -918,6 +932,9 @@ struct RecoveredRow {
     /// Needed to settle the tracked record of a row this sweep dead-letters.
     #[diesel(sql_type = diesel::sql_types::Text)]
     payload: String,
+    /// The attempt a requeued row runs next.
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    attempt: i32,
 }
 
 /// Wait until the queue schema exists, then hand back the pool.
@@ -1149,20 +1166,80 @@ async fn queue_depth_survey_loop(
     }
 }
 
+/// Move a running job's claim expiry forward, if this worker still holds it.
+async fn renew_claim(
+    pool: &SqlitePool,
+    clock: &dyn crate::time::ClockSource,
+    job_id: &str,
+    worker_id: &str,
+) -> LeaseRenewal {
+    use diesel_async::RunQueryDsl as _;
+
+    let mut conn = match pool.get().await {
+        Ok(conn) => conn,
+        Err(error) => return LeaseRenewal::Failed(format!("sqlite jobs pool error: {error}")),
+    };
+    // Read the time after the wait for a connection, so the wait does not
+    // make the new claim time older than it is.
+    let now = clock.now().timestamp_millis();
+    match diesel::sql_query(format!(
+        "UPDATE autumn_jobs SET claimed_at = ? \
+         WHERE id = ? AND claimed_by = ? AND status = '{STATUS_RUNNING}'"
+    ))
+    .bind::<diesel::sql_types::BigInt, _>(now)
+    .bind::<diesel::sql_types::Text, _>(job_id)
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .execute(&mut *conn)
+    .await
+    {
+        Ok(0) => LeaseRenewal::Lost,
+        Ok(_) => LeaseRenewal::Renewed,
+        Err(error) => LeaseRenewal::Failed(format!("sqlite claim renewal failed: {error}")),
+    }
+}
+
+/// Start renewing `row`'s claim for `worker_id`.
+async fn lease_heartbeat(
+    pool: &SqlitePool,
+    row: &SqliteJobRow,
+    claimed_at: tokio::time::Instant,
+    worker_id: &str,
+    state: &AppState,
+    visibility_timeout_ms: u64,
+) -> LeaseHeartbeat {
+    let pool = pool.clone();
+    let job_id = row.id.clone();
+    let worker_id = worker_id.to_owned();
+    let clock = state.clock_arc();
+    LeaseHeartbeat::start(claimed_at, visibility_timeout_ms, move || {
+        let pool = pool.clone();
+        let clock = Arc::clone(&clock);
+        let job_id = job_id.clone();
+        let worker_id = worker_id.clone();
+        async move { renew_claim(&pool, clock.as_ref(), &job_id, &worker_id).await }
+    })
+    .await
+}
+
 /// Run one claimed job and settle its row.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn execute_job(
     row: SqliteJobRow,
+    claimed_at: tokio::time::Instant,
     jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
     pool: &SqlitePool,
     worker_id: &str,
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
+    visibility_timeout_ms: u64,
 ) {
     let attempt = u32::try_from(row.attempt).unwrap_or(0);
     let max_attempts = u32::try_from(row.max_attempts).unwrap_or(1);
     let payload = row.payload_value();
 
-    if job_admin.try_record_start(&row.id, attempt) == JobAdminStartDecision::Canceled {
+    if record_attempt_start(&row.name, &row.id, attempt, state, job_admin)
+        == JobAdminStartDecision::Canceled
+    {
         let ack = nack_failure(
             pool,
             now_ms(state),
@@ -1193,13 +1270,13 @@ async fn execute_job(
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&row.name)
-        .map(|info| (info.handler, info.uniqueness.clone()));
+        .map(|info| (info.handler, info.uniqueness.clone(), info.timeout));
     let pending_unique_key = job_info_snapshot
         .as_ref()
-        .and_then(|(_, uniqueness)| uniqueness.as_ref())
+        .and_then(|(_, uniqueness, _)| uniqueness.as_ref())
         .filter(|unique| unique.window == JobUniquenessWindow::Pending)
         .map(|unique| job_unique_key(unique, &payload));
-    let Some((handler, _)) = job_info_snapshot else {
+    let Some((handler, _, timeout)) = job_info_snapshot else {
         // No handler exists on this process, so requeueing would make every
         // worker claim and discard the row until its attempts ran out.
         let error = format!("unknown job '{}'", row.name);
@@ -1208,6 +1285,7 @@ async fn execute_job(
             ack,
             &row.name,
             &row.id,
+            attempt,
             "unknown-type",
             PgLifecycleRecord::Failure { error: &error },
             state,
@@ -1229,6 +1307,19 @@ async fn execute_job(
         row.tracestate.as_deref(),
     );
     let final_attempt = is_final_attempt(&attempt, &max_attempts);
+    let heartbeat = lease_heartbeat(
+        pool,
+        &row,
+        claimed_at,
+        worker_id,
+        state,
+        visibility_timeout_ms,
+    )
+    .await;
+    let bounds = ExecutionBounds {
+        timeout,
+        lease_lost: Some(heartbeat.lost_token()),
+    };
     let outcome = tracing::Instrument::instrument(
         run_job_handler(
             &row.name,
@@ -1236,22 +1327,24 @@ async fn execute_job(
             state.clone(),
             payload,
             final_attempt,
+            bounds,
             super::durable_work_run(state, Some(row.run_at)),
         ),
         job_span,
     )
     .await;
-    settle_outcome(
-        outcome,
-        &row,
-        pool,
-        worker_id,
-        state,
-        job_admin,
-        pending_unique_key.as_deref(),
-        final_attempt,
-    )
-    .await;
+    heartbeat
+        .stop_after(settle_outcome(
+            outcome,
+            &row,
+            pool,
+            worker_id,
+            state,
+            job_admin,
+            pending_unique_key.as_deref(),
+            final_attempt,
+        ))
+        .await;
 }
 
 /// Write a finished attempt back to the queue table and record it.
@@ -1268,12 +1361,16 @@ async fn settle_outcome(
 ) {
     let attempt = u32::try_from(row.attempt).unwrap_or(0);
     match outcome {
+        JobExecutionOutcome::LeaseLost => {
+            record_lease_lost(&row.name, &row.id, attempt, state, job_admin);
+        }
         JobExecutionOutcome::Succeeded => {
             let ack = ack_success(pool, now_ms(state), &row.id, worker_id).await;
             record_pg_lifecycle_ack_result(
                 ack,
                 &row.name,
                 &row.id,
+                attempt,
                 "success",
                 PgLifecycleRecord::Success,
                 state,
@@ -1312,7 +1409,7 @@ async fn settle_outcome(
             )
             .await;
             record_pg_lifecycle_ack_result(
-                ack, &row.name, &row.id, "failure", lifecycle, state, job_admin,
+                ack, &row.name, &row.id, attempt, "failure", lifecycle, state, job_admin,
             );
         }
         // A panic dead-letters at once whatever the remaining attempts, as on
@@ -1324,6 +1421,7 @@ async fn settle_outcome(
                 ack,
                 &row.name,
                 &row.id,
+                attempt,
                 "panic",
                 PgLifecycleRecord::Failure { error: &error },
                 state,
@@ -1344,6 +1442,7 @@ async fn worker_loop(
     schedule: QueueSchedule,
     slots: Arc<QueueSlots>,
     poll_interval: std::time::Duration,
+    visibility_timeout_ms: u64,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     let mut cursor = schedule.cursor();
@@ -1367,9 +1466,21 @@ async fn worker_loop(
                 continue;
             };
             let deferred = super::deferred_job_names(&state, &jobs_by_name);
+            // The claim stamps `claimed_at` inside the claim query.
+            let claimed_at = tokio::time::Instant::now();
             match claim_next_job(&pool, &worker_id, &queue, now_ms(&state), &deferred).await {
                 Some(row) => {
-                    execute_job(row, &jobs_by_name, &pool, &worker_id, &state, &job_admin).await;
+                    execute_job(
+                        row,
+                        claimed_at,
+                        &jobs_by_name,
+                        &pool,
+                        &worker_id,
+                        &state,
+                        &job_admin,
+                        visibility_timeout_ms,
+                    )
+                    .await;
                     drop(guard);
                     handled = true;
                     break;
@@ -1392,17 +1503,23 @@ async fn maintenance_loop(
     queue_handle: SqliteJobQueue,
     visibility_timeout_ms: u64,
     survey_blocked: bool,
-    history_window: Option<std::time::Duration>,
     state: AppState,
+    job_admin: JobAdminMemoryBackend,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
+    // Opt-in, and read from the same `retention.job_history` window the
+    // Postgres sweep uses. Unset means history is kept forever, as on Postgres.
+    let history_window = state
+        .extension::<crate::config::AutumnConfig>()
+        .and_then(|config| config.retention.job_history.clone())
+        .and_then(|window| crate::config::parse_duration_str(&window).ok());
     let interval_duration = maintenance_interval(visibility_timeout_ms);
     let Some(pool) = wait_ready(&queue_handle, interval_duration, &shutdown).await else {
         return;
     };
     // Sweep once at start: a row still marked running belongs to a process that
     // is no longer here.
-    recover_stale_claims(&pool, visibility_timeout_ms, &state).await;
+    recover_stale_claims(&pool, visibility_timeout_ms, &state, &job_admin).await;
     let mut tracking_cleanup = tokio::time::interval(TRACKING_CLEANUP_INTERVAL);
     tracking_cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut interval = tokio::time::interval(interval_duration);
@@ -1410,7 +1527,7 @@ async fn maintenance_loop(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                recover_stale_claims(&pool, visibility_timeout_ms, &state).await;
+                recover_stale_claims(&pool, visibility_timeout_ms, &state, &job_admin).await;
                 if survey_blocked {
                     update_concurrency_blocked_gauges(&pool, &state).await;
                 }
@@ -1563,32 +1680,28 @@ pub(super) fn start_runtime(
         return Ok(());
     }
 
-    let visibility_timeout_ms = config.sqlite.visibility_timeout_ms;
+    let visibility_timeout_ms =
+        runtime_visibility_timeout_ms("sqlite", config.sqlite.visibility_timeout_ms);
     let survey_blocked = jobs_by_name
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .values()
         .any(|job| job.concurrency.is_some());
-    // Opt-in, and read from the same `retention.job_history` window the
-    // Postgres sweep uses. Unset means history is kept forever, as on Postgres.
-    let history_window = state
-        .extension::<crate::config::AutumnConfig>()
-        .and_then(|config| config.retention.job_history.clone())
-        .and_then(|window| crate::config::parse_duration_str(&window).ok());
     let poll_interval = std::time::Duration::from_millis(config.sqlite.poll_interval_ms.max(1));
     let worker_count = config.workers.max(1);
 
     {
         let queue_handle = queue_handle.clone();
         let state = state.clone();
+        let job_admin = job_admin.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
             maintenance_loop(
                 queue_handle,
                 visibility_timeout_ms,
                 survey_blocked,
-                history_window,
                 state,
+                job_admin,
                 shutdown,
             )
             .await;
@@ -1614,6 +1727,7 @@ pub(super) fn start_runtime(
                 schedule,
                 slots,
                 poll_interval,
+                visibility_timeout_ms,
                 shutdown,
             )
             .await;

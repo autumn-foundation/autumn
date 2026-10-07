@@ -389,9 +389,9 @@ authority under a manifest that says otherwise.
   helper that erases the table, so both are refused and the read is discharged
   with `#[agent_effect(none, reason = "...")]`.
 - **A non-inert macro naming a handle** — `refund_pipeline!(repo, 7)`. Note
-  that `format!` and `vec!` are *not* inert here even though they are for
-  [query budgets](query-budgets.md): `vec!` can carry a handle and `format!`
-  launders URLs. Only pure logging, assertion and template macros are inert.
+  that `format!` and `vec!` are *not* inert here even though they cost no
+  query in [query budgets](query-budgets.md): `vec!` can carry a handle and
+  `format!` launders URLs. Only pure logging, assertion and template macros are inert.
 - **A body-local `macro_rules!` naming a handle** — it is hygienic at its
   *definition* site, so it performs that handle's effects wherever it is
   invoked, and the invocation (`wipe!()`) mentions nothing to see.
