@@ -1,6 +1,6 @@
 # ADR 0004: Externalize Distributed Runtime State
 
-- Status: Proposed
+- Status: Accepted (2026-10-07; durable async state elaborated by ADR-0016)
 - Date: 2026-04-09
 - Deciders: Autumn maintainers
 - Tags: state, sessions, distributed-systems, runtime
@@ -146,4 +146,4 @@ copy-pasted folklore.
 - Add session backend config and Redis-backed session storage
 - Add production-safety warnings or guards for in-memory session usage
 - Document the boundary between local `#[scheduled]` work and durable Harvest
-  workloads
+  workloads (done: ADR-0016 and the jobs guide's "Pick the right tool" table)

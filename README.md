@@ -33,7 +33,7 @@ for that same "ship the app, not the plumbing" shape in Rust.
 
 ```bash
 # Install the published CLI
-cargo install autumn-cli --version 0.8.0
+cargo install autumn-cli --version 0.8.0 --locked
 
 # Local development only, from an Autumn checkout:
 # cargo install --path autumn-cli
@@ -178,8 +178,10 @@ instead of forming a circular release dependency.
 
 Use built-in `#[scheduled]` tasks and `#[job]` handlers for lightweight app-local
 background work. Reach for Harvest when the work needs workflow durability or a
-dedicated runner. See the [Harvest architecture notes](docs/autumn-workflow-architecture.md)
-for the model and roadmap.
+dedicated runner. See the [Harvest pointer page](docs/autumn-workflow-architecture.md)
+and the [Autumn Harvest repository](https://github.com/autumn-foundation/autumn-harvest)
+for the engine itself, and [ADR-0016](docs/adr/0016-durable-workflows-live-in-harvest.md)
+for why durable workflows stay out of Autumn core.
 
 ## Example
 
@@ -292,7 +294,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Wire Contracts](docs/guide/wire-contracts.md) — `#[endpoint]` turns a typed handler into a contract, `wire_client!` generates the caller's typed client from it, and `#[contract_checked]` fails the caller's build at the call site when a request or response field the caller actually reads or sets stops matching — including the two breaks the type checker cannot see, a new required field behind `..Default::default()` and a serde-skipped field (experimental)
 - [Sandboxed Plugins](docs/guide/sandboxed-plugins.md) — install an unaudited third-party plugin as a capability-sandboxed `wasm32-wasip1` artifact: one declared prefix, no filesystem/network/env/database, hard CPU and memory ceilings, and a trap that is a 5xx on its own prefix instead of a dead process (experimental)
 - [Todo Tutorial](docs/guide/tutorial/index.md)
-- [Autumn Harvest Architecture Notes](docs/autumn-workflow-architecture.md)
+- [Autumn Harvest](docs/autumn-workflow-architecture.md) — when to reach for the companion durable workflow engine, and where it lives
 - [API Reference](https://docs.rs/autumn-web)
 - [Pre-rendering Design Notes](docs/design/hybrid-rendering.md)
 - [Stability Policy](STABILITY.md) — SemVer, MSRV, and migration commitments

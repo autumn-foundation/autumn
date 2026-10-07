@@ -268,7 +268,9 @@ Use `#[scheduled]` for recurring work. Use `#[task]` for operator-invoked
 CLI work (`autumn task <name>`).
 
 For durable multi-step workflows or jobs that need activity retries, timers,
-or human approval steps, reach for Autumn Harvest.
+or human approval steps, reach for Autumn Harvest (`autumn-harvest-plugin`).
+Do not hand-roll step checkpoints or sagas on top of `#[job]`; see
+`docs/adr/0016-durable-workflows-live-in-harvest.md`.
 
 ## Security checklist
 
