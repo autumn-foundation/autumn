@@ -789,10 +789,10 @@ const READY_CONN_CHANNEL_CAPACITY: usize = 1024;
 pub struct TlsListener {
     /// Completed streams from the background handshake tasks.
     rx: tokio::sync::mpsc::Receiver<ReadyConn>,
-    /// The `server.http.max_connections` slots, when set. The acceptor takes
-    /// a slot before TCP accept, so a connection counts during its handshake
-    /// and while it waits in the queue (issue #3065).
-    cap: Arc<std::sync::OnceLock<Arc<tokio::sync::Semaphore>>>,
+    /// Starts the acceptor, with the `server.http.max_connections` slots
+    /// when set. Until then no TCP connection is accepted, so none can
+    /// escape a cap installed after `new` (issue #3065). `None` once sent.
+    start: Option<tokio::sync::oneshot::Sender<Option<Arc<tokio::sync::Semaphore>>>>,
     /// Where `accept` puts the slot of the stream it returns.
     handoff: Option<crate::http_server::SlotHandoff>,
     /// The bound address, captured before `tcp` moved into the acceptor task.
@@ -800,6 +800,8 @@ pub struct TlsListener {
     /// Shutdown signal; also used to park `accept` once the acceptor has ended
     /// (channel closed) so axum's own graceful-shutdown future drives teardown.
     shutdown: tokio_util::sync::CancellationToken,
+    #[cfg(test)]
+    handshakes: Arc<tokio::sync::Semaphore>,
 }
 
 impl TlsListener {
@@ -807,6 +809,9 @@ impl TlsListener {
     /// bounding each handshake by `handshake_timeout` (a stalled or silent
     /// client is dropped rather than starving other clients). `shutdown` ties
     /// the background acceptor task's lifetime to server shutdown.
+    ///
+    /// The acceptor starts at the first [`accept`](axum::serve::Listener::accept).
+    /// Until then clients wait in the kernel backlog.
     ///
     /// # Panics
     ///
@@ -825,44 +830,70 @@ impl TlsListener {
         let acceptor = tokio_rustls::TlsAcceptor::from(config);
         let (tx, rx) = tokio::sync::mpsc::channel(READY_CONN_CHANNEL_CAPACITY);
         let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
-        let cap = Arc::new(std::sync::OnceLock::new());
+        let (start, started) = tokio::sync::oneshot::channel();
         let acceptor_shutdown = shutdown.clone();
+        #[cfg(test)]
+        let handshakes = Arc::clone(&semaphore);
 
-        tokio::spawn(run_acceptor(
-            tcp,
-            acceptor,
-            handshake_timeout,
-            semaphore,
-            Arc::clone(&cap),
-            tx,
-            acceptor_shutdown,
-        ));
+        tokio::spawn(async move {
+            let cap = tokio::select! {
+                () = acceptor_shutdown.cancelled() => return,
+                cap = started => match cap {
+                    Ok(cap) => cap,
+                    // The listener was dropped before it accepted.
+                    Err(_) => return,
+                },
+            };
+            run_acceptor(
+                tcp,
+                acceptor,
+                handshake_timeout,
+                semaphore,
+                cap,
+                tx,
+                acceptor_shutdown,
+            )
+            .await;
+        });
 
         Self {
             rx,
-            cap,
+            start: Some(start),
             handoff: None,
             local_addr,
             shutdown,
+            #[cfg(test)]
+            handshakes,
         }
     }
 
-    /// Count at most `max` connections, from TCP accept to close. Returns
-    /// where `accept` puts the slot of each stream, for the serve loop.
-    pub(crate) fn limit_connections(&mut self, max: usize) -> crate::http_server::SlotHandoff {
-        let _ = self.cap.set(Arc::new(tokio::sync::Semaphore::new(max)));
+    /// Count at most `max` connections, from TCP accept to close, and start
+    /// the acceptor. Returns where `accept` puts the slot of each stream, for
+    /// the serve loop. `None` when the acceptor already started: the cap can
+    /// no longer cover every connection, so the serve loop keeps its own.
+    pub(crate) fn limit_connections(
+        &mut self,
+        max: usize,
+    ) -> Option<crate::http_server::SlotHandoff> {
+        let start = self.start.take()?;
+        let _ = start.send(Some(Arc::new(tokio::sync::Semaphore::new(max))));
         let handoff = crate::http_server::SlotHandoff::default();
         self.handoff = Some(Arc::clone(&handoff));
-        handoff
+        Some(handoff)
+    }
+
+    #[cfg(test)]
+    fn handshakes_in_flight(&self) -> usize {
+        MAX_CONCURRENT_HANDSHAKES - self.handshakes.available_permits()
     }
 }
 
 /// Take a connection slot, when the cap is set. `None` on shutdown.
 async fn take_slot(
-    cap: &std::sync::OnceLock<Arc<tokio::sync::Semaphore>>,
+    cap: Option<&Arc<tokio::sync::Semaphore>>,
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> Option<Option<crate::http_server::Slot>> {
-    let Some(slots) = cap.get() else {
+    let Some(slots) = cap else {
         return Some(None);
     };
     tokio::select! {
@@ -881,13 +912,13 @@ async fn run_acceptor(
     acceptor: tokio_rustls::TlsAcceptor,
     handshake_timeout: std::time::Duration,
     semaphore: Arc<tokio::sync::Semaphore>,
-    cap: Arc<std::sync::OnceLock<Arc<tokio::sync::Semaphore>>>,
+    cap: Option<Arc<tokio::sync::Semaphore>>,
     tx: tokio::sync::mpsc::Sender<ReadyConn>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     loop {
         // At the connection cap, wait for a free slot before TCP accept.
-        let Some(mut slot) = take_slot(&cap, &shutdown).await else {
+        let Some(slot) = take_slot(cap.as_ref(), &shutdown).await else {
             break;
         };
         let (stream, peer) = tokio::select! {
@@ -909,14 +940,6 @@ async fn run_acceptor(
                 }
             },
         };
-
-        // The cap can be set while `accept` waited.
-        if slot.is_none() && cap.get().is_some() {
-            let Some(late) = take_slot(&cap, &shutdown).await else {
-                break;
-            };
-            slot = late;
-        }
 
         // Acquire a permit BEFORE spawning so in-flight handshakes are bounded:
         // once `MAX_CONCURRENT_HANDSHAKES` are running, this parks (applying
@@ -979,6 +1002,10 @@ impl axum::serve::Listener for TlsListener {
     type Addr = std::net::SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        if let Some(start) = self.start.take() {
+            // No cap was installed: start the acceptor without one.
+            let _ = start.send(None);
+        }
         if let Some((tls, peer, slot)) = self.rx.recv().await {
             if let Some(handoff) = &self.handoff {
                 *handoff
@@ -1615,6 +1642,41 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
     // `hyper_util::server::conn::auto` already speaks h2 once the client
     // sends the preface. The fix advertises `h2` first, then `http/1.1`:
     // ALPN-less and http/1.1-only clients are unaffected.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_connection_is_accepted_before_the_cap_is_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = write_temp(dir.path(), "c.pem", CERT_PEM);
+        let key = write_temp(dir.path(), "k.pem", KEY_PEM);
+        let provider = crypto_provider();
+        let certified = load_certified_key(&cert, &key, &provider, now()).unwrap();
+        let config =
+            build_server_config(provider, Arc::new(ReloadableCertResolver::new(certified)))
+                .unwrap();
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut listener = TlsListener::new(
+            tcp,
+            config,
+            std::time::Duration::from_secs(30),
+            shutdown.clone(),
+        );
+        // Two silent clients wait in the kernel backlog before the serve arm
+        // installs the cap (for example during an upgrade's startup hooks).
+        let _first = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _second = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(listener.handshakes_in_flight(), 0, "nothing starts early");
+        assert!(listener.limit_connections(1).is_some());
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            listener.handshakes_in_flight(),
+            1,
+            "with max_connections = 1, the second client waits before its handshake"
+        );
+        shutdown.cancel();
+    }
+
     #[tokio::test]
     async fn the_connection_cap_applies_before_the_tls_handshake() {
         let dir = tempfile::tempdir().unwrap();
@@ -1628,8 +1690,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = tcp.local_addr().unwrap();
         let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
-        let cap = Arc::new(std::sync::OnceLock::new());
-        cap.set(Arc::new(tokio::sync::Semaphore::new(1))).unwrap();
+        let cap = Some(Arc::new(tokio::sync::Semaphore::new(1)));
         let (tx, _rx) = tokio::sync::mpsc::channel(READY_CONN_CHANNEL_CAPACITY);
         let shutdown = tokio_util::sync::CancellationToken::new();
         tokio::spawn(run_acceptor(
@@ -1637,7 +1698,7 @@ AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
             tokio_rustls::TlsAcceptor::from(config),
             std::time::Duration::from_secs(30),
             Arc::clone(&handshakes),
-            Arc::clone(&cap),
+            cap,
             tx,
             shutdown.clone(),
         ));

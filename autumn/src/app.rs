@@ -5604,7 +5604,7 @@ impl AppBuilder {
                 // accept, so a connection counts during its TLS handshake too.
                 let handoff = http_limits
                     .max_connections
-                    .map(|max| listener.limit_connections(max));
+                    .and_then(|max| listener.limit_connections(max));
                 // Applied inside the connect-info layer (which
                 // `into_make_service_with_connect_info` installs outermost), so
                 // this sees `ConnectInfo<TlsConnectInfo>` and everything below
