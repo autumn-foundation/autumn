@@ -403,6 +403,15 @@ scan_manifest() {
         dotted_package[name] = quoted_value(norm)
         alias_of[name] = dotted_package[name]
       }
+      # A rename spelled as loose dotted keys, at the root or under
+      # `[target]`: `dependencies.web.package = "autumn-web"`.
+      if ((section == "" || section ~ /^\[target(\.[^]]*)?\]$/) \
+          && norm ~ /(^|\.)(dependencies|dev-dependencies|build-dependencies)\.[A-Za-z0-9_-]+\.package[ \t]*=/) {
+        name = norm
+        sub(/\.package[ \t]*=.*$/, "", name)
+        sub(/.*\./, "", name)
+        alias_of[name] = quoted_value(norm)
+      }
       # The inline form, whose alias a FEATURE path then names:
       #   web = { package = "autumn-web", optional = true }
       #   embedded = ["dep:web", "web/sqlite"]
@@ -448,8 +457,13 @@ scan_manifest() {
       if (loose) {
         key = norm
         sub(/[ \t]*=.*$/, "", key)
-        if (key ~ /(^|\.)(dependencies|dev-dependencies|build-dependencies)(\.|$)/ && mentions_sqlite \
-            && (norm ~ ("(^|\\.)(" flip ")(\\.|[ \t]*=)") \
+        # The dependency name is the segment after `dependencies`.
+        dep = key
+        if (sub(/^(.*\.)?(dependencies|dev-dependencies|build-dependencies)\./, "", dep)) sub(/\..*$/, "", dep)
+        else dep = ""
+        if (dep != "" && mentions_sqlite \
+            && (dep ~ ("^(" flip ")$") \
+                || (dep in alias_of && alias_of[dep] ~ ("^(" flip ")$")) \
                 || norm ~ ("package[ \t]*=[ \t]*\"(" flip ")\""))) {
           report("dependency edge enables the `sqlite` backend flip")
           next
@@ -883,6 +897,25 @@ EOF
 "cfg(unix)".dependencies.autumn-web = { version = "0.7", features = ["sqlite"] }
 EOF
   check_fail "a target dependency spelled as a dotted key" target_dotted
+
+  make_case root_dotted_renamed <<'EOF'
+dependencies.web.package = "autumn-web"
+dependencies.web.features = ["sqlite"]
+
+[package]
+name = "consumer"
+EOF
+  check_fail "a renamed dependency spelled as root-level dotted keys" root_dotted_renamed
+
+  make_case root_dotted_unrelated <<'EOF'
+dependencies.diesel = { version = "2", features = ["sqlite"] }
+dependencies.store.package = "some-store"
+dependencies.store.features = ["sqlite"]
+
+[package]
+name = "consumer"
+EOF
+  check_pass "an unrelated crate spelled as a dotted key is not an edge" root_dotted_unrelated
 
   make_case root_features <<'EOF'
 features = { default = ["autumn-web/sqlite"] }
