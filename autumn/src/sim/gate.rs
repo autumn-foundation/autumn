@@ -365,7 +365,7 @@ mod tests {
             let seen = Arc::clone(&order);
             rt.block_on(async move {
                 let log = Arc::clone(&seen);
-                let blocking = tokio::task::spawn_blocking(move || {
+                let blocking = crate::time::spawn_blocking(move || {
                     let _gate = Scope::enter();
                     log.lock().unwrap().push("blocking");
                 });
@@ -395,7 +395,7 @@ mod tests {
             let mut handles = Vec::new();
             for _ in 0..4 {
                 let done = Arc::clone(&done);
-                handles.push(tokio::task::spawn_blocking(move || {
+                handles.push(crate::time::spawn_blocking(move || {
                     let _outer = Scope::enter();
                     let _inner = Scope::enter();
                     done.fetch_add(1, Ordering::SeqCst);
@@ -416,7 +416,7 @@ mod tests {
         let rt = runtime().unwrap();
         // No sim: the blocking work runs at once, even while local work spins.
         rt.block_on(async {
-            let handle = tokio::task::spawn_blocking(|| {
+            let handle = crate::time::spawn_blocking(|| {
                 let _gate = Scope::enter();
             });
             while !handle.is_finished() {
@@ -427,7 +427,7 @@ mod tests {
         seat.take();
         rt.block_on(async {
             let _open = super::Open::new();
-            let handle = tokio::task::spawn_blocking(|| {
+            let handle = crate::time::spawn_blocking(|| {
                 let _gate = Scope::enter();
             });
             while !handle.is_finished() {

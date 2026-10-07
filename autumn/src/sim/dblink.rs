@@ -358,8 +358,8 @@ async fn open(url: String, link: Option<DbLink>) -> diesel::ConnectionResult<Run
     use diesel::connection::SimpleConnection as _;
 
     let link = std::panic::AssertUnwindSafe(link);
-    let conn = tokio::task::spawn_blocking(move || {
-        let _gate = super::gate::Scope::enter();
+    // The helper runs the closure in a turn of the gate.
+    let conn = crate::time::spawn_blocking(move || {
         let link = link;
         if let Some(link) = link.as_ref()
             && link.is_session_lost()
