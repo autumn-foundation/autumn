@@ -38,6 +38,12 @@
 #      backend (`sqlite = ["autumn-web/sqlite", …]`), selected the same explicit
 #      way autumn-web's is; the same line in any other crate is an edge.
 #   3. No `default` feature list enables `sqlite`, bare or forwarded.
+#   4. Rules 2 and 3 follow chains of local features: `default = ["embedded"]`
+#      with `embedded = ["sqlite"]` is the same flip. The report shows the
+#      chain (issue #2571).
+#
+# The lexer folds TOML multi-line strings, so a bracket or quote in one does
+# not move the scan out of step (issue #2571).
 #
 # It is a manifest gate, not a build: no toolchain, ~1 second, self-testing.
 #
@@ -82,6 +88,7 @@ scan_manifest() {
     BEGIN {
       SQ = sprintf("%c", 39)   # a literal single quote, unwritable inline here
       pkg = ""
+      ml = ""
       defines_flip_sqlite = 0
     }
 
@@ -145,6 +152,55 @@ scan_manifest() {
       return key tail
     }
 
+    # TOML multi-line strings (three double or three single quotes) can span
+    # lines and hold any bracket or quote. Fold each one to an empty string ""
+    # so the per-line helpers above never see its content. `ml` holds the
+    # open delimiter across lines; "" when none is open.
+    function fold_multiline(s,   i, c, q, out, d, j) {
+      out = ""; q = ""; i = 1
+      if (ml != "") {
+        j = ml_close(s, 1)
+        if (j == 0) return ""
+        out = "\"\""
+        ml = ""
+        i = j
+      }
+      for (; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (q == "\"" && c == "\\") { out = out c substr(s, i + 1, 1); i++; continue }
+        if (q != "") { if (c == q) q = ""; out = out c; continue }
+        if (c == "#") { out = out substr(s, i); break }
+        d = substr(s, i, 3)
+        if (d == "\"\"\"" || d == SQ SQ SQ) {
+          ml = d
+          j = ml_close(s, i + 3)
+          out = out "\"\""
+          if (j == 0) return out
+          ml = ""
+          i = j - 1
+          continue
+        }
+        if (c == "\"" || c == SQ) q = c
+        out = out c
+      }
+      return out
+    }
+    # Index just past the delimiter that closes `ml`, from `start`; 0 when
+    # this line does not close it. A run of up to five quotes closes with its
+    # last three: the first one or two are content.
+    function ml_close(s, start,   i, r, qc) {
+      qc = substr(ml, 1, 1)
+      for (i = start; i <= length(s); i++) {
+        if (qc == "\"" && substr(s, i, 1) == "\\") { i++; continue }
+        if (substr(s, i, 3) == ml) {
+          r = 3
+          while (r < 5 && substr(s, i + r, 1) == qc) r++
+          return i + r
+        }
+      }
+      return 0
+    }
+
     # ── Entry assembly ───────────────────────────────────────────────────
     #
     # Joins a logical entry that spans lines — a `features` array written one
@@ -152,6 +208,7 @@ scan_manifest() {
     # miss it entirely. Returns "" while an entry is still open.
     function feed(line,   entry) {
       sub(/\r$/, "", line)              # a CRLF checkout must not blind the gate
+      line = fold_multiline(line)
       line = strip_comment(line)
       if (pending != "") {
         pending = pending " " line
@@ -216,6 +273,32 @@ scan_manifest() {
       return value
     }
 
+    # Find each local feature that enables the flip, directly or through a
+    # chain of other local features (`default = ["embedded"]`,
+    # `embedded = ["sqlite"]`). `via[f]` is the next hop; "" for a direct one.
+    function resolve_reach(   k, n, p, parts, changed) {
+      for (k in feat_entry)
+        if (forwards_flip(feat_entry[k])) { reach[k] = 1; via[k] = "" }
+      if (defines_flip_sqlite && !("sqlite" in reach)) { reach["sqlite"] = 1; via["sqlite"] = "" }
+      changed = 1
+      while (changed) {
+        changed = 0
+        for (k in feat_refs) {
+          if (k in reach) continue
+          n = split(feat_refs[k], parts, " ")
+          for (p = 1; p <= n; p++) {
+            if (parts[p] in reach) { reach[k] = 1; via[k] = parts[p]; changed = 1; break }
+          }
+        }
+      }
+    }
+    # The hops from feature `k` to the flip, for the report.
+    function chain(k,   s) {
+      s = k
+      while (via[k] != "") { k = via[k]; s = s " -> " k }
+      return s
+    }
+
     # ── Pass 1: whose manifest is this, and what does it define? ─────────
     NR == FNR {
       entry = feed($0)
@@ -226,8 +309,21 @@ scan_manifest() {
         sub(/^name[ \t]*=[ \t]*"/, "", pkg)
         sub(/".*$/, "", pkg)
       }
-      if (section == "[features]" && norm ~ /^sqlite[ \t]*=/ && forwards_flip(norm))
-        defines_flip_sqlite = 1
+      # Record each feature and the LOCAL features it enables. Pass 2 resolves
+      # the chains, after every alias is known.
+      if (section == "[features]" && norm ~ /^[A-Za-z0-9_.+-]+[ \t]*=/) {
+        fkey = norm
+        sub(/[ \t]*=.*$/, "", fkey)
+        feat_entry[fkey] = norm
+        refs = norm
+        sub(/^[^=]*=/, "", refs)
+        feat_refs[fkey] = ""
+        while (match(refs, /"[^"]*"/)) {
+          ref = substr(refs, RSTART + 1, RLENGTH - 2)
+          refs = substr(refs, RSTART + RLENGTH)
+          if (ref !~ /[\/:]/) feat_refs[fkey] = feat_refs[fkey] " " ref
+        }
+      }
 
       # A RENAMED dependency names its real crate in a `package` key that can
       # sit anywhere in the entry, so the rules cannot see it one line at a
@@ -264,10 +360,13 @@ scan_manifest() {
 
     # ── Pass 2: the rules ────────────────────────────────────────────────
     FNR == 1 {
-      pending = ""; section = ""
+      pending = ""; section = ""; ml = ""
+      if ("sqlite" in feat_entry && forwards_flip(feat_entry["sqlite"]))
+        defines_flip_sqlite = 1
       # autumn-web owns the flip, so a bare "sqlite" in ITS default list is the
       # flip itself, with nothing to forward to.
       if (pkg ~ ("^(" flip ")$")) defines_flip_sqlite = 1
+      resolve_reach()
     }
     {
       entry = feed($0)
@@ -308,10 +407,12 @@ scan_manifest() {
       if (section == "[features]") {
         key = norm
         sub(/[ \t]*=.*$/, "", key)
-        if (key == "default" && (forwards || (mentions_sqlite && defines_flip_sqlite))) {
-          report("`default` enables the `sqlite` backend flip")
+        if (key == "default" && (key in reach)) {
+          report("`default` enables the `sqlite` backend flip (" chain(key) ")")
         } else if (forwards && key != "sqlite") {
           report("feature `" key "` forwards the `sqlite` backend flip")
+        } else if ((key in reach) && key != "sqlite") {
+          report("feature `" key "` reaches the `sqlite` backend flip (" chain(key) ")")
         } else if (forwards && !(pkg ~ ("^(" flip ")$"))) {
           # A same-named `sqlite` feature is the sanctioned opt-in ONLY in the
           # two crates that own the flip. Anywhere else it is an edge wearing
@@ -587,6 +688,80 @@ description = "contains \" and [ bracket"
 autumn-web = { version = "0.7", features = ["sqlite"] }
 EOF
   check_fail "an escaped quote does not desync the scan" escaped
+
+  # A TOML multi-line string can hold an unmatched bracket. The lexer must
+  # carry string state across lines, or the edge below is swallowed (#2571).
+  make_case multiline_basic <<'EOF'
+[package]
+name = "consumer"
+description = """
+an unmatched [ bracket
+"""
+
+[dependencies]
+autumn-web = { version = "0.7", features = ["sqlite"] }
+EOF
+  check_fail "a multi-line basic string does not desync the scan" multiline_basic
+
+  make_case multiline_literal <<'EOF'
+[package]
+name = "consumer"
+description = '''
+an unmatched { brace and a "quote
+'''
+
+[dependencies]
+autumn-web = { version = "0.7", features = ["sqlite"] }
+EOF
+  check_fail "a multi-line literal string does not desync the scan" multiline_literal
+
+  # A multi-line string that LOOKS like an edge is text, not an edge.
+  make_case multiline_text <<'EOF'
+[package]
+name = "consumer"
+description = """
+[dependencies]
+autumn-web = { version = "0.7", features = ["sqlite"] }
+"""
+
+[dependencies]
+autumn-web = { version = "0.7", features = ["db"] }
+EOF
+  check_pass "an edge spelled inside a multi-line string is not an edge" multiline_text
+
+  # A chain of local features reaches the flip in two hops (#2571).
+  make_case default_chain <<'EOF'
+[package]
+name = "autumn-cli"
+
+[features]
+default = ["embedded"]
+embedded = ["sqlite"]
+sqlite = ["autumn-web/sqlite"]
+EOF
+  check_fail "default reaching the flip through a local feature chain" default_chain
+
+  make_case feature_chain <<'EOF'
+[package]
+name = "autumn-cli"
+
+[features]
+everything = ["embedded", "tls"]
+embedded = ["sqlite"]
+sqlite = ["autumn-web/sqlite"]
+EOF
+  check_fail "a feature reaching the flip through a local feature chain" feature_chain
+
+  make_case chain_unrelated <<'EOF'
+[package]
+name = "some-store"
+
+[features]
+default = ["embedded"]
+embedded = ["sqlite"]
+sqlite = ["rusqlite"]
+EOF
+  check_pass "a chain to an unrelated sqlite feature is not the flip" chain_unrelated
 
   make_case same_name_elsewhere <<'EOF'
 [package]
