@@ -52,6 +52,22 @@ async fn split_writer() -> impl WsHandler {
     }
 }
 
+/// A `split()` handler whose writer closes the socket and keeps its sink,
+/// while the reader stays parked (the client never sends).
+#[ws("/sink-close")]
+async fn sink_close() -> impl WsHandler {
+    |socket: WebSocket| async move {
+        let (mut sink, mut stream) = socket.split();
+        tokio::spawn(async move {
+            let _ = sink.close().await;
+            let _sink = sink;
+            std::future::pending::<()>().await;
+        });
+        while let Some(Ok(_)) = stream.next().await {}
+        std::future::pending::<()>().await;
+    }
+}
+
 /// A handler on the axum socket. It keeps the hold for the socket's life.
 #[get("/raw")]
 async fn raw(ws: autumn_web::ws::WebSocketUpgrade) -> axum::response::Response {
@@ -67,7 +83,7 @@ async fn serve_with(configure: impl FnOnce(&mut AutumnConfig)) -> SocketAddr {
     configure(&mut config);
     let router = TestApp::new()
         .config(config)
-        .routes(routes![limited, raw, split_writer])
+        .routes(routes![limited, raw, split_writer, sink_close])
         .build()
         .into_router();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -354,5 +370,32 @@ async fn pings_between_fragments_keep_the_socket_open() {
             Some(Ok(TMessage::Pong(_))) => {}
             other => panic!("unexpected frame: {other:?}"),
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sink_side_close_releases_the_socket() {
+    let addr = serve_with(|c| c.realtime.max_connections = Some(1)).await;
+    let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/sink-close"))
+        .await
+        .expect("first socket");
+    let close = tokio::time::timeout(Duration::from_secs(5), client.next())
+        .await
+        .expect("close frame in time");
+    assert!(matches!(close, Some(Ok(TMessage::Close(_)))), "{close:?}");
+    // The handler keeps both halves, but the closed socket frees its slot.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if tokio_tungstenite::connect_async(format!("ws://{addr}/sink-close"))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the closed socket still holds the slot"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }

@@ -652,14 +652,15 @@ With a limit set:
   `{"replica": {"ready": false, "lag_ms": 30000, "max_lag_ms": 5000, "detail": "..."}}`.
 
 The lag query returns `0` when the WAL receiver runs, it got a message from
-the primary in the last 60 s, and all received WAL is replayed. If not, it returns the time since the last replayed transaction.
+the primary within the lag limit, and all received WAL is replayed. If not,
+it returns the time since the last replayed transaction.
 This is a simplified form of the query:
 
 ```sql
 SELECT CASE
   WHEN NOT pg_is_in_recovery() THEN 0
   WHEN EXISTS (SELECT 1 FROM pg_stat_wal_receiver
-               WHERE last_msg_receipt_time > clock_timestamp() - INTERVAL '60 seconds')
+               WHERE last_msg_receipt_time > clock_timestamp() - <replica_max_lag_ms>)
        AND pg_last_wal_replay_lsn() >= pg_last_wal_receive_lsn() THEN 0
   ELSE clock_timestamp() - pg_last_xact_replay_timestamp()  -- in ms
 END
@@ -669,6 +670,12 @@ Know these limits of the query:
 
 - After a long quiet period on the primary, the first new WAL can show a
   large lag for one check. Reads then use the primary for one interval.
+- On a quiet link, the replica hears from the primary about every half
+  `wal_receiver_timeout` (a replica setting, 60 s by default). When
+  `replica_max_lag_ms` is shorter than that interval, a quiet replica reads as
+  stale between messages, and reads use the primary. To use a short limit on
+  a quiet database, set `wal_receiver_timeout` on the replica to at most
+  twice the limit.
 - A replica that restores WAL from an archive (no WAL receiver) shows the
   time since its last replayed transaction.
 - Clock skew between the primary and the replica adds to the value.

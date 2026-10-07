@@ -665,7 +665,7 @@ async fn refresh_replica_readiness<S: ProvideProbeState + Sync>(state: &S) {
                         state.probes(),
                         conn,
                         replica_lag_query_budget(max_lag),
-                        |conn| Box::pin(crate::db::measure_replica_lag(conn)),
+                        |conn| Box::pin(crate::db::measure_replica_lag(conn, max_lag)),
                     )
                     .await;
                 }

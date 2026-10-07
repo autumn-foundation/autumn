@@ -456,6 +456,9 @@ pub struct WebSocket {
     /// one inside tungstenite. So after each such send, the read side wakes
     /// it. Without this, a `split()` writer task can wait forever.
     writer_waker: Option<std::task::Waker>,
+    /// The waker of a parked `poll_next`. A sink-side close ends the socket,
+    /// and the reader must then see the end.
+    reader_waker: Option<std::task::Waker>,
     /// Released when the socket drops.
     hold: ConnectionHold,
 }
@@ -499,6 +502,7 @@ impl WebSocket {
             closing: None,
             done: false,
             writer_waker: None,
+            reader_waker: None,
             hold,
         }
     }
@@ -574,6 +578,9 @@ impl WebSocket {
             _tunnel: None,
         };
         self.wake_writer();
+        if let Some(waker) = self.reader_waker.take() {
+            waker.wake();
+        }
     }
 
     fn start_close(&mut self, frame: Option<Message>, then: AfterClose) {
@@ -731,6 +738,7 @@ impl futures::Stream for WebSocket {
                 let _ = sleep.as_mut().poll(cx);
             }
             this.poll_ping(cx);
+            this.reader_waker = Some(cx.waker().clone());
             return Poll::Pending;
         }
     }
@@ -765,6 +773,11 @@ impl futures::Sink<Message> for WebSocket {
             Some(socket) => Pin::new(socket).poll_close(cx),
             None => return Poll::Ready(Ok(())),
         };
+        if poll.is_ready() {
+            // The close frame is sent (or the send failed): the socket is
+            // done. Release it, also while a `split()` half lives on.
+            self.finish();
+        }
         self.note_writer(cx, poll)
     }
 }

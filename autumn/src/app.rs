@@ -10760,7 +10760,7 @@ fn spawn_replica_lag_monitor(
             match replica.get().await {
                 Ok(conn) => {
                     crate::probe::refresh_replica_lag_bounded(&probes, conn, budget, |conn| {
-                        Box::pin(crate::db::measure_replica_lag(conn))
+                        Box::pin(crate::db::measure_replica_lag(conn, max_lag))
                     })
                     .await;
                 }

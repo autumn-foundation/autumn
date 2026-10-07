@@ -2718,11 +2718,13 @@ pub(crate) async fn probe_connection_alive(
 /// Replica lag query (issue #3065).
 ///
 /// - Not in recovery (a primary, or a plain database): lag is `0`.
-/// - The WAL receiver runs, it got a message from the primary in the last
-///   60 s (`wal_sender_timeout`), and all received WAL is replayed: lag is
-///   `0`. An idle primary writes no new transactions, so the replay timestamp
-///   alone would grow without limit. A disconnected or stalled receiver keeps
-///   its last receive LSN, so the LSN check alone would read as fresh. A role
+/// - The WAL receiver runs, it got a message from the primary within the lag
+///   limit (`$1`, in ms), and all received WAL is replayed: lag is `0`. An
+///   idle primary writes no new transactions, so the replay timestamp alone
+///   would grow without limit. A disconnected or stalled receiver keeps its
+///   last receive LSN, so the LSN check alone would read as fresh. A message
+///   older than the limit proves nothing within the limit, so then the branch
+///   below applies. A role
 ///   without `pg_read_all_stats` sees `last_msg_receipt_time` as `NULL`. That
 ///   is not proof of freshness, so the branch below applies.
 /// - Else: time since the last replayed transaction. `NULL` when nothing has
@@ -2732,7 +2734,7 @@ pub(crate) async fn probe_connection_alive(
 const REPLICA_LAG_SQL: &str = "SELECT CASE \
      WHEN NOT pg_is_in_recovery() THEN 0::BIGINT \
      WHEN EXISTS (SELECT 1 FROM pg_stat_wal_receiver \
-          WHERE last_msg_receipt_time > clock_timestamp() - INTERVAL '60 seconds') \
+          WHERE last_msg_receipt_time > clock_timestamp() - make_interval(secs => $1::DOUBLE PRECISION / 1000)) \
           AND pg_last_wal_receive_lsn() IS NOT NULL \
           AND pg_last_wal_replay_lsn() >= pg_last_wal_receive_lsn() THEN 0::BIGINT \
      WHEN pg_last_xact_replay_timestamp() IS NULL THEN NULL \
@@ -2740,10 +2742,12 @@ const REPLICA_LAG_SQL: &str = "SELECT CASE \
           (clock_timestamp() - pg_last_xact_replay_timestamp())) * 1000))::BIGINT \
      END AS lag_ms";
 
-/// Measure the replica lag on `conn`. See [`REPLICA_LAG_SQL`].
+/// Measure the replica lag on `conn`, for the lag limit `max_lag`. See
+/// [`REPLICA_LAG_SQL`].
 #[cfg(not(feature = "sqlite"))]
 pub(crate) async fn measure_replica_lag(
     conn: &mut PooledConnection,
+    max_lag: std::time::Duration,
 ) -> Result<std::time::Duration, String> {
     use diesel_async::RunQueryDsl as _;
 
@@ -2753,7 +2757,9 @@ pub(crate) async fn measure_replica_lag(
         lag_ms: Option<i64>,
     }
 
+    let window_ms = i64::try_from(max_lag.as_millis()).unwrap_or(i64::MAX);
     let row: LagRow = diesel::sql_query(REPLICA_LAG_SQL)
+        .bind::<diesel::sql_types::BigInt, _>(window_ms)
         .get_result(&mut **conn)
         .await
         .map_err(|error| error.to_string())?;
@@ -2767,6 +2773,19 @@ pub(crate) async fn measure_replica_lag(
 
 #[cfg(all(test, not(feature = "sqlite")))]
 mod replica_lag_sql_tests {
+    #[test]
+    fn the_receiver_window_is_the_lag_limit() {
+        let sql = super::REPLICA_LAG_SQL;
+        assert!(
+            !sql.contains("60 seconds"),
+            "a fixed window lets a stalled receiver read as fresh past the limit"
+        );
+        assert!(
+            sql.contains("last_msg_receipt_time > clock_timestamp() - make_interval(secs => $1"),
+            "the receiver must have heard from the primary within the lag limit: {sql}"
+        );
+    }
+
     #[test]
     fn unknown_replay_time_stays_null() {
         let sql = super::REPLICA_LAG_SQL;
@@ -2789,6 +2808,7 @@ mod replica_lag_sql_tests {
 )]
 pub(crate) async fn measure_replica_lag(
     _conn: &mut PooledConnection,
+    _max_lag: std::time::Duration,
 ) -> Result<std::time::Duration, String> {
     Ok(std::time::Duration::ZERO)
 }
