@@ -989,7 +989,11 @@ How it works:
    passes with a warning.
 
 The latency check uses the app's current p50, p95 or p99. The app computes
-them over its last 10,000 requests, not over the bake window only.
+them over its last 10,000 requests, not over the bake window only. These
+quantiles count every response: also 5xx, unmatched paths and the bake's own
+requests. So a limit from an SLO only approximates that SLO, and
+`autumn deploy up` says so. The Prometheus burn-rate alerts measure the SLO
+itself.
 
 When you do not set the limits, they come from your
 [SLOs](slo.md#bake-and-roll-back). The 5xx limit is the 14.4× burn rate of the

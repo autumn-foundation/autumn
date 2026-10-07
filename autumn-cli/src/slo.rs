@@ -237,6 +237,7 @@ fn fnv1a(text: &str) -> u64 {
 }
 
 /// Undo the `\"` and `\\` escapes of a matcher value, for a YAML label.
+/// `parse_selector` rejects every other escape.
 fn unescape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut chars = value.chars();
@@ -317,7 +318,10 @@ fn parse_selector(raw: &str) -> Result<Vec<Matcher>, String> {
         loop {
             match chars.get(i) {
                 None | Some('\n' | '\r') => return fail("a value has no closing quote"),
-                Some('\\') => i += 2,
+                // PromQL decodes Go escapes (`\n`, `\x41`, ...). Keep only the two
+                // that the YAML label can copy as one character.
+                Some('\\') if matches!(chars.get(i + 1), Some('"' | '\\')) => i += 2,
+                Some('\\') => return fail("a value may escape only \\\" and \\\\"),
                 Some('"') => break,
                 Some(_) => i += 1,
             }

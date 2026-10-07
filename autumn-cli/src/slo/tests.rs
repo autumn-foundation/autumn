@@ -412,6 +412,13 @@ fn a_bad_selector_is_rejected() {
         "slo_scope=\"x\"",
         "job=\"a\",job=\"b\"",
         "job=\"a\u{2028}b\"",
+        // PromQL decodes these (Go escapes); the YAML label would not match.
+        r#"team="a\nb""#,
+        r#"team="a\tb""#,
+        r#"team="a\x41""#,
+        r#"team="a\u0041""#,
+        r#"path=~"a\.b""#,
+        r#"team="a\""#,
     ] {
         let mut options = fixture_options();
         options.selector = Some(bad.to_owned());
@@ -434,6 +441,14 @@ fn the_selector_is_parsed_and_normalized() {
         ]
     );
     assert_eq!(parse_selector("").expect("empty"), Vec::new());
+}
+
+#[test]
+fn only_quote_and_backslash_escapes_are_kept_and_decoded() {
+    let parsed = parse_selector(r#"team="a\"b\\c",path=~"x\\.y""#).expect("valid");
+    assert_eq!(parsed[0].value, r#"a\"b\\c"#);
+    assert_eq!(unescape(&parsed[0].value), r#"a"b\c"#);
+    assert_eq!(parsed[1].render(), r#"path=~"x\\.y""#);
 }
 
 #[test]

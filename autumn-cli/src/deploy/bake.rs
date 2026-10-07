@@ -537,6 +537,9 @@ pub(crate) fn resolve_policy(
         for (_, name) in &gates {
             sources.push(format!("SLO {name}"));
         }
+        if !gates.is_empty() {
+            warnings.push(APP_WIDE_LATENCY.to_owned());
+        }
         gates.into_iter().map(|(g, _)| g).collect()
     };
 
@@ -550,6 +553,12 @@ pub(crate) fn resolve_policy(
         warnings,
     }))
 }
+
+/// The note for a latency gate that comes from an SLO.
+pub(crate) const APP_WIDE_LATENCY: &str = "The latency gates read the app-wide quantiles of \
+     /actuator/metrics. They count every response, also 5xx, unmatched paths and the bake's own \
+     requests, so they only approximate the SLO. The Prometheus burn-rate alerts measure the SLO \
+     itself.";
 
 /// The quantile that gates a latency SLO with `budget_ppm`.
 ///
@@ -1278,8 +1287,32 @@ mod tests {
         );
         assert!(p.source.contains("SLO fast, SLO slow"), "{}", p.source);
         // 99.95 % allows 0.72 % slow requests at 14.4x: below what p99 sees.
-        assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
+        assert_eq!(p.warnings.len(), 2, "{:?}", p.warnings);
         assert!(p.warnings[0].starts_with("SLO slower:"), "{:?}", p.warnings);
+        assert_eq!(p.warnings[1], APP_WIDE_LATENCY);
+    }
+
+    #[test]
+    fn an_slo_latency_gate_says_it_reads_the_app_wide_quantile() {
+        let p = resolve_policy(
+            &on(60),
+            &[slo("l", 99.0, SliKind::Latency, None, Some(250))],
+            None,
+        )
+        .expect("ok")
+        .expect("on");
+        assert_eq!(p.warnings, vec![APP_WIDE_LATENCY.to_owned()]);
+        // An operator limit is not an SLO, so it needs no such note.
+        let mut config = on(60);
+        config.max_p99_ms = Some(250);
+        let p = resolve_policy(
+            &config,
+            &[slo("l", 99.0, SliKind::Latency, None, Some(250))],
+            None,
+        )
+        .expect("ok")
+        .expect("on");
+        assert!(p.warnings.is_empty(), "{:?}", p.warnings);
     }
 
     #[test]
@@ -1300,7 +1333,7 @@ mod tests {
             .expect("ok")
             .expect("on");
             assert_eq!(p.latency[0].quantile, quantile, "{objective}");
-            assert!(p.warnings.is_empty(), "{objective}: {:?}", p.warnings);
+            assert_eq!(p.warnings, vec![APP_WIDE_LATENCY], "{objective}");
         }
         // 99.99 %: 0.144 % slow at 14.4x, which p99 cannot see.
         let p = resolve_policy(

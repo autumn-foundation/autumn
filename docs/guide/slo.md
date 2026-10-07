@@ -119,8 +119,9 @@ never read or write each other's series. Each `=` matcher in `--selector` also
 becomes a plain label, so you can route alerts on it. The dashboard UID and
 title include the selector too.
 
-`--selector` values hold printable ASCII only. The generator rejects the label
-names it sets itself, such as `slo`, `severity` and `slo_scope`.
+`--selector` values hold printable ASCII only, and may escape only `\"` and
+`\\`. The generator rejects the label names it sets itself, such as `slo`,
+`severity` and `slo_scope`.
 
 ---
 
