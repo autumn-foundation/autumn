@@ -313,7 +313,7 @@ fn filter_query(query: &str, allowed: &[&str], enumerable: bool) -> String {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         if !allowed.iter().any(|a| key.trim().eq_ignore_ascii_case(a)) {
             dropped = true;
-        } else if is_simple_token(value) || (is_host_key(key) && is_host_token(value)) {
+        } else if is_safe_value(key, value) {
             kept.push(pair.to_owned());
         } else {
             kept.push(format!("{key}=****"));
@@ -325,22 +325,33 @@ fn filter_query(query: &str, allowed: &[&str], enumerable: bool) -> String {
     kept.join("&")
 }
 
-fn is_host_key(key: &str) -> bool {
+/// Whether an allowlisted query value is safe to echo. `hostaddr` takes only
+/// numeric addresses, so each of its items must parse as one. `host` may also
+/// hold an address. Any other key needs a simple token.
+fn is_safe_value(key: &str, value: &str) -> bool {
     let key = key.trim();
-    key.eq_ignore_ascii_case("host") || key.eq_ignore_ascii_case("hostaddr")
+    if key.eq_ignore_ascii_case("hostaddr") {
+        return value.split(',').all(|item| parse_ip(item).is_some());
+    }
+    is_simple_token(value) || (key.eq_ignore_ascii_case("host") && is_host_token(value))
+}
+
+/// Parse one address, with or without IPv6 brackets.
+fn parse_ip(item: &str) -> Option<std::net::IpAddr> {
+    item.strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(item)
+        .parse()
+        .ok()
 }
 
 /// A host value may also hold IP addresses (`::1`, `[::1]`, `10.0.0.1`). Each
 /// comma-separated item must then parse as one, so `token:hunter2` does not
 /// pass.
 fn is_host_token(value: &str) -> bool {
-    value.split(',').all(|item| {
-        let item = item
-            .strip_prefix('[')
-            .and_then(|rest| rest.strip_suffix(']'))
-            .unwrap_or(item);
-        item.parse::<std::net::IpAddr>().is_ok() || is_simple_token(item)
-    })
+    value
+        .split(',')
+        .all(|item| parse_ip(item).is_some() || is_simple_token(item))
 }
 
 /// Whether a query value is a simple token that is safe to echo.
@@ -867,6 +878,15 @@ mod tests {
         assert_eq!(
             redact_target("postgres://db/app?host=[::1],10.0.0.1"),
             "postgres://db/app?host=[::1],10.0.0.1"
+        );
+        // `hostaddr` takes only numeric addresses, so each item must be one.
+        assert_eq!(
+            redact_target("postgres://db/app?hostaddr=hunter2"),
+            "postgres://db/app?hostaddr=****"
+        );
+        assert_eq!(
+            redact_target("postgres://db/app?hostaddr=10.0.0.1,::1"),
+            "postgres://db/app?hostaddr=10.0.0.1,::1"
         );
     }
 

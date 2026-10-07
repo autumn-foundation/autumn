@@ -44,7 +44,10 @@
 #      `[features]`, root `features.default = [...]` keys, and a root inline
 #      `features = { ... }` table.
 #   5. A dependency spelled as a dotted key at the root or under `[target]`
-#      (`dependencies.autumn-web = { … }`) is an edge too.
+#      (`dependencies.autumn-web = { … }`) is an edge too. There, an inline
+#      table is flattened into dotted keys at any depth, so
+#      `dependencies = { autumn-web = { … } }` and `target = { … }` read the
+#      same way.
 #   6. The lexer decodes ASCII unicode escapes, so `"\u0073qlite"` reads as
 #      "sqlite". A non-ASCII escape in a dependency or feature entry or
 #      header fails closed: the rules cannot read it.
@@ -498,6 +501,42 @@ scan_manifest() {
       }
       return ""
     }
+    # Whether the current section is the root or a [target] table, where an
+    # inline table is just another spelling of dotted keys.
+    function in_loose_section() {
+      return (section == "" || section ~ /^\[target(\.[^]]*)?\]$/)
+    }
+    # Entry `e` as a list of entries in q[1..n]. In a loose section, an
+    # inline-table value is flattened into dotted keys at any depth, so
+    # `dependencies = { autumn-web = { features = [...] } }` reads as
+    # `dependencies.autumn-web.features = [...]` and the dotted-key rules
+    # apply. Anything else is the one entry `e`.
+    function expand(e, q,   i, v) {
+      split("", q)
+      i = assign_index(e)
+      if (i == 0 || !in_loose_section()) { q[1] = e; return 1 }
+      v = substr(e, i + 1)
+      gsub(/^[ \t]+|[ \t]+$/, "", v)
+      if (v !~ /^\{.*\}$/) { q[1] = e; return 1 }
+      return flatten(e, q, 0)
+    }
+    # Append the dotted entries of inline-table entry `e` to q, after n.
+    function flatten(e, q, n,   i, prefix, m, k, fields, j, kk, v) {
+      i = assign_index(e)
+      prefix = substr(e, 1, i - 1)
+      gsub(/[ \t]+$/, "", prefix)
+      m = inline_fields(e, fields)
+      for (k = 1; k <= m; k++) {
+        j = assign_index(fields[k])
+        kk = substr(fields[k], 1, j - 1)
+        gsub(/[ \t]+$/, "", kk)
+        v = substr(fields[k], j + 1)
+        gsub(/^[ \t]+|[ \t]+$/, "", v)
+        if (v ~ /^\{.*\}$/) n = flatten(prefix "." kk " = " v, q, n)
+        else q[++n] = prefix "." kk " = " v
+      }
+      return n
+    }
     # The feature entries (`name = [...]`) that entry `e` defines, in
     # out[1..n]. The table has three spellings: a `[features]` table, root
     # dotted keys (`features.default = [...]`), and a root inline table
@@ -551,6 +590,9 @@ scan_manifest() {
     NR == FNR {
       entry = feed($0)
       if (entry == "") next
+      nq = expand(entry, q)
+      for (qi = 1; qi <= nq; qi++) {
+      entry = q[qi]
       norm = normalize_quotes(entry)
       if ((section == "[package]" && norm ~ /^name[ \t]*=/) \
           || (section == "" && norm ~ /^package\.name[ \t]*=/)) {
@@ -609,6 +651,7 @@ scan_manifest() {
         sub(/".*$/, "", value)
         alias_of[name] = value
       }
+      }
       next
     }
 
@@ -629,82 +672,86 @@ scan_manifest() {
         report("a unicode escape in a table header cannot be checked; write it plainly")
         next
       }
-      norm = normalize_quotes(entry)
-      mentions_sqlite = features_name_sqlite(entry)
-      forwards = forwards_flip(norm)
-      loose = (section == "" || section ~ /^\[target(\.[^]]*)?\]$/)
+      nq = expand(entry, q)
+      for (qi = 1; qi <= nq; qi++) {
+        entry = q[qi]
+        norm = normalize_quotes(entry)
+        mentions_sqlite = features_name_sqlite(entry)
+        forwards = forwards_flip(norm)
+        loose = (section == "" || section ~ /^\[target(\.[^]]*)?\]$/)
 
-      # ── 0. Spellings the rules below do not read: fail closed ─────────
-      # An ASCII escape was decoded above. A non-ASCII one left in a
-      # dependency or feature entry can spell a name the rules cannot read.
-      key = norm
-      sub(/[ \t]*=.*$/, "", key)
-      if ((is_dep_table() || dep_section_crate() != "" || section == "[features]" \
-           || (loose && (loose_dep_name(key) != "" || (section == "" && key ~ /^features(\.|$)/)))) \
-          && has_unicode_escape(entry)) {
-        report("a unicode escape in a dependency or feature entry cannot be checked; write it plainly")
-        next
-      }
-      # A dependency or feature table spelled as a dotted key, at the root or
-      # under `[target]`: `dependencies.autumn-web = { … }`.
-      if (loose) {
+        # ── 0. Spellings the rules below do not read: fail closed ─────────
+        # An ASCII escape was decoded above. A non-ASCII one left in a
+        # dependency or feature entry can spell a name the rules cannot read.
         key = norm
         sub(/[ \t]*=.*$/, "", key)
-        dep = loose_dep_name(key)
-        if (dep != "" && mentions_sqlite \
-            && (dep ~ ("^(" flip ")$") \
-                || (dep in alias_of && alias_of[dep] ~ ("^(" flip ")$")) \
-                || norm ~ ("package[ \t]*=[ \t]*\"(" flip ")\""))) {
-          report("dependency edge enables the `sqlite` backend flip")
-          next
+        if ((is_dep_table() || dep_section_crate() != "" || section == "[features]" \
+             || (loose && (loose_dep_name(key) != "" || (section == "" && key ~ /^features(\.|$)/)))) \
+            && has_unicode_escape(entry)) {
+          report("a unicode escape in a dependency or feature entry cannot be checked; write it plainly")
+          continue
         }
-      }
-
-      # ── 1. A dependency edge that enables the flip ────────────────────
-      if (is_dep_table() && mentions_sqlite) {
-        # Inline: by key, or renamed with `package` in the same entry.
-        if (norm ~ ("^(" flip ")[ \t]*=") \
-            || norm ~ ("package[ \t]*=[ \t]*\"(" flip ")\"")) {
-          report("dependency edge enables the `sqlite` backend flip")
-          next
-        }
-        # Dotted: `autumn-web.features`, or an alias pass 1 resolved.
-        if (norm ~ ("^" NAME "\\.features[ \t]*=")) {
-          alias = norm
-          sub(/\.features.*$/, "", alias)
-          if (alias ~ ("^(" flip ")$") \
-              || (alias in dotted_package && dotted_package[alias] ~ ("^(" flip ")$"))) {
+        # A dependency or feature table spelled as a dotted key, at the root or
+        # under `[target]`: `dependencies.autumn-web = { … }`.
+        if (loose) {
+          key = norm
+          sub(/[ \t]*=.*$/, "", key)
+          dep = loose_dep_name(key)
+          if (dep != "" && mentions_sqlite \
+              && (dep ~ ("^(" flip ")$") \
+                  || (dep in alias_of && alias_of[dep] ~ ("^(" flip ")$")) \
+                  || norm ~ ("package[ \t]*=[ \t]*\"(" flip ")\""))) {
             report("dependency edge enables the `sqlite` backend flip")
-            next
+            continue
           }
         }
-      }
-      # Section form: the crate is the last header segment, unless a
-      # `package` key inside the section renamed it.
-      crate = dep_section_crate()
-      if (crate != "" && (section in section_package)) crate = section_package[section]
-      if (crate ~ ("^(" flip ")$") && norm ~ /^features[ \t]*=/ && mentions_sqlite) {
-        report("dependency edge enables the `sqlite` backend flip")
-        next
-      }
 
-      # ── 2 & 3. A feature that forwards or defaults into the flip ──────
-      nfe = feature_entries(norm, fe)
-      for (f = 1; f <= nfe; f++) {
-        key = fe[f]
-        sub(/[ \t]*=.*$/, "", key)
-        forwards = forwards_flip(fe[f])
-        if (key == "default" && (key in reach)) {
-          report("`default` enables the `sqlite` backend flip (" chain(key) ")")
-        } else if (forwards && key != "sqlite") {
-          report("feature `" key "` forwards the `sqlite` backend flip")
-        } else if ((key in reach) && key != "sqlite") {
-          report("feature `" key "` reaches the `sqlite` backend flip (" chain(key) ")")
-        } else if (forwards && !(pkg ~ ("^(" flip ")$"))) {
-          # A same-named `sqlite` feature is the sanctioned opt-in ONLY in the
-          # two crates that own the flip. Anywhere else it is an edge wearing
-          # the exception as a name.
-          report("feature `sqlite` forwards the backend flip from a crate that does not own it")
+        # ── 1. A dependency edge that enables the flip ────────────────────
+        if (is_dep_table() && mentions_sqlite) {
+          # Inline: by key, or renamed with `package` in the same entry.
+          if (norm ~ ("^(" flip ")[ \t]*=") \
+              || norm ~ ("package[ \t]*=[ \t]*\"(" flip ")\"")) {
+            report("dependency edge enables the `sqlite` backend flip")
+            continue
+          }
+          # Dotted: `autumn-web.features`, or an alias pass 1 resolved.
+          if (norm ~ ("^" NAME "\\.features[ \t]*=")) {
+            alias = norm
+            sub(/\.features.*$/, "", alias)
+            if (alias ~ ("^(" flip ")$") \
+                || (alias in dotted_package && dotted_package[alias] ~ ("^(" flip ")$"))) {
+              report("dependency edge enables the `sqlite` backend flip")
+              continue
+            }
+          }
+        }
+        # Section form: the crate is the last header segment, unless a
+        # `package` key inside the section renamed it.
+        crate = dep_section_crate()
+        if (crate != "" && (section in section_package)) crate = section_package[section]
+        if (crate ~ ("^(" flip ")$") && norm ~ /^features[ \t]*=/ && mentions_sqlite) {
+          report("dependency edge enables the `sqlite` backend flip")
+          continue
+        }
+
+        # ── 2 & 3. A feature that forwards or defaults into the flip ──────
+        nfe = feature_entries(norm, fe)
+        for (f = 1; f <= nfe; f++) {
+          key = fe[f]
+          sub(/[ \t]*=.*$/, "", key)
+          forwards = forwards_flip(fe[f])
+          if (key == "default" && (key in reach)) {
+            report("`default` enables the `sqlite` backend flip (" chain(key) ")")
+          } else if (forwards && key != "sqlite") {
+            report("feature `" key "` forwards the `sqlite` backend flip")
+          } else if ((key in reach) && key != "sqlite") {
+            report("feature `" key "` reaches the `sqlite` backend flip (" chain(key) ")")
+          } else if (forwards && !(pkg ~ ("^(" flip ")$"))) {
+            # A same-named `sqlite` feature is the sanctioned opt-in ONLY in the
+            # two crates that own the flip. Anywhere else it is an edge wearing
+            # the exception as a name.
+            report("feature `sqlite` forwards the backend flip from a crate that does not own it")
+          }
         }
       }
     }
@@ -1306,6 +1353,40 @@ EOF
 autumn-web = { path = "it's", features = ["sqlite"] }
 EOF
   check_fail "an apostrophe in another value does not hide the features list" apostrophe_elsewhere
+
+  # An inline table at the root or under [target] is the same table as its
+  # dotted keys, at any depth.
+  make_case root_inline_deps <<'EOF'
+dependencies = { autumn-web = { path = "../autumn", features = ["sqlite"] } }
+EOF
+  check_fail "a root inline dependencies table" root_inline_deps
+
+  make_case root_inline_renamed <<'EOF'
+dependencies = { web = { package = "autumn-web", features = ["sqlite"] } }
+EOF
+  check_fail "a renamed dependency in a root inline table" root_inline_renamed
+
+  make_case root_inline_target <<'EOF'
+target = { "cfg(unix)" = { dependencies = { autumn-web = { version = "0.7", features = ["sqlite"] } } } }
+EOF
+  check_fail "a nested root inline target table" root_inline_target
+
+  make_case target_section_inline <<'EOF'
+[target."cfg(unix)"]
+dependencies = { autumn-web = { version = "0.7", features = ["sqlite"] } }
+EOF
+  check_fail "an inline dependencies table under a target section" target_section_inline
+
+  make_case root_inline_package <<'EOF'
+package = { name = "autumn-web" }
+features.default = ["sqlite"]
+EOF
+  check_fail "a root inline package table names the flip owner" root_inline_package
+
+  make_case root_inline_clean <<'EOF'
+dependencies = { autumn-web = { path = "../autumn", features = ["db"] }, diesel = { version = "2", features = ["sqlite"] } }
+EOF
+  check_pass "a clean root inline dependencies table" root_inline_clean
 
   make_case root_features <<'EOF'
 features = { default = ["autumn-web/sqlite"] }
