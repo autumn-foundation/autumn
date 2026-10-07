@@ -522,6 +522,8 @@ pub enum HttpErrorKind {
     NoMock,
     /// The outbound circuit breaker was open.
     CircuitBreakerOpen,
+    /// The client-side adaptive throttle rejected the call (issue #3068).
+    ThrottledLocally,
     /// The SSRF policy blocked the address.
     SsrfBlocked,
     /// A redirect chain exceeded the hop limit.

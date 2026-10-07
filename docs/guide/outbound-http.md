@@ -104,6 +104,52 @@ client.post(url).retries(2).retry_non_idempotent().send().await?;
 client.get(url).no_retry().send().await?;
 ```
 
+## Adaptive throttling
+
+When a host rejects most calls, more calls only add load. The client can stop
+them locally (Google SRE client-side throttling, issue #3068). It is off by
+default:
+
+```toml
+[http.client.adaptive_throttle]
+enabled = true
+k = 2.0            # reject once accepts fall below 1/k of requests
+window_secs = 120
+```
+
+For each host, the client counts attempts (`requests`) and attempts that the
+host did not reject (`accepts`). A `429`, a `503` or a transport error is not
+an accept. A new attempt is rejected locally with probability
+`max(0, (requests − k × accepts) / (requests + 1))`. While the host accepts
+more than `1/k` of the attempts, nothing is rejected. Old counts leave the
+window. Thus the client sends requests to the host again when the host is
+serviceable.
+
+A rejected attempt ends the call with `ClientError::ThrottledLocally { host }`.
+With `?` in a handler, it maps to `503`. A local reject is not a
+circuit-breaker failure. Retries are attempts too, so the throttle also stops
+a retry. All `Client` extractors in an app use one set of counts.
+
+The custom send path (`pin_to`, `get_ssrf_safe`, `no_redirect`,
+`follow_redirects`) uses the throttle only with `breaker_scoped()`, once per
+call, because its hosts often come from users. A throttle tracks at most 4096
+hosts; it does not reject calls to a host it does not track.
+
+## Criticality header
+
+The client sends `X-Autumn-Criticality` with the class of the inbound request
+that it serves (see [Criticality](resilience.md#criticality)). It does not
+send `default`, because a missing header means `default`. Set a class for one
+call:
+
+```rust,ignore
+client
+    .get("https://api.example.com/report")
+    .criticality(autumn_web::Criticality::Sheddable)
+    .send()
+    .await?;
+```
+
 ## Response
 
 ```rust

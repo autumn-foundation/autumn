@@ -1300,6 +1300,12 @@ fn plan_scaffold_with_options_impl(
         // rather than a runtime miss. `labels.used_keys()` is the exact set the render
         // emitted — no more, which `autumn i18n check` would flag as unused, and no fewer.
         let autumn_toml_path_for_i18n = project_root.join("autumn.toml");
+        // #2439: `ChangesetForm` looks up this key. It is the same key as
+        // `autumn_web::form::NUL_CHARACTER_MESSAGE_KEY`.
+        labels.framework_key(
+            scaffold_i18n::NUL_MESSAGE_KEY,
+            scaffold_i18n::NUL_MESSAGE_ENGLISH,
+        );
         let referenced_keys = labels.used_keys();
         if labels.enabled() && !referenced_keys.is_empty() {
             // Write to the bundle the app actually resolves through, not a
@@ -26397,6 +26403,28 @@ exempt_paths = [
         assert!(routes.contains("const UNIQUE_CONSTRAINTS"), "{routes}");
     }
 
+    /// #2439: the framework reads the NUL field error from the bundle. An
+    /// `--i18n` scaffold ships the catalog entry. No view uses it.
+    #[test]
+    fn i18n_scaffold_ships_the_nul_message_key() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260503000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+        assert!(
+            ftl.contains("common.error.nul_character = Cannot contain the NUL character (0x00)"),
+            "{ftl}"
+        );
+    }
+
     /// Without the flag the whole path is byte-for-byte as it was, including
     /// the binding name.
     #[test]
@@ -26502,7 +26530,7 @@ exempt_paths = [
 
     /// AC4/AC7: every referenced key exists in the emitted `en.ftl`, and the
     /// file carries no key the views never reference (which `autumn i18n check`
-    /// would report as unused).
+    /// would report as unused), except the one key that the framework looks up.
     #[test]
     fn i18n_en_ftl_matches_the_referenced_key_set_exactly() {
         let tmp = project_with_main(default_main());
@@ -26527,10 +26555,12 @@ exempt_paths = [
             missing.is_empty(),
             "keys referenced but not defined in en.ftl: {missing:?}\n{ftl}"
         );
+        // The framework looks up this key. No view names it (#2439).
         let unused: Vec<_> = defined.difference(&referenced).collect();
-        assert!(
-            unused.is_empty(),
-            "keys defined in en.ftl but never referenced: {unused:?}\n{routes}"
+        assert_eq!(
+            unused,
+            ["common.error.nul_character"],
+            "keys defined in en.ftl but never referenced:\n{routes}"
         );
         // English values, so an `en` app reads exactly like the plain scaffold.
         assert!(ftl.contains("common.create = Create"), "{ftl}");

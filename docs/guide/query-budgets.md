@@ -117,20 +117,120 @@ Both halves are compiled in CI as trybuild fixtures — see
 |---|---|
 | Straight-line statements | **sum** |
 | `if` / `match` arms | **maximum** — only one arm runs, so the bound is the worst one |
-| A loop whose body issues a query | **unbounded** (rejected under a finite budget) |
-| A loop with a literal bound (`for _ in 0..3`) | body cost **× 3** |
+| `return`, `break`, `continue` | the early path does not include the cost of the code it skips. `if cached { return repo.find_cached().await; } repo.find_fresh().await` is **1**. A `return` inside a loop does not reach the code after the loop. A `break` does |
+| A loop whose body issues a query on a path that starts another pass | **unbounded** (rejected under a finite budget) |
+| A loop with a literal bound (`for _ in 0..3`) | **× 3** for a path that starts another pass. A path that leaves the loop (`break`, `return`) is paid once: `for _ in 0..3 { repo.a().await?; break; }` is **1** |
 | A loop whose body issues nothing | **0** — loops are free until they query |
-| A chain rooted at a `Db` / repository handle | **1**, however many builder methods (`on_primary()`, `scoped()`, `limit()`, …) it carries — splitting the chain across `let` bindings does not change the count |
+| A chain rooted at a `Db` / repository handle | **1**, however many builder methods (`on_primary()`, `scoped()`, `limit()`, …) it carries — splitting the chain across `let` bindings, or picking it with `if` / `match`, does not change the count |
 | `.preload(rows, Post::preload().author().tags())` | **one per association** — two here, the batched `WHERE … IN (…)` loads, plus **1** for a finder ahead of it in the same chain |
 | A diesel executor call (`.load(&mut *db)`, `.first(…)`, `.get_result(…)`) | **1** |
-| A `#[model]` static finder (`Post::published(&mut db)`) | **1** |
-| `db.tx(\|conn\| …)` / `db.tx_with(…)` | **1**, plus the callback body counted **once** — the callback's `conn` is tracked, so a helper handed it is still counted |
+| An associated function handed the handle (`Post::published(&mut db)`) | **reported** — put `#[query_cost(N)]` on the statement |
+| `db.tx(\|conn\| …)` / `db.tx_with(…)` / `db.tx_immediate(…)` | **1**, plus the callback body counted **once** — the callback's `conn` is tracked, so a helper handed it is still reported. The receiver must be a database connection (`Db`, `PgConnection`, `state.db()`, `maybe.unwrap()` on an `Option<Db>`, the callback's `conn`): on a repository or another value, the callback may run many times, and its `conn` is a handle |
 | `repo.find_in_batches(…)` / `find_each(…)` | **unbounded** — a keyset walk issues one query per batch, a count set by the table's size |
-| An `Option`/`Result` combinator closure (`unwrap_or_else`, `ok_or_else`, …) | counted **once** — it is not an iterator adapter |
+| An `Option`/`Result` combinator closure (`map`, `and_then`, `unwrap_or_else`, …) | counted **once** when the receiver is known to be an `Option` or a `Result`, and `then` on a `bool`; otherwise it may run per element |
 
 A repository future is counted where it is **built**, not where it is awaited,
 so collecting futures in a `.map(…)` and driving them with `join_all` later is
 caught as the same N+1.
+
+## How a handle is tracked
+
+The analysis follows the handle through every name that holds it:
+
+- **Bindings.** The analysis reads each of these binding forms: `let`,
+  `let … else`, assignment, `if let`, `while let`, `match` arms, `for`
+  patterns, closure parameters and transaction callback parameters. A type
+  annotation also marks a handle: `let r: PgPostRepository = …`. An
+  `Arc<PgPostRepository>`, `Box<…>`, `Rc<…>`, `dyn PostRepository` or
+  `impl PostRepository` is a handle too, and so is a `State<…>` or
+  `Extension<…>` extractor of any of them (`State(repo):
+  State<PgPostRepository>`). Another extractor holds a handle only for an
+  exact handle type: `Json<CreateRepository>` is a request body, not a
+  handle. A type annotation made only of
+  standard and primitive types, such as `let ids: Vec<i64> = …`, marks the
+  binding as plain. rustc checks it, so it cannot hold a handle.
+- **Scopes.** A `let` in a block ends with the block. An assignment to a name
+  declared outside the block stays after the block. A value that a block, an
+  arm or a `break` gives keeps what it holds:
+  `let alias = { let moved = repo; moved };` makes `alias` a handle. An
+  assignment clears a handle only when the value shows what it holds
+  (`slot = None;`). `alias = make();` or `alias = a + b;` has the old type,
+  so it keeps the handle.
+- **Branches.** After an `if`, a `match` or a loop, a name holds a handle when
+  it holds one on any path. The bindings at a `return`, `break` or `continue`
+  apply where that exit lands.
+- **Containers.** A value built from a handle holds it: `[repo]`,
+  `vec![repo]`, `(repo, 1)`, `Some(repo)`, `Ctx { db }`. A parameter of type
+  `Vec`, `VecDeque`, `Option`, map, set, tuple, array or slice of a handle
+  type also holds handles (`Vec<PgPostRepository>`, `Option<Db>`,
+  `HashMap<i64, PgPostRepository>`). So does a `Result` with a handle or
+  such a container on either side.
+  - A name bound to a struct or tuple literal records what each part holds.
+    In `let ctx = PageCtx { repo: &repo, user };`, `ctx.repo` is a handle
+    and `ctx.user` is not.
+  - An index (`repos[0]`), a field (`pair.0`), a pattern (`Some(r)`,
+    `for r in repos`) or `?` gives a handle.
+  - A method that the container's own type has and that takes `self` is not
+    a query: `repos.into_iter()`, `maybe.unwrap()`, `maybe.map(|r| r.id)`,
+    `result.ok()`, and the `Iterator` adapters that take `self` (`map`,
+    `filter`, `count`, `last`, `max_by_key`, `collect`, …). Each type has its
+    own list. The method gives a handle when it returns a part
+    (`maybe.unwrap()`), and a container when it returns an iterator or an
+    `Option` of a part (`repos.into_iter()`, `it.last()`).
+  - A method that borrows the container (`&self` or `&mut self`) is
+    reported, also when the type has it: `repos.len()`, `repos.push(repo)`,
+    `repos.as_slice()`, `maybe.as_ref()`, `maybe.take()`, `it.next()`,
+    `it.any(…)`. Rust looks for a `self` method before a `&self` method, and
+    for a `&self` method before a `&mut self` method, so an application trait
+    method `len(self)` on `Vec<PgPostRepository>` runs in place of
+    `Vec::len`. The macro has no type information to rule that out. What
+    the method gives may hold handles at any depth. Every other method on
+    the container is reported too (`repos.refresh_all()`, or an
+    extension-trait `repos.ok()`), and so are `clone` and `extend`.
+  - To read a container of handles without a report, use an index
+    (`repos[0]`, `&repos[1..]`), a pattern (`let [first, ..] = &repos[..]`,
+    `if let Some(r) = &maybe`), a `for` loop (`for r in &repos`) or a method
+    that takes `self`. Otherwise, put `#[query_cost(N)]` on the statement,
+    and give the binding a type made only of standard and primitive types:
+    `#[query_cost(0)] let n: usize = repos.len();`. Without the type, a later
+    use of `n` is reported too.
+  - A handle in an `Option` or a `Result` has only their methods. So
+    `lazy.checkout()` on a `Result<LazyDb, E>` is reported. Call
+    `lazy.expect("…").checkout()` instead.
+  - A method or function given a handle may store it: after
+    `list.push(repo)` or `fill(&mut list, &repo)`, `list` holds a handle. A
+    store or an assignment through a `&mut` alias (`let slot = &mut list;
+    slot.push(repo);`, `*slot = …`) is a store into `list`. A callback stores what it returns (`slot.get_or_insert_with(|| &repo)`).
+    Every method on a user struct that holds a handle (`ctx.clear()` on
+    `Ctx { repo }`) is reported too.
+  - A callback's result holds what the callback returns, whatever the
+    receiver holds: `ids.iter().map(|_| &repo)` gives handles, and so do
+    `fold`, `then` and `unwrap_or_else`. A method that borrows its receiver
+    and is given such a callback (`find_map`, `try_fold`, `try_for_each`,
+    `any`) is reported: a trait method in its place may call the callback
+    many times. A `return` in the
+    callback counts too. A closure that names a handle holds it, so
+    `ids.iter().map(make)` and `make()` keep the handle.
+  - `map_or`, `map_or_else` and `fold` give only what their
+    default and callback give: `Some(repo).map_or(0, |_| 1)` is plain. A
+    callback on a `Result` parameter gets only its side: in
+    `result.map_err(|e| …)`, `e` is the error, not the handle. `result.ok()`
+    and `result.err()` also give only their side, and `result.map(|_| 1)`
+    keeps only the `Err` side. `Ok(repo)` has a plain `Err` side, and
+    `Err(repo)` has a plain `Ok` side.
+  - A container of containers or of user values (`Vec<Vec<PgPostRepository>>`,
+    `Option<Vec<…>>`, `[ctx]`, `repos.chunks(2)`, or
+    `repos.iter().map(|r| Ctx { repo: r })`) keeps that shape for all its
+    parts. Every method on it or on a part of it is reported.
+    `Arc<Vec<…>>` is a plain container: a smart pointer adds no depth.
+    `left.append(&mut right)` adds the parts of `right`, so `left` stays a
+    plain container.
+  - A helper handed the container is reported.
+
+When the parts are not known, for example in a parameter or a destructured
+value, every part counts as a handle. This can over-count, but it never
+under-counts. A query future in an array (`join_all([repo.a(), repo.b()])`)
+is counted where it is built, so the array does not count as a container.
 
 ## What the analysis refuses to guess
 
@@ -140,6 +240,19 @@ negative ships an N+1 to production.
 
 - **A helper function handed the handle** — `load_links(&mut db, id)`. Its body
   is another function; the macro sees only the call.
+- **An associated function handed the handle** — `Post::published(&mut db)`.
+  It has the same shape as `ReportBuilder::build(&mut db)`, which can issue any
+  number of queries. Put `#[query_cost(1)]` on the statement that calls a
+  one-query finder. An awaited constructor
+  (`PgPostRepository::new(&mut db).await`, `Arc::new(&repo).await`) is
+  reported too. No std constructor gives a future, so it is an `async fn`,
+  and an `async fn` can run queries. This is also true when the `.await` comes later
+  (`let pending = PgPostRepository::new(&mut db); pending.await`). An
+  `.await` on any value that holds a handle is reported, unless the value is
+  a query or accessor on a handle, a call, or an `async` block.
+- **An operator handed the handle** — `repo + x`, `-repo`. An `Add` or `Neg`
+  impl is a function, and its output can be a future. A comparison
+  (`repo == other`) gives a `bool` and is not reported.
 - **A macro body that `await`s while naming the handle** — `html! { …
   (fetch(&mut db).await?) … }`. A macro body is token soup to `syn`. A template
   that merely *passes* the handle to a render helper is fine: only an `await`
@@ -293,7 +406,7 @@ Within an annotated function, every construct that can issue a query is either
 counted or reported — never silently skipped. Counting rests on two framework
 contracts, both of which the macro states in its diagnostics:
 
-1. One repository-chain call, one `#[model]` static finder, or one `preload`
+1. One repository-chain call, one diesel executor call, or one `preload`
    association issues one query.
 2. A call site the analysis cannot read declares its own cost with
    `#[query_cost(N)]`, or is excluded with `#[query_exempt(reason = "…")]`.
@@ -307,8 +420,9 @@ rather than assumed.
 
 The analysis tracks a handle from where the signature names it (the `Db` /
 repository extractor), through fields and conventionally-named accessors
-(`self.repo`, `state.db`, `app.pool()`), and into transaction callbacks. Two
-things sit outside it, by construction:
+(`self.repo`, `state.db`, `app.pool()`), through every binding and container
+(see [How a handle is tracked](#how-a-handle-is-tracked)), and into transaction
+callbacks. These things sit outside it, by construction:
 
 - **A handle obtained some other way** — for example a repository pulled off an
   application-state extractor by an application-specific method
@@ -319,6 +433,28 @@ things sit outside it, by construction:
   database without any handle in the handler's signature, so no static
   attribution is possible; they are the same class as the background-job work
   listed under Scope above.
+- **An application trait on a reference to a container.** The macro reports
+  every method that borrows a container of handles, because a trait method
+  can run in its place (see [How a handle is tracked](#how-a-handle-is-tracked)).
+  It trusts a standard method that takes `self`: an inherent method comes
+  before a trait method, and two trait methods with one name do not compile.
+  But Rust tries the receiver's own type first. When the receiver is a
+  reference (`maybe: &Option<PgPostRepository>`), a trait implemented for
+  `&Option<PgPostRepository>` with a `map(self)` method runs in place of
+  `Option::map`. The macro reports `(&maybe).map(…)`, but it does not see
+  that a name holds a reference. Do not implement a trait for a reference to
+  a container of handles.
+- **An application item that takes a standard name.** The macro trusts a
+  standard name that is bare or under a `std` path: the type `Vec`, `vec!`,
+  `format!`, `drop`. It does not trust one under another path
+  (`custom::Vec`, `custom::vec!`), or one that the handler body defines or
+  imports (`macro_rules! vec`, `fn drop`, `use E::V as Some`, `use E::*`,
+  `use custom as mem` for `mem::drop`).
+  Such an item applies in its own block, and to a value that leaves it.
+  It cannot see a module-level `use` or `macro_rules!` that replaces a bare
+  standard name. Do not give an item of yours a standard name. A std path
+  must start with `std`, `core` or `alloc`: `mem::drop` and `vec::Vec` may
+  name a module-level alias, so they are not trusted.
 
 ### `proven_max` is not `query_count()`
 

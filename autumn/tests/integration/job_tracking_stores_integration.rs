@@ -36,6 +36,7 @@ fn noop_job_info() -> JobInfo {
         uniqueness: None,
         concurrency: None,
         handler: noop_handler,
+        timeout: None,
     }
 }
 

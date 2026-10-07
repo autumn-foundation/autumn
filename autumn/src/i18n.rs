@@ -579,6 +579,17 @@ impl Bundle {
         format!("{{${key}}}")
     }
 
+    /// Returns the message for `key` in `locale`, or `None` if no locale in the
+    /// fallback chain has it.
+    ///
+    /// Unlike [`Bundle::translate`], a miss records nothing and returns no
+    /// marker. The caller can use its own text.
+    #[must_use]
+    pub fn lookup(&self, locale: &str, key: &str) -> Option<String> {
+        self.lookup_template(locale, key)
+            .map(|template| interpolate(template, &[]))
+    }
+
     fn lookup_template(&self, locale: &str, key: &str) -> Option<&str> {
         if let Some(found) = self.messages.get(locale).and_then(|m| m.get(key)) {
             return Some(found.as_str());

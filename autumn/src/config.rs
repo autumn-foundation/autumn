@@ -135,6 +135,7 @@
 //! | `AUTUMN_JOBS__MAX_ATTEMPTS` | `jobs.max_attempts` | `u32` |
 //! | `AUTUMN_JOBS__INITIAL_BACKOFF_MS` | `jobs.initial_backoff_ms` | `u64` |
 //! | `AUTUMN_JOBS__MAX_BACKOFF_MS` | `jobs.max_backoff_ms` | `u64` |
+//! | `AUTUMN_JOBS__DEFAULT_TIMEOUT_MS` | `jobs.default_timeout_ms` | `u64` |
 //! | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` | `String` |
 //! | `AUTUMN_JOBS__REDIS__KEY_PREFIX` | `jobs.redis.key_prefix` | `String` |
 //! | `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` | `jobs.redis.visibility_timeout_ms` | `u64` |
@@ -2424,6 +2425,11 @@ pub struct HttpClientConfig {
     /// [`RetryBudgetConfig`].
     #[serde(default)]
     pub retry_budget: RetryBudgetConfig,
+
+    /// Client-side adaptive throttling per host (issue #3068). Off by
+    /// default. See [`AdaptiveThrottleConfig`].
+    #[serde(default)]
+    pub adaptive_throttle: AdaptiveThrottleConfig,
 }
 
 /// Retry budget settings (`[http.client.retry_budget]`, issue #3058).
@@ -2536,6 +2542,80 @@ impl Default for RetryBudgetConfig {
     }
 }
 
+/// `[http.client.adaptive_throttle]`: Google SRE client-side throttling.
+///
+/// When a host rejects too many recent attempts (`429` or `503`, or no
+/// response), the client rejects new attempts to that host locally with
+/// probability `max(0, (requests − k × accepts) / (requests + 1))`. The
+/// error is [`ClientError::ThrottledLocally`](crate::http_client::ClientError::ThrottledLocally).
+///
+/// ```toml
+/// [http.client.adaptive_throttle]
+/// enabled = true
+/// k = 2.0            # reject once accepts fall below 1/k of requests
+/// window_secs = 120
+/// ```
+#[cfg(feature = "http-client")]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[non_exhaustive]
+pub struct AdaptiveThrottleConfig {
+    /// Turn the throttle on. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The multiplier `K`. At least 1.0. Default: 2.0.
+    #[serde(default = "default_throttle_k")]
+    pub k: f64,
+    /// The sliding window, in seconds. At least 1. Default: 120.
+    #[serde(default = "default_throttle_window_secs")]
+    pub window_secs: u64,
+}
+
+#[cfg(feature = "http-client")]
+const fn default_throttle_k() -> f64 {
+    2.0
+}
+
+#[cfg(feature = "http-client")]
+const fn default_throttle_window_secs() -> u64 {
+    120
+}
+
+#[cfg(feature = "http-client")]
+impl Default for AdaptiveThrottleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            k: default_throttle_k(),
+            window_secs: default_throttle_window_secs(),
+        }
+    }
+}
+
+#[cfg(feature = "http-client")]
+impl AdaptiveThrottleConfig {
+    /// Check the settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] when `k < 1.0` or
+    /// `window_secs == 0`.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !(self.k >= 1.0 && self.k.is_finite()) {
+            return Err(ConfigError::Validation(format!(
+                "http.client.adaptive_throttle.k = {} must be a number >= 1.0: a smaller k \
+                 rejects calls to a healthy host",
+                self.k
+            )));
+        }
+        if self.window_secs == 0 {
+            return Err(ConfigError::Validation(
+                "http.client.adaptive_throttle.window_secs must be at least 1".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(feature = "http-client")]
 const fn default_http_timeout_secs() -> u64 {
     30
@@ -2567,6 +2647,7 @@ impl Default for HttpClientConfig {
             base_urls: std::collections::HashMap::new(),
             send_deadline_header: default_http_send_deadline_header(),
             retry_budget: RetryBudgetConfig::default(),
+            adaptive_throttle: AdaptiveThrottleConfig::default(),
         }
     }
 }
@@ -3850,6 +3931,11 @@ pub struct JobConfig {
     /// Default: 3 600 000 (1 hour). See [`crate::backoff`].
     #[serde(default = "default_job_max_backoff_ms")]
     pub max_backoff_ms: u64,
+    /// Maximum time in milliseconds for one run of a job that has no
+    /// `#[job(timeout)]` (issue #3051). A slower run fails and retries. `0`
+    /// (the default) sets no limit.
+    #[serde(default)]
+    pub default_timeout_ms: u64,
     /// Ordered/weighted list of queues workers drain, highest priority first.
     ///
     /// Unset = a single `default` queue (today's behavior). A TOML array such as
@@ -3895,6 +3981,7 @@ impl Default for JobConfig {
             max_attempts: default_job_max_attempts(),
             initial_backoff_ms: default_job_backoff_ms(),
             max_backoff_ms: default_job_max_backoff_ms(),
+            default_timeout_ms: 0,
             queues: JobQueuesConfig::default(),
             pin: Vec::new(),
             fleet: JobFleetConfig::default(),
@@ -5367,6 +5454,9 @@ impl AutumnConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.database.validate()?;
         self.cors.validate()?;
+        self.server.admission.validate()?;
+        #[cfg(feature = "http-client")]
+        self.http.client.adaptive_throttle.validate()?;
         #[cfg(feature = "http-client")]
         self.http.client.retry_budget.validate()?;
         self.scheduler.validate()?;
@@ -5592,6 +5682,7 @@ impl AutumnConfig {
     /// - `AUTUMN_JOBS__MAX_ATTEMPTS` → `jobs.max_attempts` (`u32`)
     /// - `AUTUMN_JOBS__INITIAL_BACKOFF_MS` → `jobs.initial_backoff_ms` (`u64`)
     /// - `AUTUMN_JOBS__MAX_BACKOFF_MS` → `jobs.max_backoff_ms` (`u64`)
+    /// - `AUTUMN_JOBS__DEFAULT_TIMEOUT_MS` → `jobs.default_timeout_ms` (`u64`)
     /// - `AUTUMN_JOBS__REDIS__URL` → `jobs.redis.url` (`String`)
     /// - `AUTUMN_JOBS__REDIS__KEY_PREFIX` → `jobs.redis.key_prefix` (`String`)
     /// - `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` → `jobs.redis.visibility_timeout_ms` (`u64`)
@@ -5663,6 +5754,7 @@ impl AutumnConfig {
         self.apply_cache_env_overrides_with_env(env);
         self.apply_channels_env_overrides_with_env(env);
         self.apply_jobs_env_overrides_with_env(env);
+        self.apply_outbox_env_overrides_with_env(env);
         self.apply_scheduler_env_overrides_with_env(env);
         self.apply_retention_env_overrides_with_env(env);
         self.apply_role_env_overrides_with_env(env);
@@ -6133,6 +6225,52 @@ impl AutumnConfig {
         );
     }
 
+    /// `[server.admission]` env overrides (issue #3068).
+    fn apply_admission_env_overrides_with_env(&mut self, env: &dyn Env) {
+        let admission = &mut self.server.admission;
+        parse_env(env, "AUTUMN_SERVER__ADMISSION__MODE", &mut admission.mode);
+        parse_env(
+            env,
+            "AUTUMN_SERVER__ADMISSION__ALGORITHM",
+            &mut admission.algorithm,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SERVER__ADMISSION__MIN_LIMIT",
+            &mut admission.min_limit,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_SERVER__ADMISSION__MAX_LIMIT",
+            &mut admission.max_limit,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SERVER__ADMISSION__INITIAL_LIMIT",
+            &mut admission.initial_limit,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SERVER__ADMISSION__LATENCY_THRESHOLD_MS",
+            &mut admission.latency_threshold_ms,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_SERVER__ADMISSION__TRUST_CRITICALITY_HEADER",
+            &mut admission.trust_criticality_header,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SERVER__ADMISSION__PARTITIONS__DEFAULT",
+            &mut admission.partitions.default,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SERVER__ADMISSION__PARTITIONS__SHEDDABLE",
+            &mut admission.partitions.sheddable,
+        );
+    }
+
     fn apply_server_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env(env, "AUTUMN_SERVER__PORT", &mut self.server.port);
         parse_env_string(env, "AUTUMN_SERVER__HOST", &mut self.server.host);
@@ -6186,6 +6324,7 @@ impl AutumnConfig {
             "AUTUMN_SERVER__CAPACITY_CONTRACT",
             &mut self.server.capacity_contract,
         );
+        self.apply_admission_env_overrides_with_env(env);
 
         // `[server.tls]` is a nested optional. Materialize it from the
         // environment when any of its keys are set (seeding an empty struct if
@@ -6622,6 +6761,11 @@ impl AutumnConfig {
             "AUTUMN_JOBS__MAX_BACKOFF_MS",
             &mut self.jobs.max_backoff_ms,
         );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__DEFAULT_TIMEOUT_MS",
+            &mut self.jobs.default_timeout_ms,
+        );
         parse_env_option_string(env, "AUTUMN_JOBS__REDIS__URL", &mut self.jobs.redis.url);
         parse_env_string(
             env,
@@ -6663,6 +6807,9 @@ impl AutumnConfig {
             "AUTUMN_JOBS__TRACKING__ROUTE_ENABLED",
             &mut self.jobs.tracking.route_enabled,
         );
+    }
+
+    fn apply_outbox_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_bool(env, "AUTUMN_OUTBOX__ENABLED", &mut self.outbox.enabled);
         parse_env(
             env,
@@ -7756,6 +7903,228 @@ pub struct ServerConfig {
     /// `AUTUMN_SERVER__TLS__HANDSHAKE_TIMEOUT_SECS` env vars.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+
+    /// Admission control: static or adaptive limit, and criticality
+    /// partitions (issue #3068). See [`AdmissionConfig`].
+    ///
+    /// Configured via `[server.admission]` or `AUTUMN_SERVER__ADMISSION__*`.
+    #[serde(default)]
+    pub admission: AdmissionConfig,
+}
+
+/// How admission control sets its concurrency limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum AdmissionMode {
+    /// A fixed ceiling from `server.max_concurrent_requests`, the capacity
+    /// contract, or the profile default.
+    #[default]
+    Static,
+    /// A ceiling that follows measured latency. See [`AdmissionAlgorithm`].
+    Adaptive,
+}
+
+impl std::str::FromStr for AdmissionMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "static" => Ok(Self::Static),
+            "adaptive" => Ok(Self::Adaptive),
+            other => Err(format!("unknown admission mode {other:?}")),
+        }
+    }
+}
+
+/// The algorithm that moves an adaptive limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum AdmissionAlgorithm {
+    /// Netflix Gradient2: compares the latest RTT with a long-term average.
+    #[default]
+    Gradient2,
+    /// Netflix Vegas: estimates the queue from the lowest RTT seen.
+    Vegas,
+    /// Additive increase, multiplicative decrease. It backs off on a `504`,
+    /// a cancel at the request deadline, or a response slower than
+    /// [`AdmissionConfig::latency_threshold_ms`].
+    Aimd,
+}
+
+impl std::str::FromStr for AdmissionAlgorithm {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "gradient2" => Ok(Self::Gradient2),
+            "vegas" => Ok(Self::Vegas),
+            "aimd" => Ok(Self::Aimd),
+            other => Err(format!("unknown admission algorithm {other:?}")),
+        }
+    }
+}
+
+/// `[server.admission]`: admission control settings (issue #3068).
+///
+/// ```toml
+/// [server.admission]
+/// mode = "adaptive"          # "static" (default) or "adaptive"
+/// algorithm = "gradient2"    # "gradient2" (default), "vegas" or "aimd"
+/// min_limit = 8
+/// max_limit = 1000           # default: the static ceiling, else 1000
+/// initial_limit = 20
+/// trust_criticality_header = false
+///
+/// [server.admission.partitions]
+/// default = 1.0              # share of the limit for `default` requests
+/// sheddable = 0.5            # share of the limit for `sheddable` requests
+/// ```
+///
+/// The defaults change nothing for routes without a criticality.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[non_exhaustive]
+pub struct AdmissionConfig {
+    /// `static` (default) or `adaptive`.
+    #[serde(default)]
+    pub mode: AdmissionMode,
+    /// The adaptive algorithm. Not used in `static` mode.
+    #[serde(default)]
+    pub algorithm: AdmissionAlgorithm,
+    /// The lowest adaptive limit. At least 1. Default: 8.
+    #[serde(default = "default_admission_min_limit")]
+    pub min_limit: usize,
+    /// The highest adaptive limit. Default: the static ceiling (from
+    /// `max_concurrent_requests`, the capacity contract or the profile), or
+    /// [`DEFAULT_ADMISSION_MAX_LIMIT`] when there is none.
+    #[serde(default)]
+    pub max_limit: Option<usize>,
+    /// The adaptive limit before the first sample. Default: 20.
+    #[serde(default = "default_admission_initial_limit")]
+    pub initial_limit: usize,
+    /// For `aimd`: a response slower than this backs the limit off.
+    /// Default: 1000 ms.
+    #[serde(default = "default_admission_latency_threshold_ms")]
+    pub latency_threshold_ms: u64,
+    /// Read the criticality of an inbound request from the
+    /// `X-Autumn-Criticality` header. The header replaces the route's value.
+    /// Default: `false`. Set it only when you trust all callers, or when an
+    /// edge proxy removes or sets the header.
+    #[serde(default)]
+    pub trust_criticality_header: bool,
+    /// The share of the limit for each criticality.
+    #[serde(default)]
+    pub partitions: AdmissionPartitionsConfig,
+}
+
+/// The highest adaptive limit when no static ceiling applies.
+pub const DEFAULT_ADMISSION_MAX_LIMIT: usize = 1000;
+
+const fn default_admission_min_limit() -> usize {
+    8
+}
+
+const fn default_admission_initial_limit() -> usize {
+    20
+}
+
+const fn default_admission_latency_threshold_ms() -> u64 {
+    1000
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        Self {
+            mode: AdmissionMode::default(),
+            algorithm: AdmissionAlgorithm::default(),
+            min_limit: default_admission_min_limit(),
+            max_limit: None,
+            initial_limit: default_admission_initial_limit(),
+            latency_threshold_ms: default_admission_latency_threshold_ms(),
+            trust_criticality_header: false,
+            partitions: AdmissionPartitionsConfig::default(),
+        }
+    }
+}
+
+/// `[server.admission.partitions]`: the share of the limit that each
+/// criticality can fill. `critical` always gets the full limit.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[non_exhaustive]
+pub struct AdmissionPartitionsConfig {
+    /// The share for `default` requests, in `0.0..=1.0`. Default: 1.0.
+    #[serde(default = "default_partition_default")]
+    pub default: f64,
+    /// The share for `sheddable` requests, in `0.0..=default`. Default: 0.5.
+    #[serde(default = "default_partition_sheddable")]
+    pub sheddable: f64,
+}
+
+const fn default_partition_default() -> f64 {
+    1.0
+}
+
+const fn default_partition_sheddable() -> f64 {
+    0.5
+}
+
+impl Default for AdmissionPartitionsConfig {
+    fn default() -> Self {
+        Self {
+            default: default_partition_default(),
+            sheddable: default_partition_sheddable(),
+        }
+    }
+}
+
+impl AdmissionConfig {
+    /// The partition shares.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a share is out of range or out of order.
+    pub fn partition_shares(
+        &self,
+    ) -> Result<crate::admission::PartitionShares, crate::admission::AdmissionConfigError> {
+        crate::admission::PartitionShares::new(self.partitions.default, self.partitions.sheddable)
+    }
+
+    /// The adaptive limit bounds. `ceiling` is the static ceiling, if any.
+    ///
+    /// When `max_limit` is unset, the ceiling is the maximum. A ceiling
+    /// below `min_limit` (for example a small capacity contract) lowers the
+    /// minimum to the ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless `1 <= min_limit <= max_limit`.
+    pub fn limit_bounds(
+        &self,
+        ceiling: Option<usize>,
+    ) -> Result<crate::admission::LimitBounds, crate::admission::AdmissionConfigError> {
+        let (min, max) = match (self.max_limit, ceiling) {
+            (Some(max), _) => (self.min_limit, max),
+            (None, Some(ceiling)) if ceiling > 0 => (self.min_limit.min(ceiling), ceiling),
+            (None, _) => (self.min_limit, DEFAULT_ADMISSION_MAX_LIMIT),
+        };
+        crate::admission::LimitBounds::new(min, max, self.initial_limit)
+    }
+
+    /// Check the settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] for bad shares or limit bounds.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.partition_shares()
+            .map_err(|e| ConfigError::Validation(e.to_string()))?;
+        // The static ceiling is not known here; check the explicit bounds.
+        let max = self.max_limit.unwrap_or(usize::MAX);
+        crate::admission::LimitBounds::new(self.min_limit, max, self.initial_limit)
+            .map_err(|e| ConfigError::Validation(e.to_string()))?;
+        Ok(())
+    }
 }
 
 /// Direct-HTTPS (native TLS termination) settings (issue #1603).
@@ -11039,6 +11408,7 @@ impl Default for ServerConfig {
             max_concurrent_requests: None,
             capacity_contract: None,
             tls: None,
+            admission: AdmissionConfig::default(),
         }
     }
 }
@@ -15315,6 +15685,21 @@ path = "/healthz"
         assert_eq!(config.jobs.redis.visibility_timeout_ms, 45_000);
     }
 
+    /// `jobs.default_timeout_ms` defaults to `0` (no limit) and reads from
+    /// TOML and the environment (issue #3051).
+    #[test]
+    fn jobs_default_timeout_ms_defaults_to_zero_and_overrides() {
+        assert_eq!(AutumnConfig::default().jobs.default_timeout_ms, 0);
+
+        let config: AutumnConfig = toml::from_str("[jobs]\ndefault_timeout_ms = 30000\n").unwrap();
+        assert_eq!(config.jobs.default_timeout_ms, 30_000);
+
+        let env = MockEnv::new().with("AUTUMN_JOBS__DEFAULT_TIMEOUT_MS", "1500");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.jobs.default_timeout_ms, 1_500);
+    }
+
     // ── [retention] unified framework-owned data retention (issue #1605) ──
 
     #[test]
@@ -18182,6 +18567,147 @@ path = "/healthz"
             config.server.capacity_contract.as_deref(),
             Some("deploy/capacity.lock")
         );
+    }
+
+    // ── server.admission (#3068) ─────────────────────────────────
+
+    #[test]
+    fn admission_defaults_change_nothing() {
+        let a = AutumnConfig::default().server.admission;
+        assert_eq!(a.mode, AdmissionMode::Static);
+        assert_eq!(a.algorithm, AdmissionAlgorithm::Gradient2);
+        assert!(!a.trust_criticality_header);
+        assert_eq!(
+            a.partition_shares().unwrap(),
+            crate::admission::PartitionShares::default()
+        );
+    }
+
+    #[test]
+    fn admission_parses_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.admission]
+            mode = "adaptive"
+            algorithm = "vegas"
+            min_limit = 4
+            max_limit = 400
+            initial_limit = 40
+            latency_threshold_ms = 250
+            trust_criticality_header = true
+            [server.admission.partitions]
+            default = 0.9
+            sheddable = 0.4
+            "#,
+        )
+        .expect("server.admission should parse");
+        let a = &config.server.admission;
+        assert_eq!(a.mode, AdmissionMode::Adaptive);
+        assert_eq!(a.algorithm, AdmissionAlgorithm::Vegas);
+        assert_eq!(
+            (a.min_limit, a.max_limit, a.initial_limit),
+            (4, Some(400), 40)
+        );
+        assert_eq!(a.latency_threshold_ms, 250);
+        assert!(a.trust_criticality_header);
+        let shares = a.partition_shares().unwrap();
+        assert_eq!(
+            shares.threshold(crate::admission::Criticality::Default, 100),
+            90
+        );
+        assert_eq!(
+            shares.threshold(crate::admission::Criticality::Sheddable, 100),
+            40
+        );
+        config.validate().expect("valid admission config");
+    }
+
+    #[test]
+    fn admission_rejects_an_unknown_algorithm() {
+        let err = toml::from_str::<AutumnConfig>(
+            r#"
+            [server.admission]
+            algorithm = "hystrix"
+            "#,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn admission_env_overrides() {
+        let env = MockEnv::new()
+            .with("AUTUMN_SERVER__ADMISSION__MODE", "adaptive")
+            .with("AUTUMN_SERVER__ADMISSION__ALGORITHM", "aimd")
+            .with("AUTUMN_SERVER__ADMISSION__MIN_LIMIT", "2")
+            .with("AUTUMN_SERVER__ADMISSION__MAX_LIMIT", "50")
+            .with("AUTUMN_SERVER__ADMISSION__INITIAL_LIMIT", "10")
+            .with("AUTUMN_SERVER__ADMISSION__LATENCY_THRESHOLD_MS", "99")
+            .with("AUTUMN_SERVER__ADMISSION__TRUST_CRITICALITY_HEADER", "true")
+            .with("AUTUMN_SERVER__ADMISSION__PARTITIONS__DEFAULT", "0.8")
+            .with("AUTUMN_SERVER__ADMISSION__PARTITIONS__SHEDDABLE", "0.2");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        let a = &config.server.admission;
+        assert_eq!(a.mode, AdmissionMode::Adaptive);
+        assert_eq!(a.algorithm, AdmissionAlgorithm::Aimd);
+        assert_eq!(
+            (a.min_limit, a.max_limit, a.initial_limit),
+            (2, Some(50), 10)
+        );
+        assert_eq!(a.latency_threshold_ms, 99);
+        assert!(a.trust_criticality_header);
+        assert!((a.partitions.default - 0.8).abs() < f64::EPSILON);
+        assert!((a.partitions.sheddable - 0.2).abs() < f64::EPSILON);
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn adaptive_throttle_parses_and_validates() {
+        let config: AutumnConfig = toml::from_str(
+            r"
+            [http.client.adaptive_throttle]
+            enabled = true
+            k = 1.5
+            window_secs = 60
+            ",
+        )
+        .expect("adaptive_throttle should parse");
+        let t = config.http.client.adaptive_throttle;
+        assert!(t.enabled);
+        assert!((t.k - 1.5).abs() < f64::EPSILON);
+        assert_eq!(t.window_secs, 60);
+        config.validate().expect("valid");
+        assert!(
+            !AutumnConfig::default()
+                .http
+                .client
+                .adaptive_throttle
+                .enabled
+        );
+
+        let mut bad = AutumnConfig::default();
+        bad.http.client.adaptive_throttle.k = 0.5;
+        assert!(bad.validate().is_err(), "k < 1");
+        let mut bad = AutumnConfig::default();
+        bad.http.client.adaptive_throttle.window_secs = 0;
+        assert!(bad.validate().is_err(), "window 0");
+    }
+
+    #[test]
+    fn admission_validate_rejects_bad_bounds_and_shares() {
+        let mut config = AutumnConfig::default();
+        config.server.admission.min_limit = 0;
+        assert!(config.validate().is_err(), "min_limit = 0");
+
+        let mut config = AutumnConfig::default();
+        config.server.admission.min_limit = 10;
+        config.server.admission.max_limit = Some(5);
+        assert!(config.validate().is_err(), "min_limit > max_limit");
+
+        let mut config = AutumnConfig::default();
+        config.server.admission.partitions.sheddable = 0.9;
+        config.server.admission.partitions.default = 0.5;
+        assert!(config.validate().is_err(), "sheddable > default");
     }
 
     // ── server.max_concurrent_requests (#1006) ────────────────────

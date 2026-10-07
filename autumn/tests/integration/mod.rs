@@ -177,6 +177,7 @@ mod ingress_named_futures;
 mod inline_broadcast_prefetch;
 mod inspector_integration;
 mod isr_coordination;
+mod job_lease_heartbeat;
 mod job_recorder_integration;
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 mod job_retry_jitter_pg;
@@ -253,6 +254,8 @@ mod nested_form_atomic_save;
 mod nested_form_order_example;
 mod notifications;
 mod nul_byte_input;
+#[cfg(feature = "i18n")]
+mod nul_message_i18n;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_conformance;
 #[cfg(feature = "offline-sync")]
@@ -356,6 +359,8 @@ mod repository_bulk_operations;
 mod repository_commit_hooks_claim_ack_profile;
 #[cfg(feature = "db")]
 mod repository_dependent_destroy;
+#[cfg(feature = "db")]
+mod repository_nul_field;
 // Ledger findings/fix harness for the `dependent(..., on_delete = destroy)`
 // cascade's per-row loop: profiles a leaf child's reload-then-delete N+1 and
 // (after the fix) the batched `dependent_delete_all` replacement.
@@ -411,11 +416,15 @@ mod sharding_commit_hooks;
 #[cfg(feature = "db")]
 mod sharding_integration;
 mod signed_webhooks;
+mod sim_adaptive_admission;
+mod sim_admission_criticality;
 mod sim_advance_to;
 mod sim_ambient_clock;
 mod sim_ambient_modules;
 mod sim_chaos_clock_skew_monotonic;
 mod sim_circuit_breaker_slow_calls;
+#[cfg(feature = "http-client")]
+mod sim_client_throttle;
 mod sim_clock_drain;
 #[cfg(feature = "collab")]
 mod sim_collab_convergence;

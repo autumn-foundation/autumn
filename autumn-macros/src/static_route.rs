@@ -372,6 +372,7 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // (see `autumn_web::static_gen`), scoping the exemption to those
                 // internal renders rather than the live route metadata.
                 timeout: ::autumn_web::RouteTimeout::Inherit,
+                criticality: ::autumn_web::Criticality::Default,
                 api_version: ::core::option::Option::None,
                 sunset_opt_out: false,
                 seo: #seo_defaults,

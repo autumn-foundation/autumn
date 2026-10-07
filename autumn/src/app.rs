@@ -13770,6 +13770,7 @@ mod agent_authority_route_summary_tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -13845,6 +13846,7 @@ mod validate_repository_api_policies_tests {
             repository: meta,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -14312,6 +14314,8 @@ fn build_state(
         client: crate::http_client::Client::build_inner(&config.http.client),
         timeout_secs: config.http.client.timeout_secs,
     });
+    #[cfg(feature = "http-client")]
+    crate::http_client::install_shared_throttle(&state, &config.http.client);
     state
 }
 
@@ -17406,6 +17410,7 @@ mod tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -17735,6 +17740,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -17819,6 +17825,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -17993,6 +18000,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -18101,6 +18109,7 @@ mod tests {
                     repository: None,
                     idempotency: crate::route::RouteIdempotency::Direct,
                     timeout: crate::route::RouteTimeout::Inherit,
+                    criticality: crate::admission::Criticality::Default,
                     seo: crate::seo::SeoRouteDefaults::EMPTY,
                     api_version: None,
                     sunset_opt_out: false,
@@ -18208,6 +18217,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -18567,6 +18577,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: startup_noop_job_handler,
+                timeout: None,
             }])
             .on_startup(|_state| async {
                 crate::job::enqueue("startup-seed", serde_json::json!({ "kind": "warmup" })).await
@@ -18629,6 +18640,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: startup_noop_job_handler,
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -18784,6 +18796,7 @@ mod tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -18822,6 +18835,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -18841,6 +18855,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -19232,6 +19247,7 @@ mod tests {
                     repository: None,
                     idempotency: crate::route::RouteIdempotency::Direct,
                     timeout: crate::route::RouteTimeout::Inherit,
+                    criticality: crate::admission::Criticality::Default,
                     seo: crate::seo::SeoRouteDefaults::EMPTY,
                     api_version: None,
                     sunset_opt_out: false,
@@ -19292,6 +19308,7 @@ mod tests {
                     repository: None,
                     idempotency: crate::route::RouteIdempotency::Direct,
                     timeout: crate::route::RouteTimeout::Inherit,
+                    criticality: crate::admission::Criticality::Default,
                     seo: crate::seo::SeoRouteDefaults::EMPTY,
                     api_version: None,
                     sunset_opt_out: false,

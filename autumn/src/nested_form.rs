@@ -511,6 +511,19 @@ where
     P: serde::de::DeserializeOwned + validator::Validate,
     C: NestedChild,
 {
+    decode_nested_with_nul_message(pairs, crate::form::NUL_CHARACTER_FIELD_ERROR)
+}
+
+/// Like [`decode_nested_urlencoded`], but the caller sets the message for a NUL
+/// byte.
+fn decode_nested_with_nul_message<P, C>(
+    pairs: &[(String, String)],
+    nul_message: &str,
+) -> Result<NestedChangeset<P, C>, String>
+where
+    P: serde::de::DeserializeOwned + validator::Validate,
+    C: NestedChild,
+{
     let collection = C::COLLECTION;
 
     // Split parent pairs from grouped child subfields. `BTreeMap` keeps the
@@ -575,7 +588,7 @@ where
             .map_err(|e| e.to_string())?;
     let mut parent = parent_data.into_changeset();
     for field in parent_nul_fields {
-        parent.add_error(field, crate::form::NUL_CHARACTER_FIELD_ERROR);
+        parent.add_error(field, nul_message);
     }
 
     let mut rows: Vec<NestedRow> = Vec::new();
@@ -586,6 +599,7 @@ where
         match decode_child_row::<C>(
             &subfields,
             child_nul_fields.get(&idx).map_or(&[], Vec::as_slice),
+            nul_message,
         ) {
             ChildRow::Dropped => {}
             ChildRow::Bound { row, child } => {
@@ -637,10 +651,11 @@ enum ChildRow<C> {
 ///
 /// `nul_fields` names the subfields of this row whose submitted value carried
 /// a NUL byte (#2423); the values in `subfields` have already been cleaned, so
-/// this only decides what to say about them.
+/// this function only sets the message for them, from `nul_message`.
 fn decode_child_row<C: NestedChild>(
     subfields: &[(String, String)],
     nul_fields: &[String],
+    nul_message: &str,
 ) -> ChildRow<C> {
     let mut values: HashMap<String, String> = HashMap::new();
     let mut destroyed = false;
@@ -702,7 +717,7 @@ fn decode_child_row<C: NestedChild>(
             errors
                 .entry(field.clone())
                 .or_default()
-                .push(crate::form::NUL_CHARACTER_FIELD_ERROR.to_owned());
+                .push(nul_message.to_owned());
         }
         return ChildRow::Rejected(NestedRow {
             values,
@@ -749,7 +764,7 @@ fn decode_child_row<C: NestedChild>(
         errors
             .entry(field.clone())
             .or_default()
-            .push(crate::form::NUL_CHARACTER_FIELD_ERROR.to_owned());
+            .push(nul_message.to_owned());
         child = None;
     }
 
@@ -1247,6 +1262,7 @@ where
 
         // Same content-type gate axum's own form extractors apply. Multipart
         // is out of scope for now (follow-up).
+        let (req, nul_message) = crate::form::nul_field_message(req, state).await;
         let content_type = req
             .headers()
             .get(http::header::CONTENT_TYPE)
@@ -1286,7 +1302,7 @@ where
             }
         }
 
-        let changeset = decode_nested_urlencoded::<P, C>(&pairs)
+        let changeset = decode_nested_with_nul_message::<P, C>(&pairs, &nul_message)
             .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e).into_response())?;
 
         Ok(Self {
