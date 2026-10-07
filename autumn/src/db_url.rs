@@ -66,6 +66,27 @@ pub fn is_bare_in_memory_sqlite(url: &str) -> bool {
     url.is_empty() || url == ":memory:"
 }
 
+/// Refuse a target that does not name Postgres, for a store that opens its own
+/// Postgres connection from a URL.
+///
+/// `PgFlagStore::new(url)` and its siblings do not screen the target. Without
+/// this check, a `SQLite` target fails in libpq, and libpq quotes the target
+/// with its credentials in the error (#2539 §5).
+///
+/// # Errors
+///
+/// Returns the refusal message, with the target redacted.
+pub fn require_postgres_target(url: &str, store: &str) -> Result<(), String> {
+    if DatabaseBackend::detect(url) == Some(DatabaseBackend::Postgres) {
+        return Ok(());
+    }
+    Err(format!(
+        "{store} needs a Postgres database target, got {:?}; on another backend, \
+         use the in-memory store",
+        redact_target(url)
+    ))
+}
+
 /// Mask credentials in a database target before it goes into a message.
 ///
 /// **A `SQLite` target keeps its filename and its diagnostic parameters.** It
@@ -99,15 +120,12 @@ pub fn is_bare_in_memory_sqlite(url: &str) -> bool {
 /// string). A bare filesystem path is exactly that, and is the case where
 /// naming the target is the whole value of the message.
 ///
-/// # Known gap
+/// An OPAQUE url (`postgres:password=hunter2`) parses, but the parser reports
+/// no password, query or fragment in it. It keeps its scheme only, unless the
+/// rest is one path-shaped token (`mysql:app.db`).
 ///
-/// "The default is to mask" holds for everything `Url::parse` REJECTS. It does
-/// not yet hold for an OPAQUE url it accepts: `postgres:password=hunter2`
-/// parses, reports no password, query or fragment, and has no `@` in its path,
-/// so it returns verbatim and reaches the boot error. Tracked in #2571 — the
-/// fix is to treat a URL with no authority whose path carries key/value
-/// material as unclassified, rather than trusting that a successful parse
-/// means the parser understood every part of it.
+/// An allowlisted query key does not make its value safe. A kept value that is
+/// not a simple token is masked ([`is_simple_token`]).
 pub fn redact_target(url: &str) -> String {
     let backend = DatabaseBackend::detect(url);
     if backend == Some(DatabaseBackend::Sqlite) {
@@ -129,6 +147,19 @@ pub fn redact_target(url: &str) -> String {
                 .is_some_and(|fragment| fragment.contains('@'))
         {
             return "****".to_owned();
+        }
+        // No authority, so the parser saw no userinfo, query or fragment: do
+        // not trust the rest. Keep it only when it is one path-shaped token,
+        // as for a bare path below. A one-letter scheme is a Windows drive
+        // letter, which is a path.
+        if parsed.cannot_be_a_base() && parsed.scheme().len() > 1 {
+            let opaque = url.split_once(':').map_or("", |(_, rest)| rest);
+            if opaque.is_empty()
+                || opaque.contains(['=', '@', '?', ':', '%', '#'])
+                || opaque.contains(char::is_whitespace)
+            {
+                return format!("{}:****", parsed.scheme());
+            }
         }
         let has_password = parsed.password().is_some();
         if has_password {
@@ -246,24 +277,37 @@ fn filter_query(query: &str, allowed: &[&str], enumerable: bool) -> String {
     if !enumerable {
         return "****".to_owned();
     }
-    let mut kept: Vec<&str> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
     let mut dropped = false;
     // BOTH separators. Splitting on `&` alone let a `;`-joined tail ride
     // through on the back of an allowed key —
     // `?sslmode=require;password=hunter2` was one pair whose key was
     // `sslmode`. `;` is what an operator pastes in from a JDBC-style string.
     for pair in query.split(['&', ';']) {
-        let key = pair.split_once('=').map_or(pair, |(key, _)| key).trim();
-        if allowed.iter().any(|a| key.eq_ignore_ascii_case(a)) {
-            kept.push(pair);
-        } else {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if !allowed.iter().any(|a| key.trim().eq_ignore_ascii_case(a)) {
             dropped = true;
+        } else if is_simple_token(value) {
+            kept.push(pair.to_owned());
+        } else {
+            kept.push(format!("{key}=****"));
         }
     }
     if dropped {
-        kept.push("****");
+        kept.push("****".to_owned());
     }
     kept.join("&")
+}
+
+/// Whether a query value is a simple token that is safe to echo.
+///
+/// The default is to mask. A value with `@`, `:`, `%`, whitespace or a quote
+/// can hold a nested target or an encoded one, so it does not pass. Paths
+/// (`/var/run/postgresql`) and host lists (`db1,db2`) pass.
+fn is_simple_token(value: &str) -> bool {
+    value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~' | ',' | '/' | '+'))
 }
 
 /// Re-render one allowlisted keyword/value pair's value.
@@ -549,6 +593,51 @@ mod tests {
         assert_eq!(
             redact_target("host=db user='app x' password=hunter2"),
             "host=db user='app x' ****"
+        );
+    }
+
+    // An opaque URL parses, but the parser reports no password, query or
+    // fragment. Key/value material in it is masked (#2571 item 1).
+    #[test]
+    fn an_opaque_url_keeps_only_its_scheme() {
+        assert_eq!(redact_target("postgres:password=hunter2"), "postgres:****");
+        assert_eq!(
+            redact_target("postgresql:host=db password=hunter2"),
+            "postgresql:****"
+        );
+        assert_eq!(redact_target("postgres:app:hunter2"), "postgres:****");
+        assert_eq!(redact_target("mysql:pass%77ord"), "mysql:****");
+        // One path-shaped token stays, as a bare path does.
+        assert_eq!(redact_target("mysql:app.db"), "mysql:app.db");
+        // A Windows drive letter parses as a one-letter scheme. It is a path.
+        assert_eq!(redact_target(r"C:\data\app.db"), r"C:\data\app.db");
+    }
+
+    // An allowlisted key does not make its value safe. A value that is not a
+    // simple token is masked (#2571 item 4).
+    #[test]
+    fn an_allowlisted_query_value_must_be_a_simple_token() {
+        assert_eq!(
+            redact_target("postgres://db/app?application_name=postgres://app:hunter2@other/db"),
+            "postgres://db/app?application_name=****"
+        );
+        assert_eq!(
+            redact_target("postgres://db/app?sslmode=require&application_name=app:hunter2@other"),
+            "postgres://db/app?sslmode=require&application_name=****"
+        );
+        // Simple tokens stay legible: paths, lists, numbers.
+        assert_eq!(
+            redact_target(
+                "postgres://db/app?host=/var/run/postgresql&sslrootcert=/etc/ssl/root.crt"
+            ),
+            "postgres://db/app?host=/var/run/postgresql&sslrootcert=/etc/ssl/root.crt"
+        );
+        // The SQLite arm: no credential comes out, and a plain value stays.
+        let out = redact_target("sqlite://file:app.db?mode=ro&vfs=postgres://app:hunter2@other/db");
+        assert!(!out.contains("hunter2"), "leaked: {out}");
+        assert_eq!(
+            redact_target("file:app.db?mode=ro&vfs=unix dotfile"),
+            "file:app.db?mode=ro&vfs=****"
         );
     }
 
