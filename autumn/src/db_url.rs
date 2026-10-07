@@ -409,9 +409,9 @@ pub fn redact_driver_error(msg: &str, url: &str) -> String {
     out
 }
 
-/// The passwords in a target, raw and percent-decoded: the userinfo password
-/// of a URL, and each `password` / `sslpassword` value of a query or of a
-/// keyword/value string.
+/// The passwords in a target, raw and percent-decoded, longest first: the
+/// userinfo password of a URL, and each `password` / `sslpassword` value of a
+/// query or of a keyword/value string.
 ///
 /// Read by string surgery, not by `Url::parse`: a target that libpq rejects
 /// can be one that `Url::parse` rejects too.
@@ -450,6 +450,10 @@ fn secrets_in(url: &str) -> Vec<String> {
         }
         secrets.push(secret);
     }
+    // Longest first: a short secret inside a longer one must not cut the longer
+    // one before its turn.
+    secrets.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    secrets.dedup();
     secrets
 }
 
@@ -794,6 +798,13 @@ mod tests {
 
         // A keyword/value password is masked wherever it shows.
         let out = redact_driver_error("failed near hunter2", "host=db password=hunter2");
+        assert!(!out.contains("hunter2"), "{out}");
+
+        // One secret inside another: the longer one is masked first.
+        let out = redact_driver_error(
+            "failed near hunter2a",
+            "host=db password=a sslpassword=hunter2a",
+        );
         assert!(!out.contains("hunter2"), "{out}");
 
         // A quoted part of the redacted target stays legible.
