@@ -368,9 +368,10 @@ scan_manifest() {
         sub(/^name[ \t]*=[ \t]*"/, "", pkg)
         sub(/".*$/, "", pkg)
       }
-      # Record each feature and the LOCAL features it enables. Pass 2 resolves
+      # Record each feature, by any name cargo accepts, and the LOCAL features
+      # it enables. Pass 2 resolves
       # the chains, after every alias is known.
-      if (section == "[features]" && norm ~ /^[A-Za-z0-9_.+-]+[ \t]*=/) {
+      if (section == "[features]" && norm ~ /^[^= \t][^=]*=/) {
         fkey = norm
         sub(/[ \t]*=.*$/, "", fkey)
         feat_entry[fkey] = norm
@@ -947,6 +948,17 @@ embedded = ["sqlite"]
 sqlite = ["autumn-web/sqlite"]
 EOF
   check_fail "a feature reaching the flip through a local feature chain" feature_chain
+
+  make_case chain_unicode <<'EOF'
+[package]
+name = "autumn-cli"
+
+[features]
+default = ["émbedded"]
+"émbedded" = ["sqlite"]
+sqlite = ["autumn-web/sqlite"]
+EOF
+  check_fail "a chain through a non-ASCII feature name" chain_unicode
 
   make_case chain_unrelated <<'EOF'
 [package]
