@@ -43,7 +43,7 @@ those paths itself.
 | Endpoint | Probe | What it reflects |
 | --- | --- | --- |
 | `/live` | liveness | Only that the process is up. Ignores startup and dependency state, so it answers `200` whenever the process is running. |
-| `/ready` | readiness | Startup completion, shutdown draining, connection-pool saturation, a configured read replica (unless `replica_fallback = "primary"`), and any readiness indicators you register. `503` when any is not ready. |
+| `/ready` | readiness | Startup completion, shutdown draining, a cached `SELECT 1` on the primary database, a configured read replica (unless `replica_fallback = "primary"`), and any readiness indicators you register. `503` when any is not ready. |
 | `/startup` | startup | Stays unavailable until startup hooks complete. |
 | `/health` | — | Compatibility alias for readiness: same checks and same status as `/ready`. |
 
@@ -55,19 +55,21 @@ Recommended use:
 
 Do not point all three at `/health` just because it was easy in older apps.
 `/health` is a readiness answer, so it returns `503` for conditions a restart
-does not fix: a saturated connection pool, a read replica that cannot safely
+does not fix: an unreachable primary database, a read replica that cannot safely
 serve reads, a readiness indicator of your own reporting down, or a drain
 already in progress. A *liveness* probe reading one of those has the
 orchestrator kill a process that was working — a busy minute becomes a restart
 loop, which is the failure mode separate probes exist to prevent. Point
 liveness at `/live`, which reports on the process and nothing else.
 
-Readiness does **not** ping the primary database. The built-in `db` indicator
-reports pool *availability* — whether a connection is free, or nobody is queued
-for one — so a primary that has become unreachable while the pool still holds
-idle connections can leave `/ready` at `200`. A configured read replica is
-different: it is probed with a real `SELECT 1`. If you need readiness to gate
-on primary connectivity, register an indicator that runs a query.
+Readiness pings the primary database with `SELECT 1` on one dedicated
+connection outside the pool. Autumn keeps the result for `health.cache_ttl_ms`
+(default 1 s). One probe refreshes it, and the other probes wait. A ping that
+fails or takes longer than `health.ping_timeout_ms` (default 2 s) gives `503`.
+Keep that limit below the probe `timeoutSeconds`. Pool saturation does **not**
+affect readiness. A busy app replica stays in rotation. To shed excess
+requests with `503` and `Retry-After`, set `server.max_concurrent_requests`
+(off by default). A configured read replica gets the same ping.
 
 For readiness that also reflects your own subsystems, see
 [Health Indicators](health-indicators.md).

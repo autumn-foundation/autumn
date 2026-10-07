@@ -314,6 +314,65 @@ let ceiling: Option<usize> = limit.limit();
 
 **Automation:** `manual` — a new enum variant needs a new match arm, and no
 safe rewrite can choose its body.
+### Config: `HealthConfig` gains four public fields
+
+**Why:** `/ready` now pings the primary database. The new fields set the
+ping cache, the ping time limit, and which pings gate `/ready` (issue #3059).
+
+**Before (`{X.Y}`):** a struct literal listed every field.
+
+```rust
+let health = autumn_web::config::HealthConfig {
+    enabled: true,
+    path: "/health".into(),
+    live_path: "/live".into(),
+    ready_path: "/ready".into(),
+    startup_path: "/startup".into(),
+    detailed: false,
+};
+```
+
+**After (`{(X+1).0}`):** add `..HealthConfig::default()`. It sets
+`cache_ttl_ms = 1000`, `ping_timeout_ms = 2000`, `db_readiness = true` and
+`redis_readiness = false`.
+
+```rust
+let health = autumn_web::config::HealthConfig {
+    detailed: false,
+    ..autumn_web::config::HealthConfig::default()
+};
+```
+
+**Automation:** `manual` - the fix adds a struct update expression, and no
+codemod rewrites struct literals.
+
+### Probes: `/ready` pings the primary database
+
+**Why:** pool saturation made a busy replica unready, and an idle pool made a
+dead database look ready (issue #3059).
+
+**Before (`{X.Y}`):** `/ready`, `/health` and the `db` component of
+`/actuator/health` failed when the pool had no free connection and a request
+waited. They did not connect to the primary.
+
+**After (`{(X+1).0}`):** they send `SELECT 1` to the primary on one dedicated
+connection. A failed ping, or one slower than `health.ping_timeout_ms`, gives
+`503`. A busy pool does not. Do these checks:
+
+- Add one connection per replica to your Postgres `max_connections` budget.
+- Keep `health.ping_timeout_ms` below the probe timeout of your platform (for
+  Kubernetes, `timeoutSeconds`).
+- To keep a replica in rotation when the primary fails, set
+  `health.db_readiness = false`.
+- The generated Dockerfile `HEALTHCHECK` probes `/health`. It now fails when
+  the primary is down. ECS and Docker Swarm replace an unhealthy container. On
+  those platforms, set `AUTUMN_HEALTHCHECK_URL=http://localhost:3000/live`.
+- A test that changes a health indicator and reads `/actuator/health` again
+  in less than 1 s can read the cached result. Set `health.cache_ttl_ms = 0`
+  in the test config.
+
+**Automation:** `manual` - it is a runtime behaviour change, and no code
+rewrite applies.
 
 ### Resilience: `CircuitBreakerPolicy` and `CircuitBreakerPolicyConfig` have slow-call fields
 
@@ -354,6 +413,38 @@ A struct literal of `autumn_web::config::CircuitBreakerPolicyConfig` needs
 
 **Automation:** `manual` - each struct literal needs a value for the new
 fields, and the choice changes when the breaker opens.
+
+### Media: `MediaPlugin` installs only the primitives you enable
+
+**Why:** The docs said both primitives are off by default, but `build`
+installed storage, the encode jobs and the retention sweep for every plugin.
+`with_broadcast()` did nothing. Issue #1974.
+
+**Before (`{X.Y}`):**
+
+```rust
+// Storage, encode jobs and the retention sweep installed.
+autumn_web::app().plugin(MediaPlugin::new().config(media).recordings_root("recordings"))
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+// Enable the primitive you use. Broadcast also installs MediaMtxClient and MediaUrls.
+autumn_web::app().plugin(
+    MediaPlugin::new()
+        .config(media)
+        .with_broadcast()
+        .recordings_root("recordings"),
+)
+```
+
+With no primitive, the plugin installs no routes, extensions or jobs, and logs
+a warning. `extension::<MediaWorkflows>()` then returns `None`, jobs on the
+`media` queue have no handler, and the retention sweep does not start.
+
+**Automation:** `manual` — this is a runtime behavior change. The code still
+compiles, so a codemod cannot know which primitive your app uses.
 
 ### Feature flags: `PgFlagStore::get` errors before the first load
 

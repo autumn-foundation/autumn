@@ -1299,6 +1299,11 @@ jobs:
           cargo test -p autumn-web --features "redis,ws" --lib job::tests::redis_page_spans \
             | tee "${RUNNER_TEMP}/redis-page-spans.log"
           assert_ran "${RUNNER_TEMP}/redis-page-spans.log" "redis_page_spans unit tests"
+          # The Redis PING health indicator (#3059): fake RESP servers, no
+          # Docker. Named here so it does not run only by feature unification.
+          cargo test -p autumn-web --features "redis,ws" --lib redis_health:: \
+            | tee "${RUNNER_TEMP}/redis-health.log"
+          assert_ran "${RUNNER_TEMP}/redis-health.log" "redis_health unit tests"
       - name: Run direct-TLS (HTTPS) tests
         if: matrix.lane == 'tls'
         # `tls` is not a default feature, so the `test` job's workspace `cargo

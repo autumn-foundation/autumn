@@ -3273,7 +3273,7 @@ impl AppBuilder {
         let name = name.into();
         // "db" is a reserved built-in component name. Allowing a custom indicator
         // under this name would produce an inconsistent response: the custom result
-        // would still gate the aggregate status while the built-in pool check owns
+        // would still gate the aggregate status while the built-in primary ping owns
         // the components.db / checks.database display. The "db:shard:" prefix is
         // reserved for the framework's per-shard indicators for the same reason.
         #[cfg(feature = "db")]
@@ -4077,6 +4077,19 @@ impl AppBuilder {
         // precondition, so the exporter shares both — see
         // `validate_pre_router_preconditions`.)
 
+        // Subsystems whose backend the builder installed do not use the
+        // configured Redis, so they get no Redis indicator (#3059).
+        #[cfg(feature = "redis")]
+        let mut unused_redis_subsystems: Vec<&'static str> = Vec::new();
+        #[cfg(feature = "redis")]
+        if session_store.is_some() {
+            unused_redis_subsystems.push("sessions");
+        }
+        #[cfg(all(feature = "redis", feature = "ws"))]
+        if channels_backend.is_some() {
+            unused_redis_subsystems.push("channels");
+        }
+
         // 6. Build the router (with optional static-file layer)
         let mut state = build_state(
             &config,
@@ -4503,6 +4516,24 @@ impl AppBuilder {
             std::process::exit(1);
         }
         finalize_event_bus(listeners, &mut jobs, &state);
+
+        // One `redis:<subsystem>` PING indicator per Redis-backed subsystem
+        // (#3059). Here, the job set is final: with no jobs, no job runtime
+        // starts, so `jobs` gets no indicator. The user indicators are already
+        // registered: if two names are the same, the user indicator stays.
+        #[cfg(feature = "redis")]
+        {
+            if jobs.is_empty() {
+                unused_redis_subsystems.push("jobs");
+            }
+            unused_redis_subsystems.extend(crate::redis_health::unused_for_role(role));
+            crate::redis_health::register_redis_health_indicators(
+                &config,
+                &state.health_indicator_registry,
+                &crate::redis_health::app_pingers(&state),
+                &unused_redis_subsystems,
+            );
+        }
 
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
@@ -6393,6 +6424,7 @@ impl AppBuilder {
         install_story_registry(&state, story_gallery);
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
+        state.apply_health_config(&config.health);
 
         // Apply deferred policy and scope registrations onto the live app state,
         // as `run()` does. Static routes can carry `#[authorize]` checks or sit
@@ -8167,6 +8199,7 @@ impl AppBuilder {
         // does not add one), and a replayed request should meet the app as a
         // warm process, not one still starting.
         state.probes = crate::probe::ProbeState::default();
+        state.apply_health_config(&config.health);
         state.insert_extension(RegisteredApiVersions(api_versions));
         #[cfg(feature = "db")]
         if let Some(interceptor) = db_interceptor {
@@ -14183,6 +14216,7 @@ fn build_state(
         entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
         app_id: AppState::next_app_id(),
     };
+    state.apply_health_config(&config.health);
     #[cfg(feature = "db")]
     if state.replica_pool.is_some() {
         state
@@ -14193,7 +14227,11 @@ fn build_state(
     // `db:shard:<name>` component (replica readiness refresh + pool stats).
     #[cfg(feature = "db")]
     if let Some(set) = state.shards() {
-        crate::sharding::register_shard_health_indicators(set, &state.health_indicator_registry);
+        crate::sharding::register_shard_health_indicators(
+            set,
+            &state.health_indicator_registry,
+            config.health.ping_timeout(),
+        );
     }
     state.insert_extension(config.clone());
     state.insert_extension(crate::step_up::StepUpGlobalConfig {
