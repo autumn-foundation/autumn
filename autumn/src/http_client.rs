@@ -2222,11 +2222,7 @@ impl RequestBuilder {
                 req = req.body(body.clone());
             }
 
-            let outcome = req.send().await;
-            if let Some(ticket) = ticket {
-                ticket.record(matches!(&outcome, Ok(r) if throttle_accepts(r.status().as_u16())));
-            }
-            match outcome {
+            match req.send().await {
                 Ok(resp) => {
                     let status = resp.status();
                     let headers = resp.headers().clone();
@@ -2234,6 +2230,9 @@ impl RequestBuilder {
 
                     // 429 and 502-504 → retry if attempts remain.
                     if is_retryable_response(status.as_u16()) && attempt + 1 < max_attempts {
+                        if let Some(ticket) = ticket {
+                            ticket.record(throttle_accepts(status.as_u16()));
+                        }
                         delay = self.retry_policy.retry_delay(
                             &*self.entropy,
                             attempt,
@@ -2244,12 +2243,18 @@ impl RequestBuilder {
 
                     let body = if self.discard_response_body {
                         // Dropped unread — see `discard_response_body`.
-                        Bytes::new()
+                        Ok(Bytes::new())
                     } else {
                         resp.bytes()
                             .await
-                            .map_err(|e| ClientError::Request(e.without_url()))?
+                            .map_err(|e| ClientError::Request(e.without_url()))
                     };
+                    // Count the attempt only now: a body that fails to arrive
+                    // is a transport error, not an accept.
+                    if let Some(ticket) = ticket {
+                        ticket.record(body.is_ok() && throttle_accepts(status.as_u16()));
+                    }
+                    let body = body?;
                     let elapsed = crate::time::ambient_instant().saturating_duration_since(start);
                     log_request(
                         self.method.as_str(),
@@ -2269,9 +2274,17 @@ impl RequestBuilder {
                 // Only retry transient connect/timeout errors; non-transient errors
                 // (e.g. malformed URL) fail immediately.
                 Err(e) if (e.is_connect() || e.is_timeout()) && attempt + 1 < max_attempts => {
+                    if let Some(ticket) = ticket {
+                        ticket.record(false);
+                    }
                     delay = self.retry_policy.retry_delay(&*self.entropy, attempt, None);
                 }
-                Err(e) => return Err(ClientError::Request(e.without_url())),
+                Err(e) => {
+                    if let Some(ticket) = ticket {
+                        ticket.record(false);
+                    }
+                    return Err(ClientError::Request(e.without_url()));
+                }
             }
         }
 
@@ -3638,6 +3651,57 @@ mod tests {
             throttles.iter().all(|t| Arc::ptr_eq(t, &throttles[0])),
             "every client must share the one throttle"
         );
+    }
+
+    /// Regression (#3183 review): a response whose body fails to arrive is
+    /// a transport error for the throttle, not an accept.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_truncated_body_is_not_an_accept() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        // A server that sends a 200 head with a 100-byte length, 3 bytes of
+        // body, then closes.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0_u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nabc")
+                    .await;
+                drop(socket);
+            }
+        });
+
+        let mut config = HttpClientConfig::default();
+        config.adaptive_throttle.enabled = true;
+        let client = Client::from_config(&config);
+        let url = format!("http://{addr}/x");
+        for _ in 0..20 {
+            let res = client.get(&url).no_retry().send().await;
+            assert!(
+                matches!(
+                    res,
+                    Err(ClientError::Request(_) | ClientError::ThrottledLocally { .. })
+                ),
+                "a truncated body is an error: {res:?}"
+            );
+        }
+        let throttle = client.throttle.as_ref().expect("on");
+        assert!(
+            throttle.reject_probability(&addr.to_string(), crate::time::ambient_instant()) > 0.5,
+            "truncated bodies must count as rejects"
+        );
+        crate::circuit_breaker::global_registry().clear();
     }
 
     #[test]

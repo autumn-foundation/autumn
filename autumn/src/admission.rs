@@ -567,6 +567,17 @@ impl Vegas {
     }
 
     fn update(&mut self, sample: Sample) -> usize {
+        // A drop decreases the limit first. Its RTT (often a fast failure)
+        // is never a base RTT.
+        if sample.dropped {
+            let limit = self.estimated;
+            let next = self.bounds.clamp_f64(limit - Self::log10_root(limit));
+            if next < limit {
+                self.probe_count = 0;
+            }
+            self.estimated = next;
+            return self.limit();
+        }
         let rtt = rtt_nanos(sample.rtt);
         self.probe_count = self.probe_count.saturating_add(1);
         let probe_every = self
@@ -584,9 +595,7 @@ impl Vegas {
         }
         let limit = self.estimated;
         let step = Self::log10_root(limit);
-        let next = if sample.dropped {
-            limit - step
-        } else if usize_to_f64(sample.in_flight) * 2.0 < limit {
+        let next = if usize_to_f64(sample.in_flight) * 2.0 < limit {
             return self.limit();
         } else {
             let queue = (limit * (1.0 - self.rtt_noload / rtt)).ceil();
@@ -1429,6 +1438,25 @@ mod tests {
             limit = v.update(sample(50, limit));
         }
         assert!(limit < 20, "Vegas re-based on a queued RTT: limit {limit}");
+    }
+
+    /// Regression (#3183 review): a fast first drop must decrease the limit
+    /// and must not become the base RTT.
+    #[test]
+    fn vegas_drop_before_any_base_rtt_still_backs_off() {
+        let mut v = Vegas::new(bounds(1, 1000, 50));
+        let fast_drop = Sample {
+            dropped: true,
+            ..sample(1, 50)
+        };
+        let first = v.update(fast_drop);
+        assert!(first < 50, "the first sample is a drop: {first}");
+        assert!(v.rtt_noload <= 0.0, "a drop is not a base RTT");
+        let mut limit = first;
+        for _ in 0..20 {
+            limit = v.update(fast_drop);
+        }
+        assert!(limit < first, "repeated drops keep backing off: {limit}");
     }
 
     #[test]
