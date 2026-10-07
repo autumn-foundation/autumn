@@ -408,10 +408,12 @@ struct TxClaim {
     body_hash: Vec<u8>,
     ttl: Duration,
     committed: AtomicBool,
-    /// A lower bound on this request's lock deadline (Unix ms, app clock):
-    /// taken before the store set the lock, and moved when the lock moves.
-    /// Until then the row cannot be swept, so a missing row means another
-    /// database; after it, a missing row means the key was lost.
+    /// An upper bound on this request's lock deadline (Unix ms, app clock):
+    /// read just after the store set the lock, and moved when the lock moves.
+    /// Before it, a missing row means another database (`500`); after it, the
+    /// sweep may have deleted the row, so the key was lost (`409`). The two
+    /// overlap only between the store's deadline and this bound: the time it
+    /// takes the middleware to read the clock after the lock statement.
     lock_deadline_ms: AtomicI64,
 }
 
@@ -564,7 +566,15 @@ impl IdempotencyTx {
                 && session.has_pending_changes().await
             {
                 extend_lock_to_expiry(conn, &claim.storage_key, &claim.owner).await?;
-                claim.lock_deadline_ms.fetch_max(expires, Ordering::Relaxed);
+                // The lock now ends at the record expiry, which
+                // `keep_past_crash_lock` may have moved to the old deadline
+                // plus the TTL. Keep an upper bound on both.
+                let held_until = AtomicI64::load(&claim.lock_deadline_ms, Ordering::Relaxed)
+                    .saturating_add(ttl)
+                    .max(expires);
+                claim
+                    .lock_deadline_ms
+                    .fetch_max(held_until, Ordering::Relaxed);
             }
             AtomicBool::store(&claim.committed, true, Ordering::SeqCst);
             Ok(Response::from_parts(parts, Body::from(bytes)))

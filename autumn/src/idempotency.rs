@@ -1588,10 +1588,10 @@ async fn lookup_prepared_entry(
     store.get(&prepared.storage_key).await
 }
 
-/// A lower bound on the deadline of a lock taken now for `in_flight_ttl`, in
-/// Unix ms on the app clock: read before the store sets the lock, with the
+/// An upper bound on the deadline of a lock just taken for `in_flight_ttl`,
+/// in Unix ms on the app clock: read after the store set the lock, with the
 /// same 1 s floor for a zero TTL.
-fn lock_deadline_floor_ms(in_flight_ttl: Duration) -> i64 {
+fn lock_deadline_bound_ms(in_flight_ttl: Duration) -> i64 {
     let ttl = if in_flight_ttl.is_zero() {
         Duration::from_secs(1)
     } else {
@@ -1798,7 +1798,6 @@ where
 
     // ── In-flight check (concurrent duplicate) ─────────────────────────────
     let lock_owner = in_flight_lock_owner(entropy.as_ref());
-    let lock_deadline_ms = lock_deadline_floor_ms(in_flight_ttl);
     if !acquire_lock(
         store.as_ref(),
         &prepared.storage_key,
@@ -1813,6 +1812,7 @@ where
         );
         return Ok(in_flight_conflict(metrics.as_ref()));
     }
+    let lock_deadline_ms = lock_deadline_bound_ms(in_flight_ttl);
     let lock = InFlightLock {
         store: store.clone(),
         key: prepared.storage_key.clone(),
