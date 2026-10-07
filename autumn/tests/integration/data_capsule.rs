@@ -483,6 +483,22 @@ async fn export_refuses_a_link_to_a_column_that_the_target_lacks() {
 }
 
 #[tokio::test]
+async fn export_refuses_a_row_without_a_value_in_a_required_column() {
+    // A custom store can give a row without a NOT NULL column. Import would
+    // write NULL there and fail, so export must not sign such a capsule.
+    let store = seeded_store();
+    store.insert("posts", json!({"id": 12, "author_id": 1}));
+    let models = registry().capsule_models().to_vec();
+    let err = export_subject(&models, &store, "1")
+        .await
+        .expect_err("row without title");
+    assert!(
+        matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains("title")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
 async fn export_refuses_a_row_without_its_key() {
     // A custom store can give a row without its key, or with a null key:
     // the viewer has no anchor for it, and import would write NULL.
@@ -831,6 +847,82 @@ async fn import_refuses_a_column_that_the_target_now_generates() {
         .expect_err("generated column");
     assert!(
         matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains("users.bio")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn import_refuses_a_column_whose_type_the_target_changed() {
+    // `email` is `text` in the capsule but `varchar(5)` in the target. The
+    // target type could change the value, so import must refuse it.
+    let capsule = export_ada(&seeded_store()).await;
+    let target = MemoryCapsuleStore::new()
+        .table(
+            "users",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("email", "character varying(5)"),
+                FieldSpec::new("bio", "text").nullable(),
+            ],
+        )
+        .table(
+            "posts",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("author_id", "bigint"),
+                FieldSpec::new("title", "text"),
+                FieldSpec::new("meta", "jsonb").nullable(),
+            ],
+        )
+        .table(
+            "comments",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("author_id", "bigint"),
+                FieldSpec::new("post_id", "bigint"),
+                FieldSpec::new("body", "text"),
+            ],
+        );
+    let err = import_capsule(&capsule, registry().capsule_models(), &target)
+        .await
+        .expect_err("changed type");
+    assert!(
+        matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains("users.email")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn import_orders_tables_by_the_current_links_too() {
+    // The capsule is from before posts linked to users, so its manifest
+    // gives no order. The current model links them: users must come first.
+    let old = [
+        CapsuleModel::new("posts", "author_id"),
+        CapsuleModel::new("users", "id"),
+    ];
+    let capsule = export_subject(&old, &seeded_store(), "1").await.unwrap();
+    let current = [
+        CapsuleModel::new("posts", "author_id").belongs_to("author_id", "users"),
+        CapsuleModel::new("users", "id"),
+    ];
+    let summary = import_capsule(&capsule, &current, &empty_store())
+        .await
+        .expect("import");
+    let order: Vec<&str> = summary.tables.iter().map(|t| t.table.as_str()).collect();
+    assert_eq!(order, ["users", "posts"]);
+}
+
+#[tokio::test]
+async fn import_refuses_a_row_column_that_the_manifest_does_not_describe() {
+    // Export refuses such a row. A capsule built or changed through the
+    // public API can still carry one, and the viewer would not show it.
+    let mut capsule = export_ada(&seeded_store()).await;
+    capsule.records.get_mut("users").unwrap()[0].insert("secret".to_owned(), json!("x"));
+    let err = import_capsule(&capsule, registry().capsule_models(), &empty_store())
+        .await
+        .expect_err("undescribed column");
+    assert!(
+        matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains("secret")),
         "{err:?}"
     );
 }

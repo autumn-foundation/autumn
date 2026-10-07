@@ -193,26 +193,8 @@ pub async fn export_subject(
                 )));
             }
         }
-        // A row must hold only described columns. A column outside `fields`
-        // would be in the capsule, but not in the manifest or the viewer.
         for row in &rows {
-            if let Some(column) = row.keys().find(|k| !fields.iter().any(|f| &f.name == *k)) {
-                return Err(DataCapsuleError::InvalidInput(format!(
-                    "the store gave column {column:?} of {}, which its description of the \
-                     table does not have",
-                    model.table
-                )));
-            }
-            // The viewer anchors a record at its key, and import writes both
-            // columns: a row needs a value in each.
-            for column in [&model.primary_key, &model.subject_column] {
-                if row.get(column).and_then(value_key).is_none() {
-                    return Err(DataCapsuleError::InvalidInput(format!(
-                        "the store gave a row of {} without a value in {column:?}",
-                        model.table
-                    )));
-                }
-            }
+            check_exported_row(model, &fields, row)?;
         }
         described.insert(
             model.table.as_str(),
@@ -261,6 +243,47 @@ pub async fn export_subject(
         records,
         blobs: BTreeMap::new(),
     })
+}
+
+/// Check a row that `store` gave for `model`, whose table has `fields`.
+fn check_exported_row(
+    model: &CapsuleModel,
+    fields: &[FieldSpec],
+    row: &Record,
+) -> Result<(), DataCapsuleError> {
+    // A row must hold only described columns. A column outside `fields`
+    // would be in the capsule, but not in the manifest or the viewer.
+    if let Some(column) = row.keys().find(|k| !fields.iter().any(|f| &f.name == *k)) {
+        return Err(DataCapsuleError::InvalidInput(format!(
+            "the store gave column {column:?} of {}, which its description of the table \
+             does not have",
+            model.table
+        )));
+    }
+    // Import writes every column of the capsule. A row without a value in a
+    // NOT NULL column would fail there, so do not sign it.
+    if let Some(field) = fields.iter().find(|f| {
+        !f.nullable
+            && !f.generated
+            && !model.excluded.contains(&f.name)
+            && row.get(&f.name).is_none_or(serde_json::Value::is_null)
+    }) {
+        return Err(DataCapsuleError::InvalidInput(format!(
+            "the store gave a row of {} without a value in the NOT NULL column {:?}",
+            model.table, field.name
+        )));
+    }
+    // The viewer anchors a record at its key, and import writes both
+    // columns: a row needs a value in each.
+    for column in [&model.primary_key, &model.subject_column] {
+        if row.get(column).and_then(value_key).is_none() {
+            return Err(DataCapsuleError::InvalidInput(format!(
+                "the store gave a row of {} without a value in {column:?}",
+                model.table
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Import `capsule` into `store`, parents before children, as one unit.
@@ -362,10 +385,19 @@ pub(super) fn check_importable<'c>(
                 )));
             }
         }
-        // Export refuses a row without a value in its key or subject column.
-        // A capsule built or changed through the public API can still carry
-        // one.
+        // Export refuses a row without a value in its key or subject column,
+        // and a row column that the manifest does not describe. A capsule
+        // built or changed through the public API can still carry one.
         for row in capsule.records(&model.table) {
+            if let Some(column) = row
+                .keys()
+                .find(|k| !model.fields.iter().any(|f| &f.name == *k))
+            {
+                return Err(DataCapsuleError::InvalidInput(format!(
+                    "a row of {} holds column {column:?}, which the manifest does not describe",
+                    model.table
+                )));
+            }
             for column in [&model.primary_key, &model.subject_column] {
                 if row.get(column).and_then(value_key).is_none() {
                     return Err(DataCapsuleError::InvalidInput(format!(
@@ -392,13 +424,14 @@ pub(super) fn check_importable<'c>(
             }
         }
     }
-    import_order(&manifest.models)
+    import_order(&manifest.models, models)
 }
 
 /// Check that each table in `store` has the columns that import writes: the
-/// fields of the capsule, without the generated ones, and that it does not
-/// generate them now. A capsule made before a column was dropped, renamed, or
-/// made generated would fail at the insert, after its blobs are written. Run [`check_importable`] first.
+/// fields of the capsule, without the generated ones, with the same type, and
+/// that it does not generate them now. A capsule made before a column was
+/// dropped, renamed, or made generated would fail at the insert, after its
+/// blobs are written; one made before a type changed could lose data. Run [`check_importable`] first.
 pub(super) async fn check_target(
     capsule: &DataCapsule,
     models: &[CapsuleModel],
@@ -423,6 +456,14 @@ pub(super) async fn check_target(
                     return Err(DataCapsuleError::InvalidInput(format!(
                         "{}.{} is in the capsule, but the target table generates it",
                         model.table, field.name
+                    )));
+                }
+                // Another type, or another modifier, can change the value:
+                // `numeric(6, 2)` rounds a `numeric(10, 3)` value.
+                Some(target) if target.data_type != field.data_type => {
+                    return Err(DataCapsuleError::InvalidInput(format!(
+                        "{}.{} is {} in the capsule, but {} in the target table",
+                        model.table, field.name, field.data_type, target.data_type
                     )));
                 }
                 Some(_) => {}
@@ -460,20 +501,27 @@ pub(super) fn adopt_blob_columns(capsule: &mut DataCapsule, models: &[CapsuleMod
 
 /// Sort models so that each `belongs_to` target comes first.
 ///
+/// The links are those of the manifest and those of `current`, the models of
+/// the app now: a link added after the export binds the target as well.
 /// Links to tables outside the capsule and links to the same table do not
 /// count. The sort keeps manifest order where it can.
-fn import_order(models: &[ModelManifest]) -> Result<Vec<&ModelManifest>, DataCapsuleError> {
+fn import_order<'m>(
+    models: &'m [ModelManifest],
+    current: &[CapsuleModel],
+) -> Result<Vec<&'m ModelManifest>, DataCapsuleError> {
     let tables: BTreeSet<&str> = models.iter().map(|m| m.table.as_str()).collect();
     let mut placed: BTreeSet<&str> = BTreeSet::new();
     let mut order = Vec::with_capacity(models.len());
     while order.len() < models.len() {
         let next = models.iter().find(|m| {
+            let mut targets = m.relationships.iter().map(|r| r.target.as_str()).chain(
+                current
+                    .iter()
+                    .filter(|c| c.table == m.table)
+                    .flat_map(|c| c.relationships.iter().map(|r| r.target.as_str())),
+            );
             !placed.contains(m.table.as_str())
-                && m.relationships.iter().all(|r| {
-                    r.target == m.table
-                        || !tables.contains(r.target.as_str())
-                        || placed.contains(r.target.as_str())
-                })
+                && targets.all(|t| t == m.table || !tables.contains(t) || placed.contains(t))
         });
         let Some(next) = next else {
             let rest: Vec<&str> = models
@@ -562,7 +610,7 @@ mod tests {
     }
 
     fn order(models: &[ModelManifest]) -> Vec<&str> {
-        import_order(models)
+        import_order(models, &[])
             .unwrap()
             .iter()
             .map(|m| m.table.as_str())
@@ -592,7 +640,7 @@ mod tests {
             manifest("b", &["a"]),
             manifest("c", &[]),
         ];
-        let err = import_order(&models).unwrap_err();
+        let err = import_order(&models, &[]).unwrap_err();
         assert!(
             matches!(err, DataCapsuleError::RelationshipCycle(ref t) if t == "a, b"),
             "{err}"

@@ -63,8 +63,8 @@ key, and each link, blob, and excluded column, and the target column of a
 link to a model in the same export. A typo fails the export (`400`), so a
 capsule never lacks records, blobs, or links. The other way round, a custom
 `CapsuleStore` must give only the columns that it describes, and a value in
-the key and subject column of every row: any other row fails the export
-(`400`).
+the key and subject column, and in each `NOT NULL` column, of every row: any
+other row fails the export (`400`).
 
 **Exclude all secrets.** Export copies every column that you do not exclude.
 Exclude password hashes, tokens, and internal flags. Import cannot restore an
@@ -201,8 +201,9 @@ capsule directory and to each directory above it.
 ## Import rules
 
 - Each table in the capsule must be a registered capsule model.
-- Import writes parent tables before child tables. A cycle of `belongs_to`
-  links is an error. A link to the same table is permitted.
+- Import writes parent tables before child tables, by the links of the
+  capsule and of the models as they are now. A cycle of `belongs_to` links is
+  an error. A link to the same table is permitted.
 - Postgres import uses one transaction. If one record fails, import writes no
   record.
 - Import skips generated columns.
@@ -230,9 +231,10 @@ capsule directory and to each directory above it.
   it. No lock can prevent this, so run import in a maintenance window.
 - Import writes blobs before records. It first checks the bytes of each blob
   against its manifest entry, that no two entries share a key, and that each
-  target table has the columns of the capsule: a capsule made before you
-  dropped, renamed, or made a column generated is refused (`400`) before any
-  blob is written. If a blob key holds different bytes or
+  target table has the columns of the capsule, with the same types: a capsule
+  made before you dropped, renamed, retyped, or made a column generated is
+  refused (`400`) before any blob is written. A row column that the manifest
+  does not describe is refused too. If a blob key holds different bytes or
   a different MIME type, import stops and writes no blob. If a blob changes
   while import reads it, or another writer takes a key during the import,
   import stops with a conflict (`409`).
