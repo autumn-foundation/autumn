@@ -73,9 +73,9 @@ port="${QUICKSTART_PORT:-3000}"
 base_url="http://127.0.0.1:${port}"
 serve_timeout="${QUICKSTART_SERVE_TIMEOUT_SECS:-180}"
 
-# cargo install writes to ~/.cargo/bin; make sure we find the result even in
-# minimal shells.
-export PATH="$HOME/.cargo/bin:$PATH"
+# cargo install writes to ${CARGO_HOME:-~/.cargo}/bin; put it first so the binary just installed beats any
+# older `autumn` already on PATH (and so we find it in minimal shells).
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 
 phase_started_at=$(date +%s)
 
