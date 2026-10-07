@@ -179,6 +179,16 @@ fn fields_match<'a>(tag: &str, fields: impl IntoIterator<Item = Option<&'a str>>
     if star { !tags } else { matched }
 }
 
+/// Returns the tag of an `ETag` value. The value must hold exactly one
+/// valid entity-tag. If not, the result is `None`.
+fn single_tag(value: &str) -> Option<&str> {
+    let mut tags = entity_tags(value);
+    match (tags.next(), tags.next()) {
+        (Some(Some(tag)), None) => Some(tag),
+        _ => None,
+    }
+}
+
 /// HTTP optional whitespace (RFC 9110 §5.6.3): only SP and HTAB.
 const OWS: [char; 2] = [' ', '\t'];
 
@@ -960,7 +970,7 @@ async fn apply_etag(response: Response<Body>, if_none_match: &[HeaderValue]) -> 
     // before buffering the body.
     if let Some(existing_etag) = response.headers().get(ETAG).cloned() {
         // An unreadable or malformed handler ETag never gives a 304.
-        let tag = header_str(&existing_etag).and_then(|v| entity_tags(v).next().flatten());
+        let tag = header_str(&existing_etag).and_then(single_tag);
         if let Some(tag) = tag
             && fields_match(tag, if_none_match.iter().map(header_str))
         {
@@ -2084,6 +2094,12 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(IF_NONE_MATCH, etag.header_value());
         assert!(fresh_when(&headers, etag).is_fresh());
+    }
+
+    #[tokio::test]
+    async fn etag_layer_multi_value_handler_etag_never_304s() {
+        let status = layer_status(r#""a", "b""#, &[r#""a""#]).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
