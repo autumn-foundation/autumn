@@ -42,6 +42,7 @@ diesel::table! {
         locked_until_ms -> BigInt,
         expires_at_ms -> BigInt,
         ttl_ms -> BigInt,
+        record_owner -> Nullable<Text>,
     }
 }
 
@@ -232,6 +233,7 @@ impl IdempotencyStore for DbIdempotencyStore {
                     keys::locked_until_ms.eq(0),
                     keys::expires_at_ms.eq(expires),
                     keys::ttl_ms.eq(ttl_ms),
+                    keys::record_owner.eq(owner),
                 ))
                 .on_conflict(keys::storage_key)
                 .do_update()
@@ -239,19 +241,24 @@ impl IdempotencyStore for DbIdempotencyStore {
                     keys::record.eq(Some(&bytes)),
                     keys::expires_at_ms.eq(expiry),
                     keys::ttl_ms.eq(ttl_ms),
+                    keys::record_owner.eq(owner),
                 ));
-            // Another owner's live lock: its response wins, so write nothing.
+            // Write nothing when another owner holds a live lock, or stored a
+            // record that has not expired: a request that outlived its lock
+            // never replaces the newer response.
             // `ON CONFLICT … DO UPDATE … WHERE`: the `WHERE` reads the existing row.
-            diesel::query_dsl::methods::FilterDsl::filter(
-                upsert,
-                keys::locked_until_ms
-                    .le(now)
-                    .or(keys::locked_by.is_null())
-                    .or(keys::locked_by.eq(owner)),
-            )
-            .execute(&mut conn)
-            .await
-            .map_err(|e| db_error("store idempotency record", e))?;
+            let lock_free = keys::locked_until_ms
+                .le(now)
+                .or(keys::locked_by.is_null())
+                .or(keys::locked_by.eq(owner));
+            let record_free = keys::record
+                .is_null()
+                .or(keys::expires_at_ms.le(now))
+                .or(keys::record_owner.eq(owner));
+            diesel::query_dsl::methods::FilterDsl::filter(upsert, lock_free.and(record_free))
+                .execute(&mut conn)
+                .await
+                .map_err(|e| db_error("store idempotency record", e))?;
             self.sweep(&mut conn).await;
             Ok(())
         })
@@ -539,6 +546,7 @@ impl IdempotencyTx {
                     keys::record.eq(Some(encoded)),
                     keys::expires_at_ms.eq(now_ms().saturating_add(ttl)),
                     keys::ttl_ms.eq(ttl),
+                    keys::record_owner.eq(Some(claim.owner.clone())),
                 ))
                 .execute(conn)
                 .await?;

@@ -1271,3 +1271,54 @@ async fn recovery_point_keeps_the_layer_ttl_on_takeover() {
         .expect("body");
     assert_eq!(&body[..], b"resumed after charged");
 }
+
+/// A outlives its lock and B takes the key, stores its response and releases.
+/// A's late `set` then finds no live lock, but B's record is still there: A's
+/// stale write must not replace it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_set_after_release_keeps_the_newer_record() {
+    use autumn_web::idempotency::IdempotencyStore as _;
+    let (_substrate, store) = bare_store();
+    let key = "late-after-release";
+    assert!(
+        store
+            .try_lock(key, "a", Duration::from_millis(300))
+            .await
+            .unwrap()
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        store
+            .try_lock(key, "b", Duration::from_secs(10))
+            .await
+            .unwrap()
+    );
+    store
+        .set(
+            key,
+            "b",
+            store_record(201),
+            Vec::new(),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    store.unlock(key, "b").await.unwrap();
+
+    store
+        .set(
+            key,
+            "a",
+            store_record(500),
+            Vec::new(),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+    let entry = store.get(key).await.unwrap().expect("B's record");
+    assert_eq!(
+        entry.record.status, 201,
+        "A's stale write did not replace B's record"
+    );
+}

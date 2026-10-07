@@ -341,9 +341,10 @@ impl IdempotencyStore for MyStore {
 - `try_get`, `try_set`, `try_lock_owned` and `unlock_owned` are removed. Put
   their bodies in `get`, `set`, `try_lock` and `unlock`.
 - `unlock` must release the lock only when `owner` holds it.
-- `set` takes the lock `owner`. While another owner holds a live lock on the
-  key, `set` must write nothing: a request that outlived its lock must not
-  replace the response of the request that holds the key now.
+- `set` takes the lock `owner`. It must write nothing while another owner
+  holds a live lock on the key, or has stored a response for it that has not
+  expired: a request that outlived its lock must not replace the newer
+  request's response. Store the owner with the response to check this.
 - A direct call to a store method needs `.await`.
 
 **Automation:** `manual` - each method needs a new body and a new return

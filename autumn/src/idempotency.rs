@@ -437,10 +437,10 @@ pub trait IdempotencyStore: std::any::Any + Send + Sync {
 
     /// Store the response for `key` for `ttl`, as the lock `owner`.
     ///
-    /// While another owner holds a live lock on `key`, do nothing: an attempt
-    /// that outlived its lock must not replace the response of the request
-    /// that holds the key now. The holder itself, or a key with no live lock,
-    /// is written.
+    /// Do nothing while another owner holds a live lock on `key`, or has
+    /// stored a response for it that has not expired: an attempt that
+    /// outlived its lock must not replace the newer request's response. An
+    /// owner may rewrite its own response.
     fn set<'a>(
         &'a self,
         key: &'a str,
@@ -484,7 +484,7 @@ fn ready<'a, T: Send + 'a>(value: T) -> IdempotencyFuture<'a, T> {
 /// Suitable for single-process deployments and integration tests. For
 /// multi-replica deployments configure `backend = "redis"` in `autumn.toml`.
 pub struct MemoryIdempotencyStore {
-    entries: RwLock<HashMap<String, IdempotencyEntry>>,
+    entries: RwLock<HashMap<String, MemoryEntry>>,
     in_flight: RwLock<HashMap<String, MemoryInFlightLock>>,
     /// Counts `set` calls to trigger periodic expired-entry eviction.
     write_count: AtomicU64,
@@ -494,6 +494,12 @@ pub struct MemoryIdempotencyStore {
 struct MemoryInFlightLock {
     owner: String,
     expires_at: Instant,
+}
+
+/// A stored entry and the lock owner that wrote it.
+struct MemoryEntry {
+    entry: IdempotencyEntry,
+    owner: String,
 }
 
 /// Compute an expiry `Instant` for `ttl`, saturating instead of panicking on
@@ -530,7 +536,7 @@ impl MemoryIdempotencyStore {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .get(key)
-            .cloned();
+            .map(|stored| stored.entry.clone());
         entry.filter(|e| e.expires_at > crate::time::ambient_instant())
     }
 
@@ -542,16 +548,26 @@ impl MemoryIdempotencyStore {
         body_hash: Vec<u8>,
         ttl: Duration,
     ) {
-        // Another owner's live lock: its response wins. Keep the guard until
-        // the entry is in, so no `try_lock` can take the key in between.
+        // Write nothing when another owner holds a live lock, or stored an
+        // entry that has not expired: a request that outlived its lock never
+        // replaces the newer response. Keep the guard until the entry is in,
+        // so no `try_lock` can take the key in between.
+        let now = crate::time::ambient_instant();
         let in_flight = self
             .in_flight
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        let held_by_another = in_flight.get(key).is_some_and(|lock| {
-            lock.owner != owner && lock.expires_at > crate::time::ambient_instant()
-        });
+        let held_by_another = in_flight
+            .get(key)
+            .is_some_and(|lock| lock.owner != owner && lock.expires_at > now);
         if held_by_another {
+            return;
+        }
+        let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
+        let stored_by_another = entries
+            .get(key)
+            .is_some_and(|stored| stored.owner != owner && stored.entry.expires_at > now);
+        if stored_by_another {
             return;
         }
         let entry = IdempotencyEntry {
@@ -559,15 +575,19 @@ impl MemoryIdempotencyStore {
             body_hash,
             expires_at: saturating_deadline(ttl),
         };
-        let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
-        entries.insert(key.to_owned(), entry);
+        entries.insert(
+            key.to_owned(),
+            MemoryEntry {
+                entry,
+                owner: owner.to_owned(),
+            },
+        );
         drop(in_flight);
         // Periodically evict expired entries to bound memory growth for
         // long-running processes. O(N) scan is amortised over every 128 writes.
         let n = self.write_count.fetch_add(1, Ordering::Relaxed);
         if n.is_multiple_of(128) {
-            let now = crate::time::ambient_instant();
-            entries.retain(|_, v| v.expires_at > now);
+            entries.retain(|_, v| v.entry.expires_at > now);
         }
     }
 
@@ -760,6 +780,11 @@ mod redis_store {
         fn lock_key(&self, key: &str) -> String {
             format!("{}:lock:{}", self.key_prefix, key)
         }
+
+        /// The lock owner that wrote the entry; it expires with the entry.
+        fn owner_key(&self, key: &str) -> String {
+            format!("{}:owner:{}", self.key_prefix, key)
+        }
     }
 
     fn backend_error(action: &str, error: &redis::RedisError) -> IdempotencyStoreError {
@@ -789,18 +814,25 @@ mod redis_store {
         ) -> IdempotencyFuture<'a, ()> {
             let lock_key = self.lock_key(key);
             let redis_key = self.entry_key(key);
+            let owner_key = self.owner_key(key);
             let mut conn = self.connection.clone();
             Box::pin(async move {
                 let bytes = StoredEntry::encode(record, body_hash)?;
-                // One script: write unless another owner holds the lock.
+                // One script: write nothing while another owner holds the
+                // lock, or wrote an entry that has not expired.
                 let written: redis::RedisResult<i32> = redis::Script::new(
                     "local holder = redis.call('GET', KEYS[1]) \
                      if holder and holder ~= ARGV[1] then return 0 end \
+                     local writer = redis.call('GET', KEYS[3]) \
+                     if writer and writer ~= ARGV[1] \
+                        and redis.call('EXISTS', KEYS[2]) == 1 then return 0 end \
                      redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3]) \
+                     redis.call('SET', KEYS[3], ARGV[1], 'EX', ARGV[3]) \
                      return 1",
                 )
                 .key(&lock_key)
                 .key(&redis_key)
+                .key(&owner_key)
                 .arg(owner)
                 .arg(bytes)
                 .arg(ttl.as_secs().max(1))
@@ -2129,6 +2161,11 @@ mod tests {
         store.set_now("k", "a", record(500), Vec::new(), Duration::from_secs(60));
         assert!(store.get_now("k").is_none(), "a does not hold the key");
         store.set_now("k", "b", record(201), Vec::new(), Duration::from_secs(60));
+        assert_eq!(store.get_now("k").expect("b's record").record.status, 201);
+
+        // After b releases, a's late write still cannot replace b's entry.
+        store.unlock_now("k", "b");
+        store.set_now("k", "a", record(500), Vec::new(), Duration::from_secs(60));
         assert_eq!(store.get_now("k").expect("b's record").record.status, 201);
     }
 

@@ -426,7 +426,8 @@ impl IdempotencyStore for MyStore {
         Box::pin(async move { /* ... */ })
     }
 
-    /// Write nothing while another owner holds a live lock on `key`.
+    /// Write nothing while another owner holds a live lock on `key`, or has
+    /// stored an unexpired response for it.
     fn set<'a>(
         &'a self,
         key: &'a str,
