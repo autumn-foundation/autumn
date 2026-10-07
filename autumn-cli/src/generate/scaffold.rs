@@ -1303,8 +1303,8 @@ fn plan_scaffold_with_options_impl(
         // #2439: `ChangesetForm` looks up this key. It is the same key as
         // `autumn_web::form::NUL_CHARACTER_MESSAGE_KEY`.
         labels.framework_key(
-            "common.error.nul_character",
-            "Cannot contain the NUL character (0x00)",
+            scaffold_i18n::NUL_MESSAGE_KEY,
+            scaffold_i18n::NUL_MESSAGE_ENGLISH,
         );
         let referenced_keys = labels.used_keys();
         if labels.enabled() && !referenced_keys.is_empty() {

@@ -386,6 +386,15 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `Model::__AUTUMN_CONFIDENTIAL_COLUMNS`. See
   `docs/guide/confidential-fields.md` for the threat model, including what
   sealing does not hide.
+- NUL byte (`0x00`) in text (issues #2423, #2439) — Postgres cannot store it.
+  `ChangesetForm` and `NestedChangesetForm` add a field error. The message is
+  `form::NUL_CHARACTER_FIELD_ERROR`. With an `i18n` bundle, they look up
+  `form::NUL_CHARACTER_MESSAGE_KEY` (`common.error.nul_character`) in the
+  request locale. A NUL that reaches the database is a `422`, for `TEXT` and
+  for `JSONB`. `error::is_nul_byte_violation` detects it. The generated
+  `#[repository(api = ...)]` create and update handlers name the field in
+  `errors[]`. `error::nul_byte_json_fields` finds the field in a JSON body.
+  See `docs/guide/forms.md`.
 - `#[normalize(trim, downcase, upcase, squish, strip_nul, with = path::to::fn)]` (issue
   #1379) — canonicalizes a `String` column, composing normalizers
   left-to-right. Built-ins live in `autumn_web::normalize`

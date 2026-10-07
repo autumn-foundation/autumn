@@ -647,7 +647,7 @@ common.error.nul_character = No puede contener el carácter NUL (0x00)
 If there is no bundle, or the key is missing, the message is
 `NUL_CHARACTER_FIELD_ERROR` in English. A missing key does not record a miss.
 
-`autumn generate --i18n` adds the English entry to `en.ftl`. `autumn i18n check`
+`autumn generate scaffold --i18n` adds the English entry to `en.ftl`. `autumn i18n check`
 does not report the key as unused.
 
 The API `422` message stays in English. No locale is available there.

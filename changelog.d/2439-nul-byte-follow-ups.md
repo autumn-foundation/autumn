@@ -13,7 +13,7 @@
 - **forms:** the NUL field error is localizable. `ChangesetForm` and
   `NestedChangesetForm` look up `common.error.nul_character` in the request
   locale when the request has an `i18n` bundle. If the key is missing, the English
-  text stays. `autumn generate --i18n` scaffolds ship the key, and `autumn i18n check`
+  text stays. `autumn generate scaffold --i18n` ships the key, and `autumn i18n check`
   does not report it as unused.
 - **errors:** `error::nul_byte_json_fields` returns the paths of the string
   values that hold a NUL byte. `i18n::Bundle::lookup` returns a message
