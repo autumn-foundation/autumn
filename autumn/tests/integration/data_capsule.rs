@@ -1589,6 +1589,60 @@ mod blobs {
     }
 
     #[tokio::test]
+    async fn import_checks_the_target_columns_before_it_writes_a_blob() {
+        // The target table no longer has `cv_key`. The insert would fail, and
+        // a failed import keeps its blobs: import must refuse the capsule
+        // before it writes the first one.
+        use std::sync::Arc;
+
+        use autumn_web::gdpr::portability::CapsuleService;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_blobs = blob_store(&tmp.path().join("a"));
+        source_blobs
+            .put("avatars/ada.png", "image/png", Bytes::from_static(b"png"))
+            .await
+            .unwrap();
+        source_blobs
+            .put("docs/ada-cv.txt", "text/plain", Bytes::from_static(b"cv"))
+            .await
+            .unwrap();
+        let source = CapsuleService::new(models(), Arc::new(store()), signer())
+            .with_blob_store(Arc::new(source_blobs));
+        let root = tmp.path().join("capsule");
+        source.export_to("1", &root).await.unwrap();
+
+        let target_blobs = Arc::new(blob_store(&tmp.path().join("b")));
+        let users = MemoryCapsuleStore::new().table(
+            "users",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("avatar", "jsonb").nullable(),
+            ],
+        );
+        let target = CapsuleService::new(
+            vec![CapsuleModel::new("users", "id").blob("avatar")],
+            Arc::new(users),
+            signer(),
+        )
+        .with_blob_store(target_blobs.clone());
+        let err = target.import_from(&root).await.expect_err("dropped column");
+        assert!(
+            matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains("users.cv_key")),
+            "{err:?}"
+        );
+        for key in ["avatars/ada.png", "docs/ada-cv.txt"] {
+            assert!(
+                matches!(
+                    target_blobs.get(key).await,
+                    Err(BlobStoreError::NotFound(_))
+                ),
+                "{key}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn import_refuses_a_record_that_refers_to_a_blob_the_capsule_lacks() {
         // The source has no CV: export skips it, but the record still names
         // it. Import must not write a record that points at nothing, or at

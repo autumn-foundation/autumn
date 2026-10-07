@@ -247,8 +247,14 @@ impl CapsuleService {
     ///
     /// The errors of [`DataCapsule::read_dir`], `restore_blobs`, and
     /// [`import_capsule`]. [`DataCapsuleError::NotConfigured`] when the capsule
-    /// has blobs but the service has no blob store. When the record import
-    /// fails, the blobs that this call wrote are removed again.
+    /// has blobs but the service has no blob store.
+    ///
+    /// The checks that need no blob store run before the first blob is
+    /// written. When the record import still fails, the blobs that this call
+    /// wrote stay in the blob store: another import can already point at the
+    /// same bytes, so a retry reuses them. If you abandon the import, delete
+    /// those blobs yourself; they hold personal data (see the data capsules
+    /// guide).
     pub async fn import_from(&self, dir: &Path) -> Result<ImportSummary, DataCapsuleError> {
         let (dir, signer) = (dir.to_path_buf(), self.signer.clone());
         let capsule = blocking(move || DataCapsule::read_dir(&dir, &signer)).await?;
@@ -268,6 +274,7 @@ impl CapsuleService {
         // first what can be checked without the store: a capsule that can
         // never be imported must leave no blob behind.
         super::check_importable(capsule, &self.models)?;
+        super::check_target(capsule, &self.models, self.store.as_ref()).await?;
         super::blobs::restore_blobs(capsule, blobs.as_ref()).await?;
         let mut rebound = capsule.clone();
         super::adopt_blob_columns(&mut rebound, &self.models);

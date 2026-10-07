@@ -229,7 +229,9 @@ capsule directory and to each directory above it.
   The same holds for a blob that another writer replaces after import checks
   it. No lock can prevent this, so run import in a maintenance window.
 - Import writes blobs before records. It first checks the bytes of each blob
-  against its manifest entry, and that no two entries share a key. If a blob key holds different bytes or
+  against its manifest entry, that no two entries share a key, and that each
+  target table has the columns of the capsule: a capsule made before you
+  dropped or renamed a column is refused (`400`) before any blob is written. If a blob key holds different bytes or
   a different MIME type, import stops and writes no blob. If a blob changes
   while import reads it, or another writer takes a key during the import,
   import stops with a conflict (`409`).

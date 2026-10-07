@@ -273,9 +273,9 @@ pub async fn export_subject(
 /// [`DataCapsuleError::UnknownTable`], [`DataCapsuleError::RelationshipCycle`],
 /// [`DataCapsuleError::UnsupportedFormat`],
 /// [`DataCapsuleError::InvalidInput`] for a record that names a blob the
-/// capsule does not hold, for a column that the model now excludes, or for a
-/// table whose subject column or key the model has changed, or an error from
-/// `store` (for example
+/// capsule does not hold, for a column that the model now excludes or that
+/// the target table does not have, or for a table whose subject column or key
+/// the model has changed, or an error from `store` (for example
 /// [`DataCapsuleError::Conflict`]).
 pub async fn import_capsule(
     capsule: &DataCapsule,
@@ -283,6 +283,7 @@ pub async fn import_capsule(
     store: &dyn CapsuleStore,
 ) -> Result<ImportSummary, DataCapsuleError> {
     let order = check_importable(capsule, models)?;
+    check_target(capsule, models, store).await?;
     let batches: Vec<ImportBatch<'_>> = order
         .iter()
         .map(|model| ImportBatch::new(model, capsule.records(&model.table)))
@@ -392,6 +393,35 @@ pub(super) fn check_importable<'c>(
         }
     }
     import_order(&manifest.models)
+}
+
+/// Check that each table in `store` has the columns that import writes: the
+/// fields of the capsule, without the generated ones. A capsule made before a
+/// column was dropped or renamed would fail at the insert, after its blobs are
+/// written. Run [`check_importable`] first.
+pub(super) async fn check_target(
+    capsule: &DataCapsule,
+    models: &[CapsuleModel],
+    store: &dyn CapsuleStore,
+) -> Result<(), DataCapsuleError> {
+    for model in &capsule.manifest.models {
+        let Some(current) = models.iter().find(|m| m.table == model.table) else {
+            return Err(DataCapsuleError::UnknownTable(model.table.clone()));
+        };
+        let described = store.describe(current).await?;
+        if let Some(field) = model
+            .fields
+            .iter()
+            .filter(|f| !f.generated)
+            .find(|f| !described.iter().any(|d| d.name == f.name))
+        {
+            return Err(DataCapsuleError::InvalidInput(format!(
+                "{}.{} is in the capsule, but the target table has no such column",
+                model.table, field.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The blob columns of `model` in a capsule: those of its manifest, and those
