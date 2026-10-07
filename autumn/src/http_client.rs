@@ -2663,8 +2663,8 @@ impl RequestBuilder {
         // reqwest follows the redirects. It comes from the original method:
         // a `POST` that a 303 turns into a `GET` gets no retries the `POST`
         // did not have.
-        let retries_left = matches!(hop_client, HopClient::Pooled(_))
-            .then(|| AtomicU32::new(self.max_attempts(is_half_open).saturating_sub(1)));
+        let chain_retries = matches!(hop_client, HopClient::Pooled(_))
+            .then(|| ChainRetries::new(self.max_attempts(is_half_open).saturating_sub(1)));
         // Hosts refilled for this chain: the first one already was.
         let mut refilled: std::collections::HashSet<String> =
             url_host(&self.url).into_iter().collect();
@@ -2710,7 +2710,7 @@ impl RequestBuilder {
                 is_half_open,
                 hop_gate,
                 true,
-                retries_left.as_ref(),
+                chain_retries.as_ref(),
             )
             .await?;
 
@@ -3371,6 +3371,23 @@ fn build_oneshot_client(
     builder.build().map_err(ClientError::Request)
 }
 
+/// The retries a redirect chain shares (see `follow_pooled`).
+struct ChainRetries {
+    /// Retries the chain may still make.
+    left: AtomicU32,
+    /// Retries already made, so a later hop's backoff goes on from them.
+    used: AtomicU32,
+}
+
+impl ChainRetries {
+    const fn new(retries: u32) -> Self {
+        Self {
+            left: AtomicU32::new(retries),
+            used: AtomicU32::new(0),
+        }
+    }
+}
+
 /// Send a single request through `client` (no manual redirect following — the
 /// client's redirect policy governs that) with the same transient-error and
 /// 429/5xx retry behaviour as the shared path, and collect the [`Response`].
@@ -3437,7 +3454,7 @@ async fn send_one(
     suppress_retries: bool,
     gate: &RetryGate,
     skip_redirect_body: bool,
-    retries_left: Option<&AtomicU32>,
+    chain: Option<&ChainRetries>,
 ) -> Result<Response, ClientError> {
     let start = crate::time::ambient_instant();
     let mut last_retry = None;
@@ -3448,9 +3465,11 @@ async fn send_one(
     } else {
         1
     };
-    // A redirect chain shares one retry count (see `follow_pooled`).
-    if let Some(left) = retries_left {
-        max_attempts = max_attempts.min(left.load(Ordering::Relaxed).saturating_add(1));
+    // A redirect chain shares one retry count (see `follow_pooled`), and
+    // its backoff goes on from the retries earlier hops made.
+    let retries_before = chain.map_or(0, |chain| chain.used.load(Ordering::Relaxed));
+    if let Some(chain) = chain {
+        max_attempts = max_attempts.min(chain.left.load(Ordering::Relaxed).saturating_add(1));
     }
     let mut last_transient_err: Option<reqwest::Error> = None;
 
@@ -3469,8 +3488,9 @@ async fn send_one(
     for attempt in 0..max_attempts {
         let last = attempt + 1 == max_attempts;
         if attempt > 0 {
-            if let Some(left) = retries_left {
-                left.fetch_sub(1, Ordering::Relaxed);
+            if let Some(chain) = chain {
+                chain.left.fetch_sub(1, Ordering::Relaxed);
+                chain.used.fetch_add(1, Ordering::Relaxed);
             }
             if deadline.is_some_and(|d| crate::time::ambient_instant() >= d) {
                 return Err(gate.classify(deadline_exceeded_err(&mut last_transient_err)));
@@ -3521,7 +3541,11 @@ async fn send_one(
                     && deadline.is_none_or(|d| crate::time::ambient_instant() < d)
                 {
                     let hint = retry_hint(status.as_u16(), &headers);
-                    let next = retry_policy.retry_delay(entropy, attempt, hint);
+                    let next = retry_policy.retry_delay(
+                        entropy,
+                        retries_before.saturating_add(attempt),
+                        hint,
+                    );
                     // A wait (hinted or not) that reaches the deadline cannot
                     // retry in time, so this response is the final outcome.
                     let wait_reaches_deadline = deadline.is_some_and(|d| {
@@ -3567,7 +3591,8 @@ async fn send_one(
                 return Err(ClientError::DeadlineExceeded);
             }
             Err(e) if (e.is_connect() || e.is_timeout()) && !last => {
-                let wait = retry_policy.retry_delay(entropy, attempt, None);
+                let wait =
+                    retry_policy.retry_delay(entropy, retries_before.saturating_add(attempt), None);
                 if !gate.allow(RetryKind::Transient, wait) {
                     return Err(ClientError::Request(e.without_url()));
                 }
@@ -6652,6 +6677,70 @@ mod tests {
             assert_eq!(response.status().as_u16(), 503, "the one retry is spent");
             assert_eq!(origin_hits.load(Ordering::SeqCst), 2);
             assert_eq!(target_hits.load(Ordering::SeqCst), 1);
+        }
+
+        /// Entropy that always draws one value.
+        #[derive(Debug)]
+        struct FixedDraw(u64);
+
+        impl crate::entropy::Entropy for FixedDraw {
+            fn next_u64(&self) -> u64 {
+                self.0
+            }
+            fn fill_bytes(&self, dest: &mut [u8]) {
+                dest.fill(0);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_redirect_hop_continues_the_chain_backoff() {
+            use axum::response::IntoResponse;
+            let origin_hits = Arc::new(AtomicU32::new(0));
+            let target_hits = Arc::new(AtomicU32::new(0));
+            let (origin, target) = (Arc::clone(&origin_hits), Arc::clone(&target_hits));
+            // Each hop fails once, then works.
+            let app = axum::Router::new()
+                .route(
+                    "/r",
+                    axum::routing::get(move || async move {
+                        if origin.fetch_add(1, Ordering::SeqCst) == 0 {
+                            axum::http::StatusCode::BAD_GATEWAY.into_response()
+                        } else {
+                            axum::response::Redirect::temporary("/t").into_response()
+                        }
+                    }),
+                )
+                .route(
+                    "/t",
+                    axum::routing::get(move || async move {
+                        if target.fetch_add(1, Ordering::SeqCst) == 0 {
+                            axum::http::StatusCode::BAD_GATEWAY.into_response()
+                        } else {
+                            "done".into_response()
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let url = format!("http://127.0.0.1:{port}/r");
+            // 20_099 = 101 × 199: the first retry waits 20_099 % 101 = 0 ms,
+            // the second 20_099 % 201 = 200 ms.
+            let mut client = Client::new();
+            client.entropy = Arc::new(FixedDraw(20_099));
+            let start = std::time::Instant::now();
+            let response =
+                with_deadline(Duration::from_secs(5), client.get(&url).retries(2).send())
+                    .await
+                    .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            assert_eq!(origin_hits.load(Ordering::SeqCst), 2);
+            assert_eq!(target_hits.load(Ordering::SeqCst), 2);
+            assert!(
+                start.elapsed() >= Duration::from_millis(200),
+                "the hop's retry is the chain's second: {:?}",
+                start.elapsed()
+            );
         }
 
         #[tokio::test]
