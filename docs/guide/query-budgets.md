@@ -142,7 +142,11 @@ The analysis follows the handle through every name that holds it:
   patterns, closure parameters and transaction callback parameters. A type
   annotation also marks a handle: `let r: PgPostRepository = …`. An
   `Arc<PgPostRepository>`, `Box<…>`, `Rc<…>`, `dyn PostRepository` or
-  `impl PostRepository` is a handle too. A type annotation made only of
+  `impl PostRepository` is a handle too, and so is a `State<…>` or
+  `Extension<…>` extractor of any of them (`State(repo):
+  State<PgPostRepository>`). Another extractor holds a handle only for an
+  exact handle type: `Json<CreateRepository>` is a request body, not a
+  handle. A type annotation made only of
   standard and primitive types, such as `let ids: Vec<i64> = …`, marks the
   binding as plain. rustc checks it, so it cannot hold a handle.
 - **Scopes.** A `let` in a block ends with the block. An assignment to a name
@@ -166,20 +170,30 @@ The analysis follows the handle through every name that holds it:
     and `ctx.user` is not.
   - An index (`repos[0]`), a field (`pair.0`), a pattern (`Some(r)`,
     `for r in repos`) or `?` gives a handle.
-  - A method that the container's own type has (a `Vec` method on a `Vec`,
-    an `Option` method on an `Option`) is not a query. Each type has its own
-    list: `push` is a `Vec` method, not a `VecDeque` one. The method gives a
-    handle when it returns a part (`repos.remove(0)`, `maybe.unwrap()`), and
-    a container when it returns a view or an `Option` of a part
-    (`repos.as_slice().iter()`, `slice.first()`, `deque.remove(0)`). Any
-    other method on the container is reported (`repos.refresh_all()`, or an
-    extension-trait `repos.ok()`).
-  - An extension trait can take over a method that the type gets only
-    through `Deref` or only under a trait bound. So a slice method called on
-    a `Vec` or an array (`repos.iter()`, `repos.first()`, `repos.sort()`) is
-    reported, and so is `clone` on any container. Call the slice method on
-    `repos.as_slice()` instead. `extend` comes from the `Extend` trait, so it
-    is reported on a container of handles and when it is given a handle.
+  - A method that the container's own type has and that takes `self` is not
+    a query: `repos.into_iter()`, `maybe.unwrap()`, `maybe.map(|r| r.id)`,
+    `result.ok()`, and the `Iterator` adapters that take `self` (`map`,
+    `filter`, `count`, `last`, `max_by_key`, `collect`, …). Each type has its
+    own list. The method gives a handle when it returns a part
+    (`maybe.unwrap()`), and a container when it returns an iterator or an
+    `Option` of a part (`repos.into_iter()`, `it.last()`).
+  - A method that borrows the container (`&self` or `&mut self`) is
+    reported, also when the type has it: `repos.len()`, `repos.push(repo)`,
+    `repos.as_slice()`, `maybe.as_ref()`, `maybe.take()`, `it.next()`,
+    `it.any(…)`. Rust looks for a `self` method before a `&self` method, and
+    for a `&self` method before a `&mut self` method, so an application trait
+    method `len(self)` on `Vec<PgPostRepository>` runs in place of
+    `Vec::len`. The macro has no type information to rule that out. What
+    the method gives may hold handles at any depth. Every other method on
+    the container is reported too (`repos.refresh_all()`, or an
+    extension-trait `repos.ok()`), and so are `clone` and `extend`.
+  - To read a container of handles without a report, use an index
+    (`repos[0]`, `&repos[1..]`), a pattern (`let [first, ..] = &repos[..]`,
+    `if let Some(r) = &maybe`), a `for` loop (`for r in &repos`) or a method
+    that takes `self`. Otherwise, put `#[query_cost(N)]` on the statement,
+    and give the binding a type made only of standard and primitive types:
+    `#[query_cost(0)] let n: usize = repos.len();`. Without the type, a later
+    use of `n` is reported too.
   - A handle in an `Option` or a `Result` has only their methods. So
     `lazy.checkout()` on a `Result<LazyDb, E>` is reported. Call
     `lazy.expect("…").checkout()` instead.
@@ -191,10 +205,13 @@ The analysis follows the handle through every name that holds it:
     `Ctx { repo }`) is reported too.
   - A callback's result holds what the callback returns, whatever the
     receiver holds: `ids.iter().map(|_| &repo)` gives handles, and so do
-    `fold`, `find_map`, `then` and `unwrap_or_else`. A `return` in the
+    `fold`, `then` and `unwrap_or_else`. A method that borrows its receiver
+    and is given such a callback (`find_map`, `try_fold`, `try_for_each`,
+    `any`) is reported: a trait method in its place may call the callback
+    many times. A `return` in the
     callback counts too. A closure that names a handle holds it, so
     `ids.iter().map(make)` and `make()` keep the handle.
-  - `map_or`, `map_or_else`, `fold` and `try_fold` give only what their
+  - `map_or`, `map_or_else` and `fold` give only what their
     default and callback give: `Some(repo).map_or(0, |_| 1)` is plain. A
     callback on a `Result` parameter gets only its side: in
     `result.map_err(|e| …)`, `e` is the error, not the handle. `result.ok()`
@@ -416,15 +433,17 @@ callbacks. These things sit outside it, by construction:
   database without any handle in the handler's signature, so no static
   attribution is possible; they are the same class as the background-job work
   listed under Scope above.
-- **An application trait that takes over a standard method name.** Rust looks
-  for a `self` method before a `&self` method, and for a `&self` method before
-  a `&mut self` method. So an application trait method `len(self)` on
-  `Vec<PgPostRepository>` runs in place of `Vec::len`. The macro has no type
-  information and assumes that no such trait is in scope. It does see a call
-  with an argument count that the standard method does not take
-  (`repos.push()`), and reports it. No standard container method gives a
-  future, so it also reports an `.await` on one (`repos.push(repo).await`).
-  Do not give a trait on a container of handles a standard method name.
+- **An application trait on a reference to a container.** The macro reports
+  every method that borrows a container of handles, because a trait method
+  can run in its place (see [How a handle is tracked](#how-a-handle-is-tracked)).
+  It trusts a standard method that takes `self`: an inherent method comes
+  before a trait method, and two trait methods with one name do not compile.
+  But Rust tries the receiver's own type first. When the receiver is a
+  reference (`maybe: &Option<PgPostRepository>`), a trait implemented for
+  `&Option<PgPostRepository>` with a `map(self)` method runs in place of
+  `Option::map`. The macro reports `(&maybe).map(…)`, but it does not see
+  that a name holds a reference. Do not implement a trait for a reference to
+  a container of handles.
 - **An application item that takes a standard name.** The macro trusts a
   standard name that is bare or under a `std` path: the type `Vec`, `vec!`,
   `format!`, `drop`. It does not trust one under another path

@@ -227,6 +227,10 @@ const HANDLE_TYPES: &[&str] = &[
 /// Wrappers to look inside for a `LazyDb` parameter (`Result<LazyDb, E>`). An
 /// allowlist: an unknown wrapper (`Cart<LazyDb>`) may have its own domain
 /// `checkout()` (Codex review, PR #2762, round 7).
+/// Extractors that hand a handler a value the router shares. What they hold
+/// is a handle by the same rule as a parameter type.
+const STATE_EXTRACTORS: &[&str] = &["State", "Extension"];
+
 const LAZY_DB_WRAPPERS: &[&str] = &["Result", "Option", "Arc", "Rc", "Box", "Extension", "State"];
 
 /// Methods whose result is a container of what their callback returns:
@@ -831,6 +835,97 @@ const SORTED_SET_METHODS: &[&str] = &[
 
 const TUPLE_METHODS: &[&str] = &[];
 
+/// The methods of each container above that take `self`. Only these are
+/// proof of the std method. Rust looks for a `self` method before a `&self`
+/// method, and for a `&self` method before a `&mut self` method. So an
+/// application trait method `len(self)` on `Vec<PgPostRepository>` runs in
+/// place of `Vec::len`. A `self` method cannot be taken over: an inherent
+/// method comes before a trait method, and two trait methods with one name
+/// do not compile.
+const CONTAINER_SELF_METHODS: &[&str] = &["into_iter"];
+
+const MAP_SELF_METHODS: &[&str] = &["into_iter", "into_keys", "into_values"];
+
+const ITER_SELF_METHODS: &[&str] = &[
+    "map",
+    "filter",
+    "filter_map",
+    "flat_map",
+    "flatten",
+    "enumerate",
+    "rev",
+    "skip",
+    "take",
+    "chain",
+    "zip",
+    "peekable",
+    "collect",
+    "inspect",
+    "step_by",
+    "skip_while",
+    "take_while",
+    "count",
+    "for_each",
+    "fold",
+    "reduce",
+    "max",
+    "min",
+    "max_by",
+    "min_by",
+    "max_by_key",
+    "min_by_key",
+    "last",
+    "cloned",
+    "copied",
+];
+
+const OPTION_SELF_METHODS: &[&str] = &[
+    "is_some_and",
+    "is_none_or",
+    "unwrap",
+    "expect",
+    "unwrap_or",
+    "unwrap_or_default",
+    "unwrap_or_else",
+    "map",
+    "map_or",
+    "map_or_else",
+    "and_then",
+    "or",
+    "xor",
+    "or_else",
+    "filter",
+    "ok_or",
+    "ok_or_else",
+    "into_iter",
+    "inspect",
+    "cloned",
+    "copied",
+];
+
+const RESULT_SELF_METHODS: &[&str] = &[
+    "is_ok_and",
+    "is_err_and",
+    "ok",
+    "err",
+    "map_err",
+    "unwrap_err",
+    "expect_err",
+    "unwrap",
+    "expect",
+    "unwrap_or",
+    "unwrap_or_default",
+    "unwrap_or_else",
+    "map",
+    "map_or",
+    "map_or_else",
+    "and_then",
+    "or_else",
+    "into_iter",
+    "inspect",
+    "inspect_err",
+];
+
 /// The kind of standard container a carrier is. A method is known only if
 /// this container has it: an extension trait may add a method with a standard
 /// name (`ok()` on a `Vec`) that queries.
@@ -895,6 +990,28 @@ impl Shape {
 
     fn has(self, method: &str) -> bool {
         self.methods().contains(&method)
+    }
+
+    /// Does this container's own `method` take `self`? See
+    /// [`CONTAINER_SELF_METHODS`].
+    fn takes_self(self, method: &str) -> bool {
+        let methods = match self {
+            Self::Bool => BOOL_METHODS,
+            Self::Db | Self::Tuple => &[],
+            Self::Vec
+            | Self::Array
+            | Self::Slice
+            | Self::Deque
+            | Self::List
+            | Self::Heap
+            | Self::Set
+            | Self::SortedSet => CONTAINER_SELF_METHODS,
+            Self::Map | Self::SortedMap => MAP_SELF_METHODS,
+            Self::Iter | Self::IterRef => ITER_SELF_METHODS,
+            Self::Opt | Self::OptRef => OPTION_SELF_METHODS,
+            Self::Res => RESULT_SELF_METHODS,
+        };
+        methods.contains(&method)
     }
 
     /// Does `method` give a plain value here, where on an `Option` it gives
@@ -4518,10 +4635,6 @@ impl Analyzer {
         self.env.binding(&wrapper_root(e)?).inner
     }
 
-    /// Is `method`, called with `args` arguments, a known method of the
-    /// standard container `receiver`? Not on a user value or a nested
-    /// container: their methods are the user's. Not with an argument count
-    /// the standard method does not take: `repos.push()` is a trait method.
     /// Is `e` the plain result of a known container method on a receiver
     /// that holds handles (`repos.push(repo)`, `repos.len()`), or a name
     /// bound to one? A std method of this kind gives no future.
@@ -4536,42 +4649,28 @@ impl Analyzer {
         }
     }
 
+    /// Is `method`, called with `args` arguments, a known method of the
+    /// standard container `receiver`? Not on a user value or a nested
+    /// container: their methods are the user's. Not with an argument count
+    /// the standard method does not take: `repos.push()` is a trait method.
+    /// Not a method that borrows `receiver`, and not on `&receiver`: a trait
+    /// method may run in its place (see [`CONTAINER_SELF_METHODS`]).
     fn known_container_method(&self, receiver: &Expr, method: &str, args: usize) -> bool {
         !self.expr_is_holder(receiver)
             && !self.expr_is_nested(receiver)
+            && !matches!(peel_parens(receiver), Expr::Reference(_))
             && self.shape_of(receiver).is_some_and(|shape| {
-                shape.has(method) && std_arities(shape, method).contains(&args)
+                shape.has(method)
+                    && shape.takes_self(method)
+                    && std_arities(shape, method).contains(&args)
             })
     }
 
     /// `receiver.method(arg)` may store `arg` in `receiver`. When an argument
     /// holds a handle, the name at the root of `receiver` now holds it too.
     fn store_into(&mut self, receiver: &Expr, method: &str, args: &[&Expr]) {
-        // `repos.clear()` on a name that owns its value empties it. What it
-        // held stays a floor: a later opaque store has the element type.
-        if method == "clear" && args.is_empty() && self.known_container_method(receiver, method, 0)
-        {
-            if let Some(name) = path_ident(peel_parens(receiver)) {
-                let mut binding = self.env.binding(&name);
-                if binding.referents.is_empty() && binding.kind != Kind::Plain {
-                    let floor = binding.declared.take().unwrap_or_else(|| {
-                        Box::new(Binding {
-                            kind: binding.kind,
-                            shape: binding.shape,
-                            inner: binding.inner,
-                            ..Binding::of(Kind::Plain)
-                        })
-                    });
-                    binding.kind = Kind::Plain;
-                    binding.parts = None;
-                    binding.declared = Some(floor);
-                    self.env.assign(name, binding);
-                }
-            }
-            return;
-        }
         // An opaque value stored into a container with a floor has the
-        // element type: `repos.push(make_repo())` after `repos.clear()`.
+        // element type: `repos.push(make_repo())` into a `Vec<PgPostRepository>`.
         if STORE_METHODS.contains(&method)
             && args.iter().any(|a| self.is_opaque_value(a))
             && let Some(root) = place_root(receiver)
@@ -7153,9 +7252,14 @@ fn type_is_handle(ty: &Type) -> bool {
             {
                 return true;
             }
+            // A shared-state extractor holds what the router was given:
+            // `State<PgPostRepository>`, `Extension<Arc<dyn PostRepository>>`.
+            if STATE_EXTRACTORS.contains(&name.as_str()) {
+                return generic_types(segment).any(type_is_handle);
+            }
             // A smart pointer derefs to what it holds: `Arc<PgPostRepository>`.
-            // Any other wrapper (`Extension<Db>`, `State<Db>`) counts for an
-            // *exact* handle type only, so `Form<NewRepo>` is not a handle.
+            // Any other wrapper (`Json<…>`, `Form<…>`) counts for an *exact*
+            // handle type only, so `Form<NewRepository>` is not a handle.
             // A `Result` is a handle only through its `Ok` side.
             let smart_pointer = SMART_POINTERS.contains(&name.as_str());
             let take = if name == "Result" { 1 } else { usize::MAX };
@@ -9772,8 +9876,8 @@ mod tests {
                 Expect::Exact(1),
             ),
             (
-                "element taken by remove",
-                "let mut repos = vec![repo]; let _ = repos.remove(0).find_all();",
+                "element taken by into_iter().last()",
+                "let repos = vec![repo]; let _ = repos.into_iter().last().unwrap().find_all();",
                 Expect::Exact(1),
             ),
             (
@@ -9782,8 +9886,8 @@ mod tests {
                 Expect::Exact(1),
             ),
             (
-                "first, then if let",
-                "let repos = vec![repo]; if let Some(r) = repos.as_slice().first() { let _ = r.find_all(); }",
+                "slice pattern, then if let",
+                "let repos = vec![repo]; if let [r, ..] = &repos[..] { let _ = r.find_all(); }",
                 Expect::Exact(1),
             ),
             (
@@ -9792,8 +9896,8 @@ mod tests {
                 Expect::Exact(1),
             ),
             (
-                "method on the container is free",
-                "let repos = vec![repo]; let _ = repos.len();",
+                "a self method on the container is free",
+                "let repos = vec![repo]; let _ = repos.into_iter().count();",
                 Expect::Exact(0),
             ),
             (
@@ -10003,7 +10107,7 @@ mod tests {
     fn a_smart_pointer_around_a_container_is_a_container() {
         let handler = r"
             async fn h(repos: Arc<Vec<PgPostRepository>>) -> AutumnResult<usize> {
-                for repo in repos.as_slice().iter() { let _ = repo.find_all().await?; }
+                for repo in &*repos { let _ = repo.find_all().await?; }
                 Ok(0)
             }
             ";
@@ -10293,7 +10397,8 @@ mod tests {
             (
                 "append of a Vec of handles keeps a flat Vec",
                 "async fn h(mut left: Vec<PgPostRepository>, mut right: Vec<PgPostRepository>) \
-                 -> AutumnResult<usize> { left.append(&mut right); left.append(&mut right); \
+                 -> AutumnResult<usize> { #[query_cost(0)] left.append(&mut right); \
+                 #[query_cost(0)] left.append(&mut right); \
                  let _ = left[0].find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
@@ -10484,11 +10589,13 @@ mod tests {
                 Expect::Unbounded,
             ),
             (
+                // `find_map` borrows the iterator: a trait method may run in
+                // its place and call the closure that holds the handle.
                 "find_map",
                 "let found = ids.iter().find_map(|_| Some(&repo)); \
                  let _ = found.unwrap().find_all().await?;"
                     .to_string(),
-                Expect::Exact(1),
+                Expect::Unbounded,
             ),
             (
                 "fold",
@@ -10599,7 +10706,7 @@ mod tests {
             (
                 "chain with handles on the argument side",
                 "async fn h(ids: Vec<i64>, repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
-                 let all: Vec<_> = Vec::new().iter().chain(repos.as_slice().iter()).collect(); \
+                 let all: Vec<_> = Vec::new().into_iter().chain(repos.into_iter()).collect(); \
                  let _ = all[0].find_all().await?; render(ids); Ok(0) }",
                 Expect::Exact(1),
             ),
@@ -10682,25 +10789,25 @@ mod tests {
                 Expect::Unbounded,
             ),
             (
-                "Vec::insert gives a unit",
+                "Vec::insert borrows the Vec",
                 "async fn h(mut repos: Vec<PgPostRepository>, repo: PgPostRepository) \
                  -> AutumnResult<usize> { let done = repos.insert(0, repo); render(done); Ok(0) }",
-                Expect::Exact(0),
+                Expect::Unbounded,
             ),
             (
-                "HashSet::insert and remove give a bool",
+                "HashSet::insert and remove borrow the set",
                 "async fn h(mut repos: HashSet<PgPostRepository>, repo: PgPostRepository) \
                  -> AutumnResult<usize> { let a = repos.insert(repo); \
                  let b = repos.remove(&repo); render(a); render(b); Ok(0) }",
-                Expect::Exact(0),
+                Expect::Unbounded,
             ),
             // Guard: `Option::insert` gives the part.
             (
-                "Option::insert gives the part",
+                "Option::insert borrows the Option",
                 "async fn h(mut slot: Option<PgPostRepository>, repo: PgPostRepository) \
                  -> AutumnResult<usize> { let r = slot.insert(repo); \
                  let _ = r.find_all().await?; Ok(0) }",
-                Expect::Exact(1),
+                Expect::Unbounded,
             ),
         ]);
     }
@@ -10738,7 +10845,7 @@ mod tests {
             (
                 "a map value is a handle",
                 "async fn h(repos: HashMap<i64, PgPostRepository>) -> AutumnResult<usize> { \
-                 let r = repos.values().next().unwrap(); let _ = r.find_all().await?; Ok(0) }",
+                 let r = repos.into_values().last().unwrap(); let _ = r.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
         ]);
@@ -10771,7 +10878,7 @@ mod tests {
             (
                 "a slice element is a handle",
                 "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
-                 let [first, ..] = repos.as_slice() else { return Ok(0) }; \
+                 let [first, ..] = &repos[..] else { return Ok(0) }; \
                  let _ = first.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
@@ -10853,29 +10960,29 @@ mod tests {
             (
                 "an iterator mapped to a plain value",
                 "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
-                 let ids: Vec<_> = repos.as_slice().iter().map(|_| 1).collect(); render(ids); Ok(0) }",
+                 let ids: Vec<_> = repos.into_iter().map(|_| 1).collect(); render(ids); Ok(0) }",
                 Expect::Exact(0),
             ),
             // Guards: `cloned` on an `Option` of a reference is known, and a
             // `Result` mapped on its `Ok` side keeps its `Err` side.
             (
-                "first().cloned() on a Vec of handles",
+                "first().cloned() on a Vec of handles borrows it",
                 "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
                  let r = repos.as_slice().first().cloned().unwrap(); let _ = r.find_all().await?; Ok(0) }",
-                Expect::Exact(1),
+                Expect::Unbounded,
             ),
             (
-                "iter().find().cloned() on a Vec of handles",
+                "into_iter().max_by_key() on a Vec of handles gives a part",
                 "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
-                 let r = repos.as_slice().iter().find(|_| true).cloned().unwrap(); \
+                 let r = repos.into_iter().max_by_key(|r| r.id).unwrap(); \
                  let _ = r.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
             (
-                "as_ref().cloned() on an Option of a handle",
+                "as_ref().cloned() on an Option of a handle borrows it",
                 "async fn h(maybe: Option<PgPostRepository>) -> AutumnResult<usize> { \
                  let r = maybe.as_ref().cloned().unwrap(); let _ = r.find_all().await?; Ok(0) }",
-                Expect::Exact(1),
+                Expect::Unbounded,
             ),
             (
                 "an iterator mapped to its own handles",
@@ -11095,22 +11202,22 @@ mod tests {
             ),
             // Guards: a Vec's own methods and a slice's methods stay known.
             (
-                "Vec::remove is the Vec's own method",
+                "Vec::remove borrows the Vec",
                 "async fn h(mut repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
                  let r = repos.remove(0); let _ = r.find_all().await?; Ok(0) }",
-                Expect::Exact(1),
+                Expect::Unbounded,
             ),
             (
-                "a slice's first is the slice's own method",
+                "a slice's first borrows the slice",
                 "async fn h(repos: &[PgPostRepository]) -> AutumnResult<usize> { \
                  let r = repos.first().unwrap(); let _ = r.find_all().await?; Ok(0) }",
-                Expect::Exact(1),
+                Expect::Unbounded,
             ),
             (
-                "as_slice then first",
+                "as_slice then first borrows the Vec",
                 "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
                  let r = repos.as_slice().first().unwrap(); let _ = r.find_all().await?; Ok(0) }",
-                Expect::Exact(1),
+                Expect::Unbounded,
             ),
         ]);
     }
@@ -11590,7 +11697,7 @@ mod tests {
             (
                 "a LazyDb taken from a container still gives a tracked connection",
                 "async fn h(lazy: LazyDb) -> AutumnResult<usize> { \
-                 let lazy = [lazy].into_iter().next().unwrap(); let mut db = lazy.checkout().await?; let _ = db.find_all().await?; let _ = db.find_all().await?; Ok(0) }",
+                 let lazy = [lazy].into_iter().last().unwrap(); let mut db = lazy.checkout().await?; let _ = db.find_all().await?; let _ = db.find_all().await?; Ok(0) }",
                 Expect::Exact(3),
             ),
             (
@@ -11636,9 +11743,9 @@ mod tests {
                 Expect::Exact(0),
             ),
             (
-                "map_err after as_ref takes the error side",
+                "map_err takes the error side",
                 "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
-                 let _ = result.as_ref().map_err(|e| render(e)); Ok(0) }",
+                 let _ = result.map_err(|e| render(e)); Ok(0) }",
                 Expect::Exact(0),
             ),
             (
@@ -11690,9 +11797,9 @@ mod tests {
     fn patterns_and_typed_locals_keep_result_sides() {
         check_handlers(&[
             (
-                "a match over as_ref keeps the error side",
+                "a match keeps the error side",
                 "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
-                 match result.as_ref() { Ok(_) => {} Err(e) => render(e) } Ok(0) }",
+                 match result { Ok(_) => {} Err(e) => render(e) } Ok(0) }",
                 Expect::Exact(0),
             ),
             (
@@ -11726,16 +11833,16 @@ mod tests {
                 Expect::Exact(1),
             ),
             (
-                "a Db unwrapped after as_ref is a connection",
+                "a Db unwrapped from an Option is a connection",
                 "async fn h(maybe: Option<Db>) -> AutumnResult<usize> { \
-                 let db = maybe.as_ref().unwrap(); let _ = db.tx(|conn| conn.find_all()).await; Ok(0) }",
+                 let db = maybe.unwrap(); let _ = db.tx(|conn| conn.find_all()).await; Ok(0) }",
                 Expect::Exact(2),
             ),
             (
-                "a Db unwrapped through a reference alias is a connection",
+                "as_ref through a reference alias borrows the Option",
                 "async fn h(maybe: Option<Db>) -> AutumnResult<usize> { \
                  let alias = &maybe; let db = alias.as_ref().unwrap(); let _ = db.tx(|conn| conn.find_all()).await; Ok(0) }",
-                Expect::Exact(2),
+                Expect::Unbounded,
             ),
         ]);
     }
@@ -11758,7 +11865,7 @@ mod tests {
             (
                 "an alias of an adapter keeps the Result sides",
                 "async fn h(result: Result<PgPostRepository, Error>) -> AutumnResult<usize> { \
-                 let alias = result.as_ref(); let _ = alias.map_err(|e| render(e)); Ok(0) }",
+                 let alias = result.map(|r| r); let _ = alias.map_err(|e| render(e)); Ok(0) }",
                 Expect::Exact(0),
             ),
         ]);
@@ -11768,10 +11875,12 @@ mod tests {
     fn try_for_each_gives_its_residual() {
         check_handlers(&[
             (
-                "try_for_each gives its callback's residual",
+                // `try_for_each` borrows the iterator: a trait method may run
+                // in its place and call the closure that holds the handle.
+                "try_for_each borrows the iterator",
                 "async fn h(repo: PgPostRepository, ids: Vec<i64>) -> AutumnResult<usize> { \
                  let failed = ids.into_iter().try_for_each(|_| Err::<(), _>(&repo)); let r = failed.unwrap_err(); let _ = r.find_all().await?; Ok(0) }",
-                Expect::Exact(1),
+                Expect::Unbounded,
             ),
             (
                 "guard: try_for_each with a plain callback is plain",
@@ -11798,10 +11907,10 @@ mod tests {
                 Expect::Unbounded,
             ),
             (
-                "guard: push with one argument is a known method",
+                "push borrows the Vec",
                 "async fn h(repos: Vec<PgPostRepository>, repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut all = repos; all.push(repo); let _ = all.len(); Ok(0) }",
-                Expect::Exact(0),
+                Expect::Unbounded,
             ),
             (
                 "a Vec insert with one argument is opaque",
@@ -11816,16 +11925,16 @@ mod tests {
                 Expect::Unbounded,
             ),
             (
-                "guard: a set insert with one argument is known",
+                "a set insert borrows the set",
                 "async fn h(ids: HashSet<i64>, repos: HashSet<PgPostRepository>) -> AutumnResult<usize> { \
                  let mut all = repos; let _ = all.insert(1); let _ = ids; Ok(0) }",
-                Expect::Exact(0),
+                Expect::Unbounded,
             ),
             (
-                "guard: a Vec insert with two arguments is known",
+                "a Vec insert borrows the Vec",
                 "async fn h(repos: Vec<PgPostRepository>, repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut all = repos; all.insert(0, repo); let _ = all.len(); Ok(0) }",
-                Expect::Exact(0),
+                Expect::Unbounded,
             ),
             (
                 "a qualified Some is not Option::Some",
@@ -11836,7 +11945,7 @@ mod tests {
             (
                 "guard: Option::Some is a constructor",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
-                 let maybe = Option::Some(&repo); let _ = maybe.is_some(); Ok(0) }",
+                 let maybe = Option::Some(&repo); let _ = maybe.is_some_and(|_| true); Ok(0) }",
                 Expect::Exact(0),
             ),
         ]);
@@ -12113,14 +12222,14 @@ mod tests {
             (
                 "a ref mut binding is a mutable alias",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
-                 let mut repos = Vec::new(); { let ref mut alias = repos; alias.push(repo); } \
+                 let mut repos = Vec::new(); { let ref mut alias = repos; #[query_cost(0)] alias.push(repo); } \
                  let _ = repos[0].find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
             (
                 "a ref mut match arm is a mutable alias",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
-                 let mut repos = Vec::new(); match repos { ref mut alias => alias.push(repo) } \
+                 let mut repos = Vec::new(); match repos { ref mut alias => { #[query_cost(0)] alias.push(repo); } } \
                  let _ = repos[0].find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
@@ -12393,7 +12502,7 @@ mod tests {
                 "guard: a typed alias picked by an if aliases both places",
                 "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
                  let mut left = Vec::new(); let mut right = Vec::new(); \
-                 { let target: &mut Vec<PgPostRepository> = if flag { &mut left } else { &mut right }; target.push(repo); } \
+                 { let target: &mut Vec<PgPostRepository> = if flag { &mut left } else { &mut right }; #[query_cost(0)] target.push(repo); } \
                  let _ = left[0].find_all().await?; let _ = right; Ok(0) }",
                 Expect::Exact(1),
             ),
@@ -12401,7 +12510,7 @@ mod tests {
                 "guard: an alias picked by a match aliases every arm",
                 "async fn h(repo: PgPostRepository, n: i64) -> AutumnResult<usize> { \
                  let mut left = Vec::new(); let mut right = Vec::new(); \
-                 { let target = match n { 0 => &mut left, _ => &mut right }; target.push(repo); } \
+                 { let target = match n { 0 => &mut left, _ => &mut right }; #[query_cost(0)] target.push(repo); } \
                  let _ = right[0].find_all().await?; let _ = left; Ok(0) }",
                 Expect::Exact(1),
             ),
@@ -12409,7 +12518,7 @@ mod tests {
                 "guard: a typed alias of one place aliases it",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut left = Vec::new(); \
-                 { let target: &mut Vec<PgPostRepository> = &mut left; target.push(repo); } \
+                 { let target: &mut Vec<PgPostRepository> = &mut left; #[query_cost(0)] target.push(repo); } \
                  let _ = left[0].find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
@@ -12508,7 +12617,7 @@ mod tests {
                 "guard: an alias a loop breaks with aliases its place",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut left = Vec::new(); \
-                 { let target: &mut Vec<PgPostRepository> = loop { break &mut left; }; target.push(repo); } \
+                 { let target: &mut Vec<PgPostRepository> = loop { break &mut left; }; #[query_cost(0)] target.push(repo); } \
                  let _ = left[0].find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
@@ -12517,7 +12626,7 @@ mod tests {
                 "async fn h(repo: PgPostRepository, flag: bool) -> AutumnResult<usize> { \
                  let mut left = Vec::new(); let mut right = Vec::new(); \
                  { let target: &mut Vec<PgPostRepository> = 'pick: { if flag { break 'pick &mut left; } &mut right }; \
-                 target.push(repo); } \
+                 #[query_cost(0)] target.push(repo); } \
                  let _ = left[0].find_all().await?; let _ = right; Ok(0) }",
                 Expect::Exact(1),
             ),
@@ -12608,7 +12717,7 @@ mod tests {
                 "guard: an alias from an unsafe block aliases its place",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut left = Vec::new(); \
-                 { let target: &mut Vec<PgPostRepository> = unsafe { &mut left }; target.push(repo); } \
+                 { let target: &mut Vec<PgPostRepository> = unsafe { &mut left }; #[query_cost(0)] target.push(repo); } \
                  let _ = left[0].find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
@@ -12633,8 +12742,8 @@ mod tests {
             ),
             (
                 "a std path to Vec keeps its methods",
-                "async fn h(mut repos: std::vec::Vec<PgPostRepository>, repo: PgPostRepository) -> AutumnResult<usize> { \
-                 repos.push(repo); Ok(0) }",
+                "async fn h(repos: std::vec::Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let _ = repos.into_iter().count(); Ok(0) }",
                 Expect::Exact(0),
             ),
             (
@@ -12710,9 +12819,9 @@ mod tests {
                 Expect::Unbounded,
             ),
             (
-                "a container method that is not awaited stays free",
-                "async fn h(mut repos: Vec<PgPostRepository>, repo: PgPostRepository) -> AutumnResult<usize> { \
-                 repos.push(repo); let n = repos.len(); render(n); Ok(0) }",
+                "a self container method that is not awaited stays free",
+                "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                 let n = repos.into_iter().count(); render(n); Ok(0) }",
                 Expect::Exact(0),
             ),
             (
@@ -12743,7 +12852,7 @@ mod tests {
                 "guard: an alias an invoked closure gives back aliases its place",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut left = Vec::new(); \
-                 { let target: &mut Vec<PgPostRepository> = (|x| x)(&mut left); target.push(repo); } \
+                 { let target: &mut Vec<PgPostRepository> = (|x| x)(&mut left); #[query_cost(0)] target.push(repo); } \
                  let _ = left[0].find_all().await?; Ok(0) }",
                 // A call may give back a part, so `left` nests the handle.
                 Expect::Unbounded,
@@ -12752,7 +12861,7 @@ mod tests {
                 "guard: a function given a mut borrow may give it back",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut left = Vec::new(); \
-                 { let target: &mut Vec<PgPostRepository> = pick(&mut left); target.push(repo); } \
+                 { let target: &mut Vec<PgPostRepository> = pick(&mut left); #[query_cost(0)] target.push(repo); } \
                  let _ = left[0].find_all().await?; Ok(0) }",
                 // A call may give back a part, so `left` nests the handle.
                 Expect::Unbounded,
@@ -12864,15 +12973,16 @@ mod tests {
                 Expect::Exact(1),
             ),
             (
-                "clear empties a container",
+                "clear borrows a container",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut repos = vec![repo]; repos.clear(); render(repos); Ok(0) }",
-                Expect::Exact(0),
+                Expect::Unbounded,
             ),
             (
-                "guard: an opaque store after clear has the element type",
+                "guard: declared stores after clear keep the element type",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
-                 let mut repos = vec![repo]; repos.clear(); repos.push(make_repo()); \
+                 let mut repos = vec![repo]; #[query_cost(0)] repos.clear(); \
+                 #[query_cost(0)] repos.push(make_repo()); \
                  let _ = repos[0].find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
@@ -12901,7 +13011,7 @@ mod tests {
                 "a store through a typed whole alias keeps the owner a carrier",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut repos = Vec::new(); \
-                 { let slot: &mut Vec<PgPostRepository> = &mut repos; slot.push(repo); } \
+                 { let slot: &mut Vec<PgPostRepository> = &mut repos; #[query_cost(0)] slot.push(repo); } \
                  let _ = repos[0].find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
@@ -13046,7 +13156,7 @@ mod tests {
                 "guard: a method result borrows its mut arguments",
                 "async fn h(repo: PgPostRepository, picker: Picker) -> AutumnResult<usize> { \
                  let mut left = Vec::new(); \
-                 { let target: &mut Vec<PgPostRepository> = picker.pick(&mut left); target.push(repo); } \
+                 { let target: &mut Vec<PgPostRepository> = picker.pick(&mut left); #[query_cost(0)] target.push(repo); } \
                  render(left); Ok(0) }",
                 Expect::Unbounded,
             ),
@@ -13112,7 +13222,7 @@ mod tests {
                 "guard: each store in a chain follows its own arguments",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut source = Some(repo); let mut dest = Vec::new(); \
-                 dest.insert(0, source.take().unwrap()).clone_from(&{ source = None; 1 }); render(dest); Ok(0) }",
+                 dest.insert(0, source.unwrap()).clone_from(&{ source = None; 1 }); render(dest); Ok(0) }",
                 Expect::Unbounded,
             ),
         ]);
@@ -13307,28 +13417,28 @@ mod tests {
                 "guard: a later argument does not erase an earlier one",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut source = Some(repo); \
-                 helper(source.take().unwrap(), { source = None; }).await?; Ok(0) }",
+                 helper(source.unwrap(), { source = None; }).await?; Ok(0) }",
                 Expect::Unbounded,
             ),
             (
                 "guard: a later method argument does not erase an earlier one",
                 "async fn h(repo: PgPostRepository, svc: Service) -> AutumnResult<usize> { \
                  let mut source = Some(repo); \
-                 svc.helper(source.take().unwrap(), { source = None; }).await?; Ok(0) }",
+                 svc.helper(source.unwrap(), { source = None; }).await?; Ok(0) }",
                 Expect::Unbounded,
             ),
             (
                 "guard: a method argument does not erase its receiver",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut source = Some(repo); \
-                 source.as_ref().unwrap().find_all_by({ source = None; 1 }).await?; Ok(0) }",
+                 source.unwrap().find_all_by({ source = None; 1 }).await?; Ok(0) }",
                 Expect::Exact(1),
             ),
             (
                 "guard: an assignment runs its value before its place",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut source = Some(repo); let mut rows = vec![Vec::new()]; \
-                 rows[{ source = None; 0 }] = source.as_ref().unwrap().find_all().await?; Ok(0) }",
+                 rows[{ source = None; 0 }] = source.unwrap().find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
             (
@@ -13342,16 +13452,16 @@ mod tests {
             (
                 "guard: a later method argument does not erase what an earlier one gained",
                 "async fn h(repo: PgPostRepository, sink: Sink) -> AutumnResult<usize> { \
-                 let mut source = Vec::new(); \
-                 sink.consume({ source.push(repo); source.pop().unwrap() }, { source.clear() }).await?; Ok(0) }",
+                 let mut source = None; \
+                 sink.consume({ source = Some(repo); source.unwrap() }, { source = None }).await?; Ok(0) }",
                 Expect::Unbounded,
             ),
             (
                 "guard: an invoked closure takes each argument as it ran",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
-                 let mut source = Vec::new(); \
+                 let mut source = None; \
                  (|r, _| async move { r.find_all().await })\
-                 ({ source.push(repo); source.pop().unwrap() }, { source.clear() }).await?; Ok(0) }",
+                 ({ source = Some(repo); source.unwrap() }, { source = None }).await?; Ok(0) }",
                 Expect::Exact(1),
             ),
             (
@@ -13513,7 +13623,7 @@ mod tests {
                 "guard: a compound assignment may run its value first",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut source = Some(repo); let mut totals = vec![0]; \
-                 totals[{ source = None; 0 }] += source.as_ref().unwrap().count().await?; Ok(0) }",
+                 totals[{ source = None; 0 }] += source.unwrap().count().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
             (
@@ -13587,7 +13697,7 @@ mod tests {
                 "guard: a later tuple element does not erase an earlier one",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut source = Some(repo); \
-                 let wrapped = (source.take().unwrap(), { source = None; 0 }); \
+                 let wrapped = (source.unwrap(), { source = None; 0 }); \
                  wrapped.0.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
@@ -13595,7 +13705,7 @@ mod tests {
                 "guard: a later struct field does not erase an earlier one",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut source = Some(repo); \
-                 let wrapped = Ctx { db: source.take().unwrap(), n: { source = None; 0 } }; \
+                 let wrapped = Ctx { db: source.unwrap(), n: { source = None; 0 } }; \
                  wrapped.db.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
@@ -13637,7 +13747,7 @@ mod tests {
                 "guard: an invoked closure's result keeps an earlier argument",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut source = Some(repo); \
-                 let alias = (|r, _| r)(source.take().unwrap(), { source = None; 0 }); \
+                 let alias = (|r, _| r)(source.unwrap(), { source = None; 0 }); \
                  alias.find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
@@ -13645,7 +13755,7 @@ mod tests {
                 "guard: a later vec element does not erase an earlier one",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut source = Some(Ctx { inner: Some(repo) }); \
-                 let wrapped = vec![source.take().unwrap(), { source = None; Ctx { inner: None } }]; \
+                 let wrapped = vec![source.unwrap(), { source = None; Ctx { inner: None } }]; \
                  wrapped[0].inner.as_ref().unwrap().find_all().await?; Ok(0) }",
                 Expect::Unbounded,
             ),
@@ -13653,7 +13763,7 @@ mod tests {
                 "guard: a range end does not erase its start",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut source = Some(Ctx { inner: Some(repo) }); \
-                 let wrapped = (source.take().unwrap())..({ source = None; Ctx { inner: None } }); \
+                 let wrapped = (source.unwrap())..({ source = None; Ctx { inner: None } }); \
                  wrapped.start.inner.as_ref().unwrap().find_all().await?; Ok(0) }",
                 Expect::Unbounded,
             ),
@@ -13661,7 +13771,7 @@ mod tests {
                 "guard: a later plain vec element does not erase an earlier read",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut source = Some(repo); \
-                 let wrapped = vec![source.take().unwrap(), { source = None; make() }]; \
+                 let wrapped = vec![source.unwrap(), { source = None; make() }]; \
                  wrapped[0].find_all().await?; Ok(0) }",
                 Expect::Exact(1),
             ),
@@ -13669,7 +13779,7 @@ mod tests {
                 "guard: a plain range end does not erase its start's read",
                 "async fn h(repo: PgPostRepository) -> AutumnResult<usize> { \
                  let mut source = Some(repo); \
-                 let wrapped = (source.take().unwrap())..({ source = None; make() }); \
+                 let wrapped = (source.unwrap())..({ source = None; make() }); \
                  wrapped.start.find_all().await?; Ok(0) }",
                 Expect::Unbounded,
             ),
@@ -14064,7 +14174,7 @@ mod tests {
             (
                 "guard: a type path rooted at std is std",
                 "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
-                 let ids: std::vec::Vec<i64> = repos.as_slice().iter().map(|r| r.id).collect(); render(ids); Ok(0) }",
+                 let ids: std::vec::Vec<i64> = repos.into_iter().map(|r| r.id).collect(); render(ids); Ok(0) }",
                 Expect::Exact(0),
             ),
         ]);
@@ -14080,10 +14190,10 @@ mod tests {
                 Expect::Unbounded,
             ),
             (
-                "guard: a scalar method handed the handle gives a plain value",
+                "a scalar method handed the handle borrows its receiver",
                 "async fn h(repo: PgPostRepository, repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
                  let found = repos.as_slice().contains(&repo); render(found); Ok(0) }",
-                Expect::Exact(0),
+                Expect::Unbounded,
             ),
             (
                 "guard: a plain method handed only plain values gives a plain value",
@@ -14140,10 +14250,10 @@ mod tests {
                 Expect::Unbounded,
             ),
             (
-                "split_off gives a Vec of the handles",
+                "split_off borrows the Vec of handles",
                 "async fn h(mut repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
                  let mut rest = repos.split_off(1); let r = rest.pop().unwrap(); let _ = r.find_all().await?; Ok(0) }",
-                Expect::Exact(1),
+                Expect::Unbounded,
             ),
             (
                 "the result of std::mem::drop is plain",
@@ -14160,19 +14270,19 @@ mod tests {
             (
                 "a BinaryHeap annotation of plain parts is plain",
                 "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
-                 let ids: BinaryHeap<i64> = repos.as_slice().iter().map(|r| r.id).collect(); render(ids); Ok(0) }",
+                 let ids: BinaryHeap<i64> = repos.into_iter().map(|r| r.id).collect(); render(ids); Ok(0) }",
                 Expect::Exact(0),
             ),
             (
                 "a LinkedList annotation of plain parts is plain",
                 "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
-                 let ids: LinkedList<i64> = repos.as_slice().iter().map(|r| r.id).collect(); render(ids); Ok(0) }",
+                 let ids: LinkedList<i64> = repos.into_iter().map(|r| r.id).collect(); render(ids); Ok(0) }",
                 Expect::Exact(0),
             ),
             (
                 "guard: a Vec annotation of plain parts is plain",
                 "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
-                 let ids: Vec<i64> = repos.as_slice().iter().map(|r| r.id).collect(); render(ids); Ok(0) }",
+                 let ids: Vec<i64> = repos.into_iter().map(|r| r.id).collect(); render(ids); Ok(0) }",
                 Expect::Exact(0),
             ),
             (
@@ -14188,10 +14298,10 @@ mod tests {
                 Expect::Unbounded,
             ),
             (
-                "get_or_insert gives the element",
+                "get_or_insert borrows the Option",
                 "async fn h(repo: PgPostRepository, mut slot: Option<PgPostRepository>) -> AutumnResult<usize> { \
                  let alias = slot.get_or_insert(repo); let _ = alias.find_all().await?; Ok(0) }",
-                Expect::Exact(1),
+                Expect::Unbounded,
             ),
             (
                 "an exempt unknown container method may give a part",
@@ -14218,37 +14328,30 @@ mod tests {
             ("BTreeMap<i64, PgPostRepository>", "repos.capacity()"),
             ("LinkedList<PgPostRepository>", "repos.capacity()"),
         ];
-        // The type has the method, so it issues nothing.
+        // The type has the method and it takes `self`, so it issues nothing.
+        // A method that borrows is reported: see
+        // `a_container_method_that_borrows_may_be_a_trait_method`.
         let present = [
-            ("Vec<PgPostRepository>", "repos.as_mut_slice().sort()"),
-            ("VecDeque<PgPostRepository>", "repos.push_back(other)"),
-            ("[PgPostRepository; 2]", "repos.as_mut_slice().reverse()"),
+            ("Vec<PgPostRepository>", "repos.into_iter().count()"),
+            ("VecDeque<PgPostRepository>", "repos.into_iter().count()"),
+            ("LinkedList<PgPostRepository>", "repos.into_iter().count()"),
+            ("BinaryHeap<PgPostRepository>", "repos.into_iter().count()"),
+            ("[PgPostRepository; 2]", "repos.into_iter().count()"),
+            ("HashSet<PgPostRepository>", "repos.into_iter().count()"),
+            ("BTreeSet<PgPostRepository>", "repos.into_iter().count()"),
+            (
+                "HashMap<i64, PgPostRepository>",
+                "repos.into_values().count()",
+            ),
             (
                 "BTreeMap<i64, PgPostRepository>",
-                "repos.retain(|_, _| true)",
+                "repos.into_keys().count()",
             ),
-            ("HashSet<PgPostRepository>", "repos.drain()"),
-            ("Vec<PgPostRepository>", "repos.capacity()"),
-            ("VecDeque<PgPostRepository>", "repos.capacity()"),
-            ("BinaryHeap<PgPostRepository>", "repos.capacity()"),
-            ("HashMap<i64, PgPostRepository>", "repos.capacity()"),
-            ("HashSet<PgPostRepository>", "repos.capacity()"),
-            ("Vec<PgPostRepository>", "repos.split_off(1)"),
-            ("VecDeque<PgPostRepository>", "repos.split_off(1)"),
-            ("LinkedList<PgPostRepository>", "repos.split_off(1)"),
+            ("Option<PgPostRepository>", "repos.is_some_and(|_| false)"),
             (
-                "Vec<PgPostRepository>",
-                "repos.resize_with(2, || other.clone())",
+                "Result<PgPostRepository, AppError>",
+                "repos.is_ok_and(|_| false)",
             ),
-            (
-                "VecDeque<PgPostRepository>",
-                "repos.resize_with(2, || other.clone())",
-            ),
-            (
-                "VecDeque<PgPostRepository>",
-                "repos.make_contiguous().len()",
-            ),
-            ("Option<PgPostRepository>", "repos.take_if(|_| false)"),
         ];
         let handler = |ty: &str, call: &str| {
             format!(
@@ -14256,11 +14359,12 @@ mod tests {
                  {{ let _ = {call}; Ok(0) }}"
             )
         };
-        // `VecDeque::remove` gives an `Option` of the handle.
-        let deque = "async fn h(mut repos: VecDeque<PgPostRepository>) -> AutumnResult<usize> { \
-                     let repo = repos.pop_front().unwrap(); let _ = repo.find_all().await?; \
-                     let other = repos.remove(0).unwrap(); let _ = other.find_all().await?; \
-                     Ok(0) }";
+        // An element taken by a `self` method is a handle.
+        let deque = "async fn h(repos: VecDeque<PgPostRepository>, more: VecDeque<PgPostRepository>) \
+                     -> AutumnResult<usize> { \
+                     let repo = repos.into_iter().last().unwrap(); let _ = repo.find_all().await?; \
+                     let other = more.into_iter().max_by_key(|r| r.id).unwrap(); \
+                     let _ = other.find_all().await?; Ok(0) }";
         let mut failures = Vec::new();
         for (ty, call) in missing {
             if check(&handler(ty, call), Expect::Unbounded).is_some() {
@@ -14275,8 +14379,8 @@ mod tests {
         if let Some(why) = check(deque, Expect::Exact(2)) {
             failures.push(format!("VecDeque element: {why}"));
         }
-        let map = "async fn h(mut repos: HashMap<i64, PgPostRepository>) -> AutumnResult<usize> \
-                   { let repo = repos.remove(&1).unwrap(); let _ = repo.find_all().await?; Ok(0) }";
+        let map = "async fn h(repos: HashMap<i64, PgPostRepository>) -> AutumnResult<usize> \
+                   { let repo = repos.into_values().last().unwrap(); let _ = repo.find_all().await?; Ok(0) }";
         if let Some(why) = check(map, Expect::Exact(1)) {
             failures.push(format!("HashMap element: {why}"));
         }
@@ -14285,6 +14389,186 @@ mod tests {
                        { let _ = repos.remove(0).refresh_all().await; Ok(0) }";
         if check(unknown, Expect::Unbounded).is_some() {
             failures.push("VecDeque: `remove(0).refresh_all()` is not reported".to_string());
+        }
+        assert_matrix(&failures);
+    }
+
+    #[test]
+    fn a_container_method_that_borrows_may_be_a_trait_method() {
+        // Rust looks for a `self` method before a `&self` method, and for a
+        // `&self` method before a `&mut self` method. An application trait
+        // method `len(self)` on `Vec<PgPostRepository>` runs in place of
+        // `Vec::len`. So a std method that borrows its receiver proves
+        // nothing on a container of handles.
+        let borrows = [
+            ("Vec<PgPostRepository>", "repos.len()"),
+            ("Vec<PgPostRepository>", "repos.push(other)"),
+            ("Vec<PgPostRepository>", "repos.as_slice().len()"),
+            ("Option<PgPostRepository>", "repos.is_some()"),
+            ("Option<PgPostRepository>", "repos.as_ref()"),
+            ("Option<PgPostRepository>", "repos.take()"),
+            ("Result<PgPostRepository, AppError>", "repos.is_ok()"),
+            ("HashMap<i64, PgPostRepository>", "repos.get(&1)"),
+            (
+                "Vec<PgPostRepository>",
+                "repos.into_iter().any(|r| r.id == 1)",
+            ),
+            ("Vec<PgPostRepository>", "repos.into_iter().next()"),
+            // Through a reference, a trait on `&Option<_>` comes first.
+            ("Option<PgPostRepository>", "(&repos).map(|r| r.id)"),
+        ];
+        // A `self` method cannot be taken over: an inherent method comes
+        // before a trait method, and two trait methods with one name do
+        // not compile.
+        let owns = [
+            (
+                "Vec<PgPostRepository>",
+                "repos.into_iter().map(|r| r.id).count()",
+            ),
+            (
+                "Vec<PgPostRepository>",
+                "repos.into_iter().for_each(|r| { let _ = r.id; })",
+            ),
+            ("Option<PgPostRepository>", "repos.map(|r| r.id)"),
+            (
+                "Option<PgPostRepository>",
+                "repos.is_some_and(|r| r.id == 1)",
+            ),
+            ("Result<PgPostRepository, AppError>", "repos.ok()"),
+            (
+                "HashMap<i64, PgPostRepository>",
+                "repos.into_values().count()",
+            ),
+        ];
+        let handler = |ty: &str, call: &str| {
+            format!(
+                "async fn h(mut repos: {ty}, other: PgPostRepository) -> AutumnResult<usize> \
+                 {{ let _ = {call}; Ok(0) }}"
+            )
+        };
+        let mut failures = Vec::new();
+        for (ty, call) in borrows {
+            if check(&handler(ty, call), Expect::Unbounded).is_some() {
+                failures.push(format!("{ty}: `{call}` is not reported"));
+            }
+        }
+        for (ty, call) in owns {
+            if let Some(why) = check(&handler(ty, call), Expect::Exact(0)) {
+                failures.push(format!("{ty}: `{call}`: {why}"));
+            }
+        }
+        // A container of plain values has no handle to give a trait.
+        let plain = "async fn h(ids: Vec<i64>) -> AutumnResult<usize> { \
+                     let _ = ids.len(); let _ = ids.iter().any(|i| *i == 1); Ok(0) }";
+        if let Some(why) = check(plain, Expect::Exact(0)) {
+            failures.push(format!("Vec<i64>: {why}"));
+        }
+        assert_matrix(&failures);
+    }
+
+    #[test]
+    fn a_container_of_handles_is_read_without_borrowing() {
+        let mut failures = Vec::new();
+        // The guide's ways to read a container without a borrowing method.
+        let reads = [
+            (
+                "Vec<PgPostRepository>",
+                "let _ = repos[0].find_all().await?;",
+                1,
+            ),
+            (
+                "Vec<PgPostRepository>",
+                "let rest = &repos[1..]; let _ = rest[0].find_all().await?;",
+                1,
+            ),
+            (
+                "Vec<PgPostRepository>",
+                "let [first, ..] = &repos[..] else { return Ok(0) }; \
+                 let _ = first.find_all().await?;",
+                1,
+            ),
+            (
+                "Option<PgPostRepository>",
+                "if let Some(r) = &repos { let _ = r.find_all().await?; }",
+                1,
+            ),
+            (
+                "Vec<PgPostRepository>",
+                "for r in &repos { let _ = r.id; }",
+                0,
+            ),
+        ];
+        for (ty, body, n) in reads {
+            let handler =
+                format!("async fn h(repos: {ty}) -> AutumnResult<usize> {{ {body} Ok(0) }}");
+            if let Some(why) = check(&handler, Expect::Exact(n)) {
+                failures.push(format!("{ty}: `{body}`: {why}"));
+            }
+        }
+        // A declared cost and a std type keep the result plain: the compiler
+        // checks that `n` is a `usize`.
+        let typed = "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                     #[query_cost(0)] let n: usize = repos.len(); \
+                     let [repo, ..] = &repos[..] else { return Ok(n) }; \
+                     Ok(n + repo.find_all().await?.len()) }";
+        if let Some(why) = check(typed, Expect::Exact(1)) {
+            failures.push(format!("typed len: {why}"));
+        }
+        // Without the type, the result may hold handles.
+        let untyped = "async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> { \
+                       #[query_cost(0)] let n = repos.len(); Ok(n + 1) }";
+        if check(untyped, Expect::Unbounded).is_some() {
+            failures.push("untyped len: `n + 1` is not reported".to_string());
+        }
+        assert_matrix(&failures);
+    }
+
+    #[test]
+    fn a_state_or_extension_extractor_of_a_repository_is_a_handle() {
+        let one = |sig: &str, body: &str| {
+            format!("async fn h({sig}) -> AutumnResult<usize> {{ {body} Ok(0) }}")
+        };
+        let mut failures = Vec::new();
+        let handles = [
+            ("State(repo): State<PgPostRepository>", "repo"),
+            ("repo: State<PgPostRepository>", "repo"),
+            ("Extension(repo): Extension<PgPostRepository>", "repo"),
+            ("repo: Extension<PgPostRepository>", "repo"),
+            ("State(repo): State<Arc<PgPostRepository>>", "repo"),
+            ("State(repo): State<Arc<dyn PostRepository>>", "repo"),
+            ("repo: axum::extract::State<PgPostRepository>", "repo"),
+            ("State(db): State<Db>", "db"),
+        ];
+        for (sig, name) in handles {
+            let counted = one(sig, &format!("let _ = {name}.find_all().await?;"));
+            if let Some(why) = check(&counted, Expect::Exact(1)) {
+                failures.push(format!("`{sig}`: {why}"));
+            }
+            let looped = one(
+                sig,
+                &format!("for id in ids() {{ let _ = {name}.find(id).await?; }}"),
+            );
+            if check(&looped, Expect::Unbounded).is_some() {
+                failures.push(format!("`{sig}`: a loop of queries is not reported"));
+            }
+        }
+        // Guards: a request body named like a repository is not a handle, and
+        // an application state struct stays outside the analysis.
+        let plain = [
+            (
+                "Json(body): Json<CreateRepository>",
+                "let _ = body.validate();",
+            ),
+            (
+                "Form(body): Form<NewRepository>",
+                "let _ = body.validate();",
+            ),
+            ("State(app): State<AppState>", "let _ = app.config();"),
+        ];
+        for (sig, body) in plain {
+            if let Some(why) = check(&one(sig, body), Expect::Exact(0)) {
+                failures.push(format!("`{sig}`: {why}"));
+            }
         }
         assert_matrix(&failures);
     }
@@ -14454,7 +14738,7 @@ mod tests {
     fn a_map_of_handles_is_a_container() {
         let handler = r"
             async fn h(repos: HashMap<i64, PgPostRepository>) -> AutumnResult<usize> {
-                for repo in repos.values() { let _ = repo.find_all().await?; }
+                for repo in repos.into_values() { let _ = repo.find_all().await?; }
                 Ok(0)
             }
             ";
@@ -14487,14 +14771,14 @@ mod tests {
         // `Vec<i64>` is checked by rustc and cannot hold a handle.
         let handler = matrix_handler(
             "let repos = vec![repo]; \
-             let ids: Vec<i64> = repos.as_slice().iter().map(|r| r.id).collect(); \
+             let ids: Vec<i64> = repos.into_iter().map(|r| r.id).collect(); \
              let _ = render(ids);",
         );
         assert_clean("0", &handler);
         // A `_` leaves the type open, so the container rule still applies.
         let open = matrix_handler(
             "let repos = vec![repo]; \
-             let ids: Vec<_> = repos.as_slice().iter().map(|r| r.id).collect(); \
+             let ids: Vec<_> = repos.into_iter().map(|r| r.id).collect(); \
              let _ = render(ids);",
         );
         assert_error_contains("50", &open, &["render"]);
@@ -14524,13 +14808,20 @@ mod tests {
             }
             ";
         assert_error_contains("50", handler, &["refresh_all"]);
-        // Known container methods stay free.
-        let known = r"
+        // A known std method that borrows the container is reported too: a
+        // trait method may run in its place.
+        let borrows = r"
             async fn h(mut repos: Vec<PgPostRepository>, extra: PgPostRepository) -> AutumnResult<usize> {
                 repos.push(extra);
-                repos.as_mut_slice().sort_by_key(|r| r.id);
-                repos.as_slice().iter().for_each(|r| drop(r));
-                Ok(repos.len())
+                Ok(0)
+            }
+            ";
+        assert_error_contains("50", borrows, &["push"]);
+        // Known methods that take `self` stay free.
+        let known = r"
+            async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> {
+                let ids: Vec<i64> = repos.into_iter().map(|r| r.id).collect();
+                Ok(ids.len())
             }
             ";
         assert_clean("0", known);
@@ -14552,12 +14843,12 @@ mod tests {
         let handler = r"
             async fn h(repos: Vec<PgPostRepository>) -> AutumnResult<usize> {
                 for r in &repos { let _ = r.find_all().await?; }
-                Ok(repos.len())
+                Ok(0)
             }
             ";
         assert_error_contains("50", handler, &["loop"]);
         // The rule does not depend on how the handle type is named.
-        let only_len = r"
+        let only_counts = r"
             async fn h(
                 repos: Vec<PgPostRepository>,
                 slots: Option<PgPostRepository>,
@@ -14565,11 +14856,11 @@ mod tests {
                 maybe_db: Option<Db>,
                 arc_repo: std::sync::Arc<PgPostRepository>,
             ) -> AutumnResult<usize> {
-                Ok(repos.len() + usize::from(slots.is_some()) + dbs.len()
-                    + usize::from(maybe_db.is_some()))
+                Ok(repos.into_iter().count() + usize::from(slots.is_some_and(|_| true))
+                    + dbs.into_iter().count() + usize::from(maybe_db.is_some_and(|_| true)))
             }
             ";
-        assert_clean("0", only_len);
+        assert_clean("0", only_counts);
         let through_arc = r"
             async fn h(arc_repo: std::sync::Arc<PgPostRepository>) -> AutumnResult<usize> {
                 Ok(arc_repo.find_all().await?.len())

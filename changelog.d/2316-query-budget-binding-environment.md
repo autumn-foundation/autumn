@@ -5,6 +5,13 @@
   of counting it as one query. Nothing at the call site tells a one-query
   finder from a helper that loops. Put `#[query_cost(N)]` on the statement
   (#2316, [migration guide](docs/migrations/next.md)).
+- **Breaking:** `#[query_budget]` reports a method that borrows a container
+  of handles, such as `repos.len()`, `repos.push(repo)` or `maybe.as_ref()`
+  on a `Vec`, `Option` or `Result` of a handle type. An application trait
+  method with that name may run in its place. A method that takes `self`
+  (`repos.into_iter()`, `maybe.unwrap()`), an index, a pattern and a `for`
+  loop stay free. Put `#[query_cost(N)]` on the statement
+  (#2316, [migration guide](docs/migrations/next.md)).
 
 ### Fixed
 
@@ -20,20 +27,21 @@
   `match` arm or a `break` gives keeps its handle. Before, some of these
   forms lost the handle, and a query through it was not counted (#2316).
 - **query budgets:** a handle kept in a container is tracked. An index, a
-  field, a pattern, `?` or an element method (`remove`, `unwrap`) on
+  field, a pattern, `?` or an element method that takes `self` (`unwrap`) on
   `[repo]`, `vec![repo]`, `Some(repo)` or a `Vec`, `Option`, `Result`, map
   or set parameter of a handle type gives a handle. `Arc<Vec<…>>` is a container,
   and a container of containers keeps its shape. An unknown method on such
   a container, or any method on a user struct that holds a handle, is
   reported. A container method is known only for the container type that
-  has it: `sort` on a `VecDeque` is reported. A slice method called on a
-  `Vec` or an array (`repos.iter()`) and `clone` on a container are
-  reported too, because an extension trait can take them over; call the
-  slice method on `repos.as_slice()`. After `list.push(repo)` or `fill(&mut list, &repo)`, `list` holds
-  a handle. A type annotation made only of standard and primitive types
+  has it, and only when it takes `self`: `sort` on a `VecDeque` is
+  reported, and so are `clone` and every method that borrows the
+  container. After `#[query_cost(0)] list.push(repo);` or
+  `fill(&mut list, &repo)`, `list` holds a handle. A type annotation made only of standard and primitive types
   (`Vec<i64>`) marks a binding as plain (#2316).
 - **query budgets:** a parameter of type `Arc<PgPostRepository>`, `Box<…>`,
-  `Rc<…>`, `dyn PostRepository` or `impl PostRepository` is a handle. A
+  `Rc<…>`, `dyn PostRepository` or `impl PostRepository` is a handle, and so
+  is a `State<…>` or `Extension<…>` extractor of one
+  (`State(repo): State<PgPostRepository>`). A
   handle assigned into a field (`deps.0 = repo`) is tracked. Before, a query
   through these was not counted (#2316).
 - **query budgets:** `db.tx_immediate(…)`, `scoped_immediate_transaction`

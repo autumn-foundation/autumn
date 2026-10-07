@@ -285,6 +285,50 @@ async fn index(mut db: Db) -> AutumnResult<Markup> {
 **Automation:** `manual` — the cost of each helper is a fact only its author
 knows, so no codemod can write the `N` in `#[query_cost(N)]`.
 
+### Query budgets: a method that borrows a container of handles is reported (#2316)
+
+**Why:** Rust looks for a `self` method before a `&self` method, and for a
+`&self` method before a `&mut self` method. So an application trait method
+`len(self)` on `Vec<PgPostRepository>` runs in place of `Vec::len`, and it
+can query. The analysis has no type information to rule that out.
+
+This affects you only if a `#[query_budget(N)]` function calls a method that
+borrows a `Vec`, `Option`, `Result`, map or set of a handle type
+(`repos.len()`, `repos.push(repo)`, `repos.iter()`, `maybe.as_ref()`). The
+build fails with "`len` is called on a container of database handles". Read
+the container with an index, a pattern, a `for` loop or a method that takes
+`self`, or put `#[query_cost(N)]` on the statement.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[query_budget(1)]
+async fn first(repos: Vec<PgPostRepository>) -> AutumnResult<usize> {
+    let n = repos.len();
+    let Some(repo) = repos.first() else { return Ok(0) };
+    Ok(n + repo.find_all().await?.len())
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+#[query_budget(1)]
+async fn first(repos: Vec<PgPostRepository>) -> AutumnResult<usize> {
+    #[query_cost(0)]
+    let n: usize = repos.len();
+    let [repo, ..] = &repos[..] else { return Ok(0) };
+    Ok(n + repo.find_all().await?.len())
+}
+```
+
+What a borrowing method gives may hold handles, so give its binding a type
+made only of standard and primitive types (`let n: usize`). Without it, a
+later use of `n` is reported too.
+
+**Automation:** `manual` — the fix depends on what the call reads, and no
+codemod can choose between an index, a pattern and `#[query_cost(N)]`.
+
 ---
 
 ### Config: the `prod` profile enables `strict_config` and new protections
