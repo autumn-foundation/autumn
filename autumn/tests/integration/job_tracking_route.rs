@@ -54,6 +54,7 @@ impl Plugin for TrackedGateJobPlugin {
             uniqueness: None,
             concurrency: None,
             handler: tracked_gate_job_handler,
+            timeout: None,
         }])
     }
 }

@@ -1134,6 +1134,7 @@ impl crate::plugin::Plugin for OutboundWebhookPlugin {
             concurrency: None,
             version: 1,
             handler: deliver_webhook_job,
+            timeout: None,
         }])
     }
 }

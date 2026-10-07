@@ -388,6 +388,7 @@ async fn webhook_outbound_dispatch_fanout_profile() {
         uniqueness: None,
         concurrency: None,
         handler: autumn_web::webhook_outbound::deliver_webhook_job,
+        timeout: None,
     };
     // `run_workers = false`: this harness measures the enqueue leg only. No
     // worker claims/processes the rows, so the claim/ack machinery never

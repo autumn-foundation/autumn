@@ -202,6 +202,7 @@ idempotency.redis.url
 idempotency.ttl_secs
 jobs
 jobs.backend
+jobs.default_timeout_ms
 jobs.fleet
 jobs.fleet.declared_queues
 jobs.fleet.manifest
