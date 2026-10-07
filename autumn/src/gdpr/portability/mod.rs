@@ -265,7 +265,8 @@ pub async fn export_subject(
 /// [`DataCapsuleError::UnknownTable`], [`DataCapsuleError::RelationshipCycle`],
 /// [`DataCapsuleError::UnsupportedFormat`],
 /// [`DataCapsuleError::InvalidInput`] for a record that names a blob the
-/// capsule does not hold, or an error from `store` (for example
+/// capsule does not hold, or for a column that the model now excludes, or an
+/// error from `store` (for example
 /// [`DataCapsuleError::Conflict`]).
 pub async fn import_capsule(
     capsule: &DataCapsule,
@@ -316,8 +317,31 @@ pub(super) fn check_importable<'c>(
             &model.relationships,
             &model.blob_columns,
         )?;
-        if !models.iter().any(|m| m.table == model.table) {
-            return Err(DataCapsuleError::UnknownTable(model.table.clone()));
+        let current = models
+            .iter()
+            .find(|m| m.table == model.table)
+            .ok_or_else(|| DataCapsuleError::UnknownTable(model.table.clone()))?;
+        // A capsule from before the app excluded a column still holds it, for
+        // example a password hash. The exclusion holds for import too: the
+        // column, and a blob it names, must not be written back.
+        let held = model
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .chain(model.blob_columns.iter().map(String::as_str))
+            .chain(
+                capsule
+                    .records(&model.table)
+                    .iter()
+                    .flat_map(|row| row.keys().map(String::as_str)),
+            );
+        for column in held {
+            if current.excluded.iter().any(|e| e == column) {
+                return Err(DataCapsuleError::InvalidInput(format!(
+                    "{}.{column} is excluded from capsules, but the capsule holds it",
+                    model.table
+                )));
+            }
         }
         // Export skips a blob that its store does not have, but the record
         // still names it. Such a record would point at nothing, or at other

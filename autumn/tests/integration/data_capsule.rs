@@ -701,6 +701,26 @@ async fn import_rejects_a_table_the_app_did_not_register() {
 }
 
 #[tokio::test]
+async fn import_refuses_a_column_that_the_model_now_excludes() {
+    // The capsule is from before the app excluded `bio`. The exclusion holds
+    // for import too: the column must not be written back.
+    let capsule = export_ada(&seeded_store()).await;
+    let mut models = registry().capsule_models().to_vec();
+    for model in &mut models {
+        if model.table == "users" {
+            model.excluded.push("bio".to_owned());
+        }
+    }
+    let err = import_capsule(&capsule, &models, &empty_store())
+        .await
+        .expect_err("excluded column");
+    assert!(
+        matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains("users.bio")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
 async fn import_rejects_a_relationship_cycle() {
     let models = [
         CapsuleModel::new("users", "id").belongs_to("id", "comments"),
@@ -1179,6 +1199,67 @@ mod blobs {
         .with_blob_store(target_blobs.clone());
         let err = target.import_from(&root).await.expect_err("unknown table");
         assert!(matches!(err, DataCapsuleError::UnknownTable(_)), "{err:?}");
+        for key in ["avatars/ada.png", "docs/ada-cv.txt"] {
+            assert!(
+                matches!(
+                    target_blobs.get(key).await,
+                    Err(BlobStoreError::NotFound(_))
+                ),
+                "{key}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn import_refuses_a_blob_column_that_the_model_now_excludes() {
+        // The target app now excludes `cv_key`. Import must not restore the
+        // CV, nor write its key back.
+        use std::sync::Arc;
+
+        use autumn_web::gdpr::portability::CapsuleService;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_blobs = blob_store(&tmp.path().join("a"));
+        source_blobs
+            .put("avatars/ada.png", "image/png", Bytes::from_static(b"png"))
+            .await
+            .unwrap();
+        source_blobs
+            .put("docs/ada-cv.txt", "text/plain", Bytes::from_static(b"cv"))
+            .await
+            .unwrap();
+        let source = CapsuleService::new(models(), Arc::new(store()), signer())
+            .with_blob_store(Arc::new(source_blobs));
+        let root = tmp.path().join("capsule");
+        source.export_to("1", &root).await.unwrap();
+
+        let target_blobs = Arc::new(blob_store(&tmp.path().join("b")));
+        let users = MemoryCapsuleStore::new().table(
+            "users",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("avatar", "jsonb").nullable(),
+                FieldSpec::new("cv_key", "text").nullable(),
+            ],
+        );
+        let target = CapsuleService::new(
+            vec![
+                CapsuleModel::new("users", "id")
+                    .blob("avatar")
+                    .exclude("cv_key"),
+            ],
+            Arc::new(users),
+            signer(),
+        )
+        .with_blob_store(target_blobs.clone());
+        let err = target
+            .import_from(&root)
+            .await
+            .expect_err("excluded column");
+        assert!(
+            matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains("users.cv_key")),
+            "{err:?}"
+        );
         for key in ["avatars/ada.png", "docs/ada-cv.txt"] {
             assert!(
                 matches!(

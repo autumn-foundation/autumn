@@ -68,7 +68,10 @@ the key and subject column of every row: any other row fails the export
 
 **Exclude all secrets.** Export copies every column that you do not exclude.
 Exclude password hashes, tokens, and internal flags. Import cannot restore an
-excluded column, so the column must accept `NULL` or have a default.
+excluded column, so the column must accept `NULL` or have a default. An
+exclusion holds for import too: a capsule made before you excluded a column
+still holds it, and import refuses that capsule (`400`) rather than write the
+column, or a blob it names, back.
 
 **Check blob ownership.** Export copies each blob that a blob column names. If
 users can write a blob key into a row, make sure that the key belongs to the
