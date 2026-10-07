@@ -2665,9 +2665,11 @@ impl RequestBuilder {
         let mut headers = self.extra_headers.clone();
         let mut body = self.body.clone();
         // On the pooled path the whole chain shares one retry count, as when
-        // reqwest follows the redirects.
+        // reqwest follows the redirects. It comes from the original method:
+        // a `POST` that a 303 turns into a `GET` gets no retries the `POST`
+        // did not have.
         let retries_left = matches!(hop_client, HopClient::Pooled(_))
-            .then(|| AtomicU32::new(self.retry_policy.max_retries));
+            .then(|| AtomicU32::new(self.max_attempts(is_half_open).saturating_sub(1)));
         for hop in 0.. {
             // Pin only applies to the first hop's original target.
             let resolve = if hop == 0 {
@@ -6601,6 +6603,40 @@ mod tests {
             .unwrap();
             assert_eq!(response.status().as_u16(), 503, "the one retry is spent");
             assert_eq!(origin_hits.load(Ordering::SeqCst), 2);
+            assert_eq!(target_hits.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn a_post_redirected_to_get_under_a_deadline_gets_no_retry() {
+            use axum::response::IntoResponse;
+            let target_hits = Arc::new(AtomicU32::new(0));
+            let target = Arc::clone(&target_hits);
+            let app = axum::Router::new()
+                .route(
+                    "/r",
+                    axum::routing::post(|| async { axum::response::Redirect::to("/t") }),
+                )
+                .route(
+                    "/t",
+                    axum::routing::get(move || async move {
+                        if target.fetch_add(1, Ordering::SeqCst) == 0 {
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        } else {
+                            "done".into_response()
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let url = format!("http://127.0.0.1:{port}/r");
+            let response = with_deadline(
+                Duration::from_secs(3),
+                Client::new().post(&url).retries(3).send(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status().as_u16(), 503, "as without a deadline");
             assert_eq!(target_hits.load(Ordering::SeqCst), 1);
         }
 
