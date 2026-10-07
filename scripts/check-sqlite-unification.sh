@@ -96,6 +96,10 @@ scan_manifest() {
       pkg = ""
       ml = ""
       ESCAPED_HEADER = sprintf("%c", 1) "escaped-header"
+      # A dependency or feature name, as cargo accepts it once its quotes are
+      # gone: any run without a dot, blank, `=`, quote, slash, `?` or bracket.
+      NAME = "[^]. \t=\"/?[]+"
+      DEPS = "(dependencies|dev-dependencies|build-dependencies)"
       defines_flip_sqlite = 0
     }
 
@@ -296,12 +300,29 @@ scan_manifest() {
       return unquote_key(line)
     }
 
+    # The dependency name in a loose dotted key, or "". Only the paths cargo
+    # reads: `dependencies.X` and `target.T.dependencies.X` at the root,
+    # `T.dependencies.X` under `[target]`, `dependencies.X` under
+    # `[target.T]`. Not `package.metadata.dependencies.X`.
+    function loose_dep_name(key,   k) {
+      k = key
+      if (section == "") {
+        if (k ~ ("^target\\.[^.]+\\." DEPS "\\.")) sub(/^target\.[^.]+\./, "", k)
+      } else if (section == "[target]") {
+        if (k !~ ("^[^.]+\\." DEPS "\\.")) return ""
+        sub(/^[^.]+\./, "", k)
+      } else if (section !~ /^\[target\.[^]]+\]$/) return ""
+      if (k !~ ("^" DEPS "\\.")) return ""
+      sub(("^" DEPS "\\."), "", k)
+      sub(/\..*$/, "", k)
+      return k
+    }
     function is_dep_table() {
       return section ~ /(^\[|\.)(dependencies|dev-dependencies|build-dependencies)\]$/
     }
     # `[dependencies.autumn-web]` — the crate is in the header, not the key.
     function dep_section_crate(   name) {
-      if (!match(section, /(^\[|\.)(dependencies|dev-dependencies|build-dependencies)\.[A-Za-z0-9_-]+\]$/))
+      if (!match(section, "(^\\[|\\.)" DEPS "\\." NAME "\\]$"))
         return ""
       name = section
       sub(/\]$/, "", name)
@@ -319,7 +340,7 @@ scan_manifest() {
       # the feature only if something else enabled the dependency". A `default`
       # that pairs it with `dep:autumn-web` enables both, so the `?` spelling
       # flips the backend exactly like the plain one.
-      while (match(tail, /"[A-Za-z0-9_-]+\??\/sqlite"/)) {
+      while (match(tail, "\"" NAME "\\??/sqlite\"")) {
         name = substr(tail, RSTART + 1, RLENGTH - 2)
         sub(/\??\/sqlite$/, "", name)
         if (name ~ ("^(" flip ")$")) return 1
@@ -401,7 +422,7 @@ scan_manifest() {
         section_package[section] = quoted_value(norm)
         alias_of[dep_section_crate()] = section_package[section]
       }
-      if (is_dep_table() && norm ~ /^[A-Za-z0-9_-]+\.package[ \t]*=/) {
+      if (is_dep_table() && norm ~ ("^" NAME "\\.package[ \t]*=")) {
         name = norm
         sub(/\.package.*$/, "", name)
         dotted_package[name] = quoted_value(norm)
@@ -409,17 +430,14 @@ scan_manifest() {
       }
       # A rename spelled as loose dotted keys, at the root or under
       # `[target]`: `dependencies.web.package = "autumn-web"`.
-      if ((section == "" || section ~ /^\[target(\.[^]]*)?\]$/) \
-          && norm ~ /(^|\.)(dependencies|dev-dependencies|build-dependencies)\.[A-Za-z0-9_-]+\.package[ \t]*=/) {
-        name = norm
-        sub(/\.package[ \t]*=.*$/, "", name)
-        sub(/.*\./, "", name)
-        alias_of[name] = quoted_value(norm)
-      }
+      key = norm
+      sub(/[ \t]*=.*$/, "", key)
+      name = loose_dep_name(key)
+      if (name != "" && key ~ ("(^|\\.)" DEPS "\\." NAME "\\.package$")) alias_of[name] = quoted_value(norm)
       # The inline form, whose alias a FEATURE path then names:
       #   web = { package = "autumn-web", optional = true }
       #   embedded = ["dep:web", "web/sqlite"]
-      if (is_dep_table() && norm ~ /^[A-Za-z0-9_-]+[ \t]*=/ && norm ~ /package[ \t]*=[ \t]*"/) {
+      if (is_dep_table() && norm ~ ("^" NAME "[ \t]*=") && norm ~ /package[ \t]*=[ \t]*"/) {
         name = norm
         sub(/[ \t]*=.*$/, "", name)
         value = norm
@@ -465,10 +483,7 @@ scan_manifest() {
       if (loose) {
         key = norm
         sub(/[ \t]*=.*$/, "", key)
-        # The dependency name is the segment after `dependencies`.
-        dep = key
-        if (sub(/^(.*\.)?(dependencies|dev-dependencies|build-dependencies)\./, "", dep)) sub(/\..*$/, "", dep)
-        else dep = ""
+        dep = loose_dep_name(key)
         if (dep != "" && mentions_sqlite \
             && (dep ~ ("^(" flip ")$") \
                 || (dep in alias_of && alias_of[dep] ~ ("^(" flip ")$")) \
@@ -476,7 +491,7 @@ scan_manifest() {
           report("dependency edge enables the `sqlite` backend flip")
           next
         }
-        if (key ~ /(^|\.)features(\.|$)/ && forwards) {
+        if (section == "" && key ~ /^features(\.|$)/ && forwards) {
           report("a dotted `features` key forwards the `sqlite` backend flip")
           next
         }
@@ -491,7 +506,7 @@ scan_manifest() {
           next
         }
         # Dotted: `autumn-web.features`, or an alias pass 1 resolved.
-        if (norm ~ /^[A-Za-z0-9_-]+\.features[ \t]*=/) {
+        if (norm ~ ("^" NAME "\\.features[ \t]*=")) {
           alias = norm
           sub(/\.features.*$/, "", alias)
           if (alias ~ ("^(" flip ")$") \
@@ -930,6 +945,33 @@ dependencies.store.features = ["sqlite"]
 name = "consumer"
 EOF
   check_pass "an unrelated crate spelled as a dotted key is not an edge" root_dotted_unrelated
+
+  make_case loose_unicode_alias <<'EOF'
+dependencies."wébb".package = "autumn-web"
+dependencies."wébb".features = ["sqlite"]
+
+[package]
+name = "consumer"
+EOF
+  check_fail "a quoted non-ASCII alias in loose dotted keys" loose_unicode_alias
+
+  make_case section_unicode_alias <<'EOF'
+[dependencies."wébb"]
+package = "autumn-web"
+features = ["sqlite"]
+EOF
+  check_fail "a quoted non-ASCII alias in a section header" section_unicode_alias
+
+  make_case root_metadata <<'EOF'
+package.metadata.dependencies.autumn-web = { features = ["sqlite"] }
+package.metadata.features = { default = ["autumn-web/sqlite"] }
+EOF
+  check_pass "dotted package metadata is not a dependency or a feature" root_metadata
+
+  make_case target_root_dotted <<'EOF'
+target."cfg(unix)".dependencies.autumn-web = { version = "0.7", features = ["sqlite"] }
+EOF
+  check_fail "a target dependency spelled as a root-level dotted key" target_root_dotted
 
   make_case root_features <<'EOF'
 features = { default = ["autumn-web/sqlite"] }
