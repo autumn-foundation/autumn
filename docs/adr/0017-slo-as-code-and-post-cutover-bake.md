@@ -1,4 +1,4 @@
-# ADR 0016: SLOs as Code and a Post-Cutover Bake
+# ADR 0017: SLOs as Code and a Post-Cutover Bake
 
 - Status: Accepted
 - Date: 2026-10-07

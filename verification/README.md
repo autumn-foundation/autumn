@@ -69,7 +69,7 @@ covers those parts with the default config. The test
 ## Deploy bake verdict
 
 `bake_verdict.rs` models `judge` in `autumn-cli/src/deploy/bake.rs`
-(issue #3069, ADR 0016). Verify it with:
+(issue #3069, ADR 0017). Verify it with:
 
 ```sh
 verus verification/bake_verdict.rs
