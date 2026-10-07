@@ -28,6 +28,8 @@
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
 use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -107,8 +109,14 @@ impl Deadline {
     }
 
     /// Like [`scope`](Self::scope), but returns a named future type.
-    pub fn scope_future<F: Future>(self, future: F) -> DeadlineScope<F> {
-        CURRENT.scope(Some(self.nested()), future)
+    ///
+    /// The enclosing deadline is read at each poll, not here, so a future
+    /// built outside a scope and polled inside it keeps the earlier one.
+    pub const fn scope_future<F: Future>(self, future: F) -> DeadlineScope<F> {
+        DeadlineScope {
+            deadline: self,
+            future,
+        }
     }
 
     /// Like [`scope`](Self::scope), for code that is not async.
@@ -133,8 +141,25 @@ pub fn parse_header(value: &http::HeaderValue) -> Option<Duration> {
     text.parse().ok().map(Duration::from_millis)
 }
 
-/// The future of [`Deadline::scope_future`].
-pub type DeadlineScope<F> = tokio::task::futures::TaskLocalFuture<Option<Deadline>, F>;
+pin_project_lite::pin_project! {
+    /// The future of [`Deadline::scope_future`]. Each poll runs the inner
+    /// future with its deadline, or the enclosing one when that is earlier.
+    pub struct DeadlineScope<F> {
+        deadline: Deadline,
+        #[pin]
+        future: F,
+    }
+}
+
+impl<F: Future> Future for DeadlineScope<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        let this = self.project();
+        let deadline = this.deadline.nested();
+        CURRENT.sync_scope(Some(deadline), || this.future.poll(cx))
+    }
+}
 
 /// Run `future` with no deadline, as a separate process would. A simulated
 /// host uses it: only the [`DEADLINE_HEADER`] carries the deadline to it.
@@ -178,6 +203,21 @@ mod tests {
         tokio::time::advance(Duration::from_secs(4)).await;
         assert_eq!(deadline.remaining(), Duration::ZERO);
         assert!(deadline.is_expired());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_scope_built_outside_keeps_an_earlier_outer_deadline() {
+        let outer = Deadline::after(Duration::from_secs(1));
+        let later = Deadline::after(Duration::from_secs(5));
+        let inner = later.scope_future(async { Deadline::current() });
+        assert_eq!(outer.scope(inner).await, Some(outer), "the earlier one");
+
+        let inner = outer.scope_future(async { Deadline::current() });
+        assert_eq!(
+            later.scope(inner).await,
+            Some(outer),
+            "the inner one is earlier"
+        );
     }
 
     #[tokio::test(start_paused = true)]
