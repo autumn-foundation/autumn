@@ -143,7 +143,12 @@ pub async fn restore_blobs(
 }
 
 /// Point each `storage::Blob` object in the blob columns of `capsule` at
-/// `store`: its `provider_id` and `etag` become those of `store`. Call it
+/// `store`.
+///
+/// Its `provider_id`, `etag`, `content_type` and `byte_size` become those
+/// that `store` keeps for the key. The handle in a source row can be stale
+/// (the key was written again before export), and the target app reads these
+/// fields, for example for size limits. Call it
 /// after [`restore_blobs`] and before [`import_capsule`](super::import_capsule).
 ///
 /// A plain key string, and a key that the capsule has no bytes for, stay as
@@ -163,7 +168,7 @@ pub async fn rebind_blobs(
         .iter()
         .map(|b| b.key.as_str())
         .collect();
-    let mut etags = std::collections::BTreeMap::new();
+    let mut metas = std::collections::BTreeMap::new();
     for model in &capsule.manifest.models {
         for row in capsule.records.get_mut(&model.table).into_iter().flatten() {
             for column in &model.blob_columns {
@@ -177,9 +182,9 @@ pub async fn rebind_blobs(
                     continue;
                 }
                 let key = key.to_owned();
-                if !etags.contains_key(&key) {
-                    let etag = match store.head(&key).await {
-                        Ok(Some(meta)) => meta.etag,
+                if !metas.contains_key(&key) {
+                    let meta = match store.head(&key).await {
+                        Ok(Some(meta)) => meta,
                         Ok(None) | Err(BlobStoreError::NotFound(_)) => {
                             return Err(DataCapsuleError::Conflict(format!(
                                 "blob {key:?} is gone after the restore"
@@ -189,10 +194,13 @@ pub async fn rebind_blobs(
                             return Err(DataCapsuleError::Blob(format!("head {key:?}: {e}")));
                         }
                     };
-                    etags.insert(key.clone(), etag);
+                    metas.insert(key.clone(), meta);
                 }
+                let meta = &metas[&key];
                 blob.insert("provider_id".to_owned(), store.provider_id().into());
-                blob.insert("etag".to_owned(), etags[&key].clone().into());
+                blob.insert("etag".to_owned(), meta.etag.clone().into());
+                blob.insert("content_type".to_owned(), meta.content_type.clone().into());
+                blob.insert("byte_size".to_owned(), meta.byte_size.into());
             }
         }
     }

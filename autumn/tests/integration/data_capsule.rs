@@ -1326,6 +1326,10 @@ mod blobs {
         let avatar = &rows[0]["avatar"];
         assert_eq!(avatar["provider_id"], "target", "{avatar}");
         assert_eq!(avatar["etag"], json!(head.etag), "{avatar}");
+        // The source handle says 4 bytes, but the blob has 3: the handle
+        // takes all metadata from the store that holds the bytes.
+        assert_eq!(avatar["byte_size"], json!(head.byte_size), "{avatar}");
+        assert_eq!(avatar["content_type"], json!(head.content_type), "{avatar}");
         assert_eq!(avatar["key"], "avatars/ada.png");
         // A plain key string stays as it is.
         assert_eq!(rows[0]["cv_key"], "docs/ada-cv.txt");
