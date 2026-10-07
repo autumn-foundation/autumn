@@ -4766,7 +4766,7 @@ where
         return BakeStep::Halt;
     }
     let result = if input.auto_rollback {
-        match compensate_rollback(cfg, input, executor) {
+        match compensate_rollback(cfg, input, slots.public_port, executor) {
             fleet::HostOutcome::CompensatedRollback => BAKE_ROLLED_BACK,
             fleet::HostOutcome::Manual { .. } => BAKE_ROLLBACK_REFUSED,
             _ => BAKE_ROLLBACK_FAILED,
@@ -4843,7 +4843,12 @@ fn compensate_fleet<E, P>(
                 eprintln!(
                     "\u{21A9}\u{FE0F}  [{host}] rolling back to the previous release\u{2026}"
                 );
-                compensate_rollback(cfg, input, &executors[index])
+                compensate_rollback(
+                    cfg,
+                    input,
+                    probes[index].slots.public_port,
+                    &executors[index],
+                )
             }
             fleet::RollbackAction::Teardown(_) => {
                 eprintln!(
@@ -4876,16 +4881,22 @@ fn compensate_fleet<E, P>(
 /// the new release and is reported, which is strictly better than flipping it at a
 /// release dir we cannot prove exists — that failure lands post-boundary, with no
 /// teardown, turning one broken host into two.
+///
+/// `public_port` is the host's effective public port for this run
+/// ([`exec::SlotPlan::public_port`]): the port before a `server.port` move. A
+/// legacy two-field marker derives the previous slot's port from it, and the
+/// previous release was deployed under that port, not the new one.
 fn compensate_rollback<E, P>(
     cfg: &ResolvedDeployConfig,
     input: &FleetUpInput<'_, P>,
+    public_port: u16,
     executor: &E,
 ) -> fleet::HostOutcome
 where
     E: exec::DeployExecutor,
     P: ProxyController,
 {
-    let target = match exec::resolve_rollback_target(cfg, input.public_port, executor) {
+    let target = match exec::resolve_rollback_target(cfg, public_port, executor) {
         Ok(target) => target,
         // The host records no previous release (a first deploy clears the marker,
         // and a host deployed before the marker existed simply has none).
@@ -13914,6 +13925,63 @@ mod tests {
             labels.iter().filter(|l| **l == bake::SAMPLE_LABEL).count(),
             3,
             "the bake stops at the breach: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn a_bake_rollback_during_a_port_move_derives_the_legacy_port_from_the_old_port() {
+        // The proxy is installed on port 80 and the new config asks for 3000, so
+        // the cutover runs on the old port and the move follows it. The marker
+        // has the legacy two-field form, so the rollback derives the previous
+        // slot's port. It must use the old port (blue = 81), not the new one
+        // (blue = 3001), where nothing listens.
+        let fleet = fleet_of(&["web-a"]);
+        let probe = "redeploy:blue\t81\n\
+             ---autumn-kamal-proxy-list---\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 80\n"
+            .to_owned();
+        let recorder = fleet::test_support::FleetRecorder::new()
+            .script("web-a", "proxy-compat-probe", compatible_deploy_help())
+            .script("web-a", "detect-current", probe)
+            .script("web-a", "probe-release-dir", "absent")
+            .script(
+                "web-a",
+                "resolve-previous",
+                format!("prev:{PREVIOUS_RELEASE_DIR}\tblue"),
+            )
+            .script("web-a", "probe-rollback-target", "present");
+        let recorder = script_bake(recorder, "web-a", &SPIKED_BAKE);
+        let fixture = FleetFixture::new();
+        let policy = bake_policy();
+        let input = FleetUpInput {
+            bake: Some(&policy),
+            ..fixture.input(&fleet)
+        };
+
+        let err = run_up_with(&input, |cfg| Ok(recorder.executor(cfg)))
+            .expect_err("a breached bake must fail the deploy");
+        let DeployError::BakeFailed { result, .. } = &err else {
+            panic!("expected BakeFailed, got {err:?}");
+        };
+        assert_eq!(*result, BAKE_ROLLED_BACK);
+
+        let restart = recorder
+            .index_of("web-a", "restart-previous")
+            .expect("rolled back");
+        let rollback: Vec<String> = recorder.calls_for("web-a")[restart..]
+            .iter()
+            .filter_map(|call| match call {
+                exec::test_support::RecordedCall::Run { shell, .. } => Some(shell.clone()),
+                exec::test_support::RecordedCall::Upload { .. } => None,
+            })
+            .collect();
+        assert!(
+            rollback.iter().any(|shell| shell.contains(":81")),
+            "the rollback must target blue on the old port: {rollback:#?}"
+        );
+        assert!(
+            rollback.iter().all(|shell| !shell.contains(":3001")),
+            "the rollback must not derive the port from the new server.port: {rollback:#?}"
         );
     }
 
