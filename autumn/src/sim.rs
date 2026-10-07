@@ -312,6 +312,9 @@ pub struct Sim {
     /// The database link of each replica, made on first use.
     #[cfg(feature = "sqlite")]
     db_links: std::sync::Mutex<std::collections::BTreeMap<String, DbLink>>,
+
+    /// This sim's place in its sim runtime's live count (issue #3067).
+    gate_seat: gate::SimSeat,
 }
 
 /// One named replica: its spec, its clock, and its app while it is alive.
@@ -345,7 +348,8 @@ impl Sim {
             auto_advanced: std::sync::Mutex::new(std::time::Duration::ZERO),
             alive: std::sync::atomic::AtomicBool::new(true),
         });
-        gate::sim_started();
+        let gate_seat = gate::SimSeat::default();
+        gate_seat.take();
         let ambient_guard = crate::time::install_ambient(ambient_clock.clone());
         let sim_stack = SimStackGuard::enter(Arc::clone(&ambient_clock));
         Self {
@@ -366,6 +370,7 @@ impl Sim {
             replicas: Vec::new(),
             #[cfg(feature = "sqlite")]
             db_links: std::sync::Mutex::default(),
+            gate_seat,
         }
     }
 
@@ -380,6 +385,8 @@ impl Sim {
     pub fn anchor(&self) {
         if tokio::runtime::Handle::try_current().is_ok() {
             lock_sim_stack(&self.stack_guard.home, SimStack::settle);
+            // A sim built before `sim::runtime()` joins its gate here.
+            self.gate_seat.take();
         }
     }
 
@@ -1330,7 +1337,7 @@ impl Drop for Sim {
     fn drop(&mut self) {
         // The runtime drops the app tasks after the sim. A task with a query
         // in flight then waits for it, so let gated queries run (#3067).
-        gate::sim_ended();
+        self.gate_seat.leave();
     }
 }
 

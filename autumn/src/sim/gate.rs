@@ -147,6 +147,12 @@ pub fn exit() {
     }
 }
 
+/// The sims alive on this thread's sim runtime.
+#[cfg(test)]
+fn live_sims() -> u32 {
+    runtime_gate().map_or(0, |gate| gate.lock().sims)
+}
+
 fn runtime_gate() -> Option<Arc<Gate>> {
     RUNS.with(|gate| gate.borrow().clone())
 }
@@ -157,21 +163,41 @@ pub fn give_ups() -> u64 {
     runtime_gate().map_or(0, |gate| gate.lock().give_ups)
 }
 
-/// Count a sim that starts on this runtime.
-pub fn sim_started() {
-    if let Some(gate) = runtime_gate() {
-        gate.lock().sims += 1;
+/// A sim's place in the live count of its sim runtime.
+///
+/// A sim built inside its runtime takes its place at once. A sim built before
+/// its runtime takes it when it is anchored. When the last sim leaves, gated
+/// work does not wait, so the runtime can drop the tasks of the sims' apps.
+#[derive(Default)]
+pub struct SimSeat(Mutex<Option<Arc<Gate>>>);
+
+impl SimSeat {
+    /// Count the sim on this thread's sim runtime. A second call does nothing.
+    pub fn take(&self) {
+        let mut seat = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if seat.is_none()
+            && let Some(gate) = runtime_gate()
+        {
+            gate.lock().sims += 1;
+            *seat = Some(gate);
+        }
+    }
+
+    /// Remove the sim from the count it took. A second call does nothing.
+    pub fn leave(&self) {
+        let gate = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+        if let Some(gate) = gate {
+            let mut state = gate.lock();
+            state.sims = state.sims.saturating_sub(1);
+            drop(state);
+            gate.turn.notify_all();
+        }
     }
 }
 
-/// Count a sim that ends. When the last one ends, gated work does not wait,
-/// so the runtime can drop the tasks of the sims' apps.
-pub fn sim_ended() {
-    if let Some(gate) = runtime_gate() {
-        let mut state = gate.lock();
-        state.sims = state.sims.saturating_sub(1);
-        drop(state);
-        gate.turn.notify_all();
+impl Drop for SimSeat {
+    fn drop(&mut self) {
+        self.leave();
     }
 }
 
@@ -220,24 +246,31 @@ impl Drop for Scope {
 /// The gate's turn for the statement a connection runs.
 ///
 /// Diesel can emit `StartQuery` and then skip `FinishQuery` when a bind fails.
-/// So a new start first ends the turn the last start left open.
+/// So a new start first ends the turn the last start left open. A turn does
+/// not change the thread's gated depth: a turn left open on a dropped
+/// connection then does not let later work skip the gate.
 #[derive(Debug, Default)]
 pub struct QueryTurn {
-    open: bool,
+    took: bool,
 }
 
 impl QueryTurn {
     pub fn start(&mut self) {
-        if self.open {
-            exit();
+        self.finish();
+        // Inside other gated work (a `Scope`), the turn is taken already.
+        if DEPTH.with(Cell::get) == 0
+            && let Some(gate) = GATE.with(|gate| gate.borrow().clone())
+        {
+            gate.take_turn();
+            self.took = true;
         }
-        enter();
-        self.open = true;
     }
 
     pub fn finish(&mut self) {
-        if std::mem::take(&mut self.open) {
-            exit();
+        if std::mem::take(&mut self.took)
+            && let Some(gate) = GATE.with(|gate| gate.borrow().clone())
+        {
+            gate.end_turn();
         }
     }
 }
@@ -306,7 +339,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use super::{Scope, runtime, sim_ended, sim_started};
+    use super::{Scope, SimSeat, runtime};
 
     /// Gated work ends only while every task waits, so a fast blocking result
     /// never jumps ahead of local work.
@@ -315,7 +348,8 @@ mod tests {
         for _ in 0..20 {
             let order = Arc::new(Mutex::new(Vec::new()));
             let rt = runtime().unwrap();
-            sim_started();
+            let seat = SimSeat::default();
+            seat.take();
             let seen = Arc::clone(&order);
             rt.block_on(async move {
                 let log = Arc::clone(&seen);
@@ -329,7 +363,7 @@ mod tests {
                 }
                 blocking.await.unwrap();
             });
-            sim_ended();
+            seat.leave();
             assert_eq!(
                 *order.lock().unwrap(),
                 ["local", "local", "local", "blocking"]
@@ -342,7 +376,8 @@ mod tests {
     #[test]
     fn sim_gate_one_operation_per_park_and_nesting_passes() {
         let rt = runtime().unwrap();
-        sim_started();
+        let seat = SimSeat::default();
+        seat.take();
         let done = Arc::new(AtomicUsize::new(0));
         rt.block_on(async {
             let mut handles = Vec::new();
@@ -358,7 +393,7 @@ mod tests {
                 handle.await.unwrap();
             }
         });
-        sim_ended();
+        seat.leave();
         assert_eq!(done.load(Ordering::SeqCst), 4);
     }
 
@@ -376,7 +411,8 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         });
-        sim_started();
+        let seat = SimSeat::default();
+        seat.take();
         rt.block_on(async {
             let _open = super::Open::new();
             let handle = tokio::task::spawn_blocking(|| {
@@ -386,7 +422,38 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         });
-        sim_ended();
+        seat.leave();
+    }
+
+    /// Diesel can skip `FinishQuery` after a bind error. A turn left open
+    /// must not leave this thread inside gated work, or every later
+    /// operation on the one blocking thread skips the gate.
+    #[test]
+    fn sim_gate_a_query_turn_left_open_does_not_leak() {
+        let mut turn = super::QueryTurn::default();
+        turn.start();
+        drop(turn);
+        assert_eq!(super::DEPTH.with(std::cell::Cell::get), 0);
+    }
+
+    /// A sim built before its runtime counts once it is anchored, and its
+    /// drop removes only its own count.
+    #[test]
+    fn sim_gate_counts_a_sim_built_before_its_runtime_once_anchored() {
+        let sim = crate::sim::Sim::from_seed(1);
+        let rt = runtime().unwrap();
+        rt.block_on(async {
+            sim.anchor();
+            assert_eq!(super::live_sims(), 1, "the anchored sim counts");
+            sim.anchor();
+            assert_eq!(super::live_sims(), 1, "a second anchor counts nothing");
+            let inner = crate::sim::Sim::from_seed(2);
+            assert_eq!(super::live_sims(), 2);
+            drop(inner);
+            assert_eq!(super::live_sims(), 1);
+            drop(sim);
+            assert_eq!(super::live_sims(), 0);
+        });
     }
 
     #[test]
