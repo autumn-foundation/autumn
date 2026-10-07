@@ -16,8 +16,9 @@ use crate::storage::{BlobStore, BlobStoreError};
 ///
 /// # Errors
 ///
-/// [`DataCapsuleError::Conflict`] when a `Blob` names another store than
-/// `store` (its `provider_id`), or when a blob changes while it is read.
+/// [`DataCapsuleError::Conflict`] when a `Blob` object names another store
+/// than `store`, or no store (`provider_id`), or when a blob changes while it
+/// is read.
 ///
 /// [`DataCapsuleError::Blob`] when `store` fails for a reason other than "not
 /// found".
@@ -32,18 +33,17 @@ pub async fn collect_blobs(
                 // A `Blob` names its store. After a switch of backend, a row
                 // can hold a handle of the old store, and the same key in
                 // `store` can hold other bytes: never export those.
-                let provider = row
-                    .get(column)
-                    .and_then(serde_json::Value::as_object)
-                    .and_then(|blob| blob.get("provider_id"))
-                    .and_then(serde_json::Value::as_str);
-                if let Some(provider) = provider.filter(|p| *p != store.provider_id()) {
-                    return Err(DataCapsuleError::Conflict(format!(
-                        "{}.{column} holds a blob of store {provider:?}, but the blob store is \
-                         {:?}",
-                        model.table,
-                        store.provider_id()
-                    )));
+                // Only a plain key string names no store.
+                if let Some(blob) = row.get(column).and_then(serde_json::Value::as_object) {
+                    let provider = blob.get("provider_id").and_then(serde_json::Value::as_str);
+                    if provider != Some(store.provider_id()) {
+                        return Err(DataCapsuleError::Conflict(format!(
+                            "{}.{column} holds a blob of store {}, but the blob store is {:?}",
+                            model.table,
+                            provider.map_or_else(|| "(none)".to_owned(), |p| format!("{p:?}")),
+                            store.provider_id()
+                        )));
+                    }
                 }
                 if let Some(key) = row.get(column).and_then(blob_key) {
                     keys.insert(key.to_owned());
@@ -141,9 +141,11 @@ fn is_sha256(etag: &str) -> bool {
 /// writes nothing. A key with the same bytes and MIME type is not written again.
 ///
 /// The function writes with [`BlobStore::put_if_absent`]. If another writer
-/// takes a key after the check, that is also a conflict. Then the function
-/// deletes the blobs that it wrote and keeps the blob of the other writer. A
-/// store without a conditional create gives
+/// takes a key after the check, that is also a conflict. A failed restore
+/// deletes no blob, not even one that it wrote: another import can find the
+/// same bytes under that key, take the blob as its own, and commit records
+/// that point at it. A retry finds those bytes and reuses them. A store
+/// without a conditional create gives
 /// [`DataCapsuleError::NotConfigured`]. Call it, then [`rebind_blobs`], before
 /// [`import_capsule`](super::import_capsule): then no imported record points at
 /// a blob that is not there, or at another store.
@@ -157,7 +159,42 @@ pub async fn restore_blobs(
     capsule: &DataCapsule,
     store: &dyn BlobStore,
 ) -> Result<usize, DataCapsuleError> {
-    restore_and_track(capsule, store).await?;
+    let mut to_write = Vec::new();
+    for entry in &capsule.manifest.blobs {
+        let bytes = capsule
+            .blobs
+            .get(&entry.sha256)
+            .ok_or_else(|| DataCapsuleError::Blob(format!("no bytes for blob {:?}", entry.key)))?;
+        if !check_existing(store, entry).await? {
+            to_write.push((entry, bytes));
+        }
+    }
+    for (entry, bytes) in to_write {
+        match store
+            .put_if_absent(&entry.key, &entry.content_type, bytes.clone())
+            .await
+        {
+            Ok(Some(_)) => verify_created(store, entry).await?,
+            // Another writer took the key after the check. If the key is
+            // free again, the blob is not there: that is a conflict too.
+            Ok(None) => {
+                if !check_existing(store, entry).await? {
+                    return Err(DataCapsuleError::Conflict(format!(
+                        "blob {:?} changed during the import",
+                        entry.key
+                    )));
+                }
+            }
+            Err(BlobStoreError::Unsupported(_)) => {
+                return Err(DataCapsuleError::NotConfigured(
+                    "the blob store cannot create a blob without the risk of replacing one \
+                     (BlobStore::put_if_absent)"
+                        .to_owned(),
+                ));
+            }
+            Err(e) => return Err(DataCapsuleError::Blob(format!("put {:?}: {e}", entry.key))),
+        }
+    }
     Ok(capsule.manifest.blobs.len())
 }
 
@@ -226,58 +263,6 @@ pub async fn rebind_blobs(
     Ok(())
 }
 
-/// Restore the blobs of `capsule` and give the entries that this call wrote.
-/// [`roll_back`] removes them again, for example when the record import
-/// fails after this.
-pub(super) async fn restore_and_track<'c>(
-    capsule: &'c DataCapsule,
-    store: &dyn BlobStore,
-) -> Result<Vec<&'c BlobEntry>, DataCapsuleError> {
-    let mut to_write = Vec::new();
-    for entry in &capsule.manifest.blobs {
-        let bytes = capsule
-            .blobs
-            .get(&entry.sha256)
-            .ok_or_else(|| DataCapsuleError::Blob(format!("no bytes for blob {:?}", entry.key)))?;
-        if !check_existing(store, entry).await? {
-            to_write.push((entry, bytes));
-        }
-    }
-    let mut written = Vec::new();
-    for (entry, bytes) in to_write {
-        let result = match store
-            .put_if_absent(&entry.key, &entry.content_type, bytes.clone())
-            .await
-        {
-            Ok(Some(_)) => {
-                written.push(entry);
-                verify_created(store, entry).await
-            }
-            // Another writer took the key after the check. If the key is
-            // free again, the blob is not there: that is a conflict too.
-            Ok(None) => match check_existing(store, entry).await {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(DataCapsuleError::Conflict(format!(
-                    "blob {:?} changed during the import",
-                    entry.key
-                ))),
-                Err(e) => Err(e),
-            },
-            Err(BlobStoreError::Unsupported(_)) => Err(DataCapsuleError::NotConfigured(
-                "the blob store cannot create a blob without the risk of replacing one \
-                 (BlobStore::put_if_absent)"
-                    .to_owned(),
-            )),
-            Err(e) => Err(DataCapsuleError::Blob(format!("put {:?}: {e}", entry.key))),
-        };
-        if let Err(error) = result {
-            roll_back(store, &written).await;
-            return Err(error);
-        }
-    }
-    Ok(written)
-}
-
 /// Read back a blob that this import created. Another writer can replace it
 /// right after the create, and a store can keep the bytes but lose the MIME
 /// type.
@@ -298,28 +283,6 @@ async fn verify_created(store: &dyn BlobStore, entry: &BlobEntry) -> Result<(), 
             "blob {:?} was stored with MIME type {content_type:?}, not {:?}",
             entry.key, entry.content_type
         )))
-    }
-}
-
-/// Delete the blobs that this import wrote.
-///
-/// Another writer can replace a blob after this import made it. So delete a
-/// key only when it still holds the bytes of this import. The store has no
-/// conditional delete, so a replacement between the read and the delete is
-/// still possible, but the window is short.
-pub(super) async fn roll_back(store: &dyn BlobStore, written: &[&BlobEntry]) {
-    for entry in written {
-        let ours = store
-            .get(&entry.key)
-            .await
-            .is_ok_and(|bytes| hex::encode(Sha256::digest(&bytes)) == entry.sha256);
-        if !ours {
-            tracing::warn!(blob_key = %entry.key, "capsule import: blob changed, not rolled back");
-            continue;
-        }
-        if let Err(e) = store.delete(&entry.key).await {
-            tracing::warn!(blob_key = %entry.key, error = %e, "capsule import: rollback failed");
-        }
     }
 }
 

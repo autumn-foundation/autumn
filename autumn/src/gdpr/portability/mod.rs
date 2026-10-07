@@ -192,6 +192,17 @@ pub async fn export_subject(
                 )));
             }
         }
+        // A row must hold only described columns. A column outside `fields`
+        // would be in the capsule, but not in the manifest or the viewer.
+        for row in &rows {
+            if let Some(column) = row.keys().find(|k| !fields.iter().any(|f| &f.name == *k)) {
+                return Err(DataCapsuleError::InvalidInput(format!(
+                    "the store gave column {column:?} of {}, which its description of the \
+                     table does not have",
+                    model.table
+                )));
+            }
+        }
         fields.retain(|f| !model.excluded.contains(&f.name));
         for row in &mut rows {
             row.retain(|column, _| !model.excluded.contains(column));

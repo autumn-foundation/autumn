@@ -422,14 +422,36 @@ impl CapsuleStore for PgCapsuleStore {
                     // Check every move first: one `setval` that fails after
                     // another one ran would leave a changed sequence.
                     // Each imported column can own a sequence, not only the key.
-                    let mut moves = Vec::new();
+                    let mut owned = Vec::new();
                     for (_, _, batch) in &statements {
                         for field in batch.model.fields.iter().filter(|f| !f.generated) {
-                            if let Some(next) =
-                                plan_sequence(conn, &batch.model.table, &field.name).await?
+                            if let Some(seq) =
+                                serial_sequence(conn, &batch.model.table, &field.name).await?
                             {
-                                moves.push(next);
+                                owned.push((seq, batch.model.table.as_str(), field.name.as_str()));
                             }
+                        }
+                    }
+                    // Another import of the same sequence plans from its own
+                    // rows, and its `setval` could move the sequence back
+                    // past ours. Lock each sequence until commit, in one
+                    // order, so two imports cannot hold each other's lock.
+                    owned.sort_unstable();
+                    owned.dedup_by(|a, b| a.0 == b.0);
+                    for (seq, _, _) in &owned {
+                        diesel::sql_query(
+                            "SELECT pg_advisory_xact_lock(hashtextextended(\
+                             'autumn.capsule.sequence:' || $1::regclass::oid::text, 0))",
+                        )
+                        .bind::<diesel::sql_types::Text, _>(seq)
+                        .execute(conn)
+                        .await
+                        .map_err(|e| store_error(&format!("lock sequence {seq}"), &e))?;
+                    }
+                    let mut moves = Vec::new();
+                    for (seq, table, column) in &owned {
+                        if let Some(next) = plan_sequence(conn, table, column, seq).await? {
+                            moves.push(next);
                         }
                     }
                     for (seq, value, table) in moves {
@@ -558,9 +580,25 @@ struct SequencePlan {
     cycle: bool,
 }
 
-/// The `setval` that moves the serial or identity sequence of `column` past
-/// the imported values, as `(sequence, value, column)`, or `None` when the
-/// column has no sequence or needs no move.
+/// The serial or identity sequence of `table.column`, if it has one.
+async fn serial_sequence(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    column: &str,
+) -> Result<Option<String>, DataCapsuleError> {
+    // `pg_get_serial_sequence` reads the column name as it is, unquoted.
+    let seq: SequenceRow = diesel::sql_query("SELECT pg_get_serial_sequence($1, $2) AS seq")
+        .bind::<diesel::sql_types::Text, _>(quote(table)?)
+        .bind::<diesel::sql_types::Text, _>(column)
+        .get_result(conn)
+        .await
+        .map_err(|e| store_error(&format!("sequence of {table}.{column}"), &e))?;
+    Ok(seq.seq)
+}
+
+/// The `setval` that moves `seq`, the sequence of `column`, past the imported
+/// values, as `(sequence, value, column)`, or `None` when no move is needed.
+/// The caller holds the lock of `seq`.
 ///
 /// # Errors
 ///
@@ -572,18 +610,10 @@ async fn plan_sequence(
     conn: &mut AsyncPgConnection,
     table: &str,
     column: &str,
+    seq: &str,
 ) -> Result<Option<(String, i64, String)>, DataCapsuleError> {
     let quoted_table = quote(table)?;
-    // `pg_get_serial_sequence` reads the column name as it is, unquoted.
-    let seq: SequenceRow = diesel::sql_query("SELECT pg_get_serial_sequence($1, $2) AS seq")
-        .bind::<diesel::sql_types::Text, _>(&quoted_table)
-        .bind::<diesel::sql_types::Text, _>(column)
-        .get_result(conn)
-        .await
-        .map_err(|e| store_error(&format!("sequence of {table}.{column}"), &e))?;
-    let Some(seq) = seq.seq else {
-        return Ok(None);
-    };
+    let seq = seq.to_owned();
     let target = format!("{table}.{column}");
     let pk = quote(column)?;
     // The sequence makes only `start + k * inc`, so only a key on that path

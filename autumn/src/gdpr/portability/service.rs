@@ -264,16 +264,11 @@ impl CapsuleService {
             no_blob_store(capsule)?;
             return import_capsule(capsule, &self.models, self.store.as_ref()).await;
         };
-        let written = super::blobs::restore_and_track(capsule, blobs.as_ref()).await?;
+        // A failed import keeps the blobs: see `restore_blobs`.
+        super::blobs::restore_blobs(capsule, blobs.as_ref()).await?;
         let mut rebound = capsule.clone();
-        let result = match super::blobs::rebind_blobs(&mut rebound, blobs.as_ref()).await {
-            Ok(()) => import_capsule(&rebound, &self.models, self.store.as_ref()).await,
-            Err(error) => Err(error),
-        };
-        if result.is_err() {
-            super::blobs::roll_back(blobs.as_ref(), &written).await;
-        }
-        result
+        super::blobs::rebind_blobs(&mut rebound, blobs.as_ref()).await?;
+        import_capsule(&rebound, &self.models, self.store.as_ref()).await
     }
 
     #[cfg(not(feature = "storage"))]

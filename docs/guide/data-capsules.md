@@ -60,7 +60,9 @@ autumn_web::app()
 
 Every column that a model names must be in the table: the subject column, the
 key, and each link, blob, and excluded column. A typo fails the export
-(`400`), so a capsule never lacks records, blobs, or links.
+(`400`), so a capsule never lacks records, blobs, or links. The other way
+round, a custom `CapsuleStore` must give only the columns that it describes:
+a row with another column fails the export (`400`).
 
 **Exclude all secrets.** Export copies every column that you do not exclude.
 Exclude password hashes, tokens, and internal flags. Import cannot restore an
@@ -73,9 +75,9 @@ fails. A blob that the store does not have is skipped with a warning, but its
 record still names it: import then fails (`400`) rather than write a record
 that points at nothing, or at other bytes under the same key. If a blob changes while export reads it, export fails with a conflict
 (`409`): run it again. A `Blob` value names its store (`provider_id`). If it
-names another store than the configured one, for example after a switch of
-backend, export fails with a conflict (`409`): the same key in the new store
-can hold other bytes.
+names another store than the configured one (for example after a switch of
+backend), or no store, export fails with a conflict (`409`): the same key in
+the new store can hold other bytes. Only a plain key string names no store.
 
 ## Set the signing secret
 
@@ -209,12 +211,16 @@ capsule directory and to each directory above it.
   key, the import succeeds and the other insert fails with a duplicate key.
   The same holds for a blob that another writer replaces after import checks
   it. No lock can prevent this, so run import in a maintenance window.
-- Import writes blobs before records. If the record import fails, import
-  removes the blobs that it wrote. If a blob key holds different bytes or a
-  different MIME type, import stops and writes no blob. If a blob changes
-  while import reads it, import stops with a conflict (`409`). If another writer
-  takes a key during the import, import stops and deletes the blobs that it
-  wrote. Import needs a blob store with a conditional create
+- Import writes blobs before records. If a blob key holds different bytes or
+  a different MIME type, import stops and writes no blob. If a blob changes
+  while import reads it, or another writer takes a key during the import,
+  import stops with a conflict (`409`).
+- **A failed import keeps the blobs that it wrote.** Another import of the
+  same capsule can find those bytes, take them as its own, and commit records
+  that point at them, so deleting them could break that import. Run the
+  import again: it finds the same bytes and reuses them. If you give up on
+  the import, delete those blobs yourself; they hold personal data.
+- Import needs a blob store with a conditional create
   (`BlobStore::put_if_absent`). `LocalBlobStore` and the S3 backend have one.
   With a store that has none, import of a capsule with blobs fails (`501`).
 - An imported `Blob` value names the target store: import sets its

@@ -447,6 +447,28 @@ async fn export_rejects_blob_and_relationship_columns_that_name_no_column() {
 }
 
 #[tokio::test]
+async fn export_refuses_a_column_that_the_store_does_not_describe() {
+    // A store that gives a column outside its own description would put it in
+    // the capsule, but not in the manifest or the viewer.
+    let store = MemoryCapsuleStore::new().table(
+        "users",
+        vec![
+            FieldSpec::new("id", "bigint"),
+            FieldSpec::new("email", "text"),
+        ],
+    );
+    store.insert(
+        "users",
+        json!({"id": 1, "email": "ada@example.com", "password_hash": "x"}),
+    );
+    let err = export_subject(&[CapsuleModel::new("users", "id")], &store, "1")
+        .await
+        .expect_err("an undescribed column");
+    assert!(matches!(err, DataCapsuleError::InvalidInput(_)), "{err:?}");
+    assert!(err.to_string().contains("password_hash"), "{err}");
+}
+
+#[tokio::test]
 async fn verify_refuses_metadata_larger_than_a_capsule_needs() {
     // Valid JSON with 1 MiB of trailing spaces: it parses, so only a size
     // limit stops it, before the whole file is in memory.
@@ -1106,6 +1128,37 @@ mod blobs {
     }
 
     #[tokio::test]
+    async fn export_refuses_a_blob_handle_without_a_store() {
+        // A `Blob` always names its store. A handle without `provider_id` (or
+        // with `null`) cannot show that its key is one of this store.
+        let tmp = tempfile::tempdir().unwrap();
+        let blobs = blob_store(&tmp.path().join("a"));
+        blobs
+            .put("avatars/ada.png", "image/png", Bytes::from_static(b"png"))
+            .await
+            .unwrap();
+        for avatar in [
+            json!({"key": "avatars/ada.png"}),
+            json!({"provider_id": null, "key": "avatars/ada.png"}),
+        ] {
+            let records = MemoryCapsuleStore::new().table(
+                "users",
+                vec![
+                    FieldSpec::new("id", "bigint"),
+                    FieldSpec::new("avatar", "jsonb").nullable(),
+                    FieldSpec::new("cv_key", "text").nullable(),
+                ],
+            );
+            records.insert("users", json!({"id": 1, "avatar": avatar, "cv_key": null}));
+            let mut capsule = export_subject(&models(), &records, "1").await.unwrap();
+            let err = collect_blobs(&mut capsule, &blobs)
+                .await
+                .expect_err("a handle that names no store");
+            assert!(matches!(err, DataCapsuleError::Conflict(_)), "{err:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn restore_does_not_overwrite_a_blob_written_during_the_import() {
         let tmp = tempfile::tempdir().unwrap();
         let source_blobs = blob_store(&tmp.path().join("a"));
@@ -1141,11 +1194,12 @@ mod blobs {
             target.get("docs/ada-cv.txt").await.unwrap(),
             Bytes::from_static(b"theirs")
         );
-        // The blob that this import wrote before the conflict is gone again.
-        assert!(matches!(
-            target.get("avatars/ada.png").await,
-            Err(BlobStoreError::NotFound(_))
-        ));
+        // The blob that this import wrote before the conflict stays: another
+        // import can have taken it as its own by now.
+        assert_eq!(
+            target.get("avatars/ada.png").await.unwrap(),
+            Bytes::from_static(b"\x89PNG")
+        );
     }
 
     #[tokio::test]
@@ -1178,17 +1232,16 @@ mod blobs {
             .await
             .expect_err("MIME type not kept");
         assert!(matches!(err, DataCapsuleError::Blob(_)), "{err:?}");
-        // Nothing that this import wrote stays.
-        for key in ["avatars/ada.png", "docs/ada-cv.txt"] {
-            assert!(
-                matches!(target.get(key).await, Err(BlobStoreError::NotFound(_))),
-                "{key}"
-            );
-        }
+        // A failed restore deletes nothing: another import can share a blob
+        // that this one wrote.
+        assert_eq!(
+            target.get("avatars/ada.png").await.unwrap(),
+            Bytes::from_static(b"\x89PNG")
+        );
     }
 
     #[tokio::test]
-    async fn rollback_keeps_a_blob_that_another_writer_replaced() {
+    async fn a_failed_restore_keeps_a_blob_that_another_writer_replaced() {
         let tmp = tempfile::tempdir().unwrap();
         let source_blobs = blob_store(&tmp.path().join("a"));
         source_blobs
@@ -1207,7 +1260,7 @@ mod blobs {
         collect_blobs(&mut capsule, &source_blobs).await.unwrap();
 
         // The import writes the avatar, another writer replaces it, then the
-        // second blob fails and the import rolls back.
+        // second blob fails.
         let target = OddStore {
             inner: blob_store(&tmp.path().join("b")),
             odd: Odd {
@@ -1222,7 +1275,7 @@ mod blobs {
         assert_eq!(
             target.get("avatars/ada.png").await.unwrap(),
             Bytes::from_static(b"theirs"),
-            "rollback must not delete a blob that is not this import's"
+            "a failed restore must not delete a blob that is not this import's"
         );
     }
 
@@ -1433,7 +1486,7 @@ mod blobs {
     }
 
     #[tokio::test]
-    async fn a_failed_record_import_removes_the_blobs_it_wrote() {
+    async fn a_failed_record_import_keeps_the_blobs_for_a_retry() {
         use std::sync::Arc;
 
         use autumn_web::gdpr::portability::CapsuleService;
@@ -1463,13 +1516,23 @@ mod blobs {
             .await
             .expect_err("record conflict");
         assert!(matches!(err, DataCapsuleError::Conflict(_)), "{err:?}");
-        assert!(
-            matches!(
-                target_blobs.get("avatars/ada.png").await,
-                Err(BlobStoreError::NotFound(_))
-            ),
-            "a failed import leaves no blob"
+        // The blobs stay: another import can share them and have its records
+        // committed by now. A retry finds the same bytes and reuses them.
+        assert_eq!(
+            target_blobs.get("avatars/ada.png").await.unwrap(),
+            Bytes::from_static(b"png")
         );
+        let empty = MemoryCapsuleStore::new().table(
+            "users",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("avatar", "jsonb").nullable(),
+                FieldSpec::new("cv_key", "text").nullable(),
+            ],
+        );
+        let retry = CapsuleService::new(models(), Arc::new(empty), signer())
+            .with_blob_store(target_blobs.clone());
+        assert_eq!(retry.import_from(&root).await.expect("retry").records, 1);
     }
 
     #[tokio::test]

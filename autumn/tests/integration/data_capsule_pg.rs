@@ -491,7 +491,7 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
     let mut admin = PgConnection::establish(&format!("{base}/postgres")).expect("connect");
     for db in [
         "target", "busy", "deferred", "capped", "cached", "cycled", "stepped", "wide", "offpath",
-        "limited", "blind",
+        "limited", "blind", "locked",
     ] {
         admin
             .batch_execute(&format!("CREATE DATABASE {db}"))
@@ -506,7 +506,7 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
         .expect("source");
     for db in [
         "target", "busy", "deferred", "capped", "cached", "cycled", "stepped", "wide", "offpath",
-        "limited", "blind",
+        "limited", "blind", "locked",
     ] {
         PgConnection::establish(&format!("{base}/{db}"))
             .expect("connect")
@@ -727,6 +727,29 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
     )
     .await;
     assert_eq!(last, "unused");
+
+    // Two imports of one sequence must not plan at once: each sees only its
+    // own rows, and the later `setval` could move the sequence back. Import
+    // takes a lock per sequence until it commits; here another session holds
+    // the lock of `notes_id_seq`, so the import must wait for it.
+    let locked = pool(&format!("{base}/locked"));
+    let mut holder = PgConnection::establish(&format!("{base}/locked")).expect("connect");
+    holder
+        .batch_execute(
+            "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended(\
+             'autumn.capsule.sequence:' || 'notes_id_seq'::regclass::oid::text, 0))",
+        )
+        .expect("lock");
+    let waiting = {
+        let (capsule, models, locked) = (capsule.clone(), models.clone(), locked.clone());
+        tokio::spawn(async move {
+            import_capsule(&capsule, &models, &PgCapsuleStore::new(locked)).await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    assert!(!waiting.is_finished(), "the import must wait for the lock");
+    holder.batch_execute("COMMIT").expect("unlock");
+    waiting.await.unwrap().expect("import after the lock");
 
     // A role with `UPDATE` but neither `SELECT` nor `USAGE` on a sequence may
     // see no last value, as if the sequence were unused. This one is at 1000:
