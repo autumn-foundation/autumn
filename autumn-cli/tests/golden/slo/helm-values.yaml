@@ -8,3 +8,4 @@ analysis:
     - "shop-availability"
     - "shop-checkout"
     - "shop-orders-latency"
+    - "shop-latency"

@@ -16,6 +16,21 @@ spec:
           labels:
             app: "shop"
             slo: "availability"
+            job: "shop"
+        - record: autumn_slo:sli_bad:rate5m
+          expr: |-
+            (sum(rate(autumn_http_responses_total{status="5xx",job="shop"}[5m])) or vector(0))
+          labels:
+            app: "shop"
+            slo: "availability"
+            job: "shop"
+        - record: autumn_slo:sli_total:rate5m
+          expr: |-
+            sum(rate(autumn_http_responses_total{job="shop"}[5m]))
+          labels:
+            app: "shop"
+            slo: "availability"
+            job: "shop"
         - record: autumn_slo:sli_error:ratio_rate5m
           expr: |-
             (sum(rate(autumn_http_responses_total{status="5xx",job="shop"}[5m])) or vector(0))
@@ -24,6 +39,7 @@ spec:
           labels:
             app: "shop"
             slo: "availability"
+            job: "shop"
         - record: autumn_slo:sli_error:ratio_rate30m
           expr: |-
             (sum(rate(autumn_http_responses_total{status="5xx",job="shop"}[30m])) or vector(0))
@@ -32,6 +48,7 @@ spec:
           labels:
             app: "shop"
             slo: "availability"
+            job: "shop"
         - record: autumn_slo:sli_error:ratio_rate1h
           expr: |-
             (sum(rate(autumn_http_responses_total{status="5xx",job="shop"}[1h])) or vector(0))
@@ -40,6 +57,7 @@ spec:
           labels:
             app: "shop"
             slo: "availability"
+            job: "shop"
         - record: autumn_slo:sli_error:ratio_rate6h
           expr: |-
             (sum(rate(autumn_http_responses_total{status="5xx",job="shop"}[6h])) or vector(0))
@@ -48,30 +66,34 @@ spec:
           labels:
             app: "shop"
             slo: "availability"
+            job: "shop"
         - record: autumn_slo:sli_error:ratio_rate3d
           expr: |-
-            (sum(rate(autumn_http_responses_total{status="5xx",job="shop"}[3d])) or vector(0))
+            sum_over_time(autumn_slo:sli_bad:rate5m{app="shop",job="shop",slo="availability"}[3d])
             /
-            sum(rate(autumn_http_responses_total{job="shop"}[3d]))
+            sum_over_time(autumn_slo:sli_total:rate5m{app="shop",job="shop",slo="availability"}[3d])
           labels:
             app: "shop"
             slo: "availability"
+            job: "shop"
         - record: autumn_slo:sli_error:ratio_rate30d
           expr: |-
-            (sum(rate(autumn_http_responses_total{status="5xx",job="shop"}[30d])) or vector(0))
+            sum_over_time(autumn_slo:sli_bad:rate5m{app="shop",job="shop",slo="availability"}[30d])
             /
-            sum(rate(autumn_http_responses_total{job="shop"}[30d]))
+            sum_over_time(autumn_slo:sli_total:rate5m{app="shop",job="shop",slo="availability"}[30d])
           labels:
             app: "shop"
             slo: "availability"
+            job: "shop"
         - alert: AutumnSloErrorBudgetBurn
           expr: |-
-            autumn_slo:sli_error:ratio_rate1h{app="shop",slo="availability"} > 0.0144
+            autumn_slo:sli_error:ratio_rate1h{app="shop",job="shop",slo="availability"} > 0.0144
             and
-            autumn_slo:sli_error:ratio_rate5m{app="shop",slo="availability"} > 0.0144
+            autumn_slo:sli_error:ratio_rate5m{app="shop",job="shop",slo="availability"} > 0.0144
           labels:
             app: "shop"
             slo: "availability"
+            job: "shop"
             severity: "page"
             long_window: "1h"
             short_window: "5m"
@@ -80,12 +102,13 @@ spec:
             description: "Objective 99.9% (non-5xx responses, all routes). The error ratio is above 0.0144 over 1h and 5m."
         - alert: AutumnSloErrorBudgetBurn
           expr: |-
-            autumn_slo:sli_error:ratio_rate6h{app="shop",slo="availability"} > 0.006
+            autumn_slo:sli_error:ratio_rate6h{app="shop",job="shop",slo="availability"} > 0.006
             and
-            autumn_slo:sli_error:ratio_rate30m{app="shop",slo="availability"} > 0.006
+            autumn_slo:sli_error:ratio_rate30m{app="shop",job="shop",slo="availability"} > 0.006
           labels:
             app: "shop"
             slo: "availability"
+            job: "shop"
             severity: "page"
             long_window: "6h"
             short_window: "30m"
@@ -94,12 +117,13 @@ spec:
             description: "Objective 99.9% (non-5xx responses, all routes). The error ratio is above 0.006 over 6h and 30m."
         - alert: AutumnSloErrorBudgetBurn
           expr: |-
-            autumn_slo:sli_error:ratio_rate3d{app="shop",slo="availability"} > 0.001
+            autumn_slo:sli_error:ratio_rate3d{app="shop",job="shop",slo="availability"} > 0.001
             and
-            autumn_slo:sli_error:ratio_rate6h{app="shop",slo="availability"} > 0.001
+            autumn_slo:sli_error:ratio_rate6h{app="shop",job="shop",slo="availability"} > 0.001
           labels:
             app: "shop"
             slo: "availability"
+            job: "shop"
             severity: "ticket"
             long_window: "3d"
             short_window: "6h"
@@ -113,6 +137,21 @@ spec:
           labels:
             app: "shop"
             slo: "checkout"
+            job: "shop"
+        - record: autumn_slo:sli_bad:rate5m
+          expr: |-
+            (sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",status_class="5xx",job="shop"}[5m])) or vector(0))
+          labels:
+            app: "shop"
+            slo: "checkout"
+            job: "shop"
+        - record: autumn_slo:sli_total:rate5m
+          expr: |-
+            sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",job="shop"}[5m]))
+          labels:
+            app: "shop"
+            slo: "checkout"
+            job: "shop"
         - record: autumn_slo:sli_error:ratio_rate5m
           expr: |-
             (sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",status_class="5xx",job="shop"}[5m])) or vector(0))
@@ -121,6 +160,7 @@ spec:
           labels:
             app: "shop"
             slo: "checkout"
+            job: "shop"
         - record: autumn_slo:sli_error:ratio_rate30m
           expr: |-
             (sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",status_class="5xx",job="shop"}[30m])) or vector(0))
@@ -129,6 +169,7 @@ spec:
           labels:
             app: "shop"
             slo: "checkout"
+            job: "shop"
         - record: autumn_slo:sli_error:ratio_rate1h
           expr: |-
             (sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",status_class="5xx",job="shop"}[1h])) or vector(0))
@@ -137,6 +178,7 @@ spec:
           labels:
             app: "shop"
             slo: "checkout"
+            job: "shop"
         - record: autumn_slo:sli_error:ratio_rate6h
           expr: |-
             (sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",status_class="5xx",job="shop"}[6h])) or vector(0))
@@ -145,64 +187,70 @@ spec:
           labels:
             app: "shop"
             slo: "checkout"
+            job: "shop"
         - record: autumn_slo:sli_error:ratio_rate3d
           expr: |-
-            (sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",status_class="5xx",job="shop"}[3d])) or vector(0))
+            sum_over_time(autumn_slo:sli_bad:rate5m{app="shop",job="shop",slo="checkout"}[3d])
             /
-            sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",job="shop"}[3d]))
+            sum_over_time(autumn_slo:sli_total:rate5m{app="shop",job="shop",slo="checkout"}[3d])
           labels:
             app: "shop"
             slo: "checkout"
+            job: "shop"
         - record: autumn_slo:sli_error:ratio_rate30d
           expr: |-
-            (sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",status_class="5xx",job="shop"}[30d])) or vector(0))
+            sum_over_time(autumn_slo:sli_bad:rate5m{app="shop",job="shop",slo="checkout"}[30d])
             /
-            sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",job="shop"}[30d]))
+            sum_over_time(autumn_slo:sli_total:rate5m{app="shop",job="shop",slo="checkout"}[30d])
           labels:
             app: "shop"
             slo: "checkout"
+            job: "shop"
         - alert: AutumnSloErrorBudgetBurn
           expr: |-
-            autumn_slo:sli_error:ratio_rate1h{app="shop",slo="checkout"} > 0.072
+            autumn_slo:sli_error:ratio_rate1h{app="shop",job="shop",slo="checkout"} > 0.072
             and
-            autumn_slo:sli_error:ratio_rate5m{app="shop",slo="checkout"} > 0.072
+            autumn_slo:sli_error:ratio_rate5m{app="shop",job="shop",slo="checkout"} > 0.072
           labels:
             app: "shop"
             slo: "checkout"
+            job: "shop"
             severity: "page"
             long_window: "1h"
             short_window: "5m"
           annotations:
             summary: "shop SLO checkout burns its error budget at 14.4x or more"
-            description: "Objective 99.5% (non-5xx responses, route /api/orders). The error ratio is above 0.072 over 1h and 5m. Customers can place orders."
+            description: "Objective 99.5% (non-5xx responses, route /api/orders). The error ratio is above 0.072 over 1h and 5m. Customers can place \"orders\"."
         - alert: AutumnSloErrorBudgetBurn
           expr: |-
-            autumn_slo:sli_error:ratio_rate6h{app="shop",slo="checkout"} > 0.03
+            autumn_slo:sli_error:ratio_rate6h{app="shop",job="shop",slo="checkout"} > 0.03
             and
-            autumn_slo:sli_error:ratio_rate30m{app="shop",slo="checkout"} > 0.03
+            autumn_slo:sli_error:ratio_rate30m{app="shop",job="shop",slo="checkout"} > 0.03
           labels:
             app: "shop"
             slo: "checkout"
+            job: "shop"
             severity: "page"
             long_window: "6h"
             short_window: "30m"
           annotations:
             summary: "shop SLO checkout burns its error budget at 6x or more"
-            description: "Objective 99.5% (non-5xx responses, route /api/orders). The error ratio is above 0.03 over 6h and 30m. Customers can place orders."
+            description: "Objective 99.5% (non-5xx responses, route /api/orders). The error ratio is above 0.03 over 6h and 30m. Customers can place \"orders\"."
         - alert: AutumnSloErrorBudgetBurn
           expr: |-
-            autumn_slo:sli_error:ratio_rate3d{app="shop",slo="checkout"} > 0.005
+            autumn_slo:sli_error:ratio_rate3d{app="shop",job="shop",slo="checkout"} > 0.005
             and
-            autumn_slo:sli_error:ratio_rate6h{app="shop",slo="checkout"} > 0.005
+            autumn_slo:sli_error:ratio_rate6h{app="shop",job="shop",slo="checkout"} > 0.005
           labels:
             app: "shop"
             slo: "checkout"
+            job: "shop"
             severity: "ticket"
             long_window: "3d"
             short_window: "6h"
           annotations:
             summary: "shop SLO checkout burns its error budget at 1x or more"
-            description: "Objective 99.5% (non-5xx responses, route /api/orders). The error ratio is above 0.005 over 3d and 6h. Customers can place orders."
+            description: "Objective 99.5% (non-5xx responses, route /api/orders). The error ratio is above 0.005 over 3d and 6h. Customers can place \"orders\"."
     - name: "autumn-slo-shop-orders-latency"
       rules:
         - record: autumn_slo:objective:ratio
@@ -210,105 +258,278 @@ spec:
           labels:
             app: "shop"
             slo: "orders-latency"
+            job: "shop"
+        - record: autumn_slo:sli_bad:rate5m
+          expr: |-
+            (
+              sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders/{id}",status_class!="5xx",job="shop"}[5m]))
+              -
+              sum(rate(autumn_http_request_duration_seconds_bucket{route="/api/orders/{id}",status_class!="5xx",le="0.25",job="shop"}[5m]))
+            )
+          labels:
+            app: "shop"
+            slo: "orders-latency"
+            job: "shop"
+        - record: autumn_slo:sli_total:rate5m
+          expr: |-
+            sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders/{id}",status_class!="5xx",job="shop"}[5m]))
+          labels:
+            app: "shop"
+            slo: "orders-latency"
+            job: "shop"
         - record: autumn_slo:sli_error:ratio_rate5m
           expr: |-
-            1 - (
-              sum(rate(autumn_http_request_duration_seconds_bucket{route="/api/orders",le="0.25",job="shop"}[5m]))
-              /
-              sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",job="shop"}[5m]))
+            (
+              sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders/{id}",status_class!="5xx",job="shop"}[5m]))
+              -
+              sum(rate(autumn_http_request_duration_seconds_bucket{route="/api/orders/{id}",status_class!="5xx",le="0.25",job="shop"}[5m]))
             )
+            /
+            sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders/{id}",status_class!="5xx",job="shop"}[5m]))
           labels:
             app: "shop"
             slo: "orders-latency"
+            job: "shop"
         - record: autumn_slo:sli_error:ratio_rate30m
           expr: |-
-            1 - (
-              sum(rate(autumn_http_request_duration_seconds_bucket{route="/api/orders",le="0.25",job="shop"}[30m]))
-              /
-              sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",job="shop"}[30m]))
+            (
+              sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders/{id}",status_class!="5xx",job="shop"}[30m]))
+              -
+              sum(rate(autumn_http_request_duration_seconds_bucket{route="/api/orders/{id}",status_class!="5xx",le="0.25",job="shop"}[30m]))
             )
+            /
+            sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders/{id}",status_class!="5xx",job="shop"}[30m]))
           labels:
             app: "shop"
             slo: "orders-latency"
+            job: "shop"
         - record: autumn_slo:sli_error:ratio_rate1h
           expr: |-
-            1 - (
-              sum(rate(autumn_http_request_duration_seconds_bucket{route="/api/orders",le="0.25",job="shop"}[1h]))
-              /
-              sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",job="shop"}[1h]))
+            (
+              sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders/{id}",status_class!="5xx",job="shop"}[1h]))
+              -
+              sum(rate(autumn_http_request_duration_seconds_bucket{route="/api/orders/{id}",status_class!="5xx",le="0.25",job="shop"}[1h]))
             )
+            /
+            sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders/{id}",status_class!="5xx",job="shop"}[1h]))
           labels:
             app: "shop"
             slo: "orders-latency"
+            job: "shop"
         - record: autumn_slo:sli_error:ratio_rate6h
           expr: |-
-            1 - (
-              sum(rate(autumn_http_request_duration_seconds_bucket{route="/api/orders",le="0.25",job="shop"}[6h]))
-              /
-              sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",job="shop"}[6h]))
+            (
+              sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders/{id}",status_class!="5xx",job="shop"}[6h]))
+              -
+              sum(rate(autumn_http_request_duration_seconds_bucket{route="/api/orders/{id}",status_class!="5xx",le="0.25",job="shop"}[6h]))
             )
+            /
+            sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders/{id}",status_class!="5xx",job="shop"}[6h]))
           labels:
             app: "shop"
             slo: "orders-latency"
+            job: "shop"
         - record: autumn_slo:sli_error:ratio_rate3d
           expr: |-
-            1 - (
-              sum(rate(autumn_http_request_duration_seconds_bucket{route="/api/orders",le="0.25",job="shop"}[3d]))
-              /
-              sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",job="shop"}[3d]))
-            )
+            sum_over_time(autumn_slo:sli_bad:rate5m{app="shop",job="shop",slo="orders-latency"}[3d])
+            /
+            sum_over_time(autumn_slo:sli_total:rate5m{app="shop",job="shop",slo="orders-latency"}[3d])
           labels:
             app: "shop"
             slo: "orders-latency"
+            job: "shop"
         - record: autumn_slo:sli_error:ratio_rate30d
           expr: |-
-            1 - (
-              sum(rate(autumn_http_request_duration_seconds_bucket{route="/api/orders",le="0.25",job="shop"}[30d]))
-              /
-              sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",job="shop"}[30d]))
-            )
+            sum_over_time(autumn_slo:sli_bad:rate5m{app="shop",job="shop",slo="orders-latency"}[30d])
+            /
+            sum_over_time(autumn_slo:sli_total:rate5m{app="shop",job="shop",slo="orders-latency"}[30d])
           labels:
             app: "shop"
             slo: "orders-latency"
+            job: "shop"
         - alert: AutumnSloErrorBudgetBurn
           expr: |-
-            autumn_slo:sli_error:ratio_rate1h{app="shop",slo="orders-latency"} > 0.144
+            autumn_slo:sli_error:ratio_rate1h{app="shop",job="shop",slo="orders-latency"} > 0.144
             and
-            autumn_slo:sli_error:ratio_rate5m{app="shop",slo="orders-latency"} > 0.144
+            autumn_slo:sli_error:ratio_rate5m{app="shop",job="shop",slo="orders-latency"} > 0.144
           labels:
             app: "shop"
             slo: "orders-latency"
+            job: "shop"
             severity: "page"
             long_window: "1h"
             short_window: "5m"
           annotations:
             summary: "shop SLO orders-latency burns its error budget at 14.4x or more"
-            description: "Objective 99% (requests faster than 250 ms, route /api/orders). The error ratio is above 0.144 over 1h and 5m."
+            description: "Objective 99% (requests faster than 250 ms, route /api/orders/{id}). The error ratio is above 0.144 over 1h and 5m."
         - alert: AutumnSloErrorBudgetBurn
           expr: |-
-            autumn_slo:sli_error:ratio_rate6h{app="shop",slo="orders-latency"} > 0.06
+            autumn_slo:sli_error:ratio_rate6h{app="shop",job="shop",slo="orders-latency"} > 0.06
             and
-            autumn_slo:sli_error:ratio_rate30m{app="shop",slo="orders-latency"} > 0.06
+            autumn_slo:sli_error:ratio_rate30m{app="shop",job="shop",slo="orders-latency"} > 0.06
           labels:
             app: "shop"
             slo: "orders-latency"
+            job: "shop"
             severity: "page"
             long_window: "6h"
             short_window: "30m"
           annotations:
             summary: "shop SLO orders-latency burns its error budget at 6x or more"
-            description: "Objective 99% (requests faster than 250 ms, route /api/orders). The error ratio is above 0.06 over 6h and 30m."
+            description: "Objective 99% (requests faster than 250 ms, route /api/orders/{id}). The error ratio is above 0.06 over 6h and 30m."
         - alert: AutumnSloErrorBudgetBurn
           expr: |-
-            autumn_slo:sli_error:ratio_rate3d{app="shop",slo="orders-latency"} > 0.01
+            autumn_slo:sli_error:ratio_rate3d{app="shop",job="shop",slo="orders-latency"} > 0.01
             and
-            autumn_slo:sli_error:ratio_rate6h{app="shop",slo="orders-latency"} > 0.01
+            autumn_slo:sli_error:ratio_rate6h{app="shop",job="shop",slo="orders-latency"} > 0.01
           labels:
             app: "shop"
             slo: "orders-latency"
+            job: "shop"
             severity: "ticket"
             long_window: "3d"
             short_window: "6h"
           annotations:
             summary: "shop SLO orders-latency burns its error budget at 1x or more"
-            description: "Objective 99% (requests faster than 250 ms, route /api/orders). The error ratio is above 0.01 over 3d and 6h."
+            description: "Objective 99% (requests faster than 250 ms, route /api/orders/{id}). The error ratio is above 0.01 over 3d and 6h."
+    - name: "autumn-slo-shop-latency"
+      rules:
+        - record: autumn_slo:objective:ratio
+          expr: vector(0.95)
+          labels:
+            app: "shop"
+            slo: "latency"
+            job: "shop"
+        - record: autumn_slo:sli_bad:rate5m
+          expr: |-
+            (
+              sum(rate(autumn_http_request_duration_seconds_count{route!="_unmatched",status_class!="5xx",job="shop"}[5m]))
+              -
+              sum(rate(autumn_http_request_duration_seconds_bucket{route!="_unmatched",status_class!="5xx",le=~"1(\\.0)?",job="shop"}[5m]))
+            )
+          labels:
+            app: "shop"
+            slo: "latency"
+            job: "shop"
+        - record: autumn_slo:sli_total:rate5m
+          expr: |-
+            sum(rate(autumn_http_request_duration_seconds_count{route!="_unmatched",status_class!="5xx",job="shop"}[5m]))
+          labels:
+            app: "shop"
+            slo: "latency"
+            job: "shop"
+        - record: autumn_slo:sli_error:ratio_rate5m
+          expr: |-
+            (
+              sum(rate(autumn_http_request_duration_seconds_count{route!="_unmatched",status_class!="5xx",job="shop"}[5m]))
+              -
+              sum(rate(autumn_http_request_duration_seconds_bucket{route!="_unmatched",status_class!="5xx",le=~"1(\\.0)?",job="shop"}[5m]))
+            )
+            /
+            sum(rate(autumn_http_request_duration_seconds_count{route!="_unmatched",status_class!="5xx",job="shop"}[5m]))
+          labels:
+            app: "shop"
+            slo: "latency"
+            job: "shop"
+        - record: autumn_slo:sli_error:ratio_rate30m
+          expr: |-
+            (
+              sum(rate(autumn_http_request_duration_seconds_count{route!="_unmatched",status_class!="5xx",job="shop"}[30m]))
+              -
+              sum(rate(autumn_http_request_duration_seconds_bucket{route!="_unmatched",status_class!="5xx",le=~"1(\\.0)?",job="shop"}[30m]))
+            )
+            /
+            sum(rate(autumn_http_request_duration_seconds_count{route!="_unmatched",status_class!="5xx",job="shop"}[30m]))
+          labels:
+            app: "shop"
+            slo: "latency"
+            job: "shop"
+        - record: autumn_slo:sli_error:ratio_rate1h
+          expr: |-
+            (
+              sum(rate(autumn_http_request_duration_seconds_count{route!="_unmatched",status_class!="5xx",job="shop"}[1h]))
+              -
+              sum(rate(autumn_http_request_duration_seconds_bucket{route!="_unmatched",status_class!="5xx",le=~"1(\\.0)?",job="shop"}[1h]))
+            )
+            /
+            sum(rate(autumn_http_request_duration_seconds_count{route!="_unmatched",status_class!="5xx",job="shop"}[1h]))
+          labels:
+            app: "shop"
+            slo: "latency"
+            job: "shop"
+        - record: autumn_slo:sli_error:ratio_rate6h
+          expr: |-
+            (
+              sum(rate(autumn_http_request_duration_seconds_count{route!="_unmatched",status_class!="5xx",job="shop"}[6h]))
+              -
+              sum(rate(autumn_http_request_duration_seconds_bucket{route!="_unmatched",status_class!="5xx",le=~"1(\\.0)?",job="shop"}[6h]))
+            )
+            /
+            sum(rate(autumn_http_request_duration_seconds_count{route!="_unmatched",status_class!="5xx",job="shop"}[6h]))
+          labels:
+            app: "shop"
+            slo: "latency"
+            job: "shop"
+        - record: autumn_slo:sli_error:ratio_rate3d
+          expr: |-
+            sum_over_time(autumn_slo:sli_bad:rate5m{app="shop",job="shop",slo="latency"}[3d])
+            /
+            sum_over_time(autumn_slo:sli_total:rate5m{app="shop",job="shop",slo="latency"}[3d])
+          labels:
+            app: "shop"
+            slo: "latency"
+            job: "shop"
+        - record: autumn_slo:sli_error:ratio_rate30d
+          expr: |-
+            sum_over_time(autumn_slo:sli_bad:rate5m{app="shop",job="shop",slo="latency"}[30d])
+            /
+            sum_over_time(autumn_slo:sli_total:rate5m{app="shop",job="shop",slo="latency"}[30d])
+          labels:
+            app: "shop"
+            slo: "latency"
+            job: "shop"
+        - alert: AutumnSloErrorBudgetBurn
+          expr: |-
+            autumn_slo:sli_error:ratio_rate1h{app="shop",job="shop",slo="latency"} > 0.72
+            and
+            autumn_slo:sli_error:ratio_rate5m{app="shop",job="shop",slo="latency"} > 0.72
+          labels:
+            app: "shop"
+            slo: "latency"
+            job: "shop"
+            severity: "page"
+            long_window: "1h"
+            short_window: "5m"
+          annotations:
+            summary: "shop SLO latency burns its error budget at 14.4x or more"
+            description: "Objective 95% (requests faster than 1000 ms, all routes). The error ratio is above 0.72 over 1h and 5m."
+        - alert: AutumnSloErrorBudgetBurn
+          expr: |-
+            autumn_slo:sli_error:ratio_rate6h{app="shop",job="shop",slo="latency"} > 0.3
+            and
+            autumn_slo:sli_error:ratio_rate30m{app="shop",job="shop",slo="latency"} > 0.3
+          labels:
+            app: "shop"
+            slo: "latency"
+            job: "shop"
+            severity: "page"
+            long_window: "6h"
+            short_window: "30m"
+          annotations:
+            summary: "shop SLO latency burns its error budget at 6x or more"
+            description: "Objective 95% (requests faster than 1000 ms, all routes). The error ratio is above 0.3 over 6h and 30m."
+        - alert: AutumnSloErrorBudgetBurn
+          expr: |-
+            autumn_slo:sli_error:ratio_rate3d{app="shop",job="shop",slo="latency"} > 0.05
+            and
+            autumn_slo:sli_error:ratio_rate6h{app="shop",job="shop",slo="latency"} > 0.05
+          labels:
+            app: "shop"
+            slo: "latency"
+            job: "shop"
+            severity: "ticket"
+            long_window: "3d"
+            short_window: "6h"
+          annotations:
+            summary: "shop SLO latency burns its error budget at 1x or more"
+            description: "Objective 95% (requests faster than 1000 ms, all routes). The error ratio is above 0.05 over 3d and 6h."

@@ -16733,8 +16733,24 @@ path = "/healthz"
     }
 
     #[test]
+    fn env_override_wins_over_toml_deploy_bake_and_ignores_a_bad_value() {
+        let mut config: AutumnConfig = toml::from_str(
+            "[deploy]\nhost = \"h\"\n\n[deploy.bake]\nduration_secs = 300\nmax_p99_ms = 400\n",
+        )
+        .unwrap();
+        let env = MockEnv::new()
+            .with("AUTUMN_DEPLOY__BAKE__DURATION_SECS", "60")
+            // Not a number: the TOML value stays.
+            .with("AUTUMN_DEPLOY__BAKE__MAX_P99_MS", "5m");
+        config.apply_env_overrides_with_env(&env);
+        let bake = config.deploy.expect("deploy").bake;
+        assert_eq!(bake.duration_secs, 60);
+        assert_eq!(bake.max_p99_ms, Some(400));
+    }
+
+    #[test]
     fn env_override_sets_every_deploy_bake_key() {
-        // Each key alone materializes [deploy]; together they win over TOML.
+        // Each key alone materializes [deploy].
         let env = MockEnv::new()
             .with("AUTUMN_DEPLOY__BAKE__DURATION_SECS", "120")
             .with("AUTUMN_DEPLOY__BAKE__INTERVAL_SECS", "5")

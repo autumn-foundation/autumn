@@ -15,9 +15,9 @@ spec:
     address: "http://prometheus.monitoring.svc:9090"
   query: |-
     (
-      (sum(rate(autumn_http_responses_total{status="5xx",namespace="{{ namespace }}",pod=~"{{ target }}-[0-9a-zA-Z]+(-[0-9a-zA-Z]+)",job="shop"}[{{ interval }}])) or vector(0))
+      (sum(rate(autumn_http_responses_total{status="5xx",namespace="{{ namespace }}",pod=~"{{ target }}-[0-9a-zA-Z]+(-[0-9a-zA-Z]+)",job="shop"}[5m])) or vector(0))
       /
-      sum(rate(autumn_http_responses_total{namespace="{{ namespace }}",pod=~"{{ target }}-[0-9a-zA-Z]+(-[0-9a-zA-Z]+)",job="shop"}[{{ interval }}]))
+      sum(rate(autumn_http_responses_total{namespace="{{ namespace }}",pod=~"{{ target }}-[0-9a-zA-Z]+(-[0-9a-zA-Z]+)",job="shop"}[5m]))
     )
     / 0.001
 ---
@@ -34,9 +34,9 @@ spec:
     address: "http://prometheus.monitoring.svc:9090"
   query: |-
     (
-      (sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",status_class="5xx",namespace="{{ namespace }}",pod=~"{{ target }}-[0-9a-zA-Z]+(-[0-9a-zA-Z]+)",job="shop"}[{{ interval }}])) or vector(0))
+      (sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",status_class="5xx",namespace="{{ namespace }}",pod=~"{{ target }}-[0-9a-zA-Z]+(-[0-9a-zA-Z]+)",job="shop"}[5m])) or vector(0))
       /
-      sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",namespace="{{ namespace }}",pod=~"{{ target }}-[0-9a-zA-Z]+(-[0-9a-zA-Z]+)",job="shop"}[{{ interval }}]))
+      sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",namespace="{{ namespace }}",pod=~"{{ target }}-[0-9a-zA-Z]+(-[0-9a-zA-Z]+)",job="shop"}[5m]))
     )
     / 0.005
 ---
@@ -53,10 +53,35 @@ spec:
     address: "http://prometheus.monitoring.svc:9090"
   query: |-
     (
-      1 - (
-        sum(rate(autumn_http_request_duration_seconds_bucket{route="/api/orders",le="0.25",namespace="{{ namespace }}",pod=~"{{ target }}-[0-9a-zA-Z]+(-[0-9a-zA-Z]+)",job="shop"}[{{ interval }}]))
-        /
-        sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",namespace="{{ namespace }}",pod=~"{{ target }}-[0-9a-zA-Z]+(-[0-9a-zA-Z]+)",job="shop"}[{{ interval }}]))
+      (
+        sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders/{id}",status_class!="5xx",namespace="{{ namespace }}",pod=~"{{ target }}-[0-9a-zA-Z]+(-[0-9a-zA-Z]+)",job="shop"}[5m]))
+        -
+        sum(rate(autumn_http_request_duration_seconds_bucket{route="/api/orders/{id}",status_class!="5xx",le="0.25",namespace="{{ namespace }}",pod=~"{{ target }}-[0-9a-zA-Z]+(-[0-9a-zA-Z]+)",job="shop"}[5m]))
       )
+      /
+      sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders/{id}",status_class!="5xx",namespace="{{ namespace }}",pod=~"{{ target }}-[0-9a-zA-Z]+(-[0-9a-zA-Z]+)",job="shop"}[5m]))
     )
     / 0.01
+---
+apiVersion: flagger.app/v1beta1
+kind: MetricTemplate
+metadata:
+  name: "shop-latency"
+  labels:
+    app.kubernetes.io/name: "shop"
+    app.kubernetes.io/managed-by: autumn
+spec:
+  provider:
+    type: prometheus
+    address: "http://prometheus.monitoring.svc:9090"
+  query: |-
+    (
+      (
+        sum(rate(autumn_http_request_duration_seconds_count{route!="_unmatched",status_class!="5xx",namespace="{{ namespace }}",pod=~"{{ target }}-[0-9a-zA-Z]+(-[0-9a-zA-Z]+)",job="shop"}[5m]))
+        -
+        sum(rate(autumn_http_request_duration_seconds_bucket{route!="_unmatched",status_class!="5xx",le=~"1(\\.0)?",namespace="{{ namespace }}",pod=~"{{ target }}-[0-9a-zA-Z]+(-[0-9a-zA-Z]+)",job="shop"}[5m]))
+      )
+      /
+      sum(rate(autumn_http_request_duration_seconds_count{route!="_unmatched",status_class!="5xx",namespace="{{ namespace }}",pod=~"{{ target }}-[0-9a-zA-Z]+(-[0-9a-zA-Z]+)",job="shop"}[5m]))
+    )
+    / 0.05

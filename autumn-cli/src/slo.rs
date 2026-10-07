@@ -29,8 +29,25 @@ use serde::Serialize;
 /// The windows for which a recording rule exists.
 pub const RECORDING_WINDOWS: [&str; 6] = ["5m", "30m", "1h", "6h", "3d", "30d"];
 
-/// The window of the rollout analysis queries (Argo Rollouts).
+/// The windows computed from the raw series. The longer windows use
+/// `sum_over_time` over the recorded 5m rates, so a query loads few samples.
+const RAW_WINDOWS: [&str; 4] = ["5m", "30m", "1h", "6h"];
+
+/// The window of the rollout analysis queries (Argo Rollouts and Flagger).
+/// It holds several scrapes, so one late scrape does not empty a result.
 const ANALYSIS_WINDOW: &str = "5m";
+
+/// Label names that the generated queries and rules own.
+const RESERVED_LABELS: [&str; 8] = [
+    "__name__",
+    "app",
+    "slo",
+    "le",
+    "route",
+    "status",
+    "status_class",
+    "version",
+];
 
 /// The default output directory.
 pub const DEFAULT_OUT_DIR: &str = "deploy/slo";
@@ -47,6 +64,8 @@ pub struct GenerateOptions {
     pub selector: Option<String>,
     /// Prometheus address for the analysis templates.
     pub prometheus_url: String,
+    /// The output directory, for the usage comment in `helm-values.yaml`.
+    pub out_dir: String,
 }
 
 /// One generated file.
@@ -82,7 +101,7 @@ pub fn generate(slos: &[Slo], options: &GenerateOptions) -> Result<Generated, St
         );
     }
     let app = kube_name(&options.app)?;
-    let selector = check_selector(options.selector.as_deref())?;
+    let matchers = parse_selector(options.selector.as_deref().unwrap_or(""))?;
     for slo in slos {
         let name = metric_template_name(&app, slo);
         if name.len() > 63 {
@@ -92,10 +111,29 @@ pub fn generate(slos: &[Slo], options: &GenerateOptions) -> Result<Generated, St
             ));
         }
     }
+    let selector = matchers
+        .iter()
+        .map(Matcher::render)
+        .collect::<Vec<_>>()
+        .join(",");
+    // An equality matcher becomes a rule label too, so two environments that
+    // share one Prometheus do not write the same recorded series.
+    let rule_labels: Vec<(String, String)> = matchers
+        .iter()
+        .filter(|m| m.op == "=" && !m.value.contains('\\'))
+        .map(|m| (m.name.clone(), m.value.clone()))
+        .collect();
+    let own = std::iter::once(format!("app=\"{app}\""))
+        .chain(rule_labels.iter().map(|(k, v)| format!("{k}=\"{v}\"")))
+        .collect::<Vec<_>>()
+        .join(",");
     let ctx = Context {
         app,
         selector,
+        rule_labels,
+        own,
         prometheus_url: options.prometheus_url.clone(),
+        out_dir: options.out_dir.clone(),
     };
     let files = vec![
         GeneratedFile {
@@ -131,8 +169,21 @@ pub fn generate(slos: &[Slo], options: &GenerateOptions) -> Result<Generated, St
 
 struct Context {
     app: String,
-    selector: Option<String>,
+    /// The `--selector` matchers, normalized. Empty when not set.
+    selector: String,
+    /// Labels on every recorded series: the equality matchers.
+    rule_labels: Vec<(String, String)>,
+    /// Matchers that select this app's recorded series, without `slo`.
+    own: String,
     prometheus_url: String,
+    out_dir: String,
+}
+
+impl Context {
+    /// Matchers that select the recorded series of `slo`.
+    fn own(&self, slo: &Slo) -> String {
+        format!("{},slo=\"{}\"", self.own, slo.name)
+    }
 }
 
 /// Convert a name to a DNS-1123 label: lowercase, `_` to `-`.
@@ -160,17 +211,90 @@ pub fn kube_name(raw: &str) -> Result<String, String> {
     }
 }
 
-fn check_selector(selector: Option<&str>) -> Result<Option<String>, String> {
-    let Some(raw) = selector.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(None);
-    };
-    if raw.contains(['{', '}', '\n', '\r']) || !raw.contains('=') {
-        return Err(format!(
-            "--selector {raw:?} is not valid; give label matchers without braces, \
-             for example 'job=\"shop\"'"
-        ));
+/// One label matcher from `--selector`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Matcher {
+    name: String,
+    op: &'static str,
+    /// The value as written between the quotes, escapes included.
+    value: String,
+}
+
+impl Matcher {
+    fn render(&self) -> String {
+        format!("{}{}\"{}\"", self.name, self.op, self.value)
     }
-    Ok(Some(raw.trim_end_matches(',').to_owned()))
+}
+
+/// Parse `--selector`: label matchers such as `job="shop",env!~"dev|test"`.
+///
+/// The value must be in double quotes. The parser rejects what would break
+/// the generated files: braces outside the value, a newline, `{{` or `}}`
+/// (Argo Rollouts and Flagger read them as templates), and the labels that
+/// the generated queries own.
+fn parse_selector(raw: &str) -> Result<Vec<Matcher>, String> {
+    let fail = |why: &str| {
+        Err(format!(
+            "--selector {raw:?} is not valid: {why}. Give label matchers such as \
+             'job=\"shop\",namespace=\"prod\"'"
+        ))
+    };
+    let chars: Vec<char> = raw.chars().collect();
+    let mut matchers = Vec::new();
+    let mut i = 0;
+    loop {
+        while i < chars.len() && (chars[i] == ' ' || chars[i] == ',') {
+            i += 1;
+        }
+        if i == chars.len() {
+            break;
+        }
+        let start = i;
+        while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        let name: String = chars[start..i].iter().collect();
+        if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+            return fail("a label name must start with a letter or '_'");
+        }
+        if RESERVED_LABELS.contains(&name.as_str()) {
+            return fail(&format!("the label {name} is set by the generator"));
+        }
+        let rest: String = chars[i..].iter().take(2).collect();
+        let op = ["=~", "!~", "!=", "="]
+            .into_iter()
+            .find(|op| rest.starts_with(op));
+        let Some(op) = op else {
+            return fail("a matcher needs =, !=, =~ or !~");
+        };
+        i += op.len();
+        if chars.get(i) != Some(&'"') {
+            return fail("a value must be in double quotes");
+        }
+        i += 1;
+        let value_start = i;
+        loop {
+            match chars.get(i) {
+                None | Some('\n' | '\r') => return fail("a value has no closing quote"),
+                Some('\\') => i += 2,
+                Some('"') => break,
+                Some(_) => i += 1,
+            }
+        }
+        let value: String = chars[value_start..i.min(chars.len())].iter().collect();
+        i += 1;
+        if value.contains("{{") || value.contains("}}") {
+            return fail("a value must not contain {{ or }}");
+        }
+        if value.chars().any(char::is_control) {
+            return fail("a value must not contain control characters");
+        }
+        matchers.push(Matcher { name, op, value });
+        if i < chars.len() && chars[i] != ',' && chars[i] != ' ' {
+            return fail("put a comma between matchers");
+        }
+    }
+    Ok(matchers)
 }
 
 fn warnings(slos: &[Slo]) -> Vec<String> {
@@ -212,47 +336,76 @@ fn series(metric: &str, matchers: &[&str]) -> String {
     }
 }
 
-/// The error ratio of `slo` over `window`, as a Prometheus query.
+/// The `le` matcher for a latency bound. Prometheus 3 stores a whole-second
+/// bound such as `le="1"` as `le="1.0"`, so those bounds match both forms.
+#[must_use]
+pub fn le_matcher(threshold_ms: u64) -> String {
+    let le = format_decimal(threshold_ms, 3);
+    if threshold_ms % 1_000 == 0 {
+        format!("le=~\"{le}(\\\\.0)?\"")
+    } else {
+        format!("le=\"{le}\"")
+    }
+}
+
+/// The bad-event and all-event rate series of `slo`, as Prometheus queries.
+///
+/// The latency SLI leaves out 5xx responses, which the availability SLI
+/// counts, and requests that match no route (for example scanner 404s).
+fn bad_and_total(slo: &Slo, extra: &[&str], window: &str) -> (String, String) {
+    let route = slo.route().map(|r| format!("route=\"{r}\""));
+    let route = route.as_deref().unwrap_or("");
+    let with = |base: &[&str]| -> Vec<String> {
+        base.iter().chain(extra).map(|m| (*m).to_owned()).collect()
+    };
+    let rate = |metric, matchers: Vec<String>| {
+        let matchers: Vec<&str> = matchers.iter().map(String::as_str).collect();
+        format!("sum(rate({}[{window}]))", series(metric, &matchers))
+    };
+    match &slo.sli {
+        Sli::Availability { route: None } => (
+            format!(
+                "({} or vector(0))",
+                rate(RESPONSES, with(&["status=\"5xx\""]))
+            ),
+            rate(RESPONSES, with(&[])),
+        ),
+        Sli::Availability { route: Some(_) } => (
+            format!(
+                "({} or vector(0))",
+                rate(DURATION_COUNT, with(&[route, "status_class=\"5xx\""]))
+            ),
+            rate(DURATION_COUNT, with(&[route])),
+        ),
+        Sli::Latency { threshold_ms, .. } => {
+            let scope = if route.is_empty() {
+                "route!=\"_unmatched\""
+            } else {
+                route
+            };
+            let le = le_matcher(*threshold_ms);
+            let total = rate(DURATION_COUNT, with(&[scope, "status_class!=\"5xx\""]));
+            let good = rate(
+                DURATION_BUCKET,
+                with(&[scope, "status_class!=\"5xx\"", le.as_str()]),
+            );
+            (format!("(\n  {total}\n  -\n  {good}\n)"), total)
+        }
+    }
+}
+
+/// The error ratio of `slo` over `window`, from the raw series.
 ///
 /// `extra` holds label matchers added to every series.
 #[must_use]
 pub fn error_ratio(slo: &Slo, extra: &[&str], window: &str) -> String {
-    let route = slo.route().map(|r| format!("route=\"{r}\""));
-    let route = route.as_deref().unwrap_or("");
-    match &slo.sli {
-        Sli::Availability { route: None } => {
-            let mut bad = vec!["status=\"5xx\""];
-            bad.extend_from_slice(extra);
-            format!(
-                "(sum(rate({}[{window}])) or vector(0))\n/\nsum(rate({}[{window}]))",
-                series(RESPONSES, &bad),
-                series(RESPONSES, extra),
-            )
-        }
-        Sli::Availability { route: Some(_) } => {
-            let mut bad = vec![route, "status_class=\"5xx\""];
-            bad.extend_from_slice(extra);
-            let mut all = vec![route];
-            all.extend_from_slice(extra);
-            format!(
-                "(sum(rate({}[{window}])) or vector(0))\n/\nsum(rate({}[{window}]))",
-                series(DURATION_COUNT, &bad),
-                series(DURATION_COUNT, &all),
-            )
-        }
-        Sli::Latency { threshold_ms, .. } => {
-            let le = format!("le=\"{}\"", format_decimal(*threshold_ms, 3));
-            let mut good = vec![route, le.as_str()];
-            good.extend_from_slice(extra);
-            let mut all = vec![route];
-            all.extend_from_slice(extra);
-            format!(
-                "1 - (\n  sum(rate({}[{window}]))\n  /\n  sum(rate({}[{window}]))\n)",
-                series(DURATION_BUCKET, &good),
-                series(DURATION_COUNT, &all),
-            )
-        }
-    }
+    let (bad, total) = bad_and_total(slo, extra, window);
+    format!("{bad}\n/\n{total}")
+}
+
+/// The name of a recorded 5m rate: `bad` or `total` events.
+fn rate_name(kind: &str) -> String {
+    format!("autumn_slo:sli_{kind}:rate5m")
 }
 
 fn ratio(ppm: u64) -> String {
@@ -302,12 +455,15 @@ fn header(out: &mut String) {
 fn render_groups(out: &mut String, slos: &[Slo], ctx: &Context, indent: usize) {
     let pad = " ".repeat(indent);
     let _ = writeln!(out, "{pad}groups:");
-    let selector = ctx.selector.as_deref().unwrap_or("");
+    let selector = ctx.selector.as_str();
     for slo in slos {
         let labels = |out: &mut String, extra: &[(&str, &str)]| {
             let _ = writeln!(out, "{pad}        labels:");
             let _ = writeln!(out, "{pad}          app: {}", yaml_str(&ctx.app));
             let _ = writeln!(out, "{pad}          slo: {}", yaml_str(&slo.name));
+            for (key, value) in &ctx.rule_labels {
+                let _ = writeln!(out, "{pad}          {key}: {}", yaml_str(value));
+            }
             for (key, value) in extra {
                 let _ = writeln!(out, "{pad}          {key}: {}", yaml_str(value));
             }
@@ -317,6 +473,7 @@ fn render_groups(out: &mut String, slos: &[Slo], ctx: &Context, indent: usize) {
             "{pad}  - name: {}",
             yaml_str(&format!("autumn-slo-{}-{}", ctx.app, slo.name))
         );
+        let own = ctx.own(slo);
         let _ = writeln!(out, "{pad}    rules:");
         let _ = writeln!(out, "{pad}      - record: autumn_slo:objective:ratio");
         let _ = writeln!(
@@ -325,13 +482,28 @@ fn render_groups(out: &mut String, slos: &[Slo], ctx: &Context, indent: usize) {
             ratio(u64::from(slo.objective_ppm))
         );
         labels(out, &[]);
-        for window in RECORDING_WINDOWS {
-            let _ = writeln!(out, "{pad}      - record: {}", recording_name(window));
+        let (bad, total) = bad_and_total(slo, &[selector], "5m");
+        for (kind, expr) in [("bad", bad), ("total", total)] {
+            let _ = writeln!(out, "{pad}      - record: {}", rate_name(kind));
             let _ = writeln!(out, "{pad}        expr: |-");
-            block(out, indent + 10, &error_ratio(slo, &[selector], window));
+            block(out, indent + 10, &expr);
             labels(out, &[]);
         }
-        let own = format!("app=\"{}\",slo=\"{}\"", ctx.app, slo.name);
+        for window in RECORDING_WINDOWS {
+            let expr = if RAW_WINDOWS.contains(&window) {
+                error_ratio(slo, &[selector], window)
+            } else {
+                format!(
+                    "sum_over_time({bad}{{{own}}}[{window}])\n/\nsum_over_time({total}{{{own}}}[{window}])",
+                    bad = rate_name("bad"),
+                    total = rate_name("total"),
+                )
+            };
+            let _ = writeln!(out, "{pad}      - record: {}", recording_name(window));
+            let _ = writeln!(out, "{pad}        expr: |-");
+            block(out, indent + 10, &expr);
+            labels(out, &[]);
+        }
         for window in BURN_WINDOWS {
             let threshold = burn_threshold(slo, window.factor_tenths);
             let factor = format_decimal(u64::from(window.factor_tenths), 1);
@@ -447,7 +619,7 @@ fn render_argo(slos: &[Slo], ctx: &Context) -> String {
     let _ = writeln!(out, "      value: {}", yaml_str(&ctx.prometheus_url));
     out.push_str("  metrics:\n");
     let canary = "version=\"{{args.canary-hash}}\"";
-    let selector = ctx.selector.as_deref().unwrap_or("");
+    let selector = ctx.selector.as_str();
     let max = max_burn_text();
     for slo in slos {
         let _ = writeln!(out, "    - name: {}", yaml_str(&slo.name));
@@ -479,7 +651,7 @@ fn render_flagger(slos: &[Slo], ctx: &Context) -> String {
          # above analysis.maxBurnRate.\n",
     );
     let canary = "namespace=\"{{ namespace }}\",pod=~\"{{ target }}-[0-9a-zA-Z]+(-[0-9a-zA-Z]+)\"";
-    let selector = ctx.selector.as_deref().unwrap_or("");
+    let selector = ctx.selector.as_str();
     for (index, slo) in slos.iter().enumerate() {
         if index > 0 {
             out.push_str("---\n");
@@ -497,7 +669,7 @@ fn render_flagger(slos: &[Slo], ctx: &Context) -> String {
         block(
             &mut out,
             4,
-            &burn_rate(slo, &[canary, selector], "{{ interval }}"),
+            &burn_rate(slo, &[canary, selector], ANALYSIS_WINDOW),
         );
     }
     out
@@ -508,7 +680,8 @@ fn render_helm_values(slos: &[Slo], ctx: &Context) -> String {
     header(&mut out);
     let _ = writeln!(
         out,
-        "# Use it with: helm upgrade --install {app} deploy/helm -f {DEFAULT_OUT_DIR}/helm-values.yaml",
+        "# Use it with: helm upgrade --install {app} deploy/helm -f {out_dir}/helm-values.yaml",
+        out_dir = ctx.out_dir.trim_end_matches('/'),
         app = ctx.app
     );
     out.push_str("analysis:\n");
@@ -637,7 +810,7 @@ const fn target(ref_id: &'static str, expr: String, legend_format: &'static str)
 
 /// The four panels of one SLO row, starting at grid row `y`.
 fn slo_panels(slo: &Slo, ctx: &Context, y: u32, first_id: u32) -> [Panel; 4] {
-    let own = format!("app=\"{}\",slo=\"{}\"", ctx.app, slo.name);
+    let own = ctx.own(slo);
     let objective = format_decimal(u64::from(slo.objective_ppm), 4);
     let budget = format!("(1 - autumn_slo:objective:ratio{{{own}}})");
     let burn = |window: &str| format!("{}{{{own}}} / {budget}", recording_name(window));
@@ -726,6 +899,20 @@ fn slo_panels(slo: &Slo, ctx: &Context, y: u32, first_id: u32) -> [Panel; 4] {
     ]
 }
 
+/// A Grafana UID: at most 40 characters. A long app name keeps a prefix and
+/// adds a hash of the whole name, so two long names do not collide.
+fn dashboard_uid(app: &str) -> String {
+    let uid = format!("autumn-slo-{app}");
+    if uid.len() <= 40 {
+        return uid;
+    }
+    // FNV-1a: stable across builds and platforms.
+    let hash = uid.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    format!("{}-{:08x}", &uid[..31], hash & 0xffff_ffff)
+}
+
 fn render_dashboard(slos: &[Slo], ctx: &Context) -> String {
     let panels = slos
         .iter()
@@ -733,7 +920,7 @@ fn render_dashboard(slos: &[Slo], ctx: &Context) -> String {
         .flat_map(|(slo, index)| slo_panels(slo, ctx, index * 9, index * 4 + 1))
         .collect();
     let dashboard = Dashboard {
-        uid: format!("autumn-slo-{}", ctx.app).chars().take(40).collect(),
+        uid: dashboard_uid(&ctx.app),
         title: format!("{} SLOs", ctx.app),
         tags: vec!["autumn", "slo"],
         timezone: "browser",
@@ -802,6 +989,7 @@ pub fn execute(
         app: args.app.clone().unwrap_or_else(|| default_app.to_owned()),
         selector: args.selector.clone(),
         prometheus_url: args.prometheus_url.clone(),
+        out_dir: args.out_dir.display().to_string(),
     };
     let generated = generate(&slos, &options)?;
     if args.check {

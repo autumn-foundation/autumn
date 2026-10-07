@@ -12,5 +12,6 @@ resources:
   - service.yaml
   - pdb.yaml
 images:
+  # Set the registry and the release tag in your overlay.
   - name: {{k8s_name}}
-    newTag: latest
+    newTag: 0.1.0

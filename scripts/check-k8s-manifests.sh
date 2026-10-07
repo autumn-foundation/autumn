@@ -8,7 +8,7 @@
 # The checks:
 #   1. Render the `autumn release init --target kubernetes` templates.
 #   2. `helm lint --strict` on the chart: default values, then each opt-in mode
-#      (Argo Rollouts, Flagger, ServiceMonitor).
+#      (Argo Rollouts, Flagger, PodMonitor, Flagger with a PodMonitor).
 #   3. `helm template | kubeconform -strict` for each of those modes.
 #   4. The chart refuses bad values (Argo and Flagger together, no buffer).
 #   5. `kustomize build | kubeconform -strict` on the Kustomize base.
@@ -16,12 +16,15 @@
 #      MetricTemplates from `autumn slo generate`.
 #   7. `promtool check rules` and `promtool test rules` on the golden rules.
 #
-# Tools: the script downloads pinned versions and checks their SHA-256. Set
-# HELM, KUBECONFORM, KUSTOMIZE or PROMTOOL to use your own binary. Set
-# K8S_TOOLS_DIR to change the download directory.
+# Tools: the script downloads pinned linux-amd64 versions. It keeps the
+# tarballs in K8S_TOOLS_DIR (default: target/k8s-tools) and checks their
+# SHA-256 on every run, also when they come from a cache. On another platform,
+# set HELM, KUBECONFORM, KUSTOMIZE and PROMTOOL to your own binaries.
 #
-# CRD schemas (Argo Rollouts, Flagger, prometheus-operator) come from the
-# datreeio/CRDs-catalog. Kubernetes schemas come from kubeconform's default.
+# Schemas come from two pinned commits: Kubernetes from
+# yannh/kubernetes-json-schema, and the CRDs (Argo Rollouts, Flagger,
+# prometheus-operator) from datreeio/CRDs-catalog. kubeconform caches them in
+# K8S_TOOLS_DIR/schemas.
 
 set -euo pipefail
 
@@ -37,7 +40,10 @@ KUSTOMIZE_SHA256="3669470b454d865c8184d6bce78df05e977c9aea31c30df3c669317d43bcc7
 PROMETHEUS_VERSION="3.5.0"
 PROMETHEUS_SHA256="e811827af26d822afb09a4f28314f61b618b12cff5369835a67f674d8b46f39a"
 KUBERNETES_VERSION="1.31.0"
-CRD_CATALOG='https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+K8S_SCHEMA_COMMIT="8df8a883b68a24a104b4a9e43c1288090ae60b3b"
+CRD_CATALOG_COMMIT="fd90051867733c60d32d16450556e9cd18459aef"
+K8S_SCHEMAS="https://raw.githubusercontent.com/yannh/kubernetes-json-schema/${K8S_SCHEMA_COMMIT}/{{.NormalizedKubernetesVersion}}-standalone{{.StrictSuffix}}/{{.ResourceKind}}{{.KindSuffix}}.json"
+CRD_CATALOG="https://raw.githubusercontent.com/datreeio/CRDs-catalog/${CRD_CATALOG_COMMIT}/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json"
 
 templates="autumn-cli/src/templates/release/kubernetes"
 golden="autumn-cli/tests/golden/slo"
@@ -52,57 +58,67 @@ fail() {
   exit 1
 }
 
-# download URL SHA256 DEST: fetch URL to DEST and check its SHA-256.
-download() {
-  local url="$1" sha="$2" dest="$3"
-  curl -fsSL --retry 3 -o "${dest}" "${url}"
-  echo "${sha}  ${dest}" | sha256sum -c --quiet - || fail "checksum mismatch for ${url}"
+sha256() {
+  if command -v sha256sum > /dev/null; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+# fetch URL SHA256 NAME: keep the tarball in tools_dir, and check its SHA-256
+# on every run. Print its path.
+fetch() {
+  local url="$1" sha="$2" dest="${tools_dir}/$3"
+  if [[ ! -f "${dest}" ]]; then
+    curl -fsSL --retry 3 -o "${dest}.part" "${url}"
+    mv "${dest}.part" "${dest}"
+  fi
+  if [[ "$(sha256 "${dest}")" != "${sha}" ]]; then
+    rm -f "${dest}"
+    fail "checksum mismatch for ${url}"
+  fi
+  echo "${dest}"
 }
 
 install_tools() {
-  mkdir -p "${tools_dir}"
+  mkdir -p "${tools_dir}/schemas" "${work}/bin"
+  if [[ -z "${HELM:-}${KUBECONFORM:-}${KUSTOMIZE:-}${PROMTOOL:-}" ]] \
+    && [[ "$(uname -sm)" != "Linux x86_64" ]]; then
+    fail "the pinned tools are linux-amd64 only; set HELM, KUBECONFORM, KUSTOMIZE and PROMTOOL"
+  fi
+  local tgz
   if [[ -z "${HELM:-}" ]]; then
-    HELM="${tools_dir}/helm-${HELM_VERSION}"
-    if [[ ! -x "${HELM}" ]]; then
-      download "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz" \
-        "${HELM_SHA256}" "${work}/helm.tgz"
-      tar -xzf "${work}/helm.tgz" -C "${work}" linux-amd64/helm
-      mv "${work}/linux-amd64/helm" "${HELM}"
-    fi
+    tgz="$(fetch "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz" \
+      "${HELM_SHA256}" "helm-${HELM_VERSION}.tgz")"
+    tar -xzf "${tgz}" -C "${work}" linux-amd64/helm
+    HELM="${work}/linux-amd64/helm"
   fi
   if [[ -z "${KUBECONFORM:-}" ]]; then
-    KUBECONFORM="${tools_dir}/kubeconform-${KUBECONFORM_VERSION}"
-    if [[ ! -x "${KUBECONFORM}" ]]; then
-      download "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
-        "${KUBECONFORM_SHA256}" "${work}/kubeconform.tgz"
-      tar -xzf "${work}/kubeconform.tgz" -C "${work}" kubeconform
-      mv "${work}/kubeconform" "${KUBECONFORM}"
-    fi
+    tgz="$(fetch "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+      "${KUBECONFORM_SHA256}" "kubeconform-${KUBECONFORM_VERSION}.tgz")"
+    tar -xzf "${tgz}" -C "${work}/bin" kubeconform
+    KUBECONFORM="${work}/bin/kubeconform"
   fi
   if [[ -z "${KUSTOMIZE:-}" ]]; then
-    KUSTOMIZE="${tools_dir}/kustomize-${KUSTOMIZE_VERSION}"
-    if [[ ! -x "${KUSTOMIZE}" ]]; then
-      download "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
-        "${KUSTOMIZE_SHA256}" "${work}/kustomize.tgz"
-      tar -xzf "${work}/kustomize.tgz" -C "${work}" kustomize
-      mv "${work}/kustomize" "${KUSTOMIZE}"
-    fi
+    tgz="$(fetch "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
+      "${KUSTOMIZE_SHA256}" "kustomize-${KUSTOMIZE_VERSION}.tgz")"
+    tar -xzf "${tgz}" -C "${work}/bin" kustomize
+    KUSTOMIZE="${work}/bin/kustomize"
   fi
   if [[ -z "${PROMTOOL:-}" ]]; then
-    PROMTOOL="${tools_dir}/promtool-${PROMETHEUS_VERSION}"
-    if [[ ! -x "${PROMTOOL}" ]]; then
-      local dir="prometheus-${PROMETHEUS_VERSION}.linux-amd64"
-      download "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/${dir}.tar.gz" \
-        "${PROMETHEUS_SHA256}" "${work}/prometheus.tgz"
-      tar -xzf "${work}/prometheus.tgz" -C "${work}" "${dir}/promtool"
-      mv "${work}/${dir}/promtool" "${PROMTOOL}"
-    fi
+    local dir="prometheus-${PROMETHEUS_VERSION}.linux-amd64"
+    tgz="$(fetch "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/${dir}.tar.gz" \
+      "${PROMETHEUS_SHA256}" "prometheus-${PROMETHEUS_VERSION}.tgz")"
+    tar -xzf "${tgz}" -C "${work}" "${dir}/promtool"
+    PROMTOOL="${work}/${dir}/promtool"
   fi
 }
 
 validate() {
   "${KUBECONFORM}" -strict -summary -kubernetes-version "${KUBERNETES_VERSION}" \
-    -schema-location default -schema-location "${CRD_CATALOG}" "$@"
+    -cache "${tools_dir}/schemas" \
+    -schema-location "${K8S_SCHEMAS}" -schema-location "${CRD_CATALOG}" "$@"
 }
 
 # Render the release templates as `autumn release init` does for a project
@@ -121,12 +137,17 @@ render() {
   fi
 }
 
-# expect_failure DESCRIPTION COMMAND...: the command must exit non-zero.
+# expect_failure DESCRIPTION REASON COMMAND...: the command must exit non-zero
+# and print REASON, so an unrelated error cannot pass the check.
 expect_failure() {
-  local description="$1"
-  shift
+  local description="$1" reason="$2"
+  shift 2
   if "$@" > "${work}/expected-failure.log" 2>&1; then
     fail "${description}: the command passed, but it must fail"
+  fi
+  if ! grep -qF -- "${reason}" "${work}/expected-failure.log"; then
+    cat "${work}/expected-failure.log" >&2
+    fail "${description}: the command failed, but not with \"${reason}\""
   fi
   echo "ok: ${description} is refused"
 }
@@ -144,9 +165,9 @@ spec:
   template: {}
   notAField: true
 EOF
-  expect_failure "kubeconform on an invalid Deployment" validate "${work}/bad.yaml"
+  expect_failure "kubeconform on an invalid Deployment" "is invalid" validate "${work}/bad.yaml"
   render "${work}/chart"
-  expect_failure "a chart with no shutdown buffer" \
+  expect_failure "a chart with no shutdown buffer" "bufferSeconds must be 1 or more" \
     "${HELM}" template demo "${work}/chart/helm" --set shutdown.bufferSeconds=0
   echo "self-test passed"
 }
@@ -166,7 +187,8 @@ main() {
     "default::"
     "argo-rollouts::--set rollout.enabled=true --set analysis.templateName=demo-app-slo"
     "flagger::--set flagger.enabled=true -f ${golden}/helm-values.yaml"
-    "service-monitor::--set metrics.serviceMonitor.enabled=true"
+    "pod-monitor::--set metrics.podMonitor.enabled=true"
+    "flagger-pod-monitor::--set flagger.enabled=true --set metrics.podMonitor.enabled=true --set flagger.provider=nginx -f ${golden}/helm-values.yaml"
   )
   local mode name args
   for mode in "${modes[@]}"; do
@@ -191,9 +213,17 @@ main() {
   grep -q 'name: shop-availability' "${work}/flagger.yaml" \
     || fail "the Flagger Canary does not use the generated MetricTemplates"
 
-  expect_failure "Argo Rollouts and Flagger together" \
+  grep -q 'kind: PodMonitor' "${work}/flagger-pod-monitor.yaml" \
+    || fail "Flagger mode has no PodMonitor"
+  if grep -q 'prometheus.io/scrape' "${work}/pod-monitor.yaml"; then
+    fail "a pod with a PodMonitor also has scrape annotations"
+  fi
+  grep -q 'automountServiceAccountToken: false' "${work}/default.yaml" \
+    || fail "the pod mounts a service account token"
+
+  expect_failure "Argo Rollouts and Flagger together" "not both" \
     "${HELM}" template demo "${chart}" --set rollout.enabled=true --set flagger.enabled=true
-  expect_failure "a shutdown buffer of 0" \
+  expect_failure "a shutdown buffer of 0" "bufferSeconds must be 1 or more" \
     "${HELM}" template demo "${chart}" --set shutdown.bufferSeconds=0
 
   echo "==> kustomize build | kubeconform"

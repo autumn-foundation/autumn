@@ -240,6 +240,9 @@ pub fn validate(configs: &[SloConfig]) -> Result<Vec<Slo>, SloError> {
             ));
         }
         let objective_ppm = objective_to_ppm(config.objective).map_err(fail)?;
+        if let Some(description) = &config.description {
+            check_description(description).map_err(fail)?;
+        }
         let route = match config.route.as_deref() {
             None => None,
             Some(route) => Some(check_route(route).map_err(fail)?.to_owned()),
@@ -298,19 +301,35 @@ fn check_name(name: &str) -> Result<(), String> {
     }
 }
 
+/// A route goes into Prometheus label matchers, YAML block scalars, and
+/// Argo Rollouts and Flagger templates. Allow printable ASCII only, and no
+/// character or pair that one of them reads as syntax.
 fn check_route(route: &str) -> Result<&str, String> {
     if !route.starts_with('/') {
         return Err(format!("route {route:?} must start with '/'"));
     }
-    if route
+    let bad_char = route
         .chars()
-        .any(|c| c == '"' || c == '\\' || c.is_control())
-    {
+        .any(|c| !c.is_ascii_graphic() || matches!(c, '"' | '\\' | '`'));
+    if bad_char || route.contains("{{") || route.contains("}}") {
         return Err(format!(
-            "route {route:?} must not contain '\"', '\\' or control characters"
+            "route {route:?} must hold printable ASCII only, with no space, '\"', '\\', \
+             '`', '{{{{' or '}}}}'"
         ));
     }
     Ok(route)
+}
+
+/// A description goes into alert annotations, which Prometheus reads as Go
+/// templates. Reject template braces and control characters.
+fn check_description(description: &str) -> Result<(), String> {
+    if description.contains("{{") || description.contains("}}") {
+        return Err("description must not contain '{{' or '}}'".to_owned());
+    }
+    if description.chars().any(char::is_control) {
+        return Err("description must not contain control characters".to_owned());
+    }
+    Ok(())
 }
 
 /// Convert a percentage to ppm. Reject values outside `(0, 100)` and values
@@ -438,8 +457,40 @@ mod tests {
     }
 
     #[test]
+    fn descriptions_are_checked() {
+        for bad in ["See {{ the runbook }}", "a }} b", "line\nbreak"] {
+            let mut config = availability("a", 99.0);
+            config.description = Some(bad.to_owned());
+            let message = error_of(&[config]);
+            assert!(message.contains("description"), "{bad:?}: {message}");
+        }
+        let mut config = availability("a", 99.0);
+        config.description = Some("Customers see \"orders\" {quickly}.".to_owned());
+        assert!(validate(&[config]).is_ok());
+    }
+
+    #[test]
+    fn route_patterns_with_parameters_are_allowed() {
+        let mut config = availability("a", 99.0);
+        config.route = Some("/api/orders/{id}".to_owned());
+        assert!(validate(&[config]).is_ok());
+    }
+
+    #[test]
     fn routes_are_checked() {
-        for bad in ["api", "/a\"b", "/a\\b", "/a\nb", ""] {
+        for bad in [
+            "api",
+            "/a\"b",
+            "/a\\b",
+            "/a\nb",
+            "",
+            "/a b",
+            "/x/{{ query `up` }}",
+            "/a}}",
+            "/a`b",
+            "/a\u{2028}b",
+            "/caf\u{e9}",
+        ] {
             let mut config = availability("a", 99.0);
             config.route = Some(bad.to_owned());
             let message = error_of(&[config]);

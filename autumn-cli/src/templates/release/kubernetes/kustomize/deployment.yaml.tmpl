@@ -28,6 +28,8 @@ spec:
         prometheus.io/port: "3000"
     spec:
       terminationGracePeriodSeconds: 50
+      # The app does not call the Kubernetes API.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001

@@ -28,7 +28,7 @@ fn fixture_configs() -> Vec<SloConfig> {
         Some("/api/orders"),
         None,
     );
-    checkout.description = Some("Customers can place orders.".to_owned());
+    checkout.description = Some("Customers can place \"orders\".".to_owned());
     vec![
         config("availability", 99.9, SliKind::Availability, None, None),
         checkout,
@@ -36,9 +36,11 @@ fn fixture_configs() -> Vec<SloConfig> {
             "orders-latency",
             99.0,
             SliKind::Latency,
-            Some("/api/orders"),
+            Some("/api/orders/{id}"),
             Some(250),
         ),
+        // All routes, on a whole-second bucket.
+        config("latency", 95.0, SliKind::Latency, None, Some(1_000)),
     ]
 }
 
@@ -47,6 +49,7 @@ fn fixture_options() -> GenerateOptions {
         app: "shop".to_owned(),
         selector: Some("job=\"shop\"".to_owned()),
         prometheus_url: DEFAULT_PROMETHEUS_URL.to_owned(),
+        out_dir: DEFAULT_OUT_DIR.to_owned(),
     }
 }
 
@@ -135,16 +138,38 @@ fn availability_for_one_route_reads_the_histogram_count() {
 }
 
 #[test]
-fn latency_reads_the_bucket_at_the_threshold() {
+fn latency_counts_slow_non_5xx_requests_as_bad() {
     let slos = slo::validate(&fixture_configs()).expect("valid");
     let expr = error_ratio(&slos[2], &[], "30m");
-    assert!(
-        expr.contains(
-            "autumn_http_request_duration_seconds_bucket{route=\"/api/orders\",le=\"0.25\"}[30m]"
-        ),
-        "{expr}"
+    let count = r#"autumn_http_request_duration_seconds_count{route="/api/orders/{id}",status_class!="5xx"}[30m]"#;
+    let bucket = r#"autumn_http_request_duration_seconds_bucket{route="/api/orders/{id}",status_class!="5xx",le="0.25"}[30m]"#;
+    assert_eq!(
+        expr,
+        format!("(\n  sum(rate({count}))\n  -\n  sum(rate({bucket}))\n)\n/\nsum(rate({count}))")
     );
-    assert!(expr.starts_with("1 - ("), "{expr}");
+    // All routes: requests that match no route are not traffic.
+    let all = error_ratio(&slos[3], &[], "5m");
+    assert!(all.contains(r#"route!="_unmatched""#), "{all}");
+}
+
+#[test]
+fn whole_second_bounds_match_the_prometheus_3_le_form() {
+    assert_eq!(le_matcher(250), r#"le="0.25""#);
+    assert_eq!(le_matcher(1_000), r#"le=~"1(\\.0)?""#);
+    assert_eq!(le_matcher(10_000), r#"le=~"10(\\.0)?""#);
+    assert_eq!(le_matcher(2_500), r#"le="2.5""#);
+}
+
+#[test]
+fn long_windows_sum_the_recorded_5m_rates() {
+    let rules = file(&fixture(), "prometheus-rules.yaml").to_owned();
+    assert!(rules.contains("- record: autumn_slo:sli_bad:rate5m"));
+    assert!(rules.contains("- record: autumn_slo:sli_total:rate5m"));
+    assert!(rules.contains(
+        r#"sum_over_time(autumn_slo:sli_bad:rate5m{app="shop",job="shop",slo="availability"}[30d])"#
+    ));
+    assert!(!rules.contains("[30d]))"), "no raw rate over 30 days");
+    assert!(!rules.contains("[3d]))"), "no raw rate over 3 days");
 }
 
 #[test]
@@ -166,16 +191,12 @@ fn burn_thresholds_are_exact_for_99_9() {
         .collect();
     assert_eq!(thresholds, vec!["0.0144", "0.006", "0.001"]);
     let rules = file(&fixture(), "prometheus-rules.yaml").to_owned();
-    assert!(
-        rules.contains(
-            "autumn_slo:sli_error:ratio_rate1h{app=\"shop\",slo=\"availability\"} > 0.0144"
-        )
-    );
-    assert!(
-        rules.contains(
-            "autumn_slo:sli_error:ratio_rate3d{app=\"shop\",slo=\"availability\"} > 0.001"
-        )
-    );
+    assert!(rules.contains(
+        "autumn_slo:sli_error:ratio_rate1h{app=\"shop\",job=\"shop\",slo=\"availability\"} > 0.0144"
+    ));
+    assert!(rules.contains(
+        "autumn_slo:sli_error:ratio_rate3d{app=\"shop\",job=\"shop\",slo=\"availability\"} > 0.001"
+    ));
 }
 
 #[test]
@@ -184,13 +205,18 @@ fn rule_files_are_valid_yaml_with_three_alerts_per_slo() {
     let rules: serde_yaml::Value =
         serde_yaml::from_str(file(&generated, "prometheus-rules.yaml")).expect("yaml");
     let groups = rules["groups"].as_sequence().expect("groups");
-    assert_eq!(groups.len(), 3);
+    assert_eq!(groups.len(), 4);
     for group in groups {
         let rules = group["rules"].as_sequence().expect("rules");
         let alerts = rules.iter().filter(|r| r.get("alert").is_some()).count();
         let records = rules.iter().filter(|r| r.get("record").is_some()).count();
         assert_eq!(alerts, BURN_WINDOWS.len());
-        assert_eq!(records, RECORDING_WINDOWS.len() + 1);
+        // The objective, two 5m rates, and one ratio per window.
+        assert_eq!(records, RECORDING_WINDOWS.len() + 3);
+        // The equality matcher of --selector labels every rule.
+        for rule in rules {
+            assert_eq!(rule["labels"]["job"], "shop", "{rule:?}");
+        }
     }
     let crd: serde_yaml::Value =
         serde_yaml::from_str(file(&generated, "prometheus-rule.yaml")).expect("yaml");
@@ -245,14 +271,23 @@ fn the_dashboard_has_four_panels_per_slo() {
     let dashboard: serde_json::Value =
         serde_json::from_str(file(&fixture(), "grafana-dashboard.json")).expect("json");
     assert_eq!(dashboard["uid"], "autumn-slo-shop");
-    assert_eq!(dashboard["panels"].as_array().expect("panels").len(), 12);
+    assert_eq!(dashboard["panels"].as_array().expect("panels").len(), 16);
     let ids: std::collections::BTreeSet<_> = dashboard["panels"]
         .as_array()
         .expect("panels")
         .iter()
         .map(|p| p["id"].as_u64().expect("id"))
         .collect();
-    assert_eq!(ids.len(), 12, "panel ids are unique");
+    assert_eq!(ids.len(), 16, "panel ids are unique");
+}
+
+#[test]
+fn long_app_names_get_distinct_dashboard_uids() {
+    let a = dashboard_uid(&format!("{}-one", "x".repeat(40)));
+    let b = dashboard_uid(&format!("{}-two", "x".repeat(40)));
+    assert_eq!(a.len(), 40);
+    assert_ne!(a, b);
+    assert_eq!(dashboard_uid("shop"), "autumn-slo-shop");
 }
 
 #[test]
@@ -263,7 +298,7 @@ fn argo_queries_select_the_canary_and_divide_by_the_budget() {
     assert_eq!(argo["kind"], "AnalysisTemplate");
     assert_eq!(argo["metadata"]["name"], "shop-slo");
     let metrics = argo["spec"]["metrics"].as_sequence().expect("metrics");
-    assert_eq!(metrics.len(), 3);
+    assert_eq!(metrics.len(), 4);
     let query = metrics[0]["provider"]["prometheus"]["query"]
         .as_str()
         .expect("query");
@@ -295,11 +330,16 @@ fn flagger_has_one_template_per_slo_and_the_helm_values_name_them() {
         .collect();
     assert_eq!(
         names,
-        vec!["shop-availability", "shop-checkout", "shop-orders-latency"]
+        vec![
+            "shop-availability",
+            "shop-checkout",
+            "shop-orders-latency",
+            "shop-latency",
+        ]
     );
     for doc in &docs {
         let query = doc["spec"]["query"].as_str().expect("query");
-        assert!(query.contains("[{{ interval }}]"), "{query}");
+        assert!(query.contains("[5m]"), "{query}");
         assert!(query.contains("pod=~\"{{ target }}-"), "{query}");
     }
     let values: serde_yaml::Value =
@@ -332,11 +372,49 @@ fn the_app_name_is_made_kubernetes_safe() {
 #[test]
 fn a_bad_selector_is_rejected() {
     let slos = slo::validate(&fixture_configs()).expect("valid");
-    for bad in ["{job=\"x\"}", "job", "a=\"b\"\nc"] {
+    for bad in [
+        "{job=\"x\"}",
+        "job",
+        "a=\"b\"\nc",
+        "job=shop",
+        "job=\"shop\" # x",
+        "job=\"unterminated",
+        "job=\"a\"env=\"b\"",
+        "slo=\"x\"",
+        "route=\"/x\"",
+        "job=\"{{args.x}}\"",
+        "1job=\"x\"",
+    ] {
         let mut options = fixture_options();
         options.selector = Some(bad.to_owned());
         assert!(generate(&slos, &options).is_err(), "{bad:?}");
     }
+}
+
+#[test]
+fn the_selector_is_parsed_and_normalized() {
+    let parsed =
+        parse_selector(r#" job="shop", path=~"a{2}" ,env!="dev",x!~"a\"b" "#).expect("valid");
+    let rendered: Vec<_> = parsed.iter().map(Matcher::render).collect();
+    assert_eq!(
+        rendered,
+        vec![
+            r#"job="shop""#,
+            r#"path=~"a{2}""#,
+            r#"env!="dev""#,
+            r#"x!~"a\"b""#
+        ]
+    );
+    assert_eq!(parse_selector("").expect("empty"), Vec::new());
+}
+
+#[test]
+fn the_helm_values_comment_follows_the_out_dir() {
+    let slos = slo::validate(&fixture_configs()).expect("valid");
+    let mut options = fixture_options();
+    options.out_dir = "ops/slo/".to_owned();
+    let generated = generate(&slos, &options).expect("generate");
+    assert!(file(&generated, "helm-values.yaml").contains("-f ops/slo/helm-values.yaml"));
 }
 
 #[test]
@@ -407,8 +485,8 @@ fn execute_writes_then_check_passes_then_detects_drift() {
     };
     assert_eq!(paths.len(), 6);
     assert_eq!(
-        std::fs::read_to_string(dir.join("helm-values.yaml")).expect("read"),
-        file(&fixture(), "helm-values.yaml")
+        std::fs::read_to_string(dir.join("prometheus-rules.yaml")).expect("read"),
+        file(&fixture(), "prometheus-rules.yaml")
     );
 
     let (outcome, _) = execute(&configs, "ignored", &args(&dir, true)).expect("check");

@@ -29,21 +29,26 @@ dashboards and no Kubernetes manifests (ADR 0001, phase 3). Issue #3069.
    the Flagger analysis and the deploy bake fail a release that burns its error
    budget at the fast page rate.
 5. **The deploy bake samples `/actuator/metrics` over SSH.** Each sample is one
-   remote command (`sleep N && curl …`). The CLI reads no clock, so the
-   recording executor drives the tests. A breach rolls the host back with the
-   existing compensation path. In a fleet it halts the rollout with the step
-   `bake`, and the existing fleet compensation rolls back every host on the new
-   release.
+   remote command (`sleep N && curl … && systemctl show -p NRestarts …`). It
+   sends a trusted `Host` header, because the `prod` profile rejects
+   `127.0.0.1`. The CLI reads no clock, so the recording executor drives the
+   tests. A breach rolls the host back with the existing compensation path. In
+   a fleet it halts the rollout with the step `bake`. The existing fleet
+   compensation then rolls back every host on the new release, `Degraded`
+   hosts included.
 6. **Thin traffic never rolls back.** Fewer than `min_requests` new responses
-   give no verdict. A counter reset (a restart) and an unreadable sample always
-   roll back.
+   give no verdict, and the bake does not count its own metric requests. An
+   error breach needs at least 2 new 5xx. A restart (a higher systemd
+   `NRestarts`, or a counter that goes down) always rolls back. A sample that
+   fails two times in a row rolls back.
 7. **`autumn release init --target kubernetes`** writes a Helm chart and a
    Kustomize base. The chart computes `terminationGracePeriodSeconds` from the
    same values that set the drain window, and refuses a buffer under 1 s.
 8. **Argo canaries use the pod-template hash as the `version` label.** The hash
    does not change on promotion, so a later analysis cannot mix pods.
 9. **CI checks the generated files with the real tools** (`helm lint`,
-   `kubeconform`, `kustomize`, `promtool`), pinned and checksum-verified.
+   `kubeconform`, `kustomize`, `promtool`). CI pins each tool version and checks
+   its SHA-256 on every run. It pins the schema sources to commits.
 10. **Verus proves the bake verdict** (`verification/bake_verdict.rs`): thin
     traffic never rolls back, a restart always does, the error gate is
     monotonic, and a pass is sound. A property test checks that the runtime
@@ -69,7 +74,10 @@ dashboards and no Kubernetes manifests (ADR 0001, phase 3). Issue #3069.
   availability works today.
 - The bake judges the whole app, so it uses only SLOs with no `route`.
   `/actuator/metrics` has p50, p95 and p99 only, so a latency objective maps to
-  the nearest quantile at or below it.
+  the nearest quantile at or below it. These quantiles cover the app's last
+  10,000 requests, not the bake window only.
+- The 3d and 30d windows add up recorded 5m rates. They need 30 days of
+  Prometheus retention.
 - A failed bake rolls back binaries only. A migration that already ran stays
   applied, as for every automatic rollback.
 - The chart has no migration Job and no Ingress.

@@ -9549,13 +9549,20 @@ fn ci_lints_the_kubernetes_manifests_and_slo_files() {
     );
     let script = std::fs::read_to_string(root.join("scripts/check-k8s-manifests.sh"))
         .expect("read scripts/check-k8s-manifests.sh");
+    assert!(
+        !script.contains("CRDs-catalog/main") && !script.contains("kubernetes-json-schema/master"),
+        "schemas must come from pinned commits"
+    );
     for needle in [
         "lint --strict",
         "kubeconform",
         "build \"${rendered}/kustomize\"",
         "check rules",
         "test rules",
-        "sha256sum -c",
+        "checksum mismatch",
+        "K8S_SCHEMA_COMMIT=",
+        "CRD_CATALOG_COMMIT=",
+        "-cache",
     ] {
         assert!(script.contains(needle), "the gate must run `{needle}`");
     }

@@ -1,11 +1,25 @@
 {{/*
-The full name: the release name, plus the chart name when it is not part of it.
+The chart name, or nameOverride.
+*/}}
+{{- define "app.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 55 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/*
+The object name: fullnameOverride, or the release name plus the chart name
+when it is not part of it. At most 55 characters, so Flagger can add
+-primary or -canary and stay within 63.
 */}}
 {{- define "app.fullname" -}}
-{{- if contains .Chart.Name .Release.Name -}}
-{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 55 | trimSuffix "-" -}}
 {{- else -}}
-{{- printf "%s-%s" .Release.Name .Chart.Name | trunc 63 | trimSuffix "-" -}}
+{{- $name := include "app.name" . -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 55 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 55 | trimSuffix "-" -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 
@@ -17,7 +31,7 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 
 {{- define "app.selectorLabels" -}}
-app.kubernetes.io/name: {{ .Chart.Name }}
+app.kubernetes.io/name: {{ include "app.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
@@ -40,11 +54,17 @@ The pod template. The Deployment and the Rollout share it.
 metadata:
   labels:
     {{- include "app.selectorLabels" . | nindent 4 }}
-  {{- if .Values.metrics.annotations }}
+  {{- $scrape := and .Values.metrics.annotations (not .Values.metrics.podMonitor.enabled) }}
+  {{- if or $scrape .Values.podAnnotations }}
   annotations:
+    {{- if $scrape }}
     prometheus.io/scrape: "true"
-    prometheus.io/path: /actuator/prometheus
+    prometheus.io/path: {{ .Values.metrics.path | quote }}
     prometheus.io/port: {{ .Values.containerPort | quote }}
+    {{- end }}
+    {{- with .Values.podAnnotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
   {{- end }}
 spec:
   {{- with .Values.imagePullSecrets }}
@@ -52,6 +72,8 @@ spec:
     {{- toYaml . | nindent 4 }}
   {{- end }}
   terminationGracePeriodSeconds: {{ include "app.gracePeriod" . }}
+  # The app does not call the Kubernetes API.
+  automountServiceAccountToken: false
   securityContext:
     runAsNonRoot: true
     runAsUser: 10001

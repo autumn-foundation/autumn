@@ -30,11 +30,11 @@ helm upgrade --install shop deploy/helm \
   --set image.tag=1.4.0
 ```
 
-With Kustomize, make an overlay that sets the image and the Secret, then apply
-it:
+With Kustomize, make an overlay that uses the base. Set the image and the
+Secret in the overlay. Then apply the overlay:
 
 ```bash
-kubectl apply -k deploy/kustomize/base
+kubectl apply -k deploy/kustomize/overlays/prod
 ```
 
 Put `AUTUMN_DATABASE__PRIMARY_URL` and `AUTUMN_SECURITY__SIGNING_SECRET` in a
@@ -57,6 +57,7 @@ not start without a signing secret.
 | `PodDisruptionBudget` | `maxUnavailable: 1` | A node drain removes one pod at a time. |
 | Rolling update | `maxUnavailable: 0`, `maxSurge: 1` | A new pod is ready before an old pod stops. |
 | Security | non-root UID 10001, no privilege escalation, all capabilities dropped | Matches the image user. |
+| `automountServiceAccountToken` | `false` | The app does not call the Kubernetes API. |
 
 Do not point a probe at `/health`. It fails when a dependency is down. See
 [Cloud-Native Autumn](cloud-native.md) for the probe contract.
@@ -84,9 +85,17 @@ In the Kustomize base, the four numbers are literals. A comment in
 
 ## Metrics
 
-Each pod has `prometheus.io/*` annotations for `/actuator/prometheus` on the
-app port. With prometheus-operator, set `metrics.serviceMonitor.enabled=true`
-to render a `ServiceMonitor` instead.
+Each pod has `prometheus.io/*` annotations for `metrics.path`
+(`/actuator/prometheus`) on the app port. Change `metrics.path` when you change
+the `[actuator] prefix`.
+
+With prometheus-operator, set `metrics.podMonitor.enabled=true` to render a
+`PodMonitor`. The chart then removes the annotations, so Prometheus does not
+scrape a pod two times. Set `metrics.podMonitor.labels` to the labels your
+Prometheus selects on, for example `release: kube-prometheus-stack`. A
+`PodMonitor` finds the Flagger primary and canary pods too.
+
+Keep `/actuator/*` off the public internet. Block it at your Ingress.
 
 ---
 
@@ -99,6 +108,16 @@ The chart refuses to render with both.
 |---|---|
 | `rollout.enabled=true` | Renders an Argo Rollouts `Rollout` with canary steps (`rollout.steps`), not a Deployment. |
 | `flagger.enabled=true` | Renders a Flagger `Canary` for the Deployment. Flagger makes the Services, so the chart does not. |
+
+The Argo Rollouts canary has no traffic router, so the weight is a pod count.
+With 2 replicas, `setWeight: 20` and `setWeight: 50` each give 1 canary pod
+(about 33 % of the traffic). Use more replicas for finer steps.
+
+Flagger needs a traffic source to shift weight. Set `flagger.provider` (for
+example `nginx`) and `flagger.ingressRef`. With the plain `kubernetes`
+provider, Flagger does a blue/green test. A canary with no traffic gives no
+metric values, and Flagger fails it. Add a load test in `flagger.webhooks`
+when your app has little traffic.
 
 The canary analysis comes from your SLOs. Run `autumn slo generate`, apply its
 templates, and pass `deploy/slo/helm-values.yaml` to Helm:
@@ -116,8 +135,8 @@ faster than that. See [SLOs as Code](slo.md#canary-analysis).
 
 With Argo Rollouts, the chart sets `AUTUMN_DEPLOY_VERSION` to the
 `rollouts-pod-template-hash` label. The `version` metric label then tells the
-canary pods from the stable pods. The label does not change when a canary is
-promoted, so a later analysis cannot mix old and new pods.
+canary pods from the stable pods. Promotion does not change the label. A later
+analysis cannot mix old and new pods.
 
 ---
 
@@ -126,7 +145,8 @@ promoted, so a later analysis cannot mix old and new pods.
 The `Kubernetes manifests` job in this repository runs
 `scripts/check-k8s-manifests.sh`. It renders the templates and runs:
 
-- `helm lint --strict` with the default values, and with each canary mode.
+- `helm lint --strict` with the default values, each canary mode, and the
+  `PodMonitor`.
 - `helm template | kubeconform -strict` for each of those modes.
 - `kustomize build | kubeconform -strict` on the base.
 - `kubeconform` on the generated SLO templates, and `promtool` on the rules.
@@ -137,6 +157,9 @@ Run the same check on your own chart:
 helm lint --strict deploy/helm
 helm template shop deploy/helm | kubeconform -strict -summary
 ```
+
+Object names are at most 55 characters, so Flagger can add `-primary` or
+`-canary`. Use `nameOverride` or `fullnameOverride` to set them.
 
 ## Not included
 

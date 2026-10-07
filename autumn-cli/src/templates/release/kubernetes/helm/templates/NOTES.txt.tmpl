@@ -2,6 +2,6 @@
 
 Probes: startup {{ .Values.probes.startupPath }}, liveness {{ .Values.probes.livePath }}, readiness {{ .Values.probes.readyPath }}.
 Grace period: {{ include "app.gracePeriod" . }} s.
-Metrics: /actuator/prometheus on port {{ .Values.containerPort }}.
+Metrics: {{ .Values.metrics.path }} on port {{ .Values.containerPort }}.
 
 Run `autumn slo generate` to make SLO alerts and canary analysis templates.

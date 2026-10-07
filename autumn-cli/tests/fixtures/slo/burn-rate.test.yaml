@@ -2,9 +2,12 @@
 # CI runs it in scripts/check-k8s-manifests.sh:
 #   promtool test rules autumn-cli/tests/fixtures/slo/burn-rate.test.yaml
 #
-# The "availability" SLO has an objective of 99.9 %. Traffic is 1000
-# good responses per minute. From minute 60, 100 more responses per minute
-# are 5xx (about 9 %). That burns the budget at about 90x.
+# Test 1 and 2: the "availability" SLO (99.9 %). Traffic is 1000 good
+# responses per minute. From minute 60, 100 more responses per minute are 5xx
+# (about 9 %). That burns the budget at about 90x.
+#
+# Test 3: the "latency" SLO (95 % under 1 s, all routes). The bucket uses the
+# Prometheus 3 form le="1.0". From minute 60, every request is slow.
 rule_files:
   - ../../golden/slo/prometheus-rules.yaml
 
@@ -22,12 +25,12 @@ tests:
       - expr: autumn_slo:sli_error:ratio_rate5m{slo="availability"}
         eval_time: 50m
         exp_samples:
-          - labels: 'autumn_slo:sli_error:ratio_rate5m{app="shop",slo="availability"}'
+          - labels: 'autumn_slo:sli_error:ratio_rate5m{app="shop",job="shop",slo="availability"}'
             value: 0
       - expr: autumn_slo:objective:ratio{slo="availability"}
         eval_time: 50m
         exp_samples:
-          - labels: 'autumn_slo:objective:ratio{app="shop",slo="availability"}'
+          - labels: 'autumn_slo:objective:ratio{app="shop",job="shop",slo="availability"}'
             value: 0.999
     alert_rule_test:
       # Before the spike: no alert.
@@ -39,6 +42,7 @@ tests:
         exp_alerts:
           - exp_labels:
               app: shop
+              job: shop
               slo: availability
               severity: page
               long_window: 1h
@@ -48,6 +52,7 @@ tests:
               description: "Objective 99.9% (non-5xx responses, all routes). The error ratio is above 0.0144 over 1h and 5m."
           - exp_labels:
               app: shop
+              job: shop
               slo: availability
               severity: ticket
               long_window: 3d
@@ -57,6 +62,7 @@ tests:
               description: "Objective 99.9% (non-5xx responses, all routes). The error ratio is above 0.001 over 3d and 6h."
           - exp_labels:
               app: shop
+              job: shop
               slo: availability
               severity: page
               long_window: 6h
@@ -80,6 +86,7 @@ tests:
         exp_alerts:
           - exp_labels:
               app: shop
+              job: shop
               slo: availability
               severity: page
               long_window: 1h
@@ -89,6 +96,7 @@ tests:
               description: "Objective 99.9% (non-5xx responses, all routes). The error ratio is above 0.0144 over 1h and 5m."
           - exp_labels:
               app: shop
+              job: shop
               slo: availability
               severity: ticket
               long_window: 3d
@@ -98,6 +106,7 @@ tests:
               description: "Objective 99.9% (non-5xx responses, all routes). The error ratio is above 0.001 over 3d and 6h."
           - exp_labels:
               app: shop
+              job: shop
               slo: availability
               severity: page
               long_window: 6h
@@ -111,6 +120,7 @@ tests:
         exp_alerts:
           - exp_labels:
               app: shop
+              job: shop
               slo: availability
               severity: ticket
               long_window: 3d
@@ -120,6 +130,7 @@ tests:
               description: "Objective 99.9% (non-5xx responses, all routes). The error ratio is above 0.001 over 3d and 6h."
           - exp_labels:
               app: shop
+              job: shop
               slo: availability
               severity: page
               long_window: 6h
@@ -127,3 +138,72 @@ tests:
             exp_annotations:
               summary: "shop SLO availability burns its error budget at 6x or more"
               description: "Objective 99.9% (non-5xx responses, all routes). The error ratio is above 0.006 over 6h and 30m."
+
+  # Latency: every request becomes slow. A 5xx and an unmatched route
+  # are not latency traffic, so their slow requests do not count.
+  - interval: 1m
+    input_series:
+      - series: 'autumn_http_request_duration_seconds_count{job="shop",route="/a",status_class="2xx"}'
+        values: '0+1000x120'
+      - series: 'autumn_http_request_duration_seconds_bucket{job="shop",route="/a",status_class="2xx",le="1.0"}'
+        values: '0+1000x60 60000x59'
+      - series: 'autumn_http_request_duration_seconds_count{job="shop",route="/a",status_class="5xx"}'
+        values: '0+1000x120'
+      - series: 'autumn_http_request_duration_seconds_bucket{job="shop",route="/a",status_class="5xx",le="1.0"}'
+        values: '0x120'
+      - series: 'autumn_http_request_duration_seconds_count{job="shop",route="_unmatched",status_class="4xx"}'
+        values: '0+1000x120'
+      - series: 'autumn_http_request_duration_seconds_bucket{job="shop",route="_unmatched",status_class="4xx",le="1.0"}'
+        values: '0x120'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: AutumnSloErrorBudgetBurn
+        exp_alerts: []
+      # 15 slow minutes of 75: the 6h and 1h windows are below 6x and 14.4x.
+      - eval_time: 75m
+        alertname: AutumnSloErrorBudgetBurn
+        exp_alerts:
+          - exp_labels:
+              app: shop
+              job: shop
+              slo: latency
+              severity: ticket
+              long_window: 3d
+              short_window: 6h
+            exp_annotations:
+              summary: "shop SLO latency burns its error budget at 1x or more"
+              description: "Objective 95% (requests faster than 1000 ms, all routes). The error ratio is above 0.05 over 3d and 6h."
+      # 60 slow minutes of 120: every window is above its burn rate.
+      - eval_time: 120m
+        alertname: AutumnSloErrorBudgetBurn
+        exp_alerts:
+          - exp_labels:
+              app: shop
+              job: shop
+              slo: latency
+              severity: page
+              long_window: 1h
+              short_window: 5m
+            exp_annotations:
+              summary: "shop SLO latency burns its error budget at 14.4x or more"
+              description: "Objective 95% (requests faster than 1000 ms, all routes). The error ratio is above 0.72 over 1h and 5m."
+          - exp_labels:
+              app: shop
+              job: shop
+              slo: latency
+              severity: ticket
+              long_window: 3d
+              short_window: 6h
+            exp_annotations:
+              summary: "shop SLO latency burns its error budget at 1x or more"
+              description: "Objective 95% (requests faster than 1000 ms, all routes). The error ratio is above 0.05 over 3d and 6h."
+          - exp_labels:
+              app: shop
+              job: shop
+              slo: latency
+              severity: page
+              long_window: 6h
+              short_window: 30m
+            exp_annotations:
+              summary: "shop SLO latency burns its error budget at 6x or more"
+              description: "Objective 95% (requests faster than 1000 ms, all routes). The error ratio is above 0.3 over 6h and 30m."

@@ -803,9 +803,15 @@ jobs:
   k8s-manifests:
     name: Kubernetes manifests (helm lint, kubeconform)
     runs-on: ubuntu-latest
+    # The job runs downloaded tools, so it gets a read-only token and keeps
+    # no credentials in the checkout.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
-      - name: Cache the pinned Kubernetes tools
+        with:
+          persist-credentials: false
+      - name: Cache the pinned Kubernetes tools and schemas
         uses: actions/cache@v6
         with:
           path: target/k8s-tools
@@ -823,8 +829,9 @@ jobs:
         #   rules on the golden rules, with an injected 5xx spike.
         #
         # No Rust toolchain: the script renders the templates itself. A Rust
-        # test keeps its placeholder list complete. The script downloads
-        # pinned tool versions and checks their SHA-256. Self-test first.
+        # test keeps its placeholder list complete. The script pins the tool
+        # versions and the schema commits, and checks each tool tarball's
+        # SHA-256 on every run, also from the cache. Self-test first.
         run: ./scripts/check-k8s-manifests.sh --self-test && ./scripts/check-k8s-manifests.sh
 
   migration-collisions:

@@ -3,6 +3,14 @@
 
 replicaCount: 2
 
+# Override the chart name, or the whole object name. Names are cut to 55
+# characters, so Flagger can add -primary or -canary.
+nameOverride: ""
+fullnameOverride: ""
+
+# Extra pod annotations.
+podAnnotations: {}
+
 image:
   repository: {{k8s_name}}
   # Empty: use the chart appVersion.
@@ -59,12 +67,19 @@ tolerations: []
 affinity: {}
 
 metrics:
-  # Add prometheus.io/* scrape annotations to each pod.
+  # The scrape path: your [actuator] prefix, then /prometheus.
+  path: /actuator/prometheus
+  # Add prometheus.io/* scrape annotations to each pod. The chart does not
+  # add them when podMonitor is on, so Prometheus does not scrape a pod twice.
   annotations: true
-  # A prometheus-operator ServiceMonitor. Needs the monitoring.coreos.com CRDs.
-  serviceMonitor:
+  # A prometheus-operator PodMonitor. Needs the monitoring.coreos.com CRDs.
+  # It selects pods, so it also finds the Flagger primary and canary pods.
+  podMonitor:
     enabled: false
     interval: 30s
+    # Labels that your Prometheus selects on, for example
+    # `release: kube-prometheus-stack`.
+    labels: {}
 
 # Argo Rollouts canary. Needs the Argo Rollouts controller. The chart then
 # renders a Rollout, not a Deployment.
@@ -80,6 +95,16 @@ rollout:
 # not render one. Do not set this and rollout.enabled together.
 flagger:
   enabled: false
+  # The traffic provider, for example nginx, istio or gatewayapi:v1. Empty:
+  # Flagger's default. With the plain kubernetes provider, Flagger does a
+  # blue/green test, not a weighted canary.
+  provider: ""
+  # The Ingress for an ingress provider, for example
+  # {apiVersion: networking.k8s.io/v1, kind: Ingress, name: shop}.
+  ingressRef: {}
+  # Flagger webhooks, for example a load test. A canary with no traffic gives
+  # no metric values, and Flagger fails it.
+  webhooks: []
   interval: 1m
   threshold: 2
   maxWeight: 50

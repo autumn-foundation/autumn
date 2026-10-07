@@ -70,6 +70,10 @@ pub const BAKE_ROLLED_BACK: &str = "The host was rolled back to the previous rel
 pub const BAKE_ROLLBACK_FAILED: &str = "The automatic rollback did not finish, so the host can \
      still run the new release. Run `autumn deploy rollback`.";
 
+/// [`DeployError::BakeFailed`]: the rollback target was not safe to use.
+pub const BAKE_ROLLBACK_REFUSED: &str = "The automatic rollback was not safe, so the host still \
+     runs the new release. Follow the recovery steps above.";
+
 /// [`DeployError::BakeFailed`]: `--no-rollback` left the new release live.
 pub const BAKE_FROZEN: &str = "--no-rollback is set, so the new release still serves. Run \
      `autumn deploy rollback` to roll back.";
@@ -106,9 +110,12 @@ pub enum DeployError {
     /// The post-cutover bake found a breach on a one-host deploy (issue #3069).
     ///
     /// A fleet reports a bake breach as [`Self::FleetHalted`] with the step
-    /// `bake`. `result` is one of [`BAKE_ROLLED_BACK`], [`BAKE_ROLLBACK_FAILED`]
-    /// or [`BAKE_FROZEN`].
-    #[error("the bake failed on {host}: {reason}. {result}")]
+    /// `bake`. `result` is one of [`BAKE_ROLLED_BACK`], [`BAKE_ROLLBACK_FAILED`],
+    /// [`BAKE_ROLLBACK_REFUSED`] or [`BAKE_FROZEN`].
+    #[error(
+        "the bake failed on {host}: {reason}. {result}{}",
+        .schema_note.map_or_else(String::new, |note| format!(" Note: {note}"))
+    )]
     BakeFailed {
         /// The host.
         host: String,
@@ -116,6 +123,8 @@ pub enum DeployError {
         reason: String,
         /// What the deploy did about it.
         result: &'static str,
+        /// Set when a migration ran: the rollback restored binaries only.
+        schema_note: Option<&'static str>,
     },
 
     /// A multi-host rollout stopped mid-fleet (issue #1621, AC-3).
@@ -3752,7 +3761,8 @@ fn run_up(
     if let Some(policy) = &bake_policy {
         eprintln!("{}\n", policy.describe());
     }
-    let metrics_path = actuator_metrics_path(&config.actuator.prefix);
+    let metrics_path = bake::metrics_path(&config.actuator.prefix);
+    let bake_host = bake::host_header(&config.security.trusted_hosts.hosts);
 
     run_up_with(
         &FleetUpInput {
@@ -3787,6 +3797,7 @@ fn run_up(
             auto_rollback: !options.no_rollback,
             bake: bake_policy.as_ref(),
             metrics_path: &metrics_path,
+            bake_host: bake_host.as_deref(),
         },
         // Host presence is guaranteed by the passing ssh_reachability grader above,
         // so this `None` arm is unreachable in practice; it keeps the pre-#1621
@@ -3816,11 +3827,6 @@ fn resolve_bake_policy(
     let slos =
         autumn_web::slo::validate(&config.slo).map_err(|e| DeployError::Config(e.to_string()))?;
     bake::resolve_policy(&bake_config, &slos, flag).map_err(DeployError::Config)
-}
-
-/// The `/actuator/metrics` path under the configured actuator prefix.
-fn actuator_metrics_path(prefix: &str) -> String {
-    format!("{}/metrics", prefix.trim_end_matches('/'))
 }
 
 /// What this project's `[database]` config means for a fleet rollout (issue #1621,
@@ -3915,6 +3921,9 @@ struct FleetUpInput<'a, P: ProxyController> {
     bake: Option<&'a bake::BakePolicy>,
     /// The app's `/actuator/metrics` path, which the bake samples.
     metrics_path: &'a str,
+    /// A `Host` header for the bake's metric requests, from
+    /// `[security.trusted_hosts]`. The `prod` profile rejects `127.0.0.1`.
+    bake_host: Option<&'a str>,
 }
 
 /// One host's read-only probe result: everything the rollout needs to know about
@@ -4422,6 +4431,25 @@ where
                                     host_plan.host,
                                     input.release_id,
                                 );
+                                // The host serves the new release, so it bakes too.
+                                if matches!(
+                                    bake_host(
+                                        input,
+                                        index,
+                                        single,
+                                        host_plan,
+                                        cfg,
+                                        &state.slots,
+                                        executor
+                                    ),
+                                    BakeStep::Halt | BakeStep::Fail(_)
+                                ) {
+                                    outcomes[index] = fleet::HostOutcome::LiveOnNew {
+                                        failed_step: bake::BAKE_LABEL,
+                                    };
+                                    halt = Some((host_plan.host.clone(), bake::BAKE_LABEL));
+                                    break;
+                                }
                                 continue;
                             }
                             // The proxy's public bind is now unknown — unlike a
@@ -4449,66 +4477,16 @@ where
                         }
                     }
                 }
-                // The post-cutover bake (#3069). A first deploy has no previous
-                // release to return to, so it does not bake.
-                if let Some(policy) = input.bake {
-                    let prefix = if single {
-                        String::new()
-                    } else {
-                        format!("[{}/{total} {}] ", index + 1, host_plan.host)
-                    };
-                    if matches!(host_plan.mode, fleet::HostMode::First) {
-                        eprintln!(
-                            "{prefix}bake skipped: a first deploy has no previous release \
-                             to roll back to."
-                        );
-                    } else {
-                        let outcome = bake::run(
-                            policy,
-                            state.slots.candidate_port,
-                            input.metrics_path,
-                            executor,
-                            &mut |line| eprintln!("{prefix}{line}"),
-                        );
-                        match outcome {
-                            bake::BakeOutcome::Passed { responses, judged } => {
-                                if judged {
-                                    eprintln!("{prefix}bake passed ({responses} responses).");
-                                } else {
-                                    eprintln!(
-                                        "\u{26A0}\u{FE0F}  {prefix}bake passed with no verdict: \
-                                         {responses} responses is fewer than {}.",
-                                        policy.min_requests
-                                    );
-                                }
-                            }
-                            bake::BakeOutcome::Breached(breach) => {
-                                eprintln!("\n\u{274C} {prefix}bake failed: {breach}\n");
-                                if single {
-                                    let result = if !input.auto_rollback {
-                                        BAKE_FROZEN
-                                    } else if compensate_rollback(cfg, input, executor)
-                                        == fleet::HostOutcome::CompensatedRollback
-                                    {
-                                        BAKE_ROLLED_BACK
-                                    } else {
-                                        BAKE_ROLLBACK_FAILED
-                                    };
-                                    return Err(DeployError::BakeFailed {
-                                        host: host_plan.host.clone(),
-                                        reason: breach.to_string(),
-                                        result,
-                                    });
-                                }
-                                // The fleet halt compensates this host with the
-                                // others that are on the new release.
-                                outcomes[index] = fleet::HostOutcome::LiveOnNew {
-                                    failed_step: bake::BAKE_LABEL,
-                                };
-                                halt = Some((host_plan.host.clone(), bake::BAKE_LABEL));
-                                break;
-                            }
-                        }
+                // The post-cutover bake (#3069).
+                match bake_host(input, index, single, host_plan, cfg, &state.slots, executor) {
+                    BakeStep::Continue => {}
+                    BakeStep::Fail(error) => return Err(error),
+                    BakeStep::Halt => {
+                        outcomes[index] = fleet::HostOutcome::LiveOnNew {
+                            failed_step: bake::BAKE_LABEL,
+                        };
+                        halt = Some((host_plan.host.clone(), bake::BAKE_LABEL));
+                        break;
                     }
                 }
                 outcomes[index] = fleet::HostOutcome::Serving;
@@ -4592,6 +4570,17 @@ where
                         host_plan.host,
                         input.release_id,
                     );
+                    // The host serves the new release, so it bakes too.
+                    if matches!(
+                        bake_host(input, index, single, host_plan, cfg, &state.slots, executor),
+                        BakeStep::Halt | BakeStep::Fail(_)
+                    ) {
+                        outcomes[index] = fleet::HostOutcome::LiveOnNew {
+                            failed_step: bake::BAKE_LABEL,
+                        };
+                        halt = Some((host_plan.host.clone(), bake::BAKE_LABEL));
+                        break;
+                    }
                     continue;
                 }
                 eprintln!(
@@ -4660,6 +4649,104 @@ where
         );
     }
     Ok(())
+}
+
+/// What the rollout does after one host's bake (#3069).
+enum BakeStep {
+    /// No bake, or the bake passed.
+    Continue,
+    /// A fleet host breached: halt and compensate.
+    Halt,
+    /// A single host breached; this is the deploy's error.
+    Fail(DeployError),
+}
+
+/// Bake one host that serves the new release (#3069).
+///
+/// A first deploy does not bake: it has no previous release to return to. A
+/// single host is rolled back here. A fleet host returns [`BakeStep::Halt`],
+/// and the fleet compensation rolls it back with the others.
+fn bake_host<E, P>(
+    input: &FleetUpInput<'_, P>,
+    index: usize,
+    single: bool,
+    host_plan: &fleet::HostPlan,
+    cfg: &ResolvedDeployConfig,
+    slots: &exec::SlotPlan,
+    executor: &E,
+) -> BakeStep
+where
+    E: exec::DeployExecutor,
+    P: ProxyController,
+{
+    let Some(policy) = input.bake else {
+        return BakeStep::Continue;
+    };
+    let prefix = if single {
+        String::new()
+    } else {
+        format!(
+            "[{}/{} {}] ",
+            index + 1,
+            input.fleet.hosts.len(),
+            host_plan.host
+        )
+    };
+    if matches!(host_plan.mode, fleet::HostMode::First) {
+        eprintln!("{prefix}bake skipped: a first deploy has no previous release to roll back to.");
+        return BakeStep::Continue;
+    }
+    let unit = exec::slot_unit_name(&cfg.service_name, slots.candidate_slot);
+    let target = bake::BakeTarget {
+        port: slots.candidate_port,
+        metrics_path: input.metrics_path,
+        host_header: input.bake_host,
+        unit: &unit,
+    };
+    let breach = match bake::run(policy, &target, executor, &mut |line| {
+        eprintln!("{prefix}{line}");
+    }) {
+        bake::BakeOutcome::Passed { responses, judged } => {
+            if judged {
+                eprintln!("{prefix}bake passed ({responses} responses).");
+            } else {
+                eprintln!(
+                    "\u{26A0}\u{FE0F}  {prefix}bake passed with no verdict: {responses} \
+                     responses is fewer than {}.",
+                    policy.min_requests
+                );
+            }
+            return BakeStep::Continue;
+        }
+        bake::BakeOutcome::Breached(breach) => breach,
+    };
+    eprintln!("\n\u{274C} {prefix}bake failed: {breach}\n");
+    if !single {
+        return BakeStep::Halt;
+    }
+    let result = if input.auto_rollback {
+        match compensate_rollback(cfg, input, executor) {
+            fleet::HostOutcome::CompensatedRollback => BAKE_ROLLED_BACK,
+            fleet::HostOutcome::Manual { .. } => BAKE_ROLLBACK_REFUSED,
+            _ => BAKE_ROLLBACK_FAILED,
+        }
+    } else {
+        BAKE_FROZEN
+    };
+    let schema_note = (result == BAKE_ROLLED_BACK && host_plan.migrate == exec::MigrateStep::Run)
+        .then_some(fleet::SINGLE_HOST_SCHEMA_AHEAD_NOTE);
+    if result != BAKE_ROLLED_BACK
+        && let Err(error) = provision_media_host(input.media_cfg, executor)
+    {
+        // The new release still serves, so it still needs its media host.
+        eprintln!("\u{26A0}\u{FE0F}  {error}");
+    }
+    BakeStep::Fail(DeployError::BakeFailed {
+        host: host_plan.host.clone(),
+        reason: breach.to_string(),
+        result,
+        schema_note,
+    })
 }
 
 /// Compensate a halted rollout: undo every host that is already on the new release,
@@ -9978,6 +10065,7 @@ mod tests {
                 auto_rollback: true,
                 bake: None,
                 metrics_path: "/actuator/metrics",
+                bake_host: Some("app.example.com"),
             }
         }
 
@@ -13698,16 +13786,21 @@ mod tests {
             interval_secs: 10,
             min_requests: 20,
             max_error_ppm: 14_400,
-            latency: None,
+            latency: Vec::new(),
             source: "test".to_owned(),
         }
     }
 
-    /// A `/actuator/metrics` body with `ok` 2xx and `errors` 5xx responses.
+    /// A bake sample's stdout: `ok` 2xx and `errors` 5xx responses, then the
+    /// systemd restart count.
     fn bake_metrics(ok: u64, errors: u64) -> String {
         format!(
             r#"{{"http":{{"latency_ms":{{"p50":1,"p95":2,"p99":3}},
-            "by_status":{{"2xx":{ok},"3xx":0,"4xx":0,"5xx":{errors}}}}}}}"#
+            "by_status":{{"2xx":{ok},"3xx":0,"4xx":0,"5xx":{errors}}}}}}}
+{}
+0
+"#,
+            bake::RESTARTS_MARKER
         )
     }
 
@@ -13752,13 +13845,18 @@ mod tests {
             host,
             reason,
             result,
+            schema_note,
         } = &err
         else {
             panic!("expected BakeFailed, got {err:?}");
         };
         assert_eq!(host, "web-a");
-        assert!(reason.contains("40 of 200 responses were 5xx"), "{reason}");
+        // 200 new responses, less the bake's own 2 metric requests.
+        assert!(reason.contains("40 of 198 responses were 5xx"), "{reason}");
         assert_eq!(*result, BAKE_ROLLED_BACK);
+        // A one-host deploy runs the migration, so the schema stays ahead.
+        assert_eq!(*schema_note, Some(fleet::SINGLE_HOST_SCHEMA_AHEAD_NOTE));
+        assert!(err.to_string().contains("was NOT rolled back"), "{err}");
 
         // The bake runs after the cutover, and the rollback after the bake.
         let flip = recorder.index_of("web-a", "proxy-flip").expect("cut over");
@@ -13830,6 +13928,8 @@ mod tests {
             shell.contains("'http://127.0.0.1:3002/ops/metrics'"),
             "{shell}"
         );
+        assert!(shell.contains("-H 'Host: app.example.com'"), "{shell}");
+        assert!(shell.contains("'myapp-green.service'"), "{shell}");
     }
 
     #[test]
@@ -13903,6 +14003,29 @@ mod tests {
     fn a_failed_automatic_rollback_after_the_bake_is_reported() {
         let fleet = fleet_of(&["web-a"]);
         let recorder = script_redeploy(fleet::test_support::FleetRecorder::new(), "web-a");
+        // The rollback starts, then its restart fails.
+        let recorder =
+            script_compensation(recorder, "web-a", "present").fail("web-a", "restart-previous");
+        let recorder = script_bake(recorder, "web-a", &SPIKED_BAKE);
+        let fixture = FleetFixture::new();
+        let policy = bake_policy();
+        let input = FleetUpInput {
+            bake: Some(&policy),
+            ..fixture.input(&fleet)
+        };
+
+        let err = run_up_with(&input, |cfg| Ok(recorder.executor(cfg))).expect_err("fails");
+
+        assert!(
+            matches!(err, DeployError::BakeFailed { result, schema_note: None, .. } if result == BAKE_ROLLBACK_FAILED),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_unsafe_rollback_after_the_bake_is_refused_and_reported() {
+        let fleet = fleet_of(&["web-a"]);
+        let recorder = script_redeploy(fleet::test_support::FleetRecorder::new(), "web-a");
         // The previous release dir is gone, so the rollback refuses.
         let recorder = script_compensation(recorder, "web-a", "absent");
         let recorder = script_bake(recorder, "web-a", &SPIKED_BAKE);
@@ -13916,8 +14039,118 @@ mod tests {
         let err = run_up_with(&input, |cfg| Ok(recorder.executor(cfg))).expect_err("fails");
 
         assert!(
-            matches!(err, DeployError::BakeFailed { result, .. } if result == BAKE_ROLLBACK_FAILED),
+            matches!(err, DeployError::BakeFailed { result, .. } if result == BAKE_ROLLBACK_REFUSED),
             "{err:?}"
+        );
+        assert!(recorder.index_of("web-a", "restart-previous").is_none());
+    }
+
+    #[test]
+    fn no_rollback_freezes_a_fleet_whose_bake_failed() {
+        let hosts = ["web-a", "web-b", "web-c"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_redeploy(recorder, host);
+        }
+        recorder = script_bake(recorder, "web-a", &HEALTHY_BAKE);
+        recorder = script_bake(recorder, "web-b", &SPIKED_BAKE);
+        let fixture = FleetFixture::new();
+        let policy = bake_policy();
+        let input = FleetUpInput {
+            bake: Some(&policy),
+            ..fixture.input_frozen(&fleet)
+        };
+
+        let err = run_up_with(&input, |cfg| Ok(recorder.executor(cfg))).expect_err("halts");
+
+        let halt = fleet_halt_of(&err);
+        assert_eq!(halt.failed_host, "web-b");
+        assert_eq!(halt.failed_step, bake::BAKE_LABEL);
+        assert!(halt.rolled_back.is_empty(), "{:?}", halt.rolled_back);
+        assert_eq!(
+            halt.still_on_new,
+            vec!["web-a".to_owned(), "web-b".to_owned()]
+        );
+        assert!(recorder.positions_of("restart-previous").is_empty());
+    }
+
+    #[test]
+    fn a_host_degraded_by_a_port_rebind_still_bakes() {
+        // web-a's port move rolls back, so web-a is Degraded on the new release.
+        // Its bake must still run; here the bake fails and the fleet halts.
+        let fleet = fleet_of(&["web-a", "web-b"]);
+        let probe_a = "redeploy:blue\t81\n\
+             ---autumn-kamal-proxy-list---\n\
+             ---autumn-kamal-proxy-unit---\n--http-port 80\n"
+            .to_owned();
+        let recorder = fleet::test_support::FleetRecorder::new()
+            .script("web-a", "proxy-compat-probe", compatible_deploy_help())
+            .script("web-a", "detect-current", probe_a)
+            .script("web-a", "probe-release-dir", "absent")
+            .fail_on_occurrence("web-a", "proxy-restart-if-changed", 2);
+        let recorder = script_compensation(recorder, "web-a", "present");
+        let recorder = script_bake(recorder, "web-a", &SPIKED_BAKE);
+        let recorder = script_redeploy(recorder, "web-b");
+        let fixture = FleetFixture::new();
+        let policy = bake_policy();
+        let input = FleetUpInput {
+            bake: Some(&policy),
+            ..fixture.input(&fleet)
+        };
+
+        let err = run_up_with(&input, |cfg| Ok(recorder.executor(cfg))).expect_err("halts");
+
+        let halt = fleet_halt_of(&err);
+        assert_eq!(halt.failed_host, "web-a");
+        assert_eq!(halt.failed_step, bake::BAKE_LABEL);
+        assert!(recorder.index_of("web-a", bake::SAMPLE_LABEL).is_some());
+        assert!(
+            recorder
+                .run_labels_for("web-b")
+                .iter()
+                .all(|l| !l.starts_with("start-"))
+        );
+    }
+
+    #[test]
+    fn a_degraded_host_still_bakes() {
+        // web-a cuts over, but its housekeeping step fails: it is Degraded and
+        // serves the new release. Its bake must still run, and here it fails.
+        let hosts = ["web-a", "web-b"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_redeploy(recorder, host);
+        }
+        recorder =
+            script_compensation(recorder, "web-a", "present").fail("web-a", "record-proxy-options");
+        recorder = script_bake(recorder, "web-a", &SPIKED_BAKE);
+        let fixture = FleetFixture::new();
+        let policy = bake_policy();
+        let input = FleetUpInput {
+            bake: Some(&policy),
+            ..fixture.input(&fleet)
+        };
+
+        let err = run_up_with(&input, |cfg| Ok(recorder.executor(cfg))).expect_err("halts");
+
+        let halt = fleet_halt_of(&err);
+        assert_eq!(halt.failed_host, "web-a");
+        assert_eq!(halt.failed_step, bake::BAKE_LABEL);
+        assert_eq!(halt.rolled_back, vec!["web-a".to_owned()]);
+        assert!(
+            halt.degraded
+                .iter()
+                .any(|(h, l)| h == "web-a" && *l == "record-proxy-options"),
+            "the debris is still reported: {:?}",
+            halt.degraded
+        );
+        assert!(
+            recorder
+                .run_labels_for("web-b")
+                .iter()
+                .all(|l| !l.starts_with("start-"))
         );
     }
 
@@ -13967,12 +14200,5 @@ mod tests {
             resolve_bake_policy(&config, Some(30)),
             Err(DeployError::Config(message)) if message.contains("[[slo]] availability")
         ));
-    }
-
-    #[test]
-    fn the_metrics_path_follows_the_actuator_prefix() {
-        assert_eq!(actuator_metrics_path("/actuator"), "/actuator/metrics");
-        assert_eq!(actuator_metrics_path("/ops/"), "/ops/metrics");
-        assert_eq!(actuator_metrics_path(""), "/metrics");
     }
 }

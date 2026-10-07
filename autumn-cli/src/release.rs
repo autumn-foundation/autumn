@@ -66,8 +66,8 @@ mod templates {
         include_str!("templates/release/kubernetes/helm/templates/service.yaml.tmpl");
     pub const HELM_PDB: &str =
         include_str!("templates/release/kubernetes/helm/templates/pdb.yaml.tmpl");
-    pub const HELM_SERVICE_MONITOR: &str =
-        include_str!("templates/release/kubernetes/helm/templates/servicemonitor.yaml.tmpl");
+    pub const HELM_POD_MONITOR: &str =
+        include_str!("templates/release/kubernetes/helm/templates/podmonitor.yaml.tmpl");
     pub const HELM_NOTES: &str =
         include_str!("templates/release/kubernetes/helm/templates/NOTES.txt.tmpl");
     pub const KUSTOMIZATION: &str =
@@ -344,15 +344,7 @@ pub fn run(action: ReleaseAction) {
                         "  See docs/guide/deployment.md and docs/guide/signing-secrets.md for the full walkthrough."
                     );
                     if target == Target::Kubernetes {
-                        println!();
-                        println!("  Kubernetes:");
-                        println!("       helm upgrade --install {project_name} deploy/helm");
-                        println!("     or");
-                        println!("       kubectl apply -k deploy/kustomize/base");
-                        println!(
-                            "     Run `autumn slo generate` for SLO alerts and canary analysis. \
-                             See docs/guide/kubernetes.md."
-                        );
+                        println!("{}", kubernetes_next_steps(&project_name));
                     }
                 }
                 Err(e) => {
@@ -865,8 +857,8 @@ const KUBERNETES_FILES: [(&str, &str); 15] = [
     ),
     ("deploy/helm/templates/pdb.yaml", templates::HELM_PDB),
     (
-        "deploy/helm/templates/servicemonitor.yaml",
-        templates::HELM_SERVICE_MONITOR,
+        "deploy/helm/templates/podmonitor.yaml",
+        templates::HELM_POD_MONITOR,
     ),
     ("deploy/helm/templates/NOTES.txt", templates::HELM_NOTES),
     (
@@ -883,6 +875,17 @@ const KUBERNETES_FILES: [(&str, &str); 15] = [
     ),
     ("deploy/kustomize/base/pdb.yaml", templates::KUSTOMIZE_PDB),
 ];
+
+/// The Kubernetes part of the next steps. Helm rejects a release name with
+/// `_`, so the command uses [`k8s_name`].
+fn kubernetes_next_steps(project_name: &str) -> String {
+    format!(
+        "\n  Kubernetes:\n       helm upgrade --install {} deploy/helm\n     or, with your \
+         overlay of the base:\n       kubectl apply -k <your-overlay>\n     Run `autumn slo \
+         generate` for SLO alerts and canary analysis. See docs/guide/kubernetes.md.",
+        k8s_name(project_name)
+    )
+}
 
 /// A DNS-1123 name for Kubernetes objects: lowercase, `-` for `_`, at most
 /// 53 characters (the Helm release-name limit).
@@ -11203,7 +11206,7 @@ esac
             "deploy/helm/templates/canary.yaml",
             "deploy/helm/templates/service.yaml",
             "deploy/helm/templates/pdb.yaml",
-            "deploy/helm/templates/servicemonitor.yaml",
+            "deploy/helm/templates/podmonitor.yaml",
             "deploy/helm/templates/NOTES.txt",
             "deploy/kustomize/base/kustomization.yaml",
             KUSTOMIZE_DEPLOYMENT,
@@ -11215,6 +11218,16 @@ esac
                 "missing {expected}: {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn kubernetes_next_steps_use_a_helm_safe_release_name() {
+        let steps = kubernetes_next_steps("my_shop");
+        assert!(
+            steps.contains("helm upgrade --install my-shop deploy/helm"),
+            "{steps}"
+        );
+        assert!(!steps.contains("my_shop"), "{steps}");
     }
 
     #[test]

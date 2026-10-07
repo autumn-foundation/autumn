@@ -8,8 +8,8 @@ command to make the monitoring files:
 - Argo Rollouts and Flagger analysis templates. A canary fails when it burns
   the error budget too fast.
 
-`autumn deploy up` also reads the SLOs. It can bake each new release and roll
-it back when the release burns the budget too fast. See
+`autumn deploy up` also reads the SLOs. It can bake each new release. It rolls
+the release back when the release burns the budget too fast. See
 [Bake and roll back](#bake-and-roll-back).
 
 ---
@@ -39,21 +39,33 @@ description = "Customers see their orders quickly."
 |---|---|---|
 | `name` | yes | A unique name: lowercase letters, digits and `-`. It starts with a letter. |
 | `objective` | yes | The target percentage of good events. It is more than 0 and less than 100, with four decimals or fewer. |
-| `sli` | yes | `"availability"` (responses that are not 5xx) or `"latency"` (requests that finish in `threshold_ms` or less). |
-| `route` | no | The matched route pattern, for example `/api/orders/{id}`. When you do not set it, the SLO covers all routes. |
+| `sli` | yes | `"availability"` or `"latency"`. See the next table. |
+| `route` | no | The matched route pattern, for example `/api/orders/{id}`. Printable ASCII only, with no space, `"`, `\`, `` ` ``, `{{` or `}}`. When you do not set it, the SLO covers all routes. |
 | `threshold_ms` | latency only | The latency limit. It must be a histogram bucket bound: 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000 or 10000. |
-| `description` | no | Text for the alert annotations and the dashboard. |
+| `description` | no | Text for the alert annotations and the dashboard. It must not contain `{{` or `}}`, because Prometheus reads annotations as templates. |
+
+| SLI | Good events | All events |
+|---|---|---|
+| `availability` | Responses that are not 5xx | All responses |
+| `latency` | Non-5xx requests that finish in `threshold_ms` or less | Non-5xx requests. With no `route`, requests that match no route are not counted. |
+
+The latency SLI does not count 5xx responses, so a fast error does not make
+latency look good. The availability SLI counts them.
 
 The app does not read these tables at run time. Strict config validation
-knows them, so the `prod` profile accepts them and rejects a typo.
+includes these keys. The `prod` profile accepts them. It rejects a key with a
+typo.
 
 ### Which metrics each SLO reads
 
 | SLO | Series |
 |---|---|
-| Availability, all routes | `autumn_http_responses_total{status="5xx"}` |
+| Availability, all routes | `autumn_http_responses_total{status}` |
 | Availability, one route | `autumn_http_request_duration_seconds_count{route, status_class}` |
-| Latency | `autumn_http_request_duration_seconds_bucket{route, le}` |
+| Latency | `autumn_http_request_duration_seconds_count{route, status_class}` and `autumn_http_request_duration_seconds_bucket{route, status_class, le}` |
+
+Prometheus 3 stores a whole-second bucket bound such as `le="1"` as
+`le="1.0"`. The generated queries match both forms.
 
 The route and latency SLOs use the request-duration histogram (issue #3064).
 Until your app exports it, those rules return no data. The all-routes
@@ -90,21 +102,35 @@ date.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--out-dir DIR` | `deploy/slo` | The output directory. |
-| `--app NAME` | `[deploy] app_name`, then the package name | The `app` label and the Kubernetes object names. |
-| `--selector MATCHERS` | none | Extra label matchers for every query, for example `'job="shop"'`. |
+| `--app NAME` | `[deploy] app_name`, then the package name, then `app` | The `app` label and the Kubernetes object names. |
+| `--selector MATCHERS` | none | Extra label matchers for every query, for example `'job="shop",namespace="prod"'`. Each value is in double quotes. |
 | `--prometheus-url URL` | `http://prometheus.monitoring.svc:9090` | The Prometheus address in the analysis templates. |
 | `--check` | off | Compare only. |
 
 > **Set `--selector` when one Prometheus scrapes more than one app.** Without
 > it, the queries add the series of every app together.
 
+Each `=` matcher in `--selector` also becomes a label on the recorded series
+and the alerts. Two environments of one app can then share one Prometheus:
+generate one rule set for each, with `namespace="staging"` and
+`namespace="prod"`.
+
 ---
 
 ## The alerts
 
-For each SLO, the rules record the error ratio over 5m, 30m, 1h, 6h, 3d and
-30d, as `autumn_slo:sli_error:ratio_rate<window>{app, slo}`. They also record
-the objective as `autumn_slo:objective:ratio`.
+For each SLO, the rules record:
+
+- the objective, as `autumn_slo:objective:ratio`;
+- the 5m rate of bad events and of all events, as `autumn_slo:sli_bad:rate5m`
+  and `autumn_slo:sli_total:rate5m`;
+- the error ratio over 5m, 30m, 1h, 6h, 3d and 30d, as
+  `autumn_slo:sli_error:ratio_rate<window>`.
+
+Every recorded series has the labels `app`, `slo` and the `--selector` `=`
+labels. The 3d and 30d ratios add up the recorded 5m rates with
+`sum_over_time`, so they load few samples. They need 30 days of Prometheus
+retention. With less, the 30-day panels cover less time.
 
 Three alerts follow the Google SRE workbook. All three are named
 `AutumnSloErrorBudgetBurn`:
@@ -165,8 +191,9 @@ the limit (`failureLimit: 1`).
 
 `flagger-metric-templates.yaml` holds one `MetricTemplate` for each SLO. It
 selects canary pods with the Flagger `{{ target }}` pod-name pattern. It needs
-the `namespace` and `pod` labels on your series, which a prometheus-operator
-`ServiceMonitor` adds.
+the `namespace` and `pod` labels on your series. The chart's `PodMonitor`
+(`metrics.podMonitor.enabled=true`) adds them. Each query covers 5 minutes, so
+one late scrape does not empty the result. Scrape at least every 30 s.
 
 ```bash
 kubectl apply -f deploy/slo/flagger-metric-templates.yaml
@@ -175,15 +202,17 @@ helm upgrade --install shop deploy/helm \
 ```
 
 The chart puts each template in the `Canary` analysis with
-`thresholdRange.max: 14.4`. Flagger needs traffic to judge a canary. Use its
-load tester when your app has little traffic.
+`thresholdRange.max: 14.4`. Flagger needs traffic to judge a canary. Set
+`flagger.provider` and `flagger.ingressRef` for your ingress or mesh. Add a load
+test in `flagger.webhooks` when your app has little traffic.
 
 ---
 
 ## Bake and roll back
 
-`autumn deploy up` can wait after each host cuts over, sample the new release,
-and roll it back on a bad result. This is the bake. It is off by default.
+After each host cuts over, `autumn deploy up` can wait and sample the new
+release. On a bad result, it rolls the release back. This is the bake. It is
+off by default.
 
 ```toml
 [deploy.bake]
@@ -202,13 +231,15 @@ The limits:
 
 - **5xx ratio.** `max_error_rate` when you set it. Otherwise the 14.4× burn
   rate of the strictest all-routes availability SLO. Otherwise 5 %.
-- **Latency.** `max_p99_ms` when you set it. Otherwise the smallest
-  `threshold_ms` of the all-routes latency SLOs, on the p99, p95 or p50 that
-  matches its objective. Otherwise no latency check.
+- **Latency.** `max_p99_ms` when you set it. Otherwise one limit for each
+  all-routes latency SLO, on the p99, p95 or p50 that matches its objective.
+  When two SLOs map to one quantile, the smaller limit wins. Otherwise no
+  latency check.
 
 The bake rolls the host back when the 5xx ratio or the latency is above the
-limit, when the process restarts, or when `/actuator/metrics` does not answer.
-Fewer than `min_requests` new responses never cause a rollback.
+limit, when the process restarts, or when `/actuator/metrics` does not answer
+two times in a row. Fewer than `min_requests` new responses never cause a
+rollback. One 5xx alone never causes a rollback.
 
 See [the deployment guide](deployment.md#bake-roll-back-on-post-cutover-metrics)
 for the fleet behavior and the output.

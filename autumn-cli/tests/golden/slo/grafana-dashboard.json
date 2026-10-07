@@ -53,7 +53,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "1 - autumn_slo:sli_error:ratio_rate30d{app=\"shop\",slo=\"availability\"}",
+          "expr": "1 - autumn_slo:sli_error:ratio_rate30d{app=\"shop\",job=\"shop\",slo=\"availability\"}",
           "legendFormat": "SLI",
           "datasource": {
             "type": "prometheus",
@@ -85,7 +85,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "1 - autumn_slo:sli_error:ratio_rate30d{app=\"shop\",slo=\"availability\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"availability\"})",
+          "expr": "1 - autumn_slo:sli_error:ratio_rate30d{app=\"shop\",job=\"shop\",slo=\"availability\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",job=\"shop\",slo=\"availability\"})",
           "legendFormat": "budget left",
           "datasource": {
             "type": "prometheus",
@@ -118,7 +118,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "autumn_slo:sli_error:ratio_rate1h{app=\"shop\",slo=\"availability\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"availability\"})",
+          "expr": "autumn_slo:sli_error:ratio_rate1h{app=\"shop\",job=\"shop\",slo=\"availability\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",job=\"shop\",slo=\"availability\"})",
           "legendFormat": "1h",
           "datasource": {
             "type": "prometheus",
@@ -127,7 +127,7 @@
         },
         {
           "refId": "B",
-          "expr": "autumn_slo:sli_error:ratio_rate6h{app=\"shop\",slo=\"availability\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"availability\"})",
+          "expr": "autumn_slo:sli_error:ratio_rate6h{app=\"shop\",job=\"shop\",slo=\"availability\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",job=\"shop\",slo=\"availability\"})",
           "legendFormat": "6h",
           "datasource": {
             "type": "prometheus",
@@ -136,7 +136,7 @@
         },
         {
           "refId": "C",
-          "expr": "autumn_slo:sli_error:ratio_rate3d{app=\"shop\",slo=\"availability\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"availability\"})",
+          "expr": "autumn_slo:sli_error:ratio_rate3d{app=\"shop\",job=\"shop\",slo=\"availability\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",job=\"shop\",slo=\"availability\"})",
           "legendFormat": "3d",
           "datasource": {
             "type": "prometheus",
@@ -165,7 +165,7 @@
       "id": 6,
       "type": "stat",
       "title": "SLI (30d)",
-      "description": "Customers can place orders.",
+      "description": "Customers can place \"orders\".",
       "gridPos": {
         "h": 8,
         "w": 6,
@@ -179,7 +179,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "1 - autumn_slo:sli_error:ratio_rate30d{app=\"shop\",slo=\"checkout\"}",
+          "expr": "1 - autumn_slo:sli_error:ratio_rate30d{app=\"shop\",job=\"shop\",slo=\"checkout\"}",
           "legendFormat": "SLI",
           "datasource": {
             "type": "prometheus",
@@ -211,7 +211,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "1 - autumn_slo:sli_error:ratio_rate30d{app=\"shop\",slo=\"checkout\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"checkout\"})",
+          "expr": "1 - autumn_slo:sli_error:ratio_rate30d{app=\"shop\",job=\"shop\",slo=\"checkout\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",job=\"shop\",slo=\"checkout\"})",
           "legendFormat": "budget left",
           "datasource": {
             "type": "prometheus",
@@ -244,7 +244,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "autumn_slo:sli_error:ratio_rate1h{app=\"shop\",slo=\"checkout\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"checkout\"})",
+          "expr": "autumn_slo:sli_error:ratio_rate1h{app=\"shop\",job=\"shop\",slo=\"checkout\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",job=\"shop\",slo=\"checkout\"})",
           "legendFormat": "1h",
           "datasource": {
             "type": "prometheus",
@@ -253,7 +253,7 @@
         },
         {
           "refId": "B",
-          "expr": "autumn_slo:sli_error:ratio_rate6h{app=\"shop\",slo=\"checkout\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"checkout\"})",
+          "expr": "autumn_slo:sli_error:ratio_rate6h{app=\"shop\",job=\"shop\",slo=\"checkout\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",job=\"shop\",slo=\"checkout\"})",
           "legendFormat": "6h",
           "datasource": {
             "type": "prometheus",
@@ -262,7 +262,7 @@
         },
         {
           "refId": "C",
-          "expr": "autumn_slo:sli_error:ratio_rate3d{app=\"shop\",slo=\"checkout\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"checkout\"})",
+          "expr": "autumn_slo:sli_error:ratio_rate3d{app=\"shop\",job=\"shop\",slo=\"checkout\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",job=\"shop\",slo=\"checkout\"})",
           "legendFormat": "3d",
           "datasource": {
             "type": "prometheus",
@@ -279,7 +279,7 @@
     {
       "id": 9,
       "type": "row",
-      "title": "orders-latency — objective 99% (requests faster than 250 ms, route /api/orders)",
+      "title": "orders-latency — objective 99% (requests faster than 250 ms, route /api/orders/{id})",
       "gridPos": {
         "h": 1,
         "w": 24,
@@ -304,7 +304,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "1 - autumn_slo:sli_error:ratio_rate30d{app=\"shop\",slo=\"orders-latency\"}",
+          "expr": "1 - autumn_slo:sli_error:ratio_rate30d{app=\"shop\",job=\"shop\",slo=\"orders-latency\"}",
           "legendFormat": "SLI",
           "datasource": {
             "type": "prometheus",
@@ -336,7 +336,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "1 - autumn_slo:sli_error:ratio_rate30d{app=\"shop\",slo=\"orders-latency\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"orders-latency\"})",
+          "expr": "1 - autumn_slo:sli_error:ratio_rate30d{app=\"shop\",job=\"shop\",slo=\"orders-latency\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",job=\"shop\",slo=\"orders-latency\"})",
           "legendFormat": "budget left",
           "datasource": {
             "type": "prometheus",
@@ -369,7 +369,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "autumn_slo:sli_error:ratio_rate1h{app=\"shop\",slo=\"orders-latency\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"orders-latency\"})",
+          "expr": "autumn_slo:sli_error:ratio_rate1h{app=\"shop\",job=\"shop\",slo=\"orders-latency\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",job=\"shop\",slo=\"orders-latency\"})",
           "legendFormat": "1h",
           "datasource": {
             "type": "prometheus",
@@ -378,7 +378,7 @@
         },
         {
           "refId": "B",
-          "expr": "autumn_slo:sli_error:ratio_rate6h{app=\"shop\",slo=\"orders-latency\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"orders-latency\"})",
+          "expr": "autumn_slo:sli_error:ratio_rate6h{app=\"shop\",job=\"shop\",slo=\"orders-latency\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",job=\"shop\",slo=\"orders-latency\"})",
           "legendFormat": "6h",
           "datasource": {
             "type": "prometheus",
@@ -387,7 +387,132 @@
         },
         {
           "refId": "C",
-          "expr": "autumn_slo:sli_error:ratio_rate3d{app=\"shop\",slo=\"orders-latency\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",slo=\"orders-latency\"})",
+          "expr": "autumn_slo:sli_error:ratio_rate3d{app=\"shop\",job=\"shop\",slo=\"orders-latency\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",job=\"shop\",slo=\"orders-latency\"})",
+          "legendFormat": "3d",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "row",
+      "title": "latency — objective 95% (requests faster than 1000 ms, all routes)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 27
+      }
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "SLI (30d)",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 0,
+        "y": 28
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1 - autumn_slo:sli_error:ratio_rate30d{app=\"shop\",job=\"shop\",slo=\"latency\"}",
+          "legendFormat": "SLI",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 3
+        }
+      }
+    },
+    {
+      "id": 15,
+      "type": "stat",
+      "title": "Error budget left (30d)",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 28
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1 - autumn_slo:sli_error:ratio_rate30d{app=\"shop\",job=\"shop\",slo=\"latency\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",job=\"shop\",slo=\"latency\"})",
+          "legendFormat": "budget left",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 1
+        }
+      }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Burn rate",
+      "description": "1 spends the budget in exactly 30 days. A page fires at 14.4x (1h and 5m) and at 6x (6h and 30m).",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 28
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "autumn_slo:sli_error:ratio_rate1h{app=\"shop\",job=\"shop\",slo=\"latency\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",job=\"shop\",slo=\"latency\"})",
+          "legendFormat": "1h",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "autumn_slo:sli_error:ratio_rate6h{app=\"shop\",job=\"shop\",slo=\"latency\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",job=\"shop\",slo=\"latency\"})",
+          "legendFormat": "6h",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "autumn_slo:sli_error:ratio_rate3d{app=\"shop\",job=\"shop\",slo=\"latency\"} / (1 - autumn_slo:objective:ratio{app=\"shop\",job=\"shop\",slo=\"latency\"})",
           "legendFormat": "3d",
           "datasource": {
             "type": "prometheus",

@@ -6,6 +6,13 @@ metadata:
   labels:
     {{- include "app.labels" . | nindent 4 }}
 spec:
+  {{- with .Values.flagger.provider }}
+  provider: {{ . }}
+  {{- end }}
+  {{- with .Values.flagger.ingressRef }}
+  ingressRef:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   targetRef:
     apiVersion: apps/v1
     kind: Deployment
@@ -29,4 +36,8 @@ spec:
           max: {{ $.Values.analysis.maxBurnRate }}
         interval: {{ $.Values.flagger.interval }}
       {{- end }}
+    {{- with .Values.flagger.webhooks }}
+    webhooks:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
 {{- end }}

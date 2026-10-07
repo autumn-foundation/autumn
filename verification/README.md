@@ -69,8 +69,15 @@ covers those parts with the default config. The test
 verus verification/bake_verdict.rs
 ```
 
-It proves that thin traffic never rolls back, that a counter reset always
-rolls back, that the error gate is monotonic in the error count, and that a
-pass is sound. The executable `judge` is verified against the spec, with the
-same `u128` arithmetic as the runtime. The property test
-`judge_matches_the_verus_model` checks that the runtime agrees with the spec.
+It proves five rules:
+
+- Thin traffic never rolls back.
+- A restart always rolls back.
+- Fewer than `min_errors` new 5xx never give an error breach.
+- More errors cannot change an error breach to a pass.
+- A pass means that no limit is exceeded.
+
+Verus checks the executable `judge` in the file against the spec, with the
+same `u128` arithmetic as the runtime. The runtime `judge` is separate code.
+The property test `judge_matches_the_verus_model` checks it against a Rust
+copy of `spec_judge`.
