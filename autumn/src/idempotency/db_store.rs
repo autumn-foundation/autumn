@@ -209,6 +209,8 @@ impl IdempotencyStore for DbIdempotencyStore {
     ) -> IdempotencyFuture<'a, ()> {
         Box::pin(async move {
             let bytes = StoredEntry::encode(record, body_hash)?;
+            // The clock after checkout: a slow pool must not eat the TTL.
+            let mut conn = self.conn().await?;
             let now = now_ms();
             let ttl_ms = ms(ttl);
             let expires = now.saturating_add(ttl_ms);
@@ -224,7 +226,6 @@ impl IdempotencyStore for DbIdempotencyStore {
             let held_expiry = keys::locked_until_ms + ttl_ms;
             let expiry = diesel::dsl::case_when(keys::locked_until_ms.gt(now), held_expiry)
                 .otherwise(expires);
-            let mut conn = self.conn().await?;
             let upsert = diesel::insert_into(keys::autumn_idempotency_keys)
                 .values((
                     keys::storage_key.eq(key),
@@ -271,6 +272,10 @@ impl IdempotencyStore for DbIdempotencyStore {
         lock_ttl: Duration,
     ) -> IdempotencyFuture<'a, bool> {
         Box::pin(async move {
+            let mut conn = self.conn().await?;
+            self.sweep(&mut conn).await;
+            // The clock after checkout and the sweep: a slow pool must not
+            // eat the lock's lifetime.
             let now = now_ms();
             let lock_ttl = if lock_ttl.is_zero() {
                 Duration::from_secs(1)
@@ -279,8 +284,6 @@ impl IdempotencyStore for DbIdempotencyStore {
             };
             let until = now.saturating_add(ms(lock_ttl));
             let expires = until.max(after(self.default_ttl));
-            let mut conn = self.conn().await?;
-            self.sweep(&mut conn).await;
             // Check first without a row lock. On Postgres the upsert below
             // waits for any open transaction that changed the row, so a
             // duplicate of a running request must return here, at once.

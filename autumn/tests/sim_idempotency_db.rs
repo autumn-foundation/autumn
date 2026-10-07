@@ -1380,3 +1380,31 @@ async fn commit_after_the_row_is_swept_is_a_conflict() {
     let response = pending.await.expect("join").expect("infallible");
     assert_eq!(response.status(), StatusCode::CONFLICT);
 }
+
+/// The pool (one connection) is busy for longer than the 1 s lock. A's lock
+/// still lasts 1 s from when A gets a connection, so B is refused right after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_ttl_starts_after_pool_checkout() {
+    use autumn_web::idempotency::IdempotencyStore as _;
+    let (substrate, store) = bare_store();
+    let busy = substrate.pool().get().await.expect("checkout");
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        drop(busy);
+    });
+    assert!(
+        store
+            .try_lock("slow-pool", "a", Duration::from_secs(1))
+            .await
+            .unwrap(),
+        "a gets the key once the pool frees"
+    );
+    release.await.expect("join");
+    assert!(
+        !store
+            .try_lock("slow-pool", "b", Duration::from_secs(1))
+            .await
+            .unwrap(),
+        "a's lock is still live"
+    );
+}
