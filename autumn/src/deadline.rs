@@ -184,20 +184,53 @@ pub(crate) struct DeadlineStopped(pub(crate) &'static str);
 /// Run `future`, but stop it at the current deadline.
 ///
 /// With no deadline set, this runs `future` to the end. Past the deadline,
-/// `future` is not polled at all.
+/// `future` is not polled again.
 ///
 /// # Errors
 ///
 /// [`DeadlineExceeded`] when the deadline passes first.
 pub async fn bounded<F: Future>(future: F) -> Result<F::Output, DeadlineExceeded> {
     match Deadline::current() {
-        // `timeout_at` polls the future before it checks the timer, so a
-        // future that is ready at once would still run.
-        Some(deadline) if deadline.is_expired() => Err(DeadlineExceeded),
-        Some(deadline) => tokio::time::timeout_at(deadline.instant(), future)
+        Some(deadline) => {
+            Bounded {
+                deadline,
+                sleep: tokio::time::sleep_until(deadline.instant()),
+                future,
+            }
             .await
-            .map_err(|_elapsed| DeadlineExceeded),
+        }
         None => Ok(future.await),
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// The future of [`bounded`] under a deadline.
+    ///
+    /// Unlike `tokio::time::timeout_at`, which polls the inner future before
+    /// it checks the timer, this checks the deadline before every poll, so
+    /// work that is ready only at or after the deadline does not run.
+    struct Bounded<F> {
+        deadline: Deadline,
+        #[pin]
+        sleep: tokio::time::Sleep,
+        #[pin]
+        future: F,
+    }
+}
+
+impl<F: Future> Future for Bounded<F> {
+    type Output = Result<F::Output, DeadlineExceeded>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        if this.deadline.is_expired() {
+            return Poll::Ready(Err(DeadlineExceeded));
+        }
+        if let Poll::Ready(output) = this.future.poll(cx) {
+            return Poll::Ready(Ok(output));
+        }
+        // Wakes the task at the deadline.
+        this.sleep.poll(cx).map(|()| Err(DeadlineExceeded))
     }
 }
 
@@ -212,6 +245,21 @@ mod tests {
         tokio::time::advance(Duration::from_millis(5)).await;
         let result = deadline
             .scope(bounded(async {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            }))
+            .await;
+        assert_eq!(result, Err(DeadlineExceeded));
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_does_not_resume_work_at_the_deadline() {
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let deadline = Deadline::after(Duration::from_millis(10));
+        // Live at the first poll; ready again only when the deadline is due.
+        let result = deadline
+            .scope(bounded(async {
+                tokio::time::sleep_until(deadline.instant()).await;
                 ran.store(true, std::sync::atomic::Ordering::SeqCst);
             }))
             .await;
