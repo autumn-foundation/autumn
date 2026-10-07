@@ -185,14 +185,12 @@ fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
     )
 }
 
-/// Lock owner for submit-token locks. One token is one request, so all
-/// attempts share an owner and any of them may release the lock.
-const LOCK_OWNER: &str = "";
-
-/// Release the in-flight lock for `key`. An error is logged; the lock then
-/// expires by its in-flight TTL.
-async fn release_lock(store: &Arc<dyn IdempotencyStore>, key: &str) {
-    if let Err(error) = store.unlock(key, LOCK_OWNER).await {
+/// Release this attempt's in-flight lock for `key`. Each attempt has its own
+/// `owner`: an attempt that outlived its lock must not free the lock of a retry
+/// that took the token since. An error is logged; the lock then expires by its
+/// in-flight TTL.
+async fn release_lock(store: &Arc<dyn IdempotencyStore>, key: &str, owner: &str) {
+    if let Err(error) = store.unlock(key, owner).await {
         tracing::warn!(error = %error, "Submit-token unlock failed; the lock expires by its TTL");
     }
 }
@@ -609,9 +607,10 @@ where
 
             // Acquire the in-flight lock. A concurrent duplicate that loses the
             // race gets a 409 so it can never re-run the handler.
+            let owner = Uuid::new_v4().to_string();
             let acquired = settings
                 .store
-                .try_lock(&key, LOCK_OWNER, settings.in_flight_ttl)
+                .try_lock(&key, &owner, settings.in_flight_ttl)
                 .await
                 .unwrap_or_else(|error| {
                     // Fail closed: an outage must not let two submits run.
@@ -634,7 +633,7 @@ where
             // `IdempotencyService` does on a post-lock lookup error.
             match settings.store.get(&key).await {
                 Ok(Some(entry)) => {
-                    release_lock(&settings.store, &key).await;
+                    release_lock(&settings.store, &key, &owner).await;
                     return Ok(replay_response(&entry.record));
                 }
                 Ok(None) => {}
@@ -648,7 +647,7 @@ where
             }
 
             let response = inner.call(req).await?;
-            Ok(cache_consumed_token_response(response, &settings, &key).await)
+            Ok(cache_consumed_token_response(response, &settings, &key, &owner).await)
         })
     }
 }
@@ -661,6 +660,7 @@ async fn cache_consumed_token_response(
     response: Response<Body>,
     settings: &SubmitTokenSettings,
     key: &str,
+    owner: &str,
 ) -> Response<Body> {
     let (parts, body) = response.into_parts();
     match collect_body(body, MAX_CACHEABLE_RESPONSE_BODY).await {
@@ -695,14 +695,14 @@ async fn cache_consumed_token_response(
                     return crate::idempotency::persistence_failed_response();
                 }
             }
-            release_lock(&settings.store, key).await;
+            release_lock(&settings.store, key, owner).await;
             Response::from_parts(parts, Body::from(bytes))
         }
         CollectedBody::Oversized { body, .. } => {
             // Too large to cache — stream through. The lock is released; a later
             // retry re-runs (acceptable: form responses are tiny redirects, so
             // this path is not hit in practice).
-            release_lock(&settings.store, key).await;
+            release_lock(&settings.store, key, owner).await;
             Response::from_parts(parts, body)
         }
         CollectedBody::Errored(error) => {
@@ -727,7 +727,7 @@ async fn cache_consumed_token_response(
                 "Submit-token response buffering failed on a read error; failing closed"
             );
             if !(200..400).contains(&status) {
-                release_lock(&settings.store, key).await;
+                release_lock(&settings.store, key, owner).await;
             }
             response_read_error_response()
         }
@@ -1972,7 +1972,7 @@ mod tests {
         let key = storage_key(token);
         assert!(
             store
-                .try_lock(&key, LOCK_OWNER, Duration::from_secs(86_400))
+                .try_lock(&key, "first-attempt", Duration::from_secs(86_400))
                 .await
                 .unwrap()
         );
@@ -1990,5 +1990,65 @@ mod tests {
             0,
             "the handler must not run for a retry held out by the in-flight lock"
         );
+    }
+
+    /// Attempt A outlives its 1 s lock and fails, so it is not cached and
+    /// releases its lock. Retry B took the key after A's lock expired and is
+    /// still running. A's release must not free B's lock: a third attempt gets
+    /// `409` and does not run the handler while B runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn late_release_keeps_a_newer_attempts_lock() {
+        let store: Arc<dyn IdempotencyStore> =
+            Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
+        let config = SubmitTokenConfig {
+            enabled: true,
+            in_flight_ttl_secs: 1,
+            ..Default::default()
+        };
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let app = Router::new()
+            .route(
+                "/submit",
+                post(move || {
+                    let count = count_inner.clone();
+                    async move {
+                        let run = count.fetch_add(1, Ordering::SeqCst);
+                        match run {
+                            // A: outlives its lock, then fails (not cached).
+                            0 => {
+                                tokio::time::sleep(Duration::from_millis(1_500)).await;
+                                (StatusCode::INTERNAL_SERVER_ERROR, "failed")
+                            }
+                            // B: still running when A releases.
+                            1 => {
+                                tokio::time::sleep(Duration::from_millis(2_000)).await;
+                                (StatusCode::CREATED, "created")
+                            }
+                            _ => (StatusCode::CREATED, "created"),
+                        }
+                    }
+                }),
+            )
+            .layer(SubmitTokenLayer::new(store, &config));
+
+        let token = "tok-late-release";
+        let a = tokio::spawn(app.clone().oneshot(urlencoded_post(token)));
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let b = tokio::spawn(app.clone().oneshot(urlencoded_post(token)));
+        // A finishes at ~1.5 s and releases; B runs until ~3.2 s.
+        let a = a.await.unwrap().unwrap();
+        assert_eq!(a.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let c = app.clone().oneshot(urlencoded_post(token)).await.unwrap();
+        assert_eq!(
+            c.status(),
+            StatusCode::CONFLICT,
+            "B still holds the token; A's release must not free B's lock"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 2, "C did not run the handler");
+        let b = b.await.unwrap().unwrap();
+        assert_eq!(b.status(), StatusCode::CREATED);
     }
 }
