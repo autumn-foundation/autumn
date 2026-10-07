@@ -201,9 +201,10 @@ capsule directory and to each directory above it.
   the direction of the sequence. Only the imported keys count, not the rows
   that the table had before. A sequence makes only `start + k * step`, so
   only keys on that path count: with `INCREMENT BY 3` from 1, key 500 is not
-  a value it makes and does not move it. It does this only after all inserts and
-  deferred constraints succeed, and after it checks every move, so a failed
-  import does not change a sequence.
+  a value it makes and does not move it. A sequence can own a `numeric` or
+  float column too: an integral key such as `"1.00"` counts as `1`. It does
+  this only after all inserts and deferred constraints succeed, and after it
+  checks every move, so a failed import does not change a sequence.
 - A key outside the range of its sequence is a conflict (`409`). A sequence
   with `CACHE` above 1 is refused (`501`): other sessions can hold cached
   values that an imported key can take. A `CYCLE` sequence is refused
@@ -248,7 +249,9 @@ bounds.
 The subject id must be a valid value of the subject column type. For example,
 `abc` for a `bigint` column is an input error (`400`). The column type must not
 change the value: `ab123-extra` for a `varchar(5)` column, or `1.234` for a
-`numeric(6, 2)` column, is also an input error.
+`numeric(6, 2)` column, is also an input error. The same holds for types that
+round by themselves: `16777217` for a `real` column (it reads as `16777216`),
+`1.234` for a `money` column, or `2024-01-01 12:00` for a `date` column.
 
 ## Limits
 

@@ -254,6 +254,11 @@ fn subject_column<'c>(
 /// the value after the cast must be equal to the value as the base type
 /// without a modifier.
 ///
+/// Some base types change the value themselves: `real` reads `16777217` as
+/// `16777216`, `money` rounds to cents and `date` drops the time of day. Both
+/// sides of a comparison in such a type change alike, so compare through a
+/// type that holds the input as it is.
+///
 /// A failed cast aborts the transaction, so run it last before the query.
 async fn check_subject(
     conn: &mut AsyncPgConnection,
@@ -276,15 +281,27 @@ async fn check_subject(
             model.table
         ))
     };
-    let row = diesel::sql_query(format!(
-        "SELECT CAST($1 AS {subject_type}) IS NOT NULL AS ok, \
-                CAST(CAST($1 AS {subject_type}) AS {bare}) IS NOT DISTINCT FROM \
-                CAST($1 AS {bare}) AS exact"
-    ))
-    .bind::<diesel::sql_types::Text, _>(subject)
-    .get_result::<CastRow>(conn)
-    .await
-    .map_err(|e| invalid(e.to_string()))?;
+    let read = format!("CAST($1 AS {subject_type})");
+    let exact = match bare {
+        // The shortest text of a float reads back as the same float, and
+        // `numeric` holds it exactly. A direct cast to `numeric` rounds to 15
+        // digits.
+        "real" | "double precision" => {
+            format!(
+                "CAST(CAST({read} AS text) AS numeric) IS NOT DISTINCT FROM CAST($1 AS numeric)"
+            )
+        }
+        "money" => format!("CAST({read} AS numeric) IS NOT DISTINCT FROM CAST($1 AS numeric)"),
+        "date" => {
+            format!("CAST({read} AS timestamp) IS NOT DISTINCT FROM CAST($1 AS timestamp)")
+        }
+        _ => format!("CAST({read} AS {bare}) IS NOT DISTINCT FROM CAST($1 AS {bare})"),
+    };
+    let row = diesel::sql_query(format!("SELECT {read} IS NOT NULL AS ok, {exact} AS exact"))
+        .bind::<diesel::sql_types::Text, _>(subject)
+        .get_result::<CastRow>(conn)
+        .await
+        .map_err(|e| invalid(e.to_string()))?;
     // A cast that gives `NULL` (a custom type can do this) matches no row.
     if !row.ok {
         return Err(invalid("the cast gives NULL".to_owned()));
@@ -586,17 +603,37 @@ struct SequencePlan {
     cycle: bool,
 }
 
-/// The integer values of `column` in the imported rows.
-fn imported_keys(records: &[Record], column: &str) -> Vec<i64> {
+/// The numeric values of `column` in the imported rows, as decimal text.
+///
+/// A sequence can own a `numeric` or float column, whose values travel as
+/// strings such as `"1.00"` or `"1e+06"`. The database reads them as `numeric`,
+/// which holds each one exactly, and keeps the integral ones.
+fn imported_keys(records: &[Record], column: &str) -> Vec<String> {
     records
         .iter()
-        .filter_map(|row| {
-            let value = row.get(column)?;
-            value
-                .as_i64()
-                .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+        .filter_map(|row| match row.get(column)? {
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            serde_json::Value::String(s) => Some(s.clone()),
+            _ => None,
         })
+        .filter(|key| is_decimal(key))
         .collect()
+}
+
+/// Whether `numeric` reads `s` without an error: an optional sign, digits
+/// with an optional point, and an optional exponent. A key needs at most 19
+/// digits, so longer parts and larger exponents are not keys.
+fn is_decimal(s: &str) -> bool {
+    let (mantissa, exponent) = s.split_once(['e', 'E']).unwrap_or((s, "0"));
+    let mantissa = mantissa.strip_prefix(['-', '+']).unwrap_or(mantissa);
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = |part: &str| part.len() <= 1000 && part.bytes().all(|b| b.is_ascii_digit());
+    !(whole.is_empty() && fraction.is_empty())
+        && digits(whole)
+        && digits(fraction)
+        && exponent
+            .parse::<i16>()
+            .is_ok_and(|e| (-1000..=1000).contains(&e))
 }
 
 /// The serial or identity sequence of `table.column`, if it has one.
@@ -630,7 +667,7 @@ async fn plan_sequence(
     table: &str,
     column: &str,
     seq: &str,
-    keys: &[i64],
+    keys: &[String],
 ) -> Result<Option<(String, i64, String)>, DataCapsuleError> {
     let seq = seq.to_owned();
     let target = format!("{table}.{column}");
@@ -642,29 +679,35 @@ async fn plan_sequence(
     // compare with the value before its start. The arithmetic is in numeric:
     // `key - start` and `start - inc` can leave the bigint range. Only the
     // imported keys count: a row that the target had before, even one outside
-    // the sequence range, is not this import's to check.
+    // the sequence range, is not this import's to check. A key that is not an
+    // integer, or is outside the bigint range, is not a value a sequence
+    // makes.
     let plan: Option<SequencePlan> = diesel::sql_query(
         "SELECT s.m AS target, s.cache, s.min, s.max, s.cycle, CASE WHEN s.inc > 0 \
            THEN s.m > COALESCE(s.last, s.start::numeric - s.inc) \
            ELSE s.m < COALESCE(s.last, s.start::numeric - s.inc) END AS needed, \
            s.can_read, has_sequence_privilege($1::regclass, 'UPDATE') AS can_update \
          FROM (SELECT CASE WHEN q.seqincrement > 0 \
-                        THEN MAX(k.v) FILTER (WHERE mod(k.v::numeric - q.seqstart, q.seqincrement) = 0) \
-                        ELSE MIN(k.v) FILTER (WHERE mod(k.v::numeric - q.seqstart, q.seqincrement) = 0) \
+                        THEN MAX(k.v) FILTER (WHERE k.on_path) \
+                        ELSE MIN(k.v) FILTER (WHERE k.on_path) \
                       END::bigint AS m, \
                       has_sequence_privilege($1::regclass, 'SELECT, USAGE') AS can_read, \
                       CASE WHEN has_sequence_privilege($1::regclass, 'SELECT, USAGE') \
                         THEN pg_sequence_last_value($1::regclass) END AS last, \
                       q.seqincrement AS inc, q.seqstart AS start, q.seqcache AS cache, \
                       q.seqmin AS min, q.seqmax AS max, q.seqcycle AS cycle \
-               FROM unnest($2::bigint[]) AS k(v) CROSS JOIN pg_sequence q \
+               FROM pg_sequence q CROSS JOIN LATERAL ( \
+                      SELECT r.v, r.v = trunc(r.v) \
+                             AND r.v BETWEEN -9223372036854775808 AND 9223372036854775807 \
+                             AND mod(r.v - q.seqstart, q.seqincrement) = 0 AS on_path \
+                      FROM (SELECT CAST(t AS numeric) AS v FROM unnest($2::text[]) AS u(t)) r) k \
                WHERE q.seqrelid = $1::regclass \
                GROUP BY q.seqincrement, q.seqstart, q.seqcache, q.seqmin, q.seqmax, \
                         q.seqcycle) s \
          WHERE s.m IS NOT NULL",
     )
     .bind::<diesel::sql_types::Text, _>(&seq)
-    .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(keys)
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(keys)
     .get_result(conn)
     .await
     .optional()
@@ -716,6 +759,33 @@ async fn plan_sequence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keys_are_the_decimals_that_numeric_reads() {
+        for s in [
+            "1",
+            "-1",
+            "+1",
+            "1.00",
+            "1.",
+            ".5",
+            "1e+06",
+            "1E-3",
+            "9007199254740993.00",
+        ] {
+            assert!(is_decimal(s), "{s}");
+        }
+        for s in [
+            "", ".", "-", "1.2.3", "1e", "1e5000", "abc", "0x10", " 1", "NaN", "inf",
+        ] {
+            assert!(!is_decimal(s), "{s}");
+        }
+        let rows: Vec<Record> = serde_json::from_str(
+            r#"[{"id": 1}, {"id": "2.00"}, {"id": 3.0}, {"id": "x"}, {"id": null}, {}]"#,
+        )
+        .unwrap();
+        assert_eq!(imported_keys(&rows, "id"), ["1", "2.00", "3.0"]);
+    }
 
     #[test]
     fn lossy_number_types_travel_as_text() {

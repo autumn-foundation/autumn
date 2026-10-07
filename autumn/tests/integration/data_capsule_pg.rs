@@ -409,7 +409,15 @@ async fn postgres_rejects_a_subject_that_the_column_type_changes() {
              CREATE TABLE fees (id INT PRIMARY KEY, amount NUMERIC(6, 2), note TEXT); \
              INSERT INTO accounts VALUES ('ab123', 'mine'); \
              INSERT INTO codes VALUES ('ab123', 'mine'); \
-             INSERT INTO fees VALUES (1, 1.23, 'mine');",
+             INSERT INTO fees VALUES (1, 1.23, 'mine'); \
+             CREATE TABLE gauges (id INT PRIMARY KEY, reading REAL, note TEXT); \
+             INSERT INTO gauges VALUES (1, 16777216, 'mine'), (2, 0.1, 'mine'); \
+             CREATE TABLE probes (id INT PRIMARY KEY, reading DOUBLE PRECISION, note TEXT); \
+             INSERT INTO probes VALUES (1, 9007199254740992, 'mine'); \
+             CREATE TABLE wallets (id INT PRIMARY KEY, balance MONEY, note TEXT); \
+             INSERT INTO wallets VALUES (1, 1.23, 'mine'); \
+             CREATE TABLE diaries (id INT PRIMARY KEY, day DATE, note TEXT); \
+             INSERT INTO diaries VALUES (1, '2024-01-01', 'mine');",
         )
         .expect("schema");
     let store = PgCapsuleStore::new(pool(&url));
@@ -432,6 +440,13 @@ async fn postgres_rejects_a_subject_that_the_column_type_changes() {
             CapsuleModel::new("nested", "code").primary_key("code"),
             "ab123-extra",
         ),
+        // A float rounds both sides of a comparison in its own type alike:
+        // `16777217` is `16777216` as `real`.
+        (CapsuleModel::new("gauges", "reading"), "16777217"),
+        (CapsuleModel::new("probes", "reading"), "9007199254740993"),
+        // `money` rounds to cents, and `date` drops the time of day.
+        (CapsuleModel::new("wallets", "balance"), "1.234"),
+        (CapsuleModel::new("diaries", "day"), "2024-01-01 12:00"),
     ] {
         let err = export_subject(std::slice::from_ref(&model), &store, subject)
             .await
@@ -458,6 +473,76 @@ async fn postgres_rejects_a_subject_that_the_column_type_changes() {
         .await
         .expect("export");
     assert_eq!(capsule.records("fees").len(), 1);
+    for (model, subject) in [
+        (CapsuleModel::new("gauges", "reading"), "16777216"),
+        (CapsuleModel::new("gauges", "reading"), "0.1"),
+        (CapsuleModel::new("probes", "reading"), "9007199254740992"),
+        (CapsuleModel::new("wallets", "balance"), "1.230"),
+        (CapsuleModel::new("diaries", "day"), "2024-01-01"),
+    ] {
+        let table = model.table.clone();
+        let capsule = export_subject(std::slice::from_ref(&model), &store, subject)
+            .await
+            .unwrap_or_else(|e| panic!("{table} {subject}: {e:?}"));
+        assert_eq!(capsule.records(&table).len(), 1, "{table} {subject}");
+    }
+
+    drop(container);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn postgres_import_moves_the_sequence_of_a_numeric_key() {
+    // A sequence can own a `numeric` column with a scale. Export writes its
+    // values as strings such as `"1.00"`, which are still integral keys.
+    const RECEIPTS: &str = "
+        CREATE SEQUENCE receipts_id_seq;
+        CREATE TABLE receipts (
+            id NUMERIC(10, 2) PRIMARY KEY DEFAULT nextval('receipts_id_seq'),
+            owner INT NOT NULL
+        );
+        ALTER SEQUENCE receipts_id_seq OWNED BY receipts.id;";
+    let container = Postgres::default()
+        .with_tag("16-alpine")
+        .start()
+        .await
+        .expect("postgres");
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let mut admin = PgConnection::establish(&format!("{base}/postgres")).expect("connect");
+    admin
+        .batch_execute("CREATE DATABASE target")
+        .expect("create db");
+    admin
+        .batch_execute(&format!(
+            "{RECEIPTS}
+             INSERT INTO receipts (owner) VALUES (1), (1);"
+        ))
+        .expect("source");
+    PgConnection::establish(&format!("{base}/target"))
+        .expect("connect")
+        .batch_execute(RECEIPTS)
+        .expect("schema");
+    let models = [CapsuleModel::new("receipts", "owner")];
+    let capsule = export_subject(
+        &models,
+        &PgCapsuleStore::new(pool(&format!("{base}/postgres"))),
+        "1",
+    )
+    .await
+    .expect("export");
+
+    let target = pool(&format!("{base}/target"));
+    import_capsule(&capsule, &models, &PgCapsuleStore::new(target.clone()))
+        .await
+        .expect("import");
+    let next = text(
+        &target,
+        "INSERT INTO receipts (owner) VALUES (2) RETURNING id::text AS value",
+    )
+    .await;
+    assert_eq!(next, "3.00");
 
     drop(container);
 }
