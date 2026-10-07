@@ -1377,16 +1377,23 @@ impl DeferredIdempotencyCommit {
     }
 }
 
-pub(crate) async fn finalize_deferred_session_commit(
+/// Take the deferred commit and return the future that stores the record with
+/// the response's final headers, or `None` when no commit is pending.
+///
+/// Synchronous, with a boxed future: `SessionLayer` runs on every request, and
+/// an `async fn` awaited there would add its whole state machine to every
+/// request's future, not only to the rare one with a pending commit (see
+/// `config_alloc_gate`).
+pub(crate) fn finalize_deferred_session_commit(
     response: &mut Response<Body>,
-) -> Result<(), IdempotencyStoreError> {
-    let Some(commit) = response
+) -> Option<IdempotencyFuture<'_, ()>> {
+    let commit = response
         .extensions_mut()
-        .remove::<DeferredIdempotencyCommit>()
-    else {
-        return Ok(());
-    };
-    commit.commit_with_final_headers(response.headers()).await
+        .remove::<DeferredIdempotencyCommit>()?;
+    let headers = response.headers();
+    Some(Box::pin(async move {
+        commit.commit_with_final_headers(headers).await
+    }))
 }
 
 /// Register the storage key a retry presenting `session_id` will compute as

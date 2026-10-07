@@ -1009,9 +1009,9 @@ where
                 );
             }
 
-            if crate::idempotency::finalize_deferred_session_commit(&mut response)
-                .await
-                .is_err()
+            if let Some(finalize) =
+                crate::idempotency::finalize_deferred_session_commit(&mut response)
+                && finalize.await.is_err()
             {
                 return Ok(crate::idempotency::persistence_failed_response());
             }
