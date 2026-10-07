@@ -173,7 +173,11 @@ SET LOCAL idle_in_transaction_session_timeout = 60000
 ```
 
 This covers `db.tx`, `db.tx_with`, `db.tx_immediate`, and repository writes in
-a request, a `#[scheduled]` task, or a job. A savepoint keeps the outer values. A transaction pooler
+a request, a `#[scheduled]` task, a job, an after-commit callback, and the
+`offline-sync` push and pull. A task you start yourself with `tokio::spawn`
+does not inherit them: a repository used there keeps the session
+`statement_timeout` it sets on checkout, but not the `SET LOCAL` pair. Await
+the repository call in the handler, or use `db.tx` inside the task. A savepoint keeps the outer values. A transaction pooler
 (`PgBouncer` in transaction mode) keeps a `SET LOCAL`, but drops a session
 `SET`. The `prod` profile sets `30s` and `60s` (#3057). A route's
 `StatementTimeout` extension replaces the statement value for the

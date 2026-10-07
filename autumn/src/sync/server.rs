@@ -1163,6 +1163,34 @@ pub struct PgSyncBackend {
     database_url: String,
 }
 
+std::thread_local! {
+    /// The request's `SET LOCAL` timeout batch (#3057), for a blocking sync
+    /// call. The route handler reads it from the request scope before
+    /// `spawn_blocking`, which does not carry task-locals.
+    static SYNC_TX_SET_LOCAL: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` on this (blocking) thread with `set_local` as the sync backend's
+/// transaction timeouts, then clear them.
+fn with_sync_tx_set_local<T>(set_local: Option<String>, f: impl FnOnce() -> T) -> T {
+    SYNC_TX_SET_LOCAL.with(|cell| *cell.borrow_mut() = set_local);
+    let result = f();
+    SYNC_TX_SET_LOCAL.with(|cell| cell.borrow_mut().take());
+    result
+}
+
+/// The `SET LOCAL` timeout batch for this blocking sync call, if the route
+/// handler passed one.
+fn sync_tx_set_local() -> Option<String> {
+    SYNC_TX_SET_LOCAL.with(|cell| cell.borrow().clone())
+}
+
+/// The request's `SET LOCAL` timeout batch, read in the route handler's task.
+fn request_tx_set_local() -> Option<String> {
+    crate::db::TxTimeouts::current().and_then(crate::db::TxTimeouts::set_local_sql)
+}
+
 /// Run `$body` with a `&mut` sync diesel connection to `$url` that honors
 /// the connection string's `sslmode` — the SAME TLS-aware path the app
 /// pool and the migration/wait checks use (see
@@ -1280,8 +1308,13 @@ impl SyncBackend for PgSyncBackend {
         resolver: &dyn ConflictResolver,
     ) -> Result<PushResponse, SyncError> {
         validate_push(request)?;
+        let set_local = sync_tx_set_local();
         with_sync_pg_connection!(&self.database_url, |conn| {
             conn.transaction::<_, diesel::result::Error, _>(|conn| {
+                // The app's statement and idle-in-transaction timeouts (#3057).
+                if let Some(sql) = &set_local {
+                    diesel::connection::SimpleConnection::batch_execute(conn, sql)?;
+                }
                 // Serialize push batches (held until commit). See the doc
                 // comment on PG_PUSH_ADVISORY_LOCK_KEY for why this is
                 // required for correctness, not just politeness.
@@ -1482,10 +1515,16 @@ impl SyncBackend for PgSyncBackend {
         // transaction), and unlike `build_transaction()` (an inherent
         // PgConnection method) it works on both connection types the
         // TLS-aware macro dispatches to.
+        let set_local = sync_tx_set_local();
         with_sync_pg_connection!(&self.database_url, |conn| {
             conn.transaction::<_, diesel::result::Error, _>(|conn| {
                 sql_query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
                     .execute(conn)?;
+                // The app's statement and idle-in-transaction timeouts (#3057),
+                // after `SET TRANSACTION`, which must come first.
+                if let Some(sql) = &set_local {
+                    diesel::connection::SimpleConnection::batch_execute(conn, sql)?;
+                }
                 let horizon = pg_horizon(conn, scope)?;
                 if session_start > 0 && session_start < horizon {
                     return Ok(PullResponse::FullResyncRequired {
@@ -1730,8 +1769,11 @@ where
                             )
                                 .into_response();
                         }
+                        let set_local = request_tx_set_local();
                         let result = crate::time::spawn_blocking(move || {
-                            backend.apply_push(scope.as_str(), &request, resolver.as_ref())
+                            with_sync_tx_set_local(set_local, || {
+                                backend.apply_push(scope.as_str(), &request, resolver.as_ref())
+                            })
                         })
                         .await;
                         respond(result)
@@ -1750,8 +1792,16 @@ where
                         };
                         let limit = query.limit.clamp(1, MAX_PULL_LIMIT);
                         let session_start = query.session_start();
+                        let set_local = request_tx_set_local();
                         let result = crate::time::spawn_blocking(move || {
-                            backend.pull_since(scope.as_str(), query.cursor, limit, session_start)
+                            with_sync_tx_set_local(set_local, || {
+                                backend.pull_since(
+                                    scope.as_str(),
+                                    query.cursor,
+                                    limit,
+                                    session_start,
+                                )
+                            })
                         })
                         .await;
                         respond(result)
@@ -1786,6 +1836,30 @@ fn respond<T: serde::Serialize>(
 
 #[cfg(test)]
 mod tests {
+    /// The route handler reads the request's timeouts and hands them to the
+    /// blocking backend call, which `spawn_blocking` would otherwise drop.
+    #[tokio::test]
+    async fn sync_calls_get_the_request_tx_timeouts() {
+        let timeouts = crate::db::TxTimeouts::new(Some(std::time::Duration::from_secs(30)), None);
+        let set_local = timeouts
+            .scope(async { super::request_tx_set_local() })
+            .await;
+        assert_eq!(set_local, timeouts.set_local_sql());
+
+        let seen = tokio::task::spawn_blocking(move || {
+            super::with_sync_tx_set_local(set_local, super::sync_tx_set_local)
+        })
+        .await
+        .expect("blocking call");
+        assert_eq!(seen, timeouts.set_local_sql());
+        assert_eq!(super::sync_tx_set_local(), None, "cleared after the call");
+        assert_eq!(
+            super::request_tx_set_local(),
+            None,
+            "nothing outside a scope"
+        );
+    }
+
     #[test]
     fn constant_time_token_eq_is_plain_equality() {
         assert!(super::constant_time_token_eq("sync-secret", "sync-secret"));
