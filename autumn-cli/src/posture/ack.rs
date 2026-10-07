@@ -21,10 +21,10 @@
 //! have been filtered already and says so out loud rather than pretending to an
 //! authorization model it has no identity to enforce.
 //!
-//! The same division applies to [`SOURCE_SEPARATOR`]: it is the one line this
-//! parser takes at face value, so the harvester neutralizes any occurrence
-//! inside a body before writing it. A caller feeding this function unfiltered
-//! text inherits that job.
+//! [`parse_acks`] trusts one line, [`SOURCE_SEPARATOR`], as a comment
+//! boundary. A comment that contains that line can fake a boundary. So the
+//! scaffolded workflow writes one file per comment and uses `--ack-dir`, which
+//! parses each file with [`parse_comment`]. That parser trusts no line.
 
 use super::diff::Finding;
 use super::model::hex_digest;
@@ -32,7 +32,7 @@ use super::model::hex_digest;
 /// The comment phrase that acknowledges a posture widening.
 pub const ACK_PHRASE: &str = "/ack-posture";
 
-/// Line the harvester writes between two comment bodies.
+/// Line that divides two comment bodies in an `--ack-file`.
 ///
 /// Fenced-code state must not leak from one comment into the next: a colleague
 /// who pastes a log and forgets the closing fence would otherwise silently
@@ -74,7 +74,32 @@ pub fn short(digest: &str) -> String {
     digest.chars().take(SHORT_DIGEST_LEN).collect()
 }
 
-/// Extract every acknowledgment marker from harvested pull-request text.
+/// Extract every acknowledgment marker from harvested pull-request text in
+/// which [`SOURCE_SEPARATOR`] lines divide the comment bodies (`--ack-file`).
+///
+/// Each body is parsed on its own by [`parse_comment`].
+#[must_use]
+pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
+    let mut acks = Vec::new();
+    let mut body = String::new();
+    for line in text.lines() {
+        if line.trim() == SOURCE_SEPARATOR {
+            acks.extend(parse_comment(&body));
+            body.clear();
+        } else {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    acks.extend(parse_comment(&body));
+    acks
+}
+
+/// Extract every acknowledgment marker from one comment body.
+///
+/// The body has no separator to trust: [`SOURCE_SEPARATOR`] in it is plain
+/// text. `--ack-dir` uses this for each file, so no text in a comment can
+/// fake a comment boundary (#2472).
 ///
 /// Strict on purpose:
 /// - the phrase must start the line (leading whitespace allowed), so it cannot
@@ -87,7 +112,7 @@ pub fn short(digest: &str) -> String {
 ///   does not acknowledge anything either;
 /// - the digest must be plain lower/upper-case hex, 8..=64 characters.
 #[must_use]
-pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
+pub fn parse_comment(text: &str) -> Vec<Acknowledgment> {
     let mut acks = Vec::new();
     // The character and length of the fence currently open, if any. Toggling a
     // bool instead would let the inner ``` of a report quoted inside a ````
@@ -115,17 +140,6 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
     // inline code — including across a newline.
     let mut code_span: Option<usize> = None;
     for line in text.lines() {
-        if line.trim() == SOURCE_SEPARATOR {
-            // A new comment body starts here, with a clean slate. Checked
-            // first, because the separator is itself an HTML comment.
-            fence = None;
-            html_comment = false;
-            quote_paragraph = false;
-            raw_html = None;
-            open_tag = TagState::default();
-            code_span = None;
-            continue;
-        }
         // A blank line ends the quoted paragraph, so the lazy continuation
         // stops here and the rest of the comment is live text again. Read from
         // the raw line: a line that renders empty because it is all HTML
@@ -799,6 +813,22 @@ Looks fine to me.
 -->
 ";
         assert!(parse_acks(body).is_empty());
+    }
+
+    /// One comment, parsed alone, has no separator to trust: the line is
+    /// plain text, so it cannot reset a fence and make a marker live.
+    #[test]
+    fn a_single_comment_does_not_honor_the_separator() {
+        let body = format!("```\n{SOURCE_SEPARATOR}\n/ack-posture 0123456789abcdef\n```\n");
+        assert!(
+            parse_comment(&body).is_empty(),
+            "{:?}",
+            parse_comment(&body)
+        );
+        assert_eq!(
+            parse_comment("/ack-posture 0123456789abcdef  ok\n").len(),
+            1
+        );
     }
 
     /// The harvester's own separator is an HTML comment, so comment tracking

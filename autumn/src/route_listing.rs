@@ -719,15 +719,25 @@ pub(crate) fn append_framework_routes(
     infos: &mut Vec<RouteInfo>,
     config: &crate::config::AutumnConfig,
 ) {
-    let mut probe_paths = std::collections::HashSet::new();
-    for (path, name) in [
-        (config.health.live_path.as_str(), "live"),
-        (config.health.ready_path.as_str(), "ready"),
-        (config.health.startup_path.as_str(), "startup"),
-        (config.health.path.as_str(), "health"),
-    ] {
-        if probe_paths.insert(path) {
-            infos.push(RouteInfo::framework_get(path.to_owned(), name));
+    // List a probe only where `mount_probe_endpoints` mounts it: never when
+    // `health.enabled = false`, and never on a path a user `GET` (or `WS`)
+    // owns (#1971). A second entry for one route corrupts the posture
+    // manifest (#2472).
+    let mut probe_paths: std::collections::HashSet<String> = infos
+        .iter()
+        .filter(|i| i.method == "GET" || i.method == "WS")
+        .map(|i| i.path.clone())
+        .collect();
+    if config.health.enabled {
+        for (path, name) in [
+            (config.health.live_path.as_str(), "live"),
+            (config.health.ready_path.as_str(), "ready"),
+            (config.health.startup_path.as_str(), "startup"),
+            (config.health.path.as_str(), "health"),
+        ] {
+            if probe_paths.insert(path.to_owned()) {
+                infos.push(RouteInfo::framework_get(path.to_owned(), name));
+            }
         }
     }
 
@@ -1741,6 +1751,52 @@ mod tests {
             paths.contains(&config.health.startup_path.as_str()),
             "startup path missing: {paths:?}"
         );
+    }
+
+    /// A user `GET` on a probe path wins, and the router does not mount the
+    /// probe (#1971). So the listing must not list it either: two entries for
+    /// one route make the posture manifest corrupt (#2472).
+    #[test]
+    fn append_framework_routes_skips_a_probe_a_user_route_owns() {
+        let config = AutumnConfig::default();
+        let mut infos = vec![RouteInfo {
+            method: "GET".to_owned(),
+            path: config.health.path.clone(),
+            handler: "my_health".to_owned(),
+            source: RouteSource::User,
+            ..RouteInfo::default()
+        }];
+        append_framework_routes(&mut infos, &config);
+        let at_health: Vec<&RouteInfo> = infos
+            .iter()
+            .filter(|i| i.method == "GET" && i.path == config.health.path)
+            .collect();
+        assert_eq!(at_health.len(), 1, "{at_health:?}");
+        assert_eq!(at_health[0].handler, "my_health");
+        assert!(
+            infos.iter().any(|i| i.path == config.health.live_path),
+            "the other probes stay listed"
+        );
+    }
+
+    /// `health.enabled = false` mounts no probe, so none is listed.
+    #[test]
+    fn append_framework_routes_lists_no_probe_when_health_is_off() {
+        let mut config = AutumnConfig::default();
+        config.health.enabled = false;
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &config);
+        for probe in [
+            &config.health.path,
+            &config.health.live_path,
+            &config.health.ready_path,
+            &config.health.startup_path,
+        ] {
+            assert!(
+                !infos.iter().any(|i| &i.path == probe),
+                "{probe} is not mounted, so it must not be listed"
+            );
+        }
     }
 
     #[test]
