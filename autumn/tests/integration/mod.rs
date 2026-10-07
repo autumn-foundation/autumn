@@ -83,6 +83,7 @@ mod config_deprecation;
 mod config_runtime_drift;
 #[cfg(feature = "constela")]
 mod constela;
+mod cost_deferral_durable;
 mod cost_metering;
 #[cfg(feature = "acme")]
 mod custom_domain_issuance;
@@ -186,6 +187,8 @@ mod job_tracking_route;
 mod job_tracking_stores_integration;
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 mod lease_lock;
+#[cfg(feature = "db")]
+mod list_rows_snapshot;
 #[cfg(all(feature = "ws", feature = "maud", feature = "htmx", feature = "db"))]
 mod live_broadcast;
 mod live_state;
@@ -230,6 +233,8 @@ mod middleware_stack_depth;
 mod middleware_stack_order;
 #[cfg(feature = "db")]
 mod migrate_checksum_proptest;
+// Reads migrate.rs and ci.yml as text; needs no feature.
+mod migration_lock_timeout_ci_coverage;
 #[cfg(feature = "db")]
 mod model_counter_cache;
 #[cfg(feature = "db")]
@@ -316,6 +321,11 @@ mod rate_limit_tenant_scope;
 mod raw_router_escape_hatch;
 #[cfg(feature = "db")]
 mod read_your_writes_routing;
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+mod ready_db_ping;
+// Redis `PING` health indicator (#3059).
+#[cfg(feature = "redis")]
+mod redis_health_indicator;
 // ci.yml names the `--lib` Redis job-admin Docker tests by prefix filter; this
 // fails when one of them stops matching (#1186). No feature gate: it only reads
 // job.rs and ci.yml as text.
@@ -476,6 +486,7 @@ mod translatable_model;
 #[cfg(feature = "i18n")]
 mod translatable_request;
 mod tx_isolation_retry_integration;
+mod tx_local_timeouts;
 #[cfg(feature = "db")]
 mod validate_merged_model;
 #[cfg(feature = "db")]

@@ -602,6 +602,20 @@ impl AppState {
         &self.probes
     }
 
+    /// Apply `[health]` dependency-check settings: the cache TTL of the
+    /// indicator registry and of the database pings, the ping time limit, and
+    /// whether the primary ping gates `/ready`.
+    pub(crate) fn apply_health_config(&self, health: &crate::config::HealthConfig) {
+        self.health_indicator_registry
+            .set_cache_ttl(health.cache_ttl());
+        #[cfg(feature = "db")]
+        {
+            self.probes
+                .configure_db_check(health.cache_ttl(), health.ping_timeout());
+            self.probes.set_db_readiness(health.db_readiness);
+        }
+    }
+
     /// Mark startup as complete so readiness can become healthy.
     pub fn mark_startup_complete(&self) {
         self.probes.mark_startup_complete();
@@ -1121,6 +1135,10 @@ impl DbState for AppState {
         self.extension::<crate::config::AutumnConfig>()
             .and_then(|cfg| cfg.database.statement_timeout)
     }
+    fn idle_in_transaction_timeout(&self) -> Option<std::time::Duration> {
+        self.extension::<crate::config::AutumnConfig>()
+            .and_then(|cfg| cfg.database.idle_in_transaction_timeout)
+    }
 
     fn slow_query_threshold(&self) -> std::time::Duration {
         self.extension::<crate::config::AutumnConfig>().map_or_else(
@@ -1262,6 +1280,11 @@ impl crate::actuator::ProvideActuatorState for AppState {
     }
 
     #[cfg(feature = "db")]
+    fn probe_state(&self) -> Option<&crate::probe::ProbeState> {
+        Some(&self.probes)
+    }
+
+    #[cfg(feature = "db")]
     fn shards(&self) -> Option<&crate::sharding::ShardSet> {
         self.shards.as_ref()
     }
@@ -1377,6 +1400,45 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
+    /// Counts checks of a health indicator.
+    struct Counted(std::sync::atomic::AtomicUsize);
+
+    impl crate::actuator::HealthIndicator for Counted {
+        fn check(&self) -> futures::future::BoxFuture<'_, crate::actuator::HealthCheckOutput> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { crate::actuator::HealthCheckOutput::up() })
+        }
+    }
+
+    async fn checks_after_two_runs(health: &crate::config::HealthConfig) -> usize {
+        let state = AppState::for_test();
+        state.apply_health_config(health);
+        let counted = Arc::new(Counted(std::sync::atomic::AtomicUsize::new(0)));
+        state
+            .health_indicator_registry
+            .register(
+                "counted",
+                crate::actuator::IndicatorGroup::Readiness,
+                counted.clone(),
+            )
+            .expect("register");
+        state.health_indicator_registry.run_readiness().await;
+        state.health_indicator_registry.run_readiness().await;
+        counted.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn apply_health_config_sets_the_indicator_cache_ttl() {
+        let cached = crate::config::HealthConfig::default();
+        assert_eq!(checks_after_two_runs(&cached).await, 1);
+
+        let uncached = crate::config::HealthConfig {
+            cache_ttl_ms: 0,
+            ..crate::config::HealthConfig::default()
+        };
+        assert_eq!(checks_after_two_runs(&uncached).await, 2);
+    }
+
     /// Re-clocking a state that a runtime has already touched is refused loudly.
     ///
     /// By the time job names are registered, the runtime holds its own clone of

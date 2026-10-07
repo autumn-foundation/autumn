@@ -10344,6 +10344,9 @@ fn emit_crud_bodies_hooked(
 
     let timeout_route_init = quote! {
         use ::autumn_web::db::DbState as _;
+        // A route's `StatementTimeout` also bounds this request's `SET LOCAL`
+        // (#3057).
+        ::autumn_web::__private::note_route_statement_timeout(&_parts);
         // Postgres statement_timeout is a signed 32-bit integer (ms).
         const __AUTUMN_PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
         let __autumn_timeout_ms: u64 = _parts
@@ -13484,6 +13487,9 @@ fn emit_crud_bodies_plain(config: &RepoConfig, inputs: &CrudBodiesInputs<'_>) ->
 
     let timeout_route_init = quote! {
         use ::autumn_web::db::DbState as _;
+        // A route's `StatementTimeout` also bounds this request's `SET LOCAL`
+        // (#3057).
+        ::autumn_web::__private::note_route_statement_timeout(&_parts);
         // Postgres statement_timeout is a signed 32-bit integer (ms).
         const __AUTUMN_PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
         let __autumn_timeout_ms: u64 = _parts
@@ -17546,6 +17552,21 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
         ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>>> + Send;
     };
 
+    // The current tenant, or `None` under `across_tenants()`. Shared by every list
+    // read, so all of them scope the same way.
+    let list_tenant_setup = if config.tenant_scoped {
+        quote! {
+            let __tenant = if self.across_tenants {
+                ::core::option::Option::None
+            } else {
+                let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                    .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
+                ::core::option::Option::Some(t)
+            };
+        }
+    } else {
+        quote! {}
+    };
     let list_impl_method = if config.tenant_scoped {
         quote! {
             async fn list(
@@ -17560,13 +17581,7 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
                 // inherent methods take precedence when present.
                 #[allow(unused_imports)]
                 use ::autumn_web::pagination::AutumnListable as _;
-                let __tenant = if self.across_tenants {
-                    ::core::option::Option::None
-                } else {
-                    let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
-                        .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
-                    ::core::option::Option::Some(t)
-                };
+                #list_tenant_setup
                 let mut conn = self.__autumn_acquire_read_conn().await?;
 
                 let mut __count_q = #table_ident::table.into_boxed() #sd_filter;
@@ -17662,20 +17677,7 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
                 req: &::autumn_web::pagination::PageRequest,
             ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>>> + Send;
         };
-        // Optional tenant setup + per-query tenant filters, mirroring `list`.
-        let scoped_tenant_setup = if config.tenant_scoped {
-            quote! {
-                let __tenant = if self.across_tenants {
-                    ::core::option::Option::None
-                } else {
-                    let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
-                        .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
-                    ::core::option::Option::Some(t)
-                };
-            }
-        } else {
-            quote! {}
-        };
+        // Per-query tenant filters, mirroring `list`.
         let scoped_tenant_count_filter = if config.tenant_scoped {
             quote! {
                 if let ::core::option::Option::Some(ref t) = __tenant {
@@ -17706,7 +17708,7 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 #[allow(unused_imports)]
                 use ::autumn_web::pagination::AutumnListable as _;
-                #scoped_tenant_setup
+                #list_tenant_setup
                 let mut conn = self.__autumn_acquire_read_conn().await?;
 
                 let mut __count_q = #table_ident::table.into_boxed() #sd_filter;
@@ -17739,6 +17741,152 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
         (trait_method, impl_method)
     } else {
         (quote! {}, quote! {})
+    };
+
+    // ── #2185: count-free list reads ────────────────────────────────────
+    //
+    // `list_rows`/`list_scoped_rows` are `list`/`list_scoped` without the COUNT and
+    // the offset: one LIMIT statement, so all rows come from one snapshot. They use
+    // the same tenant fragment and allowlist helpers as `list`/`list_scoped`.
+    let list_rows_tenant_filter = if config.tenant_scoped {
+        quote! {
+            let __q = if let ::core::option::Option::Some(ref t) = __tenant {
+                __q.filter(#table_ident::tenant_id.eq(t.clone()))
+            } else {
+                __q
+            };
+        }
+    } else {
+        quote! {}
+    };
+    // Unlike `list`'s guard, this one also rejects when no shard set is
+    // configured: the read would drop the tenant filter and return one pool's
+    // rows as if they were all of them (#1741).
+    let rows_cross_shard_guard = |method: &str| {
+        if !(config.sharded && config.tenant_scoped) {
+            return quote! {};
+        }
+        let no_shard_set_msg = format!(
+            "cross-shard {method} requires a configured shard set: across_tenants() \
+             cannot read across shards without a shard set (the repository was built \
+             without shard context, e.g. via with_pool_untracked); build it with shard \
+             context instead"
+        );
+        let unsupported_msg = format!(
+            "cross-shard {method} is not supported: use find_all() with \
+             across_tenants() on a sharded repository instead"
+        );
+        quote! {
+            if self.across_tenants {
+                if self.__autumn_shards.is_none() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(#no_shard_set_msg)
+                    );
+                }
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::bad_request_msg(#unsupported_msg)
+                );
+            }
+        }
+    };
+    let rows_read = |method: &str, owner_filter: TokenStream| {
+        let cross_shard_guard = rows_cross_shard_guard(method);
+        quote! {
+            #cross_shard_guard
+            use ::autumn_web::reexports::diesel::prelude::*;
+            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+            #[allow(unused_imports)]
+            use ::autumn_web::pagination::AutumnListable as _;
+            #list_tenant_setup
+            let __limit = <i64 as ::core::convert::TryFrom<usize>>::try_from(limit).unwrap_or(i64::MAX);
+            let mut conn = self.__autumn_acquire_read_conn().await?;
+            let __q = #table_ident::table.into_boxed() #sd_filter;
+            #list_rows_tenant_filter
+            #owner_filter
+            let __q = #model_name::__autumn_list_apply_filters(__q, query);
+            let __q = #model_name::__autumn_list_apply_order(__q, query);
+            __q.limit(__limit)
+                .select(#model_name::as_select())
+                .load::<#model_name>(&mut conn)
+                .await
+                .map_err(::autumn_web::AutumnError::from)
+        }
+    };
+    let list_rows_doc = quote! {
+        /// One statement reads all rows, so they come from one snapshot: a
+        /// concurrent insert or delete cannot duplicate or skip a row. There
+        /// is no `COUNT(*)` and no offset.
+        ///
+        /// Use it for a bulk read, such as an export. To detect more than
+        /// `limit` rows, ask for one more row than you keep.
+    };
+    let unscoped_rows_read = rows_read("list_rows", quote! {});
+    let list_trait_method = quote! {
+        #list_trait_method
+
+        /// Load up to `limit` records in [`list`](Self::list) order, with the
+        /// same allowlisted sort, filters and scope.
+        ///
+        #list_rows_doc
+        fn list_rows(
+            &self,
+            query: &::autumn_web::pagination::ListQuery,
+            limit: usize,
+        ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>>> + Send;
+    };
+    let list_impl_method = quote! {
+        #list_impl_method
+
+        async fn list_rows(
+            &self,
+            query: &::autumn_web::pagination::ListQuery,
+            limit: usize,
+        ) -> ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>> {
+            #unscoped_rows_read
+        }
+    };
+    let (list_scoped_trait_method, list_scoped_impl_method) = if let Some(ref owner_col) =
+        owner_col_ident
+    {
+        // The owner filter comes before the allowlist, so a request
+        // `filter[..]` can only narrow the owner's rows.
+        let scoped_rows_read = rows_read(
+            "list_scoped_rows",
+            quote! {
+                let __q = __q.filter(#table_ident::#owner_col.eq(owner_id));
+            },
+        );
+        (
+            quote! {
+                #list_scoped_trait_method
+
+                /// Load up to `limit` records **owned by `owner_id`** in
+                /// [`list_scoped`](Self::list_scoped) order, with the same
+                /// allowlisted sort and filters.
+                ///
+                #list_rows_doc
+                fn list_scoped_rows(
+                    &self,
+                    owner_id: i64,
+                    query: &::autumn_web::pagination::ListQuery,
+                    limit: usize,
+                ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>>> + Send;
+            },
+            quote! {
+                #list_scoped_impl_method
+
+                async fn list_scoped_rows(
+                    &self,
+                    owner_id: i64,
+                    query: &::autumn_web::pagination::ListQuery,
+                    limit: usize,
+                ) -> ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>> {
+                    #scoped_rows_read
+                }
+            },
+        )
+    } else {
+        (list_scoped_trait_method, list_scoped_impl_method)
     };
 
     // `cursor_page` is generated only when the user declares `cursor_key = field`.
@@ -24374,6 +24522,182 @@ mod tests {
                 && body
                     .contains("__page_q = __page_q . filter (posts :: author_id . eq (owner_id))"),
             "list_scoped must filter both __count_q and __page_q by owner: {body}"
+        );
+    }
+
+    /// Returns the body of the generated `async fn <name>` up to the next
+    /// `async fn`, so a check cannot read into the next method.
+    fn generated_method_body<'a>(generated: &'a str, name: &str) -> &'a str {
+        let needle = format!("async fn {name} (");
+        let start = generated
+            .find(&needle)
+            .unwrap_or_else(|| panic!("`{name}` impl not found: {generated}"));
+        let rest = &generated[start + needle.len()..];
+        let end = rest.find("async fn ").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn repository_list_rows_is_one_count_free_statement() {
+        // #2185: `list_rows` is `list` without the `COUNT(*)` and without the
+        // offset. It loads up to `limit` rows in one statement.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        assert!(
+            generated.contains("fn list_rows (& self , query : & :: autumn_web :: pagination :: ListQuery , limit : usize"),
+            "repository must declare `list_rows(query, limit)`: {generated}"
+        );
+        let body = generated_method_body(&generated, "list_rows");
+        assert!(
+            body.contains("Post :: __autumn_list_apply_filters")
+                && body.contains("Post :: __autumn_list_apply_order"),
+            "list_rows must use the same allowlist helpers as list: {body}"
+        );
+        assert!(
+            !body.contains(". count ()"),
+            "list_rows must not run a COUNT(*): {body}"
+        );
+        assert!(
+            !body.contains(". offset ("),
+            "list_rows must read from the first row, with no offset: {body}"
+        );
+        assert!(
+            body.contains(". limit (__limit)"),
+            "list_rows must bound the read with the caller's limit: {body}"
+        );
+        assert!(
+            body.contains("< i64 as :: core :: convert :: TryFrom < usize >> :: try_from (limit)"),
+            "list_rows must convert the limit without a wrapping cast: {body}"
+        );
+        assert!(
+            body.contains("__autumn_acquire_read_conn"),
+            "list_rows must keep the read routing of list: {body}"
+        );
+        assert_eq!(
+            body.matches(". load :: <").count(),
+            1,
+            "list_rows must issue exactly one statement: {body}"
+        );
+        assert!(
+            !generated.contains("list_scoped_rows"),
+            "no `owner =` attr must emit no owner-scoped methods: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_list_rows_keeps_the_soft_delete_filter_of_list() {
+        // #2185: the export must not show rows the index hides.
+        let generated = repository_macro(
+            quote! { Post, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let list = generated_method_body(&generated, "list");
+        let rows = generated_method_body(&generated, "list_rows");
+        let filter = "posts :: deleted_at . is_null ()";
+        assert!(list.contains(filter), "list premise changed: {list}");
+        assert!(
+            rows.contains(filter),
+            "list_rows must exclude soft-deleted rows like list: {rows}"
+        );
+    }
+
+    #[test]
+    fn repository_list_rows_keeps_the_tenant_filter_of_list() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let rows = generated_method_body(&generated, "list_rows");
+        assert!(
+            rows.contains("CURRENT_TENANT")
+                && rows.contains("posts :: tenant_id . eq (t . clone ())"),
+            "list_rows must scope to the current tenant like list: {rows}"
+        );
+    }
+
+    #[test]
+    fn repository_list_rows_keeps_the_cross_shard_guard_of_list() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let rows = generated_method_body(&generated, "list_rows");
+        assert!(
+            rows.contains("cross-shard list_rows is not supported"),
+            "list_rows must reject a cross-shard read like list: {rows}"
+        );
+    }
+
+    #[test]
+    fn repository_list_rows_rejects_across_tenants_without_a_shard_set() {
+        // A sharded repository built without shard context (e.g.
+        // `with_pool_untracked`) has one pool. An across-tenant read there drops
+        // the tenant filter and reads that one shard: a partial result with no
+        // error. Reject it, as the derived reads do (#1741).
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded, owner = author_id },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        for method in ["list_rows", "list_scoped_rows"] {
+            let body = generated_method_body(&generated, method);
+            let guard = body
+                .find("if self . across_tenants")
+                .unwrap_or_else(|| panic!("{method} must check across_tenants: {body}"));
+            let no_shards = body
+                .find("if self . __autumn_shards . is_none ()")
+                .unwrap_or_else(|| panic!("{method} must check for a missing shard set: {body}"));
+            let read = body
+                .find("__autumn_acquire_read_conn")
+                .unwrap_or_else(|| panic!("{method} must read through the routed pool: {body}"));
+            assert!(
+                guard < no_shards && no_shards < read,
+                "{method} must reject a shardless across-tenant read before it reads: {body}"
+            );
+            assert!(
+                body.contains(&format!(
+                    "cross-shard {method} requires a configured shard set"
+                )),
+                "{method} must name the missing shard set: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_owner_scoped_list_rows_filters_owner_before_the_allowlist() {
+        // #2185: the owner-scoped export reads through `list_scoped_rows`. The
+        // owner filter comes before the request filters, so `filter[..]` can
+        // only narrow the owner's rows.
+        let generated = repository_macro(
+            quote! { Post, owner = author_id, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("fn list_scoped_rows (& self , owner_id : i64 , query : & :: autumn_web :: pagination :: ListQuery , limit : usize"),
+            "owner-scoped repository must declare `list_scoped_rows`: {generated}"
+        );
+        let body = generated_method_body(&generated, "list_scoped_rows");
+        let owner = body
+            .find("posts :: author_id . eq (owner_id)")
+            .unwrap_or_else(|| panic!("list_scoped_rows must filter by owner: {body}"));
+        let allowlist = body
+            .find("Post :: __autumn_list_apply_filters")
+            .unwrap_or_else(|| panic!("list_scoped_rows must apply the allowlist: {body}"));
+        assert!(
+            owner < allowlist,
+            "the owner filter must come before the request filters: {body}"
+        );
+        assert!(
+            body.contains("posts :: deleted_at . is_null ()"),
+            "list_scoped_rows must exclude soft-deleted rows: {body}"
+        );
+        assert!(
+            !body.contains(". count ()") && !body.contains(". offset ("),
+            "list_scoped_rows must be one count-free read: {body}"
         );
     }
 

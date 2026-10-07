@@ -4057,9 +4057,11 @@ fn render_routes_file(
     let owner_scoped_standard = owner_scoped_index && !sharded && !live && !live_validation;
     // #1315: the `GET /{plural}/export.csv` download and the index's "Export CSV" link.
     // Emitted exactly where the index's row set is a repository call the export can reuse
-    // verbatim — `repo.list_scoped` on the owner-scoped standard index, `repo.list` on the
-    // plain one. That is the whole security argument for AC5: the export never re-derives
-    // a row set of its own, so it cannot widen past what the index already shows.
+    // — `repo.list_scoped` on the owner-scoped standard index, `repo.list` on the plain
+    // one. The export calls their count-free siblings, `list_scoped_rows`/`list_rows`
+    // (#2185), which the macro builds from the same filters. That is the whole security
+    // argument for AC5: the export never re-derives a row set of its own, so it cannot
+    // widen past what the index already shows.
     //
     // Gated off for `--live`, an SSE `<ul>` on `repo.page` with no `ListQuery` to honour;
     // for `--sharded`, where `from_shard` pins the query to one shard so an "export
@@ -6282,16 +6284,34 @@ mod attachment_read_back_tests {{
         // AC5: mirror the index's posture exactly. The owner-scoped index is
         // `#[secured]` and resolves its owner from the same `PolicyContext` the
         // mutating handlers authorize against; the plain index carries neither.
-        let (secured_attr, authz_params, owner_let, list_call) = if owner_scoped_standard {
+        // #2185: one count-free read, so the file comes from one snapshot.
+        let (secured_attr, authz_params, owner_let, rows_call) = if owner_scoped_standard {
             (
                 "#[secured]\n",
                 format!("{authz_params_full},"),
                 "    let ctx = autumn_web::authorization::PolicyContext::from_request(&state, &session).await;\n    \
                  let owner_id = ctx.user_id_i64().unwrap_or(-1);\n",
-                "repo.list_scoped(owner_id, &list_query, &page_req)",
+                "list_scoped_rows(owner_id, &list_query, MAX_EXPORT_ROWS + 1)",
             )
         } else {
-            ("", String::new(), "", "repo.list(&list_query, &page_req)")
+            (
+                "",
+                String::new(),
+                "",
+                "list_rows(&list_query, MAX_EXPORT_ROWS + 1)",
+            )
+        };
+        // Laid out as rustfmt lays it out. The scoped chain is longer than
+        // `chain_width` (60), so it always breaks at each call. The plain chain is
+        // shorter: it stays on one line when that fits in 100 columns, and else
+        // moves below the `=`.
+        let head = format!("let mut rows: Vec<{pascal_name}> =");
+        let rows_let = if owner_scoped_standard {
+            format!("{head} repo\n        .{rows_call}\n        .await?;")
+        } else if 4 + head.len() + " repo.".len() + rows_call.len() + ".await?;".len() <= 100 {
+            format!("{head} repo.{rows_call}.await?;")
+        } else {
+            format!("{head}\n        repo.{rows_call}.await?;")
         };
         // Issue #1319's search box swaps results in via htmx WITHOUT pushing a
         // URL, so the index's query string — and therefore this export's — never
@@ -6327,9 +6347,10 @@ mod attachment_read_back_tests {{
         };
         let scope_note = if owner_scoped_standard {
             "///\n\
-             /// Rows are read through the repository's OWNER-SCOPED `list_scoped`, the\n\
-             /// same method the index uses. This handler never calls the unscoped\n\
-             /// `list`/`page`, so the download can never contain another user's rows.\n"
+             /// Rows are read through the repository's OWNER-SCOPED `list_scoped_rows`,\n\
+             /// which applies the same owner filter as the index's `list_scoped`. This\n\
+             /// handler never calls an unscoped read, so the download can never contain\n\
+             /// another user's rows.\n"
         } else {
             ""
         };
@@ -6337,15 +6358,14 @@ mod attachment_read_back_tests {{
             "{schema_impl}\n\
              /// The most rows one `GET /{plural}/export.csv` will return.\n\
              ///\n\
-             /// The handler reads up to one batch PAST this so it can tell a full\n\
-             /// export from a truncated one; the surplus is trimmed before the CSV is\n\
-             /// written.\n\
+             /// The handler reads one row PAST this, so it can tell a full export\n\
+             /// from a truncated one. It removes that row before it writes the CSV.\n\
              ///\n\
              /// This bounds the ROW COUNT, which bounds memory only as far as your\n\
              /// widest row: the response is collected in memory before it is sent, so\n\
              /// a model with an unbounded `Text` column can still build a large body\n\
              /// here. Put a `{{max}}` length on such columns, lower this constant, or —\n\
-             /// for a genuinely unbounded export — stream the batches straight into\n\
+             /// for a genuinely unbounded export — stream the rows straight into\n\
              /// the response body with `Download::from_stream` instead of collecting\n\
              /// them first.\n\
              const MAX_EXPORT_ROWS: usize = 10_000;\n\n\
@@ -6357,34 +6377,19 @@ mod attachment_read_back_tests {{
              /// table. `?page=`/`?size=` are ignored on purpose: an export spans every\n\
              /// page of the current filter.\n\
              ///\n\
-             /// Rows are read in `MAX_PAGE_SIZE` batches (so no single query loads the\n\
-             /// table) and capped at `MAX_EXPORT_ROWS`, plus one batch past the cap to\n\
-             /// detect truncation. `Content-Type`,\n\
-             /// `Content-Disposition` and `Content-Length` come from `Download`, which\n\
-             /// infers `text/csv` from the `.csv` filename and sanitizes the name.\n\
-             ///\n\
-             /// CONSISTENCY is per batch, not per export. Each batch is an independent\n\
-             /// `LIMIT`/`OFFSET` query on its own pooled connection, so a row inserted\n\
-             /// or deleted mid-export shifts the offsets under the batches still to\n\
-             /// come: a row can land in the file twice, or not at all. The index has\n\
-             /// the same property — an export just spans more pages, and more\n\
-             /// wall-clock, so it is likelier to notice. For a point-in-time exact\n\
-             /// download, read the batches by hand inside\n\
-             /// `Db::tx_with(TxOptions::repeatable_read().read_only(), ..)`; the\n\
-             /// repository's pooled reads cannot be routed through a caller's\n\
-             /// transaction today, so that path means writing the query yourself —\n\
-             /// including this one's sort/filter allowlist and any owner scoping.\n\
+             /// Rows come from ONE repository read, capped at `MAX_EXPORT_ROWS` plus\n\
+             /// one row to detect truncation. One statement reads one snapshot, so a\n\
+             /// row inserted or deleted during the export cannot appear twice or go\n\
+             /// missing. If you set `database.statement_timeout`, the whole read must\n\
+             /// finish in that time. `Content-Type`, `Content-Disposition` and\n\
+             /// `Content-Length` come from `Download`, which infers `text/csv` from the\n\
+             /// `.csv` filename and sanitizes the name.\n\
              ///\n\
              /// COST, not row-set, is why this carries a `#[throttle]` the index does\n\
-             /// not, and the cost is worse than the row count suggests. `list` runs a\n\
-             /// filtered `COUNT(*)` before each page, so a full export is ~100 page\n\
-             /// queries AND ~100 whole-result-set counts — ~200 round trips where one\n\
-             /// index page costs two. The counts are pure waste here: this loop never\n\
-             /// reads `total_elements`, it stops on a short batch. They are paid\n\
-             /// anyway because `list` is also what applies the sort/filter allowlist,\n\
-             /// and the repository exposes no count-free equivalent. On a large or\n\
-             /// poorly indexed table budget accordingly: lower `MAX_EXPORT_ROWS`,\n\
-             /// tighten this throttle, or put the route behind auth.\n\
+             /// not. One export loads up to `MAX_EXPORT_ROWS` rows and builds the whole\n\
+             /// file in memory. One index page loads up to `MAX_PAGE_SIZE` rows. On a\n\
+             /// large table, lower `MAX_EXPORT_ROWS`, tighten this throttle, or put the\n\
+             /// route behind auth.\n\
              ///\n\
              /// The limit applies per client address and is independent of\n\
              /// `security.rate_limit.enabled` (that flag governs the GLOBAL limiter);\n\
@@ -6404,24 +6409,9 @@ mod attachment_read_back_tests {{
              ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n    \
              use autumn_web::reexports::axum::response::IntoResponse as _;\n\
              {default_sort_let}{owner_let}    \
-             let batch_size = autumn_web::pagination::MAX_PAGE_SIZE;\n    \
-             let mut rows: Vec<{pascal_name}> = Vec::new();\n    \
-             let mut page: u32 = 1;\n    \
-             loop {{\n        \
-             let page_req = PageRequest::new(page, batch_size);\n        \
-             let batch: Page<{pascal_name}> = {list_call}.await?;\n        \
-             // A short batch is the last one: nothing after it to ask for.\n        \
-             let exhausted = batch.content.len() < batch_size as usize;\n        \
-             rows.extend(batch.content);\n        \
-             // `>`, not `>=`: stopping the moment the cap is FILLED cannot tell a\n        \
-             // result set of exactly MAX_EXPORT_ROWS from a larger one, so the\n        \
-             // truncation warning below would never fire and over-cap exports would\n        \
-             // drop rows silently. Read past the cap and trim the surplus off.\n        \
-             if exhausted || rows.len() > MAX_EXPORT_ROWS {{\n            \
-             break;\n        \
-             }}\n        \
-             page += 1;\n    \
-             }}\n    \
+             // One row past the cap: a set of exactly MAX_EXPORT_ROWS rows then does\n    \
+             // not look truncated, and a larger set does.\n    \
+             {rows_let}\n    \
              // Truncate rather than fail: a partial spreadsheet beats a 500. But a\n    \
              // SILENTLY partial one is a trap for anyone exporting to reconcile, so\n    \
              // say so twice — once in the log for the operator, once in a response\n    \
@@ -10432,14 +10422,14 @@ const CSV_TEXT_CELL_HELPER: &str = "\n\n\
 /// The VALUES can differ from `show`'s for two kinds, deliberately: a
 /// `references` column exports the raw foreign key rather than the parent label
 /// the view resolves (an id round-trips back through `import_csv`; a label does
-/// not, and resolving one per row would be an N+1 inside the export loop), and
+/// not, and resolving one per row would be an N+1 inside the export), and
 /// an `Attachment` exports the blob's storage key rather than a signed URL that
 /// would have expired by the time anyone opened the file.
 ///
 /// `fields` must be the model's DECLARED columns — the list before
 /// [`augment_fields_for_soft_delete`] appends `deleted_at`. Under
 /// `--soft-delete` the model struct does carry a `deleted_at` field, but the
-/// export deliberately omits it: `list`/`list_scoped` filter
+/// export deliberately omits it: `list_rows`/`list_scoped_rows` filter
 /// `deleted_at IS NULL`, so the column is NULL for every row that can reach the
 /// export, and a column that is always blank is noise in a spreadsheet.
 fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {

@@ -287,6 +287,131 @@ knows, so no codemod can write the `N` in `#[query_cost(N)]`.
 
 ---
 
+### Config: the `prod` profile enables `strict_config` and new protections
+
+**Why:** The `prod` profile shipped with its protections off. A misspelled
+timeout key took the default in silence. A slow database caused readiness to
+flap across the fleet, instead of an early `503` (issue #3057).
+
+**Before (`{X.Y}`):** with `AUTUMN_PROFILE=prod`, this booted, and
+`statement_timeout` stayed unset:
+
+```toml
+[database]
+statment_timeout = "5s"   # misspelled
+```
+
+**After (`{(X+1).0}`):** the same file stops the boot with "Strict config
+check failed. Unknown keys in configuration". Correct the key, or turn the
+check off:
+
+```toml
+[server]
+strict_config = false     # or AUTUMN_SERVER__STRICT_CONFIG=false
+```
+
+The `prod` profile also changes these defaults. Each has a one-line opt-out:
+
+| Default in `prod` | Opt-out |
+| --- | --- |
+| Load shedding at primary pool size × 32, at least 256 | `server.max_concurrent_requests = 0` |
+| `database.statement_timeout = "30s"` | `statement_timeout = "0s"` |
+| `database.idle_in_transaction_timeout = "60s"` | `idle_in_transaction_timeout = "0s"` |
+
+Every profile also gets a migration `lock_timeout` of `5s` with `5` jittered
+retries, in each transactional migration. Opt out with
+`database.migration_lock_timeout = "0s"`. The `autumn migrate` CLI passes the
+timeout to `diesel` in `PGOPTIONS`. Run migrations against Postgres directly,
+not through a transaction pooler.
+
+A long report query that runs inside a request now stops at `30s`. Give that
+route a `StatementTimeout` extension, or raise the global value.
+
+**Automation:** `manual` — this is a configuration and behaviour change, and no
+code rewrite applies.
+
+### Capacity: `AdmissionLimit` is `#[non_exhaustive]` and has a new variant
+
+**Why:** The `prod` profile default ceiling needs its own source
+(`AdmissionLimit::ProfileDefault`, issue #3057).
+
+**Before (`{X.Y}`):**
+
+```rust
+match limit {
+    AdmissionLimit::Configured(n) | AdmissionLimit::Contract(n) => Some(n),
+    AdmissionLimit::Unlimited => None,
+}
+```
+
+**After (`{(X+1).0}`):** use `limit.limit()`, or add a wildcard arm:
+
+```rust
+let ceiling: Option<usize> = limit.limit();
+```
+
+**Automation:** `manual` — a new enum variant needs a new match arm, and no
+safe rewrite can choose its body.
+### Config: `HealthConfig` gains four public fields
+
+**Why:** `/ready` now pings the primary database. The new fields set the
+ping cache, the ping time limit, and which pings gate `/ready` (issue #3059).
+
+**Before (`{X.Y}`):** a struct literal listed every field.
+
+```rust
+let health = autumn_web::config::HealthConfig {
+    enabled: true,
+    path: "/health".into(),
+    live_path: "/live".into(),
+    ready_path: "/ready".into(),
+    startup_path: "/startup".into(),
+    detailed: false,
+};
+```
+
+**After (`{(X+1).0}`):** add `..HealthConfig::default()`. It sets
+`cache_ttl_ms = 1000`, `ping_timeout_ms = 2000`, `db_readiness = true` and
+`redis_readiness = false`.
+
+```rust
+let health = autumn_web::config::HealthConfig {
+    detailed: false,
+    ..autumn_web::config::HealthConfig::default()
+};
+```
+
+**Automation:** `manual` - the fix adds a struct update expression, and no
+codemod rewrites struct literals.
+
+### Probes: `/ready` pings the primary database
+
+**Why:** pool saturation made a busy replica unready, and an idle pool made a
+dead database look ready (issue #3059).
+
+**Before (`{X.Y}`):** `/ready`, `/health` and the `db` component of
+`/actuator/health` failed when the pool had no free connection and a request
+waited. They did not connect to the primary.
+
+**After (`{(X+1).0}`):** they send `SELECT 1` to the primary on one dedicated
+connection. A failed ping, or one slower than `health.ping_timeout_ms`, gives
+`503`. A busy pool does not. Do these checks:
+
+- Add one connection per replica to your Postgres `max_connections` budget.
+- Keep `health.ping_timeout_ms` below the probe timeout of your platform (for
+  Kubernetes, `timeoutSeconds`).
+- To keep a replica in rotation when the primary fails, set
+  `health.db_readiness = false`.
+- The generated Dockerfile `HEALTHCHECK` probes `/health`. It now fails when
+  the primary is down. ECS and Docker Swarm replace an unhealthy container. On
+  those platforms, set `AUTUMN_HEALTHCHECK_URL=http://localhost:3000/live`.
+- A test that changes a health indicator and reads `/actuator/health` again
+  in less than 1 s can read the cached result. Set `health.cache_ttl_ms = 0`
+  in the test config.
+
+**Automation:** `manual` - it is a runtime behaviour change, and no code
+rewrite applies.
+
 ### Resilience: `CircuitBreakerPolicy` and `CircuitBreakerPolicyConfig` have slow-call fields
 
 **Why:** The breaker opened on failures only. A dependency that became slow
@@ -326,6 +451,39 @@ A struct literal of `autumn_web::config::CircuitBreakerPolicyConfig` needs
 
 **Automation:** `manual` - each struct literal needs a value for the new
 fields, and the choice changes when the breaker opens.
+
+### Media: `MediaPlugin` installs only the primitives you enable
+
+**Why:** The docs said both primitives are off by default, but `build`
+installed storage, the encode jobs and the retention sweep for every plugin.
+`with_broadcast()` did nothing. Issue #1974.
+
+**Before (`{X.Y}`):**
+
+```rust
+// Storage, encode jobs and the retention sweep installed.
+autumn_web::app().plugin(MediaPlugin::new().config(media).recordings_root("recordings"))
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+// Enable the primitive you use. Broadcast also installs MediaMtxClient and MediaUrls.
+autumn_web::app().plugin(
+    MediaPlugin::new()
+        .config(media)
+        .with_broadcast()
+        .recordings_root("recordings"),
+)
+```
+
+With no primitive, the plugin installs no routes, extensions or jobs, and logs
+a warning. `extension::<MediaWorkflows>()` then returns `None`, jobs on the
+`media` queue have no handler, and the retention sweep does not start.
+
+**Automation:** `manual` — this is a runtime behavior change. The code still
+compiles, so a codemod cannot know which primitive your app uses.
+
 ### Feature flags: `PgFlagStore::get` errors before the first load
 
 **Why:** `get` connected to the database on the request thread, and a store

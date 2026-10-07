@@ -3273,7 +3273,7 @@ impl AppBuilder {
         let name = name.into();
         // "db" is a reserved built-in component name. Allowing a custom indicator
         // under this name would produce an inconsistent response: the custom result
-        // would still gate the aggregate status while the built-in pool check owns
+        // would still gate the aggregate status while the built-in primary ping owns
         // the components.db / checks.database display. The "db:shard:" prefix is
         // reserved for the framework's per-shard indicators for the same reason.
         #[cfg(feature = "db")]
@@ -4077,6 +4077,19 @@ impl AppBuilder {
         // precondition, so the exporter shares both — see
         // `validate_pre_router_preconditions`.)
 
+        // Subsystems whose backend the builder installed do not use the
+        // configured Redis, so they get no Redis indicator (#3059).
+        #[cfg(feature = "redis")]
+        let mut unused_redis_subsystems: Vec<&'static str> = Vec::new();
+        #[cfg(feature = "redis")]
+        if session_store.is_some() {
+            unused_redis_subsystems.push("sessions");
+        }
+        #[cfg(all(feature = "redis", feature = "ws"))]
+        if channels_backend.is_some() {
+            unused_redis_subsystems.push("channels");
+        }
+
         // 6. Build the router (with optional static-file layer)
         let mut state = build_state(
             &config,
@@ -4503,6 +4516,24 @@ impl AppBuilder {
             std::process::exit(1);
         }
         finalize_event_bus(listeners, &mut jobs, &state);
+
+        // One `redis:<subsystem>` PING indicator per Redis-backed subsystem
+        // (#3059). Here, the job set is final: with no jobs, no job runtime
+        // starts, so `jobs` gets no indicator. The user indicators are already
+        // registered: if two names are the same, the user indicator stays.
+        #[cfg(feature = "redis")]
+        {
+            if jobs.is_empty() {
+                unused_redis_subsystems.push("jobs");
+            }
+            unused_redis_subsystems.extend(crate::redis_health::unused_for_role(role));
+            crate::redis_health::register_redis_health_indicators(
+                &config,
+                &state.health_indicator_registry,
+                &crate::redis_health::app_pingers(&state),
+                &unused_redis_subsystems,
+            );
+        }
 
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
@@ -6393,6 +6424,7 @@ impl AppBuilder {
         install_story_registry(&state, story_gallery);
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
+        state.apply_health_config(&config.health);
 
         // Apply deferred policy and scope registrations onto the live app state,
         // as `run()` does. Static routes can carry `#[authorize]` checks or sit
@@ -7094,6 +7126,7 @@ impl AppBuilder {
 
         // Writable targets only: the control primary, then each shard primary.
         let control_url = config.database.effective_primary_url().map(str::to_owned);
+        let lock_policy = crate::migrate::MigrationLockPolicy::from_config(&config.database);
         let shard_targets: Vec<(String, String)> = config
             .database
             .shards
@@ -7192,6 +7225,7 @@ impl AppBuilder {
                             url,
                             crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
                             "control",
+                            lock_policy,
                         );
                     }
                 }
@@ -7209,6 +7243,7 @@ impl AppBuilder {
                         url,
                         crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
                         label,
+                        lock_policy,
                     );
                 }
             }
@@ -8164,6 +8199,7 @@ impl AppBuilder {
         // does not add one), and a replayed request should meet the app as a
         // warm process, not one still starting.
         state.probes = crate::probe::ProbeState::default();
+        state.apply_health_config(&config.health);
         state.insert_extension(RegisteredApiVersions(api_versions));
         #[cfg(feature = "db")]
         if let Some(interceptor) = db_interceptor {
@@ -9032,6 +9068,7 @@ async fn execute_task_result(
     start: crate::time::MonotonicInstant,
     name: &str,
     schedule: &'static str,
+    waited: bool,
 ) -> Result<u64, (u64, String)> {
     // A tick is work a sim drain must see (issue #2967).
     crate::sim::note_drain_progress();
@@ -9045,15 +9082,16 @@ async fn execute_task_result(
         task = %name,
         schedule = schedule,
     );
-    let future = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        (handler)(state.clone()).instrument(task_span)
-    })) {
-        Ok(future) => future,
-        Err(panic) => {
-            let duration_ms = task_duration_ms(state, start);
-            return Err((duration_ms, format_scheduled_task_panic(panic.as_ref())));
-        }
+    // The handler is called in the first poll, so `catch_unwind` below also
+    // catches a handler that panics before it returns its future, and the
+    // meter records that tick too (issue #1720).
+    let handler_state = state.clone();
+    let future = async move { (handler)(handler_state).instrument(task_span).await };
+    let run = crate::cost::WorkRun {
+        tenant: None,
+        waited,
     };
+    let future = crate::cost::meter_work(state, crate::cost::WorkKind::Task, name, run, future);
     let result = std::panic::AssertUnwindSafe(future).catch_unwind().await;
     let duration_ms = task_duration_ms(state, start);
 
@@ -9077,6 +9115,10 @@ fn format_scheduled_task_panic(panic: &(dyn Any + Send)) -> String {
 
 /// Run one tick with `tick` as its [`crate::scheduler::current_tick`], and
 /// stop it after `lease_ttl` when one is set.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one tick: its task, schedule, lease and cost wait"
+)]
 async fn execute_task_result_with_optional_lease_ttl(
     state: &AppState,
     handler: crate::task::TaskHandler,
@@ -9085,11 +9127,14 @@ async fn execute_task_result_with_optional_lease_ttl(
     schedule: &'static str,
     lease_ttl: Option<std::time::Duration>,
     tick: crate::scheduler::ScheduledTick,
+    waited: bool,
 ) -> Result<u64, (u64, String)> {
-    let run = crate::scheduler::with_tick(
-        tick,
-        execute_task_result(state, handler, start, name, schedule),
-    );
+    let run = execute_task_result(state, handler, start, name, schedule, waited);
+    // A scheduled task runs outside any request, so its framework
+    // transactions get the configured timeouts from here (#3057).
+    #[cfg(feature = "db")]
+    let run = crate::db::scope_background_tx_timeouts(state, run);
+    let run = crate::scheduler::with_tick(tick, run);
     let Some(lease_ttl) = lease_ttl else {
         return run.await;
     };
@@ -9128,6 +9173,7 @@ async fn execute_fixed_delay_task(
     let gate = CostGate {
         shutdown,
         waiting: None,
+        waited: std::sync::atomic::AtomicBool::new(false),
     };
     let wait_first = CostGate::waits_before_lease(&*coordinator);
     let (lease, tick_key) = loop {
@@ -9185,6 +9231,7 @@ async fn execute_fixed_delay_task(
         "fixed_delay",
         lease_ttl,
         tick,
+        gate.waited(),
     )
     .await
     {
@@ -9227,6 +9274,8 @@ struct CostGate {
     shutdown: tokio_util::sync::CancellationToken,
     /// `true` while the tick waits. The cron loop folds later ticks into it.
     waiting: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// `true` after the tick waited in a real window. The cost meter reads it.
+    waited: std::sync::atomic::AtomicBool,
 }
 
 impl CostGate {
@@ -9238,8 +9287,13 @@ impl CostGate {
             name,
             &self.shutdown,
             self.waiting.as_deref(),
+            &self.waited,
         )
         .await
+    }
+
+    fn waited(&self) -> bool {
+        self.waited.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Free a claim whose tick has not run, so a retry of the same key can
@@ -9376,7 +9430,14 @@ async fn execute_cron_task(
     let lease_ttl = lease_ttl_for_run(&lease, coordination, lease_ttl);
     let tick = crate::scheduler::ScheduledTick::new(&tick_key, &lease);
     match execute_task_result_with_optional_lease_ttl(
-        &state, handler, start, &name, "cron", lease_ttl, tick,
+        &state,
+        handler,
+        start,
+        &name,
+        "cron",
+        lease_ttl,
+        tick,
+        gate.waited(),
     )
     .await
     {
@@ -9555,6 +9616,7 @@ async fn run_cron_task_loop(
                     CostGate {
                         shutdown: shutdown.clone(),
                         waiting: Some(Arc::clone(&deferring)),
+                        waited: std::sync::atomic::AtomicBool::new(false),
                     },
                 ));
                 cursor = scheduled_at;
@@ -11723,11 +11785,8 @@ async fn resolve_shard_set(
                     })
                     .find(|url| crate::db::sqlite_target_is_shared_cache(url))
                     .unwrap_or_default();
-                crate::db::reject_sqlite_statement_timeout(
-                    config.database.statement_timeout,
-                    target,
-                )
-                .map_err(|e| format!("Failed to create shard pools: {e}"))?;
+                crate::db::reject_sqlite_unsupported_timeouts(&config.database, target)
+                    .map_err(|e| format!("Failed to create shard pools: {e}"))?;
             }
             crate::sharding::build_shard_set(&config.database, topologies, router)
         }
@@ -11818,7 +11877,7 @@ async fn setup_database(
             .migration_url()
             .or_else(|| config.database.effective_primary_url())
             .unwrap_or_default();
-        crate::db::reject_sqlite_statement_timeout(config.database.statement_timeout, target)
+        crate::db::reject_sqlite_unsupported_timeouts(&config.database, target)
             .map_err(|e| format!("Failed to create database pool: {e}"))?;
     }
 
@@ -11922,7 +11981,12 @@ async fn setup_database(
     #[allow(clippy::question_mark)]
     if runtime_boot
         && crate::derivation::has_derivation_descriptors()
-        && let Err(e) = start_derivation_backfill(topology.as_ref(), shards.as_ref()).await
+        && let Err(e) = start_derivation_backfill(
+            topology.as_ref(),
+            shards.as_ref(),
+            crate::db::TxTimeouts::from_config(&config.database),
+        )
+        .await
     {
         #[cfg(feature = "managed-pg")]
         crate::managed_pg::emergency_stop_async().await;
@@ -12013,10 +12077,15 @@ const BOOT_BACKFILL_BATCHES: usize = 8;
 /// spawned for a target whose reconcile failed: the sweep reads the state the
 /// reconcile writes, so sweeping after a failed reconcile would work from a
 /// stale answer.
+///
+/// `timeouts` are the app's configured transaction timeouts. This runs at
+/// boot, outside any request, so the reconcile and the backfill batches get
+/// them from here (#3057).
 #[cfg(feature = "db")]
 async fn start_derivation_backfill(
     topology: Option<&crate::db::DatabaseTopology>,
     shards: Option<&crate::sharding::ShardSet>,
+    timeouts: crate::db::TxTimeouts,
 ) -> Result<(), String> {
     // No connection needed, so a collision is caught before any data is touched.
     crate::derivation::check_registered_derivations()
@@ -12047,7 +12116,10 @@ async fn start_derivation_backfill(
                 continue;
             }
         };
-        match crate::derivation::ensure_derivations(&mut conn).await {
+        match timeouts
+            .scope(crate::derivation::ensure_derivations(&mut conn))
+            .await
+        {
             Ok(enqueued) => {
                 if !enqueued.is_empty() {
                     tracing::info!(
@@ -12068,7 +12140,7 @@ async fn start_derivation_backfill(
             }
         }
         drop(conn);
-        spawn_derivation_backfill(label, pool);
+        spawn_derivation_backfill(label, pool, timeouts);
     }
     Ok(())
 }
@@ -12082,7 +12154,11 @@ async fn start_derivation_backfill(
 /// cooperate: each batch locks the derivation's state row, so they take turns on
 /// one sweep instead of racing.
 #[cfg(feature = "db")]
-fn spawn_derivation_backfill(label: String, pool: crate::db::Pool<crate::db::RuntimeConnection>) {
+fn spawn_derivation_backfill(
+    label: String,
+    pool: crate::db::Pool<crate::db::RuntimeConnection>,
+    timeouts: crate::db::TxTimeouts,
+) {
     tokio::spawn(async move {
         let options = crate::derivation::BackfillOptions {
             max_batches: Some(BOOT_BACKFILL_BATCHES),
@@ -12103,7 +12179,10 @@ fn spawn_derivation_backfill(label: String, pool: crate::db::Pool<crate::db::Run
                     return;
                 }
             };
-            let report = match crate::derivation::run_backfill(&mut conn, &options).await {
+            let report = match timeouts
+                .scope(crate::derivation::run_backfill(&mut conn, &options))
+                .await
+            {
                 Ok(report) => report,
                 Err(error) => {
                     tracing::warn!(%error, database = %label, "derivation backfill failed");
@@ -12166,8 +12245,14 @@ fn apply_pending_or_exit(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
     target: &str,
+    lock_policy: crate::migrate::MigrationLockPolicy,
 ) -> usize {
-    match crate::migrate::run_pending_locked(database_url, migrations, None) {
+    match crate::migrate::run_pending_locked_with_policy(
+        database_url,
+        migrations,
+        None,
+        lock_policy,
+    ) {
         Ok(result) => result.applied.len(),
         Err(error) => {
             let reason = match error {
@@ -12175,6 +12260,9 @@ fn apply_pending_or_exit(
                     "could not connect to the database"
                 }
                 crate::migrate::MigrationError::Migration(_) => "a migration failed to apply",
+                crate::migrate::MigrationError::LockContention { .. } => {
+                    "a migration timed out on a table lock on every attempt"
+                }
                 _ => "migration error",
             };
             eprintln!("autumn migrate: {reason} (target {target})");
@@ -12532,6 +12620,7 @@ async fn run_startup_migrations(
     let profile = config.profile.clone();
     let auto_migrate = config.database.auto_migrate;
     let auto_in_prod = config.database.auto_migrate_in_production;
+    let lock_policy = crate::migrate::MigrationLockPolicy::from_config(&config.database);
     // Computed once, on the FINAL registered set (after `setup_database`'s own
     // fold added any shard-required sets), so a version collision between ANY
     // two registered sources is resolved automatically rather than causing
@@ -12596,6 +12685,7 @@ async fn run_startup_migrations(
                     auto_in_prod,
                     crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
                     "control",
+                    lock_policy,
                 );
             }
             // The shard directory table lives on the control plane only, so it
@@ -12611,6 +12701,7 @@ async fn run_startup_migrations(
                         &disambiguated,
                     ),
                     "control",
+                    lock_policy,
                 );
             }
             // The shard-map guard table also lives on the control plane only. It
@@ -12631,6 +12722,7 @@ async fn run_startup_migrations(
                         &disambiguated,
                     ),
                     "control",
+                    lock_policy,
                 );
             }
         }
@@ -12652,6 +12744,7 @@ async fn run_startup_migrations(
                     auto_in_prod,
                     crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
                     target,
+                    lock_policy,
                 );
             }
         }
@@ -14123,6 +14216,7 @@ fn build_state(
         entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
         app_id: AppState::next_app_id(),
     };
+    state.apply_health_config(&config.health);
     #[cfg(feature = "db")]
     if state.replica_pool.is_some() {
         state
@@ -14133,7 +14227,11 @@ fn build_state(
     // `db:shard:<name>` component (replica readiness refresh + pool stats).
     #[cfg(feature = "db")]
     if let Some(set) = state.shards() {
-        crate::sharding::register_shard_health_indicators(set, &state.health_indicator_registry);
+        crate::sharding::register_shard_health_indicators(
+            set,
+            &state.health_indicator_registry,
+            config.health.ping_timeout(),
+        );
     }
     state.insert_extension(config.clone());
     state.insert_extension(crate::step_up::StepUpGlobalConfig {
@@ -16399,15 +16497,18 @@ mod tests {
             "the migrate one-shot must not start the server"
         );
 
-        // The per-target applier reuses `run_pending_locked` (the exact engine
-        // `auto_migrate` drives — no duplicated migration logic) and exits
+        // The per-target applier reuses `run_pending_locked_with_policy` (the
+        // exact engine `auto_migrate` drives — no duplicated migration logic) and exits
         // non-zero on failure so a bad migration aborts before cutover (AC-3).
         let helper_start = source
             .find("fn apply_pending_or_exit(")
             .expect("apply_pending_or_exit exists");
-        let helper = &source[helper_start..helper_start + 1200];
+        let helper_end = source[helper_start..]
+            .find("\n}\n")
+            .map_or(source.len(), |end| helper_start + end);
+        let helper = &source[helper_start..helper_end];
         assert!(
-            helper.contains("crate::migrate::run_pending_locked("),
+            helper.contains("crate::migrate::run_pending_locked_with_policy("),
             "must reuse the shared locked applier, not duplicate migration logic"
         );
         assert!(
@@ -19785,7 +19886,8 @@ mod tests {
         let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
         let start = state.monotonic();
         let result =
-            super::execute_task_result(&state, handler, start, "test_task", "fixed_delay").await;
+            super::execute_task_result(&state, handler, start, "test_task", "fixed_delay", false)
+                .await;
         assert!(result.is_ok(), "expected Ok from successful handler");
         // duration_ms should be a reasonable value (not MAX)
         assert!(result.unwrap() < u64::MAX);
@@ -19798,7 +19900,8 @@ mod tests {
             |_| Box::pin(async { Err(crate::AutumnError::bad_request_msg("test error")) });
         let start = state.monotonic();
         let result =
-            super::execute_task_result(&state, handler, start, "test_task", "fixed_delay").await;
+            super::execute_task_result(&state, handler, start, "test_task", "fixed_delay", false)
+                .await;
         assert!(result.is_err(), "expected Err from failing handler");
         let (duration_ms, msg) = result.unwrap_err();
         assert!(duration_ms < u64::MAX);
@@ -19821,12 +19924,35 @@ mod tests {
             start,
             "test_task",
             "fixed_delay",
+            false,
         )
         .await;
 
         let (duration_ms, msg) = result.expect_err("expected Err from panicking handler");
         assert!(duration_ms < u64::MAX);
         assert!(msg.contains("scheduled task handler panicked: panic before scheduled future"));
+    }
+
+    /// A tick whose handler panics before it returns its future is metered
+    /// too (issue #1720).
+    #[tokio::test]
+    async fn execute_task_result_meters_an_immediate_handler_panic() {
+        let state = AppState::for_test();
+        let accountant = crate::cost::CostAccountant::new(10);
+        state.insert_extension(accountant.clone());
+        let start = state.monotonic();
+        let result = super::execute_task_result(
+            &state,
+            instantly_panicking_scheduled_handler,
+            start,
+            "test_task",
+            "fixed_delay",
+            false,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(accountant.snapshot().tasks.total.runs, 1);
     }
 
     #[tokio::test]
@@ -20012,6 +20138,7 @@ mod tests {
                 super::CostGate {
                     shutdown: tokio_util::sync::CancellationToken::new(),
                     waiting: None,
+                    waited: std::sync::atomic::AtomicBool::new(false),
                 },
             ));
 
@@ -20116,6 +20243,7 @@ mod tests {
             super::CostGate {
                 shutdown: tokio_util::sync::CancellationToken::new(),
                 waiting: Some(std::sync::Arc::clone(&flag)),
+                waited: std::sync::atomic::AtomicBool::new(false),
             },
         ));
 
@@ -20180,6 +20308,7 @@ mod tests {
             super::CostGate {
                 shutdown: tokio_util::sync::CancellationToken::new(),
                 waiting: Some(std::sync::Arc::clone(&waiting)),
+                waited: std::sync::atomic::AtomicBool::new(false),
             },
         )
         .await;
@@ -20417,6 +20546,7 @@ mod tests {
             super::CostGate {
                 shutdown: tokio_util::sync::CancellationToken::new(),
                 waiting: None,
+                waited: std::sync::atomic::AtomicBool::new(false),
             },
         )
         .await;
@@ -20463,6 +20593,7 @@ mod tests {
             super::CostGate {
                 shutdown: tokio_util::sync::CancellationToken::new(),
                 waiting: None,
+                waited: std::sync::atomic::AtomicBool::new(false),
             },
         )
         .await;
@@ -20593,6 +20724,7 @@ mod tests {
             super::CostGate {
                 shutdown: tokio_util::sync::CancellationToken::new(),
                 waiting: None,
+                waited: std::sync::atomic::AtomicBool::new(false),
             },
         )
         .await;

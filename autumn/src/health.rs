@@ -145,8 +145,17 @@ mod tests {
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn health_with_pool_returns_pool_status() -> Result<(), Box<dyn std::error::Error>> {
+        // Postgres: a port that refuses, so the primary ping fails (#3059).
+        // SQLite: an in-memory database, so the ping succeeds.
+        #[cfg(not(feature = "sqlite"))]
+        let url = {
+            let addr = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+            format!("postgres://autumn@{addr}/autumn")
+        };
+        #[cfg(feature = "sqlite")]
+        let url = crate::test_urls::primary("test");
         let config = crate::config::DatabaseConfig {
-            url: Some(crate::test_urls::primary("test")),
+            url: Some(url),
             pool_size: 5,
             ..Default::default()
         };
@@ -166,12 +175,22 @@ mod tests {
             .oneshot(Request::builder().uri("/health").body(Body::empty())?)
             .await?;
 
-        assert_eq!(response.status(), StatusCode::OK);
+        let reachable = cfg!(feature = "sqlite");
+        let expected = if reachable {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        assert_eq!(response.status(), expected);
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let json: serde_json::Value = serde_json::from_slice(&body)?;
 
-        assert_eq!(json["status"], "ok");
+        assert_eq!(json["status"], if reachable { "ok" } else { "degraded" });
+        assert_eq!(
+            json["database"]["status"],
+            if reachable { "ok" } else { "down" }
+        );
         assert!(json["version"].is_string());
         assert_eq!(json["pool"]["size"], 5);
         assert!(json["pool"]["available"].is_number());
