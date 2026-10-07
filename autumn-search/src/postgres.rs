@@ -37,7 +37,7 @@ use std::sync::{OnceLock, RwLock};
 
 use autumn_web::pagination::Page;
 use autumn_web::search::{IndexDefinition, SearchDocument};
-use diesel::sql_types::{Array, BigInt, Double, Nullable, Text};
+use diesel::sql_types::{BigInt, Double, Nullable, Text};
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::deadpool::Pool;
 
@@ -1073,10 +1073,22 @@ fn bind_all(mut query: BoxedQuery<'_>, binds: impl IntoIterator<Item = Bound>) -
             Bound::NullableText(value) => query.bind::<Nullable<Text>, _>(value),
             Bound::BigInt(value) => query.bind::<BigInt, _>(value),
             Bound::Double(value) => query.bind::<Double, _>(value),
-            Bound::Ids(values) => query.bind::<Array<BigInt>, _>(values),
+            Bound::Ids(values) => bind_ids(query, values),
         };
     }
     query
+}
+
+/// Bind an id list as a Postgres `BIGINT[]`.
+///
+/// `SQLite` has no array type. The plugin refuses this store at boot on a
+/// `SQLite` build, so that arm does not run. It binds the ids as JSON text to
+/// keep the bind count correct and the crate free of panics.
+fn bind_ids(query: BoxedQuery<'_>, values: Vec<i64>) -> BoxedQuery<'_> {
+    autumn_web::backend_select! {
+        pg => { query.bind::<diesel::sql_types::Array<BigInt>, _>(values) },
+        sqlite => { query.bind::<Text, _>(serde_json::Value::from(values).to_string()) },
+    }
 }
 
 impl SearchBackend for PostgresSearchStore {
