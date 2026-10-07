@@ -4468,12 +4468,11 @@ pub struct RequestTimeoutService<S> {
 }
 
 impl<S> RequestTimeoutService<S> {
-    /// The deadline that applies to `req`, or `None` when it is exempt. The
-    /// flag is `true` when the caller's deadline header set it.
+    /// The deadline that applies to `req`, or `None` when it is exempt.
     ///
     /// Uses borrowed lookups throughout so an exempt or deadline-free route
     /// allocates nothing.
-    fn deadline_for<B>(&self, req: &Request<B>) -> Option<(Duration, bool)> {
+    fn deadline_for<B>(&self, req: &Request<B>) -> Option<Duration> {
         // Internal `autumn build` / ISR regeneration renders drive a
         // `#[static_get]` route directly via `oneshot` and tag the request with
         // `RenderDeadlineExempt` (there is no client connection whose deadline
@@ -4509,10 +4508,7 @@ impl<S> RequestTimeoutService<S> {
             .then(|| req.headers().get(crate::deadline::DEADLINE_HEADER))
             .flatten()
             .and_then(crate::deadline::parse_header);
-        Some(match caller_deadline {
-            Some(caller) if caller < route_deadline => (caller, true),
-            _ => (route_deadline, false),
-        })
+        Some(caller_deadline.map_or(route_deadline, |caller| caller.min(route_deadline)))
     }
 }
 
@@ -4532,7 +4528,7 @@ where
     }
 
     fn call(&mut self, req: Request<axum::body::Body>) -> Self::Future {
-        let Some((duration, from_caller)) = self.deadline_for(&req) else {
+        let Some(duration) = self.deadline_for(&req) else {
             // Exempt (disabled route, or global off with a non-Override route)
             // — no timer and no allocation on this hot path.
             return RequestTimeoutFuture::Unbounded {
@@ -4573,10 +4569,9 @@ where
         // The handler sees the deadline through `Deadline::current()` (issue
         // #3058). The task-local scope costs no allocation.
         let start = crate::time::ambient_instant();
-        // A caller deadline of 0 leaves no time. `timeout_at` polls the
-        // handler before it checks the timer, so a handler that is ready at
-        // once would still run; answer with the timeout response instead.
-        if from_caller && duration.is_zero() {
+        // A deadline of 0 (from the caller's header) leaves no time: answer
+        // with the timeout response without calling the handler at all.
+        if duration.is_zero() {
             return RequestTimeoutFuture::Elapsed {
                 response: Some(deadline_exceeded_response(
                     &self.settings,
@@ -4592,7 +4587,7 @@ where
         let inner = deadline.sync_scope(|| self.inner.call(req));
 
         RequestTimeoutFuture::Bounded {
-            inner: tokio::time::timeout_at(deadline.instant(), deadline.scope_future(inner)),
+            inner: crate::deadline::Bounded::until(deadline, deadline.scope_future(inner)),
             settings: Arc::clone(&self.settings),
             duration,
             matched_path,
@@ -4607,12 +4602,14 @@ pin_project_lite::pin_project! {
     /// Future returned by [`RequestTimeoutService`].
     ///
     /// `Unbounded` is the exempt path and is literally the inner service's own
-    /// future; `Bounded` wraps it in `tokio::time::Timeout`, which is a named
-    /// type, so neither variant is heap-allocated.
+    /// future; `Bounded` wraps it in [`crate::deadline::Bounded`], which is a
+    /// named type, so neither variant is heap-allocated. It checks the
+    /// deadline before every poll of the handler, so a handler woken at or
+    /// after the deadline does not run on (issue #3058).
     ///
     /// `Elapsed` exists to make the deadline actually *cancel*.
-    /// `tokio::time::Timeout::poll` does not drop the future it wraps when the
-    /// timer fires — it just reports `Err(Elapsed)` — so a `Bounded` variant
+    /// `Bounded::poll` does not drop the future it wraps when the deadline
+    /// passes — it just reports `Err(DeadlineExceeded)` — so a `Bounded` variant
     /// that returned the `503` in place would keep the whole cancelled handler
     /// tree (its database connection guards, its load-shed slot, its webhook
     /// [`ReplayKeyGuard`](crate::webhook)) alive until whatever owns *this*
@@ -4629,7 +4626,7 @@ pin_project_lite::pin_project! {
         },
         Bounded {
             #[pin]
-            inner: tokio::time::Timeout<crate::deadline::DeadlineScope<F>>,
+            inner: crate::deadline::Bounded<crate::deadline::DeadlineScope<F>>,
             settings: Arc<RequestTimeoutSettings>,
             duration: Duration,
             matched_path: Option<String>,
@@ -4670,7 +4667,7 @@ where
                     start,
                 } => match std::task::ready!(inner.poll(cx)) {
                     Ok(response) => return std::task::Poll::Ready(response),
-                    Err(_elapsed) => Self::Elapsed {
+                    Err(crate::deadline::DeadlineExceeded) => Self::Elapsed {
                         response: Some(deadline_exceeded_response(
                             settings,
                             *duration,

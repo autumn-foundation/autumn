@@ -364,6 +364,34 @@ async fn a_zero_inbound_deadline_does_not_run_the_handler() {
     );
 }
 
+static LATE_MUTATIONS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[post("/late-mutation")]
+async fn late_mutation() -> &'static str {
+    let deadline = autumn_web::deadline::Deadline::current().expect("a request deadline");
+    tokio::time::sleep_until(deadline.instant()).await;
+    LATE_MUTATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    "done"
+}
+
+#[tokio::test]
+async fn a_handler_woken_at_the_deadline_does_not_run_on() {
+    let client = TestApp::new()
+        .routes(routes![late_mutation])
+        .config(with_global_timeout(100))
+        .build();
+    client
+        .post("/late-mutation")
+        .send()
+        .await
+        .assert_status(503);
+    assert_eq!(
+        LATE_MUTATIONS.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the handler must not run past its deadline"
+    );
+}
+
 #[tokio::test]
 async fn inbound_deadline_header_cannot_extend_the_route_deadline() {
     let client = TestApp::new()

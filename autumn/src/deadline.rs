@@ -191,30 +191,35 @@ pub(crate) struct DeadlineStopped(pub(crate) &'static str);
 /// [`DeadlineExceeded`] when the deadline passes first.
 pub async fn bounded<F: Future>(future: F) -> Result<F::Output, DeadlineExceeded> {
     match Deadline::current() {
-        Some(deadline) => {
-            Bounded {
-                deadline,
-                sleep: tokio::time::sleep_until(deadline.instant()),
-                future,
-            }
-            .await
-        }
+        Some(deadline) => Bounded::until(deadline, future).await,
         None => Ok(future.await),
     }
 }
 
 pin_project_lite::pin_project! {
-    /// The future of [`bounded`] under a deadline.
+    /// The future of [`bounded`] under a deadline, also used by the request
+    /// timeout layer.
     ///
     /// Unlike `tokio::time::timeout_at`, which polls the inner future before
     /// it checks the timer, this checks the deadline before every poll, so
     /// work that is ready only at or after the deadline does not run.
-    struct Bounded<F> {
+    pub(crate) struct Bounded<F> {
         deadline: Deadline,
         #[pin]
         sleep: tokio::time::Sleep,
         #[pin]
         future: F,
+    }
+}
+
+impl<F> Bounded<F> {
+    /// Run `future` until `deadline`.
+    pub(crate) fn until(deadline: Deadline, future: F) -> Self {
+        Self {
+            deadline,
+            sleep: tokio::time::sleep_until(deadline.instant()),
+            future,
+        }
     }
 }
 
