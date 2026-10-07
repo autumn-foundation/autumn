@@ -3042,11 +3042,15 @@ struct RetryGate {
     /// The key of the current host's budget.
     host: Option<String>,
     send_header: bool,
+    /// The first-attempt refill of `budget`, done by the first
+    /// [`check`](Self::check) that finds time left, so a request that never
+    /// starts an attempt refills nothing.
+    refill_pending: AtomicBool,
 }
 
 impl RetryGate {
-    /// Read the current deadline. Record the first attempt in the budget of
-    /// `host`.
+    /// Read the current deadline. The first attempt is recorded in the
+    /// budget of `host` when it starts.
     fn start(budgets: Option<Arc<RetryBudgets>>, host: Option<&str>, send_header: bool) -> Self {
         Self::with_deadline(Deadline::current(), budgets, host, send_header)
     }
@@ -3061,19 +3065,13 @@ impl RetryGate {
             .as_deref()
             .zip(host)
             .map(|(budgets, host)| budgets.for_host(host));
-        // Refill only for a request that can start: one past its deadline
-        // makes no attempt.
-        if let Some(budget) = &budget
-            && !deadline.is_some_and(Deadline::is_expired)
-        {
-            budget.record_request();
-        }
         Self {
             deadline,
             budgets,
             budget,
             host: host.map(str::to_owned),
             send_header,
+            refill_pending: AtomicBool::new(true),
         }
     }
 
@@ -3130,13 +3128,11 @@ impl RetryGate {
             budget: self.budget.clone(),
             host: self.host.clone(),
             send_header: self.send_header,
+            refill_pending: AtomicBool::new(false),
         };
         hop.rekey(url);
-        if url_host(url).is_some_and(|host| refilled.insert(host))
-            && !hop.expired()
-            && let Some(budget) = &hop.budget
-        {
-            budget.record_request();
+        if url_host(url).is_some_and(|host| refilled.insert(host)) {
+            hop.refill_pending = AtomicBool::new(true);
         }
         hop
     }
@@ -3162,9 +3158,16 @@ impl RetryGate {
     }
 
     /// An error when no time is left to start an attempt.
+    ///
+    /// The first check with time left does the first-attempt refill.
     fn check(&self) -> Result<(), ClientError> {
         if self.expired() {
             return Err(ClientError::DeadlineExceeded);
+        }
+        if self.refill_pending.swap(false, Ordering::Relaxed)
+            && let Some(budget) = &self.budget
+        {
+            budget.record_request();
         }
         Ok(())
     }
@@ -7100,13 +7103,25 @@ mod tests {
             while target_budget.try_acquire(RetryKind::Transient) {}
             let origin =
                 RetryGate::with_deadline(None, Some(Arc::clone(&budgets)), Some("a:443"), true);
-            let after_first = origin_budget.available();
             let mut refilled = std::collections::HashSet::from(["a:443".to_owned()]);
             // a -> b -> a -> b
-            let _ = origin.for_hop("https://b/1", &mut refilled);
+            origin.check().unwrap();
+            let after_first = origin_budget.available();
+            let before_b = target_budget.available();
+            origin
+                .for_hop("https://b/1", &mut refilled)
+                .check()
+                .unwrap();
             let after_b = target_budget.available();
-            let _ = origin.for_hop("https://a/2", &mut refilled);
-            let _ = origin.for_hop("https://b/3", &mut refilled);
+            assert!(after_b > before_b, "the first visit to b refills it");
+            origin
+                .for_hop("https://a/2", &mut refilled)
+                .check()
+                .unwrap();
+            origin
+                .for_hop("https://b/3", &mut refilled)
+                .check()
+                .unwrap();
             assert!(
                 (origin_budget.available() - after_first).abs() < f64::EPSILON,
                 "the origin is not credited again"
@@ -7189,18 +7204,42 @@ mod tests {
             let budget = budgets.for_host("h:80");
             while budget.try_acquire(RetryKind::Transient) {}
             let empty = budget.available();
-            let _late = RetryGate::with_deadline(
+            let late = RetryGate::with_deadline(
                 Some(Deadline::at(tokio::time::Instant::now())),
                 Some(Arc::clone(&budgets)),
                 Some("h:80"),
                 true,
             );
+            assert!(late.check().is_err());
             assert!(
                 (budget.available() - empty).abs() < f64::EPSILON,
                 "no refill"
             );
-            let _live = RetryGate::with_deadline(None, Some(budgets), Some("h:80"), true);
-            assert!(budget.available() > empty, "a live request refills");
+
+            // Live when built, expired before the first attempt.
+            let short = RetryGate::with_deadline(
+                Some(Deadline::after(Duration::from_millis(1))),
+                Some(Arc::clone(&budgets)),
+                Some("h:80"),
+                true,
+            );
+            tokio::time::advance(Duration::from_millis(5)).await;
+            assert!(short.check().is_err());
+            assert!(
+                (budget.available() - empty).abs() < f64::EPSILON,
+                "no refill without an attempt"
+            );
+
+            let live = RetryGate::with_deadline(None, Some(budgets), Some("h:80"), true);
+            assert!(
+                (budget.available() - empty).abs() < f64::EPSILON,
+                "not when built"
+            );
+            live.check().unwrap();
+            let once = budget.available();
+            assert!(once > empty, "a live request refills at its first attempt");
+            live.check().unwrap();
+            assert!((budget.available() - once).abs() < f64::EPSILON, "once");
         }
 
         #[test]
@@ -7220,6 +7259,7 @@ mod tests {
                 budget: Some(Arc::clone(&budget)),
                 host: None,
                 send_header: true,
+                refill_pending: AtomicBool::new(false),
             };
             assert!(gate.allow(RetryKind::Transient, Duration::ZERO));
             gate.finish(Some(RetryKind::Transient), 500);

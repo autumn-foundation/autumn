@@ -1415,9 +1415,17 @@ fn server_error_detail(status: StatusCode) -> String {
 
 impl AutumnError {
     /// `true` when the request deadline stopped the work behind this error
-    /// (issue #3058): a `ClientError::DeadlineExceeded` or a
-    /// [`crate::deadline::DeadlineExceeded`] that the handler returned.
+    /// (issue #3058): a `ClientError::DeadlineExceeded`, a
+    /// [`crate::deadline::DeadlineExceeded`], or a framework call such as a
+    /// database connection wait that the deadline cut.
     fn is_deadline_stop(&self) -> bool {
+        if self
+            .inner
+            .downcast_ref::<crate::deadline::DeadlineStopped>()
+            .is_some()
+        {
+            return true;
+        }
         #[cfg(feature = "http-client")]
         if matches!(
             self.inner.downcast_ref::<crate::http_client::ClientError>(),
@@ -1516,6 +1524,13 @@ mod tests {
         assert_eq!(
             marked(crate::http_client::ClientError::DeadlineExceeded.into()),
             (StatusCode::GATEWAY_TIMEOUT, true)
+        );
+        assert_eq!(
+            marked(AutumnError::service_unavailable(
+                crate::deadline::DeadlineStopped("db wait")
+            )),
+            (StatusCode::SERVICE_UNAVAILABLE, true),
+            "a deadline-cut connection wait keeps its 503"
         );
         assert_eq!(
             marked(std::io::Error::other("boom").into()),

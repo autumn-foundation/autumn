@@ -173,6 +173,14 @@ pub(crate) async fn unscoped<F: Future>(future: F) -> F::Output {
 #[error("deadline exceeded")]
 pub struct DeadlineExceeded;
 
+/// A framework call the request deadline stopped, reported with its own
+/// message and status (for example the `503` of a database connection wait).
+/// Like [`DeadlineExceeded`], its response tells the session layer not to
+/// save partial session changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct DeadlineStopped(pub(crate) &'static str);
+
 /// Run `future`, but stop it at the current deadline.
 ///
 /// With no deadline set, this runs `future` to the end.

@@ -3506,9 +3506,9 @@ impl Db {
             )
             .await
             .map_err(|_elapsed| {
-                AutumnError::service_unavailable_msg(
+                AutumnError::service_unavailable(crate::deadline::DeadlineStopped(
                     "request deadline exceeded while waiting for a database connection",
-                )
+                ))
             })??,
             None => checkout_future.instrument(span.clone()).await?,
         };
