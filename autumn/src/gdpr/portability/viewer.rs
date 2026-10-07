@@ -5,7 +5,7 @@
 //! `viewer/manifest.json` [`StaticManifest`]. A browser opens the pages from
 //! the disk. The pages have no script and load nothing from a network.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
 use crate::static_gen::{ManifestEntry, StaticManifest, url_to_file_path};
@@ -55,45 +55,63 @@ pub(super) fn render(
 
 /// Lookups that the pages need, made one time.
 struct KeyIndex {
-    /// The primary-key values of each table, for links that only point at
-    /// rows the capsule has.
-    keys: HashMap<String, BTreeSet<String>>,
+    /// For each `(table, column)` that a link targets: the column value of
+    /// each row, to the primary key of that row. A link to a column that is
+    /// not the key (a unique slug, say) then finds the anchor of its row. A
+    /// value on two rows has no single row, so it maps to `None`.
+    rows: HashMap<(String, String), HashMap<String, Option<String>>>,
     /// For each `(table, key)`, the "Referenced by" list items.
     back: HashMap<(String, String), Vec<String>>,
 }
 
 impl KeyIndex {
     fn new(manifest: &CapsuleManifest, records: &BTreeMap<String, Vec<Record>>) -> Self {
-        let keys = manifest
-            .models
-            .iter()
-            .map(|m| {
-                let keys = records
-                    .get(&m.table)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|r| r.get(&m.primary_key).and_then(value_key))
-                    .collect();
-                (m.table.clone(), keys)
-            })
-            .collect();
-        let mut back: HashMap<(String, String), Vec<String>> = HashMap::new();
-        for other in &manifest.models {
-            for rel in &other.relationships {
-                let Some(target) = manifest.model(&rel.target) else {
+        let mut rows: HashMap<(String, String), HashMap<String, Option<String>>> = HashMap::new();
+        for rel in manifest.models.iter().flat_map(|m| &m.relationships) {
+            let Some(target) = manifest.model(&rel.target) else {
+                continue;
+            };
+            let entry = (rel.target.clone(), rel.target_column.clone());
+            if rows.contains_key(&entry) {
+                continue;
+            }
+            let mut values: HashMap<String, Option<String>> = HashMap::new();
+            for row in records.get(&target.table).into_iter().flatten() {
+                let (Some(value), Some(key)) = (
+                    row.get(&rel.target_column).and_then(value_key),
+                    row.get(&target.primary_key).and_then(value_key),
+                ) else {
                     continue;
                 };
-                if rel.target_column != target.primary_key {
-                    continue;
-                }
+                values
+                    .entry(value)
+                    .and_modify(|found| {
+                        if found.as_ref() != Some(&key) {
+                            *found = None;
+                        }
+                    })
+                    .or_insert(Some(key));
+            }
+            rows.insert(entry, values);
+        }
+        let mut index = Self {
+            rows,
+            back: HashMap::new(),
+        };
+        for other in &manifest.models {
+            for rel in &other.relationships {
                 for row in records.get(&other.table).into_iter().flatten() {
                     let (Some(key), Some(other_key)) = (
-                        row.get(&rel.column).and_then(value_key),
+                        row.get(&rel.column)
+                            .and_then(value_key)
+                            .and_then(|v| index.resolve(&rel.target, &rel.target_column, &v)),
                         row.get(&other.primary_key).and_then(value_key),
                     ) else {
                         continue;
                     };
-                    back.entry((rel.target.clone(), key))
+                    index
+                        .back
+                        .entry((rel.target.clone(), key))
                         .or_default()
                         .push(format!(
                             "<li><a href=\"../{}/index.html#{}\">{} {}</a> ({})</li>",
@@ -106,11 +124,16 @@ impl KeyIndex {
                 }
             }
         }
-        Self { keys, back }
+        index
     }
 
-    fn has(&self, table: &str, key: &str) -> bool {
-        self.keys.get(table).is_some_and(|keys| keys.contains(key))
+    /// The primary key of the row of `table` whose `column` is `value`, when
+    /// the capsule has exactly one such row.
+    fn resolve(&self, table: &str, column: &str, value: &str) -> Option<String> {
+        self.rows
+            .get(&(table.to_owned(), column.to_owned()))?
+            .get(value)?
+            .clone()
     }
 
     /// The "Referenced by" list of one record, or nothing.
@@ -265,10 +288,8 @@ fn cell(
         .iter()
         .filter(|r| r.column == column)
         .find_map(|r| {
-            let key = value_key(value)?;
-            let target = manifest.model(&r.target)?;
-            (target.primary_key == r.target_column && index.has(&r.target, &key))
-                .then_some((r.target.as_str(), key))
+            let key = index.resolve(&r.target, &r.target_column, &value_key(value)?)?;
+            Some((r.target.as_str(), key))
         });
     match link {
         Some((target, key)) => format!(
@@ -283,6 +304,7 @@ fn cell(
 
 #[cfg(test)]
 mod tests {
+    use super::super::model::Relationship;
     use super::*;
 
     #[test]
@@ -298,6 +320,56 @@ mod tests {
         assert_eq!(anchor("10"), "r-10");
         assert_eq!(anchor("a b\"<"), "r-a_20b_22_3c");
         assert_eq!(anchor("é"), "r-_c3_a9");
+    }
+
+    #[test]
+    fn links_follow_a_reference_to_a_column_that_is_not_the_key() {
+        let model = |table: &str, relationships: Vec<Relationship>| ModelManifest {
+            table: table.to_owned(),
+            primary_key: "id".to_owned(),
+            subject_column: "id".to_owned(),
+            fields: Vec::new(),
+            relationships,
+            blob_columns: Vec::new(),
+            record_count: 1,
+            file: format!("records/{table}.json"),
+        };
+        let mut manifest = CapsuleManifest::new("1");
+        manifest.models = vec![
+            model("users", Vec::new()),
+            model(
+                "posts",
+                vec![Relationship {
+                    column: "author_slug".to_owned(),
+                    target: "users".to_owned(),
+                    target_column: "slug".to_owned(),
+                }],
+            ),
+        ];
+        let row = |v: serde_json::Value| v.as_object().unwrap().clone();
+        let records = BTreeMap::from([
+            (
+                "users".to_owned(),
+                vec![row(serde_json::json!({"id": 1, "slug": "ada"}))],
+            ),
+            (
+                "posts".to_owned(),
+                vec![row(serde_json::json!({"id": 7, "author_slug": "ada"}))],
+            ),
+        ]);
+        let files: BTreeMap<_, _> = render(&manifest, &records).into_iter().collect();
+        let page = |name: &str| String::from_utf8(files[name].clone()).unwrap();
+        // The slug links to the anchor of the user's key, and back.
+        assert!(
+            page("viewer/posts/index.html").contains("href=\"../users/index.html#r-1\""),
+            "{}",
+            page("viewer/posts/index.html")
+        );
+        assert!(
+            page("viewer/users/index.html").contains("href=\"../posts/index.html#r-7\""),
+            "{}",
+            page("viewer/users/index.html")
+        );
     }
 
     #[test]

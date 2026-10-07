@@ -370,12 +370,7 @@ impl BlobStore for LocalBlobStore {
                 }
                 Err(()) => {
                     // A caller must not get a blob without its MIME type.
-                    // Remove the blob only while `path` is still the file
-                    // this call linked: another writer can replace it.
-                    if same_file(&path, &tmp_path).await {
-                        let _ = tokio::fs::remove_file(&path).await;
-                        drop_stale_sidecar(&path).await;
-                    }
+                    remove_own_blob(&path, &tmp_path).await;
                     let _ = tokio::fs::remove_file(&tmp_path).await;
                     return Err(BlobStoreError::Io(format!(
                         "could not store the metadata of {key}"
@@ -1155,6 +1150,25 @@ async fn commit_meta(
     Ok(false)
 }
 
+/// Remove the blob at `path` only if it is the file that `tmp_path` linked.
+///
+/// A writer in another process (or another store on the same root) does not
+/// take the commit lock and can replace `path` at any time. So the rename takes
+/// the file that is in place at that moment, and the check and the removal act
+/// on that one file. A file of another writer goes back with a link, which
+/// never replaces a newer one. A sidecar stays: this call wrote none, and a
+/// sidecar without its blob is never read.
+async fn remove_own_blob(path: &std::path::Path, tmp_path: &std::path::Path) {
+    let taken = temp_sibling_path(path);
+    if tokio::fs::rename(path, &taken).await.is_err() {
+        return;
+    }
+    if !same_file(&taken, tmp_path).await {
+        let _ = tokio::fs::hard_link(&taken, path).await;
+    }
+    let _ = tokio::fs::remove_file(&taken).await;
+}
+
 /// Remove the sidecar of `blob_path` only if it still holds `meta`.
 ///
 /// The rename takes the sidecar that is in place at that moment, so the check
@@ -1571,6 +1585,36 @@ mod tests {
             s.get("a/b.png").await,
             Err(BlobStoreError::NotFound(_))
         ));
+        // No temp file stays next to the key.
+        let names: Vec<_> = std::fs::read_dir(dir.path().join("a"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["b.png.meta"]);
+    }
+
+    #[tokio::test]
+    async fn remove_own_blob_keeps_the_blob_of_another_writer() {
+        let dir = temp_root();
+        let path = dir.path().join("k.bin");
+        let ours = dir.path().join("ours.tmp");
+        std::fs::write(&ours, b"ours").unwrap();
+        // Another writer put its own file at the path.
+        std::fs::write(&path, b"theirs").unwrap();
+        remove_own_blob(&path, &ours).await;
+        assert_eq!(std::fs::read(&path).unwrap(), b"theirs");
+
+        // The file that `ours` linked goes.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&ours, &path).unwrap();
+        remove_own_blob(&path, &ours).await;
+        assert!(!path.exists());
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["ours.tmp"]);
     }
 
     #[tokio::test]

@@ -447,6 +447,32 @@ async fn export_rejects_blob_and_relationship_columns_that_name_no_column() {
 }
 
 #[tokio::test]
+async fn verify_refuses_metadata_larger_than_a_capsule_needs() {
+    // Valid JSON with 1 MiB of trailing spaces: it parses, so only a size
+    // limit stops it, before the whole file is in memory.
+    let (_dir, root) = written().await;
+    let path = root.join("signature.json");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend(std::iter::repeat_n(b' ', 1 << 20));
+    std::fs::write(&path, bytes).unwrap();
+    let err = DataCapsule::read_dir(&root, &signer()).expect_err("signature too large");
+    assert!(matches!(err, DataCapsuleError::Integrity(_)), "{err:?}");
+    assert!(err.to_string().contains("too large"), "{err}");
+
+    // A sparse manifest of 65 MiB costs no disk, but would cost the memory.
+    let (_dir, root) = written().await;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.join("manifest.json"))
+        .unwrap()
+        .set_len(65 << 20)
+        .unwrap();
+    let err = DataCapsule::read_dir(&root, &signer()).expect_err("manifest too large");
+    assert!(matches!(err, DataCapsuleError::Integrity(_)), "{err:?}");
+    assert!(err.to_string().contains("too large"), "{err}");
+}
+
+#[tokio::test]
 async fn every_viewer_link_points_at_a_file_and_an_anchor() {
     let (_dir, root) = written().await;
     let mut pages = vec![root.join("viewer/index.html")];
@@ -1049,6 +1075,37 @@ mod blobs {
     }
 
     #[tokio::test]
+    async fn import_refuses_a_record_that_refers_to_a_blob_the_capsule_lacks() {
+        // The source has no CV: export skips it, but the record still names
+        // it. Import must not write a record that points at nothing, or at
+        // other bytes that the target keeps under that key.
+        let tmp = tempfile::tempdir().unwrap();
+        let blobs = blob_store(&tmp.path().join("a"));
+        blobs
+            .put("avatars/ada.png", "image/png", Bytes::from_static(b"png"))
+            .await
+            .unwrap();
+        let mut capsule = export_subject(&models(), &store(), "1").await.unwrap();
+        collect_blobs(&mut capsule, &blobs).await.unwrap();
+        assert_eq!(capsule.manifest.blobs.len(), 1);
+
+        let target = MemoryCapsuleStore::new().table(
+            "users",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("avatar", "jsonb").nullable(),
+                FieldSpec::new("cv_key", "text").nullable(),
+            ],
+        );
+        let err = import_capsule(&capsule, &models(), &target)
+            .await
+            .expect_err("a blob the capsule lacks");
+        assert!(matches!(err, DataCapsuleError::InvalidInput(_)), "{err:?}");
+        assert!(err.to_string().contains("docs/ada-cv.txt"), "{err}");
+        assert!(target.rows("users").is_empty());
+    }
+
+    #[tokio::test]
     async fn restore_does_not_overwrite_a_blob_written_during_the_import() {
         let tmp = tempfile::tempdir().unwrap();
         let source_blobs = blob_store(&tmp.path().join("a"));
@@ -1328,6 +1385,10 @@ mod blobs {
             .put("avatars/ada.png", "image/png", Bytes::from_static(b"png"))
             .await
             .unwrap();
+        source_blobs
+            .put("docs/ada-cv.txt", "text/plain", Bytes::from_static(b"cv"))
+            .await
+            .unwrap();
         let source = CapsuleService::new(models(), Arc::new(store()), signer())
             .with_blob_store(Arc::new(source_blobs));
         let root = tmp.path().join("capsule");
@@ -1381,6 +1442,10 @@ mod blobs {
         let source_blobs = blob_store(&tmp.path().join("a"));
         source_blobs
             .put("avatars/ada.png", "image/png", Bytes::from_static(b"png"))
+            .await
+            .unwrap();
+        source_blobs
+            .put("docs/ada-cv.txt", "text/plain", Bytes::from_static(b"cv"))
             .await
             .unwrap();
         let source = CapsuleService::new(models(), Arc::new(store()), signer())

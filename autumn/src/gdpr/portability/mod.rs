@@ -223,7 +223,9 @@ pub async fn export_subject(
 /// # Errors
 ///
 /// [`DataCapsuleError::UnknownTable`], [`DataCapsuleError::RelationshipCycle`],
-/// [`DataCapsuleError::UnsupportedFormat`], or an error from `store` (for example
+/// [`DataCapsuleError::UnsupportedFormat`],
+/// [`DataCapsuleError::InvalidInput`] for a record that names a blob the
+/// capsule does not hold, or an error from `store` (for example
 /// [`DataCapsuleError::Conflict`]).
 pub async fn import_capsule(
     capsule: &DataCapsule,
@@ -250,6 +252,21 @@ pub async fn import_capsule(
         )?;
         if !models.iter().any(|m| m.table == model.table) {
             return Err(DataCapsuleError::UnknownTable(model.table.clone()));
+        }
+        // Export skips a blob that its store does not have, but the record
+        // still names it. Such a record would point at nothing, or at other
+        // bytes that the target keeps under that key.
+        for row in capsule.records(&model.table) {
+            for column in &model.blob_columns {
+                if let Some(key) = row.get(column).and_then(viewer::blob_key)
+                    && manifest.blob(key).is_none()
+                {
+                    return Err(DataCapsuleError::InvalidInput(format!(
+                        "{}.{column} refers to blob {key:?}, which the capsule does not hold",
+                        model.table
+                    )));
+                }
+            }
         }
     }
     let order = import_order(&manifest.models)?;

@@ -19,6 +19,16 @@ fn check_depth(dir: &str) -> Result<(), DataCapsuleError> {
     Ok(())
 }
 
+/// Fail when a file of `size` bytes is larger than `max`.
+fn too_large(rel: &str, size: u64, max: u64) -> Result<(), DataCapsuleError> {
+    if size > max {
+        return Err(DataCapsuleError::Integrity(format!(
+            "file is too large: {rel} ({size} bytes, at most {max})"
+        )));
+    }
+    Ok(())
+}
+
 pub(super) use imp::Root;
 
 #[cfg(unix)]
@@ -34,7 +44,7 @@ mod imp {
     use nix::sys::stat::{Mode, SFlag, fchmod, fstat, fstatat, mkdirat, mode_t};
     use nix::unistd::{UnlinkatFlags, unlinkat};
 
-    use super::{DataCapsuleError, check_depth};
+    use super::{DataCapsuleError, check_depth, too_large};
 
     const DIR_FLAGS: OFlag = OFlag::O_RDONLY
         .union(OFlag::O_DIRECTORY)
@@ -107,6 +117,16 @@ mod imp {
             &self,
             rel: &str,
         ) -> Result<Vec<u8>, DataCapsuleError> {
+            self.read_at_most(rel, u64::MAX)
+        }
+
+        /// Read `rel`, or fail when it has more than `max` bytes. The size is
+        /// checked before the read, and the read stops after `max` bytes.
+        pub(in crate::gdpr::portability) fn read_at_most(
+            &self,
+            rel: &str,
+            max: u64,
+        ) -> Result<Vec<u8>, DataCapsuleError> {
             let mut segments: Vec<&str> = rel.split('/').collect();
             let name = segments
                 .pop()
@@ -120,10 +140,13 @@ mod imp {
                     "entry is not a regular file: {rel}"
                 )));
             }
+            too_large(rel, u64::try_from(stat.st_size).unwrap_or(u64::MAX), max)?;
             let mut bytes = Vec::new();
             std::fs::File::from(fd)
+                .take(max.saturating_add(1))
                 .read_to_end(&mut bytes)
                 .map_err(|e| DataCapsuleError::io(rel, e))?;
+            too_large(rel, bytes.len() as u64, max)?;
             Ok(bytes)
         }
 
@@ -340,6 +363,18 @@ mod imp {
             &self,
             rel: &str,
         ) -> Result<Vec<u8>, DataCapsuleError> {
+            self.read_at_most(rel, u64::MAX)
+        }
+
+        /// Read `rel`, or fail when it has more than `max` bytes. The size is
+        /// checked before the read, and the read stops after `max` bytes.
+        pub(in crate::gdpr::portability) fn read_at_most(
+            &self,
+            rel: &str,
+            max: u64,
+        ) -> Result<Vec<u8>, DataCapsuleError> {
+            use std::io::Read as _;
+
             let path = rel.split('/').fold(self.path.clone(), |p, s| p.join(s));
             let meta = std::fs::symlink_metadata(&path).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
@@ -353,7 +388,13 @@ mod imp {
                     "entry is not a regular file: {rel}"
                 )));
             }
-            std::fs::read(&path).map_err(|e| DataCapsuleError::io(path, e))
+            super::too_large(rel, meta.len(), max)?;
+            let mut bytes = Vec::new();
+            std::fs::File::open(&path)
+                .and_then(|file| file.take(max.saturating_add(1)).read_to_end(&mut bytes))
+                .map_err(|e| DataCapsuleError::io(&path, e))?;
+            super::too_large(rel, bytes.len() as u64, max)?;
+            Ok(bytes)
         }
 
         /// Make the root owner-only and check that it is empty.

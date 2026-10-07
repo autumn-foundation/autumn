@@ -27,6 +27,11 @@ use crate::security::config::{ResolvedSigningKeys, SigningSecretConfig};
 
 const MANIFEST_FILE: &str = "manifest.json";
 const SIGNATURE_FILE: &str = "signature.json";
+/// The largest manifest that verify reads. It is read before its signature
+/// is checked, so a capsule from anyone must not make it allocate more.
+const MAX_MANIFEST_BYTES: u64 = 64 << 20;
+/// The largest signature file: a few hundred bytes in practice.
+const MAX_SIGNATURE_BYTES: u64 = 64 << 10;
 const ALGORITHM: &str = "HMAC-SHA256";
 /// Domain separation: a capsule signature is never a valid cookie or CSRF tag.
 const SIGNATURE_DOMAIN: &[u8] = b"autumn-data-capsule/v1\n";
@@ -231,6 +236,13 @@ impl DataCapsule {
         }
 
         let manifest_bytes = to_json(MANIFEST_FILE, &manifest)?;
+        // Verify would refuse a larger manifest: never write one.
+        if manifest_bytes.len() as u64 > MAX_MANIFEST_BYTES {
+            return Err(DataCapsuleError::InvalidInput(format!(
+                "the manifest has {} bytes, more than the {MAX_MANIFEST_BYTES} that verify reads",
+                manifest_bytes.len()
+            )));
+        }
         let signature = SignatureFile {
             algorithm: ALGORITHM.to_owned(),
             signature: signer.sign(&manifest_bytes),
@@ -356,8 +368,11 @@ fn load_verified(
             )));
         }
     }
-    let manifest_bytes = root.read(MANIFEST_FILE)?;
-    let signature: SignatureFile = from_json(SIGNATURE_FILE, &root.read(SIGNATURE_FILE)?)?;
+    let manifest_bytes = root.read_at_most(MANIFEST_FILE, MAX_MANIFEST_BYTES)?;
+    let signature: SignatureFile = from_json(
+        SIGNATURE_FILE,
+        &root.read_at_most(SIGNATURE_FILE, MAX_SIGNATURE_BYTES)?,
+    )?;
     if signature.algorithm != ALGORITHM {
         return Err(DataCapsuleError::UnsupportedFormat(format!(
             "signature algorithm {:?}",
