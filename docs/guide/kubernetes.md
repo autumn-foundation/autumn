@@ -27,11 +27,19 @@ With Helm:
 ```bash
 helm upgrade --install shop deploy/helm \
   --set image.repository=registry.example.com/shop \
-  --set image.tag=1.4.0
+  --set image.tag=1.4.0 \
+  --set 'trustedHosts[0]=shop.example.com'
 ```
 
-With Kustomize, make an overlay that uses the base. Set the image and the
-Secret in the overlay. Then apply the overlay:
+`trustedHosts` is required. The prod profile does not start without
+`[security.trusted_hosts]`, so the chart refuses to render without it. The
+chart also trusts the pod IP: Prometheus scrapes a pod by its IP, and sends
+the IP as the `Host` header.
+
+With Kustomize, make an overlay that uses the base. Set the image, the Secret
+and your host names in the overlay. The base sets
+`AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS` to a placeholder host and the pod IP.
+Then apply the overlay:
 
 ```bash
 kubectl apply -k deploy/kustomize/overlays/prod

@@ -347,6 +347,19 @@ fn parse_selector(raw: &str) -> Result<Vec<Matcher>, String> {
 
 fn warnings(slos: &[Slo]) -> Vec<String> {
     let mut out = Vec::new();
+    let histogram: Vec<&str> = slos
+        .iter()
+        .filter(|slo| matches!(slo.sli, Sli::Latency { .. }) || slo.route().is_some())
+        .map(|slo| slo.name.as_str())
+        .collect();
+    if !histogram.is_empty() {
+        out.push(format!(
+            "SLO {} reads the {DURATION_BUCKET} histogram (issue #3064). Make sure \
+             /actuator/prometheus exports it, or these rules return no data and their \
+             alerts and canary checks never fail.",
+            histogram.join(", "),
+        ));
+    }
     for slo in slos {
         // A burn rate above 1/budget needs an error ratio above 100 %.
         let fast = u64::from(slo.budget_ppm()) * u64::from(BURN_WINDOWS[0].factor_tenths) / 10;

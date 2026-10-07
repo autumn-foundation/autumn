@@ -48,6 +48,17 @@ terminationGracePeriodSeconds, so it must be longer than the drain window.
 {{- end -}}
 
 {{/*
+The trusted hosts, comma-separated. The prod profile does not start without
+them.
+*/}}
+{{- define "app.trustedHosts" -}}
+{{- if not .Values.trustedHosts -}}
+{{- fail "set trustedHosts to the app's public host names; the prod profile does not start without [security.trusted_hosts]" -}}
+{{- end -}}
+{{- join "," .Values.trustedHosts -}}
+{{- end -}}
+
+{{/*
 The pod template. The Deployment and the Rollout share it.
 */}}
 {{- define "app.podTemplate" -}}
@@ -93,6 +104,13 @@ spec:
       env:
         - name: AUTUMN_SERVER__HOST
           value: "0.0.0.0"
+        # The pod IP is trusted too: Prometheus sends it as the Host header.
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS
+          value: {{ printf "%s,$(POD_IP)" (include "app.trustedHosts" .) | quote }}
         - name: AUTUMN_SERVER__PORT
           value: {{ .Values.containerPort | quote }}
         - name: AUTUMN_SERVER__PRESTOP_GRACE_SECS

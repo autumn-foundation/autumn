@@ -45,6 +45,15 @@ spec:
           env:
             - name: AUTUMN_SERVER__HOST
               value: "0.0.0.0"
+            # The prod profile does not start without trusted hosts. Set your
+            # public host names in your overlay. The pod IP is trusted too, so
+            # Prometheus can scrape the pod by its IP.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS
+              value: "{{k8s_name}}.example.com,$(POD_IP)"
             - name: AUTUMN_SERVER__PORT
               value: "3000"
             - name: AUTUMN_SERVER__PRESTOP_GRACE_SECS

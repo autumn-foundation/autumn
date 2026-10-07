@@ -548,7 +548,24 @@ fn a_low_objective_warns_that_the_fast_page_cannot_fire() {
         "{:?}",
         generated.warnings
     );
-    assert!(fixture().warnings.is_empty());
+}
+
+#[test]
+fn slos_that_read_the_histogram_warn_about_it() {
+    let warnings = fixture().warnings;
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].starts_with("SLO checkout, orders-latency, latency reads the"),
+        "{warnings:?}"
+    );
+    let slos =
+        slo::validate(&[config("a", 99.9, SliKind::Availability, None, None)]).expect("valid");
+    assert!(
+        generate(&slos, &fixture_options())
+            .expect("generate")
+            .warnings
+            .is_empty()
+    );
 }
 
 fn args(dir: &Path, check: bool) -> GenerateArgs {

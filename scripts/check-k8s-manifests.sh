@@ -168,7 +168,8 @@ EOF
   expect_failure "kubeconform on an invalid Deployment" "is invalid" validate "${work}/bad.yaml"
   render "${work}/chart"
   expect_failure "a chart with no shutdown buffer" "bufferSeconds must be 1 or more" \
-    "${HELM}" template demo "${work}/chart/helm" --set shutdown.bufferSeconds=0
+    "${HELM}" template demo "${work}/chart/helm" --set 'trustedHosts[0]=a.example.com' \
+    --set shutdown.bufferSeconds=0
   echo "self-test passed"
 }
 
@@ -192,10 +193,12 @@ main() {
     "flagger-gatewayapi::--set flagger.enabled=true --set flagger.provider=gatewayapi:v1 --set flagger.service.gatewayRefs[0].name=public -f ${golden}/helm-values.yaml"
     "pod-annotations::--set podAnnotations.prometheus\\.io/port=9000 --set podAnnotations.team=web"
   )
+  # The chart requires trustedHosts; every mode sets it.
+  local base_args="--set trustedHosts[0]=demo.example.com"
   local mode name args
   for mode in "${modes[@]}"; do
     name="${mode%%::*}"
-    args="${mode#*::}"
+    args="${base_args} ${mode#*::}"
     echo "==> helm lint --strict (${name})"
     # shellcheck disable=SC2086 # args is a word list on purpose.
     "${HELM}" lint --strict "${chart}" ${args}
@@ -228,11 +231,17 @@ main() {
   fi
   grep -q 'automountServiceAccountToken: false' "${work}/default.yaml" \
     || fail "the pod mounts a service account token"
+  grep -q 'value: "demo.example.com,$(POD_IP)"' "${work}/default.yaml" \
+    || fail "the trusted hosts do not include the configured host and the pod IP"
 
+  expect_failure "a chart with no trusted hosts" "set trustedHosts" \
+    "${HELM}" template demo "${chart}"
+  # shellcheck disable=SC2086 # base_args is a word list on purpose.
   expect_failure "Argo Rollouts and Flagger together" "not both" \
-    "${HELM}" template demo "${chart}" --set rollout.enabled=true --set flagger.enabled=true
+    "${HELM}" template demo "${chart}" ${base_args} --set rollout.enabled=true --set flagger.enabled=true
+  # shellcheck disable=SC2086
   expect_failure "a shutdown buffer of 0" "bufferSeconds must be 1 or more" \
-    "${HELM}" template demo "${chart}" --set shutdown.bufferSeconds=0
+    "${HELM}" template demo "${chart}" ${base_args} --set shutdown.bufferSeconds=0
 
   echo "==> kustomize build | kubeconform"
   "${KUSTOMIZE}" build "${rendered}/kustomize" > "${work}/kustomize.yaml"

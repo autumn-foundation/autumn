@@ -19,6 +19,12 @@ image:
 
 imagePullSecrets: []
 
+# Required. The public host names of the app, for [security.trusted_hosts].
+# The prod profile does not start without them. The chart also trusts the
+# pod IP, so Prometheus can scrape the pod by its IP.
+trustedHosts: []
+#  - shop.example.com
+
 # Extra environment variables for the app container.
 env: []
 # Put secrets in a Secret and load them here, for example:

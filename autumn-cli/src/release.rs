@@ -882,7 +882,7 @@ fn kubernetes_next_steps(project_name: &str) -> String {
     format!(
         "\n  Kubernetes:\n     Push the image to your registry. Then:\n       helm upgrade \
          --install {name} deploy/helm --set image.repository=<registry>/{name} --set \
-         image.tag=<tag>\n     or, with your overlay of the base:\n       kubectl apply -k \
+         image.tag=<tag> --set 'trustedHosts[0]=<your-domain>'\n     or, with your overlay of the base:\n       kubectl apply -k \
          <your-overlay>\n     Run `autumn slo generate` for SLO alerts and canary analysis. See \
          docs/guide/kubernetes.md.",
         name = k8s_name(project_name)
@@ -11317,6 +11317,29 @@ esac
         assert!(helpers.contains("AUTUMN_SERVER__PRESTOP_GRACE_SECS"));
         assert!(helpers.contains("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS"));
         assert!(helpers.contains("preStop:"));
+    }
+
+    /// The prod profile does not start without trusted hosts, and Prometheus
+    /// scrapes a pod by its IP.
+    #[test]
+    fn kubernetes_manifests_set_trusted_hosts_and_trust_the_pod_ip() {
+        let files = render_target(Target::Kubernetes, false);
+        let helpers = kubernetes_file(&files, "deploy/helm/templates/_helpers.tpl");
+        assert!(helpers.contains("fail \"set trustedHosts"));
+        assert!(helpers.contains("AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS"));
+        assert!(helpers.contains("fieldPath: status.podIP"));
+        assert!(helpers.contains("$(POD_IP)"));
+        let deployment = kubernetes_file(&files, KUSTOMIZE_DEPLOYMENT);
+        assert!(deployment.contains("value: \"my-app.example.com,$(POD_IP)\""));
+        let pod_ip = deployment.find("name: POD_IP").expect("POD_IP");
+        let hosts = deployment
+            .find("AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS")
+            .expect("hosts");
+        assert!(
+            pod_ip < hosts,
+            "POD_IP must come first, so $(POD_IP) expands"
+        );
+        assert!(kubernetes_next_steps("my_shop").contains("trustedHosts[0]=<your-domain>"));
     }
 
     #[test]
