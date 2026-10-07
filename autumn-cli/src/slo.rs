@@ -588,8 +588,9 @@ fn render_groups(out: &mut String, slos: &[Slo], ctx: &Context, indent: usize) {
             let _ = writeln!(out, "{pad}          app: {}", yaml_str(&ctx.app));
             let _ = writeln!(out, "{pad}          slo: {}", yaml_str(&slo.name));
             let _ = writeln!(out, "{pad}          slo_scope: {}", yaml_str(&ctx.scope));
+            // Quote user keys: YAML 1.1 reads a bare `on` or `yes` as a boolean.
             for (key, value) in &ctx.rule_labels {
-                let _ = writeln!(out, "{pad}          {key}: {}", yaml_str(value));
+                let _ = writeln!(out, "{pad}          {}: {}", yaml_str(key), yaml_str(value));
             }
             for (key, value) in extra {
                 let _ = writeln!(out, "{pad}          {key}: {}", yaml_str(value));
@@ -700,7 +701,7 @@ fn render_prometheus_rule(slos: &[Slo], ctx: &Context) -> String {
     let _ = writeln!(out, "  name: {}", yaml_str(&format!("{}-slo", ctx.app)));
     object_labels(&mut out, &ctx.app);
     for (key, value) in &ctx.object_labels {
-        let _ = writeln!(out, "    {key}: {}", yaml_str(value));
+        let _ = writeln!(out, "    {}: {}", yaml_str(key), yaml_str(value));
     }
     out.push_str("spec:\n");
     render_groups(&mut out, slos, ctx, 2);

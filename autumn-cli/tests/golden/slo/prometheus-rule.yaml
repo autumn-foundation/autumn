@@ -17,7 +17,7 @@ spec:
             app: "shop"
             slo: "availability"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_bad:rate5m
           expr: |-
             (sum(rate(autumn_http_responses_total{status="5xx",job="shop"}[5m])) or vector(0))
@@ -25,7 +25,7 @@ spec:
             app: "shop"
             slo: "availability"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_total:rate5m
           expr: |-
             sum(rate(autumn_http_responses_total{job="shop"}[5m]))
@@ -33,7 +33,7 @@ spec:
             app: "shop"
             slo: "availability"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate5m
           expr: |-
             (sum(rate(autumn_http_responses_total{status="5xx",job="shop"}[5m])) or vector(0))
@@ -43,7 +43,7 @@ spec:
             app: "shop"
             slo: "availability"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate30m
           expr: |-
             (sum(rate(autumn_http_responses_total{status="5xx",job="shop"}[30m])) or vector(0))
@@ -53,7 +53,7 @@ spec:
             app: "shop"
             slo: "availability"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate1h
           expr: |-
             (sum(rate(autumn_http_responses_total{status="5xx",job="shop"}[1h])) or vector(0))
@@ -63,7 +63,7 @@ spec:
             app: "shop"
             slo: "availability"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate6h
           expr: |-
             (sum(rate(autumn_http_responses_total{status="5xx",job="shop"}[6h])) or vector(0))
@@ -73,7 +73,7 @@ spec:
             app: "shop"
             slo: "availability"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate3d
           expr: |-
             sum_over_time(autumn_slo:sli_bad:rate5m{app="shop",slo_scope="c2ec12d7",job="shop",slo="availability"}[3d])
@@ -83,7 +83,7 @@ spec:
             app: "shop"
             slo: "availability"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate30d
           expr: |-
             sum_over_time(autumn_slo:sli_bad:rate5m{app="shop",slo_scope="c2ec12d7",job="shop",slo="availability"}[30d])
@@ -93,7 +93,7 @@ spec:
             app: "shop"
             slo: "availability"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - alert: AutumnSloErrorBudgetBurn
           expr: |-
             autumn_slo:sli_error:ratio_rate1h{app="shop",slo_scope="c2ec12d7",job="shop",slo="availability"} > 0.0144
@@ -103,7 +103,7 @@ spec:
             app: "shop"
             slo: "availability"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
             severity: "page"
             long_window: "1h"
             short_window: "5m"
@@ -119,7 +119,7 @@ spec:
             app: "shop"
             slo: "availability"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
             severity: "page"
             long_window: "6h"
             short_window: "30m"
@@ -135,7 +135,7 @@ spec:
             app: "shop"
             slo: "availability"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
             severity: "ticket"
             long_window: "3d"
             short_window: "6h"
@@ -150,7 +150,7 @@ spec:
             app: "shop"
             slo: "checkout"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_bad:rate5m
           expr: |-
             (sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",status_class="5xx",job="shop"}[5m])) or vector(0))
@@ -158,7 +158,7 @@ spec:
             app: "shop"
             slo: "checkout"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_total:rate5m
           expr: |-
             sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",job="shop"}[5m]))
@@ -166,7 +166,7 @@ spec:
             app: "shop"
             slo: "checkout"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate5m
           expr: |-
             (sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",status_class="5xx",job="shop"}[5m])) or vector(0))
@@ -176,7 +176,7 @@ spec:
             app: "shop"
             slo: "checkout"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate30m
           expr: |-
             (sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",status_class="5xx",job="shop"}[30m])) or vector(0))
@@ -186,7 +186,7 @@ spec:
             app: "shop"
             slo: "checkout"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate1h
           expr: |-
             (sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",status_class="5xx",job="shop"}[1h])) or vector(0))
@@ -196,7 +196,7 @@ spec:
             app: "shop"
             slo: "checkout"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate6h
           expr: |-
             (sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders",status_class="5xx",job="shop"}[6h])) or vector(0))
@@ -206,7 +206,7 @@ spec:
             app: "shop"
             slo: "checkout"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate3d
           expr: |-
             sum_over_time(autumn_slo:sli_bad:rate5m{app="shop",slo_scope="c2ec12d7",job="shop",slo="checkout"}[3d])
@@ -216,7 +216,7 @@ spec:
             app: "shop"
             slo: "checkout"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate30d
           expr: |-
             sum_over_time(autumn_slo:sli_bad:rate5m{app="shop",slo_scope="c2ec12d7",job="shop",slo="checkout"}[30d])
@@ -226,7 +226,7 @@ spec:
             app: "shop"
             slo: "checkout"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - alert: AutumnSloErrorBudgetBurn
           expr: |-
             autumn_slo:sli_error:ratio_rate1h{app="shop",slo_scope="c2ec12d7",job="shop",slo="checkout"} > 0.072
@@ -236,7 +236,7 @@ spec:
             app: "shop"
             slo: "checkout"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
             severity: "page"
             long_window: "1h"
             short_window: "5m"
@@ -252,7 +252,7 @@ spec:
             app: "shop"
             slo: "checkout"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
             severity: "page"
             long_window: "6h"
             short_window: "30m"
@@ -268,7 +268,7 @@ spec:
             app: "shop"
             slo: "checkout"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
             severity: "ticket"
             long_window: "3d"
             short_window: "6h"
@@ -283,7 +283,7 @@ spec:
             app: "shop"
             slo: "orders-latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_bad:rate5m
           expr: |-
             (
@@ -295,7 +295,7 @@ spec:
             app: "shop"
             slo: "orders-latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_total:rate5m
           expr: |-
             sum(rate(autumn_http_request_duration_seconds_count{route="/api/orders/{id}",status_class!="5xx",job="shop"}[5m]))
@@ -303,7 +303,7 @@ spec:
             app: "shop"
             slo: "orders-latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate5m
           expr: |-
             (
@@ -317,7 +317,7 @@ spec:
             app: "shop"
             slo: "orders-latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate30m
           expr: |-
             (
@@ -331,7 +331,7 @@ spec:
             app: "shop"
             slo: "orders-latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate1h
           expr: |-
             (
@@ -345,7 +345,7 @@ spec:
             app: "shop"
             slo: "orders-latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate6h
           expr: |-
             (
@@ -359,7 +359,7 @@ spec:
             app: "shop"
             slo: "orders-latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate3d
           expr: |-
             sum_over_time(autumn_slo:sli_bad:rate5m{app="shop",slo_scope="c2ec12d7",job="shop",slo="orders-latency"}[3d])
@@ -369,7 +369,7 @@ spec:
             app: "shop"
             slo: "orders-latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate30d
           expr: |-
             sum_over_time(autumn_slo:sli_bad:rate5m{app="shop",slo_scope="c2ec12d7",job="shop",slo="orders-latency"}[30d])
@@ -379,7 +379,7 @@ spec:
             app: "shop"
             slo: "orders-latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - alert: AutumnSloErrorBudgetBurn
           expr: |-
             autumn_slo:sli_error:ratio_rate1h{app="shop",slo_scope="c2ec12d7",job="shop",slo="orders-latency"} > 0.144
@@ -389,7 +389,7 @@ spec:
             app: "shop"
             slo: "orders-latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
             severity: "page"
             long_window: "1h"
             short_window: "5m"
@@ -405,7 +405,7 @@ spec:
             app: "shop"
             slo: "orders-latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
             severity: "page"
             long_window: "6h"
             short_window: "30m"
@@ -421,7 +421,7 @@ spec:
             app: "shop"
             slo: "orders-latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
             severity: "ticket"
             long_window: "3d"
             short_window: "6h"
@@ -436,7 +436,7 @@ spec:
             app: "shop"
             slo: "latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_bad:rate5m
           expr: |-
             (
@@ -448,7 +448,7 @@ spec:
             app: "shop"
             slo: "latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_total:rate5m
           expr: |-
             sum(rate(autumn_http_request_duration_seconds_count{route!="_unmatched",status_class!="5xx",job="shop"}[5m]))
@@ -456,7 +456,7 @@ spec:
             app: "shop"
             slo: "latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate5m
           expr: |-
             (
@@ -470,7 +470,7 @@ spec:
             app: "shop"
             slo: "latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate30m
           expr: |-
             (
@@ -484,7 +484,7 @@ spec:
             app: "shop"
             slo: "latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate1h
           expr: |-
             (
@@ -498,7 +498,7 @@ spec:
             app: "shop"
             slo: "latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate6h
           expr: |-
             (
@@ -512,7 +512,7 @@ spec:
             app: "shop"
             slo: "latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate3d
           expr: |-
             sum_over_time(autumn_slo:sli_bad:rate5m{app="shop",slo_scope="c2ec12d7",job="shop",slo="latency"}[3d])
@@ -522,7 +522,7 @@ spec:
             app: "shop"
             slo: "latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - record: autumn_slo:sli_error:ratio_rate30d
           expr: |-
             sum_over_time(autumn_slo:sli_bad:rate5m{app="shop",slo_scope="c2ec12d7",job="shop",slo="latency"}[30d])
@@ -532,7 +532,7 @@ spec:
             app: "shop"
             slo: "latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
         - alert: AutumnSloErrorBudgetBurn
           expr: |-
             autumn_slo:sli_error:ratio_rate1h{app="shop",slo_scope="c2ec12d7",job="shop",slo="latency"} > 0.72
@@ -542,7 +542,7 @@ spec:
             app: "shop"
             slo: "latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
             severity: "page"
             long_window: "1h"
             short_window: "5m"
@@ -558,7 +558,7 @@ spec:
             app: "shop"
             slo: "latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
             severity: "page"
             long_window: "6h"
             short_window: "30m"
@@ -574,7 +574,7 @@ spec:
             app: "shop"
             slo: "latency"
             slo_scope: "c2ec12d7"
-            job: "shop"
+            "job": "shop"
             severity: "ticket"
             long_window: "3d"
             short_window: "6h"

@@ -258,13 +258,31 @@ fn rule_labels_go_on_the_prometheus_rule_object_only() {
     // Sorted, so the output does not depend on the flag order.
     let text = file(&generated, "prometheus-rule.yaml");
     assert!(
-        text.find("example.com/team").expect("team") < text.find("release:").expect("release"),
+        text.find("example.com/team").expect("team") < text.find("\"release\":").expect("release"),
         "{text}"
     );
     options.rule_labels.reverse();
     assert_eq!(generate(&slos, &options).expect("generate"), generated);
     // The plain rule file has no Kubernetes object, so no labels.
     assert!(!file(&generated, "prometheus-rules.yaml").contains("kube-prometheus-stack"));
+}
+
+/// A YAML 1.1 reader (Kubernetes) reads a bare `on`, `yes` or `no` key as a
+/// boolean, so user label keys are quoted.
+#[test]
+fn user_label_keys_are_quoted() {
+    let slos = slo::validate(&fixture_configs()).expect("valid");
+    let mut options = fixture_options();
+    options.selector = Some(r#"on="prod""#.to_owned());
+    options.rule_labels = vec!["yes=1".to_owned()];
+    let generated = generate(&slos, &options).expect("generate");
+    for name in ["prometheus-rules.yaml", "prometheus-rule.yaml"] {
+        let text = file(&generated, name);
+        assert!(text.contains(r#""on": "prod""#), "{name}: {text}");
+        assert!(!text.contains("\n          on:"), "{name}");
+    }
+    let crd = file(&generated, "prometheus-rule.yaml");
+    assert!(crd.contains(r#""yes": "1""#), "{crd}");
 }
 
 #[test]
@@ -551,7 +569,7 @@ fn equality_values_are_unescaped_for_labels() {
     )
     .to_owned();
     assert!(
-        rules.contains(r#"team: "a\"b""#),
+        rules.contains(r#""team": "a\"b""#),
         "the YAML label is unescaped"
     );
     assert!(
