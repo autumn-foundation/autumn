@@ -126,24 +126,38 @@ pub fn pooler_warnings(config: &crate::config::DatabaseConfig) -> Vec<String> {
     } else {
         "database.url"
     };
-    [
-        (primary_key, config.effective_primary_url()),
-        ("database.replica_url", config.replica_url.as_deref()),
-    ]
-    .into_iter()
-    .filter_map(|(key, url)| Some((key, detect_pooler(url?)?)))
-    .map(|(key, hint)| {
-        format!(
-            "{key} looks like {} ({}). In transaction mode, session advisory locks \
+    let mut urls = vec![
+        (primary_key.to_owned(), config.effective_primary_url()),
+        (
+            "database.replica_url".to_owned(),
+            config.replica_url.as_deref(),
+        ),
+    ];
+    // Shard checkouts use the same session settings and prepared statements.
+    for (index, shard) in config.shards.iter().enumerate() {
+        urls.push((
+            format!("database.shards[{index}].primary_url"),
+            Some(shard.primary_url.as_str()),
+        ));
+        urls.push((
+            format!("database.shards[{index}].replica_url"),
+            shard.replica_url.as_deref(),
+        ));
+    }
+    urls.into_iter()
+        .filter_map(|(key, url)| Some((key, detect_pooler(url?)?)))
+        .map(|(key, hint)| {
+            format!(
+                "{key} looks like {} ({}). In transaction mode, session advisory locks \
              (`Lock`, migrations, ISR), the per-checkout `SET statement_timeout` and \
              prepared statements do not work as expected. See \
              docs/guide/connection-poolers.md. Set database.warn_on_pooler = false to \
              silence this warning.",
-            hint.kind.name(),
-            hint.reason
-        )
-    })
-    .collect()
+                hint.kind.name(),
+                hint.reason
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -241,6 +255,37 @@ mod tests {
             assert!(warning.contains("advisory lock"));
             assert!(!warning.contains("6432/app"), "URL must not be logged");
         }
+    }
+
+    #[test]
+    fn warns_for_pooled_shard_urls_with_the_indexed_key() {
+        let mut config = db("postgres://db:5432/app", None);
+        config.shards = vec![
+            crate::config::ShardConfig {
+                name: "us".to_owned(),
+                primary_url: "postgres://us-db:5432/app".to_owned(),
+                ..Default::default()
+            },
+            crate::config::ShardConfig {
+                name: "eu".to_owned(),
+                primary_url: "postgres://eu-pool:6432/app".to_owned(),
+                replica_url: Some("postgres://eu-ro.pooler.supabase.com:6543/app".to_owned()),
+                ..Default::default()
+            },
+        ];
+        let warnings = pooler_warnings(&config);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("database.shards[1].primary_url"),
+            "{}",
+            warnings[0]
+        );
+        assert!(
+            warnings[1].contains("database.shards[1].replica_url"),
+            "{}",
+            warnings[1]
+        );
+        assert!(warnings.iter().all(|w| !w.contains("shards[0]")));
     }
 
     #[test]

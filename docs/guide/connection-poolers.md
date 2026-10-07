@@ -49,9 +49,11 @@ benefit for that client.
 
 ## Boot warning
 
-At boot, Autumn examines `database.url`, `database.primary_url` and
-`database.replica_url`. It does not examine shard URLs. When a URL looks like
-a pooler, the app logs a warning. These URL parts start the warning:
+At boot, Autumn examines `database.url`, `database.primary_url`,
+`database.replica_url`, and the `primary_url` and `replica_url` of each
+`[[database.shards]]` entry. When a URL looks like a pooler, the app logs a
+warning that names the key, for example `database.shards[1].primary_url`.
+These URL parts start the warning:
 
 | URL part | Pooler |
 |----------|--------|
