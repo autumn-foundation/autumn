@@ -3350,7 +3350,7 @@ pub(crate) const BREAKER_SLOW_CALL_RATIO_FAMILY: &str = "autumn_circuit_breaker_
 /// `emitted_families` set with it so a plugin [`MetricsSource`] cannot shadow a
 /// built-in family, and [`crate::metrics`] refuses to register an app metric
 /// under any of these names.
-pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 28] = [
+pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 30] = [
     "autumn_http_requests_total",
     "autumn_http_requests_active",
     "autumn_http_responses_total",
@@ -3367,6 +3367,8 @@ pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 28] = [
     "autumn_request_timeouts_total",
     "autumn_read_your_writes_pins_total",
     "autumn_requests_shed_total",
+    "autumn_admission_limit",
+    "autumn_admission_shed_total",
     "autumn_http_route_requests_total",
     "autumn_metrics_source_errors_total",
     SERIES_DROPPED_FAMILY,
@@ -3539,6 +3541,53 @@ fn render_plugin_sources(
     }
 }
 
+/// Write `autumn_requests_shed_total`, `autumn_admission_limit` and
+/// `autumn_admission_shed_total` (#3068).
+fn write_admission_metrics(
+    out: &mut String,
+    version: &str,
+    http: &crate::middleware::metrics::HttpMetrics,
+) {
+    use std::fmt::Write as _;
+
+    // autumn_requests_shed_total
+    out.push_str(
+        "# HELP autumn_requests_shed_total \
+         HTTP requests rejected by admission control because the in-flight count was at its limit\n",
+    );
+    out.push_str("# TYPE autumn_requests_shed_total counter\n");
+    let _ = writeln!(
+        out,
+        "autumn_requests_shed_total{{version=\"{version}\"}} {}",
+        http.requests_shed_total
+    );
+
+    let admission = &http.admission;
+    out.push_str(
+        "# HELP autumn_admission_limit Current admission-control concurrency limit (0 = no limit)\n",
+    );
+    out.push_str("# TYPE autumn_admission_limit gauge\n");
+    let _ = writeln!(
+        out,
+        "autumn_admission_limit{{version=\"{version}\"}} {}",
+        admission.limit
+    );
+    out.push_str(
+        "# HELP autumn_admission_shed_total HTTP requests rejected by admission control, by criticality\n",
+    );
+    out.push_str("# TYPE autumn_admission_shed_total counter\n");
+    for (criticality, count) in [
+        ("critical", admission.shed_critical),
+        ("default", admission.shed_default),
+        ("sheddable", admission.shed_sheddable),
+    ] {
+        let _ = writeln!(
+            out,
+            "autumn_admission_shed_total{{version=\"{version}\",criticality=\"{criticality}\"}} {count}"
+        );
+    }
+}
+
 /// Render the built-in `autumn_http_*` metric families into `out`, tagged with
 /// the replica's deploy `version` label so canary and stable cohorts can be
 /// compared by a controller scraping both.
@@ -3638,18 +3687,7 @@ fn write_builtin_http_metrics(
         snapshot.read_your_writes_pins_total
     );
 
-    // autumn_requests_shed_total
-    out.push_str(
-        "# HELP autumn_requests_shed_total \
-         HTTP requests rejected by admission control because server.max_concurrent_requests was at its ceiling\n",
-    );
-    out.push_str("# TYPE autumn_requests_shed_total counter\n");
-    let _ = writeln!(
-        out,
-        "autumn_requests_shed_total{{version=\"{version}\"}} {}",
-        snapshot.http.requests_shed_total
-    );
-
+    write_admission_metrics(out, version, &snapshot.http);
     // by_route
     if !snapshot.http.by_route.is_empty() {
         out.push_str("# HELP autumn_http_route_requests_total HTTP requests by route and method\n");
@@ -8009,6 +8047,13 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         assert!(text.contains("# HELP autumn_requests_shed_total"));
         assert!(text.contains("# TYPE autumn_requests_shed_total counter"));
         assert!(text.contains("autumn_requests_shed_total{version=\"stable\"} 0"));
+
+        assert!(text.contains("# TYPE autumn_admission_limit gauge"));
+        assert!(text.contains("autumn_admission_limit{version=\"stable\"} 0"));
+        assert!(text.contains("# TYPE autumn_admission_shed_total counter"));
+        assert!(text.contains(
+            "autumn_admission_shed_total{version=\"stable\",criticality=\"sheddable\"} 0"
+        ));
     }
 
     /// Issue #3055: clones share one dead-letter trim counter.

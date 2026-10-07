@@ -221,7 +221,10 @@ where
         {
             if matches!(
                 any_err.downcast_ref::<crate::http_client::ClientError>(),
-                Some(crate::http_client::ClientError::CircuitBreakerOpen)
+                Some(
+                    crate::http_client::ClientError::CircuitBreakerOpen
+                        | crate::http_client::ClientError::ThrottledLocally { .. }
+                )
             ) {
                 status = StatusCode::SERVICE_UNAVAILABLE;
             }
