@@ -918,7 +918,7 @@ fn lease_heartbeat_interval(visibility_timeout_ms: u64) -> std::time::Duration {
 /// of the visibility timeout, so it stops before another worker can recover
 /// the claim.
 #[cfg(any(feature = "db", feature = "redis"))]
-fn lease_give_up_after(visibility_timeout_ms: u64) -> std::time::Duration {
+const fn lease_give_up_after(visibility_timeout_ms: u64) -> std::time::Duration {
     std::time::Duration::from_millis(visibility_timeout_ms.saturating_mul(2) / 3)
 }
 
