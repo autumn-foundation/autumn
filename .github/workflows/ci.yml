@@ -2400,14 +2400,18 @@ jobs:
             --test confidential_repository_bidx \
             --test sim_sqlite_substrate \
             --test sim_sqlite_integration \
-            --test sim_chaos_crash
+            --test sim_chaos_crash \
+            --test sim_outbox_crash \
+            --test sqlite_outbox_writers
       - name: Run the sqlite mail-chaos suite (W5.a, issue #1797)
-        # `sim_chaos_mail` needs the `mail` feature for the mail
-        # interceptor/transport surface, so it runs as its own invocation to
-        # avoid widening the feature set of the other sqlite tests above.
+        # `sim_chaos_mail` and `sim_outbox_mail` (#3062) need the `mail`
+        # feature for the mail interceptor/transport surface, so they run as
+        # their own invocation to avoid widening the feature set of the other
+        # sqlite tests above.
         run: |
           cargo test -p autumn-web --features "sqlite,test-support,mail" \
-            --test sim_chaos_mail
+            --test sim_chaos_mail \
+            --test sim_outbox_mail
       - name: Run the sim op-driver DoD suite (W6 PR2, issue #1797)
         # `sim_op_driver` needs the `sim-testing` feature (`proptest` as a
         # library dependency) — runs as its own invocation to avoid widening

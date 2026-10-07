@@ -950,6 +950,8 @@ pub use nested_form::{
 };
 pub mod data;
 pub mod normalize;
+#[cfg(feature = "db")]
+pub mod outbox;
 pub mod validation;
 pub mod webhook;
 #[cfg(feature = "http-client")]
