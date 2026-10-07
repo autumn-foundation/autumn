@@ -546,6 +546,29 @@ pub(crate) fn emit_api_handlers(config: &RepoConfig, inputs: &ApiInputs<'_>) -> 
         }
     };
 
+    // #2439: Postgres does not say which column held a NUL byte. After a NUL
+    // rejection, look for the byte in the payload and name that field. This
+    // code runs on the error path only. A payload without `Serialize` gets an
+    // empty list.
+    let name_nul_new = quote! {
+        |err| {
+            #[allow(unused_imports)]
+            use ::autumn_web::error::{MaybeJsonBodyFallback as _, MaybeJsonBodyViaSerialize as _};
+            ::autumn_web::error::__name_nul_fields(err, || {
+                (&::autumn_web::error::MaybeJsonBody(&new)).autumn_json_body()
+            })
+        }
+    };
+    let name_nul_patch = quote! {
+        |err| {
+            #[allow(unused_imports)]
+            use ::autumn_web::error::{MaybeJsonBodyFallback as _, MaybeJsonBodyViaSerialize as _};
+            ::autumn_web::error::__name_nul_fields(err, || {
+                (&::autumn_web::error::MaybeJsonBody(&patch)).autumn_json_body()
+            })
+        }
+    };
+
     let create_return_type = if has_policy {
         quote! {
             ::autumn_web::idempotency::IdempotencyReplayOr<
@@ -596,7 +619,7 @@ pub(crate) fn emit_api_handlers(config: &RepoConfig, inputs: &ApiInputs<'_>) -> 
             {
                 return ::autumn_web::idempotency::IdempotencyReplayOr::Replay(response);
             }
-            let record = match repo.save(&new).await {
+            let record = match repo.save(&new).await.map_err(#name_nul_new) {
                 ::core::result::Result::Ok(record) => record,
                 ::core::result::Result::Err(err) => {
                     return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
@@ -614,7 +637,7 @@ pub(crate) fn emit_api_handlers(config: &RepoConfig, inputs: &ApiInputs<'_>) -> 
             #decode_create_payload
             #validate_new
             #policy_check_create_pre
-            let record = repo.save(&new).await?;
+            let record = repo.save(&new).await.map_err(#name_nul_new)?;
             Ok((::autumn_web::reexports::http::StatusCode::CREATED, ::autumn_web::prelude::Json(record)))
         }
     };
@@ -709,7 +732,7 @@ pub(crate) fn emit_api_handlers(config: &RepoConfig, inputs: &ApiInputs<'_>) -> 
             {
                 return ::autumn_web::idempotency::IdempotencyReplayOr::Replay(response);
             }
-            let record = match repo.update(id, &patch).await {
+            let record = match repo.update(id, &patch).await.map_err(#name_nul_patch) {
                 ::core::result::Result::Ok(record) => record,
                 ::core::result::Result::Err(err) => {
                     return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
@@ -725,7 +748,7 @@ pub(crate) fn emit_api_handlers(config: &RepoConfig, inputs: &ApiInputs<'_>) -> 
         quote! {
             #validate_patch
             #policy_check_update_pre
-            let record = repo.update(id, &patch).await?;
+            let record = repo.update(id, &patch).await.map_err(#name_nul_patch)?;
             Ok(::autumn_web::prelude::Json(record))
         }
     };

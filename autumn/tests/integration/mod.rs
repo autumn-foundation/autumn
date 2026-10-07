@@ -254,6 +254,8 @@ mod nested_form_atomic_save;
 mod nested_form_order_example;
 mod notifications;
 mod nul_byte_input;
+#[cfg(feature = "i18n")]
+mod nul_message_i18n;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_conformance;
 #[cfg(feature = "offline-sync")]
@@ -357,6 +359,8 @@ mod repository_bulk_operations;
 mod repository_commit_hooks_claim_ack_profile;
 #[cfg(feature = "db")]
 mod repository_dependent_destroy;
+#[cfg(feature = "db")]
+mod repository_nul_field;
 // Ledger findings/fix harness for the `dependent(..., on_delete = destroy)`
 // cascade's per-row loop: profiles a leaf child's reload-then-delete N+1 and
 // (after the fix) the batched `dependent_delete_all` replacement.
