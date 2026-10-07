@@ -163,7 +163,9 @@ pub async fn restore_blobs(
     store: &dyn BlobStore,
 ) -> Result<usize, DataCapsuleError> {
     // A failed restore keeps what it wrote, so check every entry against its
-    // bytes before the first key is read or written.
+    // bytes, and that no two share a key, before the first key is read or
+    // written.
+    super::archive::check_unique_blob_keys(&capsule.manifest.blobs)?;
     let mut entries = Vec::with_capacity(capsule.manifest.blobs.len());
     for entry in &capsule.manifest.blobs {
         let bytes = capsule

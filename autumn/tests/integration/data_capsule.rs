@@ -993,6 +993,48 @@ mod blobs {
     }
 
     #[tokio::test]
+    async fn restore_refuses_two_entries_for_one_key() {
+        // Two entries that each describe their bytes, under one key. Such a
+        // capsule can never be imported, so restore must refuse it before it
+        // writes the first one.
+        let tmp = tempfile::tempdir().unwrap();
+        let source_blobs = blob_store(&tmp.path().join("a"));
+        source_blobs
+            .put("avatars/ada.png", "image/png", Bytes::from_static(b"png"))
+            .await
+            .unwrap();
+        source_blobs
+            .put("docs/ada-cv.txt", "text/plain", Bytes::from_static(b"cv"))
+            .await
+            .unwrap();
+        let mut capsule = export_subject(&models(), &store(), "1").await.unwrap();
+        collect_blobs(&mut capsule, &source_blobs)
+            .await
+            .expect("collect");
+        for entry in &mut capsule.manifest.blobs {
+            "avatars/ada.png".clone_into(&mut entry.key);
+        }
+
+        let target_blobs = blob_store(&tmp.path().join("b"));
+        let err = restore_blobs(&capsule, &target_blobs)
+            .await
+            .expect_err("two entries for one key");
+        assert!(
+            matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains("avatars/ada.png")),
+            "{err:?}"
+        );
+        assert!(matches!(
+            target_blobs.get("avatars/ada.png").await,
+            Err(BlobStoreError::NotFound(_))
+        ));
+        // Signed, such a capsule would never import either.
+        let err = capsule
+            .write_dir(&tmp.path().join("capsule"), &signer())
+            .expect_err("two entries for one key");
+        assert!(matches!(err, DataCapsuleError::InvalidInput(_)), "{err:?}");
+    }
+
+    #[tokio::test]
     async fn restore_never_overwrites_a_different_blob() {
         let tmp = tempfile::tempdir().unwrap();
         let source_blobs = blob_store(&tmp.path().join("a"));

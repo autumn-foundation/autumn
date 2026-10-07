@@ -129,6 +129,21 @@ pub(super) fn check_format(manifest: &CapsuleManifest) -> Result<(), DataCapsule
     Ok(())
 }
 
+/// Check that no two entries of `blobs` share a key. Under one key the store
+/// can keep one blob, so a capsule with two can never be imported.
+pub(super) fn check_unique_blob_keys(blobs: &[BlobEntry]) -> Result<(), DataCapsuleError> {
+    let mut keys = BTreeSet::new();
+    for blob in blobs {
+        if !keys.insert(blob.key.as_str()) {
+            return Err(DataCapsuleError::InvalidInput(format!(
+                "the capsule has two blob entries for key {:?}",
+                blob.key
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Check that `blob` describes `bytes`: their SHA-256 and their length.
 ///
 /// A capsule built or changed through the public API can carry an entry that
@@ -244,6 +259,7 @@ impl DataCapsule {
             model.file = record_file(&model.table);
             files.push((model.file.clone(), to_json(&model.file, records)?));
         }
+        check_unique_blob_keys(&manifest.blobs)?;
         // Two keys with the same bytes share one file: write it one time.
         let mut seen = std::collections::BTreeSet::new();
         for blob in &manifest.blobs {

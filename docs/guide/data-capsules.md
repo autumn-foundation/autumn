@@ -218,16 +218,18 @@ capsule directory and to each directory above it.
   with `CACHE` above 1 is refused (`501`): other sessions can hold cached
   values that an imported key can take. A `CYCLE` sequence is refused
   (`501`) too: after its last value, it starts again at an imported key.
-- The import role needs `UPDATE` on each sequence it moves, and `SELECT` or
-  `USAGE` to read where the sequence is. Without them, import stops before
-  it moves any sequence.
+- The import role needs `UPDATE` on each sequence it moves, and `SELECT` to
+  read where the sequence is. `USAGE` alone is not enough: it cannot tell a
+  sequence restarted with `ALTER SEQUENCE ... RESTART WITH` from an unused
+  one, and import keeps a pending restart value rather than move the sequence
+  back below it. Without them, import stops before it moves any sequence.
 - **Import when no other writer uses the tables.** Another session can take a
   value from a sequence and insert its row later. If the capsule holds that
   key, the import succeeds and the other insert fails with a duplicate key.
   The same holds for a blob that another writer replaces after import checks
   it. No lock can prevent this, so run import in a maintenance window.
 - Import writes blobs before records. It first checks the bytes of each blob
-  against its manifest entry. If a blob key holds different bytes or
+  against its manifest entry, and that no two entries share a key. If a blob key holds different bytes or
   a different MIME type, import stops and writes no blob. If a blob changes
   while import reads it, or another writer takes a key during the import,
   import stops with a conflict (`409`).

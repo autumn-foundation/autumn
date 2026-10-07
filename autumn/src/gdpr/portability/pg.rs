@@ -596,11 +596,24 @@ struct SequencePlan {
     #[diesel(sql_type = diesel::sql_types::Bool)]
     needed: bool,
     #[diesel(sql_type = diesel::sql_types::Bool)]
-    can_read: bool,
-    #[diesel(sql_type = diesel::sql_types::Bool)]
     can_update: bool,
     #[diesel(sql_type = diesel::sql_types::Bool)]
     cycle: bool,
+}
+
+#[derive(diesel::QueryableByName)]
+struct SelectGrant {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    can_select: bool,
+}
+
+/// Where a sequence is: its `last_value`, and whether `nextval` gave it.
+#[derive(diesel::QueryableByName)]
+struct SequencePosition {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    last_value: i64,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    is_called: bool,
 }
 
 /// The numeric values of `column` in the imported rows, as decimal text.
@@ -671,30 +684,57 @@ async fn plan_sequence(
 ) -> Result<Option<(String, i64, String)>, DataCapsuleError> {
     let seq = seq.to_owned();
     let target = format!("{table}.{column}");
+    if keys.is_empty() {
+        return Ok(None);
+    }
+    // Read where the sequence is from the sequence itself. After `RESTART
+    // WITH n` or `setval(.., false)` it is not called, and its next value is
+    // `n` itself; `pg_sequence_last_value` gives `NULL` then, as for an
+    // unused sequence, and planning from the start would move it back. That
+    // read needs `SELECT`: without it, a used sequence could look unused,
+    // and `setval` could move it back onto values it already made.
+    let state: SelectGrant =
+        diesel::sql_query("SELECT has_sequence_privilege($1::regclass, 'SELECT') AS can_select")
+            .bind::<diesel::sql_types::Text, _>(&seq)
+            .get_result(conn)
+            .await
+            .map_err(|e| store_error(&format!("sequence of {target}"), &e))?;
+    if !state.can_select {
+        return Err(DataCapsuleError::Store(format!(
+            "the import role has no SELECT privilege on the sequence of {target}: \
+             import cannot read where it is"
+        )));
+    }
+    // `seq` comes from `pg_get_serial_sequence`, which quotes as SQL needs.
+    let position: SequencePosition =
+        diesel::sql_query(format!("SELECT last_value, is_called FROM {seq}"))
+            .get_result(conn)
+            .await
+            .map_err(|e| store_error(&format!("sequence of {target}"), &e))?;
     // The sequence makes only `start + k * inc`, so only a key on that path
     // can be a value it makes. The sequence moves to the outermost such key,
     // in its own direction. A key off the path (500 for `INCREMENT BY 3` from
     // 1) needs no move: moving to the path value before it would only use up
-    // values that are still free. An unused sequence has no last value: then
-    // compare with the value before its start. The arithmetic is in numeric:
-    // `key - start` and `start - inc` can leave the bigint range. Only the
+    // values that are still free. A key needs a move when it is at or past
+    // the next value of the sequence: `last_value` when it is not called (an
+    // unused or restarted sequence), else the value after it. The arithmetic
+    // is in numeric: `key - start` and `last + inc` can leave the bigint
+    // range. Only the
     // imported keys count: a row that the target had before, even one outside
     // the sequence range, is not this import's to check. A key that is not an
     // integer, or is outside the bigint range, is not a value a sequence
     // makes.
     let plan: Option<SequencePlan> = diesel::sql_query(
         "SELECT s.m AS target, s.cache, s.min, s.max, s.cycle, CASE WHEN s.inc > 0 \
-           THEN s.m > COALESCE(s.last, s.start::numeric - s.inc) \
-           ELSE s.m < COALESCE(s.last, s.start::numeric - s.inc) END AS needed, \
-           s.can_read, has_sequence_privilege($1::regclass, 'UPDATE') AS can_update \
+           THEN s.m >= s.next ELSE s.m <= s.next END AS needed, \
+           has_sequence_privilege($1::regclass, 'UPDATE') AS can_update \
          FROM (SELECT CASE WHEN q.seqincrement > 0 \
                         THEN MAX(k.v) FILTER (WHERE k.on_path) \
                         ELSE MIN(k.v) FILTER (WHERE k.on_path) \
                       END::bigint AS m, \
-                      has_sequence_privilege($1::regclass, 'SELECT, USAGE') AS can_read, \
-                      CASE WHEN has_sequence_privilege($1::regclass, 'SELECT, USAGE') \
-                        THEN pg_sequence_last_value($1::regclass) END AS last, \
-                      q.seqincrement AS inc, q.seqstart AS start, q.seqcache AS cache, \
+                      CASE WHEN $4 THEN $3::numeric + q.seqincrement ELSE $3::numeric END \
+                        AS next, \
+                      q.seqincrement AS inc, q.seqcache AS cache, \
                       q.seqmin AS min, q.seqmax AS max, q.seqcycle AS cycle \
                FROM pg_sequence q CROSS JOIN LATERAL ( \
                       SELECT r.v, r.v = trunc(r.v) \
@@ -708,6 +748,8 @@ async fn plan_sequence(
     )
     .bind::<diesel::sql_types::Text, _>(&seq)
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(keys)
+    .bind::<diesel::sql_types::BigInt, _>(position.last_value)
+    .bind::<diesel::sql_types::Bool, _>(position.is_called)
     .get_result(conn)
     .await
     .optional()
@@ -715,15 +757,6 @@ async fn plan_sequence(
     let Some(plan) = plan else {
         return Ok(None);
     };
-    // Without `SELECT` or `USAGE` the last value is hidden (an error, or
-    // `NULL` on some versions). A used sequence would then look unused, and
-    // `setval` could move it back onto values it already made.
-    if !plan.can_read {
-        return Err(DataCapsuleError::Store(format!(
-            "the import role has no SELECT or USAGE privilege on the sequence of {target}: \
-             import cannot read its last value"
-        )));
-    }
     if plan.cache > 1 {
         return Err(DataCapsuleError::NotConfigured(format!(
             "the sequence of {target} caches {} values; import needs CACHE 1",

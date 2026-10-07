@@ -575,8 +575,20 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
     let base = format!("postgres://postgres:postgres@{host}:{port}");
     let mut admin = PgConnection::establish(&format!("{base}/postgres")).expect("connect");
     for db in [
-        "target", "busy", "deferred", "capped", "cached", "cycled", "stepped", "wide", "offpath",
-        "limited", "blind", "locked", "stray",
+        "target",
+        "busy",
+        "deferred",
+        "capped",
+        "cached",
+        "cycled",
+        "stepped",
+        "wide",
+        "offpath",
+        "limited",
+        "blind",
+        "locked",
+        "stray",
+        "restarted",
     ] {
         admin
             .batch_execute(&format!("CREATE DATABASE {db}"))
@@ -590,8 +602,20 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
         ))
         .expect("source");
     for db in [
-        "target", "busy", "deferred", "capped", "cached", "cycled", "stepped", "wide", "offpath",
-        "limited", "blind", "locked", "stray",
+        "target",
+        "busy",
+        "deferred",
+        "capped",
+        "cached",
+        "cycled",
+        "stepped",
+        "wide",
+        "offpath",
+        "limited",
+        "blind",
+        "locked",
+        "stray",
+        "restarted",
     ] {
         PgConnection::establish(&format!("{base}/{db}"))
             .expect("connect")
@@ -834,6 +858,25 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
     .await;
     assert_eq!(next, "501");
 
+    // `RESTART WITH 1000` leaves the sequence uncalled: its next value is
+    // 1000, while `pg_sequence_last_value` gives `NULL` as for an unused
+    // sequence. Key 500 is behind that next value, so the sequence must stay
+    // at 1000 rather than move back to 501.
+    let restarted = pool(&format!("{base}/restarted"));
+    PgConnection::establish(&format!("{base}/restarted"))
+        .expect("connect")
+        .batch_execute("ALTER SEQUENCE notes_id_seq RESTART WITH 1000")
+        .expect("restart");
+    import_capsule(&capsule, &models, &PgCapsuleStore::new(restarted.clone()))
+        .await
+        .expect("import");
+    let next = text(
+        &restarted,
+        "INSERT INTO notes (owner) VALUES (2) RETURNING id::text AS value",
+    )
+    .await;
+    assert_eq!(next, "1000");
+
     // Two imports of one sequence must not plan at once: each sees only its
     // own rows, and the later `setval` could move the sequence back. Import
     // takes a lock per sequence until it commits; here another session holds
@@ -857,9 +900,10 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
     holder.batch_execute("COMMIT").expect("unlock");
     waiting.await.unwrap().expect("import after the lock");
 
-    // A role with `UPDATE` but neither `SELECT` nor `USAGE` on a sequence may
-    // see no last value, as if the sequence were unused. This one is at 1000:
-    // import must not move it back to the imported key 500.
+    // A role without `SELECT` on a sequence cannot read where it is: with
+    // `USAGE` alone, a restarted sequence looks unused, and without either
+    // it may see no last value at all. This one is at 1000: import must not
+    // move it back to the imported key 500.
     PgConnection::establish(&format!("{base}/blind"))
         .expect("connect")
         .batch_execute(
@@ -868,7 +912,7 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
              GRANT USAGE ON SCHEMA public TO blind; \
              GRANT SELECT, INSERT ON ledger, notes TO blind; \
              GRANT SELECT, USAGE, UPDATE ON SEQUENCE ledger_id_seq, notes_ticket_seq TO blind; \
-             GRANT UPDATE ON SEQUENCE notes_id_seq TO blind;",
+             GRANT USAGE, UPDATE ON SEQUENCE notes_id_seq TO blind;",
         )
         .expect("grants");
     let blind_url = format!(
@@ -877,11 +921,10 @@ async fn postgres_import_moves_sequences_in_their_direction_and_only_on_success(
     );
     let err = import_capsule(&capsule, &models, &PgCapsuleStore::new(pool(&blind_url)))
         .await
-        .expect_err("no SELECT or USAGE on notes_id_seq");
+        .expect_err("no SELECT on notes_id_seq");
     assert!(matches!(err, DataCapsuleError::Store(_)), "{err:?}");
-    // The plan checks the privilege itself: some Postgres versions give no
-    // last value here instead of an error.
-    assert!(err.to_string().contains("SELECT or USAGE"), "{err}");
+    // The plan checks the privilege itself, before it reads the sequence.
+    assert!(err.to_string().contains("no SELECT privilege"), "{err}");
     let last = text(
         &pool(&format!("{base}/blind")),
         "SELECT pg_sequence_last_value('notes_id_seq')::text AS value",
