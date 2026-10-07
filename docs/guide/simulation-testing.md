@@ -776,8 +776,10 @@ Three more rules hold for code that a sim drives:
   pass the value in.
 - **Do not drop a `SQLite` query in flight.** diesel-async panics when it
   drops one on a current-thread runtime, such as the sim's. A `select!` drops
-  its losing branches, so keep a query out of a `select!` that can end first
-  (a timeout, a stop signal): pin it outside, or spawn it.
+  the futures it owns when another branch wins. Pin the query outside the
+  `select!` and poll it by reference. If another branch wins, spawn the query.
+  The job worker still drops a handler on a lost claim or a timeout, so a
+  handler query in flight at that time panics in a sim.
 
 The `sim-sweep` found all three in the framework's own job, scheduler, lock
 and heartbeat code (issue #3067); they now follow these rules.

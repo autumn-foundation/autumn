@@ -33,16 +33,16 @@
 - **jobs, scheduler, lock:** the background loops and the job claim
   heartbeat use `biased;` in `tokio::select!`, with shutdown first, so a sim
   replays their branch order.
+- **jobs:** the job claim heartbeat lets a renewal in flight finish on its
+  own task when it gives up or stops. Before, a `SQLite` renewal dropped on a
+  current-thread runtime panicked before the heartbeat stopped the run, and a
+  peer ran the job again. A late `SQLite` renewal also never moves a claim
+  time back. The #3067 sweep found this.
 - **lock:** the `SQLite` `LockGuard` stops its renewal task by a signal, not
   by an abort, so a release does not drop a renewal query in flight.
 
 ### Fixed
 
-- **jobs:** the job claim heartbeat no longer drops a renewal in flight when
-  it gives up or stops. On a current-thread runtime, diesel-async panicked on
-  that drop with `SQLite`, before the heartbeat stopped the run. The run then
-  went on without its claim, and a peer ran the job again. The #3067 sweep
-  found this.
 - **jobs:** `SQLite` stale-claim recovery draws its per-row jitter from the
   app's entropy, not from `SQLite`'s `random()`, so a sim replays it.
 

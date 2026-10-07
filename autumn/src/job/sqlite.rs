@@ -1190,10 +1190,12 @@ async fn renew_claim(
         Err(error) => return LeaseRenewal::Failed(format!("sqlite jobs pool error: {error}")),
     };
     // Read the time after the wait for a connection, so the wait does not
-    // make the new claim time older than it is.
+    // make the new claim time older than it is. `MAX` keeps a late renewal
+    // (one that waited on the write lock, or one of an earlier attempt of
+    // this worker) from moving the claim time back.
     let now = clock.now().timestamp_millis();
     match diesel::sql_query(format!(
-        "UPDATE autumn_jobs SET claimed_at = ? \
+        "UPDATE autumn_jobs SET claimed_at = MAX(COALESCE(claimed_at, 0), ?) \
          WHERE id = ? AND claimed_by = ? AND status = '{STATUS_RUNNING}'"
     ))
     .bind::<diesel::sql_types::BigInt, _>(now)

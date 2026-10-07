@@ -23,9 +23,10 @@
 //! seed, and returns its [`Trace`]. Only the `sim-sweep` binary and the sim
 //! tests use this module. Its API can change; semver does not cover it.
 
-// A fleet run holds the substrate's `SQLite` connection across awaits. It runs
-// on the current-thread sim runtime only, so its futures need not be `Send`.
-#![allow(clippy::future_not_send)]
+#![allow(
+    clippy::future_not_send,
+    reason = "a fleet run holds the substrate's SQLite connection across awaits, on the current-thread sim runtime only"
+)]
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
@@ -285,9 +286,10 @@ struct JobsLog {
     replicas: BTreeSet<String>,
     /// Runs a crash stopped.
     stopped: u32,
-    /// Runs that ended before they finished, for example on a lost claim.
+    /// Runs that the job worker stopped (not by a crash), for example on a
+    /// lost claim.
     cancelled: u32,
-    /// Runs longer than the visibility timeout that finished.
+    /// Finished runs that were longer than the visibility timeout.
     long_finished: u32,
     overlaps: Vec<String>,
 }
@@ -335,8 +337,8 @@ fn fleet_job(
     })
 }
 
-/// Marks a run as ended when the runtime drops it before it finishes, for
-/// example when the heartbeat stops a run that lost its claim.
+/// Removes the run from `running` if the job worker drops the run before it
+/// finishes. Example: the heartbeat lost the claim.
 struct RunGuard {
     id: u64,
     replica: String,
@@ -416,7 +418,7 @@ async fn jobs(sim: &mut Sim) {
         fleet.apply(sim, &Step::Mount(name));
     }
 
-    // One job in three runs longer than the visibility timeout.
+    // About one job in three runs longer than the visibility timeout.
     let count = draw.between(3, 6);
     for id in 0..count {
         let on = names[usize::try_from(id % 2).unwrap_or(0)];
@@ -499,10 +501,7 @@ async fn jobs(sim: &mut Sim) {
         log.long_finished > 0,
         "fleet-jobs-a-long-job-finished-past-the-visibility-timeout"
     );
-    sometimes!(
-        log.cancelled > 0,
-        "fleet-jobs-a-run-stopped-before-it-finished"
-    );
+    sometimes!(log.cancelled > 0, "fleet-jobs-a-lost-claim-stopped-a-run");
 }
 
 /// Job rows that are not `completed`.

@@ -49,11 +49,11 @@ result at a different point in different runs.
    - unbiased `tokio::select!` in the job, scheduler, lock and cost loops and
      the job claim heartbeat (now `biased;`, shutdown first);
    - the run-unique substrate database name in a log line (aliased in traces).
-9. The sweep also found a bug in the job claim heartbeat (#3051). When it
-   gave up with a renewal in flight, `select!` dropped the renewal, and
-   diesel-async panicked before the heartbeat stopped the run. A peer then ran
-   the job again. The heartbeat now lets a renewal in flight end on its own
-   task.
+9. The sweep also found a bug in the job claim heartbeat (#3051). When the
+   heartbeat gave up or stopped with a renewal in flight, `select!` dropped
+   the renewal, and diesel-async panicked before the heartbeat stopped the
+   run. A peer then ran the job again. The heartbeat now lets a renewal in
+   flight finish on its own task.
 
 ## Consequences
 
@@ -74,6 +74,10 @@ result at a different point in different runs.
   - Postgres lanes. `LeaseLock` (#3053) and the tick table (#3052) use the
     database clock, so the sim cannot drive them. Their testcontainer tests
     cover them.
+  - handler queries dropped mid-flight. On a lost claim or a timeout, the job
+    worker drops the handler. A `SQLite` query in flight then panics on a
+    current-thread runtime. The fleet handlers do not query, so the sweep does
+    not cover this.
   - an idempotency-under-crash scenario. The idempotency store is per process
     (memory) or Redis, and the record is not atomic with handler writes
     (#3061). A shared store across replicas needs the Redis lane or #3061.

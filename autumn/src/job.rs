@@ -975,10 +975,15 @@ impl LeaseHeartbeat {
             claimed_at,
             lease_give_up_after(visibility_timeout_ms),
         );
+        // Keep the renewal outside the select, as `spawn` does.
+        let mut renewing = Box::pin(renew());
         let renewal = tokio::select! {
             biased;
-            renewal = renew() => Some(renewal),
-            () = tokio::time::sleep_until(give_up_at) => None,
+            renewal = &mut renewing => Some(renewal),
+            () = tokio::time::sleep_until(give_up_at) => {
+                tokio::spawn(renewing);
+                None
+            }
         };
         match renewal {
             Some(LeaseRenewal::Renewed) => Self::spawn(started, visibility_timeout_ms, renew),
@@ -1030,7 +1035,7 @@ impl LeaseHeartbeat {
                 let mut next_attempt =
                     crate::time_math::saturating_tokio_deadline(last_renewed, interval);
                 loop {
-                    // Biased, stop first: a sim replays the branch order.
+                    // Biased: stop goes first, so a sim gets the same order each run.
                     tokio::select! {
                         biased;
                         () = stop.cancelled() => return,
@@ -1043,10 +1048,10 @@ impl LeaseHeartbeat {
                     // The give-up time also bounds a renewal that stalls.
                     let give_up_at =
                         crate::time_math::saturating_tokio_deadline(last_renewed, give_up_after);
-                    // The renewal stays outside the select: `select!` drops
-                    // the losing futures before it runs a branch, and
-                    // diesel-async panics when it drops a `SQLite` query in
-                    // flight on a current-thread runtime.
+                    // Keep the renewal outside the select. `select!` drops the
+                    // losing futures before it runs a branch. diesel-async
+                    // panics when it drops a `SQLite` query in flight on a
+                    // current-thread runtime.
                     let mut renewing = Box::pin(renew());
                     // Biased: a renewal that completes at the give-up time counts.
                     let renewal = tokio::select! {
@@ -1060,9 +1065,9 @@ impl LeaseHeartbeat {
                         }
                     };
                     let Some(renewal) = renewal else {
-                        // Let the renewal in flight end on its own task. A
-                        // late renewal can only delay the recovery of a run
-                        // that stopped.
+                        // Let the renewal in flight finish on its own task.
+                        // Do not drop it. A late renewal never moves a claim
+                        // time back.
                         tokio::spawn(renewing);
                         return;
                     };
@@ -1102,7 +1107,8 @@ impl LeaseHeartbeat {
     /// Run `settle` (the ack or nack) while the heartbeat still renews the
     /// claim, then stop it. A settle that stalls past the lease must not let
     /// stale recovery requeue a job whose handler already finished. A renewal
-    /// that lands after the settle matches no claim, so it changes nothing.
+    /// that lands after the settle matches no claim, or only moves a new
+    /// claim's time forward.
     async fn stop_after<F: Future>(self, settle: F) -> F::Output {
         let settled = settle.await;
         self.stop().await;
@@ -25232,36 +25238,93 @@ mod lease_tests {
         heartbeat.stop().await;
     }
 
-    /// A renewal in flight at the give-up time must not be dropped. diesel-async
-    /// panics when it drops a `SQLite` query in flight on a current-thread
-    /// runtime, and `select!` drops the losing futures before it runs a
-    /// branch. The panic then came before `lost.cancel()`, so the run went on
-    /// without a claim and a peer ran the job again (found by the #3067 sweep).
+    /// A renewal that records a drop before it finishes. diesel-async panics
+    /// when it drops a `SQLite` query in flight on a current-thread runtime.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    fn renewal_that_records_a_drop(
+        dropped: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> impl FnMut() -> std::pin::Pin<Box<dyn Future<Output = LeaseRenewal> + Send>> + Send + 'static
+    {
+        struct InFlight(Arc<std::sync::atomic::AtomicBool>, bool);
+        impl Drop for InFlight {
+            fn drop(&mut self) {
+                if !self.1 {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        let dropped = Arc::clone(dropped);
+        move || {
+            let dropped = Arc::clone(&dropped);
+            Box::pin(async move {
+                let mut query = InFlight(dropped, false);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                query.1 = true;
+                LeaseRenewal::Failed("slow".to_owned())
+            })
+        }
+    }
+
+    /// The heartbeat must not drop a renewal in flight at the give-up time.
+    /// `select!` drops the losing futures before it runs a branch. On a
+    /// `SQLite` renewal, the drop panicked before `lost.cancel()`. The run
+    /// continued without a claim, and a peer ran the job again (#3067 sweep).
     #[cfg(any(feature = "db", feature = "redis"))]
     #[tokio::test(start_paused = true)]
     async fn heartbeat_gives_up_without_dropping_a_renewal_in_flight() {
-        /// Panics when dropped before it finishes, as diesel-async does.
-        struct InFlight(bool);
-        impl Drop for InFlight {
-            fn drop(&mut self) {
-                assert!(self.0, "a renewal in flight was dropped");
-            }
-        }
-        let heartbeat = LeaseHeartbeat::spawn(tokio::time::Instant::now(), 300, || async {
-            let mut query = InFlight(false);
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            query.0 = true;
-            LeaseRenewal::Failed("slow".to_owned())
-        });
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let heartbeat = LeaseHeartbeat::spawn(
+            tokio::time::Instant::now(),
+            300,
+            renewal_that_records_a_drop(&dropped),
+        );
         let lost = heartbeat.lost_token();
         tokio::time::sleep(Duration::from_millis(210)).await;
         assert!(
             lost.is_cancelled(),
             "the heartbeat stops the run at the give-up time"
         );
-        // Let the renewal end on its own.
+        assert!(!dropped.load(Ordering::SeqCst), "the renewal was dropped");
+        // Let the renewal finish on its own.
         tokio::time::sleep(Duration::from_secs(1)).await;
         heartbeat.stop().await;
+        assert!(!dropped.load(Ordering::SeqCst), "the renewal was dropped");
+    }
+
+    /// A stop must not drop a renewal in flight either.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_stops_without_dropping_a_renewal_in_flight() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let heartbeat = LeaseHeartbeat::spawn(
+            tokio::time::Instant::now(),
+            300,
+            renewal_that_records_a_drop(&dropped),
+        );
+        // The first renewal starts at 100ms and runs for 1s.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        heartbeat.stop().await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!dropped.load(Ordering::SeqCst), "the renewal was dropped");
+    }
+
+    /// An overdue first renewal in `start` must not be dropped at the give-up
+    /// time.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn an_overdue_first_renewal_is_not_dropped_at_the_give_up_time() {
+        let claimed_at = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let heartbeat =
+            LeaseHeartbeat::start(claimed_at, 300, renewal_that_records_a_drop(&dropped)).await;
+        assert!(
+            heartbeat.lost_token().is_cancelled(),
+            "no renewal before the give-up time: the handler must not run"
+        );
+        assert!(!dropped.load(Ordering::SeqCst), "the renewal was dropped");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!dropped.load(Ordering::SeqCst), "the renewal was dropped");
     }
 
     /// The claim's deadline starts when the backend writes the claim, before
