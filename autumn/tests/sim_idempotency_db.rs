@@ -1026,3 +1026,114 @@ async fn set_then_unlock_keeps_the_configured_ttl() {
         "the record expires one TTL after the release"
     );
 }
+
+/// The first request records a step and crashes. The retry takes the key and
+/// crashes too, before it reads or writes anything. The third request still
+/// finds the recovery point: taking over the key keeps the row one TTL past the
+/// new lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn short_ttl_recovery_point_survives_two_crashes() {
+    let substrate = SqliteSubstrate::with_migrations(&[&FRAMEWORK_MIGRATIONS, &APP_MIGRATIONS])
+        .expect("substrate");
+    let calls = Calls::default();
+    let store = Arc::new(DbIdempotencyStore::new(
+        substrate.pool(),
+        Duration::from_secs(1),
+    ));
+    let pool = substrate.pool();
+    let handler_calls = calls.clone();
+    // Run 1 records a step and hangs. Run 2 hangs at once. Run 3 resumes.
+    let handler = move |idem: IdempotencyTx| {
+        let pool = pool.clone();
+        let calls = handler_calls.clone();
+        async move {
+            let run = calls.get();
+            calls.add();
+            if run == 1 {
+                std::future::pending::<()>().await;
+            }
+            let mut pooled = pool.get().await.expect("checkout");
+            let conn: &mut RuntimeConnection = &mut pooled;
+            if let Some(point) = idem.recovery_point(conn).await.expect("recovery point") {
+                return format!("resumed after {point}");
+            }
+            let step = idem.clone();
+            conn.transaction::<_, autumn_web::AutumnError, _>(async move |conn| {
+                step.set_recovery_point(conn, "charged").await
+            })
+            .await
+            .expect("transaction");
+            drop(pooled);
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    };
+    let app = axum::Router::new()
+        .route("/step", axum::routing::post(handler))
+        .layer(
+            IdempotencyLayer::new(store)
+                .with_ttl(Duration::from_secs(1))
+                .with_in_flight_ttl(Duration::from_secs(2)),
+        );
+
+    for attempt in 1..=2 {
+        let crashed = tokio::time::timeout(
+            Duration::from_millis(500),
+            app.clone().oneshot(step("charge", "A")),
+        )
+        .await;
+        assert!(crashed.is_err(), "attempt {attempt} is dropped");
+        // The 2 s lock frees the key at about 2 s after the attempt.
+        tokio::time::sleep(Duration::from_millis(1_800)).await;
+    }
+    assert_eq!(calls.get(), 2, "both attempts ran the handler");
+
+    // A third run that does not find the step records it again and hangs.
+    let third = tokio::time::timeout(
+        Duration::from_secs(5),
+        app.clone().oneshot(step("charge", "A")),
+    )
+    .await
+    .expect("the third request resumes rather than re-running the step")
+    .expect("infallible");
+    let body = axum::body::to_bytes(third.into_body(), 1024)
+        .await
+        .expect("body");
+    assert_eq!(
+        &body[..],
+        b"resumed after charged",
+        "the recovery point outlives the second crash"
+    );
+}
+
+/// A zero response TTL: once released, the record is gone at once, not kept
+/// until the end of the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_ttl_record_expires_on_release() {
+    use autumn_web::idempotency::IdempotencyStore as _;
+    let (_substrate, store) = bare_store();
+    let key = "zero-ttl";
+    assert!(
+        store
+            .try_lock(key, "a", Duration::from_secs(5))
+            .await
+            .unwrap()
+    );
+    store
+        .set(key, store_record(201), Vec::new(), Duration::ZERO)
+        .await
+        .unwrap();
+    store.unlock(key, "a").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        store.get(key).await.unwrap().is_none(),
+        "a zero-TTL record is not replayed after release"
+    );
+    assert!(
+        store
+            .try_lock(key, "b", Duration::from_secs(5))
+            .await
+            .unwrap(),
+        "the key starts over"
+    );
+}

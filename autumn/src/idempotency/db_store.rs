@@ -295,7 +295,13 @@ impl IdempotencyStore for DbIdempotencyStore {
             .await
             .map_err(|e| db_error("delete expired idempotency key", e))?;
             // Take the lock when the key is new, or has no record and its lock
-            // expired. A recovery point stays for the next owner.
+            // expired. A recovery point stays for the next owner: the row
+            // lives one TTL past the new lock, or longer if it already did,
+            // so a crash of this owner too leaves it for the one after.
+            let crash_expires = until.saturating_add(ms(self.default_ttl));
+            let taken_expiry =
+                diesel::dsl::case_when(keys::expires_at_ms.gt(crash_expires), keys::expires_at_ms)
+                    .otherwise(crash_expires);
             let upsert = diesel::insert_into(keys::autumn_idempotency_keys)
                 .values((
                     keys::storage_key.eq(key),
@@ -308,7 +314,7 @@ impl IdempotencyStore for DbIdempotencyStore {
                 .set((
                     keys::locked_by.eq(owner),
                     keys::locked_until_ms.eq(until),
-                    keys::expires_at_ms.eq(expires),
+                    keys::expires_at_ms.eq(taken_expiry),
                 ));
             // `ON CONFLICT … DO UPDATE … WHERE`: the `WHERE` reads the existing row.
             let acquired = diesel::query_dsl::methods::FilterDsl::filter(
@@ -336,26 +342,23 @@ impl IdempotencyStore for DbIdempotencyStore {
             .execute(&mut conn)
             .await
             .map_err(|e| db_error("release idempotency lock", e))?;
-            // A record written in a transaction lives `ttl_ms` from now. One
-            // statement: if the release stops before it, the row keeps the
-            // crash-safe expiry from `keep_past_crash_lock`.
+            // A record (from `set` or a transaction) lives `ttl_ms` from now,
+            // a zero TTL included. One statement: if the release stops before
+            // it, the row keeps its crash-safe expiry.
             #[allow(
                 clippy::arithmetic_side_effects,
                 reason = "a SQL expression, evaluated by the database"
             )]
             let release_expiry = keys::ttl_ms + now_ms();
-            diesel::update(
-                held.filter(keys::record.is_not_null())
-                    .filter(keys::ttl_ms.gt(0)),
-            )
-            .set((
-                keys::expires_at_ms.eq(release_expiry),
-                keys::locked_by.eq(None::<String>),
-                keys::locked_until_ms.eq(0),
-            ))
-            .execute(&mut conn)
-            .await
-            .map_err(|e| db_error("release idempotency lock", e))?;
+            diesel::update(held.filter(keys::record.is_not_null()))
+                .set((
+                    keys::expires_at_ms.eq(release_expiry),
+                    keys::locked_by.eq(None::<String>),
+                    keys::locked_until_ms.eq(0),
+                ))
+                .execute(&mut conn)
+                .await
+                .map_err(|e| db_error("release idempotency lock", e))?;
             // Any other row this request holds: release only.
             diesel::update(held)
                 .set((
