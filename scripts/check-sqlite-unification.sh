@@ -43,8 +43,9 @@
 #      chain (issue #2571).
 #   5. A dependency spelled as a dotted key at the root or under `[target]`
 #      (`dependencies.autumn-web = { … }`) is an edge too.
-#   6. A unicode escape in a basic string of a dependency or feature entry,
-#      or of a table header, fails closed: the rules cannot read it.
+#   6. The lexer decodes ASCII unicode escapes, so `"\u0073qlite"` reads as
+#      "sqlite". A non-ASCII escape in a dependency or feature entry or
+#      header fails closed: the rules cannot read it.
 #
 # The lexer folds TOML multi-line strings to one-line strings that keep their
 # text, so a bracket in one does not move the scan out of step, and
@@ -148,6 +149,43 @@ scan_manifest() {
         else if (c == "]" || c == "}") depth--
       }
       return depth <= 0
+    }
+    # Decode each ASCII unicode escape (`\u0073`, `\U00000073`) in a basic
+    # string, so the rules read the name cargo reads. A non-ASCII escape, or
+    # one that decodes to a quote, a backslash or a control character, stays
+    # as written: `has_unicode_escape` still sees it.
+    function decode_escapes(s,   i, c, q, out, n, v) {
+      q = ""; out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (q == "\"" && c == "\\") {
+          n = (substr(s, i + 1, 1) == "u") ? 4 : (substr(s, i + 1, 1) == "U") ? 8 : 0
+          v = (n > 0) ? hex_value(substr(s, i + 2, n)) : -1
+          if (v >= 32 && v < 127 && v != 34 && v != 92) {
+            out = out sprintf("%c", v)
+            i += 1 + n
+          } else {
+            out = out c substr(s, i + 1, 1)
+            i++
+          }
+          continue
+        }
+        if (q != "") { if (c == q) q = "" }
+        else if (c == "\"" || c == SQ) q = c
+        out = out c
+      }
+      return out
+    }
+    # The value of a string of hex digits, or -1 if one is not a hex digit.
+    function hex_value(h,   i, d, v) {
+      if (h == "") return -1
+      v = 0
+      for (i = 1; i <= length(h); i++) {
+        d = index("0123456789abcdef", tolower(substr(h, i, 1))) - 1
+        if (d < 0) return -1
+        v = v * 16 + d
+      }
+      return v
     }
     # Whether `s` holds a unicode escape. Only a basic string has escapes:
     # TOML reads a backslash in a literal string as a backslash.
@@ -283,6 +321,7 @@ scan_manifest() {
     function feed(line,   entry) {
       sub(/\r$/, "", line)              # a CRLF checkout must not blind the gate
       line = fold_multiline(line)
+      line = decode_escapes(line)
       line = strip_comment(line)
       if (ml != "") {
         # A multi-line string is still open: hold the entry until it closes.
@@ -301,9 +340,11 @@ scan_manifest() {
       gsub(/^[ \t]+|[ \t]+$/, "", line)
       if (line == "") return ""
       if (line ~ /^\[/) {
-        # A unicode escape in a header can spell a dependency name, and the
-        # rules cannot read it. Hand pass 2 a marker to report.
-        if (has_unicode_escape(line)) { entry_line = FNR; section = line; return ESCAPED_HEADER }
+        # A unicode escape left in a dependency or feature header is a
+        # non-ASCII one, which the rules cannot read. Hand pass 2 a marker.
+        if (has_unicode_escape(line) && line ~ /(dependencies|features|target)/) {
+          entry_line = FNR; section = line; return ESCAPED_HEADER
+        }
         # A header ends any entry. It carries no string values, so every
         # quote in it is key-quoting (`[dependencies."autumn-web"]`,
         # `[target."cfg(unix)".dependencies]`); strip them so the section
@@ -503,9 +544,12 @@ scan_manifest() {
       loose = (section == "" || section ~ /^\[target(\.[^]]*)?\]$/)
 
       # ── 0. Spellings the rules below do not read: fail closed ─────────
-      # A TOML unicode escape can spell any name, so the rules cannot read
-      # it.
-      if ((is_dep_table() || dep_section_crate() != "" || section == "[features]" || loose) \
+      # An ASCII escape was decoded above. A non-ASCII one left in a
+      # dependency or feature entry can spell a name the rules cannot read.
+      key = norm
+      sub(/[ \t]*=.*$/, "", key)
+      if ((is_dep_table() || dep_section_crate() != "" || section == "[features]" \
+           || (loose && (loose_dep_name(key) != "" || (section == "" && key ~ /^features(\.|$)/)))) \
           && has_unicode_escape(entry)) {
         report("a unicode escape in a dependency or feature entry cannot be checked; write it plainly")
         next
@@ -994,6 +1038,32 @@ EOF
 features = ["sqlite"]
 EOF
   check_fail "a unicode escape in a table header fails closed" header_unicode
+
+  # An escape in unrelated metadata is not a dependency or a feature.
+  make_case header_metadata_escape <<'EOF'
+[package.metadata."\u006banner"]
+text = "\u00e9t\u00e9"
+EOF
+  check_pass "an escape in a metadata header is not an edge" header_metadata_escape
+
+  make_case root_metadata_escape <<'EOF'
+package.metadata.banner = "\u0068ello"
+package.metadata.accent = "\u00e9"
+EOF
+  check_pass "an escape in a root metadata key is not an edge" root_metadata_escape
+
+  # A non-ASCII escape cannot be decoded here, so a feature key that holds
+  # one still fails closed.
+  make_case feature_key_escape <<'EOF'
+[package]
+name = "autumn-cli"
+
+[features]
+default = ["x"]
+"\u00e9" = ["sqlite"]
+sqlite = ["autumn-web/sqlite"]
+EOF
+  check_fail "a non-ASCII escape in a feature key fails closed" feature_key_escape
 
   make_case spaced_header <<'EOF'
 [ dependencies ]
