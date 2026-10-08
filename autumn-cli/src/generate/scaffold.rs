@@ -2747,6 +2747,41 @@ fn plan_scaffold_with_options_impl(
         }
     }
 
+    // Issue #2328: a `--force` run that drops a flag stops emitting its surface,
+    // so give back the feature that surface needed. `destroy` has its own reverts.
+    // `i18n` and `maud` stay: `.i18n_auto()` and the shared layout still use them.
+    if !for_revert {
+        let cargo_path = project_root.join("Cargo.toml");
+        let routes_dir = project_root.join("src").join("routes");
+        let own_routes = routes_dir.join(format!("{plural}.rs"));
+        let own_model = project_root
+            .join("src")
+            .join("models")
+            .join(format!("{snake_name}.rs"));
+        let attachments = has_attachment_fields(&fields);
+        let htmx_needed = (search_enabled && !options_with_key.api)
+            || options_with_key.live
+            || options_with_key.live_validation;
+        let released = [
+            ("csv", !export_enabled),
+            ("multipart", !import_enabled && !attachments),
+            ("storage", !attachments),
+            ("markdown", !rich_text_views),
+            ("htmx", !htmx_needed),
+        ];
+        for (feature, unused) in released {
+            if unused {
+                let (dir, own) = if feature == "htmx" {
+                    (Some(routes_dir.clone()), own_routes.clone())
+                } else {
+                    (None, own_model.clone())
+                };
+                plan.release_feature(cargo_path.clone(), feature, dir, own);
+            }
+        }
+        plan.settle_released_features();
+    }
+
     Ok(plan)
 }
 
@@ -26953,8 +26988,7 @@ exempt_paths = [
     mod feature_release {
         use super::*;
 
-        const CARGO: &str =
-            "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = \"0.7.0\"\n";
+        const CARGO: &str = "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = \"0.7.0\"\n";
 
         fn project() -> TempDir {
             let tmp = project_with_main(default_main());
@@ -27007,7 +27041,11 @@ exempt_paths = [
             run(&tmp, "Post", POST, &searchable());
             assert!(autumn_web_line(&tmp).contains("htmx"));
             run(&tmp, "Post", POST, &ScaffoldOptions::default());
-            assert!(!autumn_web_line(&tmp).contains("htmx"), "{}", autumn_web_line(&tmp));
+            assert!(
+                !autumn_web_line(&tmp).contains("htmx"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
         }
 
         #[test]
@@ -27024,33 +27062,54 @@ exempt_paths = [
         #[test]
         fn dropping_attachment_releases_storage_and_multipart() {
             let tmp = project();
-            run(&tmp, "Post", &["title:String", "cover:attachment"], &ScaffoldOptions::default());
+            run(
+                &tmp,
+                "Post",
+                &["title:String", "cover:attachment"],
+                &ScaffoldOptions::default(),
+            );
             assert!(autumn_web_line(&tmp).contains("storage"));
             run(&tmp, "Post", POST, &ScaffoldOptions::default());
             let line = autumn_web_line(&tmp);
-            assert!(!line.contains("storage") && !line.contains("multipart"), "{line}");
+            assert!(
+                !line.contains("storage") && !line.contains("multipart"),
+                "{line}"
+            );
         }
 
         #[test]
         fn dropping_richtext_releases_markdown() {
             let tmp = project();
-            run(&tmp, "Post", &["title:String", "body:richtext"], &ScaffoldOptions::default());
+            run(
+                &tmp,
+                "Post",
+                &["title:String", "body:richtext"],
+                &ScaffoldOptions::default(),
+            );
             assert!(autumn_web_line(&tmp).contains("markdown"));
             run(&tmp, "Post", POST, &ScaffoldOptions::default());
-            assert!(!autumn_web_line(&tmp).contains("markdown"), "{}", autumn_web_line(&tmp));
+            assert!(
+                !autumn_web_line(&tmp).contains("markdown"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
         }
 
         #[test]
-        fn going_api_releases_csv() {
+        fn going_live_releases_csv() {
             let tmp = project();
             run(&tmp, "Post", POST, &ScaffoldOptions::default());
             assert!(autumn_web_line(&tmp).contains("csv"));
-            let api = ScaffoldOptions {
-                api: true,
+            let live = ScaffoldOptions {
+                live: true,
                 ..Default::default()
             };
-            run(&tmp, "Post", POST, &api);
-            assert!(!autumn_web_line(&tmp).contains("csv"), "{}", autumn_web_line(&tmp));
+            run(&tmp, "Post", POST, &live);
+            assert!(
+                !autumn_web_line(&tmp).contains("csv"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
         }
 
         #[test]
@@ -27059,7 +27118,11 @@ exempt_paths = [
             run(&tmp, "Note", POST, &importing());
             run(&tmp, "Post", POST, &importing());
             run(&tmp, "Post", POST, &ScaffoldOptions::default());
-            assert!(autumn_web_line(&tmp).contains("multipart"), "{}", autumn_web_line(&tmp));
+            assert!(
+                autumn_web_line(&tmp).contains("multipart"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
         }
 
         #[test]
@@ -27068,7 +27131,11 @@ exempt_paths = [
             run(&tmp, "Note", POST, &searchable());
             run(&tmp, "Post", POST, &searchable());
             run(&tmp, "Post", POST, &ScaffoldOptions::default());
-            assert!(autumn_web_line(&tmp).contains("htmx"), "{}", autumn_web_line(&tmp));
+            assert!(
+                autumn_web_line(&tmp).contains("htmx"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
         }
 
         #[test]
@@ -27081,7 +27148,11 @@ exempt_paths = [
             )
             .unwrap();
             run(&tmp, "Post", POST, &ScaffoldOptions::default());
-            assert!(autumn_web_line(&tmp).contains("multipart"), "{}", autumn_web_line(&tmp));
+            assert!(
+                autumn_web_line(&tmp).contains("multipart"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
         }
 
         #[test]

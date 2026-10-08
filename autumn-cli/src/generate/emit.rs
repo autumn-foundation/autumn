@@ -591,6 +591,20 @@ pub struct Plan {
     /// [`Plan::revert`] (`autumn destroy`, issue #1048) can remove exactly
     /// what this plan would have inserted into a shared file.
     pub reverts: Vec<Revert>,
+    /// `autumn-web` features this run no longer needs (issue #2328).
+    /// Resolved by [`Plan::settle_released_features`].
+    released_features: Vec<ReleasedFeature>,
+}
+
+/// An `autumn-web` feature a regenerate run no longer needs.
+#[derive(Debug)]
+struct ReleasedFeature {
+    path: PathBuf,
+    feature: String,
+    /// Directory whose other files pin a feature that has no source marker.
+    owner_dir: Option<PathBuf>,
+    /// The file this run rewrites in `owner_dir`; it never pins the feature.
+    own_file: PathBuf,
 }
 
 impl Plan {
@@ -604,6 +618,7 @@ impl Plan {
             actions: Vec::new(),
             warnings: Vec::new(),
             reverts: Vec::new(),
+            released_features: Vec::new(),
         }
     }
 
@@ -618,6 +633,74 @@ impl Plan {
     /// (issue #1048) — irrelevant to a normal `generate` run.
     pub fn push_revert(&mut self, revert: Revert) {
         self.reverts.push(revert);
+    }
+
+    /// Declare that this run no longer needs `feature` in `path`
+    /// (`Cargo.toml`). The `--force` counterpart of [`Revert::CargoAutumnWebFeature`].
+    ///
+    /// [`Plan::settle_released_features`] drops it when nothing else uses it.
+    /// `owner_dir` and `own_file` apply only to a feature with no source
+    /// marker (see [`autumn_web_feature_markers`]).
+    pub fn release_feature(
+        &mut self,
+        path: PathBuf,
+        feature: &str,
+        owner_dir: Option<PathBuf>,
+        own_file: PathBuf,
+    ) {
+        self.released_features.push(ReleasedFeature {
+            path,
+            feature: feature.to_owned(),
+            owner_dir,
+            own_file,
+        });
+    }
+
+    /// Remove each released feature that no surviving code needs.
+    ///
+    /// Call once, after the last action is queued. Reads pending file
+    /// contents, not the files on disk, so the code this run replaces
+    /// does not keep its own feature alive.
+    pub fn settle_released_features(&mut self) {
+        use super::schema_edit::remove_autumn_web_feature;
+        let released = std::mem::take(&mut self.released_features);
+        if released.is_empty() {
+            return;
+        }
+        let pending = pending_contents(self);
+        for r in released {
+            let needed = autumn_web_feature_pinned_by_backend(&r.feature, &self.project_root)
+                || if autumn_web_feature_markers(&r.feature).is_empty() {
+                    // No marker: keep unless the owner directory is known and empty.
+                    r.owner_dir.as_deref().is_none_or(|dir| {
+                        resource_dir_has_other_files(dir, std::slice::from_ref(&r.own_file))
+                    })
+                } else {
+                    autumn_web_feature_still_needed_elsewhere(
+                        &r.feature,
+                        &self.project_root,
+                        &[],
+                        &pending,
+                    )
+                };
+            if needed {
+                continue;
+            }
+            let base = self
+                .actions
+                .iter()
+                .rev()
+                .find_map(|a| match a {
+                    Action::Modify { path, contents } if path == &r.path => Some(contents.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| fs::read_to_string(&r.path).unwrap_or_default());
+            let updated = remove_autumn_web_feature(&base, &r.feature);
+            if updated != base {
+                self.actions.retain(|a| a.path() != r.path);
+                self.modify(r.path, updated);
+            }
+        }
     }
 
     /// Push a [`Action::Create`] action.
