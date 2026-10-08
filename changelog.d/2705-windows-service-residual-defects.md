@@ -11,4 +11,4 @@
   - A very large `prestop_grace_secs` or `shutdown_timeout_secs` no longer
     panics the stop path. The stop wait is capped at 24 hours.
   - The preshutdown timeout is set from the budget the app reports, not from a
-    guess made at install time. Until then it keeps the OS default.
+    guess made at install time. Until then it uses a 60s fallback.

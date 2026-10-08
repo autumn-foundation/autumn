@@ -284,16 +284,16 @@ pub const FALLBACK_DRAIN_BUDGET_SECS: u64 = 60;
 
 /// The preshutdown timeout to set, given the budget the app reported.
 ///
-/// `None` keeps the OS default (180s). The CLI cannot see a budget chosen
-/// through `with_config_loader`, so a guess made before the app reports can be
-/// too short. Windows would then kill the service mid-drain at machine
-/// shutdown.
+/// Before the app reports, use the fallback budget. The OS default can be
+/// only 10 seconds, and the CLI cannot see a budget chosen through
+/// `with_config_loader`. A timeout that is too short makes Windows stop the
+/// service before the drain ends.
 #[cfg_attr(
     not(windows),
     allow(dead_code, reason = "used by the Windows arm, tested everywhere")
 )]
-fn preshutdown_for_reported(reported_budget_secs: Option<u64>) -> Option<Duration> {
-    reported_budget_secs.map(stop_wait_hint)
+fn preshutdown_for_reported(reported_budget_secs: Option<u64>) -> Duration {
+    stop_wait_hint(reported_budget_secs.unwrap_or(FALLBACK_DRAIN_BUDGET_SECS))
 }
 
 /// The `--service-record <path>` value in a registered service's command line.
@@ -767,8 +767,9 @@ mod windows_impl {
         service
             .set_failure_actions_on_non_crash_failures(true)
             .map_err(|e| format!("cannot arm the service restart policy: {e}"))?;
-        // The preshutdown timeout stays at the 180-second OS default until the
-        // app reports its real budget (see below).
+        // Set a safe timeout before the start. The app replaces it with its
+        // real budget once it reports (see below). The OS default can be 10s.
+        let _ = service.set_preshutdown_timeout(super::preshutdown_for_reported(None));
         service
             .start::<&std::ffi::OsStr>(&[])
             .map_err(|e| format!("registered the service but could not start it: {e}"))?;
@@ -782,8 +783,7 @@ mod windows_impl {
                 Ok(ServiceState::Running) => {
                     // Give the drain the same time at machine shutdown that it
                     // gets from `sc stop`. The app may write its budget a moment
-                    // after the SCM shows Running, so poll briefly. On failure
-                    // the OS default stays.
+                    // after the SCM shows Running, so poll briefly.
                     let until = Instant::now() + Duration::from_secs(10);
                     let reported = loop {
                         let budget = serve::recorded_stop_budget(paths);
@@ -792,18 +792,16 @@ mod windows_impl {
                         }
                         std::thread::sleep(Duration::from_millis(250));
                     };
-                    match super::preshutdown_for_reported(reported) {
-                        Some(hint) => {
-                            if let Err(e) = service.set_preshutdown_timeout(hint) {
-                                eprintln!(
-                                    "autumn serve install-service: preshutdown timeout not set: {e}"
-                                );
-                            }
-                        }
-                        None => eprintln!(
+                    if reported.is_none() {
+                        eprintln!(
                             "autumn serve install-service: the app did not report its \
-                             drain budget; the preshutdown timeout keeps the OS default"
-                        ),
+                             drain budget; using the {FALLBACK_DRAIN_BUDGET_SECS}s fallback \
+                             for the preshutdown timeout"
+                        );
+                    } else if let Err(e) =
+                        service.set_preshutdown_timeout(super::preshutdown_for_reported(reported))
+                    {
+                        eprintln!("autumn serve install-service: preshutdown timeout not set: {e}");
                     }
                     return Ok(());
                 }
@@ -1281,7 +1279,7 @@ mod windows_impl {
                     // wait hint extends it, so an app with a 30-second drain
                     // would be terminated mid-drain on every reboot and its
                     // managed cluster left for WAL recovery. `PRESHUTDOWN` runs
-                    // earlier, with a 180-second default we raise to cover the
+                    // earlier, with a default of 10 to 180 seconds that we raise to cover the
                     // app's own budget. The two flags are mutually exclusive.
                     controls_accepted: if state == ServiceState::Running {
                         ServiceControlAccept::STOP | ServiceControlAccept::PRESHUTDOWN
@@ -1379,16 +1377,16 @@ mod tests {
     }
 
     #[test]
-    fn preshutdown_keeps_the_os_default_until_the_app_reports() {
-        assert_eq!(preshutdown_for_reported(None), None);
+    fn preshutdown_uses_the_fallback_until_the_app_reports() {
+        assert_eq!(
+            preshutdown_for_reported(None),
+            stop_wait_hint(FALLBACK_DRAIN_BUDGET_SECS)
+        );
     }
 
     #[test]
     fn preshutdown_follows_the_reported_budget() {
-        assert_eq!(
-            preshutdown_for_reported(Some(300)),
-            Some(stop_wait_hint(300))
-        );
+        assert_eq!(preshutdown_for_reported(Some(300)), stop_wait_hint(300));
     }
 
     #[test]
