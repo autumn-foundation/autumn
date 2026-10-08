@@ -492,6 +492,8 @@ mod test_db_integration;
 mod throttle_route;
 mod time_zone_integration;
 #[cfg(feature = "tls")]
+mod tls_alpn;
+#[cfg(feature = "tls")]
 mod tls_app_surface;
 #[cfg(feature = "tls")]
 mod tls_client_auth;

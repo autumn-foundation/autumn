@@ -5274,7 +5274,8 @@ pub(crate) fn actuator_router_with_prefix<
                 )
                 .route(
                     &actuator_route_path(prefix, "/tasks/stream"),
-                    axum::routing::get(tasks_stream_endpoint::<S>),
+                    axum::routing::get(tasks_stream_endpoint::<S>)
+                        .connect(tasks_stream_endpoint::<S>),
                 );
         }
     }

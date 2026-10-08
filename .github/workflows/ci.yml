@@ -1380,6 +1380,10 @@ jobs:
           cargo test -p autumn-web --features "tls,ws,test-support" \
             --test integration_tests tls_app_surface:: | tee "${RUNNER_TEMP}/tls-surface.log"
           assert_ran "${RUNNER_TEMP}/tls-surface.log" "tls_app_surface"
+          # ALPN `h2` negotiation and `wss://` over h2 extended CONNECT (#2321).
+          cargo test -p autumn-web --features "tls,ws,test-support" \
+            --test integration_tests tls_alpn:: | tee "${RUNNER_TEMP}/tls-alpn.log"
+          assert_ran "${RUNNER_TEMP}/tls-alpn.log" "tls_alpn"
           # The custom-domain SNI resolver + certificate cache (#1635) need
           # `tls` to compile at all, so the default `test` lane runs only the
           # feature-free half of `custom_domains`. Run the whole module here.

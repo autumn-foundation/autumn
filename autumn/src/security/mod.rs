@@ -177,3 +177,59 @@ pub use rate_limit::{
 };
 pub use submit_token::{SubmitFormField, SubmitToken, SubmitTokenLayer};
 pub use trusted_proxies::{ProxyResolver, ResolvedClientIdentity, TrustedProxiesLayer};
+
+/// Whether `req` is an HTTP/2 `WebSocket` upgrade (RFC 8441): a `CONNECT`
+/// with `:protocol = websocket`. It is the HTTP/2 form of the `GET` upgrade,
+/// so the gates that pass the `GET` upgrade pass this too. A plain `CONNECT`
+/// is not one.
+pub(crate) fn is_websocket_connect<B>(req: &axum::http::Request<B>) -> bool {
+    req.method() == axum::http::Method::CONNECT
+        && req
+            .extensions()
+            .get::<hyper::ext::Protocol>()
+            .is_some_and(|p| p.as_str().eq_ignore_ascii_case("websocket"))
+}
+
+#[cfg(test)]
+mod websocket_connect_tests {
+    use super::is_websocket_connect;
+    use axum::http::{Method, Request};
+
+    fn request(method: Method, protocol: Option<&'static str>) -> Request<()> {
+        let mut req = Request::builder().method(method).uri("/").body(()).unwrap();
+        if let Some(p) = protocol {
+            req.extensions_mut()
+                .insert(hyper::ext::Protocol::from_static(p));
+        }
+        req
+    }
+
+    #[test]
+    fn connect_with_websocket_protocol_is_an_upgrade() {
+        assert!(is_websocket_connect(&request(
+            Method::CONNECT,
+            Some("websocket")
+        )));
+    }
+
+    #[test]
+    fn plain_connect_is_not_an_upgrade() {
+        assert!(!is_websocket_connect(&request(Method::CONNECT, None)));
+    }
+
+    #[test]
+    fn connect_with_another_protocol_is_not_an_upgrade() {
+        assert!(!is_websocket_connect(&request(
+            Method::CONNECT,
+            Some("connect-udp")
+        )));
+    }
+
+    #[test]
+    fn get_with_a_protocol_is_not_an_upgrade() {
+        assert!(!is_websocket_connect(&request(
+            Method::GET,
+            Some("websocket")
+        )));
+    }
+}

@@ -540,6 +540,8 @@ redis.workspace = true
 proptest = "1.4"
 time = { workspace = true }
 tokio-tungstenite = "0.30.0"
+# HTTP/2 client for the `tls_alpn` suite (#2321); already in the lockfile.
+h2 = "0.4"
 loom = "0.7.2"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
 rustversion = "1"

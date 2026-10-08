@@ -436,7 +436,11 @@ where
         let clean = crate::security::path::clean_path(req.uri().path());
         let path = clean.as_str();
         let is_exempt = crate::security::path::is_exempt_path(path, &self.settings.exempt_paths);
-        let is_safe = is_exempt || self.settings.safe_methods.contains(req.method());
+        // The HTTP/2 `WebSocket` upgrade is safe, like the `GET` upgrade: a
+        // browser cannot add a CSRF header to it.
+        let is_safe = is_exempt
+            || self.settings.safe_methods.contains(req.method())
+            || crate::security::is_websocket_connect(&req);
         let raw_cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name);
 
         // When signing is active, discard any cookie that fails HMAC verification
