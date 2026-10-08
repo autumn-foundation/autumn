@@ -418,11 +418,26 @@ fn normalize_type(ty: &str) -> String {
     out
 }
 
-/// Remove the block of `table` and one blank line next to it. `None` when the
+/// Remove the block of `table`, its outer attributes and doc comments, and one
+/// blank line next to it. `None` when the
 /// text has no block for `table`.
 fn remove_block(text: &str, table: &str) -> Option<String> {
     let token = ident_token(table).unwrap_or_else(|| table.to_owned());
-    let (start, end) = schema_block_range(text, &token)?;
+    let (mut start, end) = schema_block_range(text, &token)?;
+    // Take the outer attributes (`#[cfg(...)]`) and doc comments of the call
+    // too, or they would apply to the next item.
+    let line_start = |at: usize| text[..at].rfind('\n').map_or(0, |i| i + 1);
+    if text[line_start(start)..start].trim().is_empty() {
+        start = line_start(start);
+        while start > 0 {
+            let prev = line_start(start - 1);
+            let line = text[prev..start].trim();
+            if !(line.starts_with("#[") || line.starts_with("///")) {
+                break;
+            }
+            start = prev;
+        }
+    }
     let prefix = &text[..start];
     let rest = &text[end..];
     let mut suffix = rest.strip_prefix('\n').unwrap_or(rest);
@@ -1451,5 +1466,23 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
             ))]),
         );
         assert_eq!(out.text, existing);
+    }
+
+    /// A drop removes the outer attributes and doc comments of the block.
+    #[test]
+    fn a_drop_removes_the_outer_attributes_of_the_block() {
+        let existing = "diesel::table! {\n    users (id) {\n        id -> Int8,\n    }\n}\n\n/// Comments.\n#[cfg(feature = \"comments\")]\ndiesel::table! {\n    comments (id) {\n        id -> Int8,\n    }\n}\n";
+        let out = sync_for_plan(
+            existing,
+            &parsed(vec![]),
+            &plan(vec![SchemaChange::DropTable(Table::new(
+                "comments",
+                Backend::Postgres,
+            ))]),
+        );
+        assert_eq!(
+            out.text,
+            "diesel::table! {\n    users (id) {\n        id -> Int8,\n    }\n}\n"
+        );
     }
 }
