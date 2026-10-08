@@ -364,8 +364,15 @@ async fn failure_before_subscription_still_cancels_on_exhaustion() {
 
 #[tokio::test]
 async fn failure_before_subscription_still_marks_unpaid_on_exhaustion() {
-    let billing = support::config()
-        .dunning(DunningPolicy::standard().with_on_exhausted(ExhaustionAction::MarkUnpaid));
+    let billing = support::config().dunning(
+        DunningPolicy::standard()
+            .with_retry_delays(vec![
+                Duration::from_secs(3600),
+                Duration::from_secs(7200),
+                Duration::from_secs(10_800),
+            ])
+            .with_on_exhausted(ExhaustionAction::MarkUnpaid),
+    );
     failure_before_subscription_exhausts(billing, false).await;
 }
 
