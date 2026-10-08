@@ -198,8 +198,13 @@ my-app/
 > and the snapshot. To rename, put `#[renamed_from("old_name")]` on the field,
 > or on the model after `#[model]`. The diff then emits `ALTER TABLE ...
 > RENAME`, not a drop plus an add. To diff against what the migrations really
-> make, pass `--dev-url <dev server URL>` (or set `AUTUMN_DEV_URL`). See
-> `docs/guide/declarative-schema.md`.
+> make, pass `--dev-url <dev server URL>` (or set `AUTUMN_DEV_URL`).
+> `--write-migration` also writes the model's `diesel::table!` block in
+> `src/schema.rs`: do not edit a managed block by hand. To adopt a model, add
+> `managed`, then run `autumn schema diff --write-migration`.
+> `autumn schema doctor` reports a stale `src/schema.rs` block
+> (`schema-rs-drift`) and an unmanaged model that differs from its table
+> (`unmanaged-drift`). See `docs/guide/declarative-schema.md`.
 
 ## Cargo.toml
 
