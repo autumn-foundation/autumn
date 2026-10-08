@@ -1,6 +1,7 @@
 //! ALPN negotiation on the in-process TLS listener (issue #2321).
 //!
-//! Drives the real `TlsListener` with real h2 and HTTP/1.1 clients. Every
+//! Drives the real `TlsListener` and the production serve loop
+//! (`http_server::serve`) with real h2 and HTTP/1.1 clients. Every
 //! h2 test connects through `connect_h2`, which asserts that ALPN picked
 //! `h2`. If the server stops advertising `h2`, they all fail.
 
@@ -17,8 +18,8 @@ use futures::stream::Stream;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::tls_support::{
-    CertFixture, RECORDING_HANDSHAKE_TIMEOUT, RecordingVerifier, TestServer, serve_tls_router,
-    tls_connect_alpn,
+    CertFixture, RECORDING_HANDSHAKE_TIMEOUT, RecordingVerifier, TestServer,
+    serve_tls_router_production, tls_connect_alpn,
 };
 
 type Tls = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
@@ -71,7 +72,8 @@ async fn serve(request_timeout_ms: Option<u64>) -> (TestServer, CertFixture) {
         .config(config)
         .build()
         .into_router();
-    let (server, _reloader) = serve_tls_router(router, &fixture, RECORDING_HANDSHAKE_TIMEOUT).await;
+    let (server, _reloader) =
+        serve_tls_router_production(router, &fixture, RECORDING_HANDSHAKE_TIMEOUT).await;
     (server, fixture)
 }
 
@@ -213,7 +215,7 @@ mod wss {
             .build()
             .into_router();
         let (server, _reloader) =
-            serve_tls_router(router, &fixture, RECORDING_HANDSHAKE_TIMEOUT).await;
+            serve_tls_router_production(router, &fixture, RECORDING_HANDSHAKE_TIMEOUT).await;
         let send = connect_h2(&server).await;
         let mut send = send.ready().await.expect("h2 ready");
 
