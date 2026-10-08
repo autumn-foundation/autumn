@@ -254,7 +254,12 @@ enum TableEvent {
     Drop(TableRef),
     /// `ALTER TABLE old RENAME TO new`: the record moves with the table, so a
     /// rename INTO `comments` carries the source table's columns across.
-    Rename { from: TableRef, to: TableRef },
+    /// With `IF EXISTS`, an absent source makes it a no-op.
+    Rename {
+        from: TableRef,
+        to: TableRef,
+        if_exists: bool,
+    },
     /// `ALTER TABLE [IF EXISTS] name SET SCHEMA other`: same name, new schema.
     /// With `IF EXISTS`, an absent source makes it a no-op.
     Move {
@@ -262,6 +267,78 @@ enum TableEvent {
         to: TableRef,
         if_exists: bool,
     },
+}
+
+/// Apply one event to the running picture of every table.
+fn apply_table_event(tables: &mut HashMap<TableRef, TableState>, event: TableEvent) {
+    match event {
+        TableEvent::Create(table, columns) => {
+            tables.insert(
+                table,
+                TableState {
+                    exists: true,
+                    columns,
+                },
+            );
+        }
+        TableEvent::Add(table, column) => {
+            let state = tables.entry(table).or_default();
+            if !state.columns.contains(&column) {
+                state.columns.push(column);
+            }
+        }
+        TableEvent::Remove(table, column) => {
+            if let Some(state) = tables.get_mut(&table) {
+                state.columns.retain(|held| *held != column);
+            }
+        }
+        TableEvent::Drop(table) => {
+            let state = tables.entry(table).or_default();
+            state.exists = false;
+            state.columns.clear();
+        }
+        TableEvent::Rename {
+            from,
+            to,
+            if_exists,
+        } => {
+            if if_exists && !tables.get(&from).is_some_and(|state| state.exists) {
+                return;
+            }
+            // A rename is positive evidence the table exists: the
+            // author just renamed it, and in a valid history the
+            // statement would fail otherwise. The old scan read every
+            // `RENAME TO comments` as the table existing; the
+            // generalisation keeps that and additionally carries the
+            // source table's columns across (#2282). When the history
+            // never saw the source, its columns are unknown — present
+            // but not polymorphic, so generation stays loud instead of
+            // claiming a reuse it cannot verify.
+            //
+            // `RENAME TO` takes a bare relation name: the table stays
+            // in its schema, so `archive.legacy_comments RENAME TO
+            // comments` yields `archive.comments`, not `comments`.
+            let to = TableRef {
+                schema: to.schema.or_else(|| from.schema.clone()),
+                name: to.name,
+            };
+            let mut state = tables.remove(&from).unwrap_or_default();
+            state.exists = true;
+            tables.insert(to, state);
+        }
+        TableEvent::Move {
+            from,
+            to,
+            if_exists,
+        } => {
+            if if_exists && !tables.get(&from).is_some_and(|state| state.exists) {
+                return;
+            }
+            let mut state = tables.remove(&from).unwrap_or_default();
+            state.exists = true;
+            tables.insert(to, state);
+        }
+    }
 }
 
 /// Replay every migration's `up.sql` in version order: for every table, does it
@@ -298,15 +375,22 @@ fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
             }
         }
         for (at, table, statement) in alter_tables(sql) {
+            let if_exists = sql[at + "alter table".len()..]
+                .trim_start()
+                .starts_with("if exists");
             // A table rename moves the whole record; it mentions no column.
             if let Some(to) = table_rename_target(statement) {
-                events.push((at, TableEvent::Rename { from: table, to }));
+                events.push((
+                    at,
+                    TableEvent::Rename {
+                        from: table,
+                        to,
+                        if_exists,
+                    },
+                ));
                 continue;
             }
             if let Some(to) = table_set_schema_target(statement, &table) {
-                let if_exists = sql[at + "alter table".len()..]
-                    .trim_start()
-                    .starts_with("if exists");
                 events.push((
                     at,
                     TableEvent::Move {
@@ -334,67 +418,7 @@ fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
         }
         events.sort_by_key(|(at, _)| *at);
         for (_, event) in events {
-            match event {
-                TableEvent::Create(table, columns) => {
-                    tables.insert(
-                        table,
-                        TableState {
-                            exists: true,
-                            columns,
-                        },
-                    );
-                }
-                TableEvent::Add(table, column) => {
-                    let state = tables.entry(table).or_default();
-                    if !state.columns.contains(&column) {
-                        state.columns.push(column);
-                    }
-                }
-                TableEvent::Remove(table, column) => {
-                    if let Some(state) = tables.get_mut(&table) {
-                        state.columns.retain(|held| *held != column);
-                    }
-                }
-                TableEvent::Drop(table) => {
-                    let state = tables.entry(table).or_default();
-                    state.exists = false;
-                    state.columns.clear();
-                }
-                TableEvent::Rename { from, to } => {
-                    // A rename is positive evidence the table exists: the
-                    // author just renamed it, and in a valid history the
-                    // statement would fail otherwise. The old scan read every
-                    // `RENAME TO comments` as the table existing; the
-                    // generalisation keeps that and additionally carries the
-                    // source table's columns across (#2282). When the history
-                    // never saw the source, its columns are unknown — present
-                    // but not polymorphic, so generation stays loud instead of
-                    // claiming a reuse it cannot verify.
-                    //
-                    // `RENAME TO` takes a bare relation name: the table stays
-                    // in its schema, so `archive.legacy_comments RENAME TO
-                    // comments` yields `archive.comments`, not `comments`.
-                    let to = TableRef {
-                        schema: to.schema.or_else(|| from.schema.clone()),
-                        name: to.name,
-                    };
-                    let mut state = tables.remove(&from).unwrap_or_default();
-                    state.exists = true;
-                    tables.insert(to, state);
-                }
-                TableEvent::Move {
-                    from,
-                    to,
-                    if_exists,
-                } => {
-                    if if_exists && !tables.get(&from).is_some_and(|state| state.exists) {
-                        continue;
-                    }
-                    let mut state = tables.remove(&from).unwrap_or_default();
-                    state.exists = true;
-                    tables.insert(to, state);
-                }
-            }
+            apply_table_event(&mut tables, event);
         }
     }
     tables
@@ -2161,6 +2185,23 @@ mod tests {
         assert!(
             ensure_no_comments_conflict(tmp.path()).is_ok(),
             "nothing moved, so `comments` is still free"
+        );
+    }
+
+    /// `IF EXISTS` makes a rename of an absent table a no-op too.
+    #[test]
+    fn a_conditional_rename_of_an_absent_table_changes_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_rename");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "ALTER TABLE IF EXISTS legacy_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        assert!(
+            ensure_no_comments_conflict(tmp.path()).is_ok(),
+            "nothing was renamed, so `comments` is still free"
         );
     }
 
