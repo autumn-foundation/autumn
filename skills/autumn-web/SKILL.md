@@ -765,7 +765,10 @@ depth 0), `max_body = 10000` bytes; `author_name` is unset by default (the
 framework will not guess a column, and a scaffolded `User` carries an `email`).
 Renaming the struct changes `type_name` and orphans existing rows — pin it
 first. `autumn generate scaffold post title:string comments:commentable`
-emits the table (once per project), the column, and the attribute.
+emits the table (once per project), the column, and the attribute. If the
+project already has a plain `comments` table (for example, a scaffolded
+`Comment` resource), the command stops and writes no file. Rename that table
+or add every missing shared-table column, then run it again.
 
 The model emits a `{Model}Comments` trait blanket-implemented for that model's
 repository — import it as `_`:
