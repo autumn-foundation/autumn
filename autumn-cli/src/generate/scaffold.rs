@@ -3379,10 +3379,7 @@ fn render_model_form(
                     into_new,
                     "        {name}: bytea_from_hex(&form.{name}){bad_hex},"
                 );
-                let _ = writeln!(
-                    from_row,
-                    "            {name}: bytea_to_hex(&row.{name}),"
-                );
+                let _ = writeln!(from_row, "            {name}: bytea_to_hex(&row.{name}),");
             }
         } else if matches!(f.kind, FieldKind::NaiveDateTime | FieldKind::DateTime) {
             // Represented as a `String` on the form (the browser's wire shape),
