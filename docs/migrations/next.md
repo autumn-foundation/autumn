@@ -223,6 +223,56 @@ app that does not set `[cost]` behaves as before. `CostConfig` is
 **Automation:** `manual` — a codemod cannot know which fields a struct literal
 means to leave at their defaults.
 
+### Admission: `Route`, `ServerConfig` and `HttpClientConfig` have new fields
+
+**Why:** Adaptive admission control (issue #3068) adds a route criticality,
+`[server.admission]` and `[http.client.adaptive_throttle]`. These structs have
+public fields and are not `#[non_exhaustive]`, so a struct literal does not
+compile. The route macros set `criticality` for you.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+let route = autumn_web::Route {
+    // …
+    timeout: autumn_web::RouteTimeout::Inherit,
+    seo: Default::default(),
+};
+let client = autumn_web::config::HttpClientConfig {
+    timeout_secs: 10,
+    max_retries: 1,
+    max_retry_after_secs: 10,
+    max_backoff_ms: 20_000,
+    base_urls: Default::default(),
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+let route = autumn_web::Route {
+    // …
+    timeout: autumn_web::RouteTimeout::Inherit,
+    criticality: autumn_web::Criticality::Default,
+    seo: Default::default(),
+};
+let client = autumn_web::config::HttpClientConfig {
+    timeout_secs: 10,
+    max_retries: 1,
+    ..Default::default()
+};
+```
+
+The new fields are `Route::criticality`, `ServerConfig::admission` and
+`HttpClientConfig::adaptive_throttle`. Their defaults change nothing: static
+admission, no throttle, and `default` criticality.
+
+`capsule::schema::HttpErrorKind` (feature `reporting`) has a new variant,
+`ThrottledLocally`. An exhaustive `match` on it needs a new arm.
+
+**Automation:** `manual` — add the field, or use `..Default::default()` where
+the struct has a default.
+
 ### HTTP client: `retries(n)` no longer retries `POST` and `PATCH`
 
 **Why:** `.retries(n)` also turned on retries for non-idempotent methods. A

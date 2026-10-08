@@ -221,7 +221,10 @@ where
         {
             if matches!(
                 any_err.downcast_ref::<crate::http_client::ClientError>(),
-                Some(crate::http_client::ClientError::CircuitBreakerOpen)
+                Some(
+                    crate::http_client::ClientError::CircuitBreakerOpen
+                        | crate::http_client::ClientError::ThrottledLocally { .. }
+                )
             ) {
                 status = StatusCode::SERVICE_UNAVAILABLE;
             }
@@ -1064,8 +1067,8 @@ impl<E: std::error::Error + 'static> std::error::Error for NulByteRejected<E> {
 }
 
 /// Whether `err` carries a Postgres rejection of an embedded NUL byte
-/// (SQLSTATE `22021`, issue #2423) — malformed *client* input rather than a
-/// server bug.
+/// (SQLSTATE `22021` for text, `22P05` for `JSONB`; issues #2423, #2439) —
+/// malformed *client* input rather than a server bug.
 ///
 /// A `TEXT`/`VARCHAR` column cannot hold `0x00`, so a value carrying one is
 /// refused at `INSERT`/`UPDATE` time no matter how it arrived. The blanket
@@ -1126,7 +1129,7 @@ fn is_pg_nul_byte_error(err: &diesel::result::Error) -> bool {
     let diesel::result::Error::DatabaseError(_, info) = err else {
         return false;
     };
-    pg_message_is_nul_rejection(info.message())
+    pg_message_is_nul_rejection(info.message()) || pg_error_is_jsonb_nul_rejection(info.as_ref())
 }
 
 /// Classify a Postgres server message as the `22021` NUL rejection.
@@ -1155,6 +1158,142 @@ fn is_pg_nul_byte_error(err: &diesel::result::Error) -> bool {
 #[cfg(feature = "db")]
 fn pg_message_is_nul_rejection(message: &str) -> bool {
     message.ends_with(": 0x00") && message.contains("UTF")
+}
+
+/// Classify a Postgres error as the `22P05` NUL-in-JSON rejection (`JSONB`).
+///
+/// Postgres refuses `\u0000` inside a JSON string with the message
+/// `unsupported Unicode escape sequence` and the detail
+/// `\u0000 cannot be converted to text.` A client can echo text into a message,
+/// so the message and the detail must both match exactly. A Postgres 16 server
+/// returned these texts. If a locale translates either text, the error stays a
+/// `500`. This is safe.
+#[cfg(feature = "db")]
+fn pg_error_is_jsonb_nul_rejection(info: &dyn diesel::result::DatabaseErrorInformation) -> bool {
+    info.message() == "unsupported Unicode escape sequence"
+        && info.details() == Some(r"\u0000 cannot be converted to text.")
+}
+
+/// Paths of the string values in `body` that hold a NUL character.
+///
+/// Each path uses the field names that `ChangesetForm` reports: `title`,
+/// `address.street`, `items[1].sku`. Call it in a handler after
+/// [`is_nul_byte_violation`] is true. The generated `#[repository(api = ...)]`
+/// write handlers call it for you.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::error::nul_byte_json_fields;
+///
+/// let body = serde_json::json!({"title": "ok", "tags": ["a\u{0}"]});
+/// assert_eq!(nul_byte_json_fields(&body), ["tags[0]"]);
+/// ```
+#[cfg(feature = "db")]
+#[must_use]
+pub fn nul_byte_json_fields(body: &serde_json::Value) -> Vec<String> {
+    fn walk(value: &serde_json::Value, path: &str, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(text) if text.contains('\0') => out.push(path.to_owned()),
+            serde_json::Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    walk(item, &format!("{path}[{index}]"), out);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (key, item) in map {
+                    let child = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    walk(item, &child, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(body, "", &mut out);
+    out
+}
+
+/// Add the field name to a NUL rejection. The `422` then has an `errors[]`
+/// entry.
+///
+/// Postgres does not say which column held the byte. The generated write
+/// handlers look for it in the payload. `body` runs only for a NUL rejection.
+/// Other errors pass through unchanged. A NUL that is not found also passes
+/// through unchanged.
+///
+/// Not part of the stable API — used only by macro-generated code.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+#[must_use]
+pub fn __name_nul_fields(
+    mut err: AutumnError,
+    body: impl FnOnce() -> Option<serde_json::Value>,
+) -> AutumnError {
+    if err.details.is_some() || !is_nul_byte_violation(&err) {
+        return err;
+    }
+    let fields = body().map(|body| nul_byte_json_fields(&body));
+    if let Some(fields) = fields.filter(|fields| !fields.is_empty()) {
+        err.details = Some(
+            fields
+                .into_iter()
+                .map(|field| {
+                    (
+                        field,
+                        vec![crate::form::NUL_CHARACTER_FIELD_ERROR.to_owned()],
+                    )
+                })
+                .collect(),
+        );
+    }
+    err
+}
+
+// A write payload can lack `Serialize`, for example a hand-written `NewModel`.
+// The handlers pick the JSON view with autoref specialization, as
+// `validation::MaybeValidate` does.
+
+/// Wrapper for autoref specialization. Generated code uses it with
+/// [`__name_nul_fields`].
+///
+/// Not part of the stable API — used only by macro-generated code.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub struct MaybeJsonBody<'a, T>(pub &'a T);
+
+/// Specialized branch: the payload implements `Serialize`.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub trait MaybeJsonBodyViaSerialize {
+    /// The payload as JSON.
+    fn autumn_json_body(&self) -> Option<serde_json::Value>;
+}
+
+#[cfg(feature = "db")]
+impl<T: serde::Serialize> MaybeJsonBodyViaSerialize for MaybeJsonBody<'_, T> {
+    fn autumn_json_body(&self) -> Option<serde_json::Value> {
+        serde_json::to_value(self.0).ok()
+    }
+}
+
+/// Fallback branch: the payload has no JSON view.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub trait MaybeJsonBodyFallback {
+    /// Always `None`.
+    fn autumn_json_body(&self) -> Option<serde_json::Value>;
+}
+
+#[cfg(feature = "db")]
+impl<T> MaybeJsonBodyFallback for &MaybeJsonBody<'_, T> {
+    fn autumn_json_body(&self) -> Option<serde_json::Value> {
+        None
+    }
 }
 
 impl std::fmt::Display for AutumnError {
@@ -1741,14 +1880,14 @@ mod tests {
         /// `DatabaseErrorKind::Unknown` and drops the code), so the message is
         /// all the classifier has to go on.
         #[derive(Debug)]
-        struct FakeMessageInfo(&'static str);
+        struct FakeMessageInfo(&'static str, Option<&'static str>);
 
         impl diesel::result::DatabaseErrorInformation for FakeMessageInfo {
             fn message(&self) -> &str {
                 self.0
             }
             fn details(&self) -> Option<&str> {
-                None
+                self.1
             }
             fn hint(&self) -> Option<&str> {
                 None
@@ -1770,8 +1909,55 @@ mod tests {
         fn unknown_db_error(message: &'static str) -> diesel::result::Error {
             diesel::result::Error::DatabaseError(
                 diesel::result::DatabaseErrorKind::Unknown,
-                Box::new(FakeMessageInfo(message)),
+                Box::new(FakeMessageInfo(message, None)),
             )
+        }
+
+        fn unknown_db_error_with_detail(
+            message: &'static str,
+            detail: &'static str,
+        ) -> diesel::result::Error {
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::Unknown,
+                Box::new(FakeMessageInfo(message, Some(detail))),
+            )
+        }
+
+        /// Postgres 16 text for SQLSTATE `22P05`: a NUL inside a JSON string.
+        const PG_JSONB_NUL_MESSAGE: &str = "unsupported Unicode escape sequence";
+        const PG_JSONB_NUL_DETAIL: &str = r"\u0000 cannot be converted to text.";
+
+        #[test]
+        fn pg_jsonb_nul_error_maps_to_422_not_500() {
+            let err: AutumnError =
+                unknown_db_error_with_detail(PG_JSONB_NUL_MESSAGE, PG_JSONB_NUL_DETAIL).into();
+            assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(is_nul_byte_violation(&err));
+            assert_eq!(err.to_string(), crate::error::NUL_BYTE_REJECTED_MESSAGE);
+        }
+
+        /// The message alone must not classify. The detail must also match.
+        #[test]
+        fn jsonb_message_without_the_nul_detail_stays_500() {
+            let err: AutumnError = unknown_db_error(PG_JSONB_NUL_MESSAGE).into();
+            assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let err: AutumnError = unknown_db_error_with_detail(
+                PG_JSONB_NUL_MESSAGE,
+                r"\ud83d is an unpaired surrogate.",
+            )
+            .into();
+            assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
+        /// A client can echo text into a message. The pair must match exactly.
+        #[test]
+        fn echoed_jsonb_text_does_not_classify() {
+            let err: AutumnError = unknown_db_error_with_detail(
+                r#"invalid input syntax for type integer: "unsupported Unicode escape sequence""#,
+                PG_JSONB_NUL_DETAIL,
+            )
+            .into();
+            assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
         }
 
         /// The exact message Postgres 16 returns for SQLSTATE `22021`.
@@ -1894,6 +2080,99 @@ mod tests {
         fn predicate_is_false_for_non_db_errors() {
             let err = AutumnError::internal_server_error_msg(PG_NUL_MESSAGE);
             assert!(!is_nul_byte_violation(&err));
+        }
+
+        // ── Naming the field (#2439) ────────────────────────────────────────
+
+        // Both traits must be in scope for autoref resolution.
+        #[allow(unused_imports)]
+        use crate::error::{
+            __name_nul_fields, MaybeJsonBody, MaybeJsonBodyFallback as _,
+            MaybeJsonBodyViaSerialize as _, nul_byte_json_fields,
+        };
+
+        #[test]
+        fn json_fields_name_top_level_nested_and_array_strings() {
+            let body = serde_json::json!({
+                "title": "ok",
+                "body": "a\u{0}b",
+                "address": {"street": "x\u{0}"},
+                "items": [{"sku": "fine"}, {"sku": "\u{0}"}],
+                "tags": ["ok", "n\u{0}"],
+                "count": 3,
+            });
+            let mut fields = nul_byte_json_fields(&body);
+            fields.sort();
+            assert_eq!(
+                fields,
+                ["address.street", "body", "items[1].sku", "tags[1]"]
+            );
+        }
+
+        #[test]
+        fn json_fields_are_empty_without_a_nul() {
+            let body = serde_json::json!({"title": "ok", "n": [1, {"a": "b"}]});
+            assert!(nul_byte_json_fields(&body).is_empty());
+        }
+
+        #[test]
+        fn a_nul_violation_gets_the_field_named() {
+            let err: AutumnError = unknown_db_error(PG_NUL_MESSAGE).into();
+            let err = __name_nul_fields(err, || Some(serde_json::json!({"body": "a\u{0}b"})));
+            assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let details = err.details().expect("the field is named");
+            assert_eq!(details.len(), 1);
+            assert_eq!(
+                details["body"],
+                [crate::form::NUL_CHARACTER_FIELD_ERROR.to_owned()]
+            );
+            assert!(is_nul_byte_violation(&err), "the original stays reachable");
+        }
+
+        #[test]
+        fn a_jsonb_nul_violation_gets_the_field_named() {
+            let err: AutumnError =
+                unknown_db_error_with_detail(PG_JSONB_NUL_MESSAGE, PG_JSONB_NUL_DETAIL).into();
+            let err = __name_nul_fields(err, || Some(serde_json::json!({"meta": {"k": "\u{0}"}})));
+            assert!(err.details().expect("named").contains_key("meta.k"));
+        }
+
+        #[test]
+        fn other_errors_are_left_alone_and_the_body_is_never_built() {
+            let built = std::cell::Cell::new(false);
+            let err: AutumnError = unknown_db_error("division by zero").into();
+            let err = __name_nul_fields(err, || {
+                built.set(true);
+                Some(serde_json::json!({"body": "\u{0}"}))
+            });
+            assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(!err.has_field_errors());
+            assert!(!built.get(), "the cold path must not serialize");
+        }
+
+        #[test]
+        fn an_unlocatable_nul_keeps_the_empty_error_list() {
+            let err: AutumnError = unknown_db_error(PG_NUL_MESSAGE).into();
+            let err = __name_nul_fields(err, || None);
+            assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(!err.has_field_errors());
+        }
+
+        // The extra `&` makes autoref pick the right branch.
+        #[allow(clippy::needless_borrow)]
+        #[test]
+        fn only_serializable_payloads_expose_a_json_body() {
+            #[derive(serde::Serialize)]
+            struct Yes {
+                body: String,
+            }
+            struct No;
+            let yes = Yes { body: "x".into() };
+            assert_eq!(
+                (&MaybeJsonBody(&yes)).autumn_json_body(),
+                Some(serde_json::json!({"body": "x"}))
+            );
+            assert_eq!((&MaybeJsonBody(&No)).autumn_json_body(), None);
         }
     }
 

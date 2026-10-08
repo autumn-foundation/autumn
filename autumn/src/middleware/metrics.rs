@@ -91,6 +91,14 @@ struct MetricsInner {
     /// Time spent waiting for a database pool connection.
     /// Exposed as `autumn_db_pool_wait_seconds`.
     db_pool_wait: AtomicHistogram,
+    /// The current admission limit, or 0 without a limiter.
+    /// Exposed as `autumn_admission_limit`.
+    admission_limit: AtomicU64,
+    /// Shed requests per criticality.
+    /// Exposed as `autumn_admission_shed_total{criticality=...}`.
+    shed_critical: AtomicU64,
+    shed_default: AtomicU64,
+    shed_sheddable: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -321,6 +329,10 @@ impl MetricsCollector {
                 read_your_writes_pins_total: AtomicU64::new(0),
                 requests_shed_total: AtomicU64::new(0),
                 db_pool_wait: AtomicHistogram::default(),
+                admission_limit: AtomicU64::new(0),
+                shed_critical: AtomicU64::new(0),
+                shed_default: AtomicU64::new(0),
+                shed_sheddable: AtomicU64::new(0),
             }),
         }
     }
@@ -349,6 +361,25 @@ impl MetricsCollector {
         self.inner
             .requests_shed_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one shed request of class `criticality`. Also increments
+    /// `autumn_requests_shed_total`.
+    pub(crate) fn record_request_shed_for(&self, criticality: crate::admission::Criticality) {
+        self.record_request_shed();
+        let counter = match criticality {
+            crate::admission::Criticality::Critical => &self.inner.shed_critical,
+            crate::admission::Criticality::Default => &self.inner.shed_default,
+            crate::admission::Criticality::Sheddable => &self.inner.shed_sheddable,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Set the current admission limit (`autumn_admission_limit`).
+    pub(crate) fn set_admission_limit(&self, limit: usize) {
+        self.inner
+            .admission_limit
+            .store(u64::try_from(limit).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
     /// Increment the read-your-own-writes pin redirect counter.
@@ -620,6 +651,12 @@ impl MetricsCollector {
                     .load(Ordering::Relaxed),
                 request_timeouts_total: self.inner.request_timeouts_total.load(Ordering::Relaxed),
                 requests_shed_total: self.inner.requests_shed_total.load(Ordering::Relaxed),
+                admission: AdmissionSnapshot {
+                    limit: self.inner.admission_limit.load(Ordering::Relaxed),
+                    shed_critical: self.inner.shed_critical.load(Ordering::Relaxed),
+                    shed_default: self.inner.shed_default.load(Ordering::Relaxed),
+                    shed_sheddable: self.inner.shed_sheddable.load(Ordering::Relaxed),
+                },
             },
             idempotency: IdempotencyMetricsSnapshot {
                 hits: self.inner.idempotency_hits.load(Ordering::Relaxed),
@@ -699,6 +736,23 @@ pub struct HttpMetrics {
     /// because `server.max_concurrent_requests` was at its ceiling
     /// (`autumn_requests_shed_total`).
     pub requests_shed_total: u64,
+    /// Admission limit and shed counts per criticality (issue #3068).
+    pub admission: AdmissionSnapshot,
+}
+
+/// Admission-control metrics (issue #3068).
+#[derive(Serialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AdmissionSnapshot {
+    /// The current admission limit, or 0 without a limiter
+    /// (`autumn_admission_limit`).
+    pub limit: u64,
+    /// Shed `critical` requests.
+    pub shed_critical: u64,
+    /// Shed `default` requests.
+    pub shed_default: u64,
+    /// Shed `sheddable` requests.
+    pub shed_sheddable: u64,
 }
 
 /// Percentiles for latency measurements.

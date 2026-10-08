@@ -370,6 +370,7 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // handler (e.g. wrap the async auth/setup in
                 // `tokio::time::timeout`).
                 timeout: ::autumn_web::RouteTimeout::Inherit,
+                criticality: ::autumn_web::Criticality::Default,
                 api_version: ::core::option::Option::None,
                 sunset_opt_out: false,
                 // A WebSocket upgrade serves no crawlable HTML document, so

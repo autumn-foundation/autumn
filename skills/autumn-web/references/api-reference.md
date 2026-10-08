@@ -118,7 +118,7 @@ copy of the publish order.
 
 | Macro | Purpose |
 |---|---|
-| `#[get]`, `#[post]`, `#[put]`, `#[patch]`, `#[delete]` | HTTP route handlers; optional args `name`, `api_version`, `sunset_opt_out`, `timeout_ms`, `timeout = "off"`, and `seo(...)` |
+| `#[get]`, `#[post]`, `#[put]`, `#[patch]`, `#[delete]` | HTTP route handlers; optional args `name`, `api_version`, `sunset_opt_out`, `timeout_ms`, `timeout = "off"`, `criticality` (`"critical"`, `"default"` or `"sheddable"`; admission class, #3068), and `seo(...)` |
 | `routes![...]` | Collect route handlers |
 | `#[autumn_web::main]` | Tokio runtime + Autumn profile bootstrap; optional runtime args `flavor` (`"multi_thread"` default / `"current_thread"`), `worker_threads`, `max_blocking_threads`, `thread_name`, `thread_stack_size`, `thread_keep_alive = "30s"`, and `configure = path::to::fn` — a `fn(&mut tokio::runtime::Builder)` run last, the escape hatch for `Builder` methods the args don't name (0.8.0). Numeric args take expressions, not only literals. No args = tokio defaults; an unknown/duplicate/zero arg, or `worker_threads` under `current_thread`, is a compile error |
 | `#[static_get]`, `static_routes![...]` | Static pre-render routes for `autumn build`; also accepts `params`, `revalidate`, and `seo(...)`. The `Content-Type` the handler declares is recorded per route in `dist/manifest.json` and served verbatim (0.8.0, #1832) — set it explicitly for non-HTML routes (`application/xml`, `application/rss+xml`) since the serve path no longer infers it from the route slug |
@@ -386,6 +386,15 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `Model::__AUTUMN_CONFIDENTIAL_COLUMNS`. See
   `docs/guide/confidential-fields.md` for the threat model, including what
   sealing does not hide.
+- NUL byte (`0x00`) in text (issues #2423, #2439) — Postgres cannot store it.
+  `ChangesetForm` and `NestedChangesetForm` add a field error. The message is
+  `form::NUL_CHARACTER_FIELD_ERROR`. With an `i18n` bundle, they look up
+  `form::NUL_CHARACTER_MESSAGE_KEY` (`common.error.nul_character`) in the
+  request locale. A NUL that reaches the database is a `422`, for `TEXT` and
+  for `JSONB`. `error::is_nul_byte_violation` detects it. The generated
+  `#[repository(api = ...)]` create and update handlers name the field in
+  `errors[]`. `error::nul_byte_json_fields` finds the field in a JSON body.
+  See `docs/guide/forms.md`.
 - `#[normalize(trim, downcase, upcase, squish, strip_nul, with = path::to::fn)]` (issue
   #1379) — canonicalizes a `String` column, composing normalizers
   left-to-right. Built-ins live in `autumn_web::normalize`

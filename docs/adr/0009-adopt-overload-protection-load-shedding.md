@@ -240,3 +240,12 @@ lockfile can never shed every request on the way up. Per-route ceilings and
 adaptive/AIMD tuning remain open follow-ups.
 
 See `docs/guide/capacity-contracts.md`.
+
+---
+
+## Update (2026-10, issue #3068) — adaptive limits and criticality
+
+[ADR 0016](0016-adaptive-admission-control.md) adds the follow-ups this ADR
+deferred: an adaptive limit (`server.admission.mode = "adaptive"`),
+per-route criticality partitions, and client-side adaptive throttling. The
+static mode described above stays the default and does not change.
