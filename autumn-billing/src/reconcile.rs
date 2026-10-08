@@ -449,6 +449,16 @@ impl Ctx<'_> {
             None
         };
         self.relink(&invoice).await?;
+        // Relinking can close the row. Hooks only see an open one.
+        let row = match row {
+            Some(row) => self
+                .service
+                .store()
+                .dunning_by_invoice(&row.invoice_id)
+                .await?
+                .filter(|current| OPEN_STATES.contains(&current.state)),
+            None => None,
+        };
         if !applied {
             return Ok(());
         }
