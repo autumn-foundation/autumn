@@ -1714,6 +1714,7 @@ impl JobRegistry {
     /// `job.rs`) that needs to force capacity eviction without duplicating
     /// the constant. Test-only.
     #[cfg(test)]
+    #[allow(dead_code, reason = "used only by feature-gated job tests")]
     pub(crate) const fn pg_marks_cap_for_test() -> usize {
         PG_MARKS_BY_JOB_ID_CAP
     }

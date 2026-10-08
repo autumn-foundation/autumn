@@ -3813,6 +3813,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             );
         }
     };
+    // #2319: marks this table as ledgered. Raw-SQL framework paths read the
+    // mark and refuse to write to it.
+    let ledgered_table_registration = if config.ledgered {
+        quote! {
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::__private::LedgeredTableDescriptor { table: #table_name }
+            }
+        }
+    } else {
+        quote! {}
+    };
     let versioned_inventory_registration = if config.versioned {
         quote! {
             ::autumn_web::reexports::inventory::submit! {
@@ -6340,6 +6351,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #hook_inventory_registration
         #versioned_inventory_registration
+        #ledgered_table_registration
         #sharded_inventory_registration
         #position_claim_registration
         #graph_inventory_registration

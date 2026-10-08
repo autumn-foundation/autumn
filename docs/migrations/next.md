@@ -696,6 +696,30 @@ applies.
 
 ---
 
+### Ledger: raw-SQL framework writes to a ledgered table are refused (#2319)
+
+**Why:** a counter-cache update or a `delete_all` / `nullify` cascade runs raw
+SQL. On a ledgered table it changed rows and recorded no revision, so the
+ledger disagreed with the table.
+
+**Before (`{X.Y}`):** the write ran. `ledger_verify` later reported
+`LiveStateMismatch`:
+
+```rust
+#[repository(Post, soft_delete, ledgered = true)]
+pub trait PostRepository {}
+// Comment has #[belongs_to(Post, counter_cache)]: each comment bumped posts.comment_count.
+```
+
+**After (`{(X+1).0}`):** the write fails with `LedgerError::OutOfBandWrite`
+(HTTP 409). Remove the counter cache, or the `dependent(...)` clause. For a
+cascade, use `on_delete = destroy`: a ledgered child records a revision.
+
+**Automation:** `manual` - it is a behaviour change, and no code rewrite
+applies.
+
+---
+
 ## Plugin authors
 
 Everything here is addressed to someone maintaining an `autumn-plugin-*` /
