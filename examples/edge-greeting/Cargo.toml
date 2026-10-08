@@ -39,6 +39,12 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 
+[features]
+# For `autumn build --embed`, which passes this feature to the native build
+# and to the capsule build. `autumn-web` is not in the capsule's graph, so the
+# feature does nothing there.
+embed-assets = ["autumn-web/embed-assets"]
+
 [[bin]]
 name = "edge-greeting"
 path = "src/main.rs"

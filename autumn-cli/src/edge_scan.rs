@@ -1037,7 +1037,7 @@ fn package_name_from_manifest(table: &toml::Table) -> Option<String> {
 /// count as declaring an "optional dependency," crediting a
 /// `#[cfg(feature = "...")]` route that Cargo never really compiles for
 /// wasm32-wasip1 — a phantom route that can spuriously demand a capsule/WASI
-/// target or reject `--embed` (Codex review on #2739, round 13, P2).
+/// target (Codex review on #2739, round 13, P2).
 ///
 /// Only a literal `wasm32-wasip1` triple, or a `cfg(...)` predicate built
 /// from a leaf naming one of `WASM32_WASIP1_CFG_VALUES`' known `(key,
@@ -1735,7 +1735,7 @@ fn enabled_features_from_manifest_for_resolver(
     // is compiled out of an ordinary default build exactly like any other
     // never-enabled feature name — so seeding it unconditionally made THAT
     // route look included when Cargo really excludes it, a phantom route
-    // that can spuriously demand a capsule/WASI target or reject `--embed`
+    // that can spuriously demand a capsule/WASI target
     // (Codex review on #2739, round 12, P2, correcting round 9's overly
     // broad fix: `default` is only ever "always on" for a build that already
     // declares it, never as a feature this scan may assume into existence).
@@ -2196,8 +2196,8 @@ fn scan_items(
                     // dangerous direction this cfg support exists to avoid:
                     // not a missed route, but a phantom one that makes an
                     // otherwise-default build look like it needs the edge
-                    // capsule / WASI target, or spuriously conflicts with
-                    // `--embed` (Codex review on #2739, round 11, P2 —
+                    // capsule / WASI target (Codex review on #2739, round
+                    // 11, P2 —
                     // extended to a `cfg_attr`-injected exclusion in round
                     // 33, P2).
                     let cfg_excludes = item_mod

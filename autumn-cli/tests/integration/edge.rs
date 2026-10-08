@@ -7,10 +7,10 @@
 //! compile or link — and the scaffold's `Cargo.toml` deliberately has no
 //! dependencies, so nothing here may reach a real `cargo build`.
 //!
-//! That constraint is also the point of the build-path tests: the `--edge` and
-//! `--embed` refusals are specified to happen BEFORE the native cargo build, so
-//! they are driven through the empty-`PATH` runner (where a `cargo` invocation
-//! could not even spawn) and additionally assert that no compile was started.
+//! That constraint is also the point of the build-path tests: the `--edge`
+//! refusal is specified to happen BEFORE the native cargo build, so it is
+//! driven through the empty-`PATH` runner (where a `cargo` invocation could
+//! not even spawn) and additionally asserts that no compile was started.
 
 use std::fs;
 use std::path::Path;
@@ -427,8 +427,10 @@ fn build_edge_flag_without_edge_routes_fails_before_compiling() {
     );
 }
 
+/// `--embed` no longer refuses edge routes (#1790). It goes on to the
+/// native build. The empty `PATH` stops it there, so no compile runs.
 #[test]
-fn build_embed_refuses_edge_routes_before_compiling() {
+fn build_embed_with_edge_routes_proceeds_to_the_native_build() {
     let dir = project(&[
         ("src/main.rs", UNREGISTERED_EDGE_APP),
         (
@@ -436,17 +438,15 @@ fn build_embed_refuses_edge_routes_before_compiling() {
             "fn main() { autumn_edge::serve(edge_routes![greet]); }\n",
         ),
     ]);
-    let (stdout, stderr, code) = run_autumn(dir.path(), &["build", "--embed"], &[]);
+    let (stdout, stderr, _code) = run_autumn(dir.path(), &["build", "--embed"], &[]);
     let combined = format!("{stdout}{stderr}");
 
-    assert_ne!(code, Some(0), "{combined}");
     assert!(
-        combined.contains("edge capsule build is not yet supported with --embed"),
-        "{combined}"
+        !combined.contains("not yet supported with --embed"),
+        "an embed build must not refuse edge routes: {combined}"
     );
-    assert!(combined.contains("#1790"), "{combined}");
     assert!(
-        !combined.contains("Compiling"),
-        "the refusal must run before the native build: {combined}"
+        combined.contains("Compiling"),
+        "the embed build must start the native build: {combined}"
     );
 }

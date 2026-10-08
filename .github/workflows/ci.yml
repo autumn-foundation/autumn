@@ -2618,6 +2618,14 @@ jobs:
         run: |
           cargo run -q -p autumn-cli --bin autumn -- build --debug --edge
           test -s ../../target/wasm32-wasip1/release/edge-capsule.wasm
+      - name: autumn build --embed emits the capsule
+        # AC-1 for an embed build. Remove the artifact first, so only this
+        # build can make it again.
+        working-directory: examples/edge-greeting
+        run: |
+          rm -f ../../target/wasm32-wasip1/release/edge-capsule.wasm
+          cargo run -q -p autumn-cli --bin autumn -- build --debug --embed --edge
+          test -s ../../target/wasm32-wasip1/release/edge-capsule.wasm
       - name: autumn edge serve and autumn edge ttfb, end to end
         # AC-3 with no glue: the real CLI puts the capsule in front of the
         # real origin binary. One host has no distance, so the probe checks

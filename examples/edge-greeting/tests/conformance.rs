@@ -159,6 +159,14 @@ const CORPUS: &[ConformanceCase] = &[
         expect: Expectation::Served,
     },
     ConformanceCase {
+        name: "typed path helper encodes a slash and unicode the same way",
+        method: "GET",
+        uri: "/link/%C3%A9%2Fx%20y",
+        headers: &[],
+        provided_capabilities: &[],
+        expect: Expectation::Served,
+    },
+    ConformanceCase {
         name: "trailing slash",
         method: "GET",
         uri: "/greet/ada/",
@@ -609,6 +617,7 @@ fn origin() -> autumn_web::test::TestClient {
             edge_greeting::handlers::stats,
             edge_greeting::handlers::count,
             edge_greeting::handlers::whoami,
+            edge_greeting::handlers::link,
             edge_greeting::handlers::boom,
             edge_greeting::origin::feedback,
         ])
@@ -1182,8 +1191,9 @@ impl Generator {
     }
 
     fn uri(&mut self) -> String {
-        match self.below(9) {
+        match self.below(10) {
             0 | 1 => format!("/greet/{}", self.segment()),
+            8 => format!("/link/{}", self.segment()),
             2 => format!("/note/{}", self.pick(&["greeting", "release", "missing"])),
             3 => format!("/note/{}", self.segment()),
             4 => format!("/stats?{}", self.query()),

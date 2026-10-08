@@ -317,12 +317,26 @@ The conformance suite runs each side twice and compares it with itself before
 comparing lanes, so a handler that manages to be non-deterministic is reported
 as that, not as a divergence.
 
-### Known limitation: `paths::*` helpers
+### Typed path helpers
 
-The typed path helpers the route macros generate (`paths::greet(…)`) live in the
-native companion, which is compiled out for wasm. Inside a capsule, build links
-by hand or with a `const`. This is a first-slice limitation, not a design
-decision.
+The path helper of an `#[edge]` route compiles for `wasm32-wasip1`. It uses
+`autumn_edge::paths`, which encodes the same bytes as `autumn_web::paths`.
+Collect the helpers with `autumn_edge::paths![]`:
+
+```rust
+use autumn_edge::paths::PathExt as _;
+
+#[get("/link/{name}")]
+#[edge]
+pub async fn link(Path(name): Path<String>) -> String {
+    paths::greet(&name).with_query("from", "link")
+}
+
+autumn_edge::paths![greet, link];
+```
+
+The helper of a plain route still calls `autumn_web`. Do not list it in an
+edge-safe module's `paths![]`.
 
 ## The wire protocol (version 1)
 
@@ -428,8 +442,10 @@ An app with `#[edge]` routes and no static routes builds without an error. The
 capsule is the build's output. Thus the static renderer accepts an empty route
 set.
 
-`--embed` is refused alongside edge routes in this slice, with an actionable
-error rather than a silently skipped step.
+`autumn build --embed` also builds the capsule, after the embedded binary.
+The capsule build gets `embed-assets` too, so a route gated on that feature
+is in both lanes. `autumn-web` is not in the capsule's graph, so its
+`embed-assets` feature does nothing there.
 
 ### `autumn doctor`
 
@@ -763,8 +779,6 @@ a middleware, a macro or a dependency is exactly what could break it.
   HTTP client cannot send it, and `OPTIONS /` is a different request.
 - **The node adds `accept: */*`** to a forwarded request that has no
   `accept` header. The HTTP client does this.
-- **`paths::*` helpers are unavailable inside a capsule.**
-- **`autumn build --embed` refuses to combine with edge routes.**
 - **The wire protocol and the host API are experimental.** They will change; the
   version field is there so a mismatch degrades safely instead of guessing.
 
