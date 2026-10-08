@@ -978,6 +978,8 @@ pub mod __private {
     #[cfg(feature = "db")]
     pub use crate::db::scoped_transaction;
     #[cfg(feature = "db")]
+    pub use crate::ledger::LedgeredTableDescriptor;
+    #[cfg(feature = "db")]
     pub use crate::repository::position_advisory_lock;
     #[cfg(all(feature = "db", feature = "ws"))]
     pub use crate::repository_commit_hooks::CURRENT_CHANNELS;

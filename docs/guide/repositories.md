@@ -524,7 +524,10 @@ removed parent.
 
 The one child shape that refuses is a **ledgered** soft-delete child under a
 hard-deleting parent: hard-deleting it would destroy ledger history, so the
-cascade returns a typed conflict instead of removing the row.
+cascade returns a typed conflict instead of removing the row. A `delete_all` or
+`nullify` dependent into a ledgered child is always refused, because its raw SQL
+records no revision. See
+[Ledgered entities](ledgered-entities.md#writes-from-outside-the-repository).
 
 ### What the cascade guarantees
 

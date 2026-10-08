@@ -1045,6 +1045,9 @@ appends a revision automatically.
 
 What to know when writing app code against it:
 
+- **Raw-SQL framework paths are refused.** A counter cache on a ledgered
+  parent, and `dependent(.., on_delete = delete_all | nullify)` into a ledgered
+  child, fail with `LedgerError::OutOfBandWrite`. Use `on_delete = destroy`.
 - **`soft_delete` is mandatory** and `purge` does not exist. `delete_by_id`
   records a delete revision; `restore` records the undelete. Both keep the
   ledger and the table in agreement.

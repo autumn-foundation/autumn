@@ -1030,6 +1030,7 @@ pub async fn recompute_comment_count(
         return Ok(0);
     };
 
+    crate::ledger::refuse_out_of_band_write(spec.parent_table, "counter cache")?;
     let spec = *spec;
     let parent_type = parent_type.to_owned();
     let tenant = tenant.map(str::to_owned);

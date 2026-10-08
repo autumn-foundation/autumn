@@ -1011,6 +1011,12 @@ path = "tests/sqlite_version_history.rs"
 name = "sqlite_ledger"
 path = "tests/sqlite_ledger.rs"
 
+# Separate binary: `inventory` descriptors are per binary, and the fixtures
+# register their own ledgered `lgo_*` tables (#2319). Runs in the sqlite lane.
+[[test]]
+name = "sqlite_ledger_out_of_band"
+path = "tests/sqlite_ledger_out_of_band.rs"
+
 # SQLite durable commit-hook worker end-to-end proof (issue #1996 item 5). Drives
 # the ported worker (BEGIN IMMEDIATE claim + in-process Notify kick + retry/backoff
 # + dead-letter + graceful drain) and the real enqueue surface against an in-memory

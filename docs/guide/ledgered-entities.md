@@ -262,17 +262,31 @@ leaves something internally perfect. Nor can it see a write that reached the
 table without appending a revision at all.
 
 So `ledger_verify` also reads the live row and compares it against the head
-revision. That closes both gaps, and with them every remaining write path that
-can move a ledgered row without the repository's knowledge — a raw `UPDATE`, a
-[counter-cache](counter-cache.md) bump on a ledgered parent, a `dependent(...,
-on_delete = delete_all)` cascade declared on some *other* repository. None of
-those can be refused at compile time (they are declared elsewhere, or maintained
-by the framework), but none of them can hide either.
+revision. That closes both gaps, and it catches a raw `UPDATE` that reached the
+table without the repository.
 
 The reads are taken twice: a write landing between them would look exactly like a
 divergence, and this routine exists to produce trustworthy accusations. If the
 chain head moves under it, the live comparison is skipped rather than reported —
 a concurrent write is not tampering.
+
+### Writes from outside the repository
+
+Some framework paths write raw SQL to a table without the table's own
+repository. On a ledgered table, each one is **refused** with
+`LedgerError::OutOfBandWrite`. The write does not run, and the chain stays true.
+
+| Path | Result |
+|------|--------|
+| A [counter-cache](counter-cache.md) column on a ledgered parent | Refused on any child write or recompute. |
+| `dependent(..., on_delete = delete_all)` into a ledgered child | Refused. No row is erased. |
+| `dependent(..., on_delete = nullify)` into a ledgered child | Refused. No foreign key is cleared. |
+
+The error names the table and the path. To fix it, remove the counter cache or
+the `dependent(...)` clause, or use `on_delete = destroy` (a ledgered child
+records a revision). The check runs even if the parent has no children.
+Autumn cannot refuse a hand-written `UPDATE`; the live-row cross-check catches it. The check sees only
+repositories linked into the binary, and matches the bare table name.
 
 ### Threat model — read this
 
@@ -373,7 +387,7 @@ it is refused at the repository seam — at compile time, not at runtime:
 | `ledgered = true` without `soft_delete` | Rejected: a hard `DELETE` erases the row the ledger reconstructs, so an as-of query would return state whose record no longer exists and `verify` could not tell erasure from tampering. |
 | Calling `purge(id)` | Not generated. `purge` is soft-delete's hard-delete escape hatch — a raw `DELETE FROM` that writes no history at all. `delete_by_id` and `restore` — both of which record a revision — are the whole delete surface. |
 | A `dependent(..., on_delete = destroy)` cascade from a **soft**-deleting parent | The ledgered child is soft-deleted and records a revision, like any other delete. |
-| The same cascade from a **hard**-deleting parent | Refused at runtime with a typed `LedgerError::HardDeleteCascade`. Neither outcome is available: erasing the child destroys the record its ledger reconstructs, and soft-deleting it leaves a live foreign key pointing at a parent row about to disappear, which the database rejects. The parent's macro cannot see that the child is ledgered — they are separate `#[repository]` invocations — so this is the one guard the first slice cannot make a compile error. Make the parent `soft_delete`, or use `on_delete = nullify`. |
+| The same cascade from a **hard**-deleting parent | Refused at runtime with a typed `LedgerError::HardDeleteCascade`. Neither outcome is available: erasing the child destroys the record its ledger reconstructs, and soft-deleting it leaves a live foreign key pointing at a parent row about to disappear, which the database rejects. The parent's macro cannot see that the child is ledgered — they are separate `#[repository]` invocations — so this is a runtime guard, not a compile error. Make the parent `soft_delete`, or remove the `dependent(...)` clause. |
 | `#[version_history(sensitive = [...])]` | Rejected: a redacted column cannot be reconstructed, so byte-for-byte as-of fidelity would be unprovable. |
 | `no_versioned_record_impl` | Rejected: the ledger snapshots through the generated `VersionedRecord` impl, and a hand-written one is not guaranteed to serialize every column. |
 | `retention(...)` / `position(...)` | Already rejected for `versioned = true`: both mutate rows outside the history-writing paths. |
@@ -433,12 +447,10 @@ this slice.
 - No distributed or multi-node ledger consensus.
 - Postgres and SQLite only.
 - No pagination on `ledger_revisions` — a record's whole chain is read at once.
-- Writes that reach a ledgered table from outside its own repository — a
-  [counter-cache](counter-cache.md) column maintained on a ledgered parent, a
-  `dependent(..., on_delete = delete_all | nullify)` cascade declared on another
-  repository, a hand-written `UPDATE` — do not append a revision. They cannot be
-  refused at compile time (they are declared elsewhere), but `ledger_verify`
-  reports each as a `LiveStateMismatch`.
+- A hand-written `UPDATE` does not append a revision. Autumn cannot see it.
+  `ledger_verify` reports it as a `LiveStateMismatch`. Framework write paths
+  that bypass the repository are refused instead: see
+  [Writes from outside the repository](#writes-from-outside-the-repository).
 - Transaction time is read from the database *before* the write commits, so a
   revision can still become visible a commit's worth of time after the instant it
   carries. Closing that would need a commit timestamp, which cannot be read

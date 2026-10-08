@@ -181,6 +181,7 @@ pub async fn dependent_nullify<M: 'static>(
 ) -> crate::AutumnResult<()> {
     use diesel_async::RunQueryDsl;
 
+    crate::ledger::refuse_out_of_band_write(table, "dependent nullify")?;
     if has_counter_caches {
         let ids = dependent_child_ids(conn, table, fk_column, parent_id).await?;
         counter_cache_before_detach_many(conn, specs, fk_column, &ids).await?;
@@ -330,6 +331,7 @@ pub async fn dependent_delete_all<M: 'static>(
 ) -> crate::AutumnResult<()> {
     use diesel_async::RunQueryDsl;
 
+    crate::ledger::refuse_out_of_band_write(table, "dependent delete_all")?;
     if has_counter_caches {
         // The id selection below row-locks the children before the
         // counter-cache hook can take the lock that serializes mutations on
