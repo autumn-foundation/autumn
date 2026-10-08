@@ -1852,7 +1852,8 @@ fn sqlite_uri_has_query_pair(target: &str, key: &str, value: &str) -> bool {
 }
 
 /// Decode `%XX` escapes the way `SQLite`'s URI parser does; a `%` not followed
-/// by two hex digits is kept literally.
+/// by two hex digits is kept literally. A decoded NUL (`%00`) ends the
+/// output: `SQLite` drops the rest of that name or value (issue #3032).
 #[cfg(feature = "sqlite")]
 fn percent_decode(input: &str) -> Vec<u8> {
     let bytes = input.as_bytes();
@@ -1865,6 +1866,9 @@ fn percent_decode(input: &str) -> Vec<u8> {
                 bytes.get(i + 2).and_then(|b| (*b as char).to_digit(16)),
             )
         {
+            if hi == 0 && lo == 0 {
+                break;
+            }
             // Two hex digits always fit in a byte.
             out.push(u8::try_from(hi * 16 + lo).unwrap_or(b'%'));
             i += 3;
@@ -5711,6 +5715,34 @@ mod tests {
         assert!(sqlite_target_is_shared_cache(
             "file:app.db?cache=private&cache=shared"
         ));
+    }
+
+    // Issue #3032. A decoded NUL (`%00`) ends only the name or value being
+    // read. SQLite keeps parsing the next pair. Checked against SQLite 3.45.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_shared_cache_nul_ends_only_current_component() {
+        // NUL in a value: the text after it is dropped.
+        assert!(sqlite_target_is_shared_cache("file:a?cache=shared%00"));
+        assert!(sqlite_target_is_shared_cache("file:a?cache=shared%00x"));
+        assert!(!sqlite_target_is_shared_cache("file:a?cache=shar%00ed"));
+        // NUL in the last value: the last value still wins.
+        assert!(!sqlite_target_is_shared_cache(
+            "file::memory:?cache=shared&cache=private%00"
+        ));
+        assert!(sqlite_target_is_shared_cache(
+            "file:a?cache=private%00&cache=shared"
+        ));
+        assert!(!sqlite_target_is_shared_cache(
+            "file:a?cache=shared%00&cache=private"
+        ));
+        // NUL at the start of a name: the name is empty, so the pair is no
+        // `cache` pair.
+        assert!(sqlite_target_is_shared_cache(
+            "file:a?cache=shared&%00cache=private"
+        ));
+        // NUL in the path does not stop the query.
+        assert!(sqlite_target_is_shared_cache("file:a%00?cache=shared"));
     }
 
     #[cfg(feature = "sqlite")]
