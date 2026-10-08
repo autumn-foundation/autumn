@@ -1,6 +1,6 @@
 //! Capsule registration, manifest, and error types.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -370,6 +370,22 @@ pub(super) fn check_model_names(
         check_ident(&rel.target_column)?;
     }
     blob_columns.iter().try_for_each(|c| check_ident(c))
+}
+
+/// Check the fields of `table` that a capsule holds. Import writes them by
+/// name, each once.
+pub(super) fn check_field_names(table: &str, fields: &[FieldSpec]) -> Result<(), DataCapsuleError> {
+    let mut names = BTreeSet::new();
+    for field in fields {
+        check_ident(&field.name)?;
+        if !names.insert(field.name.as_str()) {
+            return Err(DataCapsuleError::InvalidInput(format!(
+                "{table}.{} is described twice in the capsule",
+                field.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The record file of `table`.

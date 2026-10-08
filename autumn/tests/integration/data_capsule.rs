@@ -215,6 +215,38 @@ async fn write_dir_refuses_a_format_that_this_build_does_not_read() {
 }
 
 #[tokio::test]
+async fn write_dir_refuses_a_field_that_import_refuses() {
+    // A capsule built or changed through the public API can name a field
+    // twice, or with an unsafe name. Signed, it could never be imported.
+    let tmp = tempfile::tempdir().unwrap();
+    for change in [
+        |c: &mut DataCapsule| {
+            let users = &mut c.manifest.models[0];
+            let email = users.fields[1].clone();
+            users.fields.push(email);
+        },
+        |c: &mut DataCapsule| c.manifest.models[0].fields[1].name = "e mail".to_owned(),
+    ] {
+        let mut capsule = export_ada(&seeded_store()).await;
+        assert_eq!(capsule.manifest.models[0].table, "users");
+        assert_eq!(capsule.manifest.models[0].fields[1].name, "email");
+        change(&mut capsule);
+        let root = tmp.path().join("capsule");
+        let err = capsule
+            .write_dir(&root, &signer())
+            .expect_err("a field that import refuses");
+        assert!(
+            matches!(
+                &err,
+                DataCapsuleError::InvalidName(_) | DataCapsuleError::InvalidInput(_)
+            ),
+            "{err:?}"
+        );
+        assert!(!root.exists());
+    }
+}
+
+#[tokio::test]
 async fn write_dir_refuses_a_directory_that_is_not_empty() {
     let capsule = export_ada(&seeded_store()).await;
     let dir = tempfile::tempdir().unwrap();
@@ -480,6 +512,65 @@ async fn export_refuses_a_link_to_a_column_that_the_target_lacks() {
         .expect_err("a typo in the target column");
     assert!(matches!(err, DataCapsuleError::InvalidInput(_)), "{err:?}");
     assert!(err.to_string().contains("idd"), "{err}");
+}
+
+#[tokio::test]
+async fn export_refuses_a_link_to_a_column_that_the_target_excludes() {
+    // The capsule leaves out an excluded column. A link to it would point at
+    // a value that the capsule does not hold: import writes the parent
+    // without it, and the child breaks the foreign key.
+    let models = [
+        CapsuleModel::new("users", "id").exclude("email"),
+        CapsuleModel::new("posts", "author_id").references("author_id", "users", "email"),
+    ];
+    let err = export_subject(&models, &seeded_store(), "1")
+        .await
+        .expect_err("a link to an excluded column");
+    assert!(
+        matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains("users.\"email\"")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn export_refuses_a_field_that_the_store_describes_twice() {
+    // Import writes each field once. A capsule that names one twice could
+    // not be imported into the store that it came from.
+    let store = MemoryCapsuleStore::new().table(
+        "notes",
+        vec![
+            FieldSpec::new("id", "bigint"),
+            FieldSpec::new("owner", "bigint"),
+            FieldSpec::new("owner", "bigint"),
+        ],
+    );
+    store.insert("notes", json!({"id": 1, "owner": 1}));
+    let err = export_subject(&[CapsuleModel::new("notes", "owner")], &store, "1")
+        .await
+        .expect_err("a field described twice");
+    assert!(
+        matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains("notes.owner")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn export_refuses_a_field_with_a_name_that_import_refuses() {
+    // PostgreSQL allows a quoted column such as "display name". Import
+    // refuses that name, so export must not sign a capsule that holds it.
+    let store = MemoryCapsuleStore::new().table(
+        "notes",
+        vec![
+            FieldSpec::new("id", "bigint"),
+            FieldSpec::new("owner", "bigint"),
+            FieldSpec::new("display name", "text").nullable(),
+        ],
+    );
+    store.insert("notes", json!({"id": 1, "owner": 1, "display name": "Ada"}));
+    let err = export_subject(&[CapsuleModel::new("notes", "owner")], &store, "1")
+        .await
+        .expect_err("an unsafe field name");
+    assert!(matches!(err, DataCapsuleError::InvalidName(_)), "{err:?}");
 }
 
 #[tokio::test]

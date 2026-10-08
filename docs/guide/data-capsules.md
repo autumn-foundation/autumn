@@ -61,10 +61,15 @@ autumn_web::app()
 Every column that a model names must be in the table: the subject column, the
 key, and each link, blob, and excluded column, and the target column of a
 link to a model in the same export. A typo fails the export (`400`), so a
-capsule never lacks records, blobs, or links. The other way round, a custom
-`CapsuleStore` must give only the columns that it describes, and a value in
-the key and subject column, and in each `NOT NULL` column, of every row: any
-other row fails the export (`400`).
+capsule never lacks records, blobs, or links. A link cannot target an
+excluded column either: the capsule would not hold the value that the link
+points at. The other way round, a custom `CapsuleStore` must give only the
+columns that it describes, and a value in the key and subject column, and in
+each `NOT NULL` column, of every row: any other row fails the export (`400`).
+Export also refuses a column that the store describes twice, or that has a
+name with anything but ASCII letters, digits, and `_` (such as a quoted
+`"display name"`): import would refuse the capsule. `write_dir` refuses such
+a column too.
 
 **Exclude all secrets.** Export copies every column that you do not exclude.
 Exclude password hashes, tokens, and internal flags. Import cannot restore an

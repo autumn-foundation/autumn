@@ -150,7 +150,8 @@ fn check_models(models: &[CapsuleModel]) -> Result<(), DataCapsuleError> {
 ///
 /// [`DataCapsuleError::InvalidInput`] for an empty subject, a duplicate
 /// model, or a subject, primary-key, excluded, blob, or relationship column
-/// that the table does not have,
+/// that the table does not have, a link to an excluded column, or a column
+/// that `store` describes twice,
 /// [`DataCapsuleError::InvalidName`] for an unsafe name, or an error from
 /// `store`.
 pub async fn export_subject(
@@ -176,6 +177,7 @@ pub async fn export_subject(
     let mut manifest = CapsuleManifest::new(subject);
     let mut records = BTreeMap::new();
     let mut described: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    let mut held: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for (model, (mut fields, mut rows)) in models.iter().zip(data) {
         // Fail closed: a typo must not export a secret column, or give a
         // capsule without its records, blobs or links. A custom store can
@@ -201,6 +203,13 @@ pub async fn export_subject(
             fields.iter().map(|f| f.name.clone()).collect(),
         );
         fields.retain(|f| !model.excluded.contains(&f.name));
+        // Import refuses a field named twice or unsafely: the capsule could
+        // not go back into the store that it came from.
+        model::check_field_names(&model.table, &fields)?;
+        held.insert(
+            model.table.as_str(),
+            fields.iter().map(|f| f.name.clone()).collect(),
+        );
         for row in &mut rows {
             row.retain(|column, _| !model.excluded.contains(column));
         }
@@ -234,6 +243,16 @@ pub async fn export_subject(
                 return Err(DataCapsuleError::InvalidInput(format!(
                     "{}.{} links to {}.{:?}, but {} has no such column",
                     model.table, rel.column, rel.target, rel.target_column, rel.target
+                )));
+            }
+            // The capsule leaves out an excluded column: a link to it points
+            // at a value that import cannot write.
+            if let Some(columns) = held.get(rel.target.as_str())
+                && !columns.contains(&rel.target_column)
+            {
+                return Err(DataCapsuleError::InvalidInput(format!(
+                    "{}.{} links to {}.{:?}, which export leaves out",
+                    model.table, rel.column, rel.target, rel.target_column
                 )));
             }
         }
@@ -343,19 +362,9 @@ pub(super) fn check_importable<'c>(
             &model.relationships,
             &model.blob_columns,
         )?;
-        // Import writes the fields by name, each once. Export describes
-        // each column once and refuses an unsafe name; a capsule built or
+        // Export and `write_dir` refuse such a field; a capsule built or
         // changed through the public API can still carry one.
-        let mut names = BTreeSet::new();
-        for field in &model.fields {
-            model::check_ident(&field.name)?;
-            if !names.insert(field.name.as_str()) {
-                return Err(DataCapsuleError::InvalidInput(format!(
-                    "{}.{} is described twice in the capsule",
-                    model.table, field.name
-                )));
-            }
-        }
+        model::check_field_names(&model.table, &model.fields)?;
         let current = models
             .iter()
             .find(|m| m.table == model.table)

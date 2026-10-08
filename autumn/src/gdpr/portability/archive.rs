@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use super::DataCapsule;
 use super::model::{
     BlobEntry, CapsuleManifest, DATA_CAPSULE_FORMAT, DATA_CAPSULE_FORMAT_VERSION, DataCapsuleError,
-    Record, check_model_names, record_file,
+    Record, check_field_names, check_model_names, record_file,
 };
 use super::root::Root;
 use crate::security::config::{ResolvedSigningKeys, SigningSecretConfig};
@@ -201,8 +201,9 @@ impl DataCapsule {
     ///
     /// [`DataCapsuleError::NotEmpty`] when `dir` has content,
     /// [`DataCapsuleError::UnsupportedFormat`] for a format or version that
-    /// this build does not read, an I/O error, or an unsafe name in the
-    /// manifest.
+    /// this build does not read, [`DataCapsuleError::InvalidInput`] for a
+    /// field that a model of the manifest names twice, an I/O error, or an
+    /// unsafe name in the manifest.
     pub fn write_dir(&self, dir: &Path, signer: &CapsuleSigner) -> Result<(), DataCapsuleError> {
         // A capsule built or changed through the public API can name another
         // format. Signed, it would fail its own verify.
@@ -254,6 +255,9 @@ impl DataCapsule {
                 &model.relationships,
                 &model.blob_columns,
             )?;
+            // Signed, a field that import refuses would give a capsule that
+            // cannot be imported.
+            check_field_names(&model.table, &model.fields)?;
             let records = self.records(&model.table);
             model.record_count = records.len() as u64;
             model.file = record_file(&model.table);
