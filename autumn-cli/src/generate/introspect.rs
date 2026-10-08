@@ -570,13 +570,14 @@ fn raw_string_end(
     Some(find(i + 2 + hashes, &close).map_or(b.len(), |p| p + close.len()))
 }
 
-/// True when `text` ends with an identifier character, Unicode included:
-/// a macro name found after it is the end of a longer name.
+/// True when `text` ends with an identifier character: a macro name found
+/// after it is the end of a longer name. Every non-ASCII character counts,
+/// so all Unicode identifier characters (combining marks too) are covered.
 #[must_use]
 pub fn ends_in_word(text: &str) -> bool {
     text.chars()
         .next_back()
-        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        .is_some_and(|c| !c.is_ascii() || c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// The start of the macro path that ends at `at`: `diesel::` before
@@ -586,7 +587,8 @@ pub fn macro_path_start(text: &str, at: usize) -> usize {
     let mut start = at;
     while let Some(rest) = text[..start].trim_end().strip_suffix("::") {
         let segment = rest.trim_end();
-        let word = segment.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_');
+        let word = segment
+            .trim_end_matches(|c: char| !c.is_ascii() || c.is_ascii_alphanumeric() || c == '_');
         // A raw identifier segment: `r#type::`.
         let word = word
             .strip_suffix("r#")
@@ -618,7 +620,13 @@ pub fn is_in_comment_or_string(text: &str, at: usize) -> bool {
 fn block_table_name(text: &str, open: usize) -> Option<String> {
     let mut name: Vec<u8> = Vec::new();
     let mut brackets = 0usize;
+    // In a `use ...;` declaration (diesel `print-schema` writes them first).
+    let mut in_use = false;
     scan_code(text, open + 1, |_, c| {
+        if in_use {
+            in_use = c != b';';
+            return false;
+        }
         if brackets > 0 || c == b'#' && name.is_empty() {
             match c {
                 b'[' => brackets += 1,
@@ -630,10 +638,17 @@ fn block_table_name(text: &str, open: usize) -> Option<String> {
         // A byte of a non-ASCII character is part of a Unicode identifier.
         if c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80 || (c == b'#' && name == b"r") {
             name.push(c);
-            false
-        } else {
-            !(name.is_empty() && c.is_ascii_whitespace())
+            return false;
         }
+        if name.is_empty() {
+            return !c.is_ascii_whitespace();
+        }
+        if name == b"use" {
+            name.clear();
+            in_use = c != b';';
+            return false;
+        }
+        true
     });
     String::from_utf8(name).ok().filter(|n| !n.is_empty())
 }
@@ -686,9 +701,14 @@ pub fn schema_block_range(existing: &str, table: &str) -> Option<(usize, usize)>
         let (Some(open), Some(mut end)) = (open, end) else {
             break;
         };
-        // A `(...)` or `[...]` call ends with `;`: it is part of the call.
-        if bytes[open] != b'{' && bytes.get(end) == Some(&b';') {
-            end += 1;
+        // A `(...)` or `[...]` call ends with `;` (also after spaces): it is
+        // part of the call.
+        let gap = bytes[end..]
+            .iter()
+            .take_while(|&&c| c == b' ' || c == b'\t')
+            .count();
+        if bytes[open] != b'{' && bytes.get(end + gap) == Some(&b';') {
+            end += gap + 1;
         }
         // Does this macro define the table we're looking for? The name may sit
         // on its own line, before the key (`posts\n(id) {`).

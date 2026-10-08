@@ -129,8 +129,19 @@ pub fn validate(text: &str) -> Result<(), String> {
         {
             continue;
         }
-        // The table name is the first word of the body; attributes are groups.
+        // The table name is the first word of the body after `use ...;`
+        // declarations. Attributes are groups.
+        let mut in_use = false;
         let name = call.mac.tokens.clone().into_iter().find_map(|t| match t {
+            proc_macro2::TokenTree::Punct(p) if in_use && p.as_char() == ';' => {
+                in_use = false;
+                None
+            }
+            _ if in_use => None,
+            proc_macro2::TokenTree::Ident(ident) if ident == "use" => {
+                in_use = true;
+                None
+            }
             proc_macro2::TokenTree::Ident(ident) => Some(unraw(&ident.to_string()).to_owned()),
             _ => None,
         });
@@ -1701,5 +1712,41 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
             out.text,
             "diesel::table! {\n    用户 (id) {\n        id -> Int8,\n    }\n}\n"
         );
+    }
+
+    /// A block that opens with `use` declarations (diesel `print-schema`
+    /// writes them for custom types) is found, and is not a duplicate.
+    #[test]
+    fn a_block_with_use_declarations_is_found() {
+        let stale = "diesel::table! {\n    use diesel::sql_types::*;\n\n    posts (id) {\n        id -> Int8,\n    }\n}\n\ndiesel::table! {\n    use diesel::sql_types::*;\n\n    users (id) {\n        id -> Int8,\n    }\n}\n";
+        assert!(validate(stale).is_ok());
+        let out = sync_for_plan(
+            stale,
+            &parsed(vec![posts(Backend::Postgres)]),
+            &plan(vec![]),
+        );
+        assert_eq!(out.written, vec!["posts".to_owned()]);
+        assert!(out.text.contains("users (id)"), "{}", out.text);
+        assert!(validate(&out.text).is_ok(), "{}", out.text);
+    }
+
+    /// A spaced `;` after a `table!(...)` call goes with the call, and a
+    /// combining mark continues a longer macro name.
+    #[test]
+    fn a_spaced_table_semicolon_and_a_combining_mark() {
+        let paren = "diesel::table!(\n    posts (id) {\n        id -> Int8,\n    }\n) ;\n";
+        let out = sync_for_plan(
+            paren,
+            &parsed(vec![posts(Backend::Postgres)]),
+            &plan(vec![]),
+        );
+        assert_eq!(out.text, POSTS_BLOCK);
+
+        let custom = "e\u{301}joinable!(comments -> posts (post_id));\n";
+        let drop = plan(vec![SchemaChange::DropTable(Table::new(
+            "comments",
+            Backend::Postgres,
+        ))]);
+        assert_eq!(sync_for_plan(custom, &parsed(vec![]), &drop).text, custom);
     }
 }
