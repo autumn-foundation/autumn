@@ -133,7 +133,7 @@ mod shard_local_job_tests {
         config.jobs.postgres.shard_local = true;
         config.database.primary_url = Some(control_url);
         // `config` first: it replaces the whole config, shards included.
-        let _client = TestApp::new()
+        let client = TestApp::new()
             .config(config)
             .with_db(control.clone())
             .with_shards(vec![ShardConfig {
@@ -186,6 +186,19 @@ mod shard_local_job_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(welcomed(), 1, "the shard worker ran the job once");
+        // The control job registry backs the control queue gauges. A shard
+        // run must not change it.
+        let control_status = client
+            .state()
+            .job_registry()
+            .snapshot()
+            .remove(JOB_NAME)
+            .expect("the job is registered");
+        assert_eq!(
+            (control_status.total_successes, control_status.in_flight),
+            (0, 0),
+            "shard runs do not touch the control job registry"
+        );
 
         // Control-database outage: nobody can connect to it. The shard
         // transaction and the shard worker do not need it.
