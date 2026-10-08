@@ -477,10 +477,9 @@ async fn run_mirror(
             if won {
                 ctx.registry.record_comparison_abandoned();
                 record_outcome(&ctx.registry, &context.route, "abandoned");
-            } else {
-                // The work already began recording. Recording is short; let it end.
-                let _ = work.await;
             }
+            // Else the work already began recording. Do not wait for it: the
+            // slot must free at the deadline, and the job ends on its own.
         }
     }
 }
