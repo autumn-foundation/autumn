@@ -140,6 +140,8 @@ enum DbSchemaState {
 enum SchemaRsState {
     /// The project has no `src/schema.rs`, and a model is managed.
     NoFile,
+    /// `src/schema.rs` exists but cannot be read.
+    Unreadable(String),
     /// No model is managed.
     NoManaged,
     /// The result of the comparison.
@@ -250,10 +252,11 @@ fn probe_schema_rs(project_root: &Path, backend: Backend) -> SchemaRsState {
     if !desired.tables.iter().any(|t| t.managed) {
         return SchemaRsState::NoManaged;
     }
-    std::fs::read_to_string(project_root.join(SCHEMA_RS_PATH))
-        .map_or(SchemaRsState::NoFile, |existing| {
-            SchemaRsState::Checked(check_tables(&existing, &desired))
-        })
+    match std::fs::read_to_string(project_root.join(SCHEMA_RS_PATH)) {
+        Ok(existing) => SchemaRsState::Checked(check_tables(&existing, &desired)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SchemaRsState::NoFile,
+        Err(e) => SchemaRsState::Unreadable(e.to_string()),
+    }
 }
 
 /// The unmanaged models whose table in `db` is missing or has other column
@@ -722,6 +725,10 @@ fn schema_rs_check(state: &SchemaRsState) -> Check {
             "no managed model — nothing to compare".to_owned(),
         ),
         SchemaRsState::NoFile => (Status::Warn, format!("no {SCHEMA_RS_PATH} — skipped")),
+        SchemaRsState::Unreadable(reason) => (
+            Status::Warn,
+            format!("could not read {SCHEMA_RS_PATH}: {reason}"),
+        ),
         SchemaRsState::ModelsError(reason) => {
             (Status::Warn, format!("could not read the models: {reason}"))
         }
@@ -1773,5 +1780,18 @@ mod tests {
         assert_eq!(drift.unchecked, vec!["posts".to_owned()]);
         let row = unmanaged_check(&UnmanagedState::Checked(drift));
         assert!(row.detail.contains("not checked: posts"), "{row:?}");
+    }
+
+    /// A `src/schema.rs` that exists but cannot be read is not "no file".
+    #[test]
+    fn schema_rs_drift_reports_an_unreadable_file() {
+        let root = scaffold(POST_MODEL, Some(&posts_snapshot("Postgres")));
+        std::fs::create_dir_all(root.path().join("src/schema.rs")).unwrap();
+        let row = schema_rs_row(root.path());
+        assert_eq!(row.status, Status::Warn, "{row:?}");
+        assert!(
+            row.detail.contains("could not read src/schema.rs"),
+            "{row:?}"
+        );
     }
 }
