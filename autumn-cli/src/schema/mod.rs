@@ -797,10 +797,10 @@ fn diff_at_with(
         println!("No schema changes — models match the baseline.");
         if write_migration {
             let sync = plan_schema_rs(project_root, &desired, &plan)?;
+            let adopted = adopted_snapshot(snapshot.as_ref(), &baseline_tables, backend, &desired);
             commit_empty_plan(
                 &snapshot_path,
-                snapshot.as_ref(),
-                &desired,
+                adopted.as_ref(),
                 sync.as_ref(),
                 write_schema_rs,
             )?;
@@ -876,26 +876,43 @@ fn diff_at_with(
 }
 
 /// `--write-migration` with no SQL change. A newly managed model needs no
-/// migration, but the snapshot records its `managed` flag and `src/schema.rs`
-/// can need its block.
+/// migration, but the snapshot records its `managed` flag (`adopted`, see
+/// [`adopted_snapshot`]) and `src/schema.rs` can need its block.
 fn commit_empty_plan(
     snapshot_path: &Path,
-    snapshot: Option<&SchemaSnapshot>,
-    desired: &parse::ParsedSchema,
+    adopted: Option<&SchemaSnapshot>,
     sync: Option<&(PathBuf, schema_rs::SchemaRsSync)>,
     write_schema_rs: &dyn Fn(&Path, &str) -> std::io::Result<()>,
 ) -> Result<(), String> {
-    let adopted = snapshot.and_then(|s| {
-        let mut tables = s.tables.clone();
-        mark_managed(&mut tables, desired);
-        (tables != s.tables).then(|| SchemaSnapshot::new(s.backend, tables))
-    });
-    commit_outputs(snapshot_path, adopted.as_ref(), None, sync, write_schema_rs)?;
+    commit_outputs(snapshot_path, adopted, None, sync, write_schema_rs)?;
     if adopted.is_some() {
         println!("recorded the managed models in {}", snapshot_path.display());
     }
     report_schema_rs(sync);
     Ok(())
+}
+
+/// The snapshot to write for an empty plan: the snapshot with the new
+/// `managed` flags, when a flag changed. With `--dev-url` and no snapshot,
+/// a new snapshot from the replayed `baseline`, as a non-empty plan makes.
+fn adopted_snapshot(
+    snapshot: Option<&SchemaSnapshot>,
+    baseline: &[Table],
+    backend: Backend,
+    desired: &parse::ParsedSchema,
+) -> Option<SchemaSnapshot> {
+    snapshot.map_or_else(
+        || {
+            let mut tables = baseline.to_vec();
+            mark_managed(&mut tables, desired);
+            Some(SchemaSnapshot::new(backend, tables))
+        },
+        |s| {
+            let mut tables = s.tables.clone();
+            mark_managed(&mut tables, desired);
+            (tables != s.tables).then(|| SchemaSnapshot::new(s.backend, tables))
+        },
+    )
 }
 
 /// Mark each table that a managed model declares as managed. A model that
@@ -2252,6 +2269,22 @@ mod tests {
         diff_at(root.path(), &write_args()).expect("write ok");
         assert_eq!(std::fs::read_to_string(path).unwrap(), broken);
         assert!(root.path().join("migrations").exists());
+    }
+
+    /// `--dev-url --write-migration` with no snapshot and no SQL change
+    /// still creates the snapshot from the replayed baseline, with the new
+    /// managed flags.
+    #[test]
+    fn an_empty_dev_url_write_creates_the_snapshot() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let snapshot_path = root.path().join(SNAPSHOT_DEFAULT_PATH);
+        let desired = parse::parse_model_source(POST_MODEL, Backend::Postgres).expect("parse");
+        let mut baseline = desired.tables.clone();
+        baseline[0].managed = false;
+        let adopted = adopted_snapshot(None, &baseline, Backend::Postgres, &desired);
+        commit_empty_plan(&snapshot_path, adopted.as_ref(), None, &|_, _| Ok(())).expect("commit");
+        let written = snapshot::load_snapshot(&snapshot_path).expect("snapshot");
+        assert!(written.tables[0].managed, "{:?}", written.tables);
     }
 
     /// A failed `schema.rs` write leaves the migration and the snapshot as

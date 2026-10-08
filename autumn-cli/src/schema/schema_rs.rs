@@ -683,11 +683,17 @@ fn macro_calls(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> {
         if in_word || is_in_comment_or_string(text, at) {
             continue;
         }
-        let Some(open) = text[from..]
-            .find(|c: char| !c.is_whitespace())
-            .map(|i| from + i)
-            .filter(|&i| text[i..].starts_with(['(', '[', '{']))
-        else {
+        // The first code byte after the name (comments skipped) must open
+        // the call.
+        let mut open = None;
+        scan_code(text, from, |i, c| {
+            if c.is_ascii_whitespace() {
+                return false;
+            }
+            open = matches!(c, b'(' | b'[' | b'{').then_some(i);
+            true
+        });
+        let Some(open) = open else {
             continue;
         };
         let Some(close) = matching_delim(text, open) else {
@@ -1748,5 +1754,21 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
             Backend::Postgres,
         ))]);
         assert_eq!(sync_for_plan(custom, &parsed(vec![]), &drop).text, custom);
+    }
+
+    /// A comment between the macro name and its delimiter does not hide the
+    /// call.
+    #[test]
+    fn a_comment_before_the_delimiter_does_not_hide_a_call() {
+        let existing = "diesel::joinable! /* why */ (comments -> posts (post_id));\n";
+        let out = sync_for_plan(
+            existing,
+            &parsed(vec![]),
+            &plan(vec![SchemaChange::DropTable(Table::new(
+                "comments",
+                Backend::Postgres,
+            ))]),
+        );
+        assert_eq!(out.text, "");
     }
 }
