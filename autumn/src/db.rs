@@ -131,6 +131,197 @@ tokio::task_local! {
     pub static AFTER_COMMIT_REGISTRY: Arc<Mutex<Vec<CommitCallback>>>;
 }
 
+/// Timeouts that each framework transaction sets with `SET LOCAL` (#3057).
+///
+/// A transaction pooler (`PgBouncer` in transaction mode) drops a session
+/// `SET`, but keeps a `SET LOCAL` for the transaction that issued it. The
+/// values are milliseconds. `Some(0)` turns the limit off.
+///
+/// An unset statement timeout is sent as `0`. `Db::checkout` and generated
+/// repositories already `SET statement_timeout = 0` for the session when none
+/// is configured. `DEFAULT` would undo that and bring back a role or database
+/// default. An unset idle timeout is sent as `DEFAULT`; nothing sets it for
+/// the session, so that is the session value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TxTimeouts {
+    /// `statement_timeout`, in milliseconds.
+    pub(crate) statement_ms: Option<u64>,
+    /// `idle_in_transaction_session_timeout`, in milliseconds.
+    pub(crate) idle_in_transaction_ms: Option<u64>,
+}
+
+#[cfg_attr(
+    feature = "sqlite",
+    allow(
+        dead_code,
+        reason = "`SET LOCAL` is Postgres-only; SQLite sends nothing"
+    )
+)]
+impl TxTimeouts {
+    /// Build from the configured durations. Each value is capped at
+    /// `i32::MAX` milliseconds, the Postgres maximum.
+    pub(crate) fn new(
+        statement: Option<std::time::Duration>,
+        idle_in_transaction: Option<std::time::Duration>,
+    ) -> Self {
+        Self {
+            statement_ms: statement.map(|d| pg_timeout_ms(Some(d))),
+            idle_in_transaction_ms: idle_in_transaction.map(|d| pg_timeout_ms(Some(d))),
+        }
+    }
+
+    /// The timeouts from an app's `[database]` config.
+    pub(crate) fn from_config(config: &crate::config::DatabaseConfig) -> Self {
+        Self::new(config.statement_timeout, config.idle_in_transaction_timeout)
+    }
+
+    /// The `SET LOCAL` batch, or `None` when neither value is set. Then
+    /// nothing is sent, and a transaction costs no extra round trip.
+    ///
+    /// The batch always has both statements, in this order. The capsule
+    /// recorder matches that exact form (`capsule::wire`).
+    pub(crate) fn set_local_sql(self) -> Option<String> {
+        (self.statement_ms.is_some() || self.idle_in_transaction_ms.is_some()).then(|| {
+            format!(
+                "SET LOCAL statement_timeout = {}; \
+                 SET LOCAL idle_in_transaction_session_timeout = {}",
+                self.statement_ms.unwrap_or(0),
+                self.idle_in_transaction_ms
+                    .map_or_else(|| "DEFAULT".to_owned(), |ms| ms.to_string())
+            )
+        })
+    }
+
+    /// Run `fut` with these timeouts in scope. Each outermost transaction
+    /// that [`scoped_transaction`] opens in `fut` sets them with `SET LOCAL`.
+    pub(crate) async fn scope<F: std::future::Future>(self, fut: F) -> F::Output {
+        TX_TIMEOUTS.scope(self, fut).await
+    }
+
+    /// Run a request `fut` with these timeouts as its defaults. A route's
+    /// [`StatementTimeout`] replaces the statement value when an extractor
+    /// sees it (see [`note_route_statement_timeout`]).
+    pub(crate) async fn scope_request<F: std::future::Future>(self, fut: F) -> F::Output {
+        REQUEST_TX_TIMEOUTS
+            .scope(Arc::new(Mutex::new(self)), fut)
+            .await
+    }
+
+    /// The timeouts in scope for this task: the innermost `Db` scope, else
+    /// the request defaults, else `None`.
+    pub(crate) fn current() -> Option<Self> {
+        TX_TIMEOUTS.try_with(|t| *t).ok().or_else(|| {
+            REQUEST_TX_TIMEOUTS
+                .try_with(|cell| {
+                    *cell
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                })
+                .ok()
+        })
+    }
+}
+
+/// Run background work (a scheduled task or a job) with the app's configured
+/// [`TxTimeouts`] in scope, so its framework transactions set them as a
+/// request's do (#3057). A `Db` method inside still scopes its own values.
+///
+/// The values are read here, so the returned future holds no borrow of
+/// `state`.
+pub(crate) fn scope_background_tx_timeouts<S: DbState, F: std::future::Future>(
+    state: &S,
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> + use<S, F> {
+    let timeouts = TxTimeouts::new(
+        state.statement_timeout(),
+        state.idle_in_transaction_timeout(),
+    );
+    TX_TIMEOUTS.scope(timeouts, fut)
+}
+
+/// Record a route's [`StatementTimeout`] for the request's transactions.
+///
+/// The request layer sits outside the route layer that adds the extension,
+/// so an extractor that sees it reports it here. `Db` does this itself.
+/// Generated repositories call it through `__private`.
+#[doc(hidden)]
+pub fn note_route_statement_timeout(parts: &axum::http::request::Parts) {
+    if let Some(timeout) = parts.extensions.get::<StatementTimeout>() {
+        note_statement_timeout(*timeout);
+    }
+}
+
+/// Record a route's [`StatementTimeout`] for the request's transactions, for
+/// a handler that receives the extension itself (the offline-sync routes).
+pub(crate) fn note_statement_timeout(timeout: StatementTimeout) {
+    let ms = pg_timeout_ms(Some(timeout.0));
+    let _ = REQUEST_TX_TIMEOUTS.try_with(|cell| {
+        cell.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .statement_ms = Some(ms);
+    });
+}
+
+/// A Postgres timeout setting in milliseconds, capped at `i32::MAX`.
+fn pg_timeout_ms(timeout: Option<std::time::Duration>) -> u64 {
+    const PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
+    timeout.map_or(0, |d| {
+        u64::try_from(d.as_millis())
+            .unwrap_or(PG_TIMEOUT_MAX_MS)
+            .min(PG_TIMEOUT_MAX_MS)
+    })
+}
+
+tokio::task_local! {
+    /// The [`TxTimeouts`] of one `Db`: set by [`Db::tx`] and its siblings.
+    static TX_TIMEOUTS: TxTimeouts;
+}
+
+tokio::task_local! {
+    /// The request's [`TxTimeouts`], for code that opens a transaction on a
+    /// connection of its own (generated repositories). Set by the request
+    /// layer. Mutable so that a route override can replace the default.
+    static REQUEST_TX_TIMEOUTS: Arc<Mutex<TxTimeouts>>;
+}
+
+/// Issue the in-scope [`TxTimeouts`] as `SET LOCAL`, at transaction depth 1
+/// only. A savepoint keeps the outer transaction's values.
+///
+/// # Errors
+///
+/// Returns the database error from the `SET LOCAL` batch.
+#[cfg(not(feature = "sqlite"))]
+async fn apply_tx_timeouts<C>(conn: &mut C) -> Result<(), diesel::result::Error>
+where
+    C: diesel_async::AsyncConnection + Send,
+{
+    use diesel_async::TransactionManager as _;
+    let Some(sql) = TxTimeouts::current().and_then(TxTimeouts::set_local_sql) else {
+        return Ok(());
+    };
+    let depth = C::TransactionManager::transaction_manager_status_mut(conn)
+        .transaction_depth()?
+        .map(std::num::NonZeroU32::get);
+    if depth == Some(1) {
+        conn.batch_execute(&sql).await?;
+    }
+    Ok(())
+}
+
+/// `SET LOCAL` is Postgres syntax. `SQLite` has no such settings.
+#[cfg(feature = "sqlite")]
+#[allow(
+    clippy::unused_async,
+    clippy::needless_pass_by_ref_mut,
+    reason = "same signature as the Postgres version"
+)]
+async fn apply_tx_timeouts<C>(_conn: &mut C) -> Result<(), diesel::result::Error>
+where
+    C: diesel_async::AsyncConnection + Send,
+{
+    Ok(())
+}
+
 /// Per-request accumulator for database query timing, used by the
 /// `Server-Timing` middleware to surface `db;dur=…;desc="N queries"`.
 ///
@@ -363,6 +554,10 @@ pub(crate) struct RequestQueryTimer {
     /// connections that actually carry a timer, which `Db::checkout` installs
     /// solely while a query observer is scoped.
     clock: std::sync::Arc<dyn crate::time::ClockSource>,
+    /// The sim gate's turn for the running statement. This timer replaces the
+    /// gate's own instrumentation on a connection, so it takes the turn too
+    /// (issue #3067). Off a sim runtime it does nothing.
+    turn: crate::sim::gate::QueryTurn,
 }
 
 #[cfg(feature = "db")]
@@ -385,6 +580,7 @@ impl Default for RequestQueryTimer {
         Self {
             pending: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            turn: crate::sim::gate::QueryTurn::default(),
         }
     }
 }
@@ -408,6 +604,7 @@ impl RequestQueryTimer {
         Self {
             pending: None,
             clock,
+            turn: crate::sim::gate::QueryTurn::default(),
         }
     }
 
@@ -511,8 +708,10 @@ impl diesel::connection::Instrumentation for RequestQueryTimer {
                 // opted-out timer never pays the allocation — see `on_start`.
                 let now = self.clock.monotonic();
                 self.on_start(now, || query.to_string());
+                self.turn.start();
             }
             InstrumentationEvent::FinishQuery { .. } => {
+                self.turn.finish();
                 let now = self.clock.monotonic();
                 self.on_finish(now);
             }
@@ -578,6 +777,11 @@ pub(crate) fn reject_ambient_after_commit_registry_for_tx() -> Result<(), Autumn
     Ok(())
 }
 
+/// Run the committed transaction's after-commit callbacks on a new task.
+///
+/// A spawned task does not inherit task-locals, so the [`TxTimeouts`] in
+/// scope here (the request's, or a scheduled task's or job's) are carried
+/// into it. A repository write in a callback then sets them as well (#3057).
 pub(crate) fn spawn_committed_after_commit_callbacks(
     callbacks: Vec<CommitCallback>,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -585,33 +789,37 @@ pub(crate) fn spawn_committed_after_commit_callbacks(
         return None;
     }
 
-    Some(tokio::task::spawn(async move {
-        for cb in callbacks {
-            let result = match std::panic::catch_unwind(AssertUnwindSafe(cb)) {
-                Ok(callback) => AssertUnwindSafe(callback).catch_unwind().await,
-                Err(panic) => Err(panic),
-            };
+    let timeouts = TxTimeouts::current().unwrap_or_default();
+    Some(tokio::task::spawn(TX_TIMEOUTS.scope(
+        timeouts,
+        async move {
+            for cb in callbacks {
+                let result = match std::panic::catch_unwind(AssertUnwindSafe(cb)) {
+                    Ok(callback) => AssertUnwindSafe(callback).catch_unwind().await,
+                    Err(panic) => Err(panic),
+                };
 
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    let failures_total = record_after_commit_failure();
-                    tracing::error!(
-                        autumn.after_commit.failures_total = failures_total,
-                        "after_commit callback failed (tx already committed): {e}"
-                    );
-                }
-                Err(panic) => {
-                    let failures_total = record_after_commit_failure();
-                    let panic = after_commit_panic_message(&*panic);
-                    tracing::error!(
-                        autumn.after_commit.failures_total = failures_total,
-                        "after_commit callback panicked (tx already committed): {panic}"
-                    );
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        let failures_total = record_after_commit_failure();
+                        tracing::error!(
+                            autumn.after_commit.failures_total = failures_total,
+                            "after_commit callback failed (tx already committed): {e}"
+                        );
+                    }
+                    Err(panic) => {
+                        let failures_total = record_after_commit_failure();
+                        let panic = after_commit_panic_message(&*panic);
+                        tracing::error!(
+                            autumn.after_commit.failures_total = failures_total,
+                            "after_commit callback panicked (tx already committed): {panic}"
+                        );
+                    }
                 }
             }
-        }
-    }))
+        },
+    )))
 }
 
 fn after_commit_panic_message(payload: &(dyn Any + Send)) -> String {
@@ -744,6 +952,12 @@ pub trait DbState {
     }
     /// Returns the global statement timeout, if configured.
     fn statement_timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// Returns the global `idle_in_transaction_session_timeout`, if
+    /// configured (#3057).
+    fn idle_in_transaction_timeout(&self) -> Option<std::time::Duration> {
         None
     }
 
@@ -1329,7 +1543,7 @@ static SQLITE_REPLICATION_ACTIVE: std::sync::atomic::AtomicBool =
 ///   `sqlite3_unlock_notify`), so the pragma is inert for that one lock class —
 ///   harmless, not harmful (issue #2881).
 #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
-const fn sqlite_connection_pragmas(read_only: bool, replicating: bool) -> &'static str {
+pub(crate) const fn sqlite_connection_pragmas(read_only: bool, replicating: bool) -> &'static str {
     if read_only {
         "PRAGMA busy_timeout = 5000; \
          PRAGMA foreign_keys = ON;"
@@ -1910,7 +2124,7 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
     };
 
     #[cfg(feature = "sqlite")]
-    reject_sqlite_statement_timeout(config.statement_timeout, url)?;
+    reject_sqlite_unsupported_timeouts(config, url)?;
 
     let pool = build_pool(
         url,
@@ -1986,6 +2200,43 @@ pub(crate) fn reject_sqlite_statement_timeout(
     )))
 }
 
+/// Reject every timeout `SQLite` cannot enforce: `database.statement_timeout`
+/// and `database.idle_in_transaction_timeout` (#3057). Each pool factory and
+/// provider path calls this one guard, so none can miss a setting.
+///
+/// # Errors
+///
+/// Returns [`PoolError::UnsupportedBackend`] for the first nonzero setting.
+#[cfg(feature = "sqlite")]
+pub(crate) fn reject_sqlite_unsupported_timeouts(
+    config: &DatabaseConfig,
+    target: &str,
+) -> Result<(), PoolError> {
+    reject_sqlite_statement_timeout(config.statement_timeout, target)?;
+    reject_sqlite_idle_in_transaction_timeout(config.idle_in_transaction_timeout)
+}
+
+/// Reject a configured `database.idle_in_transaction_timeout` under the
+/// `SQLite` backend (#3057). `SQLite` has no such setting, so a nonzero value
+/// would look enforced and not be. `None` and zero are allowed.
+///
+/// # Errors
+///
+/// Returns [`PoolError::UnsupportedBackend`] for a nonzero value.
+#[cfg(feature = "sqlite")]
+pub(crate) fn reject_sqlite_idle_in_transaction_timeout(
+    timeout: Option<Duration>,
+) -> Result<(), PoolError> {
+    let Some(timeout) = timeout.filter(|t| !t.is_zero()) else {
+        return Ok(());
+    };
+    Err(PoolError::UnsupportedBackend(format!(
+        "SQLite backend cannot enforce database.idle_in_transaction_timeout ({}ms). \
+         Unset it for the SQLite backend, or run on Postgres.",
+        timeout.as_millis()
+    )))
+}
+
 /// Reject a `SQLite` `replica_url` that cannot act as a real read replica for the
 /// given `primary_url`.
 ///
@@ -2031,7 +2282,7 @@ pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopolog
     };
 
     #[cfg(feature = "sqlite")]
-    reject_sqlite_statement_timeout(config.statement_timeout, primary_url)?;
+    reject_sqlite_unsupported_timeouts(config, primary_url)?;
 
     let primary = build_pool(
         primary_url,
@@ -2075,7 +2326,7 @@ pub fn create_shard_topology(
     // Postgres-only), so the same fail-closed guard applies per shard. The shard
     // inherits the `[database]` `statement_timeout`.
     #[cfg(feature = "sqlite")]
-    reject_sqlite_statement_timeout(defaults.statement_timeout, &shard.primary_url)?;
+    reject_sqlite_unsupported_timeouts(defaults, &shard.primary_url)?;
 
     let primary = build_pool(
         &shard.primary_url,
@@ -2456,6 +2707,12 @@ where
     use diesel_async::TransactionManager as _;
 
     C::TransactionManager::begin_transaction(conn).await?;
+    if let Err(set_error) = apply_tx_timeouts(conn).await {
+        return match C::TransactionManager::rollback_transaction(conn).await {
+            Ok(()) | Err(diesel::result::Error::BrokenTransactionManager) => Err(set_error.into()),
+            Err(rollback_error) => Err(rollback_error.into()),
+        };
+    }
     match f(&mut *conn).await {
         Ok(value) => {
             C::TransactionManager::commit_transaction(conn).await?;
@@ -2700,20 +2957,6 @@ where
 /// Connection type managed by the deadpool pool.
 pub type PooledConnection = diesel_async::pooled_connection::deadpool::Object<RuntimeConnection>;
 
-/// Prove a pooled connection is actually alive, not merely checked out.
-///
-/// `pg_manager_config` sets `RecyclingMethod::Fast`, so `pool.get()` alone
-/// can return a stale connection without proving it is alive (issue #2485).
-/// A health/readiness probe that only checks out and drops a connection
-/// would then report a dead primary or replica as reachable. Run this on a
-/// fresh checkout so the probe itself proves liveness, not the pool.
-pub(crate) async fn probe_connection_alive(
-    conn: &mut PooledConnection,
-) -> Result<(), diesel::result::Error> {
-    use diesel_async::SimpleAsyncConnection as _;
-    conn.batch_execute("SELECT 1").await
-}
-
 struct TxDepthGuard<'a> {
     depth: &'a mut usize,
     poisoned: &'a mut bool,
@@ -2787,6 +3030,8 @@ pub struct Db {
     /// from the same timeline `start_time` came from.
     clock: std::sync::Arc<dyn crate::time::ClockSource>,
     is_test_tx: bool,
+    /// Set with `SET LOCAL` at the start of each transaction (#3057).
+    tx_timeouts: TxTimeouts,
 }
 
 impl Db {
@@ -2884,7 +3129,8 @@ impl Db {
         let result = AFTER_COMMIT_REGISTRY
             .scope(
                 registry.clone(),
-                scoped_transaction::<T, E, _, _>(&mut self.conn, f),
+                self.tx_timeouts
+                    .scope(scoped_transaction::<T, E, _, _>(&mut self.conn, f)),
             )
             .await
             .map_err(Into::into);
@@ -3016,7 +3262,8 @@ impl Db {
         let result = AFTER_COMMIT_REGISTRY
             .scope(
                 registry.clone(),
-                scoped_immediate_transaction(&mut self.conn, f),
+                self.tx_timeouts
+                    .scope(scoped_immediate_transaction(&mut self.conn, f)),
             )
             .await
             .map_err(Into::into);
@@ -3173,9 +3420,13 @@ impl Db {
             // meaningless nested inside — the outer test transaction, so there is nothing
             // to retry against a single test-harness connection.
             let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
+            let timeouts = self.tx_timeouts;
             let conn: &mut RuntimeConnection = &mut self.conn;
             let result = AFTER_COMMIT_REGISTRY
-                .scope(registry, scoped_transaction::<T, E, _, _>(conn, f))
+                .scope(
+                    registry,
+                    timeouts.scope(scoped_transaction::<T, E, _, _>(conn, f)),
+                )
                 .instrument(span.clone())
                 .await
                 .map_err(Into::into);
@@ -3197,9 +3448,13 @@ impl Db {
         #[cfg(feature = "sqlite")]
         {
             let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
+            let timeouts = self.tx_timeouts;
             let conn: &mut RuntimeConnection = &mut self.conn;
             let result: Result<T, E> = AFTER_COMMIT_REGISTRY
-                .scope(registry.clone(), scoped_transaction::<T, E, _, _>(conn, f))
+                .scope(
+                    registry.clone(),
+                    timeouts.scope(scoped_transaction::<T, E, _, _>(conn, f)),
+                )
                 .instrument(span.clone())
                 .await;
             span.record("db.tx.attempts", 1u32);
@@ -3254,10 +3509,19 @@ impl Db {
                         builder = builder.deferrable();
                     }
 
+                    // The builder sends its own `BEGIN ...`, so the timeouts go
+                    // first inside the closure (#3057).
+                    let set_local = self.tx_timeouts.set_local_sql();
                     AFTER_COMMIT_REGISTRY
                         .scope(
                             registry.clone(),
-                            builder.run::<T, E, _>(async move |conn| f_ref(conn).await),
+                            builder.run::<T, E, _>(async move |conn| {
+                                if let Some(sql) = set_local {
+                                    use diesel_async::SimpleAsyncConnection as _;
+                                    conn.batch_execute(&sql).await?;
+                                }
+                                f_ref(conn).await
+                            }),
                         )
                         .instrument(span.clone())
                         .await
@@ -3364,6 +3628,9 @@ pub(crate) struct DbCheckoutParams<'a> {
     /// Resolved statement timeout (route override already merged with the
     /// global config). `None` disables the timeout (`SET statement_timeout = 0`).
     pub statement_timeout: Option<std::time::Duration>,
+    /// `idle_in_transaction_session_timeout` for this connection's
+    /// transactions. `None` disables it.
+    pub idle_in_transaction_timeout: Option<std::time::Duration>,
     /// `"METHOD /matched/path"` key used for per-route DB metrics.
     pub route_key: Option<String>,
     pub metrics: Option<crate::middleware::MetricsCollector>,
@@ -3430,11 +3697,9 @@ impl Db {
         // Postgres session GUC. Under the `sqlite` feature the runtime backend
         // is entirely SQLite (the `RuntimeConnection` alias flips wholesale —
         // see `build_sqlite_pool`), which rejects the statement and would turn
-        // every `Db`-using route into a 503. The const, the `RunQueryDsl`
-        // import, the timeout arithmetic, and the `SET` itself are therefore all
-        // gated off on the SQLite build; the Postgres path is byte-identical.
-        #[cfg(not(feature = "sqlite"))]
-        const PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
+        // every `Db`-using route into a 503. The `RunQueryDsl` import, the
+        // timeout arithmetic, and the `SET` itself are therefore all gated off
+        // on the SQLite build; the Postgres path is byte-identical.
         #[cfg(not(feature = "sqlite"))]
         use diesel_async::RunQueryDsl as _;
 
@@ -3494,21 +3759,10 @@ impl Db {
 
         let mut conn = checkout_future.instrument(span.clone()).await?;
 
-        // `statement_timeout` is a Postgres session GUC; it is intentionally
-        // unused on the SQLite backend (see the gating note below), so consume
-        // it here to keep the shared `DbCheckoutParams` field from reading as
-        // dead code under `--features sqlite`.
-        #[cfg(feature = "sqlite")]
-        let _ = params.statement_timeout;
-
         // Postgres statement_timeout is a signed 32-bit integer (milliseconds).
         // Cap at i32::MAX to avoid a confusing 503 for very large configured values.
         #[cfg(not(feature = "sqlite"))]
-        let timeout_ms = params.statement_timeout.map_or(0u64, |d| {
-            u64::try_from(d.as_millis())
-                .unwrap_or(PG_TIMEOUT_MAX_MS)
-                .min(PG_TIMEOUT_MAX_MS)
-        });
+        let timeout_ms = pg_timeout_ms(params.statement_timeout);
 
         // Install a fresh per-request query timer, but only when a query observer is
         // active: either a `REQUEST_DB_TIMINGS` scope (the `ServerTimingLayer`, enabled
@@ -3593,6 +3847,10 @@ impl Db {
             start_time,
             clock: params.clock,
             is_test_tx,
+            tx_timeouts: TxTimeouts::new(
+                params.statement_timeout,
+                params.idle_in_transaction_timeout,
+            ),
         })
     }
 
@@ -3613,6 +3871,7 @@ impl Db {
             pool_name: "test",
             shard: None,
             statement_timeout: None,
+            idle_in_transaction_timeout: None,
             route_key: None,
             metrics: None,
             slow_query_threshold: std::time::Duration::from_millis(500),
@@ -3636,6 +3895,7 @@ impl Db {
 #[derive(Clone)]
 pub(crate) struct RequestDbContext {
     pub statement_timeout: Option<std::time::Duration>,
+    pub idle_in_transaction_timeout: Option<std::time::Duration>,
     pub route_key: Option<String>,
     pub metrics: Option<crate::middleware::MetricsCollector>,
     pub slow_query_threshold: std::time::Duration,
@@ -3647,6 +3907,7 @@ pub(crate) struct RequestDbContext {
 
 impl RequestDbContext {
     pub(crate) fn from_parts<S: DbState>(parts: &axum::http::request::Parts, state: &S) -> Self {
+        note_route_statement_timeout(parts);
         let timeout_override = parts.extensions.get::<StatementTimeout>().copied();
         let matched_path = parts
             .extensions
@@ -3656,6 +3917,7 @@ impl RequestDbContext {
             statement_timeout: timeout_override
                 .map(|t| t.0)
                 .or_else(|| state.statement_timeout()),
+            idle_in_transaction_timeout: state.idle_in_transaction_timeout(),
             route_key: Some(format!("{} {}", parts.method, matched_path)),
             metrics: state.metrics().cloned(),
             slow_query_threshold: state.slow_query_threshold(),
@@ -3736,6 +3998,7 @@ impl LazyDb {
             pool_name: "primary",
             shard: None,
             statement_timeout: self.ctx.statement_timeout,
+            idle_in_transaction_timeout: self.ctx.idle_in_transaction_timeout,
             route_key: self.ctx.route_key,
             metrics: self.ctx.metrics,
             slow_query_threshold: self.ctx.slow_query_threshold,
@@ -3799,6 +4062,7 @@ where
             pool_name: "primary",
             shard: None,
             statement_timeout: ctx.statement_timeout,
+            idle_in_transaction_timeout: ctx.idle_in_transaction_timeout,
             route_key: ctx.route_key,
             metrics: ctx.metrics,
             slow_query_threshold: ctx.slow_query_threshold,
@@ -4004,6 +4268,94 @@ impl DatabasePoolProvider for DieselDeadpoolPoolProvider {
 
 #[cfg(test)]
 mod tests {
+    /// An unset statement timeout keeps the session's `0` from checkout; an
+    /// unset idle timeout keeps the session value through `DEFAULT`.
+    #[test]
+    fn tx_timeouts_send_zero_for_an_unset_statement_timeout() {
+        use std::time::Duration;
+        let sql = |statement, idle| super::TxTimeouts::new(statement, idle).set_local_sql();
+        assert_eq!(sql(None, None), None);
+        assert_eq!(
+            sql(None, Some(Duration::from_secs(60))).as_deref(),
+            Some(
+                "SET LOCAL statement_timeout = 0; \
+                 SET LOCAL idle_in_transaction_session_timeout = 60000"
+            )
+        );
+        assert_eq!(
+            sql(Some(Duration::from_secs(30)), None).as_deref(),
+            Some(
+                "SET LOCAL statement_timeout = 30000; \
+                 SET LOCAL idle_in_transaction_session_timeout = DEFAULT"
+            )
+        );
+    }
+
+    /// A scheduled task or a job has no request scope. The background scope
+    /// gives its framework transactions the app's configured timeouts.
+    #[tokio::test]
+    async fn background_work_gets_the_configured_tx_timeouts() {
+        use std::time::Duration;
+        struct Configured;
+        impl super::DbState for Configured {
+            fn pool(&self) -> Option<&super::Pool<super::RuntimeConnection>> {
+                None
+            }
+            fn statement_timeout(&self) -> Option<Duration> {
+                Some(Duration::from_secs(30))
+            }
+            fn idle_in_transaction_timeout(&self) -> Option<Duration> {
+                Some(Duration::from_secs(60))
+            }
+        }
+        assert_eq!(super::TxTimeouts::current(), None);
+        let inside = super::scope_background_tx_timeouts(&Configured, async {
+            super::TxTimeouts::current()
+        })
+        .await;
+        assert_eq!(
+            inside,
+            Some(super::TxTimeouts::new(
+                Some(Duration::from_secs(30)),
+                Some(Duration::from_secs(60))
+            ))
+        );
+    }
+
+    /// After-commit callbacks run on a spawned task, which inherits no
+    /// task-locals. The spawner carries the timeouts in scope into it.
+    #[tokio::test]
+    async fn after_commit_callbacks_keep_the_tx_timeouts() {
+        use std::time::Duration;
+        struct Configured;
+        impl super::DbState for Configured {
+            fn pool(&self) -> Option<&super::Pool<super::RuntimeConnection>> {
+                None
+            }
+            fn statement_timeout(&self) -> Option<Duration> {
+                Some(Duration::from_secs(30))
+            }
+        }
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen_in_callback = std::sync::Arc::clone(&seen);
+        let callback: super::CommitCallback = Box::new(move || {
+            Box::pin(async move {
+                *seen_in_callback.lock().expect("lock") = super::TxTimeouts::current();
+                Ok(())
+            })
+        });
+        let drain = super::scope_background_tx_timeouts(&Configured, async move {
+            super::spawn_committed_after_commit_callbacks(vec![callback])
+        })
+        .await
+        .expect("a callback was registered");
+        drain.await.expect("callback task");
+        assert_eq!(
+            *seen.lock().expect("lock"),
+            Some(super::TxTimeouts::new(Some(Duration::from_secs(30)), None))
+        );
+    }
+
     #[test]
     fn replication_adds_the_auto_checkpoint_lock_to_the_pooled_pragmas() {
         // Continuous replication (#1628) needs the replicator to be the only
@@ -5260,6 +5612,61 @@ mod tests {
         assert!(sqlite_target_is_shared_cache(
             "file:app.db?cache=private&cache=shared"
         ));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn reject_sqlite_unsupported_timeouts_checks_both_settings() {
+        let idle_only = DatabaseConfig {
+            idle_in_transaction_timeout: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        assert!(reject_sqlite_unsupported_timeouts(&idle_only, "file:/srv/app.db").is_err());
+        let statement_only = DatabaseConfig {
+            statement_timeout: Some(Duration::from_secs(30)),
+            ..Default::default()
+        };
+        assert!(reject_sqlite_unsupported_timeouts(&statement_only, "file:/srv/app.db").is_err());
+        assert!(
+            reject_sqlite_unsupported_timeouts(&DatabaseConfig::default(), "file:/srv/app.db")
+                .is_ok()
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_shard_topology_refuses_sqlite_idle_timeout() {
+        let shard = crate::config::ShardConfig {
+            name: "s0".to_owned(),
+            primary_url: ":memory:".to_owned(),
+            ..Default::default()
+        };
+        let defaults = DatabaseConfig {
+            idle_in_transaction_timeout: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        match create_shard_topology(&shard, &defaults) {
+            Err(PoolError::UnsupportedBackend(message)) => {
+                assert!(message.contains("idle_in_transaction_timeout"), "{message}");
+            }
+            Err(other) => panic!("expected UnsupportedBackend, got {other:?}"),
+            Ok(_) => panic!("expected UnsupportedBackend, got a topology"),
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn reject_sqlite_idle_in_transaction_timeout_refuses_a_nonzero_value() {
+        let err = reject_sqlite_idle_in_transaction_timeout(Some(Duration::from_secs(60)))
+            .expect_err("SQLite cannot enforce it");
+        match err {
+            PoolError::UnsupportedBackend(message) => {
+                assert!(message.contains("idle_in_transaction_timeout"), "{message}");
+            }
+            other => panic!("expected UnsupportedBackend, got {other:?}"),
+        }
+        assert!(reject_sqlite_idle_in_transaction_timeout(None).is_ok());
+        assert!(reject_sqlite_idle_in_transaction_timeout(Some(Duration::ZERO)).is_ok());
     }
 
     // The `statement_timeout` rejection must not claim `busy_timeout` bounds

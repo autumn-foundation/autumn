@@ -2127,6 +2127,7 @@ pub(crate) mod test_support {
     struct HostScript {
         host: String,
         stdout: Vec<(&'static str, String)>,
+        stdout_on_occurrence: Vec<(&'static str, usize, String)>,
         fail: Vec<&'static str>,
         fail_on_occurrence: Vec<(&'static str, usize)>,
         transport_fail: Vec<&'static str>,
@@ -2185,6 +2186,22 @@ pub(crate) mod test_support {
             self
         }
 
+        /// Script one host's stdout for one 1-indexed occurrence of `label`
+        /// (#3069): each bake poll can then see a new metrics sample.
+        pub(crate) fn script_occurrence(
+            mut self,
+            host: &str,
+            label: &'static str,
+            occurrence: usize,
+            stdout: impl Into<String>,
+        ) -> Self {
+            let stdout = stdout.into();
+            self.entry(host)
+                .stdout_on_occurrence
+                .push((label, occurrence, stdout));
+            self
+        }
+
         /// Make one host's `label` fail (a scripted `CommandFailed`).
         pub(crate) fn fail(mut self, host: &str, label: &'static str) -> Self {
             self.entry(host).fail.push(label);
@@ -2236,6 +2253,9 @@ pub(crate) mod test_support {
             if let Some(script) = self.scripts.iter().find(|s| s.host == host) {
                 for (label, stdout) in &script.stdout {
                     exec = exec.with_stdout(label, stdout.clone());
+                }
+                for (label, occurrence, stdout) in &script.stdout_on_occurrence {
+                    exec = exec.with_stdout_on_occurrence(label, *occurrence, stdout.clone());
                 }
                 for label in &script.fail {
                     exec = exec.failing(label);

@@ -44,7 +44,7 @@ const IDENTIFYING_KEYWORDS: [&str; 6] = ["host", "hostaddr", "port", "dbname", "
 /// Blanking the lot instead would cost the boot summary its most-read detail —
 /// `?sslmode=verify-full&application_name=web` is exactly what an operator
 /// checks first.
-const PG_DIAGNOSTIC_PARAMS: [&str; 8] = [
+const PG_DIAGNOSTIC_PARAMS: [&str; 9] = [
     "sslmode",
     "sslrootcert",
     "sslcert",
@@ -52,6 +52,7 @@ const PG_DIAGNOSTIC_PARAMS: [&str; 8] = [
     "connect_timeout",
     "target_session_attrs",
     "host",
+    "hostaddr",
     "port",
 ];
 
@@ -64,6 +65,29 @@ const PG_DIAGNOSTIC_PARAMS: [&str; 8] = [
 /// either build.
 pub fn is_bare_in_memory_sqlite(url: &str) -> bool {
     url.is_empty() || url == ":memory:"
+}
+
+/// Refuse a target that does not name Postgres, for a store that opens its own
+/// Postgres connection from a URL.
+///
+/// `PgFlagStore::new(url)` and its siblings do not screen the target when they
+/// are built. Without this check at connect time, a `SQLite` target fails in
+/// libpq, and libpq quotes the target with its credentials in the error
+/// (#2539 §5). An empty target passes: libpq reads it as "use the `PG*`
+/// environment defaults".
+///
+/// # Errors
+///
+/// Returns the refusal message, with the target redacted.
+pub fn require_postgres_target(url: &str, store: &str) -> Result<(), String> {
+    if url.trim().is_empty() || DatabaseBackend::detect(url) == Some(DatabaseBackend::Postgres) {
+        return Ok(());
+    }
+    Err(format!(
+        "{store} needs a Postgres database target, got {:?}; on another backend, \
+         use the in-memory store",
+        redact_target(url)
+    ))
 }
 
 /// Mask credentials in a database target before it goes into a message.
@@ -99,15 +123,12 @@ pub fn is_bare_in_memory_sqlite(url: &str) -> bool {
 /// string). A bare filesystem path is exactly that, and is the case where
 /// naming the target is the whole value of the message.
 ///
-/// # Known gap
+/// An OPAQUE url (`postgres:password=hunter2`) parses, but the parser reports
+/// no password, query or fragment in it. It keeps its scheme only, unless the
+/// rest is one path-shaped token (`mysql:app.db`).
 ///
-/// "The default is to mask" holds for everything `Url::parse` REJECTS. It does
-/// not yet hold for an OPAQUE url it accepts: `postgres:password=hunter2`
-/// parses, reports no password, query or fragment, and has no `@` in its path,
-/// so it returns verbatim and reaches the boot error. Tracked in #2571 — the
-/// fix is to treat a URL with no authority whose path carries key/value
-/// material as unclassified, rather than trusting that a successful parse
-/// means the parser understood every part of it.
+/// An allowlisted query key does not make its value safe. A kept value that is
+/// not a simple token is masked ([`is_simple_token`]).
 pub fn redact_target(url: &str) -> String {
     let backend = DatabaseBackend::detect(url);
     if backend == Some(DatabaseBackend::Sqlite) {
@@ -129,6 +150,35 @@ pub fn redact_target(url: &str) -> String {
                 .is_some_and(|fragment| fragment.contains('@'))
         {
             return "****".to_owned();
+        }
+        // A one-letter scheme is a Windows drive letter: a path. It gets the
+        // bare-path test below.
+        if parsed.scheme().len() == 1 {
+            return if is_bare_path(url) {
+                url.to_owned()
+            } else {
+                "****".to_owned()
+            };
+        }
+        // JDBC-style `;k=v` material in a host or a path is not understood.
+        if parsed
+            .host_str()
+            .is_some_and(|host| host.contains([';', '=']))
+            || (!parsed.cannot_be_a_base() && parsed.path().contains([';', '=']))
+        {
+            return format!("{}://****", parsed.scheme());
+        }
+        // No authority, so the parser saw no userinfo, query or fragment: do
+        // not trust the rest. Keep it only when it is one path-shaped token,
+        // as for a bare path below.
+        if parsed.cannot_be_a_base() {
+            let opaque = url.split_once(':').map_or("", |(_, rest)| rest);
+            if opaque.is_empty()
+                || opaque.contains(['=', '@', '?', ':', '%', '#'])
+                || opaque.contains(char::is_whitespace)
+            {
+                return format!("{}:****", parsed.scheme());
+            }
         }
         let has_password = parsed.password().is_some();
         if has_password {
@@ -176,10 +226,17 @@ pub fn redact_target(url: &str) -> String {
             format!("{} ****", kept.join(" "))
         };
     }
-    if !url.is_empty() && !url.contains(['=', '@', '?']) && !url.contains(char::is_whitespace) {
+    if is_bare_path(url) {
         return url.to_owned();
     }
     "****".to_owned()
+}
+
+/// One path-shaped token: no `=` (no key/value pair), no `@` (no userinfo), no
+/// `?` (no query), no `#` (no fragment) and no whitespace (not a keyword/value
+/// string).
+fn is_bare_path(url: &str) -> bool {
+    !url.is_empty() && !url.contains(['=', '@', '?', '#']) && !url.contains(char::is_whitespace)
 }
 
 /// Mask userinfo and drop non-diagnostic parameters in a `SQLite` target.
@@ -246,24 +303,66 @@ fn filter_query(query: &str, allowed: &[&str], enumerable: bool) -> String {
     if !enumerable {
         return "****".to_owned();
     }
-    let mut kept: Vec<&str> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
     let mut dropped = false;
     // BOTH separators. Splitting on `&` alone let a `;`-joined tail ride
     // through on the back of an allowed key —
     // `?sslmode=require;password=hunter2` was one pair whose key was
     // `sslmode`. `;` is what an operator pastes in from a JDBC-style string.
     for pair in query.split(['&', ';']) {
-        let key = pair.split_once('=').map_or(pair, |(key, _)| key).trim();
-        if allowed.iter().any(|a| key.eq_ignore_ascii_case(a)) {
-            kept.push(pair);
-        } else {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if !allowed.iter().any(|a| key.trim().eq_ignore_ascii_case(a)) {
             dropped = true;
+        } else if is_safe_value(key, value) {
+            kept.push(pair.to_owned());
+        } else {
+            kept.push(format!("{key}=****"));
         }
     }
     if dropped {
-        kept.push("****");
+        kept.push("****".to_owned());
     }
     kept.join("&")
+}
+
+/// Whether an allowlisted query value is safe to echo. `hostaddr` takes only
+/// numeric addresses, so each of its items must parse as one. `host` may also
+/// hold an address. Any other key needs a simple token.
+fn is_safe_value(key: &str, value: &str) -> bool {
+    let key = key.trim();
+    if key.eq_ignore_ascii_case("hostaddr") {
+        return value.split(',').all(|item| parse_ip(item).is_some());
+    }
+    is_simple_token(value) || (key.eq_ignore_ascii_case("host") && is_host_token(value))
+}
+
+/// Parse one address, with or without IPv6 brackets.
+fn parse_ip(item: &str) -> Option<std::net::IpAddr> {
+    item.strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(item)
+        .parse()
+        .ok()
+}
+
+/// A host value may also hold IP addresses (`::1`, `[::1]`, `10.0.0.1`). Each
+/// comma-separated item must then parse as one, so `token:hunter2` does not
+/// pass.
+fn is_host_token(value: &str) -> bool {
+    value
+        .split(',')
+        .all(|item| parse_ip(item).is_some() || is_simple_token(item))
+}
+
+/// Whether a query value is a simple token that is safe to echo.
+///
+/// The default is to mask. A value with `@`, `:`, `%`, whitespace or a quote
+/// can hold a nested target or an encoded one, so it does not pass. Paths
+/// (`/var/run/postgresql`) and host lists (`db1,db2`) pass.
+fn is_simple_token(value: &str) -> bool {
+    value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~' | ',' | '/' | '+'))
 }
 
 /// Re-render one allowlisted keyword/value pair's value.
@@ -280,6 +379,97 @@ fn identifying_value(value: &str) -> String {
         return format!("'{value}'");
     }
     value.to_owned()
+}
+
+/// Redact a driver error about the target `url`.
+///
+/// libpq can quote ONE decoded part of the target, not the whole target
+/// (`invalid percent-encoded token: "p%ss"`), and a scheme scan finds nothing
+/// in that. This redactor knows the target, so it does three things:
+///
+/// 1. It masks each password from `url` first, so a quote inside a password
+///    cannot split it before step 2.
+/// 2. It masks a quoted span that is not part of the [`redact_target`] form of
+///    `url`.
+/// 3. It runs [`redact_targets_in_message`].
+pub fn redact_driver_error(msg: &str, url: &str) -> String {
+    let safe = redact_target(url);
+    let mut masked = msg.to_owned();
+    for secret in &secrets_in(url) {
+        masked = masked.replace(secret.as_str(), "****");
+    }
+    let mut out = String::with_capacity(masked.len());
+    let mut rest = masked.as_str();
+    while let Some(open) = rest.find('"') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('"') else {
+            break;
+        };
+        let span = &after[..close];
+        out.push_str(&rest[..=open]);
+        if span.is_empty() || safe.contains(span) {
+            out.push_str(span);
+        } else {
+            out.push_str("****");
+        }
+        out.push('"');
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    redact_targets_in_message(&out)
+}
+
+/// The passwords in a target, raw and percent-decoded, longest first: the
+/// userinfo password of a URL, and each `password` / `sslpassword` value of a
+/// query or of a keyword/value string.
+///
+/// Read by string surgery, not by `Url::parse`: a target that libpq rejects
+/// can be one that `Url::parse` rejects too.
+fn secrets_in(url: &str) -> Vec<String> {
+    let mut raw: Vec<String> = Vec::new();
+    if let Some((_, rest)) = url.split_once("://") {
+        if let Some((userinfo, _)) = rest.rsplit_once('@')
+            && let Some((_, password)) = userinfo.split_once(':')
+        {
+            raw.push(password.to_owned());
+        }
+        if let Some((_, query)) = rest.split_once('?') {
+            for pair in query.split(['&', ';']) {
+                if let Some((key, value)) = pair.split_once('=')
+                    && is_password_key(key)
+                {
+                    raw.push(value.to_owned());
+                }
+            }
+        }
+    } else if let Some(pairs) = crate::pg_conn_str::keyword_value_pairs(url) {
+        raw.extend(
+            pairs
+                .into_iter()
+                .filter(|(key, _)| is_password_key(key))
+                .map(|(_, value)| value),
+        );
+    }
+    let mut secrets = Vec::new();
+    for secret in raw.into_iter().filter(|secret| !secret.is_empty()) {
+        let decoded = percent_encoding::percent_decode_str(&secret)
+            .decode_utf8_lossy()
+            .into_owned();
+        if decoded != secret && !decoded.is_empty() {
+            secrets.push(decoded);
+        }
+        secrets.push(secret);
+    }
+    // Longest first: a short secret inside a longer one must not cut the longer
+    // one before its turn.
+    secrets.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    secrets.dedup();
+    secrets
+}
+
+fn is_password_key(key: &str) -> bool {
+    let key = key.trim();
+    key.eq_ignore_ascii_case("password") || key.eq_ignore_ascii_case("sslpassword")
 }
 
 /// Redact every database target embedded in a free-text message.
@@ -550,6 +740,166 @@ mod tests {
             redact_target("host=db user='app x' password=hunter2"),
             "host=db user='app x' ****"
         );
+    }
+
+    // An opaque URL parses, but the parser reports no password, query or
+    // fragment. Key/value material in it is masked (#2571 item 1).
+    #[test]
+    fn an_opaque_url_keeps_only_its_scheme() {
+        assert_eq!(redact_target("postgres:password=hunter2"), "postgres:****");
+        assert_eq!(
+            redact_target("postgresql:host=db password=hunter2"),
+            "postgresql:****"
+        );
+        assert_eq!(redact_target("postgres:app:hunter2"), "postgres:****");
+        assert_eq!(redact_target("mysql:pass%77ord"), "mysql:****");
+        // One path-shaped token stays, as a bare path does.
+        assert_eq!(redact_target("mysql:app.db"), "mysql:app.db");
+        // A Windows drive letter parses as a one-letter scheme. It is a path.
+        assert_eq!(redact_target(r"C:\data\app.db"), r"C:\data\app.db");
+    }
+
+    // An allowlisted key does not make its value safe. A value that is not a
+    // simple token is masked (#2571 item 4).
+    #[test]
+    fn an_allowlisted_query_value_must_be_a_simple_token() {
+        assert_eq!(
+            redact_target("postgres://db/app?application_name=postgres://app:hunter2@other/db"),
+            "postgres://db/app?application_name=****"
+        );
+        assert_eq!(
+            redact_target("postgres://db/app?sslmode=require&application_name=app:hunter2@other"),
+            "postgres://db/app?sslmode=require&application_name=****"
+        );
+        // Simple tokens stay legible: paths, lists, numbers.
+        assert_eq!(
+            redact_target(
+                "postgres://db/app?host=/var/run/postgresql&sslrootcert=/etc/ssl/root.crt"
+            ),
+            "postgres://db/app?host=/var/run/postgresql&sslrootcert=/etc/ssl/root.crt"
+        );
+        // The SQLite arm: no credential comes out, and a plain value stays.
+        let out = redact_target("sqlite://file:app.db?mode=ro&vfs=postgres://app:hunter2@other/db");
+        assert!(!out.contains("hunter2"), "leaked: {out}");
+        assert_eq!(
+            redact_target("file:app.db?mode=ro&vfs=unix dotfile"),
+            "file:app.db?mode=ro&vfs=****"
+        );
+    }
+
+    // libpq can quote ONE decoded part of a target, not the whole target,
+    // so a scheme scan finds nothing. The redactor that knows the target
+    // masks it (#2539 review).
+    #[test]
+    fn a_driver_error_does_not_echo_a_part_of_the_target() {
+        let url = "postgres://app:p%ss@localhost:1/db";
+        let out = redact_driver_error(r#"invalid percent-encoded token: "p%ss""#, url);
+        assert_eq!(out, r#"invalid percent-encoded token: "****""#);
+
+        let url = "postgres://app:hun ter2@[::1/db";
+        let out = redact_driver_error(
+            r#"unexpected spaces found in "hun ter2", use percent-encoded spaces (%20) instead"#,
+            url,
+        );
+        assert!(!out.contains("ter2"), "{out}");
+        // libpq 16 quotes the whole target, which holds a space.
+        let out = redact_driver_error(r#"invalid URI: "postgres://app:hun ter2@[::1/db""#, url);
+        assert!(!out.contains("ter2"), "{out}");
+
+        // A keyword/value password is masked wherever it shows.
+        let out = redact_driver_error("failed near hunter2", "host=db password=hunter2");
+        assert!(!out.contains("hunter2"), "{out}");
+
+        // A quote inside the password must not split it before it is masked.
+        let url = r#"postgres://app:p"secret@host/db"#;
+        let out = redact_driver_error(r#"invalid: "postgres://app:p"secret@host/db""#, url);
+        assert!(!out.contains("secret"), "{out}");
+
+        // One secret inside another: the longer one is masked first.
+        let out = redact_driver_error(
+            "failed near hunter2a",
+            "host=db password=a sslpassword=hunter2a",
+        );
+        assert!(!out.contains("hunter2"), "{out}");
+
+        // A quoted part of the redacted target stays legible.
+        assert_eq!(
+            redact_driver_error(
+                r#"could not translate host name "db" to address"#,
+                "postgres://app:pw@db/app"
+            ),
+            r#"could not translate host name "db" to address"#
+        );
+    }
+
+    // JDBC-style `;k=v` material in a host or a path is not understood.
+    #[test]
+    fn key_value_material_in_a_host_or_path_is_masked() {
+        assert_eq!(
+            redact_target("postgres://db;password=hunter2/app"),
+            "postgres://****"
+        );
+        assert_eq!(
+            redact_target("postgres://host/db;password=hunter2"),
+            "postgres://****"
+        );
+        let refusal = require_postgres_target("mysql://host/db;password=hunter2", "Store")
+            .expect_err("not Postgres");
+        assert!(!refusal.contains("hunter2"), "{refusal}");
+    }
+
+    // A one-letter scheme is a drive letter. It gets the bare-path test.
+    #[test]
+    fn a_one_letter_scheme_gets_the_bare_path_test() {
+        assert_eq!(redact_target("x:password=hunter2"), "****");
+        assert_eq!(redact_target(r"C:\data\pw=hunter2.db"), "****");
+        assert_eq!(redact_target(r"C:\data\app.db"), r"C:\data\app.db");
+        // A fragment is never a path.
+        assert_eq!(redact_target("x:app#hunter2"), "****");
+        assert_eq!(redact_target("/var/lib/app.db#hunter2"), "****");
+    }
+
+    #[test]
+    fn an_ipv6_host_value_stays_legible() {
+        assert_eq!(
+            redact_target("postgres://db/app?host=[::1]&hostaddr=::1"),
+            "postgres://db/app?host=[::1]&hostaddr=::1"
+        );
+        // Only on the host keys.
+        assert_eq!(
+            redact_target("postgres://db/app?application_name=a:b"),
+            "postgres://db/app?application_name=****"
+        );
+        // Only a real IP address may hold `:`.
+        assert_eq!(
+            redact_target("postgres://db/app?hostaddr=token:hunter2"),
+            "postgres://db/app?hostaddr=****"
+        );
+        assert_eq!(
+            redact_target("postgres://db/app?host=db1:x,[::1]"),
+            "postgres://db/app?host=****"
+        );
+        assert_eq!(
+            redact_target("postgres://db/app?host=[::1],10.0.0.1"),
+            "postgres://db/app?host=[::1],10.0.0.1"
+        );
+        // `hostaddr` takes only numeric addresses, so each item must be one.
+        assert_eq!(
+            redact_target("postgres://db/app?hostaddr=hunter2"),
+            "postgres://db/app?hostaddr=****"
+        );
+        assert_eq!(
+            redact_target("postgres://db/app?hostaddr=10.0.0.1,::1"),
+            "postgres://db/app?hostaddr=10.0.0.1,::1"
+        );
+    }
+
+    // An empty conninfo means "libpq defaults from the PG* environment".
+    #[test]
+    fn an_empty_conninfo_is_a_postgres_target_for_the_stores() {
+        assert!(require_postgres_target("", "Store").is_ok());
+        assert!(require_postgres_target("  ", "Store").is_ok());
+        assert!(require_postgres_target("sqlite::memory:", "Store").is_err());
     }
 
     #[test]

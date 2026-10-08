@@ -697,6 +697,11 @@ const MIN_SCHEDULER_LEASE_TTL: Duration = Duration::from_secs(1);
 /// tick after `scheduler.lease_ttl_secs` instead of wedging the task. Set the
 /// TTL above the longest a tick body can take. See
 /// `docs/guide/scheduled-multi-replica.md`.
+///
+/// Each process stamps and reaps leases with its own clock. On one host the
+/// processes share a clock. If their clocks can differ, keep the difference
+/// below the TTL: a process with a fast clock reaps a live lease early, and a
+/// second process then runs the tick again (found by the sim sweep, #3067).
 #[cfg(feature = "sqlite")]
 #[derive(Clone)]
 pub struct SqliteLeaseSchedulerCoordinator {

@@ -45,7 +45,12 @@ use crate::routes;
 /// `[server.tls.client_auth]`. Purely additive — every v3 dimension keeps its
 /// shape, and a v3 document reads as "no route requires mTLS" rather than
 /// failing the differ.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 4;
+///
+/// v5 (#2472) adds the top-level `build`: the Cargo profile and features the
+/// audited binary was built with. Two builds can mount different routes, so
+/// the reader must know which build the manifest describes. A document
+/// without `build` came from a dev build with default features.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 5;
 
 /// Options controlling `autumn routes audit`.
 pub struct AuditOptions<'a> {
@@ -59,6 +64,12 @@ pub struct AuditOptions<'a> {
     /// Reserved: tighten the gate in future revisions. The default posture
     /// (fail on any unclassified route) already applies without it.
     pub strict: bool,
+    /// Cargo features the audited binary is built with. A route behind a
+    /// feature the build does not enable is not in the manifest.
+    pub features: routes::CargoFeatures,
+    /// Cargo profile the audited binary is built with. A route behind
+    /// `#[cfg(not(debug_assertions))]` is only in a release build.
+    pub profile: routes::CargoProfile,
 }
 
 /// A single route as read back from the app's dumped route listing.
@@ -128,14 +139,74 @@ pub enum Provenance {
     RuntimeOnly,
 }
 
-/// Top-level security manifest (schema v4).
+/// Top-level security manifest (schema v5).
 #[derive(Debug, Serialize)]
 pub struct Manifest {
     pub schema_version: u32,
+    /// The Cargo build this manifest describes.
+    pub build: BuildConfig,
     pub dimensions: Dimensions,
     /// Dimensions deliberately not yet emitted, with the provenance class they
     /// will eventually carry and why they are excluded from this build.
     pub excluded: Vec<ExcludedDimension>,
+}
+
+/// The Cargo build a manifest describes (schema v5, #2472).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BuildConfig {
+    /// Cargo profile name: `dev`, `release`, or a custom profile.
+    pub profile: String,
+    /// The `--features` values, split, sorted and deduplicated.
+    pub features: Vec<String>,
+    /// `--all-features`.
+    pub all_features: bool,
+    /// `--no-default-features`.
+    pub no_default_features: bool,
+}
+
+impl Default for BuildConfig {
+    /// A plain `cargo build`: the dev profile with default features.
+    fn default() -> Self {
+        Self {
+            profile: "dev".to_owned(),
+            features: Vec::new(),
+            all_features: false,
+            no_default_features: false,
+        }
+    }
+}
+
+impl BuildConfig {
+    /// The build that these Cargo flags select.
+    #[must_use]
+    pub fn new(features: &routes::CargoFeatures, profile: &routes::CargoProfile) -> Self {
+        let profile = if profile.release {
+            "release".to_owned()
+        } else {
+            profile.profile.clone().unwrap_or_else(|| "dev".to_owned())
+        };
+        Self {
+            profile,
+            features: normalize_features(&features.features),
+            all_features: features.all,
+            no_default_features: features.no_default,
+        }
+    }
+}
+
+/// Split Cargo `--features` values on commas and spaces, then sort and
+/// deduplicate them. Cargo reads `a,b` and `b a` as the same set.
+#[must_use]
+pub fn normalize_features(values: &[String]) -> Vec<String> {
+    let mut features: Vec<String> = values
+        .iter()
+        .flat_map(|v| v.split([',', ' ']))
+        .filter(|f| !f.is_empty())
+        .map(str::to_owned)
+        .collect();
+    features.sort();
+    features.dedup();
+    features
 }
 
 /// Manifest dimensions. Order is fixed (`routes`, then `csrf`, then
@@ -691,6 +762,7 @@ pub fn build_manifest(routes: &[AuditRoute], security: Option<&SecurityDump>) ->
 
     Manifest {
         schema_version: MANIFEST_SCHEMA_VERSION,
+        build: BuildConfig::default(),
         dimensions: Dimensions {
             routes: routes_dim,
             csrf,
@@ -700,6 +772,28 @@ pub fn build_manifest(routes: &[AuditRoute], security: Option<&SecurityDump>) ->
         },
         excluded: excluded_dimensions(),
     }
+}
+
+/// The manifest for one audit run: the dumped routes plus the build that made
+/// them.
+///
+/// # Errors
+///
+/// Returns the reason when `routes posture` would refuse the manifest, for
+/// example a route listed twice. The audit then fails, and does not write a
+/// file the gate cannot read.
+pub fn audited_manifest(
+    routes: &[AuditRoute],
+    security: Option<&SecurityDump>,
+    build: BuildConfig,
+) -> Result<Manifest, String> {
+    let manifest = Manifest {
+        build,
+        ..build_manifest(routes, security)
+    };
+    crate::posture::model::PostureManifest::parse(&manifest_json(&manifest), "the manifest")
+        .map_err(|e| e.to_string())?;
+    Ok(manifest)
 }
 
 /// Parse the security-config marker line ([`SECURITY_CONFIG_MARKER`]) from the
@@ -829,8 +923,15 @@ pub fn format_summary(routes: &[AuditRoute]) -> String {
 /// Run `autumn routes audit`.
 pub fn run(opts: &AuditOptions<'_>) {
     eprintln!("\u{1F342} autumn routes audit\n");
-    routes::compile_binary(opts.package, opts.bin);
-    let binary = routes::find_binary(opts.package, opts.bin);
+    // Name a non-default build, so the reader knows which build the
+    // manifest describes.
+    if !opts.features.is_default() || !opts.profile.is_default() {
+        let mut build_flags = opts.features.to_args();
+        build_flags.extend(opts.profile.to_args());
+        eprintln!("Building with {}\n", build_flags.join(" "));
+    }
+    routes::compile_binary_with(opts.package, opts.bin, &opts.features, &opts.profile);
+    let binary = routes::find_binary_in_profile(opts.package, opts.bin, &opts.profile);
 
     // Capture stderr (rather than inheriting it) so we can detect the app's
     // omitted-routes marker; forward it verbatim afterwards so warnings stay
@@ -876,7 +977,11 @@ pub fn run(opts: &AuditOptions<'_>) {
         std::process::exit(1);
     });
 
-    let manifest = build_manifest(&routes, security.as_ref());
+    let build = BuildConfig::new(&opts.features, &opts.profile);
+    let manifest = audited_manifest(&routes, security.as_ref(), build).unwrap_or_else(|e| {
+        eprintln!("\u{2717} {e}");
+        std::process::exit(1);
+    });
     let json = manifest_json(&manifest);
 
     if let Some(path) = opts.manifest {
@@ -1047,7 +1152,7 @@ mod tests {
         assert_eq!(manifest.dimensions.routes.entries[0].provenance, "provable");
 
         let json: serde_json::Value = serde_json::from_str(&manifest_json(&manifest)).unwrap();
-        assert_eq!(json["schema_version"], 4);
+        assert_eq!(json["schema_version"], 5);
         let entry = &json["dimensions"]["routes"]["entries"][0];
         for key in [
             "path",
@@ -1147,7 +1252,7 @@ mod tests {
         let sec = security_dump(true, &[]);
         let json = manifest_value(&build_manifest(&routes, Some(&sec)));
 
-        assert_eq!(json["schema_version"], 4);
+        assert_eq!(json["schema_version"], 5);
         assert_eq!(json["dimensions"]["routes"]["provenance"], "provable");
         assert_eq!(
             json["dimensions"]["routes"]["source"],
@@ -2014,6 +2119,89 @@ mod tests {
                 .iter()
                 .any(|p| p == "/_autumn/unsubscribe"),
             "dimension exempt_paths must record the unsubscribe path"
+        );
+    }
+
+    // ── build record (schema v5, #2472) ─────────────────────────────────────
+
+    #[test]
+    fn manifest_records_the_default_build() {
+        let m = build_manifest(&[route("GET", "/a", "a", "public")], None);
+        let v = manifest_value(&m);
+        assert_eq!(v["schema_version"], 5);
+        assert_eq!(
+            v["build"],
+            serde_json::json!({
+                "profile": "dev",
+                "features": [],
+                "all_features": false,
+                "no_default_features": false,
+            })
+        );
+        // A reader sees which build it is before the dimensions.
+        let json = manifest_json(&m);
+        assert!(
+            json.find("\"build\"") < json.find("\"dimensions\""),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn audited_manifest_records_the_requested_build() {
+        let build = BuildConfig::new(
+            &routes::CargoFeatures::default(),
+            &routes::CargoProfile::from_release(true),
+        );
+        let m = audited_manifest(&[route("GET", "/a", "a", "public")], None, build)
+            .expect("a valid manifest");
+        assert_eq!(manifest_value(&m)["build"]["profile"], "release");
+    }
+
+    /// The audit checks its manifest with the reader, so it never writes a
+    /// file that `routes posture` refuses.
+    #[test]
+    fn audited_manifest_refuses_a_route_listed_twice() {
+        let twice = [
+            route("GET", "/health", "mine", "public"),
+            route("GET", "/health", "health", "framework"),
+        ];
+        let err = audited_manifest(&twice, None, BuildConfig::default())
+            .expect_err("a duplicate route must fail the audit");
+        assert!(err.contains("more than once"), "{err}");
+    }
+
+    #[test]
+    fn build_config_names_the_cargo_build() {
+        let features = routes::CargoFeatures {
+            features: vec!["embed-assets,b".to_owned(), "a  b".to_owned()],
+            all: true,
+            no_default: true,
+        };
+        let build = BuildConfig::new(&features, &routes::CargoProfile::from_release(true));
+        assert_eq!(build.profile, "release");
+        // Split, sorted and deduplicated: Cargo reads `a,b` and `a b` alike.
+        assert_eq!(build.features, ["a", "b", "embed-assets"]);
+        assert!(build.all_features && build.no_default_features);
+
+        let named = |name: &str| {
+            BuildConfig::new(
+                &routes::CargoFeatures::default(),
+                &routes::CargoProfile {
+                    release: false,
+                    profile: Some(name.to_owned()),
+                },
+            )
+            .profile
+        };
+        assert_eq!(named("dist"), "dist");
+        assert_eq!(named("release"), "release");
+        assert_eq!(named("dev"), "dev");
+        assert_eq!(
+            BuildConfig::new(
+                &routes::CargoFeatures::default(),
+                &routes::CargoProfile::default()
+            ),
+            BuildConfig::default()
         );
     }
 

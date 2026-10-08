@@ -144,6 +144,49 @@ Every breaking change carries this label — `scripts/check-migration-guides.sh`
 fails without it, and fails an `auto`/`review` label that names no shipped
 codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
+### Jobs: `JobInfo` has a new `timeout` field
+
+**Why:** A job can now set the longest time one run may take (issue #3051).
+`JobInfo` carries it as `timeout: Option<Duration>`.
+
+**Before (`0.8`):**
+
+```rust
+let info = JobInfo {
+    name: "export".to_string(),
+    max_attempts: 3,
+    initial_backoff_ms: 250,
+    queue: "default".to_string(),
+    uniqueness: None,
+    concurrency: None,
+    version: 1,
+    handler: export_handler,
+};
+```
+
+**After (`0.9`):**
+
+```rust
+let info = JobInfo {
+    name: "export".to_string(),
+    max_attempts: 3,
+    initial_backoff_ms: 250,
+    queue: "default".to_string(),
+    uniqueness: None,
+    concurrency: None,
+    version: 1,
+    timeout: None, // or Some(Duration::from_secs(30))
+    handler: export_handler,
+};
+```
+
+Code that uses `#[job]` or `JobInfo::new` does not change. `JobConfig` also
+has a new `default_timeout_ms` field: see the struct-literal note in the next
+section.
+
+**Automation:** `manual` — add `timeout: None` to each hand-written `JobInfo`
+literal. `#[job]` and `JobInfo::new` set it.
+
 ### Config: `AutumnConfig` gains a `cost` field
 
 **Why:** Per-request cost records and cost-aware deferral (issue #1720) need
@@ -180,6 +223,56 @@ app that does not set `[cost]` behaves as before. `CostConfig` is
 **Automation:** `manual` — a codemod cannot know which fields a struct literal
 means to leave at their defaults.
 
+### Admission: `Route`, `ServerConfig` and `HttpClientConfig` have new fields
+
+**Why:** Adaptive admission control (issue #3068) adds a route criticality,
+`[server.admission]` and `[http.client.adaptive_throttle]`. These structs have
+public fields and are not `#[non_exhaustive]`, so a struct literal does not
+compile. The route macros set `criticality` for you.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+let route = autumn_web::Route {
+    // …
+    timeout: autumn_web::RouteTimeout::Inherit,
+    seo: Default::default(),
+};
+let client = autumn_web::config::HttpClientConfig {
+    timeout_secs: 10,
+    max_retries: 1,
+    max_retry_after_secs: 10,
+    max_backoff_ms: 20_000,
+    base_urls: Default::default(),
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+let route = autumn_web::Route {
+    // …
+    timeout: autumn_web::RouteTimeout::Inherit,
+    criticality: autumn_web::Criticality::Default,
+    seo: Default::default(),
+};
+let client = autumn_web::config::HttpClientConfig {
+    timeout_secs: 10,
+    max_retries: 1,
+    ..Default::default()
+};
+```
+
+The new fields are `Route::criticality`, `ServerConfig::admission` and
+`HttpClientConfig::adaptive_throttle`. Their defaults change nothing: static
+admission, no throttle, and `default` criticality.
+
+`capsule::schema::HttpErrorKind` (feature `reporting`) has a new variant,
+`ThrottledLocally`. An exhaustive `match` on it needs a new arm.
+
+**Automation:** `manual` — add the field, or use `..Default::default()` where
+the struct has a default.
+
 ### HTTP client: `retries(n)` no longer retries `POST` and `PATCH`
 
 **Why:** `.retries(n)` also turned on retries for non-idempotent methods. A
@@ -202,8 +295,9 @@ client.post(url).retries(2).retry_non_idempotent().send().await?;
 ```
 
 If you build a `RetryPolicy`, `HttpClientConfig` or `JobConfig` with a
-struct literal, add the new field (`max_backoff`, `max_backoff_ms`), or end
-the literal with `..Default::default()`.
+struct literal, add the new fields (`max_backoff`, `max_backoff_ms`, and on
+`JobConfig` also `default_timeout_ms`), or end the literal with
+`..Default::default()`.
 
 **Automation:** `manual` — the fix adds a call only where you want `POST` or
 `PATCH` retried. A codemod cannot know which calls are safe to repeat.
@@ -249,6 +343,213 @@ Three behaviour changes come with it:
 **Automation:** `manual` - it is a database privilege change, and no code
 rewrite applies.
 
+### Query budgets: an associated function handed the handle is reported (#2316)
+
+**Why:** `Post::published(&mut db)` and `ReportBuilder::build(&mut db)` have
+the same shape, so the analysis cannot tell a one-query finder from a helper
+that loops. It counted both as 1 query, and a helper could hide an N+1.
+
+This affects you only if a `#[query_budget(N)]` function gives a database or
+repository handle to `Type::f(…)`. The build fails with "`f` is handed the
+database handle". Put `#[query_cost(N)]` on the statement. An awaited
+constructor of a handle type (`PgPostRepository::new(&mut db).await`) is
+reported the same way.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[query_budget(1)]
+async fn index(mut db: Db) -> AutumnResult<Markup> {
+    let posts = Post::published(&mut db).await?;
+    Ok(render(&posts))
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+#[query_budget(1)]
+async fn index(mut db: Db) -> AutumnResult<Markup> {
+    #[query_cost(1)]
+    let posts = Post::published(&mut db).await?;
+    Ok(render(&posts))
+}
+```
+
+**Automation:** `manual` — the cost of each helper is a fact only its author
+knows, so no codemod can write the `N` in `#[query_cost(N)]`.
+
+### Query budgets: a method that borrows a container of handles is reported (#2316)
+
+**Why:** Rust looks for a `self` method before a `&self` method, and for a
+`&self` method before a `&mut self` method. So an application trait method
+`len(self)` on `Vec<PgPostRepository>` runs in place of `Vec::len`, and it
+can query. The analysis has no type information to rule that out.
+
+This affects you only if a `#[query_budget(N)]` function calls a method that
+borrows a `Vec`, `Option`, `Result`, map or set of a handle type
+(`repos.len()`, `repos.push(repo)`, `repos.iter()`, `maybe.as_ref()`). The
+build fails with "`len` is called on a container of database handles". Read
+the container with an index, a pattern, a `for` loop or a method that takes
+`self`, or put `#[query_cost(N)]` on the statement.
+
+**Before (`{X.Y}`):**
+
+```rust
+#[query_budget(1)]
+async fn first(repos: Vec<PgPostRepository>) -> AutumnResult<usize> {
+    let n = repos.len();
+    let Some(repo) = repos.first() else { return Ok(0) };
+    Ok(n + repo.find_all().await?.len())
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+#[query_budget(1)]
+async fn first(repos: Vec<PgPostRepository>) -> AutumnResult<usize> {
+    #[query_cost(0)]
+    let n: usize = repos.len();
+    let [repo, ..] = &repos[..] else { return Ok(0) };
+    Ok(n + repo.find_all().await?.len())
+}
+```
+
+What a borrowing method gives may hold handles, so give its binding a type
+made only of standard and primitive types (`let n: usize`). Without it, a
+later use of `n` is reported too.
+
+**Automation:** `manual` — the fix depends on what the call reads, and no
+codemod can choose between an index, a pattern and `#[query_cost(N)]`.
+
+---
+
+### Config: the `prod` profile enables `strict_config` and new protections
+
+**Why:** The `prod` profile shipped with its protections off. A misspelled
+timeout key took the default in silence. A slow database caused readiness to
+flap across the fleet, instead of an early `503` (issue #3057).
+
+**Before (`{X.Y}`):** with `AUTUMN_PROFILE=prod`, this booted, and
+`statement_timeout` stayed unset:
+
+```toml
+[database]
+statment_timeout = "5s"   # misspelled
+```
+
+**After (`{(X+1).0}`):** the same file stops the boot with "Strict config
+check failed. Unknown keys in configuration". Correct the key, or turn the
+check off:
+
+```toml
+[server]
+strict_config = false     # or AUTUMN_SERVER__STRICT_CONFIG=false
+```
+
+The `prod` profile also changes these defaults. Each has a one-line opt-out:
+
+| Default in `prod` | Opt-out |
+| --- | --- |
+| Load shedding at primary pool size × 32, at least 256 | `server.max_concurrent_requests = 0` |
+| `database.statement_timeout = "30s"` | `statement_timeout = "0s"` |
+| `database.idle_in_transaction_timeout = "60s"` | `idle_in_transaction_timeout = "0s"` |
+
+Every profile also gets a migration `lock_timeout` of `5s` with `5` jittered
+retries, in each transactional migration. Opt out with
+`database.migration_lock_timeout = "0s"`. The `autumn migrate` CLI passes the
+timeout to `diesel` in `PGOPTIONS`. Run migrations against Postgres directly,
+not through a transaction pooler.
+
+A long report query that runs inside a request now stops at `30s`. Give that
+route a `StatementTimeout` extension, or raise the global value.
+
+**Automation:** `manual` — this is a configuration and behaviour change, and no
+code rewrite applies.
+
+### Capacity: `AdmissionLimit` is `#[non_exhaustive]` and has a new variant
+
+**Why:** The `prod` profile default ceiling needs its own source
+(`AdmissionLimit::ProfileDefault`, issue #3057).
+
+**Before (`{X.Y}`):**
+
+```rust
+match limit {
+    AdmissionLimit::Configured(n) | AdmissionLimit::Contract(n) => Some(n),
+    AdmissionLimit::Unlimited => None,
+}
+```
+
+**After (`{(X+1).0}`):** use `limit.limit()`, or add a wildcard arm:
+
+```rust
+let ceiling: Option<usize> = limit.limit();
+```
+
+**Automation:** `manual` — a new enum variant needs a new match arm, and no
+safe rewrite can choose its body.
+### Config: `HealthConfig` gains four public fields
+
+**Why:** `/ready` now pings the primary database. The new fields set the
+ping cache, the ping time limit, and which pings gate `/ready` (issue #3059).
+
+**Before (`{X.Y}`):** a struct literal listed every field.
+
+```rust
+let health = autumn_web::config::HealthConfig {
+    enabled: true,
+    path: "/health".into(),
+    live_path: "/live".into(),
+    ready_path: "/ready".into(),
+    startup_path: "/startup".into(),
+    detailed: false,
+};
+```
+
+**After (`{(X+1).0}`):** add `..HealthConfig::default()`. It sets
+`cache_ttl_ms = 1000`, `ping_timeout_ms = 2000`, `db_readiness = true` and
+`redis_readiness = false`.
+
+```rust
+let health = autumn_web::config::HealthConfig {
+    detailed: false,
+    ..autumn_web::config::HealthConfig::default()
+};
+```
+
+**Automation:** `manual` - the fix adds a struct update expression, and no
+codemod rewrites struct literals.
+
+### Probes: `/ready` pings the primary database
+
+**Why:** pool saturation made a busy replica unready, and an idle pool made a
+dead database look ready (issue #3059).
+
+**Before (`{X.Y}`):** `/ready`, `/health` and the `db` component of
+`/actuator/health` failed when the pool had no free connection and a request
+waited. They did not connect to the primary.
+
+**After (`{(X+1).0}`):** they send `SELECT 1` to the primary on one dedicated
+connection. A failed ping, or one slower than `health.ping_timeout_ms`, gives
+`503`. A busy pool does not. Do these checks:
+
+- Add one connection per replica to your Postgres `max_connections` budget.
+- Keep `health.ping_timeout_ms` below the probe timeout of your platform (for
+  Kubernetes, `timeoutSeconds`).
+- To keep a replica in rotation when the primary fails, set
+  `health.db_readiness = false`.
+- The generated Dockerfile `HEALTHCHECK` probes `/health`. It now fails when
+  the primary is down. ECS and Docker Swarm replace an unhealthy container. On
+  those platforms, set `AUTUMN_HEALTHCHECK_URL=http://localhost:3000/live`.
+- A test that changes a health indicator and reads `/actuator/health` again
+  in less than 1 s can read the cached result. Set `health.cache_ttl_ms = 0`
+  in the test config.
+
+**Automation:** `manual` - it is a runtime behaviour change, and no code
+rewrite applies.
+
 ### Resilience: `CircuitBreakerPolicy` and `CircuitBreakerPolicyConfig` have slow-call fields
 
 **Why:** The breaker opened on failures only. A dependency that became slow
@@ -288,6 +589,39 @@ A struct literal of `autumn_web::config::CircuitBreakerPolicyConfig` needs
 
 **Automation:** `manual` - each struct literal needs a value for the new
 fields, and the choice changes when the breaker opens.
+
+### Media: `MediaPlugin` installs only the primitives you enable
+
+**Why:** The docs said both primitives are off by default, but `build`
+installed storage, the encode jobs and the retention sweep for every plugin.
+`with_broadcast()` did nothing. Issue #1974.
+
+**Before (`{X.Y}`):**
+
+```rust
+// Storage, encode jobs and the retention sweep installed.
+autumn_web::app().plugin(MediaPlugin::new().config(media).recordings_root("recordings"))
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+// Enable the primitive you use. Broadcast also installs MediaMtxClient and MediaUrls.
+autumn_web::app().plugin(
+    MediaPlugin::new()
+        .config(media)
+        .with_broadcast()
+        .recordings_root("recordings"),
+)
+```
+
+With no primitive, the plugin installs no routes, extensions or jobs, and logs
+a warning. `extension::<MediaWorkflows>()` then returns `None`, jobs on the
+`media` queue have no handler, and the retention sweep does not start.
+
+**Automation:** `manual` — this is a runtime behavior change. The code still
+compiles, so a codemod cannot know which primitive your app uses.
+
 ### Feature flags: `PgFlagStore::get` errors before the first load
 
 **Why:** `get` connected to the database on the request thread, and a store
@@ -352,7 +686,8 @@ single most valuable section of the guide — keep it factual and short.
 |---------------------------|------------------|-----|
 | `error[E0432]: unresolved import \`autumn_web::foo\`` | module reorganized | `use autumn_web::<new path>;` |
 | `error[E0061]: this function takes 2 arguments but 1 was supplied` | `App::run` added a parameter | see [Breaking changes › {Area}] |
-| `error[E0063]: missing field \`max_backoff\`` (or `max_backoff_ms`) | a `RetryPolicy`, `HttpClientConfig` or `JobConfig` literal | add the field, or `..Default::default()` |
+| `error[E0063]: missing field \`max_backoff\`` (or `max_backoff_ms`, `default_timeout_ms`) | a `RetryPolicy`, `HttpClientConfig` or `JobConfig` literal | add the field, or `..Default::default()` |
+| `error[E0063]: missing field \`timeout\`` | a `JobInfo` literal | add `timeout: None` |
 | `error[E0061]: this function takes 6 arguments but 5 arguments were supplied` | a direct call to `autumn_web::commentable::comment_thread` (or `add_comment`, `delete_comment`, `recompute_comment_count`) | add `None` as the last argument; see [Commentable](#commentable-the-runtime-helpers-take-soft_delete-optionbool) |
 
 ## Configuration changes
@@ -367,6 +702,9 @@ If nothing changed, delete this section.
   HTTP client's retry backoff.
 - New: `[jobs] max_backoff_ms` and `AUTUMN_JOBS__MAX_BACKOFF_MS` (default
   `3600000`, 1 h). The cap on job retry backoff for every backend.
+- New: `[jobs] default_timeout_ms` and `AUTUMN_JOBS__DEFAULT_TIMEOUT_MS`
+  (default `0`, no limit). The longest one run of a job without
+  `#[job(timeout)]` may take (issue #3051).
 - **Resilience (issue #3060):** new keys `slow_call_duration_threshold_ms`
   (default `60000`, `0` turns detection off), `slow_call_rate_threshold`
   (default `1.0`) and `cancelled_call_outcome` (default `"slow"`) under
@@ -384,6 +722,15 @@ Changes that still compile but behave differently at runtime. Examples:
 
 If nothing changed, delete this section.
 
+- **Jobs: a hung handler keeps its claim (#3051).** Durable workers renew each
+  claim while the job runs. Before, a hung handler lost its claim after the
+  visibility timeout, and a second worker ran the job again. Now the claim
+  stays until the process stops. Set `#[job(timeout = "...")]` or
+  `jobs.default_timeout_ms` on a job that can hang.
+- **Jobs: Redis claim deadlines use the Redis server clock (#3051).** During a
+  rolling deploy, an old worker still compares deadlines to its own clock. An
+  old worker whose clock runs ahead of Redis can requeue a live job. Keep
+  worker clocks in sync (NTP) during the deploy.
 - Retries use full jitter (issue #3054). The delay before retry `n` is a
   random value in `[0, min(cap, base * 2^n)]`. Before, the HTTP client and the
   `postgres`, `redis` and `sqlite` job backends used the exact value

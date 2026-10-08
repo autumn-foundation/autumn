@@ -10344,6 +10344,9 @@ fn emit_crud_bodies_hooked(
 
     let timeout_route_init = quote! {
         use ::autumn_web::db::DbState as _;
+        // A route's `StatementTimeout` also bounds this request's `SET LOCAL`
+        // (#3057).
+        ::autumn_web::__private::note_route_statement_timeout(&_parts);
         // Postgres statement_timeout is a signed 32-bit integer (ms).
         const __AUTUMN_PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
         let __autumn_timeout_ms: u64 = _parts
@@ -13484,6 +13487,9 @@ fn emit_crud_bodies_plain(config: &RepoConfig, inputs: &CrudBodiesInputs<'_>) ->
 
     let timeout_route_init = quote! {
         use ::autumn_web::db::DbState as _;
+        // A route's `StatementTimeout` also bounds this request's `SET LOCAL`
+        // (#3057).
+        ::autumn_web::__private::note_route_statement_timeout(&_parts);
         // Postgres statement_timeout is a signed 32-bit integer (ms).
         const __AUTUMN_PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
         let __autumn_timeout_ms: u64 = _parts

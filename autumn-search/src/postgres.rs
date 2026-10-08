@@ -37,7 +37,7 @@ use std::sync::{OnceLock, RwLock};
 
 use autumn_web::pagination::Page;
 use autumn_web::search::{IndexDefinition, SearchDocument};
-use diesel::sql_types::{Array, BigInt, Double, Nullable, Text};
+use diesel::sql_types::{BigInt, Double, Nullable, Text};
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::deadpool::Pool;
 
@@ -598,6 +598,7 @@ impl PostgresSearchStore {
     }
 
     fn pool(&self) -> SearchResult<&RuntimePool> {
+        require_postgres_runtime()?;
         self.pool.get().ok_or_else(|| {
             SearchError::Backend(
                 "the search store has no database pool; is `database.primary_url` configured?"
@@ -1073,10 +1074,46 @@ fn bind_all(mut query: BoxedQuery<'_>, binds: impl IntoIterator<Item = Bound>) -
             Bound::NullableText(value) => query.bind::<Nullable<Text>, _>(value),
             Bound::BigInt(value) => query.bind::<BigInt, _>(value),
             Bound::Double(value) => query.bind::<Double, _>(value),
-            Bound::Ids(values) => query.bind::<Array<BigInt>, _>(values),
+            Bound::Ids(values) => bind_ids(query, values),
         };
     }
     query
+}
+
+/// Refuse every use of this store on a `SQLite` build of autumn-web.
+///
+/// The store sends Postgres SQL. An app can build it and install a `SQLite`
+/// pool without the plugin, so every trait method checks first, before any
+/// early return, and the pool accessor checks too (#2539 §5).
+#[allow(
+    clippy::unnecessary_wraps,
+    clippy::missing_const_for_fn,
+    reason = "the SQLite arm of `backend_select!` returns an error"
+)]
+fn require_postgres_runtime() -> SearchResult<()> {
+    autumn_web::backend_select! {
+        pg => { Ok(()) },
+        sqlite => {
+            Err(SearchError::Backend(
+                "PostgresSearchStore needs the Postgres backend, but this build of autumn-web \
+                 uses SQLite (`--features sqlite`)"
+                    .to_owned(),
+            ))
+        },
+    }
+}
+
+/// Bind an id list as a Postgres `BIGINT[]`.
+///
+/// `SQLite` has no array type. The store refuses every query on a `SQLite`
+/// build ([`require_postgres_runtime`]), so that arm does not run. It binds
+/// the ids as JSON text to keep the bind count correct and the crate free of
+/// panics.
+fn bind_ids(query: BoxedQuery<'_>, values: Vec<i64>) -> BoxedQuery<'_> {
+    autumn_web::backend_select! {
+        pg => { query.bind::<diesel::sql_types::Array<BigInt>, _>(values) },
+        sqlite => { query.bind::<Text, _>(serde_json::Value::from(values).to_string()) },
+    }
 }
 
 impl SearchBackend for PostgresSearchStore {
@@ -1094,6 +1131,7 @@ impl SearchBackend for PostgresSearchStore {
 
     fn write_watermark(&self) -> BoxFuture<'_, SearchResult<Option<String>>> {
         Box::pin(async move {
+            require_postgres_runtime()?;
             // The DATABASE's clock, not the process's. `updated_at` is set by
             // `NOW()` server-side, so comparing it against an app-side
             // timestamp would be at the mercy of clock skew between however
@@ -1114,7 +1152,10 @@ impl SearchBackend for PostgresSearchStore {
         documents: &'a [IndexedDocument],
         watermark: Option<&'a str>,
     ) -> BoxFuture<'a, SearchResult<()>> {
-        Box::pin(async move { self.write_documents(definition, documents, watermark).await })
+        Box::pin(async move {
+            require_postgres_runtime()?;
+            self.write_documents(definition, documents, watermark).await
+        })
     }
 
     fn ensure_index<'a>(
@@ -1122,6 +1163,7 @@ impl SearchBackend for PostgresSearchStore {
         definition: &'a IndexDefinition,
     ) -> BoxFuture<'a, SearchResult<()>> {
         Box::pin(async move {
+            require_postgres_runtime()?;
             checked(definition)?;
             let mut conn = self.conn().await?;
 
@@ -1187,7 +1229,10 @@ impl SearchBackend for PostgresSearchStore {
         definition: &'a IndexDefinition,
         documents: &'a [IndexedDocument],
     ) -> BoxFuture<'a, SearchResult<()>> {
-        Box::pin(async move { self.write_documents(definition, documents, None).await })
+        Box::pin(async move {
+            require_postgres_runtime()?;
+            self.write_documents(definition, documents, None).await
+        })
     }
 
     fn delete<'a>(
@@ -1196,6 +1241,7 @@ impl SearchBackend for PostgresSearchStore {
         ids: &'a [i64],
     ) -> BoxFuture<'a, SearchResult<()>> {
         Box::pin(async move {
+            require_postgres_runtime()?;
             checked(definition)?;
             // `IN ()` is a syntax error, so an empty slice must never reach SQL.
             if ids.is_empty() {
@@ -1266,6 +1312,7 @@ impl SearchBackend for PostgresSearchStore {
 
     fn clear<'a>(&'a self, definition: &'a IndexDefinition) -> BoxFuture<'a, SearchResult<()>> {
         Box::pin(async move {
+            require_postgres_runtime()?;
             checked(definition)?;
             let mut conn = self.conn().await?;
             // Documents and ledger in one statement, for the same reason `delete` uses
@@ -1307,6 +1354,7 @@ impl SearchBackend for PostgresSearchStore {
         query: &'a KeywordQuery,
     ) -> BoxFuture<'a, SearchResult<Page<SearchHit>>> {
         Box::pin(async move {
+            require_postgres_runtime()?;
             checked(definition)?;
             // Fail closed: a blank query and an impossible filter both return
             // an empty page having issued NO query — never a full scan.
@@ -1390,6 +1438,7 @@ impl SearchBackend for PostgresSearchStore {
         query: &'a VectorQuery,
     ) -> BoxFuture<'a, SearchResult<Vec<SearchHit>>> {
         Box::pin(async move {
+            require_postgres_runtime()?;
             checked(definition)?;
             if !definition.supports_vector_search() {
                 return Err(SearchError::VectorUnsupported {
@@ -1517,6 +1566,7 @@ impl SearchBackend for PostgresSearchStore {
         filter: &'a SearchFilter,
     ) -> BoxFuture<'a, SearchResult<Option<Vec<f32>>>> {
         Box::pin(async move {
+            require_postgres_runtime()?;
             checked(definition)?;
             // A record the filter excludes reads back as absent — this is a
             // query like any other, and the seed id is caller-supplied.
@@ -1718,6 +1768,7 @@ impl DocumentSource for PostgresSearchStore {
         ids: &'a [i64],
     ) -> BoxFuture<'a, SearchResult<Vec<SearchDocument>>> {
         Box::pin(async move {
+            require_postgres_runtime()?;
             checked(definition)?;
             if ids.is_empty() {
                 return Ok(Vec::new());
@@ -1733,6 +1784,7 @@ impl DocumentSource for PostgresSearchStore {
         limit: usize,
     ) -> BoxFuture<'a, SearchResult<Vec<SearchDocument>>> {
         Box::pin(async move {
+            require_postgres_runtime()?;
             checked(definition)?;
             self.load_documents(definition, Selection::After { after, limit })
                 .await
@@ -2004,8 +2056,41 @@ mod tests {
         SearchIndexField::new("body", 'B'),
     ];
 
+    // An app can use the store without the plugin. On a SQLite build, every
+    // query is refused before it reaches the pool (#2539 §5).
+    #[test]
+    fn the_store_needs_the_postgres_backend() {
+        let result = require_postgres_runtime();
+        autumn_web::backend_select! {
+            pg => {
+                assert!(result.is_ok(), "{result:?}");
+            },
+            sqlite => {
+                let message = result.expect_err("refused on SQLite").to_string();
+                assert!(message.contains("SQLite"), "{message}");
+            },
+        }
+    }
+
     fn definition() -> IndexDefinition {
         IndexDefinition::new("articles", "english", FIELDS, Some("body"), false)
+    }
+
+    // A short-circuit (an empty id list here) must not hide the backend
+    // mismatch on SQLite (#2539 review).
+    #[tokio::test]
+    async fn an_early_return_does_not_skip_the_backend_check() {
+        let store = PostgresSearchStore::new(None);
+        let result = store.delete(&definition(), &[]).await;
+        autumn_web::backend_select! {
+            pg => {
+                assert!(result.is_ok(), "{result:?}");
+            },
+            sqlite => {
+                let message = result.expect_err("refused on SQLite").to_string();
+                assert!(message.contains("SQLite"), "{message}");
+            },
+        }
     }
 
     fn doc(id: i64) -> IndexedDocument {
@@ -2719,10 +2804,12 @@ mod tests {
         let Err(error) = store.pool() else {
             panic!("a store with no installed pool must not report one");
         };
-        assert!(
-            error.to_string().contains("database.primary_url"),
-            "{error}"
-        );
+        // On SQLite, the backend refusal comes first (#2539 §5).
+        let expected = autumn_web::backend_select! {
+            pg => { "database.primary_url" },
+            sqlite => { "SQLite" },
+        };
+        assert!(error.to_string().contains(expected), "{error}");
         assert!(store.vector_mode().is_none());
     }
 

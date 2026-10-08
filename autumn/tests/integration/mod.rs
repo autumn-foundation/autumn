@@ -180,6 +180,7 @@ mod ingress_named_futures;
 mod inline_broadcast_prefetch;
 mod inspector_integration;
 mod isr_coordination;
+mod job_lease_heartbeat;
 mod job_recorder_integration;
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 mod job_retry_jitter_pg;
@@ -236,6 +237,8 @@ mod middleware_stack_depth;
 mod middleware_stack_order;
 #[cfg(feature = "db")]
 mod migrate_checksum_proptest;
+// Reads migrate.rs and ci.yml as text; needs no feature.
+mod migration_lock_timeout_ci_coverage;
 #[cfg(feature = "db")]
 mod model_counter_cache;
 #[cfg(feature = "db")]
@@ -254,6 +257,8 @@ mod nested_form_atomic_save;
 mod nested_form_order_example;
 mod notifications;
 mod nul_byte_input;
+#[cfg(feature = "i18n")]
+mod nul_message_i18n;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_conformance;
 #[cfg(feature = "offline-sync")]
@@ -270,6 +275,8 @@ mod offline_sync_store;
 mod openapi;
 #[cfg(feature = "openapi")]
 mod openapi_export;
+#[cfg(feature = "db")]
+mod outbox_pg;
 mod pagination;
 mod pagination_cursor_proptest;
 mod path_helpers;
@@ -322,6 +329,11 @@ mod rate_limit_tenant_scope;
 mod raw_router_escape_hatch;
 #[cfg(feature = "db")]
 mod read_your_writes_routing;
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+mod ready_db_ping;
+// Redis `PING` health indicator (#3059).
+#[cfg(feature = "redis")]
+mod redis_health_indicator;
 // ci.yml names the `--lib` Redis job-admin Docker tests by prefix filter; this
 // fails when one of them stops matching (#1186). No feature gate: it only reads
 // job.rs and ci.yml as text.
@@ -350,6 +362,8 @@ mod repository_bulk_operations;
 mod repository_commit_hooks_claim_ack_profile;
 #[cfg(feature = "db")]
 mod repository_dependent_destroy;
+#[cfg(feature = "db")]
+mod repository_nul_field;
 // Ledger findings/fix harness for the `dependent(..., on_delete = destroy)`
 // cascade's per-row loop: profiles a leaf child's reload-then-delete N+1 and
 // (after the fix) the batched `dependent_delete_all` replacement.
@@ -405,11 +419,15 @@ mod sharding_commit_hooks;
 #[cfg(feature = "db")]
 mod sharding_integration;
 mod signed_webhooks;
+mod sim_adaptive_admission;
+mod sim_admission_criticality;
 mod sim_advance_to;
 mod sim_ambient_clock;
 mod sim_ambient_modules;
 mod sim_chaos_clock_skew_monotonic;
 mod sim_circuit_breaker_slow_calls;
+#[cfg(feature = "http-client")]
+mod sim_client_throttle;
 mod sim_clock_drain;
 #[cfg(feature = "collab")]
 mod sim_collab_convergence;
@@ -482,6 +500,7 @@ mod translatable_model;
 #[cfg(feature = "i18n")]
 mod translatable_request;
 mod tx_isolation_retry_integration;
+mod tx_local_timeouts;
 #[cfg(feature = "db")]
 mod validate_merged_model;
 #[cfg(feature = "db")]

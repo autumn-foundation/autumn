@@ -83,6 +83,8 @@ pub fn app() -> AppBuilder {
         one_off_tasks: Vec::new(),
         jobs: Vec::new(),
         listeners: Vec::new(),
+        #[cfg(feature = "db")]
+        outbox_handlers: crate::outbox::OutboxHandlers::default(),
         static_metas: Vec::new(),
         exception_filters: Vec::new(),
         scoped_groups: Vec::new(),
@@ -427,6 +429,9 @@ pub struct AppBuilder {
     /// Registered event listeners; durable ones are synthesized into jobs at
     /// build time and the rest dispatch synchronously via the event registry.
     pub(crate) listeners: Vec<crate::events::ListenerInfo>,
+    /// Outbox topic handlers (issue #3062).
+    #[cfg(feature = "db")]
+    pub(crate) outbox_handlers: crate::outbox::OutboxHandlers,
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
     pub(crate) exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     pub(crate) scoped_groups: Vec<ScopedGroup>,
@@ -846,6 +851,27 @@ impl AppBuilder {
     #[must_use]
     pub fn listeners(mut self, listeners: Vec<crate::events::ListenerInfo>) -> Self {
         self.listeners.extend(listeners);
+        self
+    }
+
+    /// Set the outbox handler of `topic` (issue #3062).
+    ///
+    /// The relay calls it for each message written with
+    /// [`Outbox::write`](crate::outbox::Outbox::write) on `topic`. It runs
+    /// only when `outbox.enabled = true`. A message can arrive more than
+    /// once; drop copies with [`Inbox::seen`](crate::outbox::Inbox::seen).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `topic` is empty or starts with `autumn.` (reserved).
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn outbox_handler<F, Fut>(mut self, topic: impl Into<String>, handler: F) -> Self
+    where
+        F: Fn(AppState, crate::outbox::OutboxMessage) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = crate::AutumnResult<()>> + Send + 'static,
+    {
+        self.outbox_handlers.insert(topic, handler);
         self
     }
 
@@ -2488,7 +2514,10 @@ impl AppBuilder {
     /// use std::time::Duration;
     /// use autumn_web::feature_flags::pg::PgFlagStore;
     ///
-    /// let store = Arc::new(PgFlagStore::new(&config.database.primary_url));
+    /// // `None` when no primary target is set, or it is not Postgres.
+    /// let store = Arc::new(
+    ///     PgFlagStore::from_database_config(&config.database).expect("a Postgres target"),
+    /// );
     /// PgFlagStore::spawn_poll_listener(Arc::clone(&store), Duration::from_secs(1));
     /// autumn_web::app()
     ///     .with_flag_store(Arc::clone(&store))
@@ -2591,7 +2620,10 @@ impl AppBuilder {
     /// use std::time::Duration;
     /// use autumn_web::experiments::pg::PgExperimentStore;
     ///
-    /// let store = Arc::new(PgExperimentStore::new(&config.database.primary_url));
+    /// // `None` when no primary target is set, or it is not Postgres.
+    /// let store = Arc::new(
+    ///     PgExperimentStore::from_database_config(&config.database).expect("a Postgres target"),
+    /// );
     /// PgExperimentStore::spawn_poll_listener(Arc::clone(&store), Duration::from_secs(5));
     /// autumn_web::app()
     ///     .with_experiment_store(Arc::clone(&store))
@@ -3273,7 +3305,7 @@ impl AppBuilder {
         let name = name.into();
         // "db" is a reserved built-in component name. Allowing a custom indicator
         // under this name would produce an inconsistent response: the custom result
-        // would still gate the aggregate status while the built-in pool check owns
+        // would still gate the aggregate status while the built-in primary ping owns
         // the components.db / checks.database display. The "db:shard:" prefix is
         // reserved for the framework's per-shard indicators for the same reason.
         #[cfg(feature = "db")]
@@ -3727,6 +3759,8 @@ impl AppBuilder {
             one_off_tasks: _,
             mut jobs,
             listeners,
+            #[cfg(feature = "db")]
+            outbox_handlers,
             static_metas,
             exception_filters,
             scoped_groups,
@@ -4086,6 +4120,19 @@ impl AppBuilder {
         // (The audit itself now runs above, with the other pre-router
         // precondition, so the exporter shares both — see
         // `validate_pre_router_preconditions`.)
+
+        // Subsystems whose backend the builder installed do not use the
+        // configured Redis, so they get no Redis indicator (#3059).
+        #[cfg(feature = "redis")]
+        let mut unused_redis_subsystems: Vec<&'static str> = Vec::new();
+        #[cfg(feature = "redis")]
+        if session_store.is_some() {
+            unused_redis_subsystems.push("sessions");
+        }
+        #[cfg(all(feature = "redis", feature = "ws"))]
+        if channels_backend.is_some() {
+            unused_redis_subsystems.push("channels");
+        }
 
         // 6. Build the router (with optional static-file layer)
         let mut state = build_state(
@@ -4447,6 +4494,19 @@ impl AppBuilder {
         if let Some(handle) = mail_suppression_store {
             state.insert_extension(handle);
         }
+        // Before the mailer: with `outbox.enabled`, `deliver_later` goes
+        // through the outbox unless the app set its own queue (issue #3062).
+        #[cfg(feature = "db")]
+        {
+            crate::outbox::install(&state, &config.outbox, outbox_handlers);
+            if state.extension::<crate::outbox::OutboxRelay>().is_some()
+                && let Err(error) = crate::outbox::ensure_relay_schema(&state).await
+            {
+                tracing::error!(error = %error, "Failed to create the outbox tables");
+                exit_stop_managed_pg();
+                std::process::exit(1);
+            }
+        }
         #[cfg(feature = "mail")]
         crate::mail::install_mailer_with_factory(
             &state,
@@ -4513,6 +4573,24 @@ impl AppBuilder {
             std::process::exit(1);
         }
         finalize_event_bus(listeners, &mut jobs, &state);
+
+        // One `redis:<subsystem>` PING indicator per Redis-backed subsystem
+        // (#3059). Here, the job set is final: with no jobs, no job runtime
+        // starts, so `jobs` gets no indicator. The user indicators are already
+        // registered: if two names are the same, the user indicator stays.
+        #[cfg(feature = "redis")]
+        {
+            if jobs.is_empty() {
+                unused_redis_subsystems.push("jobs");
+            }
+            unused_redis_subsystems.extend(crate::redis_health::unused_for_role(role));
+            crate::redis_health::register_redis_health_indicators(
+                &config,
+                &state.health_indicator_registry,
+                &crate::redis_health::app_pingers(&state),
+                &unused_redis_subsystems,
+            );
+        }
 
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
@@ -5120,6 +5198,15 @@ impl AppBuilder {
                 pool,
                 server_shutdown.child_token(),
             );
+        }
+        // The outbox relay is background work too: only roles that run
+        // workers send messages (issue #3062).
+        #[cfg(feature = "db")]
+        if role.runs_workers() {
+            drop(crate::outbox::start_relay_worker(
+                state.clone(),
+                server_shutdown.child_token(),
+            ));
         }
         // Repositories built over a shard pool (`with_pool`) enqueue durable
         // commit hooks into that shard's queue table; drain each one too — again
@@ -6073,6 +6160,8 @@ impl AppBuilder {
             one_off_tasks: _,
             jobs: _,
             listeners,
+            #[cfg(feature = "db")]
+                outbox_handlers: _,
             static_metas,
             exception_filters: _,
             scoped_groups,
@@ -6403,6 +6492,7 @@ impl AppBuilder {
         install_story_registry(&state, story_gallery);
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
+        state.apply_health_config(&config.health);
 
         // Apply deferred policy and scope registrations onto the live app state,
         // as `run()` does. Static routes can carry `#[authorize]` checks or sit
@@ -7104,6 +7194,7 @@ impl AppBuilder {
 
         // Writable targets only: the control primary, then each shard primary.
         let control_url = config.database.effective_primary_url().map(str::to_owned);
+        let lock_policy = crate::migrate::MigrationLockPolicy::from_config(&config.database);
         let shard_targets: Vec<(String, String)> = config
             .database
             .shards
@@ -7202,6 +7293,7 @@ impl AppBuilder {
                             url,
                             crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
                             "control",
+                            lock_policy,
                         );
                     }
                 }
@@ -7219,6 +7311,7 @@ impl AppBuilder {
                         url,
                         crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
                         label,
+                        lock_policy,
                     );
                 }
             }
@@ -7714,6 +7807,8 @@ impl AppBuilder {
             one_off_tasks,
             mut jobs,
             listeners,
+            #[cfg(feature = "db")]
+            outbox_handlers,
             #[cfg(feature = "i18n")]
             custom_layers,
             #[cfg(not(feature = "i18n"))]
@@ -7930,6 +8025,18 @@ impl AppBuilder {
         #[cfg(feature = "mail")]
         if let Some(handle) = mail_suppression_store {
             state.insert_extension(handle);
+        }
+        // A one-off task writes to the outbox; the server relay sends it.
+        #[cfg(feature = "db")]
+        {
+            crate::outbox::install(&state, &config.outbox, outbox_handlers);
+            if state.extension::<crate::outbox::OutboxRelay>().is_some()
+                && let Err(error) = crate::outbox::ensure_relay_schema(&state).await
+            {
+                eprintln!("Failed to create the outbox tables: {error}");
+                exit_stop_managed_pg();
+                std::process::exit(1);
+            }
         }
         #[cfg(feature = "mail")]
         crate::mail::install_mailer_with_factory(
@@ -8319,6 +8426,7 @@ impl AppBuilder {
         // does not add one), and a replayed request should meet the app as a
         // warm process, not one still starting.
         state.probes = crate::probe::ProbeState::default();
+        state.apply_health_config(&config.health);
         state.insert_extension(RegisteredApiVersions(api_versions));
         #[cfg(feature = "db")]
         if let Some(interceptor) = db_interceptor {
@@ -9293,13 +9401,15 @@ pub(crate) fn start_task_scheduler_with_config(
             crate::task::Schedule::FixedDelay(delay) => {
                 let coordinator = Arc::clone(&coordinator);
                 let shutdown = shutdown.child_token();
-                tokio::spawn(async move {
+                crate::sim::spawn_app_task(&state.clone(), async move {
                     loop {
                         state.task_registry.record_next_run_at(
                             &name,
                             &format_next_task_run_after(state.clock().now(), delay),
                         );
                         tokio::select! {
+                            // Fixed branch order, so a sim replays it (#3067).
+                            biased;
                             () = shutdown.cancelled() => break,
                             () = tokio::time::sleep(delay) => {
                                 execute_fixed_delay_task(
@@ -9474,10 +9584,12 @@ async fn execute_task_result_with_optional_lease_ttl(
     tick: crate::scheduler::ScheduledTick,
     waited: bool,
 ) -> Result<u64, (u64, String)> {
-    let run = crate::scheduler::with_tick(
-        tick,
-        execute_task_result(state, handler, start, name, schedule, waited),
-    );
+    let run = execute_task_result(state, handler, start, name, schedule, waited);
+    // A scheduled task runs outside any request, so its framework
+    // transactions get the configured timeouts from here (#3057).
+    #[cfg(feature = "db")]
+    let run = crate::db::scope_background_tx_timeouts(state, run);
+    let run = crate::scheduler::with_tick(tick, run);
     let Some(lease_ttl) = lease_ttl else {
         return run.await;
     };
@@ -9851,7 +9963,7 @@ fn run_cron_scheduler(
         let state = state.clone();
         let coordinator = Arc::clone(coordinator);
         let shutdown = shutdown.child_token();
-        tokio::spawn(async move {
+        crate::sim::spawn_app_task(&state.clone(), async move {
             run_cron_task_loop(task, state, shutdown, coordinator, lease_ttl).await;
         });
     }
@@ -9910,6 +10022,8 @@ async fn run_cron_task_loop(
         );
         let sleep_for = cron_sleep_duration_until(state.clock().now(), &scheduled_at);
         tokio::select! {
+            // Fixed branch order, so a sim replays it (#3067).
+            biased;
             () = shutdown.cancelled() => break,
             () = tokio::time::sleep(sleep_for) => {
                 let woke_at = state.clock().now().with_timezone(&timezone);
@@ -9948,7 +10062,7 @@ async fn run_cron_task_loop(
                     unix_secs: u64::try_from(scheduled_at.timestamp()).unwrap_or_default(),
                     window: cron_occurrence_window(&cron, &scheduled_at),
                 };
-                tokio::spawn(execute_cron_task(
+                crate::sim::spawn_app_task(&state, execute_cron_task(
                     name.clone(),
                     state.clone(),
                     handler,
@@ -12128,11 +12242,8 @@ async fn resolve_shard_set(
                     })
                     .find(|url| crate::db::sqlite_target_is_shared_cache(url))
                     .unwrap_or_default();
-                crate::db::reject_sqlite_statement_timeout(
-                    config.database.statement_timeout,
-                    target,
-                )
-                .map_err(|e| format!("Failed to create shard pools: {e}"))?;
+                crate::db::reject_sqlite_unsupported_timeouts(&config.database, target)
+                    .map_err(|e| format!("Failed to create shard pools: {e}"))?;
             }
             crate::sharding::build_shard_set(&config.database, topologies, router)
         }
@@ -12223,7 +12334,7 @@ async fn setup_database(
             .migration_url()
             .or_else(|| config.database.effective_primary_url())
             .unwrap_or_default();
-        crate::db::reject_sqlite_statement_timeout(config.database.statement_timeout, target)
+        crate::db::reject_sqlite_unsupported_timeouts(&config.database, target)
             .map_err(|e| format!("Failed to create database pool: {e}"))?;
     }
 
@@ -12327,7 +12438,12 @@ async fn setup_database(
     #[allow(clippy::question_mark)]
     if runtime_boot
         && crate::derivation::has_derivation_descriptors()
-        && let Err(e) = start_derivation_backfill(topology.as_ref(), shards.as_ref()).await
+        && let Err(e) = start_derivation_backfill(
+            topology.as_ref(),
+            shards.as_ref(),
+            crate::db::TxTimeouts::from_config(&config.database),
+        )
+        .await
     {
         #[cfg(feature = "managed-pg")]
         crate::managed_pg::emergency_stop_async().await;
@@ -12418,10 +12534,15 @@ const BOOT_BACKFILL_BATCHES: usize = 8;
 /// spawned for a target whose reconcile failed: the sweep reads the state the
 /// reconcile writes, so sweeping after a failed reconcile would work from a
 /// stale answer.
+///
+/// `timeouts` are the app's configured transaction timeouts. This runs at
+/// boot, outside any request, so the reconcile and the backfill batches get
+/// them from here (#3057).
 #[cfg(feature = "db")]
 async fn start_derivation_backfill(
     topology: Option<&crate::db::DatabaseTopology>,
     shards: Option<&crate::sharding::ShardSet>,
+    timeouts: crate::db::TxTimeouts,
 ) -> Result<(), String> {
     // No connection needed, so a collision is caught before any data is touched.
     crate::derivation::check_registered_derivations()
@@ -12452,7 +12573,10 @@ async fn start_derivation_backfill(
                 continue;
             }
         };
-        match crate::derivation::ensure_derivations(&mut conn).await {
+        match timeouts
+            .scope(crate::derivation::ensure_derivations(&mut conn))
+            .await
+        {
             Ok(enqueued) => {
                 if !enqueued.is_empty() {
                     tracing::info!(
@@ -12473,7 +12597,7 @@ async fn start_derivation_backfill(
             }
         }
         drop(conn);
-        spawn_derivation_backfill(label, pool);
+        spawn_derivation_backfill(label, pool, timeouts);
     }
     Ok(())
 }
@@ -12487,7 +12611,11 @@ async fn start_derivation_backfill(
 /// cooperate: each batch locks the derivation's state row, so they take turns on
 /// one sweep instead of racing.
 #[cfg(feature = "db")]
-fn spawn_derivation_backfill(label: String, pool: crate::db::Pool<crate::db::RuntimeConnection>) {
+fn spawn_derivation_backfill(
+    label: String,
+    pool: crate::db::Pool<crate::db::RuntimeConnection>,
+    timeouts: crate::db::TxTimeouts,
+) {
     tokio::spawn(async move {
         let options = crate::derivation::BackfillOptions {
             max_batches: Some(BOOT_BACKFILL_BATCHES),
@@ -12508,7 +12636,10 @@ fn spawn_derivation_backfill(label: String, pool: crate::db::Pool<crate::db::Run
                     return;
                 }
             };
-            let report = match crate::derivation::run_backfill(&mut conn, &options).await {
+            let report = match timeouts
+                .scope(crate::derivation::run_backfill(&mut conn, &options))
+                .await
+            {
                 Ok(report) => report,
                 Err(error) => {
                     tracing::warn!(%error, database = %label, "derivation backfill failed");
@@ -12571,8 +12702,14 @@ fn apply_pending_or_exit(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg> + Send,
     target: &str,
+    lock_policy: crate::migrate::MigrationLockPolicy,
 ) -> usize {
-    match crate::migrate::run_pending_locked(database_url, migrations, None) {
+    match crate::migrate::run_pending_locked_with_policy(
+        database_url,
+        migrations,
+        None,
+        lock_policy,
+    ) {
         Ok(result) => result.applied.len(),
         Err(error) => {
             let reason = match error {
@@ -12580,6 +12717,9 @@ fn apply_pending_or_exit(
                     "could not connect to the database"
                 }
                 crate::migrate::MigrationError::Migration(_) => "a migration failed to apply",
+                crate::migrate::MigrationError::LockContention { .. } => {
+                    "a migration timed out on a table lock on every attempt"
+                }
                 _ => "migration error",
             };
             eprintln!("autumn migrate: {reason} (target {target})");
@@ -12937,6 +13077,7 @@ async fn run_startup_migrations(
     let profile = config.profile.clone();
     let auto_migrate = config.database.auto_migrate;
     let auto_in_prod = config.database.auto_migrate_in_production;
+    let lock_policy = crate::migrate::MigrationLockPolicy::from_config(&config.database);
     // Computed once, on the FINAL registered set (after `setup_database`'s own
     // fold added any shard-required sets), so a version collision between ANY
     // two registered sources is resolved automatically rather than causing
@@ -13001,6 +13142,7 @@ async fn run_startup_migrations(
                     auto_in_prod,
                     crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
                     "control",
+                    lock_policy,
                 );
             }
             // The shard directory table lives on the control plane only, so it
@@ -13016,6 +13158,7 @@ async fn run_startup_migrations(
                         &disambiguated,
                     ),
                     "control",
+                    lock_policy,
                 );
             }
             // The shard-map guard table also lives on the control plane only. It
@@ -13036,6 +13179,7 @@ async fn run_startup_migrations(
                         &disambiguated,
                     ),
                     "control",
+                    lock_policy,
                 );
             }
         }
@@ -13057,6 +13201,7 @@ async fn run_startup_migrations(
                     auto_in_prod,
                     crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
                     target,
+                    lock_policy,
                 );
             }
         }
@@ -14010,6 +14155,7 @@ mod agent_authority_route_summary_tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -14085,6 +14231,7 @@ mod validate_repository_api_policies_tests {
             repository: meta,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -14528,6 +14675,7 @@ fn build_state(
         entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
         app_id: AppState::next_app_id(),
     };
+    state.apply_health_config(&config.health);
     #[cfg(feature = "db")]
     if state.replica_pool.is_some() {
         state
@@ -14538,7 +14686,11 @@ fn build_state(
     // `db:shard:<name>` component (replica readiness refresh + pool stats).
     #[cfg(feature = "db")]
     if let Some(set) = state.shards() {
-        crate::sharding::register_shard_health_indicators(set, &state.health_indicator_registry);
+        crate::sharding::register_shard_health_indicators(
+            set,
+            &state.health_indicator_registry,
+            config.health.ping_timeout(),
+        );
     }
     state.insert_extension(config.clone());
     state.insert_extension(crate::step_up::StepUpGlobalConfig {
@@ -14549,6 +14701,8 @@ fn build_state(
         client: crate::http_client::Client::build_inner(&config.http.client),
         timeout_secs: config.http.client.timeout_secs,
     });
+    #[cfg(feature = "http-client")]
+    crate::http_client::install_shared_throttle(&state, &config.http.client);
     state
 }
 
@@ -16804,15 +16958,18 @@ mod tests {
             "the migrate one-shot must not start the server"
         );
 
-        // The per-target applier reuses `run_pending_locked` (the exact engine
-        // `auto_migrate` drives — no duplicated migration logic) and exits
+        // The per-target applier reuses `run_pending_locked_with_policy` (the
+        // exact engine `auto_migrate` drives — no duplicated migration logic) and exits
         // non-zero on failure so a bad migration aborts before cutover (AC-3).
         let helper_start = source
             .find("fn apply_pending_or_exit(")
             .expect("apply_pending_or_exit exists");
-        let helper = &source[helper_start..helper_start + 1200];
+        let helper_end = source[helper_start..]
+            .find("\n}\n")
+            .map_or(source.len(), |end| helper_start + end);
+        let helper = &source[helper_start..helper_end];
         assert!(
-            helper.contains("crate::migrate::run_pending_locked("),
+            helper.contains("crate::migrate::run_pending_locked_with_policy("),
             "must reuse the shared locked applier, not duplicate migration logic"
         );
         assert!(
@@ -17640,6 +17797,7 @@ mod tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -17969,6 +18127,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -18053,6 +18212,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -18227,6 +18387,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -18335,6 +18496,7 @@ mod tests {
                     repository: None,
                     idempotency: crate::route::RouteIdempotency::Direct,
                     timeout: crate::route::RouteTimeout::Inherit,
+                    criticality: crate::admission::Criticality::Default,
                     seo: crate::seo::SeoRouteDefaults::EMPTY,
                     api_version: None,
                     sunset_opt_out: false,
@@ -18442,6 +18604,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -18801,6 +18964,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: startup_noop_job_handler,
+                timeout: None,
             }])
             .on_startup(|_state| async {
                 crate::job::enqueue("startup-seed", serde_json::json!({ "kind": "warmup" })).await
@@ -18863,6 +19027,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: startup_noop_job_handler,
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -19018,6 +19183,7 @@ mod tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -19056,6 +19222,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -19075,6 +19242,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -19466,6 +19634,7 @@ mod tests {
                     repository: None,
                     idempotency: crate::route::RouteIdempotency::Direct,
                     timeout: crate::route::RouteTimeout::Inherit,
+                    criticality: crate::admission::Criticality::Default,
                     seo: crate::seo::SeoRouteDefaults::EMPTY,
                     api_version: None,
                     sunset_opt_out: false,
@@ -19526,6 +19695,7 @@ mod tests {
                     repository: None,
                     idempotency: crate::route::RouteIdempotency::Direct,
                     timeout: crate::route::RouteTimeout::Inherit,
+                    criticality: crate::admission::Criticality::Default,
                     seo: crate::seo::SeoRouteDefaults::EMPTY,
                     api_version: None,
                     sunset_opt_out: false,

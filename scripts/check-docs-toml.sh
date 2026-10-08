@@ -783,6 +783,12 @@ def edit_distance(a, b, limit=1):
     return prev[-1]
 
 
+# Roots that are an ARRAY of tables (`[[slo]]`). A single `[x]` table is never
+# a misnamed array root, so these never host one. Without this, `slo.name` made
+# `name` unique to `slo`, and `[starter] name = "saas"` read as Autumn config.
+ARRAY_ROOTS = frozenset({"slo"})
+
+
 def unique_host_root(body, schema):
     """The single known root that this fence's sections' children all fit, or None.
 
@@ -801,7 +807,11 @@ def unique_host_root(body, schema):
         children = {k for k in value}
         if not children:
             continue
-        hosts = [r for r in schema.get("", set()) if children <= schema.get(r, set())]
+        hosts = [
+            r
+            for r in schema.get("", set()) - ARRAY_ROOTS
+            if children <= schema.get(r, set())
+        ]
         if len(hosts) == 1:
             return hosts[0]
     return None
@@ -1542,6 +1552,7 @@ def self_test():
         ("cli dev keys found", bool(dev)),
         ("server.port is known", "port" in live_schema.get("server", set())),
         ("session.max_age_secs is known", "max_age_secs" in live_schema.get("session", set())),
+        ("array roots are real roots", ARRAY_ROOTS <= live_schema.get("", set())),
     ):
         if ok:
             passed += 1

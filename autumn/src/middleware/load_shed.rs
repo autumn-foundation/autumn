@@ -9,11 +9,11 @@
 //! probe paths always pass through uncounted, so platform load balancers
 //! keep every replica in rotation regardless of load (see #1006).
 //!
-//! Disabled entirely when no ceiling is configured
-//! (`server.max_concurrent_requests` unset or `0`) — see
+//! Disabled entirely when no ceiling resolves (`server.max_concurrent_requests
+//! = 0`, or unset outside the `prod` profile with no capacity contract) — see
 //! `build_load_shed_layer` (in `router.rs`, private to the crate), which
 //! returns `None` in that case so this layer is never applied and there is
-//! no overhead.
+//! no overhead. The `prod` profile sets a default ceiling (#3057).
 //!
 //! The ceiling itself no longer has to be a hand-tuned guess: with
 //! `[server] capacity_contract` pointing at a committed `capacity.lock`, it is
@@ -21,8 +21,15 @@
 //! host class, so the layer sheds at a measured edge rather than an assumed
 //! one (issue #1733, `docs/guide/capacity-contracts.md`). An explicit
 //! `max_concurrent_requests` still wins, and every contract problem degrades
-//! to *unlimited* rather than to a ceiling — see
-//! [`crate::capacity::resolve_admission_limit`].
+//! to the profile default (unlimited outside `prod`) — see
+//! [`crate::capacity::resolve_admission_limit_with_default`].
+//!
+//! Adaptive mode (issue #3068, ADR 0016): [`LoadShedLayer::adaptive`] reads
+//! the ceiling from an [`AdaptiveLimiter`], and gives it one sample per
+//! admitted request. Criticality partitions apply in both modes: a request
+//! of class `c` is admitted only while the in-flight count is below
+//! [`PartitionShares::threshold`]. The class comes from the [`Criticality`]
+//! request extension, which `CriticalityLayer` (in `router.rs`) sets.
 //!
 //! The admission gauge is a dedicated counter, independent of
 //! [`crate::middleware::MetricsCollector`]'s `requests_active` and the
@@ -59,6 +66,7 @@ use axum::response::IntoResponse;
 use pin_project_lite::pin_project;
 use tower::{Layer, Service};
 
+use crate::admission::{AdaptiveLimiter, Criticality, InboundDeadline, PartitionShares, Sample};
 use crate::middleware::MetricsCollector;
 use crate::middleware::maintenance::{health_prefix_matches, prefix_with_trailing_slash};
 
@@ -90,11 +98,21 @@ pub struct LoadShedExempt;
 /// Clone this layer freely — the in-flight counter is shared via [`Arc`].
 #[derive(Clone)]
 pub struct LoadShedLayer {
-    limit: usize,
+    limit: LimitSource,
+    shares: PartitionShares,
     in_flight: Arc<AtomicUsize>,
     metrics: MetricsCollector,
     paths: Arc<ExemptPaths>,
     cors: Option<Arc<crate::config::CorsConfig>>,
+}
+
+/// Where the ceiling comes from.
+#[derive(Clone)]
+enum LimitSource {
+    /// A fixed ceiling. `0` disables shedding.
+    Static(usize),
+    /// A ceiling that an [`AdaptiveLimiter`] moves.
+    Adaptive(Arc<AdaptiveLimiter>),
 }
 
 /// The exempt-path sets, resolved once at router-assembly time.
@@ -119,8 +137,34 @@ impl LoadShedLayer {
     /// misconfigured value never wedges every request shut.
     #[must_use]
     pub fn new(limit: usize, metrics: MetricsCollector) -> Self {
+        Self::with_source(LimitSource::Static(limit), metrics)
+    }
+
+    /// Create a layer whose ceiling `limiter` sets (issue #3068).
+    ///
+    /// Each admitted request gives the limiter one [`Sample`] when its
+    /// response head is ready. These give no sample, because their latency
+    /// does not show capacity:
+    ///
+    /// - a `4xx` or `503` response (rate limit, not found, maintenance);
+    /// - a route with `timeout = "off"` (for example, a long poll);
+    /// - a request that the client cancels.
+    ///
+    /// If the request timeout cancels the request, the layer records the
+    /// elapsed time as a drop. Shed and exempt requests give no sample.
+    #[must_use]
+    pub fn adaptive(limiter: Arc<AdaptiveLimiter>, metrics: MetricsCollector) -> Self {
+        metrics.set_admission_limit(limiter.limit());
+        Self::with_source(LimitSource::Adaptive(limiter), metrics)
+    }
+
+    fn with_source(limit: LimitSource, metrics: MetricsCollector) -> Self {
+        if let LimitSource::Static(limit) = limit {
+            metrics.set_admission_limit(limit);
+        }
         Self {
             limit,
+            shares: PartitionShares::default(),
             in_flight: Arc::new(AtomicUsize::new(0)),
             metrics,
             paths: Arc::new(ExemptPaths {
@@ -129,6 +173,22 @@ impl LoadShedLayer {
                 probe_paths: Vec::new(),
             }),
             cors: None,
+        }
+    }
+
+    /// The share of the ceiling that each [`Criticality`] can fill.
+    /// Default: [`PartitionShares::default`].
+    #[must_use]
+    pub const fn with_partitions(mut self, shares: PartitionShares) -> Self {
+        self.shares = shares;
+        self
+    }
+
+    /// The current ceiling. `0` means no ceiling.
+    fn current_limit(&self) -> usize {
+        match &self.limit {
+            LimitSource::Static(limit) => *limit,
+            LimitSource::Adaptive(limiter) => limiter.limit(),
         }
     }
 
@@ -186,6 +246,7 @@ pub struct LoadShedService<S> {
 
 impl<S> LoadShedService<S> {
     /// Whether `req` bypasses admission control entirely (probes/actuator).
+    /// Whether `req` is on a probe or actuator path.
     fn is_exempt<B>(&self, req: &Request<B>) -> bool {
         let path = req.uri().path();
         let prefix_matched = health_prefix_matches(
@@ -200,7 +261,24 @@ impl<S> LoadShedService<S> {
                 .probe_paths
                 .iter()
                 .any(|probe| probe == path)
-            || req.extensions().get::<LoadShedExempt>().is_some()
+    }
+
+    /// Shed `req` as class `criticality`: count it and build the `503`.
+    fn shed<B, F>(&self, req: &Request<B>, criticality: Criticality) -> LoadShedFuture<F> {
+        self.layer.metrics.record_request_shed_for(criticality);
+        // Capture the request Origin before it's dropped, so a
+        // mirrored CORS response can echo it back (see with_cors).
+        let cors_origin = self
+            .layer
+            .cors
+            .as_ref()
+            .and_then(|_| req.headers().get(http::header::ORIGIN).cloned());
+        LoadShedFuture::ShortCircuit {
+            response: Some(build_shed_response(
+                self.layer.cors.as_deref(),
+                cors_origin.as_ref(),
+            )),
+        }
     }
 }
 
@@ -217,33 +295,43 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        if self.layer.limit == 0 || self.is_exempt(&req) {
+        let limit = self.layer.current_limit();
+        if limit == 0 || self.is_exempt(&req) {
+            return LoadShedFuture::Forward {
+                inner: self.inner.call(req),
+                guard: None,
+            };
+        }
+        if req.extensions().get::<LoadShedExempt>().is_some() {
+            // An outer admission (the `/mcp` envelope) already counted this
+            // request, as `critical`, before it knew the route. Check the
+            // class of the route it reaches now. The in-flight count includes this request's own slot, so a
+            // fresh request would pass only if `in_flight <= threshold`.
+            if let Some(&criticality) = req.extensions().get::<Criticality>()
+                && self.layer.in_flight.load(Ordering::Acquire)
+                    > self.layer.shares.threshold(criticality, limit)
+            {
+                return self.shed(&req, criticality);
+            }
             return LoadShedFuture::Forward {
                 inner: self.inner.call(req),
                 guard: None,
             };
         }
 
+        let criticality = req
+            .extensions()
+            .get::<Criticality>()
+            .copied()
+            .unwrap_or_default();
+        let threshold = self.layer.shares.threshold(criticality, limit);
         let in_flight = &self.layer.in_flight;
         let mut current = in_flight.load(Ordering::Acquire);
         loop {
-            if current >= self.layer.limit {
-                self.layer.metrics.record_request_shed();
-                // Capture the request Origin before it's dropped, so a
-                // mirrored CORS response can echo it back (see with_cors).
-                let cors_origin = self
-                    .layer
-                    .cors
-                    .as_ref()
-                    .and_then(|_| req.headers().get(http::header::ORIGIN).cloned());
-                return LoadShedFuture::ShortCircuit {
-                    response: Some(build_shed_response(
-                        self.layer.cors.as_deref(),
-                        cors_origin.as_ref(),
-                    )),
-                };
+            if current >= threshold {
+                return self.shed(&req, criticality);
             }
-            // `current < limit` is checked immediately above, so the bump is
+            // `current < threshold` is checked immediately above, so the bump is
             // exact; `saturating_add` only guards the theoretical `usize::MAX`
             // limit, where sticking at MAX beats aborting the request.
             match in_flight.compare_exchange_weak(
@@ -257,12 +345,55 @@ where
             }
         }
 
+        let deadline = req.extensions().get::<InboundDeadline>().copied();
+        let sampler = match (&self.layer.limit, deadline) {
+            (LimitSource::Static(_), _) | (_, Some(InboundDeadline::Off)) => None,
+            (LimitSource::Adaptive(limiter), deadline) => Some(Sampler {
+                limiter: Arc::clone(limiter),
+                metrics: self.layer.metrics.clone(),
+                start: tokio::time::Instant::now(),
+                // The CAS above succeeded, so `current < threshold <= usize::MAX`.
+                in_flight: current.saturating_add(1),
+                deadline: match deadline {
+                    Some(InboundDeadline::At(at)) => Some(at),
+                    _ => None,
+                },
+            }),
+        };
         LoadShedFuture::Forward {
             inner: self.inner.call(req),
             guard: Some(InFlightGuard {
                 counter: Arc::clone(in_flight),
+                sampler,
             }),
         }
+    }
+}
+
+/// The start of one admitted request, for an adaptive limit.
+struct Sampler {
+    limiter: Arc<AdaptiveLimiter>,
+    metrics: MetricsCollector,
+    start: tokio::time::Instant,
+    in_flight: usize,
+    /// The request deadline, when the request-timeout layer set one.
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl Sampler {
+    /// Give the limiter the sample for this request.
+    fn record(self, dropped: bool) {
+        let now = tokio::time::Instant::now();
+        let sample = Sample {
+            rtt: now.saturating_duration_since(self.start),
+            in_flight: self.in_flight,
+            dropped,
+            at: self.limiter.elapsed(now),
+        };
+        let metrics = &self.metrics;
+        let _ = self
+            .limiter
+            .record_with(sample, |limit| metrics.set_admission_limit(limit));
     }
 }
 
@@ -273,10 +404,40 @@ where
 /// `requests_active`.
 struct InFlightGuard {
     counter: Arc<AtomicUsize>,
+    /// `Some` in adaptive mode until the sample is recorded.
+    sampler: Option<Sampler>,
+}
+
+impl InFlightGuard {
+    /// Record the sample for a response. `None` is an inner service error.
+    ///
+    /// A `504` or an error is a drop. A `4xx` or `503` gives no sample: a
+    /// rate limit, a not-found or maintenance mode answers fast and does not
+    /// show capacity.
+    fn complete(&mut self, status: Option<axum::http::StatusCode>) {
+        let Some(sampler) = self.sampler.take() else {
+            return;
+        };
+        match status {
+            Some(s) if s.is_client_error() || s == axum::http::StatusCode::SERVICE_UNAVAILABLE => {}
+            Some(s) => sampler.record(s == axum::http::StatusCode::GATEWAY_TIMEOUT),
+            None => sampler.record(true),
+        }
+    }
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
+        // Cancelled before a response. At the request deadline, this is
+        // overload: record the elapsed time as a drop. Before it, the client
+        // went away, which does not show capacity.
+        if let Some(sampler) = self.sampler.take()
+            && sampler
+                .deadline
+                .is_some_and(|d| tokio::time::Instant::now() >= d)
+        {
+            sampler.record(true);
+        }
         self.counter.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -348,6 +509,9 @@ where
                 .expect("LoadShedFuture polled after completion"))),
             LoadShedFutureProj::Forward { inner, guard } => {
                 let output = std::task::ready!(inner.poll(cx));
+                if let Some(guard) = guard.as_mut() {
+                    guard.complete(output.as_ref().ok().map(Response::status));
+                }
                 // Release the slot as soon as the inner future resolves,
                 // rather than waiting for this whole future to be dropped —
                 // if a caller (middleware combinator, logging, post-
@@ -374,6 +538,7 @@ mod tests {
     fn make_app(layer: LoadShedLayer) -> Router {
         Router::new()
             .route("/", get(|| async { "ok" }))
+            .route("/work", get(|| async { "ok" }))
             .route("/actuator/health", get(|| async { "healthy" }))
             .route("/live", get(|| async { "live" }))
             .layer(layer)
@@ -428,6 +593,7 @@ mod tests {
                 get(move || blocking_handler(gate.clone(), entered.clone())),
             )
             .route("/", get(|| async { "root" }))
+            .route("/work", get(|| async { "work" }))
             .route("/actuator/health", get(|| async { "healthy" }))
             .route("/live", get(|| async { "live" }))
             .layer(layer)
@@ -594,6 +760,261 @@ mod tests {
         );
     }
 
+    // ── Criticality partitions (#3068) ────────────────────────────────────
+
+    fn request(uri: &str, criticality: Option<crate::admission::Criticality>) -> Request<Body> {
+        let mut req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        if let Some(c) = criticality {
+            req.extensions_mut().insert(c);
+        }
+        req
+    }
+
+    #[tokio::test]
+    async fn sheddable_is_shed_before_critical() {
+        use crate::admission::Criticality;
+        let metrics = MetricsCollector::new();
+        // Limit 2, default shares: sheddable may fill 1 slot.
+        let layer = LoadShedLayer::new(2, metrics.clone());
+        let gate = Arc::new(Notify::new());
+        let entered = Arc::new(StdAtomicUsize::new(0));
+        let app = make_blocking_app(layer, gate.clone(), entered.clone());
+
+        let held = {
+            let app = app.clone();
+            tokio::spawn(
+                async move { app.oneshot(request("/block", None)).await.unwrap().status() },
+            )
+        };
+        wait_for_entered(&entered, 1).await;
+
+        let shed = app
+            .clone()
+            .oneshot(request("/work", Some(Criticality::Sheddable)))
+            .await
+            .unwrap();
+        assert_eq!(shed.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let crit = app
+            .clone()
+            .oneshot(request("/work", Some(Criticality::Critical)))
+            .await
+            .unwrap();
+        assert_eq!(crit.status(), axum::http::StatusCode::OK);
+
+        let snap = metrics.snapshot().http;
+        assert_eq!(snap.requests_shed_total, 1);
+        assert_eq!(snap.admission.shed_sheddable, 1);
+        assert_eq!(snap.admission.shed_critical, 0);
+
+        gate.notify_waiters();
+        assert_eq!(held.await.unwrap(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn custom_shares_reserve_headroom_for_critical() {
+        use crate::admission::{Criticality, PartitionShares};
+        let layer = LoadShedLayer::new(2, MetricsCollector::new())
+            .with_partitions(PartitionShares::new(0.5, 0.0).unwrap());
+        let gate = Arc::new(Notify::new());
+        let entered = Arc::new(StdAtomicUsize::new(0));
+        let app = make_blocking_app(layer, gate.clone(), entered.clone());
+
+        let held = {
+            let app = app.clone();
+            tokio::spawn(
+                async move { app.oneshot(request("/block", None)).await.unwrap().status() },
+            )
+        };
+        wait_for_entered(&entered, 1).await;
+
+        assert_eq!(
+            app.clone()
+                .oneshot(request("/work", None))
+                .await
+                .unwrap()
+                .status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "default may fill only half the limit"
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request("/work", Some(Criticality::Critical)))
+                .await
+                .unwrap()
+                .status(),
+            axum::http::StatusCode::OK
+        );
+        gate.notify_waiters();
+        assert_eq!(held.await.unwrap(), axum::http::StatusCode::OK);
+    }
+
+    // ── Adaptive limit (#3068) ────────────────────────────────────────────
+
+    fn aimd_limiter(initial: usize) -> Arc<crate::admission::AdaptiveLimiter> {
+        use crate::admission::{AdaptiveLimiter, Aimd, LimitAlgorithm, LimitBounds};
+        AdaptiveLimiter::new(LimitAlgorithm::Aimd(Aimd::new(
+            LimitBounds::new(1, 100, initial).unwrap(),
+            Duration::from_secs(1),
+        )))
+    }
+
+    #[tokio::test]
+    async fn adaptive_limit_grows_on_fast_full_use() {
+        let metrics = MetricsCollector::new();
+        let limiter = aimd_limiter(2);
+        let app = make_app(LoadShedLayer::adaptive(
+            Arc::clone(&limiter),
+            metrics.clone(),
+        ));
+        assert_eq!(metrics.snapshot().http.admission.limit, 2);
+        // One in flight at limit 2 is full use for AIMD: +1.
+        assert_eq!(
+            status(app.clone(), "/work").await,
+            axum::http::StatusCode::OK
+        );
+        assert_eq!(limiter.limit(), 3);
+        assert_eq!(metrics.snapshot().http.admission.limit, 3);
+    }
+
+    #[tokio::test]
+    async fn adaptive_limit_backs_off_on_gateway_timeout() {
+        let limiter = aimd_limiter(50);
+        let app = Router::new()
+            .route(
+                "/slow-upstream",
+                get(|| async { axum::http::StatusCode::GATEWAY_TIMEOUT }),
+            )
+            .layer(LoadShedLayer::adaptive(
+                Arc::clone(&limiter),
+                MetricsCollector::new(),
+            ));
+        assert_eq!(
+            status(app, "/slow-upstream").await,
+            axum::http::StatusCode::GATEWAY_TIMEOUT
+        );
+        assert_eq!(limiter.limit(), 45, "a 504 is a drop: x0.9");
+    }
+
+    #[tokio::test]
+    async fn adaptive_limit_sheds_at_the_current_limit() {
+        let limiter = aimd_limiter(1);
+        let layer = LoadShedLayer::adaptive(Arc::clone(&limiter), MetricsCollector::new());
+        let gate = Arc::new(Notify::new());
+        let entered = Arc::new(StdAtomicUsize::new(0));
+        let app = make_blocking_app(layer, gate.clone(), entered.clone());
+        let held = {
+            let app = app.clone();
+            tokio::spawn(
+                async move { app.oneshot(request("/block", None)).await.unwrap().status() },
+            )
+        };
+        wait_for_entered(&entered, 1).await;
+        assert_eq!(
+            status(app.clone(), "/work").await,
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(limiter.limit(), 1, "a shed request is not a sample");
+        gate.notify_waiters();
+        assert_eq!(held.await.unwrap(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn adaptive_exempt_paths_are_not_sampled() {
+        let limiter = aimd_limiter(2);
+        let app = make_app(
+            LoadShedLayer::adaptive(Arc::clone(&limiter), MetricsCollector::new())
+                .with_health_prefix("/actuator"),
+        );
+        assert_eq!(
+            status(app, "/actuator/health").await,
+            axum::http::StatusCode::OK
+        );
+        assert_eq!(limiter.limit(), 2);
+    }
+
+    fn hang_app(layer: LoadShedLayer) -> Router {
+        Router::new()
+            .route(
+                "/hang",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    "never"
+                }),
+            )
+            .route(
+                "/missing",
+                get(|| async { axum::http::StatusCode::NOT_FOUND }),
+            )
+            .route(
+                "/maintenance",
+                get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+            )
+            .layer(layer)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adaptive_client_cancel_records_nothing() {
+        let limiter = aimd_limiter(50);
+        let layer = LoadShedLayer::adaptive(Arc::clone(&limiter), MetricsCollector::new());
+        let app = hang_app(layer.clone());
+        // No deadline: the client went away.
+        let res =
+            tokio::time::timeout(Duration::from_secs(5), app.oneshot(request("/hang", None))).await;
+        assert!(res.is_err());
+        assert_eq!(limiter.limit(), 50);
+        assert_eq!(layer.in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn adaptive_client_errors_and_503_are_not_sampled() {
+        let limiter = aimd_limiter(1);
+        let app = hang_app(LoadShedLayer::adaptive(
+            Arc::clone(&limiter),
+            MetricsCollector::new(),
+        ));
+        for uri in ["/missing", "/maintenance"] {
+            app.clone().oneshot(request(uri, None)).await.unwrap();
+        }
+        assert_eq!(
+            limiter.limit(),
+            1,
+            "a fast 404 or 503 must not grow the limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn adaptive_timeout_off_routes_are_not_sampled() {
+        let limiter = aimd_limiter(1);
+        let app = make_app(LoadShedLayer::adaptive(
+            Arc::clone(&limiter),
+            MetricsCollector::new(),
+        ));
+        let mut req = request("/work", None);
+        req.extensions_mut().insert(InboundDeadline::Off);
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            axum::http::StatusCode::OK
+        );
+        assert_eq!(limiter.limit(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adaptive_deadline_cancel_is_a_drop() {
+        // The request timeout cancels the request at its 5 s deadline. AIMD
+        // must back off.
+        let limiter = aimd_limiter(50);
+        let layer = LoadShedLayer::adaptive(Arc::clone(&limiter), MetricsCollector::new());
+        let app = hang_app(layer.clone());
+        let mut req = request("/hang", None);
+        req.extensions_mut().insert(InboundDeadline::At(
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        ));
+        let res = tokio::time::timeout(Duration::from_secs(5), app.oneshot(req)).await;
+        assert!(res.is_err(), "the timeout cancels the request");
+        assert_eq!(limiter.limit(), 45);
+        assert_eq!(layer.in_flight.load(Ordering::Acquire), 0);
+    }
+
     // ── MCP replay exemption (avoids double-counting a tools/call) ────────
 
     #[tokio::test]
@@ -650,6 +1071,61 @@ mod tests {
         gate.notify_waiters();
         assert_eq!(exempt_fut.await.unwrap(), axum::http::StatusCode::OK);
         assert_eq!(held.await.unwrap(), axum::http::StatusCode::OK);
+    }
+
+    /// Regression (#3183 review): an MCP `tools/call` replay is already
+    /// counted at the envelope as `default`. The replay must still be shed
+    /// when its route's class is over its share.
+    #[tokio::test]
+    async fn exempt_replay_is_rechecked_against_its_class() {
+        use crate::admission::Criticality;
+        // Limit 2, sheddable share 0.5: one slot for sheddable.
+        let layer = LoadShedLayer::new(2, MetricsCollector::new());
+        let gate = Arc::new(Notify::new());
+        let entered = Arc::new(StdAtomicUsize::new(0));
+        let app = make_blocking_app(layer, gate.clone(), entered.clone());
+
+        // One ordinary request in flight, then the envelope's own slot: the
+        // replay below sees in_flight = 2 (simulated by a second holder).
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let app = app.clone();
+            held.push(tokio::spawn(async move {
+                app.oneshot(request("/block", Some(Criticality::Critical)))
+                    .await
+                    .unwrap()
+                    .status()
+            }));
+        }
+        wait_for_entered(&entered, 2).await;
+
+        let replay = |c| {
+            let mut req = request("/work", Some(c));
+            req.extensions_mut().insert(LoadShedExempt);
+            req
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(replay(Criticality::Sheddable))
+                .await
+                .unwrap()
+                .status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "a sheddable tool over its share is shed"
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(replay(Criticality::Critical))
+                .await
+                .unwrap()
+                .status(),
+            axum::http::StatusCode::OK,
+            "a critical tool at the limit is not shed again"
+        );
+        gate.notify_waiters();
+        for h in held {
+            assert_eq!(h.await.unwrap(), axum::http::StatusCode::OK);
+        }
     }
 
     // ── Probe / actuator exemption ────────────────────────────────────────

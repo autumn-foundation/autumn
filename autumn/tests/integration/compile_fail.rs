@@ -45,6 +45,10 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/route_seo_duplicate_key.rs");
     t.compile_fail("tests/compile-fail/route_seo_empty_group.rs");
 
+    // Route `criticality` (#3068): a value other than "critical", "default"
+    // or "sheddable" is a compile error, not a silent `default`.
+    t.compile_fail("tests/compile-fail/route_criticality_invalid.rs");
+
     // Static route macro failures
     t.compile_fail("tests/compile-fail/static_get_path_params.rs");
     t.compile_fail("tests/compile-fail/static_get_non_async.rs");

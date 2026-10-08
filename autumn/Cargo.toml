@@ -506,6 +506,9 @@ nix = { version = "0.31.2", features = ["resource", "time"] }
 # cannot lift a forbid (E0453). The crate installs its `#[global_allocator]` on
 # link, so only binaries that actually reference it are affected.
 allocation-counter = "0.8.1"
+# Criterion benches (issue #3068, `benches/admission.rs`). No plots: only the
+# statistics and the `cargo bench` harness.
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 diesel = { version = "2", features = ["chrono", "postgres"] }
 # `rust_decimal`'s diesel impls (`AsExpression<Numeric>`, `ToSql`/`FromSql` on
 # the Pg backend) back the `#[model]` Postgres-`Decimal` integration test
@@ -592,6 +595,12 @@ harness = false
 # the exact commands.
 [[bench]]
 name = "request_pipeline"
+harness = false
+
+# Criterion benches for admission control (issue #3068): static vs adaptive
+# admission cost through `LoadShedService`, and the cost of one limit update.
+[[bench]]
+name = "admission"
 harness = false
 
 [[bench]]
@@ -724,6 +733,13 @@ path = "tests/cost_reconcile.rs"
 [[test]]
 name = "password_policy_alloc_gate"
 path = "tests/password_policy_alloc_gate.rs"
+
+# Adaptive admission adds no allocations to an admitted request (issue #3068).
+# Own binary for the same `allocation-counter` global-allocator reason as
+# `config_alloc_gate` above.
+[[test]]
+name = "admission_alloc_gate"
+path = "tests/admission_alloc_gate.rs"
 
 # Allocation gate for the sandbox's request-header canonicalisation: a header
 # the allowlist drops must not be cloned on its way to being discarded. The
@@ -1217,6 +1233,34 @@ path = "tests/sim_fault_plan_db.rs"
 [[test]]
 name = "sim_chaos_crash"
 path = "tests/sim_chaos_crash.rs"
+
+# Issue #3067: several replicas on one sim clock and one SQLite database.
+# SQLite-only (the sim substrate), so a standalone target like the others.
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sim_replicas`.
+[[test]]
+name = "sim_replicas"
+path = "tests/sim_replicas.rs"
+
+# Issue #3067: the same-seed trace check. Its own binary, because `tracing`
+# caches callsite interest for the whole process.
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sim_fleet_trace`.
+[[test]]
+name = "sim_fleet_trace"
+path = "tests/sim_fleet_trace.rs"
+
+# Issue #3062: transactional outbox crash sweep and `deliver_later` restart.
+# SQLite-only (the sim substrate), so a standalone target like the others.
+[[test]]
+name = "sim_outbox_crash"
+path = "tests/sim_outbox_crash.rs"
+
+[[test]]
+name = "sim_outbox_mail"
+path = "tests/sim_outbox_mail.rs"
+
+[[test]]
+name = "sqlite_outbox_writers"
+path = "tests/sqlite_outbox_writers.rs"
 
 # W5.a (item 5, issue #1797): deterministic per-send SMTP transport fault
 # schedule ("send #7 fails, #8 times out") over the in-memory SQLite sim

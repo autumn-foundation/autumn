@@ -43,7 +43,7 @@ those paths itself.
 | Endpoint | Probe | What it reflects |
 | --- | --- | --- |
 | `/live` | liveness | Only that the process is up. Ignores startup and dependency state, so it answers `200` whenever the process is running. |
-| `/ready` | readiness | Startup completion, shutdown draining, connection-pool saturation, a configured read replica (unless `replica_fallback = "primary"`), and any readiness indicators you register. `503` when any is not ready. |
+| `/ready` | readiness | Startup completion, shutdown draining, a cached `SELECT 1` on the primary database, a configured read replica (unless `replica_fallback = "primary"`), and any readiness indicators you register. `503` when any is not ready. |
 | `/startup` | startup | Stays unavailable until startup hooks complete. |
 | `/health` | — | Compatibility alias for readiness: same checks and same status as `/ready`. |
 
@@ -55,19 +55,21 @@ Recommended use:
 
 Do not point all three at `/health` just because it was easy in older apps.
 `/health` is a readiness answer, so it returns `503` for conditions a restart
-does not fix: a saturated connection pool, a read replica that cannot safely
+does not fix: an unreachable primary database, a read replica that cannot safely
 serve reads, a readiness indicator of your own reporting down, or a drain
 already in progress. A *liveness* probe reading one of those has the
 orchestrator kill a process that was working — a busy minute becomes a restart
 loop, which is the failure mode separate probes exist to prevent. Point
 liveness at `/live`, which reports on the process and nothing else.
 
-Readiness does **not** ping the primary database. The built-in `db` indicator
-reports pool *availability* — whether a connection is free, or nobody is queued
-for one — so a primary that has become unreachable while the pool still holds
-idle connections can leave `/ready` at `200`. A configured read replica is
-different: it is probed with a real `SELECT 1`. If you need readiness to gate
-on primary connectivity, register an indicator that runs a query.
+Readiness pings the primary database with `SELECT 1` on one dedicated
+connection outside the pool. Autumn keeps the result for `health.cache_ttl_ms`
+(default 1 s). One probe refreshes it, and the other probes wait. A ping that
+fails or takes longer than `health.ping_timeout_ms` (default 2 s) gives `503`.
+Keep that limit below the probe `timeoutSeconds`. Pool saturation does **not**
+affect readiness. A busy app replica stays in rotation. To shed excess
+requests with `503` and `Retry-After`, set `server.max_concurrent_requests`
+(off by default). A configured read replica gets the same ping.
 
 For readiness that also reflects your own subsystems, see
 [Health Indicators](health-indicators.md).
@@ -895,6 +897,9 @@ AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS=60
 
 ### Kubernetes / ECS configuration
 
+`autumn release init --target kubernetes` writes a Helm chart and a Kustomize
+base with these settings. See [Kubernetes](kubernetes.md).
+
 Wire `prestop_grace_secs` to your `preStop` hook and termination grace period:
 
 ```yaml
@@ -996,6 +1001,46 @@ autumn_web::app()
     .await;
 ```
 
+## Production Protections
+
+The `prod` profile turns on these protections (issue #3057). Each has a
+one-line opt-out.
+
+| Protection | `prod` default | Opt-out |
+| --- | --- | --- |
+| Load shedding | primary pool size × 32 in-flight requests (at least 256), then `503` | `server.max_concurrent_requests = 0` |
+| Statement timeout | `database.statement_timeout = "30s"` | `"0s"` |
+| Idle in transaction | `database.idle_in_transaction_timeout = "60s"` | `"0s"` |
+| Strict config | `server.strict_config = true` | `false` |
+| Migration lock wait | `database.migration_lock_timeout = "5s"`, `5` retries (all profiles) | `"0s"` |
+| Rate limiting | off | turn it on, see below |
+
+Notes:
+
+- **Load shedding.** An explicit `server.max_concurrent_requests` wins. A
+  [capacity contract](capacity-contracts.md) wins over the profile default.
+  When the contract cannot be used, the profile default applies. Probe and
+  actuator routes are never shed. Watch `autumn_requests_shed_total`.
+- **Timeouts.** Each framework transaction starts with `SET LOCAL
+  statement_timeout` and `SET LOCAL idle_in_transaction_session_timeout`. A
+  transaction pooler (`PgBouncer` in transaction mode) keeps these. It drops
+  the session `SET` that applies outside a transaction. To bound those
+  statements too, set the timeout on the app's database role:
+  `ALTER ROLE app SET statement_timeout = '30s'`. Run migrations with a
+  different role, because the migrator does not change `statement_timeout`.
+  A route's `StatementTimeout` applies to the transactions of that request.
+  SQLite builds do not get these defaults, and refuse a nonzero value.
+- **Migrations.** In each transactional migration, a DDL statement that waits
+  more than `5s` for a table lock fails. The migrator retries it after a
+  jittered delay. A `run_in_transaction = false` migration (for example
+  `CREATE INDEX CONCURRENTLY`) waits with no limit. Run migrations against
+  Postgres directly, not through `PgBouncer`.
+- **Rate limiting.** `prod` does not turn it on. A shared limit can block
+  clients behind one proxy address. Configure
+  [`security.rate_limit`](rate-limiting.md) and
+  [`security.trusted_proxies`](middleware.md#forwarded-header-client-identity-plugin-author-guidance)
+  for your traffic, then turn it on.
+
 ## Minimal Deployment Checklist
 
 Before calling an Autumn app "cloud ready", verify:
@@ -1017,3 +1062,7 @@ Before calling an Autumn app "cloud ready", verify:
 - `server.prestop_grace_secs` is tuned to match your load balancer's deregistration propagation time
 - `terminationGracePeriodSeconds` (Kubernetes) or equivalent is set to `preStop_hook_secs + prestop_grace_secs + shutdown_timeout_secs + buffer` (`shutdown_timeout_secs` covers drain **and** hooks combined)
 - `autumn_shutdown_aborted_requests_total` is monitored and alerts on any non-zero value after a rolling deploy
+- the [production protections](#production-protections) are on, or each opt-out is deliberate
+- `autumn_requests_shed_total` is monitored, and the shedding ceiling is tuned or comes from a capacity contract
+- `autumn.toml` boots under `strict_config` (the `prod` default)
+- rate limiting is configured for your traffic, or you have a documented reason to leave it off

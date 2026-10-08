@@ -68,6 +68,7 @@ mod serve;
 mod service;
 mod setup;
 mod shard;
+mod slo;
 mod starters;
 mod task;
 mod test_cmd;
@@ -99,24 +100,7 @@ pub enum RoutesSubcommands {
     /// when any route is unclassified — i.e. neither framework-owned, guarded
     /// (`#[secured]` / `#[authorize]`), nor explicitly `#[public]` — naming each
     /// offending route so it can be closed. This is the CI gate.
-    Audit {
-        /// Package to inspect (for workspaces).
-        #[arg(short, long)]
-        package: Option<String>,
-        /// Binary target to inspect (for packages with multiple bin targets).
-        #[arg(long, value_name = "BIN")]
-        bin: Option<String>,
-        /// Write the JSON security manifest to this file path.
-        #[arg(long, value_name = "PATH")]
-        manifest: Option<String>,
-        /// Emit the JSON manifest to stdout instead of the human summary.
-        #[arg(long)]
-        json: bool,
-        /// Reserved for tightening the gate; fail-on-unclassified is already the
-        /// default behavior.
-        #[arg(long)]
-        strict: bool,
-    },
+    Audit(RoutesAuditArgs),
     /// Diff, acknowledge, and verify security posture across commits (#1624).
     ///
     /// `routes audit` proves what the security surface *is*; `routes posture`
@@ -163,13 +147,19 @@ pub enum PostureSubcommands {
         /// An acknowledgment digest, without the comment ceremony (repeatable).
         #[arg(long, value_name = "DIGEST")]
         ack: Vec<String>,
-        /// File of pull-request text to scan for `/ack-posture` markers.
+        /// File of pull-request comments, divided by
+        /// `<!-- autumn:ack-source -->` lines. Prefer `--ack-dir`.
         ///
-        /// The workflow harvests it from comments whose author is an OWNER,
-        /// MEMBER or COLLABORATOR: this command trusts what it is given and
-        /// enforces no authorization of its own.
+        /// This command does no authorization. The workflow must give it only
+        /// comments from people with write permission.
         #[arg(long, value_name = "PATH")]
         ack_file: Option<String>,
+        /// Directory of pull-request comments, one file per comment, to scan
+        /// for `/ack-posture` markers. Each file is parsed alone, so comment
+        /// text cannot fake a comment boundary. This command does no
+        /// authorization.
+        #[arg(long, value_name = "DIR")]
+        ack_dir: Option<String>,
         /// Treat a missing base manifest as "no baseline yet" (exit 0) instead
         /// of an error. What a repository enabling the gate wants on its first
         /// run.
@@ -262,6 +252,50 @@ pub struct CacheAuditArgs {
     /// Audit the binary built under this Cargo profile (a custom
     /// `[profile.<NAME>]` builds into `target/<NAME>`; `dev` into
     /// `target/debug`).
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
+}
+
+/// Arguments for `autumn routes audit`.
+///
+/// A separate `Args` struct for the same reason as [`CacheAuditArgs`]: it
+/// keeps clap's derive frame small.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
+pub struct RoutesAuditArgs {
+    /// Package to inspect (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to inspect (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Write the JSON security manifest to this file path.
+    #[arg(long, value_name = "PATH")]
+    manifest: Option<String>,
+    /// Emit the JSON manifest to stdout instead of the human summary.
+    #[arg(long)]
+    json: bool,
+    /// Reserved for tightening the gate; fail-on-unclassified is already the
+    /// default behavior.
+    #[arg(long)]
+    strict: bool,
+    /// Cargo features to build the audited binary with. Repeat the flag or
+    /// give a comma-separated list. A route behind a feature that the build
+    /// does not enable is not in the manifest.
+    #[arg(long, value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build the audited binary with all Cargo features enabled.
+    #[arg(long)]
+    all_features: bool,
+    /// Build the audited binary without default Cargo features.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Audit the release build. A route behind
+    /// `#[cfg(not(debug_assertions))]` is only in a release build.
+    #[arg(long, conflicts_with = "profile")]
+    release: bool,
+    /// Audit the binary built with this Cargo profile. You cannot use it
+    /// with `--release`.
     #[arg(long, value_name = "NAME")]
     profile: Option<String>,
 }
@@ -1897,6 +1931,13 @@ enum Commands {
     /// Fire a synthetic operator alert through configured delivery channels.
     #[command(subcommand)]
     Alert(AlertCommands),
+
+    /// Turn the `[[slo]]` tables in autumn.toml into monitoring files.
+    ///
+    /// Writes Prometheus burn-rate rules, a Grafana dashboard, and Argo
+    /// Rollouts and Flagger analysis templates. See docs/guide/slo.md.
+    #[command(subcommand)]
+    Slo(SloCommands),
     /// Issue and revoke API bearer tokens backed by the `api_tokens` table.
     ///
     /// Requires the `api_tokens` table to exist. Run `autumn migrate` first;
@@ -3608,6 +3649,40 @@ enum AlertCommands {
 }
 
 #[derive(Subcommand)]
+enum SloCommands {
+    /// Generate Prometheus rules, a Grafana dashboard and analysis templates.
+    ///
+    /// Reads the `[[slo]]` tables in autumn.toml (issue #3069). The output is
+    /// deterministic, so you can commit it and check it in CI with `--check`.
+    Generate(SloGenerateArgs),
+}
+
+#[derive(clap::Args)]
+struct SloGenerateArgs {
+    /// Directory for the generated files.
+    #[arg(long, value_name = "DIR", default_value = slo::DEFAULT_OUT_DIR)]
+    out_dir: PathBuf,
+    /// Application name for labels and object names. Default: `[deploy]
+    /// app_name`, then the package name.
+    #[arg(long, value_name = "NAME")]
+    app: Option<String>,
+    /// Extra label matchers for every query, for example 'job="shop"'.
+    #[arg(long, value_name = "MATCHERS")]
+    selector: Option<String>,
+    /// Prometheus address in the analysis templates.
+    #[arg(long, value_name = "URL", default_value = slo::DEFAULT_PROMETHEUS_URL)]
+    prometheus_url: String,
+    /// A label on the `PrometheusRule` object, for a Prometheus
+    /// `ruleSelector`, for example 'release=kube-prometheus-stack'. Repeat it
+    /// for more labels.
+    #[arg(long, value_name = "NAME=VALUE")]
+    rule_label: Vec<String>,
+    /// Compare with the files in --out-dir; write nothing. Exit 1 on drift.
+    #[arg(long)]
+    check: bool,
+}
+
+#[derive(Subcommand)]
 enum WebhookCommands {
     /// Send a simulated webhook request with a generated HMAC signature.
     Sim {
@@ -3866,8 +3941,9 @@ enum ReleaseCommands {
     /// --target fly                    : also emits fly.toml.
     /// --target docker-compose         : also emits docker-compose.yml with app + Postgres.
     /// --target azure-container-apps   : also emits main.tf, variables.tf, outputs.tf,
-    ///                                   terraform.tfvars.example, and
-    ///                                   .github/workflows/azure-deploy.yml.
+    ///                                   terraform.tfvars.example,
+    ///                                   .github/workflows/azure-deploy.yml, and
+    ///                                   azure-cutover.sh.
     /// --target aws-app-runner         : also emits main.tf, variables.tf, outputs.tf, and
     ///                                   terraform.tfvars.example (ECR + App Runner + RDS,
     ///                                   no CI workflow — fast/minimal path).
@@ -3880,12 +3956,18 @@ enum ReleaseCommands {
     ///                                   .github/workflows/gcp-deploy.yml (Artifact
     ///                                   Registry + Cloud Run + Cloud SQL behind a VPC
     ///                                   connector, opt-in Memorystore Redis).
+    /// --target kubernetes             : also emits a Helm chart (deploy/helm/) and a
+    ///                                   Kustomize base (deploy/kustomize/base/) with
+    ///                                   /startup, /live and /ready probes, a `preStop`
+    ///                                   hook, a grace period longer than the drain
+    ///                                   window, a `PodDisruptionBudget`, and opt-in
+    ///                                   Argo Rollouts or Flagger canaries.
     Init {
         /// Overwrite existing files instead of erroring on collision.
         #[arg(long)]
         force: bool,
         /// Deployment target: fly | docker-compose | azure-container-apps | aws-app-runner |
-        /// aws-ecs | gcp-cloud-run (omit for bare Dockerfile).
+        /// aws-ecs | gcp-cloud-run | kubernetes (omit for bare Dockerfile).
         #[arg(long, value_name = "TARGET")]
         target: Option<String>,
         /// Scaffold a separate worker-role service in the generated
@@ -3960,6 +4042,13 @@ enum DeployCommands {
         /// inspected before anything else moves.
         #[arg(long)]
         no_rollback: bool,
+
+        /// Bake each host for this many seconds after its cutover, and roll it
+        /// back when the error rate or latency is too high (issue #3069).
+        ///
+        /// Overrides `[deploy.bake] duration_secs`. `0` turns the bake off.
+        #[arg(long, value_name = "SECS")]
+        bake_secs: Option<u64>,
     },
 
     /// Report every configured host's deploy state, read-only (issue #1621).
@@ -5273,6 +5362,14 @@ fn run_command(command: Commands) {
             event,
         }) => webhook::run_sim(&provider, &url, &secret, &payload, event.as_deref()),
         Commands::Alert(AlertCommands::Test { channel }) => alert::run_test(channel.as_deref()),
+        Commands::Slo(SloCommands::Generate(args)) => slo::run_generate(&slo::GenerateArgs {
+            out_dir: args.out_dir,
+            app: args.app,
+            selector: args.selector,
+            prometheus_url: args.prometheus_url,
+            rule_labels: args.rule_label,
+            check: args.check,
+        }),
         Commands::Console {
             profile,
             package,
@@ -5582,24 +5679,27 @@ fn run_command(command: Commands) {
             user_only,
             command,
         } => match command {
-            Some(RoutesSubcommands::Audit {
-                package: audit_package,
-                bin: audit_bin,
-                manifest,
-                json,
-                strict,
-            }) => {
+            Some(RoutesSubcommands::Audit(args)) => {
                 // Fall back to the parent `routes` target flags so both
                 // `autumn routes -p blog audit` and `autumn routes audit -p blog`
                 // select the same binary in multi-target workspaces.
-                let package = audit_package.or(package);
-                let bin = audit_bin.or(bin);
+                let package = args.package.or(package);
+                let bin = args.bin.or(bin);
                 routes_audit::run(&routes_audit::AuditOptions {
                     package: package.as_deref(),
                     bin: bin.as_deref(),
-                    manifest: manifest.as_deref(),
-                    json,
-                    strict,
+                    manifest: args.manifest.as_deref(),
+                    json: args.json,
+                    strict: args.strict,
+                    features: routes::CargoFeatures {
+                        features: args.features,
+                        all: args.all_features,
+                        no_default: args.no_default_features,
+                    },
+                    profile: routes::CargoProfile {
+                        release: args.release,
+                        profile: args.profile,
+                    },
                 });
             }
             Some(RoutesSubcommands::Posture(command)) => {
@@ -5611,6 +5711,7 @@ fn run_command(command: Commands) {
                         output,
                         ack,
                         ack_file,
+                        ack_dir,
                         allow_missing_base,
                     } => posture::run_diff(&posture::DiffOptions {
                         base,
@@ -5619,6 +5720,7 @@ fn run_command(command: Commands) {
                         output: output.as_deref(),
                         acks: ack,
                         ack_file: ack_file.as_deref(),
+                        ack_dir: ack_dir.as_deref(),
                         allow_missing_base: *allow_missing_base,
                     }),
                     PostureSubcommands::Digest { manifest, format } => {
@@ -6423,11 +6525,16 @@ fn run_deploy_command(cmd: &DeployCommands) {
                 ..deploy::DeployOptions::default()
             },
         ),
-        DeployCommands::Up { only, no_rollback } => (
+        DeployCommands::Up {
+            only,
+            no_rollback,
+            bake_secs,
+        } => (
             deploy::DeployAction::Up,
             deploy::DeployOptions {
                 only: only.clone(),
                 no_rollback: *no_rollback,
+                bake_secs: *bake_secs,
                 ..deploy::DeployOptions::default()
             },
         ),
@@ -7320,6 +7427,61 @@ mod tests {
     fn parse_setup_with_force() {
         let cli = Cli::try_parse_from(["autumn", "setup", "--force"]).unwrap();
         assert!(matches!(cli.command, Commands::Setup { force: true }));
+    }
+
+    #[test]
+    fn parse_deploy_up_bake_secs() {
+        let cli = Cli::try_parse_from(["autumn", "deploy", "up"]).unwrap();
+        let Commands::Deploy(DeployCommands::Up { bake_secs, .. }) = cli.command else {
+            panic!("expected deploy up");
+        };
+        assert_eq!(bake_secs, None);
+        let cli = Cli::try_parse_from(["autumn", "deploy", "up", "--bake-secs", "300"]).unwrap();
+        let Commands::Deploy(DeployCommands::Up { bake_secs, .. }) = cli.command else {
+            panic!("expected deploy up");
+        };
+        assert_eq!(bake_secs, Some(300));
+        assert!(Cli::try_parse_from(["autumn", "deploy", "up", "--bake-secs", "-1"]).is_err());
+    }
+
+    #[test]
+    fn parse_slo_generate_defaults_and_flags() {
+        let cli = Cli::try_parse_from(["autumn", "slo", "generate"]).unwrap();
+        let Commands::Slo(SloCommands::Generate(args)) = cli.command else {
+            panic!("expected slo generate");
+        };
+        assert_eq!(args.out_dir, PathBuf::from("deploy/slo"));
+        assert_eq!(args.prometheus_url, slo::DEFAULT_PROMETHEUS_URL);
+        assert!(args.app.is_none() && args.selector.is_none() && !args.check);
+
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "slo",
+            "generate",
+            "--out-dir",
+            "ops/slo",
+            "--app",
+            "shop",
+            "--selector",
+            "job=\"shop\"",
+            "--prometheus-url",
+            "http://prom:9090",
+            "--rule-label",
+            "release=kps",
+            "--rule-label",
+            "team=pay",
+            "--check",
+        ])
+        .unwrap();
+        let Commands::Slo(SloCommands::Generate(args)) = cli.command else {
+            panic!("expected slo generate");
+        };
+        assert_eq!(args.out_dir, PathBuf::from("ops/slo"));
+        assert_eq!(args.app.as_deref(), Some("shop"));
+        assert_eq!(args.rule_label, ["release=kps", "team=pay"]);
+        assert_eq!(args.selector.as_deref(), Some("job=\"shop\""));
+        assert_eq!(args.prometheus_url, "http://prom:9090");
+        assert!(args.check);
     }
 
     #[test]
@@ -9413,22 +9575,92 @@ mod tests {
         .unwrap();
         match cli.command {
             Commands::Routes {
-                command:
-                    Some(RoutesSubcommands::Audit {
-                        package,
-                        manifest,
-                        json,
-                        strict,
-                        ..
-                    }),
+                command: Some(RoutesSubcommands::Audit(args)),
                 ..
             } => {
-                assert_eq!(package.as_deref(), Some("blog"));
-                assert_eq!(manifest.as_deref(), Some("target/security.json"));
-                assert!(json);
-                assert!(!strict);
+                assert_eq!(args.package.as_deref(), Some("blog"));
+                assert_eq!(args.manifest.as_deref(), Some("target/security.json"));
+                assert!(args.json);
+                assert!(!args.strict);
+                // No flag keeps the dev build and default features.
+                assert!(args.features.is_empty());
+                assert!(!args.all_features);
+                assert!(!args.no_default_features);
+                assert!(!args.release);
+                assert!(args.profile.is_none());
             }
             _ => panic!("expected Routes audit subcommand"),
+        }
+    }
+
+    /// The gate must audit the build that ships (#2472): a route behind
+    /// `#[cfg(not(debug_assertions))]` or a non-default feature is not in a
+    /// default dev build.
+    #[test]
+    fn parse_routes_audit_forwards_the_cargo_build_selection() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "routes",
+            "audit",
+            "--release",
+            "--features",
+            "embed-assets",
+            "--features",
+            "a,b",
+            "--no-default-features",
+            "--all-features",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Routes {
+                command: Some(RoutesSubcommands::Audit(args)),
+                ..
+            } => {
+                assert!(args.release);
+                assert_eq!(args.features, ["embed-assets", "a,b"]);
+                assert!(args.no_default_features);
+                assert!(args.all_features);
+            }
+            _ => panic!("expected Routes audit subcommand"),
+        }
+
+        let cli = Cli::try_parse_from(["autumn", "routes", "audit", "--profile", "dist"]).unwrap();
+        match cli.command {
+            Commands::Routes {
+                command: Some(RoutesSubcommands::Audit(args)),
+                ..
+            } => assert_eq!(args.profile.as_deref(), Some("dist")),
+            _ => panic!("expected Routes audit subcommand"),
+        }
+
+        // Cargo rejects `--release --profile`; refuse it before building.
+        assert!(
+            Cli::try_parse_from(["autumn", "routes", "audit", "--release", "--profile", "ci"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_routes_posture_diff_accepts_ack_dir() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "routes",
+            "posture",
+            "diff",
+            "--base",
+            "b.json",
+            "--head",
+            "h.json",
+            "--ack-dir",
+            "acks",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Routes {
+                command: Some(RoutesSubcommands::Posture(PostureSubcommands::Diff { ack_dir, .. })),
+                ..
+            } => assert_eq!(ack_dir.as_deref(), Some("acks")),
+            _ => panic!("expected Routes posture diff subcommand"),
         }
     }
 
@@ -9444,19 +9676,14 @@ mod tests {
             Commands::Routes {
                 package: parent_package,
                 bin: parent_bin,
-                command:
-                    Some(RoutesSubcommands::Audit {
-                        package: audit_package,
-                        bin: audit_bin,
-                        ..
-                    }),
+                command: Some(RoutesSubcommands::Audit(args)),
                 ..
             } => {
                 assert_eq!(parent_package.as_deref(), Some("blog"));
-                assert_eq!(audit_package, None);
+                assert_eq!(args.package, None);
                 // The fallback the dispatch applies.
-                let resolved_package = audit_package.or(parent_package);
-                let resolved_bin = audit_bin.or(parent_bin);
+                let resolved_package = args.package.or(parent_package);
+                let resolved_bin = args.bin.or(parent_bin);
                 assert_eq!(resolved_package.as_deref(), Some("blog"));
                 assert_eq!(resolved_bin, None);
             }
@@ -9473,16 +9700,12 @@ mod tests {
         match cli.command {
             Commands::Routes {
                 package: parent_package,
-                command:
-                    Some(RoutesSubcommands::Audit {
-                        package: audit_package,
-                        ..
-                    }),
+                command: Some(RoutesSubcommands::Audit(args)),
                 ..
             } => {
                 assert_eq!(parent_package.as_deref(), Some("blog"));
-                assert_eq!(audit_package.as_deref(), Some("shop"));
-                let resolved = audit_package.or(parent_package);
+                assert_eq!(args.package.as_deref(), Some("shop"));
+                let resolved = args.package.or(parent_package);
                 assert_eq!(resolved.as_deref(), Some("shop"));
             }
             _ => panic!("expected Routes audit subcommand"),

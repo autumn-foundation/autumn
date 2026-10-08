@@ -1677,8 +1677,15 @@ pub mod pg {
         }
 
         fn connect(&self) -> Result<diesel::PgConnection, ExperimentStoreError> {
-            diesel::PgConnection::establish(&self.database_url)
-                .map_err(|e| ExperimentStoreError::Backend(e.to_string()))
+            crate::db_url::require_postgres_target(&self.database_url, "PgExperimentStore")
+                .map_err(ExperimentStoreError::Backend)?;
+            // libpq quotes the target in its error, so redact it.
+            diesel::PgConnection::establish(&self.database_url).map_err(|e| {
+                ExperimentStoreError::Backend(crate::db_url::redact_driver_error(
+                    &e.to_string(),
+                    &self.database_url,
+                ))
+            })
         }
 
         fn cached(&self, name: &str) -> CacheLookup {
@@ -3006,5 +3013,40 @@ mod tests {
                 "{url} is a Postgres target"
             );
         }
+    }
+
+    // `new(url)` does not screen the target. The first connect refuses it with
+    // a message that names the cause, and no credential goes out (#2539 §5).
+    #[cfg(feature = "db")]
+    #[test]
+    fn pg_experiment_store_new_refuses_a_non_postgres_target_at_first_use() {
+        use crate::experiments::ExperimentStore as _;
+
+        let store = pg::PgExperimentStore::new("sqlite://app:hunter2@host/app.db");
+        let err = store
+            .get("exp")
+            .expect_err("a SQLite target is refused")
+            .to_string();
+        assert!(
+            err.contains("Postgres"),
+            "the refusal names the cause: {err}"
+        );
+        assert!(!err.contains("hunter2"), "the refusal leaks: {err}");
+
+        // libpq quotes a malformed target in its error. That must not leak.
+        let store = pg::PgExperimentStore::new("postgres://app:hunter2@[::1/db");
+        let err = store
+            .get("exp")
+            .expect_err("a malformed target fails")
+            .to_string();
+        assert!(!err.contains("hunter2"), "the driver error leaks: {err}");
+
+        // libpq can quote only the decoded password.
+        let store = pg::PgExperimentStore::new("postgres://app:p%ss@localhost:1/db");
+        let err = store
+            .get("exp")
+            .expect_err("a bad escape fails")
+            .to_string();
+        assert!(!err.contains("p%ss"), "the driver error leaks: {err}");
     }
 }

@@ -118,7 +118,7 @@ copy of the publish order.
 
 | Macro | Purpose |
 |---|---|
-| `#[get]`, `#[post]`, `#[put]`, `#[patch]`, `#[delete]` | HTTP route handlers; optional args `name`, `api_version`, `sunset_opt_out`, `timeout_ms`, `timeout = "off"`, and `seo(...)` |
+| `#[get]`, `#[post]`, `#[put]`, `#[patch]`, `#[delete]` | HTTP route handlers; optional args `name`, `api_version`, `sunset_opt_out`, `timeout_ms`, `timeout = "off"`, `criticality` (`"critical"`, `"default"` or `"sheddable"`; admission class, #3068), and `seo(...)` |
 | `routes![...]` | Collect route handlers |
 | `#[autumn_web::main]` | Tokio runtime + Autumn profile bootstrap; optional runtime args `flavor` (`"multi_thread"` default / `"current_thread"`), `worker_threads`, `max_blocking_threads`, `thread_name`, `thread_stack_size`, `thread_keep_alive = "30s"`, and `configure = path::to::fn` — a `fn(&mut tokio::runtime::Builder)` run last, the escape hatch for `Builder` methods the args don't name (0.8.0). Numeric args take expressions, not only literals. No args = tokio defaults; an unknown/duplicate/zero arg, or `worker_threads` under `current_thread`, is a compile error |
 | `#[static_get]`, `static_routes![...]` | Static pre-render routes for `autumn build`; also accepts `params`, `revalidate`, and `seo(...)`. The `Content-Type` the handler declares is recorded per route in `dist/manifest.json` and served verbatim (0.8.0, #1832) — set it explicitly for non-HTML routes (`application/xml`, `application/rss+xml`) since the serve path no longer infers it from the route slug |
@@ -386,6 +386,15 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `Model::__AUTUMN_CONFIDENTIAL_COLUMNS`. See
   `docs/guide/confidential-fields.md` for the threat model, including what
   sealing does not hide.
+- NUL byte (`0x00`) in text (issues #2423, #2439) — Postgres cannot store it.
+  `ChangesetForm` and `NestedChangesetForm` add a field error. The message is
+  `form::NUL_CHARACTER_FIELD_ERROR`. With an `i18n` bundle, they look up
+  `form::NUL_CHARACTER_MESSAGE_KEY` (`common.error.nul_character`) in the
+  request locale. A NUL that reaches the database is a `422`, for `TEXT` and
+  for `JSONB`. `error::is_nul_byte_violation` detects it. The generated
+  `#[repository(api = ...)]` create and update handlers name the field in
+  `errors[]`. `error::nul_byte_json_fields` finds the field in a JSON body.
+  See `docs/guide/forms.md`.
 - `#[normalize(trim, downcase, upcase, squish, strip_nul, with = path::to::fn)]` (issue
   #1379) — canonicalizes a `String` column, composing normalizers
   left-to-right. Built-ins live in `autumn_web::normalize`
@@ -1149,6 +1158,9 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   `[jobs.queues]` weight table; tracked jobs (`job::enqueue_tracked`,
   `enqueue_tracked_for`, `TrackedJobHandle`, optional third `JobContext`
   handler arg, `GET /_autumn/jobs/{token}`, `jobs.tracking.*` config).
+- Unreleased (#3051): `timeout = "30s"` key and `jobs.default_timeout_ms`;
+  durable claims renew on a heartbeat; `JobContext::lease_lost()`,
+  `is_cancelled()`, `cancelled()`.
 
 ## Distributed locks (0.6.0)
 
@@ -1350,6 +1362,26 @@ even inside a `#[sim_test]`. For a deadline whose counterparty is
 | `sim::crash_at(index, op)` → `CrashOutcome` | Drop `op` at its `index`-th suspension. Pair with `CrashPoint::await_index` and `Sim::kill` / `Sim::restart` |
 | `Sim::try_run_to_idle()` → `Result<(), SimStall>` | `run_to_idle` panics with the seed when the drain never settles (a job that re-enqueues itself); this returns the `SimStall` instead |
 | `http_client::ClientError::SimNetwork` | A sim drop, partition, timeout or unknown host. `ClientError` is `#[non_exhaustive]` |
+
+## Multi-replica simulation (`autumn_web::sim`, #3067)
+
+Two or three apps on one sim clock and one `SQLite` database, for tests of
+jobs, the scheduler and locks across nodes.
+
+| API | Use |
+|---|---|
+| `Sim::mount_replica(name_or_Replica, app)` / `replica(name)` / `try_replica(name)` | Mount named apps next to each other. Each has its own state, job runtime and scheduled tasks |
+| `Sim::kill_replica(name)` / `restart_replica(name, app)` | Stop a replica's tasks as a crash does; mount it again |
+| `Replica::named("b").clock_ahead(d)` / `clock_behind(d)` / `clock_drift_ppm(p)` / `seeded_clock(max, ppm)` | A clock per replica. `Sim::step_replica_clock(name, TimeDelta)` is an NTP step. Keep the skew below `scheduler.lease_ttl_secs` |
+| `Sim::db_link(name)` + `SqliteSubstrate::replica_pool(&link)` | One replica's own pool on the shared database. `link.lose_session()` / `restore_session()`, `mid_query_errors(table, p)`, `commit_ambiguity(table, p)`, `clear_faults()`, `events()` |
+| `Sim::run_for(d)` | Move time one event at a time; time does not move while a query runs. Use it, not `advance`, with replicas |
+| `sim::runtime()` | The runtime `#[sim_test]` uses (one blocking thread, gated DB work), for a sim outside the macro |
+| `sim::trace::capture(fut)` → `(T, Trace)` / `Trace::diff` | Record framework `tracing` events with sim time; run one seed twice and diff. Run trace checks in their own test binary |
+
+Rules for code a sim drives: `biased;` in `tokio::select!`; no database
+`random()`; never drop a `SQLite` query in flight (pin it outside the
+`select!`, spawn it if another branch wins). See
+`docs/guide/simulation-testing.md` → "Multiple replicas".
 
 ## Authored fault scenarios (`autumn_web::sim::FaultPlan`, #1680)
 
@@ -1741,10 +1773,19 @@ Frequently used env keys:
 | `AUTUMN_CHANNELS__BACKEND` | `channels.backend` |
 | `AUTUMN_CHANNELS__REPLAY_BUFFER` | `channels.replay_buffer` (0.6.0) |
 | `AUTUMN_JOBS__BACKEND` | `jobs.backend` (`local` / `postgres` / `redis` / `sqlite`) |
+| `AUTUMN_JOBS__DEFAULT_TIMEOUT_MS` | `jobs.default_timeout_ms` (`0` = no limit) |
 | `AUTUMN_JOBS__SQLITE__VISIBILITY_TIMEOUT_MS` | `jobs.sqlite.visibility_timeout_ms` |
 | `AUTUMN_JOBS__SQLITE__POLL_INTERVAL_MS` | `jobs.sqlite.poll_interval_ms` |
 | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` |
 | `AUTUMN_JOBS__REDIS__DEAD_LETTER_LIMIT` | `jobs.redis.dead_letter_limit` (default 10 000; `0` = unbounded) |
+| `AUTUMN_OUTBOX__ENABLED` | `outbox.enabled` (default `false`; transactional outbox relay) |
+| `AUTUMN_OUTBOX__POLL_INTERVAL_MS` | `outbox.poll_interval_ms` (default 500) |
+| `AUTUMN_OUTBOX__BATCH_SIZE` | `outbox.batch_size` (default 100) |
+| `AUTUMN_OUTBOX__MAX_ATTEMPTS` | `outbox.max_attempts` (default 10) |
+| `AUTUMN_OUTBOX__INITIAL_BACKOFF_MS` | `outbox.initial_backoff_ms` (default 1000) |
+| `AUTUMN_OUTBOX__MAX_BACKOFF_MS` | `outbox.max_backoff_ms` (default 300000) |
+| `AUTUMN_OUTBOX__LEASE_MS` | `outbox.lease_ms` (default 60000) |
+| `AUTUMN_OUTBOX__RETENTION_MS` | `outbox.retention_ms` (default 7 days) |
 | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` (`in_process` / `postgres` / `sqlite`) |
 | `AUTUMN_SECURITY__SIGNING_SECRET` | `security.signing_secret.secret` |
 | `AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API` | `security.allow_unauthorized_repository_api` |
@@ -1753,7 +1794,41 @@ Frequently used env keys:
 | `AUTUMN_MAIL__ALLOW_IN_PROCESS_DELIVER_LATER_IN_PRODUCTION` | `mail.allow_in_process_deliver_later_in_production` |
 | `AUTUMN_STORAGE__BACKEND` | `storage.backend` |
 | `AUTUMN_CACHE__BACKEND` | `cache.backend` |
+| `AUTUMN_HEALTH__CACHE_TTL_MS` | `health.cache_ttl_ms` (default `1000`; `0` = no cache) (#3059) |
+| `AUTUMN_HEALTH__PING_TIMEOUT_MS` | `health.ping_timeout_ms` (default `2000`; `0` refused) (#3059) |
+| `AUTUMN_HEALTH__DB_READINESS` | `health.db_readiness` (default `true`) (#3059) |
+| `AUTUMN_HEALTH__REDIS_READINESS` | `health.redis_readiness` (default `false`) (#3059) |
 | `AUTUMN_OBSERVABILITY__SERVER_TIMING` | `observability.server_timing` (0.6.0) — bool; `Server-Timing` response header opt-in. Defaults on in `dev`/`development`, off elsewhere. See `docs/guide/observability/server-timing.md`. |
+
+### `[health]` — readiness pings and result cache (#3059)
+
+`/ready`, `/health` and the `db` component of `/actuator/health` send
+`SELECT 1` to the primary on one dedicated connection outside the pool. Pool
+saturation is **not** a readiness signal: do not write a health indicator that
+reads `pool.status()`. To shed load, set `server.max_concurrent_requests`.
+
+```toml
+[health]
+cache_ttl_ms = 1000      # one refresh per window; probers share it; 0 = off
+ping_timeout_ms = 2000   # a late DB/Redis ping is DOWN; keep below the probe timeout
+db_readiness = true      # false: a failed primary ping does not gate /ready
+redis_readiness = false  # true: redis:<subsystem> indicators gate /ready
+```
+
+- The read replica and `db:shard:<name>` use the same ping.
+- Each subsystem that runs on Redis (channels, idempotency, jobs, rate_limit,
+  sessions, submit_token, webhook_replay) gets a `redis:<subsystem>` indicator
+  (feature `redis`); `RedisCachePlugin` adds `redis:cache`. It is health-only
+  by default, because all replicas share Redis. For another Redis, register
+  `autumn_web::redis_health::RedisHealthIndicator::new(url)?.configured(&config.health)`
+  with `.health_indicator(name, Arc::new(..))`. A plugin that has the
+  `AppState` uses `RedisHealthIndicator::shared(&state, url)` instead, so it
+  shares the app's one `PING` connection per URL.
+- Registered indicators are cached too
+  (`HealthIndicatorRegistry::set_cache_ttl`). In a `TestApp` test that flips an
+  indicator and reads it again at once, set `health.cache_ttl_ms = 0`.
+- The DB error text appears only when `health.detailed = true`.
+- See `docs/guide/health-indicators.md` ("Fail open on shared dependencies").
 
 ### `[cluster]` — embedded clustering (0.7.0, #1762)
 

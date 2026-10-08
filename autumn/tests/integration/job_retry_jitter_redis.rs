@@ -29,8 +29,9 @@ fn always_fails(
     Box::pin(async move { Err(AutumnError::internal_server_error_msg("blip")) })
 }
 
-/// A handler that hangs, as on a dependency that never answers. Its claim
-/// expires and the stale-claim recovery requeues the job.
+/// A handler that hangs, as on a dependency that never answers. The lease
+/// heartbeat keeps its claim alive (#3051), so the claim expires only when
+/// the worker dies.
 fn hangs(
     _state: AppState,
     _payload: Value,
@@ -68,6 +69,52 @@ fn config(url: &str, workers: usize, visibility_timeout_ms: u64) -> JobConfig {
             ..Default::default()
         },
         ..Default::default()
+    }
+}
+
+/// Run `phase` on a new runtime, then shut that runtime down without waiting.
+/// That stops every task it spawned, lease heartbeats included, like a
+/// process kill.
+fn run_then_kill<F>(phase: F)
+where
+    F: FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("worker runtime");
+        runtime.block_on(phase());
+        runtime.shutdown_background();
+    })
+    .join()
+    .expect("worker thread");
+}
+
+/// Wait until the `processing` set holds `count` claims.
+async fn wait_for_claims(url: &str, count: usize) {
+    let client = autumn_web::redis_tls::open_client(url).expect("open redis client");
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect to redis");
+    let processing_key = format!("{KEY_PREFIX}:processing");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let claims: usize = redis::cmd("ZCARD")
+            .arg(&processing_key)
+            .query_async(&mut conn)
+            .await
+            .expect("read the processing set");
+        if claims >= count {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "every job must be claimed; {claims} of {count} are"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -141,36 +188,57 @@ async fn redis_job_retries_spread_out() {
     job::clear_global_job_client();
 }
 
-/// Claims that expire together (handlers that hung on one dependency) must
-/// not all run again at once. Before the fix the recovery pushed every job
-/// back onto its queue at once.
+/// Claims that expire together must not all run again at once. Before the
+/// fix the recovery pushed every job back onto its queue at once.
+///
+/// A claim expires only when its worker dies, since the lease heartbeat
+/// renews it while the worker lives (#3051). So worker A claims every job,
+/// its handlers hang, and the test kills it. Worker B recovers the claims.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn redis_recovered_claims_spread_out() {
+    const VISIBILITY_MS: u64 = 500;
+
     let _guard = job::global_job_runtime_test_lock().lock().await;
     job::clear_global_job_client();
     let (_container, url) = redis_server().await;
+
+    let url_a = url.clone();
+    run_then_kill(move || {
+        Box::pin(async move {
+            let state = AppState::for_test().with_profile("dev");
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            // One worker per job, so worker A claims every job.
+            job::start_runtime(
+                vec![JobInfo::new("redis_hang_job", 3, 3_600_000, hangs)],
+                &state,
+                &shutdown,
+                &config(&url_a, STORM_JOBS, VISIBILITY_MS),
+                true,
+            )
+            .expect("worker A starts");
+            for n in 0..STORM_JOBS {
+                job::enqueue("redis_hang_job", serde_json::json!({ "n": n }))
+                    .await
+                    .expect("enqueue");
+            }
+            wait_for_claims(&url_a, STORM_JOBS).await;
+        })
+    });
+    job::clear_global_job_client();
 
     let state = AppState::for_test()
         .with_profile("dev")
         .with_entropy(autumn_web::entropy::SeededEntropy::shared(0x3054));
     let shutdown = tokio_util::sync::CancellationToken::new();
-    // One worker per job, so every job hangs and every claim expires. Two
-    // spare workers run the stale-claim sweep, as another replica would.
     job::start_runtime(
         vec![JobInfo::new("redis_hang_job", 3, 3_600_000, hangs)],
         &state,
         &shutdown,
-        &config(&url, STORM_JOBS + 2, 500),
+        &config(&url, 2, VISIBILITY_MS),
         true,
     )
-    .expect("redis job runtime starts");
-
-    for n in 0..STORM_JOBS {
-        job::enqueue("redis_hang_job", serde_json::json!({ "n": n }))
-            .await
-            .expect("enqueue");
-    }
+    .expect("worker B starts");
 
     let spread_ms = delayed_spread_ms(&url).await;
     assert!(

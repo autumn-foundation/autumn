@@ -57,6 +57,7 @@
 //! | `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS` | `server.timeouts.request_timeout_ms` | `u64` |
 //! | `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS` | `server.max_concurrent_requests` | `usize` |
 //! | `AUTUMN_SERVER__CAPACITY_CONTRACT` | `server.capacity_contract` | `String` |
+//! | `AUTUMN_SERVER__STRICT_CONFIG` | `server.strict_config` | `bool` |
 //! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
 //! | `AUTUMN_DATABASE__PRIMARY_URL` | `database.primary_url` | `String` |
 //! | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` | `String` |
@@ -68,6 +69,10 @@
 //! | `AUTUMN_DATABASE__STARTUP_WAIT_SECS` | `database.startup_wait_secs` | `u64` |
 //! | `AUTUMN_DATABASE__AUTO_MIGRATE` | `database.auto_migrate` | `Option<bool>` |
 //! | `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` | `database.auto_migrate_in_production` | `bool` |
+//! | `AUTUMN_DATABASE__STATEMENT_TIMEOUT` | `database.statement_timeout` | duration (`"30s"`, ms); empty clears |
+//! | `AUTUMN_DATABASE__IDLE_IN_TRANSACTION_TIMEOUT` | `database.idle_in_transaction_timeout` | duration; empty clears |
+//! | `AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT` | `database.migration_lock_timeout` | duration; empty is ignored |
+//! | `AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES` | `database.migration_lock_retries` | `u32` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__NAME` | `database.shards[i].name` | `String` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__PRIMARY_URL` | `database.shards[i].primary_url` | `String` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__SLOTS` | `database.shards[i].slots` | CSV of indices / `A-B` ranges |
@@ -94,6 +99,10 @@
 //! | `AUTUMN_HEALTH__STARTUP_PATH` | `health.startup_path` | `String` |
 //! | `AUTUMN_HEALTH__DETAILED` | `health.detailed` | `bool` |
 //! | `AUTUMN_HEALTH__ENABLED` | `health.enabled` | `bool` |
+//! | `AUTUMN_HEALTH__CACHE_TTL_MS` | `health.cache_ttl_ms` | `u64` |
+//! | `AUTUMN_HEALTH__PING_TIMEOUT_MS` | `health.ping_timeout_ms` | `u64` |
+//! | `AUTUMN_HEALTH__REDIS_READINESS` | `health.redis_readiness` | `bool` |
+//! | `AUTUMN_HEALTH__DB_READINESS` | `health.db_readiness` | `bool` |
 //! | `AUTUMN_CORS__ALLOWED_ORIGINS` | `cors.allowed_origins` | comma-separated `String` |
 //! | `AUTUMN_CORS__ALLOWED_METHODS` | `cors.allowed_methods` | comma-separated `String` |
 //! | `AUTUMN_CORS__ALLOWED_HEADERS` | `cors.allowed_headers` | comma-separated `String` |
@@ -125,6 +134,7 @@
 //! | `AUTUMN_JOBS__MAX_ATTEMPTS` | `jobs.max_attempts` | `u32` |
 //! | `AUTUMN_JOBS__INITIAL_BACKOFF_MS` | `jobs.initial_backoff_ms` | `u64` |
 //! | `AUTUMN_JOBS__MAX_BACKOFF_MS` | `jobs.max_backoff_ms` | `u64` |
+//! | `AUTUMN_JOBS__DEFAULT_TIMEOUT_MS` | `jobs.default_timeout_ms` | `u64` |
 //! | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` | `String` |
 //! | `AUTUMN_JOBS__REDIS__KEY_PREFIX` | `jobs.redis.key_prefix` | `String` |
 //! | `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` | `jobs.redis.visibility_timeout_ms` | `u64` |
@@ -132,6 +142,14 @@
 //! | `AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS` | `jobs.postgres.visibility_timeout_ms` | `u64` |
 //! | `AUTUMN_JOBS__TRACKING__TTL_SECS` | `jobs.tracking.ttl_secs` | `u64` |
 //! | `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` | `jobs.tracking.route_enabled` | `bool` |
+//! | `AUTUMN_OUTBOX__ENABLED` | `outbox.enabled` | `bool` |
+//! | `AUTUMN_OUTBOX__POLL_INTERVAL_MS` | `outbox.poll_interval_ms` | `u64` |
+//! | `AUTUMN_OUTBOX__BATCH_SIZE` | `outbox.batch_size` | `usize` |
+//! | `AUTUMN_OUTBOX__MAX_ATTEMPTS` | `outbox.max_attempts` | `u32` |
+//! | `AUTUMN_OUTBOX__INITIAL_BACKOFF_MS` | `outbox.initial_backoff_ms` | `u64` |
+//! | `AUTUMN_OUTBOX__MAX_BACKOFF_MS` | `outbox.max_backoff_ms` | `u64` |
+//! | `AUTUMN_OUTBOX__LEASE_MS` | `outbox.lease_ms` | `u64` |
+//! | `AUTUMN_OUTBOX__RETENTION_MS` | `outbox.retention_ms` | `u64` |
 //! | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` | `in_process` / `postgres` / `sqlite` |
 //! | `AUTUMN_RETENTION__SWEEP_INTERVAL` | `retention.sweep_interval` | duration `String` |
 //! | `AUTUMN_RETENTION__JOB_HISTORY` | `retention.job_history` | duration `String` |
@@ -554,8 +572,13 @@ ranges = ["127.0.0.0/8", "::1/128"]
 "#,
         )
         .expect("valid dev toml"),
-        "prod" => toml::from_str(
-            r#"
+        "prod" => {
+            #[cfg_attr(
+                feature = "sqlite",
+                allow(unused_mut, reason = "only the Postgres build adds to it")
+            )]
+            let mut prod: toml::Value = toml::from_str(
+                r#"
 [log]
 level = "info"
 format = "Json"
@@ -566,6 +589,8 @@ environment = "production"
 [server]
 host = "0.0.0.0"
 shutdown_timeout_secs = 30
+# Prod: a misspelled key fails the boot (#3057).
+strict_config = true
 
 [server.timeouts]
 request_timeout_ms = 30_000
@@ -583,8 +608,24 @@ enabled = true
 [session]
 secure = true
 "#,
-        )
-        .expect("valid prod toml"),
+            )
+            .expect("valid prod toml");
+            // SQLite cannot enforce these, and it refuses to boot with a
+            // `statement_timeout` set, so they are Postgres-only defaults.
+            #[cfg(not(feature = "sqlite"))]
+            deep_merge(
+                &mut prod,
+                toml::from_str(
+                    r#"
+[database]
+statement_timeout = "30s"
+idle_in_transaction_timeout = "60s"
+"#,
+                )
+                .expect("valid prod database toml"),
+            );
+            prod
+        }
         _ => toml::Value::Table(toml::map::Map::new()), // Custom profiles get no smart defaults
     }
 }
@@ -1318,6 +1359,16 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub deploy: Option<DeployConfig>,
 
+    /// Service level objectives (`[[slo]]` tables, issue #3069).
+    ///
+    /// The app does not read them at run time. `autumn slo generate` and
+    /// `autumn deploy` read them. See [`crate::slo`].
+    ///
+    /// Keep this field above `database`, for the same reason as `deploy`:
+    /// strict validation then checks the keys in each table.
+    #[serde(default)]
+    pub slo: Vec<crate::slo::SloConfig>,
+
     /// Deterministic replay capsule settings (`[failure_capture]` section,
     /// issue #1598).
     ///
@@ -1457,6 +1508,10 @@ pub struct AutumnConfig {
     /// Background job backend and runtime settings.
     #[serde(default)]
     pub jobs: JobConfig,
+
+    /// Transactional outbox relay settings (issue #3062).
+    #[serde(default)]
+    pub outbox: OutboxConfig,
 
     /// Scheduled task coordination backend settings.
     #[serde(default)]
@@ -1696,6 +1751,66 @@ pub struct DeployTlsConfig {
     pub host: Option<String>,
 }
 
+/// The post-cutover bake (`[deploy.bake]`, issue #3069).
+///
+/// After each host cuts over, `autumn deploy up` samples the new release's
+/// `/actuator/metrics` for `duration_secs`. It rolls the host back when the
+/// 5xx ratio or the latency is above the limit. The bake is off by default.
+///
+/// ```toml
+/// [deploy.bake]
+/// duration_secs = 300      # 0 turns the bake off (default: 0)
+/// interval_secs = 10       # time between samples (default: 10)
+/// min_requests = 20        # fewest responses for a verdict (default: 20)
+/// max_error_rate = 0.01    # default: from [[slo]], else 0.05
+/// max_p99_ms = 500         # default: from [[slo]], else no latency check
+/// ```
+///
+/// When `max_error_rate` is not set, the limit comes from the `[[slo]]`
+/// availability objectives with no `route`: the error ratio that burns the
+/// budget at 14.4×. When `max_p99_ms` is not set, it comes from the `[[slo]]`
+/// latency objectives with no `route`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeployBakeConfig {
+    /// Bake time in seconds after each host cuts over. `0` turns the bake
+    /// off. Default: `0`.
+    #[serde(default)]
+    pub duration_secs: u64,
+    /// Seconds between metric samples. Default: `10`.
+    #[serde(default = "default_deploy_bake_interval_secs")]
+    pub interval_secs: u64,
+    /// The fewest new responses before the bake gives a verdict. Thin
+    /// traffic never causes a rollback. Default: `20`.
+    #[serde(default = "default_deploy_bake_min_requests")]
+    pub min_requests: u64,
+    /// The highest 5xx ratio, from `0.0` to `1.0`.
+    #[serde(default)]
+    pub max_error_rate: Option<f64>,
+    /// The highest p99 latency, in milliseconds.
+    #[serde(default)]
+    pub max_p99_ms: Option<u64>,
+}
+
+const fn default_deploy_bake_interval_secs() -> u64 {
+    10
+}
+
+const fn default_deploy_bake_min_requests() -> u64 {
+    20
+}
+
+impl Default for DeployBakeConfig {
+    fn default() -> Self {
+        Self {
+            duration_secs: 0,
+            interval_secs: default_deploy_bake_interval_secs(),
+            min_requests: default_deploy_bake_min_requests(),
+            max_error_rate: None,
+            max_p99_ms: None,
+        }
+    }
+}
+
 /// Push-button VPS deploy settings (`[deploy]` section, issue #1607).
 ///
 /// Describes the SSH-reachable target server and the remote install layout for
@@ -1812,6 +1927,11 @@ pub struct DeployConfig {
     /// of something the deploy fixes.
     #[serde(default = "default_deploy_install_proxy")]
     pub install_proxy: bool,
+
+    /// The post-cutover bake (`[deploy.bake]`, issue #3069). Off by default.
+    /// See [`DeployBakeConfig`].
+    #[serde(default)]
+    pub bake: DeployBakeConfig,
 }
 
 /// Default for [`DeployConfig::install_proxy`]: prepare the host (issue #1607).
@@ -1836,6 +1956,7 @@ impl Default for DeployConfig {
             profile: default_deploy_profile(),
             tls: DeployTlsConfig::default(),
             install_proxy: default_deploy_install_proxy(),
+            bake: DeployBakeConfig::default(),
         }
     }
 }
@@ -2367,6 +2488,85 @@ pub struct HttpClientConfig {
     /// [`TestApp::http_mock`](crate::test::TestApp::http_mock).
     #[serde(default)]
     pub base_urls: std::collections::HashMap<String, String>,
+
+    /// Client-side adaptive throttling per host (issue #3068). Off by
+    /// default. See [`AdaptiveThrottleConfig`].
+    #[serde(default)]
+    pub adaptive_throttle: AdaptiveThrottleConfig,
+}
+
+/// `[http.client.adaptive_throttle]`: Google SRE client-side throttling.
+///
+/// When a host rejects too many recent attempts (`429` or `503`, or no
+/// response), the client rejects new attempts to that host locally with
+/// probability `max(0, (requests − k × accepts) / (requests + 1))`. The
+/// error is [`ClientError::ThrottledLocally`](crate::http_client::ClientError::ThrottledLocally).
+///
+/// ```toml
+/// [http.client.adaptive_throttle]
+/// enabled = true
+/// k = 2.0            # reject once accepts fall below 1/k of requests
+/// window_secs = 120
+/// ```
+#[cfg(feature = "http-client")]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[non_exhaustive]
+pub struct AdaptiveThrottleConfig {
+    /// Turn the throttle on. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The multiplier `K`. At least 1.0. Default: 2.0.
+    #[serde(default = "default_throttle_k")]
+    pub k: f64,
+    /// The sliding window, in seconds. At least 1. Default: 120.
+    #[serde(default = "default_throttle_window_secs")]
+    pub window_secs: u64,
+}
+
+#[cfg(feature = "http-client")]
+const fn default_throttle_k() -> f64 {
+    2.0
+}
+
+#[cfg(feature = "http-client")]
+const fn default_throttle_window_secs() -> u64 {
+    120
+}
+
+#[cfg(feature = "http-client")]
+impl Default for AdaptiveThrottleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            k: default_throttle_k(),
+            window_secs: default_throttle_window_secs(),
+        }
+    }
+}
+
+#[cfg(feature = "http-client")]
+impl AdaptiveThrottleConfig {
+    /// Check the settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] when `k < 1.0` or
+    /// `window_secs == 0`.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !(self.k >= 1.0 && self.k.is_finite()) {
+            return Err(ConfigError::Validation(format!(
+                "http.client.adaptive_throttle.k = {} must be a number >= 1.0: a smaller k \
+                 rejects calls to a healthy host",
+                self.k
+            )));
+        }
+        if self.window_secs == 0 {
+            return Err(ConfigError::Validation(
+                "http.client.adaptive_throttle.window_secs must be at least 1".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "http-client")]
@@ -2398,6 +2598,7 @@ impl Default for HttpClientConfig {
             max_retry_after_secs: default_http_max_retry_after_secs(),
             max_backoff_ms: default_http_max_backoff_ms(),
             base_urls: std::collections::HashMap::new(),
+            adaptive_throttle: AdaptiveThrottleConfig::default(),
         }
     }
 }
@@ -3579,6 +3780,83 @@ fn default_openapi_path() -> String {
     "/openapi.json".to_owned()
 }
 
+/// Transactional outbox relay configuration (issue #3062).
+///
+/// See `docs/guide/outbox.md`. The relay runs only when `enabled` is `true`
+/// and the app has a database.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct OutboxConfig {
+    /// Start the relay, create the tables at boot, and send `deliver_later`
+    /// mail through the outbox. Default `false`.
+    pub enabled: bool,
+    /// Wait between relay polls when no message is ready. Default `500`.
+    pub poll_interval_ms: u64,
+    /// Messages one relay claims per poll. Default `100`.
+    pub batch_size: usize,
+    /// Attempts before a message goes to the dead letters. Default `10`.
+    pub max_attempts: u32,
+    /// First retry delay. Each retry doubles it, with jitter. Default `1000`.
+    pub initial_backoff_ms: u64,
+    /// Upper limit of the retry delay. Default `300000` (5 minutes).
+    pub max_backoff_ms: u64,
+    /// How long a claim stays valid. After a crash, the message is sent again
+    /// when the claim expires. Default `60000`.
+    pub lease_ms: u64,
+    /// Age after which the relay deletes sent messages and inbox entries.
+    /// Default `604800000` (7 days).
+    pub retention_ms: u64,
+}
+
+impl OutboxConfig {
+    /// Check the values the relay needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] when `batch_size`, `max_attempts`
+    /// or `lease_ms` is zero, or `max_backoff_ms` is smaller than
+    /// `initial_backoff_ms`. With a zero lease, a claim ends at once and the
+    /// relay sends nothing.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (key, value) in [
+            (
+                "batch_size",
+                u64::try_from(self.batch_size).unwrap_or(u64::MAX),
+            ),
+            ("max_attempts", u64::from(self.max_attempts)),
+            ("lease_ms", self.lease_ms),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "outbox.{key} must be greater than zero"
+                )));
+            }
+        }
+        if self.max_backoff_ms < self.initial_backoff_ms {
+            return Err(ConfigError::Validation(
+                "outbox.max_backoff_ms must not be smaller than outbox.initial_backoff_ms"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for OutboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval_ms: 500,
+            batch_size: 100,
+            max_attempts: 10,
+            initial_backoff_ms: 1_000,
+            max_backoff_ms: 300_000,
+            lease_ms: 60_000,
+            retention_ms: 604_800_000,
+        }
+    }
+}
+
 /// Background job runtime configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct JobConfig {
@@ -3604,6 +3882,11 @@ pub struct JobConfig {
     /// Default: 3 600 000 (1 hour). See [`crate::backoff`].
     #[serde(default = "default_job_max_backoff_ms")]
     pub max_backoff_ms: u64,
+    /// Maximum time in milliseconds for one run of a job that has no
+    /// `#[job(timeout)]` (issue #3051). A slower run fails and retries. `0`
+    /// (the default) sets no limit.
+    #[serde(default)]
+    pub default_timeout_ms: u64,
     /// Ordered/weighted list of queues workers drain, highest priority first.
     ///
     /// Unset = a single `default` queue (today's behavior). A TOML array such as
@@ -3649,6 +3932,7 @@ impl Default for JobConfig {
             max_attempts: default_job_max_attempts(),
             initial_backoff_ms: default_job_backoff_ms(),
             max_backoff_ms: default_job_max_backoff_ms(),
+            default_timeout_ms: 0,
             queues: JobQueuesConfig::default(),
             pin: Vec::new(),
             fleet: JobFleetConfig::default(),
@@ -4210,6 +4494,24 @@ impl AutumnConfig {
     /// See [`crate::push::PushConfig::load_vapid_key`].
     pub fn validate_push(&self) -> Result<(), crate::push::PushError> {
         self.push.load_vapid_key().map(|_| ())
+    }
+
+    /// The load-shedding ceiling the profile supplies when
+    /// `server.max_concurrent_requests` is unset and no capacity contract
+    /// applies (#3057).
+    ///
+    /// `prod` returns the primary pool size times
+    /// [`PROD_REQUESTS_PER_POOL_CONNECTION`], and at least
+    /// [`PROD_MIN_ADMISSION_LIMIT`]. Other profiles return `None` (no
+    /// ceiling). Set `server.max_concurrent_requests = 0` to turn shedding off.
+    #[must_use]
+    pub fn profile_admission_default(&self) -> Option<usize> {
+        matches!(self.profile.as_deref(), Some("prod" | "production")).then(|| {
+            self.database
+                .effective_primary_pool_size()
+                .saturating_mul(PROD_REQUESTS_PER_POOL_CONNECTION)
+                .max(PROD_MIN_ADMISSION_LIMIT)
+        })
     }
 }
 
@@ -4792,10 +5094,8 @@ impl AutumnConfig {
         // Layer 6: env var overrides (highest priority)
         config.apply_env_overrides_with_env(env);
 
-        let is_strict_env = env
-            .var("AUTUMN_SERVER__STRICT_CONFIG")
-            .is_ok_and(|v| v == "true" || v == "1");
-        if config.server.strict_config || is_strict_env {
+        // Env overrides already applied `AUTUMN_SERVER__STRICT_CONFIG`.
+        if config.server.strict_config {
             let enforce_all = config.server.strict_config_enforce_all
                 || env
                     .var("AUTUMN_SERVER__STRICT_CONFIG_ENFORCE_ALL")
@@ -5105,7 +5405,11 @@ impl AutumnConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.database.validate()?;
         self.cors.validate()?;
+        self.server.admission.validate()?;
+        #[cfg(feature = "http-client")]
+        self.http.client.adaptive_throttle.validate()?;
         self.scheduler.validate()?;
+        self.outbox.validate()?;
         // #1605: reject an unparseable or zero retention window at boot rather
         // than silently skipping the dataset it names — a policy an operator
         // believes is enforced but isn't is worse than no policy.
@@ -5146,6 +5450,8 @@ impl AutumnConfig {
         // at apply time, so `autumn check` names the key. A cap of 0 would
         // silently drop every labeled sample the app records.
         self.metrics.validate()?;
+        // A zero ping limit fails every ping, so `/ready` is never `200`.
+        self.health.validate()?;
         // A zero recheck would spin; a negative threshold keeps deferrable work
         // waiting for ever, because the runtime-config signal is never below 0.
         self.cost.validate().map_err(ConfigError::Validation)?;
@@ -5313,6 +5619,10 @@ impl AutumnConfig {
     /// - `AUTUMN_HEALTH__STARTUP_PATH` → `health.startup_path` (String)
     /// - `AUTUMN_HEALTH__DETAILED` → `health.detailed` (bool)
     /// - `AUTUMN_HEALTH__ENABLED` → `health.enabled` (bool)
+    /// - `AUTUMN_HEALTH__CACHE_TTL_MS` → `health.cache_ttl_ms` (u64)
+    /// - `AUTUMN_HEALTH__PING_TIMEOUT_MS` → `health.ping_timeout_ms` (u64)
+    /// - `AUTUMN_HEALTH__REDIS_READINESS` → `health.redis_readiness` (bool)
+    /// - `AUTUMN_HEALTH__DB_READINESS` → `health.db_readiness` (bool)
     ///
     /// # Jobs
     /// - `AUTUMN_JOBS__BACKEND` → `jobs.backend` (`local` / `redis` / `sqlite`)
@@ -5321,12 +5631,23 @@ impl AutumnConfig {
     /// - `AUTUMN_JOBS__MAX_ATTEMPTS` → `jobs.max_attempts` (`u32`)
     /// - `AUTUMN_JOBS__INITIAL_BACKOFF_MS` → `jobs.initial_backoff_ms` (`u64`)
     /// - `AUTUMN_JOBS__MAX_BACKOFF_MS` → `jobs.max_backoff_ms` (`u64`)
+    /// - `AUTUMN_JOBS__DEFAULT_TIMEOUT_MS` → `jobs.default_timeout_ms` (`u64`)
     /// - `AUTUMN_JOBS__REDIS__URL` → `jobs.redis.url` (`String`)
     /// - `AUTUMN_JOBS__REDIS__KEY_PREFIX` → `jobs.redis.key_prefix` (`String`)
     /// - `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` → `jobs.redis.visibility_timeout_ms` (`u64`)
     /// - `AUTUMN_JOBS__REDIS__DEAD_LETTER_LIMIT` → `jobs.redis.dead_letter_limit` (`usize`, `0` = unbounded)
     /// - `AUTUMN_JOBS__TRACKING__TTL_SECS` → `jobs.tracking.ttl_secs` (`u64`)
     /// - `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` → `jobs.tracking.route_enabled` (`bool`)
+    ///
+    /// # Outbox (issue #3062)
+    /// - `AUTUMN_OUTBOX__ENABLED` → `outbox.enabled` (`bool`)
+    /// - `AUTUMN_OUTBOX__POLL_INTERVAL_MS` → `outbox.poll_interval_ms` (`u64`)
+    /// - `AUTUMN_OUTBOX__BATCH_SIZE` → `outbox.batch_size` (`usize`)
+    /// - `AUTUMN_OUTBOX__MAX_ATTEMPTS` → `outbox.max_attempts` (`u32`)
+    /// - `AUTUMN_OUTBOX__INITIAL_BACKOFF_MS` → `outbox.initial_backoff_ms` (`u64`)
+    /// - `AUTUMN_OUTBOX__MAX_BACKOFF_MS` → `outbox.max_backoff_ms` (`u64`)
+    /// - `AUTUMN_OUTBOX__LEASE_MS` → `outbox.lease_ms` (`u64`)
+    /// - `AUTUMN_OUTBOX__RETENTION_MS` → `outbox.retention_ms` (`u64`)
     ///
     /// # Retention (issue #1605)
     /// - `AUTUMN_RETENTION__SWEEP_INTERVAL` → `retention.sweep_interval` (duration `String`)
@@ -5382,6 +5703,7 @@ impl AutumnConfig {
         self.apply_cache_env_overrides_with_env(env);
         self.apply_channels_env_overrides_with_env(env);
         self.apply_jobs_env_overrides_with_env(env);
+        self.apply_outbox_env_overrides_with_env(env);
         self.apply_scheduler_env_overrides_with_env(env);
         self.apply_retention_env_overrides_with_env(env);
         self.apply_role_env_overrides_with_env(env);
@@ -5852,6 +6174,52 @@ impl AutumnConfig {
         );
     }
 
+    /// `[server.admission]` env overrides (issue #3068).
+    fn apply_admission_env_overrides_with_env(&mut self, env: &dyn Env) {
+        let admission = &mut self.server.admission;
+        parse_env(env, "AUTUMN_SERVER__ADMISSION__MODE", &mut admission.mode);
+        parse_env(
+            env,
+            "AUTUMN_SERVER__ADMISSION__ALGORITHM",
+            &mut admission.algorithm,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SERVER__ADMISSION__MIN_LIMIT",
+            &mut admission.min_limit,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_SERVER__ADMISSION__MAX_LIMIT",
+            &mut admission.max_limit,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SERVER__ADMISSION__INITIAL_LIMIT",
+            &mut admission.initial_limit,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SERVER__ADMISSION__LATENCY_THRESHOLD_MS",
+            &mut admission.latency_threshold_ms,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_SERVER__ADMISSION__TRUST_CRITICALITY_HEADER",
+            &mut admission.trust_criticality_header,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SERVER__ADMISSION__PARTITIONS__DEFAULT",
+            &mut admission.partitions.default,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SERVER__ADMISSION__PARTITIONS__SHEDDABLE",
+            &mut admission.partitions.sheddable,
+        );
+    }
+
     fn apply_server_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env(env, "AUTUMN_SERVER__PORT", &mut self.server.port);
         parse_env_string(env, "AUTUMN_SERVER__HOST", &mut self.server.host);
@@ -5890,11 +6258,17 @@ impl AutumnConfig {
             "AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS",
             &mut self.server.max_concurrent_requests,
         );
+        parse_env_bool(
+            env,
+            "AUTUMN_SERVER__STRICT_CONFIG",
+            &mut self.server.strict_config,
+        );
         parse_env_option_string(
             env,
             "AUTUMN_SERVER__CAPACITY_CONTRACT",
             &mut self.server.capacity_contract,
         );
+        self.apply_admission_env_overrides_with_env(env);
 
         // `[server.tls]` is a nested optional. Materialize it from the
         // environment when any of its keys are set (seeding an empty struct if
@@ -6000,6 +6374,31 @@ impl AutumnConfig {
             env,
             "AUTUMN_DATABASE__DIRECTORY_SHARD_ROUTER",
             &mut self.database.directory_shard_router,
+        );
+        parse_env_option_duration(
+            env,
+            "AUTUMN_DATABASE__STATEMENT_TIMEOUT",
+            &mut self.database.statement_timeout,
+        );
+        parse_env_option_duration(
+            env,
+            "AUTUMN_DATABASE__IDLE_IN_TRANSACTION_TIMEOUT",
+            &mut self.database.idle_in_transaction_timeout,
+        );
+        // An empty value is ignored here, as `autumn migrate` ignores it.
+        let mut lock_timeout = Some(self.database.migration_lock_timeout);
+        parse_env_option_duration(
+            env,
+            "AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT",
+            &mut lock_timeout,
+        );
+        if let Some(timeout) = lock_timeout {
+            self.database.migration_lock_timeout = timeout;
+        }
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES",
+            &mut self.database.migration_lock_retries,
         );
         self.apply_shard_env_overrides(env);
     }
@@ -6131,6 +6530,26 @@ impl AutumnConfig {
         );
         parse_env_bool(env, "AUTUMN_HEALTH__DETAILED", &mut self.health.detailed);
         parse_env_bool(env, "AUTUMN_HEALTH__ENABLED", &mut self.health.enabled);
+        parse_env(
+            env,
+            "AUTUMN_HEALTH__CACHE_TTL_MS",
+            &mut self.health.cache_ttl_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_HEALTH__PING_TIMEOUT_MS",
+            &mut self.health.ping_timeout_ms,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_HEALTH__REDIS_READINESS",
+            &mut self.health.redis_readiness,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_HEALTH__DB_READINESS",
+            &mut self.health.db_readiness,
+        );
     }
 
     fn apply_cors_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -6286,6 +6705,11 @@ impl AutumnConfig {
             "AUTUMN_JOBS__MAX_BACKOFF_MS",
             &mut self.jobs.max_backoff_ms,
         );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__DEFAULT_TIMEOUT_MS",
+            &mut self.jobs.default_timeout_ms,
+        );
         parse_env_option_string(env, "AUTUMN_JOBS__REDIS__URL", &mut self.jobs.redis.url);
         parse_env_string(
             env,
@@ -6326,6 +6750,41 @@ impl AutumnConfig {
             env,
             "AUTUMN_JOBS__TRACKING__ROUTE_ENABLED",
             &mut self.jobs.tracking.route_enabled,
+        );
+    }
+
+    fn apply_outbox_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(env, "AUTUMN_OUTBOX__ENABLED", &mut self.outbox.enabled);
+        parse_env(
+            env,
+            "AUTUMN_OUTBOX__POLL_INTERVAL_MS",
+            &mut self.outbox.poll_interval_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_OUTBOX__BATCH_SIZE",
+            &mut self.outbox.batch_size,
+        );
+        parse_env(
+            env,
+            "AUTUMN_OUTBOX__MAX_ATTEMPTS",
+            &mut self.outbox.max_attempts,
+        );
+        parse_env(
+            env,
+            "AUTUMN_OUTBOX__INITIAL_BACKOFF_MS",
+            &mut self.outbox.initial_backoff_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_OUTBOX__MAX_BACKOFF_MS",
+            &mut self.outbox.max_backoff_ms,
+        );
+        parse_env(env, "AUTUMN_OUTBOX__LEASE_MS", &mut self.outbox.lease_ms);
+        parse_env(
+            env,
+            "AUTUMN_OUTBOX__RETENTION_MS",
+            &mut self.outbox.retention_ms,
         );
     }
 
@@ -7253,6 +7712,9 @@ pub struct ServerConfig {
     pub host: String,
 
     /// Exit startup if any unknown config keys are found in autumn.toml/profiles.
+    ///
+    /// The `prod` profile sets `true` (#3057). Override via
+    /// `AUTUMN_SERVER__STRICT_CONFIG`.
     #[serde(default)]
     pub strict_config: bool,
 
@@ -7314,9 +7776,10 @@ pub struct ServerConfig {
     pub unix_socket: Option<String>,
 
     /// Ceiling on concurrent in-flight requests (admission control / load
-    /// shedding). `None` or `0` (the default) disables the ceiling — today's
-    /// unlimited behavior — so no existing application silently changes
-    /// throughput.
+    /// shedding). `0` disables the ceiling. `None` (the default) uses the
+    /// capacity contract, then the profile default: primary pool size ×
+    /// [`PROD_REQUESTS_PER_POOL_CONNECTION`] under `prod` (#3057), no ceiling
+    /// under other profiles.
     ///
     /// Once this many requests are admitted and still in flight, additional
     /// requests receive an immediate `503 Service Unavailable` with a
@@ -7350,9 +7813,9 @@ pub struct ServerConfig {
     ///
     /// An explicit `max_concurrent_requests` always wins, and every failure
     /// along the contract path (missing file, malformed document, a contract
-    /// measured on a different host class) degrades to *unlimited* with a
-    /// warning rather than to a ceiling — see
-    /// [`capacity::resolve_admission_limit`](crate::capacity::resolve_admission_limit).
+    /// measured on a different host class) degrades to the profile default
+    /// (unlimited outside `prod`) with a warning — see
+    /// [`capacity::resolve_admission_limit_with_default`](crate::capacity::resolve_admission_limit_with_default).
     ///
     /// Configured via `AUTUMN_SERVER__CAPACITY_CONTRACT`.
     #[serde(default)]
@@ -7377,6 +7840,228 @@ pub struct ServerConfig {
     /// `AUTUMN_SERVER__TLS__HANDSHAKE_TIMEOUT_SECS` env vars.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+
+    /// Admission control: static or adaptive limit, and criticality
+    /// partitions (issue #3068). See [`AdmissionConfig`].
+    ///
+    /// Configured via `[server.admission]` or `AUTUMN_SERVER__ADMISSION__*`.
+    #[serde(default)]
+    pub admission: AdmissionConfig,
+}
+
+/// How admission control sets its concurrency limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum AdmissionMode {
+    /// A fixed ceiling from `server.max_concurrent_requests`, the capacity
+    /// contract, or the profile default.
+    #[default]
+    Static,
+    /// A ceiling that follows measured latency. See [`AdmissionAlgorithm`].
+    Adaptive,
+}
+
+impl std::str::FromStr for AdmissionMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "static" => Ok(Self::Static),
+            "adaptive" => Ok(Self::Adaptive),
+            other => Err(format!("unknown admission mode {other:?}")),
+        }
+    }
+}
+
+/// The algorithm that moves an adaptive limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum AdmissionAlgorithm {
+    /// Netflix Gradient2: compares the latest RTT with a long-term average.
+    #[default]
+    Gradient2,
+    /// Netflix Vegas: estimates the queue from the lowest RTT seen.
+    Vegas,
+    /// Additive increase, multiplicative decrease. It backs off on a `504`,
+    /// a cancel at the request deadline, or a response slower than
+    /// [`AdmissionConfig::latency_threshold_ms`].
+    Aimd,
+}
+
+impl std::str::FromStr for AdmissionAlgorithm {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "gradient2" => Ok(Self::Gradient2),
+            "vegas" => Ok(Self::Vegas),
+            "aimd" => Ok(Self::Aimd),
+            other => Err(format!("unknown admission algorithm {other:?}")),
+        }
+    }
+}
+
+/// `[server.admission]`: admission control settings (issue #3068).
+///
+/// ```toml
+/// [server.admission]
+/// mode = "adaptive"          # "static" (default) or "adaptive"
+/// algorithm = "gradient2"    # "gradient2" (default), "vegas" or "aimd"
+/// min_limit = 8
+/// max_limit = 1000           # default: the static ceiling, else 1000
+/// initial_limit = 20
+/// trust_criticality_header = false
+///
+/// [server.admission.partitions]
+/// default = 1.0              # share of the limit for `default` requests
+/// sheddable = 0.5            # share of the limit for `sheddable` requests
+/// ```
+///
+/// The defaults change nothing for routes without a criticality.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[non_exhaustive]
+pub struct AdmissionConfig {
+    /// `static` (default) or `adaptive`.
+    #[serde(default)]
+    pub mode: AdmissionMode,
+    /// The adaptive algorithm. Not used in `static` mode.
+    #[serde(default)]
+    pub algorithm: AdmissionAlgorithm,
+    /// The lowest adaptive limit. At least 1. Default: 8.
+    #[serde(default = "default_admission_min_limit")]
+    pub min_limit: usize,
+    /// The highest adaptive limit. Default: the static ceiling (from
+    /// `max_concurrent_requests`, the capacity contract or the profile), or
+    /// [`DEFAULT_ADMISSION_MAX_LIMIT`] when there is none.
+    #[serde(default)]
+    pub max_limit: Option<usize>,
+    /// The adaptive limit before the first sample. Default: 20.
+    #[serde(default = "default_admission_initial_limit")]
+    pub initial_limit: usize,
+    /// For `aimd`: a response slower than this backs the limit off.
+    /// Default: 1000 ms.
+    #[serde(default = "default_admission_latency_threshold_ms")]
+    pub latency_threshold_ms: u64,
+    /// Read the criticality of an inbound request from the
+    /// `X-Autumn-Criticality` header. The header replaces the route's value.
+    /// Default: `false`. Set it only when you trust all callers, or when an
+    /// edge proxy removes or sets the header.
+    #[serde(default)]
+    pub trust_criticality_header: bool,
+    /// The share of the limit for each criticality.
+    #[serde(default)]
+    pub partitions: AdmissionPartitionsConfig,
+}
+
+/// The highest adaptive limit when no static ceiling applies.
+pub const DEFAULT_ADMISSION_MAX_LIMIT: usize = 1000;
+
+const fn default_admission_min_limit() -> usize {
+    8
+}
+
+const fn default_admission_initial_limit() -> usize {
+    20
+}
+
+const fn default_admission_latency_threshold_ms() -> u64 {
+    1000
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        Self {
+            mode: AdmissionMode::default(),
+            algorithm: AdmissionAlgorithm::default(),
+            min_limit: default_admission_min_limit(),
+            max_limit: None,
+            initial_limit: default_admission_initial_limit(),
+            latency_threshold_ms: default_admission_latency_threshold_ms(),
+            trust_criticality_header: false,
+            partitions: AdmissionPartitionsConfig::default(),
+        }
+    }
+}
+
+/// `[server.admission.partitions]`: the share of the limit that each
+/// criticality can fill. `critical` always gets the full limit.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[non_exhaustive]
+pub struct AdmissionPartitionsConfig {
+    /// The share for `default` requests, in `0.0..=1.0`. Default: 1.0.
+    #[serde(default = "default_partition_default")]
+    pub default: f64,
+    /// The share for `sheddable` requests, in `0.0..=default`. Default: 0.5.
+    #[serde(default = "default_partition_sheddable")]
+    pub sheddable: f64,
+}
+
+const fn default_partition_default() -> f64 {
+    1.0
+}
+
+const fn default_partition_sheddable() -> f64 {
+    0.5
+}
+
+impl Default for AdmissionPartitionsConfig {
+    fn default() -> Self {
+        Self {
+            default: default_partition_default(),
+            sheddable: default_partition_sheddable(),
+        }
+    }
+}
+
+impl AdmissionConfig {
+    /// The partition shares.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a share is out of range or out of order.
+    pub fn partition_shares(
+        &self,
+    ) -> Result<crate::admission::PartitionShares, crate::admission::AdmissionConfigError> {
+        crate::admission::PartitionShares::new(self.partitions.default, self.partitions.sheddable)
+    }
+
+    /// The adaptive limit bounds. `ceiling` is the static ceiling, if any.
+    ///
+    /// When `max_limit` is unset, the ceiling is the maximum. A ceiling
+    /// below `min_limit` (for example a small capacity contract) lowers the
+    /// minimum to the ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless `1 <= min_limit <= max_limit`.
+    pub fn limit_bounds(
+        &self,
+        ceiling: Option<usize>,
+    ) -> Result<crate::admission::LimitBounds, crate::admission::AdmissionConfigError> {
+        let (min, max) = match (self.max_limit, ceiling) {
+            (Some(max), _) => (self.min_limit, max),
+            (None, Some(ceiling)) if ceiling > 0 => (self.min_limit.min(ceiling), ceiling),
+            (None, _) => (self.min_limit, DEFAULT_ADMISSION_MAX_LIMIT),
+        };
+        crate::admission::LimitBounds::new(min, max, self.initial_limit)
+    }
+
+    /// Check the settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] for bad shares or limit bounds.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.partition_shares()
+            .map_err(|e| ConfigError::Validation(e.to_string()))?;
+        // The static ceiling is not known here; check the explicit bounds.
+        let max = self.max_limit.unwrap_or(usize::MAX);
+        crate::admission::LimitBounds::new(self.min_limit, max, self.initial_limit)
+            .map_err(|e| ConfigError::Validation(e.to_string()))?;
+        Ok(())
+    }
 }
 
 /// Direct-HTTPS (native TLS termination) settings (issue #1603).
@@ -8926,9 +9611,48 @@ pub struct DatabaseConfig {
     #[serde(default)]
     pub auto_migrate_in_production: bool,
 
-    /// Optional database statement timeout.
+    /// Optional database statement timeout. `"0s"` disables it.
+    ///
+    /// Set as a session `SET` on checkout, and again as `SET LOCAL` at the
+    /// start of each framework transaction, so a transaction pooler such as
+    /// `PgBouncer` cannot drop it. The `prod` profile sets `30s` (#3057).
+    ///
+    /// Override via `AUTUMN_DATABASE__STATEMENT_TIMEOUT`.
     #[serde(deserialize_with = "deserialize_option_duration", default)]
     pub statement_timeout: Option<std::time::Duration>,
+
+    /// Optional `idle_in_transaction_session_timeout`. `"0s"` disables it.
+    ///
+    /// Set as `SET LOCAL` at the start of each framework transaction. Postgres
+    /// ends a session that stays idle in an open transaction for longer than
+    /// this. The `prod` profile sets `60s` (#3057).
+    ///
+    /// Override via `AUTUMN_DATABASE__IDLE_IN_TRANSACTION_TIMEOUT`.
+    #[serde(deserialize_with = "deserialize_option_duration", default)]
+    pub idle_in_transaction_timeout: Option<std::time::Duration>,
+
+    /// Postgres `lock_timeout` for the migration session. Default: `5s`.
+    /// `"0s"` disables it.
+    ///
+    /// A migration that waits longer than this for a table lock fails, and
+    /// the migrator retries it (see [`Self::migration_lock_retries`]). This
+    /// stops a DDL statement that queues behind a long transaction from
+    /// blocking all traffic on that table (#3057).
+    ///
+    /// Override via `AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT`.
+    #[serde(
+        deserialize_with = "deserialize_duration",
+        default = "default_migration_lock_timeout"
+    )]
+    pub migration_lock_timeout: std::time::Duration,
+
+    /// Retries after a migration fails on `migration_lock_timeout`.
+    /// Default: `5`. `0` disables the retry. Each retry waits a jittered,
+    /// exponential delay.
+    ///
+    /// Override via `AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES`.
+    #[serde(default = "default_migration_lock_retries")]
+    pub migration_lock_retries: u32,
 
     /// Slow query threshold. Default: `500ms`.
     #[serde(
@@ -9637,7 +10361,15 @@ impl TelemetryProtocol {
 /// assert_eq!(health.ready_path, "/ready");
 /// assert_eq!(health.startup_path, "/startup");
 /// assert!(!health.detailed);
+/// assert_eq!(health.cache_ttl_ms, 1_000);
+/// assert_eq!(health.ping_timeout_ms, 2_000);
+/// assert!(health.db_readiness);
+/// assert!(!health.redis_readiness);
 /// ```
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent on/off switches of one config section"
+)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct HealthConfig {
     /// When `true` (the default), the framework auto-mounts the built-in
@@ -9670,6 +10402,74 @@ pub struct HealthConfig {
     /// `dev` profile via smart defaults).
     #[serde(default)]
     pub detailed: bool,
+
+    /// How long one dependency check result stays valid, in milliseconds.
+    /// Applies to the database pings and to each registered health indicator.
+    /// When a result is stale, one probe refreshes it. The other probes wait
+    /// for that result. `0` turns the cache off. Default: `1000`.
+    #[serde(default = "default_health_cache_ttl_ms")]
+    pub cache_ttl_ms: u64,
+
+    /// Time limit for one built-in dependency ping (database `SELECT 1`,
+    /// Redis `PING`), in milliseconds. A ping that does not finish in time is
+    /// `DOWN`. Keep it below the probe timeout of the platform. Must not be
+    /// `0`. Default: `2000`.
+    #[serde(default = "default_health_ping_timeout_ms")]
+    pub ping_timeout_ms: u64,
+
+    /// When `true`, a failed primary database ping makes `/ready` return
+    /// `503`. When `false`, only `/actuator/health` shows it. Default: `true`.
+    #[serde(default = "default_health_db_readiness")]
+    pub db_readiness: bool,
+
+    /// When `true`, the built-in Redis indicators gate `/ready`. The default
+    /// is `false`: they show in `/actuator/health` only. All replicas share
+    /// Redis. A Redis failure that gates `/ready` removes every replica from
+    /// rotation.
+    #[serde(default)]
+    pub redis_readiness: bool,
+}
+
+impl HealthConfig {
+    /// [`Self::cache_ttl_ms`] as a [`Duration`](std::time::Duration).
+    #[must_use]
+    pub const fn cache_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.cache_ttl_ms)
+    }
+
+    /// [`Self::ping_timeout_ms`] as a [`Duration`](std::time::Duration).
+    #[must_use]
+    pub const fn ping_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.ping_timeout_ms)
+    }
+
+    /// Check the values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] when `ping_timeout_ms` is `0`.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.ping_timeout_ms == 0 {
+            return Err(ConfigError::Validation(
+                "health.ping_timeout_ms must be greater than 0: a zero limit fails every \
+                 database and Redis ping, so /ready never returns 200"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+const fn default_health_db_readiness() -> bool {
+    true
+}
+
+const fn default_health_cache_ttl_ms() -> u64 {
+    1_000
+}
+
+const fn default_health_ping_timeout_ms() -> u64 {
+    2_000
 }
 
 /// Actuator endpoint configuration.
@@ -10029,7 +10829,7 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
     // only that key produces no deploy section at all — a silent skip, not an
     // error, in both `AutumnConfig::load` and `autumn doctor`. Every key parsed
     // below MUST appear here.
-    const KEYS: [&str; 13] = [
+    const KEYS: [&str; 18] = [
         "AUTUMN_DEPLOY__HOST",
         "AUTUMN_DEPLOY__HOSTS",
         "AUTUMN_DEPLOY__USER",
@@ -10043,6 +10843,11 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
         "AUTUMN_DEPLOY__TLS__ENABLED",
         "AUTUMN_DEPLOY__TLS__HOST",
         "AUTUMN_DEPLOY__INSTALL_PROXY",
+        "AUTUMN_DEPLOY__BAKE__DURATION_SECS",
+        "AUTUMN_DEPLOY__BAKE__INTERVAL_SECS",
+        "AUTUMN_DEPLOY__BAKE__MIN_REQUESTS",
+        "AUTUMN_DEPLOY__BAKE__MAX_ERROR_RATE",
+        "AUTUMN_DEPLOY__BAKE__MAX_P99_MS",
     ];
     if !KEYS.iter().any(|key| env.var(key).is_ok()) {
         return;
@@ -10118,6 +10923,29 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
         "AUTUMN_DEPLOY__INSTALL_PROXY",
         &mut deploy.install_proxy,
     );
+    // The post-cutover bake (#3069). Env wins over TOML.
+    let bake = &mut deploy.bake;
+    parse_env(
+        env,
+        "AUTUMN_DEPLOY__BAKE__DURATION_SECS",
+        &mut bake.duration_secs,
+    );
+    parse_env(
+        env,
+        "AUTUMN_DEPLOY__BAKE__INTERVAL_SECS",
+        &mut bake.interval_secs,
+    );
+    parse_env(
+        env,
+        "AUTUMN_DEPLOY__BAKE__MIN_REQUESTS",
+        &mut bake.min_requests,
+    );
+    parse_env_option(
+        env,
+        "AUTUMN_DEPLOY__BAKE__MAX_ERROR_RATE",
+        &mut bake.max_error_rate,
+    );
+    parse_env_option(env, "AUTUMN_DEPLOY__BAKE__MAX_P99_MS", &mut bake.max_p99_ms);
 }
 
 /// Parse an environment variable into a typed target, logging a warning on failure.
@@ -10159,6 +10987,22 @@ fn parse_env_option<T: std::str::FromStr>(env: &dyn Env, key: &str, target: &mut
             match val.parse::<T>() {
                 Ok(v) => *target = Some(v),
                 Err(_) => eprintln!("Warning: {key}={val:?} is not valid, ignoring"),
+            }
+        }
+    }
+}
+
+/// Parse a duration env var (`"30s"`, `"500ms"`, or bare milliseconds).
+/// An empty value clears the target.
+fn parse_env_option_duration(env: &dyn Env, key: &str, target: &mut Option<std::time::Duration>) {
+    if let Ok(val) = env.var(key) {
+        let val = val.trim();
+        if val.is_empty() {
+            *target = None;
+        } else {
+            match parse_duration_str(val) {
+                Ok(d) => *target = Some(d),
+                Err(e) => eprintln!("Warning: {key}={val:?} is not valid ({e}), ignoring"),
             }
         }
     }
@@ -10244,6 +11088,29 @@ const fn default_prestop_grace() -> u64 {
 const fn default_pool_size() -> usize {
     10
 }
+
+const fn default_migration_lock_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(5)
+}
+
+const fn default_migration_lock_retries() -> u32 {
+    5
+}
+
+/// Admitted requests per primary pool connection in the `prod` load-shedding
+/// ceiling (#3057). The ceiling is `primary pool size × this value`, and at
+/// least [`PROD_MIN_ADMISSION_LIMIT`].
+///
+/// Requests above the pool size wait for a connection, and a long queue only
+/// adds latency before the `connect_timeout_secs` failure. 32 waiters per
+/// connection is a high, safe ceiling. Tune it with
+/// `server.max_concurrent_requests` or a capacity contract.
+pub const PROD_REQUESTS_PER_POOL_CONNECTION: usize = 32;
+
+/// The lowest `prod` load-shedding ceiling (#3057). A small primary pool (a
+/// sharded app, or an app that does not use its database much) must not shed
+/// normal traffic.
+pub const PROD_MIN_ADMISSION_LIMIT: usize = 256;
 
 const fn default_max_connections_warn_threshold() -> usize {
     100
@@ -10479,6 +11346,7 @@ impl Default for ServerConfig {
             max_concurrent_requests: None,
             capacity_contract: None,
             tls: None,
+            admission: AdmissionConfig::default(),
         }
     }
 }
@@ -10500,6 +11368,9 @@ impl Default for DatabaseConfig {
             auto_migrate: None,
             auto_migrate_in_production: false,
             statement_timeout: None,
+            idle_in_transaction_timeout: None,
+            migration_lock_timeout: default_migration_lock_timeout(),
+            migration_lock_retries: default_migration_lock_retries(),
             slow_query_threshold: default_slow_query_threshold(),
             shards: Vec::new(),
             directory_shard_router: false,
@@ -10546,6 +11417,10 @@ impl Default for HealthConfig {
             ready_path: default_ready_path(),
             startup_path: default_startup_path(),
             detailed: false,
+            cache_ttl_ms: default_health_cache_ttl_ms(),
+            ping_timeout_ms: default_health_ping_timeout_ms(),
+            db_readiness: default_health_db_readiness(),
+            redis_readiness: false,
         }
     }
 }
@@ -12159,13 +13034,14 @@ mod tests {
     }
 
     // When strict_config is OFF, behavior is unchanged: `[media]` is tolerated
-    // even with no roots registered (non-strict never ran the check).
+    // even with no roots registered (non-strict never ran the check). `prod`
+    // turns strict_config on (#3057), so the test turns it off explicitly.
     #[test]
     fn non_strict_config_tolerates_media_root_without_registration() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(
             temp.path().join("autumn.toml"),
-            "[media]\nqueue = \"media\"\n",
+            "[server]\nstrict_config = false\n\n[media]\nqueue = \"media\"\n",
         )
         .unwrap();
 
@@ -14747,6 +15623,21 @@ path = "/healthz"
         assert_eq!(config.jobs.redis.visibility_timeout_ms, 45_000);
     }
 
+    /// `jobs.default_timeout_ms` defaults to `0` (no limit) and reads from
+    /// TOML and the environment (issue #3051).
+    #[test]
+    fn jobs_default_timeout_ms_defaults_to_zero_and_overrides() {
+        assert_eq!(AutumnConfig::default().jobs.default_timeout_ms, 0);
+
+        let config: AutumnConfig = toml::from_str("[jobs]\ndefault_timeout_ms = 30000\n").unwrap();
+        assert_eq!(config.jobs.default_timeout_ms, 30_000);
+
+        let env = MockEnv::new().with("AUTUMN_JOBS__DEFAULT_TIMEOUT_MS", "1500");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.jobs.default_timeout_ms, 1_500);
+    }
+
     // ── [retention] unified framework-owned data retention (issue #1605) ──
 
     #[test]
@@ -14971,6 +15862,76 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.jobs.redis.dead_letter_limit, 250);
+    }
+
+    #[test]
+    fn outbox_validate_rejects_zero_values() {
+        assert!(OutboxConfig::default().validate().is_ok());
+        for config in [
+            OutboxConfig {
+                lease_ms: 0,
+                ..OutboxConfig::default()
+            },
+            OutboxConfig {
+                max_attempts: 0,
+                ..OutboxConfig::default()
+            },
+            OutboxConfig {
+                batch_size: 0,
+                ..OutboxConfig::default()
+            },
+        ] {
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("must be greater than zero"), "{error}");
+        }
+        let error = OutboxConfig {
+            initial_backoff_ms: 300_000,
+            max_backoff_ms: 1_000,
+            ..OutboxConfig::default()
+        }
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("max_backoff_ms"), "{error}");
+    }
+
+    #[test]
+    fn outbox_defaults_parse_and_env_overrides() {
+        let defaults = AutumnConfig::default().outbox;
+        assert!(!defaults.enabled, "the outbox is off by default");
+        assert_eq!(defaults, OutboxConfig::default());
+        assert_eq!(defaults.max_attempts, 10);
+
+        let config: AutumnConfig =
+            toml::from_str("[outbox]\nenabled = true\nlease_ms = 5000\n").expect("outbox");
+        assert!(config.outbox.enabled);
+        assert_eq!(config.outbox.lease_ms, 5_000);
+        assert_eq!(config.outbox.batch_size, 100, "unset keys keep defaults");
+
+        let env = MockEnv::new()
+            .with("AUTUMN_OUTBOX__ENABLED", "true")
+            .with("AUTUMN_OUTBOX__POLL_INTERVAL_MS", "50")
+            .with("AUTUMN_OUTBOX__BATCH_SIZE", "7")
+            .with("AUTUMN_OUTBOX__MAX_ATTEMPTS", "3")
+            .with("AUTUMN_OUTBOX__INITIAL_BACKOFF_MS", "20")
+            .with("AUTUMN_OUTBOX__MAX_BACKOFF_MS", "200")
+            .with("AUTUMN_OUTBOX__LEASE_MS", "900")
+            .with("AUTUMN_OUTBOX__RETENTION_MS", "1000");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.outbox,
+            OutboxConfig {
+                enabled: true,
+                poll_interval_ms: 50,
+                batch_size: 7,
+                max_attempts: 3,
+                initial_backoff_ms: 20,
+                max_backoff_ms: 200,
+                lease_ms: 900,
+                retention_ms: 1_000,
+            }
+        );
     }
 
     #[test]
@@ -16128,6 +17089,75 @@ path = "/healthz"
             toml::from_str("[deploy]\nhost = \"203.0.113.10\"\ninstall_proxy = true\n").unwrap();
         from_toml.apply_env_overrides_with_env(&env);
         assert!(!from_toml.deploy.expect("deploy configured").install_proxy);
+    }
+
+    #[test]
+    fn deploy_bake_defaults_to_off() {
+        let config: AutumnConfig = toml::from_str("[deploy]\nhost = \"h\"\n").unwrap();
+        let bake = config.deploy.expect("deploy").bake;
+        assert_eq!(bake.duration_secs, 0);
+        assert_eq!(bake.interval_secs, 10);
+        assert_eq!(bake.min_requests, 20);
+        assert!(bake.max_error_rate.is_none());
+        assert!(bake.max_p99_ms.is_none());
+    }
+
+    #[test]
+    fn deploy_bake_parses_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            "[deploy]\nhost = \"h\"\n\n[deploy.bake]\nduration_secs = 300\n\
+             interval_secs = 15\nmin_requests = 50\nmax_error_rate = 0.01\nmax_p99_ms = 400\n",
+        )
+        .unwrap();
+        let bake = config.deploy.expect("deploy").bake;
+        assert_eq!(bake.duration_secs, 300);
+        assert_eq!(bake.interval_secs, 15);
+        assert_eq!(bake.min_requests, 50);
+        assert_eq!(bake.max_error_rate, Some(0.01));
+        assert_eq!(bake.max_p99_ms, Some(400));
+    }
+
+    #[test]
+    fn env_override_wins_over_toml_deploy_bake_and_ignores_a_bad_value() {
+        let mut config: AutumnConfig = toml::from_str(
+            "[deploy]\nhost = \"h\"\n\n[deploy.bake]\nduration_secs = 300\nmax_p99_ms = 400\n",
+        )
+        .unwrap();
+        let env = MockEnv::new()
+            .with("AUTUMN_DEPLOY__BAKE__DURATION_SECS", "60")
+            // Not a number: the TOML value stays.
+            .with("AUTUMN_DEPLOY__BAKE__MAX_P99_MS", "5m");
+        config.apply_env_overrides_with_env(&env);
+        let bake = config.deploy.expect("deploy").bake;
+        assert_eq!(bake.duration_secs, 60);
+        assert_eq!(bake.max_p99_ms, Some(400));
+    }
+
+    #[test]
+    fn env_override_sets_every_deploy_bake_key() {
+        // Each key alone materializes [deploy].
+        let env = MockEnv::new()
+            .with("AUTUMN_DEPLOY__BAKE__DURATION_SECS", "120")
+            .with("AUTUMN_DEPLOY__BAKE__INTERVAL_SECS", "5")
+            .with("AUTUMN_DEPLOY__BAKE__MIN_REQUESTS", "7")
+            .with("AUTUMN_DEPLOY__BAKE__MAX_ERROR_RATE", "0.02")
+            .with("AUTUMN_DEPLOY__BAKE__MAX_P99_MS", "300");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        let bake = config.deploy.expect("env should materialize deploy").bake;
+        assert_eq!(bake.duration_secs, 120);
+        assert_eq!(bake.interval_secs, 5);
+        assert_eq!(bake.min_requests, 7);
+        assert_eq!(bake.max_error_rate, Some(0.02));
+        assert_eq!(bake.max_p99_ms, Some(300));
+
+        let only = MockEnv::new().with("AUTUMN_DEPLOY__BAKE__MAX_P99_MS", "250");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&only);
+        assert_eq!(
+            config.deploy.expect("materialized").bake.max_p99_ms,
+            Some(250)
+        );
     }
 
     #[test]
@@ -17546,6 +18576,147 @@ path = "/healthz"
         );
     }
 
+    // ── server.admission (#3068) ─────────────────────────────────
+
+    #[test]
+    fn admission_defaults_change_nothing() {
+        let a = AutumnConfig::default().server.admission;
+        assert_eq!(a.mode, AdmissionMode::Static);
+        assert_eq!(a.algorithm, AdmissionAlgorithm::Gradient2);
+        assert!(!a.trust_criticality_header);
+        assert_eq!(
+            a.partition_shares().unwrap(),
+            crate::admission::PartitionShares::default()
+        );
+    }
+
+    #[test]
+    fn admission_parses_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server.admission]
+            mode = "adaptive"
+            algorithm = "vegas"
+            min_limit = 4
+            max_limit = 400
+            initial_limit = 40
+            latency_threshold_ms = 250
+            trust_criticality_header = true
+            [server.admission.partitions]
+            default = 0.9
+            sheddable = 0.4
+            "#,
+        )
+        .expect("server.admission should parse");
+        let a = &config.server.admission;
+        assert_eq!(a.mode, AdmissionMode::Adaptive);
+        assert_eq!(a.algorithm, AdmissionAlgorithm::Vegas);
+        assert_eq!(
+            (a.min_limit, a.max_limit, a.initial_limit),
+            (4, Some(400), 40)
+        );
+        assert_eq!(a.latency_threshold_ms, 250);
+        assert!(a.trust_criticality_header);
+        let shares = a.partition_shares().unwrap();
+        assert_eq!(
+            shares.threshold(crate::admission::Criticality::Default, 100),
+            90
+        );
+        assert_eq!(
+            shares.threshold(crate::admission::Criticality::Sheddable, 100),
+            40
+        );
+        config.validate().expect("valid admission config");
+    }
+
+    #[test]
+    fn admission_rejects_an_unknown_algorithm() {
+        let err = toml::from_str::<AutumnConfig>(
+            r#"
+            [server.admission]
+            algorithm = "hystrix"
+            "#,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn admission_env_overrides() {
+        let env = MockEnv::new()
+            .with("AUTUMN_SERVER__ADMISSION__MODE", "adaptive")
+            .with("AUTUMN_SERVER__ADMISSION__ALGORITHM", "aimd")
+            .with("AUTUMN_SERVER__ADMISSION__MIN_LIMIT", "2")
+            .with("AUTUMN_SERVER__ADMISSION__MAX_LIMIT", "50")
+            .with("AUTUMN_SERVER__ADMISSION__INITIAL_LIMIT", "10")
+            .with("AUTUMN_SERVER__ADMISSION__LATENCY_THRESHOLD_MS", "99")
+            .with("AUTUMN_SERVER__ADMISSION__TRUST_CRITICALITY_HEADER", "true")
+            .with("AUTUMN_SERVER__ADMISSION__PARTITIONS__DEFAULT", "0.8")
+            .with("AUTUMN_SERVER__ADMISSION__PARTITIONS__SHEDDABLE", "0.2");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        let a = &config.server.admission;
+        assert_eq!(a.mode, AdmissionMode::Adaptive);
+        assert_eq!(a.algorithm, AdmissionAlgorithm::Aimd);
+        assert_eq!(
+            (a.min_limit, a.max_limit, a.initial_limit),
+            (2, Some(50), 10)
+        );
+        assert_eq!(a.latency_threshold_ms, 99);
+        assert!(a.trust_criticality_header);
+        assert!((a.partitions.default - 0.8).abs() < f64::EPSILON);
+        assert!((a.partitions.sheddable - 0.2).abs() < f64::EPSILON);
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn adaptive_throttle_parses_and_validates() {
+        let config: AutumnConfig = toml::from_str(
+            r"
+            [http.client.adaptive_throttle]
+            enabled = true
+            k = 1.5
+            window_secs = 60
+            ",
+        )
+        .expect("adaptive_throttle should parse");
+        let t = config.http.client.adaptive_throttle;
+        assert!(t.enabled);
+        assert!((t.k - 1.5).abs() < f64::EPSILON);
+        assert_eq!(t.window_secs, 60);
+        config.validate().expect("valid");
+        assert!(
+            !AutumnConfig::default()
+                .http
+                .client
+                .adaptive_throttle
+                .enabled
+        );
+
+        let mut bad = AutumnConfig::default();
+        bad.http.client.adaptive_throttle.k = 0.5;
+        assert!(bad.validate().is_err(), "k < 1");
+        let mut bad = AutumnConfig::default();
+        bad.http.client.adaptive_throttle.window_secs = 0;
+        assert!(bad.validate().is_err(), "window 0");
+    }
+
+    #[test]
+    fn admission_validate_rejects_bad_bounds_and_shares() {
+        let mut config = AutumnConfig::default();
+        config.server.admission.min_limit = 0;
+        assert!(config.validate().is_err(), "min_limit = 0");
+
+        let mut config = AutumnConfig::default();
+        config.server.admission.min_limit = 10;
+        config.server.admission.max_limit = Some(5);
+        assert!(config.validate().is_err(), "min_limit > max_limit");
+
+        let mut config = AutumnConfig::default();
+        config.server.admission.partitions.sheddable = 0.9;
+        config.server.admission.partitions.default = 0.5;
+        assert!(config.validate().is_err(), "sheddable > default");
+    }
+
     // ── server.max_concurrent_requests (#1006) ────────────────────
 
     #[test]
@@ -18282,6 +19453,50 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert!(config.health.detailed);
+    }
+
+    #[test]
+    fn env_overrides_health_dependency_checks() {
+        let env = MockEnv::new()
+            .with("AUTUMN_HEALTH__CACHE_TTL_MS", "250")
+            .with("AUTUMN_HEALTH__PING_TIMEOUT_MS", "750")
+            .with("AUTUMN_HEALTH__DB_READINESS", "false")
+            .with("AUTUMN_HEALTH__REDIS_READINESS", "true");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.health.cache_ttl(),
+            std::time::Duration::from_millis(250)
+        );
+        assert_eq!(
+            config.health.ping_timeout(),
+            std::time::Duration::from_millis(750)
+        );
+        assert!(!config.health.db_readiness);
+        assert!(config.health.redis_readiness);
+    }
+
+    #[test]
+    fn health_dependency_checks_parse_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            "[health]\ncache_ttl_ms = 0\nping_timeout_ms = 300\ndb_readiness = false\n",
+        )
+        .expect("valid toml");
+        assert_eq!(config.health.cache_ttl_ms, 0);
+        assert_eq!(config.health.ping_timeout_ms, 300);
+        assert!(!config.health.db_readiness);
+        assert!(!config.health.redis_readiness);
+    }
+
+    #[test]
+    fn zero_ping_timeout_is_rejected() {
+        let mut config = AutumnConfig::default();
+        config.health.ping_timeout_ms = 0;
+        let error = config.validate().expect_err("zero ping timeout");
+        assert!(
+            error.to_string().contains("health.ping_timeout_ms"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -19338,6 +20553,214 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             config.server.timeouts.request_timeout_ms.is_none(),
             "dev profile must not enable a request timeout by default"
         );
+    }
+
+    // ── #3057: prod protections ────────────────────────────────────────────
+
+    /// Load `autumn.toml` (body `toml`) under `profile` with extra env vars.
+    fn load_3057(profile: &str, toml: &str, vars: &[(&str, &str)]) -> AutumnConfig {
+        try_load_3057(profile, toml, vars).expect("config loads")
+    }
+
+    fn try_load_3057(
+        profile: &str,
+        toml: &str,
+        vars: &[(&str, &str)],
+    ) -> Result<AutumnConfig, ConfigError> {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("autumn.toml"), toml).unwrap();
+        let mut env: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        env.insert("AUTUMN_ENV".to_owned(), profile.to_owned());
+        env.insert(
+            "AUTUMN_MANIFEST_DIR".to_owned(),
+            temp.path().to_str().unwrap().to_owned(),
+        );
+        AutumnConfig::load_with_env(&FakeEnv(env))
+    }
+
+    #[test]
+    fn prod_profile_enables_strict_config() {
+        assert!(load_3057("prod", "", &[]).server.strict_config);
+        assert!(!load_3057("dev", "", &[]).server.strict_config);
+    }
+
+    #[test]
+    fn prod_profile_rejects_misspelled_timeout_key() {
+        let toml = "[database]\nstatment_timeout = \"5s\"\n";
+        let err = try_load_3057("prod", toml, &[]).expect_err("typo must fail in prod");
+        assert!(format!("{err:?}").contains("statment_timeout"), "{err:?}");
+        assert!(try_load_3057("dev", toml, &[]).is_ok());
+    }
+
+    #[test]
+    fn prod_strict_config_opt_out() {
+        let toml = "[server]\nstrict_config = false\n[database]\nstatment_timeout = \"5s\"\n";
+        assert!(!load_3057("prod", toml, &[]).server.strict_config);
+        let toml = "[database]\nstatment_timeout = \"5s\"\n";
+        let env = [("AUTUMN_SERVER__STRICT_CONFIG", "false")];
+        assert!(!load_3057("prod", toml, &env).server.strict_config);
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    #[test]
+    fn prod_profile_sets_database_timeouts() {
+        let config = load_3057("prod", "", &[]);
+        assert_eq!(
+            config.database.statement_timeout,
+            Some(std::time::Duration::from_secs(30))
+        );
+        assert_eq!(
+            config.database.idle_in_transaction_timeout,
+            Some(std::time::Duration::from_secs(60))
+        );
+    }
+
+    /// `SQLite` cannot enforce these timeouts and refuses to boot with one set.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn prod_profile_leaves_database_timeouts_off_on_sqlite() {
+        let config = load_3057("prod", "", &[]);
+        assert_eq!(config.database.statement_timeout, None);
+        assert_eq!(config.database.idle_in_transaction_timeout, None);
+    }
+
+    #[test]
+    fn dev_profile_leaves_database_timeouts_off() {
+        let config = load_3057("dev", "", &[]);
+        assert_eq!(config.database.statement_timeout, None);
+        assert_eq!(config.database.idle_in_transaction_timeout, None);
+    }
+
+    #[test]
+    fn prod_database_timeouts_opt_out_via_toml() {
+        let toml = "[database]\nstatement_timeout = \"0s\"\nidle_in_transaction_timeout = \"0s\"\n";
+        let config = load_3057("prod", toml, &[]);
+        assert_eq!(
+            config.database.statement_timeout,
+            Some(std::time::Duration::ZERO)
+        );
+        assert_eq!(
+            config.database.idle_in_transaction_timeout,
+            Some(std::time::Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn database_timeouts_env_overrides() {
+        let env = [
+            ("AUTUMN_DATABASE__STATEMENT_TIMEOUT", "0"),
+            ("AUTUMN_DATABASE__IDLE_IN_TRANSACTION_TIMEOUT", "15s"),
+        ];
+        let config = load_3057("prod", "", &env);
+        assert_eq!(
+            config.database.statement_timeout,
+            Some(std::time::Duration::ZERO)
+        );
+        assert_eq!(
+            config.database.idle_in_transaction_timeout,
+            Some(std::time::Duration::from_secs(15))
+        );
+        // An empty value clears the setting.
+        let env = [("AUTUMN_DATABASE__STATEMENT_TIMEOUT", "")];
+        assert_eq!(load_3057("prod", "", &env).database.statement_timeout, None);
+    }
+
+    #[test]
+    fn migration_lock_defaults_apply_to_every_profile() {
+        for profile in ["dev", "prod", "staging"] {
+            let db = load_3057(profile, "", &[]).database;
+            assert_eq!(
+                db.migration_lock_timeout,
+                std::time::Duration::from_secs(5),
+                "{profile}"
+            );
+            assert_eq!(db.migration_lock_retries, 5, "{profile}");
+        }
+    }
+
+    #[test]
+    fn migration_lock_opt_out() {
+        let toml = "[database]\nmigration_lock_timeout = \"0s\"\nmigration_lock_retries = 0\n";
+        let db = load_3057("prod", toml, &[]).database;
+        assert_eq!(db.migration_lock_timeout, std::time::Duration::ZERO);
+        assert_eq!(db.migration_lock_retries, 0);
+        let env = [
+            ("AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT", "2s"),
+            ("AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES", "1"),
+        ];
+        let db = load_3057("prod", "", &env).database;
+        assert_eq!(db.migration_lock_timeout, std::time::Duration::from_secs(2));
+        assert_eq!(db.migration_lock_retries, 1);
+        // An empty env value keeps the file value, as `autumn migrate` does.
+        let toml = "[database]\nmigration_lock_timeout = \"0s\"\n";
+        let env = [("AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT", "")];
+        let db = load_3057("prod", toml, &env).database;
+        assert_eq!(db.migration_lock_timeout, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn prod_profile_admission_default_is_pool_size_times_k() {
+        let config = load_3057("prod", "[database]\npool_size = 20\n", &[]);
+        assert_eq!(
+            config.profile_admission_default(),
+            Some(20 * PROD_REQUESTS_PER_POOL_CONNECTION)
+        );
+        // The primary role size wins over the shared default.
+        let config = load_3057(
+            "prod",
+            "[database]\npool_size = 20\nprimary_pool_size = 9\n",
+            &[],
+        );
+        assert_eq!(
+            config.profile_admission_default(),
+            Some(9 * PROD_REQUESTS_PER_POOL_CONNECTION)
+        );
+        // A small pool still gets the floor.
+        let config = load_3057("prod", "[database]\nprimary_pool_size = 2\n", &[]);
+        assert_eq!(
+            config.profile_admission_default(),
+            Some(PROD_MIN_ADMISSION_LIMIT)
+        );
+        assert_eq!(load_3057("dev", "", &[]).profile_admission_default(), None);
+        assert_eq!(
+            load_3057("staging", "", &[]).profile_admission_default(),
+            None
+        );
+    }
+
+    #[test]
+    fn prod_profile_admission_default_resolves_to_a_ceiling() {
+        let config = load_3057("prod", "", &[]);
+        let limit = crate::capacity::resolve_configured_admission_limit_with_default(
+            config.server.max_concurrent_requests,
+            config.server.capacity_contract.as_deref(),
+            config.profile_admission_default(),
+        );
+        assert_eq!(
+            limit,
+            crate::capacity::AdmissionLimit::ProfileDefault(
+                default_pool_size() * PROD_REQUESTS_PER_POOL_CONNECTION
+            )
+        );
+    }
+
+    #[test]
+    fn prod_admission_default_opt_out() {
+        for (toml, env) in [
+            ("[server]\nmax_concurrent_requests = 0\n", vec![]),
+            ("", vec![("AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS", "0")]),
+        ] {
+            let config = load_3057("prod", toml, &env);
+            let limit = crate::capacity::resolve_configured_admission_limit_with_default(
+                config.server.max_concurrent_requests,
+                config.server.capacity_contract.as_deref(),
+                config.profile_admission_default(),
+            );
+            assert_eq!(limit, crate::capacity::AdmissionLimit::Unlimited);
+        }
     }
 
     #[test]

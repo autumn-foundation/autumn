@@ -186,6 +186,7 @@ GATED_MODULES=(
   autumn/src/migrate.rs:default
   autumn/src/notifications.rs:default
   autumn/src/openapi.rs:default
+  autumn/src/outbox.rs:default
   autumn/src/push/store.rs:default
   autumn/src/read_your_writes.rs:default
   autumn/src/replication/engine.rs:default

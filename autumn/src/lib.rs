@@ -74,6 +74,7 @@ extern crate self as autumn_web;
 #[cfg(feature = "maud")]
 pub mod a11y;
 pub mod actuator;
+pub mod admission;
 pub mod aggregate;
 /// Operator alerts for built-in failure conditions.
 ///
@@ -173,6 +174,8 @@ pub mod current;
 pub mod custom_domain;
 #[cfg(feature = "db")]
 pub mod db;
+#[cfg(feature = "db")]
+pub(crate) mod db_ping;
 pub(crate) mod db_url;
 pub mod dotenv;
 pub mod download;
@@ -209,6 +212,7 @@ pub mod feed;
 /// See [`mod@format`] for the full API.
 pub mod format;
 pub mod health;
+pub(crate) mod health_cache;
 #[cfg(feature = "db")]
 pub mod hooks;
 #[cfg(feature = "i18n")]
@@ -655,6 +659,7 @@ pub use presence::presence_stream;
 #[cfg(feature = "presence")]
 pub use presence::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 pub(crate) mod route;
+pub use admission::Criticality;
 pub use route::{RepositoryApiMeta, Route, RouteIdempotency, RouteTimeout};
 // Re-exported alongside the other `Route` field types so a hand-built
 // `Route { .. }` needs only the `autumn_web::` prefix.
@@ -664,6 +669,9 @@ pub use seo::SeoRouteDefaults;
 /// Enable with the Cargo feature `markdown`.
 #[cfg(feature = "markdown")]
 pub mod markdown;
+/// Redis `PING` health indicator (issue #3059).
+#[cfg(feature = "redis")]
+pub mod redis_health;
 /// Process-wide rustls `CryptoProvider` guard for TLS Redis (`rediss://`)
 /// URLs — see [`redis_tls::open_client`] (issue #2172).
 #[cfg(feature = "redis")]
@@ -730,6 +738,7 @@ pub mod repl;
 pub mod runtime_config;
 #[cfg(feature = "seed")]
 pub mod seed;
+pub mod slo;
 
 // ── #1343 AC4: fake-seeder registration forwarding ──────────────────────────
 //
@@ -944,6 +953,8 @@ pub use nested_form::{
 };
 pub mod data;
 pub mod normalize;
+#[cfg(feature = "db")]
+pub mod outbox;
 pub mod validation;
 pub mod webhook;
 #[cfg(feature = "http-client")]
@@ -960,6 +971,8 @@ pub mod __private {
     pub use crate::db::is_retryable_txn_error;
     #[cfg(feature = "db")]
     pub use crate::db::maybe_immediate_transaction;
+    #[cfg(feature = "db")]
+    pub use crate::db::note_route_statement_timeout;
     #[cfg(feature = "db")]
     pub use crate::db::scoped_immediate_transaction;
     #[cfg(feature = "db")]

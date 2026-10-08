@@ -174,6 +174,11 @@ pub struct Route {
     /// Per-route override for the global inbound request timeout.
     pub timeout: RouteTimeout,
 
+    /// Admission-control class (issue #3068). Under overload, the server
+    /// rejects `sheddable` routes first and `critical` routes last. Set it
+    /// with `#[get("/x", criticality = "sheddable")]`.
+    pub criticality: crate::admission::Criticality,
+
     /// SEO meta tag defaults declared via the route attribute's `seo(...)`
     /// argument (e.g. `#[get("/about", seo(title = "About"))]`).
     ///
