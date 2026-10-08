@@ -2332,10 +2332,9 @@ fn ledger_append_ts(
         quote! {}
     };
 
-    // #2326: a delete or restore becomes true when it is made. The record it is
-    // handed still carries the row's old valid-time column, so reading that would
-    // back-date the revision and make it win valid-time queries about instants
-    // before the change. `None` makes the append use the mutation instant.
+    // #2326: a delete or restore is valid from the moment it is made. The record
+    // still holds the old valid time. Reading it would back-date the revision.
+    // `None` makes the append use the mutation instant.
     let valid_from_stmt = if matches!(op, "delete" | "restore") {
         quote! {
             let __lg_valid_from: ::core::option::Option<
@@ -2353,18 +2352,28 @@ fn ledger_append_ts(
         }
     };
 
+    // #2326: refuse before the snapshot. The snapshot would turn NaN into `null`.
+    // A delete or restore writes no float, so a legacy row that holds one can
+    // still be deleted or restored.
+    let non_finite_check = if matches!(op, "insert" | "update") {
+        quote! {
+            ::autumn_web::ledger::refuse_non_finite(
+                #table_name_ts,
+                __lg_record_id,
+                (#record_expr).__autumn_ledger_non_finite_column(),
+            )?;
+        }
+    } else {
+        quote! {}
+    };
+
     quote! {
         {
             let __lg_record_id: i64 = {
                 use ::autumn_web::version_history::VersionedRecord as _;
                 (#record_expr).version_record_id()
             };
-            // #2326: refuse before the snapshot, which would turn NaN into `null`.
-            ::autumn_web::ledger::refuse_non_finite(
-                #table_name_ts,
-                __lg_record_id,
-                (#record_expr).__autumn_ledger_non_finite_column(),
-            )?;
+            #non_finite_check
             let __lg_tenant_id: ::core::option::Option<&str> = {
                 use ::autumn_web::version_history::VersionedRecord as _;
                 (#record_expr).version_tenant_id()
@@ -5002,7 +5011,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     record_id: i64,
                     revision: &::autumn_web::ledger::LedgerRevision,
                 ) -> ::autumn_web::AutumnResult<#model_name> {
-                    // #2326: the codec leaves an undecryptable envelope in place.
+                    // #2326: the codec leaves an undecryptable envelope in place. Refuse it here.
                     ::autumn_web::ledger::ensure_snapshot_recoverable(
                         #table_name,
                         record_id,
@@ -28201,6 +28210,12 @@ mod tests {
     #[test]
     fn ledger_append_refuses_a_non_finite_float_before_hashing() {
         // #2326: the check must run before the snapshot is taken.
+        for op in ["delete", "restore"] {
+            assert!(
+                !ledger_append_for(op).contains("__autumn_ledger_non_finite_column"),
+                "`{op}` writes no float, so it must not be refused for a legacy value"
+            );
+        }
         let generated = ledger_append_for("update");
         let check = generated
             .find("__autumn_ledger_non_finite_column")
@@ -28225,6 +28240,11 @@ mod tests {
             generated.contains("ensure_snapshot_recoverable"),
             "as-of reconstruction must reject an unrecovered envelope: {generated}"
         );
+        let guard = generated.find("ensure_snapshot_recoverable").unwrap();
+        let decode = generated[guard..]
+            .find("__autumn_commit_hook_from_value")
+            .expect("the model is decoded after the guard");
+        assert!(decode > 0);
     }
 
     #[test]

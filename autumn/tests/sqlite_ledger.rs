@@ -2946,18 +2946,38 @@ async fn a_non_finite_update_is_refused_and_leaves_the_chain_intact() {
     repo.update(
         id,
         &UpdateLgInvoice {
-            amount_rate: Patch::Set(f64::NAN),
+            amount_rate: Patch::Set(f64::NEG_INFINITY),
             ..Default::default()
         },
     )
     .await
-    .expect_err("NaN must be refused");
+    .expect_err("infinity must be refused");
 
     let report = repo.ledger_verify(id).await.expect("verify");
     assert!(report.is_intact(), "{report:?}");
     assert_eq!(report.revisions_checked, 3, "no revision was appended");
     let live = repo.find_by_id(id).await.expect("read").expect("row");
     assert!(live.amount_rate.is_finite(), "the row kept its old value");
+}
+
+#[test]
+fn the_generated_check_names_the_first_non_finite_column() {
+    let mut invoice = LgInvoice {
+        id: 1,
+        reference: "R".to_string(),
+        amount_cents: 1,
+        amount_rate: 1.0,
+        metadata: "{}".to_string(),
+        deleted_at: None,
+    };
+    assert_eq!(invoice.__autumn_ledger_non_finite_column(), None);
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        invoice.amount_rate = bad;
+        assert_eq!(
+            invoice.__autumn_ledger_non_finite_column(),
+            Some("amount_rate")
+        );
+    }
 }
 
 #[tokio::test]

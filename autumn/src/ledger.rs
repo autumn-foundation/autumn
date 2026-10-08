@@ -1418,9 +1418,8 @@ pub enum LedgerError {
     },
     /// A ledgered write carried a `NaN` or infinite float (#2326).
     ///
-    /// JSON has no spelling for either, so the snapshot would store `null`, hash
-    /// it, and never read it back. The write is refused before any revision is
-    /// hashed.
+    /// JSON cannot hold either value. A snapshot would store `null` and could not
+    /// be read back. The write is refused before the hash.
     #[error(
         "cannot ledger {table}#{record_id}: column `{column}` holds NaN or an infinite \
          float, which a snapshot cannot store. Write a finite value, or stop ledgering \
@@ -1597,8 +1596,9 @@ pub fn refuse_non_finite(
 /// Refuse to reconstruct a model from a snapshot whose `#[encrypted]` column
 /// cannot be decrypted (#2326).
 ///
-/// The model codec leaves an unrecoverable envelope in place, which suits commit
-/// hook replay. As-of reconstruction would then return ciphertext as plaintext.
+/// The model codec leaves an undecryptable envelope in place. This suits
+/// commit-hook replay. In as-of reconstruction, it would return ciphertext as
+/// plaintext.
 ///
 /// # Errors
 ///
@@ -1610,6 +1610,12 @@ pub fn ensure_snapshot_recoverable(
     seq: i64,
     snapshot: &serde_json::Value,
 ) -> crate::AutumnResult<()> {
+    if !crate::encryption::registered_encrypted_columns()
+        .iter()
+        .any(|d| d.table == table)
+    {
+        return Ok(());
+    }
     let mut probe = snapshot.clone();
     let lost = crate::encryption::decrypt_snapshot_columns(table, &mut probe);
     if lost.is_empty() {
@@ -1620,8 +1626,8 @@ pub fn ensure_snapshot_recoverable(
             table: table.to_string(),
             record_id,
             detail: format!(
-                "revision {seq}: encrypted column(s) `{}` cannot be decrypted; the key \
-                 that wrote them is no longer configured",
+                "revision {seq}: encrypted column(s) `{}` cannot be decrypted. The key \
+                 is missing, the key ring is not set, or the envelope is damaged",
                 lost.join("`, `")
             ),
         },
