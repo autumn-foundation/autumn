@@ -46,14 +46,17 @@
 mod config;
 mod layer;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 
 use crate::audit::{AuditEvent, AuditLogger, AuditStatus};
 use crate::entropy::Entropy;
+use crate::route::RouteTimeout;
+use crate::router::RouteAttrTable;
 use crate::slo::PPM;
 
 pub use config::{FaultInjectionConfig, FaultKind, FaultRule, FaultStopConfig, FaultTarget};
@@ -282,6 +285,48 @@ struct Window {
     errors: u64,
 }
 
+/// The request timeout of a request: the route override, else
+/// `server.timeouts.request_timeout_ms`, as the timeout layer sets it.
+#[derive(Default)]
+struct Deadlines {
+    global: Option<Duration>,
+    /// The route templates with an override, and the override per method.
+    routes: matchit::Router<HashMap<Method, RouteTimeout>>,
+}
+
+impl Deadlines {
+    fn new(global: Option<Duration>, overrides: &RouteAttrTable<RouteTimeout>) -> Self {
+        let mut routes = matchit::Router::new();
+        for (template, by_method) in overrides.iter() {
+            if let Err(error) = routes.insert(template.as_str(), by_method.clone()) {
+                // The route keeps the global timeout for its dependency waits.
+                tracing::debug!(
+                    target: "autumn.fault_injection",
+                    template = %template,
+                    %error,
+                    "route timeout not used for fault deadlines"
+                );
+            }
+        }
+        Self { global, routes }
+    }
+
+    /// The request timeout of `method` on `path`. `None` means no timeout.
+    fn for_request(&self, path: &str, method: &Method) -> Option<Duration> {
+        let timeout = self
+            .routes
+            .at(path)
+            .ok()
+            .and_then(|found| found.value.get(method).copied())
+            .unwrap_or_default();
+        match timeout {
+            RouteTimeout::Inherit => self.global,
+            RouteTimeout::Override(limit) => Some(limit),
+            RouteTimeout::Disabled => None,
+        }
+    }
+}
+
 struct Injector {
     /// At most `config::MAX_RULES` rules, so a `u64` mask selects them.
     rules: Vec<CompiledRule>,
@@ -298,8 +343,8 @@ struct Injector {
     audit: Option<Arc<AuditLogger>>,
     profile: String,
     allow_in_production: bool,
-    /// `server.timeouts.request_timeout_ms`: the cap of a dependency wait.
-    deadline: Option<Duration>,
+    /// The request timeouts: the cap of a dependency wait.
+    deadlines: Deadlines,
     /// The pending boot audit write. The next toggle waits for it.
     boot: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// One audit write at a time.
@@ -343,7 +388,7 @@ impl Injector {
 
     /// The scope for a request to `path`. `None` when the faults are
     /// disarmed, the path is exempt, or no rule matches it.
-    fn scope_for(self: &Arc<Self>, path: &str) -> Option<Arc<RequestScope>> {
+    fn scope_for(self: &Arc<Self>, path: &str, method: &Method) -> Option<Arc<RequestScope>> {
         let state = self.state.load(Ordering::Acquire);
         if !is_armed(state) || self.exempt.contains(path) {
             return None;
@@ -359,7 +404,7 @@ impl Injector {
         (matched != 0).then(|| {
             Arc::new(RequestScope {
                 path: path.into(),
-                deadline_at: self.deadline_at(),
+                deadline_at: self.deadline_at(path, method),
                 injector: Arc::clone(self),
                 generation: generation_of(state),
                 matched,
@@ -371,8 +416,9 @@ impl Injector {
     }
 
     /// When a request that starts now reaches the request timeout.
-    fn deadline_at(&self) -> Option<tokio::time::Instant> {
-        self.deadline
+    fn deadline_at(&self, path: &str, method: &Method) -> Option<tokio::time::Instant> {
+        self.deadlines
+            .for_request(path, method)
             .and_then(|deadline| tokio::time::Instant::now().checked_add(deadline))
     }
 
@@ -673,6 +719,7 @@ pub(crate) fn build(
     config: &crate::config::AutumnConfig,
     state: &crate::state::AppState,
     exempt_paths: Vec<String>,
+    route_timeouts: &RouteAttrTable<RouteTimeout>,
 ) -> Option<(FaultScopeLayer, FaultInjectionLayer, FaultInjection)> {
     let section = &config.fault_injection;
     if !section.enabled {
@@ -713,12 +760,15 @@ pub(crate) fn build(
         audit,
         profile: profile.unwrap_or_default().to_owned(),
         allow_in_production: section.allow_in_production,
-        deadline: config
-            .server
-            .timeouts
-            .request_timeout_ms
-            .filter(|ms| *ms > 0)
-            .map(Duration::from_millis),
+        deadlines: Deadlines::new(
+            config
+                .server
+                .timeouts
+                .request_timeout_ms
+                .filter(|ms| *ms > 0)
+                .map(Duration::from_millis),
+            route_timeouts,
+        ),
         boot: Mutex::new(None),
         audit_order: tokio::sync::Mutex::new(()),
         sequence: AtomicU64::new(1),
@@ -793,7 +843,7 @@ pub(crate) async fn with_faults<F: std::future::Future>(
 ) -> F::Output {
     let injector = test_injector(rules.iter().map(CompiledRule::new).collect(), u64::MAX);
     let scope = injector
-        .scope_for("/")
+        .scope_for("/", &Method::GET)
         .expect("an armed injector scopes `/`");
     SCOPE.scope(scope, future).await
 }
@@ -802,7 +852,7 @@ pub(crate) async fn with_faults<F: std::future::Future>(
 /// trips above 14.4% errors.
 #[cfg(test)]
 fn test_injector(rules: Vec<CompiledRule>, min_requests: u64) -> Arc<Injector> {
-    test_injector_with(rules, min_requests, None)
+    test_injector_with(rules, min_requests, Deadlines::default())
 }
 
 /// [`test_injector`] with a request timeout.
@@ -810,7 +860,7 @@ fn test_injector(rules: Vec<CompiledRule>, min_requests: u64) -> Arc<Injector> {
 fn test_injector_with(
     rules: Vec<CompiledRule>,
     min_requests: u64,
-    deadline: Option<Duration>,
+    deadlines: Deadlines,
 ) -> Arc<Injector> {
     Arc::new(Injector {
         rules,
@@ -828,7 +878,7 @@ fn test_injector_with(
         audit: None,
         profile: "test".to_owned(),
         allow_in_production: false,
-        deadline,
+        deadlines,
         boot: Mutex::new(None),
         audit_order: tokio::sync::Mutex::new(()),
         sequence: AtomicU64::new(1),
@@ -884,8 +934,8 @@ mod tests {
         let mut rule = FaultRule::new(FaultTarget::Route, FaultKind::Error, 1.0);
         rule.routes = vec!["/api/*".to_owned()];
         let injector = test_injector(vec![CompiledRule::new(&rule)], 1);
-        assert!(injector.scope_for("/api/orders").is_some());
-        assert!(injector.scope_for("/other").is_none());
+        assert!(injector.scope_for("/api/orders", &Method::GET).is_some());
+        assert!(injector.scope_for("/other", &Method::GET).is_none());
     }
 
     #[test]
@@ -894,7 +944,7 @@ mod tests {
         rule.latency_ms = 300_000;
         let rules = vec![CompiledRule::new(&rule), CompiledRule::new(&rule)];
         let injector = test_injector(rules, 1);
-        let scope = injector.scope_for("/").unwrap();
+        let scope = injector.scope_for("/", &Method::GET).unwrap();
         assert_eq!(scope.roll(FaultTarget::Route).latency, config::MAX_LATENCY);
     }
 
@@ -907,9 +957,9 @@ mod tests {
         let injector = test_injector_with(
             vec![CompiledRule::new(&rule)],
             1_000,
-            Some(Duration::from_secs(2)),
+            Deadlines::new(Some(Duration::from_secs(2)), &Arc::default()),
         );
-        let scope = injector.scope_for("/").unwrap();
+        let scope = injector.scope_for("/", &Method::GET).unwrap();
         let started = tokio::time::Instant::now();
         let result = SCOPE
             .scope(Arc::clone(&scope), inject(FaultTarget::Redis))
@@ -917,6 +967,35 @@ mod tests {
         assert!(result.is_err(), "the capped wait fails");
         assert_eq!(started.elapsed(), Duration::from_secs(2));
         assert!(scope.errored.load(Ordering::Relaxed));
+    }
+
+    /// A route timeout override sets the dependency deadline of that route.
+    #[tokio::test(start_paused = true)]
+    async fn a_route_timeout_sets_the_dependency_deadline() {
+        let mut rule = FaultRule::new(FaultTarget::Database, FaultKind::Latency, 1.0);
+        rule.latency_ms = 2_000;
+        let mut overrides = HashMap::new();
+        for (template, timeout) in [
+            ("/slow/{id}", RouteTimeout::Override(Duration::from_secs(5))),
+            ("/off", RouteTimeout::Disabled),
+        ] {
+            overrides.insert(template.to_owned(), HashMap::from([(Method::GET, timeout)]));
+        }
+        let injector = test_injector_with(
+            vec![CompiledRule::new(&rule)],
+            1_000,
+            Deadlines::new(Some(Duration::from_secs(1)), &Arc::new(overrides)),
+        );
+        for (path, method, ok) in [
+            ("/slow/7", Method::GET, true),
+            ("/off", Method::GET, true),
+            ("/off", Method::POST, false),
+            ("/other", Method::GET, false),
+        ] {
+            let scope = injector.scope_for(path, &method).unwrap();
+            let result = SCOPE.scope(scope, inject(FaultTarget::Database)).await;
+            assert_eq!(result.is_ok(), ok, "{method} {path}");
+        }
     }
 
     /// The waits of one request share one budget: the second wait gets the
@@ -928,9 +1007,9 @@ mod tests {
         let injector = test_injector_with(
             vec![CompiledRule::new(&rule)],
             1_000,
-            Some(Duration::from_secs(1)),
+            Deadlines::new(Some(Duration::from_secs(1)), &Arc::default()),
         );
-        let scope = injector.scope_for("/").unwrap();
+        let scope = injector.scope_for("/", &Method::GET).unwrap();
         let started = tokio::time::Instant::now();
         let (first, second) = SCOPE
             .scope(Arc::clone(&scope), async {
@@ -963,7 +1042,7 @@ mod tests {
         let handle = FaultInjection {
             inner: Arc::clone(&injector),
         };
-        let old = injector.scope_for("/").unwrap();
+        let old = injector.scope_for("/", &Method::GET).unwrap();
         handle.disarm("ops", "test").await;
         handle.arm("ops").await;
         assert!(

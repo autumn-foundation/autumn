@@ -5167,8 +5167,12 @@ fn apply_middleware(
     // again outside the static-first middleware, on the same injector. The
     // inner ones stay for the MCP dispatch clone; a request keeps the first
     // scope, and route faults roll once.
-    let fault_injection =
-        crate::fault_injection::build(config, state, fault_injection_exempt_paths(config));
+    let fault_injection = crate::fault_injection::build(
+        config,
+        state,
+        fault_injection_exempt_paths(config),
+        &route_timeouts,
+    );
     let (fault_scope_layer, fault_route_layer, fault_handle) = match fault_injection {
         Some((scope, route, handle)) => (Some(scope), Some(route), Some(handle)),
         None => (None, None, None),

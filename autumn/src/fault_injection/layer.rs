@@ -102,7 +102,7 @@ where
         if matches!(outer, Ok(true)) {
             return Box::pin(self.inner.call(req));
         }
-        let Some(scope) = self.injector.scope_for(path) else {
+        let Some(scope) = self.injector.scope_for(path, req.method()) else {
             if outer.is_ok() {
                 // Another path in an outer scope, and no rule matches this
                 // one: run it with no faults, so the outer rules do not leak
@@ -225,9 +225,13 @@ where
             fault.latency = deferred.latency;
         }
         if let Some(status) = fault.error {
+            // Outside the timeout layer, the wait stops at the deadline.
+            let wait = self
+                .deadline
+                .map_or(fault.latency, |deadline| fault.latency.min(deadline));
             return Box::pin(async move {
-                if !fault.latency.is_zero() {
-                    tokio::time::sleep(fault.latency).await;
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
                 }
                 Ok(injected_error(status))
             });
@@ -444,7 +448,9 @@ mod tests {
         mcp.target = FaultTarget::Database;
         mcp.routes = vec![super::super::RoutePattern::parse("/mcp")];
         let injector = injector(vec![mcp], 1_000);
-        let outer_scope = injector.scope_for("/mcp").unwrap();
+        let outer_scope = injector
+            .scope_for("/mcp", &axum::http::Method::GET)
+            .unwrap();
         let inner = axum::Router::new()
             .route(
                 "/api/x",
@@ -537,6 +543,25 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_secs(3));
     }
 
+    /// On the outer layer, an error with a long latency also stops at the
+    /// deadline.
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_caps_the_latency_of_an_error() {
+        let mut latency = error_rule(1_000_000);
+        latency.kind = FaultKind::Latency;
+        latency.latency = Duration::from_secs(300);
+        let injector = injector(vec![latency, error_rule(1_000_000)], 1_000);
+        let app = axum::Router::new()
+            .route("/x", get(|| async { "ok" }))
+            .layer((
+                FaultScopeLayer::new(Arc::clone(&injector)),
+                FaultInjectionLayer::new(Some(Duration::from_secs(2))),
+            ));
+        let started = tokio::time::Instant::now();
+        assert_eq!(status(app, "/x").await, 503);
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+    }
+
     /// A cached page does not reach the inner route layer. It waits in the
     /// outer layer.
     #[tokio::test(start_paused = true)]
@@ -568,7 +593,7 @@ mod tests {
         let mut rule = error_rule(1_000_000);
         rule.target = FaultTarget::Database;
         let injector = injector(vec![rule], 100);
-        let scope = injector.scope_for("/x").unwrap();
+        let scope = injector.scope_for("/x", &axum::http::Method::GET).unwrap();
         let result = SCOPE
             .scope(scope, crate::fault_injection::inject(FaultTarget::Database))
             .await;

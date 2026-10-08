@@ -71,6 +71,9 @@ one time.
 
 A dependency fault applies only in a request that matches `routes`. Work that
 runs outside a request (jobs, the scheduler, spawned tasks) gets no faults.
+All dependency waits of a request share its request timeout: the `timeout`
+of its route, else `server.timeouts.request_timeout_ms`. A wait that reaches
+it fails, as a timeout does.
 
 The random decisions use the app entropy source. A test with `SeededEntropy`
 gets the same faults on each run.
