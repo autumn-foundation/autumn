@@ -548,6 +548,7 @@ impl Ctx<'_> {
             StoreWrite::Unchanged(invoice) => (invoice, false),
             StoreWrite::Stale(_) => return Ok(()),
         };
+        self.relink(&invoice).await?;
         let store = self.service.store();
         let Some(row) = store.dunning_by_invoice(&invoice.id).await? else {
             return Ok(());
