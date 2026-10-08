@@ -27208,8 +27208,8 @@ exempt_paths = [
                 ..Default::default()
             };
             run(&tmp, "Post", POST, &live);
-            let line = autumn_web_line(&tmp);
-            assert!(line.contains("markdown") && line.contains("csv"), "{line}");
+            let kept = autumn_web_line(&tmp);
+            assert!(kept.contains("markdown") && kept.contains("csv"), "{kept}");
         }
 
         #[test]
