@@ -2653,7 +2653,13 @@ impl RequestBuilder {
                 }
                 None => exchange.await,
             };
-            if let Some(ticket) = ticket {
+            // A transient failure at the caller's deadline says nothing about
+            // the host: its ticket is dropped, which counts as an accept.
+            let deadline_stop =
+                matches!(outcome, Err(SimAttemptError::Transient(_))) && gate.expired();
+            if let Some(ticket) = ticket
+                && !deadline_stop
+            {
                 ticket.record(matches!(&outcome, Ok(r) if throttle_accepts(r.status.as_u16())));
             }
             let response = match outcome {

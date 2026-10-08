@@ -352,3 +352,27 @@ async fn sim_deadline_does_not_follow_tokio_spawn(mut sim: Sim) {
         "spawned task sees a deadline: false"
     );
 }
+
+/// Calls the hanging upstream under a short scoped deadline.
+#[get("/scoped-short")]
+async fn scoped_short(client: Client) -> AutumnResult<String> {
+    let response = Deadline::after(Duration::from_millis(100))
+        .scope(client.get("http://upstream/work").send())
+        .await?;
+    Ok(response.status().as_u16().to_string())
+}
+
+#[sim_test]
+async fn sim_deadline_stops_are_not_throttle_rejects(mut sim: Sim) {
+    let starts = Starts::default();
+    sim.net(SimNet::new().host("upstream", hanging(starts)));
+    let mut config = autumn_web::config::AutumnConfig::default();
+    config.http.client.adaptive_throttle.enabled = true;
+    sim.build(TestApp::new().routes(routes![scoped_short]).config(config));
+    // The caller's deadline stops each call. That says nothing about the
+    // host, so the throttle (#3068) must never reject a later call.
+    for _ in 0..20 {
+        let response = sim.client().get("/scoped-short").send().await;
+        assert_eq!(response.status.as_u16(), 504, "{}", response.text());
+    }
+}
