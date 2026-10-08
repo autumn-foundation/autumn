@@ -1688,4 +1688,18 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
             "diesel::table! {\n    users (id) {\n        id -> Int8,\n    }\n}\n\n"
         );
     }
+
+    /// A Unicode table name is found, so a stale block is updated.
+    #[test]
+    fn a_unicode_table_name_is_found() {
+        let mut t = posts(Backend::Postgres);
+        t.name = "用户".to_owned();
+        t.columns.truncate(1);
+        let stale = "diesel::table! {\n    用户 (id) {\n        id -> Int4,\n    }\n}\n";
+        let out = sync_for_plan(stale, &parsed(vec![t]), &plan(vec![]));
+        assert_eq!(
+            out.text,
+            "diesel::table! {\n    用户 (id) {\n        id -> Int8,\n    }\n}\n"
+        );
+    }
 }

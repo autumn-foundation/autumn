@@ -616,7 +616,7 @@ pub fn is_in_comment_or_string(text: &str, at: usize) -> bool {
 /// The table name of the `table!` block whose body opens at `open`: the
 /// first code word after attributes (`#[...]`). Doc comments are not code.
 fn block_table_name(text: &str, open: usize) -> Option<String> {
-    let mut name = String::new();
+    let mut name: Vec<u8> = Vec::new();
     let mut brackets = 0usize;
     scan_code(text, open + 1, |_, c| {
         if brackets > 0 || c == b'#' && name.is_empty() {
@@ -627,14 +627,15 @@ fn block_table_name(text: &str, open: usize) -> Option<String> {
             }
             return false;
         }
-        if c.is_ascii_alphanumeric() || c == b'_' || (c == b'#' && name == "r") {
-            name.push(char::from(c));
+        // A byte of a non-ASCII character is part of a Unicode identifier.
+        if c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80 || (c == b'#' && name == b"r") {
+            name.push(c);
             false
         } else {
             !(name.is_empty() && c.is_ascii_whitespace())
         }
     });
-    (!name.is_empty()).then_some(name)
+    String::from_utf8(name).ok().filter(|n| !n.is_empty())
 }
 
 /// Byte range `[start, end)` of the `table!` block (qualified `diesel::table!`
