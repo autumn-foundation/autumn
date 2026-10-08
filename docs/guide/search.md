@@ -190,6 +190,9 @@ Adding a searchable model is one builder line: the reindex job is keyed on the
 *index name*, not the model, so there is no per-model job, handler, or
 generated glue.
 
+`.postgres()` needs the Postgres backend. On a build with autumn-web's `sqlite`
+feature, boot refuses it. Install a different backend with `.backend(...)`.
+
 ### Configuration
 
 ```toml

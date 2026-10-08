@@ -156,7 +156,10 @@ jobs:
         # globally, so one such edge swaps `db::RuntimeConnection` for every
         # consumer in the graph. Until this gate, that invariant was prose plus
         # the `sqlite`-excluding feature lists below, and nothing read the
-        # manifests. No toolchain, ~1 second, self-testing.
+        # manifests. ~2 seconds, self-testing. The resolver layer asks
+        # `cargo metadata` what cargo resolves, so it is required here.
+        env:
+          SQLITE_GATE_REQUIRE_RESOLVE: "1"
         run: ./scripts/check-sqlite-unification.sh
       - name: Example binary-name collision gate
         # Two workspace members producing the same binary file name break the
@@ -799,6 +802,40 @@ jobs:
         # autumn-admin-plugin. The reference plugin proves the DECLARED surface;
         # the admin plugin proves a real, non-trivial consumer of it.
         run: cargo check -p autumn-admin-plugin --all-targets
+
+  k8s-manifests:
+    name: Kubernetes manifests (helm lint, kubeconform)
+    runs-on: ubuntu-latest
+    # The job runs downloaded tools, so it gets a read-only token and keeps
+    # no credentials in the checkout.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Cache the pinned Kubernetes tools and schemas
+        uses: actions/cache@v6
+        with:
+          path: target/k8s-tools
+          key: k8s-tools-${{ hashFiles('scripts/check-k8s-manifests.sh') }}
+      - name: Lint the Helm chart, the Kustomize base and the SLO files
+        # Issue #3069. `autumn release init --target kubernetes` writes a Helm
+        # chart and a Kustomize base. `autumn slo generate` writes Prometheus
+        # rules and Argo Rollouts / Flagger templates. This job checks them
+        # with the real tools:
+        #
+        #   helm lint --strict, and helm template | kubeconform -strict, for
+        #   the default values and each opt-in mode (Argo Rollouts, Flagger,
+        #   PodMonitor); kustomize build | kubeconform -strict;
+        #   kubeconform on the golden CRD objects; and promtool check/test
+        #   rules on the golden rules, with an injected 5xx spike.
+        #
+        # No Rust toolchain: the script renders the templates itself. A Rust
+        # test keeps its placeholder list complete. The script pins the tool
+        # versions and the schema commits, and checks each tool tarball's
+        # SHA-256 on every run, also from the cache. Self-test first.
+        run: ./scripts/check-k8s-manifests.sh --self-test && ./scripts/check-k8s-manifests.sh
 
   migration-collisions:
     name: Diesel migration version collisions
@@ -2372,6 +2409,16 @@ jobs:
           grep -qE 'test result: ok\. [1-9][0-9]* passed' \
             "${RUNNER_TEMP}/admin-plugin-sqlite.log" \
             || { echo "::error::no admin-plugin sqlite test ran — the #[ignore] or the target name changed"; exit 1; }
+      - name: Clippy autumn-search under the sqlite backend
+        # Issue #2539 §5. The Postgres store binds a `BIGINT[]`, which SQLite
+        # does not have, so the crate did not compile under the flip. It now
+        # does, and the store refuses SQLite at boot and on every query. The
+        # flip is explicit here, as for the admin plugin above.
+        run: cargo clippy -p autumn-search --features autumn-web/sqlite --all-targets -- -D warnings
+      - name: Run the autumn-search lib tests under sqlite
+        # Runs the SQLite arm of the refusal tests. A bare `--lib` has no
+        # filter, so a pass-count check is not needed.
+        run: cargo test -p autumn-search --features autumn-web/sqlite --lib
       - name: Run the sqlite integration suite
         # Named sqlite `[[test]]` targets only. `test-support` is required by the
         # TestApp/Db-extractor-based tests (sqlite_db_extractor, sqlite_read_only_tx,
@@ -2415,6 +2462,16 @@ jobs:
             --test sim_chaos_crash \
             --test sim_outbox_crash \
             --test sqlite_outbox_writers
+      - name: Run the multi-replica sim suites (issue #3067)
+        # Several replicas on one sim clock and one SQLite database. Single
+        # threaded, like the `sim_` lane of the `test` job: `sim_fleet_trace`
+        # compares two traces byte for byte, and `tracing` caches callsite
+        # interest for the whole process.
+        run: |
+          cargo test -p autumn-web --features "sqlite,test-support" \
+            --test sim_replicas \
+            --test sim_fleet_trace \
+            -- --test-threads=1
       - name: Run the sqlite mail-chaos suite (W5.a, issue #1797)
         # `sim_chaos_mail` and `sim_outbox_mail` (#3062) need the `mail`
         # feature for the mail interceptor/transport surface, so they run as
@@ -2453,17 +2510,24 @@ jobs:
   # break IS caught and shrunk: that's the `sim_sweep_driver` DoD suite in the
   # sqlite-runtime job above, not this job (which must always stay green).
   # Structured like the `loom` job below: its own bounded, standalone step.
+  #
+  # Issue #3067: built with `sqlite`, the sweep also runs the framework's own
+  # jobs, scheduler and lock scenarios across replicas under seeded faults,
+  # and runs the first `AUTUMN_SIM_TRACE_CHECKS` seeds twice to compare their
+  # traces. A failure prints a replay command for its seed and scenario.
   sim-sweep:
     name: Sim sweep (sim-testing)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
       - name: Run the sim-sweep seed sweep
-        run: cargo run -p autumn-web --release --features sim-testing --bin sim-sweep
+        run: cargo run -p autumn-web --release --features "sim-testing,sqlite" --bin sim-sweep
         env:
           AUTUMN_SIM_SEEDS: "512"
+          AUTUMN_SIM_TRACE_CHECKS: "32"
 
   # Genuine loom model checks: the loom_models test binary uses loom::sync::*
   # unconditionally, so loom::model() exhaustively explores thread interleavings

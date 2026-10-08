@@ -308,6 +308,12 @@ fn deploy_child_keys_are_strictly_validated() {
         // `[deploy] hots = [...]` is silently ignored and the operator deploys to
         // nothing (or, worse, to the stale single `host`).
         "deploy.hosts",
+        // #3069: the post-cutover bake.
+        "deploy.bake.duration_secs",
+        "deploy.bake.interval_secs",
+        "deploy.bake.min_requests",
+        "deploy.bake.max_error_rate",
+        "deploy.bake.max_p99_ms",
     ] {
         assert!(
             leaves.contains(key),
@@ -644,5 +650,41 @@ fn http_client_base_urls_map_is_not_flagged() {
             .iter()
             .all(|(p, _)| !p.starts_with("http.client.base_urls")),
         "arbitrary base_urls map keys must not be flagged; got {errors:?}"
+    );
+}
+
+/// `[[slo]]` tables are known to strict validation (issue #3069).
+///
+/// The prod profile turns on `strict_config`. An unknown root stops the app at
+/// boot, so `slo` must be a schema root. Each table's keys must be leaves too,
+/// so a typo such as `objectiv = 99.9` is rejected.
+#[test]
+fn slo_tables_are_strictly_validated() {
+    let leaves = AutumnConfig::schema_leaf_paths();
+    for key in [
+        "slo.name",
+        "slo.objective",
+        "slo.sli",
+        "slo.route",
+        "slo.threshold_ms",
+        "slo.description",
+    ] {
+        assert!(leaves.contains(key), "{key} must be a schema leaf");
+    }
+
+    let schema = AutumnConfig::get_schema_keys();
+    let ok = AutumnConfig::validate_toml(
+        "[[slo]]\nname = \"a\"\nobjective = 99.9\nsli = \"availability\"\n",
+        &schema,
+    );
+    assert!(ok.is_empty(), "a valid [[slo]] table must pass: {ok:?}");
+
+    let typo = AutumnConfig::validate_toml(
+        "[[slo]]\nname = \"a\"\nobjectiv = 99.9\nsli = \"availability\"\n",
+        &schema,
+    );
+    assert!(
+        typo.iter().any(|(path, _)| path == "slo.objectiv"),
+        "a typo in [[slo]] must be rejected: {typo:?}"
     );
 }

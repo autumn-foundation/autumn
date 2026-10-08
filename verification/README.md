@@ -66,6 +66,28 @@ The integration test `gate_matches_the_any_row_oracle_for_every_pair_of_rows`
 covers those parts with the default config. The test
 `require_breaks_an_event_time_tie_by_row_id` covers the tie on `id`.
 
+## Deploy bake verdict
+
+`bake_verdict.rs` models `judge` in `autumn-cli/src/deploy/bake.rs`
+(issue #3069, ADR 0017). Verify it with:
+
+```sh
+verus verification/bake_verdict.rs
+```
+
+It proves five rules:
+
+- Thin traffic never rolls back.
+- A restart always rolls back.
+- Fewer than `min_errors` new 5xx never give an error breach.
+- More errors cannot change an error breach to a pass.
+- A pass means that no limit is exceeded.
+
+Verus checks the executable `judge` in the file against the spec, with the
+same `u128` arithmetic as the runtime. The runtime `judge` is separate code.
+The property test `judge_matches_the_verus_model` checks it against a Rust
+copy of `spec_judge`.
+
 ## Admission partitions
 
 `admission_partitions.rs` models the criticality thresholds in

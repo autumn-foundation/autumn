@@ -19,8 +19,9 @@ autumn-web = { version = "0.8.0", path = "../autumn" }
 # enables a backend (or the `sqlite` runtime lane) itself, so the
 # FEATURE-UNIFICATION HAZARD in `autumn/src/db.rs` does not apply. Queries are
 # written against autumn-web's `RuntimeConnection` / `RuntimeBackend` aliases
-# so both lanes compile, and the Postgres-only SQL sits behind
-# `autumn_web::backend_select!`.
+# so both lanes compile. On a SQLite build, boot refuses
+# `SearchPlugin::postgres()` and the store refuses every query. Its one
+# Postgres-only bind sits behind `autumn_web::backend_select!` (#2539 §5).
 diesel = { workspace = true }
 diesel-async = { workspace = true }
 serde = { workspace = true }

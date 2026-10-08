@@ -1361,6 +1361,16 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub deploy: Option<DeployConfig>,
 
+    /// Service level objectives (`[[slo]]` tables, issue #3069).
+    ///
+    /// The app does not read them at run time. `autumn slo generate` and
+    /// `autumn deploy` read them. See [`crate::slo`].
+    ///
+    /// Keep this field above `database`, for the same reason as `deploy`:
+    /// strict validation then checks the keys in each table.
+    #[serde(default)]
+    pub slo: Vec<crate::slo::SloConfig>,
+
     /// Deterministic replay capsule settings (`[failure_capture]` section,
     /// issue #1598).
     ///
@@ -1743,6 +1753,66 @@ pub struct DeployTlsConfig {
     pub host: Option<String>,
 }
 
+/// The post-cutover bake (`[deploy.bake]`, issue #3069).
+///
+/// After each host cuts over, `autumn deploy up` samples the new release's
+/// `/actuator/metrics` for `duration_secs`. It rolls the host back when the
+/// 5xx ratio or the latency is above the limit. The bake is off by default.
+///
+/// ```toml
+/// [deploy.bake]
+/// duration_secs = 300      # 0 turns the bake off (default: 0)
+/// interval_secs = 10       # time between samples (default: 10)
+/// min_requests = 20        # fewest responses for a verdict (default: 20)
+/// max_error_rate = 0.01    # default: from [[slo]], else 0.05
+/// max_p99_ms = 500         # default: from [[slo]], else no latency check
+/// ```
+///
+/// When `max_error_rate` is not set, the limit comes from the `[[slo]]`
+/// availability objectives with no `route`: the error ratio that burns the
+/// budget at 14.4×. When `max_p99_ms` is not set, it comes from the `[[slo]]`
+/// latency objectives with no `route`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeployBakeConfig {
+    /// Bake time in seconds after each host cuts over. `0` turns the bake
+    /// off. Default: `0`.
+    #[serde(default)]
+    pub duration_secs: u64,
+    /// Seconds between metric samples. Default: `10`.
+    #[serde(default = "default_deploy_bake_interval_secs")]
+    pub interval_secs: u64,
+    /// The fewest new responses before the bake gives a verdict. Thin
+    /// traffic never causes a rollback. Default: `20`.
+    #[serde(default = "default_deploy_bake_min_requests")]
+    pub min_requests: u64,
+    /// The highest 5xx ratio, from `0.0` to `1.0`.
+    #[serde(default)]
+    pub max_error_rate: Option<f64>,
+    /// The highest p99 latency, in milliseconds.
+    #[serde(default)]
+    pub max_p99_ms: Option<u64>,
+}
+
+const fn default_deploy_bake_interval_secs() -> u64 {
+    10
+}
+
+const fn default_deploy_bake_min_requests() -> u64 {
+    20
+}
+
+impl Default for DeployBakeConfig {
+    fn default() -> Self {
+        Self {
+            duration_secs: 0,
+            interval_secs: default_deploy_bake_interval_secs(),
+            min_requests: default_deploy_bake_min_requests(),
+            max_error_rate: None,
+            max_p99_ms: None,
+        }
+    }
+}
+
 /// Push-button VPS deploy settings (`[deploy]` section, issue #1607).
 ///
 /// Describes the SSH-reachable target server and the remote install layout for
@@ -1859,6 +1929,11 @@ pub struct DeployConfig {
     /// of something the deploy fixes.
     #[serde(default = "default_deploy_install_proxy")]
     pub install_proxy: bool,
+
+    /// The post-cutover bake (`[deploy.bake]`, issue #3069). Off by default.
+    /// See [`DeployBakeConfig`].
+    #[serde(default)]
+    pub bake: DeployBakeConfig,
 }
 
 /// Default for [`DeployConfig::install_proxy`]: prepare the host (issue #1607).
@@ -1883,6 +1958,7 @@ impl Default for DeployConfig {
             profile: default_deploy_profile(),
             tls: DeployTlsConfig::default(),
             install_proxy: default_deploy_install_proxy(),
+            bake: DeployBakeConfig::default(),
         }
     }
 }
@@ -10892,7 +10968,7 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
     // only that key produces no deploy section at all — a silent skip, not an
     // error, in both `AutumnConfig::load` and `autumn doctor`. Every key parsed
     // below MUST appear here.
-    const KEYS: [&str; 13] = [
+    const KEYS: [&str; 18] = [
         "AUTUMN_DEPLOY__HOST",
         "AUTUMN_DEPLOY__HOSTS",
         "AUTUMN_DEPLOY__USER",
@@ -10906,6 +10982,11 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
         "AUTUMN_DEPLOY__TLS__ENABLED",
         "AUTUMN_DEPLOY__TLS__HOST",
         "AUTUMN_DEPLOY__INSTALL_PROXY",
+        "AUTUMN_DEPLOY__BAKE__DURATION_SECS",
+        "AUTUMN_DEPLOY__BAKE__INTERVAL_SECS",
+        "AUTUMN_DEPLOY__BAKE__MIN_REQUESTS",
+        "AUTUMN_DEPLOY__BAKE__MAX_ERROR_RATE",
+        "AUTUMN_DEPLOY__BAKE__MAX_P99_MS",
     ];
     if !KEYS.iter().any(|key| env.var(key).is_ok()) {
         return;
@@ -10981,6 +11062,29 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
         "AUTUMN_DEPLOY__INSTALL_PROXY",
         &mut deploy.install_proxy,
     );
+    // The post-cutover bake (#3069). Env wins over TOML.
+    let bake = &mut deploy.bake;
+    parse_env(
+        env,
+        "AUTUMN_DEPLOY__BAKE__DURATION_SECS",
+        &mut bake.duration_secs,
+    );
+    parse_env(
+        env,
+        "AUTUMN_DEPLOY__BAKE__INTERVAL_SECS",
+        &mut bake.interval_secs,
+    );
+    parse_env(
+        env,
+        "AUTUMN_DEPLOY__BAKE__MIN_REQUESTS",
+        &mut bake.min_requests,
+    );
+    parse_env_option(
+        env,
+        "AUTUMN_DEPLOY__BAKE__MAX_ERROR_RATE",
+        &mut bake.max_error_rate,
+    );
+    parse_env_option(env, "AUTUMN_DEPLOY__BAKE__MAX_P99_MS", &mut bake.max_p99_ms);
 }
 
 /// Parse an environment variable into a typed target, logging a warning on failure.
@@ -17151,6 +17255,75 @@ path = "/healthz"
             toml::from_str("[deploy]\nhost = \"203.0.113.10\"\ninstall_proxy = true\n").unwrap();
         from_toml.apply_env_overrides_with_env(&env);
         assert!(!from_toml.deploy.expect("deploy configured").install_proxy);
+    }
+
+    #[test]
+    fn deploy_bake_defaults_to_off() {
+        let config: AutumnConfig = toml::from_str("[deploy]\nhost = \"h\"\n").unwrap();
+        let bake = config.deploy.expect("deploy").bake;
+        assert_eq!(bake.duration_secs, 0);
+        assert_eq!(bake.interval_secs, 10);
+        assert_eq!(bake.min_requests, 20);
+        assert!(bake.max_error_rate.is_none());
+        assert!(bake.max_p99_ms.is_none());
+    }
+
+    #[test]
+    fn deploy_bake_parses_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            "[deploy]\nhost = \"h\"\n\n[deploy.bake]\nduration_secs = 300\n\
+             interval_secs = 15\nmin_requests = 50\nmax_error_rate = 0.01\nmax_p99_ms = 400\n",
+        )
+        .unwrap();
+        let bake = config.deploy.expect("deploy").bake;
+        assert_eq!(bake.duration_secs, 300);
+        assert_eq!(bake.interval_secs, 15);
+        assert_eq!(bake.min_requests, 50);
+        assert_eq!(bake.max_error_rate, Some(0.01));
+        assert_eq!(bake.max_p99_ms, Some(400));
+    }
+
+    #[test]
+    fn env_override_wins_over_toml_deploy_bake_and_ignores_a_bad_value() {
+        let mut config: AutumnConfig = toml::from_str(
+            "[deploy]\nhost = \"h\"\n\n[deploy.bake]\nduration_secs = 300\nmax_p99_ms = 400\n",
+        )
+        .unwrap();
+        let env = MockEnv::new()
+            .with("AUTUMN_DEPLOY__BAKE__DURATION_SECS", "60")
+            // Not a number: the TOML value stays.
+            .with("AUTUMN_DEPLOY__BAKE__MAX_P99_MS", "5m");
+        config.apply_env_overrides_with_env(&env);
+        let bake = config.deploy.expect("deploy").bake;
+        assert_eq!(bake.duration_secs, 60);
+        assert_eq!(bake.max_p99_ms, Some(400));
+    }
+
+    #[test]
+    fn env_override_sets_every_deploy_bake_key() {
+        // Each key alone materializes [deploy].
+        let env = MockEnv::new()
+            .with("AUTUMN_DEPLOY__BAKE__DURATION_SECS", "120")
+            .with("AUTUMN_DEPLOY__BAKE__INTERVAL_SECS", "5")
+            .with("AUTUMN_DEPLOY__BAKE__MIN_REQUESTS", "7")
+            .with("AUTUMN_DEPLOY__BAKE__MAX_ERROR_RATE", "0.02")
+            .with("AUTUMN_DEPLOY__BAKE__MAX_P99_MS", "300");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        let bake = config.deploy.expect("env should materialize deploy").bake;
+        assert_eq!(bake.duration_secs, 120);
+        assert_eq!(bake.interval_secs, 5);
+        assert_eq!(bake.min_requests, 7);
+        assert_eq!(bake.max_error_rate, Some(0.02));
+        assert_eq!(bake.max_p99_ms, Some(300));
+
+        let only = MockEnv::new().with("AUTUMN_DEPLOY__BAKE__MAX_P99_MS", "250");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&only);
+        assert_eq!(
+            config.deploy.expect("materialized").bake.max_p99_ms,
+            Some(250)
+        );
     }
 
     #[test]

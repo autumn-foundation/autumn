@@ -150,7 +150,17 @@ autumn routes audit --json
 
 # In a workspace, target a specific package/bin
 autumn routes audit -p blog --bin server
+
+# Audit the build you deploy (same flags as `cargo build`)
+autumn routes audit --release
 ```
+
+The manifest describes the binary that the audit builds. By default, that is
+the dev profile with default features. A route behind
+`#[cfg(not(debug_assertions))]` or a non-default feature is only in the
+manifest when you build it. Use `--release`, `--profile`, `--features`,
+`--all-features` and `--no-default-features` to audit the build you ship. The
+manifest records the build in its `build` object.
 
 Exit code is `0` when every route is classified, `1` otherwise — wire it into
 CI as a hard gate exactly like `cargo clippy -- -D warnings`. `autumn new`

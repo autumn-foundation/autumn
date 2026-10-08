@@ -1374,6 +1374,26 @@ even inside a `#[sim_test]`. For a deadline whose counterparty is
 | `http_client::ClientError::DeadlineExceeded` | The deadline stopped an outbound call. `504`; not a circuit-breaker failure |
 | `extract::ShutdownToken` | Extractor; cancelled when the server stops accepting connections |
 
+## Multi-replica simulation (`autumn_web::sim`, #3067)
+
+Two or three apps on one sim clock and one `SQLite` database, for tests of
+jobs, the scheduler and locks across nodes.
+
+| API | Use |
+|---|---|
+| `Sim::mount_replica(name_or_Replica, app)` / `replica(name)` / `try_replica(name)` | Mount named apps next to each other. Each has its own state, job runtime and scheduled tasks |
+| `Sim::kill_replica(name)` / `restart_replica(name, app)` | Stop a replica's tasks as a crash does; mount it again |
+| `Replica::named("b").clock_ahead(d)` / `clock_behind(d)` / `clock_drift_ppm(p)` / `seeded_clock(max, ppm)` | A clock per replica. `Sim::step_replica_clock(name, TimeDelta)` is an NTP step. Keep the skew below `scheduler.lease_ttl_secs` |
+| `Sim::db_link(name)` + `SqliteSubstrate::replica_pool(&link)` | One replica's own pool on the shared database. `link.lose_session()` / `restore_session()`, `mid_query_errors(table, p)`, `commit_ambiguity(table, p)`, `clear_faults()`, `events()` |
+| `Sim::run_for(d)` | Move time one event at a time; time does not move while a query runs. Use it, not `advance`, with replicas |
+| `sim::runtime()` | The runtime `#[sim_test]` uses (one blocking thread, gated DB work), for a sim outside the macro |
+| `sim::trace::capture(fut)` → `(T, Trace)` / `Trace::diff` | Record framework `tracing` events with sim time; run one seed twice and diff. Run trace checks in their own test binary |
+
+Rules for code a sim drives: `biased;` in `tokio::select!`; no database
+`random()`; never drop a `SQLite` query in flight (pin it outside the
+`select!`, spawn it if another branch wins). See
+`docs/guide/simulation-testing.md` → "Multiple replicas".
+
 ## Authored fault scenarios (`autumn_web::sim::FaultPlan`, #1680)
 
 The authored lane beside the probabilistic `sim::Chaos` builder: name the exact

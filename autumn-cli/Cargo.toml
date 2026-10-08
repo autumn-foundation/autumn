@@ -167,6 +167,9 @@ testcontainers-modules = { workspace = true }
 # same `CertificateDer::from_pem_file` + `RootCertStore::add` path the runtime
 # uses (issue #1608). Test-only: the CLI itself never mints certificates.
 rcgen = { workspace = true }
+# Parses the YAML that `autumn slo generate` writes, in its tests (#3069).
+# The lock file already has it through `autumn-web/openapi`.
+serde_yaml = "0.9"
 
 [lints]
 workspace = true

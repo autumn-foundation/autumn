@@ -2873,19 +2873,19 @@ mod tests {
             .get(".github/workflows/posture-gate.yml")
             .expect("scaffolded by default");
 
-        assert!(workflow.contains("autumn routes audit --manifest"));
+        assert!(workflow.contains("autumn routes audit $POSTURE_AUDIT_FLAGS --manifest"));
         assert!(workflow.contains("autumn routes posture diff"));
         assert!(
             workflow.contains("--allow-missing-base"),
             "first run must not break a repo"
         );
-        assert!(workflow.contains("--ack-file \"$RUNNER_TEMP/acks.txt\""));
+        assert!(workflow.contains("--ack-dir \"$RUNNER_TEMP/acks\""));
         // Every scratch path lives outside the PR-controlled checkout, so a
         // committed symlink cannot redirect one write onto another file.
         for scratch in [
             "base-posture.json",
             "committed-posture.json",
-            "acks.txt",
+            "acks/",
             "posture-diff.md",
             "head-posture/posture-manifest.json",
         ] {
@@ -3037,14 +3037,11 @@ mod tests {
         );
     }
 
-    /// The boundary between harvested comment bodies must not be forgeable. A
-    /// reviewer pasting the separator inside a fenced sample would otherwise
-    /// reset the parser's state mid-body and make a following marker live —
-    /// so the harvest neutralizes any occurrence in a body before writing it,
-    /// which keeps the boundary out of reviewer-controlled text without giving
-    /// up the fence isolation the separator exists for.
+    /// The boundary between harvested comment bodies must not be forgeable
+    /// (#2472). Each body goes to its own file, so the file boundary is the
+    /// comment boundary and no text in a body can fake one.
     #[test]
-    fn the_harvest_neutralizes_a_separator_inside_a_comment_body() {
+    fn the_harvest_writes_one_file_per_comment() {
         let files = owned(GenerateOptions::default());
         let workflow = files
             .get(".github/workflows/posture-gate.yml")
@@ -3053,20 +3050,63 @@ mod tests {
         let harvest = workflow
             .split("- name: Harvest acknowledgments")
             .nth(1)
+            .and_then(|rest| rest.split("- name:").next())
             .expect("the harvest step");
         let after_decode = harvest
             .split_once("base64 -d")
             .expect("bodies are decoded")
             .1;
-        let neutralized = after_decode
-            .split("acks.txt")
-            .next()
-            .expect("the decode is redirected into the file");
         assert!(
-            neutralized.contains("autumn:ack-source"),
-            "a decoded body must have the separator neutralized between the \
-             decode and the file: {neutralized}"
+            after_decode
+                .trim_start_matches(|c: char| c.is_whitespace() || c == '\\')
+                .starts_with("> \"$RUNNER_TEMP/acks/$(printf '%06d' \"$n\").md\""),
+            "each decoded body must go to its own file: {harvest}"
         );
+        assert!(
+            !workflow.contains("autumn:ack-source"),
+            "no in-band separator is left to forge: {workflow}"
+        );
+    }
+
+    /// The gate audits the build that ships (#2472). Both scaffolded
+    /// Dockerfiles build `--release`, so the gate audits `--release`. Every
+    /// `routes audit` the workflow runs, or tells a user to run, uses the
+    /// same flags, so the staleness check compares the same build.
+    #[test]
+    fn the_gate_audits_the_build_that_ships() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+
+        for dockerfile in [
+            include_str!("templates/Dockerfile.tmpl"),
+            include_str!("templates/Dockerfile.api.tmpl"),
+        ] {
+            // `lines()` drops the `\r` of a CRLF checkout on Windows.
+            assert!(
+                dockerfile
+                    .lines()
+                    .any(|line| line == "RUN cargo build --release"),
+                "the image build changed; change POSTURE_AUDIT_FLAGS with it"
+            );
+        }
+        assert!(
+            workflow.contains("\n  POSTURE_AUDIT_FLAGS: --release\n"),
+            "{workflow}"
+        );
+        let commands: Vec<&str> = workflow
+            .match_indices("autumn routes audit ")
+            .map(|(at, _)| &workflow[at..])
+            .collect();
+        assert!(commands.len() >= 3, "{workflow}");
+        for command in commands {
+            assert!(
+                command.starts_with("autumn routes audit $POSTURE_AUDIT_FLAGS "),
+                "every audit must select the shipped build: {}",
+                &command[..command.len().min(80)]
+            );
+        }
     }
 
     /// The job that compiles the pull request holds no write permission and
@@ -3085,7 +3125,7 @@ mod tests {
             .expect("two jobs: the build and the verdict");
 
         assert!(
-            build_job.contains("autumn routes audit --manifest"),
+            build_job.contains("autumn routes audit $POSTURE_AUDIT_FLAGS --manifest"),
             "the build job is the one that compiles: {build_job}"
         );
         assert!(
@@ -3162,8 +3202,9 @@ mod tests {
         );
         // One comment per pull request, not one per concurrent push.
         assert!(workflow.contains("cancel-in-progress: true"));
-        // One comment's unbalanced code fence swallowing another's marker.
-        assert!(workflow.contains("<!-- autumn:ack-source -->"));
+        // One comment's unbalanced code fence swallowing another's marker:
+        // each comment is its own file.
+        assert!(workflow.contains("--ack-dir \"$RUNNER_TEMP/acks\""));
     }
 
     /// It is a workflow of its own, not another job on `ci.yml`: `ci.yml` must
