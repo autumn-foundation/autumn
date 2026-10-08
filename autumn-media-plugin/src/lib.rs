@@ -452,11 +452,8 @@ impl Plugin for MediaPlugin {
         // stray/irrelevant room setting — or a room env override — must never
         // abort boot and take the broadcast path down with it. The rooms path
         // keeps the existing fail-fast (see `room_config_boot_error`).
-        if let Some(message) = room_config_boot_error(
-            enable_rooms,
-            room_max_participants,
-            config.room_namespace.as_deref(),
-        ) {
+        if let Some(message) = room_config_boot_error(enable_rooms, room_max_participants, &config)
+        {
             tracing::error!(
                 room_max_participants,
                 ceiling = DEFAULT_ROOM_MAX_PARTICIPANTS,
@@ -524,6 +521,9 @@ impl Plugin for MediaPlugin {
             let room_namespace = config.room_namespace.clone().unwrap_or_default();
             let room_token_ttl =
                 chrono::Duration::seconds(i64::from(config.room_token_ttl_seconds));
+            let room_max_session =
+                chrono::Duration::seconds(i64::from(config.room_session_max_seconds));
+            let room_rate_limit = config.room_rate_limit_per_minute;
 
             let init_store = shared_memory_store.clone();
             app = app
@@ -539,7 +539,9 @@ impl Plugin for MediaPlugin {
                         room_namespace.clone(),
                         room_token_ttl,
                         room_max_participants,
-                    );
+                    )
+                    .with_max_session(room_max_session)
+                    .with_rate_limit(room_rate_limit);
                     state.insert_extension(room_service);
                 })
                 // Spawn from `on_startup` so the reaper shares the running app's
@@ -689,13 +691,29 @@ fn room_namespace_error(namespace: Option<&str>) -> Option<String> {
 fn room_config_boot_error(
     enable_rooms: bool,
     room_max_participants: usize,
-    room_namespace: Option<&str>,
+    config: &MediaConfig,
 ) -> Option<String> {
     if !enable_rooms {
         return None;
     }
     room_max_participants_error(room_max_participants)
-        .or_else(|| room_namespace_error(room_namespace))
+        .or_else(|| room_namespace_error(config.room_namespace.as_deref()))
+        .or_else(|| room_session_max_error(config))
+}
+
+/// Reject a session limit shorter than the token TTL.
+///
+/// A join mints a token for `room_token_ttl_seconds`. A shorter session limit
+/// makes every first heartbeat fail, so the room can never hold a seat.
+fn room_session_max_error(config: &MediaConfig) -> Option<String> {
+    let session_max = config.room_session_max_seconds;
+    let token_ttl = config.room_token_ttl_seconds;
+    (session_max < token_ttl).then(|| {
+        format!(
+            "media.room_session_max_seconds ({session_max}) must be at least \
+             media.room_token_ttl_seconds ({token_ttl})"
+        )
+    })
 }
 
 /// Build a shared, database-backed [`rooms_db::DbRoomStore`] from the running
@@ -979,7 +997,14 @@ mod room_namespace_tests {
 
 #[cfg(test)]
 mod room_config_gate_tests {
-    use super::{MediaPlugin, room_config_boot_error};
+    use super::{MediaConfig, MediaPlugin, room_config_boot_error};
+
+    fn with_namespace(namespace: &str) -> MediaConfig {
+        MediaConfig {
+            room_namespace: Some(namespace.to_owned()),
+            ..MediaConfig::default()
+        }
+    }
 
     #[test]
     fn broadcast_only_ignores_invalid_room_config() {
@@ -987,9 +1012,14 @@ mod room_config_gate_tests {
         // room cap (0) or namespace ("bad/ns") is irrelevant and must NOT abort
         // boot, so no failing startup hook is installed and broadcast stays up.
         assert!(!MediaPlugin::new().with_broadcast().enable_rooms);
-        assert!(room_config_boot_error(false, 0, None).is_none());
-        assert!(room_config_boot_error(false, 50, Some("bad/ns")).is_none());
-        assert!(room_config_boot_error(false, 4, Some("tenant-a")).is_none());
+        assert!(room_config_boot_error(false, 0, &MediaConfig::default()).is_none());
+        assert!(room_config_boot_error(false, 50, &with_namespace("bad/ns")).is_none());
+        assert!(room_config_boot_error(false, 4, &with_namespace("tenant-a")).is_none());
+        let short_session = MediaConfig {
+            room_session_max_seconds: 1,
+            ..MediaConfig::default()
+        };
+        assert!(room_config_boot_error(false, 4, &short_session).is_none());
     }
 
     #[test]
@@ -999,11 +1029,11 @@ mod room_config_gate_tests {
         // preserving the pre-existing fail-fast (naming the offending value).
         assert!(MediaPlugin::new().with_rooms().enable_rooms);
 
-        let bad_cap = room_config_boot_error(true, 0, None)
+        let bad_cap = room_config_boot_error(true, 0, &MediaConfig::default())
             .expect("rooms-enabled must fail fast on room_max_participants = 0");
         assert!(bad_cap.contains('0'), "names the offending cap: {bad_cap}");
 
-        let bad_ns = room_config_boot_error(true, 4, Some("bad/ns"))
+        let bad_ns = room_config_boot_error(true, 4, &with_namespace("bad/ns"))
             .expect("rooms-enabled must fail fast on an invalid room_namespace");
         assert!(
             bad_ns.contains("bad/ns"),
@@ -1011,7 +1041,20 @@ mod room_config_gate_tests {
         );
 
         // A valid room config on the rooms path boots cleanly (no abort).
-        assert!(room_config_boot_error(true, 4, Some("tenant-a")).is_none());
+        assert!(room_config_boot_error(true, 4, &with_namespace("tenant-a")).is_none());
+    }
+
+    #[test]
+    fn rooms_enabled_fails_fast_on_a_session_max_less_than_the_token_ttl() {
+        let short_session = MediaConfig {
+            room_token_ttl_seconds: 300,
+            room_session_max_seconds: 60,
+            ..MediaConfig::default()
+        };
+        let message = room_config_boot_error(true, 4, &short_session)
+            .expect("a session shorter than its token must abort boot");
+        assert!(message.contains("60"), "names the session limit: {message}");
+        assert!(message.contains("300"), "names the token TTL: {message}");
     }
 }
 
@@ -1227,6 +1270,21 @@ mod primitive_surface_tests {
             .state_initializer(move |state| *sink.lock().unwrap() = Some(read(state)))
             .build();
         seen.lock().unwrap().take().expect("probe ran")
+    }
+
+    #[tokio::test]
+    async fn rooms_take_the_session_limit_and_rate_limit_from_config() {
+        let config = MediaConfig {
+            room_session_max_seconds: 3600,
+            room_rate_limit_per_minute: 30,
+            ..MediaConfig::default()
+        };
+        let (rate, session) = probe(MediaPlugin::new().config(config).with_rooms(), |state| {
+            let rooms = state.extension::<RoomService>().expect("rooms installed");
+            (rooms.rate_limit_per_minute(), rooms.max_session())
+        });
+        assert_eq!(rate, 30);
+        assert_eq!(session, chrono::Duration::hours(1));
     }
 
     /// The extensions `plugin` installs.

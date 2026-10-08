@@ -44,7 +44,7 @@ use autumn_web::RuntimeConnection;
 use crate::config::DEFAULT_ROOM_MAX_PARTICIPANTS;
 use crate::rooms::{
     JoinRecord, MAX_ROOMS, ParticipantView, ReapFuture, ReapStats, RoomError, RoomSnapshot,
-    RoomStore, RoomStoreFuture, SessionToken, validate_room_segment,
+    RoomStore, RoomStoreFuture, SessionToken, renewed_expiry, validate_room_segment,
 };
 
 // ── Schema ────────────────────────────────────────────────────────────────────
@@ -467,6 +467,7 @@ impl RoomStore for DbRoomStore {
         participant_id: &'a str,
         token: &'a str,
         token_ttl: Duration,
+        max_session: Duration,
     ) -> RoomStoreFuture<'a, DateTime<Utc>> {
         Box::pin(async move {
             let mut conn = self.pool.get().await.map_err(map_db_err)?;
@@ -474,29 +475,35 @@ impl RoomStore for DbRoomStore {
             // Fail-closed: an absent row and a token mismatch are the same
             // `RoomNotFound`, so a heartbeat is no membership oracle. The room
             // row is not probed separately for the same reason.
-            let stored: String = media_room_participants::table
-                .filter(
-                    media_room_participants::namespace
-                        .eq(namespace)
-                        .and(media_room_participants::room_id.eq(room_id))
-                        .and(media_room_participants::participant_id.eq(participant_id)),
-                )
-                .select(media_room_participants::token)
-                .first(&mut conn)
-                .await
-                .optional()
-                .map_err(map_db_err)?
-                .ok_or(RoomError::RoomNotFound)?;
+            let (stored, joined_at): (String, chrono::NaiveDateTime) =
+                media_room_participants::table
+                    .filter(
+                        media_room_participants::namespace
+                            .eq(namespace)
+                            .and(media_room_participants::room_id.eq(room_id))
+                            .and(media_room_participants::participant_id.eq(participant_id)),
+                    )
+                    .select((
+                        media_room_participants::token,
+                        media_room_participants::joined_at,
+                    ))
+                    .first(&mut conn)
+                    .await
+                    .optional()
+                    .map_err(map_db_err)?
+                    .ok_or(RoomError::RoomNotFound)?;
             if !autumn_web::auth::constant_time_eq(token.as_bytes(), stored.as_bytes()) {
                 return Err(RoomError::RoomNotFound);
             }
 
             let now = Utc::now();
+            let renewed = renewed_expiry(joined_at.and_utc(), now, token_ttl, max_session)
+                .ok_or(RoomError::RoomNotFound)?;
             // Truncate to microseconds — the `Timestamp` column's resolution —
             // so the expiry this call returns is exactly the one another process
             // reads back, instead of a nanosecond-precise value the row cannot
             // hold.
-            let renewed = (now + token_ttl).trunc_subsecs(6);
+            let renewed = renewed.trunc_subsecs(6);
             let updated = diesel::update(
                 media_room_participants::table.filter(
                     media_room_participants::namespace
