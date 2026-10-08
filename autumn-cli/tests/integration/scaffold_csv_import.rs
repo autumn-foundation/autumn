@@ -831,8 +831,8 @@ fn the_discarded_column_probe_sees_the_same_column_names_the_decoder_accepted() 
 }
 
 /// A `Bytea` column round-trips as `\x` + hex: the export encodes it, the form
-/// decodes it, and the import sets it. The lossy `from_utf8_lossy` rendering
-/// turned every non-UTF-8 byte into U+FFFD at download time (issue #2330).
+/// decodes it, and the import sets it. The old `from_utf8_lossy` export turned
+/// every non-UTF-8 byte into U+FFFD (issue #2330).
 #[test]
 fn a_bytea_column_round_trips_as_hex() {
     let (_tmp, project, _) = scaffold_project(
@@ -870,7 +870,7 @@ fn a_bytea_column_round_trips_as_hex() {
         "a Bytea column must no longer raise the discarded-column alert:\n{routes}"
     );
     assert!(
-        routes.contains(r#""title", "blob""#),
+        routes.contains(r#"const SETTABLE: &[&str] = &["title", "blob"];"#),
         "a Bytea column must be one the import can set:\n{routes}"
     );
     // The form decodes the same representation, rejecting bad input.
@@ -878,9 +878,10 @@ fn a_bytea_column_round_trips_as_hex() {
         routes.contains("fn bytea_from_hex(") && routes.contains("fn bytea_to_hex("),
         "both hex helpers must be emitted:\n{routes}"
     );
+    let into_new = fn_slice(&routes, "into_new");
     assert!(
-        !routes.contains("into_bytes()") && !routes.contains("String::from_utf8_lossy(value)"),
-        "the form must not use the lossy String round trip:\n{routes}"
+        into_new.contains("bytea_from_hex") && !into_new.contains("into_bytes()"),
+        "the form must decode hex, not the lossy String round trip:\n{into_new}"
     );
 }
 
@@ -902,11 +903,9 @@ fn the_hex_helpers_require_the_prefix_and_never_panic() {
     );
 }
 
-/// Excluding a column from the LISTS is not enough — the decoder must never see
-/// it. `{Pascal}Form` still carries a `String` field for a `Bytea` column, so a
-/// pair that reaches `decode_form` is written back by `into_new` regardless of
-/// what the column lists say. This asserts the exclusion where it actually
-/// bites, which the list-level assertions cannot.
+/// The decoder must never see a column the import cannot set. The column lists
+/// alone do not stop it. This test checks the filter in the handler, which the
+/// list checks cannot reach.
 #[test]
 fn an_unsettable_column_never_reaches_the_form_decoder() {
     let (_tmp, project, _) = scaffold_project(
@@ -923,8 +922,8 @@ fn an_unsettable_column_never_reaches_the_form_decoder() {
     );
 }
 
-/// A NON-NULLABLE `Bytea` keeps the import: the column is settable, so the
-/// form's required `String` field is filled from the file's hex cell.
+/// A non-nullable `Bytea` keeps the import. The column is settable, so the
+/// file's hex cell fills the form's required `String` field.
 #[test]
 fn a_required_bytea_column_keeps_the_import() {
     let (_tmp, project, output) = scaffold_project(

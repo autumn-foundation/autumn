@@ -6207,7 +6207,7 @@ mod attachment_read_back_tests {{
             .any(|f| f.kind == FieldKind::Bytea && !f.is_encrypted());
     let mut bytea_helpers = String::new();
     if form_has_bytea || export_has_bytea {
-        bytea_helpers.push_str("\n");
+        bytea_helpers.push('\n');
         bytea_helpers.push_str(BYTEA_HEX_TO_FN);
     }
     if form_has_bytea {
@@ -10257,7 +10257,8 @@ fn cell_value_expr(field: &Field) -> String {
         }
         // Nullable: Option<T> — no Render impl; unwrap to String.
         (true, _) => format!("row.{name}.as_ref().map(ToString::to_string).unwrap_or_default()"),
-        // Non-nullable Bytea: Cow<str> does implement Render.
+        // Index and show view only. Non-nullable Bytea shows as lossy UTF-8;
+        // `Cow<str>` implements `Render`.
         (false, FieldKind::Bytea) => format!("String::from_utf8_lossy(&row.{name})"),
         // String/Text/RichText: &String implements Render via deref coercion.
         (false, FieldKind::String | FieldKind::Text | FieldKind::RichText) => {
@@ -10297,9 +10298,9 @@ fn csv_value_expr(field: &Field) -> String {
         (_, FieldKind::Attachment) => {
             format!("self.{name}.as_ref().map(|blob| blob.key.clone()).unwrap_or_default()")
         }
-        // `Vec<u8>` has no `Display` either. `\x` + hex is lossless and imports
-        // back byte-identically (issue #2330). The index and show views stay lossy:
-        // they only display.
+        // `Vec<u8>` has no `Display` either. `\x` + hex loses no byte and imports
+        // back unchanged (issue #2330). The index and show views stay lossy
+        // because they only display.
         (true, FieldKind::Bytea) => {
             format!("self.{name}.as_deref().map(bytea_to_hex).unwrap_or_default()")
         }
@@ -10361,7 +10362,7 @@ const BYTEA_HEX_TO_FN: &str = r#"/// Render bytes as `\x` + lowercase hex, the P
 ///
 /// Used by the edit form and the CSV export. UTF-8 would lose every
 /// non-UTF-8 byte; hex does not. The `\x` prefix keeps a spreadsheet from
-/// reading the cell as a number and dropping its leading zeros.
+/// reading the cell as a number. It then keeps the leading zeros.
 fn bytea_to_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut text = String::with_capacity(2 + bytes.len() * 2);
@@ -10377,11 +10378,14 @@ fn bytea_to_hex(bytes: &[u8]) -> String {
 /// a form field uses it.
 const BYTEA_HEX_FROM_FN: &str = r#"/// Parse `\x` + hex into bytes. Both letter cases are valid.
 ///
-/// Any other input is an error. This includes a missing prefix and an odd
-/// number of digits. It never panics.
+/// A blank value is empty bytes. Any other input is an error. This includes
+/// a missing prefix and an odd number of digits. It never panics.
 fn bytea_from_hex(text: &str) -> Result<Vec<u8>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
     let digits = text
-        .trim()
         .strip_prefix("\\x")
         .ok_or_else(|| String::from("must start with `\\x` and hex digits"))?;
     if digits.len() & 1 == 1 {
@@ -10490,8 +10494,9 @@ fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {
     // The encoding is user-editable code's contract, so the doc comment names it.
     let bytea_note = if exported.iter().any(|f| f.kind == FieldKind::Bytea) {
         "         /// A `Bytea` column is written as `\\x` + lowercase hex (the Postgres\n\
-         /// text form), so the bytes survive the download. The import decodes it\n\
-         /// back. Keep both sides on this encoding if you change it.\n\
+         /// text form), so no byte is lost. The import decodes it back. A\n\
+         /// spreadsheet can cut a cell that is too long. If you change one\n\
+         /// side, change the other.\n\
          ///\n\
 "
     } else {
@@ -11131,14 +11136,9 @@ __HEADER_CHECK__    if autumn_web::data::csv::count_data_rows(&uploaded[..]) > M
                 // then breaks. A column whose name is genuinely padded cannot
                 // exist here — form fields are Rust identifiers.
                 let key = key.trim();
-                // A column this import cannot set must never reach the decoder.
-                // For most of them that is belt-and-braces — serde ignores a
-                // field the form does not have — but a `Bytea` column DOES have
-                // a form field (a lossy `String`, see `{Pascal}Form`), so its
-                // exported mojibake would decode and `into_new` would write
-                // those replacement bytes back over the real binary value.
-                // Excluding it from the column LISTS is not enough on its own;
-                // this is where the exclusion actually bites.
+                // A column the import cannot set never reaches the decoder.
+                // Serde ignores a field the form does not have, so this is a
+                // second guard.
                 if CSV_IGNORED_COLUMNS.contains(&key) {
                     return None;
                 }
@@ -18451,9 +18451,31 @@ async fn main() {
     }
 
     #[test]
+    fn bytea_helpers_are_emitted_only_where_used() {
+        // An unused `fn` is a `dead_code` warning in the generated app.
+        let routes_for = |cols: &[&str]| {
+            let tmp = project_with_main(default_main());
+            let cols: Vec<String> = cols.iter().map(|c| (*c).to_owned()).collect();
+            plan_scaffold(tmp.path(), "Post", &cols, "20260427000000")
+                .unwrap()
+                .execute(Flags::default())
+                .unwrap();
+            fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap()
+        };
+        let none = routes_for(&["title:String"]);
+        assert!(!none.contains("fn bytea_to_hex("), "{none}");
+        assert!(!none.contains("fn bytea_from_hex("), "{none}");
+
+        let used = routes_for(&["title:String", "payload:Bytea"]);
+        assert!(used.contains("fn bytea_to_hex("), "{used}");
+        assert!(used.contains("fn bytea_from_hex("), "{used}");
+    }
+    }
+
+    #[test]
     fn the_bytea_hex_helpers_round_trip_non_utf8_bytes() {
-        // Compile the emitted helpers and run them. A UTF-8-safe fixture
-        // would pass even with the lossy code, so use bytes that are not.
+        // Compile the emitted helpers and run them. Use bytes that are not
+        // valid UTF-8. A UTF-8-safe fixture also passes with the lossy code.
         let program = format!(
             "{BYTEA_HEX_TO_FN}\n{BYTEA_HEX_FROM_FN}\n\
              fn main() {{\n\
@@ -18465,14 +18487,18 @@ async fn main() {
                  assert_eq!(bytea_from_hex(\" \\\\x00ff \").unwrap(), [0x00, 0xFF]);\n\
                  assert_eq!(bytea_from_hex(\"\\\\x\").unwrap(), Vec::<u8>::new());\n\
                  assert_eq!(bytea_to_hex(&[]), \"\\\\x\");\n\
-                 for bad in [\"\", \"00ff\", \"\\\\x0\", \"\\\\xzz\", \"\\\\x+f\", \"\\\\xé0\", \"\\\\x0é\", \"0x00\"] {{\n\
+                 assert_eq!(bytea_from_hex(\"  \").unwrap(), Vec::<u8>::new());\n\
+                 for bad in [\"00ff\", \"\\\\x0\", \"\\\\xzz\", \"\\\\x+f\", \"\\\\xé0\", \"\\\\x0é\", \"0x00\"] {{\n\
                      assert!(bytea_from_hex(bad).is_err(), \"{{bad:?}} must be rejected\");\n\
                  }}\n\
              }}\n"
         );
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("hex.rs");
-        let bin = dir.path().join("hex_bin");
+        let bin = dir
+            .path()
+            .join("hex_bin")
+            .with_extension(std::env::consts::EXE_EXTENSION);
         fs::write(&src, program).unwrap();
         let build = std::process::Command::new("rustc")
             .args(["--edition", "2021", "-D", "warnings", "-o"])
