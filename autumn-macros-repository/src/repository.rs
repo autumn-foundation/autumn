@@ -2332,12 +2332,39 @@ fn ledger_append_ts(
         quote! {}
     };
 
+    // #2326: a delete or restore becomes true when it is made. The record it is
+    // handed still carries the row's old valid-time column, so reading that would
+    // back-date the revision and make it win valid-time queries about instants
+    // before the change. `None` makes the append use the mutation instant.
+    let valid_from_stmt = if matches!(op, "delete" | "restore") {
+        quote! {
+            let __lg_valid_from: ::core::option::Option<
+                ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+            > = ::core::option::Option::None;
+        }
+    } else {
+        quote! {
+            let __lg_valid_from: ::core::option::Option<
+                ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+            > = {
+                use ::autumn_web::ledger::LedgeredRecord as _;
+                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_valid_from(&(#record_expr))
+            };
+        }
+    };
+
     quote! {
         {
             let __lg_record_id: i64 = {
                 use ::autumn_web::version_history::VersionedRecord as _;
                 (#record_expr).version_record_id()
             };
+            // #2326: refuse before the snapshot, which would turn NaN into `null`.
+            ::autumn_web::ledger::refuse_non_finite(
+                #table_name_ts,
+                __lg_record_id,
+                (#record_expr).__autumn_ledger_non_finite_column(),
+            )?;
             let __lg_tenant_id: ::core::option::Option<&str> = {
                 use ::autumn_web::version_history::VersionedRecord as _;
                 (#record_expr).version_tenant_id()
@@ -2346,12 +2373,7 @@ fn ledger_append_ts(
             let mut __lg_snapshot: ::autumn_web::reexports::serde_json::Value =
                 (#record_expr).__autumn_commit_hook_to_value()?;
             #soft_delete_stamp
-            let __lg_valid_from: ::core::option::Option<
-                ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
-            > = {
-                use ::autumn_web::ledger::LedgeredRecord as _;
-                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_valid_from(&(#record_expr))
-            };
+            #valid_from_stmt
             ::autumn_web::ledger::append_revision(
                 &mut *#conn_ident,
                 ::autumn_web::ledger::LedgerAppend {
@@ -4980,6 +5002,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     record_id: i64,
                     revision: &::autumn_web::ledger::LedgerRevision,
                 ) -> ::autumn_web::AutumnResult<#model_name> {
+                    // #2326: the codec leaves an undecryptable envelope in place.
+                    ::autumn_web::ledger::ensure_snapshot_recoverable(
+                        #table_name,
+                        record_id,
+                        revision.seq,
+                        &revision.snapshot,
+                    )?;
                     #model_name::__autumn_commit_hook_from_value(revision.snapshot.clone())
                         .map_err(|err| ::autumn_web::AutumnError::internal_server_error(
                             ::autumn_web::ledger::LedgerError::ChainUnreadable {
@@ -15642,7 +15671,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
             let restore_impl_method = if config.ledgered {
                 let vh_restore = vh_insert_ts(
                     table_name,
-                    "update",
+                    "restore",
                     false,
                     &quote! { __restored },
                     Some(&quote! { record }),
@@ -15829,7 +15858,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
             let restore_impl_method = if config.ledgered {
                 let vh_restore = vh_insert_ts(
                     table_name,
-                    "update",
+                    "restore",
                     false,
                     &quote! { __restored },
                     Some(&quote! { record }),
@@ -28137,6 +28166,64 @@ mod tests {
             !generated.contains("fn ledger_valid_from"),
             "without valid_time = \"...\" the model takes the default \
              (valid time == transaction time): {generated}"
+        );
+    }
+
+    fn ledger_append_for(op: &str) -> String {
+        ledger_append_ts(
+            "posts",
+            op,
+            &quote! { record },
+            &quote! { conn },
+            &format_ident!("Post"),
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn ledger_append_stamps_delete_and_restore_with_the_mutation_instant() {
+        // #2326: a delete or restore must not inherit the row's old valid time.
+        for op in ["delete", "restore"] {
+            let generated = ledger_append_for(op);
+            assert!(
+                !generated.contains("ledger_valid_from"),
+                "`{op}` must take the mutation instant, not the record's valid time: {generated}"
+            );
+        }
+        for op in ["insert", "update"] {
+            assert!(
+                ledger_append_for(op).contains("ledger_valid_from"),
+                "`{op}` must keep reading the record's valid time"
+            );
+        }
+    }
+
+    #[test]
+    fn ledger_append_refuses_a_non_finite_float_before_hashing() {
+        // #2326: the check must run before the snapshot is taken.
+        let generated = ledger_append_for("update");
+        let check = generated
+            .find("__autumn_ledger_non_finite_column")
+            .expect("every ledger append must check for non-finite floats");
+        let snapshot = generated
+            .find("__autumn_commit_hook_to_value")
+            .expect("snapshot is taken");
+        assert!(
+            check < snapshot,
+            "check must precede the snapshot: {generated}"
+        );
+    }
+
+    #[test]
+    fn ledger_reconstruction_refuses_an_unrecovered_envelope() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("ensure_snapshot_recoverable"),
+            "as-of reconstruction must reject an unrecovered envelope: {generated}"
         );
     }
 

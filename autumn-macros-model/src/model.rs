@@ -10695,6 +10695,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             )
         })
         .collect();
+    let ledger_non_finite_checks: Vec<TokenStream> = all_fields
+        .iter()
+        .map(|f| {
+            let ident = f.ident.as_ref().expect("named field");
+            let field_name = LitStr::new(&ident.to_string(), ident.span());
+            quote! {
+                if (&::autumn_web::ledger::NonFiniteProbe(&self.#ident)).autumn_has_non_finite() {
+                    return ::core::option::Option::Some(#field_name);
+                }
+            }
+        })
+        .collect();
     let commit_hook_construct_fields: Vec<TokenStream> = all_fields
         .iter()
         .map(|f| {
@@ -11531,6 +11543,23 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #commit_hook_serialize_where
             {
                 #commit_hook_serialize_body
+            }
+
+            /// First column holding a `NaN` or infinite float (#2326).
+            ///
+            /// A snapshot cannot store one: JSON would write `null`.
+            #[doc(hidden)]
+            #[allow(
+                clippy::needless_borrow,
+                reason = "the extra borrow selects the fallback impl"
+            )]
+            pub fn __autumn_ledger_non_finite_column(
+                &self,
+            ) -> ::core::option::Option<&'static str> {
+                #[allow(unused_imports)]
+                use ::autumn_web::ledger::{NonFiniteFallback as _, NonFiniteViaFloat as _};
+                #(#ledger_non_finite_checks)*
+                ::core::option::Option::None
             }
 
             #[doc(hidden)]

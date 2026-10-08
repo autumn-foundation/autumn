@@ -176,6 +176,13 @@ Three consequences worth knowing:
   are covered there too. Key rotation is handled by the envelope's `key_id`, so a
   retired key still decrypts; only a column whose key is gone entirely drops out
   of the comparison, and the revision hash still covers it.
+- As-of reconstruction does not skip that column. If a key is gone, `ledger_as_of`
+  and `ledger_diff` return `LedgerError::ChainUnreadable`. The error names the
+  column and the revision. The model is never returned with ciphertext in a
+  field that should hold plaintext.
+- A `NaN` or infinite float cannot be stored in a snapshot (JSON has no spelling
+  for it). A ledgered write that holds one fails with
+  `LedgerError::NonFiniteValue`, which names the column. The write rolls back.
 
 ## Bitemporality
 
@@ -206,6 +213,10 @@ pub trait InvoiceRepository {}
 ```
 
 The column may be `DateTime<Utc>`, `NaiveDateTime`, or an `Option` of either.
+
+A delete or a restore is valid from the instant it was made. It does not read
+your column, which still holds the row's old value. Otherwise a valid-time query
+about an earlier instant would return the deleted state.
 
 Both axes are queryable:
 
