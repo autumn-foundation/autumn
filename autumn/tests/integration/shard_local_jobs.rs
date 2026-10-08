@@ -31,6 +31,11 @@ mod shard_local_job_tests {
 
     static WELCOMED: AtomicUsize = AtomicUsize::new(0);
 
+    /// The welcome jobs that ran.
+    fn welcomed() -> usize {
+        AtomicUsize::load(&WELCOMED, Ordering::SeqCst)
+    }
+
     #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
     struct WelcomeArgs {
         account: String,
@@ -38,7 +43,7 @@ mod shard_local_job_tests {
 
     #[job(name = "shard_local_welcome")]
     async fn shard_local_welcome(_state: AppState, _args: WelcomeArgs) -> AutumnResult<()> {
-        WELCOMED.fetch_add(1, Ordering::SeqCst);
+        AtomicUsize::fetch_add(&WELCOMED, 1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -83,7 +88,8 @@ mod shard_local_job_tests {
         account: &str,
         commit: bool,
     ) -> Result<(), diesel::result::Error> {
-        let mut conn = pool.get().await.expect("shard connection");
+        let mut pooled = pool.get().await.expect("shard connection");
+        let conn: &mut AsyncPgConnection = &mut pooled;
         let account = account.to_owned();
         conn.transaction::<(), diesel::result::Error, _>(|conn| {
             async move {
@@ -110,7 +116,7 @@ mod shard_local_job_tests {
     async fn enqueue_in_tx_commits_and_rolls_back_with_the_shard_write() {
         let _guard = job::global_job_runtime_test_lock().lock().await;
         job::clear_global_job_client();
-        WELCOMED.store(0, Ordering::SeqCst);
+        AtomicUsize::store(&WELCOMED, 0, Ordering::SeqCst);
 
         let db = TestDb::shared().await;
         let (control_url, control) = fresh_database(db, "shard_local_jobs_control").await;
@@ -179,11 +185,11 @@ mod shard_local_job_tests {
 
         // A worker for the shard runs the job.
         for _ in 0..200 {
-            if WELCOMED.load(Ordering::SeqCst) == 1 {
+            if welcomed() == 1 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert_eq!(WELCOMED.load(Ordering::SeqCst), 1, "the shard worker ran the job once");
+        assert_eq!(welcomed(), 1, "the shard worker ran the job once");
     }
 }

@@ -13271,9 +13271,9 @@ mod tests {
                 entropy,
                 clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
+                #[cfg(feature = "db")]
+                shard_local: false,
             }
-            #[cfg(feature = "db")]
-            shard_local: false,
         }
 
         async fn minted_ids(seed: u64) -> Vec<String> {
@@ -13605,9 +13605,9 @@ mod tests {
                 entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
                 clock: std::sync::Arc::new(crate::time::FixedClock::at(epoch)),
                 resilience_config: None,
+                #[cfg(feature = "db")]
+                shard_local: false,
             }
-            #[cfg(feature = "db")]
-            shard_local: false,
         }
 
         let epoch_a = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
@@ -13676,9 +13676,9 @@ mod tests {
                 entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
                 clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
+                #[cfg(feature = "db")]
+                shard_local: false,
             }
-            #[cfg(feature = "db")]
-            shard_local: false,
         }
 
         let client = minimal_client();
@@ -13721,9 +13721,9 @@ mod tests {
                 entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
                 clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
+                #[cfg(feature = "db")]
+                shard_local: false,
             }
-            #[cfg(feature = "db")]
-            shard_local: false,
         }
 
         let _guard = global_job_runtime_test_lock().lock().await;

@@ -184,13 +184,21 @@ fn fnv1a_64(bytes: impl IntoIterator<Item = u8>) -> u64 {
         .fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
 }
 
+/// The splitmix64 finalizer. FNV-1a alone has weak low bits, and a lane is
+/// a low-bit remainder.
+const fn mix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
 /// The lanes of `key`: `min(size, lanes)` distinct lanes in `0..lanes`,
 /// sorted.
 ///
 /// The result is a permanent contract. It depends only on the arguments, so
 /// every process and every version gives a tenant the same lanes. Round `i`
-/// hashes `key`, a `0xff` separator and `i` (little endian) with FNV-1a, and
-/// takes the hash modulo `lanes`. A lane that is already taken is skipped.
+/// hashes `key`, a `0xff` separator and `i` (little endian) with FNV-1a,
+/// mixes the hash with the splitmix64 finalizer, and takes it modulo `lanes`. A lane that is already taken is skipped.
 /// After `MAX_ROUNDS` rounds, the lowest free lanes fill the rest, so the
 /// loop always ends.
 #[must_use]
@@ -200,11 +208,11 @@ pub fn shuffle_shard(key: &str, lanes: u16, size: u16) -> Vec<u16> {
     let mut picked: Vec<u16> = Vec::with_capacity(want);
     let mut round: u32 = 0;
     while picked.len() < want && round < MAX_ROUNDS {
-        let hash = fnv1a_64(
+        let hash = mix64(fnv1a_64(
             key.bytes()
                 .chain(std::iter::once(0xff))
                 .chain(round.to_le_bytes()),
-        );
+        ));
         // `want > 0` here, so `lanes > 0`. The remainder is below `lanes`,
         // so it fits in `u16`.
         let lane = u16::try_from(hash.checked_rem(u64::from(lanes)).unwrap_or(0)).unwrap_or(0);
@@ -275,9 +283,9 @@ mod tests {
     fn shuffle_shard_is_stable() {
         // A permanent contract: a change moves every tenant to new lanes.
         assert_eq!(shuffle_shard("acme", 8, 2), shuffle_shard("acme", 8, 2));
-        assert_eq!(shuffle_shard("acme", 8, 2), vec![2, 7]);
-        assert_eq!(shuffle_shard("globex", 8, 2), vec![1, 6]);
-        assert_eq!(shuffle_shard("initech", 16, 3), vec![3, 9, 14]);
+        assert_eq!(shuffle_shard("acme", 8, 2), vec![0, 6]);
+        assert_eq!(shuffle_shard("globex", 8, 2), vec![0, 3]);
+        assert_eq!(shuffle_shard("initech", 16, 3), vec![0, 10, 14]);
     }
 
     #[test]
@@ -295,6 +303,7 @@ mod tests {
         let full_overlap = (0..1000)
             .filter(|i| shuffle_shard(&format!("tenant-{i}"), 8, 2) == noisy)
             .count();
-        assert!(full_overlap < 100, "{full_overlap} of 1000 share all lanes");
+        // 1000 / 28 is about 36.
+        assert!(full_overlap < 60, "{full_overlap} of 1000 share all lanes");
     }
 }
