@@ -6256,6 +6256,12 @@ pub fn try_build_router_with_static_inner(
     // so where exactly it merges relative to the shadow/compression/
     // static_gate/security-headers wraps below doesn't matter; only staying
     // outside `custom_layers` does.
+    // Fault injection (#3071), for the same reason as shadow mirroring below:
+    // a pre-rendered page never reaches the inner router, so the layers also
+    // go here. Before the MCP merge, so they do not wrap the `/mcp` envelope;
+    // its replays go through the inner layers, as on the dynamic path.
+    router = install_outer_fault_injection(router, config, &state);
+
     if let Some(mcp_router) = deferred_mcp_router {
         router = router.merge(mcp_router);
     }
@@ -6271,11 +6277,6 @@ pub fn try_build_router_with_static_inner(
     if let Some(shadow) = build_shadow_layer(config, &state) {
         router = router.layer(shadow);
     }
-
-    // Fault injection (#3071), for the same reason as shadow mirroring: a
-    // pre-rendered page never reaches the inner router, so the layers go
-    // here. `apply_middleware` skipped them on this path.
-    router = install_outer_fault_injection(router, config, &state);
 
     // Compression is applied outside the static-first middleware too, so
     // pre-rendered HTML that `StaticFileLayer` serves without reaching

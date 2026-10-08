@@ -335,6 +335,7 @@ impl Injector {
         (matched != 0).then(|| {
             Arc::new(RequestScope {
                 path: path.into(),
+                deadline_at: self.deadline_at(),
                 injector: Arc::clone(self),
                 generation: generation_of(state),
                 matched,
@@ -345,10 +346,17 @@ impl Injector {
         })
     }
 
+    /// When a request that starts now reaches the request timeout.
+    fn deadline_at(&self) -> Option<tokio::time::Instant> {
+        self.deadline
+            .and_then(|deadline| tokio::time::Instant::now().checked_add(deadline))
+    }
+
     /// A scope that matches no rule, for a nested request with no rules.
     fn empty_scope(self: &Arc<Self>, path: &str) -> Arc<RequestScope> {
         Arc::new(RequestScope {
             path: path.into(),
+            deadline_at: None,
             injector: Arc::clone(self),
             generation: generation_of(self.state.load(Ordering::Acquire)),
             matched: 0,
@@ -505,6 +513,8 @@ impl Injector {
 struct RequestScope {
     /// The request path that selected the rules.
     path: Box<str>,
+    /// When the request timeout ends: one budget for all dependency waits.
+    deadline_at: Option<tokio::time::Instant>,
     injector: Arc<Injector>,
     /// The arm of the injector when the request started.
     generation: u64,
@@ -593,12 +603,17 @@ pub(crate) async fn inject(target: FaultTarget) -> Result<(), InjectedFault> {
     let Ok(mut fault) = SCOPE.try_with(|scope| {
         let mut fault = scope.roll(target);
         // A seam can be outside the timeout layer (the Redis session store
-        // is). Wait at most the request timeout, then fail as a timeout
-        // would, so the stop condition counts it.
-        if let Some(deadline) = scope.injector.deadline
-            && fault.latency >= deadline
+        // is). All waits of a request share the request timeout: a wait gets
+        // at most the time left, then fails as a timeout would, so the stop
+        // condition counts it.
+        let left = scope
+            .deadline_at
+            .map(|at| at.saturating_duration_since(tokio::time::Instant::now()));
+        if let Some(left) = left
+            && !fault.latency.is_zero()
+            && fault.latency >= left
         {
-            fault.latency = deadline;
+            fault.latency = left;
             fault.error = Some(StatusCode::SERVICE_UNAVAILABLE);
             scope.errored.store(true, Ordering::Relaxed);
         }
@@ -878,6 +893,32 @@ mod tests {
         assert!(result.is_err(), "the capped wait fails");
         assert_eq!(started.elapsed(), Duration::from_secs(2));
         assert!(scope.errored.load(Ordering::Relaxed));
+    }
+
+    /// The waits of one request share one budget: the second wait gets the
+    /// time left, then fails.
+    #[tokio::test(start_paused = true)]
+    async fn dependency_waits_share_the_request_timeout() {
+        let mut rule = FaultRule::new(FaultTarget::Redis, FaultKind::Latency, 1.0);
+        rule.latency_ms = 900;
+        let injector = test_injector_with(
+            vec![CompiledRule::new(&rule)],
+            1_000,
+            Some(Duration::from_secs(1)),
+        );
+        let scope = injector.scope_for("/").unwrap();
+        let started = tokio::time::Instant::now();
+        let (first, second) = SCOPE
+            .scope(Arc::clone(&scope), async {
+                (
+                    inject(FaultTarget::Redis).await,
+                    inject(FaultTarget::Redis).await,
+                )
+            })
+            .await;
+        assert!(first.is_ok());
+        assert!(second.is_err(), "the second wait passes the budget");
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
     }
 
     #[tokio::test]

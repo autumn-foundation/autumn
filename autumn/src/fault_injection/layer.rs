@@ -86,6 +86,15 @@ where
         // A request in a scope for the same path already keeps it: the
         // SSG/ISG path has two scope layers. An MCP replay has another path,
         // so it gets a scope of its own.
+        // An internal SSG/ISR render has no client: it gets no faults, as it
+        // gets no request timeout.
+        if req
+            .extensions()
+            .get::<crate::static_gen::RenderDeadlineExempt>()
+            .is_some()
+        {
+            return Box::pin(self.inner.call(req));
+        }
         let path = req.uri().path();
         let outer = SCOPE.try_with(|scope| &*scope.path == path);
         if matches!(outer, Ok(true)) {
