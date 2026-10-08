@@ -2052,9 +2052,6 @@ impl RequestBuilder {
         // a stored one) and every path must be closed.
         #[cfg(feature = "reporting")]
         if let Some(tape) = crate::capsule::effects::current_tape() {
-            // The capture made the fault decision of `send_recorded`; make it
-            // again, so the entropy draws after it line up (#3071).
-            crate::fault_injection::replay_roll(crate::fault_injection::FaultTarget::Http);
             let method = self.method.to_string();
             // Derived exactly as `OutboundRecorder::arm` derives the recorded
             // half, so the comparison is like with like. No cap on the body:
@@ -3584,30 +3581,6 @@ mod tests {
             }
             other => panic!("rebuilt as {other:?}"),
         }
-    }
-
-    /// Issue #3071: replay makes the HTTP fault decision that capture made,
-    /// so the entropy draws after it line up. It still serves the tape.
-    #[cfg(feature = "reporting")]
-    #[tokio::test]
-    async fn replay_makes_the_http_fault_decision() {
-        use crate::fault_injection::{FaultKind, FaultRule, FaultTarget, with_faults_fired};
-
-        let tape = Arc::new(crate::capsule::effects::ReplayEffects::new(
-            crate::capsule::schema::CapsuleEffects::default(),
-        ));
-        let rules = [FaultRule::new(FaultTarget::Http, FaultKind::Error, 1.0)];
-        let send = Box::pin(Client::new().get("http://example.invalid/x").send());
-        let (result, fired) = with_faults_fired(
-            &rules,
-            crate::capsule::effects::with_effect_tape(tape, send),
-        )
-        .await;
-        assert!(
-            !matches!(result, Err(ClientError::FaultInjected(_))),
-            "replay serves the tape, not a new fault"
-        );
-        assert!(fired, "replay makes the fault decision");
     }
 
     /// Regression (#3068 review): a local throttle reject says nothing about

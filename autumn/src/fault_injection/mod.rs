@@ -54,7 +54,7 @@ use std::time::Duration;
 use axum::http::{Method, StatusCode};
 
 use crate::audit::{AuditEvent, AuditLogger, AuditStatus};
-use crate::entropy::Entropy;
+use crate::entropy::{Entropy, SeededEntropy};
 use crate::route::RouteTimeout;
 use crate::router::RouteAttrTable;
 use crate::slo::PPM;
@@ -662,15 +662,6 @@ tokio::task_local! {
     static SCOPE: Arc<RequestScope>;
 }
 
-/// The fault decision of a dependency seam, with no wait and no error.
-///
-/// Capsule replay serves the recorded result of a seam, but must make the
-/// same entropy draws as the capture did.
-#[cfg(all(feature = "reporting", feature = "http-client"))]
-pub(crate) fn replay_roll(target: FaultTarget) {
-    let _decision = SCOPE.try_with(|scope| scope.roll(target));
-}
-
 /// The dependency seam: wait for injected latency, then fail when an
 /// injected error fires.
 ///
@@ -772,7 +763,10 @@ pub(crate) fn build(
         state: AtomicU64::new(armed_state(0)),
         injected: AtomicU64::new(0),
         window: Mutex::new(Window::default()),
-        entropy: state.entropy_arc(),
+        // An own stream, seeded once here (outside any request). A request
+        // takes no draw from the app entropy, so the draws that a capsule
+        // records do not depend on the fault config.
+        entropy: Arc::new(SeededEntropy::new(state.entropy_arc().next_u64())),
         audit,
         profile: profile.unwrap_or_default().to_owned(),
         allow_in_production: section.allow_in_production,
@@ -862,20 +856,6 @@ pub(crate) async fn with_faults<F: std::future::Future>(
         .scope_for("/", &Method::GET)
         .expect("an armed injector scopes `/`");
     SCOPE.scope(scope, future).await
-}
-
-/// [`with_faults`], and whether a fault fired in the scope.
-#[cfg(test)]
-pub(crate) async fn with_faults_fired<F: std::future::Future>(
-    rules: &[FaultRule],
-    future: F,
-) -> (F::Output, bool) {
-    let injector = test_injector(rules.iter().map(CompiledRule::new).collect(), u64::MAX);
-    let scope = injector
-        .scope_for("/", &Method::GET)
-        .expect("an armed injector scopes `/`");
-    let output = SCOPE.scope(Arc::clone(&scope), future).await;
-    (output, scope.fired.load(Ordering::Relaxed))
 }
 
 /// An injector for tests: `/live` and `/actuator` are exempt, and the stop
@@ -997,6 +977,50 @@ mod tests {
         assert!(result.is_err(), "the capped wait fails");
         assert_eq!(started.elapsed(), Duration::from_secs(2));
         assert!(scope.errored.load(Ordering::Relaxed));
+    }
+
+    /// Counts the draws from the app entropy.
+    #[derive(Debug, Default)]
+    struct CountingEntropy(AtomicU64);
+
+    impl Entropy for CountingEntropy {
+        fn next_u64(&self) -> u64 {
+            self.0.fetch_add(1, Ordering::Relaxed)
+        }
+
+        fn fill_bytes(&self, dest: &mut [u8]) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            dest.fill(7);
+        }
+    }
+
+    /// The faults draw from their own stream, seeded once at build. A request
+    /// takes no draw from the app entropy, so the draws that a capsule records
+    /// do not depend on the fault config.
+    #[tokio::test]
+    async fn fault_draws_do_not_use_the_app_entropy() {
+        let counter = Arc::new(CountingEntropy::default());
+        let state = crate::state::AppState::for_test().with_entropy(Arc::clone(&counter) as _);
+        let section = FaultInjectionConfig {
+            enabled: true,
+            faults: vec![FaultRule::new(FaultTarget::Http, FaultKind::Error, 0.5)],
+            ..Default::default()
+        };
+        let config = crate::config::AutumnConfig {
+            profile: Some("staging".to_owned()),
+            fault_injection: section,
+            ..Default::default()
+        };
+        let (_scope_layer, _route_layer, handle) =
+            build(&config, &state, Vec::new(), &Arc::default()).expect("staging builds");
+        let after_build = counter.0.load(Ordering::Relaxed);
+        let scope = handle.inner.scope_for("/", &Method::GET).unwrap();
+        for _ in 0..20 {
+            let _result = SCOPE
+                .scope(Arc::clone(&scope), inject(FaultTarget::Http))
+                .await;
+        }
+        assert_eq!(counter.0.load(Ordering::Relaxed), after_build);
     }
 
     /// A timer that wakes after the deadline fails the wait, as a timeout

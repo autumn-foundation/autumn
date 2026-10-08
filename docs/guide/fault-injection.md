@@ -75,8 +75,10 @@ All dependency waits of a request share its request timeout: the `timeout`
 of its route, else `server.timeouts.request_timeout_ms`. A wait that reaches
 it fails, as a timeout does.
 
-The random decisions use the app entropy source. A test with `SeededEntropy`
-gets the same faults on each run.
+The random decisions use their own stream, seeded at boot from the app
+entropy source. A test with `SeededEntropy` gets the same faults on each run.
+A failure capsule records none of these draws, so its replay does not need
+the fault config.
 
 ## Safety rules
 
