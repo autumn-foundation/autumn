@@ -314,13 +314,20 @@ and its reason appear in the report:
 ```
 
 Only sweep-enforced datasets have a backing table a hold can name; the
-TTL-native ones cannot be held this way.
+TTL-native ones cannot be held this way, except the database idempotency
+store (below).
 
 A hold on `autumn_job_tracking` also suppresses the job runner's own
 independent `expires_at` cleanup, which predates this policy and is not part
 of it. Without that, a hold would be honoured by `autumn db retention` and
 quietly violated five minutes later by the maintenance loop — worse than
 having no hold at all.
+
+The database idempotency store (`[idempotency] backend = "database"`) keeps
+its records in `autumn_idempotency_keys` and expires them itself. A hold on
+that table works the same way: the store stops deleting and overwriting
+expired rows. A request that reuses a held, expired `Idempotency-Key` gets
+`409` rather than replacing the held response.
 
 ## The CLI
 

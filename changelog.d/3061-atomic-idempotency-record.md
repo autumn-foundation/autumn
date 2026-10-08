@@ -19,7 +19,8 @@
 - **idempotency:** `DbIdempotencyStore` keeps records in the app database
   (Postgres, or SQLite under `sqlite`). Select it with
   `[idempotency] backend = "database"`. It needs the new framework migration
-  `autumn_idempotency_keys`.
+  `autumn_idempotency_keys`. It honours a GDPR legal hold on that table
+  (`ModelRegistration::retain`): expired rows are kept, not swept.
 - **idempotency:** the `IdempotencyTx` extractor. `IdempotencyTx::commit`
   writes the response in the handler's `Db::tx`, so the response commits with
   the mutation. A crash after the commit no longer re-runs the mutation: when

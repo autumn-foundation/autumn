@@ -76,11 +76,20 @@ fn db_error(action: &str, error: impl std::fmt::Display) -> IdempotencyStoreErro
 ///
 /// Needs the framework migration that creates `autumn_idempotency_keys`.
 /// Select it with `backend = "database"` in `[idempotency]`.
+///
+/// A GDPR legal hold on `autumn_idempotency_keys` (a
+/// `ModelRegistration::retain`) stops the store from deleting or
+/// overwriting an expired row. See [`Self::with_legal_holds`].
 pub struct DbIdempotencyStore {
     pool: Pool<RuntimeConnection>,
     default_ttl: Duration,
     writes: AtomicU64,
+    /// Where the [`crate::gdpr::GdprRegistry`] is read from, for legal holds.
+    state: Option<crate::AppState>,
 }
+
+/// The store's table, as a GDPR registration names it.
+const TABLE: &str = "autumn_idempotency_keys";
 
 impl DbIdempotencyStore {
     /// Create a store on `pool`. `default_ttl` is the response retention.
@@ -90,6 +99,40 @@ impl DbIdempotencyStore {
             pool,
             default_ttl,
             writes: AtomicU64::new(0),
+            state: None,
+        }
+    }
+
+    /// Honour GDPR legal holds from the [`crate::gdpr::GdprRegistry`] in
+    /// `state`. The router sets this for `backend = "database"`.
+    ///
+    /// While `autumn_idempotency_keys` is registered with
+    /// `ModelRegistration::retain`, expired rows stay: the expiry sweep does
+    /// not run, and an expired response or recovery point is never deleted
+    /// or overwritten. A request that reuses such a key gets `409`.
+    #[must_use]
+    pub fn with_legal_holds(mut self, state: &crate::AppState) -> Self {
+        self.state = Some(state.clone());
+        self
+    }
+
+    /// The reason the table is under a legal hold, if it is. Read on each
+    /// call, as the job-tracking cleanup does: the registry is app state.
+    fn legal_hold(&self) -> Option<String> {
+        let registry = self
+            .state
+            .as_ref()?
+            .extension::<crate::gdpr::GdprRegistry>();
+        crate::data_retention::table_legal_hold(TABLE, registry.as_deref())
+    }
+
+    /// The expiry before which an expired row may be deleted or overwritten:
+    /// `now`, or never while the table is under a legal hold.
+    fn reclaim_before(&self, now: i64) -> i64 {
+        if self.legal_hold().is_some() {
+            i64::MIN
+        } else {
+            now
         }
     }
 
@@ -108,6 +151,13 @@ impl DbIdempotencyStore {
             .fetch_add(1, Ordering::Relaxed)
             .is_multiple_of(SWEEP_EVERY)
         {
+            return;
+        }
+        if let Some(reason) = self.legal_hold() {
+            tracing::debug!(
+                reason = %reason,
+                "idempotency key sweep skipped: autumn_idempotency_keys is under legal hold"
+            );
             return;
         }
         let now = now_ms();
@@ -313,9 +363,10 @@ impl IdempotencyStore for DbIdempotencyStore {
                 .le(now)
                 .or(keys::locked_by.is_null())
                 .or(keys::locked_by.eq(owner));
+            // An expired record is free too, unless a legal hold keeps it.
             let record_free = keys::record
                 .is_null()
-                .or(keys::expires_at_ms.le(now))
+                .or(keys::expires_at_ms.le(self.reclaim_before(now)))
                 .or(keys::record_owner.eq(owner));
             diesel::query_dsl::methods::FilterDsl::filter(upsert, lock_free.and(record_free))
                 .execute(&mut conn)
@@ -365,11 +416,14 @@ impl IdempotencyStore for DbIdempotencyStore {
             if busy {
                 return Ok(false);
             }
-            // An expired key with no live lock starts over.
+            // An expired key with no live lock starts over, unless a legal
+            // hold keeps it: then the upsert below refuses a row that holds
+            // an expired response or recovery point.
+            let reclaim_before = self.reclaim_before(now);
             diesel::delete(
                 keys::autumn_idempotency_keys
                     .filter(keys::storage_key.eq(key))
-                    .filter(keys::expires_at_ms.le(now))
+                    .filter(keys::expires_at_ms.le(reclaim_before))
                     .filter(keys::locked_until_ms.le(now)),
             )
             .execute(&mut conn)
@@ -410,9 +464,16 @@ impl IdempotencyStore for DbIdempotencyStore {
                     keys::expires_at_ms.eq(taken_expiry),
                 ));
             // `ON CONFLICT … DO UPDATE … WHERE`: the `WHERE` reads the existing row.
+            let kept = keys::recovery_point
+                .is_not_null()
+                .and(keys::expires_at_ms.le(now))
+                .and(keys::expires_at_ms.gt(reclaim_before));
             let acquired = diesel::query_dsl::methods::FilterDsl::filter(
                 upsert,
-                keys::record.is_null().and(keys::locked_until_ms.le(now)),
+                keys::record
+                    .is_null()
+                    .and(keys::locked_until_ms.le(now))
+                    .and(diesel::dsl::not(kept)),
             )
             .execute(&mut conn)
             .await
@@ -877,5 +938,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(point.as_deref(), Some("charged"));
+    }
+
+    /// Under a GDPR legal hold on `autumn_idempotency_keys`, an expired
+    /// response and an expired recovery point stay: the sweep skips, a reused
+    /// key is refused instead of taking the row over, and a late `set` does
+    /// not overwrite. Without the hold, the same expired key starts over.
+    #[tokio::test]
+    async fn legal_hold_keeps_expired_rows() {
+        let substrate = SqliteSubstrate::with_migrations(&[&crate::migrate::FRAMEWORK_MIGRATIONS])
+            .expect("substrate");
+        let state = crate::AppState::for_test();
+        state.insert_extension(crate::gdpr::GdprRegistry::new().register(
+            crate::gdpr::ModelRegistration::retain(TABLE, "litigation hold 2026-CV-1"),
+        ));
+        let held = DbIdempotencyStore::new(substrate.pool(), Duration::from_secs(60))
+            .with_legal_holds(&state);
+        let record = |body: &str| IdempotencyRecord {
+            status: 201,
+            headers: Vec::new(),
+            body: body.as_bytes().to_vec(),
+            metadata: Vec::new(),
+        };
+        held.set("rec", "a", record("first"), Vec::new(), Duration::ZERO)
+            .await
+            .unwrap();
+        let mut conn = held.conn().await.unwrap();
+        diesel::insert_into(keys::autumn_idempotency_keys)
+            .values((
+                keys::storage_key.eq("point"),
+                keys::recovery_point.eq(Some("charged")),
+                keys::locked_until_ms.eq(0),
+                keys::expires_at_ms.eq(0),
+                keys::ttl_ms.eq(60_000),
+            ))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        held.writes.store(0, Ordering::Relaxed);
+        held.sweep(&mut conn).await;
+        drop(conn);
+        for key in ["rec", "point"] {
+            assert!(
+                !held
+                    .try_lock(key, "b", Duration::from_secs(60))
+                    .await
+                    .unwrap(),
+                "{key}: a held expired row is not taken over"
+            );
+        }
+        held.set(
+            "rec",
+            "c",
+            record("late"),
+            Vec::new(),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let mut conn = held.conn().await.unwrap();
+        let rows: Vec<(String, Option<Vec<u8>>, Option<String>)> = keys::autumn_idempotency_keys
+            .select((keys::storage_key, keys::record, keys::recovery_point))
+            .order(keys::storage_key)
+            .load(&mut conn)
+            .await
+            .unwrap();
+        drop(conn);
+        assert_eq!(rows.len(), 2, "both expired rows are kept");
+        assert_eq!(rows[0].2.as_deref(), Some("charged"));
+        let kept = StoredEntry::decode(rows[1].1.as_deref().expect("record kept")).unwrap();
+        assert_eq!(kept.record.body, b"first", "the late set did not overwrite");
+
+        let free = DbIdempotencyStore::new(substrate.pool(), Duration::from_secs(60));
+        assert!(
+            free.try_lock("rec", "b", Duration::from_secs(60))
+                .await
+                .unwrap(),
+            "without the hold an expired key starts over"
+        );
     }
 }

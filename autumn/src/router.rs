@@ -4836,12 +4836,10 @@ fn build_idempotency_store(
                 )))
             },
             |pool| {
-                Ok(
-                    std::sync::Arc::new(crate::idempotency::DbIdempotencyStore::new(
-                        pool.clone(),
-                        ttl,
-                    )) as std::sync::Arc<dyn IdempotencyStore>,
-                )
+                Ok(std::sync::Arc::new(
+                    crate::idempotency::DbIdempotencyStore::new(pool.clone(), ttl)
+                        .with_legal_holds(state),
+                ) as std::sync::Arc<dyn IdempotencyStore>)
             },
         ),
         #[cfg(not(feature = "db"))]
