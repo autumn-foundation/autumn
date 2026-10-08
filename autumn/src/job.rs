@@ -3087,11 +3087,8 @@ async fn run_job_handler_inner(
             .await
             .is_err()
         {
-            tracing::warn!(
-                job = name,
-                cap_ms = crate::job_tracking::TRACKING_SETTLE_CAP.as_millis(),
-                "tracking settle timed out"
-            );
+            let cap_ms = crate::job_tracking::TRACKING_SETTLE_CAP.as_millis();
+            tracing::warn!(job = name, cap_ms, "tracking settle timed out");
         }
     }
 
@@ -25991,6 +25988,25 @@ mod lease_tests {
         ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
             Box::pin(async { Ok(()) })
         }
+    }
+
+    #[tokio::test]
+    async fn an_unstalled_store_answers_every_call() {
+        use crate::job_tracking::{JobTrackingStore as _, TrackedJobOwner};
+        let store = StalledTrackingStore {
+            stall_mark_running: false,
+            stall_settle: false,
+        };
+        store.create("k", TrackedJobOwner::Anonymous).await.unwrap();
+        store.mark_running("k").await.unwrap();
+        store.set_progress("k", 5, None).await.unwrap();
+        store.complete("k", Value::Null).await.unwrap();
+        store.fail("k", "e".to_owned()).await.unwrap();
+        assert!(store.get("k").await.unwrap().is_none());
+        store
+            .reset_for_retry("k", TrackedJobOwner::Anonymous, chrono::Utc::now())
+            .await
+            .unwrap();
     }
 
     /// Run a tracked job against `store`. The run must end within a long

@@ -1099,10 +1099,8 @@ pub(crate) async fn capped_settle(
     tokio::time::timeout(TRACKING_SETTLE_CAP, write)
         .await
         .unwrap_or_else(|_| {
-            tracing::warn!(
-                cap_ms = TRACKING_SETTLE_CAP.as_millis(),
-                "tracking settle timed out"
-            );
+            let cap_ms = TRACKING_SETTLE_CAP.as_millis();
+            tracing::warn!(cap_ms, "tracking settle timed out");
             Ok(())
         })
 }
