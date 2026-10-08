@@ -359,11 +359,19 @@ impl Injector {
 
     /// Disarm the current arm. Returns `true` when this call disarmed it.
     fn disarm_any(&self) -> bool {
-        self.state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                is_armed(state).then_some(state & !1)
-            })
-            .is_ok()
+        let mut state = self.state.load(Ordering::Acquire);
+        while is_armed(state) {
+            match self.state.compare_exchange_weak(
+                state,
+                state & !1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(current) => state = current,
+            }
+        }
+        false
     }
 
     /// Disarm only when arm `generation` is current and armed.
@@ -484,11 +492,6 @@ impl RequestScope {
         self.injector.state.load(Ordering::Acquire) == armed_state(self.generation)
     }
 
-    fn mark_fired(&self) {
-        self.fired.store(true, Ordering::Relaxed);
-        self.injector.injected.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Test each matched rule for `target` against its rate. Return the sum
     /// of the latencies (capped), and an error if one fired.
     fn roll(&self, target: FaultTarget) -> RouteFault {
@@ -504,19 +507,30 @@ impl RequestScope {
             .filter(|(rule, bit)| {
                 rule.target == target && self.matched & 1_u64.checked_shl(*bit).unwrap_or(0) != 0
             });
+        let mut fired = 0_u64;
         for (rule, _) in rules {
             if !self.injector.roll(rule.rate_ppm) {
                 continue;
             }
-            self.mark_fired();
+            fired = fired.saturating_add(1);
             match rule.kind {
                 FaultKind::Latency => fault.latency = fault.latency.saturating_add(rule.latency),
                 FaultKind::Error => {
-                    self.errored.store(true, Ordering::Relaxed);
                     fault.error.get_or_insert(rule.status);
                 }
             }
         }
+        // Check the arm again before the decision counts: an arm change
+        // during the loop drops it. The gap left is from here to the
+        // injection, so a fault of an old arm almost never fires.
+        if fired == 0 || !self.armed() {
+            return RouteFault::default();
+        }
+        self.fired.store(true, Ordering::Relaxed);
+        if fault.error.is_some() {
+            self.errored.store(true, Ordering::Relaxed);
+        }
+        self.injector.injected.fetch_add(fired, Ordering::Relaxed);
         fault.latency = fault.latency.min(config::MAX_LATENCY);
         fault
     }
@@ -650,7 +664,7 @@ pub(crate) fn announce(handle: &FaultInjection) {
 #[cfg(test)]
 impl FaultInjection {
     /// The handle of a test injector.
-    pub(crate) fn for_test(inner: &Arc<Injector>) -> Self {
+    fn for_test(inner: &Arc<Injector>) -> Self {
         Self {
             inner: Arc::clone(inner),
         }

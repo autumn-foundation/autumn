@@ -111,6 +111,7 @@ where
 /// Counts a request that is dropped before it completes (a timeout, or a
 /// closed client connection). It counts as an error only when a fault fired,
 /// so injected latency that causes a timeout counts against the error budget.
+/// A dropped request with no fault counts as a good result.
 struct Pending(Option<Arc<RequestScope>>);
 
 impl Drop for Pending {
@@ -118,7 +119,10 @@ impl Drop for Pending {
         let Some(scope) = self.0.take() else {
             return;
         };
-        if scope.fired.load(Ordering::Relaxed) && scope.injector.record(scope.generation, true) {
+        // Each matched request counts. A dropped one is bad only when a
+        // fault fired in it.
+        let fired = scope.fired.load(Ordering::Relaxed);
+        if scope.injector.record(scope.generation, fired) {
             scope.injector.audit_stop(STOP_REASON);
         }
     }
