@@ -588,6 +588,34 @@ let postgres = autumn_web::config::JobPostgresConfig {
 **Automation:** `manual` - the fix adds a struct update expression, and no
 codemod rewrites struct literals.
 
+### Tenancy: `TenantPropagatingBody` has a `db_bulkhead` field
+
+**Why:** a database checkout while a streaming body is polled counts against
+`tenancy.max_db_connections` (issue #3072).
+
+**Before (`{X.Y}`):**
+
+```rust
+let body = autumn_web::tenancy::TenantPropagatingBody {
+    inner,
+    tenant_id,
+    handle: None,
+};
+```
+
+**After (`{(X+1).0}`):** add `db_bulkhead: None`.
+
+```rust
+let body = autumn_web::tenancy::TenantPropagatingBody {
+    inner,
+    tenant_id,
+    handle: None,
+    db_bulkhead: None,
+};
+```
+
+**Automation:** `manual` - no codemod rewrites struct literals.
+
 ### Probes: `/ready` pings the primary database
 
 **Why:** pool saturation made a busy replica unready, and an idle pool made a

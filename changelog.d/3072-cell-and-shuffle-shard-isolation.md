@@ -21,5 +21,6 @@
 ### Breaking Changes
 
 - **Breaking:** `TenancyConfig`, `JobConfig` and `JobPostgresConfig` have new
-  public fields. A struct literal needs `..Default::default()`
+  public fields. A struct literal needs `..Default::default()`.
+  `tenancy::TenantPropagatingBody` has a new `db_bulkhead` field
   ([migration guide](docs/migrations/next.md)).

@@ -46,9 +46,10 @@ number of connections that one handler holds at the same time.
 The `autumn_tenant_bulkhead_rejections_total{kind="request"}` and
 `{kind="db"}` counters count the rejections. They have no tenant label.
 
-The caps count work in the request handler. They do not count:
+The caps count work in the request handler and in a streaming response
+body. They do not count:
 
-- a connection that a streaming body or a spawned task takes;
+- a connection that a spawned task takes;
 - a connection that does not come from `Db` or a shard extractor.
 
 With `tenancy.source = "header"` or `"subdomain"`, the client selects the

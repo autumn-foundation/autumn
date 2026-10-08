@@ -716,6 +716,7 @@ pub async fn tenancy_middleware(
         inner: body,
         tenant_id: tenant_id_clone,
         handle: handle_for_body,
+        db_bulkhead: bulkheads.db.clone(),
     };
     Response::from_parts(parts, axum::body::Body::new(wrapped))
 }
@@ -771,6 +772,9 @@ pin_project! {
         pub inner: B,
         pub tenant_id: String,
         pub handle: Option<crate::tenant_cell::TenantCellHandle>,
+        // The `tenancy.max_db_connections` bulkhead (#3072). A checkout
+        // while the body is polled counts against it.
+        pub db_bulkhead: Option<std::sync::Arc<crate::bulkhead::TenantBulkhead>>,
     }
 }
 
@@ -788,8 +792,13 @@ where
         let this = self.project();
         let tenant_id = this.tenant_id.clone();
         let handle = this.handle.clone();
+        let inner = this.inner;
         CURRENT_TENANT.sync_scope(Some(tenant_id), || {
-            crate::tenant_cell::CURRENT_TENANT_CELL.sync_scope(handle, || this.inner.poll_frame(cx))
+            crate::tenant_cell::CURRENT_TENANT_CELL.sync_scope(handle, || match this.db_bulkhead {
+                Some(db) => crate::bulkhead::TENANT_DB_BULKHEAD
+                    .sync_scope(std::sync::Arc::clone(db), || inner.poll_frame(cx)),
+                None => inner.poll_frame(cx),
+            })
         })
     }
 
@@ -892,6 +901,49 @@ impl DisplayTenantId for Option<String> {
 mod tests {
     use super::*;
     use crate::security::ResolvedClientIdentity;
+
+    /// A body that takes a database permit each time it is polled (#3072).
+    struct PermitProbeBody {
+        outcome: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
+    }
+
+    impl HttpBody for PermitProbeBody {
+        type Data = bytes::Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            let rejected = crate::bulkhead::acquire_db_permit().is_err();
+            *self.outcome.lock().unwrap() = Some(rejected);
+            Poll::Ready(None)
+        }
+    }
+
+    /// A streaming body is in the database bulkhead too (#3072).
+    #[test]
+    fn a_streaming_body_poll_is_inside_the_db_bulkhead() {
+        let bulkhead = crate::bulkhead::TenantBulkhead::new(1);
+        let _held = bulkhead.try_acquire("acme").expect("the one permit");
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut wrapped = TenantPropagatingBody {
+            inner: PermitProbeBody {
+                outcome: std::sync::Arc::clone(&outcome),
+            },
+            tenant_id: "acme".to_owned(),
+            handle: None,
+            db_bulkhead: Some(bulkhead),
+        };
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let _ = Pin::new(&mut wrapped).poll_frame(&mut cx);
+        assert_eq!(
+            *outcome.lock().unwrap(),
+            Some(true),
+            "the body's checkout counts against the tenant's cap"
+        );
+    }
 
     fn subdomain_config() -> crate::config::AutumnConfig {
         let mut c = crate::config::AutumnConfig::default();
