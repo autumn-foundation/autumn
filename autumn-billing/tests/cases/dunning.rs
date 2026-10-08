@@ -360,6 +360,32 @@ async fn failure_before_canceled_subscription_closes_the_adopted_row() {
     assert_eq!(h.provider.retry_calls(), 0);
 }
 
+/// An `Unpaid` or expired subscription closes the rows it adopts too.
+#[tokio::test]
+async fn failure_before_unpaid_subscription_closes_the_adopted_row() {
+    for (key, status) in [
+        ("evt_unpaid", SubscriptionStatus::Unpaid),
+        ("evt_expired", SubscriptionStatus::IncompleteExpired),
+    ] {
+        let h = harness_with_hooks(
+            support::config(),
+            Arc::new(NoHooks),
+            MemoryBillingStore::shared(),
+            FakeProvider::with_parser(FakeParser::BillingEventJson),
+            clocked,
+        );
+        seed_orphan_failure(&h).await;
+        let ended = BillingEventKind::SubscriptionChanged(SubscriptionSnapshot::new(
+            "sub_1", "cus_1", status,
+        ));
+        apply_event(&h.client, event(key, at(-100), ended))
+            .await
+            .unwrap();
+        assert_eq!(row(&h).await.state, DunningState::Canceled, "{status:?}");
+        assert_eq!(h.provider.retry_calls(), 0);
+    }
+}
+
 /// Fallback: with no link on the row or the invoice, exhaustion finds the
 /// subscription by the provider id on the invoice.
 #[tokio::test]

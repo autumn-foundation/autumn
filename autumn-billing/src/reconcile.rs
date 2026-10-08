@@ -44,6 +44,11 @@ use crate::{BillingService, EVENT_CLAIM_STALE_AFTER};
 /// The states a reconcile may close.
 const OPEN_STATES: &[DunningState] = &[DunningState::Pending, DunningState::Running];
 
+/// A subscription with nothing left to collect: dunning rows it owns close.
+fn is_ended(status: SubscriptionStatus) -> bool {
+    status.is_terminal() || status == SubscriptionStatus::Unpaid
+}
+
 /// What `apply` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -296,31 +301,25 @@ impl Ctx<'_> {
         store
             .link_subscription(&snapshot.provider_subscription_id, &stored.id, self.now)
             .await?;
+        // The link may have adopted rows of an ended subscription.
+        if is_ended(stored.status) {
+            self.close_dunning_for(&stored.id).await?;
+        }
         let subscription = match written {
             StoreWrite::Applied(subscription) => subscription,
             // A redelivery after a failure past the write: repeat the
             // idempotent step only. Notifications and hooks ran, or never
             // will, with the first delivery.
-            StoreWrite::Unchanged(subscription) => {
-                if subscription.status.is_terminal() {
-                    self.close_dunning_for(&subscription.id).await?;
-                }
-                return Ok(());
-            }
-            StoreWrite::Stale(subscription) => {
+            StoreWrite::Unchanged(_) => return Ok(()),
+            StoreWrite::Stale(_) => {
                 tracing::debug!(
                     provider_subscription_id = %snapshot.provider_subscription_id,
                     "🍂 Autumn Billing: stale subscription event; mirror unchanged"
                 );
-                // The link above may have adopted rows of an ended subscription.
-                if subscription.status.is_terminal() {
-                    self.close_dunning_for(&subscription.id).await?;
-                }
                 return Ok(());
             }
         };
         if subscription.status == SubscriptionStatus::Canceled {
-            self.close_dunning_for(&subscription.id).await?;
             notify::send_to_customer(
                 self.state,
                 self.service,
@@ -414,7 +413,7 @@ impl Ctx<'_> {
         store
             .link_subscription(provider_id, &subscription.id, self.now)
             .await?;
-        if subscription.status.is_terminal() {
+        if is_ended(subscription.status) {
             self.close_dunning_for(&subscription.id).await?;
         }
         Ok(())
