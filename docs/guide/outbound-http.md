@@ -128,7 +128,9 @@ serviceable.
 A rejected attempt ends the call with `ClientError::ThrottledLocally { host }`.
 With `?` in a handler, it maps to `503`. A local reject is not a
 circuit-breaker failure. Retries are attempts too, so the throttle also stops
-a retry. All `Client` extractors in an app use one set of counts.
+a retry. Under a request deadline the client follows redirects itself, so each
+redirect hop is an attempt on its own host. All `Client` extractors in an app
+use one set of counts.
 
 The custom send path (`pin_to`, `get_ssrf_safe`, `no_redirect`,
 `follow_redirects`) uses the throttle only with `breaker_scoped()`, once per

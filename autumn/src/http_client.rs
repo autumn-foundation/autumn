@@ -2459,22 +2459,17 @@ impl RequestBuilder {
         suppress_retries: bool,
         gate: &RetryGate,
     ) -> Result<Response, ClientError> {
-        // The hops and their retries run inside `send_one`, so the throttle
-        // (issue #3068) counts the call once, as on the breaker-scoped custom
-        // path.
-        let ticket = self.throttle_attempt(None)?;
+        // `send_one` asks the throttle (issue #3068) for each attempt of
+        // each hop, as the plain path does for each attempt.
         let client = self.client.clone();
-        let res = self
-            .follow_loop(
-                PLAIN_MAX_REDIRECTS,
-                Arc::new(|_: &str| true),
-                HopClient::Pooled(&client),
-                suppress_retries,
-                gate,
-            )
-            .await;
-        record_call(ticket, &res);
-        res
+        self.follow_loop(
+            PLAIN_MAX_REDIRECTS,
+            Arc::new(|_: &str| true),
+            HopClient::Pooled(&client),
+            suppress_retries,
+            gate,
+        )
+        .await
     }
 
     /// Add an `Idempotency-Key` header when this request can retry a
@@ -2560,17 +2555,7 @@ impl RequestBuilder {
         let Some(host) = host.map(str::to_owned).or_else(|| throttle_host(&self.url)) else {
             return Ok(None);
         };
-        let now = crate::time::ambient_instant();
-        if throttle.admit(&host, now, || self.entropy.next_u64()) {
-            Ok(Some(ThrottleTicket {
-                throttle: Arc::clone(throttle),
-                host,
-                recorded: false,
-            }))
-        } else {
-            tracing::debug!(host = %host, "outbound request throttled locally");
-            Err(ClientError::ThrottledLocally { host })
-        }
+        admit_throttle(throttle, host, &*self.entropy).map(Some)
     }
 
     /// How many attempts the retry policy allows for this request.
@@ -2866,6 +2851,7 @@ impl RequestBuilder {
             &gate,
             false,
             None,
+            None,
         )
         .await
     }
@@ -2949,6 +2935,11 @@ impl RequestBuilder {
                 hop_gate,
                 true,
                 chain_retries.as_ref(),
+                // The custom path counts a whole call instead (see
+                // `send_custom_breaker_guarded`).
+                matches!(hop_client, HopClient::Pooled(_))
+                    .then_some(self.throttle.as_ref())
+                    .flatten(),
             )
             .await?;
 
@@ -3103,6 +3094,7 @@ impl RequestBuilder {
                 is_half_open,
                 hop_gate,
                 false,
+                None,
                 None,
             )
             .await?;
@@ -3685,6 +3677,26 @@ impl Drop for ThrottleTicket {
     }
 }
 
+/// Ask `throttle` for one attempt to `host` (issue #3068).
+/// [`ClientError::ThrottledLocally`] when it rejects.
+fn admit_throttle(
+    throttle: &Arc<crate::admission::AdaptiveThrottle>,
+    host: String,
+    entropy: &dyn crate::entropy::Entropy,
+) -> Result<ThrottleTicket, ClientError> {
+    let now = crate::time::ambient_instant();
+    if throttle.admit(&host, now, || entropy.next_u64()) {
+        Ok(ThrottleTicket {
+            throttle: Arc::clone(throttle),
+            host,
+            recorded: false,
+        })
+    } else {
+        tracing::debug!(host = %host, "outbound request throttled locally");
+        Err(ClientError::ThrottledLocally { host })
+    }
+}
+
 /// Count a whole call that took one throttle `ticket`. A call that the
 /// caller's deadline stopped says nothing about the host (issue #3058): its
 /// ticket is dropped, which counts as an accept.
@@ -3779,6 +3791,7 @@ async fn send_one(
     gate: &RetryGate,
     skip_redirect_body: bool,
     chain: Option<&ChainRetries>,
+    throttle: Option<&Arc<crate::admission::AdaptiveThrottle>>,
 ) -> Result<Response, ClientError> {
     let start = crate::time::ambient_instant();
     let mut last_retry = None;
@@ -3841,6 +3854,16 @@ async fn send_one(
             }
         }
 
+        // With `throttle`, each attempt asks it (issue #3068), as on the plain
+        // path: a throttled retry ends the call. It asks before
+        // `RetryGate::check`, so a throttled attempt refills no budget.
+        if gate.expired() {
+            return Err(ClientError::DeadlineExceeded);
+        }
+        let ticket = match throttle.zip(throttle_host(url)) {
+            Some((throttle, host)) => Some(admit_throttle(throttle, host, entropy)?),
+            None => None,
+        };
         gate.check()?;
         let mut req = client.request(method.clone(), url);
         // Recomputed fresh every attempt (not just retries) rather than
@@ -3885,6 +3908,9 @@ async fn send_one(
                     // retry in time, so this response is the final outcome.
                     let kind = retry_kind(status.as_u16());
                     if !reaches_hop_deadline(next) && gate.allow(kind, next) {
+                        if let Some(ticket) = ticket {
+                            ticket.record(throttle_accepts(status.as_u16()));
+                        }
                         delay = next;
                         last_retry = Some(kind);
                         continue;
@@ -3896,10 +3922,19 @@ async fn send_one(
                     && matches!(redirect_location(status, &headers, url), Ok(Some(_)));
                 let body = if discard_response_body || followed {
                     // Dropped unread — see `RequestBuilder::discard_response_body`.
-                    Bytes::new()
+                    Ok(Bytes::new())
                 } else {
-                    resp.bytes().await.map_err(|e| gate.body_error(e))?
+                    resp.bytes().await.map_err(|e| gate.body_error(e))
                 };
+                // Count the attempt only now: a body that fails to arrive is
+                // a transport error, not an accept. A body the caller's
+                // deadline stopped drops the ticket, which counts as an accept.
+                if let Some(ticket) = ticket
+                    && !matches!(body, Err(ClientError::DeadlineExceeded))
+                {
+                    ticket.record(body.is_ok() && throttle_accepts(status.as_u16()));
+                }
+                let body = body?;
                 // Refund only after the body arrived.
                 gate.finish(last_retry, status.as_u16());
                 log_request(
@@ -3921,6 +3956,9 @@ async fn send_one(
                 return Err(ClientError::DeadlineExceeded);
             }
             Err(e) if (e.is_connect() || e.is_timeout()) && !last => {
+                if let Some(ticket) = ticket {
+                    ticket.record(false);
+                }
                 let wait =
                     retry_policy.retry_delay(entropy, retries_before.saturating_add(attempt), None);
                 // No retry fits in the hop, so none is charged.
@@ -3931,7 +3969,12 @@ async fn send_one(
                 last_retry = Some(RetryKind::Transient);
                 last_transient_err = Some(e);
             }
-            Err(e) => return Err(ClientError::Request(e.without_url())),
+            Err(e) => {
+                if let Some(ticket) = ticket {
+                    ticket.record(false);
+                }
+                return Err(ClientError::Request(e.without_url()));
+            }
         }
     }
 
@@ -7406,6 +7449,53 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn each_retry_under_a_deadline_is_a_throttle_attempt() {
+            use axum::response::IntoResponse;
+            // Each call gets 503, 503, then 200.
+            let hits = Arc::new(AtomicU32::new(0));
+            let counter = Arc::clone(&hits);
+            let upstream = super::spawn(axum::Router::new().route(
+                "/x",
+                axum::routing::get(move || {
+                    let status = if counter.fetch_add(1, Ordering::SeqCst) % 3 < 2 {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        axum::http::StatusCode::OK
+                    };
+                    async move { status.into_response() }
+                }),
+            ))
+            .await;
+            let url = format!("http://127.0.0.1:{}/x", upstream.port());
+            let throttle = Arc::new(crate::admission::AdaptiveThrottle::new(
+                2.0,
+                Duration::from_secs(120),
+            ));
+            // The highest draw: the throttle never rejects, so every call
+            // runs its three attempts.
+            let mut client = Client {
+                throttle: Some(Arc::clone(&throttle)),
+                ..Client::new()
+            };
+            client.entropy = Arc::new(FixedDraw(u64::MAX));
+            for _ in 0..10 {
+                let response =
+                    with_deadline(Duration::from_secs(4), client.get(&url).retries(2).send())
+                        .await
+                        .unwrap();
+                assert_eq!(response.status().as_u16(), 200);
+            }
+            assert_eq!(hits.load(Ordering::SeqCst), 30);
+            // 30 attempts, 10 accepts: below 1/K, as on the path without a
+            // deadline. One count per call would hide the 503s.
+            let host = throttle_host(&url).unwrap();
+            assert!(
+                throttle.reject_probability(&host, crate::time::ambient_instant()) > 0.3,
+                "each attempt counts"
+            );
+        }
+
+        #[tokio::test]
         async fn a_redirect_hop_continues_the_chain_backoff() {
             use axum::response::IntoResponse;
             let origin_hits = Arc::new(AtomicU32::new(0));
@@ -7512,6 +7602,7 @@ mod tests {
                 &gate,
                 false,
                 None,
+                None,
             )
             .await;
             assert_eq!(
@@ -7552,6 +7643,7 @@ mod tests {
                 &gate,
                 false,
                 None,
+                None,
             )
             .await;
             assert!(result.is_err(), "{result:?}");
@@ -7582,6 +7674,7 @@ mod tests {
                 false,
                 &gate,
                 false,
+                None,
                 None,
             )
             .await;
