@@ -203,8 +203,13 @@ pin_project_lite::pin_project! {
     /// Unlike `tokio::time::timeout_at`, which polls the inner future before
     /// it checks the timer, this checks the deadline before every poll, so
     /// work that is ready only at or after the deadline does not run.
+    ///
+    /// Each poll also runs the inner future with the deadline as
+    /// [`Deadline::current`], or the enclosing one when that is earlier, as
+    /// [`DeadlineScope`] does. The deadline is kept once, in the timer: the
+    /// request timeout layer holds this future in every request, and the
+    /// allocation gate (`tests/config_alloc_gate.rs`) counts its size.
     pub(crate) struct Bounded<F> {
-        deadline: Deadline,
         #[pin]
         sleep: tokio::time::Sleep,
         #[pin]
@@ -216,7 +221,6 @@ impl<F> Bounded<F> {
     /// Run `future` until `deadline`.
     pub(crate) fn until(deadline: Deadline, future: F) -> Self {
         Self {
-            deadline,
             sleep: tokio::time::sleep_until(deadline.instant()),
             future,
         }
@@ -228,10 +232,13 @@ impl<F: Future> Future for Bounded<F> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
-        if this.deadline.is_expired() {
+        let deadline = Deadline::at(this.sleep.deadline());
+        if deadline.is_expired() {
             return Poll::Ready(Err(DeadlineExceeded));
         }
-        if let Poll::Ready(output) = this.future.poll(cx) {
+        let future = this.future;
+        if let Poll::Ready(output) = CURRENT.sync_scope(Some(deadline.nested()), || future.poll(cx))
+        {
             return Poll::Ready(Ok(output));
         }
         // Wakes the task at the deadline.

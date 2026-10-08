@@ -4692,7 +4692,7 @@ where
         let inner = deadline.sync_scope(|| self.inner.call(req));
 
         RequestTimeoutFuture::Bounded {
-            inner: crate::deadline::Bounded::until(deadline, deadline.scope_future(inner)),
+            inner: crate::deadline::Bounded::until(deadline, inner),
             settings: Arc::clone(&self.settings),
             duration,
             matched_path,
@@ -4731,7 +4731,7 @@ pin_project_lite::pin_project! {
         },
         Bounded {
             #[pin]
-            inner: crate::deadline::Bounded<crate::deadline::DeadlineScope<F>>,
+            inner: crate::deadline::Bounded<F>,
             settings: Arc<RequestTimeoutSettings>,
             duration: Duration,
             matched_path: Option<String>,
