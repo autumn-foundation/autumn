@@ -83,11 +83,15 @@ where
     }
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
-        // A request in a scope already (the SSG/ISG path has two scope
-        // layers, and an MCP replay crosses the inner one) keeps that scope.
-        let scoped = SCOPE.try_with(|_| ()).is_ok();
-        let scope = (!scoped)
-            .then(|| self.injector.scope_for(req.uri().path()))
+        // A request in a scope for the same path already keeps it: the
+        // SSG/ISG path has two scope layers. An MCP replay has another path,
+        // so it gets a scope of its own.
+        let path = req.uri().path();
+        let same_path = SCOPE
+            .try_with(|scope| &*scope.path == path)
+            .unwrap_or(false);
+        let scope = (!same_path)
+            .then(|| self.injector.scope_for(path))
             .flatten();
         let Some(scope) = scope else {
             return Box::pin(self.inner.call(req));
@@ -356,6 +360,44 @@ mod tests {
         assert_eq!(injector.injected.load(Ordering::Relaxed), 1);
         let handle = crate::fault_injection::FaultInjection::for_test(&injector);
         assert_eq!(handle.snapshot().window_requests, 1);
+    }
+
+    /// An MCP replay crosses the inner scope layer with another path. It gets
+    /// a scope of its own, so its rules apply.
+    #[tokio::test]
+    async fn a_nested_request_for_another_path_gets_its_own_scope() {
+        let mut mcp = error_rule(0);
+        mcp.routes = vec![super::super::RoutePattern::parse("/mcp")];
+        let mut api = error_rule(1_000_000);
+        api.routes = vec![super::super::RoutePattern::parse("/api/*")];
+        let injector = injector(vec![mcp, api], 1_000);
+        let inner = axum::Router::new()
+            .route("/api/x", get(|| async { "ok" }))
+            .layer((
+                FaultScopeLayer::new(Arc::clone(&injector)),
+                FaultInjectionLayer::new(None),
+            ));
+        let replay = inner.clone();
+        let outer = axum::Router::new()
+            .route(
+                "/mcp",
+                get(move || {
+                    let replay = replay.clone();
+                    async move { status(replay, "/api/x").await.to_string() }
+                }),
+            )
+            .layer((
+                FaultScopeLayer::new(Arc::clone(&injector)),
+                FaultInjectionLayer::new(None),
+            ));
+        let response = outer
+            .oneshot(Request::get("/mcp").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"503", "the replayed /api/x request is faulted");
     }
 
     /// Outside the timeout layer, a long latency fault ends at the deadline

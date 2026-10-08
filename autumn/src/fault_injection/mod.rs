@@ -158,8 +158,9 @@ impl FaultInjection {
                 armed_state(generation_of(state).wrapping_add(1)),
                 Ordering::Release,
             );
+            let sequence = self.inner.next_sequence();
             drop(window);
-            self.inner.next_sequence()
+            sequence
         };
         self.inner
             .audit(sequence, actor, true, "armed by operator")
@@ -228,15 +229,22 @@ struct Exempt {
 
 impl Exempt {
     fn contains(&self, path: &str) -> bool {
-        if self.paths.iter().any(|exempt| exempt == path) {
+        // An exempt path also exempts its sub-paths, such as
+        // `/loggers/{name}` under `/loggers` with the actuator at the root.
+        if self.paths.iter().any(|exempt| under(path, exempt)) {
             return true;
         }
         if self.actuator_prefix.is_empty() {
             return false;
         }
-        path.strip_prefix(self.actuator_prefix.as_str())
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        under(path, &self.actuator_prefix)
     }
+}
+
+/// `true` when `path` is `base` or a sub-path of it.
+fn under(path: &str, base: &str) -> bool {
+    path.strip_prefix(base)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// The stop window.
@@ -321,6 +329,7 @@ impl Injector {
             });
         (matched != 0).then(|| {
             Arc::new(RequestScope {
+                path: path.into(),
                 injector: Arc::clone(self),
                 generation: generation_of(state),
                 matched,
@@ -476,6 +485,8 @@ impl Injector {
 
 /// The faults that matched one request.
 struct RequestScope {
+    /// The request path that selected the rules.
+    path: Box<str>,
     injector: Arc<Injector>,
     /// The arm of the injector when the request started.
     generation: u64,
@@ -749,6 +760,16 @@ mod tests {
         };
         assert!(exempt.contains("/health"));
         assert!(!exempt.contains("/api/orders"));
+    }
+
+    #[test]
+    fn an_exempt_path_exempts_its_sub_paths() {
+        let exempt = Exempt {
+            paths: vec!["/loggers".to_owned()],
+            actuator_prefix: String::new(),
+        };
+        assert!(exempt.contains("/loggers/autumn_web"));
+        assert!(!exempt.contains("/loggersx"));
     }
 
     #[test]
