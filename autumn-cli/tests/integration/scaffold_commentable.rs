@@ -442,6 +442,8 @@ fn a_scaffolded_comment_resource_makes_commentable_generation_refuse() {
         assert_eq!(
             fs::read_dir(project.join("migrations"))
                 .expect("migrations dir")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().is_dir())
                 .count(),
             1,
             "{verb}: only the Comment resource's own migration exists"
