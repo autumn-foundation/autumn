@@ -436,7 +436,12 @@ where
         let clean = crate::security::path::clean_path(req.uri().path());
         let path = clean.as_str();
         let is_exempt = crate::security::path::is_exempt_path(path, &self.settings.exempt_paths);
-        let is_safe = is_exempt || self.settings.safe_methods.contains(req.method());
+        // `CONNECT` is the HTTP/2 `WebSocket` upgrade (RFC 8441). Like the
+        // `GET` upgrade, a browser cannot add a CSRF header to it. Other
+        // routes do not serve `CONNECT`, so they answer `405`.
+        let is_safe = is_exempt
+            || self.settings.safe_methods.contains(req.method())
+            || req.method() == axum::http::Method::CONNECT;
         let raw_cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name);
 
         // When signing is active, discard any cookie that fails HMAC verification

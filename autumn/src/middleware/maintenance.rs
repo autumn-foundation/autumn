@@ -261,7 +261,11 @@ impl<S> MaintenanceService<S> {
         // 4. Read-only mode: safe methods pass through.
         if config.readonly {
             let method = req.method();
-            if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+            // `CONNECT` is the HTTP/2 `WebSocket` upgrade, as `GET` is for HTTP/1.1.
+            if matches!(
+                *method,
+                Method::GET | Method::HEAD | Method::OPTIONS | Method::CONNECT
+            ) {
                 return None;
             }
         }

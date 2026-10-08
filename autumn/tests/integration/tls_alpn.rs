@@ -1,7 +1,8 @@
 //! ALPN negotiation on the in-process TLS listener (issue #2321).
 //!
-//! Drives the real `TlsListener` with real h2 and HTTP/1.1 clients. If the
-//! server stops advertising `h2`, these tests fail.
+//! Drives the real `TlsListener` with real h2 and HTTP/1.1 clients. Every
+//! h2 test connects through `connect_h2`, which asserts that ALPN picked
+//! `h2`. If the server stops advertising `h2`, they all fail.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -13,11 +14,11 @@ use autumn_web::sse::{Event, Sse};
 use autumn_web::test::TestApp;
 use autumn_web::{get, routes};
 use futures::stream::Stream;
-use rustls_pki_types::ServerName;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::tls_support::{
     CertFixture, RECORDING_HANDSHAKE_TIMEOUT, RecordingVerifier, TestServer, serve_tls_router,
+    tls_connect_alpn,
 };
 
 type Tls = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
@@ -76,17 +77,7 @@ async fn serve(request_timeout_ms: Option<u64>) -> (TestServer, CertFixture) {
 
 /// TLS client that offers exactly `offered` as its ALPN list.
 async fn connect(server: &TestServer, offered: &[&[u8]]) -> Tls {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(RecordingVerifier::default()))
-        .with_no_client_auth();
-    config.alpn_protocols = offered.iter().map(|p| p.to_vec()).collect();
-    let tcp = tokio::net::TcpStream::connect(server.addr).await.unwrap();
-    tokio_rustls::TlsConnector::from(Arc::new(config))
-        .connect(ServerName::try_from("localhost").unwrap(), tcp)
+    tls_connect_alpn(server.addr, Arc::new(RecordingVerifier::default()), offered)
         .await
         .expect("TLS handshake")
 }
@@ -95,8 +86,14 @@ fn negotiated(stream: &Tls) -> Option<Vec<u8>> {
     stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec)
 }
 
-/// Open an h2 connection and return its request handle.
-async fn h2_open(stream: Tls) -> h2::client::SendRequest<bytes::Bytes> {
+/// Connect like a browser, assert ALPN picked `h2`, and open an h2 session.
+async fn connect_h2(server: &TestServer) -> h2::client::SendRequest<bytes::Bytes> {
+    let stream = connect(server, &[H2, H1]).await;
+    assert_eq!(
+        negotiated(&stream).as_deref(),
+        Some(H2),
+        "ALPN must pick h2"
+    );
     let (send, conn) = h2::client::handshake(stream).await.expect("h2 handshake");
     tokio::spawn(async move {
         let _ = conn.await;
@@ -106,7 +103,7 @@ async fn h2_open(stream: Tls) -> h2::client::SendRequest<bytes::Bytes> {
 
 /// Send `GET path` and return the response head and body stream.
 async fn h2_send(
-    send: &mut h2::client::SendRequest<bytes::Bytes>,
+    send: &h2::client::SendRequest<bytes::Bytes>,
     path: &str,
 ) -> (u16, h2::RecvStream) {
     let request = http::Request::get(format!("https://localhost{path}"))
@@ -121,6 +118,18 @@ async fn h2_send(
         .expect("send request");
     let response = response.await.expect("h2 response");
     (response.status().as_u16(), response.into_body())
+}
+
+/// Append body chunks to `seen` until it contains `needle`.
+async fn read_until(body: &mut h2::RecvStream, needle: &str, seen: &mut String) {
+    while !seen.contains(needle) {
+        let chunk = tokio::time::timeout(Duration::from_secs(10), body.data())
+            .await
+            .unwrap_or_else(|_| panic!("no `{needle}` in 10s; saw {seen:?}"))
+            .unwrap_or_else(|| panic!("stream ended before `{needle}`; saw {seen:?}"))
+            .expect("h2 data");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
 }
 
 async fn h2_body(mut body: h2::RecvStream) -> String {
@@ -146,15 +155,8 @@ async fn h1_get(mut stream: Tls, path: &str) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn browser_style_client_negotiates_h2_and_is_served() {
     let (server, _fixture) = serve(None).await;
-    let stream = connect(&server, &[H2, H1]).await;
-    assert_eq!(
-        negotiated(&stream).as_deref(),
-        Some(H2),
-        "ALPN must pick h2"
-    );
-
-    let mut send = h2_open(stream).await;
-    let (status, body) = h2_send(&mut send, "/fast").await;
+    let send = connect_h2(&server).await;
+    let (status, body) = h2_send(&send, "/fast").await;
     assert_eq!(status, 200);
     assert_eq!(h2_body(body).await, "quick");
     server.shutdown().await;
@@ -181,13 +183,13 @@ async fn alpn_less_client_still_works() {
     server.shutdown().await;
 }
 
-// axum's `serve` enables RFC 8441 extended CONNECT, so browsers open
-// `wss://` as an h2 stream. It must echo, not break.
+/// `wss://` over h2. axum enables RFC 8441 extended CONNECT, so a browser
+/// sends `CONNECT`. CSRF is on: the upgrade must not need a token.
 #[cfg(feature = "ws")]
 mod wss {
     use super::*;
+    use autumn_web::ws;
     use autumn_web::ws::{Message, WebSocket, WsHandler};
-    use autumn_web::{routes, ws};
 
     #[ws("/echo")]
     async fn echo() -> impl WsHandler {
@@ -203,10 +205,18 @@ mod wss {
     #[tokio::test(flavor = "multi_thread")]
     async fn websocket_echoes_over_h2_extended_connect() {
         let fixture = CertFixture::write();
-        let router = TestApp::new().routes(routes![echo]).build().into_router();
+        let mut config = AutumnConfig::default();
+        config.security.csrf.enabled = true;
+        let router = TestApp::new()
+            .routes(routes![echo])
+            .config(config)
+            .build()
+            .into_router();
         let (server, _reloader) =
             serve_tls_router(router, &fixture, RECORDING_HANDSHAKE_TIMEOUT).await;
-        let mut send = h2_open(connect(&server, &[H2, H1]).await).await;
+        let send = connect_h2(&server).await;
+        let mut send = send.ready().await.expect("h2 ready");
+
         let request = http::Request::connect("https://localhost/echo")
             .extension(h2::ext::Protocol::from_static("websocket"))
             .header("sec-websocket-version", "13")
@@ -226,17 +236,20 @@ mod wss {
             .expect("stream ended before the echo")
             .expect("h2 data");
         assert_eq!(&echoed[..], b"\x81\x04ping");
-        server.shutdown.cancel();
+
+        // Close the stream, so graceful shutdown has nothing to wait for.
+        drop((tx, rx, send));
+        server.shutdown().await;
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn request_timeout_applies_over_h2() {
     let (server, _fixture) = serve(Some(400)).await;
-    let mut send = h2_open(connect(&server, &[H2, H1]).await).await;
-    let (status, _) = h2_send(&mut send, "/slow").await;
+    let send = connect_h2(&server).await;
+    let (status, _) = h2_send(&send, "/slow").await;
     assert_eq!(status, 503);
-    let (status, body) = h2_send(&mut send, "/fast").await;
+    let (status, body) = h2_send(&send, "/fast").await;
     assert_eq!(status, 200);
     assert_eq!(h2_body(body).await, "quick");
     server.shutdown().await;
@@ -246,41 +259,24 @@ async fn request_timeout_applies_over_h2() {
 async fn sse_streams_incrementally_over_h2() {
     // Deadline is shorter than the SSE gap: a stream must be exempt.
     let (server, _fixture) = serve(Some(400)).await;
-    let mut send = h2_open(connect(&server, &[H2, H1]).await).await;
-    let (status, mut body) = h2_send(&mut send, "/stream").await;
+    let send = connect_h2(&server).await;
+    let (status, mut body) = h2_send(&send, "/stream").await;
     assert_eq!(status, 200);
 
-    let started = Instant::now();
+    // `tick-0` must arrive alone: `tick-1` comes `SSE_GAP` later.
     let mut seen = String::new();
-    while !seen.contains("tick-0") {
-        let chunk = tokio::time::timeout(Duration::from_secs(10), body.data())
-            .await
-            .expect("no first event in 10s")
-            .expect("stream ended early")
-            .expect("h2 data");
-        seen.push_str(&String::from_utf8_lossy(&chunk));
-    }
-    assert!(
-        !seen.contains("tick-1") && started.elapsed() < SSE_GAP,
-        "first event must arrive before the second is produced: {seen:?}"
-    );
-    while !seen.contains("tick-1") {
-        let chunk = tokio::time::timeout(Duration::from_secs(10), body.data())
-            .await
-            .expect("no second event in 10s")
-            .expect("stream ended before tick-1")
-            .expect("h2 data");
-        seen.push_str(&String::from_utf8_lossy(&chunk));
-    }
+    read_until(&mut body, "tick-0", &mut seen).await;
+    assert!(!seen.contains("tick-1"), "stream was buffered: {seen:?}");
+    read_until(&mut body, "tick-1", &mut seen).await;
     server.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn graceful_shutdown_drains_an_in_flight_h2_request() {
     let (server, _fixture) = serve(None).await;
-    let mut send = h2_open(connect(&server, &[H2, H1]).await).await;
+    let send = connect_h2(&server).await;
     let inflight = tokio::spawn(async move {
-        let (status, body) = h2_send(&mut send, "/drain").await;
+        let (status, body) = h2_send(&send, "/drain").await;
         (status, h2_body(body).await)
     });
 

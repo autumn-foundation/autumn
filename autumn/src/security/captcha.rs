@@ -604,6 +604,8 @@ const fn is_safe_method(method: &axum::http::Method) -> bool {
             | axum::http::Method::HEAD
             | axum::http::Method::OPTIONS
             | axum::http::Method::TRACE
+            // HTTP/2 `WebSocket` upgrade (RFC 8441), as `GET` is for HTTP/1.1.
+            | axum::http::Method::CONNECT
     )
 }
 

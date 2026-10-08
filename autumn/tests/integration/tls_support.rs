@@ -296,13 +296,23 @@ pub async fn tls_connect(
     addr: SocketAddr,
     verifier: Arc<RecordingVerifier>,
 ) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    tls_connect_alpn(addr, verifier, &[]).await
+}
+
+/// Like [`tls_connect`], but offers exactly `alpn` as the ALPN list.
+pub async fn tls_connect_alpn(
+    addr: SocketAddr,
+    verifier: Arc<RecordingVerifier>,
+    alpn: &[&[u8]],
+) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ClientConfig::builder_with_provider(provider)
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .unwrap()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     // SNI uses the certificate's `localhost` SAN even though we dial 127.0.0.1.
     let server_name = ServerName::try_from("localhost").unwrap();

@@ -1751,8 +1751,8 @@ fn check_openapi_path_against(
 /// never drift.
 ///
 /// `#[ws]` records the synthetic `WS` method, but the macro builds its handler
-/// with `axum::routing::get` and [`group_and_mount_routes`] merges it as a `GET`
-/// `MethodRouter`. So a `#[ws("/p")]` and a `#[get("/p")]` are the SAME mount as
+/// with `axum::routing::get` (plus `.connect` for HTTP/2) and
+/// [`group_and_mount_routes`] merges it as a `GET` `MethodRouter`. So a `#[ws("/p")]` and a `#[get("/p")]` are the SAME mount as
 /// far as axum is concerned and would panic on merge. Every other method mounts
 /// under itself.
 fn effective_mount_method(method: &http::Method) -> http::Method {
@@ -4314,6 +4314,10 @@ fn build_route_attr_table<T: Copy>(
         // so only expand HEAD for a genuine GET (not the WS→GET alias).
         if *method == http::Method::GET {
             by_method.insert(http::Method::HEAD, timeout);
+        }
+        // A WS route also takes the HTTP/2 upgrade, which arrives as `CONNECT`.
+        if method.as_str() == "WS" {
+            by_method.insert(http::Method::CONNECT, timeout);
         }
     };
     for route in route_list {
