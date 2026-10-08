@@ -141,8 +141,9 @@ Each arm and disarm writes an `AuditEvent` to the installed audit sinks:
 | `fault_injection.armed` | The app starts with faults, or `arm` runs. |
 | `fault_injection.disarmed` | The stop condition trips, or `disarm` runs. |
 
-The event has the actor and the `reason`, `profile` and
-`allow_in_production` metadata. Install a sink with
+The event has the actor and the `reason`, `profile`, `allow_in_production`
+and `sequence` metadata. The `sequence` gives the toggle order. Two toggles in
+the same moment can reach a sink in the other order, so sort by `sequence`. Install a sink with
 `AppBuilder::with_audit_sink`. See [Audit Logging](audit-logging.md). With no
 sink, the framework writes a `warn` at boot, and the events go to the log
 only.
