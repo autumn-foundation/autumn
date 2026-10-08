@@ -28,7 +28,7 @@
 
 use crate::paths::RuntimeParts;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Lifecycle subcommand for the Windows service journey.
@@ -80,7 +80,7 @@ const STOP_HOOK_HEADROOM: Duration = Duration::from_secs(60);
 /// from user config, so an absurd `shutdown_timeout_secs` would otherwise take
 /// down the service host mid-stop — leaving the service stuck in `StopPending`
 /// until the SCM gives up. A day is far beyond any real drain.
-const MAX_WAIT_HINT: Duration = Duration::from_secs(24 * 60 * 60);
+pub(crate) const MAX_WAIT_HINT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How often the service host checks on its app child and for a stop request.
 ///
@@ -207,6 +207,31 @@ pub fn open_failure_means_absent(raw_os_error: Option<i32>) -> bool {
     raw_os_error == Some(ERROR_SERVICE_DOES_NOT_EXIST)
 }
 
+/// Map a failed service query to "absent" or an error.
+///
+/// Only `ERROR_SERVICE_DOES_NOT_EXIST` means absent. Any other failure (a
+/// denied query, a transient SCM fault) is an error, so the caller does not
+/// take the daemon path for a service that exists.
+///
+///
+/// # Errors
+/// Every failure except "service does not exist".
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "used by the Windows arm, tested everywhere")
+)]
+pub fn query_failure(
+    raw_os_error: Option<i32>,
+    name: &str,
+    detail: &str,
+) -> Result<Option<(String, String)>, String> {
+    if open_failure_means_absent(raw_os_error) {
+        Ok(None)
+    } else {
+        Err(format!("cannot query `{name}`: {detail}"))
+    }
+}
+
 /// Whether a failure to open a service is an elevation problem, so the message
 /// can say what to do rather than only what went wrong.
 #[must_use]
@@ -258,24 +283,83 @@ pub fn exit_is_intentional(stop_requested: bool, exit_code: Option<i32>) -> bool
 /// eliminate, reachable through `sc.exe stop`.
 pub const FALLBACK_DRAIN_BUDGET_SECS: u64 = 60;
 
-/// The drain budget to record at install time, resolved from the project's own
-/// configuration under the profile the service will run.
+/// The preshutdown timeout to set, given the budget the app reported.
+///
+/// `None` keeps the OS default (180s). The CLI cannot see a budget chosen
+/// through `with_config_loader`, so a guess made before the app reports can be
+/// too short. Windows would then kill the service mid-drain at machine
+/// shutdown.
 #[cfg_attr(
     not(windows),
-    allow(
-        dead_code,
-        reason = "the Windows service arm, compiled and tested everywhere"
-    )
+    allow(dead_code, reason = "used by the Windows arm, tested everywhere")
 )]
-fn install_budget_secs(opts: &crate::serve::ServeOptions) -> u64 {
-    let base_dir = opts
-        .package
-        .as_deref()
-        .and_then(crate::dev::find_manifest_dir)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let profile = crate::serve::effective_profile(opts.profile.as_deref(), opts.release);
-    let (prestop, shutdown) = crate::serve::resolve_shutdown_budget(&base_dir, Some(&profile));
-    prestop.saturating_add(shutdown)
+fn preshutdown_for_reported(reported_budget_secs: Option<u64>) -> Option<Duration> {
+    reported_budget_secs.map(stop_wait_hint)
+}
+
+/// The `--service-record <path>` value in a registered service's command line.
+///
+/// `uninstall-service` reads it back from the SCM entry, so cleanup targets the
+/// tree the service was installed under, not the caller's.
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "used by the Windows arm, tested everywhere")
+)]
+fn record_path_from_command_line(line: &str) -> Option<PathBuf> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let (mut quoted, mut any) = (false, false);
+    for c in line.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                any = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if any {
+                    tokens.push(std::mem::take(&mut cur));
+                    any = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                any = true;
+            }
+        }
+    }
+    if any {
+        tokens.push(cur);
+    }
+    let at = tokens.iter().position(|t| t == "--service-record")?;
+    tokens.get(at + 1).map(PathBuf::from)
+}
+
+/// Write `contents` to a brand-new file at `path`.
+///
+/// Any existing file is removed first, then the new one is made with
+/// `create_new`. A truncating write would keep the old file's DACL, so a
+/// stranger's explicit ACE on a pre-created record would survive. A new file
+/// inherits the hardened directory ACL. If another process creates the path
+/// between the remove and the create, the write fails closed.
+///
+/// # Errors
+/// The old file cannot be removed, or the new one cannot be created or written.
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "used by the Windows arm, tested everywhere")
+)]
+pub fn write_fresh(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(contents)
 }
 
 /// What `install-service` records for `run-service` to read back.
@@ -376,21 +460,36 @@ pub fn missing_prerequisites() -> Vec<String> {
     ]
 }
 
-/// The registered service's name and Service Control Manager state, when this
-/// project has one.
+/// The registered service's name and Service Control Manager state.
+///
+/// `Ok(None)` means no service is registered. Any other failure is `Err`.
+///
+/// # Errors
+/// The service exists but cannot be queried.
 #[cfg(windows)]
-#[must_use]
-pub fn registered_service_state(project_identity: &str) -> Option<(String, String)> {
+pub fn registered_service_state(
+    project_identity: &str,
+) -> Result<Option<(String, String)>, String> {
     use windows_service::service::ServiceAccess;
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+    fn raw(e: &windows_service::Error) -> Option<i32> {
+        match e {
+            windows_service::Error::Winapi(io) => io.raw_os_error(),
+            _ => None,
+        }
+    }
     let name = service_name(project_identity);
-    let manager =
-        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
-    let service = manager
-        .open_service(&name, ServiceAccess::QUERY_STATUS)
-        .ok()?;
-    let state = service.query_status().ok()?.current_state;
-    Some((name, format!("{state:?}")))
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|e| format!("cannot reach the Service Control Manager ({e})"))?;
+    let service = match manager.open_service(&name, ServiceAccess::QUERY_STATUS) {
+        Ok(service) => service,
+        Err(e) => return query_failure(raw(&e), &name, &e.to_string()),
+    };
+    let state = service
+        .query_status()
+        .map_err(|e| format!("cannot query `{name}`: {e}"))?
+        .current_state;
+    Ok(Some((name, format!("{state:?}"))))
 }
 
 /// The message printed when a service command is invoked off Windows.
@@ -552,7 +651,7 @@ mod windows_impl {
         let record_path = paths.service_record_file();
         match record.to_toml() {
             Ok(toml) => {
-                if let Err(e) = std::fs::write(&record_path, toml) {
+                if let Err(e) = super::write_fresh(&record_path, toml.as_bytes()) {
                     eprintln!(
                         "autumn serve install-service: cannot write {}: {e}",
                         record_path.display()
@@ -574,9 +673,9 @@ mod windows_impl {
             // The same budget a `--daemon` start allows, so a first boot that
             // provisions a managed cluster is not called a failure.
             serve::start_ready_timeout(opts.bundled_pg),
-            // And the same drain budget the app resolved for itself, so a
-            // machine shutdown is not shorter than a `stop`.
-            stop_wait_hint(super::install_budget_secs(opts)),
+            // The preshutdown timeout follows the budget the app reports once
+            // it is running.
+            &paths,
         ) {
             eprintln!("autumn serve install-service: {e}");
             return 1;
@@ -596,7 +695,7 @@ mod windows_impl {
         working_dir: &std::path::Path,
         record_path: &std::path::Path,
         start_timeout: Duration,
-        preshutdown_timeout: Duration,
+        paths: &RuntimePaths,
     ) -> Result<(), String> {
         let manager = ServiceManager::local_computer(
             None::<&str>,
@@ -664,11 +763,8 @@ mod windows_impl {
         service
             .set_failure_actions_on_non_crash_failures(true)
             .map_err(|e| format!("cannot arm the service restart policy: {e}"))?;
-        // Give the drain the same budget at machine shutdown that it gets from a
-        // plain `sc stop`. Best-effort: an older Windows that refuses this still
-        // gets the 180-second `PRESHUTDOWN` default, which beats the 5-second
-        // `SHUTDOWN` share by a wide margin.
-        let _ = service.set_preshutdown_timeout(preshutdown_timeout);
+        // The preshutdown timeout stays at the 180-second OS default until the
+        // app reports its real budget (see below).
         service
             .start::<&std::ffi::OsStr>(&[])
             .map_err(|e| format!("registered the service but could not start it: {e}"))?;
@@ -679,7 +775,17 @@ mod windows_impl {
         let deadline = Instant::now() + start_timeout;
         loop {
             match service.query_status().map(|s| s.current_state) {
-                Ok(ServiceState::Running) => return Ok(()),
+                Ok(ServiceState::Running) => {
+                    // The app has reported its resolved budget by now. Give the
+                    // drain the same time at machine shutdown that it gets from
+                    // `sc stop`. Best-effort: on failure the OS default stays.
+                    if let Some(hint) =
+                        super::preshutdown_for_reported(serve::recorded_stop_budget(paths))
+                    {
+                        let _ = service.set_preshutdown_timeout(hint);
+                    }
+                    return Ok(());
+                }
                 Ok(ServiceState::Stopped) => {
                     return Err(format!(
                         "`{name}` is registered but its app did not start. See the \
@@ -715,7 +821,11 @@ mod windows_impl {
         let name = service_name(project_identity);
         // Only when something is actually registered; a missing service is the
         // ordinary daemon case, not an error.
-        super::registered_service_state(project_identity)?;
+        match super::registered_service_state(project_identity) {
+            Ok(None) => return None,
+            Ok(Some(_)) => {}
+            Err(e) => return Some(Err(e)),
+        }
         Some(restart_service(&name, project_identity))
     }
 
@@ -806,11 +916,28 @@ mod windows_impl {
         }
     }
 
+    /// The runtime paths the service was installed under, read back from its
+    /// SCM entry and record. `None` when either cannot be read.
+    fn installed_runtime_paths(name: &str) -> Option<RuntimePaths> {
+        let manager =
+            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
+        let service = manager
+            .open_service(name, ServiceAccess::QUERY_CONFIG)
+            .ok()?;
+        let config = service.query_config().ok()?;
+        let path = super::record_path_from_command_line(&config.executable_path.to_string_lossy())?;
+        let record = ServiceRecord::parse(&std::fs::read_to_string(path).ok()?).ok()?;
+        Some(RuntimePaths::from_parts(record.paths))
+    }
+
     /// Stop the service, deregister it, and clean up everything it left behind.
     fn uninstall(opts: &ServeOptions) -> i32 {
         let identity = serve::project_identity_for(opts.package.as_deref());
         let name = service_name(&identity);
-        let paths = RuntimePaths::resolve(&identity).ok();
+        // The installed tree first: the caller's environment may differ from the
+        // one the service was registered under.
+        let paths =
+            installed_runtime_paths(&name).or_else(|| RuntimePaths::resolve(&identity).ok());
 
         let deregistered = match deregister(&name, scm_stop_timeout(paths.as_ref())) {
             Ok(Deregistered::Removed | Deregistered::WasNotRegistered) => true,
@@ -1217,6 +1344,83 @@ mod windows_impl {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preshutdown_keeps_the_os_default_until_the_app_reports() {
+        assert_eq!(preshutdown_for_reported(None), None);
+    }
+
+    #[test]
+    fn preshutdown_follows_the_reported_budget() {
+        assert_eq!(
+            preshutdown_for_reported(Some(300)),
+            Some(stop_wait_hint(300))
+        );
+        assert!(preshutdown_for_reported(Some(300)) > Some(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn record_path_is_read_from_a_quoted_command_line() {
+        let line = r#""C:\Program Files\autumn.exe" serve run-service --service-record "C:\Users\a b\serve.service.toml""#;
+        assert_eq!(
+            record_path_from_command_line(line),
+            Some(PathBuf::from(r"C:\Users\a b\serve.service.toml"))
+        );
+    }
+
+    #[test]
+    fn record_path_is_read_from_a_bare_command_line() {
+        let line = r"autumn.exe serve run-service --service-record C:\s\r.toml";
+        assert_eq!(
+            record_path_from_command_line(line),
+            Some(PathBuf::from(r"C:\s\r.toml"))
+        );
+    }
+
+    #[test]
+    fn command_line_without_a_record_has_no_path() {
+        assert_eq!(record_path_from_command_line("autumn.exe serve"), None);
+        assert_eq!(
+            record_path_from_command_line("autumn.exe --service-record"),
+            None
+        );
+    }
+
+    #[test]
+    fn fresh_write_replaces_an_existing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("serve.service.toml");
+        std::fs::write(&path, "old").expect("seed");
+        write_fresh(&path, b"new").expect("write");
+        assert_eq!(std::fs::read(&path).expect("read"), b"new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_write_does_not_reuse_the_old_file() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("serve.service.toml");
+        std::fs::write(&path, "old").expect("seed");
+        let before = std::fs::metadata(&path).expect("meta").ino();
+        // Keep the old file alive so its inode number cannot be reused.
+        let _held = std::fs::File::open(&path).expect("hold");
+        write_fresh(&path, b"new").expect("write");
+        assert_ne!(std::fs::metadata(&path).expect("meta").ino(), before);
+    }
+
+    #[test]
+    fn missing_service_is_absent_not_an_error() {
+        assert_eq!(query_failure(Some(1060), "svc", "gone"), Ok(None));
+    }
+
+    #[test]
+    fn denied_or_transient_query_is_an_error() {
+        for raw in [Some(5), Some(6), Some(1722), None] {
+            let err = query_failure(raw, "svc", "boom").expect_err("must not read as absent");
+            assert!(err.contains("svc") && err.contains("boom"), "{err}");
+        }
+    }
+
     use super::*;
 
     #[test]

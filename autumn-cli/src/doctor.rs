@@ -3696,7 +3696,9 @@ fn resolve_daemon_service_report() -> DaemonServiceReport {
         DaemonServiceReport {
             service_capable: true,
             daemon,
-            service: crate::service::registered_service_state(&identity),
+            service: crate::service::registered_service_state(&identity)
+                .ok()
+                .flatten(),
             missing_prerequisites: crate::service::missing_prerequisites(),
         }
     }
