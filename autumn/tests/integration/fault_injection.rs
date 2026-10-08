@@ -10,9 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use autumn_web::audit::{AuditError, AuditEvent, AuditLogger, AuditSink};
 use autumn_web::config::AutumnConfig;
-use autumn_web::fault_injection::{
-    FaultInjection, FaultInjectionConfig, FaultKind, FaultRule, FaultTarget,
-};
+use autumn_web::fault_injection::{FaultInjection, FaultKind, FaultRule, FaultTarget};
 use autumn_web::prelude::*;
 use autumn_web::test::{TestApp, TestClient};
 
@@ -72,7 +70,6 @@ fn rule(target: FaultTarget, kind: FaultKind, rate: f64) -> FaultRule {
 
 fn config_with(faults: Vec<FaultRule>) -> AutumnConfig {
     let mut config = AutumnConfig::default();
-    config.fault_injection = FaultInjectionConfig::default();
     config.fault_injection.enabled = true;
     config.fault_injection.faults = faults;
     config
