@@ -212,12 +212,6 @@ pub struct AppState {
     #[cfg(all(feature = "collab", feature = "presence"))]
     pub(crate) collab: CollabHub,
 
-    /// Cancellation token signalled during graceful shutdown.
-    ///
-    /// WebSocket handlers and the [`crate::extract::ShutdownToken`] extractor
-    /// receive a child token so they can clean up when the server is stopping.
-    pub(crate) shutdown: CancellationToken,
-
     /// Per-resource policy + scope registry used by `#[authorize]`
     /// and `#[repository(policy = ...)]`-generated handlers.
     pub(crate) policy_registry: PolicyRegistry,
@@ -989,14 +983,14 @@ impl AppState {
     /// use it. Select on it to clean up when the server stops.
     #[must_use]
     pub fn shutdown_token(&self) -> CancellationToken {
-        self.shutdown.child_token()
+        self.probes.shutdown_signal().child_token()
     }
 
     /// Helper for integration tests to simulate a server shutdown.
     #[doc(hidden)]
     pub fn trigger_shutdown_for_test(&self) {
         self.begin_shutdown();
-        self.shutdown.cancel();
+        self.probes.shutdown_signal().cancel();
     }
 
     /// Update startup completion in tests after the router is already built.
@@ -1059,7 +1053,6 @@ impl AppState {
             presence,
             #[cfg(feature = "ws")]
             channels,
-            shutdown: CancellationToken::new(),
             policy_registry: PolicyRegistry::default(),
             forbidden_response: ForbiddenResponse::default(),
             auth_session_key: "user_id".into(),
@@ -1380,7 +1373,6 @@ impl AppState {
             presence,
             #[cfg(feature = "ws")]
             channels,
-            shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".into(),
