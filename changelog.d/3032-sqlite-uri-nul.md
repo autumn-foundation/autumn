@@ -1,4 +1,5 @@
 ### Fixed
 
-- **db:** a `%00` in a SQLite URI name or value now ends that name or value,
-  as SQLite does. `file:a?cache=shared%00x` is now shared-cache (issue #3032).
+- **db:** SQLite now treats `%00` in a URI as the end of that name or value.
+  `file:a?cache=shared%00x` is now found as shared-cache, so the shared-cache
+  boot warning shows (issue #3032).

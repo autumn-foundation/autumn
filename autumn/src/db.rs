@@ -1830,8 +1830,9 @@ pub(crate) fn sqlite_target_is_shared_cache(target: &str) -> bool {
 /// parameter is exactly `value`, read the way `SQLite` reads it: only a `file:`
 /// URI has query parameters (a plain path containing `?` is just a filename),
 /// the `#fragment` is ignored, names and values are percent-decoded before the
-/// case-sensitive comparison, and a repeated parameter takes its last value. `target` may be a raw configured URL
-/// (`sqlite:file:...`) or an already-normalized one.
+/// case-sensitive comparison, and a repeated parameter takes its last value.
+/// A `%00` ends the name or value it is in. `target` may be a raw configured
+/// URL (`sqlite:file:...`) or an already normalized one.
 #[cfg(feature = "sqlite")]
 fn sqlite_uri_has_query_pair(target: &str, key: &str, value: &str) -> bool {
     let target = normalize_sqlite_target(target);
@@ -1852,8 +1853,8 @@ fn sqlite_uri_has_query_pair(target: &str, key: &str, value: &str) -> bool {
 }
 
 /// Decode `%XX` escapes the way `SQLite`'s URI parser does; a `%` not followed
-/// by two hex digits is kept literally. A decoded NUL (`%00`) ends the
-/// output: `SQLite` drops the rest of that name or value (issue #3032).
+/// by two hex digits is kept literally. A decoded NUL (`%00`) stops the
+/// decoding. `SQLite` drops the rest of that name or value (issue #3032).
 #[cfg(feature = "sqlite")]
 fn percent_decode(input: &str) -> Vec<u8> {
     let bytes = input.as_bytes();
@@ -5718,7 +5719,17 @@ mod tests {
     }
 
     // Issue #3032. A decoded NUL (`%00`) ends only the name or value being
-    // read. SQLite keeps parsing the next pair. Checked against SQLite 3.45.
+    // read. SQLite keeps parsing the next pair. Checked with Python's
+    // `sqlite3` (SQLite 3.45).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn percent_decode_stops_at_decoded_nul() {
+        assert_eq!(percent_decode("a%00b"), b"a");
+        assert_eq!(percent_decode("%00"), b"");
+        assert_eq!(percent_decode("a%0"), b"a%0");
+        assert_eq!(percent_decode("%53hared"), b"Shared");
+    }
+
     #[cfg(feature = "sqlite")]
     #[test]
     fn sqlite_shared_cache_nul_ends_only_current_component() {
@@ -5740,6 +5751,14 @@ mod tests {
         // `cache` pair.
         assert!(sqlite_target_is_shared_cache(
             "file:a?cache=shared&%00cache=private"
+        ));
+        // NUL inside a name: the name is cut there.
+        assert!(!sqlite_target_is_shared_cache("file:a?ca%00che=shared"));
+        assert!(sqlite_target_is_shared_cache("file:a?cache%00x=shared"));
+        assert!(!sqlite_target_is_shared_cache("file:a?cache=a%00b=shared"));
+        // Text after a NUL cannot start a new pair.
+        assert!(sqlite_target_is_shared_cache(
+            "file:a?cache=shared%00x=y&cache=shared"
         ));
         // NUL in the path does not stop the query.
         assert!(sqlite_target_is_shared_cache("file:a%00?cache=shared"));
