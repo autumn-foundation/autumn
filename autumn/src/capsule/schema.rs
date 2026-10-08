@@ -532,6 +532,8 @@ pub enum HttpErrorKind {
     RedirectRejected,
     /// A URL could not be parsed or resolved.
     InvalidUrl,
+    /// Staging fault injection failed the call (issue #3071).
+    FaultInjected,
 }
 
 impl Default for HttpEffect {

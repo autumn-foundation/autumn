@@ -257,6 +257,9 @@ off, so an app with no `[fault_injection]` section does not change.
 `FaultInjectionConfig` is `#[non_exhaustive]`: set its fields on a default
 value.
 
+`capsule::schema::HttpErrorKind` (feature `reporting`) has a new variant,
+`FaultInjected`. An exhaustive `match` on it needs a new arm.
+
 **Automation:** `manual` — a codemod cannot know which fields a struct literal
 leaves at their defaults.
 

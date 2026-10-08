@@ -4,7 +4,8 @@
 //! or an error to a route or to a dependency, at a rate, on matched paths.
 //! The router installs two layers when the section is enabled:
 //!
-//! - an outer scope layer, outside the session layer. It selects the faults
+//! - an outer scope layer, outside the exception filters and the session
+//!   layer. It selects the faults
 //!   for the request path, puts them in a task-local scope for the database,
 //!   Redis and HTTP client seams, and counts the result for the stop
 //!   condition;

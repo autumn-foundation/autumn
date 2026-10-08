@@ -5152,9 +5152,9 @@ fn apply_middleware(
     let (body_limit, upload_config) = build_upload_layers(config);
     let trusted_host_policy = TrustedHostPolicy::from_config_with_state(config, state);
     let (rate_limit_layer, rate_limit_principal_keying) = build_rate_limit_layers(config, state);
-    // Staging fault injection (#3071). The scope layer goes directly outside
-    // the session layer, so the Redis session store is in the request scope
-    // and the stop condition sees the final status. The route layer is the
+    // Staging fault injection (#3071). The scope layer goes outside the
+    // exception filters and the session layer, so the Redis session store is
+    // in the request scope and the stop condition sees the final status. The route layer is the
     // innermost member of `inner_stack`: it runs after rate limiting and load
     // shedding, and the timeout, the access log and error reporting see an
     // injected fault as a real one. Probe and actuator paths are exempt, as
@@ -5622,10 +5622,12 @@ fn apply_middleware(
                 .flatten(),
         ),
         crate::middleware::MetricsLayer::new(state.metrics.clone()),
+        // Outside the exception filters, so the stop condition counts the
+        // final status that a filter may set (#3071).
+        tower::util::option_layer(fault_scope_layer),
         ExceptionFilterLayer::new(all_filters),
         crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev },
         ryw_layer,
-        tower::util::option_layer(fault_scope_layer),
     );
 
     // ── The single merged application ───────────────────────────────────────

@@ -17,5 +17,6 @@
 ### Breaking Changes
 
 - **Breaking:** `AutumnConfig` gains a public `fault_injection` field. A
-  struct literal needs `..AutumnConfig::default()`
+  struct literal needs `..AutumnConfig::default()`.
+  `capsule::schema::HttpErrorKind` has a new variant `FaultInjected`
   ([migration guide](docs/migrations/next.md)).
