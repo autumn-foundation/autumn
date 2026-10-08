@@ -321,6 +321,8 @@ bytes = "1.9"
 unicode-normalization = "0.1"
 http-body = "1"
 http-body-util = "0.1"
+# Already resolved via axum; `ext::Protocol` marks an HTTP/2 extended CONNECT.
+hyper = { version = "1", default-features = false, features = ["http2"] }
 # Both already resolved transitively via tower-http's compression-gzip/
 # compression-br features (used to precompute static CSS encodings once
 # instead of recompressing on every request — see `static_css_response`).

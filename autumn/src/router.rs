@@ -2560,6 +2560,7 @@ fn method_filter_for(method: &http::Method) -> axum::routing::MethodFilter {
         "HEAD" => MethodFilter::HEAD,
         "OPTIONS" => MethodFilter::OPTIONS,
         "TRACE" => MethodFilter::TRACE,
+        "CONNECT" => MethodFilter::CONNECT,
         _ => MethodFilter::GET,
     }
 }
@@ -2622,6 +2623,9 @@ fn route_list_path_methods(
         if effective == http::Method::GET && !methods.contains(&http::Method::HEAD) {
             methods.push(http::Method::HEAD);
         }
+        if route.method.as_str() == "WS" && !methods.contains(&http::Method::CONNECT) {
+            methods.push(http::Method::CONNECT);
+        }
     }
     map
 }
@@ -2650,6 +2654,9 @@ fn scoped_group_path_methods(
             }
             if effective == http::Method::GET && !methods.contains(&http::Method::HEAD) {
                 methods.push(http::Method::HEAD);
+            }
+            if route.method.as_str() == "WS" && !methods.contains(&http::Method::CONNECT) {
+                methods.push(http::Method::CONNECT);
             }
         }
     }

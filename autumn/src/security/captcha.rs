@@ -604,8 +604,6 @@ const fn is_safe_method(method: &axum::http::Method) -> bool {
             | axum::http::Method::HEAD
             | axum::http::Method::OPTIONS
             | axum::http::Method::TRACE
-            // HTTP/2 `WebSocket` upgrade (RFC 8441), as `GET` is for HTTP/1.1.
-            | axum::http::Method::CONNECT
     )
 }
 
@@ -689,7 +687,7 @@ where
 
     fn call(&mut self, mut req: Request<axum::body::Body>) -> Self::Future {
         // Safe methods (GET, HEAD, OPTIONS, TRACE) are always exempt.
-        if is_safe_method(req.method()) {
+        if is_safe_method(req.method()) || crate::security::is_websocket_connect(&req) {
             let mut inner = self.inner.clone();
             std::mem::swap(&mut self.inner, &mut inner);
             return Box::pin(async move { inner.call(req).await });
