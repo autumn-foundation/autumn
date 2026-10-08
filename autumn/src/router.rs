@@ -4653,6 +4653,10 @@ where
                 inner: self.inner.call(req),
             };
         };
+        // In a fault scope, take only the time left: a fault wait before this
+        // layer used part of the request timeout (#3071).
+        let duration =
+            crate::fault_injection::time_left().map_or(duration, |left| duration.min(left));
         // Adaptive admission tells a cancel at this deadline (overload) from a
         // client that goes away (#3068).
         if let Some(at) = tokio::time::Instant::now().checked_add(duration) {
@@ -13692,6 +13696,41 @@ mod trusted_host_tests {
             Some("application/problem+json"),
             "timeout response must use Problem Details content type"
         );
+    }
+
+    /// In a fault scope, the timeout takes only the time left: a fault wait
+    /// before this layer (the Redis session load) uses part of it (#3071).
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout_takes_the_time_left_in_a_fault_scope() {
+        let mut config = AutumnConfig::default();
+        config.server.timeouts.request_timeout_ms = Some(1000);
+
+        let state = crate::state::AppState::for_test();
+        let router: axum::Router<AppState> = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                "ok"
+            }),
+        );
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+            false,
+        )
+        .with_state(state);
+
+        let request = Request::builder().uri("/slow").body(Body::empty()).unwrap();
+        let response = crate::fault_injection::with_request_budget(
+            std::time::Duration::from_millis(200),
+            router.oneshot(request),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test(start_paused = true)]

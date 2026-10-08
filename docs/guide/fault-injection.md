@@ -73,7 +73,11 @@ A dependency fault applies only in a request that matches `routes`. Work that
 runs outside a request (jobs, the scheduler, spawned tasks) gets no faults.
 All dependency waits of a request share its request timeout: the `timeout`
 of its route, else `server.timeouts.request_timeout_ms`. A wait that reaches
-it fails, as a timeout does.
+it fails, as a timeout does. A wait before the handler (the Redis session
+load) uses part of the handler's timeout.
+
+A request in which a fault fired writes no failure capsule
+([failure capsules](failure-capsules.md)): its replay runs without the fault.
 
 The random decisions use their own stream, seeded at boot from the app
 entropy source. A test with `SeededEntropy` gets the same faults on each run.

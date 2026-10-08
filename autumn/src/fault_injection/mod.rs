@@ -662,6 +662,30 @@ tokio::task_local! {
     static SCOPE: Arc<RequestScope>;
 }
 
+/// The time left before the request timeout of the current fault scope.
+/// `None` outside a scope, or when the request has no timeout.
+///
+/// The request timeout layer takes at most this: a fault wait before it (the
+/// Redis session load) uses part of the request timeout.
+pub(crate) fn time_left() -> Option<Duration> {
+    SCOPE
+        .try_with(|scope| {
+            scope
+                .deadline_at
+                .map(|at| at.saturating_duration_since(tokio::time::Instant::now()))
+        })
+        .ok()
+        .flatten()
+}
+
+/// `true` when a fault fired in the current request. Such a request writes no
+/// failure capsule: a replay runs without the fault.
+pub(crate) fn fault_fired() -> bool {
+    SCOPE
+        .try_with(|scope| scope.fired.load(Ordering::Relaxed))
+        .unwrap_or(false)
+}
+
 /// The dependency seam: wait for injected latency, then fail when an
 /// injected error fires.
 ///
@@ -852,6 +876,25 @@ pub(crate) async fn with_faults<F: std::future::Future>(
     future: F,
 ) -> F::Output {
     let injector = test_injector(rules.iter().map(CompiledRule::new).collect(), u64::MAX);
+    let scope = injector
+        .scope_for("/", &Method::GET)
+        .expect("an armed injector scopes `/`");
+    SCOPE.scope(scope, future).await
+}
+
+/// Run `future` in a fault scope with no faults and a request timeout of
+/// `budget`, as a matched request would.
+#[cfg(test)]
+pub(crate) async fn with_request_budget<F: std::future::Future>(
+    budget: Duration,
+    future: F,
+) -> F::Output {
+    let rule = FaultRule::new(FaultTarget::Route, FaultKind::Error, 0.0);
+    let injector = test_injector_with(
+        vec![CompiledRule::new(&rule)],
+        u64::MAX,
+        Deadlines::new(Some(budget), &Arc::default()),
+    );
     let scope = injector
         .scope_for("/", &Method::GET)
         .expect("an armed injector scopes `/`");

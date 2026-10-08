@@ -24,6 +24,12 @@ async fn other() -> &'static str {
     "other"
 }
 
+/// Fails with a real `500`.
+#[get("/broken")]
+async fn broken() -> AutumnResult<&'static str> {
+    Err(AutumnError::internal_server_error_msg("broken"))
+}
+
 /// Sends one outbound call through the HTTP client.
 #[cfg(feature = "http-client")]
 #[get("/api/call")]
@@ -85,9 +91,9 @@ fn prod_config(faults: Vec<FaultRule>) -> AutumnConfig {
 fn build(config: AutumnConfig, profile: &str, audit: &Captured) -> TestClient {
     let sink = audit.clone();
     #[cfg(feature = "http-client")]
-    let routes = routes![orders, other, call];
+    let routes = routes![orders, other, broken, call];
     #[cfg(not(feature = "http-client"))]
-    let routes = routes![orders, other];
+    let routes = routes![orders, other, broken];
     TestApp::new()
         .config(config)
         .profile(profile)
@@ -293,4 +299,44 @@ async fn disabled_section_installs_nothing() {
     client.get("/api/orders").send().await.assert_ok();
     settle().await;
     assert!(audit.actions().is_empty());
+}
+
+/// The capsule files in `dir`.
+#[cfg(feature = "reporting")]
+fn capsules(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A request in which a fault fired writes no failure capsule: a replay
+/// runs without the fault. A real failure still writes one.
+#[cfg(feature = "reporting")]
+#[tokio::test]
+async fn an_injected_failure_writes_no_capsule() {
+    let dir = tempfile::tempdir().expect("capsule dir");
+    let mut config = config_with(vec![rule(FaultTarget::Route, FaultKind::Error, 1.0)]);
+    config.failure_capture.enabled = true;
+    config.failure_capture.dir = dir.path().to_string_lossy().into_owned();
+    let client = build(config, "staging", &Captured::default());
+
+    client.get("/api/orders").send().await.assert_status(503);
+    client.get("/broken").send().await.assert_status(500);
+
+    // Capsules are written on a detached task.
+    for _ in 0..100 {
+        if !capsules(dir.path()).is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let written = capsules(dir.path());
+    assert_eq!(written.len(), 1, "only the real failure: {written:?}");
 }
