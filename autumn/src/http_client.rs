@@ -1710,6 +1710,9 @@ tokio::task_local! {
     /// every host on the way gets its refill, so the plain path reads them
     /// here.
     static FOLLOWED: std::cell::RefCell<Vec<String>>;
+    /// `true` while the plain path follows redirects itself, so the pooled
+    /// client returns each redirect (see `pooled_redirect_policy`).
+    static MANUAL_REDIRECTS: bool;
 }
 
 /// Send `req` on the pooled client. Also return the redirect targets the
@@ -1754,7 +1757,7 @@ const PLAIN_MAX_REDIRECTS: usize = 10;
 /// #3058).
 fn pooled_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
-        if Deadline::current().is_some() {
+        if Deadline::current().is_some() || MANUAL_REDIRECTS.try_with(|m| *m).unwrap_or(false) {
             attempt.stop()
         } else if attempt.previous().len() > PLAIN_MAX_REDIRECTS {
             // `previous` holds the first URL too, as in reqwest's own limit.
@@ -2324,7 +2327,14 @@ impl RequestBuilder {
         let start = crate::time::ambient_instant();
         let max_attempts = self.max_attempts(suppress_retries);
         let mut gate = self.retry_gate(url_host(&self.url).as_deref());
-        if gate.deadline.is_some() {
+        // A caller's own deadline header also needs a new value per attempt
+        // and per hop, so the client follows redirects itself then too.
+        let caller_header = self
+            .extra_headers
+            .get(DEADLINE_HEADER)
+            .and_then(crate::deadline::parse_header)
+            .is_some();
+        if gate.deadline.is_some() || caller_header {
             return self.follow_pooled(suppress_retries, &gate).await;
         }
         let mut last_retry = None;
@@ -2457,14 +2467,18 @@ impl RequestBuilder {
         // `send_one` asks the throttle (issue #3068) for each attempt of
         // each hop, as the plain path does for each attempt.
         let client = self.client.clone();
-        self.follow_loop(
-            PLAIN_MAX_REDIRECTS,
-            Arc::new(|_: &str| true),
-            HopClient::Pooled(&client),
-            suppress_retries,
-            gate,
-        )
-        .await
+        MANUAL_REDIRECTS
+            .scope(
+                true,
+                self.follow_loop(
+                    PLAIN_MAX_REDIRECTS,
+                    Arc::new(|_: &str| true),
+                    HopClient::Pooled(&client),
+                    suppress_retries,
+                    gate,
+                ),
+            )
+            .await
     }
 
     /// Add an `Idempotency-Key` header when this request can retry a
@@ -3536,30 +3550,36 @@ impl RetryGate {
     }
 
     /// The [`DEADLINE_HEADER`] value for an attempt with `timeout`. `None`
-    /// with no deadline.
+    /// with no deadline and no caller value the client can read.
     ///
     /// A value the caller set is kept when it is shorter, so the header never
     /// says more than the time left. When this returns a value, the caller's
     /// own copy of the header is not sent.
     fn header(&self, timeout: Option<Duration>, caller: &HeaderMap) -> Option<HeaderValue> {
-        self.deadline?;
         let millis = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-        let left = millis(timeout?);
+        // The time left of the request deadline, when one is set.
+        let left = self.deadline.and(timeout).map(millis);
         let Some(value) = caller.get(DEADLINE_HEADER) else {
-            return self.send_header.then(|| HeaderValue::from(left));
+            return left.filter(|_| self.send_header).map(HeaderValue::from);
         };
         // The first attempt sends the caller's value as set; later ones send
-        // what is left of it.
+        // what is left of it, with or without a request deadline.
         let mut first = None;
         let caller_deadline = self.caller_deadline.get_or_init(|| {
             first = crate::deadline::parse_header(value);
             first.map(Deadline::after)
         });
-        let theirs = first.map_or_else(
-            || caller_deadline.map_or(u64::MAX, |deadline| millis(deadline.remaining())),
-            millis,
-        );
-        Some(HeaderValue::from(left.min(theirs)))
+        let theirs = first.map(millis).or_else(|| {
+            caller_deadline
+                .as_ref()
+                .map(|deadline| millis(deadline.remaining()))
+        });
+        match (left, theirs) {
+            (Some(left), Some(theirs)) => Some(HeaderValue::from(left.min(theirs))),
+            (Some(value), None) | (None, Some(value)) => Some(HeaderValue::from(value)),
+            // No deadline, and a value the client cannot read: sent as set.
+            (None, None) => None,
+        }
     }
 }
 
@@ -3981,6 +4001,9 @@ async fn send_one(
         // The request deadline (issue #3058) can make it shorter again.
         let attempt_timeout = if gate.deadline.is_some() {
             gate.attempt_timeout(hop_timeout.or(per_try))
+        } else if carried_end.is_some() {
+            // A later hop of a chain without a deadline.
+            hop_timeout.or(per_try)
         } else {
             hop_timeout
         };
@@ -7714,6 +7737,91 @@ mod tests {
                 matches!(&result, Err(ClientError::Request(e)) if e.is_timeout()),
                 "the chain must not get a new timeout per hop: {result:?}"
             );
+        }
+
+        #[tokio::test]
+        async fn without_a_deadline_a_retry_sends_what_is_left_of_the_callers_header() {
+            use axum::response::IntoResponse;
+            // The first attempt takes 60 ms and fails; the retry works.
+            let seen: Arc<std::sync::Mutex<Vec<u64>>> = Arc::default();
+            let slot = Arc::clone(&seen);
+            let upstream = super::spawn(axum::Router::new().route(
+                "/x",
+                axum::routing::get(move |headers: HeaderMap| {
+                    let slot = Arc::clone(&slot);
+                    async move {
+                        let first = {
+                            let mut seen = slot.lock().unwrap();
+                            seen.push(header_millis(&headers));
+                            seen.len() == 1
+                        };
+                        if first {
+                            tokio::time::sleep(Duration::from_millis(60)).await;
+                            axum::http::StatusCode::BAD_GATEWAY.into_response()
+                        } else {
+                            axum::http::StatusCode::OK.into_response()
+                        }
+                    }
+                }),
+            ))
+            .await;
+            let mut client = Client::new();
+            client.entropy = Arc::new(FixedDraw(0));
+            // No task deadline: only the caller's header.
+            let response = client
+                .get(format!("http://127.0.0.1:{}/x", upstream.port()))
+                .header(DEADLINE_HEADER, "200")
+                .retries(1)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen[0], 200, "{seen:?}");
+            assert!(seen[1] <= 140, "the retry re-extended the header: {seen:?}");
+        }
+
+        #[tokio::test]
+        async fn without_a_deadline_a_redirect_hop_sends_what_is_left_of_the_callers_header() {
+            use axum::response::IntoResponse;
+            let seen: Arc<std::sync::Mutex<Vec<u64>>> = Arc::default();
+            let (at_a, at_b) = (Arc::clone(&seen), Arc::clone(&seen));
+            let app = axum::Router::new()
+                .route(
+                    "/a",
+                    axum::routing::get(move |headers: HeaderMap| async move {
+                        at_a.lock().unwrap().push(header_millis(&headers));
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                        axum::response::Redirect::temporary("/b").into_response()
+                    }),
+                )
+                .route(
+                    "/b",
+                    axum::routing::get(move |headers: HeaderMap| async move {
+                        at_b.lock().unwrap().push(header_millis(&headers));
+                        "ok"
+                    }),
+                );
+            let upstream = super::spawn(app).await;
+            let response = Client::new()
+                .get(format!("http://127.0.0.1:{}/a", upstream.port()))
+                .header(DEADLINE_HEADER, "200")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 2, "{seen:?}");
+            assert_eq!(seen[0], 200, "{seen:?}");
+            assert!(seen[1] <= 140, "the hop re-extended the header: {seen:?}");
+        }
+
+        /// The [`DEADLINE_HEADER`] value of a request, or `u64::MAX`.
+        fn header_millis(headers: &HeaderMap) -> u64 {
+            headers
+                .get(DEADLINE_HEADER)
+                .and_then(|v| v.to_str().ok()?.parse().ok())
+                .unwrap_or(u64::MAX)
         }
 
         #[tokio::test]

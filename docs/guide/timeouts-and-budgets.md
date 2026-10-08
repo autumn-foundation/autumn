@@ -86,7 +86,9 @@ so clock skew between hosts has no effect. The client sends it only when a
 deadline is set, and it sends it to every host, third-party APIs too.
 
 If you set the header yourself, the client keeps your value when it is
-shorter than the time left, and sends the time left otherwise.
+shorter than the time left, and sends the time left otherwise. It treats your
+value as a deadline from the first attempt: a retry or a redirect hop sends
+what is left of it, with or without a request deadline.
 
 Each attempt and each redirect hop gets a new value. Under a deadline the
 client follows a redirect itself, not inside the HTTP stack, so the next host
