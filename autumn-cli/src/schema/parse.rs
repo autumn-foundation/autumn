@@ -8,8 +8,8 @@
 //! produced — reusing [`ColumnType::from_rust_type`] for the field-type mapping
 //! and the CLI's own [`naming::pluralize`] / [`naming::pascal_to_snake`] for
 //! table-name inference so the parser and the generator can never drift on those
-//! two axes. It emits **no** migration, `schema.rs`, or codegen output; those are
-//! later slices.
+//! two axes. It writes nothing; [`super::diff`] and [`super::schema_rs`] use
+//! its output.
 //!
 //! # Recognized `#[model]` vocabulary
 //!
@@ -17,12 +17,13 @@
 //! - `table = "..."` — explicit table-name override (mirrors the macro's one
 //!   real argument; see `autumn_macros`'s `parse_attr_args`).
 //! - `managed` (also accepted as `schema = "managed"`) — the Decision-4 adoption
-//!   marker recorded on [`Table::managed`]. NOTE: this is a **parser-recognized**
-//!   marker for the declarative-schema wave; the runtime `#[model]` macro does
-//!   not yet accept it as an argument. Any other nested argument is ignored
+//!   marker recorded on [`Table::managed`]. The `#[model]` macro accepts it
+//!   and ignores it for codegen (#2014). Any other nested argument is ignored
 //!   (forward-compatible).
 //!
 //! Field-level:
+//! - The column name is the `#[diesel(column_name = ...)]` value, else the field
+//!   name without a raw `r#` prefix (the `#[model]` macro rule).
 //! - `#[id]` — primary-key column (macro PK resolution is mirrored: explicit
 //!   `#[id]` fields win, else the first `i32`/`i64` field, else a reserved `id`).
 //! - `#[indexed]` — a non-unique secondary index on the column.
@@ -486,13 +487,44 @@ fn rename_hints(item: &syn::ItemStruct, table: &str) -> Vec<RenameHint> {
             if let (Some(ident), Some(from)) = (&field.ident, renamed_from(&field.attrs)) {
                 out.push(RenameHint {
                     table: table.to_owned(),
-                    column: Some(ident.to_string()),
+                    column: Some(field_column_name(field, ident)),
                     from,
                 });
             }
         }
     }
     out
+}
+
+/// The SQL column of a field: the `#[diesel(column_name = ...)]` value, else
+/// the field name without a raw `r#` prefix. Same rule as the `#[model]` macro.
+fn field_column_name(field: &syn::Field, ident: &syn::Ident) -> String {
+    let mut found = None;
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("diesel")) {
+        let _ = attr.parse_nested_meta(|meta| {
+            let value = meta
+                .value()
+                .and_then(syn::parse::ParseBuffer::parse::<syn::Expr>);
+            if meta.path.is_ident("column_name") {
+                found = match value {
+                    Ok(syn::Expr::Path(path)) => path.path.get_ident().map(unraw),
+                    Ok(syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(lit),
+                        ..
+                    })) => Some(lit.value()),
+                    _ => None,
+                };
+            }
+            Ok(())
+        });
+    }
+    found.unwrap_or_else(|| unraw(ident))
+}
+
+/// The identifier without a raw `r#` prefix.
+fn unraw(ident: &syn::Ident) -> String {
+    let raw = ident.to_string();
+    raw.strip_prefix("r#").unwrap_or(&raw).to_owned()
 }
 
 /// The old name in `#[renamed_from("old")]`. `None` unless `attrs` holds exactly
@@ -705,7 +737,7 @@ fn build_table(
             let Some(ident) = &field.ident else { continue };
             let (nullable, inner_ty) = strip_option(&field.ty);
             raw_fields.push(RawField {
-                name: ident.to_string(),
+                name: field_column_name(field, ident),
                 attrs: parse_field_attrs(field),
                 nullable,
                 rust_type: type_to_string(inner_ty),
@@ -2034,5 +2066,50 @@ mod tests {
         .expect("write b");
         let parsed = parse_models_dir(dir.path(), Backend::Postgres).expect("parse dir");
         assert_eq!(parsed.renames.len(), 2, "{:?}", parsed.renames);
+    }
+
+    /// A raw field ident names the SQL column without the `r#` prefix, as the
+    /// `#[model]` macro does.
+    #[test]
+    fn raw_ident_field_names_the_unrawed_column() {
+        let parsed = parse_model_source(
+            "#[model] pub struct Item { #[id] pub id: i64, pub r#type: String }",
+            Backend::Postgres,
+        )
+        .expect("parse");
+        let names: Vec<&str> = parsed.tables[0]
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(names.contains(&"type"), "{names:?}");
+        assert!(!names.iter().any(|n| n.starts_with("r#")), "{names:?}");
+    }
+
+    /// `#[diesel(column_name = ...)]` names the SQL column. Both spellings.
+    #[test]
+    fn diesel_column_name_names_the_column() {
+        let parsed = parse_model_source(
+            r#"
+            #[model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                #[diesel(column_name = "headline")]
+                pub title: String,
+                #[diesel(column_name = body_text)]
+                #[renamed_from("body")]
+                pub body: String,
+            }
+        "#,
+            Backend::Postgres,
+        )
+        .expect("parse");
+        let table = &parsed.tables[0];
+        assert_eq!(col(table, "headline").ty, ColumnType::Text);
+        assert_eq!(col(table, "body_text").ty, ColumnType::Text);
+        assert!(!table.columns.iter().any(|c| c.name == "title"));
+        // The rename hint names the new column, not the field.
+        assert_eq!(parsed.renames[0].column.as_deref(), Some("body_text"));
     }
 }

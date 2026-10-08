@@ -497,7 +497,7 @@ fn upsert_schema_block(
 /// Byte range `[start, end)` of the `table!` block (qualified `diesel::table!`
 /// or the bare `table!` re-export) that declares `table`, including any path
 /// qualifier so a replacement isn't double-prefixed. `None` if not found.
-fn schema_block_range(existing: &str, table: &str) -> Option<(usize, usize)> {
+pub fn schema_block_range(existing: &str, table: &str) -> Option<(usize, usize)> {
     let needle = format!("{table} (");
     let bytes = existing.as_bytes();
     let mut search_from = 0;
