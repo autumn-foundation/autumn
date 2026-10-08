@@ -89,8 +89,8 @@ pub struct ShadowStats {
     /// without this an operator sees `mirrored` far exceed every other counter
     /// with nothing explaining the gap.
     pub primary_incomplete: u64,
-    /// Comparisons not finished by the deadline. They are neither a match nor a
-    /// divergence, and not `skipped_oversize` or `primary_incomplete`.
+    /// Comparisons that did not finish by the deadline. Not counted as a match,
+    /// a divergence or a skip.
     pub comparisons_abandoned: u64,
 }
 

@@ -558,16 +558,17 @@ container, another port, another machine) and point `target` at it.
   revalidates. These requests are skipped and counted as `skipped_conditional`.
   The trade is that on a cache-heavy route the revalidating share of traffic
   gets no coverage — the counter shows how much.
-- **A mirror cannot outlive its deadline.** One deadline, stamped at dispatch,
-  covers the shadow request, the wait for the mirrored primary response, and
-  the comparison (decode, parse, digest, record). A client that stops reading,
-  or a long-lived `text/event-stream`, cannot hold an `max_in_flight` slot past
-  it. `max_in_flight` bounds outstanding mirrors, end to end. A primary that
-  does not finish is counted as `incomplete`. A comparison that does not finish
-  is counted as `abandoned`: it is neither a match nor a divergence, it records
-  nothing, and its slot is freed at the deadline. The CPU work runs on the
-  blocking pool, so it cannot stall request handling. An abandoned comparison
-  stops at its next step, so it uses at most one more step of CPU.
+- **A mirror cannot hold a slot past its deadline.** One deadline, set at
+  dispatch, covers the shadow request, the wait for the primary response, and
+  the comparison (decode, parse, digest, record). `max_in_flight` bounds
+  outstanding mirrors, end to end. A shadow request that is too slow is counted
+  as `timeout`. A primary response that does not finish is counted as
+  `incomplete`. A comparison that does not finish is counted as `abandoned`.
+  It is not a match or a divergence, and it records nothing.
+  The comparison runs on the blocking pool. An abandoned comparison stops after
+  the step it is running, and keeps its blocking thread until then. A second
+  cap, twice `max_in_flight`, limits these threads. Set `timeout_ms` and
+  `max_body_bytes` with this in mind.
 - **Credentials never reach a proxy.** The mirroring client disables proxy
   autodetection, so `HTTP_PROXY`/`HTTPS_PROXY` in the environment cannot divert
   a mirrored request (carrying the end user's cookie) to a third party.
@@ -690,7 +691,7 @@ $ curl -s localhost:3000/actuator/shadow | jq
 }
 ```
 
-`stats` also carries `skipped_refused`, `skipped_conditional`, and
+`stats` also carries `skipped_refused`, `skipped_conditional`,
 `primary_incomplete` and `comparisons_abandoned` (see the outcomes below).
 
 `/actuator/shadow` is a **sensitive** endpoint (`[actuator] sensitive = true`),

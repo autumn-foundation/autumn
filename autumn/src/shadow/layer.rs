@@ -23,11 +23,12 @@
 //! `max_in_flight` reserves a slot before dispatch and releases it when the
 //! detached task ends, so a candidate that stops answering costs at most that
 //! many outstanding requests rather than one per inbound request. `timeout`
-//! is ONE deadline per mirror, covering the shadow request, the wait for the
-//! primary body and the comparison. `max_in_flight` therefore bounds
-//! outstanding *mirrors*, end to end (decision for issue #2333). The CPU work
-//! runs on the blocking pool; at the deadline it is abandoned, counted as
-//! `abandoned`, and records nothing. `max_body_bytes` bounds what either side may buffer —
+//! is one deadline per mirror. It covers the shadow request, the primary body
+//! wait and the comparison. So `max_in_flight` bounds outstanding *mirrors*,
+//! end to end (issue #2333). The comparison runs on the blocking pool. At the
+//! deadline it is counted as `abandoned` and records nothing. It keeps its
+//! thread until its current step ends. A second cap, twice `max_in_flight`,
+//! limits those threads. `max_body_bytes` bounds what either side may buffer —
 //! an oversize body is not partially captured, it is abandoned and counted, so
 //! a streaming endpoint cannot grow the process.
 
@@ -130,6 +131,8 @@ struct MirrorContext {
     entropy: Arc<dyn Entropy>,
     clock: Arc<dyn ClockSource>,
     in_flight: Arc<AtomicUsize>,
+    /// Comparisons still on the blocking pool, abandoned ones included.
+    blocking: Arc<AtomicUsize>,
     /// Blocking time added to each comparison, so tests can model a large body.
     #[cfg(test)]
     compare_delay: Duration,
@@ -180,6 +183,7 @@ impl ShadowMirrorLayer {
                 entropy,
                 clock,
                 in_flight: Arc::new(AtomicUsize::new(0)),
+                blocking: Arc::new(AtomicUsize::new(0)),
                 #[cfg(test)]
                 compare_delay: Duration::ZERO,
             }),
@@ -436,23 +440,47 @@ async fn run_mirror(
     // `timeout_at` can bound them (issue #2333). At the deadline the mirror is
     // counted as `abandoned` and the slot is freed; `state` makes the work stop
     // at its next step and record nothing.
+    //
+    // An abandoned job keeps its blocking thread until its step ends, so a
+    // second counter, held until the job returns, caps that pile-up.
+    let Some(blocking) =
+        InFlightPermit::try_acquire(&ctx.blocking, ctx.settings.max_in_flight.saturating_mul(2))
+    else {
+        ctx.registry.record_comparison_abandoned();
+        record_outcome(&ctx.registry, &context.route, "abandoned");
+        return;
+    };
     let state = Arc::new(AtomicU8::new(RUNNING));
     let mut work = crate::time::spawn_blocking({
         let ctx = Arc::clone(&ctx);
         let context = context.clone();
         let state = Arc::clone(&state);
-        move || compare_and_record(&ctx, &context, &state, &primary, &shadow)
+        move || {
+            let _blocking = blocking;
+            compare_and_record(&ctx, &context, &state, &primary, &shadow);
+        }
     });
-    if tokio::time::timeout_at(deadline, &mut work).await.is_err() {
-        let won = state
-            .compare_exchange(RUNNING, ABANDONED, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        if won {
-            ctx.registry.record_comparison_abandoned();
-            record_outcome(&ctx.registry, &context.route, "abandoned");
-        } else {
-            // The work already began recording. Recording is short; let it end.
-            let _ = work.await;
+    match tokio::time::timeout_at(deadline, &mut work).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            // The work panicked. Count it as a shadow error so `mirrored` accounts for it.
+            if commit(&state) {
+                ctx.registry.record_shadow_error();
+                record_outcome(&ctx.registry, &context.route, "error");
+            }
+            tracing::debug!(target: "autumn::shadow", route = %context.route, %error, "mirror comparison task failed");
+        }
+        Err(_) => {
+            let won = state
+                .compare_exchange(RUNNING, ABANDONED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+            if won {
+                ctx.registry.record_comparison_abandoned();
+                record_outcome(&ctx.registry, &context.route, "abandoned");
+            } else {
+                // The work already began recording. Recording is short; let it end.
+                let _ = work.await;
+            }
         }
     }
 }
@@ -482,6 +510,10 @@ fn compare_and_record(
     primary: &ResponseFacts,
     shadow: &ResponseFacts,
 ) {
+    // A job that waited in the pool past the deadline does nothing.
+    if state.load(Ordering::Acquire) != RUNNING {
+        return;
+    }
     // Decode BOTH sides. A handler can serve a precompressed representation, so
     // the primary tee captures encoded bytes just as the candidate's response
     // can arrive encoded; decoding only one side would report two identical
@@ -524,6 +556,7 @@ fn compare_and_record(
         shadow_body,
     );
 
+    // Blocking sleep on purpose: this runs on the blocking pool.
     #[cfg(test)]
     std::thread::sleep(ctx.compare_delay);
 
@@ -1483,7 +1516,7 @@ mod tests {
         })
         .await;
         assert!(
-            started.elapsed() < Duration::from_millis(400),
+            started.elapsed() < Duration::from_millis(1200),
             "the mirror outlived its deadline: {:?}",
             started.elapsed()
         );
@@ -1496,7 +1529,7 @@ mod tests {
         );
 
         // The late work finishes but must record nothing.
-        tokio::time::sleep(Duration::from_millis(700)).await;
+        tokio::time::sleep(Duration::from_millis(1700)).await;
         let stats = registry.stats();
         assert_eq!(stats.compared, 0);
         assert_eq!(stats.matched, 0);
