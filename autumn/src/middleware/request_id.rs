@@ -96,8 +96,19 @@ static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 #[derive(Clone, Debug)]
 pub struct RequestId {
     uuid: Uuid,
-    /// The inbound value, as the trusted proxy sent it. `None` for a new id.
-    inbound: Option<HeaderValue>,
+    /// How the trusted proxy wrote the id. `None` for a new id.
+    ///
+    /// The text is not stored: a request id is copied into every request's
+    /// extensions and ingress futures, so its size is paid per request.
+    inbound: Option<InboundForm>,
+}
+
+/// The text form of an inbound id: hyphenated or not, and which hex digits
+/// are uppercase (bit `i` is the `i`-th hex digit).
+#[derive(Clone, Copy, Debug)]
+struct InboundForm {
+    hyphenated: bool,
+    upper: u32,
 }
 
 impl RequestId {
@@ -114,13 +125,21 @@ impl RequestId {
     /// `value` as its text, so logs match the logs of the sender.
     #[must_use]
     pub fn parse_inbound(value: &str) -> Option<Self> {
-        if !matches!(value.len(), 32 | 36) {
-            return None;
-        }
+        let hyphenated = match value.len() {
+            36 => true,
+            32 => false,
+            _ => return None,
+        };
         let uuid = Uuid::try_parse(value).ok()?;
+        let upper = value
+            .bytes()
+            .filter(u8::is_ascii_hexdigit)
+            .enumerate()
+            .filter(|(_, byte)| byte.is_ascii_uppercase())
+            .fold(0_u32, |mask, (digit, _)| mask | (1 << digit));
         Some(Self {
             uuid,
-            inbound: Some(HeaderValue::from_str(value).ok()?),
+            inbound: Some(InboundForm { hyphenated, upper }),
         })
     }
 
@@ -138,24 +157,39 @@ impl RequestId {
         }
     }
 
-    fn header_value(&self) -> Option<HeaderValue> {
-        if let Some(value) = &self.inbound {
-            return Some(value.clone());
+    /// Write the id text into `buf`: the inbound text as sent, or the
+    /// hyphenated lowercase form of a new id. No heap allocation.
+    fn encode<'a>(&self, buf: &'a mut [u8; uuid::fmt::Hyphenated::LENGTH]) -> &'a str {
+        let Some(form) = self.inbound else {
+            return self.uuid.as_hyphenated().encode_lower(buf);
+        };
+        let len = if form.hyphenated {
+            self.uuid.as_hyphenated().encode_lower(buf).len()
+        } else {
+            self.uuid.as_simple().encode_lower(buf).len()
+        };
+        let Some(text) = buf.get_mut(..len) else {
+            return "";
+        };
+        for (digit, byte) in text.iter_mut().filter(|b| **b != b'-').enumerate() {
+            if form.upper & (1 << digit) != 0 {
+                byte.make_ascii_uppercase();
+            }
         }
-        // Format the UUID into a stack buffer to avoid a String allocation.
+        // The text is ASCII hex digits and hyphens only.
+        std::str::from_utf8(text).unwrap_or_default()
+    }
+
+    fn header_value(&self) -> Option<HeaderValue> {
         let mut buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
-        let s = self.uuid.as_hyphenated().encode_lower(&mut buf);
-        HeaderValue::from_bytes(s.as_bytes()).ok()
+        HeaderValue::from_str(self.encode(&mut buf)).ok()
     }
 }
 
 impl fmt::Display for RequestId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `parse_inbound` accepts only ASCII, so `to_str` cannot fail.
-        match self.inbound.as_ref().and_then(|value| value.to_str().ok()) {
-            Some(text) => f.write_str(text),
-            None => write!(f, "{}", self.uuid),
-        }
+        let mut buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
+        f.write_str(self.encode(&mut buf))
     }
 }
 
@@ -215,8 +249,10 @@ impl<S> Layer<S> for RequestIdLayer {
     fn layer(&self, inner: S) -> Self::Service {
         RequestIdService {
             inner,
-            entropy: self.entropy.clone(),
-            trust: self.trust.clone(),
+            shared: Arc::new(RequestIdShared {
+                entropy: self.entropy.clone(),
+                trust: self.trust.clone(),
+            }),
         }
     }
 }
@@ -230,6 +266,12 @@ impl<S> Layer<S> for RequestIdLayer {
 #[derive(Clone, Debug)]
 pub struct RequestIdService<S> {
     inner: S,
+    /// One pointer: the ingress stack clones this service per request.
+    shared: Arc<RequestIdShared>,
+}
+
+#[derive(Debug)]
+struct RequestIdShared {
     entropy: Arc<dyn Entropy>,
     trust: Option<Arc<ProxyResolver>>,
 }
@@ -237,7 +279,7 @@ pub struct RequestIdService<S> {
 impl<S> RequestIdService<S> {
     /// The trusted inbound id, if the peer is trusted and the id is valid.
     fn inbound_id<B>(&self, req: &Request<B>) -> Option<RequestId> {
-        let trust = self.trust.as_ref()?;
+        let trust = self.shared.trust.as_ref()?;
         let mut values = req.headers().get_all(&X_REQUEST_ID).iter();
         let value = values.next()?.to_str().ok()?;
         // A proxy that appends, not replaces, leaves the client's value too.
@@ -263,7 +305,7 @@ where
     fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
         let id = self
             .inbound_id(&req)
-            .unwrap_or_else(|| RequestId::minted(self.entropy.uuid_v4()));
+            .unwrap_or_else(|| RequestId::minted(self.shared.entropy.uuid_v4()));
         req.extensions_mut().insert(id.clone());
 
         RequestIdFuture {
@@ -379,6 +421,39 @@ mod tests {
     fn request_id_display() {
         let id = RequestId::minted(Uuid::nil());
         assert_eq!(id.to_string(), "00000000-0000-0000-0000-000000000000");
+    }
+
+    /// `RequestId` rides in request extensions and in the ingress futures,
+    /// so its size is paid on every request (`tests/config_alloc_gate.rs`).
+    #[test]
+    fn request_id_stays_small() {
+        assert!(
+            std::mem::size_of::<RequestId>() <= 24,
+            "{} bytes",
+            std::mem::size_of::<RequestId>()
+        );
+    }
+
+    /// An inbound id keeps its text exactly, mixed case included.
+    #[test]
+    fn inbound_text_round_trips_in_every_case() {
+        for text in [
+            "0f8FAD5b-D9cb-469F-a165-70867728950E",
+            "0F8FAD5BD9CB469FA16570867728950E",
+            "0f8fad5bd9cb469fa16570867728950e",
+            "AbCdEf01-2345-6789-aBcD-eF0123456789",
+        ] {
+            let id = RequestId::parse_inbound(text).unwrap();
+            assert!(id.is_inbound());
+            assert_eq!(id.to_string(), text);
+            assert_eq!(id.header_value().unwrap(), text);
+        }
+        let minted = RequestId::minted(Uuid::nil());
+        assert!(!minted.is_inbound());
+        assert_eq!(
+            minted.header_value().unwrap(),
+            "00000000-0000-0000-0000-000000000000"
+        );
     }
 
     #[test]
