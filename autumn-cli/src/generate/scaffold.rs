@@ -3367,7 +3367,7 @@ fn render_model_form(
                 let _ = writeln!(struct_fields, "    pub {name}: Option<String>,");
                 let _ = writeln!(
                     into_new,
-                    "        {name}: form.{name}.as_deref().map(bytea_from_hex).transpose(){bad_hex},"
+                    "        {name}: form.{name}.as_deref().filter(|value| !value.trim().is_empty()).map(bytea_from_hex).transpose(){bad_hex},"
                 );
                 let _ = writeln!(
                     from_row,
@@ -10378,8 +10378,9 @@ fn bytea_to_hex(bytes: &[u8]) -> String {
 /// a form field uses it.
 const BYTEA_HEX_FROM_FN: &str = r#"/// Parse `\x` + hex into bytes. Both letter cases are valid.
 ///
-/// A blank value is empty bytes. Any other input is an error. This includes
-/// a missing prefix and an odd number of digits. It never panics.
+/// A blank value is empty bytes. A nullable column maps blank to NULL
+/// before this call. Other bad input is an error, for example a missing
+/// prefix or an odd number of digits. It never panics.
 fn bytea_from_hex(text: &str) -> Result<Vec<u8>, String> {
     let text = text.trim();
     if text.is_empty() {
@@ -18441,7 +18442,9 @@ async fn main() {
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
         assert!(routes.contains("pub payload: Option<String>,"), "{routes}");
         assert!(
-            routes.contains("payload: form.payload.as_deref().map(bytea_from_hex).transpose()"),
+            routes.contains(
+                "payload: form.payload.as_deref().filter(|value| !value.trim().is_empty()).map(bytea_from_hex).transpose()"
+            ),
             "{routes}"
         );
         assert!(
