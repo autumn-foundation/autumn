@@ -345,6 +345,19 @@ impl Injector {
         })
     }
 
+    /// A scope that matches no rule, for a nested request with no rules.
+    fn empty_scope(self: &Arc<Self>, path: &str) -> Arc<RequestScope> {
+        Arc::new(RequestScope {
+            path: path.into(),
+            injector: Arc::clone(self),
+            generation: generation_of(self.state.load(Ordering::Acquire)),
+            matched: 0,
+            fired: AtomicBool::new(false),
+            errored: AtomicBool::new(false),
+            route_rolled: AtomicBool::new(false),
+        })
+    }
+
     /// Count one faulted request of arm `generation`. Returns the toggle
     /// sequence when this request trips the stop condition. A request of an
     /// earlier arm does not count.

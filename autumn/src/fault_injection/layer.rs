@@ -87,13 +87,19 @@ where
         // SSG/ISG path has two scope layers. An MCP replay has another path,
         // so it gets a scope of its own.
         let path = req.uri().path();
-        let same_path = SCOPE
-            .try_with(|scope| &*scope.path == path)
-            .unwrap_or(false);
-        let scope = (!same_path)
-            .then(|| self.injector.scope_for(path))
-            .flatten();
-        let Some(scope) = scope else {
+        let outer = SCOPE.try_with(|scope| &*scope.path == path);
+        if matches!(outer, Ok(true)) {
+            return Box::pin(self.inner.call(req));
+        }
+        let Some(scope) = self.injector.scope_for(path) else {
+            if outer.is_ok() {
+                // Another path in an outer scope, and no rule matches this
+                // one: run it with no faults, so the outer rules do not leak
+                // in. It does not count.
+                let empty = self.injector.empty_scope(path);
+                let inner = SCOPE.sync_scope(Arc::clone(&empty), || self.inner.call(req));
+                return Box::pin(SCOPE.scope(empty, inner));
+            }
             return Box::pin(self.inner.call(req));
         };
         // Build the inner future in the scope too: an inner layer can read
@@ -398,6 +404,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"503", "the replayed /api/x request is faulted");
+    }
+
+    /// A nested request for a path with no rule does not inherit the outer
+    /// scope's faults.
+    #[tokio::test]
+    async fn a_nested_request_with_no_rule_gets_no_faults() {
+        let mut mcp = error_rule(1_000_000);
+        mcp.target = FaultTarget::Database;
+        mcp.routes = vec![super::super::RoutePattern::parse("/mcp")];
+        let injector = injector(vec![mcp], 1_000);
+        let outer_scope = injector.scope_for("/mcp").unwrap();
+        let inner = axum::Router::new()
+            .route(
+                "/api/x",
+                get(|| async {
+                    match crate::fault_injection::inject(FaultTarget::Database).await {
+                        Ok(()) => "clean",
+                        Err(_) => "faulted",
+                    }
+                }),
+            )
+            .layer(FaultScopeLayer::new(Arc::clone(&injector)));
+        let response = SCOPE
+            .scope(
+                outer_scope,
+                inner.oneshot(Request::get("/api/x").body(Body::empty()).unwrap()),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"clean");
     }
 
     /// Outside the timeout layer, a long latency fault ends at the deadline
