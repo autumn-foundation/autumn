@@ -29,7 +29,9 @@ use axum::http::{HeaderValue, Request, Response};
 use axum::response::IntoResponse;
 use tower::{Layer, Service};
 
-use super::{FAULT_HEADER, FaultDelay, FaultTarget, Injector, RequestScope, RouteFault, SCOPE};
+use super::{
+    DeferredLatency, FAULT_HEADER, FaultTarget, Injector, RequestScope, RouteFault, SCOPE,
+};
 
 type BoxFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send>>;
 
@@ -214,13 +216,13 @@ where
                 }
             })
             .unwrap_or_default();
-        // Outside the timeout layer: wait at most the timeout, then fail as
-        // the timeout layer would.
-        if let Some(deadline) = self.deadline
-            && fault.latency >= deadline
+        if self.deadline.is_none()
+            && let Some(deferred) = req.extensions().get::<DeferredLatency>()
+            && deferred.take()
         {
-            fault.latency = deadline;
-            fault.error = Some(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+            // The outer layer rolled this latency. Wait for it here, inside
+            // the request timeout of the route.
+            fault.latency = deferred.latency;
         }
         if let Some(status) = fault.error {
             return Box::pin(async move {
@@ -237,13 +239,28 @@ where
         // place.
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
-        if self.deadline.is_some() {
-            // Outside the timeout layer: the wait uses part of the deadline.
-            req.extensions_mut().insert(FaultDelay(fault.latency));
-        }
+        let Some(deadline) = self.deadline else {
+            return Box::pin(async move {
+                tokio::time::sleep(fault.latency).await;
+                inner.call(req).await
+            });
+        };
+        // Outside the timeout layer: let the inner route layer wait. A
+        // response that did not pass it (a cached page) waits here, at most
+        // the request timeout, and then fails as a timeout does.
+        let deferred = DeferredLatency::new(fault.latency);
+        req.extensions_mut().insert(deferred.clone());
         Box::pin(async move {
+            let response = inner.call(req).await?;
+            if !deferred.take() {
+                return Ok(response);
+            }
+            if fault.latency >= deadline {
+                tokio::time::sleep(deadline).await;
+                return Ok(injected_error(axum::http::StatusCode::SERVICE_UNAVAILABLE));
+            }
             tokio::time::sleep(fault.latency).await;
-            inner.call(req).await
+            Ok(response)
         })
     }
 }
@@ -471,34 +488,70 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_secs(2));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn an_outer_latency_tells_the_timeout_layer_its_wait() {
+    fn latency_injector(latency: Duration) -> Arc<Injector> {
         let mut rule = error_rule(1_000_000);
         rule.kind = FaultKind::Latency;
-        rule.latency = Duration::from_millis(900);
-        let injector = injector(vec![rule], 1_000);
+        rule.latency = latency;
+        injector(vec![rule], 1_000)
+    }
+
+    /// The SSG/ISG shape: the outer pair, outside an inner router with its
+    /// own route timeout and the inner route layer.
+    fn static_path_app(injector: &Arc<Injector>, route_timeout: Option<Duration>) -> axum::Router {
+        let inner = axum::Router::new()
+            .route("/x", get(|| async { "ok" }))
+            .layer(FaultInjectionLayer::new(None));
+        let inner = match route_timeout {
+            Some(limit) => inner.layer(axum::middleware::from_fn(
+                move |req: Request<Body>, next: axum::middleware::Next| async move {
+                    tokio::time::timeout(limit, next.run(req))
+                        .await
+                        .unwrap_or_else(|_| {
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        })
+                },
+            )),
+            None => inner,
+        };
+        inner.layer((
+            FaultScopeLayer::new(Arc::clone(injector)),
+            FaultInjectionLayer::new(Some(Duration::from_secs(1))),
+        ))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_route_timeout_bounds_an_outer_latency() {
+        let injector = latency_injector(Duration::from_millis(900));
+        let app = static_path_app(&injector, Some(Duration::from_millis(500)));
+        let started = tokio::time::Instant::now();
+        assert_eq!(status(app, "/x").await, 503);
+        assert_eq!(started.elapsed(), Duration::from_millis(500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_route_with_no_timeout_keeps_a_long_outer_latency() {
+        let injector = latency_injector(Duration::from_secs(3));
+        let app = static_path_app(&injector, None);
+        let started = tokio::time::Instant::now();
+        assert_eq!(status(app, "/x").await, 200);
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+    }
+
+    /// A cached page does not reach the inner route layer. It waits in the
+    /// outer layer.
+    #[tokio::test(start_paused = true)]
+    async fn a_cached_page_waits_in_the_outer_layer() {
+        let injector = latency_injector(Duration::from_millis(300));
         let app = axum::Router::new()
-            .route(
-                "/x",
-                get(|req: Request<Body>| async move {
-                    req.extensions()
-                        .get::<FaultDelay>()
-                        .map_or(0, |spent| spent.0.as_millis())
-                        .to_string()
-                }),
-            )
+            .route("/x", get(|| async { "ok" }))
             .layer((
                 FaultScopeLayer::new(Arc::clone(&injector)),
                 FaultInjectionLayer::new(Some(Duration::from_secs(1))),
             ));
-        let response = app
-            .oneshot(Request::get("/x").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let body = axum::body::to_bytes(response.into_body(), 64)
-            .await
-            .unwrap();
-        assert_eq!(&body[..], b"900");
+        let started = tokio::time::Instant::now();
+        assert_eq!(status(app, "/x").await, 200);
+        assert_eq!(started.elapsed(), Duration::from_millis(300));
+        assert_eq!(injector.injected.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

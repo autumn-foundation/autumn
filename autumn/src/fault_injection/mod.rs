@@ -63,12 +63,29 @@ pub use layer::{FaultInjectionLayer, FaultInjectionService};
 /// The header on a response from an injected route error.
 pub const FAULT_HEADER: &str = "x-autumn-fault";
 
-/// Request extension: the time that an outer route fault waited.
+/// Request extension: a route latency that the outer layer rolled.
 ///
-/// The request timeout layer subtracts it from the deadline, so the wait and
-/// the handler share one request timeout.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct FaultDelay(pub(crate) Duration);
+/// The inner route layer waits for it, inside the request timeout of the
+/// route. When no inner layer takes it (a cached page), the outer layer waits.
+#[derive(Clone, Debug)]
+struct DeferredLatency {
+    latency: Duration,
+    taken: Arc<AtomicBool>,
+}
+
+impl DeferredLatency {
+    fn new(latency: Duration) -> Self {
+        Self {
+            latency,
+            taken: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Takes the wait. Only the first call gets `true`.
+    fn take(&self) -> bool {
+        !self.taken.swap(true, Ordering::AcqRel)
+    }
+}
 
 /// The audit actor when the framework arms or disarms the faults.
 const SYSTEM_ACTOR: &str = "autumn";
