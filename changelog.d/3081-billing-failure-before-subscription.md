@@ -5,7 +5,7 @@
 - **billing:** an invoice keeps the provider subscription id. Storing the
   subscription links its invoices and open dunning rows.
 - **billing:** run the new migration
-  `20261008000000_billing_invoice_provider_subscription`. Invoices stored
+  `20261008182813_billing_invoice_provider_subscription`. Invoices stored
   before the upgrade are not linked.
 - **billing:** a custom `BillingStore` must override the new
   `link_subscription` method to get the fix. The default does nothing.
