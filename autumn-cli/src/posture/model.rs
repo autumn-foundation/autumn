@@ -36,7 +36,11 @@ pub const MIN_SCHEMA_VERSION: u32 = 3;
 /// dimension, and contributes no `mtls` projection lines. A route that gains an
 /// mTLS requirement therefore shows up as an added line, never as a silent
 /// re-interpretation of an old one.
-pub const MAX_SCHEMA_VERSION: u32 = 4;
+///
+/// v5 (#2472) *adds* the top-level `build`. A v3 or v4 manifest has none, and
+/// reads as the dev build with default features, which is the only build
+/// those versions could come from.
+pub const MAX_SCHEMA_VERSION: u32 = 5;
 
 // Deliberately a literal, not `MANIFEST_SCHEMA_VERSION`. Tracking the emitter
 // would auto-widen what this differ accepts on the very bump whose doc comment
@@ -88,8 +92,77 @@ impl std::error::Error for ManifestError {}
 #[derive(Debug, Clone, Deserialize)]
 pub struct PostureManifest {
     pub schema_version: u32,
+    /// The Cargo build the manifest describes (schema v5, #2472).
+    #[serde(default)]
+    pub build: BuildConfig,
     #[serde(default)]
     pub dimensions: Dimensions,
+    /// Route rows a pre-v5 emitter wrote by mistake. The diff does not see
+    /// them, but the digest does, so a digest a release recorded still
+    /// matches.
+    #[serde(skip)]
+    pub legacy_rows: Vec<RouteEntry>,
+}
+
+/// The Cargo build a manifest describes. A missing field reads as the dev
+/// build with default features.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct BuildConfig {
+    pub profile: String,
+    pub features: Vec<String>,
+    pub all_features: bool,
+    pub no_default_features: bool,
+}
+
+impl Default for BuildConfig {
+    fn default() -> Self {
+        Self {
+            profile: "dev".to_owned(),
+            features: Vec::new(),
+            all_features: false,
+            no_default_features: false,
+        }
+    }
+}
+
+impl BuildConfig {
+    /// Whether this is a plain `cargo build`.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// One escaped line that changes when the build changes.
+    #[must_use]
+    pub fn canonical(&self) -> String {
+        format!(
+            "profile={}\tfeatures={}\tall-features={}\tno-default-features={}",
+            escape_field(&self.profile),
+            escape_list(&self.features),
+            self.all_features,
+            self.no_default_features
+        )
+    }
+
+    /// The build in words, e.g. `release profile; features: embed-assets`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        let mut parts = vec![format!("{} profile", self.profile)];
+        if self.no_default_features {
+            parts.push("no default features".to_owned());
+        }
+        if self.all_features {
+            parts.push("all features".to_owned());
+        }
+        if !self.features.is_empty() {
+            parts.push(format!("features: {}", self.features.join(", ")));
+        }
+        if parts.len() == 1 {
+            parts.push("default features".to_owned());
+        }
+        parts.join("; ")
+    }
 }
 
 /// The manifest dimensions. Every one defaults to empty so a manifest that
@@ -152,7 +225,7 @@ pub struct CsrfDimension {
     pub entries: Vec<CsrfEntry>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CsrfEntry {
     pub path: String,
     pub method: String,
@@ -215,7 +288,7 @@ pub struct MtlsDimension {
 }
 
 /// One route's declared mTLS requirement.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct MtlsEntry {
     pub path: String,
     pub method: String,
@@ -384,10 +457,11 @@ impl PostureManifest {
     ///
     /// `path` is only used to make the diagnostics point somewhere.
     pub fn parse(json: &str, path: &str) -> Result<Self, ManifestError> {
-        let manifest: Self = serde_json::from_str(json).map_err(|e| ManifestError::Malformed {
-            path: path.to_owned(),
-            message: e.to_string(),
-        })?;
+        let mut manifest: Self =
+            serde_json::from_str(json).map_err(|e| ManifestError::Malformed {
+                path: path.to_owned(),
+                message: e.to_string(),
+            })?;
         if manifest.schema_version < MIN_SCHEMA_VERSION
             || manifest.schema_version > MAX_SCHEMA_VERSION
         {
@@ -396,6 +470,32 @@ impl PostureManifest {
                 found: manifest.schema_version,
             });
         }
+        if manifest.schema_version < 5 {
+            manifest.legacy_rows = drop_legacy_probe_rows(&mut manifest.dimensions);
+        }
+        // No app mounts one method on one path twice (Axum panics), so a
+        // duplicate row is a corrupt manifest. A merge of two rows cannot show
+        // two alternative guards, and it can hide a widening (#2472).
+        let d = &manifest.dimensions;
+        refuse_duplicates(
+            path,
+            "routes",
+            d.routes.entries.iter().map(|e| (e.key(), &e.path)),
+        )?;
+        refuse_duplicates(
+            path,
+            "csrf",
+            d.csrf
+                .entries
+                .iter()
+                .map(|e| ((normalize_captures(&e.path), e.method.clone()), &e.path)),
+        )?;
+        refuse_duplicates(
+            path,
+            "mtls",
+            d.mtls.entries.iter().map(|e| (e.key(), &e.path)),
+        )?;
+        manifest.build.features = crate::routes_audit::normalize_features(&manifest.build.features);
         Ok(manifest)
     }
 
@@ -422,7 +522,18 @@ impl PostureManifest {
     /// exists to avoid.
     pub fn projection(&self) -> String {
         let mut lines: Vec<String> = Vec::new();
-        for r in &self.dimensions.routes.entries {
+        // Only a non-default build, so a manifest from before v5 keeps its
+        // digest (#2472).
+        if !self.build.is_default() {
+            lines.push(format!("build\t{}", self.build.canonical()));
+        }
+        for r in self
+            .dimensions
+            .routes
+            .entries
+            .iter()
+            .chain(&self.legacy_rows)
+        {
             let roles: Vec<String> = r.role_set().into_iter().collect();
             let scopes: Vec<String> = r.scope_set().into_iter().collect();
             lines.push(format!(
@@ -506,6 +617,63 @@ impl PostureManifest {
     pub fn posture_digest(&self) -> String {
         hex_digest(self.projection().as_bytes())
     }
+}
+
+/// Remove the one duplicate that a pre-v5 emitter wrote, and return the
+/// route rows it removed.
+///
+/// Before v5, the dump listed a built-in health probe even when a user route
+/// replaced it. The router mounted only the user route. So a `framework` row
+/// beside a non-framework row with the same key is removed, and a csrf or
+/// mtls row that exactly copies an earlier row is removed. Any other
+/// duplicate stays, and parsing refuses it.
+fn drop_legacy_probe_rows(d: &mut Dimensions) -> Vec<RouteEntry> {
+    let owned: BTreeSet<RouteKey> = d
+        .routes
+        .entries
+        .iter()
+        .filter(|e| e.classification != "framework")
+        .map(RouteEntry::key)
+        .collect();
+    let (dropped, kept) = std::mem::take(&mut d.routes.entries)
+        .into_iter()
+        .partition(|e| e.classification == "framework" && owned.contains(&e.key()));
+    d.routes.entries = kept;
+    // Exact copies project to one line each, so the digest does not change.
+    dedup_exact(&mut d.csrf.entries);
+    dedup_exact(&mut d.mtls.entries);
+    dropped
+}
+
+/// Keep the first of rows that are exactly equal.
+fn dedup_exact<T: PartialEq>(rows: &mut Vec<T>) {
+    let mut kept: Vec<T> = Vec::with_capacity(rows.len());
+    for row in rows.drain(..) {
+        if !kept.contains(&row) {
+            kept.push(row);
+        }
+    }
+    *rows = kept;
+}
+
+/// Refuse a dimension that lists one `(path, method)` more than once.
+fn refuse_duplicates<'a>(
+    file: &str,
+    dimension: &str,
+    rows: impl Iterator<Item = (RouteKey, &'a String)>,
+) -> Result<(), ManifestError> {
+    let mut seen = BTreeSet::new();
+    for ((normalized, method), path) in rows {
+        if !seen.insert((normalized, method.clone())) {
+            return Err(ManifestError::Malformed {
+                path: file.to_owned(),
+                message: format!(
+                    "{dimension} lists {method} {path} more than once, but a route has one entry"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Escape a field for a delimiter-joined canonical form.
@@ -623,6 +791,181 @@ mod tests {
     fn malformed_json_names_the_file() {
         let err = PostureManifest::parse("{ not json", "base.json").expect_err("must fail");
         assert!(err.to_string().contains("base.json"), "{err}");
+    }
+
+    /// Every manifest before v5 came from a dev build with default features,
+    /// so a missing `build` reads as exactly that.
+    #[test]
+    fn a_manifest_without_a_build_reads_as_the_default_build() {
+        let m = PostureManifest::parse(&manifest(""), "m.json").expect("parses");
+        assert_eq!(m.build, BuildConfig::default());
+        assert!(m.build.is_default());
+        assert_eq!(m.build.profile, "dev");
+    }
+
+    /// A default build adds nothing to the digest, so a v4 manifest and a v5
+    /// one of the same app hash the same and no baseline goes stale.
+    #[test]
+    fn the_default_build_does_not_move_the_digest() {
+        let older = PostureManifest::parse(&manifest(""), "m.json").expect("parses");
+        let v5 = PostureManifest::parse(
+            &manifest("").replace(
+                "\"schema_version\": 3,",
+                r#""schema_version": 5, "build": {"profile": "dev", "features": [],
+                   "all_features": false, "no_default_features": false},"#,
+            ),
+            "m.json",
+        )
+        .expect("parses");
+        assert_eq!(older.posture_digest(), v5.posture_digest());
+    }
+
+    /// A non-default build is part of the digest: a baseline built under
+    /// other flags than CI uses is stale, and the attested digest names the
+    /// build it describes.
+    #[test]
+    fn a_non_default_build_moves_the_digest() {
+        let with = |build: &str| {
+            PostureManifest::parse(
+                &manifest("").replace(
+                    "\"schema_version\": 3,",
+                    &format!(r#""schema_version": 5, "build": {build},"#),
+                ),
+                "m.json",
+            )
+            .expect("parses")
+            .posture_digest()
+        };
+        let dev = with(r#"{"profile": "dev"}"#);
+        let release = with(r#"{"profile": "release"}"#);
+        let featured = with(r#"{"profile": "release", "features": ["embed-assets"]}"#);
+        assert_ne!(dev, release);
+        assert_ne!(release, featured);
+        // Feature order and duplicates carry no meaning.
+        assert_eq!(
+            with(r#"{"profile": "release", "features": ["b", "a", "a"]}"#),
+            with(r#"{"profile": "release", "features": ["a", "b"]}"#)
+        );
+    }
+
+    /// No real app mounts one method on one path twice (Axum panics), so a
+    /// duplicate key is a corrupt manifest. A merge of two entries cannot
+    /// show two alternative guards, and it can hide a widening (#2472).
+    #[test]
+    fn a_duplicate_route_key_is_refused() {
+        let gated =
+            r#"{"path":"/a/{id}","method":"GET","classification":"gated","roles":["admin"]}"#;
+        let renamed = r#"{"path":"/a/{other}","method":"GET","classification":"public"}"#;
+        let err = PostureManifest::parse(&manifest(&format!("{gated},{renamed}")), "m.json")
+            .expect_err("a duplicate key must be refused");
+        assert!(matches!(err, ManifestError::Malformed { .. }), "{err}");
+        assert!(err.to_string().contains("GET /a/{other}"), "{err}");
+
+        // The same path on another method is another route.
+        let post = r#"{"path":"/a/{id}","method":"POST","classification":"gated"}"#;
+        assert!(PostureManifest::parse(&manifest(&format!("{gated},{post}")), "m.json").is_ok());
+    }
+
+    /// Before v5, the dump listed the built-in `GET /health` beside a user
+    /// route that replaced it (the router never mounted the probe). Such a
+    /// committed baseline must still read, as the user route alone.
+    #[test]
+    fn a_pre_v5_probe_row_beside_its_user_route_is_dropped() {
+        let doc = |version: u32| {
+            format!(
+                r#"{{"schema_version":{version},"dimensions":{{
+                  "routes":{{"entries":[
+                    {{"path":"/health","method":"GET","classification":"public"}},
+                    {{"path":"/health","method":"GET","classification":"framework"}}]}},
+                  "mtls":{{"mode":"required","entries":[
+                    {{"path":"/health","method":"GET","mtls_required":true}},
+                    {{"path":"/health","method":"GET","mtls_required":true}}]}}
+                }}}}"#
+            )
+        };
+        for version in [3, 4] {
+            let m = PostureManifest::parse(&doc(version), "m.json").expect("legacy baseline reads");
+            assert_eq!(m.dimensions.routes.entries.len(), 1);
+            assert_eq!(m.dimensions.routes.entries[0].classification, "public");
+            assert_eq!(m.dimensions.mtls.entries.len(), 1);
+        }
+        // The fixed emitter never writes it, so v5 stays strict.
+        assert!(PostureManifest::parse(&doc(5), "m.json").is_err());
+    }
+
+    /// A release recorded the digest of the manifest as written, both rows
+    /// included. The cleanup is for the diff only, so `posture verify` still
+    /// matches that recorded digest.
+    #[test]
+    fn a_dropped_legacy_row_stays_in_the_digest() {
+        let json = r#"{"schema_version":4,"dimensions":{"routes":{"entries":[
+            {"path":"/health","method":"GET","classification":"public"},
+            {"path":"/health","method":"GET","classification":"framework"}]}}}"#;
+        let m = PostureManifest::parse(json, "m.json").expect("legacy baseline reads");
+        assert_eq!(m.dimensions.routes.entries.len(), 1);
+        assert_eq!(
+            m.projection(),
+            "route\t/health\tGET\tframework\troles=0:\tscopes=0:\tpolicy=false\n\
+             route\t/health\tGET\tpublic\troles=0:\tscopes=0:\tpolicy=false"
+        );
+    }
+
+    /// Only that one known pattern is forgiven. Two user rows, or two rows
+    /// that differ, are still refused in an old manifest.
+    #[test]
+    fn other_pre_v5_duplicates_are_still_refused() {
+        let routes = r#"{"schema_version":4,"dimensions":{"routes":{"entries":[
+            {"path":"/a","method":"GET","classification":"public"},
+            {"path":"/a","method":"GET","classification":"gated","roles":["admin"]}]}}}"#;
+        assert!(PostureManifest::parse(routes, "m.json").is_err());
+        let mtls = r#"{"schema_version":4,"dimensions":{"mtls":{"mode":"required","entries":[
+            {"path":"/a","method":"GET","mtls_required":true},
+            {"path":"/a","method":"GET","mtls_required":false}]}}}"#;
+        assert!(PostureManifest::parse(mtls, "m.json").is_err());
+    }
+
+    #[test]
+    fn a_build_label_names_every_flag() {
+        assert_eq!(
+            BuildConfig::default().label(),
+            "dev profile; default features"
+        );
+        let build = BuildConfig {
+            profile: "release".to_owned(),
+            features: vec!["a".to_owned(), "b".to_owned()],
+            all_features: true,
+            no_default_features: true,
+        };
+        assert_eq!(
+            build.label(),
+            "release profile; no default features; all features; features: a, b"
+        );
+    }
+
+    /// The csrf and mtls rows are one per route too. A duplicate row can
+    /// hide a lost requirement behind a kept one, so it is refused.
+    #[test]
+    fn a_duplicate_csrf_or_mtls_row_is_refused() {
+        let doc = |dimension: &str, first: &str, second: &str| {
+            format!(
+                r#"{{"schema_version":5,"dimensions":{{"{dimension}":{{"entries":[{first},{second}]}}}}}}"#
+            )
+        };
+        // A renamed capture is the same route shape.
+        let csrf = doc(
+            "csrf",
+            r#"{"path":"/pay/{id}","method":"POST","csrf_enforced":true}"#,
+            r#"{"path":"/pay/{other}","method":"POST","csrf_enforced":false}"#,
+        );
+        let mtls = doc(
+            "mtls",
+            r#"{"path":"/a","method":"GET","mtls_required":true}"#,
+            r#"{"path":"/a","method":"GET","mtls_required":false}"#,
+        );
+        for json in [csrf, mtls] {
+            let err = PostureManifest::parse(&json, "m.json").expect_err("must be refused");
+            assert!(matches!(err, ManifestError::Malformed { .. }), "{err}");
+        }
     }
 
     #[test]
