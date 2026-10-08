@@ -255,8 +255,13 @@ enum TableEvent {
     /// `ALTER TABLE old RENAME TO new`: the record moves with the table, so a
     /// rename INTO `comments` carries the source table's columns across.
     Rename { from: TableRef, to: TableRef },
-    /// `ALTER TABLE name SET SCHEMA other`: same name, new schema.
-    Move { from: TableRef, to: TableRef },
+    /// `ALTER TABLE [IF EXISTS] name SET SCHEMA other`: same name, new schema.
+    /// With `IF EXISTS`, an absent source makes it a no-op.
+    Move {
+        from: TableRef,
+        to: TableRef,
+        if_exists: bool,
+    },
 }
 
 /// Replay every migration's `up.sql` in version order: for every table, does it
@@ -299,7 +304,17 @@ fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
                 continue;
             }
             if let Some(to) = table_set_schema_target(statement, &table) {
-                events.push((at, TableEvent::Move { from: table, to }));
+                let if_exists = sql[at + "alter table".len()..]
+                    .trim_start()
+                    .starts_with("if exists");
+                events.push((
+                    at,
+                    TableEvent::Move {
+                        from: table,
+                        to,
+                        if_exists,
+                    },
+                ));
                 continue;
             }
             // An ALTER naming the column may be adding it, dropping it, or
@@ -367,7 +382,14 @@ fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
                     state.exists = true;
                     tables.insert(to, state);
                 }
-                TableEvent::Move { from, to } => {
+                TableEvent::Move {
+                    from,
+                    to,
+                    if_exists,
+                } => {
+                    if if_exists && !tables.get(&from).is_some_and(|state| state.exists) {
+                        continue;
+                    }
                     let mut state = tables.remove(&from).unwrap_or_default();
                     state.exists = true;
                     tables.insert(to, state);
@@ -2123,6 +2145,23 @@ mod tests {
         )
         .expect("write");
         assert!(ensure_no_comments_conflict(tmp.path()).is_ok());
+    }
+
+    /// `IF EXISTS` makes a schema move of an absent table a no-op.
+    #[test]
+    fn a_conditional_schema_move_of_an_absent_table_changes_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_move");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "ALTER TABLE IF EXISTS archive.comments SET SCHEMA public;\n",
+        )
+        .expect("write");
+        assert!(
+            ensure_no_comments_conflict(tmp.path()).is_ok(),
+            "nothing moved, so `comments` is still free"
+        );
     }
 
     /// DDL verbs may be split by any whitespace too, and by a comment.
