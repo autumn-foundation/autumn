@@ -4022,7 +4022,8 @@ pub struct JobTenantsConfig {
     #[serde(default)]
     pub max_concurrent: usize,
     /// The number of shuffle-shard lanes. Worker `i` serves lane
-    /// `i % lanes`. `0` (the default) turns lanes off.
+    /// `i % lanes`. `0` (the default) turns lanes off. The runtime uses at
+    /// most `jobs.workers` lanes.
     #[serde(default)]
     pub lanes: u16,
     /// The number of lanes that serve each tenant. `0` means 1.
@@ -4405,9 +4406,10 @@ pub struct JobPostgresConfig {
     /// within this bound. Default: 30 seconds.
     #[serde(default = "default_jobs_pg_visibility_timeout_ms")]
     pub visibility_timeout_ms: u64,
-    /// Keep an `autumn_jobs` table on each shard and run workers for it
-    /// (issue #3072). Then `enqueue_in_tx` on a shard connection commits or
-    /// rolls back with the shard's data. Default: `false`.
+    /// Shard-local jobs (issue #3072). Make an `autumn_jobs` table on each
+    /// shard. Run workers for each shard. Then `enqueue_in_tx` on a shard
+    /// connection commits or rolls back with the shard's data. Default:
+    /// `false`.
     #[serde(default)]
     pub shard_local: bool,
 }
@@ -12056,7 +12058,8 @@ pub struct TenancyConfig {
 
     /// The most requests of one tenant in flight at the same time (issue
     /// #3072). More get `503` with `Retry-After`. `0` (the default) sets no
-    /// limit.
+    /// limit. Compare `server.max_concurrent_requests`, the limit for all
+    /// tenants together.
     #[serde(default)]
     pub max_concurrent_requests: usize,
 
@@ -16979,6 +16982,26 @@ path = "/healthz"
             config.tenancy.public_paths,
             vec!["/login", "/signup", "/assets"]
         );
+    }
+
+    #[test]
+    fn env_override_isolation_knobs() {
+        // Issue #3072: every isolation knob is settable from the environment.
+        let env = MockEnv::new()
+            .with("AUTUMN_TENANCY__MAX_CONCURRENT_REQUESTS", "32")
+            .with("AUTUMN_TENANCY__MAX_DB_CONNECTIONS", "4")
+            .with("AUTUMN_JOBS__TENANTS__MAX_CONCURRENT", "2")
+            .with("AUTUMN_JOBS__TENANTS__LANES", "8")
+            .with("AUTUMN_JOBS__TENANTS__LANES_PER_TENANT", "3")
+            .with("AUTUMN_JOBS__POSTGRES__SHARD_LOCAL", "true");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.tenancy.max_concurrent_requests, 32);
+        assert_eq!(config.tenancy.max_db_connections, 4);
+        assert_eq!(config.jobs.tenants.max_concurrent, 2);
+        assert_eq!(config.jobs.tenants.lanes, 8);
+        assert_eq!(config.jobs.tenants.lanes_per_tenant, 3);
+        assert!(config.jobs.postgres.shard_local);
     }
 
     #[test]

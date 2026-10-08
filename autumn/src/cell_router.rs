@@ -10,6 +10,7 @@ use crate::sharding::{ShardKey, SlotId, slot_for_key};
 
 /// One cell: a name, the base URL of its ingress, and the slots it owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CellSpec {
     /// A stable name, for example `"cell-eu-1"`.
     pub name: String,
@@ -18,6 +19,23 @@ pub struct CellSpec {
     /// The slots this cell owns. Leave every cell empty to split the slots
     /// evenly in order.
     pub slots: Vec<SlotSpec>,
+}
+
+impl CellSpec {
+    /// Make a cell. Give empty `slots` to every cell to split the slots
+    /// evenly in order.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        base_url: impl Into<String>,
+        slots: Vec<SlotSpec>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            base_url: base_url.into(),
+            slots,
+        }
+    }
 }
 
 /// An error in the cell list.
@@ -84,12 +102,7 @@ impl CellRouter {
         Ok(Self { cells, slot_map })
     }
 
-    /// The cell that owns `slot`.
-    ///
-    /// # Panics
-    ///
-    /// Never: a `SlotId` from [`crate::sharding::slot_for_key`] is always in
-    /// range. An out-of-range slot maps to the last cell.
+    /// The cell that owns `slot`. An out-of-range slot maps to the last cell.
     #[must_use]
     pub fn for_slot(&self, slot: SlotId) -> &CellSpec {
         let index = self
@@ -111,11 +124,13 @@ impl CellRouter {
         self.for_key(ShardKey::Str(tenant))
     }
 
-    /// The URL in `tenant`'s cell for `path_and_query` (which starts with `/`).
+    /// The URL in `tenant`'s cell for `path_and_query`. The result always
+    /// has a `/` after the base URL, so the input cannot change the host.
     #[must_use]
     pub fn url_for(&self, tenant: &str, path_and_query: &str) -> String {
         let base = self.for_tenant(tenant).base_url.trim_end_matches('/');
-        format!("{base}{path_and_query}")
+        let path = path_and_query.trim_start_matches('/');
+        format!("{base}/{path}")
     }
 
     /// The cells, in the order given.
@@ -167,14 +182,14 @@ mod tests {
     use super::*;
 
     fn cell(name: &str, slots: &[&str]) -> CellSpec {
-        CellSpec {
-            name: name.to_owned(),
-            base_url: format!("http://{name}:3000/"),
-            slots: slots
+        CellSpec::new(
+            name,
+            format!("http://{name}:3000/"),
+            slots
                 .iter()
                 .map(|s| SlotSpec::Range((*s).to_owned()))
                 .collect(),
-        }
+        )
     }
 
     #[test]
@@ -203,6 +218,11 @@ mod tests {
         assert_eq!(
             router.url_for("acme", "/orders?x=1"),
             "http://a:3000/orders?x=1"
+        );
+        // A path without a leading `/` cannot change the host.
+        assert_eq!(
+            router.url_for("acme", "@evil.example/x"),
+            "http://a:3000/@evil.example/x"
         );
     }
 

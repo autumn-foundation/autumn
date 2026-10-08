@@ -3396,6 +3396,7 @@ pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 30] = [
     "autumn_requests_shed_total",
     "autumn_admission_limit",
     "autumn_admission_shed_total",
+    "autumn_tenant_bulkhead_rejections_total",
     "autumn_http_route_requests_total",
     "autumn_metrics_source_errors_total",
     SERIES_DROPPED_FAMILY,
@@ -3611,6 +3612,20 @@ fn write_admission_metrics(
         let _ = writeln!(
             out,
             "autumn_admission_shed_total{{version=\"{version}\",criticality=\"{criticality}\"}} {count}"
+        );
+    }
+    out.push_str(
+        "# HELP autumn_tenant_bulkhead_rejections_total \
+         Work rejected by a per-tenant bulkhead, by kind\n",
+    );
+    out.push_str("# TYPE autumn_tenant_bulkhead_rejections_total counter\n");
+    for (kind, count) in [
+        ("request", admission.tenant_request_rejections),
+        ("db", admission.tenant_db_rejections),
+    ] {
+        let _ = writeln!(
+            out,
+            "autumn_tenant_bulkhead_rejections_total{{version=\"{version}\",kind=\"{kind}\"}} {count}"
         );
     }
 }
@@ -8239,6 +8254,13 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         assert!(text.contains("# TYPE autumn_admission_shed_total counter"));
         assert!(text.contains(
             "autumn_admission_shed_total{version=\"stable\",criticality=\"sheddable\"} 0"
+        ));
+        assert!(text.contains("# TYPE autumn_tenant_bulkhead_rejections_total counter"));
+        assert!(text.contains(
+            "autumn_tenant_bulkhead_rejections_total{version=\"stable\",kind=\"request\"} 0"
+        ));
+        assert!(text.contains(
+            "autumn_tenant_bulkhead_rejections_total{version=\"stable\",kind=\"db\"} 0"
         ));
     }
 

@@ -666,7 +666,10 @@ pub async fn tenancy_middleware(
     let _request_permit = match &bulkheads.requests {
         Some(bulkhead) => match bulkhead.try_acquire(&tenant_id) {
             Some(permit) => Some(permit),
-            None => return tenant_bulkhead_rejection(&tenant_id),
+            None => {
+                state.metrics.record_tenant_request_rejection();
+                return tenant_bulkhead_rejection(&tenant_id);
+            }
         },
         None => None,
     };

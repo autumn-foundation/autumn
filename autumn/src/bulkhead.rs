@@ -5,9 +5,9 @@
 //!   (`tenancy.max_concurrent_requests`) and one for database connections
 //!   (`tenancy.max_db_connections`). The `local` job runtime uses one for
 //!   job slots (`jobs.tenants.max_concurrent`).
-//! - [`shuffle_shard`]: a stable set of lanes for a tenant. Two tenants share
-//!   all their lanes only rarely, so one noisy tenant fills a small part of
-//!   the lanes and slows few other tenants.
+//! - [`shuffle_shard`]: a stable set of lanes for a tenant. Two tenants
+//!   rarely share all their lanes. Thus one noisy tenant fills few lanes and
+//!   slows few tenants.
 //!
 //! See `docs/guide/cell-isolation.md`.
 
@@ -46,7 +46,7 @@ impl std::fmt::Debug for TenantBulkhead {
         f.debug_struct("TenantBulkhead")
             .field("max_per_tenant", &self.max_per_tenant)
             .field("tracked_tenants", &self.tracked_tenants())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -201,11 +201,15 @@ const fn mix64(mut z: u64) -> u64 {
 /// The lanes of `key`: `min(size, lanes)` distinct lanes in `0..lanes`,
 /// sorted.
 ///
-/// The result is a permanent contract. It depends only on the arguments, so
-/// every process and every version gives a tenant the same lanes. Round `i`
-/// hashes `key`, a `0xff` separator and `i` (little endian) with FNV-1a,
-/// mixes the hash with the splitmix64 finalizer, and takes it modulo `lanes`. A lane that is already taken is skipped.
-/// After `MAX_ROUNDS` rounds, the lowest free lanes fill the rest, so the
+/// The result is a permanent contract. It depends only on the arguments.
+/// Thus every process and every version gives a tenant the same lanes.
+///
+/// Round `i`:
+/// 1. Hash `key`, the byte `0xff` and `i` (little endian) with FNV-1a.
+/// 2. Mix the hash with the splitmix64 finalizer.
+/// 3. Take the hash modulo `lanes`. Ignore a lane that the result has.
+///
+/// After `MAX_ROUNDS` rounds, the lowest free lanes fill the result. Thus the
 /// loop always ends.
 #[must_use]
 pub fn shuffle_shard(key: &str, lanes: u16, size: u16) -> Vec<u16> {

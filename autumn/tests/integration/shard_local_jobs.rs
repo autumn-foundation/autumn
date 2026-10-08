@@ -1,6 +1,6 @@
 //! Issue #3072, AC2: with shard-local job tables, `enqueue_in_tx` and the
 //! shard's data write commit or roll back together, and a worker for that
-//! shard runs the job.
+//! shard runs the job, also while the control database is down.
 
 #[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
 mod shard_local_job_tests {
@@ -186,5 +186,30 @@ mod shard_local_job_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(welcomed(), 1, "the shard worker ran the job once");
+
+        // Control-database outage: nobody can connect to it. The shard
+        // transaction and the shard worker do not need it.
+        let mut admin = db.pool().get().await.expect("admin connection");
+        admin
+            .batch_execute(
+                "ALTER DATABASE shard_local_jobs_control ALLOW_CONNECTIONS false; \
+                 SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                 WHERE datname = 'shard_local_jobs_control';",
+            )
+            .await
+            .expect("cut the control database");
+        sign_up(&shard, "during-outage", true).await;
+        for _ in 0..200 {
+            if welcomed() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let ran = welcomed();
+        admin
+            .batch_execute("ALTER DATABASE shard_local_jobs_control ALLOW_CONNECTIONS true")
+            .await
+            .expect("restore the control database");
+        assert_eq!(ran, 2, "the shard worker runs jobs while the control database is down");
     }
 }

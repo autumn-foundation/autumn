@@ -323,3 +323,42 @@ async fn sim_without_bulkheads_noisy_tenant_raises_quiet_p99(mut sim: Sim) {
         sim.seed
     );
 }
+
+/// A tenant whose lane is not the first idle worker's lane still runs at
+/// once. A push wakes every idle worker, not only one.
+#[sim_test]
+async fn sim_a_lone_job_runs_on_whichever_lane_serves_its_tenant(mut sim: Sim) {
+    let _guard = job::global_job_runtime_test_lock().lock().await;
+    job::clear_global_job_client();
+    reset();
+    let mut config = config(false);
+    config.jobs.workers = 2;
+    config.jobs.tenants.lanes = 2;
+    config.jobs.tenants.lanes_per_tenant = 1;
+    sim.build(
+        TestApp::new()
+            .jobs(jobs![sim_tenant_isolation_work])
+            .config(config),
+    );
+    // Let both workers go idle.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // One tenant on each lane, each enqueued alone into an idle runtime.
+    let on_lane = |lane: u16| {
+        (0..)
+            .map(|i| format!("lane-tenant-{i}"))
+            .find(|t| autumn_web::bulkhead::shuffle_shard(t, 2, 1) == [lane])
+            .expect("a tenant on each lane")
+    };
+    for (id, lane) in [(0_u64, 0_u16), (1, 1)] {
+        let tenant = on_lane(lane);
+        enqueue_for(&tenant, id).await;
+        tokio::time::sleep(JOB_RUN * 2).await;
+        let finished = JOBS.with(|j| j.borrow().get(&id).and_then(|e| e.2));
+        assert!(
+            finished.is_some(),
+            "the job of {tenant} (lane {lane}) did not run (seed={:#x})",
+            sim.seed
+        );
+    }
+}

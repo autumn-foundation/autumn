@@ -3843,7 +3843,11 @@ impl Db {
 
         // The tenant's share of the pool (#3072). Take it before the pool
         // checkout, so a tenant at its cap does not hold a connection.
-        let tenant_permit = crate::bulkhead::acquire_db_permit()?;
+        let tenant_permit = crate::bulkhead::acquire_db_permit().inspect_err(|_| {
+            if let Some(metrics) = &params.metrics {
+                metrics.record_tenant_db_rejection();
+            }
+        })?;
 
         let pool = params.pool;
         let mut checkout_future: std::pin::Pin<

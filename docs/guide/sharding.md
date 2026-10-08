@@ -221,8 +221,9 @@ treat cross-shard aggregates as approximate.
 Most framework state is on the control topology
 (`database.primary_url`/`url`): the `autumn_jobs` queue, the Postgres
 scheduler tick table, sessions, feature flags and the shard directory. The
-plain `Db` extractor still points there. Startup fails fast if you configure
-shards plus a Postgres-backed jobs/scheduler backend without a control role.
+plain `Db` extractor still points there. Startup stops with an error if you
+configure shards and a Postgres jobs or scheduler backend without a control
+role.
 
 Some state is already on each shard: the outbox, the commit-hook queue,
 version history and derivation state. Idempotency keys are not in a

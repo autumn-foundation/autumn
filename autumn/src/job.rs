@@ -664,9 +664,9 @@ pub struct JobClient {
     per_job_settings: HashMap<String, JobRuntimeSettings>,
     pub interceptor: Option<Arc<dyn crate::interceptor::JobInterceptor>>,
     resilience_config: Option<Arc<crate::config::ResilienceConfig>>,
-    /// `jobs.postgres.shard_local` (#3072): an in-transaction enqueue skips
-    /// the fleet-wide `job_queue` breaker, so a control-database outage does
-    /// not block shard enqueues.
+    /// `jobs.postgres.shard_local` (#3072). When `true`, an in-transaction
+    /// enqueue does not use the fleet-wide `job_queue` breaker. A
+    /// control-database outage must not stop shard enqueues.
     #[cfg(feature = "db")]
     shard_local: bool,
     /// Injected entropy source for minting job ids. Defaults to
@@ -5354,10 +5354,10 @@ impl JobClient {
         // transaction commits, so we cannot safely update process-local counters
         // here — the row may disappear on rollback while the counter persists.
         if self.pg_pool.is_some() {
-            // Shard-local jobs (#3072): the row goes to the caller's database,
-            // and the caller's transaction already fails fast when that
-            // database is down. The fleet-wide breaker would only add shared
-            // fate, so it is skipped.
+            // Shard-local jobs (#3072): do not use the fleet-wide breaker. The
+            // row goes to the caller's database, and the caller's transaction
+            // fails when that database is down. A control-database outage
+            // must not stop shard enqueues.
             let guard = if self.shard_local {
                 None
             } else {
@@ -5938,7 +5938,7 @@ pub(crate) fn start_local_runtime_inner(
     limits.retain_queues(&schedule.names());
     let slots = QueueSlots::new(worker_count, limits);
     // Tenant isolation (#3072): fair order, per-tenant slots, lanes.
-    let isolation = tenant_lanes::TenantJobIsolation::from_config(tenants);
+    let isolation = tenant_lanes::TenantJobIsolation::from_config(tenants, worker_count);
     let buffer = Arc::new(if isolation.is_some() {
         LocalQueueBuffer::with_tenant_fairness()
     } else {
@@ -6054,8 +6054,8 @@ pub(crate) fn start_local_runtime_inner(
                         drop(slot);
                         drop(permit);
                         // A freed tenant slot can admit a job that another
-                        // worker skipped.
-                        buffer.notify.notify_one();
+                        // worker skipped. That worker can be on any lane.
+                        buffer.notify.notify_waiters();
                         ran = true;
                         break;
                     }
@@ -6292,7 +6292,9 @@ impl LocalQueueBuffer {
                 }
                 bucket.push(job.tenant.clone(), job);
             }
-            self.notify.notify_one();
+            // Wake every idle worker: a single woken worker can be on a lane
+            // that does not serve this tenant.
+            self.notify.notify_waiters();
             return;
         }
         {
@@ -6369,7 +6371,7 @@ impl LocalQueueBuffer {
         queue: &str,
         isolation: &tenant_lanes::TenantJobIsolation,
         lane: Option<u16>,
-    ) -> Option<(QueuedJob, Option<crate::bulkhead::TenantPermit>)> {
+    ) -> Option<(QueuedJob, tenant_lanes::JobAdmit)> {
         let mut map = self
             .fair
             .as_ref()?
@@ -12655,7 +12657,13 @@ const SHARD_JOB_SCHEMA_LOCK_KEY: i64 = 0x6175_746d_6a6f_6273; // "autmjobs"
 async fn ensure_shard_job_schema(pool: &PgPool) -> Result<(), String> {
     use diesel_async::SimpleAsyncConnection as _;
     let mut conn = pool.get().await.map_err(|e| e.to_string())?;
-    let mut sql = format!("BEGIN; SELECT pg_advisory_xact_lock({SHARD_JOB_SCHEMA_LOCK_KEY});\n");
+    // `ALTER TABLE` takes a strong lock even when the column exists. The
+    // lock timeout stops a long shard transaction from blocking boot; the
+    // caller tries again.
+    let mut sql = format!(
+        "BEGIN; SET LOCAL lock_timeout = '3s'; \
+         SELECT pg_advisory_xact_lock({SHARD_JOB_SCHEMA_LOCK_KEY});\n"
+    );
     for (_, up) in SHARD_JOB_SCHEMA {
         sql.push_str(up);
         sql.push('\n');
@@ -12705,7 +12713,9 @@ impl ShardJobWorkers {
                         () = tokio::time::sleep(delay) => {}
                         () = self.shutdown.cancelled() => return,
                     }
-                    delay = (delay * 2).min(std::time::Duration::from_secs(30));
+                    delay = delay
+                        .saturating_mul(2)
+                        .min(std::time::Duration::from_secs(30));
                 }
             }
         }
@@ -12833,7 +12843,7 @@ fn start_postgres_runtime(
     // by other replicas don't consume this process's shared slots (#1623).
     let mut limits = QueueLimits::from_config(&config.queues);
     limits.retain_queues(&schedule.names());
-    let slots = QueueSlots::new(config.workers.max(1), limits);
+    let slots = QueueSlots::new(config.workers.max(1), limits.clone());
 
     install_job_client(
         state,
@@ -12899,7 +12909,8 @@ fn start_postgres_runtime(
                 job_admin: job_admin.clone(),
                 serialize_claims,
                 schedule: schedule.clone(),
-                slots: Arc::clone(&slots),
+                // Own slots: a control backlog must not hold a shard's workers.
+                slots: QueueSlots::new(worker_count, limits.clone()),
                 visibility_timeout_ms,
                 worker_count: if run_workers { worker_count } else { 0 },
                 shutdown: shutdown.clone(),
