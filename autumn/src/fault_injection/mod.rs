@@ -271,6 +271,8 @@ struct Injector {
     audit: Option<Arc<AuditLogger>>,
     profile: String,
     allow_in_production: bool,
+    /// `server.timeouts.request_timeout_ms`: the cap of a dependency wait.
+    deadline: Option<Duration>,
     /// The pending boot audit write. The next toggle waits for it.
     boot: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// One audit write at a time.
@@ -572,11 +574,24 @@ tokio::task_local! {
 ///
 /// Returns [`InjectedFault`] when an error fault for `target` fires.
 pub(crate) async fn inject(target: FaultTarget) -> Result<(), InjectedFault> {
-    let Ok(fault) = SCOPE.try_with(|scope| scope.roll(target)) else {
+    let Ok(mut fault) = SCOPE.try_with(|scope| {
+        let mut fault = scope.roll(target);
+        // A seam can be outside the timeout layer (the Redis session store
+        // is). Wait at most the request timeout, then fail as a timeout
+        // would, so the stop condition counts it.
+        if let Some(deadline) = scope.injector.deadline
+            && fault.latency >= deadline
+        {
+            fault.latency = deadline;
+            fault.error = Some(StatusCode::SERVICE_UNAVAILABLE);
+            scope.errored.store(true, Ordering::Relaxed);
+        }
+        fault
+    }) else {
         return Ok(());
     };
     if !fault.latency.is_zero() {
-        tokio::time::sleep(fault.latency).await;
+        tokio::time::sleep(std::mem::take(&mut fault.latency)).await;
     }
     match fault.error {
         Some(_) => Err(InjectedFault { target }),
@@ -643,6 +658,12 @@ pub(crate) fn build(
         audit,
         profile: profile.unwrap_or_default().to_owned(),
         allow_in_production: section.allow_in_production,
+        deadline: config
+            .server
+            .timeouts
+            .request_timeout_ms
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis),
         boot: Mutex::new(None),
         audit_order: tokio::sync::Mutex::new(()),
         sequence: AtomicU64::new(1),
@@ -726,6 +747,16 @@ pub(crate) async fn with_faults<F: std::future::Future>(
 /// trips above 14.4% errors.
 #[cfg(test)]
 fn test_injector(rules: Vec<CompiledRule>, min_requests: u64) -> Arc<Injector> {
+    test_injector_with(rules, min_requests, None)
+}
+
+/// [`test_injector`] with a request timeout.
+#[cfg(test)]
+fn test_injector_with(
+    rules: Vec<CompiledRule>,
+    min_requests: u64,
+    deadline: Option<Duration>,
+) -> Arc<Injector> {
     Arc::new(Injector {
         rules,
         exempt: Exempt {
@@ -742,6 +773,7 @@ fn test_injector(rules: Vec<CompiledRule>, min_requests: u64) -> Arc<Injector> {
         audit: None,
         profile: "test".to_owned(),
         allow_in_production: false,
+        deadline,
         boot: Mutex::new(None),
         audit_order: tokio::sync::Mutex::new(()),
         sequence: AtomicU64::new(1),
@@ -800,6 +832,27 @@ mod tests {
         let injector = test_injector(rules, 1);
         let scope = injector.scope_for("/").unwrap();
         assert_eq!(scope.roll(FaultTarget::Route).latency, config::MAX_LATENCY);
+    }
+
+    /// A dependency wait is at most the request timeout, then fails: the
+    /// Redis session store is outside the timeout layer.
+    #[tokio::test(start_paused = true)]
+    async fn a_dependency_wait_stops_at_the_request_timeout() {
+        let mut rule = FaultRule::new(FaultTarget::Redis, FaultKind::Latency, 1.0);
+        rule.latency_ms = 300_000;
+        let injector = test_injector_with(
+            vec![CompiledRule::new(&rule)],
+            1_000,
+            Some(Duration::from_secs(2)),
+        );
+        let scope = injector.scope_for("/").unwrap();
+        let started = tokio::time::Instant::now();
+        let result = SCOPE
+            .scope(Arc::clone(&scope), inject(FaultTarget::Redis))
+            .await;
+        assert!(result.is_err(), "the capped wait fails");
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert!(scope.errored.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
