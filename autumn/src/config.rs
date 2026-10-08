@@ -6437,8 +6437,8 @@ impl AutumnConfig {
         );
     }
 
-    fn apply_server_env_overrides_with_env(&mut self, env: &dyn Env) {
-        parse_env(env, "AUTUMN_SERVER__PORT", &mut self.server.port);
+    /// `[server.http]` connection limits (issue #3065).
+    fn apply_server_http_env_overrides_with_env(&mut self, env: &dyn Env) {
         let http = &mut self.server.http;
         parse_env_option(
             env,
@@ -6465,6 +6465,11 @@ impl AutumnConfig {
             "AUTUMN_SERVER__HTTP__MAX_CONNECTIONS",
             &mut http.max_connections,
         );
+    }
+
+    fn apply_server_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env(env, "AUTUMN_SERVER__PORT", &mut self.server.port);
+        self.apply_server_http_env_overrides_with_env(env);
         parse_env_string(env, "AUTUMN_SERVER__HOST", &mut self.server.host);
         parse_env(
             env,
