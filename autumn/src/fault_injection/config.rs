@@ -271,18 +271,22 @@ impl FaultStopConfig {
         Ok(())
     }
 
-    /// The largest error ratio, in ppm, that does not stop the faults.
+    /// The largest error ratio, in ppm, that does not stop the faults:
+    /// `budget * max_burn_rate`, to the nearest ppm, at most 100%.
     pub(crate) fn max_error_ppm(&self) -> u32 {
         let budget = crate::slo::objective_to_ppm(self.objective)
             .map_or(0, |objective| crate::slo::PPM.saturating_sub(objective));
-        // Validation keeps the rate in (0, 1000], so the cast cannot truncate.
+        let limit = (f64::from(budget) * self.max_burn_rate)
+            .round()
+            .clamp(0.0, f64::from(crate::slo::PPM));
+        // The clamp keeps the value in [0, PPM], so the cast cannot truncate.
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "max_burn_rate is in (0, 1000]"
+            reason = "clamped to [0, PPM]"
         )]
-        let tenths = (self.max_burn_rate * 10.0).round() as u32;
-        crate::slo::max_error_ppm(budget, tenths)
+        let limit = limit as u32;
+        limit
     }
 }
 
@@ -465,6 +469,16 @@ mod tests {
             ..enabled(error_rule())
         };
         assert!(config.validate(Some("staging")).is_err());
+    }
+
+    #[test]
+    fn the_burn_rate_keeps_its_precision() {
+        let stop = FaultStopConfig {
+            max_burn_rate: 0.05,
+            ..FaultStopConfig::default()
+        };
+        // A 1% budget at 0.05x is 0.05% errors, not 0.1%.
+        assert_eq!(stop.max_error_ppm(), 500);
     }
 
     #[test]

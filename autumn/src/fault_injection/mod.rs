@@ -143,6 +143,10 @@ impl FaultInjection {
                 return;
             }
             *window = Window::default();
+            // Under the window lock: `record` checks the generation under the
+            // same lock, so no request of the earlier arm counts in the new
+            // window.
+            self.inner.generation.fetch_add(1, Ordering::AcqRel);
             drop(window);
             self.inner.next_sequence()
         };
@@ -253,6 +257,8 @@ struct Injector {
     /// The toggle count. Each audit event has its number, so a reader can
     /// put the events in toggle order. The boot toggle is `0`.
     sequence: AtomicU64,
+    /// The arm count. A request scope keeps the value of its arm.
+    generation: AtomicU64,
 }
 
 impl Injector {
@@ -291,6 +297,7 @@ impl Injector {
         (matched != 0).then(|| {
             Arc::new(RequestScope {
                 injector: Arc::clone(self),
+                generation: self.generation.load(Ordering::Acquire),
                 matched,
                 fired: AtomicBool::new(false),
                 errored: AtomicBool::new(false),
@@ -298,11 +305,15 @@ impl Injector {
         })
     }
 
-    /// Count one faulted request. Returns `true` when this request trips the
-    /// stop condition.
-    fn record(&self, error: bool) -> bool {
+    /// Count one faulted request of arm `generation`. Returns `true` when
+    /// this request trips the stop condition. A request of an earlier arm
+    /// does not count.
+    fn record(&self, generation: u64, error: bool) -> bool {
         let now = tokio::time::Instant::now();
         let mut window = self.lock_window();
+        if generation != self.generation.load(Ordering::Acquire) {
+            return false;
+        }
         let expired = window
             .started
             .is_none_or(|started| now.saturating_duration_since(started) >= self.window_len);
@@ -412,6 +423,8 @@ impl Injector {
 /// The faults that matched one request.
 struct RequestScope {
     injector: Arc<Injector>,
+    /// The arm of the injector when the request started.
+    generation: u64,
     /// Bit `i` is set when rule `i` matches the path.
     matched: u64,
     /// A fault fired in this request.
@@ -557,6 +570,7 @@ pub(crate) fn build(
         boot: Mutex::new(None),
         audit_order: tokio::sync::Mutex::new(()),
         sequence: AtomicU64::new(1),
+        generation: AtomicU64::new(0),
     });
     Some((
         FaultScopeLayer::new(Arc::clone(&injector)),
@@ -631,6 +645,7 @@ fn test_injector(rules: Vec<CompiledRule>, min_requests: u64) -> Arc<Injector> {
         boot: Mutex::new(None),
         audit_order: tokio::sync::Mutex::new(()),
         sequence: AtomicU64::new(1),
+        generation: AtomicU64::new(0),
     })
 }
 
@@ -684,8 +699,26 @@ mod tests {
         let handle = FaultInjection {
             inner: Arc::clone(&injector),
         };
-        assert!(!injector.record(true));
+        assert!(!injector.record(0, true));
         handle.arm("ops").await;
         assert_eq!(handle.snapshot().window_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn a_request_of_an_earlier_arm_does_not_count_after_a_rearm() {
+        let rule = FaultRule::new(FaultTarget::Route, FaultKind::Error, 1.0);
+        let injector = test_injector(vec![CompiledRule::new(&rule)], 1);
+        let handle = FaultInjection {
+            inner: Arc::clone(&injector),
+        };
+        let old = injector.scope_for("/").unwrap();
+        handle.disarm("ops", "test").await;
+        handle.arm("ops").await;
+        assert!(
+            !injector.record(old.generation, true),
+            "the old request does not trip"
+        );
+        assert_eq!(handle.snapshot().window_requests, 0);
+        assert!(handle.is_armed());
     }
 }

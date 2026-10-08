@@ -99,7 +99,7 @@ where
                     || result
                         .as_ref()
                         .map_or(true, |response| response.status().is_server_error());
-                if scope.injector.record(error) {
+                if scope.injector.record(scope.generation, error) {
                     scope.injector.audit_stop(STOP_REASON);
                 }
             }
@@ -118,7 +118,7 @@ impl Drop for Pending {
         let Some(scope) = self.0.take() else {
             return;
         };
-        if scope.fired.load(Ordering::Relaxed) && scope.injector.record(true) {
+        if scope.fired.load(Ordering::Relaxed) && scope.injector.record(scope.generation, true) {
             scope.injector.audit_stop(STOP_REASON);
         }
     }

@@ -9,10 +9,11 @@
 //! - free: `DELETE … WHERE tick_key = $3 AND generation = $4`. A replica
 //!   frees an unrun claim when the cost gate rises, then claims again.
 //!
-//! A replica can wait (the cost gate) between the choice of the tick and the
-//! claim. Before it claims, it checks on its own clock that the tick is not
-//! past its window (`execute_cron_task`). The check is closed (`<=`), which
-//! over-approximates continuous time. Each replica clock has a skew of up to
+//! A replica can wait (the cost gate, a slow claim) between the choice of the
+//! tick and the insert. `execute_cron_task` checks on its own clock that the
+//! tick is not past its window, before and after the claim. The model checks
+//! at the insert. The check is closed (`<=`), which over-approximates
+//! continuous time. Each replica clock has a skew of up to
 //! `RETENTION`; the database clock decides the row expiry.
 //! A free can be sent again after it applied (a retry after a lost reply).
 //! Release keeps the row, so it is not an action.

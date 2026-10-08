@@ -9917,6 +9917,15 @@ async fn execute_cron_task(
         }
         break lease;
     };
+    // The claim can wait too (a pool checkout, a slow query). Check the window
+    // again: a claim after the window can have found a pruned row of a tick
+    // that ran (#3071). Keep the row, so no replica runs the tick again.
+    if occurrence.is_past_window(crate::time::clock_unix_secs(state.clock())) {
+        tracing::debug!(task = %name, tick = %tick_key, "Cron task tick is past its window after the claim");
+        gate.release();
+        release_task_lease(lease, &name, &tick_key).await;
+        return;
+    }
     state
         .task_registry
         .record_leader(&name, lease.leader_id(), &tick_key);
@@ -20738,7 +20747,7 @@ mod tests {
         for (backend, acquired_while_high) in [("sqlite", 0), ("postgres", 0), ("in_process", 1)] {
             let name = format!("cost_lease_order_{backend}");
             crate::cost::mark_deferrable(crate::cost::WorkKind::Task, &name);
-            let state = AppState::for_test();
+            let state = cron_test_state();
             let signal = crate::cost::CostSignal::new(Some(1.0));
             signal.set(5.0);
             state.insert_extension(signal.clone());
@@ -20833,7 +20842,7 @@ mod tests {
         static SEEN_RETRY_TICK: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
         let name = "cost_sqlite_rising_signal".to_owned();
         crate::cost::mark_deferrable(crate::cost::WorkKind::Task, &name);
-        let state = AppState::for_test();
+        let state = cron_test_state();
         let signal = crate::cost::CostSignal::new(Some(1.0));
         state.insert_extension(signal.clone());
         let acquired = std::sync::Arc::new(AtomicUsize::new(0));
@@ -20915,7 +20924,7 @@ mod tests {
     /// every later tick would fold into a wait that never happens (#1720).
     #[tokio::test]
     async fn execute_cron_task_clears_the_cost_flag_when_the_lease_is_taken() {
-        let state = AppState::for_test();
+        let state = cron_test_state();
         let waiting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
 
@@ -21142,7 +21151,7 @@ mod tests {
     // Issue #3052: the handler reads its tick and fencing token.
     #[tokio::test]
     async fn scheduled_handler_sees_its_tick_and_fencing_token() {
-        let state = AppState::for_test();
+        let state = cron_test_state();
         state.task_registry.register_scheduled(
             "cron_fence_task",
             "cron 0 * * * * *",
@@ -21229,12 +21238,22 @@ mod tests {
         );
     }
 
-    /// #3071: a cost wait can outlast the tick row. Another replica can have
-    /// run the occurrence, and the prune can have deleted its row. After a
-    /// wait, an occurrence past its window is not claimed.
+    /// A test state whose clock is one second into the cron occurrence at
+    /// `1_700_000_000`, so the window check lets the occurrence run.
+    fn cron_test_state() -> AppState {
+        AppState::for_test().with_clock(std::sync::Arc::new(crate::time::FixedClock::at(
+            chrono::DateTime::from_timestamp(1_700_000_001, 0).expect("a valid timestamp"),
+        )))
+    }
+
+    /// #3071: a cost wait, or a slow claim, can outlast the tick row.
+    /// Another replica can have run the occurrence, and the prune can have
+    /// deleted its row. An occurrence past its window does not run.
     #[tokio::test]
-    async fn execute_cron_task_skips_an_occurrence_that_a_cost_wait_made_late() {
-        async fn claims(scheduled_unix_secs: u64) -> Vec<String> {
+    async fn execute_cron_task_skips_an_occurrence_past_its_window() {
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+
+        async fn claims(scheduled_unix_secs: u64, waited: bool) -> Vec<String> {
             let state = AppState::for_test();
             state.task_registry.register_scheduled(
                 "late_cron_task",
@@ -21249,7 +21268,10 @@ mod tests {
                 tick_keys: std::sync::Arc::clone(&tick_keys),
                 release_count: None,
             });
-            let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
+            let handler: crate::task::TaskHandler = |_| {
+                RUNS.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            };
             super::execute_cron_task(
                 "late_cron_task".to_owned(),
                 state.clone(),
@@ -21264,8 +21286,7 @@ mod tests {
                 super::CostGate {
                     shutdown: tokio_util::sync::CancellationToken::new(),
                     waiting: None,
-                    // The gate waited for this tick.
-                    waited: std::sync::atomic::AtomicBool::new(true),
+                    waited: std::sync::atomic::AtomicBool::new(waited),
                 },
             )
             .await;
@@ -21273,8 +21294,18 @@ mod tests {
         }
 
         let now = crate::time::clock_unix_secs(AppState::for_test().clock());
-        assert!(claims(1_700_000_000).await.is_empty(), "late: not claimed");
-        assert_eq!(claims(now).await, [format!("late_cron_task:{now}")]);
+        // After a cost wait: not claimed.
+        assert!(claims(1_700_000_000, true).await.is_empty());
+        // A slow claim: claimed, but not run.
+        assert_eq!(claims(1_700_000_000, false).await.len(), 1);
+        assert_eq!(
+            RUNS.load(Ordering::SeqCst),
+            0,
+            "a late occurrence does not run"
+        );
+        // In the window: claimed and run.
+        assert_eq!(claims(now, true).await, [format!("late_cron_task:{now}")]);
+        assert_eq!(RUNS.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -21385,7 +21416,7 @@ mod tests {
 
         super::execute_cron_task(
             "daily_task".to_owned(),
-            AppState::for_test(),
+            cron_test_state(),
             handler,
             crate::task::TaskCoordination::Fleet,
             std::sync::Arc::clone(&coordinator) as _,
