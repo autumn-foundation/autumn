@@ -2626,6 +2626,22 @@ impl RequestBuilder {
             let timeout = gate.attempt_timeout(self.retry_policy.request_timeout);
             let deadline_header = gate.header(timeout, &self.extra_headers);
             let exchange = self.sim_attempt(net, &host, &url, timeout, deadline_header);
+            // Under a deadline, check it before each poll of the attempt, as
+            // the real paths' request timeout does: `tokio::time::timeout`
+            // polls the attempt first, so an answer ready at the deadline
+            // would still be used.
+            let exchange = async {
+                match gate.deadline {
+                    Some(deadline) => crate::deadline::Bounded::until(deadline, exchange)
+                        .await
+                        .unwrap_or_else(|crate::deadline::DeadlineExceeded| {
+                            Err(SimAttemptError::Transient(format!(
+                                "request to {host} reached the request deadline"
+                            )))
+                        }),
+                    None => exchange.await,
+                }
+            };
             let outcome = match timeout {
                 Some(limit) => {
                     tokio::time::timeout(limit, exchange)

@@ -376,3 +376,33 @@ async fn sim_deadline_stops_are_not_throttle_rejects(mut sim: Sim) {
         assert_eq!(response.status.as_u16(), 504, "{}", response.text());
     }
 }
+
+/// An upstream that answers after exactly 100 ms.
+fn answers_at_100ms() -> axum::Router {
+    axum::Router::new().route(
+        "/work",
+        axum::routing::get(|| async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            "late"
+        }),
+    )
+}
+
+/// Calls the upstream under a 100 ms scoped deadline, with no retries.
+#[get("/scoped-exact")]
+async fn scoped_exact(client: Client) -> AutumnResult<String> {
+    let response = Deadline::after(Duration::from_millis(100))
+        .scope(client.get("http://upstream/work").no_retry().send())
+        .await?;
+    Ok(response.text())
+}
+
+#[sim_test]
+async fn sim_answer_at_the_deadline_is_too_late(mut sim: Sim) {
+    sim.net(SimNet::new().host("upstream", answers_at_100ms()));
+    sim.build(TestApp::new().routes(routes![scoped_exact]));
+    // The answer is ready at the deadline, not before it, so it must not
+    // be used: the deadline is checked before the attempt is polled again.
+    let response = sim.client().get("/scoped-exact").send().await;
+    assert_eq!(response.status.as_u16(), 504, "{}", response.text());
+}
