@@ -238,9 +238,35 @@ impl DbIdempotencyStore {
         let Some((point, body_hash, ttl_ms)) = held else {
             return Ok(false);
         };
-        if point.is_none() {
+        let Some(point) = point else {
             return Ok(true);
-        }
+        };
+        let copied = HeldPoint {
+            point,
+            body_hash,
+            ttl_ms,
+        };
+        self.copy_held_point(&mut conn, from, from_owner, copied, to, to_owner)
+            .await
+    }
+
+    /// Write `copied` (read from `from`) to the row `to_owner` holds on `to`,
+    /// only while `from_owner` still holds `from` with that point. `false`
+    /// when it no longer does.
+    async fn copy_held_point(
+        &self,
+        conn: &mut RuntimeConnection,
+        from: &str,
+        from_owner: &str,
+        copied: HeldPoint,
+        to: &str,
+        to_owner: &str,
+    ) -> Result<bool, IdempotencyStoreError> {
+        let HeldPoint {
+            point,
+            body_hash,
+            ttl_ms,
+        } = copied;
         #[allow(
             clippy::arithmetic_side_effects,
             reason = "a SQL expression, evaluated by the database"
@@ -251,22 +277,61 @@ impl DbIdempotencyStore {
         let fresh_expiry = now_ms().saturating_add(ttl_ms);
         let expiry = diesel::dsl::case_when(crash_expiry.gt(fresh_expiry), crash_expiry)
             .otherwise(fresh_expiry);
+        // The copy happens only while `from_owner` still holds the source
+        // row with the point just read: checked in the same statement, so a
+        // lock lost between the read and the write cannot copy a stale point.
+        let source = diesel::alias!(autumn_idempotency_keys as source);
+        let still_held = source
+            .filter(source.field(keys::storage_key).eq(from))
+            .filter(source.field(keys::locked_by).eq(from_owner))
+            .filter(source.field(keys::recovery_point).eq(point.clone()));
         let target = keys::autumn_idempotency_keys
             .filter(keys::storage_key.eq(to))
             .filter(keys::locked_by.eq(to_owner))
-            .filter(keys::recovery_point.is_null());
-        diesel::update(target)
+            .filter(keys::recovery_point.is_null())
+            .filter(diesel::dsl::exists(still_held));
+        let copied = diesel::update(target)
             .set((
-                keys::recovery_point.eq(point),
+                keys::recovery_point.eq(Some(point)),
                 keys::recovery_body_hash.eq(body_hash),
                 keys::ttl_ms.eq(ttl_ms),
                 keys::expires_at_ms.eq(expiry),
             ))
-            .execute(&mut conn)
+            .execute(&mut *conn)
             .await
             .map_err(|e| db_error("copy idempotency recovery point", e))?;
-        Ok(true)
+        if copied == 1 {
+            return Ok(true);
+        }
+        // Nothing copied: the source was lost, or the target already has a
+        // point (or lost its own lock, which its claim reports later).
+        self.holds(conn, from, from_owner).await
     }
+
+    /// `true` when `owner` holds `key`.
+    async fn holds(
+        &self,
+        conn: &mut RuntimeConnection,
+        key: &str,
+        owner: &str,
+    ) -> Result<bool, IdempotencyStoreError> {
+        keys::autumn_idempotency_keys
+            .filter(keys::storage_key.eq(key))
+            .filter(keys::locked_by.eq(owner))
+            .select(keys::storage_key)
+            .first::<String>(conn)
+            .await
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(|e| db_error("read idempotency lock", e))
+    }
+}
+
+/// A recovery point read from one key, to copy to another.
+struct HeldPoint {
+    point: String,
+    body_hash: Option<Vec<u8>>,
+    ttl_ms: i64,
 }
 
 /// Keep `owner`'s lock on `key` until the record expires. A lock that already
@@ -1017,6 +1082,70 @@ mod tests {
                 .await
                 .unwrap(),
             "without the hold an expired key starts over"
+        );
+    }
+
+    /// The source key changes hands between the read and the copy: the copy
+    /// writes nothing and reports the lost key, so the stale point read
+    /// before is never used.
+    #[tokio::test]
+    async fn copy_checks_the_source_owner_in_the_same_statement() {
+        let substrate = SqliteSubstrate::with_migrations(&[&crate::migrate::FRAMEWORK_MIGRATIONS])
+            .expect("substrate");
+        let store = DbIdempotencyStore::new(substrate.pool(), Duration::from_secs(60));
+        assert!(
+            store
+                .try_lock("old", "a1", Duration::from_secs(60))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .try_lock("new", "b", Duration::from_secs(60))
+                .await
+                .unwrap()
+        );
+        let mut conn = store.conn().await.unwrap();
+        // What a1 read, before another request took the old key and moved
+        // its point on.
+        let read = || HeldPoint {
+            point: "charged".to_owned(),
+            body_hash: None,
+            ttl_ms: 60_000,
+        };
+        diesel::update(keys::autumn_idempotency_keys.filter(keys::storage_key.eq("old")))
+            .set((
+                keys::locked_by.eq(Some("a2")),
+                keys::recovery_point.eq(Some("shipped")),
+            ))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+
+        let copied = store
+            .copy_held_point(&mut conn, "old", "a1", read(), "new", "b")
+            .await
+            .unwrap();
+        assert!(!copied, "a1 no longer holds the old key");
+        let point: Option<String> = keys::autumn_idempotency_keys
+            .filter(keys::storage_key.eq("new"))
+            .select(keys::recovery_point)
+            .first(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(point, None, "the stale point was not copied");
+
+        // The holder's own snapshot still copies.
+        let held = HeldPoint {
+            point: "shipped".to_owned(),
+            body_hash: None,
+            ttl_ms: 60_000,
+        };
+        assert!(
+            store
+                .copy_held_point(&mut conn, "old", "a2", held, "new", "b")
+                .await
+                .unwrap()
         );
     }
 }
