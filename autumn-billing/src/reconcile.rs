@@ -395,25 +395,30 @@ impl Ctx<'_> {
         Ok((customer, write))
     }
 
-    /// Link an invoice that still has no local subscription, when the
-    /// subscription is mirrored by now. The subscription event can land
-    /// between the lookup in `upsert_invoice` and the later writes, and its
-    /// own link then finds nothing. Rows adopted by an ended subscription
-    /// are closed.
+    /// Re-check an invoice against its subscription after the writes. The
+    /// subscription event can land between the lookup in `upsert_invoice`
+    /// (or `open_dunning`) and the later writes, and its own link or close
+    /// pass then finds nothing. An unlinked invoice gets linked. Rows of an
+    /// ended subscription are closed.
     async fn relink(&self, invoice: &Invoice) -> Result<(), BillingError> {
-        let (None, Some(provider_id)) =
-            (&invoice.subscription_id, &invoice.provider_subscription_id)
-        else {
-            return Ok(());
-        };
         let store = self.service.store();
-        let Some(subscription) = store.subscription_by_provider_id(provider_id).await? else {
-            return Ok(());
+        let subscription = match (&invoice.subscription_id, &invoice.provider_subscription_id) {
+            (Some(id), _) => store.subscription_by_id(id).await?,
+            (None, Some(provider_id)) => {
+                let Some(subscription) = store.subscription_by_provider_id(provider_id).await?
+                else {
+                    return Ok(());
+                };
+                store
+                    .link_subscription(provider_id, &subscription.id, self.now)
+                    .await?;
+                Some(subscription)
+            }
+            (None, None) => None,
         };
-        store
-            .link_subscription(provider_id, &subscription.id, self.now)
-            .await?;
-        if is_ended(subscription.status) {
+        if let Some(subscription) = subscription
+            && is_ended(subscription.status)
+        {
             self.close_dunning_for(&subscription.id).await?;
         }
         Ok(())

@@ -354,7 +354,9 @@ pub struct Invoice {
     /// Local subscription id, when the invoice belongs to one.
     pub subscription_id: Option<String>,
     /// Provider subscription id. Kept when the subscription is not yet
-    /// mirrored, so mirroring it can link this invoice later.
+    /// mirrored, so mirroring it can link this invoice later. Absent in
+    /// JSON from older versions.
+    #[serde(default)]
     pub provider_subscription_id: Option<ProviderId>,
     /// Provider invoice id.
     pub provider_invoice_id: ProviderId,
