@@ -26,7 +26,7 @@ use autumn_schema_core::{Backend, Column, ColumnType, Table};
 
 use super::diff::{MigrationPlan, SchemaChange};
 use super::parse::ParsedSchema;
-use crate::generate::introspect::{is_in_comment_or_string, schema_block_range};
+use crate::generate::introspect::{is_in_comment_or_string, scan_code, schema_block_range};
 
 /// The path of the diesel schema file, from the project root.
 pub const SCHEMA_RS_PATH: &str = "src/schema.rs";
@@ -463,14 +463,15 @@ fn rename_header(text: &str, old: &str, new: &str) -> Option<String> {
     ))
 }
 
-/// True when a line of `text` starts with `token` and then `(` or `{`: a
-/// `table!` header in any spacing.
+/// True when `text` has a `table!` block for `token`, or a line that starts
+/// with `token` and then `(` or `{`: a header in any spacing.
 fn has_header(text: &str, token: &str) -> bool {
-    text.lines().any(|line| {
-        line.trim_start()
-            .strip_prefix(token)
-            .is_some_and(|rest| rest.trim_start().starts_with(['(', '{']))
-    })
+    schema_block_range(text, token).is_some()
+        || text.lines().any(|line| {
+            line.trim_start()
+                .strip_prefix(token)
+                .is_some_and(|rest| rest.trim_start().starts_with(['(', '{']))
+        })
 }
 
 /// Update the `joinable!` and `allow_tables_to_appear_in_same_query!` macros
@@ -596,32 +597,32 @@ fn macro_calls(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> {
 /// and string literals.
 fn matching_paren(text: &str, open: usize) -> Option<usize> {
     let mut depth = 0usize;
-    for (i, c) in text[open..].char_indices() {
-        if !matches!(c, '(' | ')') || is_in_comment_or_string(text, open + i) {
-            continue;
-        }
-        if c == '(' {
-            depth += 1;
-        } else {
-            depth -= 1;
-            if depth == 0 {
-                return Some(open + i);
+    let mut close = None;
+    scan_code(text, open, |i, c| {
+        match c {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    return true;
+                }
             }
+            _ => {}
         }
-    }
-    None
+        false
+    });
+    close
 }
 
-/// `text` without its comments (`//`, `/* */`) and string literals.
+/// The code of `text`, without comments and string literals.
 fn strip_comments(text: &str) -> String {
-    let bytes = text.as_bytes();
-    text.char_indices()
-        .filter(|&(i, c)| {
-            let opens_comment = c == '/' && matches!(bytes.get(i + 1), Some(b'/' | b'*'));
-            !opens_comment && !is_in_comment_or_string(text, i)
-        })
-        .map(|(_, c)| c)
-        .collect()
+    let mut code = Vec::new();
+    scan_code(text, 0, |_, c| {
+        code.push(c);
+        false
+    });
+    String::from_utf8_lossy(&code).into_owned()
 }
 
 #[cfg(test)]
@@ -1365,6 +1366,38 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
         assert_eq!(
             out.text,
             "diesel::allow_tables_to_appear_in_same_query!(posts, users);\n"
+        );
+    }
+
+    /// A header split over lines is found: no second block is appended.
+    #[test]
+    fn a_split_header_is_not_appended_twice() {
+        let existing = "diesel::table! {\n    posts\n    (id) {\n        id -> Int8,\n    }\n}\n";
+        let out = sync_for_plan(
+            existing,
+            &parsed(vec![posts(Backend::Postgres)]),
+            &plan(vec![]),
+        );
+        assert_eq!(out.text, existing);
+        assert_eq!(out.skipped.len(), 1, "{out:?}");
+    }
+
+    /// A `}` in a block comment does not end the block: a drop removes the
+    /// whole block.
+    #[test]
+    fn a_brace_in_a_block_comment_does_not_end_a_block() {
+        let existing = "diesel::table! {\n    /* } note */\n    comments (id) {\n        id -> Int8, /* } */\n    }\n}\n\ndiesel::table! {\n    users (id) {\n        id -> Int8,\n    }\n}\n";
+        let out = sync_for_plan(
+            existing,
+            &parsed(vec![]),
+            &plan(vec![SchemaChange::DropTable(Table::new(
+                "comments",
+                Backend::Postgres,
+            ))]),
+        );
+        assert_eq!(
+            out.text,
+            "diesel::table! {\n    users (id) {\n        id -> Int8,\n    }\n}\n"
         );
     }
 }
