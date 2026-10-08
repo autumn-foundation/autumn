@@ -1233,7 +1233,7 @@ fn stop_deadline(budget_secs: u64) -> Duration {
 }
 
 /// `prestop_grace_secs + shutdown_timeout_secs`, saturating.
-pub(crate) fn drain_budget_secs(prestop: u64, shutdown: u64) -> u64 {
+pub fn drain_budget_secs(prestop: u64, shutdown: u64) -> u64 {
     prestop.saturating_add(shutdown)
 }
 

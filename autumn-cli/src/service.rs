@@ -80,7 +80,7 @@ const STOP_HOOK_HEADROOM: Duration = Duration::from_secs(60);
 /// from user config, so an absurd `shutdown_timeout_secs` would otherwise take
 /// down the service host mid-stop — leaving the service stuck in `StopPending`
 /// until the SCM gives up. A day is far beyond any real drain.
-pub(crate) const MAX_WAIT_HINT: Duration = Duration::from_secs(24 * 60 * 60);
+pub const MAX_WAIT_HINT: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How often the service host checks on its app child and for a stop request.
 ///
