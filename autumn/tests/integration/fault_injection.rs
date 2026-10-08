@@ -136,7 +136,10 @@ async fn prod_profile_does_not_install_faults_by_default() {
     let client = build(config, "prod", &audit);
 
     assert!(handle(&client).is_none(), "no handle in prod");
-    client.get("/api/orders").send().await.assert_ok();
+    // The prod host policy can refuse the test host; only the fault matters.
+    let response = client.get("/api/orders").send().await;
+    assert_ne!(response.status.as_u16(), 503);
+    assert_eq!(response.header("x-autumn-fault"), None);
 }
 
 #[tokio::test]
