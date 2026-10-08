@@ -13,6 +13,12 @@ mod tenant_db_bulkhead_tests {
         "ok"
     }
 
+    /// Holds one connection.
+    #[get("/one")]
+    async fn one(_db: Db) -> &'static str {
+        "ok"
+    }
+
     fn config(max_db_connections: usize) -> AutumnConfig {
         let mut config = AutumnConfig::default();
         config.tenancy.enabled = true;
@@ -27,7 +33,7 @@ mod tenant_db_bulkhead_tests {
     async fn a_tenant_over_its_connection_share_gets_503() {
         let db = TestDb::shared().await;
         let client = TestApp::new()
-            .routes(routes![two])
+            .routes(routes![one, two])
             .with_db(db.pool())
             .config(config(1))
             .build();
@@ -37,6 +43,13 @@ mod tenant_db_bulkhead_tests {
             .send()
             .await
             .assert_status(503);
+        // The cap is per tenant: one connection is within it.
+        client
+            .get("/one")
+            .header("x-tenant-id", "quiet")
+            .send()
+            .await
+            .assert_status(200);
     }
 
     #[tokio::test]
@@ -44,7 +57,7 @@ mod tenant_db_bulkhead_tests {
     async fn a_tenant_within_its_connection_share_is_served() {
         let db = TestDb::shared().await;
         let client = TestApp::new()
-            .routes(routes![two])
+            .routes(routes![one, two])
             .with_db(db.pool())
             .config(config(2))
             .build();

@@ -3377,7 +3377,7 @@ pub(crate) const BREAKER_SLOW_CALL_RATIO_FAMILY: &str = "autumn_circuit_breaker_
 /// `emitted_families` set with it so a plugin [`MetricsSource`] cannot shadow a
 /// built-in family, and [`crate::metrics`] refuses to register an app metric
 /// under any of these names.
-pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 30] = [
+pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 31] = [
     "autumn_http_requests_total",
     "autumn_http_requests_active",
     "autumn_http_responses_total",
