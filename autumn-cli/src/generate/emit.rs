@@ -592,7 +592,7 @@ pub struct Plan {
     /// what this plan would have inserted into a shared file.
     pub reverts: Vec<Revert>,
     /// `autumn-web` features this run no longer needs (issue #2328).
-    /// Resolved by [`Plan::settle_released_features`].
+    /// [`Plan::settle_released_features`] resolves this list.
     released_features: Vec<ReleasedFeature>,
 }
 
@@ -601,10 +601,9 @@ pub struct Plan {
 struct ReleasedFeature {
     path: PathBuf,
     feature: String,
-    /// Directory whose other files pin a feature that has no source marker.
-    owner_dir: Option<PathBuf>,
-    /// The file this run rewrites in `owner_dir`; it never pins the feature.
-    own_file: PathBuf,
+    /// For a feature with no source marker: a directory, and the file this
+    /// run rewrites in it. Other files in the directory keep the feature.
+    owner: Option<(PathBuf, PathBuf)>,
 }
 
 impl Plan {
@@ -635,33 +634,32 @@ impl Plan {
         self.reverts.push(revert);
     }
 
-    /// Declare that this run no longer needs `feature` in `path`
-    /// (`Cargo.toml`). The `--force` counterpart of [`Revert::CargoAutumnWebFeature`].
+    /// Record that this run no longer needs `feature` in `path`
+    /// (`Cargo.toml`). This is the regenerate pair of
+    /// [`Revert::CargoAutumnWebFeature`].
     ///
-    /// [`Plan::settle_released_features`] drops it when nothing else uses it.
-    /// `owner_dir` and `own_file` apply only to a feature with no source
-    /// marker (see [`autumn_web_feature_markers`]).
-    pub fn release_feature(
+    /// [`Plan::settle_released_features`] removes it if no other code uses it.
+    /// `owner` (directory, own file) applies only to a feature with no
+    /// source marker (see [`release_markers`]).
+    pub(super) fn release_feature(
         &mut self,
         path: PathBuf,
         feature: &str,
-        owner_dir: Option<PathBuf>,
-        own_file: PathBuf,
+        owner: Option<(PathBuf, PathBuf)>,
     ) {
         self.released_features.push(ReleasedFeature {
             path,
             feature: feature.to_owned(),
-            owner_dir,
-            own_file,
+            owner,
         });
     }
 
-    /// Remove each released feature that no surviving code needs.
+    /// Remove each released feature that no other code needs.
     ///
-    /// Call once, after the last action is queued. Reads pending file
-    /// contents, not the files on disk, so the code this run replaces
-    /// does not keep its own feature alive.
-    pub fn settle_released_features(&mut self) {
+    /// Call once, after the last action is queued. Read the pending file
+    /// contents, not the files on disk. Then the code that this run
+    /// replaces cannot keep its own feature.
+    pub(super) fn settle_released_features(&mut self) {
         use super::schema_edit::remove_autumn_web_feature;
         let released = std::mem::take(&mut self.released_features);
         if released.is_empty() {
@@ -669,20 +667,15 @@ impl Plan {
         }
         let pending = pending_contents(self);
         for r in released {
-            let needed = autumn_web_feature_pinned_by_backend(&r.feature, &self.project_root)
-                || if autumn_web_feature_markers(&r.feature).is_empty() {
-                    // No marker: keep unless the owner directory is known and empty.
-                    r.owner_dir.as_deref().is_none_or(|dir| {
-                        resource_dir_has_other_files(dir, std::slice::from_ref(&r.own_file))
-                    })
-                } else {
-                    autumn_web_feature_still_needed_elsewhere(
-                        &r.feature,
-                        &self.project_root,
-                        &[],
-                        &pending,
-                    )
-                };
+            let needed = match release_markers(&r.feature) {
+                // Keep the feature if marked code uses it.
+                Some(markers) => markers_in_project(&markers, &self.project_root, &[], &pending),
+                // No marker. Keep the feature unless the owner directory
+                // holds no file except `own_file`. Keep it without an owner directory.
+                None => r.owner.as_ref().is_none_or(|(dir, own)| {
+                    resource_dir_has_other_files(dir, std::slice::from_ref(own))
+                }),
+            };
             if needed {
                 continue;
             }
@@ -1573,7 +1566,10 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
         // counts as usage, leaving the feature enabled), which is the same
         // harmless direction `multipart` already accepts above; under-retention
         // is the one that does not compile.
-        "csv" => &["autumn_web::data::csv"],
+        //
+        // `Csv<T>` is the extractor and responder gated by the same feature. It
+        // lives in `autumn_web::extract` and is not in the prelude.
+        "csv" => &["autumn_web::data::csv", "extract::Csv", "Csv<"],
         _ => &[],
     }
 }
@@ -1605,9 +1601,32 @@ fn autumn_web_feature_still_needed_elsewhere(
         return false;
     }
     let markers: Vec<String> = markers.iter().map(|m| (*m).to_owned()).collect();
+    markers_in_project(&markers, project_root, excluding, overrides)
+}
+
+/// Whether any of `markers` appears in `src/`, `tests/` or `benches/`.
+fn markers_in_project(
+    markers: &[String],
+    project_root: &Path,
+    excluding: &[PathBuf],
+    overrides: &HashMap<PathBuf, String>,
+) -> bool {
     ["src", "tests", "benches"]
         .iter()
-        .any(|dir| rs_tree_contains_marker(&project_root.join(dir), &markers, excluding, overrides))
+        .any(|dir| rs_tree_contains_marker(&project_root.join(dir), markers, excluding, overrides))
+}
+
+/// Markers that show `feature` is in use, for a regenerate run.
+///
+/// `None` means the feature has no marker. `htmx` has markers here only. The
+/// stock `main.rs` names `autumn_web::htmx`, so a marker for it in
+/// [`autumn_web_feature_markers`] would keep the feature on every `destroy`.
+fn release_markers(feature: &str) -> Option<Vec<String>> {
+    let markers: &[&str] = match feature {
+        "htmx" => &["HTMX_JS_PATH", "HxRequest"],
+        other => autumn_web_feature_markers(other),
+    };
+    (!markers.is_empty()).then(|| markers.iter().map(|m| (*m).to_owned()).collect())
 }
 
 /// Whether a local Cargo `feature` (not an `autumn-web` feature — see

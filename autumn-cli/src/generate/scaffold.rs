@@ -2747,36 +2747,35 @@ fn plan_scaffold_with_options_impl(
         }
     }
 
-    // Issue #2328: a `--force` run that drops a flag stops emitting its surface,
-    // so give back the feature that surface needed. `destroy` has its own reverts.
-    // `i18n` and `maud` stay: `.i18n_auto()` and the shared layout still use them.
-    if !for_revert {
+    let own_model_path = project_root
+        .join("src")
+        .join("models")
+        .join(format!("{snake_name}.rs"));
+    // Issue #2328: when a run drops a flag, the scaffold no longer emits that code.
+    // Remove the feature that the code needed. `destroy` uses its own reverts.
+    // Keep `i18n` and `maud`. `.i18n_auto()` and the shared layout use them.
+    // Only a regenerate releases. A first run must not remove a hand-added feature.
+    if !for_revert && own_model_path.exists() {
         let cargo_path = project_root.join("Cargo.toml");
         let routes_dir = project_root.join("src").join("routes");
         let own_routes = routes_dir.join(format!("{plural}.rs"));
-        let own_model = project_root
-            .join("src")
-            .join("models")
-            .join(format!("{snake_name}.rs"));
         let attachments = has_attachment_fields(&fields);
         let htmx_needed = (search_enabled && !options_with_key.api)
             || options_with_key.live
             || options_with_key.live_validation;
+        // Only `htmx` has no source marker, so only it names an owner.
+        let htmx_owner = Some((routes_dir, own_routes));
         let released = [
-            ("csv", !export_enabled),
-            ("multipart", !import_enabled && !attachments),
-            ("storage", !attachments),
-            ("markdown", !rich_text_views),
-            ("htmx", !htmx_needed),
+            ("csv", !export_enabled, None),
+            ("multipart", !import_enabled && !attachments, None),
+            ("storage", !attachments, None),
+            ("markdown", !rich_text_views, None),
+            ("ws", !options_with_key.live, None),
+            ("htmx", !htmx_needed, htmx_owner),
         ];
-        for (feature, unused) in released {
+        for (feature, unused, owner) in released {
             if unused {
-                let (dir, own) = if feature == "htmx" {
-                    (Some(routes_dir.clone()), own_routes.clone())
-                } else {
-                    (None, own_model.clone())
-                };
-                plan.release_feature(cargo_path.clone(), feature, dir, own);
+                plan.release_feature(cargo_path.clone(), feature, owner);
             }
         }
         plan.settle_released_features();
@@ -27156,7 +27155,7 @@ exempt_paths = [
         }
 
         #[test]
-        fn dry_run_plan_shows_the_release() {
+        fn plan_edits_cargo_toml_but_leaves_the_disk_alone() {
             let tmp = project();
             run(&tmp, "Post", POST, &searchable());
             let plan = plan_scaffold_with_options(
@@ -27167,7 +27166,117 @@ exempt_paths = [
                 &ScaffoldOptions::default(),
             )
             .unwrap();
-            assert!(!action_contents(&plan, "Cargo.toml").contains("htmx"));
+            let edit = plan.actions.iter().find_map(|a| match a {
+                Action::Modify { path, contents } if path.ends_with("Cargo.toml") => Some(contents),
+                _ => None,
+            });
+            assert!(!edit.expect("a Cargo.toml edit").contains("htmx"));
+            assert!(autumn_web_line(&tmp).contains("htmx"));
+        }
+
+        #[test]
+        fn keeps_storage_for_a_sibling_attachment_scaffold() {
+            let tmp = project();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Note", &with_file, &ScaffoldOptions::default());
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("storage"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_markdown_and_csv_for_hand_written_code() {
+            let tmp = project();
+            run(
+                &tmp,
+                "Post",
+                &["title:String", "body:richtext"],
+                &ScaffoldOptions::default(),
+            );
+            fs::write(
+                tmp.path().join("src/hand.rs"),
+                "use autumn_web::extract::Csv;\n\
+                 pub fn a(_c: Csv<Vec<u8>>) { let _ = autumn_web::markdown::render(\"x\"); }\n",
+            )
+            .unwrap();
+            let live = ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", POST, &live);
+            let line = autumn_web_line(&tmp);
+            assert!(line.contains("markdown") && line.contains("csv"), "{line}");
+        }
+
+        #[test]
+        fn keeps_multipart_when_only_the_import_is_dropped() {
+            let tmp = project();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Post", &with_file, &importing());
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("multipart"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_htmx_for_code_outside_the_routes_dir() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            fs::create_dir_all(tmp.path().join("src/channels")).unwrap();
+            fs::write(
+                tmp.path().join("src/channels/chat.rs"),
+                "pub const J: &str = autumn_web::htmx::HTMX_JS_PATH;\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("htmx"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn dropping_live_releases_ws() {
+            let tmp = project();
+            let live = ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", POST, &live);
+            assert!(autumn_web_line(&tmp).contains("ws"));
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                !autumn_web_line(&tmp).contains("\"ws\""),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn a_first_run_keeps_a_hand_added_feature() {
+            let tmp = project();
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                CARGO.replace(
+                    "autumn-web = \"0.7.0\"",
+                    "autumn-web = { version = \"0.7.0\", features = [\"multipart\"] }",
+                ),
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("multipart"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
         }
     }
 }
