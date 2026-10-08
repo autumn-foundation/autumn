@@ -3000,6 +3000,14 @@ fn print_media_plan(media_cfg: &media::MediaMtxHostConfig) {
         media_cfg.unit_name
     );
     println!("{}", media::render_mediamtx_unit(media_cfg));
+    if media_cfg.install_binary {
+        println!(
+            "Before cutover: [media-install-binary] installs MediaMTX {} at {} if nothing \
+             is there (pinned image digest).",
+            media::MEDIAMTX_KNOWN_GOOD_VERSION,
+            media_cfg.binary_path,
+        );
+    }
     println!("MediaMTX provisioning steps:");
     for (i, op) in controller.ensure_installed_ops().iter().enumerate() {
         println!("  {}. [{}]", i + 1, op.label());
@@ -3082,6 +3090,14 @@ fn provision_media_host(
         media_cfg.unit_name
     );
     Ok(())
+}
+
+/// The pre-cutover ops that install the pinned `MediaMTX` binary (#1974).
+///
+/// Empty unless `[media.mediamtx]` is enabled with `install_binary = true`.
+/// The op skips a host that already has an executable at `binary_path`.
+fn media_binary_install_ops(media_cfg: &media::MediaMtxHostConfig) -> Vec<exec::DeployOp> {
+    media::MediaMtxController::new(media_cfg.clone()).binary_install_ops()
 }
 
 /// Build the secret env-file body sourced by the systemd unit's
@@ -4337,6 +4353,10 @@ where
                 ),
             );
         }
+        // MediaMTX binary (#1974): spliced before the proxy install below, so it
+        // runs right after it and before everything else. It only adds a file at an
+        // empty path, so it is safe before cutover. Empty unless media is enabled.
+        ops.splice(0..0, media_binary_install_ops(input.media_cfg));
         // Host preparation goes in AFTER the repair insert so it ends up ahead of
         // it: a host needing both is one with no proxy binary AND a drifted marker,
         // and installing the proxy is what makes every later op — the marker repair
@@ -9669,6 +9689,40 @@ mod tests {
             "provisioning must sit on the post-commit path (unreachable when a host's \
              deploy errors out and the rollout halts)",
         );
+    }
+
+    #[test]
+    fn media_binary_install_runs_before_cutover_in_up() {
+        // The MediaMTX binary install (#1974) only adds a file at an empty path,
+        // so it runs BEFORE cutover, as the first media step of the host's turn.
+        // A failed install then halts the rollout like any pre-cutover failure,
+        // and the app is never live without its media daemon.
+        let src = include_str!("deploy.rs");
+        let up_body = src
+            .split("fn run_up(")
+            .nth(1)
+            .and_then(|s| s.split("\nfn run_rollback(").next())
+            .expect("run_up body present");
+
+        let loop_at = up_body
+            .find("for (index, host_plan) in plan.hosts.iter().enumerate()")
+            .expect("per-host execution loop present");
+        let install_at = up_body
+            .find("ops.splice(0..0, media_binary_install_ops(input.media_cfg));")
+            .expect("the media binary install is spliced into the host's ops");
+        let proxy_install_at = up_body
+            .find("ops.splice(0..0, install);")
+            .expect("the proxy install splice is present");
+        let provision_at = up_body
+            .find("provision_media_host(input.media_cfg, executor)?;")
+            .expect("deferred provisioning call present");
+
+        assert!(loop_at < install_at, "install runs inside the host's turn");
+        assert!(
+            install_at < proxy_install_at,
+            "spliced before the proxy install, so it runs right after it"
+        );
+        assert!(install_at < provision_at);
     }
 
     // ── Fleet rollout driver (issue #1621, slice 3) ──────────────────────────
