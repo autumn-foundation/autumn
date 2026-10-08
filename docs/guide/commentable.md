@@ -83,9 +83,9 @@ CREATE INDEX IF NOT EXISTS idx_comments_parent_id ON comments (parent_id);
 exactly that, plus `comment_count BIGINT NOT NULL DEFAULT 0` on the scaffolded
 model and the `#[commentable]` attribute. Run it again for a second model and
 it adds only the column and the attribute — the table is shared, and the
-generator will not recreate it — and if the project already has an unrelated
-`comments` table, the migration fails loudly at `migrate` rather than no-opping
-into a runtime `column "commentable_type" does not exist`.
+generator will not recreate it. If the project already has an unrelated
+`comments` table, the generator stops and writes no file. Rename that table, or
+add the polymorphic columns to it, then run the command again.
 
 ### Why `commentable_id` has no foreign key
 

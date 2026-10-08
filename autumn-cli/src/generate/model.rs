@@ -344,11 +344,13 @@ fn plan_model_with_options_impl(
     if fields.iter().any(|f| f.kind.is_commentable())
         || (for_revert && super::commentable::model_declares_commentable(project_root, &snake_name))
     {
-        // On a revert the shared table stays as long as ANY other model still
-        // declares `#[commentable]`: it is one table for all of them.
+        // Refuse early: write nothing.
         if !for_revert {
             super::commentable::ensure_no_comments_conflict(project_root)?;
+            super::commentable::ensure_own_table_is_not_comments(&table)?;
         }
+        // On a revert the shared table stays as long as ANY other model still
+        // declares `#[commentable]`: it is one table for all of them.
         let revert_would_orphan_another_model = for_revert
             && super::commentable::another_model_is_still_commentable(project_root, &snake_name);
         let emitted = !revert_would_orphan_another_model

@@ -22,8 +22,8 @@
 //! already has an unrelated `comments` table (a `Comment` resource scaffolded
 //! the ordinary way, say) is a real conflict the author has to resolve, and
 //! `IF NOT EXISTS` would turn it into a silent no-op whose only symptom is a
-//! `column "commentable_type" does not exist` at request time. Failing the
-//! migration says so at `migrate`, where it is fixable.
+//! `column "commentable_type" does not exist` at request time. So generation
+//! refuses instead, before it writes any file.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -174,6 +174,17 @@ pub fn already_migrated(project_root: &Path) -> bool {
 pub fn ensure_no_comments_conflict(project_root: &Path) -> Result<(), GenerateError> {
     let (exists, polymorphic) = comments_table_state(project_root);
     if exists && !polymorphic {
+        return Err(GenerateError::CommentsTableConflict);
+    }
+    Ok(())
+}
+
+/// Refuse a model whose own table is the shared `comments` table.
+///
+/// # Errors
+/// [`GenerateError::CommentsTableConflict`] when `own_table` is `comments`.
+pub fn ensure_own_table_is_not_comments(own_table: &str) -> Result<(), GenerateError> {
+    if own_table == COMMENTS_TABLE {
         return Err(GenerateError::CommentsTableConflict);
     }
     Ok(())
@@ -2026,7 +2037,7 @@ mod tests {
         );
         assert!(
             ensure_no_comments_conflict(tmp.path()).is_err(),
-            "the name is taken, loudly, rather than silently reused"
+            "the name is taken, so generation refuses"
         );
     }
 
@@ -2249,8 +2260,7 @@ mod tests {
         );
         assert!(
             ensure_no_comments_conflict(tmp.path()).is_err(),
-            "the name is taken: generation emits and migrate fails loudly \
-             rather than claiming a reuse"
+            "the name is taken, so generation refuses"
         );
     }
 
@@ -2765,8 +2775,7 @@ mod tests {
             !already_migrated(tmp.path()),
             "`user_id` is not `author_id`, so the helpers would 42703"
         );
-        // It IS a name collision, so the caller warns rather than silently
-        // emitting a second `CREATE TABLE comments`.
+        // The name is taken, so generation refuses.
         assert!(ensure_no_comments_conflict(tmp.path()).is_err());
 
         // Every other required column, one at a time, for the same reason.
@@ -2835,9 +2844,9 @@ mod tests {
     /// A `Comment` model scaffolded the ordinary way owns a `comments` table
     /// with no discriminator columns. That is neither "already migrated" (the
     /// helpers would query columns that are not there) nor a clean slate — the
-    /// names collide, so the caller must be able to say so.
+    /// names collide, so generation refuses.
     #[test]
-    fn a_plain_comments_table_is_reported_as_conflicting() {
+    fn a_plain_comments_table_is_refused() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().join("migrations").join("0001_create_comments");
         std::fs::create_dir_all(&dir).expect("mkdir");
@@ -2849,7 +2858,7 @@ mod tests {
         assert!(!already_migrated(tmp.path()), "no discriminator columns");
         assert!(
             ensure_no_comments_conflict(tmp.path()).is_err(),
-            "a same-named non-polymorphic table must be reported"
+            "a same-named non-polymorphic table must be refused"
         );
 
         // The polymorphic table is NOT a conflict — it is the thing we reuse.

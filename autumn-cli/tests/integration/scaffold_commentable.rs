@@ -433,7 +433,10 @@ fn a_scaffolded_comment_resource_makes_commentable_generation_refuse() {
             ],
         );
         assert!(!ok, "{verb} must refuse");
-        assert!(output.contains("commentable_type"), "{verb}: {output}");
+        assert!(
+            output.contains("cannot add `comments:commentable`"),
+            "{verb}: {output}"
+        );
 
         assert!(
             !project.join("src/models/post.rs").exists(),
@@ -448,6 +451,34 @@ fn a_scaffolded_comment_resource_makes_commentable_generation_refuse() {
             1,
             "{verb}: only the Comment resource's own migration exists"
         );
+    }
+}
+
+/// A `Comment` model that is itself `comments:commentable` owns the table name
+/// the shared table needs. Generation refuses, and writes nothing.
+#[test]
+fn a_comment_model_cannot_be_commentable_itself() {
+    for verb in ["scaffold", "model"] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_autumn_ok(tmp.path(), &["new", "cmt-self-app"]);
+        let project = tmp.path().join("cmt-self-app");
+
+        let (ok, output) = run_autumn(
+            &project,
+            &[
+                "generate",
+                verb,
+                "Comment",
+                "body:Text",
+                "comments:commentable",
+            ],
+        );
+        assert!(!ok, "{verb} must refuse");
+        assert!(
+            output.contains("cannot add `comments:commentable`"),
+            "{verb}: {output}"
+        );
+        assert!(!project.join("src/models/comment.rs").exists(), "{verb}");
     }
 }
 
