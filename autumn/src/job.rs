@@ -6022,6 +6022,8 @@ pub(crate) fn start_local_runtime_inner(
                 // Register interest before checking so an enqueue that lands
                 // between the pop attempt and the await is never lost.
                 let notified = buffer.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
                 if let Some(isolation) = &isolation {
                     // Tenant isolation (#3072): the same slot rules, plus a
                     // tenant permit and a lane check on each pop.

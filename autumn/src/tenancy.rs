@@ -669,7 +669,8 @@ pub async fn tenancy_middleware(
         .map(|bulkhead| bulkhead.try_acquire(&tenant_id));
     if matches!(acquired, Some(None)) {
         state.metrics.record_tenant_request_rejection();
-        return tenant_bulkhead_rejection(&tenant_id);
+        let origin = parts.headers.get(axum::http::header::ORIGIN);
+        return tenant_bulkhead_rejection(&tenant_id, &config.cors, origin);
     }
     let _request_permit = acquired.flatten();
 
@@ -739,8 +740,13 @@ impl TenantBulkheads {
 }
 
 /// The `503` for a request over its tenant's cap. Same shape as an
-/// admission shed: Problem Details and `Retry-After: 1`.
-fn tenant_bulkhead_rejection(tenant_id: &str) -> Response {
+/// admission shed: Problem Details, `Retry-After: 1` and the CORS headers.
+/// The tenancy layer runs outside `CorsLayer`, so it adds them itself.
+fn tenant_bulkhead_rejection(
+    tenant_id: &str,
+    cors: &crate::config::CorsConfig,
+    origin: Option<&axum::http::HeaderValue>,
+) -> Response {
     tracing::debug!(tenant = %tenant_id, "tenant request cap reached");
     let mut response = crate::AutumnError::service_unavailable_msg(
         "Too many concurrent requests for this tenant; try again shortly.",
@@ -750,6 +756,9 @@ fn tenant_bulkhead_rejection(tenant_id: &str) -> Response {
         axum::http::header::RETRY_AFTER,
         axum::http::HeaderValue::from_static("1"),
     );
+    if !cors.allowed_origins.is_empty() {
+        crate::router::mirror_cors_headers(cors, origin, &mut response);
+    }
     response
 }
 
