@@ -113,7 +113,7 @@ mod shard_local_job_tests {
         WELCOMED.store(0, Ordering::SeqCst);
 
         let db = TestDb::shared().await;
-        let (_, control) = fresh_database(db, "shard_local_jobs_control").await;
+        let (control_url, control) = fresh_database(db, "shard_local_jobs_control").await;
         let (shard_url, shard) = fresh_database(db, "shard_local_jobs_shard0").await;
         {
             let mut conn = control.get().await.expect("control connection");
@@ -130,14 +130,16 @@ mod shard_local_job_tests {
         config.jobs.backend = "postgres".into();
         config.jobs.workers = 1;
         config.jobs.postgres.shard_local = true;
+        config.database.primary_url = Some(control_url);
+        // `config` first: it replaces the whole config, shards included.
         let _client = TestApp::new()
+            .config(config)
             .with_db(control.clone())
             .with_shards(vec![ShardConfig {
                 name: "shard0".to_owned(),
                 primary_url: shard_url,
                 ..Default::default()
             }])
-            .config(config)
             .jobs(jobs![shard_local_welcome])
             .build();
 

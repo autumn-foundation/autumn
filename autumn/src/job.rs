@@ -664,6 +664,11 @@ pub struct JobClient {
     per_job_settings: HashMap<String, JobRuntimeSettings>,
     pub interceptor: Option<Arc<dyn crate::interceptor::JobInterceptor>>,
     resilience_config: Option<Arc<crate::config::ResilienceConfig>>,
+    /// `jobs.postgres.shard_local` (#3072): an in-transaction enqueue skips
+    /// the fleet-wide `job_queue` breaker, so a control-database outage does
+    /// not block shard enqueues.
+    #[cfg(feature = "db")]
+    shard_local: bool,
     /// Injected entropy source for minting job ids. Defaults to
     /// [`crate::entropy::OsEntropy`]; a simulation seeds it via the app's
     /// [`crate::state::AppState::with_entropy`] so job ids replay deterministically.
@@ -3928,6 +3933,8 @@ impl JobClient {
             entropy: Arc::new(crate::entropy::OsEntropy),
             clock,
             resilience_config: None,
+            #[cfg(feature = "db")]
+            shard_local: false,
         }
     }
 }
@@ -5347,25 +5354,35 @@ impl JobClient {
         // transaction commits, so we cannot safely update process-local counters
         // here — the row may disappear on rollback while the counter persists.
         if self.pg_pool.is_some() {
-            let breaker = self.resilience_config.as_ref().map_or_else(
-                || {
-                    crate::circuit_breaker::global_registry().get_or_create(
-                        "job_queue",
-                        crate::circuit_breaker::CircuitBreakerPolicy::default(),
-                    )
-                },
-                |rc| {
-                    let policy =
-                        crate::circuit_breaker::CircuitBreakerPolicy::from_config(rc, "job_queue");
-                    crate::circuit_breaker::global_registry()
-                        .get_or_create_with_config("job_queue", policy)
-                },
-            );
-
-            let Ok(guard) = breaker.admit() else {
-                return Err(AutumnError::service_unavailable(std::io::Error::other(
-                    "job queue circuit breaker is open",
-                )));
+            // Shard-local jobs (#3072): the row goes to the caller's database,
+            // and the caller's transaction already fails fast when that
+            // database is down. The fleet-wide breaker would only add shared
+            // fate, so it is skipped.
+            let guard = if self.shard_local {
+                None
+            } else {
+                let breaker = self.resilience_config.as_ref().map_or_else(
+                    || {
+                        crate::circuit_breaker::global_registry().get_or_create(
+                            "job_queue",
+                            crate::circuit_breaker::CircuitBreakerPolicy::default(),
+                        )
+                    },
+                    |rc| {
+                        let policy = crate::circuit_breaker::CircuitBreakerPolicy::from_config(
+                            rc,
+                            "job_queue",
+                        );
+                        crate::circuit_breaker::global_registry()
+                            .get_or_create_with_config("job_queue", policy)
+                    },
+                );
+                let Ok(guard) = breaker.admit() else {
+                    return Err(AutumnError::service_unavailable(std::io::Error::other(
+                        "job queue circuit breaker is open",
+                    )));
+                };
+                Some(guard)
             };
 
             let id_for_enqueue = id.clone();
@@ -5391,7 +5408,9 @@ impl JobClient {
 
                 match &outcome {
                     Ok(EnqueueOutcome::Deduplicated) => {
-                        guard.success();
+                        if let Some(guard) = guard {
+                            guard.success();
+                        }
                         // A dedup decision is final even if the surrounding
                         // transaction rolls back, since no row was ever written, so
                         // the counter can be recorded immediately. This balances the
@@ -5404,10 +5423,14 @@ impl JobClient {
                         self.record_deduplicated_enqueue(name, &id_for_enqueue, false);
                     }
                     Ok(_) => {
-                        guard.success();
+                        if let Some(guard) = guard {
+                            guard.success();
+                        }
                     }
                     Err(_) => {
-                        guard.failure();
+                        if let Some(guard) = guard {
+                            guard.failure();
+                        }
                     }
                 }
 
@@ -5469,6 +5492,7 @@ pub fn start_runtime(
                 config.initial_backoff_ms,
                 &config.queues,
                 &config.pin,
+                &config.tenants,
                 run_workers,
             );
             Ok(())
@@ -5528,6 +5552,7 @@ pub fn start_runtime(
                 config.initial_backoff_ms,
                 &config.queues,
                 &config.pin,
+                &config.tenants,
                 run_workers,
             );
             Ok(())
@@ -5835,6 +5860,7 @@ pub(crate) fn start_local_runtime(
         default_initial_backoff_ms,
         queues_config,
         &[],
+        &crate::config::JobTenantsConfig::default(),
         true,
     );
 }
@@ -5856,6 +5882,7 @@ pub(crate) fn start_local_runtime_inner(
     default_initial_backoff_ms: u64,
     queues_config: &crate::config::JobQueuesConfig,
     pin: &[String],
+    tenants: &crate::config::JobTenantsConfig,
     run_workers: bool,
 ) {
     let job_admin = default_job_admin_backend_for_state(state);
@@ -5910,7 +5937,13 @@ pub(crate) fn start_local_runtime_inner(
     let mut limits = QueueLimits::from_config(queues_config);
     limits.retain_queues(&schedule.names());
     let slots = QueueSlots::new(worker_count, limits);
-    let buffer = Arc::new(LocalQueueBuffer::new());
+    // Tenant isolation (#3072): fair order, per-tenant slots, lanes.
+    let isolation = tenant_lanes::TenantJobIsolation::from_config(tenants);
+    let buffer = Arc::new(if isolation.is_some() {
+        LocalQueueBuffer::with_tenant_fairness()
+    } else {
+        LocalQueueBuffer::new()
+    });
 
     let client = JobClient {
         local_sender: Some(tx.clone()),
@@ -5934,6 +5967,8 @@ pub(crate) fn start_local_runtime_inner(
         resilience_config: state
             .extension::<crate::config::AutumnConfig>()
             .map(|c| Arc::new(c.resilience.clone())),
+        #[cfg(feature = "db")]
+        shard_local: false,
     };
     install_job_client(state, client);
 
@@ -5961,7 +5996,7 @@ pub(crate) fn start_local_runtime_inner(
         });
     }
 
-    for _ in 0..worker_count {
+    for worker_index in 0..worker_count {
         let state = state.clone();
         let tx = tx.clone();
         let job_admin = job_admin.clone();
@@ -5971,13 +6006,63 @@ pub(crate) fn start_local_runtime_inner(
         let coordination = Arc::clone(&coordination);
         let slots = Arc::clone(&slots);
         let mut cursor = schedule.cursor();
+        let isolation = isolation.clone();
 
         crate::sim::spawn_app_task(&state.clone(), async move {
+            let lane = isolation
+                .as_ref()
+                .and_then(|isolation| isolation.lane_of_worker(worker_index));
             loop {
                 // Register interest before checking so an enqueue that lands
                 // between the pop attempt and the await is never lost.
                 let notified = buffer.notify.notified();
-                if slots.is_active() {
+                if let Some(isolation) = &isolation {
+                    // Tenant isolation (#3072): the same slot rules, plus a
+                    // tenant permit and a lane check on each pop.
+                    let mut candidates: Vec<String> = cursor.next_order().to_vec();
+                    if !pin_active {
+                        for queue in buffer.fair_queue_names() {
+                            if !candidates.contains(&queue) {
+                                candidates.push(queue);
+                            }
+                        }
+                    }
+                    let mut ran = false;
+                    for queue in &candidates {
+                        let reserved = if slots.is_active() {
+                            match slots.try_reserve(queue) {
+                                Some(guard) => Some(guard),
+                                None => continue,
+                            }
+                        } else {
+                            None
+                        };
+                        let Some((job, permit)) = buffer.try_pop_fair(queue, isolation, lane)
+                        else {
+                            continue;
+                        };
+                        let slot = reserved.unwrap_or_else(|| slots.acquire(queue));
+                        execute_local_job(
+                            job,
+                            &jobs_by_name,
+                            &tx,
+                            &state,
+                            &job_admin,
+                            &coordination,
+                        )
+                        .await;
+                        drop(slot);
+                        drop(permit);
+                        // A freed tenant slot can admit a job that another
+                        // worker skipped.
+                        buffer.notify.notify_one();
+                        ran = true;
+                        break;
+                    }
+                    if ran {
+                        continue;
+                    }
+                } else if slots.is_active() {
                     // Atomic reserve-then-claim (#1623): walk the priority order
                     // and reserve a slot under the running-count lock *before*
                     // popping, so two workers can never both pass the cap/reserved
@@ -6163,6 +6248,9 @@ const LOCAL_QUEUE_WARN_THRESHOLD: usize = 10_000;
 /// a job whose queue is somehow outside the drain order is never stranded.
 struct LocalQueueBuffer {
     inner: std::sync::Mutex<HashMap<String, VecDeque<QueuedJob>>>,
+    /// With `[jobs.tenants]` (#3072): each queue served round-robin by
+    /// tenant, in place of `inner`.
+    fair: Option<std::sync::Mutex<HashMap<String, tenant_lanes::FairBucket<QueuedJob>>>>,
     notify: tokio::sync::Notify,
 }
 
@@ -6170,12 +6258,41 @@ impl LocalQueueBuffer {
     fn new() -> Self {
         Self {
             inner: std::sync::Mutex::new(HashMap::new()),
+            fair: None,
             notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// A buffer that serves each queue round-robin by tenant (#3072).
+    fn with_tenant_fairness() -> Self {
+        Self {
+            fair: Some(std::sync::Mutex::new(HashMap::new())),
+            ..Self::new()
         }
     }
 
     #[allow(clippy::significant_drop_tightening)]
     fn push(&self, job: QueuedJob) {
+        if let Some(fair) = &self.fair {
+            {
+                let mut map = fair.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let bucket = map
+                    .entry(normalize_queue_name(&job.queue))
+                    .or_insert_with(tenant_lanes::FairBucket::new);
+                if bucket.len() == LOCAL_QUEUE_WARN_THRESHOLD {
+                    tracing::warn!(
+                        queue = %job.queue,
+                        threshold = LOCAL_QUEUE_WARN_THRESHOLD,
+                        "local job queue has grown past the warning threshold; \
+                         memory use is unbounded — consider reducing enqueue rate or \
+                         switching to the Redis or Postgres backend"
+                    );
+                }
+                bucket.push(job.tenant.clone(), job);
+            }
+            self.notify.notify_one();
+            return;
+        }
         {
             let mut map = self
                 .inner
@@ -6240,6 +6357,39 @@ impl LocalQueueBuffer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.get_mut(queue).and_then(VecDeque::pop_front)
+    }
+
+    /// Pop the next job of `queue` that `isolation` admits on `lane`, with
+    /// the tenant permit that it holds while it runs (#3072).
+    #[allow(clippy::significant_drop_tightening)]
+    fn try_pop_fair(
+        &self,
+        queue: &str,
+        isolation: &tenant_lanes::TenantJobIsolation,
+        lane: Option<u16>,
+    ) -> Option<(QueuedJob, Option<crate::bulkhead::TenantPermit>)> {
+        let mut map = self
+            .fair
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bucket = map.get_mut(queue)?;
+        let popped = bucket.pop_where(|tenant| isolation.try_admit(tenant, lane));
+        if bucket.len() == 0 {
+            map.remove(queue);
+        }
+        popped
+    }
+
+    /// The queues that hold fair-buffered jobs now.
+    fn fair_queue_names(&self) -> Vec<String> {
+        self.fair.as_ref().map_or_else(Vec::new, |fair| {
+            fair.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .keys()
+                .cloned()
+                .collect()
+        })
     }
 }
 
@@ -9881,6 +10031,8 @@ fn start_redis_runtime(
             resilience_config: state
                 .extension::<crate::config::AutumnConfig>()
                 .map(|c| Arc::new(c.resilience.clone())),
+            #[cfg(feature = "db")]
+            shard_local: false,
         },
     );
 
@@ -11736,6 +11888,7 @@ async fn pg_maintenance_loop(
     state: AppState,
     job_admin: JobAdminMemoryBackend,
     survey_blocked: bool,
+    cleanup_tracking: bool,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     let mut interval = tokio::time::interval(PG_MAINTENANCE_INTERVAL);
@@ -11750,7 +11903,7 @@ async fn pg_maintenance_loop(
                     pg_update_concurrency_blocked_gauges(&pool, &state).await;
                 }
             }
-            _ = tracking_cleanup_interval.tick() => {
+            _ = tracking_cleanup_interval.tick(), if cleanup_tracking => {
                 pg_cleanup_expired_tracking_rows(&pool, &state).await;
             }
             () = shutdown.cancelled() => break,
@@ -12462,6 +12615,156 @@ fn start_postgres_runtime(
     )))
 }
 
+/// The `autumn_jobs` migrations, in order (#3072, ADR 0018).
+///
+/// A shard-local job table is made from these same files, so it cannot drift
+/// from the control table. Each file is idempotent (`IF NOT EXISTS`).
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+const SHARD_JOB_SCHEMA: [(&str, &str); 5] = [
+    (
+        "20260513000000_create_job_queue",
+        include_str!("../migrations/20260513000000_create_job_queue/up.sql"),
+    ),
+    (
+        "20260519000000_add_trace_context_to_jobs",
+        include_str!("../migrations/20260519000000_add_trace_context_to_jobs/up.sql"),
+    ),
+    (
+        "20260610000000_add_job_uniqueness_concurrency",
+        include_str!("../migrations/20260610000000_add_job_uniqueness_concurrency/up.sql"),
+    ),
+    (
+        "20260611000000_add_pending_unique_key_to_jobs",
+        include_str!("../migrations/20260611000000_add_pending_unique_key_to_jobs/up.sql"),
+    ),
+    (
+        "20260628000000_add_queue_to_jobs",
+        include_str!("../migrations/20260628000000_add_queue_to_jobs/up.sql"),
+    ),
+];
+
+/// Advisory-lock key that serializes the shard job DDL across replicas.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+const SHARD_JOB_SCHEMA_LOCK_KEY: i64 = 0x6175_746d_6a6f_6273; // "autmjobs"
+
+/// Make the job table on one shard. One transaction, under an advisory lock,
+/// so two replicas that boot together do not race on the DDL.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+async fn ensure_shard_job_schema(pool: &PgPool) -> Result<(), String> {
+    use diesel_async::SimpleAsyncConnection as _;
+    let mut conn = pool.get().await.map_err(|e| e.to_string())?;
+    let mut sql = format!("BEGIN; SELECT pg_advisory_xact_lock({SHARD_JOB_SCHEMA_LOCK_KEY});\n");
+    for (_, up) in SHARD_JOB_SCHEMA {
+        sql.push_str(up);
+        sql.push('\n');
+    }
+    sql.push_str("COMMIT;");
+    if let Err(error) = conn.batch_execute(&sql).await {
+        let _ = conn.batch_execute("ROLLBACK").await;
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+/// The job workers of one shard (#3072).
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+struct ShardJobWorkers {
+    shard: String,
+    pool: PgPool,
+    jobs_by_name: Arc<RwLock<HashMap<String, JobInfo>>>,
+    state: AppState,
+    job_admin: JobAdminMemoryBackend,
+    serialize_claims: bool,
+    schedule: QueueSchedule,
+    slots: Arc<QueueSlots>,
+    visibility_timeout_ms: u64,
+    /// `0` on a web replica: make the table, run no loops.
+    worker_count: usize,
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+impl ShardJobWorkers {
+    /// Make the shard's job table, then start its loops. A shard that is down
+    /// at boot is retried with backoff. It does not stop the other shards.
+    async fn run(self) {
+        let mut delay = std::time::Duration::from_secs(1);
+        loop {
+            match ensure_shard_job_schema(&self.pool).await {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        shard = %self.shard,
+                        error = %error,
+                        retry_in = ?delay,
+                        "cannot make the shard-local job table; retrying"
+                    );
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        () = self.shutdown.cancelled() => return,
+                    }
+                    delay = (delay * 2).min(std::time::Duration::from_secs(30));
+                }
+            }
+        }
+        if self.worker_count == 0 {
+            return;
+        }
+        {
+            let pool = self.pool.clone();
+            let state = self.state.clone();
+            let job_admin = self.job_admin.clone();
+            let shutdown = self.shutdown.clone();
+            let visibility_timeout_ms = self.visibility_timeout_ms;
+            // Gauges and tracking rows are on the control database only.
+            tokio::spawn(async move {
+                pg_maintenance_loop(
+                    pool,
+                    visibility_timeout_ms,
+                    state,
+                    job_admin,
+                    false,
+                    false,
+                    shutdown,
+                )
+                .await;
+            });
+        }
+        for _ in 0..self.worker_count {
+            let pool = self.pool.clone();
+            let jobs_by_name = Arc::clone(&self.jobs_by_name);
+            let state = self.state.clone();
+            let job_admin = self.job_admin.clone();
+            let shutdown = self.shutdown.clone();
+            let schedule = self.schedule.clone();
+            let slots = Arc::clone(&self.slots);
+            let (visibility_timeout_ms, serialize_claims) =
+                (self.visibility_timeout_ms, self.serialize_claims);
+            let shard = self.shard.clone();
+            tokio::spawn(async move {
+                let worker_id = format!(
+                    "{}:{shard}:{}",
+                    std::process::id(),
+                    state.entropy().uuid_v4()
+                );
+                pg_worker_loop(
+                    pool,
+                    worker_id,
+                    jobs_by_name,
+                    state,
+                    job_admin,
+                    serialize_claims,
+                    schedule,
+                    slots,
+                    visibility_timeout_ms,
+                    shutdown,
+                )
+                .await;
+            });
+        }
+    }
+}
+
 /// Start the Postgres job runtime.
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 #[allow(clippy::too_many_lines)]
@@ -12553,6 +12856,8 @@ fn start_postgres_runtime(
             resilience_config: state
                 .extension::<crate::config::AutumnConfig>()
                 .map(|c| Arc::new(c.resilience.clone())),
+            #[cfg(feature = "db")]
+            shard_local: config.postgres.shard_local,
         },
     );
 
@@ -12570,16 +12875,43 @@ fn start_postgres_runtime(
         });
     }
 
+    let visibility_timeout_ms =
+        runtime_visibility_timeout_ms("postgres", config.postgres.visibility_timeout_ms);
+    let worker_count = config.workers.max(1);
+
+    // Shard-local jobs (#3072, ADR 0018): a job table and workers on each
+    // shard. Every role makes the table, so `enqueue_in_tx` works on a web
+    // replica too. Only worker roles run loops.
+    if config.postgres.shard_local {
+        let shards = crate::db::DbState::shards(state).cloned().ok_or_else(|| {
+            AutumnError::internal_server_error(std::io::Error::other(
+                "jobs.postgres.shard_local = true needs [[database.shards]]",
+            ))
+        })?;
+        for shard in shards.iter() {
+            let shard_workers = ShardJobWorkers {
+                shard: shard.name().to_owned(),
+                pool: shard.primary_pool().clone(),
+                jobs_by_name: Arc::clone(&jobs_by_name),
+                state: state.clone(),
+                job_admin: job_admin.clone(),
+                serialize_claims,
+                schedule: schedule.clone(),
+                slots: Arc::clone(&slots),
+                visibility_timeout_ms,
+                worker_count: if run_workers { worker_count } else { 0 },
+                shutdown: shutdown.clone(),
+            };
+            tokio::spawn(shard_workers.run());
+        }
+    }
+
     // Web role installs the enqueue client above but runs no worker loops and
     // no maintenance loop: another (worker/combined) replica drains the durable
     // Postgres queue. Bypass the `workers.max(1)` floor so zero loops run.
     if !run_workers {
         return Ok(());
     }
-
-    let visibility_timeout_ms =
-        runtime_visibility_timeout_ms("postgres", config.postgres.visibility_timeout_ms);
-    let worker_count = config.workers.max(1);
 
     // Single maintenance task shared across all workers.
     {
@@ -12594,6 +12926,7 @@ fn start_postgres_runtime(
                 state,
                 job_admin,
                 serialize_claims,
+                true,
                 shutdown,
             )
             .await;
@@ -12939,6 +13272,8 @@ mod tests {
                 clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
             }
+            #[cfg(feature = "db")]
+            shard_local: false,
         }
 
         async fn minted_ids(seed: u64) -> Vec<String> {
@@ -13271,6 +13606,8 @@ mod tests {
                 clock: std::sync::Arc::new(crate::time::FixedClock::at(epoch)),
                 resilience_config: None,
             }
+            #[cfg(feature = "db")]
+            shard_local: false,
         }
 
         let epoch_a = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
@@ -13340,6 +13677,8 @@ mod tests {
                 clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
             }
+            #[cfg(feature = "db")]
+            shard_local: false,
         }
 
         let client = minimal_client();
@@ -13383,6 +13722,8 @@ mod tests {
                 clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
             }
+            #[cfg(feature = "db")]
+            shard_local: false,
         }
 
         let _guard = global_job_runtime_test_lock().lock().await;
@@ -13446,6 +13787,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "db")]
+            shard_local: false,
         });
 
         let failed_id = backend.record_enqueue_for_test(
@@ -13532,6 +13875,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "db")]
+            shard_local: false,
         });
 
         let failed_id = backend.record_enqueue_for_test("send_email", payload, 2, 5);
@@ -13590,6 +13935,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "db")]
+            shard_local: false,
         });
 
         let failed_id =
@@ -13651,6 +13998,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "db")]
+            shard_local: false,
         });
 
         let failed_id =
@@ -13901,6 +14250,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "db")]
+            shard_local: false,
         };
 
         let res = client.enqueue("test_job", serde_json::json!({})).await;
@@ -13965,6 +14316,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "db")]
+            shard_local: false,
         };
 
         let res = client.enqueue("test_job", serde_json::json!({})).await;
@@ -17748,6 +18101,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "db")]
+            shard_local: false,
         });
         assert!(global_job_client().is_some());
 
@@ -20032,6 +20387,8 @@ mod tests {
                 entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
                 clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
+                #[cfg(feature = "db")]
+                shard_local: false,
             };
 
             let mut conn = pool.get().await.unwrap();
@@ -21469,6 +21826,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "db")]
+            shard_local: false,
         };
         (client, rx)
     }
@@ -21866,6 +22225,8 @@ mod tests {
                 entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
                 clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
+                #[cfg(feature = "db")]
+                shard_local: false,
             };
             rt.block_on(async {
                 client
@@ -21922,6 +22283,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "db")]
+            shard_local: false,
         };
 
         for _ in 0..3 {
@@ -22073,6 +22436,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: spy.clone(),
             resilience_config: None,
+            #[cfg(feature = "db")]
+            shard_local: false,
         };
 
         let _ = client.relative_delay_origins();
@@ -22857,6 +23222,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "db")]
+            shard_local: false,
         });
 
         enqueue_in_after_commit("test_job", serde_json::json!({"x": 1}), Duration::ZERO)
@@ -22901,6 +23268,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "db")]
+            shard_local: false,
         });
 
         let past = chrono::Utc::now() - chrono::TimeDelta::hours(1);
@@ -23055,6 +23424,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "db")]
+            shard_local: false,
         });
 
         // Called outside a db.tx, so without the eager check this would
@@ -26041,5 +26412,37 @@ mod lease_tests {
 
         shutdown.cancel();
         clear_global_job_client();
+    }
+}
+
+#[cfg(all(test, feature = "db", not(feature = "sqlite")))]
+mod shard_job_schema_tests {
+    /// Every control migration that touches `autumn_jobs` must be in
+    /// `SHARD_JOB_SCHEMA`, or shard-local job tables drift (#3072).
+    #[test]
+    fn shard_job_schema_lists_every_autumn_jobs_migration() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut touching: Vec<String> = std::fs::read_dir(&dir)
+            .expect("migrations dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                // A statement (not a `--` comment) that names the table.
+                std::fs::read_to_string(entry.path().join("up.sql")).is_ok_and(|sql| {
+                    sql.lines()
+                        .filter(|line| !line.trim_start().starts_with("--"))
+                        .any(|line| {
+                            line.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                                .any(|word| word == "autumn_jobs")
+                        })
+                })
+            })
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        touching.sort();
+        let listed: Vec<String> = super::SHARD_JOB_SCHEMA
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect();
+        assert_eq!(listed, touching, "add the new autumn_jobs migration to SHARD_JOB_SCHEMA");
     }
 }

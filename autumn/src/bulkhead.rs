@@ -1,46 +1,226 @@
 //! Per-tenant bulkheads and shuffle sharding (issue #3072).
 //!
 //! - [`TenantBulkhead`]: a cap on the work that one tenant has in flight.
-//! - [`shuffle_shard`]: a stable set of lanes for a tenant.
+//!   The tenancy middleware uses one for requests
+//!   (`tenancy.max_concurrent_requests`) and one for database connections
+//!   (`tenancy.max_db_connections`). The `local` job runtime uses one for
+//!   job slots (`jobs.tenants.max_concurrent`).
+//! - [`shuffle_shard`]: a stable set of lanes for a tenant. Two tenants share
+//!   all their lanes only rarely, so one noisy tenant fills a small part of
+//!   the lanes and slows few other tenants.
+//!
+//! See `docs/guide/cell-isolation.md`.
 
-use std::sync::Arc;
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate".
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// A cap on the in-flight work of each tenant.
-pub struct TenantBulkhead;
+///
+/// A tenant entry exists only while the tenant holds a permit. Thus tenant
+/// ids from requests cannot grow the map without bound: its size is at most
+/// the number of permits out.
+pub struct TenantBulkhead {
+    max_per_tenant: usize,
+    in_flight: Mutex<HashMap<String, usize>>,
+}
 
-/// One unit of a tenant's in-flight work.
-pub struct TenantPermit;
+impl std::fmt::Debug for TenantBulkhead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TenantBulkhead")
+            .field("max_per_tenant", &self.max_per_tenant)
+            .field("tracked_tenants", &self.tracked_tenants())
+            .finish()
+    }
+}
+
+/// One unit of a tenant's in-flight work. Drop it to give the unit back.
+#[must_use = "the permit goes back when it drops"]
+pub struct TenantPermit {
+    bulkhead: Arc<TenantBulkhead>,
+    tenant: String,
+}
+
+impl std::fmt::Debug for TenantPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TenantPermit")
+            .field("tenant", &self.tenant)
+            .finish_non_exhaustive()
+    }
+}
 
 impl TenantBulkhead {
-    /// Make a bulkhead with `max_per_tenant` permits for each tenant.
+    /// Make a bulkhead with `max_per_tenant` permits for each tenant. `0`
+    /// sets no cap: every acquire succeeds, and the bulkhead still counts.
     #[must_use]
-    pub fn new(_max_per_tenant: usize) -> Arc<Self> {
-        todo!()
+    pub fn new(max_per_tenant: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max_per_tenant,
+            in_flight: Mutex::new(HashMap::new()),
+        })
     }
 
-    /// Take a permit for `tenant`.
+    /// The cap for each tenant. `0` means no cap.
     #[must_use]
-    pub fn try_acquire(self: &Arc<Self>, _tenant: &str) -> Option<TenantPermit> {
-        todo!()
+    pub const fn max_per_tenant(&self) -> usize {
+        self.max_per_tenant
+    }
+
+    /// Take a permit for `tenant`, or `None` when `tenant` is at its cap.
+    #[must_use]
+    pub fn try_acquire(self: &Arc<Self>, tenant: &str) -> Option<TenantPermit> {
+        let mut map = self.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
+        let held = map.get(tenant).copied().unwrap_or(0);
+        if self.max_per_tenant != 0 && held >= self.max_per_tenant {
+            return None;
+        }
+        map.insert(tenant.to_owned(), held.saturating_add(1));
+        drop(map);
+        Some(TenantPermit {
+            bulkhead: Arc::clone(self),
+            tenant: tenant.to_owned(),
+        })
     }
 
     /// The permits that `tenant` holds now.
     #[must_use]
-    pub fn in_flight(&self, _tenant: &str) -> usize {
-        todo!()
+    pub fn in_flight(&self, tenant: &str) -> usize {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(tenant)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// The number of tenants that hold a permit now.
     #[must_use]
     pub fn tracked_tenants(&self) -> usize {
-        todo!()
+        self.in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    fn release(&self, tenant: &str) {
+        let mut map = self.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(held) = map.get_mut(tenant) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                map.remove(tenant);
+            }
+        }
     }
 }
 
-/// The lanes of `key`.
+impl TenantPermit {
+    /// The tenant that holds this permit.
+    #[must_use]
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+}
+
+impl Drop for TenantPermit {
+    fn drop(&mut self) {
+        self.bulkhead.release(&self.tenant);
+    }
+}
+
+tokio::task_local! {
+    /// The `tenancy.max_db_connections` bulkhead of the current request. The
+    /// tenancy middleware sets it.
+    pub(crate) static TENANT_DB_BULKHEAD: Arc<TenantBulkhead>;
+}
+
+/// Take a database-connection permit for the current tenant.
+///
+/// `Ok(None)` when no tenant or no cap is in scope.
+///
+/// # Errors
+///
+/// A `503` when the tenant holds `tenancy.max_db_connections` connections.
+pub(crate) fn acquire_db_permit() -> Result<Option<TenantPermit>, crate::AutumnError> {
+    let Ok(bulkhead) = TENANT_DB_BULKHEAD.try_with(Arc::clone) else {
+        return Ok(None);
+    };
+    let Some(tenant) = crate::tenancy::CURRENT_TENANT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    bulkhead.try_acquire(&tenant).map(Some).ok_or_else(|| {
+        tracing::debug!(tenant = %tenant, "tenant database-connection cap reached");
+        crate::AutumnError::service_unavailable_msg(
+            "Too many database connections for this tenant; try again shortly.",
+        )
+    })
+}
+
+/// FNV-1a, 64 bit.
+fn fnv1a_64(bytes: impl IntoIterator<Item = u8>) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    bytes
+        .into_iter()
+        .fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
+}
+
+/// The lanes of `key`: `min(size, lanes)` distinct lanes in `0..lanes`,
+/// sorted.
+///
+/// The result is a permanent contract. It depends only on the arguments, so
+/// every process and every version gives a tenant the same lanes. Round `i`
+/// hashes `key`, a `0xff` separator and `i` (little endian) with FNV-1a, and
+/// takes the hash modulo `lanes`. A lane that is already taken is skipped.
+/// After `MAX_ROUNDS` rounds, the lowest free lanes fill the rest, so the
+/// loop always ends.
 #[must_use]
-pub fn shuffle_shard(_key: &str, _lanes: u16, _size: u16) -> Vec<u16> {
-    todo!()
+pub fn shuffle_shard(key: &str, lanes: u16, size: u16) -> Vec<u16> {
+    const MAX_ROUNDS: u32 = 1 << 20;
+    let want = usize::from(size.min(lanes));
+    let mut picked: Vec<u16> = Vec::with_capacity(want);
+    let mut round: u32 = 0;
+    while picked.len() < want && round < MAX_ROUNDS {
+        let hash = fnv1a_64(
+            key.bytes()
+                .chain(std::iter::once(0xff))
+                .chain(round.to_le_bytes()),
+        );
+        // `want > 0` here, so `lanes > 0`. The remainder is below `lanes`,
+        // so it fits in `u16`.
+        let lane = u16::try_from(hash.checked_rem(u64::from(lanes)).unwrap_or(0)).unwrap_or(0);
+        if !picked.contains(&lane) {
+            picked.push(lane);
+        }
+        round = round.saturating_add(1);
+    }
+    let missing = want.saturating_sub(picked.len());
+    let free: Vec<u16> = (0..lanes)
+        .filter(|lane| !picked.contains(lane))
+        .take(missing)
+        .collect();
+    picked.extend(free);
+    picked.sort_unstable();
+    picked
 }
 
 #[cfg(test)]

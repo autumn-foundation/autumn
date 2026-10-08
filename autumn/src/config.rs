@@ -5546,6 +5546,17 @@ impl AutumnConfig {
                     .to_owned(),
             ));
         }
+        // Shard-local jobs (#3072) run on the Postgres backend, one job table
+        // for each shard.
+        if self.jobs.postgres.shard_local
+            && (self.jobs.backend != "postgres" || !self.database.has_shards())
+        {
+            return Err(ConfigError::Validation(
+                "jobs.postgres.shard_local = true needs jobs.backend = \"postgres\" and \
+                 [[database.shards]] (see docs/guide/cell-isolation.md)"
+                    .to_owned(),
+            ));
+        }
         let is_production = matches!(self.profile.as_deref(), Some("prod" | "production"));
         self.security
             .webhooks
@@ -14390,6 +14401,25 @@ slots = ["8194-16383"]
         config
             .validate()
             .expect("legacy url should satisfy the jobs requirement");
+    }
+
+    #[test]
+    fn shard_local_jobs_need_postgres_jobs_and_shards() {
+        let mut config = AutumnConfig::default();
+        config.jobs.postgres.shard_local = true;
+        let Err(ConfigError::Validation(message)) = config.validate() else {
+            panic!("shard_local without postgres jobs and shards should fail validation");
+        };
+        assert!(message.contains("shard_local"), "{message}");
+
+        config.jobs.backend = "postgres".to_owned();
+        assert!(config.validate().is_err(), "shard_local without shards");
+
+        config.database.shards = vec![shard("shard0", "postgres://s0.example/app")];
+        config.database.primary_url = Some("postgres://control.example/app".to_owned());
+        config
+            .validate()
+            .expect("postgres jobs with shards satisfy shard_local");
     }
 
     #[test]

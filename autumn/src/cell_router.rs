@@ -5,8 +5,8 @@
 //! to a cell with the same 16,384-slot hash as [`crate::sharding`], so a
 //! cell can own whole shards.
 
-use crate::config::SlotSpec;
-use crate::sharding::{ShardKey, SlotId};
+use crate::config::{SLOT_COUNT, SlotSpec};
+use crate::sharding::{ShardKey, SlotId, slot_for_key};
 
 /// One cell: a name, the base URL of its ingress, and the slots it owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,57 +26,141 @@ pub struct CellSpec {
 pub struct CellRouterError(String);
 
 /// Maps a tenant or a slot to a cell.
+///
+/// It holds no state other than the cell list, so a router process can run
+/// many copies of it.
 #[derive(Debug, Clone)]
 pub struct CellRouter {
-    _cells: Vec<CellSpec>,
+    cells: Vec<CellSpec>,
+    /// Slot -> index into `cells`. Has `SLOT_COUNT` entries.
+    slot_map: Vec<u16>,
 }
 
 impl CellRouter {
     /// Make a router.
     ///
+    /// Give every cell explicit `slots`, or leave every cell empty to split
+    /// the slots evenly in order (the same rule as `[[database.shards]]`).
+    ///
     /// # Errors
     ///
     /// Returns an error when there are no cells, two cells have one name, or
     /// the slots are not covered exactly once.
-    pub fn new(_cells: Vec<CellSpec>) -> Result<Self, CellRouterError> {
-        todo!()
+    pub fn new(cells: Vec<CellSpec>) -> Result<Self, CellRouterError> {
+        let slot_count = usize::from(SLOT_COUNT);
+        if cells.is_empty() {
+            return Err(CellRouterError("give at least one cell".to_owned()));
+        }
+        if cells.len() > slot_count {
+            return Err(CellRouterError(format!(
+                "at most {slot_count} cells, got {}",
+                cells.len()
+            )));
+        }
+        let mut names = std::collections::HashSet::new();
+        for cell in &cells {
+            if !names.insert(cell.name.as_str()) {
+                return Err(CellRouterError(format!("duplicate cell name {:?}", cell.name)));
+            }
+        }
+
+        let declared = cells.iter().filter(|c| !c.slots.is_empty()).count();
+        let slot_map = if declared == 0 {
+            // The same even split as `DatabaseConfig::resolved_slot_map`.
+            let n = cells.len();
+            (0..slot_count)
+                .map(|slot| u16::try_from(slot * n / slot_count).unwrap_or(u16::MAX))
+                .collect()
+        } else if declared == cells.len() {
+            explicit_slot_map(&cells)?
+        } else {
+            return Err(CellRouterError(
+                "give slots to every cell or to none".to_owned(),
+            ));
+        };
+        Ok(Self { cells, slot_map })
     }
 
     /// The cell that owns `slot`.
+    ///
+    /// # Panics
+    ///
+    /// Never: a `SlotId` from [`crate::sharding::slot_for_key`] is always in
+    /// range. An out-of-range slot maps to the last cell.
     #[must_use]
-    pub fn for_slot(&self, _slot: SlotId) -> &CellSpec {
-        todo!()
+    pub fn for_slot(&self, slot: SlotId) -> &CellSpec {
+        let index = self
+            .slot_map
+            .get(usize::from(slot.0))
+            .map_or(self.cells.len() - 1, |&i| usize::from(i));
+        &self.cells[index]
     }
 
     /// The cell that owns `key`.
     #[must_use]
-    pub fn for_key(&self, _key: ShardKey<'_>) -> &CellSpec {
-        todo!()
+    pub fn for_key(&self, key: ShardKey<'_>) -> &CellSpec {
+        self.for_slot(slot_for_key(key))
     }
 
     /// The cell that owns `tenant`.
     #[must_use]
-    pub fn for_tenant(&self, _tenant: &str) -> &CellSpec {
-        todo!()
+    pub fn for_tenant(&self, tenant: &str) -> &CellSpec {
+        self.for_key(ShardKey::Str(tenant))
     }
 
     /// The URL in `tenant`'s cell for `path_and_query` (which starts with `/`).
     #[must_use]
-    pub fn url_for(&self, _tenant: &str, _path_and_query: &str) -> String {
-        todo!()
+    pub fn url_for(&self, tenant: &str, path_and_query: &str) -> String {
+        let base = self.for_tenant(tenant).base_url.trim_end_matches('/');
+        format!("{base}{path_and_query}")
     }
 
     /// The cells, in the order given.
     #[must_use]
     pub fn cells(&self) -> &[CellSpec] {
-        todo!()
+        &self.cells
     }
+}
+
+/// The slot map from explicit `slots`: each slot in exactly one cell.
+fn explicit_slot_map(cells: &[CellSpec]) -> Result<Vec<u16>, CellRouterError> {
+    let slot_count = usize::from(SLOT_COUNT);
+    let mut map: Vec<Option<u16>> = vec![None; slot_count];
+    for (index, cell) in cells.iter().enumerate() {
+        let owner = u16::try_from(index).unwrap_or(u16::MAX);
+        for spec in &cell.slots {
+            let slots = spec
+                .expand()
+                .map_err(|e| CellRouterError(format!("cell {:?}: {e}", cell.name)))?;
+            for slot in slots {
+                let Some(entry) = map.get_mut(usize::from(slot)) else {
+                    return Err(CellRouterError(format!(
+                        "cell {:?}: slot {slot} is out of range (slots are 0..{slot_count})",
+                        cell.name
+                    )));
+                };
+                if let Some(other) = entry {
+                    return Err(CellRouterError(format!(
+                        "cell {:?}: slot {slot} is already in cell {:?}",
+                        cell.name, cells[usize::from(*other)].name
+                    )));
+                }
+                *entry = Some(owner);
+            }
+        }
+    }
+    let missing = map.iter().filter(|owner| owner.is_none()).count();
+    if missing != 0 {
+        return Err(CellRouterError(format!(
+            "{missing} slots have no cell; the cells must cover 0..{slot_count}"
+        )));
+    }
+    Ok(map.into_iter().flatten().collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sharding::slot_for_key;
 
     fn cell(name: &str, slots: &[&str]) -> CellSpec {
         CellSpec {

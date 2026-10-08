@@ -659,6 +659,17 @@ pub async fn tenancy_middleware(
     // automatically carries the resolved tenant id.
     crate::log::context::set_tenant_id(&tenant_id);
 
+    // Per-tenant bulkheads (#3072). The request permit lives until the
+    // response head is ready, as an admission permit does.
+    let bulkheads = state.extension_or_insert_with(|| TenantBulkheads::from_config(&config.tenancy));
+    let _request_permit = match &bulkheads.requests {
+        Some(bulkhead) => match bulkhead.try_acquire(&tenant_id) {
+            Some(permit) => Some(permit),
+            None => return tenant_bulkhead_rejection(&tenant_id),
+        },
+        None => None,
+    };
+
     let request = Request::from_parts(parts, body);
     let tenant_id_clone = tenant_id.clone();
 
@@ -683,12 +694,18 @@ pub async fn tenancy_middleware(
     );
     let handle_for_body = Some(handle.clone());
 
-    let response = CURRENT_TENANT
-        .scope(
-            Some(tenant_id),
-            crate::tenant_cell::CURRENT_TENANT_CELL.scope(Some(handle), next.run(request)),
-        )
-        .await;
+    let run = crate::tenant_cell::CURRENT_TENANT_CELL.scope(Some(handle), next.run(request));
+    let response = match bulkheads.db.clone() {
+        Some(db) => {
+            CURRENT_TENANT
+                .scope(
+                    Some(tenant_id),
+                    crate::bulkhead::TENANT_DB_BULKHEAD.scope(db, run),
+                )
+                .await
+        }
+        None => CURRENT_TENANT.scope(Some(tenant_id), run).await,
+    };
 
     let (parts, body) = response.into_parts();
     let wrapped = TenantPropagatingBody {
@@ -697,6 +714,40 @@ pub async fn tenancy_middleware(
         handle: handle_for_body,
     };
     Response::from_parts(parts, axum::body::Body::new(wrapped))
+}
+
+/// The per-tenant bulkheads of an app (#3072), made once from
+/// `[tenancy]` and kept in the app state.
+struct TenantBulkheads {
+    /// `tenancy.max_concurrent_requests`.
+    requests: Option<std::sync::Arc<crate::bulkhead::TenantBulkhead>>,
+    /// `tenancy.max_db_connections`.
+    db: Option<std::sync::Arc<crate::bulkhead::TenantBulkhead>>,
+}
+
+impl TenantBulkheads {
+    fn from_config(config: &crate::config::TenancyConfig) -> Self {
+        let make = |max: usize| (max > 0).then(|| crate::bulkhead::TenantBulkhead::new(max));
+        Self {
+            requests: make(config.max_concurrent_requests),
+            db: make(config.max_db_connections),
+        }
+    }
+}
+
+/// The `503` for a request over its tenant's cap. Same shape as an
+/// admission shed: Problem Details and `Retry-After: 1`.
+fn tenant_bulkhead_rejection(tenant_id: &str) -> Response {
+    tracing::debug!(tenant = %tenant_id, "tenant request cap reached");
+    let mut response = crate::AutumnError::service_unavailable_msg(
+        "Too many concurrent requests for this tenant; try again shortly.",
+    )
+    .into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("1"),
+    );
+    response
 }
 
 pin_project! {

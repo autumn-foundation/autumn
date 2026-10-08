@@ -3131,6 +3131,9 @@ pub struct Db {
     is_test_tx: bool,
     /// Set with `SET LOCAL` at the start of each transaction (#3057).
     tx_timeouts: TxTimeouts,
+    /// The tenant's `tenancy.max_db_connections` permit (#3072). Last, so it
+    /// drops after the connection.
+    _tenant_permit: Option<crate::bulkhead::TenantPermit>,
 }
 
 impl Db {
@@ -3838,6 +3841,10 @@ impl Db {
         #[cfg(all(feature = "reporting", feature = "sqlite"))]
         crate::capsule::note_backend_capture_gap();
 
+        // The tenant's share of the pool (#3072). Take it before the pool
+        // checkout, so a tenant at its cap does not hold a connection.
+        let tenant_permit = crate::bulkhead::acquire_db_permit()?;
+
         let pool = params.pool;
         let mut checkout_future: std::pin::Pin<
             Box<
@@ -3950,6 +3957,7 @@ impl Db {
                 params.statement_timeout,
                 params.idle_in_transaction_timeout,
             ),
+            _tenant_permit: tenant_permit,
         })
     }
 
