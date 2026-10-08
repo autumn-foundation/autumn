@@ -234,6 +234,7 @@
 //! | `AUTUMN_SHADOW__MAX_BODY_BYTES` | `shadow.max_body_bytes` | `usize` |
 //! | `AUTUMN_SHADOW__MAX_RECORDS` | `shadow.max_records` | `usize` |
 //! | `AUTUMN_SHADOW__MAX_SAMPLE_BYTES` | `shadow.max_sample_bytes` | `usize` |
+//! | `AUTUMN_FAULT_INJECTION__ENABLED` | `fault_injection.enabled` | `bool` |
 
 use std::path::{Path, PathBuf};
 
@@ -1475,6 +1476,17 @@ pub struct AutumnConfig {
     /// this ordering breaks.
     #[serde(default)]
     pub metrics: MetricsConfig,
+
+    /// Staging fault injection (`[fault_injection]` section, issue #3071).
+    ///
+    /// Off by default. Refused in `prod` unless `allow_in_production = true`.
+    /// See [`crate::fault_injection`] and `docs/guide/fault-injection.md`.
+    ///
+    /// Keep this field above `database`, for the same reason as `shadow`:
+    /// strict validation then checks the keys. The regression guard is
+    /// `fault_injection_child_keys_are_strictly_validated`.
+    #[serde(default)]
+    pub fault_injection: crate::fault_injection::FaultInjectionConfig,
 
     /// Database connection settings (URL, pool size, timeouts).
     #[serde(default)]
@@ -5525,6 +5537,10 @@ impl AutumnConfig {
         // target, an unusable URL, an out-of-range sample rate) must fail boot
         // rather than start a replica that silently mirrors nothing.
         self.shadow.validate().map_err(ConfigError::Validation)?;
+        // Faults in prod need an explicit `allow_in_production = true`.
+        self.fault_injection
+            .validate(self.profile.as_deref())
+            .map_err(ConfigError::Validation)?;
         // Fail fast on an insecure or flapping [cluster] section: a node that
         // would boot without a shared secret must not boot at all.
         self.cluster.validate()?;
@@ -5775,6 +5791,7 @@ impl AutumnConfig {
     /// - `AUTUMN_SHADOW__MAX_BODY_BYTES` → `shadow.max_body_bytes` (`usize`)
     /// - `AUTUMN_SHADOW__MAX_RECORDS` → `shadow.max_records` (`usize`)
     /// - `AUTUMN_SHADOW__MAX_SAMPLE_BYTES` → `shadow.max_sample_bytes` (`usize`)
+    /// - `AUTUMN_FAULT_INJECTION__ENABLED` → `fault_injection.enabled` (`bool`)
     pub fn apply_env_overrides(&mut self) {
         self.apply_env_overrides_with_env(&OsEnv);
     }
@@ -5826,6 +5843,13 @@ impl AutumnConfig {
         self.apply_cluster_env_overrides_with_env(env);
         self.apply_push_env_overrides_with_env(env);
         self.apply_shadow_env_overrides_with_env(env);
+        // Only the switch. `allow_in_production` stays in the file, so an
+        // environment variable alone cannot turn on faults in prod.
+        parse_env_bool(
+            env,
+            "AUTUMN_FAULT_INJECTION__ENABLED",
+            &mut self.fault_injection.enabled,
+        );
     }
 
     /// Web Push (`[push]`) environment overrides.

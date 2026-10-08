@@ -152,6 +152,7 @@ mod failure_capsule_overhead;
 #[cfg(all(feature = "reporting", feature = "db", not(feature = "sqlite")))]
 mod failure_capsule_replay;
 mod fake_generators;
+mod fault_injection;
 mod feature_flags_integration;
 mod feed;
 mod form_for_derive;

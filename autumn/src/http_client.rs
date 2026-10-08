@@ -86,6 +86,10 @@ pub enum ClientError {
     /// The outbound circuit breaker is open.
     #[error("outbound circuit breaker is open")]
     CircuitBreakerOpen,
+    /// A staging fault (`[fault_injection]`, target `http`) failed the call
+    /// before it was sent.
+    #[error("{0}")]
+    FaultInjected(String),
     /// The client-side adaptive throttle rejected the attempt locally,
     /// because the host rejected too many recent attempts (issue #3068).
     /// See `[http.client.adaptive_throttle]`.
@@ -2088,6 +2092,10 @@ impl RequestBuilder {
 
     /// [`send`](Self::send), minus the replay gate and the capture tee.
     async fn send_recorded(mut self) -> Result<Response, ClientError> {
+        // Staging fault injection (#3071). Inert outside a fault scope.
+        crate::fault_injection::inject(crate::fault_injection::FaultTarget::Http)
+            .await
+            .map_err(|fault| ClientError::FaultInjected(fault.to_string()))?;
         // After the capture tee, so a capsule records the caller's headers
         // only and replays without a random key.
         self.ensure_idempotency_key();

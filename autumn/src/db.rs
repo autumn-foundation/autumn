@@ -3844,6 +3844,10 @@ impl Db {
                 dyn std::future::Future<Output = Result<PooledConnection, AutumnError>> + Send + '_,
             >,
         > = Box::pin(async move {
+            // Staging fault injection (#3071). Inert outside a fault scope.
+            crate::fault_injection::inject(crate::fault_injection::FaultTarget::Database)
+                .await
+                .map_err(|fault| AutumnError::service_unavailable_msg(fault.to_string()))?;
             pool.get().await.map_err(|e| {
                 tracing::error!("Failed to acquire database connection: {e}");
                 AutumnError::service_unavailable_msg(e.to_string())
@@ -4388,6 +4392,41 @@ mod tests {
                  SET LOCAL idle_in_transaction_session_timeout = DEFAULT"
             )
         );
+    }
+
+    /// A `database` fault fails the checkout before the pool dials.
+    #[cfg(not(feature = "sqlite"))]
+    #[tokio::test]
+    async fn an_injected_database_fault_fails_the_checkout() {
+        use crate::fault_injection::{FaultKind, FaultRule, FaultTarget, with_faults};
+
+        let config = crate::config::DatabaseConfig {
+            primary_url: Some("postgres://127.0.0.1:1/faults".to_owned()),
+            connect_timeout_secs: 1,
+            ..Default::default()
+        };
+        let pool = super::create_pool(&config)
+            .expect("a lazy pool builds")
+            .expect("a URL is set");
+        let checkout = super::Db::checkout(super::DbCheckoutParams {
+            pool: &pool,
+            pool_name: "primary",
+            shard: None,
+            statement_timeout: None,
+            idle_in_transaction_timeout: None,
+            route_key: None,
+            metrics: None,
+            slow_query_threshold: std::time::Duration::from_millis(500),
+            interceptors: Vec::new(),
+            #[cfg(feature = "reporting")]
+            capture_gap: None,
+            clock: std::sync::Arc::clone(&super::DEFAULT_SYSTEM_CLOCK),
+        });
+        let rules = [FaultRule::new(FaultTarget::Database, FaultKind::Error, 1.0)];
+        let Err(error) = with_faults(&rules, checkout).await else {
+            panic!("the injected fault must fail the checkout");
+        };
+        assert!(error.to_string().contains("fault injection"), "{error}");
     }
 
     /// A scheduled task or a job has no request scope. The background scope

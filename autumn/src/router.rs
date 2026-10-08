@@ -5356,6 +5356,26 @@ fn apply_middleware(
             )
         });
 
+    // Staging fault injection (#3071). The scope layer goes directly outside
+    // the session layer, so the Redis session store is in the request scope
+    // and the stop condition sees the final status. The route layer goes
+    // inside the timeout layer, so a timeout, the access log and error
+    // reporting see an injected fault as a real one. Probe and actuator paths
+    // are exempt, as for `[shadow]`.
+    let fault_injection = {
+        let mut exempt_paths = probe_bypass_paths(config);
+        exempt_paths.extend(crate::actuator::actuator_endpoint_paths(
+            &config.actuator.prefix,
+            config.actuator.sensitive,
+            config.actuator.prometheus,
+        ));
+        crate::fault_injection::build(config, state, exempt_paths)
+    };
+    let (fault_scope_layer, fault_route_layer, fault_handle) = match fault_injection {
+        Some((scope, route, handle)) => (Some(scope), Some(route), Some(handle)),
+        None => (None, None, None),
+    };
+
     let tenancy_layer = config.tenancy.enabled.then(|| {
         tracing::debug!("Multi-tenancy middleware enabled");
         axum::middleware::from_fn_with_state(state.clone(), crate::tenancy::tenancy_middleware)
@@ -5396,6 +5416,7 @@ fn apply_middleware(
         capture_layer,
         reporting_layer,
         tower::util::option_layer(timeout_layer),
+        tower::util::option_layer(fault_route_layer),
         tower::util::option_layer(tenancy_layer),
         tower::util::option_layer(tx_timeouts_layer),
         build_trusted_proxies_layer(config),
@@ -5579,6 +5600,7 @@ fn apply_middleware(
         ExceptionFilterLayer::new(all_filters),
         crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev },
         ryw_layer,
+        tower::util::option_layer(fault_scope_layer),
     );
 
     // ── The single merged application ───────────────────────────────────────
@@ -5614,6 +5636,10 @@ fn apply_middleware(
     // by `build_router_pre_state` after this function returns and after the MCP
     // dispatch clone is taken, so a `tools/call` replay never traverses the
     // page-cache gate (matching the SSG/ISG path and the documented intent).
+    if let Some(handle) = fault_handle {
+        crate::fault_injection::announce(&handle);
+        state.insert_extension(handle);
+    }
     Ok(router)
 }
 
