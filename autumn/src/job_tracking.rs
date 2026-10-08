@@ -1100,8 +1100,16 @@ async fn settle_tracked_payload_with_store(
         return;
     };
     if let Some(store) = store {
-        let _ =
-            tokio::time::timeout(TRACKING_SETTLE_CAP, store.fail(key, message.to_owned())).await;
+        let settle = store.fail(key, message.to_owned());
+        if tokio::time::timeout(TRACKING_SETTLE_CAP, settle)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                cap_ms = TRACKING_SETTLE_CAP.as_millis(),
+                "tracking settle timed out"
+            );
+        }
     }
 }
 
