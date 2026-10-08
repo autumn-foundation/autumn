@@ -20,8 +20,13 @@ struct Gate {
 }
 
 fn app(max_concurrent_requests: usize) -> (Router, Gate) {
+    app_with_cors(max_concurrent_requests, Vec::new())
+}
+
+fn app_with_cors(max_concurrent_requests: usize, origins: Vec<String>) -> (Router, Gate) {
     let state = AppState::for_test();
     let mut config = autumn_web::config::AutumnConfig::default();
+    config.cors.allowed_origins = origins;
     config.tenancy.enabled = true;
     config.tenancy.source = "header".to_string();
     config.tenancy.header_name = "x-tenant-id".to_string();
@@ -133,6 +138,31 @@ async fn a_zero_cap_does_not_limit_a_tenant() {
         .await
         .expect("infallible");
     assert_eq!(more.status(), StatusCode::OK);
+    gate.release.notify_waiters();
+    for handle in held {
+        assert_eq!(handle.await.expect("join"), StatusCode::OK);
+    }
+}
+
+/// The tenancy layer runs outside `CorsLayer`, so the bulkhead `503` carries
+/// the CORS headers itself. A browser then reads the `503`, not a CORS error.
+#[tokio::test]
+async fn a_bulkhead_503_carries_the_cors_headers() {
+    let (app, gate) = app_with_cors(1, vec!["https://app.example".to_owned()]);
+    let held = hold(&app, &gate, "noisy", 1).await;
+    let mut req = request("/fast", "noisy");
+    req.headers_mut().insert(
+        axum::http::header::ORIGIN,
+        axum::http::HeaderValue::from_static("https://app.example"),
+    );
+    let over = app.clone().oneshot(req).await.expect("infallible");
+    assert_eq!(over.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        over.headers()
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok()),
+        Some("https://app.example")
+    );
     gate.release.notify_waiters();
     for handle in held {
         assert_eq!(handle.await.expect("join"), StatusCode::OK);
