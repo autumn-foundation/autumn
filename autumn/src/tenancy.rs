@@ -663,16 +663,15 @@ pub async fn tenancy_middleware(
     // response head is ready, as an admission permit does.
     let bulkheads =
         state.extension_or_insert_with(|| TenantBulkheads::from_config(&config.tenancy));
-    let _request_permit = match &bulkheads.requests {
-        Some(bulkhead) => match bulkhead.try_acquire(&tenant_id) {
-            Some(permit) => Some(permit),
-            None => {
-                state.metrics.record_tenant_request_rejection();
-                return tenant_bulkhead_rejection(&tenant_id);
-            }
-        },
-        None => None,
-    };
+    let acquired = bulkheads
+        .requests
+        .as_ref()
+        .map(|bulkhead| bulkhead.try_acquire(&tenant_id));
+    if matches!(acquired, Some(None)) {
+        state.metrics.record_tenant_request_rejection();
+        return tenant_bulkhead_rejection(&tenant_id);
+    }
+    let _request_permit = acquired.flatten();
 
     let request = Request::from_parts(parts, body);
     let tenant_id_clone = tenant_id.clone();

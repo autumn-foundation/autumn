@@ -79,14 +79,15 @@ pub struct TenantJobIsolation {
 /// A job that may run. It holds the tenant's slot until it drops.
 pub struct JobAdmit {
     /// `None` for a job without a tenant.
-    _permit: Option<TenantPermit>,
+    #[allow(dead_code, reason = "held for its drop, which gives the slot back")]
+    permit: Option<TenantPermit>,
 }
 
 impl JobAdmit {
     /// `true` when the job holds a tenant slot.
     #[cfg(test)]
     const fn holds_slot(&self) -> bool {
-        self._permit.is_some()
+        self.permit.is_some()
     }
 }
 
@@ -96,7 +97,10 @@ impl TenantJobIsolation {
     /// The lane count shrinks to `workers`. Worker `i` serves lane
     /// `i % lanes`, so a lane above the worker count has no worker, and a
     /// tenant with only such lanes would never run.
-    pub fn from_config(config: &crate::config::JobTenantsConfig, workers: usize) -> Option<Arc<Self>> {
+    pub fn from_config(
+        config: &crate::config::JobTenantsConfig,
+        workers: usize,
+    ) -> Option<Arc<Self>> {
         if config.max_concurrent == 0 && config.lanes == 0 {
             return None;
         }
@@ -130,7 +134,7 @@ impl TenantJobIsolation {
     /// cap. A job without a tenant always runs.
     pub fn try_admit(&self, tenant: Option<&str>, lane: Option<u16>) -> Option<JobAdmit> {
         let Some(tenant) = tenant else {
-            return Some(JobAdmit { _permit: None });
+            return Some(JobAdmit { permit: None });
         };
         if let Some(lane) = lane
             && !shuffle_shard(tenant, self.lanes, self.lanes_per_tenant).contains(&lane)
@@ -138,7 +142,7 @@ impl TenantJobIsolation {
             return None;
         }
         self.slots.try_acquire(tenant).map(|permit| JobAdmit {
-            _permit: Some(permit),
+            permit: Some(permit),
         })
     }
 }
@@ -213,7 +217,9 @@ mod tests {
             "b has its own cap"
         );
         assert!(
-            isolation.try_admit(None, None).is_some_and(|admit| !admit.holds_slot()),
+            isolation
+                .try_admit(None, None)
+                .is_some_and(|admit| !admit.holds_slot()),
             "untenanted jobs are not capped"
         );
         drop(held);

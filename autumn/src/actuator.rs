@@ -8259,9 +8259,11 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         assert!(text.contains(
             "autumn_tenant_bulkhead_rejections_total{version=\"stable\",kind=\"request\"} 0"
         ));
-        assert!(text.contains(
-            "autumn_tenant_bulkhead_rejections_total{version=\"stable\",kind=\"db\"} 0"
-        ));
+        assert!(
+            text.contains(
+                "autumn_tenant_bulkhead_rejections_total{version=\"stable\",kind=\"db\"} 0"
+            )
+        );
     }
 
     /// Issue #3055: clones share one dead-letter trim counter.

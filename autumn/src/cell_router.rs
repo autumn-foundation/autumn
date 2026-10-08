@@ -25,11 +25,7 @@ impl CellSpec {
     /// Make a cell. Give empty `slots` to every cell to split the slots
     /// evenly in order.
     #[must_use]
-    pub fn new(
-        name: impl Into<String>,
-        base_url: impl Into<String>,
-        slots: Vec<SlotSpec>,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, base_url: impl Into<String>, slots: Vec<SlotSpec>) -> Self {
         Self {
             name: name.into(),
             base_url: base_url.into(),

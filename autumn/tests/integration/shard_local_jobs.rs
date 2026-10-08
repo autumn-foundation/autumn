@@ -210,6 +210,9 @@ mod shard_local_job_tests {
             .batch_execute("ALTER DATABASE shard_local_jobs_control ALLOW_CONNECTIONS true")
             .await
             .expect("restore the control database");
-        assert_eq!(ran, 2, "the shard worker runs jobs while the control database is down");
+        assert_eq!(
+            ran, 2,
+            "the shard worker runs jobs while the control database is down"
+        );
     }
 }

@@ -59,12 +59,14 @@ struct Upstream {
     slots: Semaphore,
 }
 
+/// One job: its tenant, when it was enqueued, and when it finished.
+type JobRecord = (String, Instant, Option<Instant>);
+
 thread_local! {
     /// Each `#[sim_test]` has its own thread, so this state is per test.
     static UPSTREAM: RefCell<Option<Arc<Upstream>>> = const { RefCell::new(None) };
     /// Job id -> (tenant, enqueued at, finished at).
-    static JOBS: RefCell<HashMap<u64, (String, Instant, Option<Instant>)>> =
-        RefCell::new(HashMap::new());
+    static JOBS: RefCell<HashMap<u64, JobRecord>> = RefCell::new(HashMap::new());
 }
 
 fn reset() {
@@ -209,7 +211,7 @@ async fn drive(sim: &Sim) -> Run {
             Some(d) = pending.next(), if !pending.is_empty() => requests.push(d),
             () = tokio::time::sleep_until(next_quiet), if elapsed < END => {
                 for tenant in QUIET_TENANTS {
-                    if quiet_ticks % QUIET_JOB_EVERY == 0 {
+                    if quiet_ticks.is_multiple_of(QUIET_JOB_EVERY) {
                         enqueue_for(tenant, next_id).await;
                         next_id += 1;
                     }
@@ -345,7 +347,7 @@ async fn sim_a_lone_job_runs_on_whichever_lane_serves_its_tenant(mut sim: Sim) {
 
     // One tenant on each lane, each enqueued alone into an idle runtime.
     let on_lane = |lane: u16| {
-        (0..)
+        (0..1000)
             .map(|i| format!("lane-tenant-{i}"))
             .find(|t| autumn_web::bulkhead::shuffle_shard(t, 2, 1) == [lane])
             .expect("a tenant on each lane")
