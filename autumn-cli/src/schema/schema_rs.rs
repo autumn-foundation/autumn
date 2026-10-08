@@ -26,7 +26,9 @@ use autumn_schema_core::{Backend, Column, ColumnType, Table};
 
 use super::diff::{MigrationPlan, SchemaChange};
 use super::parse::ParsedSchema;
-use crate::generate::introspect::{is_in_comment_or_string, scan_code, schema_block_range};
+use crate::generate::introspect::{
+    ends_in_word, is_in_comment_or_string, macro_path_start, scan_code, schema_block_range,
+};
 
 /// The path of the diesel schema file, from the project root.
 pub const SCHEMA_RS_PATH: &str = "src/schema.rs";
@@ -419,8 +421,7 @@ fn normalize_type(ty: &str) -> String {
 }
 
 /// Remove the block of `table`, its outer attributes and doc comments, and one
-/// blank line next to it. `None` when the
-/// text has no block for `table`.
+/// blank line next to it. `None` when the text has no block for `table`.
 fn remove_block(text: &str, table: &str) -> Option<String> {
     let token = ident_token(table).unwrap_or_else(|| table.to_owned());
     let (mut start, end) = schema_block_range(text, &token)?;
@@ -586,10 +587,7 @@ fn macro_calls(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> {
         let at = from + rel;
         from = at + name.len();
         // The end of a longer name (`audit_joinable!`) is not this macro.
-        let in_word = text[..at]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        let in_word = ends_in_word(&text[..at]);
         if in_word || is_in_comment_or_string(text, at) {
             continue;
         }
@@ -603,9 +601,7 @@ fn macro_calls(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> {
         let Some(close) = matching_paren(text, open) else {
             break;
         };
-        let start = text[..at]
-            .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == ':')
-            .len();
+        let start = macro_path_start(text, at);
         let mut end = close + 1;
         if text[end..].starts_with(';') {
             end += 1;
@@ -1484,5 +1480,32 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
             out.text,
             "diesel::table! {\n    users (id) {\n        id -> Int8,\n    }\n}\n"
         );
+    }
+
+    /// `diesel :: table!` with spaces is replaced whole.
+    #[test]
+    fn a_spaced_macro_path_is_replaced_whole() {
+        let existing = "diesel :: table! {\n    posts (id) {\n        id -> Int8,\n    }\n}\n";
+        let out = sync_for_plan(
+            existing,
+            &parsed(vec![posts(Backend::Postgres)]),
+            &plan(vec![]),
+        );
+        assert_eq!(out.text, POSTS_BLOCK);
+    }
+
+    /// A raw byte string and a Unicode macro name are not diesel calls.
+    #[test]
+    fn raw_byte_strings_and_unicode_names_are_not_calls() {
+        let existing = "const B: &[u8] = br#\"x\" diesel::table! { comments (id) {} }\"#;\n审计joinable!(comments -> posts (post_id));\n";
+        let out = sync_for_plan(
+            existing,
+            &parsed(vec![]),
+            &plan(vec![SchemaChange::DropTable(Table::new(
+                "comments",
+                Backend::Postgres,
+            ))]),
+        );
+        assert_eq!(out.text, existing);
     }
 }

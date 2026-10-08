@@ -553,7 +553,10 @@ fn raw_string_end(
     i: usize,
     find: &impl Fn(usize, &[u8]) -> Option<usize>,
 ) -> Option<usize> {
-    let starts_word = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    // `r"..."` or the raw byte string `br"..."`.
+    let starts_word =
+        i == 0 || !ident(b[i - 1]) || (b[i - 1] == b'b' && (i == 1 || !ident(b[i - 2])));
     if b[i] != b'r' || !starts_word {
         return None;
     }
@@ -564,6 +567,32 @@ fn raw_string_end(
     let mut close = vec![b'"'];
     close.extend(std::iter::repeat_n(b'#', hashes));
     Some(find(i + 2 + hashes, &close).map_or(b.len(), |p| p + close.len()))
+}
+
+/// True when `text` ends with an identifier character, Unicode included:
+/// a macro name found after it is the end of a longer name.
+#[must_use]
+pub fn ends_in_word(text: &str) -> bool {
+    text.chars()
+        .next_back()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// The start of the macro path that ends at `at`: `diesel::` before
+/// `table!`, also with spaces (`diesel :: table!`).
+#[must_use]
+pub fn macro_path_start(text: &str, at: usize) -> usize {
+    let mut start = at;
+    while let Some(rest) = text[..start].trim_end().strip_suffix("::") {
+        let segment = rest.trim_end();
+        let word = segment.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_');
+        if word.len() == segment.len() {
+            // A leading `::` (an absolute path).
+            return rest.len();
+        }
+        start = word.len();
+    }
+    start
 }
 
 /// True when byte `at` of `text` is not code (see [`scan_code`]): in a
@@ -608,28 +637,17 @@ fn block_table_name(text: &str, open: usize) -> Option<String> {
 pub fn schema_block_range(existing: &str, table: &str) -> Option<(usize, usize)> {
     let unraw = |name: &str| name.strip_prefix("r#").unwrap_or(name).to_owned();
     let want = unraw(table);
-    let bytes = existing.as_bytes();
     let mut search_from = 0;
     while let Some(macro_rel) = existing[search_from..].find("table!") {
         let name_start = search_from + macro_rel;
         search_from = name_start + "table!".len();
         // A `table!` in a comment or a string, or the end of a longer name
         // (`my_table!`), is not a diesel block.
-        let in_word = name_start > 0
-            && (bytes[name_start - 1].is_ascii_alphanumeric() || bytes[name_start - 1] == b'_');
+        let in_word = ends_in_word(&existing[..name_start]);
         if in_word || is_in_comment_or_string(existing, name_start) {
             continue;
         }
-        // Walk back over an optional path qualifier (e.g. `diesel::`).
-        let mut macro_start = name_start;
-        while macro_start > 0 {
-            let c = bytes[macro_start - 1];
-            if c.is_ascii_alphanumeric() || c == b'_' || c == b':' {
-                macro_start -= 1;
-            } else {
-                break;
-            }
-        }
+        let macro_start = macro_path_start(existing, name_start);
         // The opening brace of this call, then its match. Braces in comments
         // and literals (doc comments, `#[sql_name = "..."]`) do not count.
         let mut open = None;
