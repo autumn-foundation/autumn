@@ -206,7 +206,7 @@ pin_project_lite::pin_project! {
     ///
     /// Each poll also runs the inner future with the deadline as
     /// [`Deadline::current`], or the enclosing one when that is earlier, as
-    /// [`DeadlineScope`] does. The deadline is kept once, in the timer: the
+    /// [`DeadlineScope`] does. An earlier enclosing deadline also stops it. The deadline is kept once, in the timer: the
     /// request timeout layer holds this future in every request, and the
     /// allocation gate (`tests/config_alloc_gate.rs`) counts its size.
     pub(crate) struct Bounded<F> {
@@ -231,14 +231,18 @@ impl<F: Future> Future for Bounded<F> {
     type Output = Result<F::Output, DeadlineExceeded>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-        let deadline = Deadline::at(this.sleep.deadline());
+        let mut this = self.project();
+        // An enclosing deadline that is earlier applies: check it, and move
+        // the timer to it, so the task wakes then.
+        let deadline = Deadline::at(this.sleep.deadline()).nested();
+        if deadline.instant() < this.sleep.deadline() {
+            this.sleep.as_mut().reset(deadline.instant());
+        }
         if deadline.is_expired() {
             return Poll::Ready(Err(DeadlineExceeded));
         }
         let future = this.future;
-        if let Poll::Ready(output) = CURRENT.sync_scope(Some(deadline.nested()), || future.poll(cx))
-        {
+        if let Poll::Ready(output) = CURRENT.sync_scope(Some(deadline), || future.poll(cx)) {
             return Poll::Ready(Ok(output));
         }
         // Wakes the task at the deadline.
@@ -249,6 +253,21 @@ impl<F: Future> Future for Bounded<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_stops_at_an_earlier_enclosing_deadline() {
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let start = Instant::now();
+        // The bound is 5 s away, but the enclosing scope ends at 1 s.
+        let bound = Bounded::until(Deadline::after(Duration::from_secs(5)), async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let result = Deadline::after(Duration::from_secs(1)).scope(bound).await;
+        assert_eq!(result, Err(DeadlineExceeded));
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn bounded_does_not_poll_work_past_the_deadline() {

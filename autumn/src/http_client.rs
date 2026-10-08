@@ -3296,6 +3296,10 @@ struct RetryGate {
     /// started. The next [`check`](Self::check) that lets the retry run keeps
     /// them; a send cancelled in the backoff gives them back on drop.
     pending_retry: std::sync::Mutex<Option<(Arc<RetryBudget>, RetryKind)>>,
+    /// The caller's own [`DEADLINE_HEADER`] value as a deadline, fixed at the
+    /// first attempt. The value is relative, so a retry or a later hop sends
+    /// what is left of it, not the whole value again.
+    caller_deadline: std::sync::OnceLock<Option<Deadline>>,
 }
 
 impl Drop for RetryGate {
@@ -3336,6 +3340,7 @@ impl RetryGate {
             send_header,
             refill_pending: AtomicBool::new(true),
             pending_retry: std::sync::Mutex::new(None),
+            caller_deadline: std::sync::OnceLock::new(),
         }
     }
 
@@ -3395,6 +3400,7 @@ impl RetryGate {
             send_header: self.send_header,
             refill_pending: AtomicBool::new(false),
             pending_retry: std::sync::Mutex::new(None),
+            caller_deadline: self.caller_deadline.clone(),
         };
         hop.rekey(url);
         if url_host(url).is_some_and(|host| refilled.insert(host)) {
@@ -3499,17 +3505,23 @@ impl RetryGate {
     /// own copy of the header is not sent.
     fn header(&self, timeout: Option<Duration>, caller: &HeaderMap) -> Option<HeaderValue> {
         self.deadline?;
-        let left = u64::try_from(timeout?.as_millis()).unwrap_or(u64::MAX);
-        match caller.get(DEADLINE_HEADER) {
-            Some(value) => {
-                let theirs = crate::deadline::parse_header(value).map_or(u64::MAX, |d| {
-                    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
-                });
-                Some(HeaderValue::from(left.min(theirs)))
-            }
-            None if self.send_header => Some(HeaderValue::from(left)),
-            None => None,
-        }
+        let millis = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+        let left = millis(timeout?);
+        let Some(value) = caller.get(DEADLINE_HEADER) else {
+            return self.send_header.then(|| HeaderValue::from(left));
+        };
+        // The first attempt sends the caller's value as set; later ones send
+        // what is left of it.
+        let mut first = None;
+        let caller_deadline = self.caller_deadline.get_or_init(|| {
+            first = crate::deadline::parse_header(value);
+            first.map(Deadline::after)
+        });
+        let theirs = first.map_or_else(
+            || caller_deadline.map_or(u64::MAX, |deadline| millis(deadline.remaining())),
+            millis,
+        );
+        Some(HeaderValue::from(left.min(theirs)))
     }
 }
 
@@ -7512,6 +7524,60 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_retry_sends_what_is_left_of_the_callers_deadline_header() {
+            use axum::response::IntoResponse;
+            // The first attempt takes 60 ms and fails; the retry works.
+            let seen: Arc<std::sync::Mutex<Vec<u64>>> = Arc::default();
+            let slot = Arc::clone(&seen);
+            let upstream = super::spawn(axum::Router::new().route(
+                "/x",
+                axum::routing::get(move |headers: HeaderMap| {
+                    let slot = Arc::clone(&slot);
+                    async move {
+                        let value = headers
+                            .get(DEADLINE_HEADER)
+                            .and_then(|v| v.to_str().ok()?.parse().ok())
+                            .unwrap_or(u64::MAX);
+                        let first = {
+                            let mut seen = slot.lock().unwrap();
+                            seen.push(value);
+                            seen.len() == 1
+                        };
+                        if first {
+                            tokio::time::sleep(Duration::from_millis(60)).await;
+                            axum::http::StatusCode::BAD_GATEWAY.into_response()
+                        } else {
+                            axum::http::StatusCode::OK.into_response()
+                        }
+                    }
+                }),
+            ))
+            .await;
+            // A zero draw: the retry starts at once.
+            let mut client = Client::new();
+            client.entropy = Arc::new(FixedDraw(0));
+            let response = with_deadline(
+                Duration::from_secs(4),
+                client
+                    .get(format!("http://127.0.0.1:{}/x", upstream.port()))
+                    .header(DEADLINE_HEADER, "200")
+                    .retries(1)
+                    .send(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 2);
+            assert!(seen[0] <= 200, "{seen:?}");
+            // 60 ms of the caller's 200 ms are gone.
+            assert!(
+                seen[1] <= 140,
+                "the retry re-extended the deadline: {seen:?}"
+            );
+        }
+
+        #[tokio::test]
         async fn a_redirect_hop_continues_the_chain_backoff() {
             use axum::response::IntoResponse;
             let origin_hits = Arc::new(AtomicU32::new(0));
@@ -8287,6 +8353,7 @@ mod tests {
                 send_header: true,
                 refill_pending: AtomicBool::new(false),
                 pending_retry: std::sync::Mutex::new(None),
+                caller_deadline: std::sync::OnceLock::new(),
             };
             assert!(gate.allow(RetryKind::Transient, Duration::ZERO));
             // The retry starts.
