@@ -1228,7 +1228,8 @@ fn settle_redis_record(
 /// A Redis ack for attempt `attempt` of job `id` returned. Drop the note of
 /// the claim. If the ack applied to nothing, another worker or recovery took
 /// the claim. Then balance the start, unless recovery in this process already
-/// did.
+/// did. If the ack applied but a newer attempt balanced the start, undo the
+/// decrement that the caller makes next.
 #[cfg(feature = "redis")]
 fn settle_redis_claim(
     state: &AppState,
@@ -1238,7 +1239,12 @@ fn settle_redis_claim(
     attempt: u32,
     applied: bool,
 ) {
-    if job_admin.take_local_claim(id, attempt) && !applied {
+    let started_here = job_admin.take_local_claim(id, attempt);
+    if applied && !started_here {
+        // A newer attempt balanced this start. The caller's `record_*` call
+        // decrements again.
+        state.job_registry.restore_in_flight(name);
+    } else if started_here && !applied {
         state.job_registry.record_retry(name, LEASE_LOST_ERROR, 0);
     }
 }
@@ -10141,6 +10147,11 @@ fn record_pg_lifecycle_after_ack(
     // The worker is done with this claim. The note shows if something else
     // already balanced its start.
     let started_here = job_admin.take_local_claim(job_id, attempt);
+    if ack_applied && !started_here {
+        // A newer attempt balanced this start. The `record_*` call below
+        // decrements again.
+        state.job_registry.restore_in_flight(job_name);
+    }
     if !ack_applied {
         // The claim was evicted by stale-claim recovery before this ack ran.
         // The recovery task already transitioned the row in the database:
@@ -26186,6 +26197,52 @@ mod lease_tests {
         record_recovered_failure("leased", "elsewhere", 1, "expired", &state, &admin);
 
         assert_eq!(in_flight(&state), 1);
+    }
+
+    /// The retry of attempt 1 commits and a sibling worker here claims attempt
+    /// 2 before attempt 1 finishes its bookkeeping. The start of attempt 2
+    /// balanced attempt 1. The late applied ack must not balance it again.
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_late_applied_ack_does_not_balance_a_successor_attempt() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 1);
+        start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 2);
+        assert_eq!(in_flight(&state), 1, "attempt 2 runs");
+
+        record_pg_lifecycle_ack_result(
+            Ok(true),
+            "leased",
+            "enqueued-elsewhere",
+            1,
+            "failure",
+            PgLifecycleRecord::Retry {
+                error: "boom",
+                attempt: 1,
+                ready_at_ms: None,
+            },
+            &state,
+            &admin,
+        );
+
+        assert_eq!(in_flight(&state), 1, "attempt 2 still runs");
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn a_late_applied_redis_ack_does_not_balance_a_successor_attempt() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "elsewhere", 1);
+        start_elsewhere_enqueued(&state, &admin, "elsewhere", 2);
+
+        settle_redis_claim(&state, &admin, "leased", "elsewhere", 1, true);
+        state.job_registry.record_success("leased");
+
+        assert_eq!(in_flight(&state), 1, "attempt 2 still runs");
     }
 
     /// A Redis ack that applied to nothing balances the start once, whether
