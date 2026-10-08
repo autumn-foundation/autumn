@@ -807,13 +807,13 @@ fn the_decoder_sees_the_same_column_names_the_header_check_accepted() {
 fn the_discarded_column_probe_sees_the_same_column_names_the_decoder_accepted() {
     let (_tmp, project, _) = scaffold_project(
         "import-discarded-padded",
-        &["title:String", "blob:Option<Bytea>"],
+        &["title:String", "blob:Attachment"],
         &["--import"],
     );
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
     assert!(
         routes.contains(r#"const CSV_DISCARDED_COLUMNS: &[&str] = &["blob"];"#),
-        "the Bytea column must be the discarded one the probe watches:\n{routes}"
+        "the Attachment column must be the discarded one the probe watches:\n{routes}"
     );
     let import = handler_slice(&routes, "import");
     // The probe reads the row map, which is keyed by the header's RAW names —
@@ -830,49 +830,74 @@ fn the_discarded_column_probe_sees_the_same_column_names_the_decoder_accepted() 
     );
 }
 
-/// A `Bytea` column must not be importable, because the CSV cannot carry it
-/// back. The export renders it with `String::from_utf8_lossy`, so a byte that
-/// is not valid UTF-8 is ALREADY a U+FFFD replacement character in the file —
-/// and `into_new`'s `into_bytes()` would store those bytes, so importing this
-/// app's own export would silently replace a binary column with mojibake.
+/// A `Bytea` column round-trips as `\x` + hex: the export encodes it, the form
+/// decodes it, and the import sets it. The lossy `from_utf8_lossy` rendering
+/// turned every non-UTF-8 byte into U+FFFD at download time (issue #2330).
 #[test]
-fn a_bytea_column_is_not_importable() {
+fn a_bytea_column_round_trips_as_hex() {
     let (_tmp, project, _) = scaffold_project(
         "import-bytea",
         &["title:String", "blob:Option<Bytea>"],
         &["--import"],
     );
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
-    // Not settable — and not required either: the required set is the live
-    // schema minus the columns the import cannot set, so `blob` can never
-    // sneak into it.
+    // The export encodes. No lossy conversion may remain in the CSV record.
+    let schema = routes
+        .split("impl autumn_web::data::csv::CsvSchema for Post")
+        .nth(1)
+        .expect("the export must emit a CsvSchema impl");
     assert!(
-        routes.contains("fn csv_required_columns() -> Vec<&'static str>"),
-        "a Bytea column must not be one the import requires:
-{routes}"
+        schema.contains("bytea_to_hex"),
+        "the export must hex-encode the Bytea column:\n{schema}"
     );
-    // ...named on the upload page as a column the import cannot set...
     assert!(
-        routes.contains(r#"const CSV_IGNORED_COLUMNS: &[&str] = &["id", "blob", "created_at"];"#),
-        "a Bytea column must be named as unsettable:
-{routes}"
+        !schema.contains("from_utf8_lossy"),
+        "the export must not render a Bytea column lossily:\n{schema}"
     );
-    // ...and flagged in the report when a file actually supplies a value, since
-    // an operator editing that column would otherwise see nothing happen.
+    // Hex never starts with a formula character, so no formula guard.
     assert!(
-        routes.contains(r#"const CSV_DISCARDED_COLUMNS: &[&str] = &["blob"];"#),
-        "a supplied Bytea value must raise the discarded-column alert:
-{routes}"
+        !schema.contains("csv_text_cell(self.blob") && !schema.contains("csv_text_cell(bytea"),
+        "a hex cell needs no formula guard:\n{schema}"
     );
-    // The export still writes the column — this is an import-side exclusion, not
-    // a change to #1315's surface.
-    // (The nullable column exports through `map(|bytes| …)`, the non-nullable
-    // one through `&self.blob` — assert the parts common to both rather than
-    // one shape's exact expression.)
+    // The import settles the column: settable, not ignored, not discarded.
     assert!(
-        routes.contains("self.blob") && routes.contains("String::from_utf8_lossy"),
-        "the export must still carry the column:
-{routes}"
+        routes.contains(r#"const CSV_IGNORED_COLUMNS: &[&str] = &["id", "created_at"];"#),
+        "a Bytea column must no longer be ignored by the import:\n{routes}"
+    );
+    assert!(
+        !routes.contains("CSV_DISCARDED_COLUMNS"),
+        "a Bytea column must no longer raise the discarded-column alert:\n{routes}"
+    );
+    assert!(
+        routes.contains(r#""title", "blob""#),
+        "a Bytea column must be one the import can set:\n{routes}"
+    );
+    // The form decodes the same representation, rejecting bad input.
+    assert!(
+        routes.contains("fn bytea_from_hex(") && routes.contains("fn bytea_to_hex("),
+        "both hex helpers must be emitted:\n{routes}"
+    );
+    assert!(
+        !routes.contains("into_bytes()") && !routes.contains("String::from_utf8_lossy(value)"),
+        "the form must not use the lossy String round trip:\n{routes}"
+    );
+}
+
+/// The `\x` prefix is part of the contract: a bare digit string such as
+/// `0012` would lose its leading zeros if a spreadsheet read it as a number.
+#[test]
+fn the_hex_helpers_require_the_prefix_and_never_panic() {
+    let (_tmp, project, _) = scaffold_project(
+        "import-bytea-helpers",
+        &["title:String", "blob:Option<Bytea>"],
+        &["--import"],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    let decode = fn_slice(&routes, "bytea_from_hex");
+    assert!(decode.contains(r#"strip_prefix("\\x")"#), "{decode}");
+    assert!(
+        !decode.contains("[..") && !decode.contains("from_str_radix"),
+        "byte-slicing and from_str_radix panic or accept `+`:\n{decode}"
     );
 }
 
@@ -884,8 +909,8 @@ fn a_bytea_column_is_not_importable() {
 #[test]
 fn an_unsettable_column_never_reaches_the_form_decoder() {
     let (_tmp, project, _) = scaffold_project(
-        "import-bytea-decode",
-        &["title:String", "blob:Option<Bytea>"],
+        "import-ignored-decode",
+        &["title:String", "cover:Attachment"],
         &["--import"],
     );
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
@@ -895,50 +920,25 @@ fn an_unsettable_column_never_reaches_the_form_decoder() {
             && import.contains("return None;"),
         "an ignored column must be filtered out before decode_form sees it:\n{import}"
     );
-    // The premise the filter exists for: the form DOES still carry the column,
-    // so without the filter its exported mojibake would decode and be written.
-    assert!(
-        routes.contains("pub blob: Option<String>,"),
-        "the form still carries the Bytea column, which is why filtering matters:\n{routes}"
-    );
 }
 
-/// A NON-NULLABLE `Bytea` is refused outright. The import must filter the column
-/// out (it cannot round-trip), but the form declares it as a bare `String` with
-/// no default — so a filtered row fails "missing field" and the importer could
-/// never import anything. A nullable one is fine: the form declares
-/// `Option<String>`, so a filtered column decodes as `None`.
-///
-/// This is the general shape the `#[encrypted]` refusal is the other instance
-/// of: a column the import cannot set that the form nonetheless requires.
+/// A NON-NULLABLE `Bytea` keeps the import: the column is settable, so the
+/// form's required `String` field is filled from the file's hex cell.
 #[test]
-fn a_required_unsettable_column_refuses_the_import() {
+fn a_required_bytea_column_keeps_the_import() {
     let (_tmp, project, output) = scaffold_project(
         "import-bytea-required",
         &["title:String", "blob:Bytea"],
         &["--import"],
     );
-    assert_no_import_anywhere(&project);
-    assert!(
-        output.contains("non-nullable Bytea column"),
-        "the warning must name the shape:\n{output}"
-    );
-    assert!(
-        output.contains("blob:Option<Bytea>"),
-        "the warning must name the way out:\n{output}"
-    );
-
-    // CONTROL: the nullable form of the same column keeps the surface, because
-    // a filtered-out `Option<String>` decodes as `None` rather than failing.
-    let (_tmp2, nullable, _) = scaffold_project(
-        "import-bytea-nullable",
-        &["title:String", "blob:Option<Bytea>"],
-        &["--import"],
-    );
-    let routes = fs::read_to_string(nullable.join("src/routes/posts.rs")).unwrap();
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
     assert!(
         routes.contains(r#"#[post("/posts/import")]"#),
-        "a nullable Bytea column must still get the import:\n{routes}"
+        "a required Bytea column must still get the import:\n{routes}"
+    );
+    assert!(
+        !output.contains("non-nullable Bytea column"),
+        "no refusal warning may remain:\n{output}"
     );
 }
 
