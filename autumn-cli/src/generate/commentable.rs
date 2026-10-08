@@ -620,6 +620,7 @@ fn alter_tables(sql: &str) -> Vec<(usize, TableRef, &str)> {
 /// Scanned by destination because a rename INTO `comments` begins with whatever
 /// the table used to be called, which the caller has no other way to know.
 fn table_rename_target(statement: &str) -> Option<TableRef> {
+    let statement = &squash_whitespace(statement);
     let at = statement.find(" rename to ")?;
     // `RENAME COLUMN … TO …` is a column rename, classified with the columns.
     if statement[..at].contains("rename column") {
@@ -628,9 +629,17 @@ fn table_rename_target(statement: &str) -> Option<TableRef> {
     parse_table_ref(&statement[at + " rename to ".len()..]).map(|(table, _)| table)
 }
 
+/// `statement` with every whitespace run as one space, and one space at each
+/// end, so keyword phrases match whatever whitespace split them.
+fn squash_whitespace(statement: &str) -> String {
+    let words: Vec<&str> = statement.split_whitespace().collect();
+    format!(" {} ", words.join(" "))
+}
+
 /// The new home of `table` after `ALTER TABLE … SET SCHEMA <schema>`, if
 /// `statement` (the text after the table name) is one.
 fn table_set_schema_target(statement: &str, table: &TableRef) -> Option<TableRef> {
+    let statement = &squash_whitespace(statement);
     let at = statement.find(" set schema ")?;
     let (schema, _) = parse_ident_segment(&statement[at + " set schema ".len()..])?;
     Some(TableRef {
@@ -2093,6 +2102,29 @@ mod tests {
             ensure_no_comments_conflict(tmp.path()).is_err(),
             "the plain table is back in the default schema"
         );
+    }
+
+    /// Keywords may be split by any SQL whitespace, not one space.
+    #[test]
+    fn schema_moves_and_renames_accept_any_whitespace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_create");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT);\n\
+             ALTER TABLE comments\nSET\tSCHEMA   archive;\n",
+        )
+        .expect("write");
+        assert!(ensure_no_comments_conflict(tmp.path()).is_ok());
+
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT);\n\
+             ALTER TABLE comments\nRENAME\tTO   legacy;\n",
+        )
+        .expect("write");
+        assert!(ensure_no_comments_conflict(tmp.path()).is_ok());
     }
 
     /// `RENAME TO` keeps the table in its schema: a table renamed within
