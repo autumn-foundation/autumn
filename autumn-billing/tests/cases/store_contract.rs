@@ -1044,9 +1044,8 @@ pub async fn link_subscription_adopts_pending_invoices_and_dunning(store: &dyn B
         .await
         .unwrap();
 
-    let by_id = |id: String| async move {
-        store.invoice_by_id(&id).await.unwrap().expect("invoice")
-    };
+    let by_id =
+        |id: String| async move { store.invoice_by_id(&id).await.unwrap().expect("invoice") };
     assert_eq!(
         by_id(orphan.id.clone()).await.subscription_id.as_deref(),
         Some("adopt-sub")
@@ -1060,11 +1059,7 @@ pub async fn link_subscription_adopts_pending_invoices_and_dunning(store: &dyn B
     let row = store.dunning_by_invoice(&orphan.id).await.unwrap().unwrap();
     assert_eq!(row.subscription_id.as_deref(), Some("adopt-sub"));
     assert_eq!(row.updated_at, at(2000));
-    let closed = store
-        .dunning_by_invoice(&closed.id)
-        .await
-        .unwrap()
-        .unwrap();
+    let closed = store.dunning_by_invoice(&closed.id).await.unwrap().unwrap();
     assert_eq!(closed.subscription_id, None, "a settled row is left alone");
     // Idempotent.
     store

@@ -467,10 +467,20 @@ async fn exhausted(
     let action = service.config().dunning.on_exhausted;
     // The row was opened before the subscription was mirrored when the
     // failure arrived first; the invoice carries the link by now.
-    let subscription_id = exhausted
+    let mut subscription_id = exhausted
         .subscription_id
         .clone()
         .or_else(|| invoice.subscription_id.clone());
+    // Last resort: the link was never written, but the subscription is
+    // mirrored now.
+    if subscription_id.is_none()
+        && let Some(provider_id) = &invoice.provider_subscription_id
+    {
+        subscription_id = store
+            .subscription_by_provider_id(provider_id)
+            .await?
+            .map(|subscription| subscription.id);
+    }
     if let Some(subscription_id) = &subscription_id {
         let subscription = store
             .set_subscription_status(subscription_id, SubscriptionStatus::Unpaid, now)

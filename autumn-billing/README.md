@@ -199,6 +199,10 @@ retry runs 1 day after the failure, the second 3 days after that, the third
 cancels the subscription. Every retry goes through the store row, so a
 duplicate or early job run is a no-op.
 
+A failure can arrive before its subscription event. The invoice keeps the
+provider subscription id. When the subscription is mirrored, the plugin links
+the invoice and its open dunning row.
+
 ```rust
 let billing = BillingConfig::from_env()
     .dunning(DunningPolicy::standard().with_on_exhausted(ExhaustionAction::MarkUnpaid));

@@ -287,7 +287,16 @@ impl Ctx<'_> {
         if let Some(end) = snapshot.current_period_end {
             upsert = upsert.with_period_end(end);
         }
-        let subscription = match store.upsert_subscription(upsert).await? {
+        let written = store.upsert_subscription(upsert).await?;
+        // Every outcome has a stored row. Idempotent, so a redelivery after
+        // a failure past the write links what the first delivery missed.
+        let (StoreWrite::Applied(stored)
+        | StoreWrite::Unchanged(stored)
+        | StoreWrite::Stale(stored)) = &written;
+        store
+            .link_subscription(&snapshot.provider_subscription_id, &stored.id, self.now)
+            .await?;
+        let subscription = match written {
             StoreWrite::Applied(subscription) => subscription,
             // A redelivery after a failure past the write: repeat the
             // idempotent step only. Notifications and hooks ran, or never
@@ -370,6 +379,11 @@ impl Ctx<'_> {
         .with_attempt_count(snapshot.attempt_count);
         if let Some(subscription) = subscription {
             upsert = upsert.with_subscription(subscription.id);
+        }
+        // Kept even when the subscription is not mirrored yet, so mirroring
+        // it can link this invoice.
+        if let Some(id) = &snapshot.provider_subscription_id {
+            upsert = upsert.with_provider_subscription(id.clone());
         }
         if let Some(next) = snapshot.next_payment_attempt {
             upsert = upsert.with_next_payment_attempt(next);

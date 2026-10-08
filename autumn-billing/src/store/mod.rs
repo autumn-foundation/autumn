@@ -320,6 +320,8 @@ pub struct InvoiceUpsert {
     pub customer_id: String,
     /// Local subscription id.
     pub subscription_id: Option<String>,
+    /// Provider subscription id. `None` keeps the stored value.
+    pub provider_subscription_id: Option<ProviderId>,
     /// Provider invoice id (the key).
     pub provider_invoice_id: ProviderId,
     /// Status.
@@ -356,6 +358,7 @@ impl InvoiceUpsert {
             new_id: new_id.into(),
             customer_id: customer_id.into(),
             subscription_id: None,
+            provider_subscription_id: None,
             provider_invoice_id: provider_invoice_id.into(),
             status,
             amount_due,
@@ -371,6 +374,13 @@ impl InvoiceUpsert {
     #[must_use]
     pub fn with_subscription(mut self, subscription_id: impl Into<String>) -> Self {
         self.subscription_id = Some(subscription_id.into());
+        self
+    }
+
+    /// Set the provider subscription id.
+    #[must_use]
+    pub fn with_provider_subscription(mut self, id: impl Into<ProviderId>) -> Self {
+        self.provider_subscription_id = Some(id.into());
         self
     }
 
@@ -512,6 +522,22 @@ pub trait BillingStore: Send + Sync + 'static {
         &'a self,
         provider_invoice_id: &'a ProviderId,
     ) -> StoreFuture<'a, Option<Invoice>>;
+
+    /// Link the invoices of `provider_subscription_id` that have no local
+    /// subscription to `subscription_id`. Their `Pending` or `Running`
+    /// dunning rows are linked too. Existing links stay. Idempotent.
+    ///
+    /// Defaulted to a no-op, so a store written before this method existed
+    /// keeps compiling. Such a store keeps the old behavior.
+    fn link_subscription<'a>(
+        &'a self,
+        provider_subscription_id: &'a ProviderId,
+        subscription_id: &'a str,
+        now: DateTime<Utc>,
+    ) -> StoreFuture<'a, ()> {
+        let _ = (provider_subscription_id, subscription_id, now);
+        Box::pin(std::future::ready(Ok(())))
+    }
 
     // ── Dunning ─────────────────────────────────────────────────────────
 

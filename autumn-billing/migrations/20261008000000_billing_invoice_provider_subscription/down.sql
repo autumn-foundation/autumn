@@ -1,0 +1,2 @@
+DROP INDEX IF EXISTS billing_invoices_unlinked_provider_subscription_idx;
+ALTER TABLE billing_invoices DROP COLUMN provider_subscription_id;
