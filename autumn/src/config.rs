@@ -2524,7 +2524,7 @@ pub struct HttpClientConfig {
 /// retry_ratio = 0.1
 /// ```
 #[cfg(feature = "http-client")]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct RetryBudgetConfig {
     /// Use the retry budget. Default: `true`.
     #[serde(default = "default_retry_budget_enabled")]

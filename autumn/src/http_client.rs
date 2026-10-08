@@ -1498,12 +1498,7 @@ impl Client {
 
         // The extractor builds a new client for each request, so the budgets
         // live in the app state. Thus all requests of one app share them.
-        client.retry.budgets = budget_config.enabled.then(|| {
-            let budgets = state.extension_or_insert_with(|| {
-                SharedRetryBudgets(Arc::new(RetryBudgets::new(&budget_config)))
-            });
-            Arc::clone(&budgets.0)
-        });
+        client.retry.budgets = shared_retry_budgets(state, &budget_config);
 
         client.resilience_config = autumn_config.map(|c| Arc::new(c.resilience.clone()));
 
@@ -3273,8 +3268,51 @@ impl RetrySettings {
 /// get an answer, and tokio timers round up to whole milliseconds.
 const MIN_ATTEMPT: Duration = Duration::from_millis(10);
 
-/// The app's retry budgets, stored in `AppState`.
-pub(crate) struct SharedRetryBudgets(pub(crate) Arc<RetryBudgets>);
+/// The app's retry budgets, stored in `AppState`. `config` is the setting
+/// they were built from.
+#[derive(Clone)]
+pub(crate) struct SharedRetryBudgets {
+    budgets: Arc<RetryBudgets>,
+    config: RetryBudgetConfig,
+}
+
+/// Serializes the replacement of the shared retry budgets.
+static BUDGETS_REPLACE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The app-wide retry budgets for the effective `config`, or `None` when
+/// they are off. A `state_initializer` may replace the config after boot, so
+/// budgets built from other settings are replaced, as the shared throttle is.
+fn shared_retry_budgets(
+    state: &crate::AppState,
+    config: &RetryBudgetConfig,
+) -> Option<Arc<RetryBudgets>> {
+    if !config.enabled {
+        return None;
+    }
+    let current = || {
+        state
+            .extension::<SharedRetryBudgets>()
+            .filter(|shared| shared.config == *config)
+            .map(|shared| Arc::clone(&shared.budgets))
+    };
+    if let Some(budgets) = current() {
+        return Some(budgets);
+    }
+    // Replace under a lock and check again, so that concurrent first calls
+    // after a config change share one set. Only this slow path locks.
+    let _guard = BUDGETS_REPLACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(budgets) = current() {
+        return Some(budgets);
+    }
+    let budgets = Arc::new(RetryBudgets::new(config));
+    state.insert_extension(SharedRetryBudgets {
+        budgets: Arc::clone(&budgets),
+        config: config.clone(),
+    });
+    Some(budgets)
+}
 
 /// The request deadline and the retry budget for one send.
 ///
@@ -3668,6 +3706,10 @@ struct ChainRetries {
     left: AtomicU32,
     /// Retries already made, so a later hop's backoff goes on from them.
     used: AtomicU32,
+    /// When the attempt that answered with the redirect being followed runs
+    /// out of its `request_timeout`. As with reqwest's own redirects, one
+    /// timeout covers all hops of an attempt.
+    attempt_end: Mutex<Option<Instant>>,
 }
 
 impl ChainRetries {
@@ -3675,7 +3717,24 @@ impl ChainRetries {
         Self {
             left: AtomicU32::new(retries),
             used: AtomicU32::new(0),
+            attempt_end: Mutex::new(None),
         }
+    }
+
+    /// Take the end of the attempt that led to this hop.
+    fn take_attempt_end(&self) -> Option<Instant> {
+        self.attempt_end
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Carry `end` to the next hop's first attempt.
+    fn set_attempt_end(&self, end: Option<Instant>) {
+        *self
+            .attempt_end
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = end;
     }
 }
 
@@ -3899,11 +3958,29 @@ async fn send_one(
         // caller built it at hop-start: without this override, a retry deep
         // into a hop's budget would still get the full original per-attempt
         // timeout rather than what's actually left before `deadline`.
-        let hop_timeout =
-            deadline.map(|d| d.saturating_duration_since(crate::time::ambient_instant()));
+        let attempt_start = crate::time::ambient_instant();
+        let hop_timeout = deadline.map(|d| d.saturating_duration_since(attempt_start));
+        // On a chain the client follows itself, the first attempt of a later
+        // hop goes on with the attempt that answered with the redirect, and
+        // keeps what is left of its `request_timeout`. A retry is a new
+        // attempt, with a new timeout.
+        let carried_end = if attempt == 0 {
+            chain.and_then(ChainRetries::take_attempt_end)
+        } else {
+            None
+        };
+        let per_try = match (retry_policy.request_timeout, carried_end) {
+            (Some(_), Some(end)) => Some(end.saturating_duration_since(attempt_start)),
+            (limit, _) => limit,
+        };
+        let attempt_end = carried_end.or_else(|| {
+            retry_policy
+                .request_timeout
+                .and_then(|limit| attempt_start.checked_add(limit))
+        });
         // The request deadline (issue #3058) can make it shorter again.
         let attempt_timeout = if gate.deadline.is_some() {
-            gate.attempt_timeout(hop_timeout.or(retry_policy.request_timeout))
+            gate.attempt_timeout(hop_timeout.or(per_try))
         } else {
             hop_timeout
         };
@@ -3948,6 +4025,9 @@ async fn send_one(
                 // may be large or never end.
                 let followed = skip_redirect_body
                     && matches!(redirect_location(status, &headers, url), Ok(Some(_)));
+                if followed && let Some(chain) = chain {
+                    chain.set_attempt_end(attempt_end);
+                }
                 let body = if discard_response_body || followed {
                     // Dropped unread — see `RequestBuilder::discard_response_body`.
                     Ok(Bytes::new())
@@ -4426,6 +4506,28 @@ mod tests {
         replaced.client.adaptive_throttle.enabled = false;
         state.insert_extension(replaced);
         assert!(Client::from_state(&state).throttle.is_none(), "off again");
+    }
+
+    /// A `state_initializer` that replaces the config after boot gets retry
+    /// budgets built from the new settings, shared by all clients.
+    #[test]
+    fn from_state_rebuilds_the_retry_budgets_when_their_config_changes() {
+        let state = crate::AppState::for_test();
+        let mut config = crate::config::HttpConfig::default();
+        state.insert_extension(config.clone());
+        let a = Client::from_state(&state).retry.budgets.expect("on");
+        let b = Client::from_state(&state).retry.budgets.expect("on");
+        assert!(Arc::ptr_eq(&a, &b), "clients share one set of budgets");
+
+        config.client.retry_budget.capacity = 50;
+        state.insert_extension(config.clone());
+        let c = Client::from_state(&state).retry.budgets.expect("still on");
+        assert!(!Arc::ptr_eq(&a, &c), "new settings build new budgets");
+        assert!((c.for_host("h:80").available() - 50.0).abs() < f64::EPSILON);
+
+        config.client.retry_budget.enabled = false;
+        state.insert_extension(config);
+        assert!(Client::from_state(&state).retry.budgets.is_none(), "off");
     }
 
     /// Regression (#3183 review): concurrent first calls after a config
@@ -7574,6 +7676,43 @@ mod tests {
             assert!(
                 seen[1] <= 140,
                 "the retry re-extended the deadline: {seen:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_redirect_chain_under_a_deadline_keeps_the_client_timeout() {
+            use axum::response::IntoResponse;
+            // Each hop takes 200 ms: 400 ms in all, over the 300 ms timeout.
+            let app = axum::Router::new()
+                .route(
+                    "/a",
+                    axum::routing::get(|| async {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        axum::response::Redirect::temporary("/b").into_response()
+                    }),
+                )
+                .route(
+                    "/b",
+                    axum::routing::get(|| async {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        "ok"
+                    }),
+                );
+            let upstream = super::spawn(app).await;
+            let mut client = Client::new();
+            client.retry_policy.request_timeout = Some(Duration::from_millis(300));
+            let result = with_deadline(
+                Duration::from_secs(4),
+                client
+                    .get(format!("http://127.0.0.1:{}/a", upstream.port()))
+                    .no_retry()
+                    .send(),
+            )
+            .await;
+            // Without a deadline, reqwest's one timeout covers the redirects.
+            assert!(
+                matches!(&result, Err(ClientError::Request(e)) if e.is_timeout()),
+                "the chain must not get a new timeout per hop: {result:?}"
             );
         }
 
