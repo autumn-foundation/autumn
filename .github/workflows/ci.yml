@@ -2553,6 +2553,22 @@ jobs:
           RUSTFLAGS: "--cfg loom_models"
           LOOM_MAX_PREEMPTIONS: "3"
 
+  # Stateright models of job claims, tick election and lease locks (issue
+  # #3071). Each model checks every reachable state within small bounds. Each
+  # seeded bug must give a counterexample. `cargo test --workspace` also runs
+  # them; this job gives them a check name of their own. The Verus proofs run
+  # in `verus.yml`.
+  protocol-models:
+    name: Protocol models
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Check the protocol models
+        run: cargo test -p autumn-protocol-models --release
+
   # Edge capsule conformance (issue #1790). The proof behind AC-1 to AC-3: the
   # `edge-greeting` fixture is compiled BOTH ways — natively and to a real
   # `wasm32-wasip1` artifact — and a shared request corpus is driven through

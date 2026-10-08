@@ -1,7 +1,8 @@
 # Verus specifications
 
 This directory contains small mathematical shadows of critical runtime state.
-They are intentionally separate from the Cargo workspace because Verus uses an
+It also contains the protocol models in `models/` (see "Protocol models").
+The Verus specs are intentionally separate from the Cargo workspace because Verus uses an
 extended Rust dialect. Verify the tenant arena spine with:
 
 ```sh
@@ -106,3 +107,31 @@ keeps the limit in `min..=max`. The AIMD model rounds the back-off up; the
 runtime rounds it down. The clamp makes the property true for both. The model
 does not include the floating-point algorithms. Unit tests and sim tests
 examine them.
+
+## Protocol models
+
+`models/` is the `autumn-protocol-models` crate (issue #3071). It holds
+[Stateright](https://www.stateright.rs) models of three protocols:
+
+| Model | Production code | Properties |
+| --- | --- | --- |
+| `job_claim` | `autumn/src/job.rs` (ADR 0016) | A stale holder's settle is rejected. At most one execution runs at a time. |
+| `tick_election` | `autumn/src/scheduler.rs` (#3052) | Each tick runs at most once. |
+| `lease_lock` | `autumn/src/lock/lease.rs` (ADR 0015) | A stale holder's write is rejected. Tokens are unique per grant. At most one holder trusts its lease. |
+
+The Verus specs above prove one step at a time. The models check every
+interleaving of workers, replicas, late messages and clock steps, in small
+bounds. Run them with:
+
+```sh
+cargo test -p autumn-protocol-models
+```
+
+Each model has a `Variant`. `Correct` must hold every `always` property and
+reach every `sometimes` property. Each seeded bug (for example
+`SettleWithoutOwnerFence`) must give a counterexample. A test fails if a
+seeded bug passes, so a check that cannot fail does not pass.
+
+When a protocol changes, change its model in the same PR. `cargo test
+--workspace` runs the models. The `Protocol models` job in `ci.yml` also runs
+them in release mode.
