@@ -960,6 +960,67 @@ async fn import_refuses_a_null_in_a_column_that_the_target_now_requires() {
 }
 
 #[tokio::test]
+async fn import_refuses_a_new_required_column_of_the_target() {
+    // The target has added `nickname`, NOT NULL and without a default. The
+    // capsule has no value for it: the insert would fail after the blobs
+    // are written. A default, or a NULL, would make the column fine.
+    let capsule = export_ada(&seeded_store()).await;
+    let with_nickname = |nickname: FieldSpec| {
+        MemoryCapsuleStore::new()
+            .table(
+                "users",
+                vec![
+                    FieldSpec::new("id", "bigint"),
+                    FieldSpec::new("email", "text"),
+                    FieldSpec::new("bio", "text").nullable(),
+                    nickname,
+                ],
+            )
+            .table(
+                "posts",
+                vec![
+                    FieldSpec::new("id", "bigint"),
+                    FieldSpec::new("author_id", "bigint"),
+                    FieldSpec::new("title", "text"),
+                    FieldSpec::new("meta", "jsonb").nullable(),
+                ],
+            )
+            .table(
+                "comments",
+                vec![
+                    FieldSpec::new("id", "bigint"),
+                    FieldSpec::new("author_id", "bigint"),
+                    FieldSpec::new("post_id", "bigint"),
+                    FieldSpec::new("body", "text"),
+                ],
+            )
+    };
+    let err = import_capsule(
+        &capsule,
+        registry().capsule_models(),
+        &with_nickname(FieldSpec::new("nickname", "text")),
+    )
+    .await
+    .expect_err("new required column");
+    assert!(
+        matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains("users.nickname")),
+        "{err:?}"
+    );
+    for nickname in [
+        FieldSpec::new("nickname", "text").with_default(),
+        FieldSpec::new("nickname", "text").nullable(),
+    ] {
+        import_capsule(
+            &capsule,
+            registry().capsule_models(),
+            &with_nickname(nickname),
+        )
+        .await
+        .expect("a default or a NULL fills the column");
+    }
+}
+
+#[tokio::test]
 async fn import_refuses_a_column_that_the_target_no_longer_generates() {
     // `bio` was generated when the capsule was made, so import would skip
     // it. The target writes it now, and would take a default instead of

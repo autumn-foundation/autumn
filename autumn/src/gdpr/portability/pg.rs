@@ -125,6 +125,10 @@ struct ColumnRow {
     data_type: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     base_type: String,
+    /// `base_type` with the modifier that the domain gives it, for example
+    /// `numeric(10,3)` for a domain over `NUMERIC(10, 3)`.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    full_base_type: String,
     /// The type name without a modifier. It differs from `base_type` only
     /// for a domain or an array of a domain.
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -133,6 +137,8 @@ struct ColumnRow {
     nullable: bool,
     #[diesel(sql_type = diesel::sql_types::Bool)]
     generated: bool,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    has_default: bool,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -158,36 +164,55 @@ async fn describe_table(
         // at an array, it follows the chain of the element type too and keeps
         // `[]`: `amount[]`, and a domain over `amount[]`, are `numeric[]`.
         // Postgres has one array type per element type, so one level is all.
-        "SELECT a.attname::text AS name, \
-                format_type(a.atttypid, a.atttypmod) AS data_type, \
-                (WITH RECURSIVE outer_chain(oid, base, kind, category, elem) AS ( \
-                     SELECT t.oid, t.typbasetype, t.typtype, t.typcategory, t.typelem \
-                     UNION ALL \
-                     SELECT b.oid, b.typbasetype, b.typtype, b.typcategory, b.typelem \
-                     FROM outer_chain c JOIN pg_type b ON b.oid = c.base WHERE c.kind = 'd'), \
-                 outer_base AS (SELECT * FROM outer_chain WHERE kind <> 'd' LIMIT 1), \
-                 elem_chain(oid, base, kind) AS ( \
-                     SELECT e.oid, e.typbasetype, e.typtype \
-                     FROM outer_base o JOIN pg_type e ON e.oid = o.elem WHERE o.category = 'A' \
-                     UNION ALL \
-                     SELECT b.oid, b.typbasetype, b.typtype \
-                     FROM elem_chain c JOIN pg_type b ON b.oid = c.base WHERE c.kind = 'd') \
-                 SELECT COALESCE( \
-                     (SELECT format_type(oid, NULL) || '[]' FROM elem_chain \
-                      WHERE kind <> 'd' LIMIT 1), \
-                     (SELECT format_type(oid, NULL) FROM outer_base))) AS base_type, \
-                format_type(a.atttypid, NULL) AS plain_type, \
-                NOT a.attnotnull AS nullable, \
-                COALESCE(c.is_generated = 'ALWAYS', false) AS generated \
-         FROM pg_attribute a \
-         JOIN pg_class r ON r.oid = a.attrelid \
-         JOIN pg_type t ON t.oid = a.atttypid \
-         JOIN pg_namespace n ON n.oid = r.relnamespace \
+        // A domain keeps the modifier of its base type in `typtypmod`: each
+        // step of a chain carries the modifier of the domain before it, so
+        // the base type at the end gets it (`full_base_type`).
+        "WITH cols AS ( \
+           SELECT a.attnum, a.attname, a.atttypid, a.atttypmod, a.attnotnull, a.atthasdef, \
+                  a.attidentity, r.relname, n.nspname, \
+                  (WITH RECURSIVE outer_chain(oid, base, kind, category, elem, own, tmod) AS ( \
+                       SELECT t.oid, t.typbasetype, t.typtype, t.typcategory, t.typelem, \
+                              t.typtypmod, -1 \
+                       UNION ALL \
+                       SELECT b.oid, b.typbasetype, b.typtype, b.typcategory, b.typelem, \
+                              b.typtypmod, c.own \
+                       FROM outer_chain c JOIN pg_type b ON b.oid = c.base \
+                       WHERE c.kind = 'd'), \
+                   outer_base AS (SELECT * FROM outer_chain WHERE kind <> 'd' LIMIT 1), \
+                   elem_chain(oid, base, kind, own, tmod) AS ( \
+                       SELECT e.oid, e.typbasetype, e.typtype, e.typtypmod, -1 \
+                       FROM outer_base o JOIN pg_type e ON e.oid = o.elem \
+                       WHERE o.category = 'A' \
+                       UNION ALL \
+                       SELECT b.oid, b.typbasetype, b.typtype, b.typtypmod, c.own \
+                       FROM elem_chain c JOIN pg_type b ON b.oid = c.base WHERE c.kind = 'd') \
+                   SELECT ARRAY[ \
+                       COALESCE( \
+                         (SELECT format_type(oid, NULL) || '[]' FROM elem_chain \
+                          WHERE kind <> 'd' LIMIT 1), \
+                         (SELECT format_type(oid, NULL) FROM outer_base)), \
+                       COALESCE( \
+                         (SELECT format_type(oid, tmod) || '[]' FROM elem_chain \
+                          WHERE kind <> 'd' LIMIT 1), \
+                         (SELECT format_type(oid, tmod) FROM outer_base))]) AS bases \
+           FROM pg_attribute a \
+           JOIN pg_class r ON r.oid = a.attrelid \
+           JOIN pg_type t ON t.oid = a.atttypid \
+           JOIN pg_namespace n ON n.oid = r.relnamespace \
+           WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped) \
+         SELECT k.attname::text AS name, \
+                format_type(k.atttypid, k.atttypmod) AS data_type, \
+                k.bases[1] AS base_type, \
+                k.bases[2] AS full_base_type, \
+                format_type(k.atttypid, NULL) AS plain_type, \
+                NOT k.attnotnull AS nullable, \
+                COALESCE(c.is_generated = 'ALWAYS', false) AS generated, \
+                k.atthasdef OR k.attidentity <> '' AS has_default \
+         FROM cols k \
          LEFT JOIN information_schema.columns c \
-           ON c.table_schema = n.nspname AND c.table_name = r.relname \
-          AND c.column_name = a.attname \
-         WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped \
-         ORDER BY a.attnum",
+           ON c.table_schema = k.nspname AND c.table_name = k.relname \
+          AND c.column_name = k.attname \
+         ORDER BY k.attnum",
     )
     .bind::<diesel::sql_types::Text, _>(quote(table)?)
     .load(conn)
@@ -204,11 +229,14 @@ async fn describe_table(
             let mut field = FieldSpec::new(r.name, r.data_type);
             field.nullable = r.nullable;
             field.generated = r.generated;
+            field.has_default = r.has_default;
             // The manifest keeps the base type of a domain, so import can
             // treat a domain over `money` as `money`. A domain over a domain
             // resolves to the last base type.
+            // It keeps the modifier, so a change from `numeric(10,3)` to
+            // `numeric(6,2)` under one domain name is a change of type.
             if r.base_type != r.plain_type {
-                field.base_type = Some(r.base_type.clone());
+                field.base_type = Some(r.full_base_type);
             }
             Column {
                 field,

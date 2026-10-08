@@ -388,6 +388,62 @@ async fn postgres_import_is_atomic_and_reports_a_missing_parent() {
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+async fn postgres_import_refuses_a_domain_whose_base_modifier_changed() {
+    // Both databases have the domain `price`, but over `numeric(10, 3)` in
+    // the source and `numeric(6, 2)` in the target: the target would round
+    // 1.234 to 1.23.
+    let container = Postgres::default()
+        .with_tag("16-alpine")
+        .start()
+        .await
+        .expect("postgres");
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let mut admin = PgConnection::establish(&format!("{base}/postgres")).expect("connect");
+    admin
+        .batch_execute("CREATE DATABASE target")
+        .expect("create db");
+    admin
+        .batch_execute(
+            "CREATE DOMAIN price AS NUMERIC(10, 3); \
+             CREATE TABLE fees (id INT PRIMARY KEY, owner INT NOT NULL, amount price); \
+             INSERT INTO fees VALUES (1, 1, 1.234);",
+        )
+        .expect("source");
+    PgConnection::establish(&format!("{base}/target"))
+        .expect("connect")
+        .batch_execute(
+            "CREATE DOMAIN price AS NUMERIC(6, 2); \
+             CREATE TABLE fees (id INT PRIMARY KEY, owner INT NOT NULL, amount price);",
+        )
+        .expect("target");
+    let models = [CapsuleModel::new("fees", "owner")];
+    let capsule = export_subject(
+        &models,
+        &PgCapsuleStore::new(pool(&format!("{base}/postgres"))),
+        "1",
+    )
+    .await
+    .expect("export");
+    let target = pool(&format!("{base}/target"));
+    let err = import_capsule(&capsule, &models, &PgCapsuleStore::new(target.clone()))
+        .await
+        .expect_err("changed base modifier");
+    assert!(
+        matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains("fees.amount")),
+        "{err:?}"
+    );
+    assert_eq!(
+        count(&target, "SELECT COUNT(*) AS count FROM fees").await,
+        0
+    );
+
+    drop(container);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
 async fn postgres_rejects_a_subject_that_the_column_type_changes() {
     let container = Postgres::default()
         .with_tag("16-alpine")

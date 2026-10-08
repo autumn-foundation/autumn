@@ -485,6 +485,23 @@ pub(super) async fn check_target(
                 )));
             }
         }
+        // A column that the target added after the export, or one that the
+        // model excludes, gets its default or NULL. Without either, the
+        // insert would fail.
+        if !capsule.records(&model.table).is_empty()
+            && let Some(added) = described.iter().find(|d| {
+                !d.nullable
+                    && !d.generated
+                    && !d.has_default
+                    && !model.fields.iter().any(|f| f.name == d.name)
+            })
+        {
+            return Err(DataCapsuleError::InvalidInput(format!(
+                "{}.{} is NOT NULL without a default in the target table, but the capsule \
+                 has no value for it",
+                model.table, added.name
+            )));
+        }
     }
     Ok(())
 }

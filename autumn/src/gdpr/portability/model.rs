@@ -122,9 +122,14 @@ pub struct FieldSpec {
     /// `true` for a generated column. Import does not write it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub generated: bool,
-    /// For a domain column: the type that the domain is based on.
+    /// For a domain column: the type that the domain is based on, with its
+    /// modifier (for example `numeric(10,3)`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_type: Option<String>,
+    /// `true` when the column has a default (or is an identity column), so
+    /// an insert without a value for it still works.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_default: bool,
 }
 
 impl FieldSpec {
@@ -137,6 +142,7 @@ impl FieldSpec {
             nullable: false,
             generated: false,
             base_type: None,
+            has_default: false,
         }
     }
 
@@ -151,6 +157,13 @@ impl FieldSpec {
     #[must_use]
     pub const fn generated(mut self) -> Self {
         self.generated = true;
+        self
+    }
+
+    /// Mark the column as having a default.
+    #[must_use]
+    pub const fn with_default(mut self) -> Self {
+        self.has_default = true;
         self
     }
 }
