@@ -795,8 +795,9 @@ mod windows_impl {
                     if reported.is_none() {
                         eprintln!(
                             "autumn serve install-service: the app did not report its \
-                             drain budget; using the {FALLBACK_DRAIN_BUDGET_SECS}s fallback \
-                             for the preshutdown timeout"
+                             drain budget; using the {}s fallback \
+                             for the preshutdown timeout",
+                            super::FALLBACK_DRAIN_BUDGET_SECS
                         );
                     } else if let Err(e) =
                         service.set_preshutdown_timeout(super::preshutdown_for_reported(reported))
