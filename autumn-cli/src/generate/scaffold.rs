@@ -18470,7 +18470,6 @@ async fn main() {
         assert!(used.contains("fn bytea_to_hex("), "{used}");
         assert!(used.contains("fn bytea_from_hex("), "{used}");
     }
-    }
 
     #[test]
     fn the_bytea_hex_helpers_round_trip_non_utf8_bytes() {
