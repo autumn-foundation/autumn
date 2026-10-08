@@ -26035,6 +26035,7 @@ mod lease_tests {
     fn lost_ack_after_recovery_elsewhere_balances_the_start_once() {
         let state = AppState::for_test();
         state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // another run, same type
         let admin = JobAdminMemoryBackend::new_for_test(16);
         start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 1);
 
@@ -26051,7 +26052,7 @@ mod lease_tests {
             );
         }
 
-        assert_eq!(in_flight(&state), 0);
+        assert_eq!(in_flight(&state), 1, "only the other run remains");
     }
 
     /// Recovery of a claim another process started changes no gauge here
@@ -26077,14 +26078,15 @@ mod lease_tests {
     fn requeue_recovery_of_a_claim_started_here_balances_it_once_without_a_record() {
         let state = AppState::for_test();
         state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // another run, same type
         let admin = JobAdminMemoryBackend::new_for_test(16);
         start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 1);
 
         record_recovered_requeue("leased", "enqueued-elsewhere", 2, &state, &admin);
-        assert_eq!(in_flight(&state), 0, "recovery balanced attempt 1");
+        assert_eq!(in_flight(&state), 1, "recovery balanced attempt 1");
 
         record_lease_lost("leased", "enqueued-elsewhere", 1, &state, &admin);
-        assert_eq!(in_flight(&state), 0, "the old worker does not count again");
+        assert_eq!(in_flight(&state), 1, "the old worker does not count again");
     }
 
     /// A newer attempt starts here while an older one still counts, and this
@@ -26129,6 +26131,67 @@ mod lease_tests {
         assert!(!admin.take_local_claim("enqueued-elsewhere", 1));
     }
 
+    /// The note decides, not the record: a record that no longer shows the
+    /// attempt as running does not stop recovery from balancing a start this
+    /// process made.
+    #[cfg(feature = "db")]
+    #[test]
+    fn requeue_recovery_balances_a_noted_start_whatever_the_record_shows() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // another run, same type
+        let (admin, id) = admin_with_running_job(1);
+        state.job_registry.record_start("leased"); // attempt 1
+        admin.record_retrying(&id, "earlier failure");
+
+        record_recovered_requeue("leased", &id, 2, &state, &admin);
+
+        assert_eq!(in_flight(&state), 1, "attempt 1 is balanced");
+    }
+
+    /// The worker settled first, so recovery finds no note.
+    #[cfg(feature = "db")]
+    #[test]
+    fn recovery_after_the_worker_settled_balances_nothing() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // another run, same type
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "elsewhere", 1);
+        record_pg_lifecycle_ack_result(
+            Ok(true),
+            "leased",
+            "elsewhere",
+            1,
+            "success",
+            PgLifecycleRecord::Success,
+            &state,
+            &admin,
+        );
+        assert_eq!(in_flight(&state), 1);
+
+        record_recovered_requeue("leased", "elsewhere", 2, &state, &admin);
+        record_recovered_failure("leased", "elsewhere", 1, "expired", &state, &admin);
+
+        assert_eq!(in_flight(&state), 1);
+    }
+
+    /// A canceled start never ran, so it leaves no note.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn a_canceled_start_leaves_no_note() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        let (admin, id) = admin_with_running_job(1);
+        assert!(admin.take_local_claim(&id, 1));
+        admin.record_cancelled(&id);
+
+        let decision = record_attempt_start("leased", &id, 2, &state, &admin);
+
+        assert_eq!(decision, JobAdminStartDecision::Canceled);
+        assert!(!admin.take_local_claim(&id, 2));
+    }
+
     /// A Redis ack that applied to nothing balances the start once, whether
     /// recovery ran here or elsewhere.
     #[cfg(feature = "redis")]
@@ -26136,15 +26199,15 @@ mod lease_tests {
     fn a_lost_redis_ack_balances_the_start_once() {
         let state = AppState::for_test();
         state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // another run, same type
         let admin = JobAdminMemoryBackend::new_for_test(16);
         start_elsewhere_enqueued(&state, &admin, "elsewhere", 1);
         // Recovery elsewhere: the ack applies to nothing, twice over.
         settle_redis_claim(&state, &admin, "leased", "elsewhere", 1, false);
         settle_redis_claim(&state, &admin, "leased", "elsewhere", 1, false);
-        assert_eq!(in_flight(&state), 0);
+        assert_eq!(in_flight(&state), 1, "only the other run remains");
 
         // Recovery here took the claim first.
-        state.job_registry.record_start("leased"); // a run of this type
         start_elsewhere_enqueued(&state, &admin, "here", 3);
         record_recovered_failure("leased", "here", 3, "expired", &state, &admin);
         settle_redis_claim(&state, &admin, "leased", "here", 3, false);
