@@ -3020,7 +3020,7 @@ enabled          = true
 target           = "http://127.0.0.1:9091"  # the candidate build (you run it)
 sample_rate      = 0.05    # of ELIGIBLE traffic. Default 1.0 — start low.
 routes           = ["/api/*"]  # empty (default) = every eligible route
-timeout_ms       = 2000    # bounds the shadow request AND the primary wait
+timeout_ms       = 2000    # one deadline per mirror: request, primary wait, comparison
 max_in_flight    = 8       # excess mirrors are dropped, never queued
 max_body_bytes   = 262144  # larger responses are not compared, either side
 max_records      = 50      # divergences kept for the actuator
@@ -3057,7 +3057,7 @@ Plus two built-in metric families on `/actuator/prometheus`:
 ```
 autumn_shadow_comparisons_total{version,route,outcome}  # match|diverged|error|
                                                         # timeout|skipped|dropped|
-                                                        # refused|incomplete
+                                                        # refused|incomplete|abandoned
 autumn_shadow_divergences_total{version,route,kind}     # the series to alert on
 ```
 
