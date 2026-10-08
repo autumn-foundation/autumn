@@ -1239,6 +1239,13 @@ impl crate::actuator::ProvideActuatorState for AppState {
             .map(|handle| (*handle).clone())
     }
 
+    fn data_capsules(
+        &self,
+    ) -> Result<crate::gdpr::portability::CapsuleService, crate::gdpr::portability::DataCapsuleError>
+    {
+        crate::gdpr::portability::CapsuleService::from_state(self)
+    }
+
     fn cost_signal(&self) -> Option<crate::cost::CostSignal> {
         self.extension::<crate::cost::CostSignal>()
             .map(|signal| (*signal).clone())

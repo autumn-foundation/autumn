@@ -1249,6 +1249,8 @@ fn start_server(
     // every hot-reload restart enforce the retention policy and exit -- deleting
     // data on each save rather than merely failing to serve.
     crate::db::retention::clear_inherited_one_shot_env(&mut command);
+    // Same for `autumn data capsule` (#1811).
+    crate::data_capsule::clear_inherited_one_shot_env(&mut command);
     // Inherit stdio so tracing output (including --show-config) is visible.
     // Previously used Stdio::null(), but server logs are valuable during dev.
     command.stdout(Stdio::inherit()).stderr(Stdio::inherit());

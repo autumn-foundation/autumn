@@ -3696,6 +3696,16 @@ impl AppBuilder {
             return;
         }
 
+        // ── Data-capsule mode ───────────────────────────────────────────
+        // With AUTUMN_DATA_CAPSULE=export|import|verify, export one subject
+        // to a signed capsule, import a capsule, or verify one, and exit.
+        // Triggered by `autumn data capsule` (issue #1811). It runs inside the
+        // app, so it uses the app's own registry, database, and secret.
+        if let Some(mode) = data_capsule_mode_from_env() {
+            self.run_data_capsule_mode(mode).await;
+            return;
+        }
+
         // ── Capsule replay mode ────────────────────────────────────────
         // When AUTUMN_REPLAY_CAPSULE=<path> is set, rebuild this application
         // offline, drive the request the capsule recorded through it, print the
@@ -7656,6 +7666,151 @@ impl AppBuilder {
         }
     }
 
+    /// Run `AUTUMN_DATA_CAPSULE=export|import|verify` and exit (issue #1811).
+    ///
+    /// All modes boot the app's state initializers, which install the
+    /// [`crate::gdpr::GdprRegistry`] and any `CapsuleService`. Export and
+    /// import also use the database and the blob store. Verify uses only the
+    /// signer: it runs no migration, and its built-in pools never connect. It
+    /// still builds the pools as the other modes do, with the app's own pool
+    /// provider, so an initializer can install its `CapsuleService`.
+    #[allow(clippy::too_many_lines)]
+    async fn run_data_capsule_mode(self, mode: DataCapsuleMode) {
+        let Self {
+            state_initializers,
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+            #[cfg(feature = "db")]
+            migrations,
+            #[cfg(feature = "db")]
+            pool_provider_factory,
+            #[cfg(feature = "db")]
+            shard_provider_factory,
+            #[cfg(feature = "db")]
+            shard_router,
+            #[cfg(feature = "db")]
+            directory_shard_router,
+            #[cfg(feature = "ws")]
+            channels_backend,
+            #[cfg(feature = "storage")]
+            blob_store,
+            ..
+        } = self;
+
+        let Some(path) = std::env::var_os(DATA_CAPSULE_PATH_ENV)
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from)
+        else {
+            eprintln!("autumn data capsule: {DATA_CAPSULE_PATH_ENV} is not set");
+            std::process::exit(1);
+        };
+        let subject = std::env::var(DATA_CAPSULE_SUBJECT_ENV).unwrap_or_default();
+        if mode == DataCapsuleMode::Export && subject.is_empty() {
+            eprintln!("autumn data capsule export: {DATA_CAPSULE_SUBJECT_ENV} is not set");
+            std::process::exit(1);
+        }
+
+        let (config, _telemetry_guard) = load_config_and_telemetry(
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+        )
+        .await;
+        // A capsule holds personal data: use the same secret rules as a server.
+        fail_fast_on_invalid_signing_secret(&config);
+
+        // Verify runs no migration. It keeps the pools and the blob store, so
+        // an initializer that builds a service from them still works.
+        #[cfg(feature = "db")]
+        let verify = mode == DataCapsuleMode::Verify;
+
+        #[cfg(feature = "storage")]
+        let storage_bootstrap = blob_store.map_or_else(
+            || preflight_storage(&config),
+            |store| {
+                Some(StorageBootstrap {
+                    store,
+                    serving: None,
+                })
+            },
+        );
+
+        #[cfg(feature = "db")]
+        let (topology, shards) = if verify {
+            verify_database_parts(
+                &config,
+                pool_provider_factory,
+                shard_provider_factory,
+                shard_router,
+                directory_shard_router,
+            )
+            .await
+        } else {
+            match setup_database(
+                &config,
+                migrations,
+                pool_provider_factory,
+                shard_provider_factory,
+                shard_router,
+                directory_shard_router,
+                RepositoryCommitHookQueueMigrationMode::Runtime,
+            )
+            .await
+            {
+                Ok(database) => (database.topology, database.shards),
+                Err(error) => {
+                    eprintln!("{error}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
+            }
+        };
+
+        let state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            topology.as_ref(),
+            #[cfg(feature = "db")]
+            shards,
+            #[cfg(feature = "ws")]
+            channels_backend,
+        );
+        #[cfg(feature = "storage")]
+        if let Some(bootstrap) = storage_bootstrap {
+            let _ = bootstrap.install(&state);
+        }
+        run_state_initializers(state_initializers, &state);
+
+        let result = match mode {
+            // Verify needs only the signer. An installed `CapsuleService` can
+            // bring its own, so it runs after the state initializers too.
+            DataCapsuleMode::Verify => {
+                crate::gdpr::portability::CapsuleService::signer_for_state(&state)
+                    .and_then(|signer| crate::gdpr::portability::verify_dir(&path, &signer))
+                    .map(|report| serde_json::json!(report))
+            }
+            DataCapsuleMode::Export | DataCapsuleMode::Import => {
+                match crate::gdpr::portability::CapsuleService::from_state(&state) {
+                    Ok(service) if mode == DataCapsuleMode::Export => service
+                        .export_to(&subject, &path)
+                        .await
+                        .map(|report| serde_json::json!(report)),
+                    Ok(service) => service
+                        .import_from(&path)
+                        .await
+                        .map(|summary| serde_json::json!(summary)),
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        // `process::exit` skips `on_shutdown`: stop a managed postmaster first.
+        #[cfg(feature = "managed-pg")]
+        crate::managed_pg::emergency_stop_async().await;
+        emit_data_capsule_report(mode, &result);
+    }
+
     /// The `AUTUMN_RETENTION_DRY_RUN=1` one-shot on a build compiled WITHOUT
     /// database support: there is nothing to sweep, so report and exit 0
     /// (never starting the server).
@@ -8728,6 +8883,232 @@ pub(crate) fn framework_retention_mode_from_env() -> Option<FrameworkRetentionMo
             );
             None
         }
+    }
+}
+
+/// The `autumn data capsule` one-shot mode (issue #1811).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DataCapsuleMode {
+    /// Write a capsule for one subject.
+    Export,
+    /// Verify, then import a capsule.
+    Import,
+    /// Verify a capsule only.
+    Verify,
+}
+
+impl DataCapsuleMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Export => "export",
+            Self::Import => "import",
+            Self::Verify => "verify",
+        }
+    }
+}
+
+/// The env var `autumn data capsule` sets to select the one-shot mode.
+pub(crate) const DATA_CAPSULE_ENV: &str = "AUTUMN_DATA_CAPSULE";
+/// The subject id of `autumn data capsule export`.
+pub(crate) const DATA_CAPSULE_SUBJECT_ENV: &str = "AUTUMN_DATA_CAPSULE_SUBJECT";
+/// The capsule directory of `autumn data capsule`.
+pub(crate) const DATA_CAPSULE_PATH_ENV: &str = "AUTUMN_DATA_CAPSULE_PATH";
+/// Line prefix of the JSON report, matched by `autumn-cli/src/data_capsule.rs`.
+pub(crate) const DATA_CAPSULE_JSON_PREFIX: &str = "AUTUMN_DATA_CAPSULE_REPORT=";
+
+/// The `autumn data capsule` mode requested by `AUTUMN_DATA_CAPSULE`, if any.
+///
+/// An unknown value gives a warning and a normal boot, the same as
+/// `AUTUMN_DB_RETENTION`: a stray value must not stop a server.
+pub(crate) fn data_capsule_mode_from_env() -> Option<DataCapsuleMode> {
+    parse_data_capsule_mode(&std::env::var(DATA_CAPSULE_ENV).ok()?)
+}
+
+fn parse_data_capsule_mode(raw: &str) -> Option<DataCapsuleMode> {
+    match raw.trim() {
+        "" => None,
+        "export" => Some(DataCapsuleMode::Export),
+        "import" => Some(DataCapsuleMode::Import),
+        "verify" => Some(DataCapsuleMode::Verify),
+        other => {
+            eprintln!(
+                "Warning: {DATA_CAPSULE_ENV}={other:?} is not valid (expected \"export\", \
+                 \"import\" or \"verify\"), ignoring"
+            );
+            None
+        }
+    }
+}
+
+/// The JSON report line of `autumn data capsule`.
+fn data_capsule_report_line(
+    mode: DataCapsuleMode,
+    result: &Result<serde_json::Value, crate::gdpr::portability::DataCapsuleError>,
+) -> String {
+    let body = match result {
+        Ok(report) => serde_json::json!({"ok": true, "mode": mode.as_str(), "report": report}),
+        Err(error) => {
+            serde_json::json!({"ok": false, "mode": mode.as_str(), "error": error.to_string()})
+        }
+    };
+    format!("{DATA_CAPSULE_JSON_PREFIX}{body}")
+}
+
+/// Print the report line and exit: `0` on success, else `1`.
+fn emit_data_capsule_report(
+    mode: DataCapsuleMode,
+    result: &Result<serde_json::Value, crate::gdpr::portability::DataCapsuleError>,
+) -> ! {
+    println!("{}", data_capsule_report_line(mode, result));
+    if let Err(error) = result {
+        eprintln!("autumn data capsule {}: {error}", mode.as_str());
+    }
+    std::process::exit(i32::from(result.is_err()));
+}
+
+/// The database state that verify gives to the state initializers.
+///
+/// Verify runs no migration. It builds the pools as export and import do,
+/// with the app's `with_pool_provider` and `with_shard_provider` when it has
+/// them, so an initializer sees the same `pool()` and `shards()`, for example
+/// to build its own `CapsuleService`. The built-in pools are lazy: they
+/// connect, and a SQLite pool creates its file, only at the first checkout,
+/// which verify never makes. A provider that fails gives no state: verify then
+/// falls back to the signer of the configuration.
+#[cfg(feature = "db")]
+async fn verify_database_parts(
+    config: &AutumnConfig,
+    pool_provider: Option<PoolProviderFactory>,
+    shard_provider: Option<ShardProviderFactory>,
+    shard_router: Option<Arc<dyn crate::sharding::ShardRouter>>,
+    directory_shard_router: bool,
+) -> (
+    Option<crate::db::DatabaseTopology>,
+    Option<crate::sharding::ShardSet>,
+) {
+    let topology = match pool_provider {
+        Some(factory) => factory(config.database.clone()).await,
+        None => crate::db::create_topology(&config.database),
+    }
+    .ok()
+    .flatten();
+    let use_directory_router = shard_router.is_none()
+        && (directory_shard_router || config.database.directory_shard_router);
+    // No invalidation listener: verify opens no connection of its own.
+    let shards = resolve_shard_set(
+        config,
+        shard_router,
+        shard_provider,
+        use_directory_router,
+        false,
+        topology.as_ref(),
+    )
+    .await
+    .ok()
+    .flatten();
+    (topology, shards)
+}
+
+#[cfg(test)]
+mod data_capsule_mode_tests {
+    use super::*;
+
+    #[cfg(all(feature = "db", not(feature = "sqlite")))]
+    #[tokio::test]
+    async fn verify_gives_initializers_lazy_pools_and_shards() {
+        // A state initializer can build a routed store from `shards()`, so
+        // verify keeps the shape of the state. The pools must not connect:
+        // nothing listens on port 9.
+        let mut config = AutumnConfig::default();
+        config.database.url = Some("postgres://u:p@127.0.0.1:9/none".to_owned());
+        config.database.shards = vec![crate::config::ShardConfig {
+            name: "s1".to_owned(),
+            primary_url: crate::test_urls::primary("s1"),
+            slots: None,
+            replica_url: None,
+            primary_pool_size: None,
+            replica_pool_size: None,
+            replica_fallback: None,
+        }];
+        let (topology, shards) = verify_database_parts(&config, None, None, None, false).await;
+        assert!(topology.is_some(), "a lazy control pool");
+        assert_eq!(shards.map(|s| s.len()), Some(1), "the configured shard");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn verify_gives_sqlite_initializers_a_lazy_pool_without_a_file() {
+        // An initializer can build its `CapsuleService` from `pool()`. The
+        // pool must not open the database: SQLite would create the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.db");
+        let mut config = AutumnConfig::default();
+        config.database.url = Some(format!("sqlite://{}", path.display()));
+        let (topology, _) = verify_database_parts(&config, None, None, None, false).await;
+        assert!(topology.is_some(), "a lazy pool");
+        assert!(!path.exists(), "verify creates no database file");
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn verify_uses_the_pool_provider_of_the_app() {
+        // The app has no database URL: only its `with_pool_provider` knows
+        // the pool, as on export and import. Verify must ask it too.
+        let dir = tempfile::tempdir().unwrap();
+        let url = if cfg!(feature = "sqlite") {
+            format!("sqlite://{}", dir.path().join("app.db").display())
+        } else {
+            "postgres://u:p@127.0.0.1:9/none".to_owned()
+        };
+        let provider: PoolProviderFactory = Box::new(move |mut database| {
+            Box::pin(async move {
+                database.url = Some(url);
+                crate::db::create_topology(&database)
+            })
+        });
+        let config = AutumnConfig::default();
+        let (topology, _) = verify_database_parts(&config, Some(provider), None, None, false).await;
+        assert!(topology.is_some(), "the topology of the provider");
+    }
+
+    #[test]
+    fn mode_parses_the_three_values_and_ignores_others() {
+        assert_eq!(
+            parse_data_capsule_mode("export"),
+            Some(DataCapsuleMode::Export)
+        );
+        assert_eq!(
+            parse_data_capsule_mode(" import "),
+            Some(DataCapsuleMode::Import)
+        );
+        assert_eq!(
+            parse_data_capsule_mode("verify"),
+            Some(DataCapsuleMode::Verify)
+        );
+        assert_eq!(parse_data_capsule_mode(""), None);
+        assert_eq!(parse_data_capsule_mode("purge"), None);
+    }
+
+    #[test]
+    fn report_line_carries_the_prefix_and_the_outcome() {
+        let ok = data_capsule_report_line(
+            DataCapsuleMode::Export,
+            &Ok(serde_json::json!({"records": 3})),
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(ok.strip_prefix(DATA_CAPSULE_JSON_PREFIX).unwrap()).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["mode"], "export");
+        assert_eq!(json["report"]["records"], 3);
+
+        let err = data_capsule_report_line(
+            DataCapsuleMode::Verify,
+            &Err(crate::gdpr::portability::DataCapsuleError::MissingSigningSecret),
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(err.strip_prefix(DATA_CAPSULE_JSON_PREFIX).unwrap()).unwrap();
+        assert_eq!(json["ok"], false);
+        assert!(json["error"].as_str().unwrap().contains("signing secret"));
     }
 }
 
