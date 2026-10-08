@@ -61,7 +61,12 @@ fn request(path: &str, tenant: &str) -> Request<Body> {
 }
 
 /// Start `n` held requests for `tenant` and wait until all are in the handler.
-async fn hold(app: &Router, gate: &Gate, tenant: &str, n: usize) -> Vec<tokio::task::JoinHandle<StatusCode>> {
+async fn hold(
+    app: &Router,
+    gate: &Gate,
+    tenant: &str,
+    n: usize,
+) -> Vec<tokio::task::JoinHandle<StatusCode>> {
     let before = gate.entered.load(Ordering::SeqCst);
     let handles: Vec<_> = (0..n)
         .map(|_| {
@@ -81,22 +86,40 @@ async fn a_tenant_at_its_cap_gets_503_and_another_tenant_does_not() {
     let (app, gate) = app(2);
     let held = hold(&app, &gate, "noisy", 2).await;
 
-    let over = app.clone().oneshot(request("/fast", "noisy")).await.expect("infallible");
+    let over = app
+        .clone()
+        .oneshot(request("/fast", "noisy"))
+        .await
+        .expect("infallible");
     assert_eq!(over.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
-        over.headers().get(RETRY_AFTER).and_then(|v| v.to_str().ok()),
+        over.headers()
+            .get(RETRY_AFTER)
+            .and_then(|v| v.to_str().ok()),
         Some("1"),
         "a bulkhead 503 tells the client when to retry"
     );
 
-    let quiet = app.clone().oneshot(request("/fast", "quiet")).await.expect("infallible");
-    assert_eq!(quiet.status(), StatusCode::OK, "another tenant is not capped");
+    let quiet = app
+        .clone()
+        .oneshot(request("/fast", "quiet"))
+        .await
+        .expect("infallible");
+    assert_eq!(
+        quiet.status(),
+        StatusCode::OK,
+        "another tenant is not capped"
+    );
 
     gate.release.notify_waiters();
     for handle in held {
         assert_eq!(handle.await.expect("join"), StatusCode::OK);
     }
-    let after = app.clone().oneshot(request("/fast", "noisy")).await.expect("infallible");
+    let after = app
+        .clone()
+        .oneshot(request("/fast", "noisy"))
+        .await
+        .expect("infallible");
     assert_eq!(after.status(), StatusCode::OK, "released permits come back");
 }
 
@@ -104,7 +127,11 @@ async fn a_tenant_at_its_cap_gets_503_and_another_tenant_does_not() {
 async fn a_zero_cap_does_not_limit_a_tenant() {
     let (app, gate) = app(0);
     let held = hold(&app, &gate, "noisy", 5).await;
-    let more = app.clone().oneshot(request("/fast", "noisy")).await.expect("infallible");
+    let more = app
+        .clone()
+        .oneshot(request("/fast", "noisy"))
+        .await
+        .expect("infallible");
     assert_eq!(more.status(), StatusCode::OK);
     gate.release.notify_waiters();
     for handle in held {

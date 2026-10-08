@@ -60,7 +60,10 @@ impl CellRouter {
         let mut names = std::collections::HashSet::new();
         for cell in &cells {
             if !names.insert(cell.name.as_str()) {
-                return Err(CellRouterError(format!("duplicate cell name {:?}", cell.name)));
+                return Err(CellRouterError(format!(
+                    "duplicate cell name {:?}",
+                    cell.name
+                )));
             }
         }
 
@@ -142,7 +145,8 @@ fn explicit_slot_map(cells: &[CellSpec]) -> Result<Vec<u16>, CellRouterError> {
                 if let Some(other) = entry {
                     return Err(CellRouterError(format!(
                         "cell {:?}: slot {slot} is already in cell {:?}",
-                        cell.name, cells[usize::from(*other)].name
+                        cell.name,
+                        cells[usize::from(*other)].name
                     )));
                 }
                 *entry = Some(owner);
@@ -166,7 +170,10 @@ mod tests {
         CellSpec {
             name: name.to_owned(),
             base_url: format!("http://{name}:3000/"),
-            slots: slots.iter().map(|s| SlotSpec::Range((*s).to_owned())).collect(),
+            slots: slots
+                .iter()
+                .map(|s| SlotSpec::Range((*s).to_owned()))
+                .collect(),
         }
     }
 
@@ -193,7 +200,10 @@ mod tests {
     #[test]
     fn url_for_joins_the_base_url_and_the_path() {
         let router = CellRouter::new(vec![cell("a", &[])]).expect("valid");
-        assert_eq!(router.url_for("acme", "/orders?x=1"), "http://a:3000/orders?x=1");
+        assert_eq!(
+            router.url_for("acme", "/orders?x=1"),
+            "http://a:3000/orders?x=1"
+        );
     }
 
     #[test]

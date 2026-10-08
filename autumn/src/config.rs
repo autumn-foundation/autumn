@@ -6950,7 +6950,11 @@ impl AutumnConfig {
             "AUTUMN_JOBS__TENANTS__MAX_CONCURRENT",
             &mut self.jobs.tenants.max_concurrent,
         );
-        parse_env(env, "AUTUMN_JOBS__TENANTS__LANES", &mut self.jobs.tenants.lanes);
+        parse_env(
+            env,
+            "AUTUMN_JOBS__TENANTS__LANES",
+            &mut self.jobs.tenants.lanes,
+        );
         parse_env(
             env,
             "AUTUMN_JOBS__TENANTS__LANES_PER_TENANT",

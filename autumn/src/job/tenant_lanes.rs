@@ -154,7 +154,11 @@ mod tests {
         bucket.push(Some("quiet".into()), "q1");
         let popped = bucket.pop_where(|t| (t != Some("noisy")).then_some(()));
         assert_eq!(popped.map(|(item, ())| item), Some("q1"));
-        assert!(bucket.pop_where(|t| (t != Some("noisy")).then_some(())).is_none());
+        assert!(
+            bucket
+                .pop_where(|t| (t != Some("noisy")).then_some(()))
+                .is_none()
+        );
         assert_eq!(bucket.len(), 1, "the skipped job stays");
     }
 
@@ -177,8 +181,14 @@ mod tests {
         assert_eq!(isolation.lane_of_worker(3), None, "no lanes");
         let held = isolation.try_admit(Some("a"), None).expect("first slot");
         assert!(held.is_some(), "a tenant job holds a permit");
-        assert!(isolation.try_admit(Some("a"), None).is_none(), "a is at its cap");
-        assert!(isolation.try_admit(Some("b"), None).is_some(), "b has its own cap");
+        assert!(
+            isolation.try_admit(Some("a"), None).is_none(),
+            "a is at its cap"
+        );
+        assert!(
+            isolation.try_admit(Some("b"), None).is_some(),
+            "b has its own cap"
+        );
         assert!(
             matches!(isolation.try_admit(None, None), Some(None)),
             "untenanted jobs are not capped"

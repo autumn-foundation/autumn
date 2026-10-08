@@ -85,7 +85,10 @@ impl TenantBulkhead {
     /// Take a permit for `tenant`, or `None` when `tenant` is at its cap.
     #[must_use]
     pub fn try_acquire(self: &Arc<Self>, tenant: &str) -> Option<TenantPermit> {
-        let mut map = self.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut map = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let held = map.get(tenant).copied().unwrap_or(0);
         if self.max_per_tenant != 0 && held >= self.max_per_tenant {
             return None;
@@ -119,7 +122,10 @@ impl TenantBulkhead {
     }
 
     fn release(&self, tenant: &str) {
-        let mut map = self.in_flight.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut map = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(held) = map.get_mut(tenant) {
             *held = held.saturating_sub(1);
             if *held == 0 {
@@ -179,9 +185,9 @@ pub(crate) fn acquire_db_permit() -> Result<Option<TenantPermit>, crate::AutumnE
 fn fnv1a_64(bytes: impl IntoIterator<Item = u8>) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
-    bytes
-        .into_iter()
-        .fold(OFFSET, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(PRIME))
+    bytes.into_iter().fold(OFFSET, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+    })
 }
 
 /// The splitmix64 finalizer. FNV-1a alone has weak low bits, and a lane is

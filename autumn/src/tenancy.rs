@@ -661,7 +661,8 @@ pub async fn tenancy_middleware(
 
     // Per-tenant bulkheads (#3072). The request permit lives until the
     // response head is ready, as an admission permit does.
-    let bulkheads = state.extension_or_insert_with(|| TenantBulkheads::from_config(&config.tenancy));
+    let bulkheads =
+        state.extension_or_insert_with(|| TenantBulkheads::from_config(&config.tenancy));
     let _request_permit = match &bulkheads.requests {
         Some(bulkhead) => match bulkhead.try_acquire(&tenant_id) {
             Some(permit) => Some(permit),

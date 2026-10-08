@@ -6275,7 +6275,9 @@ impl LocalQueueBuffer {
     fn push(&self, job: QueuedJob) {
         if let Some(fair) = &self.fair {
             {
-                let mut map = fair.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut map = fair
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let bucket = map
                     .entry(normalize_queue_name(&job.queue))
                     .or_insert_with(tenant_lanes::FairBucket::new);
@@ -26443,6 +26445,9 @@ mod shard_job_schema_tests {
             .iter()
             .map(|(name, _)| (*name).to_owned())
             .collect();
-        assert_eq!(listed, touching, "add the new autumn_jobs migration to SHARD_JOB_SCHEMA");
+        assert_eq!(
+            listed, touching,
+            "add the new autumn_jobs migration to SHARD_JOB_SCHEMA"
+        );
     }
 }
