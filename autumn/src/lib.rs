@@ -108,7 +108,6 @@ pub mod batches;
 /// availability without depending on a headless-browser stack.
 pub mod browser_detect;
 pub mod build_info;
-/// Per-tenant bulkheads and shuffle sharding (issue #3072).
 pub mod bulkhead;
 pub mod cache;
 #[cfg(feature = "ws")]
@@ -119,7 +118,6 @@ pub use channels::{
     ChannelPublishError, ChannelStats, Channels, ChannelsBackend, LocalChannelsBackend,
 };
 pub mod canary;
-/// A thin router for a cell deployment (issue #3072).
 #[cfg(feature = "db")]
 pub mod cell_router;
 // Per-deploy capacity contract (`capacity.lock`): the proven envelope a build

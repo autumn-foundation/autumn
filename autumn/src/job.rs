@@ -66,7 +66,6 @@ pub type JobHandler =
 #[cfg(feature = "sqlite")]
 pub(crate) mod sqlite;
 
-/// Tenant isolation for the `local` runtime (issue #3072).
 mod tenant_lanes;
 
 const DEFAULT_JOB_ADMIN_HISTORY_LIMIT: usize = 1_000;
