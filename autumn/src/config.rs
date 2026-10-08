@@ -151,6 +151,10 @@
 //! | `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` | `jobs.redis.visibility_timeout_ms` | `u64` |
 //! | `AUTUMN_JOBS__REDIS__DEAD_LETTER_LIMIT` | `jobs.redis.dead_letter_limit` | `usize` (`0` = unbounded) |
 //! | `AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS` | `jobs.postgres.visibility_timeout_ms` | `u64` |
+//! | `AUTUMN_JOBS__POSTGRES__SHARD_LOCAL` | `jobs.postgres.shard_local` | `bool` |
+//! | `AUTUMN_JOBS__TENANTS__MAX_CONCURRENT` | `jobs.tenants.max_concurrent` | `usize` (`0` = no limit) |
+//! | `AUTUMN_JOBS__TENANTS__LANES` | `jobs.tenants.lanes` | `u16` (`0` = off) |
+//! | `AUTUMN_JOBS__TENANTS__LANES_PER_TENANT` | `jobs.tenants.lanes_per_tenant` | `u16` |
 //! | `AUTUMN_JOBS__TRACKING__TTL_SECS` | `jobs.tracking.ttl_secs` | `u64` |
 //! | `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` | `jobs.tracking.route_enabled` | `bool` |
 //! | `AUTUMN_OUTBOX__ENABLED` | `outbox.enabled` | `bool` |
@@ -4002,6 +4006,28 @@ pub struct JobConfig {
     /// built-in `GET /_autumn/jobs/{token}` status route).
     #[serde(default)]
     pub tracking: JobTrackingConfig,
+    /// Per-tenant worker slots and shuffle-shard lanes (issue #3072).
+    #[serde(default)]
+    pub tenants: JobTenantsConfig,
+}
+
+/// Tenant isolation for job workers (issue #3072).
+///
+/// Applies to the `local` backend. A job's tenant is the tenant of the
+/// request that enqueued it. Jobs without a tenant are not limited.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct JobTenantsConfig {
+    /// The most jobs of one tenant that run at the same time. `0` (the
+    /// default) sets no limit.
+    #[serde(default)]
+    pub max_concurrent: usize,
+    /// The number of shuffle-shard lanes. Worker `i` serves lane
+    /// `i % lanes`. `0` (the default) turns lanes off.
+    #[serde(default)]
+    pub lanes: u16,
+    /// The number of lanes that serve each tenant. `0` means 1.
+    #[serde(default)]
+    pub lanes_per_tenant: u16,
 }
 
 impl Default for JobConfig {
@@ -4020,6 +4046,7 @@ impl Default for JobConfig {
             postgres: JobPostgresConfig::default(),
             sqlite: JobSqliteConfig::default(),
             tracking: JobTrackingConfig::default(),
+            tenants: JobTenantsConfig::default(),
         }
     }
 }
@@ -4378,12 +4405,18 @@ pub struct JobPostgresConfig {
     /// within this bound. Default: 30 seconds.
     #[serde(default = "default_jobs_pg_visibility_timeout_ms")]
     pub visibility_timeout_ms: u64,
+    /// Keep an `autumn_jobs` table on each shard and run workers for it
+    /// (issue #3072). Then `enqueue_in_tx` on a shard connection commits or
+    /// rolls back with the shard's data. Default: `false`.
+    #[serde(default)]
+    pub shard_local: bool,
 }
 
 impl Default for JobPostgresConfig {
     fn default() -> Self {
         Self {
             visibility_timeout_ms: default_jobs_pg_visibility_timeout_ms(),
+            shard_local: false,
         }
     }
 }
@@ -5993,6 +6026,16 @@ impl AutumnConfig {
             "AUTUMN_TENANCY__IDLE_TTL_SECS",
             &mut self.tenancy.idle_ttl_secs,
         );
+        parse_env(
+            env,
+            "AUTUMN_TENANCY__MAX_CONCURRENT_REQUESTS",
+            &mut self.tenancy.max_concurrent_requests,
+        );
+        parse_env(
+            env,
+            "AUTUMN_TENANCY__MAX_DB_CONNECTIONS",
+            &mut self.tenancy.max_db_connections,
+        );
     }
 
     fn apply_alerts_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -6885,6 +6928,22 @@ impl AutumnConfig {
             env,
             "AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS",
             &mut self.jobs.postgres.visibility_timeout_ms,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_JOBS__POSTGRES__SHARD_LOCAL",
+            &mut self.jobs.postgres.shard_local,
+        );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__TENANTS__MAX_CONCURRENT",
+            &mut self.jobs.tenants.max_concurrent,
+        );
+        parse_env(env, "AUTUMN_JOBS__TENANTS__LANES", &mut self.jobs.tenants.lanes);
+        parse_env(
+            env,
+            "AUTUMN_JOBS__TENANTS__LANES_PER_TENANT",
+            &mut self.jobs.tenants.lanes_per_tenant,
         );
         parse_env(
             env,
@@ -11979,6 +12038,18 @@ pub struct TenancyConfig {
     /// `0` = disabled.
     #[serde(default)]
     pub idle_ttl_secs: u64,
+
+    /// The most requests of one tenant in flight at the same time (issue
+    /// #3072). More get `503` with `Retry-After`. `0` (the default) sets no
+    /// limit.
+    #[serde(default)]
+    pub max_concurrent_requests: usize,
+
+    /// The most database connections that one tenant's requests hold at the
+    /// same time (issue #3072). More get `503`. `0` (the default) sets no
+    /// limit.
+    #[serde(default)]
+    pub max_db_connections: usize,
 }
 
 fn default_tenancy_source() -> String {
@@ -12014,6 +12085,8 @@ impl Default for TenancyConfig {
             quota_bytes: 0,
             max_cells: 0,
             idle_ttl_secs: 0,
+            max_concurrent_requests: 0,
+            max_db_connections: 0,
         }
     }
 }
