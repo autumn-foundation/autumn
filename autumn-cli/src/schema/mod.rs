@@ -796,7 +796,7 @@ fn diff_at_with(
     if plan.is_empty() {
         println!("No schema changes — models match the baseline.");
         if write_migration {
-            let sync = plan_schema_rs(project_root, &desired, &plan);
+            let sync = plan_schema_rs(project_root, &desired, &plan)?;
             commit_empty_plan(
                 &snapshot_path,
                 snapshot.as_ref(),
@@ -830,6 +830,9 @@ fn diff_at_with(
         return Ok(());
     }
 
+    // Read `src/schema.rs` before the first write, so a read error stops here.
+    let sync = plan_schema_rs(project_root, &desired, &plan)?;
+
     // (f) Write the migration dir, matching the generator's naming convention.
     let ts = crate::generate::timestamp_now();
     let suffix = crate::generate::naming::snake(name.unwrap_or("schema_update"));
@@ -854,7 +857,6 @@ fn diff_at_with(
     mark_managed(&mut target_tables, &desired);
 
     // (h) Then write `src/schema.rs` (see `commit_outputs`).
-    let sync = plan_schema_rs(project_root, &desired, &plan);
     commit_outputs(
         &snapshot_path,
         Some(&SchemaSnapshot::new(backend, target_tables)),
@@ -952,20 +954,29 @@ fn commit_outputs(
 /// file exists and the text changes. `None` when the project has no
 /// `src/schema.rs` or the text stays the same. Prints the skipped tables of
 /// an existing file.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read. The caller
+/// stops before it writes anything.
 fn plan_schema_rs(
     project_root: &Path,
     desired: &parse::ParsedSchema,
     plan: &MigrationPlan,
-) -> Option<(PathBuf, schema_rs::SchemaRsSync)> {
+) -> Result<Option<(PathBuf, schema_rs::SchemaRsSync)>, String> {
     let path = project_root.join(schema_rs::SCHEMA_RS_PATH);
-    let Ok(existing) = std::fs::read_to_string(&path) else {
-        if desired.tables.iter().any(|t| t.managed) {
-            eprintln!(
-                "note: no {} — the diesel schema was not written",
-                schema_rs::SCHEMA_RS_PATH
-            );
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(existing) => existing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if desired.tables.iter().any(|t| t.managed) {
+                eprintln!(
+                    "note: no {} — the diesel schema was not written",
+                    schema_rs::SCHEMA_RS_PATH
+                );
+            }
+            return Ok(None);
         }
-        return None;
+        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
     };
     let sync = schema_rs::sync_for_plan(&existing, desired, plan);
     for (table, reason) in &sync.skipped {
@@ -974,7 +985,7 @@ fn plan_schema_rs(
             schema_rs::SCHEMA_RS_PATH
         );
     }
-    (sync.text != existing).then_some((path, sync))
+    Ok((sync.text != existing).then_some((path, sync)))
 }
 
 /// Write the `src/schema.rs` sync from [`plan_schema_rs`], if any.
@@ -2183,6 +2194,32 @@ mod tests {
         )
         .expect("drop ok");
         assert_eq!(std::fs::read_to_string(path).unwrap(), "");
+    }
+
+    /// A `src/schema.rs` that exists but cannot be read stops the command
+    /// before it writes anything.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_schema_rs_stops_the_command_before_any_write() {
+        let models = r#"
+            #[autumn_web::model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                pub title: String,
+                pub body: Option<String>,
+            }
+        "#;
+        let root = scaffold_project(models, &posts_snapshot("Postgres"));
+        let snapshot_path = root.path().join(SNAPSHOT_DEFAULT_PATH);
+        let before = std::fs::read_to_string(&snapshot_path).expect("snapshot");
+        // A directory at the path: reading it fails with an error that is
+        // not "not found", also as root.
+        std::fs::create_dir_all(root.path().join(schema_rs::SCHEMA_RS_PATH)).unwrap();
+        let err = diff_at(root.path(), &write_args()).unwrap_err();
+        assert!(err.contains("schema.rs"), "{err}");
+        assert!(!root.path().join("migrations").exists());
+        assert_eq!(std::fs::read_to_string(&snapshot_path).unwrap(), before);
     }
 
     /// A failed `schema.rs` write leaves the migration and the snapshot as

@@ -88,44 +88,69 @@ pub fn render_block(table: &Table) -> Result<String, String> {
 /// and renames of `plan`. Then write the managed tables of `desired`.
 #[must_use]
 pub fn sync_for_plan(existing: &str, desired: &ParsedSchema, plan: &MigrationPlan) -> SchemaRsSync {
-    sync(existing, desired, &removals(plan))
+    sync(existing, desired, &plan_edits(plan))
 }
 
 /// Compare the blocks in `existing` with the managed tables of `desired`.
 #[must_use]
 pub fn check_tables(existing: &str, desired: &ParsedSchema) -> SchemaRsCheck {
-    let sync = sync(existing, desired, &[]);
+    let sync = sync(existing, desired, &PlanEdits::default());
     SchemaRsCheck {
         stale: sync.written,
         unchecked: sync.skipped,
     }
 }
 
-/// The `(old name, new name)` pairs of the dropped (`None`) and renamed
-/// tables in `plan`.
-fn removals(plan: &MigrationPlan) -> Vec<(String, Option<String>)> {
-    plan.changes
-        .iter()
-        .filter_map(|change| match change {
-            SchemaChange::DropTable(table) => Some((table.name.clone(), None)),
-            SchemaChange::RenameTable { from, to } => Some((from.clone(), Some(to.clone()))),
-            _ => None,
-        })
-        .collect()
+/// The edits of a plan that `src/schema.rs` follows.
+#[derive(Default)]
+struct PlanEdits {
+    /// `(old, new)` table names. `None` is a drop.
+    tables: Vec<(String, Option<String>)>,
+    /// `(table, old column, new column)`.
+    columns: Vec<(String, String, String)>,
 }
 
-/// Apply `removals` (`None` drops, `Some` renames), then write the managed
-/// tables of `desired`.
-fn sync(
-    existing: &str,
-    desired: &ParsedSchema,
-    removals: &[(String, Option<String>)],
-) -> SchemaRsSync {
+/// The table drops and renames, and the column renames, of `plan`.
+fn plan_edits(plan: &MigrationPlan) -> PlanEdits {
+    let mut edits = PlanEdits::default();
+    for change in &plan.changes {
+        match change {
+            SchemaChange::DropTable(table) => edits.tables.push((table.name.clone(), None)),
+            SchemaChange::RenameTable { from, to } => {
+                edits.tables.push((from.clone(), Some(to.clone())));
+            }
+            SchemaChange::RenameColumn { table, from, to } => {
+                edits
+                    .columns
+                    .push((table.clone(), from.clone(), to.clone()));
+            }
+            _ => {}
+        }
+    }
+    edits
+}
+
+/// Apply the table and column edits, then write the managed tables of
+/// `desired`. Last, remove each `joinable!` that names a column that its
+/// managed table no longer has.
+fn sync(existing: &str, desired: &ParsedSchema, edits: &PlanEdits) -> SchemaRsSync {
     let mut out = SchemaRsSync {
         text: existing.to_owned(),
         ..SchemaRsSync::default()
     };
-    let held = apply_removals(&mut out, removals);
+    let held = apply_removals(&mut out, &edits.tables);
+    for (table, from, to) in &edits.columns {
+        let to = ident_token(to).unwrap_or_else(|| to.clone());
+        out.text = edit_joinables(&out.text, |left, right, column| {
+            if unraw(left) == table && unraw(column) == from {
+                JoinEdit::Replace(left.to_owned(), right.to_owned(), to.clone())
+            } else {
+                JoinEdit::Keep
+            }
+        });
+    }
+    // Managed tables whose block now has the model's columns.
+    let mut current: Vec<&Table> = Vec::new();
 
     let blocked: BTreeSet<&str> = desired
         .diagnostics
@@ -156,6 +181,7 @@ fn sync(
             Some((start, end)) => {
                 let shape = block_shape(&out.text[start..end]);
                 if shape.as_ref().is_some_and(|s| s.matches(table)) {
+                    current.push(table);
                     continue;
                 }
                 if shape.is_none_or(|s| s.has_attrs) {
@@ -185,7 +211,19 @@ fn sync(
             None => out.text = format!("{}\n\n{block}", out.text.trim_end()),
         }
         out.written.push(table.name.clone());
+        current.push(table);
     }
+    out.text = edit_joinables(&out.text, |left, _, column| {
+        let stale = current
+            .iter()
+            .find(|t| t.name == unraw(left))
+            .is_some_and(|t| !t.columns.iter().any(|c| c.name == unraw(column)));
+        if stale {
+            JoinEdit::Remove
+        } else {
+            JoinEdit::Keep
+        }
+    });
     out
 }
 
@@ -434,31 +472,16 @@ fn has_header(text: &str, token: &str) -> bool {
 /// removes each `joinable!` of a dropped table. It removes an allow list that
 /// has fewer than two tables. A rewritten call loses its comments.
 fn retarget_macros(text: &str, old: &str, new: Option<&str>) -> String {
-    let mut text = text.to_owned();
-    for (start, open, close, end) in macro_calls(&text, "joinable!").into_iter().rev() {
-        let inner = strip_comments(&text[open + 1..close]);
-        let Some((left, right)) = inner.split_once("->") else {
-            continue;
-        };
-        let (left, right) = (left.trim(), right.trim());
-        let (right_table, column) = right.split_once('(').unwrap_or((right, ""));
-        let right_table = right_table.trim();
-        if unraw(left) != old && unraw(right_table) != old {
-            continue;
+    let mut text = edit_joinables(text, |left, right, column| {
+        if unraw(left) != old && unraw(right) != old {
+            return JoinEdit::Keep;
         }
         let Some(new) = new else {
-            text.replace_range(start..end, "");
-            continue;
+            return JoinEdit::Remove;
         };
         let pick = |name: &str| if unraw(name) == old { new } else { name }.to_owned();
-        let call = format!(
-            "{}({} -> {} ({column})",
-            &text[start..open],
-            pick(left),
-            pick(right_table)
-        );
-        text.replace_range(start..=close, &call);
-    }
+        JoinEdit::Replace(pick(left), pick(right), column.to_owned())
+    });
     for (start, open, close, end) in macro_calls(&text, ALLOW).into_iter().rev() {
         let inner = strip_comments(&text[open + 1..close]);
         let names: Vec<&str> = inner
@@ -483,6 +506,39 @@ fn retarget_macros(text: &str, old: &str, new: Option<&str>) -> String {
             text.replace_range(start..end, "");
         } else {
             text.replace_range(open + 1..close, &kept.join(", "));
+        }
+    }
+    text
+}
+
+/// What [`edit_joinables`] does with one `joinable!` call.
+enum JoinEdit {
+    Keep,
+    Remove,
+    /// The new child table, parent table and column.
+    Replace(String, String, String),
+}
+
+/// Apply `edit` to each `joinable!(child -> parent (column))` call in `text`.
+/// A rewritten call loses its comments.
+fn edit_joinables(text: &str, edit: impl Fn(&str, &str, &str) -> JoinEdit) -> String {
+    let mut text = text.to_owned();
+    for (start, open, close, end) in macro_calls(&text, "joinable!").into_iter().rev() {
+        let inner = strip_comments(&text[open + 1..close]);
+        let Some((left, right)) = inner.split_once("->") else {
+            continue;
+        };
+        let Some((right, column)) = right.split_once('(') else {
+            continue;
+        };
+        let column = column.trim().trim_end_matches(')').trim();
+        match edit(left.trim(), right.trim(), column) {
+            JoinEdit::Keep => {}
+            JoinEdit::Remove => text.replace_range(start..end, ""),
+            JoinEdit::Replace(left, right, column) => {
+                let call = format!("{}({left} -> {right} ({column}))", &text[start..open]);
+                text.replace_range(start..=close, &call);
+            }
         }
     }
     text
@@ -830,7 +886,7 @@ diesel::allow_tables_to_appear_in_same_query!(users, posts);
     }
 }
 
-diesel::joinable!(articles -> users (user_id));
+diesel::joinable!(users -> articles (article_id));
 diesel::allow_tables_to_appear_in_same_query!(articles, users);
 ";
         let out = sync_for_plan(
@@ -845,7 +901,7 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
         assert!(out.text.contains(POSTS_BLOCK), "{}", out.text);
         assert!(
             out.text
-                .contains("diesel::joinable!(posts -> users (user_id));"),
+                .contains("diesel::joinable!(users -> posts (article_id));"),
             "{}",
             out.text
         );
@@ -1181,5 +1237,61 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
             out.text,
             "diesel::allow_tables_to_appear_in_same_query!(posts, users);\n"
         );
+    }
+
+    fn comments_block(fk: &str) -> String {
+        format!(
+            "diesel::table! {{\n    comments (id) {{\n        id -> Int8,\n        {fk} -> Int8,\n    }}\n}}\n"
+        )
+    }
+
+    fn comments(fk: &str) -> Table {
+        let mut t = Table::new("comments", Backend::Postgres);
+        let mut id = Column::new("id", ColumnType::Int64);
+        id.primary_key = true;
+        t.columns.push(id);
+        t.columns.push(Column::new(fk, ColumnType::Int64));
+        t.primary_key = vec!["id".to_owned()];
+        t
+    }
+
+    /// A renamed FK column moves its `joinable!` with it.
+    #[test]
+    fn a_renamed_fk_column_renames_its_joinable() {
+        let existing = format!(
+            "{}\ndiesel::joinable!(comments -> posts (post_id));\n",
+            comments_block("post_id")
+        );
+        let out = sync_for_plan(
+            &existing,
+            &parsed(vec![comments("article_id")]),
+            &plan(vec![SchemaChange::RenameColumn {
+                table: "comments".to_owned(),
+                from: "post_id".to_owned(),
+                to: "article_id".to_owned(),
+            }]),
+        );
+        assert!(
+            out.text
+                .contains("diesel::joinable!(comments -> posts (article_id));"),
+            "{}",
+            out.text
+        );
+    }
+
+    /// A `joinable!` whose column the managed table no longer has goes.
+    #[test]
+    fn a_dropped_fk_column_drops_its_joinable() {
+        let existing = format!(
+            "{}\ndiesel::joinable!(comments -> posts (post_id));\n",
+            comments_block("post_id")
+        );
+        let out = sync_for_plan(
+            &existing,
+            &parsed(vec![comments("author_id")]),
+            &plan(vec![]),
+        );
+        assert!(!out.text.contains("joinable"), "{}", out.text);
+        assert!(out.text.contains("author_id -> Int8"), "{}", out.text);
     }
 }

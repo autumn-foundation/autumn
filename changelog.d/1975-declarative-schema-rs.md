@@ -4,7 +4,8 @@
   (issue #1975). Each managed model gets its `diesel::table!` block. The
   command removes the block of a dropped table and gives a renamed table its
   new name. It also updates `joinable!` and
-  `allow_tables_to_appear_in_same_query!`. It does not change the block of an
+  `allow_tables_to_appear_in_same_query!`, also for a renamed or dropped
+  foreign key column. It does not change the block of an
   unmanaged model or a block that already matches. It also updates the file
   when the plan has no changes.
 - **schema:** `autumn schema diff --write-migration` records a newly managed

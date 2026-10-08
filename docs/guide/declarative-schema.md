@@ -173,7 +173,12 @@ command:
 - removes the block of a dropped table;
 - gives the block of a renamed table the new name, and keeps its attributes;
 - removes or renames the table in `joinable!` and
-  `allow_tables_to_appear_in_same_query!`. A changed call loses its comments.
+  `allow_tables_to_appear_in_same_query!`. A changed call loses its comments;
+- renames the column of a `joinable!` when you rename a foreign key column,
+  and removes a `joinable!` whose column the managed table no longer has.
+
+The command does not add a `joinable!` for a new foreign key. Write it by
+hand.
 
 The command does not change the block of an unmanaged model.
 
@@ -190,8 +195,9 @@ The command does not write a block in these conditions. It shows a warning:
 - The command cannot read the block (for example a header with no key,
   `posts {`). Edit that block by hand.
 
-Without `src/schema.rs`, the command does not make one. If the command cannot
-write `src/schema.rs`, it removes the new migration and restores the
+Without `src/schema.rs`, the command does not make one. If `src/schema.rs`
+exists but the command cannot read it, the command stops before it writes
+anything. If the command cannot write `src/schema.rs`, it removes the new migration and restores the
 snapshot. The command writes the file through a temporary file, so a failed
 write does not change it.
 
