@@ -95,11 +95,6 @@ const EDGE_BIN: &str = "edge-capsule";
 const EDGE_NO_ROUTES_ERROR: &str =
     "no #[edge] routes found; add #[edge] to a GET handler and register it with edge_routes![]";
 
-/// `--embed` bakes assets into the *native* binary and returns early; the edge
-/// lane has no equivalent in the first slice.
-const EDGE_EMBED_ERROR: &str =
-    "edge capsule build is not yet supported with --embed (issue #1790 first slice)";
-
 /// Remediation for a missing WASI target, quoted verbatim by doctor's
 /// `edge_target` check.
 pub const EDGE_TARGET_HINT: &str = "Run `rustup target add wasm32-wasip1`";
@@ -107,7 +102,7 @@ pub const EDGE_TARGET_HINT: &str = "Run `rustup target add wasm32-wasip1`";
 /// What the edge step should do for one `autumn build` invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgePlan {
-    /// No edge routes (or an embed build without any): do nothing.
+    /// No edge routes: do nothing.
     Skip,
     /// Edge routes exist but this is a plain `--debug` build: print a note.
     SkipDebug,
@@ -130,14 +125,11 @@ fn static_render_allows_empty(plan: EdgePlan) -> bool {
 /// Pure so the whole flag matrix is unit-tested; `run` performs the printing and
 /// the exit. Evaluated **before** the native `cargo build` so a flag conflict
 /// costs milliseconds instead of a full compile.
-// Four booleans is exactly the decision table this function encodes; folding
-// them into a struct would only move the same four flags behind a
-// `struct_excessive_bools` allow.
-#[allow(clippy::fn_params_excessive_bools)]
+///
+/// `--embed` does not change the plan: the capsule follows the embed build.
 pub const fn plan_edge_step(
     has_edge_routes: bool,
     edge_flag: bool,
-    embed: bool,
     debug: bool,
 ) -> Result<EdgePlan, &'static str> {
     if edge_flag && !has_edge_routes {
@@ -146,13 +138,22 @@ pub const fn plan_edge_step(
     if !has_edge_routes {
         return Ok(EdgePlan::Skip);
     }
-    if embed {
-        return Err(EDGE_EMBED_ERROR);
-    }
     if debug && !edge_flag {
         return Ok(EdgePlan::SkipDebug);
     }
     Ok(EdgePlan::Build)
+}
+
+/// The `--features` value for the capsule build.
+///
+/// An embed build adds `embed-assets`, as `build_cargo_command` does for the
+/// native build. A route gated on that feature is then in both lanes.
+fn edge_capsule_features(features: Option<&str>, embed: bool) -> Option<String> {
+    match (embed, features) {
+        (true, Some(extra)) => Some(format!("embed-assets,{extra}")),
+        (true, None) => Some("embed-assets".to_owned()),
+        (false, extra) => extra.map(str::to_owned),
+    }
 }
 
 /// Build the `cargo build` command for the edge capsule.
@@ -347,8 +348,8 @@ fn format_edge_success(names: &[&str], artifact: &Path, size_bytes: Option<u64>)
     )
 }
 
-/// Compile the edge capsule: validate registrations, preflight the WASI target,
-/// resolve the bin target, run cargo, report the artifact.
+/// Compile the edge capsule: validate registrations, resolve the bin target,
+/// run cargo, report the artifact. `run` checks the WASI target first.
 ///
 /// Every failure exits 1 with a message that names the exact next action.
 fn run_edge_capsule_build(scan: &EdgeScan, package: Option<&str>, features: Option<&str>) {
@@ -374,14 +375,6 @@ fn run_edge_capsule_build(scan: &EdgeScan, package: Option<&str>, features: Opti
         eprintln!("\n{}", format_unregistered_warning(&unregistered));
     }
 
-    if !edge_target_installed() {
-        eprintln!(
-            "\n\u{2717} the `{EDGE_TARGET}` target is not installed, so the edge capsule cannot be \
-             compiled.\n  {EDGE_TARGET_HINT}"
-        );
-        std::process::exit(1);
-    }
-
     let metadata = read_cargo_metadata();
     let cwd = std::env::current_dir().expect("current dir");
     let capsule =
@@ -403,32 +396,6 @@ fn run_edge_capsule_build(scan: &EdgeScan, package: Option<&str>, features: Opti
     );
 }
 
-/// Scan the project's sources for `#[edge]` routes.
-///
-/// A selector-free invocation whose CWD has a `src/` scans it directly — the
-/// pure source-reading path the preflight guarantee depends on: flag/scan
-/// conflicts (`--edge` with no routes, `--embed` with routes) must be
-/// reportable without spawning cargo at all, and the CLI integration tests
-/// pin that by running with an empty `PATH`. Every other shape resolves the
-/// scanned directory through [`find_binary`] — `-p`/`--bin` select a member
-/// whose sources live elsewhere, and a selector-free CWD *without* `src/` is
-/// a virtual workspace root, where only `find_binary`'s resolution matches
-/// the package every later build step operates on.
-///
-/// `features` is the same `--features` value the native and capsule builds
-/// receive (see `build_cargo_command`/`build_edge_cargo_command`); the scan
-/// needs it too, or a route gated on a feature this invocation explicitly
-/// requests — but that is not in the manifest's own `default = [...]` —
-/// would look cfg'd-out here even though the build about to run turns it on.
-///
-/// `embed` mirrors `build_cargo_command`'s own unconditional `embed-assets`
-/// feature injection for an `--embed` build: without it here too, a sole
-/// `#[cfg(feature = "embed-assets")] #[edge]` handler looked scanned-out
-/// (`edge_scan.is_empty()`), so `plan_edge_step` below saw no edge routes and
-/// silently let the embed build proceed instead of reporting the documented
-/// edge/embed conflict — the handler was then really compiled straight into
-/// the native binary by `build_embedded`, never into a capsule (Codex review
-/// on #2739, round 10, P1).
 /// The feature names to pass to the edge scan for one build invocation: the
 /// user's own `--features` list, split on `,`/whitespace like Cargo's own
 /// flag, plus `embed-assets` when `embed` is set — the same feature
@@ -450,6 +417,27 @@ fn edge_scan_requested_features(features: Option<&str>, embed: bool) -> Vec<&str
     requested
 }
 
+/// Scan the project's sources for `#[edge]` routes.
+///
+/// A selector-free invocation whose CWD has a `src/` scans it directly — the
+/// pure source-reading path the preflight guarantee depends on: flag/scan
+/// conflicts (`--edge` with no routes) must be reportable without spawning
+/// cargo at all, and the CLI integration tests pin that by running with an
+/// empty `PATH`. Every other shape resolves the scanned directory through
+/// [`find_binary`] — `-p`/`--bin` select a member whose sources live elsewhere, and a selector-free CWD *without* `src/` is
+/// a virtual workspace root, where only `find_binary`'s resolution matches
+/// the package every later build step operates on.
+///
+/// `features` is the same `--features` value the native and capsule builds
+/// receive (see `build_cargo_command`/`build_edge_cargo_command`); the scan
+/// needs it too, or a route gated on a feature this invocation explicitly
+/// requests — but that is not in the manifest's own `default = [...]` —
+/// would look cfg'd-out here even though the build about to run turns it on.
+///
+/// `embed` mirrors `build_cargo_command`'s own unconditional `embed-assets`
+/// feature injection for an `--embed` build. Without it, a sole
+/// `#[cfg(feature = "embed-assets")] #[edge]` handler looks scanned-out and
+/// the embed build makes no capsule for it (Codex review on #2739, round 10).
 fn resolve_project_edge_scan(
     debug: bool,
     embed: bool,
@@ -493,6 +481,8 @@ fn run_cargo_or_exit(mut cargo: Command) {
 ///    (not the CLI cwd), writing the manifest + hashed copies.
 /// 3. Recompile **with** the embed feature so `include_dir!` bakes the
 ///    fingerprinted tree into the binary.
+///
+/// `run` builds the edge capsule after this, when the plan asks for it.
 fn build_embedded(
     debug: bool,
     profile: &str,
@@ -606,20 +596,28 @@ pub fn run(
 
     // ── Edge preflight (issue #1790) ─────────────────────────────────────────
     // Deliberately BEFORE any cargo invocation: the scan is pure source reading,
-    // so a flag/scan conflict (`--edge` with nothing to compile, `--embed` with
-    // edge routes) is reported in milliseconds instead of after a full native
-    // build. The capsule itself is compiled much later — after the native build
-    // and fingerprinting — by `run_edge_capsule_build`.
+    // so a flag/scan conflict (`--edge` with nothing to compile) is reported
+    // in milliseconds, not after a full native build. `run_edge_capsule_build`
+    // compiles the capsule later, after the native build and fingerprinting.
     let edge_scan = resolve_project_edge_scan(debug, embed, package, bin, features);
     // A warning, not a stop: the scan reads every file under `src/`, also one
     // that no `mod` declares. rustc stops a real case with the macro's error.
     if let Some(warning) = format_unsupported_warning(&edge_scan.unsupported()) {
         eprintln!("{warning}\n");
     }
-    let plan = plan_edge_step(!edge_scan.is_empty(), edge, embed, debug).unwrap_or_else(|error| {
+    let plan = plan_edge_step(!edge_scan.is_empty(), edge, debug).unwrap_or_else(|error| {
         eprintln!("\u{2717} {error}");
         std::process::exit(1);
     });
+    // Check the WASI target before any cargo build. Without it, the capsule
+    // step fails only after the full native build.
+    if plan == EdgePlan::Build && !edge_target_installed() {
+        eprintln!(
+            "\u{2717} the `{EDGE_TARGET}` target is not installed, so the edge capsule cannot be \
+             compiled.\n  {EDGE_TARGET_HINT}"
+        );
+        std::process::exit(1);
+    }
     if plan == EdgePlan::SkipDebug {
         eprintln!(
             "note: {} #[edge] route(s) found; skipping the edge capsule in a debug build \
@@ -634,6 +632,14 @@ pub fn run(
     // single binary without a database or pre-render step.
     if embed {
         build_embedded(debug, profile, package, bin, features, auditable);
+        if plan == EdgePlan::Build {
+            let resolved_pkg = find_binary(debug, package, bin).2;
+            run_edge_capsule_build(
+                &edge_scan,
+                package.or(resolved_pkg.as_deref()),
+                edge_capsule_features(features, true).as_deref(),
+            );
+        }
         return;
     }
 
@@ -1291,63 +1297,54 @@ mod tests {
 
     #[test]
     fn edge_plan_release_build_with_routes_compiles_capsule() {
-        assert_eq!(
-            plan_edge_step(true, false, false, false),
-            Ok(EdgePlan::Build)
-        );
+        assert_eq!(plan_edge_step(true, false, false), Ok(EdgePlan::Build));
     }
 
     #[test]
     fn edge_plan_debug_build_skips_with_a_note_unless_flagged() {
-        assert_eq!(
-            plan_edge_step(true, false, false, true),
-            Ok(EdgePlan::SkipDebug)
-        );
-        assert_eq!(plan_edge_step(true, true, false, true), Ok(EdgePlan::Build));
+        assert_eq!(plan_edge_step(true, false, true), Ok(EdgePlan::SkipDebug));
+        assert_eq!(plan_edge_step(true, true, true), Ok(EdgePlan::Build));
     }
 
     #[test]
     fn edge_plan_without_routes_skips_silently() {
-        assert_eq!(
-            plan_edge_step(false, false, false, false),
-            Ok(EdgePlan::Skip)
-        );
-        assert_eq!(
-            plan_edge_step(false, false, true, false),
-            Ok(EdgePlan::Skip)
-        );
+        assert_eq!(plan_edge_step(false, false, false), Ok(EdgePlan::Skip));
     }
 
     #[test]
     fn edge_plan_flag_without_routes_is_an_actionable_error() {
         assert_eq!(
-            plan_edge_step(false, true, false, false),
+            plan_edge_step(false, true, false),
             Err(EDGE_NO_ROUTES_ERROR)
         );
         assert!(EDGE_NO_ROUTES_ERROR.contains("edge_routes![]"));
     }
 
+    /// An embed build gets the same features as the native embed build, so
+    /// a route gated on `embed-assets` is in both lanes (#1790).
     #[test]
-    fn edge_plan_refuses_embed_with_edge_routes() {
+    fn edge_capsule_features_add_embed_assets_for_an_embed_build() {
+        assert_eq!(edge_capsule_features(None, false), None);
         assert_eq!(
-            plan_edge_step(true, false, true, false),
-            Err(EDGE_EMBED_ERROR)
+            edge_capsule_features(Some("a,b"), false),
+            Some("a,b".to_owned())
         );
         assert_eq!(
-            plan_edge_step(true, true, true, false),
-            Err(EDGE_EMBED_ERROR)
+            edge_capsule_features(None, true),
+            Some("embed-assets".to_owned())
         );
-        assert!(EDGE_EMBED_ERROR.contains("--embed"));
-        assert!(EDGE_EMBED_ERROR.contains("#1790"));
+        assert_eq!(
+            edge_capsule_features(Some("a,b"), true),
+            Some("embed-assets,a,b".to_owned())
+        );
     }
 
     /// `--embed` must add `embed-assets` to the edge scan's requested
     /// features, the same feature `build_cargo_command` unconditionally adds
     /// to the real `cargo build` invocation — otherwise a sole
     /// `#[cfg(feature = "embed-assets")] #[edge]` handler looks scanned-out,
-    /// `plan_edge_step` sees no edge routes, and the embed build silently
-    /// proceeds instead of hitting the documented edge/embed conflict (Codex
-    /// review on #2739, round 10, P1).
+    /// `plan_edge_step` sees no edge routes, and the embed build makes no
+    /// capsule for it (Codex review on #2739, round 10, P1).
     #[test]
     fn embed_adds_the_embed_assets_feature_to_the_edge_scan() {
         let requested = edge_scan_requested_features(None, true);

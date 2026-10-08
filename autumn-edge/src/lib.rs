@@ -88,6 +88,7 @@ pub mod extract;
 pub mod handler;
 pub mod identity;
 pub mod kv;
+pub mod paths;
 pub mod prelude;
 pub mod reexports;
 pub mod route;
@@ -118,6 +119,12 @@ pub mod node;
 /// The dependency runs one way only. `autumn-macros` emits `::autumn_edge::…`
 /// paths as text and does not depend on this crate.
 pub use autumn_macros::{edge, edge_routes, get};
+
+/// Collect typed path helpers into a `pub mod paths`. See `autumn_web::paths!`.
+///
+/// An `#[edge]` route's helper compiles for `wasm32-wasip1`. An edge-safe
+/// module can use `autumn_edge::paths![]`.
+pub use autumn_macros::paths;
 
 pub use extract::{EdgeCache, EdgeCacheUnavailable};
 pub use handler::{EdgeExtract, EdgeHandler, EdgeLeaf, edge_get};

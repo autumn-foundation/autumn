@@ -1686,6 +1686,8 @@ An `#[edge]` GET route also compiles into a `wasm32-wasip1` capsule
 | `node::ttfb::measure(&Probe)` | TTFB edge vs origin and a byte compare of each pair; `Report::passes(min_percent)` |
 | `autumn edge serve --origin URL` | CLI edge node; `--capsule`, `--listen`, `--kv FILE`, `--probe-path`, `--no-probe`, `--response-header`, `--trusted-proxy`, `--quiet`; stops on Ctrl-C or SIGTERM |
 | `autumn edge ttfb --edge URL --origin URL --path P` | CLI probe; exit 0 pass, 1 divergence or reduction < `--min-reduction` (50), 2 error; `--divergence-only` |
+| `paths![…]` / `paths::PathExt::with_query` | Typed path helpers of `#[edge]` routes; compile for wasm; same bytes as `autumn_web::paths` |
+| `autumn build --embed` | Embedded native binary, then the capsule (with `embed-assets`) |
 | `conformance::compare_capsule(origin, capsule)` | Raw capsule vs origin; excuses `VOLATILE_HEADERS`, `SECURITY_HEADERS` and `CORS_HEADERS` only |
 | `conformance::compare(origin, served)` | What the client gets vs origin; excuses `VOLATILE_HEADERS` only |
 

@@ -12,8 +12,9 @@
 //! This test pins the CI step's `CARGO_TARGET_DIR` so a future edit cannot
 //! silently reintroduce the double build.
 //!
-//! The job's last step, "autumn build emits the capsule", builds the capsule
-//! again on purpose. It tests the CLI path (AC-1 of #1790), not the suite.
+//! The steps "autumn build emits the capsule" and "autumn build --embed emits
+//! the capsule" build the capsule again on purpose. They test the CLI path
+//! (AC-1 of #1790), not the suite.
 
 use std::path::{Path, PathBuf};
 
@@ -113,23 +114,54 @@ fn conformance_suite_uses_the_same_target_dir_suffix() {
     );
 }
 
+/// The text of the named step in the `edge-conformance` job, up to the next
+/// step.
+fn edge_conformance_step(ci: &str, name: &str) -> String {
+    let job = edge_conformance_job_block(ci);
+    let step_start = job
+        .find(&format!("- name: {name}\n"))
+        .unwrap_or_else(|| panic!("edge-conformance job has no \"{name}\" step"));
+    let step = &job[step_start..];
+    step[1..]
+        .find("- name:")
+        .map_or(step, |at| &step[..=at])
+        .to_owned()
+}
+
+fn ci_yml() -> String {
+    std::fs::read_to_string(workspace_root().join(".github/workflows/ci.yml"))
+        .expect("read .github/workflows/ci.yml")
+        .replace('\r', "")
+}
+
 /// AC-1 of #1790: one `autumn build` makes the capsule. The job must run the
 /// real CLI on the example and check that the artifact exists.
 #[test]
 fn edge_conformance_job_runs_autumn_build_and_checks_the_artifact() {
-    let ci = std::fs::read_to_string(workspace_root().join(".github/workflows/ci.yml"))
-        .expect("read .github/workflows/ci.yml")
-        .replace('\r', "");
-    let job = edge_conformance_job_block(&ci);
-    let step_start = job
-        .find("- name: autumn build emits the capsule")
-        .expect("edge-conformance job has no \"autumn build emits the capsule\" step");
-    let step = &job[step_start..];
-    let step = step[1..].find("- name:").map_or(step, |at| &step[..=at]);
+    let step = edge_conformance_step(&ci_yml(), "autumn build emits the capsule");
 
     for needle in [
         "working-directory: examples/edge-greeting",
         "-p autumn-cli --bin autumn -- build --debug --edge",
+        "test -s ../../target/wasm32-wasip1/release/edge-capsule.wasm",
+    ] {
+        assert!(
+            step.contains(needle),
+            "the step must contain `{needle}`:\n{step}"
+        );
+    }
+}
+
+/// AC-1 of #1790 for an embed build. The step removes the artifact first, so
+/// only the embed build can make it again.
+#[test]
+fn edge_conformance_job_runs_autumn_build_embed_and_checks_the_artifact() {
+    let step = edge_conformance_step(&ci_yml(), "autumn build --embed emits the capsule");
+
+    for needle in [
+        "working-directory: examples/edge-greeting",
+        "rm -f ../../target/wasm32-wasip1/release/edge-capsule.wasm",
+        "-p autumn-cli --bin autumn -- build --debug --embed --edge",
         "test -s ../../target/wasm32-wasip1/release/edge-capsule.wasm",
     ] {
         assert!(

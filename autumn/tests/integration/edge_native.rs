@@ -250,3 +250,100 @@ async fn an_in_memory_kv_is_interchangeable_with_the_cache_backed_one() {
     assert_eq!(status, 200);
     assert_eq!(body, "from the origin");
 }
+
+// ── 5. Typed path helpers are the same on both lanes ─────────────────────
+
+/// An `#[edge]` route that builds a link with its own path helper. The
+/// helper compiles for `wasm32-wasip1`, so this source is the same at the
+/// edge (#1790).
+#[get("/edge/link/{name}")]
+#[edge]
+async fn link(Path(name): Path<String>) -> String {
+    use autumn_web::edge::paths::PathExt as _;
+    paths::link(&name).with_query("from", "a b")
+}
+
+autumn_web::edge::paths![greet, link];
+
+#[test]
+fn an_edge_path_helper_encodes_like_the_origin_helper() {
+    assert_eq!(paths::greet("a/b c"), "/edge/greet/a%2Fb%20c");
+    assert_eq!(paths::link("élève"), "/edge/link/%C3%A9l%C3%A8ve");
+}
+
+#[tokio::test]
+async fn an_edge_route_that_builds_a_link_agrees_on_both_lanes() {
+    let client = TestApp::new().routes(routes![link]).build();
+    let uri = "/edge/link/one%2Ftwo";
+
+    let origin = client.get(uri).send().await;
+    let request = http::Request::builder()
+        .uri(uri)
+        .body(axum::body::Body::empty())
+        .expect("well-formed request");
+    let response = build_edge_router(edge_routes![link])
+        .oneshot(request)
+        .await
+        .expect("edge dispatch is infallible");
+    let edge = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("edge body");
+
+    assert_eq!(origin.text(), "/edge/link/one%2Ftwo?from=a%20b");
+    assert_eq!(origin.text().as_bytes(), &edge[..]);
+}
+
+/// The edge encoders and the `autumn_web` encoders give the same bytes. A
+/// link must not change with the lane that renders it.
+#[test]
+fn edge_and_origin_encoders_agree() {
+    use autumn_web::edge::paths as edge_paths;
+    use autumn_web::paths as web_paths;
+
+    let mut corpus: Vec<String> = [
+        "",
+        ".",
+        "..",
+        "a/./b",
+        "a/../b",
+        "/lead",
+        "trail/",
+        "a//b",
+        "Az09-_.~",
+        "a b",
+        "a+b",
+        "a%2Fb",
+        "a?b#c",
+        "a&b=c",
+        "élève",
+        "日本",
+        "😀",
+        "\u{0}",
+        "\u{7f}",
+        "'\"<>\\",
+        "a;b,c:d@e!f$g*h(i)j",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    corpus.extend((0_u32..=0x2ff).filter_map(char::from_u32).map(String::from));
+    corpus.extend(["0", "-1", "18446744073709551615", "1.5"].map(String::from));
+
+    for value in &corpus {
+        assert_eq!(
+            edge_paths::encode_path_segment(value),
+            web_paths::encode_path_segment(value),
+            "segment {value:?}"
+        );
+        assert_eq!(
+            edge_paths::encode_catch_all_param(value),
+            web_paths::encode_catch_all_param(value),
+            "catch-all {value:?}"
+        );
+        assert_eq!(
+            edge_paths::PathExt::with_query("/p".to_owned(), value, value),
+            web_paths::PathExt::with_query("/p".to_owned(), value, value),
+            "query {value:?}"
+        );
+    }
+}
