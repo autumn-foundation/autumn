@@ -570,7 +570,12 @@ fn macro_calls(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> {
     while let Some(rel) = text[from..].find(name) {
         let at = from + rel;
         from = at + name.len();
-        if is_in_comment_or_string(text, at) {
+        // The end of a longer name (`audit_joinable!`) is not this macro.
+        let in_word = text[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        if in_word || is_in_comment_or_string(text, at) {
             continue;
         }
         let Some(open) = text[from..]
@@ -1429,5 +1434,22 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
         let check = check_tables(&existing, &parsed(vec![comments("author_id")]));
         assert!(check.stale.is_empty());
         assert!(check.stale_macros);
+    }
+
+    /// A macro whose name only ends with `joinable!` or `table!` is not a
+    /// diesel call.
+    #[test]
+    fn a_longer_macro_name_is_not_a_diesel_call() {
+        let existing =
+            "audit_joinable!(comments -> posts (post_id));\nmy_table! {\n    comments (id) {}\n}\n";
+        let out = sync_for_plan(
+            existing,
+            &parsed(vec![]),
+            &plan(vec![SchemaChange::DropTable(Table::new(
+                "comments",
+                Backend::Postgres,
+            ))]),
+        );
+        assert_eq!(out.text, existing);
     }
 }

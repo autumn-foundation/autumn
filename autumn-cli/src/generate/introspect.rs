@@ -613,8 +613,11 @@ pub fn schema_block_range(existing: &str, table: &str) -> Option<(usize, usize)>
     while let Some(macro_rel) = existing[search_from..].find("table!") {
         let name_start = search_from + macro_rel;
         search_from = name_start + "table!".len();
-        // A `table!` in a comment or a string is not a block.
-        if is_in_comment_or_string(existing, name_start) {
+        // A `table!` in a comment or a string, or the end of a longer name
+        // (`my_table!`), is not a diesel block.
+        let in_word = name_start > 0
+            && (bytes[name_start - 1].is_ascii_alphanumeric() || bytes[name_start - 1] == b'_');
+        if in_word || is_in_comment_or_string(existing, name_start) {
             continue;
         }
         // Walk back over an optional path qualifier (e.g. `diesel::`).
