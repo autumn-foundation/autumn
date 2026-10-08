@@ -2196,10 +2196,9 @@ fn scan_items(
                     // dangerous direction this cfg support exists to avoid:
                     // not a missed route, but a phantom one that makes an
                     // otherwise-default build look like it needs the edge
-                    // capsule / WASI target (Codex review on #2739, round
-                    // 11, P2 —
-                    // extended to a `cfg_attr`-injected exclusion in round
-                    // 33, P2).
+                    // capsule / WASI target (Codex review on #2739,
+                    // round 11, P2 — extended to a `cfg_attr`-injected
+                    // exclusion in round 33, P2).
                     let cfg_excludes = item_mod
                         .attrs
                         .iter()

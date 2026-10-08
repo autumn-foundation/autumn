@@ -122,8 +122,8 @@ pub use autumn_macros::{edge, edge_routes, get};
 
 /// Collect typed path helpers into a `pub mod paths`. See `autumn_web::paths!`.
 ///
-/// An `#[edge]` route's helper compiles for `wasm32-wasip1`, so an edge-safe
-/// module can call `paths![]` from here.
+/// An `#[edge]` route's helper compiles for `wasm32-wasip1`. An edge-safe
+/// module can use `autumn_edge::paths![]`.
 pub use autumn_macros::paths;
 
 pub use extract::{EdgeCache, EdgeCacheUnavailable};

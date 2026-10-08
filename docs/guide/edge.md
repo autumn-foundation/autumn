@@ -326,6 +326,12 @@ Collect the helpers with `autumn_edge::paths![]`:
 ```rust
 use autumn_edge::paths::PathExt as _;
 
+#[get("/greet/{name}")]
+#[edge]
+pub async fn greet(Path(name): Path<String>) -> String {
+    format!("Hello, {name}!")
+}
+
 #[get("/link/{name}")]
 #[edge]
 pub async fn link(Path(name): Path<String>) -> String {
@@ -337,6 +343,9 @@ autumn_edge::paths![greet, link];
 
 The helper of a plain route still calls `autumn_web`. Do not list it in an
 edge-safe module's `paths![]`.
+
+`autumn_edge::paths::PathExt` and `autumn_web::paths::PathExt` are two
+traits. Do not import both in one module, or `.with_query` is ambiguous.
 
 ## The wire protocol (version 1)
 
@@ -412,6 +421,7 @@ build with `--config 'profile.release.trim-paths="all"'`.
 ```sh
 autumn build            # release: native binary, then the capsule
 autumn build --edge     # force the capsule step in a debug build
+autumn build --embed    # embedded binary, then the capsule
 ```
 
 The edge step runs when the project has `#[edge]` routes and the build is a
@@ -443,9 +453,15 @@ capsule is the build's output. Thus the static renderer accepts an empty route
 set.
 
 `autumn build --embed` also builds the capsule, after the embedded binary.
-The capsule build gets `embed-assets` too, so a route gated on that feature
-is in both lanes. `autumn-web` is not in the capsule's graph, so its
-`embed-assets` feature does nothing there.
+The capsule build gets the app's `embed-assets` feature too, so a route gated
+on that feature is in both lanes. The app must declare that feature. Keep
+native-only dependencies out of it, or the capsule build fails. The capsule
+does not compile `autumn-web`, so `autumn-web/embed-assets` does nothing there.
+
+A build that makes a capsule checks for the `wasm32-wasip1` target before any
+compile. If the target is missing, the build stops with the `rustup` hint. A
+Docker builder image for an app with `#[edge]` routes needs
+`rustup target add wasm32-wasip1` before `autumn build --embed`.
 
 ### `autumn doctor`
 

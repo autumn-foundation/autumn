@@ -348,8 +348,8 @@ fn format_edge_success(names: &[&str], artifact: &Path, size_bytes: Option<u64>)
     )
 }
 
-/// Compile the edge capsule: validate registrations, preflight the WASI target,
-/// resolve the bin target, run cargo, report the artifact.
+/// Compile the edge capsule: validate registrations, resolve the bin target,
+/// run cargo, report the artifact. `run` checks the WASI target first.
 ///
 /// Every failure exits 1 with a message that names the exact next action.
 fn run_edge_capsule_build(scan: &EdgeScan, package: Option<&str>, features: Option<&str>) {
@@ -373,14 +373,6 @@ fn run_edge_capsule_build(scan: &EdgeScan, package: Option<&str>, features: Opti
     let unregistered = scan.unregistered();
     if !unregistered.is_empty() {
         eprintln!("\n{}", format_unregistered_warning(&unregistered));
-    }
-
-    if !edge_target_installed() {
-        eprintln!(
-            "\n\u{2717} the `{EDGE_TARGET}` target is not installed, so the edge capsule cannot be \
-             compiled.\n  {EDGE_TARGET_HINT}"
-        );
-        std::process::exit(1);
     }
 
     let metadata = read_cargo_metadata();
@@ -430,10 +422,9 @@ fn edge_scan_requested_features(features: Option<&str>, embed: bool) -> Vec<&str
 /// A selector-free invocation whose CWD has a `src/` scans it directly — the
 /// pure source-reading path the preflight guarantee depends on: flag/scan
 /// conflicts (`--edge` with no routes) must be reportable without spawning
-/// cargo at all, and the CLI integration tests
-/// pin that by running with an empty `PATH`. Every other shape resolves the
-/// scanned directory through [`find_binary`] — `-p`/`--bin` select a member
-/// whose sources live elsewhere, and a selector-free CWD *without* `src/` is
+/// cargo at all, and the CLI integration tests pin that by running with an
+/// empty `PATH`. Every other shape resolves the scanned directory through
+/// [`find_binary`] — `-p`/`--bin` select a member whose sources live elsewhere, and a selector-free CWD *without* `src/` is
 /// a virtual workspace root, where only `find_binary`'s resolution matches
 /// the package every later build step operates on.
 ///
@@ -490,6 +481,8 @@ fn run_cargo_or_exit(mut cargo: Command) {
 ///    (not the CLI cwd), writing the manifest + hashed copies.
 /// 3. Recompile **with** the embed feature so `include_dir!` bakes the
 ///    fingerprinted tree into the binary.
+///
+/// `run` builds the edge capsule after this, when the plan asks for it.
 fn build_embedded(
     debug: bool,
     profile: &str,
@@ -604,8 +597,8 @@ pub fn run(
     // ── Edge preflight (issue #1790) ─────────────────────────────────────────
     // Deliberately BEFORE any cargo invocation: the scan is pure source reading,
     // so a flag/scan conflict (`--edge` with nothing to compile) is reported
-    // in milliseconds instead of after a full native build. The capsule itself is compiled much later — after the native build
-    // and fingerprinting — by `run_edge_capsule_build`.
+    // in milliseconds, not after a full native build. `run_edge_capsule_build`
+    // compiles the capsule later, after the native build and fingerprinting.
     let edge_scan = resolve_project_edge_scan(debug, embed, package, bin, features);
     // A warning, not a stop: the scan reads every file under `src/`, also one
     // that no `mod` declares. rustc stops a real case with the macro's error.
@@ -616,6 +609,15 @@ pub fn run(
         eprintln!("\u{2717} {error}");
         std::process::exit(1);
     });
+    // Check the WASI target before any cargo build. Without it, the capsule
+    // step fails only after the full native build.
+    if plan == EdgePlan::Build && !edge_target_installed() {
+        eprintln!(
+            "\u{2717} the `{EDGE_TARGET}` target is not installed, so the edge capsule cannot be \
+             compiled.\n  {EDGE_TARGET_HINT}"
+        );
+        std::process::exit(1);
+    }
     if plan == EdgePlan::SkipDebug {
         eprintln!(
             "note: {} #[edge] route(s) found; skipping the edge capsule in a debug build \

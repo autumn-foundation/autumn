@@ -108,7 +108,8 @@ it emits `::autumn_edge::…` paths as text.
   `edge_routes![]` invocations; documented limits in the module docs.
 - The edge step runs after the native build and before the static renderer, for
   a release build or `--edge`; `--embed` plus edge routes is refused with an
-  actionable message; the artifact is never copied into `dist/` or `static/`.
+  actionable message (lifted 2026-10-08, see
+  `2026-10-08-edge-paths-and-embed.md`); the artifact is never copied into `dist/` or `static/`.
 - Preflight for the target with a `rustup target add wasm32-wasip1` hint.
 - Doctor checks `edge_target` and `edge_routes`, both silent on projects with no
   edge routes.

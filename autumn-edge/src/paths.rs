@@ -8,7 +8,7 @@
 //! The encoders give the same bytes as `autumn_web::paths`. A test in
 //! `autumn-web` compares the two.
 
-/// Fluent query-string builder for the strings that path helpers return.
+/// Adds a query string to the `String` that a path helper returns.
 pub trait PathExt {
     /// Append a percent-encoded `key=value` query parameter.
     ///

@@ -47,7 +47,7 @@ each expansion larger.
   `build_embedded` returns before the edge step.
 - **Red (feeling):** "Same source" is false while a link helper breaks the
   capsule.
-- **Black (risks):** Two copies of the encoder can drift. An embed build of a
+- **Black (risks):** Two copies of the encoder can become different. An embed build of a
   large app takes longer.
 - **Yellow (value):** The handler source does not change for the edge. One
   command makes the embed binary and the capsule.
