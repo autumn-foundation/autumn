@@ -1,7 +1,7 @@
 ### Fixed
 
 - **serve (Windows):** five residual service defects (issue #2705).
-  - `icacls /reset` now runs with `/T`, and `install-service` writes the
+  - `icacls /reset` now runs recursively (`/T /L`), and `install-service` writes the
     service record as a new file. A file that another local user pre-created
     in a shared `AUTUMN_RUNTIME_DIR` no longer keeps its ACE.
   - `serve restart` takes the daemon path only when the service does not

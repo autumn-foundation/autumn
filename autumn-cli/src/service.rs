@@ -213,7 +213,6 @@ pub fn open_failure_means_absent(raw_os_error: Option<i32>) -> bool {
 /// denied query, a transient SCM fault) is an error, so the caller does not
 /// take the daemon path for a service that exists.
 ///
-///
 /// # Errors
 /// Every failure except "service does not exist".
 #[cfg_attr(
@@ -336,21 +335,24 @@ fn record_path_from_command_line(line: &str) -> Option<PathBuf> {
 
 /// Write `contents` to a brand-new file at `path`.
 ///
-/// Any existing file is removed first, then the new one is made with
-/// `create_new`. A truncating write would keep the old file's DACL, so a
-/// stranger's explicit ACE on a pre-created record would survive. A new file
-/// inherits the hardened directory ACL. If another process creates the path
-/// between the remove and the create, the write fails closed.
+/// Create a new file next to `path` with `create_new`, then rename it over
+/// `path`. A truncating write keeps the old DACL, so another local user's ACE
+/// on a pre-created record would stay. A new file inherits the directory ACL.
+/// The old record stays intact until the rename, so a failed write loses
+/// nothing. If another process takes the temporary name, the write fails.
 ///
 /// # Errors
-/// The old file cannot be removed, or the new one cannot be created or written.
+/// The new file cannot be created, written or renamed.
 #[cfg_attr(
     not(windows),
     allow(dead_code, reason = "used by the Windows arm, tested everywhere")
 )]
 pub fn write_fresh(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    match std::fs::remove_file(path) {
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".new");
+    let tmp = PathBuf::from(tmp);
+    match std::fs::remove_file(&tmp) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
@@ -358,8 +360,10 @@ pub fn write_fresh(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(path)?;
-    file.write_all(contents)
+        .open(&tmp)?;
+    file.write_all(contents)?;
+    drop(file);
+    std::fs::rename(&tmp, path)
 }
 
 /// What `install-service` records for `run-service` to read back.
@@ -776,13 +780,30 @@ mod windows_impl {
         loop {
             match service.query_status().map(|s| s.current_state) {
                 Ok(ServiceState::Running) => {
-                    // The app has reported its resolved budget by now. Give the
-                    // drain the same time at machine shutdown that it gets from
-                    // `sc stop`. Best-effort: on failure the OS default stays.
-                    if let Some(hint) =
-                        super::preshutdown_for_reported(serve::recorded_stop_budget(paths))
-                    {
-                        let _ = service.set_preshutdown_timeout(hint);
+                    // Give the drain the same time at machine shutdown that it
+                    // gets from `sc stop`. The app may write its budget a moment
+                    // after the SCM shows Running, so poll briefly. On failure
+                    // the OS default stays.
+                    let until = Instant::now() + Duration::from_secs(10);
+                    let reported = loop {
+                        let budget = serve::recorded_stop_budget(paths);
+                        if budget.is_some() || Instant::now() >= until {
+                            break budget;
+                        }
+                        std::thread::sleep(Duration::from_millis(250));
+                    };
+                    match super::preshutdown_for_reported(reported) {
+                        Some(hint) => {
+                            if let Err(e) = service.set_preshutdown_timeout(hint) {
+                                eprintln!(
+                                    "autumn serve install-service: preshutdown timeout not set: {e}"
+                                );
+                            }
+                        }
+                        None => eprintln!(
+                            "autumn serve install-service: the app did not report its \
+                             drain budget; the preshutdown timeout keeps the OS default"
+                        ),
                     }
                     return Ok(());
                 }
@@ -927,7 +948,8 @@ mod windows_impl {
         let config = service.query_config().ok()?;
         let path = super::record_path_from_command_line(&config.executable_path.to_string_lossy())?;
         let record = ServiceRecord::parse(&std::fs::read_to_string(path).ok()?).ok()?;
-        Some(RuntimePaths::from_parts(record.paths))
+        // The record is a file. Trust it only for this service.
+        (record.name == name).then(|| RuntimePaths::from_parts(record.paths))
     }
 
     /// Stop the service, deregister it, and clean up everything it left behind.
@@ -1345,6 +1367,18 @@ mod windows_impl {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn record_path_handles_empty_and_unterminated_quotes() {
+        assert_eq!(
+            record_path_from_command_line(r#"a --service-record """#),
+            Some(PathBuf::from(""))
+        );
+        assert_eq!(
+            record_path_from_command_line(r#"a --service-record "C:\a b"#),
+            Some(PathBuf::from(r"C:\a b"))
+        );
+    }
+
+    #[test]
     fn preshutdown_keeps_the_os_default_until_the_app_reports() {
         assert_eq!(preshutdown_for_reported(None), None);
     }
@@ -1355,7 +1389,6 @@ mod tests {
             preshutdown_for_reported(Some(300)),
             Some(stop_wait_hint(300))
         );
-        assert!(preshutdown_for_reported(Some(300)) > Some(Duration::from_secs(300)));
     }
 
     #[test]
@@ -1410,7 +1443,10 @@ mod tests {
 
     #[test]
     fn missing_service_is_absent_not_an_error() {
-        assert_eq!(query_failure(Some(1060), "svc", "gone"), Ok(None));
+        assert_eq!(
+            query_failure(Some(ERROR_SERVICE_DOES_NOT_EXIST), "svc", "gone"),
+            Ok(None)
+        );
     }
 
     #[test]

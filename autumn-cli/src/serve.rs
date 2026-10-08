@@ -1224,8 +1224,8 @@ pub fn start_supervised(
 
 /// Drain budget plus the stop grace, capped at the SCM ceiling.
 ///
-/// The budget is user config, so the sum saturates. An overflow panic inside
-/// the service host would crash it mid-stop and the SCM would restart it.
+/// The budget is user config, so the sum saturates. An overflow would panic
+/// the service host mid-stop. The SCM would then restart it.
 fn stop_deadline(budget_secs: u64) -> Duration {
     Duration::from_secs(budget_secs)
         .saturating_add(STOP_GRACE_BUFFER)
@@ -1233,7 +1233,7 @@ fn stop_deadline(budget_secs: u64) -> Duration {
 }
 
 /// `prestop_grace_secs + shutdown_timeout_secs`, saturating.
-pub fn drain_budget_secs(prestop: u64, shutdown: u64) -> u64 {
+fn drain_budget_secs(prestop: u64, shutdown: u64) -> u64 {
     prestop.saturating_add(shutdown)
 }
 
