@@ -177,20 +177,53 @@ async fn alpn_less_client_still_works() {
     server.shutdown().await;
 }
 
-// Browsers use a second HTTP/1.1 connection for `wss://` only while the
-// server does not offer RFC 8441 extended CONNECT. Pin that.
-#[tokio::test(flavor = "multi_thread")]
-async fn h2_does_not_offer_extended_connect() {
-    let (server, _fixture) = serve(None).await;
-    let mut send = h2_open(connect(&server, &[H2, H1]).await).await;
-    // The server SETTINGS frame has arrived once a request completes.
-    let (_, body) = h2_send(&mut send, "/fast").await;
-    h2_body(body).await;
-    assert!(
-        !send.is_extended_connect_protocol_enabled(),
-        "extended CONNECT would break the browser `wss://` fallback"
-    );
-    server.shutdown().await;
+// axum's `serve` enables RFC 8441 extended CONNECT, so browsers open
+// `wss://` as an h2 stream. It must echo, not break.
+#[cfg(feature = "ws")]
+mod wss {
+    use super::*;
+    use autumn_web::ws::{Message, WebSocket, WsHandler};
+    use autumn_web::{routes, ws};
+
+    #[ws("/echo")]
+    async fn echo() -> impl WsHandler {
+        |mut socket: WebSocket| async move {
+            while let Some(Ok(Message::Text(text))) = socket.recv().await {
+                if socket.send(Message::Text(text)).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn websocket_echoes_over_h2_extended_connect() {
+        let fixture = CertFixture::write();
+        let router = TestApp::new().routes(routes![echo]).build().into_router();
+        let (server, _reloader) =
+            serve_tls_router(router, &fixture, RECORDING_HANDSHAKE_TIMEOUT).await;
+        let mut send = h2_open(connect(&server, &[H2, H1]).await).await;
+        let request = http::Request::connect("https://localhost/echo")
+            .extension(h2::ext::Protocol::from_static("websocket"))
+            .header("sec-websocket-version", "13")
+            .body(())
+            .unwrap();
+        let (response, mut tx) = send.send_request(request, false).expect("CONNECT");
+        let response = response.await.expect("CONNECT response");
+        assert_eq!(response.status(), 200, "wss over h2 must be accepted");
+        let mut rx = response.into_body();
+
+        // Masked client text frame "ping" (zero mask key).
+        tx.send_data(bytes::Bytes::from_static(b"\x81\x84\0\0\0\0ping"), false)
+            .expect("send frame");
+        let echoed = tokio::time::timeout(Duration::from_secs(5), rx.data())
+            .await
+            .expect("echo timed out")
+            .expect("stream ended before the echo")
+            .expect("h2 data");
+        assert_eq!(&echoed[..], b"\x81\x04ping");
+        server.shutdown.cancel();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
