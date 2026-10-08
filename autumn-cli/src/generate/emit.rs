@@ -667,19 +667,6 @@ impl Plan {
         }
         let pending = pending_contents(self);
         for r in released {
-            // Marked code or a file next to this one: either keeps the feature.
-            // With neither a marker nor an owner, keep it.
-            let markers = release_markers(&r.feature);
-            let by_marker = markers
-                .as_deref()
-                .is_some_and(|m| markers_in_project(m, &self.project_root, &[], &pending));
-            let by_sibling = r.owner.as_ref().is_some_and(|(dir, own)| {
-                resource_dir_has_other_files(dir, std::slice::from_ref(own))
-            });
-            let needed = by_marker || by_sibling || (markers.is_none() && r.owner.is_none());
-            if needed {
-                continue;
-            }
             let base = self
                 .actions
                 .iter()
@@ -689,6 +676,23 @@ impl Plan {
                     _ => None,
                 })
                 .unwrap_or_else(|| fs::read_to_string(&r.path).unwrap_or_default());
+            // Marked code or a file next to this one: either keeps the feature.
+            // With neither a marker nor an owner, keep it.
+            let markers = release_markers(&r.feature);
+            let by_marker = markers
+                .as_deref()
+                .is_some_and(|m| markers_in_project(m, &self.project_root, &[], &pending));
+            let by_sibling = r.owner.as_ref().is_some_and(|(dir, own)| {
+                resource_dir_has_other_files(dir, std::slice::from_ref(own))
+            });
+            // `htmx` is a default feature. Without default features, other
+            // code may need it in ways no marker shows, so keep it.
+            let defaults_off = r.feature == "htmx" && base_disables_defaults(&base);
+            let needed =
+                by_marker || by_sibling || defaults_off || (markers.is_none() && r.owner.is_none());
+            if needed {
+                continue;
+            }
             let updated = remove_autumn_web_feature(&base, &r.feature);
             if updated != base {
                 self.actions.retain(|a| a.path() != r.path);
@@ -1516,7 +1520,18 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
         // feature (issue #1048 PR review: destroying the only channel/live
         // scaffold of one transport must not strip a feature the other
         // transport, generated separately, still needs).
-        "ws" => &["#[ws]", "autumn_web::sse::stream("],
+        //
+        // The prelude re-exports the `ws` types unqualified (`Channels`,
+        // `Broadcast`, `ChannelMessage`, `ChannelStats`), so a route that
+        // uses `autumn_web::prelude::*` names none of the paths above.
+        "ws" => &[
+            "#[ws]",
+            "autumn_web::sse::stream(",
+            "Channels",
+            "Broadcast",
+            "ChannelMessage",
+            "ChannelStats",
+        ],
         // `TestDb::` (not bare `TestDb`) so a doc comment merely mentioning
         // the type (e.g. the template-shipped `tests/integration_test.rs`'s
         // "Add DB-backed tests with `TestDb`...") doesn't count as usage.
@@ -1603,6 +1618,13 @@ fn autumn_web_feature_still_needed_elsewhere(
     }
     let markers: Vec<String> = markers.iter().map(|m| (*m).to_owned()).collect();
     markers_in_project(&markers, project_root, excluding, overrides)
+}
+
+/// Whether the manifest turns off default features for a dependency.
+fn base_disables_defaults(manifest: &str) -> bool {
+    manifest
+        .lines()
+        .any(|l| l.replace(' ', "").contains("default-features=false"))
 }
 
 /// Whether any of `markers` appears in `src/`, `tests/`, `benches/` or `examples/`.
