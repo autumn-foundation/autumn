@@ -85,7 +85,8 @@ model and the `#[commentable]` attribute. Run it again for a second model and
 it adds only the column and the attribute — the table is shared, and the
 generator will not recreate it. If the project already has an unrelated
 `comments` table, the generator stops and writes no file. Rename that table, or
-add the polymorphic columns to it, then run the command again.
+add every missing shared-table column to it (see the schema above), then run
+the command again.
 
 ### Why `commentable_id` has no foreign key
 
