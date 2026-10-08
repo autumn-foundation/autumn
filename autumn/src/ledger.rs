@@ -3582,6 +3582,14 @@ mod tests {
     }
 
     #[test]
+    fn refuse_non_finite_passes_none_and_refuses_a_column() {
+        refuse_non_finite("t", 1, None).unwrap();
+        let err = refuse_non_finite("t", 9, Some("score")).expect_err("must refuse");
+        let text = err.to_string();
+        assert!(text.contains("t#9") && text.contains("score"), "{text}");
+    }
+
+    #[test]
     fn non_finite_error_names_table_record_and_column() {
         let text = LedgerError::NonFiniteValue {
             table: "t".into(),
