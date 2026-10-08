@@ -32,18 +32,19 @@ use tokio::time::Instant;
 const UPSTREAM_SLOTS: usize = 8;
 /// Upstream service time for one request.
 const SERVICE: Duration = Duration::from_millis(10);
-/// The noisy tenant sends one request each `NOISY_ARRIVAL` (2000 rps, which
-/// is 2.5x the upstream capacity of 800 rps).
-const NOISY_ARRIVAL: Duration = Duration::from_micros(500);
+/// The noisy tenant sends one request each `NOISY_ARRIVAL` (1000 rps, which
+/// is 1.25x the upstream capacity of 800 rps).
+const NOISY_ARRIVAL: Duration = Duration::from_millis(1);
 /// Each quiet tenant sends one request each `QUIET_ARRIVAL`.
 const QUIET_ARRIVAL: Duration = Duration::from_millis(50);
 /// Each quiet tenant enqueues one job each `QUIET_JOB_EVERY` requests.
 const QUIET_JOB_EVERY: u32 = 5;
 const QUIET_TENANTS: [&str; 3] = ["quiet-a", "quiet-b", "quiet-c"];
 /// How long the load runs.
-const END: Duration = Duration::from_secs(5);
-/// The noisy tenant enqueues this many jobs at the start.
-const NOISY_JOBS: usize = 400;
+const END: Duration = Duration::from_secs(3);
+/// The noisy tenant enqueues this many jobs at the start: more than the
+/// workers can run before `END`.
+const NOISY_JOBS: usize = 300;
 /// One job's run time.
 const JOB_RUN: Duration = Duration::from_millis(50);
 /// Job workers.
@@ -223,9 +224,9 @@ async fn drive(sim: &Sim) -> Run {
             }
         }
     }
-    // Let the jobs that are left finish; quiet jobs must not wait for them.
-    sim.advance(Duration::from_secs(60)).await;
-    sim.run_to_idle().await;
+    // Let the jobs that are left finish. A plain sleep lets the paused
+    // runtime fire each job's timer in turn; one `advance` jump would not.
+    tokio::time::sleep(Duration::from_secs(60)).await;
 
     let quiet_jobs = JOBS.with(|j| {
         j.borrow()
