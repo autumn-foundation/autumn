@@ -1699,13 +1699,16 @@ async fn release_stale_lock(stale: Option<InFlightLock>) {
 /// the copy, its [`IdempotencyTx`] would not see the steps the first attempt
 /// committed, and would run them again. A failed copy is a store error: the
 /// request fails closed with `500`, and the stale key keeps its point.
+///
+/// `false` when the stale key's lock expired and another request took the
+/// key before the copy: the request must not run, as for a key in flight.
 #[cfg(feature = "db")]
 async fn adopt_stale_recovery_point(
     stale: Option<InFlightLock>,
     lock: &InFlightLock,
-) -> Result<(), IdempotencyStoreError> {
+) -> Result<bool, IdempotencyStoreError> {
     let Some(stale) = stale else {
-        return Ok(());
+        return Ok(true);
     };
     let store: &dyn std::any::Any = lock.store.as_ref();
     let adopted = match store.downcast_ref::<DbIdempotencyStore>() {
@@ -1713,7 +1716,7 @@ async fn adopt_stale_recovery_point(
             db.adopt_recovery_point(&stale.key, &stale.owner, &lock.key, &lock.owner)
                 .await
         }
-        None => Ok(()),
+        None => Ok(true),
     };
     stale.release().await;
     adopted
@@ -1724,9 +1727,9 @@ async fn adopt_stale_recovery_point(
 async fn adopt_stale_recovery_point(
     stale: Option<InFlightLock>,
     _lock: &InFlightLock,
-) -> Result<(), IdempotencyStoreError> {
+) -> Result<bool, IdempotencyStoreError> {
     release_stale_lock(stale).await;
-    Ok(())
+    Ok(true)
 }
 
 /// Tells the middleware whether the handler stored the record in its own
@@ -1874,7 +1877,15 @@ where
     let Some((lock, stale_lock)) =
         lock_request_keys(&store, &prepared, in_flight_ttl, entropy.as_ref()).await
     else {
-        return Ok(in_flight_conflict(metrics.as_ref()));
+        return lock_refused_response(
+            &mut inner,
+            store.as_ref(),
+            prepared,
+            metrics.as_ref(),
+            replay_through_inner,
+            fail_closed_on_replay,
+        )
+        .await;
     };
     let lock_deadline_ms = lock_deadline_bound_ms(in_flight_ttl);
 
@@ -1907,18 +1918,79 @@ where
         }
     }
 
-    if let Err(error) = adopt_stale_recovery_point(stale_lock, &lock).await {
-        lock.hold_until_ttl();
-        tracing::error!(
-            idempotency.key = %prepared.idempotency_key,
-            error = %error,
-            "Idempotency recovery point copy failed; failing closed"
-        );
-        return Ok(persistence_failed_response());
-    }
+    let lock = match carry_stale_key(stale_lock, lock, &prepared, metrics.as_ref()).await {
+        Ok(lock) => lock,
+        Err(response) => return Ok(response),
+    };
 
     let probe = TxProbe::attach(&store, &mut prepared, &lock.owner, ttl, lock_deadline_ms);
     handle_cache_miss(inner, store, ttl, prepared, metrics.as_ref(), lock, probe).await
+}
+
+/// Carry the stale cookie's recovery point over to the request's key (see
+/// [`adopt_stale_recovery_point`]) and hand the lock back, or answer for a
+/// request that must not run: `409` when another request took the stale
+/// key, `500` when the copy failed.
+// `Err` is a ready-made response, as in `prepare_idempotency_request`.
+#[allow(clippy::result_large_err)]
+async fn carry_stale_key(
+    stale: Option<InFlightLock>,
+    lock: InFlightLock,
+    prepared: &PreparedIdempotencyRequest,
+    metrics: Option<&crate::middleware::MetricsCollector>,
+) -> Result<InFlightLock, Response<Body>> {
+    match adopt_stale_recovery_point(stale, &lock).await {
+        Ok(true) => Ok(lock),
+        Ok(false) => {
+            lock.release().await;
+            Err(in_flight_conflict(metrics))
+        }
+        Err(error) => {
+            lock.hold_until_ttl();
+            tracing::error!(
+                idempotency.key = %prepared.idempotency_key,
+                error = %error,
+                "Idempotency recovery point copy failed; failing closed"
+            );
+            Err(persistence_failed_response())
+        }
+    }
+}
+
+/// The answer when a key could not be locked.
+///
+/// A store may refuse the lock because the key holds a stored response:
+/// another request stored it and released the key between this request's
+/// lookup and its lock. That response is replayed. Otherwise the key is in
+/// flight, or the store failed: `409`, and the handler does not run.
+async fn lock_refused_response<S>(
+    inner: &mut S,
+    store: &dyn IdempotencyStore,
+    prepared: PreparedIdempotencyRequest,
+    metrics: Option<&crate::middleware::MetricsCollector>,
+    replay_through_inner: bool,
+    fail_closed_on_replay: bool,
+) -> Result<Response<Body>, std::convert::Infallible>
+where
+    S: Service<Request<Body>, Response = Response<Body>, Error = std::convert::Infallible>
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    match lookup_prepared_entry(store, &prepared).await {
+        Ok(Some(entry)) => {
+            replay_cache_hit(
+                inner,
+                entry,
+                prepared,
+                metrics,
+                replay_through_inner,
+                fail_closed_on_replay,
+            )
+            .await
+        }
+        Ok(None) | Err(_) => Ok(in_flight_conflict(metrics)),
+    }
 }
 
 /// Take what the handler left for the cache in its response extensions: the
@@ -2840,5 +2912,94 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(CALLS.load(Ordering::SeqCst), 0, "the handler must not run");
+    }
+
+    /// A store that refuses the lock while a response is stored, like the
+    /// database store, and whose first lookup misses because a racing request
+    /// stores its response and releases the key just after it.
+    struct LateRecordStore {
+        inner: MemoryIdempotencyStore,
+        raced: std::sync::atomic::AtomicBool,
+    }
+
+    impl IdempotencyStore for LateRecordStore {
+        fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
+            if !self.raced.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let record = IdempotencyRecord {
+                    status: 201,
+                    headers: Vec::new(),
+                    body: b"first".to_vec(),
+                    metadata: Vec::new(),
+                };
+                self.inner.set_now(
+                    key,
+                    "racer",
+                    record,
+                    compute_body_hash(b"same", None),
+                    Duration::from_secs(60),
+                );
+                return Box::pin(std::future::ready(Ok(None)));
+            }
+            self.inner.get(key)
+        }
+
+        fn set<'a>(
+            &'a self,
+            key: &'a str,
+            owner: &'a str,
+            record: IdempotencyRecord,
+            body_hash: Vec<u8>,
+            ttl: Duration,
+        ) -> IdempotencyFuture<'a, ()> {
+            self.inner.set(key, owner, record, body_hash, ttl)
+        }
+
+        fn try_lock<'a>(
+            &'a self,
+            key: &'a str,
+            owner: &'a str,
+            lock_ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
+            if self.inner.get_now(key).is_some() {
+                return Box::pin(std::future::ready(Ok(false)));
+            }
+            self.inner.try_lock(key, owner, lock_ttl)
+        }
+
+        fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
+            self.inner.unlock(key, owner)
+        }
+    }
+
+    /// A lock refused because a response was stored after the lookup replays
+    /// that response; the handler does not run and the client gets no `409`.
+    #[tokio::test]
+    async fn lock_refused_by_a_late_record_replays_it() {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let store = Arc::new(LateRecordStore {
+            inner: MemoryIdempotencyStore::new(Duration::from_secs(60)),
+            raced: std::sync::atomic::AtomicBool::new(false),
+        });
+        let service = IdempotencyLayer::new(store).layer(tower::service_fn(
+            |_req: Request<Body>| async move {
+                CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, Infallible>(Response::new(Body::from("second")))
+            },
+        ));
+
+        let response = service
+            .oneshot(idempotent_post("/late", "late-key", "same"))
+            .await
+            .expect("infallible");
+        assert_eq!(response.status(), StatusCode::CREATED, "replayed, not 409");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(&body[..], b"first");
+        assert_eq!(
+            CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the handler did not run"
+        );
     }
 }

@@ -621,7 +621,13 @@ where
                     false
                 });
             if !acquired {
-                return Ok(in_flight_conflict_response());
+                // A store may refuse the lock because a racing request stored
+                // its response and released the token after our lookup:
+                // replay it. Otherwise the token is in flight.
+                return Ok(match settings.store.get(&key).await {
+                    Ok(Some(entry)) => replay_response(&entry.record),
+                    Ok(None) | Err(_) => in_flight_conflict_response(),
+                });
             }
 
             // Double-check after locking: a racing request may have completed
@@ -2054,5 +2060,95 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 2, "C did not run the handler");
         let b = b.await.unwrap().unwrap();
         assert_eq!(b.status(), StatusCode::CREATED);
+    }
+
+    /// A store that refuses the lock and hides the first lookup: as if a
+    /// racing request stored its response and released the token between
+    /// this request's lookup and its lock (the database store refuses a lock
+    /// while a response is stored).
+    struct LateRecordStore {
+        inner: MemoryIdempotencyStore,
+        gets: AtomicUsize,
+    }
+
+    impl IdempotencyStore for LateRecordStore {
+        fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
+            if self.gets.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Box::pin(async { Ok(None) });
+            }
+            self.inner.get(key)
+        }
+
+        fn set<'a>(
+            &'a self,
+            key: &'a str,
+            owner: &'a str,
+            record: IdempotencyRecord,
+            body_hash: Vec<u8>,
+            ttl: Duration,
+        ) -> IdempotencyFuture<'a, ()> {
+            self.inner.set(key, owner, record, body_hash, ttl)
+        }
+
+        fn try_lock<'a>(
+            &'a self,
+            _key: &'a str,
+            _owner: &'a str,
+            _lock_ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
+            Box::pin(async { Ok(false) })
+        }
+
+        fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
+            self.inner.unlock(key, owner)
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_refused_by_a_late_record_replays_it() {
+        let token = "tok-late-record";
+        let inner = MemoryIdempotencyStore::new(Duration::from_secs(600));
+        let record = IdempotencyRecord {
+            status: 201,
+            headers: Vec::new(),
+            body: b"first".to_vec(),
+            metadata: Vec::new(),
+        };
+        inner
+            .set(
+                &storage_key(token),
+                "racer",
+                record,
+                Vec::new(),
+                Duration::from_secs(600),
+            )
+            .await
+            .unwrap();
+        let store: Arc<dyn IdempotencyStore> = Arc::new(LateRecordStore {
+            inner,
+            gets: AtomicUsize::new(0),
+        });
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let app = Router::new()
+            .route(
+                "/submit",
+                post(move || {
+                    let count = count_inner.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        "created"
+                    }
+                }),
+            )
+            .layer(layer_with_store(store));
+
+        let response = app.oneshot(urlencoded_post(token)).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "the racing request's response is replayed, not a 409"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 0, "the handler did not run");
     }
 }

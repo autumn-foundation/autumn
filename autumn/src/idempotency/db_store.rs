@@ -165,26 +165,32 @@ impl DbIdempotencyStore {
     /// The middleware calls this for a retry whose session cookie went stale:
     /// the retry runs under its new session's key, and must still see the
     /// steps the first attempt committed under the old one.
+    ///
+    /// `false` when `from_owner` no longer holds `from`: its lock expired and
+    /// another request took the key. The old key may still hold a point this
+    /// call cannot read, so the caller must not run the handler.
     pub(super) async fn adopt_recovery_point(
         &self,
         from: &str,
         from_owner: &str,
         to: &str,
         to_owner: &str,
-    ) -> Result<(), IdempotencyStoreError> {
+    ) -> Result<bool, IdempotencyStoreError> {
         let mut conn = self.conn().await?;
-        let point: Option<(Option<String>, Option<Vec<u8>>, i64)> = keys::autumn_idempotency_keys
+        let held: Option<(Option<String>, Option<Vec<u8>>, i64)> = keys::autumn_idempotency_keys
             .filter(keys::storage_key.eq(from))
             .filter(keys::locked_by.eq(from_owner))
-            .filter(keys::recovery_point.is_not_null())
             .select((keys::recovery_point, keys::recovery_body_hash, keys::ttl_ms))
             .first(&mut conn)
             .await
             .optional()
             .map_err(|e| db_error("read idempotency recovery point", e))?;
-        let Some((point, body_hash, ttl_ms)) = point else {
-            return Ok(());
+        let Some((point, body_hash, ttl_ms)) = held else {
+            return Ok(false);
         };
+        if point.is_none() {
+            return Ok(true);
+        }
         #[allow(
             clippy::arithmetic_side_effects,
             reason = "a SQL expression, evaluated by the database"
@@ -208,8 +214,8 @@ impl DbIdempotencyStore {
             ))
             .execute(&mut conn)
             .await
-            .map(drop)
-            .map_err(|e| db_error("copy idempotency recovery point", e))
+            .map_err(|e| db_error("copy idempotency recovery point", e))?;
+        Ok(true)
     }
 }
 
@@ -805,5 +811,71 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for IdempotencyTx {
         let mut tx = parts.extensions.get::<Self>().cloned().unwrap_or_default();
         tx.session = parts.extensions.get::<Session>().cloned();
         Ok(tx)
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod tests {
+    use super::*;
+    use crate::sim::substrate::SqliteSubstrate;
+
+    /// The first owner of the old key lost its lock to a second request
+    /// before the copy. The copy reports that, rather than "no recovery
+    /// point", so the middleware does not run the handler.
+    #[tokio::test]
+    async fn adopt_reports_a_stale_lock_taken_by_another_request() {
+        let substrate = SqliteSubstrate::with_migrations(&[&crate::migrate::FRAMEWORK_MIGRATIONS])
+            .expect("substrate");
+        let store = DbIdempotencyStore::new(substrate.pool(), Duration::from_secs(60));
+        assert!(
+            store
+                .try_lock("old", "a1", Duration::from_millis(5))
+                .await
+                .unwrap()
+        );
+        let mut conn = store.conn().await.unwrap();
+        diesel::update(keys::autumn_idempotency_keys.filter(keys::storage_key.eq("old")))
+            .set((
+                keys::recovery_point.eq(Some("charged")),
+                keys::ttl_ms.eq(60_000),
+            ))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        drop(conn);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            store
+                .try_lock("old", "a2", Duration::from_secs(60))
+                .await
+                .unwrap(),
+            "a second request takes the old key once a1's lock expired"
+        );
+        assert!(
+            store
+                .try_lock("new", "b", Duration::from_secs(60))
+                .await
+                .unwrap()
+        );
+
+        let adopted = store
+            .adopt_recovery_point("old", "a1", "new", "b")
+            .await
+            .unwrap();
+        assert!(!adopted, "a1 lost the old key: not a key with no point");
+
+        let adopted = store
+            .adopt_recovery_point("old", "a2", "new", "b")
+            .await
+            .unwrap();
+        assert!(adopted, "the holder copies the point");
+        let mut conn = store.conn().await.unwrap();
+        let point: Option<String> = keys::autumn_idempotency_keys
+            .filter(keys::storage_key.eq("new"))
+            .select(keys::recovery_point)
+            .first(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(point.as_deref(), Some("charged"));
     }
 }
