@@ -661,6 +661,15 @@ tokio::task_local! {
     static SCOPE: Arc<RequestScope>;
 }
 
+/// The fault decision of a dependency seam, with no wait and no error.
+///
+/// Capsule replay serves the recorded result of a seam, but must make the
+/// same entropy draws as the capture did.
+#[cfg(all(feature = "reporting", feature = "http-client"))]
+pub(crate) fn replay_roll(target: FaultTarget) {
+    let _decision = SCOPE.try_with(|scope| scope.roll(target));
+}
+
 /// The dependency seam: wait for injected latency, then fail when an
 /// injected error fires.
 ///
@@ -846,6 +855,20 @@ pub(crate) async fn with_faults<F: std::future::Future>(
         .scope_for("/", &Method::GET)
         .expect("an armed injector scopes `/`");
     SCOPE.scope(scope, future).await
+}
+
+/// [`with_faults`], and whether a fault fired in the scope.
+#[cfg(test)]
+pub(crate) async fn with_faults_fired<F: std::future::Future>(
+    rules: &[FaultRule],
+    future: F,
+) -> (F::Output, bool) {
+    let injector = test_injector(rules.iter().map(CompiledRule::new).collect(), u64::MAX);
+    let scope = injector
+        .scope_for("/", &Method::GET)
+        .expect("an armed injector scopes `/`");
+    let output = SCOPE.scope(Arc::clone(&scope), future).await;
+    (output, scope.fired.load(Ordering::Relaxed))
 }
 
 /// An injector for tests: `/live` and `/actuator` are exempt, and the stop
