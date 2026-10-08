@@ -215,6 +215,7 @@ pub mod health;
 pub(crate) mod health_cache;
 #[cfg(feature = "db")]
 pub mod hooks;
+pub mod http_server;
 #[cfg(feature = "i18n")]
 pub mod i18n;
 pub mod idempotency;

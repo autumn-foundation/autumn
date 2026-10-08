@@ -2050,6 +2050,13 @@ impl ConfigProperties {
             &format!("{:?}", defaults.database.replica_fallback),
             profile_str,
         );
+        Self::track_property(
+            props,
+            "database.replica_max_lag_ms",
+            &format!("{:?}", config.database.replica_max_lag_ms),
+            &format!("{:?}", defaults.database.replica_max_lag_ms),
+            profile_str,
+        );
     }
 
     fn track_log_props(
@@ -4808,9 +4815,12 @@ pub(crate) async fn channels_endpoint<S: ProvideActuatorState + Send + Sync + 's
 #[cfg(feature = "ws")]
 pub(crate) async fn tasks_stream_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
+    tunnel: crate::http_server::KeepTunnel,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |mut socket| async move {
+        // Over HTTP/2, the server keeps the connection while this is held.
+        let _tunnel = tunnel;
         let mut rx = state.channels().subscribe("sys:tasks");
         let shutdown = state.shutdown_token();
 

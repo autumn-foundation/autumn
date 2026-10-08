@@ -343,6 +343,44 @@ Three behaviour changes come with it:
 **Automation:** `manual` - it is a database privilege change, and no code
 rewrite applies.
 
+### WebSockets: `ws::WebSocket` and `ws::WebSocketUpgrade` are Autumn types
+
+**Why:** axum's socket sends no close frame when a message is too large, and
+it has no connection cap, ping or idle timer. The Autumn types apply the
+`[realtime]` limits (issue #3065).
+
+**Before (`{X.Y}`):** `autumn_web::ws::WebSocket` and
+`autumn_web::ws::WebSocketUpgrade` were re-exports of the axum types.
+
+```rust
+fn takes_axum(socket: axum::extract::ws::WebSocket) { /* ... */ }
+takes_axum(socket); // `socket` from a `#[ws]` handler
+```
+
+**After (`{(X+1).0}`):** they are Autumn wrappers. `recv`, `send`,
+`protocol`, `Stream`, `Sink` and `split()` work as before. A `#[ws]` handler
+(the `ws` feature) does not change. Code that needs the axum type calls
+`into_parts()` and keeps the returned `ConnectionHold` for the life of the
+socket. That socket has no `[realtime]` limits.
+
+Other changes on `WebSocketUpgrade`:
+
+- It has no type parameter, and no `on_failed_upgrade`,
+  `requested_protocols` or `set_selected_protocol`. Use `into_parts()`.
+- Its rejection type is `axum::response::Response`, not
+  `WebSocketUpgradeRejection`.
+- It extracts only where `AppState: FromRef<S>`. A plain `Router<()>`
+  needs axum's own `WebSocketUpgrade`.
+
+```rust
+let (socket, hold) = socket.into_parts();
+takes_axum(socket); // keep `hold` until the socket closes
+drop(hold);
+```
+
+**Automation:** `manual`. Only code that gives the socket to an API that uses
+the axum type must change. Decide if that socket keeps the limits.
+
 ### Query budgets: an associated function handed the handle is reported (#2316)
 
 **Why:** `Post::published(&mut db)` and `ReportBuilder::build(&mut db)` have
@@ -711,6 +749,30 @@ If nothing changed, delete this section.
   `[resilience.circuit_breaker.defaults]` and host overrides. The env
   variables are `AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__SLOW_CALL_DURATION_THRESHOLD_MS`,
   `..._SLOW_CALL_RATE_THRESHOLD` and `..._CANCELLED_CALL_OUTCOME`.
+
+### `prod` profile: connection and WebSocket limits (issue #3065)
+
+The `prod` profile now sets these values. Other profiles set none of them.
+
+```toml
+[server.http]
+header_read_timeout_ms = 10_000
+keep_alive_timeout_ms = 75_000
+max_header_bytes = 65_536
+http2_max_concurrent_streams = 100
+max_connections = 10_000
+
+[realtime]
+max_message_bytes = 1_048_576
+ping_interval_ms = 30_000
+idle_timeout_ms = 120_000
+```
+
+An HTTP/1 request head over 64 KiB now gets `431`. The HTTP/2 header list
+limit goes up from 16 KiB to 64 KiB. A WebSocket message over 1 MiB now
+closes the socket with code `1009`. To turn off a timeout or a connection cap,
+set it to `0`. `max_header_bytes` and `http2_max_concurrent_streams` cannot
+be turned off. To allow larger messages or heads, set a larger value.
 
 ## Behavior changes
 

@@ -94,6 +94,21 @@ impl
     }
 }
 
+impl
+    axum::extract::connect_info::Connected<
+        crate::http_server::IncomingStream<'_, StopAcceptingOnShutdown<tokio::net::TcpListener>>,
+    > for TcpPeer
+{
+    fn connect_info(
+        stream: crate::http_server::IncomingStream<
+            '_,
+            StopAcceptingOnShutdown<tokio::net::TcpListener>,
+        >,
+    ) -> Self {
+        Self(*stream.remote_addr())
+    }
+}
+
 /// Re-stamp `ConnectInfo<SocketAddr>` from [`TcpPeer`], so the TCP serve path
 /// presents exactly the connect info it did before [`StopAcceptingOnShutdown`]
 /// wrapped its listener. Installed inside the connect-info layer, before
