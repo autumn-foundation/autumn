@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use autumn_media_plugin::rooms::{RoomError, RoomStore};
 use autumn_media_plugin::rooms_db::DbRoomStore;
-use chrono::{Duration, Utc};
+use chrono::{Duration, SubsecRound as _, Utc};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -175,7 +175,12 @@ async fn create_join_roster_leave_round_trips_and_persists() {
 
     // Roster (member-gated) reflects both joins and persisted display names.
     let roster = store
-        .roster("tenant-a", &room.id, first.token.expose())
+        .roster(
+            "tenant-a",
+            &room.id,
+            first.token.expose(),
+            Duration::hours(12),
+        )
         .await
         .expect("roster");
     assert_eq!(roster.participants.len(), 2);
@@ -190,7 +195,12 @@ async fn create_join_roster_leave_round_trips_and_persists() {
     // multi-process property the whole feature exists for.
     let other: Arc<dyn RoomStore> = Arc::new(DbRoomStore::new(pool.clone(), 6));
     let roster2 = other
-        .roster("tenant-a", &room.id, second.token.expose())
+        .roster(
+            "tenant-a",
+            &room.id,
+            second.token.expose(),
+            Duration::hours(12),
+        )
         .await
         .expect("second instance roster");
     assert_eq!(roster2.participants.len(), 2);
@@ -206,7 +216,12 @@ async fn create_join_roster_leave_round_trips_and_persists() {
         .await
         .expect("leave");
     let roster3 = store
-        .roster("tenant-a", &room.id, second.token.expose())
+        .roster(
+            "tenant-a",
+            &room.id,
+            second.token.expose(),
+            Duration::hours(12),
+        )
         .await
         .expect("roster after leave");
     assert_eq!(roster3.participants.len(), 1);
@@ -228,16 +243,20 @@ async fn roster_is_member_gated_fail_closed() {
     // No token / a wrong token resolve to the SAME error a nonexistent room
     // returns — no membership oracle.
     assert!(matches!(
-        store.roster("", &room.id, "").await,
+        store.roster("", &room.id, "", Duration::hours(12)).await,
         Err(RoomError::RoomNotFound)
     ));
     assert!(matches!(
-        store.roster("", &room.id, "not-a-member").await,
+        store
+            .roster("", &room.id, "not-a-member", Duration::hours(12))
+            .await,
         Err(RoomError::RoomNotFound)
     ));
     // Wrong namespace never leaks the room.
     assert!(matches!(
-        store.roster("other", &room.id, "").await,
+        store
+            .roster("other", &room.id, "", Duration::hours(12))
+            .await,
         Err(RoomError::RoomNotFound)
     ));
 }
@@ -309,14 +328,23 @@ async fn reap_evicts_stale_participant_and_drops_emptied_room() {
     assert_eq!(stats.rooms_reaped, 1);
 
     // room-keep still resolves for its fresh member; the stale one is gone.
-    assert!(store.roster("", "room-keep", "tok-fresh").await.is_ok());
+    assert!(
+        store
+            .roster("", "room-keep", "tok-fresh", Duration::hours(12))
+            .await
+            .is_ok()
+    );
     assert!(matches!(
-        store.roster("", "room-keep", "tok-stale").await,
+        store
+            .roster("", "room-keep", "tok-stale", Duration::hours(12))
+            .await,
         Err(RoomError::RoomNotFound)
     ));
     // room-drop is gone entirely.
     assert!(matches!(
-        store.roster("", "room-drop", "tok").await,
+        store
+            .roster("", "room-drop", "tok", Duration::hours(12))
+            .await,
         Err(RoomError::RoomNotFound)
     ));
 
@@ -390,10 +418,17 @@ async fn reap_never_crosses_namespaces() {
 
     // ns "a" room reaped; the identically-named ns "b" room is untouched.
     assert!(matches!(
-        store.roster("a", "shared-id", "tok-a").await,
+        store
+            .roster("a", "shared-id", "tok-a", Duration::hours(12))
+            .await,
         Err(RoomError::RoomNotFound)
     ));
-    assert!(store.roster("b", "shared-id", "tok-b").await.is_ok());
+    assert!(
+        store
+            .roster("b", "shared-id", "tok-b", Duration::hours(12))
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
@@ -415,7 +450,12 @@ async fn reap_on_a_clean_store_is_a_zero_count_no_op() {
     let stats = store.reap_stale(now, Duration::minutes(30)).await;
     assert_eq!(stats.participants_reaped, 0);
     assert_eq!(stats.rooms_reaped, 0);
-    assert!(store.roster("", "room-1", "tok").await.is_ok());
+    assert!(
+        store
+            .roster("", "room-1", "tok", Duration::hours(12))
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
@@ -435,7 +475,14 @@ async fn heartbeat_holds_a_seat_across_a_sweep_and_renews_the_advisory_expiry() 
 
     let before = Utc::now();
     let renewed = store
-        .heartbeat("", "room-1", "beating", "tok-a", Duration::seconds(300))
+        .heartbeat(
+            "",
+            "room-1",
+            "beating",
+            "tok-a",
+            Duration::seconds(300),
+            Duration::hours(12),
+        )
         .await
         .expect("heartbeat");
     // The renewal honors the supplied TTL, not some other horizon.
@@ -459,7 +506,12 @@ async fn heartbeat_holds_a_seat_across_a_sweep_and_renews_the_advisory_expiry() 
     // The heartbeat — not a roster poll — is what saves the seat.
     let stats = store.reap_stale(Utc::now(), Duration::minutes(30)).await;
     assert_eq!(stats.participants_reaped, 1, "only the silent seat reaped");
-    assert!(store.roster("", "room-1", "tok-a").await.is_ok());
+    assert!(
+        store
+            .roster("", "room-1", "tok-a", Duration::hours(12))
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
@@ -480,7 +532,14 @@ async fn heartbeat_is_fail_closed_with_no_membership_oracle() {
         assert!(
             matches!(
                 store
-                    .heartbeat(namespace, room, participant, token, ttl)
+                    .heartbeat(
+                        namespace,
+                        room,
+                        participant,
+                        token,
+                        ttl,
+                        Duration::hours(12)
+                    )
                     .await,
                 Err(RoomError::RoomNotFound)
             ),
@@ -508,7 +567,14 @@ async fn heartbeat_rejects_a_sibling_participants_token() {
 
     assert!(matches!(
         store
-            .heartbeat("", "room-1", "p2", "tok-1", Duration::seconds(300))
+            .heartbeat(
+                "",
+                "room-1",
+                "p2",
+                "tok-1",
+                Duration::seconds(300),
+                Duration::hours(12)
+            )
             .await,
         Err(RoomError::RoomNotFound)
     ));
@@ -529,8 +595,112 @@ async fn heartbeat_on_a_seat_reaped_concurrently_reports_it_gone() {
 
     assert!(matches!(
         store
-            .heartbeat("", "room-1", "p1", "tok", Duration::seconds(300))
+            .heartbeat(
+                "",
+                "room-1",
+                "p1",
+                "tok",
+                Duration::seconds(300),
+                Duration::hours(12)
+            )
             .await,
         Err(RoomError::RoomNotFound)
     ));
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn heartbeat_caps_the_expiry_at_the_session_limit() {
+    let (pool, _container) = setup_pool().await;
+    let store = DbRoomStore::new(pool.clone(), 6);
+    // Seeded rows hold microseconds, so truncate before the compare.
+    let joined = (Utc::now() - Duration::hours(12) + Duration::minutes(1)).trunc_subsecs(6);
+    seed(&pool, "", "room-1", joined, &[("p1", "tok", joined)]).await;
+
+    let renewed = store
+        .heartbeat(
+            "",
+            "room-1",
+            "p1",
+            "tok",
+            Duration::seconds(300),
+            Duration::hours(12),
+        )
+        .await
+        .expect("heartbeat inside the session limit");
+
+    assert_eq!(renewed, joined + Duration::hours(12));
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn heartbeat_after_the_session_limit_is_refused() {
+    let (pool, _container) = setup_pool().await;
+    let store = DbRoomStore::new(pool.clone(), 6);
+    let joined = (Utc::now() - Duration::hours(13)).trunc_subsecs(6);
+    seed(&pool, "", "room-1", joined, &[("p1", "tok", joined)]).await;
+
+    let result = store
+        .heartbeat(
+            "",
+            "room-1",
+            "p1",
+            "tok",
+            Duration::seconds(300),
+            Duration::hours(12),
+        )
+        .await;
+
+    assert!(matches!(result, Err(RoomError::RoomNotFound)));
+    let (expires, seen) = seat_clocks(&pool, "p1").await;
+    assert_eq!(
+        expires,
+        joined.naive_utc().trunc_subsecs(6),
+        "no expiry renewal"
+    );
+    assert_eq!(
+        seen,
+        joined.naive_utc().trunc_subsecs(6),
+        "no liveness refresh"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn roster_after_the_session_limit_is_refused() {
+    let (pool, _container) = setup_pool().await;
+    let store = DbRoomStore::new(pool.clone(), 6);
+    let joined = (Utc::now() - Duration::hours(13)).trunc_subsecs(6);
+    seed(&pool, "", "room-1", joined, &[("p1", "tok", joined)]).await;
+
+    let result = store.roster("", "room-1", "tok", Duration::hours(12)).await;
+
+    assert!(matches!(result, Err(RoomError::RoomNotFound)));
+    let (_, seen) = seat_clocks(&pool, "p1").await;
+    assert_eq!(seen, joined.naive_utc(), "no liveness refresh");
+}
+
+/// One seat's `(token_expires_at, last_seen_at)` in room `room-1`.
+async fn seat_clocks(
+    pool: &Pool<AsyncPgConnection>,
+    participant_id: &str,
+) -> (chrono::NaiveDateTime, chrono::NaiveDateTime) {
+    let mut conn = pool.get().await.expect("conn");
+    let row: ClockRow = diesel::sql_query(format!(
+        "SELECT token_expires_at, last_seen_at FROM media_room_participants \
+         WHERE namespace = '' AND room_id = 'room-1' AND participant_id = '{participant_id}'"
+    ))
+    .get_result(&mut conn)
+    .await
+    .expect("read seat clocks");
+    (row.token_expires_at, row.last_seen_at)
+}
+
+/// The two clock columns of one seat.
+#[derive(diesel::QueryableByName)]
+struct ClockRow {
+    #[diesel(sql_type = diesel::sql_types::Timestamp)]
+    token_expires_at: chrono::NaiveDateTime,
+    #[diesel(sql_type = diesel::sql_types::Timestamp)]
+    last_seen_at: chrono::NaiveDateTime,
 }
