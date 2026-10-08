@@ -125,8 +125,15 @@ impl FaultInjection {
     ///
     /// No event is written when the faults are already disarmed.
     pub async fn disarm(&self, actor: &str, reason: &str) {
-        if self.inner.disarm_any() {
-            let sequence = self.inner.next_sequence();
+        // The sequence is taken under the window lock, as for every toggle,
+        // so the sequence order is the toggle order.
+        let sequence = {
+            let window = self.inner.lock_window();
+            let sequence = self.inner.disarm_any().then(|| self.inner.next_sequence());
+            drop(window);
+            sequence
+        };
+        if let Some(sequence) = sequence {
             self.inner.audit(sequence, actor, false, reason).await;
         }
     }
@@ -319,18 +326,19 @@ impl Injector {
                 matched,
                 fired: AtomicBool::new(false),
                 errored: AtomicBool::new(false),
+                route_rolled: AtomicBool::new(false),
             })
         })
     }
 
-    /// Count one faulted request of arm `generation`. Returns `true` when
-    /// this request trips the stop condition. A request of an earlier arm
-    /// does not count.
-    fn record(&self, generation: u64, error: bool) -> bool {
+    /// Count one faulted request of arm `generation`. Returns the toggle
+    /// sequence when this request trips the stop condition. A request of an
+    /// earlier arm does not count.
+    fn record(&self, generation: u64, error: bool) -> Option<u64> {
         let now = tokio::time::Instant::now();
         let mut window = self.lock_window();
         if generation_of(self.state.load(Ordering::Acquire)) != generation {
-            return false;
+            return None;
         }
         let expired = window
             .started
@@ -347,13 +355,14 @@ impl Injector {
             window.errors = window.errors.saturating_add(1);
         }
         if window.requests < self.min_requests {
-            return false;
+            return None;
         }
         let errors_ppm = u128::from(window.errors).saturating_mul(u128::from(PPM));
         let limit_ppm = u128::from(self.max_error_ppm).saturating_mul(u128::from(window.requests));
         // Disarm under the window lock, and only the arm of this request: a
         // re-arm between the check and the disarm cannot be undone.
-        let tripped = errors_ppm > limit_ppm && self.disarm_generation(generation);
+        let tripped = (errors_ppm > limit_ppm && self.disarm_generation(generation))
+            .then(|| self.next_sequence());
         drop(window);
         tripped
     }
@@ -445,8 +454,7 @@ impl Injector {
 
     /// Write a stop trip in the background. The request does not wait for
     /// the audit sink, and a dropped request cannot lose the event.
-    fn audit_stop(self: &Arc<Self>, reason: &'static str) {
-        let sequence = self.next_sequence();
+    fn audit_stop(self: &Arc<Self>, sequence: u64, reason: &'static str) {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let injector = Arc::clone(self);
             runtime.spawn(async move {
@@ -477,6 +485,9 @@ struct RequestScope {
     fired: AtomicBool,
     /// An error fault fired in this request.
     errored: AtomicBool,
+    /// The route faults were rolled. A second route layer (the SSG/ISG
+    /// path, or an MCP replay) does not roll them again.
+    route_rolled: AtomicBool,
 }
 
 /// A fault decision.
@@ -627,7 +638,7 @@ pub(crate) fn build(
     });
     Some((
         FaultScopeLayer::new(Arc::clone(&injector)),
-        FaultInjectionLayer::new(),
+        FaultInjectionLayer::new(None),
         FaultInjection { inner: injector },
     ))
 }
@@ -659,6 +670,21 @@ pub(crate) fn announce(handle: &FaultInjection) {
             allow_in_production = injector.allow_in_production,
             "fault injection toggled; no runtime, so no audit event"
         );
+    }
+}
+
+impl FaultInjection {
+    /// Both layers again, on the same injector, for the SSG/ISG path. The
+    /// route layer caps injected latency at `deadline` (the request
+    /// timeout) and then fails with `503`, as the timeout layer does.
+    pub(crate) fn layers(
+        &self,
+        deadline: Option<Duration>,
+    ) -> (FaultScopeLayer, FaultInjectionLayer) {
+        (
+            FaultScopeLayer::new(Arc::clone(&self.inner)),
+            FaultInjectionLayer::new(deadline),
+        )
     }
 }
 
@@ -761,7 +787,7 @@ mod tests {
         let handle = FaultInjection {
             inner: Arc::clone(&injector),
         };
-        assert!(!injector.record(0, true));
+        assert!(injector.record(0, true).is_none());
         handle.arm("ops").await;
         assert_eq!(handle.snapshot().window_requests, 1);
     }
@@ -777,7 +803,7 @@ mod tests {
         handle.disarm("ops", "test").await;
         handle.arm("ops").await;
         assert!(
-            !injector.record(old.generation, true),
+            injector.record(old.generation, true).is_none(),
             "the old request does not trip"
         );
         assert!(

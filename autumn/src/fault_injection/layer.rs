@@ -22,13 +22,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{HeaderValue, Request, Response};
 use axum::response::IntoResponse;
 use tower::{Layer, Service};
 
-use super::{FAULT_HEADER, FaultTarget, Injector, RequestScope, SCOPE};
+use super::{FAULT_HEADER, FaultTarget, Injector, RequestScope, RouteFault, SCOPE};
 
 type BoxFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send>>;
 
@@ -82,7 +83,13 @@ where
     }
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
-        let Some(scope) = self.injector.scope_for(req.uri().path()) else {
+        // A request in a scope already (the SSG/ISG path has two scope
+        // layers, and an MCP replay crosses the inner one) keeps that scope.
+        let scoped = SCOPE.try_with(|_| ()).is_ok();
+        let scope = (!scoped)
+            .then(|| self.injector.scope_for(req.uri().path()))
+            .flatten();
+        let Some(scope) = scope else {
             return Box::pin(self.inner.call(req));
         };
         // Build the inner future in the scope too: an inner layer can read
@@ -99,8 +106,8 @@ where
                     || result
                         .as_ref()
                         .map_or(true, |response| response.status().is_server_error());
-                if scope.injector.record(scope.generation, error) {
-                    scope.injector.audit_stop(STOP_REASON);
+                if let Some(sequence) = scope.injector.record(scope.generation, error) {
+                    scope.injector.audit_stop(sequence, STOP_REASON);
                 }
             }
             result
@@ -122,24 +129,26 @@ impl Drop for Pending {
         // Each matched request counts. A dropped one is bad only when a
         // fault fired in it.
         let fired = scope.fired.load(Ordering::Relaxed);
-        if scope.injector.record(scope.generation, fired) {
-            scope.injector.audit_stop(STOP_REASON);
+        if let Some(sequence) = scope.injector.record(scope.generation, fired) {
+            scope.injector.audit_stop(sequence, STOP_REASON);
         }
     }
 }
 
 /// Tower [`Layer`] that applies the route faults of `[fault_injection]`.
 ///
-/// The router installs it inside the timeout layer when the section is
-/// enabled. Outside a fault scope, it passes each request through.
+/// The router installs it when the section is enabled. Outside a fault
+/// scope, it passes each request through. Route faults roll once per
+/// request, also when two of these layers are in the path.
 #[derive(Clone, Debug, Default)]
 pub struct FaultInjectionLayer {
-    _private: (),
+    /// The request timeout, when the layer is outside the timeout layer.
+    deadline: Option<Duration>,
 }
 
 impl FaultInjectionLayer {
-    pub(super) const fn new() -> Self {
-        Self { _private: () }
+    pub(super) const fn new(deadline: Option<Duration>) -> Self {
+        Self { deadline }
     }
 }
 
@@ -147,7 +156,10 @@ impl<S> Layer<S> for FaultInjectionLayer {
     type Service = FaultInjectionService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        FaultInjectionService { inner }
+        FaultInjectionService {
+            inner,
+            deadline: self.deadline,
+        }
     }
 }
 
@@ -155,6 +167,7 @@ impl<S> Layer<S> for FaultInjectionLayer {
 #[derive(Clone, Debug)]
 pub struct FaultInjectionService<S> {
     inner: S,
+    deadline: Option<Duration>,
 }
 
 impl<S, B> Service<Request<B>> for FaultInjectionService<S>
@@ -173,9 +186,23 @@ where
     }
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
-        let fault = SCOPE
-            .try_with(|scope| scope.roll(FaultTarget::Route))
+        let mut fault = SCOPE
+            .try_with(|scope| {
+                if scope.route_rolled.swap(true, Ordering::AcqRel) {
+                    RouteFault::default()
+                } else {
+                    scope.roll(FaultTarget::Route)
+                }
+            })
             .unwrap_or_default();
+        // Outside the timeout layer: wait at most the timeout, then fail as
+        // the timeout layer would.
+        if let Some(deadline) = self.deadline
+            && fault.latency >= deadline
+        {
+            fault.latency = deadline;
+            fault.error = Some(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        }
         if let Some(status) = fault.error {
             return Box::pin(async move {
                 if !fault.latency.is_zero() {
@@ -242,7 +269,7 @@ mod tests {
             .route("/actuator/health", get(|| async { "ok" }))
             .layer((
                 FaultScopeLayer::new(Arc::clone(injector)),
-                FaultInjectionLayer::new(),
+                FaultInjectionLayer::new(None),
             ))
     }
 
@@ -309,6 +336,45 @@ mod tests {
         let timed_out = tokio::time::timeout(Duration::from_millis(10), request).await;
         assert!(timed_out.is_err());
         assert!(!crate::fault_injection::FaultInjection::for_test(&injector).is_armed());
+    }
+
+    /// Two layer pairs (the SSG/ISG path) give one scope and one roll.
+    #[tokio::test]
+    async fn stacked_layers_fault_a_request_once() {
+        let injector = injector(vec![error_rule(1_000_000)], 1_000);
+        let app = axum::Router::new()
+            .route("/x", get(|| async { "ok" }))
+            .layer((
+                FaultScopeLayer::new(Arc::clone(&injector)),
+                FaultInjectionLayer::new(None),
+            ))
+            .layer((
+                FaultScopeLayer::new(Arc::clone(&injector)),
+                FaultInjectionLayer::new(None),
+            ));
+        assert_eq!(status(app, "/x").await, 503);
+        assert_eq!(injector.injected.load(Ordering::Relaxed), 1);
+        let handle = crate::fault_injection::FaultInjection::for_test(&injector);
+        assert_eq!(handle.snapshot().window_requests, 1);
+    }
+
+    /// Outside the timeout layer, a long latency fault ends at the deadline
+    /// with a `503`, as the timeout layer would end it.
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_caps_latency_and_fails() {
+        let mut rule = error_rule(1_000_000);
+        rule.kind = FaultKind::Latency;
+        rule.latency = Duration::from_secs(300);
+        let injector = injector(vec![rule], 1_000);
+        let app = axum::Router::new()
+            .route("/x", get(|| async { "ok" }))
+            .layer((
+                FaultScopeLayer::new(Arc::clone(&injector)),
+                FaultInjectionLayer::new(Some(Duration::from_secs(2))),
+            ));
+        let started = tokio::time::Instant::now();
+        assert_eq!(status(app, "/x").await, 503);
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
     }
 
     #[tokio::test]

@@ -4107,21 +4107,25 @@ fn fault_injection_exempt_paths(config: &AutumnConfig) -> Vec<String> {
     paths
 }
 
-/// Install both fault injection layers outside the static-first middleware
-/// (the SSG/ISG path). The scope layer is outer to the route layer.
+/// Install both fault injection layers again outside the static-first
+/// middleware (the SSG/ISG path), on the injector that `apply_middleware`
+/// built. A cached page is outside the request timeout, so the route layer
+/// caps injected latency at it.
 fn install_outer_fault_injection(
     router: axum::Router<AppState>,
     config: &AutumnConfig,
     state: &AppState,
 ) -> axum::Router<AppState> {
-    let Some((scope, route, handle)) =
-        crate::fault_injection::build(config, state, fault_injection_exempt_paths(config))
-    else {
+    let Some(handle) = state.extension::<crate::fault_injection::FaultInjection>() else {
         return router;
     };
-    crate::fault_injection::announce(&handle);
-    state.insert_extension(handle);
-    router.layer((scope, route))
+    let deadline = config
+        .server
+        .timeouts
+        .request_timeout_ms
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis);
+    router.layer(handle.layers(deadline))
 }
 
 fn build_shadow_layer(
@@ -5159,11 +5163,12 @@ fn apply_middleware(
     // shedding, and the timeout, the access log and error reporting see an
     // injected fault as a real one. Probe and actuator paths are exempt, as
     // for `[shadow]`. `build` has no side effects.
-    // On the SSG/ISG path (`defer_shadow`), the layers go outside the
-    // static-first middleware instead; see `install_outer_fault_injection`.
-    let fault_injection = (!defer_shadow)
-        .then(|| crate::fault_injection::build(config, state, fault_injection_exempt_paths(config)))
-        .flatten();
+    // On the SSG/ISG path, `install_outer_fault_injection` adds the layers
+    // again outside the static-first middleware, on the same injector. The
+    // inner ones stay for the MCP dispatch clone; a request keeps the first
+    // scope, and route faults roll once.
+    let fault_injection =
+        crate::fault_injection::build(config, state, fault_injection_exempt_paths(config));
     let (fault_scope_layer, fault_route_layer, fault_handle) = match fault_injection {
         Some((scope, route, handle)) => (Some(scope), Some(route), Some(handle)),
         None => (None, None, None),
