@@ -525,6 +525,7 @@ fn parse_table_ref(text: &str) -> Option<(TableRef, usize)> {
 const CREATE_VERBS: &[&str] = &["table", "unlogged table"];
 
 /// Every persistent `CREATE TABLE` in `sql`: (offset, table, column-list body).
+/// The body is empty when the statement has no column list.
 fn create_tables(sql: &str) -> Vec<(usize, TableRef, &str)> {
     let mut found = Vec::new();
     let mut base = 0usize;
@@ -549,9 +550,9 @@ fn create_tables(sql: &str) -> Vec<(usize, TableRef, &str)> {
             continue;
         };
         let body_start = start + "create ".len() + verb.len() + used;
-        let Some(body) = create_table_body(sql, body_start) else {
-            continue;
-        };
+        // No column list (`CREATE TABLE x AS SELECT …`): the name is taken,
+        // and the columns are unknown.
+        let body = create_table_body(sql, body_start).unwrap_or("");
         found.push((start, table, body));
     }
     found
@@ -2218,6 +2219,24 @@ mod tests {
         assert!(
             ensure_no_comments_conflict(tmp.path()).is_err(),
             "an untracked source may exist, so `comments` may be taken"
+        );
+    }
+
+    /// A `CREATE TABLE … AS` has no column list, but it still takes the name.
+    #[test]
+    fn create_table_as_occupies_the_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_ctas");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments AS SELECT 1 AS id;\n",
+        )
+        .expect("write");
+        assert!(!already_migrated(tmp.path()), "its columns are unknown");
+        assert!(
+            ensure_no_comments_conflict(tmp.path()).is_err(),
+            "the name is taken"
         );
     }
 
