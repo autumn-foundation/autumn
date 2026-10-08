@@ -26947,4 +26947,156 @@ exempt_paths = [
             "the field key must serve index, show, and form:\n{routes}"
         );
     }
+
+    /// Regenerating a scaffold without a flag releases the `autumn-web`
+    /// feature that flag enabled (issue #2328).
+    mod feature_release {
+        use super::*;
+
+        const CARGO: &str =
+            "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = \"0.7.0\"\n";
+
+        fn project() -> TempDir {
+            let tmp = project_with_main(default_main());
+            fs::write(tmp.path().join("Cargo.toml"), CARGO).unwrap();
+            tmp
+        }
+
+        fn run(tmp: &TempDir, name: &str, fields: &[&str], options: &ScaffoldOptions) {
+            let tokens: Vec<String> = fields.iter().map(|f| (*f).to_owned()).collect();
+            plan_scaffold_with_options(tmp.path(), name, &tokens, "20260827000000", options)
+                .unwrap()
+                .execute(Flags {
+                    force: true,
+                    ..Flags::default()
+                })
+                .unwrap();
+        }
+
+        fn autumn_web_line(tmp: &TempDir) -> String {
+            fs::read_to_string(tmp.path().join("Cargo.toml"))
+                .unwrap()
+                .lines()
+                .find(|l| l.starts_with("autumn-web"))
+                .unwrap()
+                .to_owned()
+        }
+
+        fn searchable() -> ScaffoldOptions {
+            ScaffoldOptions {
+                model: ModelOptions {
+                    searchable: vec!["title".to_owned()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+
+        fn importing() -> ScaffoldOptions {
+            ScaffoldOptions {
+                import: true,
+                ..Default::default()
+            }
+        }
+
+        const POST: &[&str] = &["title:String", "body:Text"];
+
+        #[test]
+        fn dropping_searchable_releases_htmx() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            assert!(autumn_web_line(&tmp).contains("htmx"));
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(!autumn_web_line(&tmp).contains("htmx"), "{}", autumn_web_line(&tmp));
+        }
+
+        #[test]
+        fn dropping_import_releases_multipart_and_keeps_csv() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &importing());
+            assert!(autumn_web_line(&tmp).contains("multipart"));
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let line = autumn_web_line(&tmp);
+            assert!(!line.contains("multipart"), "{line}");
+            assert!(line.contains("csv"), "the export still needs csv: {line}");
+        }
+
+        #[test]
+        fn dropping_attachment_releases_storage_and_multipart() {
+            let tmp = project();
+            run(&tmp, "Post", &["title:String", "cover:attachment"], &ScaffoldOptions::default());
+            assert!(autumn_web_line(&tmp).contains("storage"));
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let line = autumn_web_line(&tmp);
+            assert!(!line.contains("storage") && !line.contains("multipart"), "{line}");
+        }
+
+        #[test]
+        fn dropping_richtext_releases_markdown() {
+            let tmp = project();
+            run(&tmp, "Post", &["title:String", "body:richtext"], &ScaffoldOptions::default());
+            assert!(autumn_web_line(&tmp).contains("markdown"));
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(!autumn_web_line(&tmp).contains("markdown"), "{}", autumn_web_line(&tmp));
+        }
+
+        #[test]
+        fn going_api_releases_csv() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(autumn_web_line(&tmp).contains("csv"));
+            let api = ScaffoldOptions {
+                api: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", POST, &api);
+            assert!(!autumn_web_line(&tmp).contains("csv"), "{}", autumn_web_line(&tmp));
+        }
+
+        #[test]
+        fn keeps_feature_a_sibling_scaffold_uses() {
+            let tmp = project();
+            run(&tmp, "Note", POST, &importing());
+            run(&tmp, "Post", POST, &importing());
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(autumn_web_line(&tmp).contains("multipart"), "{}", autumn_web_line(&tmp));
+        }
+
+        #[test]
+        fn keeps_htmx_when_a_sibling_route_exists() {
+            let tmp = project();
+            run(&tmp, "Note", POST, &searchable());
+            run(&tmp, "Post", POST, &searchable());
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(autumn_web_line(&tmp).contains("htmx"), "{}", autumn_web_line(&tmp));
+        }
+
+        #[test]
+        fn keeps_feature_hand_written_code_uses() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &importing());
+            fs::write(
+                tmp.path().join("src/upload.rs"),
+                "pub async fn up(_m: autumn_web::extract::Multipart) {}\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(autumn_web_line(&tmp).contains("multipart"), "{}", autumn_web_line(&tmp));
+        }
+
+        #[test]
+        fn dry_run_plan_shows_the_release() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            let plan = plan_scaffold_with_options(
+                tmp.path(),
+                "Post",
+                &POST.iter().map(|f| (*f).to_owned()).collect::<Vec<_>>(),
+                "20260827000000",
+                &ScaffoldOptions::default(),
+            )
+            .unwrap();
+            assert!(!action_contents(&plan, "Cargo.toml").contains("htmx"));
+        }
+    }
 }
