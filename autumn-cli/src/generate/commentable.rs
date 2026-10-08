@@ -302,7 +302,7 @@ fn apply_table_event(tables: &mut HashMap<TableRef, TableState>, event: TableEve
             to,
             if_exists,
         } => {
-            if if_exists && !tables.get(&from).is_some_and(|state| state.exists) {
+            if if_exists && tables.get(&from).is_some_and(|state| !state.exists) {
                 return;
             }
             // A rename is positive evidence the table exists: the
@@ -331,7 +331,7 @@ fn apply_table_event(tables: &mut HashMap<TableRef, TableState>, event: TableEve
             to,
             if_exists,
         } => {
-            if if_exists && !tables.get(&from).is_some_and(|state| state.exists) {
+            if if_exists && tables.get(&from).is_some_and(|state| !state.exists) {
                 return;
             }
             let mut state = tables.remove(&from).unwrap_or_default();
@@ -2171,15 +2171,17 @@ mod tests {
         assert!(ensure_no_comments_conflict(tmp.path()).is_ok());
     }
 
-    /// `IF EXISTS` makes a schema move of an absent table a no-op.
+    /// `IF EXISTS` makes a schema move of a dropped table a no-op.
     #[test]
-    fn a_conditional_schema_move_of_an_absent_table_changes_nothing() {
+    fn a_conditional_schema_move_of_a_dropped_table_changes_nothing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().join("migrations").join("0001_move");
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(
             dir.join("up.sql"),
-            "ALTER TABLE IF EXISTS archive.comments SET SCHEMA public;\n",
+            "CREATE TABLE archive.comments (id BIGINT);\n\
+             DROP TABLE archive.comments;\n\
+             ALTER TABLE IF EXISTS archive.comments SET SCHEMA public;\n",
         )
         .expect("write");
         assert!(
@@ -2188,20 +2190,34 @@ mod tests {
         );
     }
 
-    /// `IF EXISTS` makes a rename of an absent table a no-op too.
+    /// `IF EXISTS` makes a rename of a dropped table a no-op too. A source the
+    /// replay never saw may exist (`CREATE TABLE … AS SELECT`), so it counts.
     #[test]
-    fn a_conditional_rename_of_an_absent_table_changes_nothing() {
+    fn a_conditional_rename_only_skips_a_known_absent_table() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().join("migrations").join("0001_rename");
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(
             dir.join("up.sql"),
-            "ALTER TABLE IF EXISTS legacy_comments RENAME TO comments;\n",
+            "CREATE TABLE legacy_comments (id BIGINT);\n\
+             DROP TABLE legacy_comments;\n\
+             ALTER TABLE IF EXISTS legacy_comments RENAME TO comments;\n",
         )
         .expect("write");
         assert!(
             ensure_no_comments_conflict(tmp.path()).is_ok(),
-            "nothing was renamed, so `comments` is still free"
+            "the source was dropped, so nothing was renamed"
+        );
+
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE legacy_comments AS SELECT 1 AS id;\n\
+             ALTER TABLE IF EXISTS legacy_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        assert!(
+            ensure_no_comments_conflict(tmp.path()).is_err(),
+            "an untracked source may exist, so `comments` may be taken"
         );
     }
 
