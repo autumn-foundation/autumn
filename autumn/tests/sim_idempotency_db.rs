@@ -1561,3 +1561,76 @@ async fn stale_cookie_retry_resumes_from_the_recovery_point() {
         "the retry under the new key sees the old key's step"
     );
 }
+
+/// A layer TTL shorter than the store default: a recovery point left by a
+/// crash lives the layer TTL past the lock, not the store default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crashed_recovery_point_keeps_the_layer_ttl() {
+    let substrate = SqliteSubstrate::with_migrations(&[&FRAMEWORK_MIGRATIONS, &APP_MIGRATIONS])
+        .expect("substrate");
+    let calls = Calls::default();
+    let store = Arc::new(DbIdempotencyStore::new(
+        substrate.pool(),
+        Duration::from_secs(86_400),
+    ));
+    let pool = substrate.pool();
+    let handler_calls = calls.clone();
+    // The first run records a step, then hangs until the client drops it.
+    let handler = move |idem: IdempotencyTx| {
+        let pool = pool.clone();
+        let calls = handler_calls.clone();
+        async move {
+            let first = calls.get() == 0;
+            calls.add();
+            let mut pooled = pool.get().await.expect("checkout");
+            let conn: &mut RuntimeConnection = &mut pooled;
+            if let Some(point) = idem.recovery_point(conn).await.expect("recovery point") {
+                return format!("resumed after {point}");
+            }
+            let step = idem.clone();
+            conn.transaction::<_, autumn_web::AutumnError, _>(async move |conn| {
+                step.set_recovery_point(conn, "charged").await
+            })
+            .await
+            .expect("transaction");
+            drop(pooled);
+            if first {
+                std::future::pending::<()>().await;
+            }
+            "started over".to_owned()
+        }
+    };
+    let app = axum::Router::new()
+        .route("/step", axum::routing::post(handler))
+        .layer(
+            IdempotencyLayer::new(store)
+                .with_ttl(Duration::from_secs(1))
+                .with_in_flight_ttl(Duration::from_secs(1)),
+        );
+
+    let crashed = tokio::time::timeout(
+        Duration::from_millis(300),
+        app.clone().oneshot(step("charge", "A")),
+    )
+    .await;
+    assert!(
+        crashed.is_err(),
+        "the first request is dropped after its step"
+    );
+
+    // Past the 1 s lock and the 1 s layer TTL after it.
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    let retry = app
+        .clone()
+        .oneshot(step("charge", "A"))
+        .await
+        .expect("infallible");
+    let body = axum::body::to_bytes(retry.into_body(), 1024)
+        .await
+        .expect("body");
+    assert_eq!(
+        &body[..],
+        b"started over",
+        "the recovery point expired with the layer TTL"
+    );
+}

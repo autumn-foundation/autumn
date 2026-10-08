@@ -159,8 +159,8 @@ impl DbIdempotencyStore {
 
     /// Copy the recovery point of the row `from_owner` holds on `from` to the
     /// row `to_owner` holds on `to`, with its body hash and TTL, unless that
-    /// row has one already. The copy lives one TTL past `to`'s lock, as a
-    /// recovery point set under it does.
+    /// row has one already. The copy lives its TTL from now, and at least one
+    /// TTL past `to`'s lock, as a recovery point set under it does.
     ///
     /// The middleware calls this for a retry whose session cookie went stale:
     /// the retry runs under its new session's key, and must still see the
@@ -190,8 +190,11 @@ impl DbIdempotencyStore {
             reason = "a SQL expression, evaluated by the database"
         )]
         let crash_expiry = keys::locked_until_ms + ttl_ms;
-        let expiry = diesel::dsl::case_when(keys::expires_at_ms.lt(crash_expiry), crash_expiry)
-            .otherwise(keys::expires_at_ms);
+        // The point's own TTL from now, or past the lock if that is later;
+        // not the store default the lock set.
+        let fresh_expiry = now_ms().saturating_add(ttl_ms);
+        let expiry = diesel::dsl::case_when(crash_expiry.gt(fresh_expiry), crash_expiry)
+            .otherwise(fresh_expiry);
         let target = keys::autumn_idempotency_keys
             .filter(keys::storage_key.eq(to))
             .filter(keys::locked_by.eq(to_owner))
@@ -655,12 +658,16 @@ impl IdempotencyTx {
                 return Ok(());
             };
             held_row(conn, &claim).await?;
+            let ttl = ms(claim.ttl);
             let written = diesel::update(owned_key(&claim))
                 .set((
                     keys::recovery_point.eq(Some(point)),
                     keys::recovery_body_hash.eq(Some(claim.body_hash.clone())),
+                    // The layer's TTL, not the store default the lock set:
+                    // `keep_past_crash_lock` below only moves it later.
+                    keys::expires_at_ms.eq(now_ms().saturating_add(ttl)),
                     // The layer's TTL, for a later owner that takes the row over.
-                    keys::ttl_ms.eq(ms(claim.ttl)),
+                    keys::ttl_ms.eq(ttl),
                 ))
                 .execute(conn)
                 .await?;
