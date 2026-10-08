@@ -2226,6 +2226,14 @@ jobs:
           # uncovered.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_jobs_scheduler_e2e
+          # Issue #3061: the database idempotency store and `IdempotencyTx`.
+          # Outside this leg they run only in the `sqlite-runtime` job and the
+          # Docker-gated Postgres suite inside the consolidated binary, which
+          # no lane measures, so Codecov read `idempotency/db_store.rs` as
+          # wholly uncovered. Same feature set as the leg above, so the
+          # instrumented library build is shared.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sim_idempotency_db
           # Issue #2108: the admin plugin's `backend_select!` sqlite arms and
           # the cross-backend model suite. Without this lane Codecov reads them
           # as a new uncovered surface. No Docker, ~0.01s of runtime.
