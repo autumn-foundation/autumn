@@ -488,27 +488,32 @@ impl KamalProxyController {
     ///    index at most once and never interactively;
     /// 2. make sure the container daemon is up (idempotent);
     /// 3. copy the binary out of the pinned image into a TEMP path, mark it `0755`,
-    ///    and `mv` it into place — so the supervised path is never a half-written
-    ///    file, even if the copy dies midway;
+    ///    make sure it answers `deploy --help`, and `mv` it into place — so the
+    ///    supervised path never holds a partial or broken file;
     /// 4. remove the scratch container, then VERIFY the installed binary answers
     ///    `kamal-proxy deploy --help` — an install that "succeeded" without landing
     ///    a working binary must fail here, not at the first cutover.
     ///
-    /// `set -e` makes any step's failure fail the op, which the caller turns into an
-    /// actionable abort before anything is cut over. It carries no secret, so it is
-    /// safe to log.
+    /// Each step that must succeed ends in `|| exit 1`. `set -e` is not used: a
+    /// shell ignores it inside a `( … ) || …` list. A failed op becomes an
+    /// actionable abort before anything is cut over. It carries no secret, so it
+    /// is safe to log.
     ///
     /// Because this whole op is gated on the proxy binary being ABSENT, it is the
     /// bare-host path: a host that already has kamal-proxy was prepared by somebody
     /// (an earlier `autumn deploy`, or the operator) and is assumed to still have
     /// `curl`, exactly as it was before host preparation existed.
     fn install_shell() -> String {
+        Self::install_shell_at(KAMAL_PROXY_BIN)
+    }
+
+    /// [`Self::install_shell`] for a binary at `bin`. Tests run it on a temp
+    /// path.
+    fn install_shell_at(bin: &str) -> String {
         let pin = KAMAL_PROXY_KNOWN_GOOD_VERSION;
         let digest = KAMAL_PROXY_KNOWN_GOOD_DIGEST;
-        let bin = KAMAL_PROXY_BIN;
         format!(
-            "( set -e; \
-             if [ -e '{bin}' ] || [ -L '{bin}' ]; then \
+            "( if [ -e '{bin}' ] || [ -L '{bin}' ]; then \
              echo 'kamal-proxy is already installed at {bin}; refusing to replace it' >&2; \
              exit 1; \
              fi; \
@@ -517,15 +522,21 @@ impl KamalProxyController {
              command -v docker >/dev/null 2>&1 || need=\"$need docker.io\"; \
              if [ -n \"$need\" ]; then \
              export DEBIAN_FRONTEND=noninteractive; \
-             apt-get update -qq; \
-             apt-get install -y -qq --no-install-recommends $need; \
+             apt-get -o DPkg::Lock::Timeout=300 update -qq || exit 1; \
+             apt-get -o DPkg::Lock::Timeout=300 install -y -qq --no-install-recommends $need \
+             || exit 1; \
              fi; \
              systemctl start docker >/dev/null 2>&1 || true; \
-             cid=$(docker create 'basecamp/kamal-proxy:{pin}@{digest}'); \
-             docker cp \"$cid:/usr/local/bin/kamal-proxy\" '{bin}.autumn-new'; \
+             rm -rf '{bin}.autumn-new' || exit 1; \
+             cid=$(docker create 'basecamp/kamal-proxy:{pin}@{digest}') || exit 1; \
+             rc=0; docker cp \"$cid:/usr/local/bin/kamal-proxy\" '{bin}.autumn-new' || rc=1; \
              docker rm -f \"$cid\" >/dev/null 2>&1 || true; \
-             chmod 755 '{bin}.autumn-new'; \
-             mv -f '{bin}.autumn-new' '{bin}'; \
+             if [ \"$rc\" -ne 0 ]; then rm -rf '{bin}.autumn-new'; exit 1; fi; \
+             chmod 755 '{bin}.autumn-new' || exit 1; \
+             if ! '{bin}.autumn-new' deploy --help >/dev/null 2>&1; then \
+             rm -f '{bin}.autumn-new'; \
+             echo 'the copied kamal-proxy does not run on this host' >&2; exit 1; fi; \
+             mv -f '{bin}.autumn-new' '{bin}' || exit 1; \
              '{bin}' deploy --help >/dev/null 2>&1 || {{ \
              echo 'the installed kamal-proxy does not run on this host' >&2; exit 1; }} \
              ) || {{ \
@@ -2071,9 +2082,15 @@ mod tests {
                 && shell.contains(&format!("mv -f '{staged}' '{KAMAL_PROXY_BIN}'")),
             "the binary is staged, marked executable, then moved into place: {shell}"
         );
+        // `set -e` does nothing inside `( … ) || …`, so each step that must
+        // succeed stops the shell itself (see `a_failed_copy_installs_nothing`).
         assert!(
-            shell.starts_with("( set -e;"),
-            "any failing step must fail the whole op: {shell}"
+            !shell.contains("set -e"),
+            "do not rely on `set -e` here: {shell}"
+        );
+        assert!(
+            shell.contains("|| exit 1"),
+            "each required step stops the shell on failure: {shell}"
         );
         // Digest-pinned, so a re-pushed tag (or a poisoned local image) cannot
         // become a root-executed binary on the target.
@@ -2098,6 +2115,54 @@ mod tests {
         assert!(
             shell.contains("install_proxy = false") && shell.contains("outbound HTTPS"),
             "a failed install must name what the host needs and the opt-out: {shell}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_copy_installs_nothing() {
+        // `set -e` does nothing inside `( … ) || …`, so each step must stop the
+        // shell itself. A partial copy must never reach the binary path, or
+        // every later deploy refuses to replace it.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let fake = dir.path().join("fakebin");
+        std::fs::create_dir(&fake).unwrap();
+        let docker = "#!/bin/sh\n\
+            case \"$1\" in\n\
+            create) echo fakecid ;;\n\
+            cp) echo partial > \"$3\"; exit 1 ;;\n\
+            esac\n";
+        for (name, body) in [
+            ("docker", docker),
+            ("systemctl", "#!/bin/sh\nexit 0\n"),
+            ("curl", "#!/bin/sh\nexit 0\n"),
+        ] {
+            let path = fake.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let bin = dir.path().join("kamal-proxy");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(KamalProxyController::install_shell_at(
+                bin.to_str().unwrap(),
+            ))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    fake.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .expect("run sh");
+        assert!(!out.status.success());
+        assert!(!bin.exists(), "a partial copy must not be installed");
+        assert!(
+            !dir.path().join("kamal-proxy.autumn-new").exists(),
+            "no staged file left"
         );
     }
 

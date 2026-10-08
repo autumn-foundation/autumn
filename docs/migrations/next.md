@@ -425,6 +425,44 @@ Redis stores do not.
 
 **Automation:** `manual` - it is a configuration default.
 
+### WebSockets: `ws::WebSocket` and `ws::WebSocketUpgrade` are Autumn types
+
+**Why:** axum's socket sends no close frame when a message is too large, and
+it has no connection cap, ping or idle timer. The Autumn types apply the
+`[realtime]` limits (issue #3065).
+
+**Before (`{X.Y}`):** `autumn_web::ws::WebSocket` and
+`autumn_web::ws::WebSocketUpgrade` were re-exports of the axum types.
+
+```rust
+fn takes_axum(socket: axum::extract::ws::WebSocket) { /* ... */ }
+takes_axum(socket); // `socket` from a `#[ws]` handler
+```
+
+**After (`{(X+1).0}`):** they are Autumn wrappers. `recv`, `send`,
+`protocol`, `Stream`, `Sink` and `split()` work as before. A `#[ws]` handler
+(the `ws` feature) does not change. Code that needs the axum type calls
+`into_parts()` and keeps the returned `ConnectionHold` for the life of the
+socket. That socket has no `[realtime]` limits.
+
+Other changes on `WebSocketUpgrade`:
+
+- It has no type parameter, and no `on_failed_upgrade`,
+  `requested_protocols` or `set_selected_protocol`. Use `into_parts()`.
+- Its rejection type is `axum::response::Response`, not
+  `WebSocketUpgradeRejection`.
+- It extracts only where `AppState: FromRef<S>`. A plain `Router<()>`
+  needs axum's own `WebSocketUpgrade`.
+
+```rust
+let (socket, hold) = socket.into_parts();
+takes_axum(socket); // keep `hold` until the socket closes
+drop(hold);
+```
+
+**Automation:** `manual`. Only code that gives the socket to an API that uses
+the axum type must change. Decide if that socket keeps the limits.
+
 ### Query budgets: an associated function handed the handle is reported (#2316)
 
 **Why:** `Post::published(&mut db)` and `ReportBuilder::build(&mut db)` have
@@ -704,6 +742,60 @@ a warning. `extension::<MediaWorkflows>()` then returns `None`, jobs on the
 **Automation:** `manual` — this is a runtime behavior change. The code still
 compiles, so a codemod cannot know which primitive your app uses.
 
+### Media: `RoomStore::heartbeat` and `RoomStore::roster` take a `session_max` limit
+
+**Why:** A heartbeat renewed the room token with no limit, and a roster poll
+accepted a token of any age. So a captured token stayed valid for as long as
+someone used it. Now neither works past `joined_at + session_max`. Issue #1974.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+fn heartbeat<'a>(
+    &'a self,
+    namespace: &'a str,
+    room_id: &'a str,
+    participant_id: &'a str,
+    token: &'a str,
+    token_ttl: Duration,
+) -> RoomStoreFuture<'a, DateTime<Utc>>;
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+fn heartbeat<'a>(
+    &'a self,
+    namespace: &'a str,
+    room_id: &'a str,
+    participant_id: &'a str,
+    token: &'a str,
+    token_ttl: Duration,
+    session_max: Duration,
+) -> RoomStoreFuture<'a, DateTime<Utc>>;
+```
+
+`roster` gains the same last argument:
+`fn roster<'a>(&'a self, namespace: &'a str, room_id: &'a str, auth_token: &'a str, session_max: Duration)`.
+
+In an out-of-tree store, compute the new expiry with
+`autumn_media_plugin::renewed_expiry(joined_at, now, token_ttl, session_max)`.
+When it returns `None`, return `RoomError::RoomNotFound` and change nothing. In
+`roster`, refuse a matching member when `now >= joined_at + session_max`, and
+do not refresh its `last_seen_at`.
+
+`MediaConfig` also has two new public fields, `room_session_max_seconds`
+(default `43200`) and `room_rate_limit_per_minute` (default `0`, off). A
+struct literal that lists every field must add them, or use
+`..MediaConfig::default()`. With rooms enabled, boot fails when
+`room_session_max_seconds` is less than `room_token_ttl_seconds`.
+
+A client that stays in a room for more than 12 hours now gets `404` from
+heartbeat and roster. It must leave, then join again. To keep longer sessions,
+set a larger `room_session_max_seconds`.
+
+**Automation:** `manual` — a codemod cannot write your store's renewal logic.
+
 ### Feature flags: `PgFlagStore::get` errors before the first load
 
 **Why:** `get` connected to the database on the request thread, and a store
@@ -734,6 +826,30 @@ if matches!(store.get("beta"), Ok(None)) {
 An app that registers the store with `with_flag_store` needs no change: the
 app loads the store at startup. `with_cache_ttl(url, Duration::ZERO)` now
 means "refresh at each read", not "read the database at each read".
+
+**Automation:** `manual` - it is a behaviour change, and no code rewrite
+applies.
+
+---
+
+### Ledger: raw-SQL framework writes to a ledgered table are refused (#2319)
+
+**Why:** a counter-cache update or a `delete_all` / `nullify` cascade runs raw
+SQL. On a ledgered table it changed rows and recorded no revision, so the
+ledger disagreed with the table.
+
+**Before (`{X.Y}`):** the write ran. `ledger_verify` later reported
+`LiveStateMismatch`:
+
+```rust
+#[repository(Post, soft_delete, ledgered = true)]
+pub trait PostRepository {}
+// Comment has #[belongs_to(Post, counter_cache)]: each comment bumped posts.comment_count.
+```
+
+**After (`{(X+1).0}`):** the write fails with `LedgerError::OutOfBandWrite`
+(HTTP 409). Remove the counter cache, or the `dependent(...)` clause. For a
+cascade, use `on_delete = destroy`: a ledgered child records a revision.
 
 **Automation:** `manual` - it is a behaviour change, and no code rewrite
 applies.
@@ -797,6 +913,30 @@ If nothing changed, delete this section.
   `[resilience.circuit_breaker.defaults]` and host overrides. The env
   variables are `AUTUMN_RESILIENCE__CIRCUIT_BREAKER__DEFAULTS__SLOW_CALL_DURATION_THRESHOLD_MS`,
   `..._SLOW_CALL_RATE_THRESHOLD` and `..._CANCELLED_CALL_OUTCOME`.
+
+### `prod` profile: connection and WebSocket limits (issue #3065)
+
+The `prod` profile now sets these values. Other profiles set none of them.
+
+```toml
+[server.http]
+header_read_timeout_ms = 10_000
+keep_alive_timeout_ms = 75_000
+max_header_bytes = 65_536
+http2_max_concurrent_streams = 100
+max_connections = 10_000
+
+[realtime]
+max_message_bytes = 1_048_576
+ping_interval_ms = 30_000
+idle_timeout_ms = 120_000
+```
+
+An HTTP/1 request head over 64 KiB now gets `431`. The HTTP/2 header list
+limit goes up from 16 KiB to 64 KiB. A WebSocket message over 1 MiB now
+closes the socket with code `1009`. To turn off a timeout or a connection cap,
+set it to `0`. `max_header_bytes` and `http2_max_concurrent_streams` cannot
+be turned off. To allow larger messages or heads, set a larger value.
 
 ## Behavior changes
 

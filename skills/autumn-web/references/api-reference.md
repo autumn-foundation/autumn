@@ -1790,6 +1790,9 @@ Frequently used env keys:
 | `AUTUMN_DATABASE__PRIMARY_URL` | `database.primary_url` |
 | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` |
 | `AUTUMN_DATABASE__REPLICA_FALLBACK` | `database.replica_fallback` |
+| `AUTUMN_DATABASE__REPLICA_MAX_LAG_MS` | `database.replica_max_lag_ms` |
+| `AUTUMN_SERVER__HTTP__HEADER_READ_TIMEOUT_MS` | `server.http.header_read_timeout_ms` |
+| `AUTUMN_REALTIME__MAX_MESSAGE_BYTES` | `realtime.max_message_bytes` |
 | `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` | `database.auto_migrate_in_production` |
 | `AUTUMN_SESSION__BACKEND` | `session.backend` |
 | `AUTUMN_SESSION__REDIS__URL` | `session.redis.url` |

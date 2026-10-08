@@ -1390,13 +1390,31 @@ pub enum LedgerError {
          would destroy the record its ledger reconstructs, and keeping it would leave \
          a foreign key pointing at a deleted parent. Make the parent repository \
          `soft_delete` (a soft parent delete soft-deletes this child and records a \
-         revision), or change the association to `on_delete = nullify`"
+         revision), or remove the `dependent(...)` clause"
     )]
     HardDeleteCascade {
         /// Table of the ledgered child.
         table: String,
         /// Primary key of the child the cascade reached.
         record_id: i64,
+    },
+    /// A framework write path that records no revision reached a ledgered table.
+    ///
+    /// Counter-cache upkeep and `dependent(.., delete_all | nullify)` cascades
+    /// run raw SQL. On a ledgered table, that SQL would change or erase rows and
+    /// record no revision. Autumn refuses the write (#2319).
+    #[error(
+        "{path} cannot write to ledgered table {table}. The write records no \
+         revision, so the ledger would disagree with the table. Remove the \
+         {path} setting (for a dependent, use `on_delete = destroy`), or stop \
+         ledgering {table}"
+    )]
+    OutOfBandWrite {
+        /// The ledgered table the write targeted.
+        table: String,
+        /// The write path: `counter cache`, `dependent delete_all` or
+        /// `dependent nullify`.
+        path: &'static str,
     },
     /// A record's stored chain is broken, so its past state cannot be trusted.
     #[error("ledger chain for {table}#{record_id} is broken at revision {seq}: {detail}")]
@@ -1975,6 +1993,51 @@ pub async fn append_revision(
         .await
         .map_err(crate::AutumnError::from)?;
 
+    Ok(())
+}
+
+/// Link-time marker for a ledgered table. Emitted by `#[repository]`.
+#[doc(hidden)]
+pub struct LedgeredTableDescriptor {
+    /// The ledgered table.
+    pub table: &'static str,
+}
+
+inventory::collect!(LedgeredTableDescriptor);
+
+/// Whether a linked repository ledgers `table`.
+///
+/// Matches the bare table name. The check cannot see a repository that is not
+/// linked into the binary.
+#[doc(hidden)]
+#[must_use]
+pub fn is_ledgered_table(table: &str) -> bool {
+    static TABLES: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
+        std::sync::OnceLock::new();
+    TABLES
+        .get_or_init(|| {
+            inventory::iter::<LedgeredTableDescriptor>
+                .into_iter()
+                .map(|descriptor| descriptor.table)
+                .collect()
+        })
+        .contains(table)
+}
+
+/// Refuse a raw write to `table` when it is ledgered.
+///
+/// Call before framework SQL that changes rows outside the owning repository.
+///
+/// # Errors
+///
+/// [`LedgerError::OutOfBandWrite`], as a conflict, when `table` is ledgered.
+pub(crate) fn refuse_out_of_band_write(table: &str, path: &'static str) -> crate::AutumnResult<()> {
+    if is_ledgered_table(table) {
+        return Err(crate::AutumnError::conflict(LedgerError::OutOfBandWrite {
+            table: table.to_string(),
+            path,
+        }));
+    }
     Ok(())
 }
 

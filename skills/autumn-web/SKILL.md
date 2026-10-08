@@ -198,8 +198,13 @@ my-app/
 > and the snapshot. To rename, put `#[renamed_from("old_name")]` on the field,
 > or on the model after `#[model]`. The diff then emits `ALTER TABLE ...
 > RENAME`, not a drop plus an add. To diff against what the migrations really
-> make, pass `--dev-url <dev server URL>` (or set `AUTUMN_DEV_URL`). See
-> `docs/guide/declarative-schema.md`.
+> make, pass `--dev-url <dev server URL>` (or set `AUTUMN_DEV_URL`).
+> `--write-migration` also writes the model's `diesel::table!` block in
+> `src/schema.rs`: do not edit a managed block by hand. To adopt a model, add
+> `managed`, then run `autumn schema diff --write-migration`.
+> `autumn schema doctor` reports a stale `src/schema.rs` block
+> (`schema-rs-drift`) and an unmanaged model that differs from its table
+> (`unmanaged-drift`). See `docs/guide/declarative-schema.md`.
 
 ## Cargo.toml
 
@@ -760,7 +765,10 @@ depth 0), `max_body = 10000` bytes; `author_name` is unset by default (the
 framework will not guess a column, and a scaffolded `User` carries an `email`).
 Renaming the struct changes `type_name` and orphans existing rows — pin it
 first. `autumn generate scaffold post title:string comments:commentable`
-emits the table (once per project), the column, and the attribute.
+emits the table (once per project), the column, and the attribute. If the
+project already has a plain `comments` table (for example, a scaffolded
+`Comment` resource), the command stops and writes no file. Rename that table
+or add every missing shared-table column, then run it again.
 
 The model emits a `{Model}Comments` trait blanket-implemented for that model's
 repository — import it as `_`:
@@ -1045,6 +1053,9 @@ appends a revision automatically.
 
 What to know when writing app code against it:
 
+- **Raw-SQL framework paths are refused.** A counter cache on a ledgered
+  parent, and `dependent(.., on_delete = delete_all | nullify)` into a ledgered
+  child, fail with `LedgerError::OutOfBandWrite`. Use `on_delete = destroy`.
 - **`soft_delete` is mandatory** and `purge` does not exist. `delete_by_id`
   records a delete revision; `restore` records the undelete. Both keep the
   ledger and the table in agreement.
@@ -2752,6 +2763,39 @@ declares. Every contract failure — missing file, malformed document, a contrac
 measured on a different host class — falls back to *unlimited*, never to a
 ceiling. See `docs/guide/capacity-contracts.md`.
 
+## Connection limits, WebSocket limits, replica lag (issue #3065)
+
+Bound slow, idle and excess connections. Every key is optional; the `prod`
+profile sets all `[server.http]` keys and the `[realtime]` size/ping/idle keys:
+
+```toml
+[server.http]
+header_read_timeout_ms = 10_000   # slowloris: full head in time, or disconnect
+keep_alive_timeout_ms = 75_000    # close a connection with no request in flight
+max_header_bytes = 65_536         # HTTP/1 head over the limit gets 431
+http2_max_concurrent_streams = 100
+max_connections = 10_000          # per listener; accept waits at the cap
+
+[realtime]                        # every #[ws] route
+max_connections = 5_000           # 503 + Retry-After above the cap
+max_message_bytes = 1_048_576     # close code 1009
+ping_interval_ms = 30_000         # pongs are hidden from the handler
+idle_timeout_ms = 120_000         # close code 1001
+
+[database]
+replica_max_lag_ms = 5_000        # reads use the primary while lag is over/unknown
+warn_on_pooler = true             # boot warning for PgBouncer / RDS Proxy URLs
+```
+
+`autumn_web::ws::WebSocket` / `WebSocketUpgrade` are Autumn wrappers (same
+`recv` / `send` / `Stream` / `Sink`); `into_parts()` gives the axum type
+(without limits) and a `ConnectionHold` to keep for the socket's life. Lag
+alone never fails readiness. See
+`docs/guide/connection-limits.md`, `docs/guide/websockets.md` (Limits),
+`docs/guide/cloud-native.md` (Lag-aware reads) and
+`docs/guide/connection-poolers.md` (what breaks behind a transaction-mode
+pooler).
+
 ## Resilience: outbound circuit breakers
 
 The HTTP client (per host), durable job enqueue (`job_queue`) and the SMTP
@@ -3988,11 +4032,17 @@ or CDN-fronted base is skipped (its public port is its own), and an unset base
 only warns, because the app may take it from `AUTUMN_MEDIA__MEDIAMTX__*_BASE`
 (Rooms since 0.6.0, this preflight 0.8.0, issue #1974). `deploy up` creates the config parent and
 `recordings_dir` (mode `0750`); an absent recordings dir under a writable parent
-passes, so a fresh host is not blocked. Installing the `mediamtx` binary stays a
-host-bootstrap step the deploy only preflights. Mesh rooms hold a seat by
+passes, so a fresh host is not blocked. When nothing is at `binary_path`,
+`deploy up` installs the digest-pinned MediaMTX 1.19.3 before cutover; it never
+replaces a file that is there (`[media.mediamtx] install_binary = false` turns
+this off). When `[deploy]` is set, `autumn doctor` runs the config-only media
+checks, and all six over SSH with `--online`. Mesh rooms hold a seat by
 `POST {api_prefix}/rooms/{room_id}/heartbeat` or a roster poll, on any interval
 under the idle TTL (default 15 min); a client that does neither is reaped from
-signaling, though its live WebRTC path survives and it can re-join.
+signaling, though its live WebRTC path survives and it can re-join. After
+`joined_at + [media] room_session_max_seconds` (default 12 h), heartbeat and
+roster return `404`; the client leaves, then joins again. `[media] room_rate_limit_per_minute`
+(default `0` = off) limits each client IP per room route.
 
 `autumn deploy status [--json] [--strict]` is read-only and safe mid-incident:
 one row per host (mode, release from the `current` symlink, live slot, `/ready`

@@ -410,43 +410,76 @@ fn generate_model_with_the_token_also_emits_the_shared_table() {
     assert!(model.contains("pub comment_count: i64"), "{model}");
 }
 
-/// A `Comment` resource scaffolded the ordinary way produces a migration
-/// directory with the very same name. Detecting the shared table by *name*
-/// would make a later `comments:commentable` skip it — while reporting that it
-/// was reused — and every `add_comment` would then fail at runtime on the
-/// missing discriminator columns.
+/// A `Comment` resource scaffolded the ordinary way owns a `comments` table
+/// without discriminator columns. Skipping the shared table would break every
+/// helper at run time, and emitting it breaks `migrate`. So generation refuses,
+/// and writes nothing.
 #[test]
-fn a_scaffolded_comment_resource_does_not_suppress_the_shared_table() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    run_autumn_ok(tmp.path(), &["new", "cmt-collide-app"]);
-    let project = tmp.path().join("cmt-collide-app");
-    run_autumn_ok(&project, &["generate", "scaffold", "Comment", "body:Text"]);
-    run_autumn_ok(
-        &project,
-        &[
-            "generate",
-            "scaffold",
-            "Post",
-            "title:String",
-            "comments:commentable",
-        ],
-    );
+fn a_scaffolded_comment_resource_makes_commentable_generation_refuse() {
+    for verb in ["scaffold", "model"] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_autumn_ok(tmp.path(), &["new", "cmt-collide-app"]);
+        let project = tmp.path().join("cmt-collide-app");
+        run_autumn_ok(&project, &["generate", "scaffold", "Comment", "body:Text"]);
 
-    let polymorphic = fs::read_dir(project.join("migrations"))
-        .expect("migrations dir")
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            // The column DEFINITION, not any mention of it: a commentable
-            // parent's own migration names `commentable_type` too, inside the
-            // cleanup trigger that deletes its comments.
-            fs::read_to_string(entry.path().join("up.sql"))
-                .is_ok_and(|sql| sql.contains("commentable_type TEXT NOT NULL"))
-        })
-        .count();
-    assert_eq!(
-        polymorphic, 1,
-        "the polymorphic table must still be emitted alongside the Comment resource's own"
-    );
+        let (ok, output) = run_autumn(
+            &project,
+            &[
+                "generate",
+                verb,
+                "Post",
+                "title:String",
+                "comments:commentable",
+            ],
+        );
+        assert!(!ok, "{verb} must refuse");
+        assert!(
+            output.contains("cannot add `comments:commentable`"),
+            "{verb}: {output}"
+        );
+
+        assert!(
+            !project.join("src/models/post.rs").exists(),
+            "{verb}: a refusal writes nothing"
+        );
+        assert_eq!(
+            fs::read_dir(project.join("migrations"))
+                .expect("migrations dir")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().is_dir())
+                .count(),
+            1,
+            "{verb}: only the Comment resource's own migration exists"
+        );
+    }
+}
+
+/// A `Comment` model that is itself `comments:commentable` owns the table name
+/// the shared table needs. Generation refuses, and writes nothing.
+#[test]
+fn a_comment_model_cannot_be_commentable_itself() {
+    for verb in ["scaffold", "model"] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_autumn_ok(tmp.path(), &["new", "cmt-self-app"]);
+        let project = tmp.path().join("cmt-self-app");
+
+        let (ok, output) = run_autumn(
+            &project,
+            &[
+                "generate",
+                verb,
+                "Comment",
+                "body:Text",
+                "comments:commentable",
+            ],
+        );
+        assert!(!ok, "{verb} must refuse");
+        assert!(
+            output.contains("cannot add `comments:commentable`"),
+            "{verb}: {output}"
+        );
+        assert!(!project.join("src/models/comment.rs").exists(), "{verb}");
+    }
 }
 
 /// `destroy scaffold` must not delete a polymorphic `comments` migration this

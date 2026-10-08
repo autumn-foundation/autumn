@@ -4,7 +4,7 @@
 //! The job stays enqueued and uses no attempt. A job that is not deferrable
 //! on the same queue runs. When the signal falls, the deferred job runs.
 //!
-//! The SQLite case is in `tests/sqlite_jobs_scheduler_e2e.rs`. These cases
+//! The `SQLite` case is in `tests/sqlite_jobs_scheduler_e2e.rs`. These cases
 //! require Docker. CI's `--ignored` sweep runs them (see CLAUDE.md).
 
 #![cfg(any(all(feature = "db", not(feature = "sqlite")), feature = "redis"))]

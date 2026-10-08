@@ -34,15 +34,13 @@
 //! session to create or join a room (`POST {prefix}/rooms` and `POST
 //! {prefix}/rooms/{room_id}/join` are `#[secured]`). Hosts must install the
 //! framework's session middleware and authenticate callers before enabling
-//! rooms. Hosts should also apply rate limiting: as a defense-in-depth backstop
-//! against unbounded memory growth from a create loop
-//! (a created-but-never-joined room is only reaped when its last participant
-//! leaves), [`InMemoryRoomStore`] caps the registry at [`MAX_ROOMS`] rooms and
-//! rejects further creation with [`RoomError::RegistryFull`] (mapped to a
-//! transient `503`). The background reaper ([`spawn_room_reaper_loop`]) also
-//! reclaims idle/created-never-joined rooms (see *Known limitations*), but the
-//! cap remains the hard backstop — neither is a substitute for the host
-//! auth/rate-limit layer.
+//! rooms. Set `[media] room_rate_limit_per_minute` to limit each client IP on
+//! each route (off by default; see [`RoomService::with_rate_limit_per_minute`]).
+//!
+//! [`InMemoryRoomStore`] holds at most [`MAX_ROOMS`] rooms. Past that, create
+//! returns [`RoomError::RegistryFull`] (`503`). The reaper
+//! ([`spawn_room_reaper_loop`]) also removes idle rooms. These are backstops
+//! only. Use authentication and a rate limit.
 //!
 //! # Operator requirements
 //!
@@ -80,7 +78,8 @@
 //! - **Advisory token expiry**: `token_expires_at` is returned to the joiner but
 //!   is **not** enforced anywhere yet (`MediaMTX` does not verify these tokens),
 //!   so it never gates a lifecycle operation — a participant can always leave
-//!   with a value-correct token regardless of its age.
+//!   with a value-correct token regardless of its age. A heartbeat never renews
+//!   it past `joined_at + room_session_max_seconds` (see [`renewed_expiry`]).
 //!
 //! # Single-process limitation
 //!
@@ -91,6 +90,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
@@ -101,11 +101,14 @@ use uuid::Uuid;
 
 use autumn_web::reexports::axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{ConnectInfo, FromRequestParts, MatchedPath, Path, State},
+    response::Response,
     routing::{get, post},
 };
 use autumn_web::reexports::http::HeaderMap;
+use autumn_web::reexports::http::request::Parts;
 use autumn_web::route_listing::RouteInfo;
+use autumn_web::security::{__check_throttle, KeyStrategy, RateLimitExempt, ThrottleSpec};
 use autumn_web::{AppState, AutumnError, AutumnResult};
 
 use crate::config::DEFAULT_ROOM_MAX_PARTICIPANTS;
@@ -530,37 +533,43 @@ pub trait RoomStore: Send + Sync {
     /// non-member with a guessable `room_id` cannot distinguish "room exists but
     /// I'm not a member" from "no such room" (no existence/membership oracle).
     ///
+    /// A member past `joined_at + session_max` is refused the same way, and its
+    /// liveness clock does not move. So a roster poll cannot keep a seat or a
+    /// captured token alive past the session limit.
+    ///
     /// # Errors
     ///
-    /// [`RoomError::RoomNotFound`] for an unknown room, a namespace mismatch, or
-    /// an `auth_token` matching no current member.
+    /// [`RoomError::RoomNotFound`] for an unknown room, a namespace mismatch, an
+    /// `auth_token` matching no current member, or a session past `session_max`.
     fn roster<'a>(
         &'a self,
         namespace: &'a str,
         room_id: &'a str,
         auth_token: &'a str,
+        session_max: Duration,
     ) -> RoomStoreFuture<'a, RoomSnapshot>;
 
     /// Refresh a participant's liveness clock and renew its advisory token
-    /// expiry to `now + token_ttl`, returning the renewed expiry.
+    /// expiry, returning the renewed expiry.
     ///
     /// The explicit liveness signal behind the idle reaper: a client that keeps
     /// heartbeating holds its seat even when it never polls the roster. The
     /// token **value is never rotated**, so an in-flight roster poll carrying
     /// the same token keeps working; only the (advisory) expiry moves.
     ///
-    /// Renewal is **unbounded**: this never refuses an aged token and imposes no
-    /// absolute session lifetime. That is safe only while `token_expires_at`
-    /// stays advisory (nothing verifies it). The slice that makes `MediaMTX`
-    /// verify these tokens owns that policy, and must bound renewal there —
-    /// otherwise a captured token stays valid for as long as it is heartbeat.
+    /// Renewal is **bounded**. The new expiry is `now + token_ttl`, but never
+    /// later than `joined_at + session_max`. At or after that limit the
+    /// heartbeat fails and changes nothing. [`roster`](RoomStore::roster)
+    /// applies the same limit, so a captured token stops working for both.
+    /// Use [`renewed_expiry`] to get the same rule.
     ///
     /// # Errors
     ///
     /// [`RoomError::RoomNotFound`] for an unknown room, a namespace mismatch, an
-    /// unknown `participant_id`, or a token that does not match — one opaque
-    /// error, so a heartbeat cannot probe room existence or membership
-    /// (fail-closed, matching [`roster`](RoomStore::roster) rather than
+    /// unknown `participant_id`, a token that does not match, or a session past
+    /// `session_max` — one opaque error, so a heartbeat cannot probe room
+    /// existence or membership (fail-closed, matching
+    /// [`roster`](RoomStore::roster) rather than
     /// [`leave_room`](RoomStore::leave_room)).
     fn heartbeat<'a>(
         &'a self,
@@ -569,6 +578,7 @@ pub trait RoomStore: Send + Sync {
         participant_id: &'a str,
         token: &'a str,
         token_ttl: Duration,
+        session_max: Duration,
     ) -> RoomStoreFuture<'a, DateTime<Utc>>;
 
     /// Reclaim stale participants and idle rooms, returning what was reaped.
@@ -591,13 +601,30 @@ pub trait RoomStore: Send + Sync {
     fn reap_stale(&self, now: DateTime<Utc>, idle_ttl: Duration) -> ReapFuture<'_>;
 }
 
+/// The token expiry a heartbeat at `now` renews to, or `None` when the session
+/// is over.
+///
+/// The expiry is `now + token_ttl`, cut to `joined_at + session_max`. When
+/// `now` is at or after that limit, there is nothing to renew. Each
+/// [`RoomStore`] applies this rule in [`RoomStore::heartbeat`].
+#[must_use]
+pub fn renewed_expiry(
+    joined_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    token_ttl: Duration,
+    session_max: Duration,
+) -> Option<DateTime<Utc>> {
+    let session_end = joined_at + session_max;
+    (now < session_end).then(|| (now + token_ttl).min(session_end))
+}
+
 /// Capacity backstop on the number of rooms an [`InMemoryRoomStore`] holds.
 ///
 /// A created-but-never-joined room is only reaped when its last participant
 /// leaves, so a high-volume authenticated create loop could grow process memory
 /// for the lifetime of the process. This cap is a defense-in-depth backstop
 /// against that (mirroring the workspace's `MAX_BUCKETS` capacity-cap idiom for
-/// in-memory registries), **not** a substitute for host rate limiting — see the
+/// in-memory registries), **not** a substitute for a rate limit — see the
 /// module-level *Security & host responsibilities* note.
 pub const MAX_ROOMS: usize = 10_000;
 
@@ -775,6 +802,7 @@ impl RoomStore for InMemoryRoomStore {
         namespace: &'a str,
         room_id: &'a str,
         auth_token: &'a str,
+        session_max: Duration,
     ) -> RoomStoreFuture<'a, RoomSnapshot> {
         Box::pin(async move {
             // A write lock (not a shared read) because a successful member read
@@ -790,18 +818,15 @@ impl RoomStore for InMemoryRoomStore {
             // member gets the same `RoomNotFound` as a nonexistent room, so a
             // non-member cannot probe room existence or their own membership. On a
             // match, touch that member's liveness clock (see `reap_stale`).
+            // A member past `joined_at + session_max` is refused the same way.
             let now = Utc::now();
-            let mut is_member = false;
-            for participant in room.participants.values_mut() {
-                if participant.verify_token(auth_token) {
-                    participant.last_seen_at = now;
-                    is_member = true;
-                    break;
-                }
-            }
-            if !is_member {
-                return Err(RoomError::RoomNotFound);
-            }
+            let member = room
+                .participants
+                .values_mut()
+                .find(|participant| participant.verify_token(auth_token))
+                .filter(|participant| now < participant.joined_at + session_max)
+                .ok_or(RoomError::RoomNotFound)?;
+            member.last_seen_at = now;
             let snapshot = room.snapshot();
             drop(rooms);
             Ok(snapshot)
@@ -815,6 +840,7 @@ impl RoomStore for InMemoryRoomStore {
         participant_id: &'a str,
         token: &'a str,
         token_ttl: Duration,
+        session_max: Duration,
     ) -> RoomStoreFuture<'a, DateTime<Utc>> {
         Box::pin(async move {
             let mut rooms = self.rooms.write().expect("room store lock poisoned");
@@ -830,9 +856,10 @@ impl RoomStore for InMemoryRoomStore {
                 return Err(RoomError::RoomNotFound);
             }
             let now = Utc::now();
+            let renewed = renewed_expiry(participant.joined_at, now, token_ttl, session_max)
+                .ok_or(RoomError::RoomNotFound)?;
             participant.last_seen_at = now;
-            participant.token_expires_at = now + token_ttl;
-            let renewed = participant.token_expires_at;
+            participant.token_expires_at = renewed;
             drop(rooms);
             Ok(renewed)
         })
@@ -1048,7 +1075,9 @@ pub struct RoomService {
     urls: MediaUrls,
     namespace: String,
     token_ttl: Duration,
+    session_max: Duration,
     max_participants: usize,
+    rate_limit_per_minute: u32,
 }
 
 impl RoomService {
@@ -1066,8 +1095,46 @@ impl RoomService {
             urls,
             namespace: namespace.into(),
             token_ttl,
+            session_max: Duration::seconds(i64::from(
+                crate::config::DEFAULT_ROOM_SESSION_MAX_SECONDS,
+            )),
             max_participants,
+            rate_limit_per_minute: 0,
         }
+    }
+
+    /// Limit each client IP to `per_minute` requests on each room route.
+    ///
+    /// `0` (the default) turns the limit off.
+    #[must_use]
+    pub const fn with_rate_limit_per_minute(mut self, per_minute: u32) -> Self {
+        self.rate_limit_per_minute = per_minute;
+        self
+    }
+
+    /// Set the maximum session length, counted from the join.
+    ///
+    /// After `joined_at + session_max`, heartbeat and roster fail with
+    /// [`RoomError::RoomNotFound`]. A join never mints a token that lives
+    /// longer. The default is
+    /// [`DEFAULT_ROOM_SESSION_MAX_SECONDS`](crate::config::DEFAULT_ROOM_SESSION_MAX_SECONDS).
+    /// Keep it at least the token TTL; this builder does not check it.
+    #[must_use]
+    pub const fn with_session_max(mut self, session_max: Duration) -> Self {
+        self.session_max = session_max;
+        self
+    }
+
+    /// The per-IP, per-route request limit. `0` means no limit.
+    #[must_use]
+    pub const fn rate_limit_per_minute(&self) -> u32 {
+        self.rate_limit_per_minute
+    }
+
+    /// The maximum session length, counted from the join.
+    #[must_use]
+    pub const fn session_max(&self) -> Duration {
+        self.session_max
     }
 
     /// The configured namespace (empty string = none).
@@ -1101,7 +1168,13 @@ impl RoomService {
     ) -> Result<JoinResponse, RoomError> {
         let record = self
             .store
-            .join_room(&self.namespace, room_id, display_name, self.token_ttl)
+            .join_room(
+                &self.namespace,
+                room_id,
+                display_name,
+                // The first token must not outlive the session either.
+                self.token_ttl.min(self.session_max),
+            )
             .await?;
 
         let publish_path = room_participant_path(&self.namespace, room_id, &record.participant_id)?;
@@ -1172,6 +1245,7 @@ impl RoomService {
                 participant_id,
                 token,
                 self.token_ttl,
+                self.session_max,
             )
             .await?;
         Ok(HeartbeatResponse {
@@ -1195,7 +1269,7 @@ impl RoomService {
     pub async fn roster(&self, room_id: &str, auth_token: &str) -> Result<RoomRoster, RoomError> {
         let snapshot = self
             .store
-            .roster(&self.namespace, room_id, auth_token)
+            .roster(&self.namespace, room_id, auth_token, self.session_max)
             .await?;
         let mut participants = Vec::with_capacity(snapshot.participants.len());
         for participant in snapshot.participants {
@@ -1279,7 +1353,8 @@ impl std::fmt::Debug for HeartbeatRequest {
 pub struct HeartbeatResponse {
     /// Always `true` — the seat was refreshed.
     pub alive: bool,
-    /// The renewed advisory token expiry (`now + room_token_ttl_seconds`).
+    /// The renewed advisory token expiry: `now + room_token_ttl_seconds`, but
+    /// never later than `joined_at + room_session_max_seconds`.
     ///
     /// Advisory only: nothing verifies it yet (see [`RoomStore::heartbeat`]).
     /// Clients use it to pace the next heartbeat.
@@ -1293,9 +1368,64 @@ fn room_service(state: &AppState) -> AutumnResult<Arc<RoomService>> {
     })
 }
 
+/// Route id for the room routes' per-IP buckets.
+///
+/// The core limiter adds the matched path to this id, so each route gets its
+/// own bucket.
+const ROOM_RATE_ROUTE_ID: &str = "autumn_media_plugin::rooms";
+
+/// Pre-body gate that applies [`RoomService::rate_limit_per_minute`] per
+/// client IP and per route.
+///
+/// It uses the core `#[throttle]` limiter, so the client IP follows
+/// `[security.trusted_proxies]` and the bucket store follows
+/// `[security.rate_limit] backend`. A request with no peer address (an
+/// in-process call) is not limited. An over-limit request gets `429` before
+/// its body is read.
+struct RoomRateGate;
+
+impl FromRequestParts<AppState> for RoomRateGate {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Response> {
+        let per_minute = state
+            .extension::<RoomService>()
+            .map_or(0, |rooms| rooms.rate_limit_per_minute());
+        if per_minute == 0 {
+            return Ok(Self);
+        }
+        let matched_path = parts.extensions.get::<MatchedPath>().cloned();
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|info| info.0);
+        let exempt = parts.extensions.get::<RateLimitExempt>().is_some();
+        __check_throttle(
+            state,
+            ROOM_RATE_ROUTE_ID,
+            matched_path.as_ref().map(MatchedPath::as_str),
+            ThrottleSpec::Inline {
+                limit: per_minute,
+                per_secs: 60,
+                key: Some(KeyStrategy::Ip),
+            },
+            &parts.headers,
+            peer,
+            None,
+            None,
+            exempt,
+        )
+        .await?;
+        Ok(Self)
+    }
+}
+
 /// `POST {prefix}/rooms` — create a room for an authenticated caller.
 #[autumn_web::secured]
-async fn rooms_create(State(state): State<AppState>) -> AutumnResult<Json<RoomSnapshot>> {
+async fn rooms_create(
+    _: RoomRateGate,
+    State(state): State<AppState>,
+) -> AutumnResult<Json<RoomSnapshot>> {
     let snapshot = room_service(&state)?
         .create()
         .await
@@ -1306,6 +1436,7 @@ async fn rooms_create(State(state): State<AppState>) -> AutumnResult<Json<RoomSn
 /// `POST {prefix}/rooms/{room_id}/join` — join a room as an authenticated caller.
 #[autumn_web::secured]
 async fn rooms_join(
+    _: RoomRateGate,
     State(state): State<AppState>,
     Path(room_id): Path<String>,
     Json(body): Json<JoinRequest>,
@@ -1319,6 +1450,7 @@ async fn rooms_join(
 
 /// `POST {prefix}/rooms/{room_id}/leave` — leave a room.
 async fn rooms_leave(
+    _: RoomRateGate,
     State(state): State<AppState>,
     Path(room_id): Path<String>,
     Json(body): Json<LeaveRequest>,
@@ -1335,6 +1467,7 @@ async fn rooms_leave(
 /// Fail-closed: an unknown room, unknown participant or wrong token all yield
 /// the same `404`, so a heartbeat is not a membership oracle.
 async fn rooms_heartbeat(
+    _: RoomRateGate,
     State(state): State<AppState>,
     Path(room_id): Path<String>,
     Json(body): Json<HeartbeatRequest>,
@@ -1371,6 +1504,7 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 /// (fail-closed, no membership oracle), because the roster hands out per-peer
 /// media endpoints.
 async fn rooms_roster(
+    _: RoomRateGate,
     State(state): State<AppState>,
     Path(room_id): Path<String>,
     headers: HeaderMap,
@@ -1461,19 +1595,21 @@ fn room_route(method: &str, path: String, handler: &str) -> RouteInfo {
 mod tests {
     use super::{
         HeartbeatRequest, InMemoryRoomStore, LeaveRequest, MAX_REAPER_TTL_SECONDS, ReapStats, Room,
-        RoomError, RoomParticipant, RoomService, RoomStore, SessionToken, bearer_token,
-        clamp_reaper_ttl, room_participant_path, room_route_infos, room_router, room_service,
-        rooms_heartbeat, rooms_roster, validate_room_segment,
+        RoomError, RoomParticipant, RoomRateGate, RoomService, RoomStore, SessionToken,
+        bearer_token, clamp_reaper_ttl, renewed_expiry, room_participant_path, room_route_infos,
+        room_router, room_service, rooms_heartbeat, rooms_roster, validate_room_segment,
     };
     use crate::config::MediaMtxConfig;
     use crate::transport::MediaUrls;
     use autumn_web::AppState;
+    use autumn_web::reexports::axum::Router;
     use autumn_web::reexports::axum::body::Body;
-    use autumn_web::reexports::axum::extract::{Path, State};
+    use autumn_web::reexports::axum::extract::{ConnectInfo, Path, State};
     use autumn_web::reexports::http::{HeaderMap, Request, StatusCode, header};
     use autumn_web::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
     use chrono::{DateTime, Duration, Utc};
     use std::collections::HashMap;
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -2154,19 +2290,195 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
-        let roster = rooms_roster(State(state.clone()), Path(room_id.clone()), headers)
-            .await
-            .expect("roster")
-            .0;
+        let roster = rooms_roster(
+            RoomRateGate,
+            State(state.clone()),
+            Path(room_id.clone()),
+            headers,
+        )
+        .await
+        .expect("roster")
+        .0;
         assert_eq!(roster.participants.len(), 1);
         assert_eq!(roster.participants[0].participant_id, joined.participant_id);
         assert!(!roster.participants[0].whep_url.is_empty());
 
         // A roster read with no Authorization header is fail-closed → 404.
-        let unauth = rooms_roster(State(state), Path(room_id), HeaderMap::new())
+        let unauth = rooms_roster(RoomRateGate, State(state), Path(room_id), HeaderMap::new())
             .await
             .expect_err("no bearer → not found");
         assert_eq!(unauth.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Per-IP rate limit ────────────────────────────────────────────────────
+
+    /// A roster `GET` from `ip` with no token: `404` unless rate limited.
+    fn roster_from(ip: [u8; 4], room_id: &str) -> Request<Body> {
+        Request::get(format!("/rooms/{room_id}"))
+            .extension(ConnectInfo(SocketAddr::from((ip, 40_000))))
+            .body(Body::empty())
+            .expect("roster request")
+    }
+
+    /// A heartbeat `POST` from `ip` with a bad token: `404` unless rate limited.
+    fn heartbeat_from(ip: [u8; 4], room_id: &str) -> Request<Body> {
+        Request::post(format!("/rooms/{room_id}/heartbeat"))
+            .extension(ConnectInfo(SocketAddr::from((ip, 40_000))))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"participant_id":"ghost","session_token":"nope"}"#,
+            ))
+            .expect("heartbeat request")
+    }
+
+    async fn statuses(app: &Router<()>, requests: Vec<Request<Body>>) -> Vec<StatusCode> {
+        let mut out = Vec::new();
+        for request in requests {
+            out.push(
+                app.clone()
+                    .oneshot(request)
+                    .await
+                    .expect("response")
+                    .status(),
+            );
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn room_routes_return_429_past_the_per_ip_limit() {
+        let state = AppState::for_test();
+        state.insert_extension(service("").with_rate_limit_per_minute(2));
+        let app = room_router().with_state(state);
+        let alice = [203, 0, 113, 7];
+
+        let seen = statuses(
+            &app,
+            vec![
+                roster_from(alice, "r1"),
+                roster_from(alice, "r1"),
+                roster_from(alice, "r1"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            seen,
+            [
+                StatusCode::NOT_FOUND,
+                StatusCode::NOT_FOUND,
+                StatusCode::TOO_MANY_REQUESTS
+            ]
+        );
+
+        // Another IP has its own bucket.
+        let bob = statuses(&app, vec![roster_from([198, 51, 100, 9], "r1")]).await;
+        assert_eq!(bob, [StatusCode::NOT_FOUND]);
+    }
+
+    #[tokio::test]
+    async fn room_rate_limit_keeps_one_bucket_per_route() {
+        let state = AppState::for_test();
+        state.insert_extension(service("").with_rate_limit_per_minute(1));
+        let app = room_router().with_state(state);
+        let ip = [203, 0, 113, 8];
+
+        let seen = statuses(
+            &app,
+            vec![
+                roster_from(ip, "r1"),
+                heartbeat_from(ip, "r1"),
+                roster_from(ip, "r1"),
+                heartbeat_from(ip, "r1"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            seen,
+            [
+                StatusCode::NOT_FOUND,
+                StatusCode::NOT_FOUND,
+                StatusCode::TOO_MANY_REQUESTS,
+                StatusCode::TOO_MANY_REQUESTS
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn room_rate_limit_answers_429_before_the_body_is_read() {
+        let state = AppState::for_test();
+        state.insert_extension(service("").with_rate_limit_per_minute(1));
+        let app = room_router().with_state(state);
+        let ip = [203, 0, 113, 10];
+        let broken = || {
+            Request::post("/rooms/r1/heartbeat")
+                .extension(ConnectInfo(SocketAddr::from((ip, 40_000))))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{"))
+                .expect("request")
+        };
+
+        let seen = statuses(&app, vec![broken(), broken()]).await;
+        assert_ne!(seen[0], StatusCode::TOO_MANY_REQUESTS, "first is in budget");
+        assert_eq!(
+            seen[1],
+            StatusCode::TOO_MANY_REQUESTS,
+            "429, not a body error"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_checks_the_session_before_the_rate_limit() {
+        // An anonymous caller gets 401 and uses no budget.
+        let store = MemoryStore::new();
+        store
+            .save(
+                "member-session",
+                HashMap::from([("user_id".to_owned(), "member-1".to_owned())]),
+            )
+            .await
+            .expect("save session");
+        let state = AppState::for_test();
+        state.insert_extension(service("").with_rate_limit_per_minute(1));
+        let app = room_router()
+            .layer(SessionLayer::new(store, SessionConfig::default()))
+            .with_state(state);
+        let ip = [203, 0, 113, 11];
+        let create = |cookie: bool| {
+            let mut request =
+                Request::post("/rooms").extension(ConnectInfo(SocketAddr::from((ip, 40_000))));
+            if cookie {
+                request = request.header(header::COOKIE, "autumn.sid=member-session");
+            }
+            request.body(Body::empty()).expect("request")
+        };
+
+        let seen = statuses(
+            &app,
+            vec![create(false), create(false), create(true), create(true)],
+        )
+        .await;
+        assert_eq!(
+            seen,
+            [
+                StatusCode::UNAUTHORIZED,
+                StatusCode::UNAUTHORIZED,
+                StatusCode::OK,
+                StatusCode::TOO_MANY_REQUESTS
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn room_rate_limit_is_off_by_default() {
+        let state = AppState::for_test();
+        let service = service("");
+        assert_eq!(service.rate_limit_per_minute(), 0);
+        state.insert_extension(service);
+        let app = room_router().with_state(state);
+        let ip = [203, 0, 113, 9];
+
+        let seen = statuses(&app, (0..5).map(|_| roster_from(ip, "r1")).collect()).await;
+        assert!(seen.iter().all(|status| *status == StatusCode::NOT_FOUND));
     }
 
     #[test]
@@ -2262,9 +2574,16 @@ mod tests {
         assert_eq!(stats.rooms_reaped, 0);
         assert_eq!(seat_count(&store, "", "room-1"), Some(1));
         // The kept seat is the fresh one.
-        assert!(store.roster("", "room-1", "tok-fresh").await.is_ok());
+        assert!(
+            store
+                .roster("", "room-1", "tok-fresh", Duration::hours(12))
+                .await
+                .is_ok()
+        );
         assert!(matches!(
-            store.roster("", "room-1", "tok-stale").await,
+            store
+                .roster("", "room-1", "tok-stale", Duration::hours(12))
+                .await,
             Err(RoomError::RoomNotFound)
         ));
     }
@@ -2402,7 +2721,12 @@ mod tests {
         );
 
         // A polls the roster — this is the liveness signal.
-        assert!(store.roster("", "room-1", "tok-a").await.is_ok());
+        assert!(
+            store
+                .roster("", "room-1", "tok-a", Duration::hours(12))
+                .await
+                .is_ok()
+        );
 
         // Reap as of now with a 30-minute TTL: A was just touched (fresh), B is
         // still an hour idle (stale).
@@ -2414,11 +2738,16 @@ mod tests {
         );
         assert_eq!(stats.rooms_reaped, 0);
         assert!(
-            store.roster("", "room-1", "tok-a").await.is_ok(),
+            store
+                .roster("", "room-1", "tok-a", Duration::hours(12))
+                .await
+                .is_ok(),
             "the actively-polling participant survived the sweep"
         );
         assert!(matches!(
-            store.roster("", "room-1", "tok-b").await,
+            store
+                .roster("", "room-1", "tok-b", Duration::hours(12))
+                .await,
             Err(RoomError::RoomNotFound)
         ));
     }
@@ -2440,7 +2769,14 @@ mod tests {
         );
 
         store
-            .heartbeat("", "room-1", "beating", "tok-a", Duration::seconds(300))
+            .heartbeat(
+                "",
+                "room-1",
+                "beating",
+                "tok-a",
+                Duration::seconds(300),
+                Duration::hours(12),
+            )
             .await
             .expect("heartbeat");
 
@@ -2448,9 +2784,16 @@ mod tests {
 
         assert_eq!(stats.participants_reaped, 1, "only the silent seat reaped");
         assert_eq!(stats.rooms_reaped, 0);
-        assert!(store.roster("", "room-1", "tok-a").await.is_ok());
+        assert!(
+            store
+                .roster("", "room-1", "tok-a", Duration::hours(12))
+                .await
+                .is_ok()
+        );
         assert!(matches!(
-            store.roster("", "room-1", "tok-b").await,
+            store
+                .roster("", "room-1", "tok-b", Duration::hours(12))
+                .await,
             Err(RoomError::RoomNotFound)
         ));
     }
@@ -2465,7 +2808,14 @@ mod tests {
 
         let before = Utc::now();
         let renewed = store
-            .heartbeat("", "room-1", "p1", "tok", Duration::seconds(300))
+            .heartbeat(
+                "",
+                "room-1",
+                "p1",
+                "tok",
+                Duration::seconds(300),
+                Duration::hours(12),
+            )
             .await
             .expect("heartbeat");
 
@@ -2488,6 +2838,175 @@ mod tests {
         assert_eq!(stored, renewed);
     }
 
+    #[test]
+    fn renewed_expiry_holds_the_session_limit_at_its_edges() {
+        let joined = Utc::now();
+        let ttl = Duration::seconds(300);
+        let max = Duration::hours(1);
+
+        // Far from the limit: plain `now + ttl`.
+        assert_eq!(renewed_expiry(joined, joined, ttl, max), Some(joined + ttl));
+        // Near the limit: cut to the limit.
+        let near = joined + max - Duration::seconds(1);
+        assert_eq!(renewed_expiry(joined, near, ttl, max), Some(joined + max));
+        // At the limit and after it: refused.
+        assert_eq!(renewed_expiry(joined, joined + max, ttl, max), None);
+        assert_eq!(
+            renewed_expiry(joined, joined + max + Duration::seconds(1), ttl, max),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_caps_the_expiry_at_the_session_limit() {
+        // Joined 11h59m ago with a 12h limit: one minute is left, so a 5-minute
+        // TTL is cut to the end of the session.
+        let store = InMemoryRoomStore::new(6);
+        let joined = Utc::now() - Duration::hours(12) + Duration::minutes(1);
+        seed_room(&store, "", "room-1", joined, &[("p1", "tok", joined)]);
+
+        let renewed = store
+            .heartbeat(
+                "",
+                "room-1",
+                "p1",
+                "tok",
+                Duration::seconds(300),
+                Duration::hours(12),
+            )
+            .await
+            .expect("heartbeat inside the session limit");
+
+        assert_eq!(renewed, joined + Duration::hours(12));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_after_the_session_limit_is_refused() {
+        // A captured token cannot be kept alive by heartbeats forever.
+        let store = InMemoryRoomStore::new(6);
+        let joined = Utc::now() - Duration::hours(13);
+        let last_seen = Utc::now() - Duration::minutes(1);
+        seed_room(&store, "", "room-1", joined, &[("p1", "tok", joined)]);
+        set_last_seen(&store, "room-1", "p1", last_seen);
+
+        let result = store
+            .heartbeat(
+                "",
+                "room-1",
+                "p1",
+                "tok",
+                Duration::seconds(300),
+                Duration::hours(12),
+            )
+            .await;
+
+        assert!(matches!(result, Err(RoomError::RoomNotFound)));
+        let (seen, expires) = seat_clocks(&store, "room-1", "p1");
+        assert_eq!(seen, last_seen, "no liveness refresh");
+        assert_eq!(expires, joined, "no expiry renewal");
+    }
+
+    #[tokio::test]
+    async fn roster_after_the_session_limit_is_refused() {
+        // A roster poll must not keep a captured token alive past the limit.
+        let store = InMemoryRoomStore::new(6);
+        let joined = Utc::now() - Duration::hours(13);
+        let last_seen = Utc::now() - Duration::minutes(1);
+        seed_room(&store, "", "room-1", joined, &[("p1", "tok", joined)]);
+        set_last_seen(&store, "room-1", "p1", last_seen);
+
+        let result = store.roster("", "room-1", "tok", Duration::hours(12)).await;
+
+        assert!(matches!(result, Err(RoomError::RoomNotFound)));
+        let (seen, _) = seat_clocks(&store, "room-1", "p1");
+        assert_eq!(seen, last_seen, "no liveness refresh");
+    }
+
+    #[tokio::test]
+    async fn room_service_roster_applies_its_session_limit() {
+        let store = Arc::new(InMemoryRoomStore::new(6));
+        let joined = Utc::now() - Duration::hours(2);
+        seed_room(&store, "", "room-1", joined, &[("p1", "tok", joined)]);
+        let service = RoomService::new(
+            store,
+            MediaUrls::from_config(&MediaMtxConfig::default()),
+            "",
+            Duration::seconds(300),
+            6,
+        )
+        .with_session_max(Duration::hours(1));
+
+        assert!(matches!(
+            service.roster("room-1", "tok").await,
+            Err(RoomError::RoomNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn room_service_join_never_mints_a_token_past_the_session_limit() {
+        let service = RoomService::new(
+            Arc::new(InMemoryRoomStore::new(6)),
+            MediaUrls::from_config(&MediaMtxConfig::default()),
+            "",
+            Duration::hours(2),
+            6,
+        )
+        .with_session_max(Duration::hours(1));
+        let room = service.create().await.expect("create");
+        let before = Utc::now();
+        let joined = service.join(&room.id, None).await.expect("join");
+        assert!(joined.token_expires_at <= Utc::now() + Duration::hours(1));
+        assert!(joined.token_expires_at >= before + Duration::hours(1));
+    }
+
+    #[tokio::test]
+    async fn room_service_heartbeat_applies_its_session_limit() {
+        let store = Arc::new(InMemoryRoomStore::new(6));
+        let joined = Utc::now() - Duration::hours(2);
+        seed_room(&store, "", "room-1", joined, &[("p1", "tok", joined)]);
+        let service = RoomService::new(
+            store,
+            MediaUrls::from_config(&MediaMtxConfig::default()),
+            "",
+            Duration::seconds(300),
+            6,
+        )
+        .with_session_max(Duration::hours(1));
+
+        assert!(matches!(
+            service.heartbeat("room-1", "p1", "tok").await,
+            Err(RoomError::RoomNotFound)
+        ));
+    }
+
+    /// Set one seat's `last_seen_at` apart from its `joined_at`.
+    fn set_last_seen(store: &InMemoryRoomStore, room_id: &str, id: &str, at: DateTime<Utc>) {
+        store
+            .rooms
+            .write()
+            .unwrap()
+            .get_mut(&(String::new(), room_id.to_owned()))
+            .and_then(|room| room.participants.get_mut(id))
+            .expect("seat present")
+            .last_seen_at = at;
+    }
+
+    /// One seat's `(last_seen_at, token_expires_at)`.
+    fn seat_clocks(
+        store: &InMemoryRoomStore,
+        room_id: &str,
+        id: &str,
+    ) -> (DateTime<Utc>, DateTime<Utc>) {
+        store
+            .rooms
+            .read()
+            .unwrap()
+            .get(&(String::new(), room_id.to_owned()))
+            .and_then(|room| room.participants.get(id))
+            .map(|seat| (seat.last_seen_at, seat.token_expires_at))
+            .expect("seat present")
+    }
+
     #[tokio::test]
     async fn heartbeat_keeps_the_token_value_stable() {
         // Renewal extends the expiry; it never rotates the value, so an
@@ -2497,12 +3016,22 @@ mod tests {
         seed_room(&store, "", "room-1", now, &[("p1", "tok", now)]);
 
         store
-            .heartbeat("", "room-1", "p1", "tok", Duration::seconds(300))
+            .heartbeat(
+                "",
+                "room-1",
+                "p1",
+                "tok",
+                Duration::seconds(300),
+                Duration::hours(12),
+            )
             .await
             .expect("heartbeat");
 
         assert!(
-            store.roster("", "room-1", "tok").await.is_ok(),
+            store
+                .roster("", "room-1", "tok", Duration::hours(12))
+                .await
+                .is_ok(),
             "the original token still authenticates after a heartbeat"
         );
     }
@@ -2525,7 +3054,9 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    store.heartbeat("", room, participant, token, ttl).await,
+                    store
+                        .heartbeat("", room, participant, token, ttl, Duration::hours(12))
+                        .await,
                     Err(RoomError::RoomNotFound)
                 ),
                 "{case} must be indistinguishable from a missing room"
@@ -2549,7 +3080,14 @@ mod tests {
 
         assert!(matches!(
             store
-                .heartbeat("", "room-1", "p2", "tok-1", Duration::seconds(300))
+                .heartbeat(
+                    "",
+                    "room-1",
+                    "p2",
+                    "tok-1",
+                    Duration::seconds(300),
+                    Duration::hours(12)
+                )
                 .await,
             Err(RoomError::RoomNotFound)
         ));
@@ -2565,7 +3103,14 @@ mod tests {
 
         assert!(matches!(
             store
-                .heartbeat("tenant-b", "room-1", "p1", "tok", Duration::seconds(300))
+                .heartbeat(
+                    "tenant-b",
+                    "room-1",
+                    "p1",
+                    "tok",
+                    Duration::seconds(300),
+                    Duration::hours(12)
+                )
                 .await,
             Err(RoomError::RoomNotFound)
         ));
@@ -2585,6 +3130,7 @@ mod tests {
         let joined = svc.join(&created.id, None).await.expect("join");
 
         let beat = rooms_heartbeat(
+            RoomRateGate,
             State(state.clone()),
             Path(created.id.clone()),
             axum_json(HeartbeatRequest {
@@ -2600,6 +3146,7 @@ mod tests {
 
         // A wrong token is a fail-closed 404, not a 401 membership oracle.
         let denied = rooms_heartbeat(
+            RoomRateGate,
             State(state),
             Path(created.id),
             axum_json(HeartbeatRequest {

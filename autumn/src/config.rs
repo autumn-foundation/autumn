@@ -55,6 +55,15 @@
 //! | `AUTUMN_SERVER__UPGRADE__ENABLED` | `server.upgrade.enabled` | `bool` |
 //! | `AUTUMN_SERVER__UPGRADE__READY_TIMEOUT_SECS` | `server.upgrade.ready_timeout_secs` | `u64` |
 //! | `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS` | `server.timeouts.request_timeout_ms` | `u64` |
+//! | `AUTUMN_SERVER__HTTP__HEADER_READ_TIMEOUT_MS` | `server.http.header_read_timeout_ms` | `u64` |
+//! | `AUTUMN_SERVER__HTTP__KEEP_ALIVE_TIMEOUT_MS` | `server.http.keep_alive_timeout_ms` | `u64` |
+//! | `AUTUMN_SERVER__HTTP__MAX_HEADER_BYTES` | `server.http.max_header_bytes` | `usize` |
+//! | `AUTUMN_SERVER__HTTP__HTTP2_MAX_CONCURRENT_STREAMS` | `server.http.http2_max_concurrent_streams` | `u32` |
+//! | `AUTUMN_SERVER__HTTP__MAX_CONNECTIONS` | `server.http.max_connections` | `usize` |
+//! | `AUTUMN_REALTIME__MAX_CONNECTIONS` | `realtime.max_connections` | `usize` |
+//! | `AUTUMN_REALTIME__MAX_MESSAGE_BYTES` | `realtime.max_message_bytes` | `usize` |
+//! | `AUTUMN_REALTIME__PING_INTERVAL_MS` | `realtime.ping_interval_ms` | `u64` |
+//! | `AUTUMN_REALTIME__IDLE_TIMEOUT_MS` | `realtime.idle_timeout_ms` | `u64` |
 //! | `AUTUMN_SERVER__MAX_CONCURRENT_REQUESTS` | `server.max_concurrent_requests` | `usize` |
 //! | `AUTUMN_SERVER__CAPACITY_CONTRACT` | `server.capacity_contract` | `String` |
 //! | `AUTUMN_SERVER__STRICT_CONFIG` | `server.strict_config` | `bool` |
@@ -65,6 +74,8 @@
 //! | `AUTUMN_DATABASE__PRIMARY_POOL_SIZE` | `database.primary_pool_size` | `usize` |
 //! | `AUTUMN_DATABASE__REPLICA_POOL_SIZE` | `database.replica_pool_size` | `usize` |
 //! | `AUTUMN_DATABASE__REPLICA_FALLBACK` | `database.replica_fallback` | `fail_readiness` / `primary` |
+//! | `AUTUMN_DATABASE__REPLICA_MAX_LAG_MS` | `database.replica_max_lag_ms` | `u64` |
+//! | `AUTUMN_DATABASE__WARN_ON_POOLER` | `database.warn_on_pooler` | `bool` |
 //! | `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` | `database.connect_timeout_secs` | `u64` |
 //! | `AUTUMN_DATABASE__STARTUP_WAIT_SECS` | `database.startup_wait_secs` | `u64` |
 //! | `AUTUMN_DATABASE__AUTO_MIGRATE` | `database.auto_migrate` | `Option<bool>` |
@@ -594,6 +605,19 @@ strict_config = true
 
 [server.timeouts]
 request_timeout_ms = 30_000
+
+# Prod: bound slow and idle clients (issue #3065).
+[server.http]
+header_read_timeout_ms = 10_000
+keep_alive_timeout_ms = 75_000
+max_header_bytes = 65_536
+http2_max_concurrent_streams = 100
+max_connections = 10_000
+
+[realtime]
+max_message_bytes = 1_048_576
+ping_interval_ms = 30_000
+idle_timeout_ms = 120_000
 
 [health]
 detailed = false
@@ -1504,6 +1528,10 @@ pub struct AutumnConfig {
     /// Real-time channel backend settings.
     #[serde(default)]
     pub channels: ChannelConfig,
+
+    /// WebSocket limits. See [`RealtimeConfig`].
+    #[serde(default)]
+    pub realtime: RealtimeConfig,
 
     /// Background job backend and runtime settings.
     #[serde(default)]
@@ -2639,6 +2667,58 @@ impl ChannelBackend {
             "redis" => Some(Self::Redis),
             _ => None,
         }
+    }
+}
+
+/// `[realtime]` — limits for WebSocket connections (issue #3065).
+///
+/// The limits apply to every `#[ws]` route and to
+/// [`crate::ws::WebSocketUpgrade`]. Every key is optional. When a key is not
+/// set, the socket applies no limit for it. The `prod` profile sets safe
+/// values for the message size, ping and idle keys.
+///
+/// ```toml
+/// [realtime]
+/// max_connections = 5000
+/// max_message_bytes = 1048576
+/// ping_interval_ms = 30000
+/// idle_timeout_ms = 120000
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct RealtimeConfig {
+    /// Maximum open WebSocket connections per process. An upgrade above the
+    /// limit gets `503` with `Retry-After`. `None` or `0` disables it.
+    #[serde(default)]
+    pub max_connections: Option<usize>,
+
+    /// Maximum size of one received message, in bytes. A larger message
+    /// closes the socket with code `1009`. `None` keeps the 64 MiB default.
+    #[serde(default)]
+    pub max_message_bytes: Option<usize>,
+
+    /// Interval between server pings. `None` or `0` disables pings.
+    #[serde(default)]
+    pub ping_interval_ms: Option<u64>,
+
+    /// Close a socket with code `1001` when no complete message arrives for
+    /// this long. Pings and pongs count. `None` or `0` disables it.
+    #[serde(default)]
+    pub idle_timeout_ms: Option<u64>,
+}
+
+impl RealtimeConfig {
+    /// Reject values the server cannot use.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] when `max_message_bytes` is `0`.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_message_bytes == Some(0) {
+            return Err(ConfigError::Validation(
+                "realtime.max_message_bytes must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -5411,6 +5491,8 @@ impl AutumnConfig {
     /// syntactically well-formed TOML but semantically invalid.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.database.validate()?;
+        self.server.http.validate()?;
+        self.realtime.validate()?;
         self.cors.validate()?;
         self.server.admission.validate()?;
         #[cfg(feature = "http-client")]
@@ -5591,6 +5673,11 @@ impl AutumnConfig {
     /// - `AUTUMN_SERVER__UPGRADE__ENABLED` → `server.upgrade.enabled` (bool)
     /// - `AUTUMN_SERVER__UPGRADE__READY_TIMEOUT_SECS` →
     ///   `server.upgrade.ready_timeout_secs` (u64)
+    /// - `AUTUMN_SERVER__HTTP__HEADER_READ_TIMEOUT_MS`,
+    ///   `AUTUMN_SERVER__HTTP__KEEP_ALIVE_TIMEOUT_MS`,
+    ///   `AUTUMN_SERVER__HTTP__MAX_HEADER_BYTES`,
+    ///   `AUTUMN_SERVER__HTTP__HTTP2_MAX_CONCURRENT_STREAMS`,
+    ///   `AUTUMN_SERVER__HTTP__MAX_CONNECTIONS` → `server.http.*`
     ///
     /// # Database
     /// - `AUTUMN_DATABASE__PRIMARY_URL` -> `database.primary_url` (String)
@@ -5598,6 +5685,8 @@ impl AutumnConfig {
     /// - `AUTUMN_DATABASE__PRIMARY_POOL_SIZE` -> `database.primary_pool_size` (usize)
     /// - `AUTUMN_DATABASE__REPLICA_POOL_SIZE` -> `database.replica_pool_size` (usize)
     /// - `AUTUMN_DATABASE__REPLICA_FALLBACK` -> `database.replica_fallback` (`fail_readiness` | `primary`)
+    /// - `AUTUMN_DATABASE__REPLICA_MAX_LAG_MS` -> `database.replica_max_lag_ms` (u64)
+    /// - `AUTUMN_DATABASE__WARN_ON_POOLER` -> `database.warn_on_pooler` (bool)
     /// - `AUTUMN_DATABASE__URL` → `database.url` (String)
     /// - `AUTUMN_DATABASE__POOL_SIZE` → `database.pool_size` (usize)
     /// - `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` → `database.connect_timeout_secs` (u64)
@@ -5709,6 +5798,7 @@ impl AutumnConfig {
         self.apply_session_env_overrides_with_env(env);
         self.apply_cache_env_overrides_with_env(env);
         self.apply_channels_env_overrides_with_env(env);
+        self.apply_realtime_env_overrides_with_env(env);
         self.apply_jobs_env_overrides_with_env(env);
         self.apply_outbox_env_overrides_with_env(env);
         self.apply_scheduler_env_overrides_with_env(env);
@@ -6229,6 +6319,32 @@ impl AutumnConfig {
 
     fn apply_server_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env(env, "AUTUMN_SERVER__PORT", &mut self.server.port);
+        let http = &mut self.server.http;
+        parse_env_option(
+            env,
+            "AUTUMN_SERVER__HTTP__HEADER_READ_TIMEOUT_MS",
+            &mut http.header_read_timeout_ms,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_SERVER__HTTP__KEEP_ALIVE_TIMEOUT_MS",
+            &mut http.keep_alive_timeout_ms,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_SERVER__HTTP__MAX_HEADER_BYTES",
+            &mut http.max_header_bytes,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_SERVER__HTTP__HTTP2_MAX_CONCURRENT_STREAMS",
+            &mut http.http2_max_concurrent_streams,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_SERVER__HTTP__MAX_CONNECTIONS",
+            &mut http.max_connections,
+        );
         parse_env_string(env, "AUTUMN_SERVER__HOST", &mut self.server.host);
         parse_env(
             env,
@@ -6312,6 +6428,20 @@ impl AutumnConfig {
         apply_deploy_env_overrides(&mut self.deploy, env);
     }
 
+    /// `database.replica_max_lag_ms` and `database.warn_on_pooler` (issue #3065).
+    fn apply_replica_lag_and_pooler_env_overrides(&mut self, env: &dyn Env) {
+        parse_env_option(
+            env,
+            "AUTUMN_DATABASE__REPLICA_MAX_LAG_MS",
+            &mut self.database.replica_max_lag_ms,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_DATABASE__WARN_ON_POOLER",
+            &mut self.database.warn_on_pooler,
+        );
+    }
+
     fn apply_database_env_overrides_with_env(&mut self, env: &dyn Env) {
         if let Ok(val) = env.var("AUTUMN_DATABASE__URL") {
             self.database.url = Some(val);
@@ -6357,6 +6487,7 @@ impl AutumnConfig {
             "AUTUMN_DATABASE__PIN_AFTER_WRITE_SECS",
             &mut self.database.pin_after_write_secs,
         );
+        self.apply_replica_lag_and_pooler_env_overrides(env);
         parse_env(
             env,
             "AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS",
@@ -6651,6 +6782,30 @@ impl AutumnConfig {
             env,
             "AUTUMN_CACHE__REDIS__KEY_PREFIX",
             &mut self.cache.redis.key_prefix,
+        );
+    }
+
+    fn apply_realtime_env_overrides_with_env(&mut self, env: &dyn Env) {
+        let realtime = &mut self.realtime;
+        parse_env_option(
+            env,
+            "AUTUMN_REALTIME__MAX_CONNECTIONS",
+            &mut realtime.max_connections,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_REALTIME__MAX_MESSAGE_BYTES",
+            &mut realtime.max_message_bytes,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_REALTIME__PING_INTERVAL_MS",
+            &mut realtime.ping_interval_ms,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_REALTIME__IDLE_TIMEOUT_MS",
+            &mut realtime.idle_timeout_ms,
         );
     }
 
@@ -7659,6 +7814,91 @@ pub struct RequestTimeoutsConfig {
     pub request_timeout_ms: Option<u64>,
 }
 
+/// `[server.http]` — connection limits for the HTTP server (issue #3065).
+///
+/// Every key is optional. When a key is not set, the server applies no limit
+/// for it, or the hyper default. The `prod` profile sets safe values for all
+/// keys.
+///
+/// ```toml
+/// [server.http]
+/// header_read_timeout_ms = 10000
+/// keep_alive_timeout_ms = 75000
+/// max_header_bytes = 65536
+/// http2_max_concurrent_streams = 100
+/// max_connections = 10000
+/// ```
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct HttpServerConfig {
+    /// Maximum time to receive a full request head. The timer starts when the
+    /// connection opens, or at the first byte after an idle period. The server
+    /// disconnects a client that is too slow. This stops slowloris attacks.
+    /// `None` or `0` disables it.
+    #[serde(default)]
+    pub header_read_timeout_ms: Option<u64>,
+
+    /// Maximum time a connection stays open with no request in flight. `None`
+    /// or `0` disables it.
+    #[serde(default)]
+    pub keep_alive_timeout_ms: Option<u64>,
+
+    /// Maximum size of the request head, in bytes. HTTP/1 requests over the
+    /// limit get `431`. Must be `8192` or more.
+    #[serde(default)]
+    pub max_header_bytes: Option<usize>,
+
+    /// Maximum number of concurrent HTTP/2 streams on one connection.
+    #[serde(default)]
+    pub http2_max_concurrent_streams: Option<u32>,
+
+    /// Maximum number of open connections. At the limit, the server stops
+    /// accepting until a connection closes. Upgraded connections (WebSocket)
+    /// count until they close. `None` or `0` disables it.
+    #[serde(default)]
+    pub max_connections: Option<usize>,
+}
+
+impl HttpServerConfig {
+    /// Smallest `max_header_bytes` the server accepts.
+    pub const MIN_HEADER_BYTES: usize = 8192;
+
+    /// Largest `max_connections` the server accepts: the most permits a
+    /// Tokio semaphore can hold.
+    pub const MAX_CONNECTIONS: usize = tokio::sync::Semaphore::MAX_PERMITS;
+
+    /// Reject values the server cannot use.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] when `max_header_bytes` is below
+    /// [`Self::MIN_HEADER_BYTES`], `http2_max_concurrent_streams` is `0`, or
+    /// `max_connections` is above [`Self::MAX_CONNECTIONS`].
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(bytes) = self.max_header_bytes
+            && bytes < Self::MIN_HEADER_BYTES
+        {
+            return Err(ConfigError::Validation(format!(
+                "server.http.max_header_bytes must be {} or more (got {bytes})",
+                Self::MIN_HEADER_BYTES
+            )));
+        }
+        if self.http2_max_concurrent_streams == Some(0) {
+            return Err(ConfigError::Validation(
+                "server.http.http2_max_concurrent_streams must be greater than zero".to_owned(),
+            ));
+        }
+        if let Some(max) = self.max_connections
+            && max > Self::MAX_CONNECTIONS
+        {
+            return Err(ConfigError::Validation(format!(
+                "server.http.max_connections must be {} or less (got {max})",
+                Self::MAX_CONNECTIONS
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// `[server.upgrade]` — in-place upgrades (issue #1674).
 ///
 /// On `SIGUSR2` a running app hands its listening socket and its designated
@@ -7769,6 +8009,10 @@ pub struct ServerConfig {
     /// Set `request_timeout_ms` in `[server.timeouts]` to enable.
     #[serde(default)]
     pub timeouts: RequestTimeoutsConfig,
+
+    /// Connection limits. See [`HttpServerConfig`].
+    #[serde(default)]
+    pub http: HttpServerConfig,
 
     /// Bind to a Unix domain socket at this path instead of `host:port`.
     ///
@@ -9573,6 +9817,23 @@ pub struct DatabaseConfig {
     #[serde(default = "default_pin_after_write_secs")]
     pub pin_after_write_secs: u64,
 
+    /// Maximum replica lag, in milliseconds (issue #3065).
+    ///
+    /// When set, the app measures the replica lag in the background, and
+    /// `/ready` reports the last sample. While the lag is over the limit, or
+    /// not known, reads go to
+    /// the primary. Lag alone does not fail readiness. `None` or `0` turns
+    /// the check off. Override via `AUTUMN_DATABASE__REPLICA_MAX_LAG_MS`.
+    #[serde(default)]
+    pub replica_max_lag_ms: Option<u64>,
+
+    /// Log a warning at boot when a database URL looks like a connection
+    /// pooler (`PgBouncer`, RDS Proxy, Supavisor, Neon). Default: `true`.
+    /// See `docs/guide/connection-poolers.md`. Override via
+    /// `AUTUMN_DATABASE__WARN_ON_POOLER`.
+    #[serde(default = "default_warn_on_pooler")]
+    pub warn_on_pooler: bool,
+
     /// Seconds to wait while acquiring a pooled connection, including
     /// creating a new connection when the pool grows.
     /// Default: `5`.
@@ -11311,6 +11572,10 @@ fn default_live_path() -> String {
     "/live".to_owned()
 }
 
+const fn default_warn_on_pooler() -> bool {
+    true
+}
+
 const fn default_upgrade_enabled() -> bool {
     true
 }
@@ -11349,6 +11614,7 @@ impl Default for ServerConfig {
             prestop_grace_secs: default_prestop_grace(),
             upgrade: UpgradeConfig::default(),
             timeouts: RequestTimeoutsConfig::default(),
+            http: HttpServerConfig::default(),
             unix_socket: None,
             max_concurrent_requests: None,
             capacity_contract: None,
@@ -11370,6 +11636,8 @@ impl Default for DatabaseConfig {
             replica_fallback: ReplicaFallback::default(),
             read_your_writes: ReadYourWrites::default(),
             pin_after_write_secs: default_pin_after_write_secs(),
+            replica_max_lag_ms: None,
+            warn_on_pooler: true,
             connect_timeout_secs: default_connect_timeout(),
             startup_wait_secs: 0,
             auto_migrate: None,
@@ -14995,6 +15263,27 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.database.pin_after_write_secs, 10);
+    }
+
+    #[test]
+    fn replica_max_lag_and_pooler_warning_config() {
+        let config = AutumnConfig::default();
+        assert_eq!(config.database.replica_max_lag_ms, None);
+        assert!(config.database.warn_on_pooler);
+
+        let parsed: AutumnConfig =
+            toml::from_str("[database]\nreplica_max_lag_ms = 2500\nwarn_on_pooler = false\n")
+                .unwrap();
+        assert_eq!(parsed.database.replica_max_lag_ms, Some(2500));
+        assert!(!parsed.database.warn_on_pooler);
+
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__REPLICA_MAX_LAG_MS", "750")
+            .with("AUTUMN_DATABASE__WARN_ON_POOLER", "false");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.database.replica_max_lag_ms, Some(750));
+        assert!(!config.database.warn_on_pooler);
     }
 
     #[test]
@@ -20562,6 +20851,56 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         );
     }
 
+    // ── [server.http] (issue #3065) ────────────────────────────────
+
+    #[test]
+    fn server_http_defaults_are_unset() {
+        assert_eq!(
+            AutumnConfig::default().server.http,
+            HttpServerConfig::default()
+        );
+        let dev: AutumnConfig =
+            toml::from_str(&toml::to_string(&profile_defaults_as_toml("dev")).unwrap()).unwrap();
+        assert_eq!(dev.server.http, HttpServerConfig::default());
+    }
+
+    #[test]
+    fn prod_profile_sets_safe_server_http_limits() {
+        let prod: AutumnConfig =
+            toml::from_str(&toml::to_string(&profile_defaults_as_toml("prod")).unwrap()).unwrap();
+        let http = prod.server.http;
+        assert_eq!(http.header_read_timeout_ms, Some(10_000));
+        assert_eq!(http.keep_alive_timeout_ms, Some(75_000));
+        assert_eq!(http.max_header_bytes, Some(65_536));
+        assert_eq!(http.http2_max_concurrent_streams, Some(100));
+        assert_eq!(http.max_connections, Some(10_000));
+    }
+
+    #[test]
+    fn server_http_parses_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r"
+            [server.http]
+            header_read_timeout_ms = 500
+            keep_alive_timeout_ms = 900
+            max_header_bytes = 16384
+            http2_max_concurrent_streams = 8
+            max_connections = 3
+        ",
+        )
+        .unwrap();
+        assert_eq!(
+            config.server.http,
+            HttpServerConfig {
+                header_read_timeout_ms: Some(500),
+                keep_alive_timeout_ms: Some(900),
+                max_header_bytes: Some(16_384),
+                http2_max_concurrent_streams: Some(8),
+                max_connections: Some(3),
+            }
+        );
+    }
+
     // ── #3057: prod protections ────────────────────────────────────────────
 
     /// Load `autumn.toml` (body `toml`) under `profile` with extra env vars.
@@ -20656,6 +20995,71 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
     }
 
     #[test]
+    fn server_http_env_overrides() {
+        let env = MockEnv::new()
+            .with("AUTUMN_SERVER__HTTP__HEADER_READ_TIMEOUT_MS", "1500")
+            .with("AUTUMN_SERVER__HTTP__KEEP_ALIVE_TIMEOUT_MS", "2500")
+            .with("AUTUMN_SERVER__HTTP__MAX_HEADER_BYTES", "9000")
+            .with("AUTUMN_SERVER__HTTP__HTTP2_MAX_CONCURRENT_STREAMS", "7")
+            .with("AUTUMN_SERVER__HTTP__MAX_CONNECTIONS", "42");
+        let mut config = AutumnConfig::default();
+        config.apply_server_env_overrides_with_env(&env);
+        assert_eq!(config.server.http.header_read_timeout_ms, Some(1500));
+        assert_eq!(config.server.http.keep_alive_timeout_ms, Some(2500));
+        assert_eq!(config.server.http.max_header_bytes, Some(9000));
+        assert_eq!(config.server.http.http2_max_concurrent_streams, Some(7));
+        assert_eq!(config.server.http.max_connections, Some(42));
+    }
+
+    #[test]
+    fn server_http_rejects_unusable_values() {
+        let mut config = AutumnConfig::default();
+        config.server.http.max_header_bytes = Some(1024);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("server.http.max_header_bytes"), "{err}");
+
+        let mut config = AutumnConfig::default();
+        config.server.http.http2_max_concurrent_streams = Some(0);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("http2_max_concurrent_streams"), "{err}");
+
+        let mut config = AutumnConfig::default();
+        config.server.http.max_connections = Some(usize::MAX);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("server.http.max_connections"), "{err}");
+
+        let mut config = AutumnConfig::default();
+        config.server.http.max_header_bytes = Some(HttpServerConfig::MIN_HEADER_BYTES);
+        config.server.http.max_connections = Some(HttpServerConfig::MAX_CONNECTIONS);
+        config.validate().unwrap();
+    }
+
+    // ── [realtime] (issue #3065) ───────────────────────────────────
+
+    #[test]
+    fn realtime_defaults_are_unset_outside_prod() {
+        assert_eq!(AutumnConfig::default().realtime, RealtimeConfig::default());
+        let dev: AutumnConfig =
+            toml::from_str(&toml::to_string(&profile_defaults_as_toml("dev")).unwrap()).unwrap();
+        assert_eq!(dev.realtime, RealtimeConfig::default());
+    }
+
+    #[test]
+    fn prod_profile_sets_safe_realtime_limits() {
+        let prod: AutumnConfig =
+            toml::from_str(&toml::to_string(&profile_defaults_as_toml("prod")).unwrap()).unwrap();
+        assert_eq!(
+            prod.realtime,
+            RealtimeConfig {
+                max_connections: None,
+                max_message_bytes: Some(1_048_576),
+                ping_interval_ms: Some(30_000),
+                idle_timeout_ms: Some(120_000),
+            }
+        );
+    }
+
+    #[test]
     fn database_timeouts_env_overrides() {
         let env = [
             ("AUTUMN_DATABASE__STATEMENT_TIMEOUT", "0"),
@@ -20736,6 +21140,29 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             load_3057("staging", "", &[]).profile_admission_default(),
             None
         );
+    }
+
+    #[test]
+    fn realtime_env_overrides_and_validation() {
+        let env = MockEnv::new()
+            .with("AUTUMN_REALTIME__MAX_CONNECTIONS", "9")
+            .with("AUTUMN_REALTIME__MAX_MESSAGE_BYTES", "4096")
+            .with("AUTUMN_REALTIME__PING_INTERVAL_MS", "1000")
+            .with("AUTUMN_REALTIME__IDLE_TIMEOUT_MS", "5000");
+        let mut config = AutumnConfig::default();
+        config.apply_realtime_env_overrides_with_env(&env);
+        assert_eq!(
+            config.realtime,
+            RealtimeConfig {
+                max_connections: Some(9),
+                max_message_bytes: Some(4096),
+                ping_interval_ms: Some(1000),
+                idle_timeout_ms: Some(5000),
+            }
+        );
+        config.realtime.max_message_bytes = Some(0);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("realtime.max_message_bytes"), "{err}");
     }
 
     #[test]
