@@ -326,7 +326,8 @@ fn edge_and_origin_encoders_agree() {
     .iter()
     .map(|s| (*s).to_owned())
     .collect();
-    corpus.extend((0_u8..=0x7f).map(|b| char::from(b).to_string()));
+    corpus.extend((0_u32..=0x2ff).filter_map(char::from_u32).map(String::from));
+    corpus.extend(["0", "-1", "18446744073709551615", "1.5"].map(String::from));
 
     for value in &corpus {
         assert_eq!(
