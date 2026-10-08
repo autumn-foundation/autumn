@@ -154,7 +154,7 @@ struct InvoiceRow {
     last_event_at: NaiveDateTime,
     created_at: NaiveDateTime,
     updated_at: NaiveDateTime,
-    // Last: the migration appended this column.
+    // Keep last. The migration appends this column, and `Queryable` reads by position.
     provider_subscription_id: Option<String>,
 }
 
@@ -983,13 +983,17 @@ impl BillingStore for DbBillingStore {
                 if ids.is_empty() {
                     return Ok(());
                 }
-                diesel::update(billing_invoices::table.filter(billing_invoices::id.eq_any(&ids)))
-                    .set((
-                        billing_invoices::subscription_id.eq(subscription_id),
-                        billing_invoices::updated_at.eq(now),
-                    ))
-                    .execute(conn)
-                    .await?;
+                diesel::update(
+                    billing_invoices::table
+                        .filter(billing_invoices::id.eq_any(&ids))
+                        .filter(billing_invoices::subscription_id.is_null()),
+                )
+                .set((
+                    billing_invoices::subscription_id.eq(subscription_id),
+                    billing_invoices::updated_at.eq(now),
+                ))
+                .execute(conn)
+                .await?;
                 diesel::update(
                     billing_dunning::table
                         .filter(billing_dunning::invoice_id.eq_any(&ids))
@@ -1169,17 +1173,28 @@ impl BillingStore for DbBillingStore {
             let states: Vec<&'static str> = from.iter().map(|state| state.as_str()).collect();
             let row = DunningRow::from_model(row);
             // One conditional update is the compare-and-set.
-            let updated = diesel::update(
-                billing_dunning::table.filter(
-                    billing_dunning::invoice_id
-                        .eq(invoice_id)
-                        .and(billing_dunning::state.eq_any(states))
-                        .and(billing_dunning::attempt.eq(expected_attempt)),
-                ),
-            )
-            .set(&row)
-            .execute(&mut conn)
-            .await
+            let target = billing_dunning::table.filter(
+                billing_dunning::invoice_id
+                    .eq(invoice_id)
+                    .and(billing_dunning::state.eq_any(states))
+                    .and(billing_dunning::attempt.eq(expected_attempt)),
+            );
+            // A settle built before a link was added must not erase it, so
+            // a row with no link leaves the stored link alone.
+            let updated = if row.subscription_id.is_some() {
+                diesel::update(target).set(&row).execute(&mut conn).await
+            } else {
+                diesel::update(target)
+                    .set((
+                        billing_dunning::customer_id.eq(&row.customer_id),
+                        billing_dunning::attempt.eq(row.attempt),
+                        billing_dunning::next_attempt_at.eq(row.next_attempt_at),
+                        billing_dunning::state.eq(&row.state),
+                        billing_dunning::updated_at.eq(row.updated_at),
+                    ))
+                    .execute(&mut conn)
+                    .await
+            }
             .map_err(|err| db_err("settle_dunning", &err))?;
             Ok(updated == 1)
         })

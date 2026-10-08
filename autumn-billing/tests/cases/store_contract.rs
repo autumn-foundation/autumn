@@ -1068,6 +1068,32 @@ pub async fn link_subscription_adopts_pending_invoices_and_dunning(store: &dyn B
         .unwrap();
 }
 
+/// A settle built before a link was added keeps the stored link.
+pub async fn settle_dunning_keeps_a_concurrent_link(store: &dyn BillingStore) {
+    store
+        .upsert_dunning(
+            dunning("settle-link", "k", 1, 100, DunningState::Running)
+                .with_subscription("settle-link-sub"),
+        )
+        .await
+        .unwrap();
+    let stale = dunning("settle-link", "k", 1, 100, DunningState::Exhausted);
+    assert_eq!(stale.subscription_id, None);
+    assert!(
+        store
+            .settle_dunning("settle-link-inv-k", 1, &[DunningState::Running], stale)
+            .await
+            .unwrap()
+    );
+    let row = store
+        .dunning_by_invoice("settle-link-inv-k")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, DunningState::Exhausted);
+    assert_eq!(row.subscription_id.as_deref(), Some("settle-link-sub"));
+}
+
 // ── Fix round 2 properties ──────────────────────────────────────────────
 
 /// One customer row per user: a second provider customer for a linked user
@@ -1501,6 +1527,7 @@ pub async fn run_contract(store: &dyn BillingStore) {
     invoice_unchanged_redelivery(store).await;
     link_subscription_adopts_pending_invoices_and_dunning(store).await;
     settle_dunning_is_compare_and_set(store).await;
+    settle_dunning_keeps_a_concurrent_link(store).await;
     prune_events_deletes_applied_rows_before(store).await;
 }
 
@@ -1547,6 +1574,7 @@ mod memory {
         invoice_unchanged_redelivery,
         link_subscription_adopts_pending_invoices_and_dunning,
         settle_dunning_is_compare_and_set,
+        settle_dunning_keeps_a_concurrent_link,
         prune_events_deletes_applied_rows_before,
     );
 
@@ -1729,4 +1757,15 @@ async fn relink_customer_default_is_unsupported_for_a_store_that_predates_it() {
         matches!(err, autumn_billing::BillingError::Unsupported(_)),
         "expected Unsupported, got {err:?}"
     );
+}
+
+/// The default `link_subscription` is a no-op, so an older store keeps
+/// compiling and keeps working.
+#[tokio::test]
+async fn link_subscription_default_is_a_no_op_for_a_store_that_predates_it() {
+    let store = LegacyStoreWithoutRelink;
+    store
+        .link_subscription(&ProviderId::new("sub"), "local", at(0))
+        .await
+        .expect("the default implementation succeeds");
 }

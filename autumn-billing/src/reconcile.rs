@@ -288,8 +288,8 @@ impl Ctx<'_> {
             upsert = upsert.with_period_end(end);
         }
         let written = store.upsert_subscription(upsert).await?;
-        // Every outcome has a stored row. Idempotent, so a redelivery after
-        // a failure past the write links what the first delivery missed.
+        // Every outcome has a stored row. This call is idempotent. A
+        // redelivery therefore links what the first delivery missed.
         let (StoreWrite::Applied(stored)
         | StoreWrite::Unchanged(stored)
         | StoreWrite::Stale(stored)) = &written;
@@ -302,16 +302,20 @@ impl Ctx<'_> {
             // idempotent step only. Notifications and hooks ran, or never
             // will, with the first delivery.
             StoreWrite::Unchanged(subscription) => {
-                if subscription.status == SubscriptionStatus::Canceled {
+                if subscription.status.is_terminal() {
                     self.close_dunning_for(&subscription.id).await?;
                 }
                 return Ok(());
             }
-            StoreWrite::Stale(_) => {
+            StoreWrite::Stale(subscription) => {
                 tracing::debug!(
                     provider_subscription_id = %snapshot.provider_subscription_id,
                     "🍂 Autumn Billing: stale subscription event; mirror unchanged"
                 );
+                // The link above may have adopted rows of an ended subscription.
+                if subscription.status.is_terminal() {
+                    self.close_dunning_for(&subscription.id).await?;
+                }
                 return Ok(());
             }
         };
@@ -392,6 +396,30 @@ impl Ctx<'_> {
         Ok((customer, write))
     }
 
+    /// Link an invoice that still has no local subscription, when the
+    /// subscription is mirrored by now. The subscription event can land
+    /// between the lookup in `upsert_invoice` and the later writes, and its
+    /// own link then finds nothing. Rows adopted by an ended subscription
+    /// are closed.
+    async fn relink(&self, invoice: &Invoice) -> Result<(), BillingError> {
+        let (None, Some(provider_id)) =
+            (&invoice.subscription_id, &invoice.provider_subscription_id)
+        else {
+            return Ok(());
+        };
+        let store = self.service.store();
+        let Some(subscription) = store.subscription_by_provider_id(provider_id).await? else {
+            return Ok(());
+        };
+        store
+            .link_subscription(provider_id, &subscription.id, self.now)
+            .await?;
+        if subscription.status.is_terminal() {
+            self.close_dunning_for(&subscription.id).await?;
+        }
+        Ok(())
+    }
+
     async fn payment_failed(
         &self,
         snapshot: &InvoiceSnapshot,
@@ -416,6 +444,7 @@ impl Ctx<'_> {
         } else {
             None
         };
+        self.relink(&invoice).await?;
         if !applied {
             return Ok(());
         }

@@ -200,8 +200,12 @@ cancels the subscription. Every retry goes through the store row, so a
 duplicate or early job run is a no-op.
 
 A failure can arrive before its subscription event. The invoice keeps the
-provider subscription id. When the subscription is mirrored, the plugin links
-the invoice and its open dunning row.
+provider subscription id. When the plugin stores the subscription, it links the
+invoice and its open dunning row.
+
+A custom `BillingStore` must override `link_subscription` to get this link.
+The default does nothing. Invoices stored before the upgrade have no provider
+subscription id. The link does not cover them.
 
 ```rust
 let billing = BillingConfig::from_env()

@@ -309,27 +309,7 @@ async fn failure_before_subscription_exhausts(billing: BillingConfig, action_can
         FakeProvider::with_parser(FakeParser::BillingEventJson),
         clocked,
     );
-    h.store
-        .upsert_customer(
-            CustomerUpsert::new("local-1", "fake", "cus_1", at(-300))
-                .with_user("42")
-                .with_email("a@example.test"),
-        )
-        .await
-        .unwrap();
-    let failed = BillingEventKind::InvoicePaymentFailed(
-        InvoiceSnapshot::new(
-            "in_1",
-            "cus_1",
-            InvoiceStatus::Open,
-            Money::from_minor(1999, Currency::USD),
-        )
-        .with_subscription("sub_1")
-        .with_attempt_count(1),
-    );
-    apply_event(&h.client, event("evt_fail", at(-200), failed))
-        .await
-        .unwrap();
+    seed_orphan_failure(&h).await;
     assert_eq!(row(&h).await.subscription_id, None);
     let sub = BillingEventKind::SubscriptionChanged(
         SubscriptionSnapshot::new("sub_1", "cus_1", SubscriptionStatus::PastDue)
@@ -355,6 +335,87 @@ async fn failure_before_subscription_exhausts(billing: BillingConfig, action_can
     assert_eq!(row(&h).await.state, DunningState::Exhausted);
     assert_eq!(subscription(&h).await.status, SubscriptionStatus::Unpaid);
     assert_eq!(h.provider.cancel_calls(), usize::from(action_cancels));
+}
+
+/// A canceled subscription closes the rows it adopts, so no retry runs.
+#[tokio::test]
+async fn failure_before_canceled_subscription_closes_the_adopted_row() {
+    let h = harness_with_hooks(
+        support::config(),
+        Arc::new(NoHooks),
+        MemoryBillingStore::shared(),
+        FakeProvider::with_parser(FakeParser::BillingEventJson),
+        clocked,
+    );
+    seed_orphan_failure(&h).await;
+    let gone = BillingEventKind::SubscriptionDeleted(SubscriptionSnapshot::new(
+        "sub_1",
+        "cus_1",
+        SubscriptionStatus::Canceled,
+    ));
+    apply_event(&h.client, event("evt_gone", at(-100), gone))
+        .await
+        .unwrap();
+    assert_eq!(row(&h).await.state, DunningState::Canceled);
+    assert_eq!(h.provider.retry_calls(), 0);
+}
+
+/// Fallback: with no link on the row or the invoice, exhaustion finds the
+/// subscription by the provider id on the invoice.
+#[tokio::test]
+async fn exhaustion_resolves_the_subscription_by_provider_id() {
+    let h = harness_with_hooks(
+        support::config(),
+        Arc::new(NoHooks),
+        MemoryBillingStore::shared(),
+        FakeProvider::with_parser(FakeParser::BillingEventJson),
+        clocked,
+    );
+    seed_orphan_failure(&h).await;
+    // Write the subscription straight to the store: no link is made.
+    h.store
+        .upsert_subscription(autumn_billing::store::SubscriptionUpsert::new(
+            "local-sub",
+            "local-1",
+            "sub_1",
+            SubscriptionStatus::PastDue,
+            at(-100),
+            at(-100),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(row(&h).await.subscription_id, None);
+    for delay in [3601, 7200, 10_800] {
+        h.client.advance_clock(Duration::from_secs(delay));
+        perform_ok(&h).await;
+    }
+    assert_eq!(subscription(&h).await.status, SubscriptionStatus::Unpaid);
+    assert_eq!(h.provider.cancel_calls(), 1);
+}
+
+/// Mirror a customer and a failed invoice whose subscription is not mirrored.
+async fn seed_orphan_failure(h: &Harness) {
+    h.store
+        .upsert_customer(
+            CustomerUpsert::new("local-1", "fake", "cus_1", at(-300))
+                .with_user("42")
+                .with_email("a@example.test"),
+        )
+        .await
+        .unwrap();
+    let failed = BillingEventKind::InvoicePaymentFailed(
+        InvoiceSnapshot::new(
+            "in_1",
+            "cus_1",
+            InvoiceStatus::Open,
+            Money::from_minor(1999, Currency::USD),
+        )
+        .with_subscription("sub_1")
+        .with_attempt_count(1),
+    );
+    apply_event(&h.client, event("evt_fail", at(-200), failed))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

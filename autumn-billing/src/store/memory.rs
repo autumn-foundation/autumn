@@ -538,7 +538,12 @@ impl BillingStore for MemoryBillingStore {
             if current.attempt != expected_attempt || !from.contains(&current.state) {
                 return false;
             }
+            // A settle built before a link was added must not erase it.
+            let linked = current.subscription_id.take();
             *current = row;
+            if current.subscription_id.is_none() {
+                current.subscription_id = linked;
+            }
             true
         }))
     }

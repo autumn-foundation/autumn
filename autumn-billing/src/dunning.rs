@@ -471,8 +471,7 @@ async fn exhausted(
         .subscription_id
         .clone()
         .or_else(|| invoice.subscription_id.clone());
-    // Last resort: the link was never written, but the subscription is
-    // mirrored now.
+    // Fallback: the link is missing but the subscription is now mirrored.
     if subscription_id.is_none()
         && let Some(provider_id) = &invoice.provider_subscription_id
     {

@@ -527,8 +527,8 @@ pub trait BillingStore: Send + Sync + 'static {
     /// subscription to `subscription_id`. Their `Pending` or `Running`
     /// dunning rows are linked too. Existing links stay. Idempotent.
     ///
-    /// Defaulted to a no-op, so a store written before this method existed
-    /// keeps compiling. Such a store keeps the old behavior.
+    /// The default is a no-op. An older store still compiles and keeps the
+    /// old behavior. A custom store must override this method to get the fix.
     fn link_subscription<'a>(
         &'a self,
         provider_subscription_id: &'a ProviderId,
