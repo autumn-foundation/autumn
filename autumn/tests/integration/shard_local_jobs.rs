@@ -106,14 +106,26 @@ mod shard_local_job_tests {
         conn.batch_execute(end).await.expect("end transaction");
     }
 
-    #[tokio::test]
-    #[ignore = "requires Docker (testcontainers)"]
-    async fn enqueue_in_tx_commits_and_rolls_back_with_the_shard_write() {
-        let _guard = job::global_job_runtime_test_lock().lock().await;
-        job::clear_global_job_client();
-        AtomicUsize::store(&WELCOMED, 0, Ordering::SeqCst);
+    /// Wait until the shard worker has run `n` welcome jobs (or time out).
+    async fn wait_for_welcomed(n: usize) -> usize {
+        for _ in 0..200 {
+            if welcomed() >= n {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        welcomed()
+    }
 
-        let db = TestDb::shared().await;
+    /// A control database with the job schema, a shard with an `accounts`
+    /// table, and an app with shard-local jobs on them.
+    async fn shard_local_app(
+        db: &TestDb,
+    ) -> (
+        autumn_web::test::TestClient,
+        Pool<AsyncPgConnection>,
+        Pool<AsyncPgConnection>,
+    ) {
         let (control_url, control) = fresh_database(db, "shard_local_jobs_control").await;
         let (shard_url, shard) = fresh_database(db, "shard_local_jobs_shard0").await;
         {
@@ -154,6 +166,38 @@ mod shard_local_job_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(ready, "the shard must get an autumn_jobs table");
+        (client, control, shard)
+    }
+
+    /// Cut the control database, enqueue on the shard, and return how many
+    /// welcome jobs ran. The control database is restored before return.
+    async fn welcomed_during_control_outage(db: &TestDb, shard: &Pool<AsyncPgConnection>) -> usize {
+        let mut admin = db.pool().get().await.expect("admin connection");
+        admin
+            .batch_execute(
+                "ALTER DATABASE shard_local_jobs_control ALLOW_CONNECTIONS false; \
+                 SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                 WHERE datname = 'shard_local_jobs_control';",
+            )
+            .await
+            .expect("cut the control database");
+        sign_up(shard, "during-outage", true).await;
+        let ran = wait_for_welcomed(2).await;
+        admin
+            .batch_execute("ALTER DATABASE shard_local_jobs_control ALLOW_CONNECTIONS true")
+            .await
+            .expect("restore the control database");
+        ran
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn enqueue_in_tx_commits_and_rolls_back_with_the_shard_write() {
+        let _guard = job::global_job_runtime_test_lock().lock().await;
+        job::clear_global_job_client();
+        AtomicUsize::store(&WELCOMED, 0, Ordering::SeqCst);
+        let db = TestDb::shared().await;
+        let (client, control, shard) = shard_local_app(db).await;
 
         // Rollback: neither the account nor the job exists.
         sign_up(&shard, "rolled-back", false).await;
@@ -179,13 +223,11 @@ mod shard_local_job_tests {
         );
 
         // A worker for the shard runs the job.
-        for _ in 0..200 {
-            if welcomed() == 1 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert_eq!(welcomed(), 1, "the shard worker ran the job once");
+        assert_eq!(
+            wait_for_welcomed(1).await,
+            1,
+            "the shard worker ran the job once"
+        );
         // The control job registry backs the control queue gauges. A shard
         // run must not change it.
         let control_status = client
@@ -200,31 +242,11 @@ mod shard_local_job_tests {
             "shard runs do not touch the control job registry"
         );
 
-        // Control-database outage: nobody can connect to it. The shard
-        // transaction and the shard worker do not need it.
-        let mut admin = db.pool().get().await.expect("admin connection");
-        admin
-            .batch_execute(
-                "ALTER DATABASE shard_local_jobs_control ALLOW_CONNECTIONS false; \
-                 SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-                 WHERE datname = 'shard_local_jobs_control';",
-            )
-            .await
-            .expect("cut the control database");
-        sign_up(&shard, "during-outage", true).await;
-        for _ in 0..200 {
-            if welcomed() == 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        let ran = welcomed();
-        admin
-            .batch_execute("ALTER DATABASE shard_local_jobs_control ALLOW_CONNECTIONS true")
-            .await
-            .expect("restore the control database");
+        // Control-database outage: the shard transaction and the shard worker
+        // do not need it.
         assert_eq!(
-            ran, 2,
+            welcomed_during_control_outage(db, &shard).await,
+            2,
             "the shard worker runs jobs while the control database is down"
         );
     }
