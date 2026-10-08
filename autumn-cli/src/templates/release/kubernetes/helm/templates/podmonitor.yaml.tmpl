@@ -1,0 +1,24 @@
+{{- if .Values.metrics.podMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "app.fullname" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+    {{- with .Values.metrics.podMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  # job = the release name, on primary and canary pods alike. Use it in
+  # `autumn slo generate --selector 'job="<release>"'`.
+  jobLabel: app.kubernetes.io/instance
+  selector:
+    matchLabels:
+      # Only the instance label. Flagger changes app.kubernetes.io/name on its
+      # primary pods, so a match on it would miss them.
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  podMetricsEndpoints:
+    - port: http
+      path: {{ .Values.metrics.path }}
+      interval: {{ .Values.metrics.podMonitor.interval }}
+{{- end }}

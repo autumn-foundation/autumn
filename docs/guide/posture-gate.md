@@ -135,10 +135,12 @@ autumn upgrade          # preview — shows the workflow it would add
 autumn upgrade --apply  # write it
 ```
 
-Then commit a baseline, which is the manifest the gate diffs against:
+Then commit a baseline, which is the manifest the gate diffs against. Build it
+with the flags in the workflow's `POSTURE_AUDIT_FLAGS` (see
+[Which build the gate audits](#which-build-the-gate-audits)):
 
 ```bash
-autumn routes audit --manifest security-posture.json
+autumn routes audit --release --manifest security-posture.json
 git add security-posture.json
 ```
 
@@ -180,7 +182,7 @@ env:
 # …in the `manifest` job:
       - name: Build this commit's posture manifest
         # Select the member package.
-        run: autumn routes audit -p my-app --manifest "$POSTURE_MANIFEST"
+        run: autumn routes audit -p my-app $POSTURE_AUDIT_FLAGS --manifest "$POSTURE_MANIFEST"
 ```
 
 Everything else — the base read, the acknowledgment harvest, the diff, the
@@ -211,8 +213,9 @@ diff; no gate can assert that away.
 
 Step by step:
 
-1. `autumn routes audit --manifest security-posture.json` builds this commit's
-   manifest. That is the only build the gate pays for.
+1. `autumn routes audit $POSTURE_AUDIT_FLAGS --manifest security-posture.json`
+   builds this commit's manifest, with the build your image ships.
+   That is the only build the gate pays for.
 2. The workflow fails if the committed `security-posture.json` describes a
    different *posture* than the one just built — a stale committed manifest
    would make the diff lie. The comparison is by posture digest, not by bytes,
@@ -226,6 +229,37 @@ Step by step:
 So the manifest is your app's posture **state file**: it lives in the
 repository, it changes in the same pull request as the code, and it is the
 artifact a release signs.
+
+### Which build the gate audits
+
+The manifest describes one binary. Two builds can mount different routes. A
+route behind `#[cfg(not(debug_assertions))]` is only in a release build. A
+route behind a feature is only in a build with that feature. Thus the gate
+must audit the build you deploy.
+
+The workflow sets the build in one place:
+
+```yaml
+env:
+  POSTURE_AUDIT_FLAGS: --release
+```
+
+The scaffolded `Dockerfile` builds `--release`. If you deploy with
+`autumn build --embed`, add `--features embed-assets`. `POSTURE_AUDIT_FLAGS`
+takes `cargo build` flags: `--release`, `--profile`, `--features`,
+`--all-features`, `--no-default-features`. When you change it, regenerate the
+baseline with the same flags. This change edits the gate, so make it in a
+separate pull request.
+
+Two checks find a wrong build:
+
+- The manifest records its build in `build`. A non-default build is part of the
+  posture digest. Thus a baseline made with other flags fails the staleness
+  check, and the attested digest names the build.
+- If the base and head manifests come from different builds,
+  `routes posture diff` reports `build_changed` as a **widening**. A diff
+  across builds can hide a widening, so a person must acknowledge it. Expect
+  this once, on the pull request that changes the baseline.
 
 ---
 
@@ -270,6 +304,10 @@ Rules worth knowing:
   exactly what moved; the alternative loses a widening in silence.
   [#2497](https://github.com/autumn-foundation/autumn/issues/2497) tracks the
   format change that would satisfy both.
+- **One file per comment.** The workflow writes each comment to its own file
+  and passes the directory as `--ack-dir`. The diff parses each file alone, so
+  an unclosed code fence in one comment cannot change another, and no comment
+  text can fake a comment boundary.
 - **Where it doesn't apply.** Quoted lines (`> /ack-posture …`) and lines
   inside fenced code blocks never acknowledge anything, so quoting a colleague
   — which GitHub's reply button does for you — cannot approve a widening by
@@ -356,7 +394,8 @@ autumn routes posture verify --manifest tampered.json \
 | Command | What it does |
 |---|---|
 | `autumn routes posture diff --base B.json --head H.json` | The gate. Markdown by default; `--format json` / `text`. |
-| `… --ack-file acks.txt` | Text harvested from the pull request, scanned for `/ack-posture` markers. |
+| `… --ack-dir acks/` | One file per pull-request comment, each scanned alone for `/ack-posture` markers. |
+| `… --ack-file acks.txt` | Comments in one file, divided by `<!-- autumn:ack-source -->` lines. Prefer `--ack-dir`. |
 | `… --ack <digest>` | The same acknowledgment, inline — for local runs. |
 | `… --allow-missing-base` | No baseline yet: report, block nothing. |
 | `… --output posture-diff.md` | Also write the report to a file. |
@@ -405,14 +444,12 @@ doesn't. It inherits every boundary of
   /users/{id}` recorded as enforced. The gate therefore treats the prefix list
   itself as posture: adding a prefix blocks, whatever the per-route rows say.
   Expect the report to name the prefix rather than the routes it touches.
-- **Routes that only exist in your deployed configuration.** `autumn routes
-  audit` compiles with Cargo's default profile and default features, while your
-  production image is typically `--release` and may enable extra features. A
-  route behind `#[cfg(not(debug_assertions))]`, or behind a feature only the
-  deployment turns on, is therefore absent from the manifest — and so invisible
-  to this gate. If your app has such routes, audit the configuration you ship
-  until [#2472](https://github.com/autumn-foundation/autumn/issues/2472) closes
-  that gap.
+- **A build you do not audit.** The gate audits the build in
+  `POSTURE_AUDIT_FLAGS`. A route that exists only in another build is not in
+  the manifest. Keep the flags the same as your image build. The `build`
+  object records only the Cargo flags. It does not record `RUSTFLAGS`,
+  `CARGO_PROFILE_*` variables or `.cargo/config.toml` settings, which can also
+  change the build.
 
 ---
 

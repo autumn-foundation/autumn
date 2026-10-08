@@ -6,8 +6,9 @@
 # `.github/workflows/posture-gate.yml` executes, minus the GitHub-specific
 # halves (comment posting, acknowledgment harvesting):
 #
-#   1. Build each example's posture manifest with `autumn routes audit`. That
-#      is the head side, and it also enforces #1604's default-deny rule — an
+#   1. Build each example's posture manifest with `autumn routes audit`, under
+#      the build a deployment ships (`AUDIT_FLAGS`, issue #2472). That is the
+#      head side, and it also enforces #1604's default-deny rule — an
 #      unclassified route fails here before any diffing happens.
 #   2. Diff it against the baseline as of the BASE REVISION — not the working
 #      tree. A change that widens an example and refreshes its committed
@@ -40,6 +41,11 @@ cd "$root"
 # Examples carrying a committed posture baseline. Keep this list and the
 # `security-posture.json` files next to those examples in step.
 EXAMPLES=("hello")
+
+# The build to audit (issue #2472). A deployment ships a release build, and a
+# route behind `#[cfg(not(debug_assertions))]` is only in that build. The
+# examples have no non-default features to ship.
+AUDIT_FLAGS=(--release)
 
 UPDATE=0
 case "${1:-}" in
@@ -83,7 +89,13 @@ note() {
 command -v cargo >/dev/null || die "cargo is required"
 
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+cleanup() {
+  if [ -d "$work/base-tree" ]; then
+    git worktree remove --force "$work/base-tree" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$work"
+}
+trap cleanup EXIT
 
 echo "Building the autumn CLI…"
 # `--locked`: a Cargo.lock that does not match the manifests should fail the
@@ -93,6 +105,8 @@ cargo build -q --locked -p autumn-cli --bin autumn
 # locally commonly set (again mirroring check-sbom.sh).
 CLI="${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-$root/target}}/debug/autumn"
 [ -x "$CLI" ] || die "the autumn CLI did not build at $CLI"
+# Absolute, because the base rebuild below runs it from another directory.
+CLI="$(cd "$(dirname "$CLI")" && pwd)/$(basename "$CLI")"
 
 failed=0
 
@@ -104,7 +118,7 @@ for example in "${EXAMPLES[@]}"; do
   echo "── $example ────────────────────────────────────────────────"
 
   # Also the #1604 default-deny gate: an unclassified route fails right here.
-  "$CLI" routes audit -p "$example" --manifest "$fresh" >/dev/null \
+  "$CLI" routes audit -p "$example" "${AUDIT_FLAGS[@]}" --manifest "$fresh" >/dev/null \
     || die "$example: \`autumn routes audit\` failed — see the output above"
   ok "$example: every route carries a proven classification"
 
@@ -122,6 +136,7 @@ for example in "${EXAMPLES[@]}"; do
   # manifest in the same change cannot make both sides agree.
   accepted="$work/$example.base.json"
   bootstrap=0
+  from_ref=0
   if ! git rev-parse --verify --quiet "$POSTURE_BASE_REF^{commit}" >/dev/null; then
     # No base revision in this checkout (a shallow clone, or a local clone with
     # no remote). Comparing against the working tree still catches a widening
@@ -132,6 +147,7 @@ for example in "${EXAMPLES[@]}"; do
     note "$example: the working tree's $baseline (CI resolves the base ref)"
   elif git cat-file -e "$POSTURE_BASE_REF:$baseline" 2>/dev/null; then
     git show "$POSTURE_BASE_REF:$baseline" > "$accepted"
+    from_ref=1
     note "$example: comparing against $POSTURE_BASE_REF:$baseline"
   else
     # The baseline is new on this branch: there is no previously accepted
@@ -139,6 +155,28 @@ for example in "${EXAMPLES[@]}"; do
     bootstrap=1
     accepted="$work/$example.absent.json"
     note "$example: no baseline on $POSTURE_BASE_REF yet — bootstrapping"
+  fi
+
+  # A base manifest from another build gives a false diff. This occurs once,
+  # when AUDIT_FLAGS changes. Then build the base revision with the same flags.
+  # A change to AUDIT_FLAGS is a change to this script, so code review covers
+  # it; no acknowledgment is asked. The diff exits 1 on a widening, so capture
+  # its output with `|| true`.
+  if [ "$from_ref" = "1" ]; then
+    probe="$("$CLI" routes posture diff --base "$accepted" --head "$fresh" --format json 2>/dev/null || true)"
+    if grep -q '"kind": "build_changed"' <<<"$probe"; then
+      note "$example: $POSTURE_BASE_REF:$baseline comes from another build."
+      note "$example: building $POSTURE_BASE_REF with ${AUDIT_FLAGS[*]} for the diff"
+      if [ ! -d "$work/base-tree" ]; then
+        git worktree add --detach --quiet "$work/base-tree" "$POSTURE_BASE_REF"
+      fi
+      # A separate target directory. In a shared one, base artifacts can look
+      # fresh to a later head build, which then uses base code.
+      (cd "$work/base-tree" \
+        && CARGO_TARGET_DIR="$work/base-target" \
+          "$CLI" routes audit -p "$example" "${AUDIT_FLAGS[@]}" --manifest "$accepted" >/dev/null) \
+        || die "$example: \`autumn routes audit\` failed on $POSTURE_BASE_REF"
+    fi
   fi
 
   args=(routes posture diff --base "$accepted" --head "$fresh" --format text)

@@ -1,0 +1,177 @@
+{{/*
+The chart name, or nameOverride.
+*/}}
+{{- define "app.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 55 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/*
+The object name: fullnameOverride, or the release name plus the chart name
+when it is not part of it. At most 55 characters, so Flagger can add
+-primary or -canary and stay within 63.
+*/}}
+{{- define "app.fullname" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 55 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := include "app.name" . -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 55 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 55 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "app.labels" -}}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{ include "app.selectorLabels" . }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end -}}
+
+{{- define "app.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "app.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end -}}
+
+{{/*
+The drain window and the grace period. Kubernetes kills the pod at the end of
+terminationGracePeriodSeconds, so it must be longer than the drain window.
+*/}}
+{{- define "app.gracePeriod" -}}
+{{- $s := .Values.shutdown -}}
+{{- if lt (int $s.bufferSeconds) 1 -}}
+{{- fail "shutdown.bufferSeconds must be 1 or more, so the grace period is longer than the drain window" -}}
+{{- end -}}
+{{- add $s.preStopSleepSeconds $s.prestopGraceSeconds $s.shutdownTimeoutSeconds $s.bufferSeconds -}}
+{{- end -}}
+
+{{/*
+The trusted hosts, comma-separated. The prod profile does not start without
+them.
+*/}}
+{{- define "app.trustedHosts" -}}
+{{- if not .Values.trustedHosts -}}
+{{- fail "set trustedHosts to the app's public host names; the prod profile does not start without [security.trusted_hosts]" -}}
+{{- end -}}
+{{- join "," .Values.trustedHosts -}}
+{{- end -}}
+
+{{/*
+The pod template. The Deployment and the Rollout share it.
+*/}}
+{{- define "app.podTemplate" -}}
+metadata:
+  labels:
+    {{- include "app.selectorLabels" . | nindent 4 }}
+  {{- $annotations := dict }}
+  {{- if and .Values.metrics.annotations (not .Values.metrics.podMonitor.enabled) }}
+  {{- $_ := set $annotations "prometheus.io/scrape" "true" }}
+  {{- $_ := set $annotations "prometheus.io/path" .Values.metrics.path }}
+  {{- $_ := set $annotations "prometheus.io/port" (toString .Values.containerPort) }}
+  {{- end }}
+  {{- /* podAnnotations win, so a key is never written two times. */}}
+  {{- $annotations = mustMergeOverwrite $annotations (.Values.podAnnotations | default dict) }}
+  {{- with $annotations }}
+  annotations:
+    {{- /* Annotation values must be strings, also when --set gives a number. */}}
+    {{- range $key, $value := . }}
+    {{ $key }}: {{ $value | toString | quote }}
+    {{- end }}
+  {{- end }}
+spec:
+  {{- with .Values.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  terminationGracePeriodSeconds: {{ include "app.gracePeriod" . }}
+  # The app does not call the Kubernetes API.
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: app
+      image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      ports:
+        - name: http
+          containerPort: {{ .Values.containerPort }}
+          protocol: TCP
+      env:
+        - name: AUTUMN_SERVER__HOST
+          value: "0.0.0.0"
+        # The pod IP is trusted too: Prometheus sends it as the Host header.
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS
+          value: {{ printf "%s,$(POD_IP)" (include "app.trustedHosts" .) | quote }}
+        - name: AUTUMN_SERVER__PORT
+          value: {{ .Values.containerPort | quote }}
+        - name: AUTUMN_SERVER__PRESTOP_GRACE_SECS
+          value: {{ .Values.shutdown.prestopGraceSeconds | quote }}
+        - name: AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS
+          value: {{ .Values.shutdown.shutdownTimeoutSeconds | quote }}
+        {{- if .Values.rollout.enabled }}
+        # The pod-template hash becomes the `version` metric label. The
+        # AnalysisTemplate from `autumn slo generate` selects the canary by it.
+        - name: AUTUMN_DEPLOY_VERSION
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.labels['rollouts-pod-template-hash']
+        {{- end }}
+        {{- with .Values.env }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.envFrom }}
+      envFrom:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      startupProbe:
+        httpGet:
+          path: {{ .Values.probes.startupPath }}
+          port: http
+        periodSeconds: 2
+        failureThreshold: 60
+      livenessProbe:
+        httpGet:
+          path: {{ .Values.probes.livePath }}
+          port: http
+        periodSeconds: 10
+        failureThreshold: 3
+      readinessProbe:
+        httpGet:
+          path: {{ .Values.probes.readyPath }}
+          port: http
+        periodSeconds: 2
+        failureThreshold: 1
+      lifecycle:
+        preStop:
+          exec:
+            command: ["sleep", "{{ .Values.shutdown.preStopSleepSeconds }}"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      {{- with .Values.resources }}
+      resources:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- with .Values.nodeSelector }}
+  nodeSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.affinity }}
+  affinity:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.tolerations }}
+  tolerations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end -}}

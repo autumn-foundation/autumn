@@ -309,7 +309,7 @@ where
     Ok(())
 }
 
-/// `SET LOCAL` is Postgres syntax. SQLite has no such settings.
+/// `SET LOCAL` is Postgres syntax. `SQLite` has no such settings.
 #[cfg(feature = "sqlite")]
 #[allow(
     clippy::unused_async,
@@ -555,6 +555,10 @@ pub(crate) struct RequestQueryTimer {
     /// connections that actually carry a timer, which `Db::checkout` installs
     /// solely while a query observer is scoped.
     clock: std::sync::Arc<dyn crate::time::ClockSource>,
+    /// The sim gate's turn for the running statement. This timer replaces the
+    /// gate's own instrumentation on a connection, so it takes the turn too
+    /// (issue #3067). Off a sim runtime it does nothing.
+    turn: crate::sim::gate::QueryTurn,
 }
 
 #[cfg(feature = "db")]
@@ -577,6 +581,7 @@ impl Default for RequestQueryTimer {
         Self {
             pending: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            turn: crate::sim::gate::QueryTurn::default(),
         }
     }
 }
@@ -600,6 +605,7 @@ impl RequestQueryTimer {
         Self {
             pending: None,
             clock,
+            turn: crate::sim::gate::QueryTurn::default(),
         }
     }
 
@@ -703,8 +709,10 @@ impl diesel::connection::Instrumentation for RequestQueryTimer {
                 // opted-out timer never pays the allocation — see `on_start`.
                 let now = self.clock.monotonic();
                 self.on_start(now, || query.to_string());
+                self.turn.start();
             }
             InstrumentationEvent::FinishQuery { .. } => {
+                self.turn.finish();
                 let now = self.clock.monotonic();
                 self.on_finish(now);
             }
@@ -1536,7 +1544,7 @@ static SQLITE_REPLICATION_ACTIVE: std::sync::atomic::AtomicBool =
 ///   `sqlite3_unlock_notify`), so the pragma is inert for that one lock class —
 ///   harmless, not harmful (issue #2881).
 #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
-const fn sqlite_connection_pragmas(read_only: bool, replicating: bool) -> &'static str {
+pub(crate) const fn sqlite_connection_pragmas(read_only: bool, replicating: bool) -> &'static str {
     if read_only {
         "PRAGMA busy_timeout = 5000; \
          PRAGMA foreign_keys = ON;"

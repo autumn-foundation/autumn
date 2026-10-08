@@ -2514,7 +2514,10 @@ impl AppBuilder {
     /// use std::time::Duration;
     /// use autumn_web::feature_flags::pg::PgFlagStore;
     ///
-    /// let store = Arc::new(PgFlagStore::new(&config.database.primary_url));
+    /// // `None` when no primary target is set, or it is not Postgres.
+    /// let store = Arc::new(
+    ///     PgFlagStore::from_database_config(&config.database).expect("a Postgres target"),
+    /// );
     /// PgFlagStore::spawn_poll_listener(Arc::clone(&store), Duration::from_secs(1));
     /// autumn_web::app()
     ///     .with_flag_store(Arc::clone(&store))
@@ -2617,7 +2620,10 @@ impl AppBuilder {
     /// use std::time::Duration;
     /// use autumn_web::experiments::pg::PgExperimentStore;
     ///
-    /// let store = Arc::new(PgExperimentStore::new(&config.database.primary_url));
+    /// // `None` when no primary target is set, or it is not Postgres.
+    /// let store = Arc::new(
+    ///     PgExperimentStore::from_database_config(&config.database).expect("a Postgres target"),
+    /// );
     /// PgExperimentStore::spawn_poll_listener(Arc::clone(&store), Duration::from_secs(5));
     /// autumn_web::app()
     ///     .with_experiment_store(Arc::clone(&store))
@@ -9047,13 +9053,15 @@ pub(crate) fn start_task_scheduler_with_config(
             crate::task::Schedule::FixedDelay(delay) => {
                 let coordinator = Arc::clone(&coordinator);
                 let shutdown = shutdown.child_token();
-                tokio::spawn(async move {
+                crate::sim::spawn_app_task(&state.clone(), async move {
                     loop {
                         state.task_registry.record_next_run_at(
                             &name,
                             &format_next_task_run_after(state.clock().now(), delay),
                         );
                         tokio::select! {
+                            // Fixed branch order, so a sim replays it (#3067).
+                            biased;
                             () = shutdown.cancelled() => break,
                             () = tokio::time::sleep(delay) => {
                                 execute_fixed_delay_task(
@@ -9607,7 +9615,7 @@ fn run_cron_scheduler(
         let state = state.clone();
         let coordinator = Arc::clone(coordinator);
         let shutdown = shutdown.child_token();
-        tokio::spawn(async move {
+        crate::sim::spawn_app_task(&state.clone(), async move {
             run_cron_task_loop(task, state, shutdown, coordinator, lease_ttl).await;
         });
     }
@@ -9666,6 +9674,8 @@ async fn run_cron_task_loop(
         );
         let sleep_for = cron_sleep_duration_until(state.clock().now(), &scheduled_at);
         tokio::select! {
+            // Fixed branch order, so a sim replays it (#3067).
+            biased;
             () = shutdown.cancelled() => break,
             () = tokio::time::sleep(sleep_for) => {
                 let woke_at = state.clock().now().with_timezone(&timezone);
@@ -9704,7 +9714,7 @@ async fn run_cron_task_loop(
                     unix_secs: u64::try_from(scheduled_at.timestamp()).unwrap_or_default(),
                     window: cron_occurrence_window(&cron, &scheduled_at),
                 };
-                tokio::spawn(execute_cron_task(
+                crate::sim::spawn_app_task(&state, execute_cron_task(
                     name.clone(),
                     state.clone(),
                     handler,
@@ -13891,6 +13901,7 @@ mod agent_authority_route_summary_tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -13966,6 +13977,7 @@ mod validate_repository_api_policies_tests {
             repository: meta,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -14442,6 +14454,8 @@ fn build_state(
         client: crate::http_client::Client::build_inner(&config.http.client),
         timeout_secs: config.http.client.timeout_secs,
     });
+    #[cfg(feature = "http-client")]
+    crate::http_client::install_shared_throttle(&state, &config.http.client);
     state
 }
 
@@ -17536,6 +17550,7 @@ mod tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -17865,6 +17880,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -17949,6 +17965,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -18123,6 +18140,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -18231,6 +18249,7 @@ mod tests {
                     repository: None,
                     idempotency: crate::route::RouteIdempotency::Direct,
                     timeout: crate::route::RouteTimeout::Inherit,
+                    criticality: crate::admission::Criticality::Default,
                     seo: crate::seo::SeoRouteDefaults::EMPTY,
                     api_version: None,
                     sunset_opt_out: false,
@@ -18338,6 +18357,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -18916,6 +18936,7 @@ mod tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -18954,6 +18975,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -18973,6 +18995,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -19364,6 +19387,7 @@ mod tests {
                     repository: None,
                     idempotency: crate::route::RouteIdempotency::Direct,
                     timeout: crate::route::RouteTimeout::Inherit,
+                    criticality: crate::admission::Criticality::Default,
                     seo: crate::seo::SeoRouteDefaults::EMPTY,
                     api_version: None,
                     sunset_opt_out: false,
@@ -19424,6 +19448,7 @@ mod tests {
                     repository: None,
                     idempotency: crate::route::RouteIdempotency::Direct,
                     timeout: crate::route::RouteTimeout::Inherit,
+                    criticality: crate::admission::Criticality::Default,
                     seo: crate::seo::SeoRouteDefaults::EMPTY,
                     api_version: None,
                     sunset_opt_out: false,

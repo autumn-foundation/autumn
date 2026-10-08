@@ -9532,3 +9532,51 @@ fn capacity_contract_scheduled_probe_uses_declared_defaults() {
         }
     }
 }
+
+/// CI lints the Kubernetes release templates and the golden SLO files with
+/// the real tools (issue #3069): `helm lint`, `kubeconform` and `promtool`.
+#[test]
+fn ci_lints_the_kubernetes_manifests_and_slo_files() {
+    let root = workspace_root();
+    let workflow = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
+        .expect("read ci.yml")
+        .replace("\r\n", "\n");
+    let commands = workflow_commands(&workflow);
+    assert!(
+        commands.iter().any(|c| c
+            == "./scripts/check-k8s-manifests.sh --self-test && ./scripts/check-k8s-manifests.sh"),
+        "ci.yml must run the Kubernetes manifest gate and its self-test: {commands:?}"
+    );
+    let script = std::fs::read_to_string(root.join("scripts/check-k8s-manifests.sh"))
+        .expect("read scripts/check-k8s-manifests.sh");
+    assert!(
+        script.contains("kubernetes-json-schema/${K8S_SCHEMA_COMMIT}/")
+            && script.contains("CRDs-catalog/${CRD_CATALOG_COMMIT}/"),
+        "schemas must come from the pinned commits"
+    );
+    for needle in [
+        "lint --strict",
+        "kubeconform",
+        "build \"${rendered}/kustomize\"",
+        "check rules",
+        "test rules",
+        "checksum mismatch",
+        "K8S_SCHEMA_COMMIT=",
+        "CRD_CATALOG_COMMIT=",
+        "-cache",
+    ] {
+        assert!(script.contains(needle), "the gate must run `{needle}`");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(root.join("scripts/check-k8s-manifests.sh"))
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert!(
+            mode & 0o111 != 0,
+            "scripts/check-k8s-manifests.sh must be executable"
+        );
+    }
+}

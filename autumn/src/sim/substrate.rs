@@ -98,7 +98,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use diesel_migrations::{EmbeddedMigrations, HarnessWithOutput, MigrationHarness};
 
-use crate::config::DatabaseConfig;
 use crate::db::RuntimeConnection;
 use crate::migrate::EmbeddedMigrationsRef;
 
@@ -201,6 +200,9 @@ impl SqliteSubstrate {
     /// [`SubstrateError::Pool`] if the runtime pool cannot be built.
     pub fn with_migrations(migrations: &[&EmbeddedMigrations]) -> Result<Self, SubstrateError> {
         let url = unique_sim_db_url();
+        // The name is unique per run by design; a same-seed trace diff must
+        // not see it (issue #3067).
+        crate::sim::trace::alias("sim db", url.split('?').next().unwrap_or(&url));
 
         // 1. Open the guard connection FIRST so the shared-cache in-memory
         //    database exists and cannot be reclaimed while we migrate + build the
@@ -242,15 +244,10 @@ impl SqliteSubstrate {
         // 4. Build the async runtime pool over the SAME shared-cache database. A
         //    single slot keeps the sim deterministic (`SQLite` is single-writer),
         //    and every checkout attaches to the guard-anchored in-memory DB and
-        //    sees the migrated schema.
-        let config = DatabaseConfig {
-            url: Some(url.clone()),
-            primary_pool_size: Some(1),
-            ..Default::default()
-        };
-        let pool = crate::db::create_pool(&config)
-            .map_err(|e| SubstrateError::Pool(e.to_string()))?
-            .ok_or_else(|| SubstrateError::Pool("substrate URL yielded no pool".to_owned()))?;
+        //    sees the migrated schema. Its connections are gated, so their
+        //    queries end at the same point of every run (issue #3067).
+        let pool = crate::sim::dblink::pool(&url, None)
+            .map_err(|e| SubstrateError::Pool(e.to_string()))?;
 
         Ok(Self {
             url,
@@ -270,6 +267,24 @@ impl SqliteSubstrate {
     #[must_use]
     pub fn pool(&self) -> Pool<RuntimeConnection> {
         self.pool.clone()
+    }
+
+    /// A one-slot pool for one replica, behind `link` (issue #3067).
+    ///
+    /// The pool opens its own session on this database. `link` can drop that
+    /// session and fault its writes, and the other replicas do not see it. Mount
+    /// each replica on its own pool:
+    /// `TestApp::new().with_db(substrate.replica_pool(&sim.db_link("a"))?)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubstrateError::Pool`] if the pool cannot be built.
+    pub fn replica_pool(
+        &self,
+        link: &crate::sim::DbLink,
+    ) -> Result<Pool<RuntimeConnection>, SubstrateError> {
+        crate::sim::dblink::pool(&self.url, Some(link))
+            .map_err(|e| SubstrateError::Pool(e.to_string()))
     }
 
     /// The `file:<unique>?mode=memory&cache=shared` URL this substrate's database

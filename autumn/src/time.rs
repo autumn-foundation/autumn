@@ -613,6 +613,9 @@ where
     )]
     tokio::task::spawn_blocking(move || {
         let _guard = carried.map(|(clock, floor, start)| install_ambient_at(clock, floor, start));
+        // On a sim runtime, run only in a turn of the gate, as a query does
+        // (issue #3067). Elsewhere this does nothing.
+        let _turn = crate::sim::gate::Scope::enter();
         f()
     })
 }

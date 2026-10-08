@@ -1,5 +1,11 @@
 {
-  "schema_version": 4,
+  "schema_version": 5,
+  "build": {
+    "profile": "release",
+    "features": [],
+    "all_features": false,
+    "no_default_features": false
+  },
   "dimensions": {
     "routes": {
       "provenance": "provable",
@@ -18,28 +24,6 @@
           "provenance": "provable"
         },
         {
-          "path": "/_autumn/inspect",
-          "method": "GET",
-          "name": "inspector_index",
-          "classification": "framework",
-          "roles": [],
-          "scopes": [],
-          "policy": false,
-          "source": "framework",
-          "provenance": "provable"
-        },
-        {
-          "path": "/_autumn/inspect/requests/{id}",
-          "method": "GET",
-          "name": "inspector_detail",
-          "classification": "framework",
-          "roles": [],
-          "scopes": [],
-          "policy": false,
-          "source": "framework",
-          "provenance": "provable"
-        },
-        {
           "path": "/_autumn/jobs/{token}",
           "method": "GET",
           "name": "job_status",
@@ -52,72 +36,6 @@
         },
         {
           "path": "/actuator/a11y",
-          "method": "GET",
-          "name": "actuator",
-          "classification": "framework",
-          "roles": [],
-          "scopes": [],
-          "policy": false,
-          "source": "framework",
-          "provenance": "provable"
-        },
-        {
-          "path": "/actuator/circuitbreakers",
-          "method": "GET",
-          "name": "actuator",
-          "classification": "framework",
-          "roles": [],
-          "scopes": [],
-          "policy": false,
-          "source": "framework",
-          "provenance": "provable"
-        },
-        {
-          "path": "/actuator/configprops",
-          "method": "GET",
-          "name": "actuator",
-          "classification": "framework",
-          "roles": [],
-          "scopes": [],
-          "policy": false,
-          "source": "framework",
-          "provenance": "provable"
-        },
-        {
-          "path": "/actuator/cost",
-          "method": "GET",
-          "name": "actuator",
-          "classification": "framework",
-          "roles": [],
-          "scopes": [],
-          "policy": false,
-          "source": "framework",
-          "provenance": "provable"
-        },
-        {
-          "path": "/actuator/derivations",
-          "method": "GET",
-          "name": "actuator",
-          "classification": "framework",
-          "roles": [],
-          "scopes": [],
-          "policy": false,
-          "source": "framework",
-          "provenance": "provable"
-        },
-        {
-          "path": "/actuator/env",
-          "method": "GET",
-          "name": "actuator",
-          "classification": "framework",
-          "roles": [],
-          "scopes": [],
-          "policy": false,
-          "source": "framework",
-          "provenance": "provable"
-        },
-        {
-          "path": "/actuator/graph",
           "method": "GET",
           "name": "actuator",
           "classification": "framework",
@@ -150,50 +68,6 @@
           "provenance": "provable"
         },
         {
-          "path": "/actuator/jobs",
-          "method": "GET",
-          "name": "actuator",
-          "classification": "framework",
-          "roles": [],
-          "scopes": [],
-          "policy": false,
-          "source": "framework",
-          "provenance": "provable"
-        },
-        {
-          "path": "/actuator/logfile",
-          "method": "GET",
-          "name": "actuator",
-          "classification": "framework",
-          "roles": [],
-          "scopes": [],
-          "policy": false,
-          "source": "framework",
-          "provenance": "provable"
-        },
-        {
-          "path": "/actuator/loggers",
-          "method": "GET",
-          "name": "actuator",
-          "classification": "framework",
-          "roles": [],
-          "scopes": [],
-          "policy": false,
-          "source": "framework",
-          "provenance": "provable"
-        },
-        {
-          "path": "/actuator/loggers/{name}",
-          "method": "PUT",
-          "name": "actuator",
-          "classification": "framework",
-          "roles": [],
-          "scopes": [],
-          "policy": false,
-          "source": "framework",
-          "provenance": "provable"
-        },
-        {
           "path": "/actuator/metrics",
           "method": "GET",
           "name": "actuator",
@@ -206,28 +80,6 @@
         },
         {
           "path": "/actuator/prometheus",
-          "method": "GET",
-          "name": "actuator",
-          "classification": "framework",
-          "roles": [],
-          "scopes": [],
-          "policy": false,
-          "source": "framework",
-          "provenance": "provable"
-        },
-        {
-          "path": "/actuator/shadow",
-          "method": "GET",
-          "name": "actuator",
-          "classification": "framework",
-          "roles": [],
-          "scopes": [],
-          "policy": false,
-          "source": "framework",
-          "provenance": "provable"
-        },
-        {
-          "path": "/actuator/tasks",
           "method": "GET",
           "name": "actuator",
           "classification": "framework",
@@ -251,39 +103,6 @@
         {
           "path": "/actuator/ui/metrics",
           "method": "GET",
-          "name": "actuator",
-          "classification": "framework",
-          "roles": [],
-          "scopes": [],
-          "policy": false,
-          "source": "framework",
-          "provenance": "provable"
-        },
-        {
-          "path": "/actuator/ui/tasks",
-          "method": "GET",
-          "name": "actuator",
-          "classification": "framework",
-          "roles": [],
-          "scopes": [],
-          "policy": false,
-          "source": "framework",
-          "provenance": "provable"
-        },
-        {
-          "path": "/actuator/webhooks/dlq",
-          "method": "GET",
-          "name": "actuator",
-          "classification": "framework",
-          "roles": [],
-          "scopes": [],
-          "policy": false,
-          "source": "framework",
-          "provenance": "provable"
-        },
-        {
-          "path": "/actuator/webhooks/replay",
-          "method": "POST",
           "name": "actuator",
           "classification": "framework",
           "roles": [],
@@ -487,20 +306,7 @@
       "provenance": "declared",
       "source": "config:security.csrf",
       "exempt_paths": [],
-      "entries": [
-        {
-          "path": "/actuator/loggers/{name}",
-          "method": "PUT",
-          "csrf_enforced": false,
-          "exempt": false
-        },
-        {
-          "path": "/actuator/webhooks/replay",
-          "method": "POST",
-          "csrf_enforced": false,
-          "exempt": false
-        }
-      ]
+      "entries": []
     },
     "security_headers": {
       "provenance": "declared",
@@ -523,8 +329,8 @@
         },
         {
           "header": "strict_transport_security",
-          "value": "",
-          "emitted": false
+          "value": "max-age=31536000; includeSubDomains",
+          "emitted": true
         },
         {
           "header": "x_content_type_options",
@@ -561,52 +367,12 @@
           "mtls_required": false
         },
         {
-          "path": "/_autumn/inspect",
-          "method": "GET",
-          "mtls_required": false
-        },
-        {
-          "path": "/_autumn/inspect/requests/{id}",
-          "method": "GET",
-          "mtls_required": false
-        },
-        {
           "path": "/_autumn/jobs/{token}",
           "method": "GET",
           "mtls_required": false
         },
         {
           "path": "/actuator/a11y",
-          "method": "GET",
-          "mtls_required": false
-        },
-        {
-          "path": "/actuator/circuitbreakers",
-          "method": "GET",
-          "mtls_required": false
-        },
-        {
-          "path": "/actuator/configprops",
-          "method": "GET",
-          "mtls_required": false
-        },
-        {
-          "path": "/actuator/cost",
-          "method": "GET",
-          "mtls_required": false
-        },
-        {
-          "path": "/actuator/derivations",
-          "method": "GET",
-          "mtls_required": false
-        },
-        {
-          "path": "/actuator/env",
-          "method": "GET",
-          "mtls_required": false
-        },
-        {
-          "path": "/actuator/graph",
           "method": "GET",
           "mtls_required": false
         },
@@ -621,42 +387,12 @@
           "mtls_required": false
         },
         {
-          "path": "/actuator/jobs",
-          "method": "GET",
-          "mtls_required": false
-        },
-        {
-          "path": "/actuator/logfile",
-          "method": "GET",
-          "mtls_required": false
-        },
-        {
-          "path": "/actuator/loggers",
-          "method": "GET",
-          "mtls_required": false
-        },
-        {
-          "path": "/actuator/loggers/{name}",
-          "method": "PUT",
-          "mtls_required": false
-        },
-        {
           "path": "/actuator/metrics",
           "method": "GET",
           "mtls_required": false
         },
         {
           "path": "/actuator/prometheus",
-          "method": "GET",
-          "mtls_required": false
-        },
-        {
-          "path": "/actuator/shadow",
-          "method": "GET",
-          "mtls_required": false
-        },
-        {
-          "path": "/actuator/tasks",
           "method": "GET",
           "mtls_required": false
         },
@@ -668,21 +404,6 @@
         {
           "path": "/actuator/ui/metrics",
           "method": "GET",
-          "mtls_required": false
-        },
-        {
-          "path": "/actuator/ui/tasks",
-          "method": "GET",
-          "mtls_required": false
-        },
-        {
-          "path": "/actuator/webhooks/dlq",
-          "method": "GET",
-          "mtls_required": false
-        },
-        {
-          "path": "/actuator/webhooks/replay",
-          "method": "POST",
           "mtls_required": false
         },
         {

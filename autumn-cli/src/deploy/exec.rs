@@ -3887,7 +3887,7 @@ pub(crate) mod test_support {
     /// [`super::DeployMode::First`] / `Absent`. A fleet test that forgets to script
     /// host N's probe would therefore exercise the first-deploy branch and still
     /// pass. [`RecordingExecutor::strict`] turns that into a loud panic.
-    pub(crate) const PROBE_LABELS: [&str; 8] = [
+    pub(crate) const PROBE_LABELS: [&str; 9] = [
         "proxy-compat-probe",
         "detect-current",
         "probe-release-dir",
@@ -3900,6 +3900,8 @@ pub(crate) mod test_support {
         "detect-maintenance-flag",
         // #2279: the fleet parses this one to decide if the old slot stopped.
         "drain-old-retry",
+        // #3069: the post-cutover bake parses each metrics sample.
+        "bake-sample",
     ];
 
     /// One recorded executor call. Uploads carry no local path: op building is
@@ -3955,6 +3957,9 @@ pub(crate) mod test_support {
         fail_on_occurrence: Vec<(&'static str, usize)>,
         /// Scripted stdout returned for a given command label.
         stdout_by_label: Vec<(&'static str, String)>,
+        /// #3069: scripted stdout for one 1-indexed occurrence of a label. It
+        /// wins over `stdout_by_label`, so a poll can see a changing value.
+        stdout_on_occurrence: Vec<(&'static str, usize, String)>,
         /// #1621: remote-path fragments whose `upload` should fail. Uploads carry
         /// no label, so failure is keyed on the destination path — the only
         /// identity an upload has. This is what lets a test fail a `WriteFile` op
@@ -4026,6 +4031,18 @@ pub(crate) mod test_support {
             stdout: impl Into<String>,
         ) -> Self {
             self.stdout_by_label.push((label, stdout.into()));
+            self
+        }
+
+        /// Script the stdout of one 1-indexed occurrence of `label` (#3069).
+        pub(crate) fn with_stdout_on_occurrence(
+            mut self,
+            label: &'static str,
+            occurrence: usize,
+            stdout: impl Into<String>,
+        ) -> Self {
+            self.stdout_on_occurrence
+                .push((label, occurrence, stdout.into()));
             self
         }
 
@@ -4116,10 +4133,16 @@ pub(crate) mod test_support {
                 });
             }
             let scripted = self
-                .stdout_by_label
+                .stdout_on_occurrence
                 .iter()
-                .find(|(l, _)| *l == cmd.label)
-                .map(|(_, out)| out.clone());
+                .find(|(l, n, _)| *l == cmd.label && *n == occurrence)
+                .map(|(_, _, out)| out.clone())
+                .or_else(|| {
+                    self.stdout_by_label
+                        .iter()
+                        .find(|(l, _)| *l == cmd.label)
+                        .map(|(_, out)| out.clone())
+                });
             assert!(
                 !(self.strict && scripted.is_none() && PROBE_LABELS.contains(&cmd.label)),
                 "unscripted probe `{}`{}: this fake would return EMPTY stdout, which every \

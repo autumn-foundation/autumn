@@ -74,6 +74,7 @@ extern crate self as autumn_web;
 #[cfg(feature = "maud")]
 pub mod a11y;
 pub mod actuator;
+pub mod admission;
 pub mod aggregate;
 /// Operator alerts for built-in failure conditions.
 ///
@@ -659,6 +660,7 @@ pub use presence::presence_stream;
 #[cfg(feature = "presence")]
 pub use presence::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 pub(crate) mod route;
+pub use admission::Criticality;
 pub use route::{RepositoryApiMeta, Route, RouteIdempotency, RouteTimeout};
 // Re-exported alongside the other `Route` field types so a hand-built
 // `Route { .. }` needs only the `autumn_web::` prefix.
@@ -737,6 +739,7 @@ pub mod repl;
 pub mod runtime_config;
 #[cfg(feature = "seed")]
 pub mod seed;
+pub mod slo;
 
 // ── #1343 AC4: fake-seeder registration forwarding ──────────────────────────
 //

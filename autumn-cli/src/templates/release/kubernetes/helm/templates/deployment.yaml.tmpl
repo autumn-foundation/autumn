@@ -1,0 +1,24 @@
+{{- if and .Values.rollout.enabled .Values.flagger.enabled }}
+{{- fail "set rollout.enabled or flagger.enabled, not both" }}
+{{- end }}
+{{- if not .Values.rollout.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "app.fullname" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      {{- include "app.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    {{- include "app.podTemplate" . | nindent 4 }}
+{{- end }}
