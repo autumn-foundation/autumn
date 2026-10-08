@@ -3543,6 +3543,8 @@ impl AppBuilder {
     /// developer error.
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::cognitive_complexity)]
+    // `run` is one long-lived future, boxed by the caller. Its frame is fine.
+    #[allow(clippy::large_stack_frames)]
     pub async fn run(self) {
         // Remember the binary this process was started from, before a deploy
         // can replace the file underneath it: an in-place upgrade (#1674) execs
@@ -8972,7 +8974,7 @@ fn emit_data_capsule_report(
 /// with the app's `with_pool_provider` and `with_shard_provider` when it has
 /// them, so an initializer sees the same `pool()` and `shards()`, for example
 /// to build its own `CapsuleService`. The built-in pools are lazy: they
-/// connect, and a SQLite pool creates its file, only at the first checkout,
+/// connect, and a `SQLite` pool creates its file, only at the first checkout,
 /// which verify never makes. A provider that fails gives no state: verify then
 /// falls back to the signer of the configuration.
 #[cfg(feature = "db")]
