@@ -1093,6 +1093,55 @@ async fn import_refuses_a_row_column_that_the_manifest_does_not_describe() {
 }
 
 #[tokio::test]
+async fn import_refuses_a_field_that_the_manifest_names_twice() {
+    // Export describes each column once. A capsule built or changed through
+    // the public API can name one twice, and the insert would list it twice.
+    let mut capsule = export_ada(&seeded_store()).await;
+    let users = capsule
+        .manifest
+        .models
+        .iter_mut()
+        .find(|m| m.table == "users")
+        .unwrap();
+    let email = users
+        .fields
+        .iter()
+        .find(|f| f.name == "email")
+        .unwrap()
+        .clone();
+    users.fields.push(email);
+    let err = import_capsule(&capsule, registry().capsule_models(), &empty_store())
+        .await
+        .expect_err("duplicate field");
+    assert!(
+        matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains("users.email")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn import_refuses_a_field_with_an_unsafe_name() {
+    let mut capsule = export_ada(&seeded_store()).await;
+    for model in &mut capsule.manifest.models {
+        for field in &mut model.fields {
+            if model.table == "users" && field.name == "bio" {
+                field.name = "bio; --".to_owned();
+                field.generated = true;
+            }
+        }
+    }
+    for row in capsule.records.get_mut("users").unwrap() {
+        if let Some(bio) = row.remove("bio") {
+            row.insert("bio; --".to_owned(), bio);
+        }
+    }
+    let err = import_capsule(&capsule, registry().capsule_models(), &empty_store())
+        .await
+        .expect_err("unsafe field name");
+    assert!(matches!(err, DataCapsuleError::InvalidName(_)), "{err:?}");
+}
+
+#[tokio::test]
 async fn import_rejects_a_relationship_cycle() {
     let models = [
         CapsuleModel::new("users", "id").belongs_to("id", "comments"),

@@ -343,6 +343,19 @@ pub(super) fn check_importable<'c>(
             &model.relationships,
             &model.blob_columns,
         )?;
+        // Import writes the fields by name, each once. Export describes
+        // each column once and refuses an unsafe name; a capsule built or
+        // changed through the public API can still carry one.
+        let mut names = BTreeSet::new();
+        for field in &model.fields {
+            model::check_ident(&field.name)?;
+            if !names.insert(field.name.as_str()) {
+                return Err(DataCapsuleError::InvalidInput(format!(
+                    "{}.{} is described twice in the capsule",
+                    model.table, field.name
+                )));
+            }
+        }
         let current = models
             .iter()
             .find(|m| m.table == model.table)

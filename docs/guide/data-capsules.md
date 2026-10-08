@@ -240,8 +240,10 @@ capsule directory and to each directory above it.
   as is a capsule with records for a table that has a `NOT NULL` column
   without a default that the capsule does not hold (a column added since, or
   an excluded one). A domain keeps its base type's modifier, so a domain over
-  `numeric(10, 3)` and one over `numeric(6, 2)` are different types. If a blob key holds different bytes or
-  a different MIME type, import stops and writes no blob. If a blob changes
+  `numeric(10, 3)` and one over `numeric(6, 2)` are different types. A
+  manifest that names a column twice, or names one with anything but ASCII
+  letters, digits, and `_`, is refused too. If a blob key holds different
+  bytes or a different MIME type, import stops and writes no blob. If a blob changes
   while import reads it, or another writer takes a key during the import,
   import stops with a conflict (`409`).
 - **A failed import keeps the blobs that it wrote.** Another import of the
