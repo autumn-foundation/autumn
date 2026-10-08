@@ -147,7 +147,11 @@ async fn h1_get(mut stream: Tls, path: &str) -> String {
 async fn browser_style_client_negotiates_h2_and_is_served() {
     let (server, _fixture) = serve(None).await;
     let stream = connect(&server, &[H2, H1]).await;
-    assert_eq!(negotiated(&stream).as_deref(), Some(H2), "ALPN must pick h2");
+    assert_eq!(
+        negotiated(&stream).as_deref(),
+        Some(H2),
+        "ALPN must pick h2"
+    );
 
     let mut send = h2_open(stream).await;
     let (status, body) = h2_send(&mut send, "/fast").await;
@@ -282,7 +286,10 @@ async fn graceful_shutdown_drains_an_in_flight_h2_request() {
 
     let waited = Instant::now();
     while !DRAIN_ENTERED.load(Ordering::SeqCst) {
-        assert!(waited.elapsed() < Duration::from_secs(20), "handler never entered");
+        assert!(
+            waited.elapsed() < Duration::from_secs(20),
+            "handler never entered"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     server.shutdown.cancel();
