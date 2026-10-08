@@ -107,6 +107,42 @@ pub fn check_tables(existing: &str, desired: &ParsedSchema) -> SchemaRsCheck {
     }
 }
 
+/// Check that `text` is valid Rust and declares each table once. The sync
+/// edits text, so this guard stops it from writing a broken file.
+///
+/// # Errors
+///
+/// Returns the reason when the text does not parse or declares a table twice.
+pub fn validate(text: &str) -> Result<(), String> {
+    let file = syn::parse_file(text).map_err(|e| format!("the result is not valid Rust: {e}"))?;
+    let mut seen = BTreeSet::new();
+    for item in &file.items {
+        let syn::Item::Macro(call) = item else {
+            continue;
+        };
+        if call
+            .mac
+            .path
+            .segments
+            .last()
+            .is_none_or(|s| s.ident != "table")
+        {
+            continue;
+        }
+        // The table name is the first word of the body; attributes are groups.
+        let name = call.mac.tokens.clone().into_iter().find_map(|t| match t {
+            proc_macro2::TokenTree::Ident(ident) => Some(unraw(&ident.to_string()).to_owned()),
+            _ => None,
+        });
+        if let Some(name) = name
+            && !seen.insert(name.clone())
+        {
+            return Err(format!("the table `{name}` is declared twice"));
+        }
+    }
+    Ok(())
+}
+
 /// The edits of a plan that `src/schema.rs` follows.
 #[derive(Default)]
 struct PlanEdits {
@@ -1589,5 +1625,42 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
             out.text,
             "diesel::joinable!{notes -> posts (post_id)}\ndiesel::joinable![users -> notes (comment_id)];\ndiesel::allow_tables_to_appear_in_same_query![notes, posts, users];\n"
         );
+    }
+
+    /// Raw C strings, raw-identifier paths and `table![...]` calls are read
+    /// as Rust reads them.
+    #[test]
+    fn raw_c_strings_raw_paths_and_bracket_tables_are_read() {
+        let lit = "const C: &core::ffi::CStr = cr#\"x\" diesel::table! { comments (id) {} }\"#;\n";
+        let drop = plan(vec![SchemaChange::DropTable(Table::new(
+            "comments",
+            Backend::Postgres,
+        ))]);
+        assert_eq!(sync_for_plan(lit, &parsed(vec![]), &drop).text, lit);
+
+        let raw_path = "r#diesel::table! {\n    posts (id) {\n        id -> Int8,\n    }\n}\n";
+        let out = sync_for_plan(
+            raw_path,
+            &parsed(vec![posts(Backend::Postgres)]),
+            &plan(vec![]),
+        );
+        assert_eq!(out.text, POSTS_BLOCK);
+
+        let bracket = "diesel::table![\n    posts (id) {\n        id -> Int8,\n    }\n];\n";
+        let out = sync_for_plan(
+            bracket,
+            &parsed(vec![posts(Backend::Postgres)]),
+            &plan(vec![]),
+        );
+        assert_eq!(out.text, POSTS_BLOCK);
+    }
+
+    /// The guard refuses text that does not parse or defines a table twice.
+    #[test]
+    fn validate_refuses_invalid_rust_and_duplicate_tables() {
+        assert!(validate(POSTS_BLOCK).is_ok());
+        let twice = format!("{POSTS_BLOCK}\n{POSTS_BLOCK}");
+        assert!(validate(&twice).unwrap_err().contains("posts"));
+        assert!(validate("diesel::table! {").is_err());
     }
 }

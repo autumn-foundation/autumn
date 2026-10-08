@@ -554,9 +554,10 @@ fn raw_string_end(
     find: &impl Fn(usize, &[u8]) -> Option<usize>,
 ) -> Option<usize> {
     let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
-    // `r"..."` or the raw byte string `br"..."`.
-    let starts_word =
-        i == 0 || !ident(b[i - 1]) || (b[i - 1] == b'b' && (i == 1 || !ident(b[i - 2])));
+    // `r"..."`, the raw byte string `br"..."` or the raw C string `cr"..."`.
+    let starts_word = i == 0
+        || !ident(b[i - 1])
+        || (matches!(b[i - 1], b'b' | b'c') && (i == 1 || !ident(b[i - 2])));
     if b[i] != b'r' || !starts_word {
         return None;
     }
@@ -586,6 +587,11 @@ pub fn macro_path_start(text: &str, at: usize) -> usize {
     while let Some(rest) = text[..start].trim_end().strip_suffix("::") {
         let segment = rest.trim_end();
         let word = segment.trim_end_matches(|c: char| c.is_alphanumeric() || c == '_');
+        // A raw identifier segment: `r#type::`.
+        let word = word
+            .strip_suffix("r#")
+            .filter(|w| !ends_in_word(w))
+            .unwrap_or(word);
         if word.len() == segment.len() {
             // A leading `::` (an absolute path).
             return rest.len();
@@ -636,6 +642,7 @@ fn block_table_name(text: &str, open: usize) -> Option<String> {
 /// qualifier so a replacement isn't double-prefixed. `None` if not found.
 pub fn schema_block_range(existing: &str, table: &str) -> Option<(usize, usize)> {
     let unraw = |name: &str| name.strip_prefix("r#").unwrap_or(name).to_owned();
+    let bytes = existing.as_bytes();
     let want = unraw(table);
     let mut search_from = 0;
     while let Some(macro_rel) = existing[search_from..].find("table!") {
@@ -648,18 +655,23 @@ pub fn schema_block_range(existing: &str, table: &str) -> Option<(usize, usize)>
             continue;
         }
         let macro_start = macro_path_start(existing, name_start);
-        // The opening brace of this call, then its match. Braces in comments
-        // and literals (doc comments, `#[sql_name = "..."]`) do not count.
+        // The delimiter of this call (`{`, `(` or `[`), then its match.
+        // Delimiters in comments and literals (doc comments,
+        // `#[sql_name = "..."]`) do not count.
         let mut open = None;
         let mut end = None;
         let mut depth = 0usize;
         scan_code(existing, search_from, |i, c| {
+            if open.is_none() && !matches!(c, b'{' | b'(' | b'[') {
+                // Not a macro call: stop unless this is white space.
+                return !c.is_ascii_whitespace();
+            }
             match c {
-                b'{' => {
+                b'{' | b'(' | b'[' => {
                     open.get_or_insert(i);
                     depth += 1;
                 }
-                b'}' if depth > 0 => {
+                b'}' | b')' | b']' => {
                     depth -= 1;
                     if depth == 0 {
                         end = Some(i + 1);
@@ -670,9 +682,13 @@ pub fn schema_block_range(existing: &str, table: &str) -> Option<(usize, usize)>
             }
             false
         });
-        let (Some(open), Some(end)) = (open, end) else {
+        let (Some(open), Some(mut end)) = (open, end) else {
             break;
         };
+        // A `(...)` or `[...]` call ends with `;`: it is part of the call.
+        if bytes[open] != b'{' && bytes.get(end) == Some(&b';') {
+            end += 1;
+        }
         // Does this macro define the table we're looking for? The name may sit
         // on its own line, before the key (`posts\n(id) {`).
         if block_table_name(existing, open).is_some_and(|name| unraw(&name) == want) {

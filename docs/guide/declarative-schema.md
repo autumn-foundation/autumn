@@ -195,6 +195,10 @@ The command does not write a block in these conditions. It shows a warning:
 - The command cannot read the block (for example a header with no key,
   `posts {`). Edit that block by hand.
 
+Before it writes, the command parses the new `src/schema.rs`. If the result is
+not valid Rust, or declares a table twice, the command does not change the
+file and shows a warning. Edit the file by hand.
+
 Without `src/schema.rs`, the command does not make one. If `src/schema.rs`
 exists but the command cannot read it, the command stops before it writes
 anything. If the command cannot write `src/schema.rs`, it removes the new migration and restores the

@@ -985,7 +985,18 @@ fn plan_schema_rs(
             schema_rs::SCHEMA_RS_PATH
         );
     }
-    Ok((sync.text != existing).then_some((path, sync)))
+    if sync.text == existing {
+        return Ok(None);
+    }
+    // The sync edits text. Never write a file that does not parse.
+    if let Err(reason) = schema_rs::validate(&sync.text) {
+        eprintln!(
+            "warning: did not update {}: {reason}; edit it by hand",
+            schema_rs::SCHEMA_RS_PATH
+        );
+        return Ok(None);
+    }
+    Ok(Some((path, sync)))
 }
 
 /// Write the `src/schema.rs` sync from [`plan_schema_rs`], if any.
@@ -2220,6 +2231,27 @@ mod tests {
         assert!(err.contains("schema.rs"), "{err}");
         assert!(!root.path().join("migrations").exists());
         assert_eq!(std::fs::read_to_string(&snapshot_path).unwrap(), before);
+    }
+
+    /// A `src/schema.rs` the sync cannot edit into valid Rust is left as is;
+    /// the migration and the snapshot still advance.
+    #[test]
+    fn an_update_that_would_not_parse_is_not_written() {
+        let models = r#"
+            #[autumn_web::model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                pub title: String,
+                pub body: Option<String>,
+            }
+        "#;
+        let root = scaffold_project(models, &posts_snapshot("Postgres"));
+        let broken = "diesel::table! {\n    posts (id) {\n        id -> Int8,\n";
+        let path = write_schema_rs(root.path(), broken);
+        diff_at(root.path(), &write_args()).expect("write ok");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), broken);
+        assert!(root.path().join("migrations").exists());
     }
 
     /// A failed `schema.rs` write leaves the migration and the snapshot as
