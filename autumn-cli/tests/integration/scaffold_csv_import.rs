@@ -845,6 +845,7 @@ fn a_bytea_column_round_trips_as_hex() {
     let schema = routes
         .split("impl autumn_web::data::csv::CsvSchema for Post")
         .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
         .expect("the export must emit a CsvSchema impl");
     assert!(
         schema.contains("bytea_to_hex"),
