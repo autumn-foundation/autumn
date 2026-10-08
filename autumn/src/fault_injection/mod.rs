@@ -441,8 +441,11 @@ struct RouteFault {
 }
 
 impl RequestScope {
+    /// `true` while the arm that started this request is current. A request
+    /// of an earlier arm fires no more faults: its result does not count.
     fn armed(&self) -> bool {
         self.injector.armed.load(Ordering::Acquire)
+            && self.injector.generation.load(Ordering::Acquire) == self.generation
     }
 
     fn mark_fired(&self) {
@@ -717,6 +720,10 @@ mod tests {
         assert!(
             !injector.record(old.generation, true),
             "the old request does not trip"
+        );
+        assert!(
+            old.roll(FaultTarget::Route).error.is_none(),
+            "the old request fires no more faults"
         );
         assert_eq!(handle.snapshot().window_requests, 0);
         assert!(handle.is_armed());

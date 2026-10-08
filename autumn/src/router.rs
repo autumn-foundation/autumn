@@ -4096,6 +4096,34 @@ fn finish_load_shed_layer(
 /// The clock and entropy source are taken from the app state rather than read
 /// ambiently, so a [`#[sim_test]`](crate::sim_test) controls both the sampling
 /// decision and the recorded timestamps.
+/// Paths that fault injection never faults: the probes and the actuator.
+fn fault_injection_exempt_paths(config: &AutumnConfig) -> Vec<String> {
+    let mut paths = probe_bypass_paths(config);
+    paths.extend(crate::actuator::actuator_endpoint_paths(
+        &config.actuator.prefix,
+        config.actuator.sensitive,
+        config.actuator.prometheus,
+    ));
+    paths
+}
+
+/// Install both fault injection layers outside the static-first middleware
+/// (the SSG/ISG path). The scope layer is outer to the route layer.
+fn install_outer_fault_injection(
+    router: axum::Router<AppState>,
+    config: &AutumnConfig,
+    state: &AppState,
+) -> axum::Router<AppState> {
+    let Some((scope, route, handle)) =
+        crate::fault_injection::build(config, state, fault_injection_exempt_paths(config))
+    else {
+        return router;
+    };
+    crate::fault_injection::announce(&handle);
+    state.insert_extension(handle);
+    router.layer((scope, route))
+}
+
 fn build_shadow_layer(
     config: &AutumnConfig,
     state: &AppState,
@@ -5131,15 +5159,11 @@ fn apply_middleware(
     // shedding, and the timeout, the access log and error reporting see an
     // injected fault as a real one. Probe and actuator paths are exempt, as
     // for `[shadow]`. `build` has no side effects.
-    let fault_injection = {
-        let mut exempt_paths = probe_bypass_paths(config);
-        exempt_paths.extend(crate::actuator::actuator_endpoint_paths(
-            &config.actuator.prefix,
-            config.actuator.sensitive,
-            config.actuator.prometheus,
-        ));
-        crate::fault_injection::build(config, state, exempt_paths)
-    };
+    // On the SSG/ISG path (`defer_shadow`), the layers go outside the
+    // static-first middleware instead; see `install_outer_fault_injection`.
+    let fault_injection = (!defer_shadow)
+        .then(|| crate::fault_injection::build(config, state, fault_injection_exempt_paths(config)))
+        .flatten();
     let (fault_scope_layer, fault_route_layer, fault_handle) = match fault_injection {
         Some((scope, route, handle)) => (Some(scope), Some(route), Some(handle)),
         None => (None, None, None),
@@ -6240,6 +6264,11 @@ pub fn try_build_router_with_static_inner(
     if let Some(shadow) = build_shadow_layer(config, &state) {
         router = router.layer(shadow);
     }
+
+    // Fault injection (#3071), for the same reason as shadow mirroring: a
+    // pre-rendered page never reaches the inner router, so the layers go
+    // here. `apply_middleware` skipped them on this path.
+    router = install_outer_fault_injection(router, config, &state);
 
     // Compression is applied outside the static-first middleware too, so
     // pre-rendered HTML that `StaticFileLayer` serves without reaching
@@ -14512,6 +14541,46 @@ mod trusted_host_tests {
             #[cfg(feature = "mcp")]
             mcp: None,
         }
+    }
+
+    /// #3071: on the SSG/ISG path the fault layers go outside the static
+    /// cache, so a route fault reaches a cached page, and only once.
+    #[tokio::test]
+    async fn route_fault_reaches_a_cached_static_page() {
+        let (_tmp, dist) = build_cached_dist("<h1>cached</h1>");
+        let mut config = AutumnConfig::default();
+        config.profile = Some("staging".to_owned());
+        config.fault_injection.enabled = true;
+        config.fault_injection.faults = vec![crate::fault_injection::FaultRule::new(
+            crate::fault_injection::FaultTarget::Route,
+            crate::fault_injection::FaultKind::Error,
+            1.0,
+        )];
+        let state = crate::state::AppState::for_test();
+        let app = super::try_build_router_with_static_inner(
+            Vec::new(),
+            &config,
+            state.clone(),
+            Some(dist.as_path()),
+            ctx_with_static_gate(redirect_gate_registration()),
+        )
+        .expect("router builds");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("x-authed", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let faults = state
+            .extension::<crate::fault_injection::FaultInjection>()
+            .expect("the handle is installed");
+        assert_eq!(faults.snapshot().injected, 1, "one fault, not two");
     }
 
     #[tokio::test]

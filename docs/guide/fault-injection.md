@@ -61,6 +61,10 @@ To arm the faults for one deployment, set
 | `redis` | Each Redis session store operation (load, save, destroy). |
 | `http` | Each call through `http_client::Client`. An error is `ClientError::FaultInjected`. |
 
+In an app with pre-rendered (SSG/ISG) pages, both fault layers go outside the
+static cache, so a cached page can get a route fault too. There, a route fault
+occurs before rate limiting and load shedding.
+
 A dependency fault applies only in a request that matches `routes`. Work that
 runs outside a request (jobs, the scheduler, spawned tasks) gets no faults.
 
