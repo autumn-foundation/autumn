@@ -255,6 +255,8 @@ enum TableEvent {
     /// `ALTER TABLE old RENAME TO new`: the record moves with the table, so a
     /// rename INTO `comments` carries the source table's columns across.
     Rename { from: TableRef, to: TableRef },
+    /// `ALTER TABLE name SET SCHEMA other`: same name, new schema.
+    Move { from: TableRef, to: TableRef },
 }
 
 /// Replay every migration's `up.sql` in version order: for every table, does it
@@ -294,6 +296,10 @@ fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
             // A table rename moves the whole record; it mentions no column.
             if let Some(to) = table_rename_target(statement) {
                 events.push((at, TableEvent::Rename { from: table, to }));
+                continue;
+            }
+            if let Some(to) = table_set_schema_target(statement, &table) {
+                events.push((at, TableEvent::Move { from: table, to }));
                 continue;
             }
             // An ALTER naming the column may be adding it, dropping it, or
@@ -357,6 +363,11 @@ fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
                         schema: to.schema.or_else(|| from.schema.clone()),
                         name: to.name,
                     };
+                    let mut state = tables.remove(&from).unwrap_or_default();
+                    state.exists = true;
+                    tables.insert(to, state);
+                }
+                TableEvent::Move { from, to } => {
                     let mut state = tables.remove(&from).unwrap_or_default();
                     state.exists = true;
                     tables.insert(to, state);
@@ -615,6 +626,17 @@ fn table_rename_target(statement: &str) -> Option<TableRef> {
         return None;
     }
     parse_table_ref(&statement[at + " rename to ".len()..]).map(|(table, _)| table)
+}
+
+/// The new home of `table` after `ALTER TABLE … SET SCHEMA <schema>`, if
+/// `statement` (the text after the table name) is one.
+fn table_set_schema_target(statement: &str, table: &TableRef) -> Option<TableRef> {
+    let at = statement.find(" set schema ")?;
+    let (schema, _) = parse_ident_segment(&statement[at + " set schema ".len()..])?;
+    Some(TableRef {
+        schema: Some(schema).filter(|schema| schema != "public"),
+        name: table.name.clone(),
+    })
 }
 
 /// Whether `haystack` mentions `column` as a complete SQL identifier.
@@ -2038,6 +2060,38 @@ mod tests {
         assert!(
             ensure_no_comments_conflict(tmp.path()).is_err(),
             "the name is taken, so generation refuses"
+        );
+    }
+
+    /// `SET SCHEMA` moves the table out of the default schema, which frees the
+    /// name. Moving it back takes the name again.
+    #[test]
+    fn set_schema_moves_the_table_out_of_and_back_into_the_default_schema() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let migrations = tmp.path().join("migrations");
+        let first = migrations.join("0001_create");
+        std::fs::create_dir_all(&first).expect("mkdir");
+        std::fs::write(
+            first.join("up.sql"),
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT);\n\
+             ALTER TABLE comments SET SCHEMA archive;\n",
+        )
+        .expect("write");
+        assert!(
+            ensure_no_comments_conflict(tmp.path()).is_ok(),
+            "the table now lives in `archive`, so the default name is free"
+        );
+
+        let back = migrations.join("0002_back");
+        std::fs::create_dir_all(&back).expect("mkdir");
+        std::fs::write(
+            back.join("up.sql"),
+            "ALTER TABLE archive.comments SET SCHEMA public;\n",
+        )
+        .expect("write");
+        assert!(
+            ensure_no_comments_conflict(tmp.path()).is_err(),
+            "the plain table is back in the default schema"
         );
     }
 
