@@ -53,6 +53,9 @@ pub struct SchemaRsCheck {
     pub stale: Vec<String>,
     /// Managed tables that the check cannot compare, with the reason.
     pub unchecked: Vec<(String, String)>,
+    /// True when a `joinable!` or allow list needs a change, also with no
+    /// stale block.
+    pub stale_macros: bool,
 }
 
 /// Render the `diesel::table!` block for `table`.
@@ -96,6 +99,7 @@ pub fn sync_for_plan(existing: &str, desired: &ParsedSchema, plan: &MigrationPla
 pub fn check_tables(existing: &str, desired: &ParsedSchema) -> SchemaRsCheck {
     let sync = sync(existing, desired, &PlanEdits::default());
     SchemaRsCheck {
+        stale_macros: sync.written.is_empty() && sync.text != existing,
         stale: sync.written,
         unchecked: sync.skipped,
     }
@@ -349,8 +353,10 @@ impl Shape {
 /// Read the shape of one `diesel::table!` block. `None` when the block has no
 /// `name (key) {` header.
 fn block_shape(block: &str) -> Option<Shape> {
+    // Read code only: a comment with `->` is not a column.
+    let code = strip_comments(block);
     let mut has_attrs = false;
-    let mut lines = block.lines().skip(1).map(str::trim);
+    let mut lines = code.lines().skip(1).map(str::trim);
     let header = lines.find(|line| {
         has_attrs |= line.starts_with("#[");
         line.contains(" (") && line.ends_with('{')
@@ -1399,5 +1405,29 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
             out.text,
             "diesel::table! {\n    users (id) {\n        id -> Int8,\n    }\n}\n"
         );
+    }
+
+    /// A comment with `->` in a block is not a column.
+    #[test]
+    fn a_comment_with_an_arrow_is_not_a_column() {
+        let existing = "diesel::table! {\n    posts (id) {\n        /// state -> meaning\n        id -> Int8,\n        title -> Text, // title -> heading\n        body -> Nullable<Text>,\n        /* a -> b */\n        created_at -> Timestamp,\n    }\n}\n";
+        let out = sync_for_plan(
+            existing,
+            &parsed(vec![posts(Backend::Postgres)]),
+            &plan(vec![]),
+        );
+        assert_eq!(out.text, existing);
+    }
+
+    /// A stale `joinable!` alone makes the check report stale macros.
+    #[test]
+    fn check_tables_reports_a_stale_joinable() {
+        let existing = format!(
+            "{}\ndiesel::joinable!(comments -> posts (post_id));\n",
+            comments_block("author_id")
+        );
+        let check = check_tables(&existing, &parsed(vec![comments("author_id")]));
+        assert!(check.stale.is_empty());
+        assert!(check.stale_macros);
     }
 }

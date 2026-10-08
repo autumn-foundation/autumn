@@ -449,7 +449,8 @@ checks are:
 - **snapshot-present** — `.autumn/schema-snapshot.json` exists and is readable.
 - **snapshot-drift** — the declared models match the snapshot baseline.
 - **schema-rs-drift** — each managed model has a matching block in
-  `src/schema.rs`. A missing or stale block is a **WARN**. To fix it, run
+  `src/schema.rs`. A missing or stale block is a **WARN**, and so is a
+  `joinable!` that names a column the managed table does not have. To fix it, run
   `autumn schema diff --write-migration`. A table that the row cannot compare
   (for example a model with an enum field) is also a **WARN**, and the row
   names it. Without a managed

@@ -697,32 +697,31 @@ fn drift_check(snapshot: &SnapshotState) -> Check {
 fn schema_rs_check(state: &SchemaRsState) -> Check {
     let (status, detail) = match state {
         SchemaRsState::Checked(check) => {
-            let unchecked: Vec<String> = check
-                .unchecked
-                .iter()
-                .map(|(table, reason)| format!("{table} ({reason})"))
-                .collect();
-            let note = if unchecked.is_empty() {
-                String::new()
-            } else {
-                format!("; not checked: {}", unchecked.join(", "))
-            };
-            if check.stale.is_empty() && check.unchecked.is_empty() {
+            let mut parts = Vec::new();
+            if !check.stale.is_empty() {
+                parts.push(format!(
+                    "missing or stale block for {}",
+                    check.stale.join(", ")
+                ));
+            }
+            if check.stale_macros {
+                parts.push("a stale `joinable!` or table list".to_owned());
+            }
+            if !parts.is_empty() {
+                parts.push("run `autumn schema diff --write-migration`".to_owned());
+            }
+            if !check.unchecked.is_empty() {
+                let unchecked: Vec<String> = check
+                    .unchecked
+                    .iter()
+                    .map(|(table, reason)| format!("{table} ({reason})"))
+                    .collect();
+                parts.push(format!("not checked: {}", unchecked.join(", ")));
+            }
+            if parts.is_empty() {
                 (Status::Ok, "the managed blocks match".to_owned())
-            } else if check.stale.is_empty() {
-                (
-                    Status::Warn,
-                    format!("the other managed blocks match{note}"),
-                )
             } else {
-                (
-                    Status::Warn,
-                    format!(
-                        "missing or stale block for {} — run `autumn schema diff \
-                         --write-migration`{note}",
-                        check.stale.join(", ")
-                    ),
-                )
+                (Status::Warn, parts.join("; "))
             }
         }
         SchemaRsState::NoManaged => (
@@ -1725,6 +1724,7 @@ mod tests {
         let check = SchemaRsCheck {
             stale: Vec::new(),
             unchecked: vec![("posts".to_owned(), "enum field".to_owned())],
+            stale_macros: false,
         };
         let row = schema_rs_check(&SchemaRsState::Checked(check));
         assert_eq!(row.status, Status::Warn, "{row:?}");
@@ -1804,5 +1804,17 @@ mod tests {
             row.detail.contains("could not read src/schema.rs"),
             "{row:?}"
         );
+    }
+
+    /// A stale `joinable!` alone is a WARN.
+    #[test]
+    fn schema_rs_drift_warns_on_stale_macros_alone() {
+        let check = SchemaRsCheck {
+            stale_macros: true,
+            ..SchemaRsCheck::default()
+        };
+        let row = schema_rs_check(&SchemaRsState::Checked(check));
+        assert_eq!(row.status, Status::Warn, "{row:?}");
+        assert!(row.detail.contains("joinable!"), "{row:?}");
     }
 }
