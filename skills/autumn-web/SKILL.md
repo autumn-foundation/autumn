@@ -129,6 +129,7 @@ the framework almost certainly already generates or ships it:
 | Triaging the same production bug twice because the first fix had no test pinning it | `autumn capsule test <capsule>` converts a capsule into a committed regression test: it copies the capsule's bytes **verbatim** into `tests/capsules/` (so whatever redaction removed stays removed), generates a `#[tokio::test]` beside it, registers both in `tests/integration/mod.rs`, and scaffolds a `capsule_support::router` hook once. The test drives the same replay engine `autumn replay` does and runs under plain `cargo test` with **zero live dependencies** — no network, DB, queue or Docker. `autumn capsule verify` replays the whole committed corpus, which doubles as an upgrade gate: run it against a new Autumn before deploying that version. Job capsules are refused here (no request to drive) — replay those with `autumn replay`. See `docs/guide/failure-capsules.md` (0.8.0, #1634) |
 | Proving a retry path survives "the 3rd DB checkout fails" or "the 2nd `send_invoice` execution fails" with a real-clock test that can only hope for the timing, or with `Chaos` rates that never reproduce the exact failure | `autumn_web::sim::FaultPlan` — an **authored**, seed-deterministic fault scenario attached with `TestApp::with_fault_plan(plan)`: `FaultPlan::from_seed(seed).fail_db_checkout(3).fail_job("send_invoice", 2)` fails exactly those effects through the existing interceptor seams (no app code changes), `only_between(from, to)` gates faults on the injected clock, `random_*_faults(n, 1..=k)` picks ordinals from the seed. `client.fault_outcome().await` returns a serializable `FaultOutcome` (`fired` / `suppressed` / `unfired` / `server_errors` via reporting / `final_state`); `to_json_string()` is byte-identical on every replay of a seed under `#[sim_test]`. Drain jobs with `Sim::run_to_idle` (not `perform_enqueued_jobs`, which bypasses `intercept_execute`). See `docs/guide/simulation-testing.md` → "Authored fault scenarios" (#1680) |
 | A `#[sim_test]` that calls a real downstream service, hopes for a timing race, or reads `Utc::now()` / `Instant::now()` in code with no clock in scope | `Sim::net(SimNet::new().host("payments", router).latency(..).drop_rate(..))` serves outbound `http_client` calls in-process with seeded latency, drops and `partition`/`heal`; `Sim::interleave` / `Sim::spawn` reorder ready work from the seed; `sim::crash_at(i, op)` drops an op at any await; `time::ambient_now()` / `ambient_instant()` follow the running `Sim`. See `docs/guide/simulation-testing.md` (#2967) |
+| Testing job, scheduler or lock coordination with one app, or with two real processes and sleeps | `Sim::mount_replica("a", app)` / `mount_replica("b", app)` on one sim clock and one `SqliteSubstrate`; per-replica clocks (`Replica::named("b").clock_ahead(d)`, `Sim::step_replica_clock`), per-replica DB faults (`Sim::db_link(name)`: `lose_session`, `mid_query_errors`, `commit_ambiguity`), `kill_replica` / `restart_replica`, and `Sim::run_for(d)` to move time. See `docs/guide/simulation-testing.md` → "Multiple replicas" (#3067) |
 | Hand-assembled `Cache-Control` header strings on a handler | `etag::cache_for(Duration)` → `CacheControl`; attach as a tuple `(cache_for(dur).public(), html!{…})` or `.wrap(resp)`. Chain `public`/`private`, `max_age`, `s_maxage`, `stale_while_revalidate`, `no_store`, `no_cache`, `must_revalidate`, `immutable`; `header_value()` renders a deterministic value. Defaults to `private` (a secured page can't be silently made public); composes with `fresh_when` — the directives ride the `200` and the preserved `304` (0.6.0, issue #1344). See `docs/guide/conditional-get.md` |
 
 When none of these fit, dropping to raw Axum (`.merge()`/`.nest()`/`.layer()`)
@@ -197,8 +198,13 @@ my-app/
 > and the snapshot. To rename, put `#[renamed_from("old_name")]` on the field,
 > or on the model after `#[model]`. The diff then emits `ALTER TABLE ...
 > RENAME`, not a drop plus an add. To diff against what the migrations really
-> make, pass `--dev-url <dev server URL>` (or set `AUTUMN_DEV_URL`). See
-> `docs/guide/declarative-schema.md`.
+> make, pass `--dev-url <dev server URL>` (or set `AUTUMN_DEV_URL`).
+> `--write-migration` also writes the model's `diesel::table!` block in
+> `src/schema.rs`: do not edit a managed block by hand. To adopt a model, add
+> `managed`, then run `autumn schema diff --write-migration`.
+> `autumn schema doctor` reports a stale `src/schema.rs` block
+> (`schema-rs-drift`) and an unmanaged model that differs from its table
+> (`unmanaged-drift`). See `docs/guide/declarative-schema.md`.
 
 ## Cargo.toml
 
@@ -759,7 +765,10 @@ depth 0), `max_body = 10000` bytes; `author_name` is unset by default (the
 framework will not guess a column, and a scaffolded `User` carries an `email`).
 Renaming the struct changes `type_name` and orphans existing rows — pin it
 first. `autumn generate scaffold post title:string comments:commentable`
-emits the table (once per project), the column, and the attribute.
+emits the table (once per project), the column, and the attribute. If the
+project already has a plain `comments` table (for example, a scaffolded
+`Comment` resource), the command stops and writes no file. Rename that table
+or add every missing shared-table column, then run it again.
 
 The model emits a `{Model}Comments` trait blanket-implemented for that model's
 repository — import it as `_`:
@@ -1044,6 +1053,9 @@ appends a revision automatically.
 
 What to know when writing app code against it:
 
+- **Raw-SQL framework paths are refused.** A counter cache on a ledgered
+  parent, and `dependent(.., on_delete = delete_all | nullify)` into a ledgered
+  child, fail with `LedgerError::OutOfBandWrite`. Use `on_delete = destroy`.
 - **`soft_delete` is mandatory** and `purge` does not exist. `delete_by_id`
   records a delete revision; `restore` records the undelete. Both keep the
   ledger and the table in agreement.
@@ -2751,6 +2763,39 @@ declares. Every contract failure — missing file, malformed document, a contrac
 measured on a different host class — falls back to *unlimited*, never to a
 ceiling. See `docs/guide/capacity-contracts.md`.
 
+## Connection limits, WebSocket limits, replica lag (issue #3065)
+
+Bound slow, idle and excess connections. Every key is optional; the `prod`
+profile sets all `[server.http]` keys and the `[realtime]` size/ping/idle keys:
+
+```toml
+[server.http]
+header_read_timeout_ms = 10_000   # slowloris: full head in time, or disconnect
+keep_alive_timeout_ms = 75_000    # close a connection with no request in flight
+max_header_bytes = 65_536         # HTTP/1 head over the limit gets 431
+http2_max_concurrent_streams = 100
+max_connections = 10_000          # per listener; accept waits at the cap
+
+[realtime]                        # every #[ws] route
+max_connections = 5_000           # 503 + Retry-After above the cap
+max_message_bytes = 1_048_576     # close code 1009
+ping_interval_ms = 30_000         # pongs are hidden from the handler
+idle_timeout_ms = 120_000         # close code 1001
+
+[database]
+replica_max_lag_ms = 5_000        # reads use the primary while lag is over/unknown
+warn_on_pooler = true             # boot warning for PgBouncer / RDS Proxy URLs
+```
+
+`autumn_web::ws::WebSocket` / `WebSocketUpgrade` are Autumn wrappers (same
+`recv` / `send` / `Stream` / `Sink`); `into_parts()` gives the axum type
+(without limits) and a `ConnectionHold` to keep for the socket's life. Lag
+alone never fails readiness. See
+`docs/guide/connection-limits.md`, `docs/guide/websockets.md` (Limits),
+`docs/guide/cloud-native.md` (Lag-aware reads) and
+`docs/guide/connection-poolers.md` (what breaks behind a transaction-mode
+pooler).
+
 ## Resilience: outbound circuit breakers
 
 The HTTP client (per host), durable job enqueue (`job_queue`) and the SMTP
@@ -2924,6 +2969,41 @@ autumn canary promote   # clear the rollback flag after traffic is moved
 The rollback flag file lives at `tmp/autumn-canary-rollback.json`. A controller
 that cannot exec into the replica can write it directly. The flag is sticky
 across restarts — clear it with `autumn canary promote` once traffic has moved.
+
+## SLOs, deploy bake and Kubernetes (issue #3069)
+
+Declare SLOs in `autumn.toml`. The app does not read them at run time.
+
+```toml
+[[slo]]
+name = "availability"     # lowercase letters, digits, '-'
+objective = 99.9          # percent, at most 4 decimals
+sli = "availability"      # or "latency" (needs threshold_ms, a bucket bound)
+# route = "/api/orders/{id}"
+```
+
+```bash
+autumn slo generate --selector 'job="shop"'   # writes deploy/slo/ (6 files)
+autumn slo generate --check                   # CI: fail on drift
+```
+
+The files are Prometheus burn-rate rules and alerts (14.4x over 1h/5m, 6x over
+6h/30m, 1x over 3d/6h), a `PrometheusRule`, a Grafana dashboard, an Argo
+Rollouts `AnalysisTemplate`, Flagger `MetricTemplate`s and Helm values. Route
+and latency SLOs read the request-duration histogram (issue #3064).
+
+Bake each host after its cutover; roll it back on a 5xx or latency breach or a
+restart (off by default):
+
+```toml
+[deploy.bake]
+duration_secs = 300   # or: autumn deploy up --bake-secs 300
+```
+
+Kubernetes: `autumn release init --target kubernetes` writes a Helm chart
+(`deploy/helm/`, set `trustedHosts`) and a Kustomize base with probes, a
+`preStop` hook, a safe grace period, a PDB, and opt-in Argo Rollouts or Flagger
+canaries. See `docs/guide/slo.md` and `docs/guide/kubernetes.md`.
 
 ## Shadow (differential) deploys
 

@@ -79,9 +79,14 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Where the app's committed posture baseline lives. Change it here and in the
-  # `autumn routes audit --manifest` step together.
+  # Where the app's committed posture baseline lives.
   POSTURE_MANIFEST: security-posture.json
+  # The build to audit: the build your image ships (issue #2472). A route
+  # behind `#[cfg(not(debug_assertions))]` or a feature is only in the
+  # manifest when the audit builds it. The scaffolded Dockerfile builds
+  # `--release`. If you deploy with `autumn build --embed`, add
+  # `--features embed-assets`. Then regenerate the baseline with these flags.
+  POSTURE_AUDIT_FLAGS: --release
 
 jobs:
   # ── Untrusted half: compiles the pull request ───────────────────────────────
@@ -118,7 +123,9 @@ jobs:
       - name: Build this commit's posture manifest
         run: |
           set -euo pipefail
-          autumn routes audit --manifest "$POSTURE_MANIFEST"
+          # Unquoted on purpose: the flags split into separate arguments.
+          # shellcheck disable=SC2086
+          autumn routes audit $POSTURE_AUDIT_FLAGS --manifest "$POSTURE_MANIFEST"
           # Hand it over under a fixed, flat name, in the runner's scratch
           # directory rather than the checkout. `upload-artifact` makes the
           # common ancestor of its search path the artifact root, so uploading
@@ -273,7 +280,7 @@ jobs:
             # generate the manifest, so this is exactly the state a project
             # lands in by scaffolding the workflow and going no further.
             if git cat-file -e "origin/${BASE_REF}:.github/workflows/posture-gate.yml" 2>/dev/null; then
-              echo "::error file=$POSTURE_MANIFEST::the posture gate is already on ${BASE_REF}, but no baseline manifest is committed — so every pull request bootstraps and nothing is being gated. Run \`autumn routes audit --manifest $POSTURE_MANIFEST\` and commit the result."
+              echo "::error file=$POSTURE_MANIFEST::the posture gate is already on ${BASE_REF}, but no baseline manifest is committed — so every pull request bootstraps and nothing is being gated. Run \`autumn routes audit $POSTURE_AUDIT_FLAGS --manifest $POSTURE_MANIFEST\` and commit the result."
               exit 1
             fi
             echo "::notice::no posture baseline is committed yet — commit $POSTURE_MANIFEST so the next pull request can be diffed against it"
@@ -283,7 +290,7 @@ jobs:
           FRESH=$(autumn routes posture digest --manifest "$RUNNER_TEMP/head-posture/posture-manifest.json")
           COMMITTED=$(autumn routes posture digest --manifest "$RUNNER_TEMP/committed-posture.json")
           if [ "$FRESH" != "$COMMITTED" ]; then
-            echo "::error file=$POSTURE_MANIFEST::the committed posture manifest describes a different security posture than this commit builds ($COMMITTED vs $FRESH) — run \`autumn routes audit --manifest $POSTURE_MANIFEST\` and commit the result"
+            echo "::error file=$POSTURE_MANIFEST::the committed posture manifest describes a different security posture than this commit builds ($COMMITTED vs $FRESH) — run \`autumn routes audit $POSTURE_AUDIT_FLAGS --manifest $POSTURE_MANIFEST\` and commit the result"
             exit 1
           fi
         env:
@@ -326,20 +333,23 @@ jobs:
       # `author_association`, which reports organization affiliation and would
       # let any org member with read access acknowledge a widening.
       #
-      # Bodies are separated by a marker so one comment's unbalanced code fence
-      # cannot swallow — or resurrect — a marker in another. Comments from the
-      # bot are skipped: its own report contains the marker it is asking for.
+      # Each body goes to its own file, and the diff parses each file alone.
+      # Thus an open code fence in one comment cannot hide or show a marker in
+      # another. Comment text cannot fake a comment boundary (issue #2472).
+      # Comments from the bot are skipped: its own report contains the marker.
       #
-      # A GitHub API hiccup must not fail the job: an empty acks.txt means
-      # "nothing acknowledged", which is the safe direction.
+      # A GitHub API error must not fail the job. An empty acks directory
+      # means "nothing acknowledged". That is the safe result.
       - name: Harvest acknowledgments from authorized reviewers
         run: |
           set -uo pipefail
-          : > "$RUNNER_TEMP/acks.txt"
+          rm -rf "$RUNNER_TEMP/acks"
+          mkdir -p "$RUNNER_TEMP/acks"
           authors_and_bodies() {
             gh api --paginate "repos/${GITHUB_REPOSITORY}/$1" \
               --jq '.[] | select((.user.login // "") != "github-actions[bot]") | "\(.user.login // "")\t\((.body // "") | @base64)"' || true
           }
+          n=0
           {
             authors_and_bodies "issues/${PR_NUMBER}/comments"
             authors_and_bodies "pulls/${PR_NUMBER}/reviews"
@@ -351,16 +361,9 @@ jobs:
               admin|write|maintain) ;;
               *) continue ;;
             esac
-            printf '%s\n' '<!-- autumn:ack-source -->' >> "$RUNNER_TEMP/acks.txt"
-            # Neutralize any separator the body itself contains: it is the one
-            # line the parser trusts, so a reviewer pasting it inside a fenced
-            # sample could otherwise reset the parser mid-body and make the
-            # marker after it live. Rewritten rather than dropped, so a comment
-            # that legitimately quotes it still reads correctly.
+            n=$((n + 1))
             printf '%s\n' "$body64" | base64 -d \
-              | sed 's|<!-- autumn:ack-source -->|<!-- autumn:ack-source (quoted) -->|g' \
-              >> "$RUNNER_TEMP/acks.txt"
-            printf '\n' >> "$RUNNER_TEMP/acks.txt"
+              > "$RUNNER_TEMP/acks/$(printf '%06d' "$n").md"
           done
         env:
           GH_TOKEN: ${{ github.token }}
@@ -374,7 +377,7 @@ jobs:
             --base "$RUNNER_TEMP/base-posture.json" \
             --head "$RUNNER_TEMP/head-posture/posture-manifest.json" \
             --allow-missing-base \
-            --ack-file "$RUNNER_TEMP/acks.txt" \
+            --ack-dir "$RUNNER_TEMP/acks" \
             --format markdown \
             --output "$RUNNER_TEMP/posture-diff.md"
           echo "status=$?" >> "$GITHUB_OUTPUT"

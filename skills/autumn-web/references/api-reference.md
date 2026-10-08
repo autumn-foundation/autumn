@@ -1363,6 +1363,26 @@ even inside a `#[sim_test]`. For a deadline whose counterparty is
 | `Sim::try_run_to_idle()` → `Result<(), SimStall>` | `run_to_idle` panics with the seed when the drain never settles (a job that re-enqueues itself); this returns the `SimStall` instead |
 | `http_client::ClientError::SimNetwork` | A sim drop, partition, timeout or unknown host. `ClientError` is `#[non_exhaustive]` |
 
+## Multi-replica simulation (`autumn_web::sim`, #3067)
+
+Two or three apps on one sim clock and one `SQLite` database, for tests of
+jobs, the scheduler and locks across nodes.
+
+| API | Use |
+|---|---|
+| `Sim::mount_replica(name_or_Replica, app)` / `replica(name)` / `try_replica(name)` | Mount named apps next to each other. Each has its own state, job runtime and scheduled tasks |
+| `Sim::kill_replica(name)` / `restart_replica(name, app)` | Stop a replica's tasks as a crash does; mount it again |
+| `Replica::named("b").clock_ahead(d)` / `clock_behind(d)` / `clock_drift_ppm(p)` / `seeded_clock(max, ppm)` | A clock per replica. `Sim::step_replica_clock(name, TimeDelta)` is an NTP step. Keep the skew below `scheduler.lease_ttl_secs` |
+| `Sim::db_link(name)` + `SqliteSubstrate::replica_pool(&link)` | One replica's own pool on the shared database. `link.lose_session()` / `restore_session()`, `mid_query_errors(table, p)`, `commit_ambiguity(table, p)`, `clear_faults()`, `events()` |
+| `Sim::run_for(d)` | Move time one event at a time; time does not move while a query runs. Use it, not `advance`, with replicas |
+| `sim::runtime()` | The runtime `#[sim_test]` uses (one blocking thread, gated DB work), for a sim outside the macro |
+| `sim::trace::capture(fut)` → `(T, Trace)` / `Trace::diff` | Record framework `tracing` events with sim time; run one seed twice and diff. Run trace checks in their own test binary |
+
+Rules for code a sim drives: `biased;` in `tokio::select!`; no database
+`random()`; never drop a `SQLite` query in flight (pin it outside the
+`select!`, spawn it if another branch wins). See
+`docs/guide/simulation-testing.md` → "Multiple replicas".
+
 ## Authored fault scenarios (`autumn_web::sim::FaultPlan`, #1680)
 
 The authored lane beside the probabilistic `sim::Chaos` builder: name the exact
@@ -1747,6 +1767,9 @@ Frequently used env keys:
 | `AUTUMN_DATABASE__PRIMARY_URL` | `database.primary_url` |
 | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` |
 | `AUTUMN_DATABASE__REPLICA_FALLBACK` | `database.replica_fallback` |
+| `AUTUMN_DATABASE__REPLICA_MAX_LAG_MS` | `database.replica_max_lag_ms` |
+| `AUTUMN_SERVER__HTTP__HEADER_READ_TIMEOUT_MS` | `server.http.header_read_timeout_ms` |
+| `AUTUMN_REALTIME__MAX_MESSAGE_BYTES` | `realtime.max_message_bytes` |
 | `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` | `database.auto_migrate_in_production` |
 | `AUTUMN_SESSION__BACKEND` | `session.backend` |
 | `AUTUMN_SESSION__REDIS__URL` | `session.redis.url` |

@@ -215,6 +215,7 @@ pub mod health;
 pub(crate) mod health_cache;
 #[cfg(feature = "db")]
 pub mod hooks;
+pub mod http_server;
 #[cfg(feature = "i18n")]
 pub mod i18n;
 pub mod idempotency;
@@ -738,6 +739,7 @@ pub mod repl;
 pub mod runtime_config;
 #[cfg(feature = "seed")]
 pub mod seed;
+pub mod slo;
 
 // ── #1343 AC4: fake-seeder registration forwarding ──────────────────────────
 //
@@ -976,6 +978,8 @@ pub mod __private {
     pub use crate::db::scoped_immediate_transaction;
     #[cfg(feature = "db")]
     pub use crate::db::scoped_transaction;
+    #[cfg(feature = "db")]
+    pub use crate::ledger::LedgeredTableDescriptor;
     #[cfg(feature = "db")]
     pub use crate::repository::position_advisory_lock;
     #[cfg(all(feature = "db", feature = "ws"))]

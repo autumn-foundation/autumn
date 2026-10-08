@@ -1,7 +1,7 @@
 //! Feature-flag store for reddit-clone.
 //!
-//! Uses InMemoryFlagStore in dev/test and PgFlagStore in production (when a
-//! primary database URL is present). Pre-configured flags:
+//! Uses InMemoryFlagStore in dev/test and PgFlagStore in production (when the
+//! primary database URL is a Postgres target). Pre-configured flags:
 //!
 //! | Flag              | Default          | Purpose                                   |
 //! |-------------------|------------------|-------------------------------------------|
@@ -13,8 +13,8 @@ use autumn_web::feature_flags::{FlagStore, InMemoryFlagStore, pg::PgFlagStore};
 
 /// Build the flag store appropriate for the current environment.
 pub fn build_store(config: &AutumnConfig) -> Box<dyn FlagStore> {
-    if let Some(url) = config.database.effective_primary_url() {
-        let store = PgFlagStore::new(url);
+    // `None` when no primary target is set, or it is not Postgres.
+    if let Some(store) = PgFlagStore::from_database_config(&config.database) {
         // Load the flags first. Before a load, `get` returns an error.
         if let Err(error) = store.refresh() {
             tracing::warn!(%error, "feature flags not loaded; skipping seed");

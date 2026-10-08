@@ -1657,6 +1657,18 @@ impl TestApp {
         self
     }
 
+    /// Trust `host` as a request host, so a sim replica serves calls that
+    /// other replicas send to it by name (issue #3067).
+    #[cfg(feature = "http-client")]
+    pub(crate) fn trust_host(mut self, host: &str) -> Self {
+        self.config
+            .security
+            .trusted_hosts
+            .hosts
+            .push(host.to_owned());
+        self
+    }
+
     /// Override the default test configuration.
     #[must_use]
     pub fn config(mut self, config: AutumnConfig) -> Self {
@@ -2184,6 +2196,8 @@ impl TestApp {
         // Install AutumnConfig so DbState::statement_timeout / slow_query_threshold
         // and HTTP Client resilience can read the test-supplied config.
         state.insert_extension(self.config.clone());
+        // A sim kill stops the app's background tasks through this (#3067).
+        state.insert_extension(crate::sim::AppTasks::default());
 
         #[cfg(feature = "mail")]
         let mail_recorder_for_client = {
@@ -2768,6 +2782,12 @@ impl Drop for TestJobRuntime {
 }
 
 impl TestClient {
+    /// The app router, for a sim replica that serves other replicas (#3067).
+    #[cfg(feature = "http-client")]
+    pub(crate) fn router(&self) -> axum::Router {
+        self.router.clone()
+    }
+
     /// Returns a reference to the [`AppState`] wired into this test app's router.
     #[must_use]
     pub const fn state(&self) -> &AppState {

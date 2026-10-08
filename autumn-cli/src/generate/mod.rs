@@ -70,6 +70,18 @@ pub enum GenerateError {
     #[error("not inside an Autumn project (no Cargo.toml found in current directory)")]
     NotInProject,
 
+    /// The name `comments` is taken, so the shared comments table cannot use it.
+    #[error(
+        "cannot add `comments:commentable`: this project already has a `comments` table \
+         without the polymorphic columns (or the model uses that table name). \
+         The shared comments table needs that name.\n\
+         Do one of these, then run the command again:\n  \
+         - rename or drop the existing table (for example, rename the `Comment` resource);\n  \
+         - add every missing shared-table column to it: id, commentable_type, \
+         commentable_id, parent_id, author_id, body, created_at, deleted_at."
+    )]
+    CommentsTableConflict,
+
     /// Filesystem error during code emission.
     #[error("{0}")]
     Io(#[from] std::io::Error),

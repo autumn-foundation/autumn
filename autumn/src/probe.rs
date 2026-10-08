@@ -143,6 +143,77 @@ struct ReplicaDependency {
     migrations_ready: bool,
     migration_check: Option<ReplicaMigrationCheck>,
     detail: Option<String>,
+    /// `database.replica_max_lag_ms`. `None` turns lag checks off.
+    max_lag: Option<std::time::Duration>,
+    /// The last measured lag. `None` when not measured or unknown.
+    lag: Option<std::time::Duration>,
+    /// When `lag` was measured. The sample ages: a monitor that stops (a hung
+    /// query, a full pool) cannot keep an old "fresh" sample alive.
+    lag_at: Option<tokio::time::Instant>,
+    /// When the measurement behind the current lag state started. Probes
+    /// overlap (the monitor and `/ready`), so a result whose measurement
+    /// started earlier is older, and it is dropped.
+    lag_started: Option<tokio::time::Instant>,
+    /// Why the lag is unknown.
+    lag_detail: Option<String>,
+}
+
+#[cfg(feature = "db")]
+impl ReplicaDependency {
+    /// Connection and migrations pass, or no replica dependency is set up.
+    const fn base_ready(&self) -> bool {
+        !self.configured || (self.connection_ready && self.migrations_ready)
+    }
+
+    /// The age of the lag sample.
+    fn lag_age(&self) -> std::time::Duration {
+        self.lag_at
+            .map_or(std::time::Duration::ZERO, |at| at.elapsed())
+    }
+
+    /// The lag is known, fresh and inside the limit, or no limit is set.
+    fn lag_ok(&self) -> bool {
+        self.max_lag.is_none_or(|max| {
+            self.lag
+                .is_some_and(|lag| lag <= max && self.lag_age() <= sample_max_age(max))
+        })
+    }
+
+    fn lag_problem(&self) -> Option<String> {
+        if self.lag_ok() {
+            return None;
+        }
+        let max = self.max_lag.map_or(0, duration_ms);
+        Some(match (self.lag, &self.lag_detail) {
+            (Some(lag), _) if lag <= self.max_lag.unwrap_or_default() => format!(
+                "replica lag sample is {}ms old; the limit is {}ms",
+                duration_ms(self.lag_age()),
+                duration_ms(sample_max_age(self.max_lag.unwrap_or_default()))
+            ),
+            (Some(lag), _) => format!(
+                "replica lag {}ms exceeds database.replica_max_lag_ms {max}ms",
+                duration_ms(lag)
+            ),
+            (None, Some(detail)) => detail.clone(),
+            (None, None) => "replica lag is not measured yet".to_owned(),
+        })
+    }
+}
+
+/// A lag sample older than this counts as unknown: twice the lag limit, and
+/// at least 1 s. The monitor samples every half limit (250 ms to 5 s), so a
+/// working monitor stays inside it. A stopped monitor (a hung query, a full
+/// pool) does not.
+#[cfg(feature = "db")]
+fn sample_max_age(max_lag: std::time::Duration) -> std::time::Duration {
+    max_lag
+        .saturating_mul(2)
+        .max(std::time::Duration::from_secs(1))
+}
+
+#[cfg(feature = "db")]
+fn duration_ms(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(feature = "db")]
@@ -155,6 +226,11 @@ impl Default for ReplicaDependency {
             migrations_ready: true,
             migration_check: None,
             detail: None,
+            max_lag: None,
+            lag: None,
+            lag_at: None,
+            lag_started: None,
+            lag_detail: None,
         }
     }
 }
@@ -226,6 +302,11 @@ impl ProbeState {
             migrations_ready: true,
             migration_check: None,
             detail: Some("replica has not passed a readiness check".to_owned()),
+            max_lag: dependency.max_lag,
+            lag: None,
+            lag_at: None,
+            lag_started: None,
+            lag_detail: None,
         };
     }
 
@@ -436,9 +517,9 @@ impl ProbeState {
             .replica_dependency
             .read()
             .expect("replica dependency lock poisoned");
-        let ready = dependency.connection_ready && dependency.migrations_ready;
-        !dependency.configured
-            || ready
+        // Lag alone does not fail readiness: reads then use the primary. A
+        // lagging shared replica must not take every pod out of rotation.
+        dependency.base_ready()
             || matches!(dependency.fallback, crate::config::ReplicaFallback::Primary)
     }
 
@@ -448,18 +529,172 @@ impl ProbeState {
             .replica_dependency
             .read()
             .expect("replica dependency lock poisoned");
-        !dependency.configured || (dependency.connection_ready && dependency.migrations_ready)
+        dependency.base_ready() && dependency.lag_ok()
     }
 
     #[cfg(feature = "db")]
     pub(crate) fn should_fallback_reads_to_primary(&self) -> bool {
+        let (base_ready, lag_ok, fallback) = {
+            let dependency = self
+                .replica_dependency
+                .read()
+                .expect("replica dependency lock poisoned");
+            (
+                dependency.base_ready(),
+                dependency.lag_ok(),
+                dependency.fallback,
+            )
+        };
+        // A stale replica always falls back: the primary is up and has the
+        // fresh rows. A down replica falls back only when the policy allows.
+        let stale_only = base_ready && !lag_ok;
+        let down_and_allowed =
+            !base_ready && matches!(fallback, crate::config::ReplicaFallback::Primary);
+        stale_only || down_and_allowed
+    }
+
+    /// Set the replica lag limit. `None` turns lag checks off.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
+    #[cfg(feature = "db")]
+    pub fn configure_replica_max_lag(&self, max_lag: Option<std::time::Duration>) {
+        self.replica_dependency
+            .write()
+            .expect("replica dependency lock poisoned")
+            .max_lag = max_lag;
+    }
+
+    /// Record a measured replica lag.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
+    #[cfg(feature = "db")]
+    pub fn record_replica_lag(&self, lag: std::time::Duration) {
+        let mut dependency = self
+            .replica_dependency
+            .write()
+            .expect("replica dependency lock poisoned");
+        let now = tokio::time::Instant::now();
+        dependency.lag = Some(lag);
+        dependency.lag_at = Some(now);
+        dependency.lag_started = Some(now);
+        dependency.lag_detail = None;
+    }
+
+    /// Record that the replica lag could not be measured. Reads go to the
+    /// primary until a measurement succeeds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
+    #[cfg(feature = "db")]
+    pub fn mark_replica_lag_unknown(&self, detail: impl Into<String>) {
+        let mut dependency = self
+            .replica_dependency
+            .write()
+            .expect("replica dependency lock poisoned");
+        dependency.lag = None;
+        dependency.lag_at = None;
+        dependency.lag_started = Some(tokio::time::Instant::now());
+        dependency.lag_detail = Some(detail.into());
+    }
+
+    /// Record the result of a lag measurement that started at `started`.
+    /// `false` when a newer measurement is already recorded: the result is
+    /// older, and it is dropped.
+    #[cfg(feature = "db")]
+    fn record_replica_lag_sample(
+        &self,
+        started: tokio::time::Instant,
+        result: Result<std::time::Duration, String>,
+    ) -> bool {
+        let mut dependency = self
+            .replica_dependency
+            .write()
+            .expect("replica dependency lock poisoned");
+        if dependency.lag_started.is_some_and(|newer| started < newer) {
+            return false;
+        }
+        dependency.lag_started = Some(started);
+        match result {
+            Ok(lag) => {
+                dependency.lag = Some(lag);
+                // The sample ages from when it was measured.
+                dependency.lag_at = Some(started);
+                dependency.lag_detail = None;
+            }
+            Err(error) => {
+                dependency.lag = None;
+                dependency.lag_at = None;
+                dependency.lag_detail = Some(format!("replica lag check failed: {error}"));
+            }
+        }
+        true
+    }
+
+    /// The last measured replica lag.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn replica_lag(&self) -> Option<std::time::Duration> {
+        self.replica_dependency
+            .read()
+            .expect("replica dependency lock poisoned")
+            .lag
+    }
+
+    /// `true` when the lag check passes (or is off).
+    #[cfg(feature = "db")]
+    pub(crate) fn replica_lag_ok(&self) -> bool {
+        self.replica_dependency
+            .read()
+            .expect("replica dependency lock poisoned")
+            .lag_ok()
+    }
+
+    /// The configured replica lag limit.
+    #[cfg(feature = "db")]
+    pub(crate) fn replica_max_lag(&self) -> Option<std::time::Duration> {
+        self.replica_dependency
+            .read()
+            .expect("replica dependency lock poisoned")
+            .max_lag
+    }
+
+    /// A snapshot of the replica state. `None` when no replica is configured.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn replica_status(&self) -> Option<ReplicaStatus> {
         let dependency = self
             .replica_dependency
             .read()
             .expect("replica dependency lock poisoned");
-        dependency.configured
-            && !(dependency.connection_ready && dependency.migrations_ready)
-            && matches!(dependency.fallback, crate::config::ReplicaFallback::Primary)
+        if !dependency.configured && dependency.max_lag.is_none() {
+            return None;
+        }
+        let base_ready = dependency.base_ready();
+        Some(ReplicaStatus {
+            ready: base_ready && dependency.lag_ok(),
+            lag_ms: dependency.lag.map(duration_ms),
+            max_lag_ms: dependency.max_lag.map(duration_ms),
+            // Driver errors can name a host: redact before a probe shows it.
+            detail: if base_ready {
+                dependency.lag_problem()
+            } else {
+                dependency.detail.clone()
+            }
+            .map(|detail| crate::db_url::redact_targets_in_message(&detail)),
+        })
     }
 
     #[cfg(feature = "db")]
@@ -498,8 +733,26 @@ pub(crate) struct ProbeResponse {
     uptime: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pool: Option<PoolStatus>,
+    #[cfg(feature = "db")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replica: Option<ReplicaStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     database: Option<DatabaseStatus>,
+}
+
+/// The replica state the detailed `/ready` body reports (issue #3065).
+#[cfg(feature = "db")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReplicaStatus {
+    /// `true` when reads go to the replica.
+    pub ready: bool,
+    /// The last measured lag, in milliseconds.
+    pub lag_ms: Option<u64>,
+    /// The configured lag limit, in milliseconds.
+    pub max_lag_ms: Option<u64>,
+    /// Why the replica is not ready.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Primary database ping result in a detailed `/ready` body.
@@ -603,6 +856,89 @@ where
     }
 }
 
+/// The longest a replica lag query may run: the lag limit, at least 1 s.
+#[cfg(feature = "db")]
+pub(crate) fn replica_lag_query_budget(max_lag: std::time::Duration) -> std::time::Duration {
+    max_lag.max(std::time::Duration::from_secs(1))
+}
+
+/// Discards a pooled connection on drop, unless the query on it finished.
+#[cfg(feature = "db")]
+struct DiscardUnlessFinished<M: deadpool::managed::Manager>(Option<deadpool::managed::Object<M>>);
+
+#[cfg(feature = "db")]
+impl<M: deadpool::managed::Manager> Drop for DiscardUnlessFinished<M> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.0.take() {
+            // The query can still run: do not return it to the pool.
+            drop(deadpool::managed::Object::take(conn));
+        }
+    }
+}
+
+/// Measure the replica lag on `conn` within `budget`, and record it.
+///
+/// A query that does not finish (a timeout, or a cancelled caller such as a
+/// `/ready` request that timed out) can still run on the server, for
+/// example on a half-open TCP connection. Its connection does not go back to
+/// the pool.
+#[cfg(feature = "db")]
+pub(crate) async fn refresh_replica_lag_bounded<M, F>(
+    probes: &ProbeState,
+    conn: deadpool::managed::Object<M>,
+    budget: std::time::Duration,
+    measure: F,
+) where
+    M: deadpool::managed::Manager,
+    F: for<'c> FnOnce(
+        &'c mut deadpool::managed::Object<M>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<std::time::Duration, String>> + Send + 'c>,
+    >,
+{
+    let started = tokio::time::Instant::now();
+    let mut guard = DiscardUnlessFinished(Some(conn));
+    let Some(conn) = guard.0.as_mut() else {
+        return;
+    };
+    let measured = tokio::time::timeout(budget, measure(conn))
+        .await
+        .map_or_else(
+            |_| Err(format!("query took over {}ms", budget.as_millis())),
+            |result| {
+                // The query finished: the connection can go back to the pool.
+                drop(guard.0.take());
+                result
+            },
+        );
+    apply_replica_lag_sample(probes, started, measured);
+}
+
+/// Record a lag measurement that started at `started`, and log a change
+/// between fresh and stale. An older measurement than the recorded one is
+/// dropped.
+#[cfg(feature = "db")]
+pub(crate) fn apply_replica_lag_sample(
+    probes: &ProbeState,
+    started: tokio::time::Instant,
+    measured: Result<std::time::Duration, String>,
+) {
+    let was_fresh = probes.replica_lag_ok();
+    if !probes.record_replica_lag_sample(started, measured) {
+        return;
+    }
+    let fresh = probes.replica_lag_ok();
+    if was_fresh && !fresh {
+        let detail = probes
+            .replica_status()
+            .and_then(|status| status.detail)
+            .unwrap_or_default();
+        tracing::warn!(target: "autumn::db", %detail, "replica is stale: reads use the primary");
+    } else if !was_fresh && fresh {
+        tracing::info!(target: "autumn::db", "replica is fresh again: reads use the replica");
+    }
+}
+
 fn probe_response<S: ProvideProbeState>(
     state: &S,
     kind: ProbeKind,
@@ -643,6 +979,12 @@ fn probe_response<S: ProvideProbeState>(
             None
         },
         pool: if detailed { pool_status } else { None },
+        #[cfg(feature = "db")]
+        replica: if detailed && matches!(kind, ProbeKind::Ready) {
+            state.probes().replica_status()
+        } else {
+            None
+        },
         database: None,
     };
 
@@ -844,6 +1186,149 @@ mod tests {
         let (status, Json(response)) = probe_response(&state, ProbeKind::Ready, true);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.status, "degraded");
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn replica_lag_alone_keeps_the_pod_ready_and_is_reported() {
+        let state = TestProbeState::new();
+        state.mark_startup_complete();
+        let probes = state.probes();
+        probes.configure_replica_dependency(crate::config::ReplicaFallback::FailReadiness);
+        probes.mark_replica_ready();
+        probes.configure_replica_max_lag(Some(std::time::Duration::from_secs(1)));
+        probes.record_replica_lag(std::time::Duration::from_secs(30));
+
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready, true);
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "reads use the primary, so stay ready"
+        );
+        let replica = response
+            .replica
+            .expect("detailed probe reports the replica");
+        assert!(!replica.ready);
+        assert_eq!(replica.lag_ms, Some(30_000));
+        assert_eq!(replica.max_lag_ms, Some(1_000));
+        let body = serde_json::to_value(&replica).unwrap();
+        assert_eq!(body["lag_ms"], 30_000);
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn replica_lag_refresh_records_the_measured_lag() {
+        let state = TestProbeState::new();
+        let probes = state.probes();
+        probes.configure_replica_dependency(crate::config::ReplicaFallback::Primary);
+        probes.mark_replica_ready();
+        probes.configure_replica_max_lag(Some(std::time::Duration::from_millis(500)));
+
+        apply_replica_lag_sample(
+            probes,
+            tokio::time::Instant::now(),
+            Ok(std::time::Duration::from_millis(900)),
+        );
+        assert_eq!(
+            probes.replica_lag(),
+            Some(std::time::Duration::from_millis(900))
+        );
+        assert!(!probes.should_route_reads_to_replica());
+        assert!(probes.should_fallback_reads_to_primary());
+
+        apply_replica_lag_sample(
+            probes,
+            tokio::time::Instant::now(),
+            Err("no route to host".to_owned()),
+        );
+        assert_eq!(probes.replica_lag(), None);
+        assert!(!probes.should_route_reads_to_replica());
+
+        apply_replica_lag_sample(
+            probes,
+            tokio::time::Instant::now(),
+            Ok(std::time::Duration::ZERO),
+        );
+        assert!(probes.should_route_reads_to_replica());
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test(start_paused = true)]
+    async fn an_old_lag_sample_ages_out() {
+        let probes = ProbeState::default();
+        probes.configure_replica_dependency(crate::config::ReplicaFallback::FailReadiness);
+        probes.mark_replica_ready();
+        probes.configure_replica_max_lag(Some(std::time::Duration::from_secs(1)));
+        probes.record_replica_lag(std::time::Duration::from_millis(100));
+        assert!(probes.should_route_reads_to_replica());
+
+        // Inside the sample window (2 x 1 s): still fresh, no flapping.
+        tokio::time::advance(std::time::Duration::from_millis(1500)).await;
+        assert!(probes.should_route_reads_to_replica());
+
+        tokio::time::advance(std::time::Duration::from_millis(1000)).await;
+        assert!(
+            !probes.should_route_reads_to_replica(),
+            "no new sample for 2.5s, so freshness is unknown"
+        );
+        assert!(probes.should_fallback_reads_to_primary());
+        let detail = probes.replica_status().unwrap().detail.unwrap();
+        assert!(detail.contains("old"), "{detail}");
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test(start_paused = true)]
+    async fn a_small_lag_limit_does_not_flap_between_samples() {
+        let probes = ProbeState::default();
+        probes.configure_replica_dependency(crate::config::ReplicaFallback::FailReadiness);
+        probes.mark_replica_ready();
+        probes.configure_replica_max_lag(Some(std::time::Duration::from_millis(100)));
+        probes.record_replica_lag(std::time::Duration::ZERO);
+        // The monitor's floor interval is 250 ms, above the 100 ms limit.
+        tokio::time::advance(std::time::Duration::from_millis(300)).await;
+        assert!(probes.should_route_reads_to_replica());
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test(start_paused = true)]
+    async fn an_older_lag_measurement_does_not_overwrite_a_newer_one() {
+        let probes = ProbeState::default();
+        probes.configure_replica_dependency(crate::config::ReplicaFallback::FailReadiness);
+        probes.mark_replica_ready();
+        probes.configure_replica_max_lag(Some(std::time::Duration::from_secs(1)));
+        // Two probes overlap: the earlier one is slow and finishes last.
+        let earlier = tokio::time::Instant::now();
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        let later = tokio::time::Instant::now();
+        apply_replica_lag_sample(&probes, later, Ok(std::time::Duration::from_secs(30)));
+        assert!(
+            !probes.should_route_reads_to_replica(),
+            "the replica is stale"
+        );
+        apply_replica_lag_sample(&probes, earlier, Ok(std::time::Duration::ZERO));
+        assert!(
+            !probes.should_route_reads_to_replica(),
+            "an older measurement must not route reads back to a stale replica"
+        );
+        assert_eq!(
+            probes.replica_lag(),
+            Some(std::time::Duration::from_secs(30))
+        );
+        // A newer measurement still applies.
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        apply_replica_lag_sample(
+            &probes,
+            tokio::time::Instant::now(),
+            Ok(std::time::Duration::ZERO),
+        );
+        assert!(probes.should_route_reads_to_replica());
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn replica_status_is_absent_without_a_replica() {
+        assert!(ProbeState::default().replica_status().is_none());
     }
 
     #[cfg(feature = "db")]
@@ -1121,6 +1606,88 @@ mod tests {
         let (status, Json(response)) = readiness_response(&state).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(response.status, "ok");
+    }
+
+    #[cfg(feature = "db")]
+    mod bounded_lag {
+        use super::*;
+        use std::time::Duration;
+
+        /// A pool of `()` connections. Only the pool size matters here.
+        struct Unit;
+
+        impl deadpool::managed::Manager for Unit {
+            type Type = ();
+            type Error = std::convert::Infallible;
+
+            async fn create(&self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            async fn recycle(
+                &self,
+                _conn: &mut (),
+                _metrics: &deadpool::managed::Metrics,
+            ) -> deadpool::managed::RecycleResult<Self::Error> {
+                Ok(())
+            }
+        }
+
+        fn pool() -> deadpool::managed::Pool<Unit> {
+            deadpool::managed::Pool::builder(Unit)
+                .max_size(1)
+                .build()
+                .unwrap()
+        }
+
+        fn probes() -> ProbeState {
+            let probes = ProbeState::default();
+            probes.configure_replica_dependency(crate::config::ReplicaFallback::FailReadiness);
+            probes.mark_replica_ready();
+            probes.configure_replica_max_lag(Some(Duration::from_secs(1)));
+            probes
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_hung_lag_query_is_bounded_and_its_connection_discarded() {
+            let (pool, probes) = (pool(), probes());
+            let conn = pool.get().await.unwrap();
+            refresh_replica_lag_bounded(&probes, conn, Duration::from_secs(1), |_| {
+                Box::pin(std::future::pending())
+            })
+            .await;
+            assert!(!probes.replica_lag_ok(), "the lag is unknown");
+            assert_eq!(pool.status().size, 0, "the connection is not reused");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_cancelled_lag_query_discards_its_connection() {
+            let (pool, probes) = (pool(), probes());
+            let conn = pool.get().await.unwrap();
+            let probe = refresh_replica_lag_bounded(&probes, conn, Duration::from_secs(10), |_| {
+                Box::pin(std::future::pending())
+            });
+            // An outer request timeout drops the probe mid-query.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), probe)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(pool.status().size, 0, "the connection is not reused");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_finished_lag_query_returns_its_connection() {
+            let (pool, probes) = (pool(), probes());
+            let conn = pool.get().await.unwrap();
+            refresh_replica_lag_bounded(&probes, conn, Duration::from_secs(1), |_| {
+                Box::pin(async { Ok(Duration::from_millis(5)) })
+            })
+            .await;
+            assert!(probes.replica_lag_ok());
+            assert_eq!(pool.status().size, 1);
+            assert_eq!(pool.status().available, 1, "back in the pool");
+        }
     }
 
     // ── Primary database readiness (#3059) ───────────────────────

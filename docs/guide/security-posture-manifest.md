@@ -11,7 +11,8 @@ runtime. Reading the manifest starts with reading these tags.
 
 ```json
 {
-  "schema_version": 4,
+  "schema_version": 5,
+  "build": { "profile": "release", "features": [], "all_features": false, "no_default_features": false },
   "dimensions": {
     "routes":           { "provenance": "provable",  "source": "macro:#[secured]/#[authorize]/#[public]", "entries": [ … ] },
     "csrf":             { "provenance": "declared",  "source": "config:security.csrf",     "entries": [ … ] },
@@ -261,6 +262,24 @@ Reading a v3 manifest stays correct: v4 only *adds* this dimension, so an older
 document reads as "no route requires mTLS" rather than failing the gate. An app
 with client auth off projects no `mtls` lines at all, so its posture digest is
 unchanged by the bump.
+
+## The `build` object (schema v5)
+
+The manifest describes one binary. Two builds can mount different routes. A
+route behind `#[cfg(not(debug_assertions))]` is only in a release build. A
+route behind a feature is only in a build with that feature. Thus the manifest
+records the Cargo build that `routes audit` made:
+
+- `profile`: `dev`, `release`, or a custom profile name.
+- `features`: the `--features` values, split, sorted and deduplicated.
+- `all_features`, `no_default_features`: the Cargo flags.
+
+A v3 or v4 manifest has no `build`. It reads as the dev profile with default
+features, because that was the only build those versions made. The default
+build adds nothing to the posture digest, so an older manifest keeps its
+digest. Any other build is part of the digest. `autumn routes posture diff`
+reports `build_changed` (**widening**) when the two manifests come from
+different builds, because a diff across builds can hide a widening.
 
 ## `runtime-only`
 

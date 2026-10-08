@@ -58,6 +58,12 @@
 //!   [`Sim::try_run_to_idle`] reports a drain that does not settle. Framework
 //!   code with no clock in scope reads [`crate::time::ambient_now`] and its
 //!   siblings, which follow the sim clock.
+//! - **Replicas (issue #3067).** [`Sim::mount_replica`] mounts several apps on
+//!   one clock, each with its own [`Replica`] clock (offset, drift, steps).
+//!   `Sim::db_link` (with `sqlite`) faults one replica's database session
+//!   and writes. [`Sim::run_for`] moves time one event at a time. [`runtime`] gates
+//!   database work, so a seed replays it. [`mod@trace`] compares two runs of
+//!   one seed.
 //!
 //! The clock and app handles inside a `Sim` are crate-private:
 //!
@@ -159,6 +165,33 @@ pub mod scenario;
 // The interleaving shuffler (issue #2967): seeded poll order for
 // `Sim::interleave` and seeded yields for `Sim::spawn`.
 mod shuffle;
+
+// Several apps on one sim clock (issue #3067).
+pub mod replica;
+
+pub use replica::{Replica, ReplicaClock};
+
+// Faults on one replica's link to the shared SQLite database (issue #3067).
+#[cfg(feature = "sqlite")]
+pub mod dblink;
+
+#[cfg(feature = "sqlite")]
+pub use dblink::{DbFaultEvent, DbFaultKind, DbLink};
+
+// The sim runtime and its blocking-work gate (issue #3067).
+pub(crate) mod gate;
+
+pub use gate::runtime;
+
+// Same-seed trace capture and diff (issue #3067).
+pub mod trace;
+
+pub use trace::{Trace, TraceDiff};
+
+// Framework scenarios (jobs, scheduler, lock) for the seed sweep (issue #3067).
+#[cfg(feature = "sqlite")]
+#[doc(hidden)]
+pub mod fleet;
 
 pub use assert::{
     SometimesRegistry, assert_all_sometimes_satisfied, reset_sometimes_registry,
@@ -271,6 +304,37 @@ pub struct Sim {
     /// app's entropy from [`seed`](Sim::seed); each restart derives a new seed
     /// from it, so a restarted process does not replay the crashed one's ids.
     mounts: u64,
+
+    /// The apps from [`mount_replica`](Sim::mount_replica), in mount order
+    /// (issue #3067).
+    replicas: Vec<ReplicaSlot>,
+
+    /// The database link of each replica, made on first use.
+    #[cfg(feature = "sqlite")]
+    db_links: std::sync::Mutex<std::collections::BTreeMap<String, DbLink>>,
+
+    /// This sim's place in its sim runtime's live count (issue #3067).
+    gate_seat: gate::SimSeat,
+}
+
+/// The name a replica has as a network host. Two replica names with one key
+/// would share one `SimNet` host, so they cannot both be mounted.
+fn replica_host_key(name: &str) -> String {
+    #[cfg(feature = "http-client")]
+    {
+        net::canonical_host(name)
+    }
+    #[cfg(not(feature = "http-client"))]
+    {
+        name.to_ascii_lowercase()
+    }
+}
+
+/// One named replica: its spec, its clock, and its app while it is alive.
+struct ReplicaSlot {
+    name: String,
+    clock: replica::NodeClock,
+    client: Option<crate::test::TestClient>,
 }
 
 impl Sim {
@@ -290,17 +354,15 @@ impl Sim {
         // can attribute observed/satisfied `sometimes!` labels to exactly one
         // seed before folding them into its cross-seed aggregate (W6, #1797).
         assert::reset_sometimes_registry();
-        let epoch = Utc
-            .timestamp_opt(SIM_EPOCH_UNIX_SECS, 0)
-            .single()
-            .unwrap_or_else(|| Utc.timestamp_nanos(0));
-        let clock = SimClock::new(TickingClock::starting_at(epoch));
+        let clock = SimClock::new(TickingClock::starting_at(sim_epoch()));
         let ambient_clock = Arc::new(AmbientSimClock {
             wall: std::sync::RwLock::new(Arc::new(clock.ticking())),
             own_advanced: std::sync::Mutex::new(std::time::Duration::ZERO),
             auto_advanced: std::sync::Mutex::new(std::time::Duration::ZERO),
             alive: std::sync::atomic::AtomicBool::new(true),
         });
+        let gate_seat = gate::SimSeat::default();
+        gate_seat.take();
         let ambient_guard = crate::time::install_ambient(ambient_clock.clone());
         let sim_stack = SimStackGuard::enter(Arc::clone(&ambient_clock));
         Self {
@@ -318,6 +380,10 @@ impl Sim {
             net: None,
             shuffle_calls: std::sync::atomic::AtomicU64::new(0),
             mounts: 0,
+            replicas: Vec::new(),
+            #[cfg(feature = "sqlite")]
+            db_links: std::sync::Mutex::default(),
+            gate_seat,
         }
     }
 
@@ -332,6 +398,8 @@ impl Sim {
     pub fn anchor(&self) {
         if tokio::runtime::Handle::try_current().is_ok() {
             lock_sim_stack(&self.stack_guard.home, SimStack::settle);
+            // A sim built before `sim::runtime()` joins its gate here.
+            self.gate_seat.take();
         }
     }
 
@@ -487,10 +555,11 @@ impl Sim {
         self.app.client()
     }
 
-    /// Simulate a process crash: drop the mounted app so the in-process job
-    /// runtime's in-flight work is **cancelled without completing** (its
-    /// [`Drop`] cancels the runtime's shutdown token and clears the global job
-    /// client), ready for durable recovery on [`restart`](Self::restart).
+    /// Simulate a process crash: stop the app's job and scheduler tasks and
+    /// drop the mounted app, so in-flight work is **cancelled without
+    /// completing** (the client's [`Drop`] also cancels the runtime's shutdown
+    /// token and clears the global job client), ready for durable recovery on
+    /// [`restart`](Self::restart).
     ///
     /// This is the kill half of the W5.c crash-recovery primitive (item 7). It
     /// deliberately drops **only** the app/runtime, never the durable database:
@@ -511,9 +580,13 @@ impl Sim {
     /// the in-memory job queue's by-design loss is documented, never pretended
     /// durable. See the [`crash`] module docs.
     pub fn kill(&mut self) {
-        // Dropping the client runs `TestJobRuntime::drop` (shutdown.cancel() +
-        // clear_global_job_client()), modelling the process dying mid-flight.
-        self.app.client = None;
+        // Stop the app's tasks, as a process death does. Dropping the client
+        // then runs `TestJobRuntime::drop` (shutdown.cancel() +
+        // clear_global_job_client()).
+        if let Some(client) = self.app.client.take() {
+            abort_app_tasks(&client);
+            drop(client);
+        }
         // A fresh process has no in-memory chaos decision log; a restart
         // re-derives it deterministically from the seed.
         self.chaos_state = None;
@@ -542,6 +615,249 @@ impl Sim {
     pub fn crash_and_restart(&mut self, app: crate::test::TestApp) -> &crate::test::TestClient {
         self.kill();
         self.restart(app)
+    }
+
+    /// Mount `app` as the replica `replica`, next to the other replicas
+    /// (issue #3067).
+    ///
+    /// Each replica is its own app on the sim's one clock: its own state, job
+    /// runtime and scheduled tasks. It reads its own [`Replica`] clock. Give
+    /// each replica its own pool on one database, so they share data as a
+    /// fleet does:
+    ///
+    /// ```rust,ignore
+    /// let substrate = SqliteSubstrate::new()?;
+    /// for name in ["a", "b"] {
+    ///     let pool = substrate.replica_pool(&sim.db_link(name))?;
+    ///     sim.mount_replica(name, TestApp::new().with_db(pool).jobs(jobs![work]));
+    /// }
+    /// sim.run_for(Duration::from_secs(30)).await;
+    /// ```
+    ///
+    /// With [`net`](Sim::net) set, the replica is also a [`SimNet`] host under
+    /// its name, so `http://b/` reaches the replica `b`.
+    ///
+    /// Process-wide state is not per replica: the cache, the event bus and the
+    /// global job client belong to the replica mounted last. Enqueue through a
+    /// replica's own `JobClient` extension instead of `job::enqueue`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a replica with this name is already mounted. A name that
+    /// is the same host name, such as one that differs only in case, is the
+    /// same name. Use
+    /// [`restart_replica`](Sim::restart_replica) to mount it again.
+    pub fn mount_replica(
+        &mut self,
+        replica: impl Into<Replica>,
+        app: crate::test::TestApp,
+    ) -> &crate::test::TestClient {
+        let replica = replica.into();
+        let key = replica_host_key(replica.name());
+        if let Some(slot) = self
+            .replicas
+            .iter()
+            .find(|slot| replica_host_key(&slot.name) == key)
+        {
+            panic!(
+                "replica `{}` is already mounted as `{}`; use `restart_replica` to mount it again",
+                replica.name(),
+                slot.name
+            );
+        }
+        let clock = replica::NodeClock::new(
+            Arc::clone(&self.ambient) as Arc<dyn crate::time::ClockSource>,
+            sim_epoch(),
+            replica.resolve(self.seed),
+        );
+        self.replicas.push(ReplicaSlot {
+            name: replica.name().to_owned(),
+            clock,
+            client: None,
+        });
+        let index = self.replicas.len() - 1;
+        self.mount_replica_at(index, app)
+    }
+
+    /// Kill the replica `name` if it is alive, then mount `app` in its place.
+    /// The replica keeps its clock, as a restarted process keeps its host's
+    /// clock. Rebuild `app` on the same database to recover its rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no replica with this name was mounted.
+    pub fn restart_replica(
+        &mut self,
+        name: &str,
+        app: crate::test::TestApp,
+    ) -> &crate::test::TestClient {
+        self.kill_replica(name);
+        let index = self.expect_replica_index(name);
+        self.mount_replica_at(index, app)
+    }
+
+    /// Kill the replica `name`: stop its tasks and drop its app, as a process
+    /// crash does. A job handler that was running stops at its next await and
+    /// does not settle its claim. The database keeps every committed row. A
+    /// kill of a dead replica changes nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no replica with this name was mounted.
+    pub fn kill_replica(&mut self, name: &str) {
+        let index = self.expect_replica_index(name);
+        let Some(client) = self.replicas[index].client.take() else {
+            return;
+        };
+        #[cfg(feature = "http-client")]
+        if let Some(net) = &self.net {
+            net.remove_host(name);
+        }
+        abort_app_tasks(&client);
+        drop(client);
+    }
+
+    /// The client of the live replica `name`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no live replica has this name.
+    #[must_use]
+    pub fn replica(&self, name: &str) -> &crate::test::TestClient {
+        self.try_replica(name)
+            .unwrap_or_else(|| panic!("no live replica `{name}`: mount it with `mount_replica`"))
+    }
+
+    /// The client of the live replica `name`, or `None`.
+    #[must_use]
+    pub fn try_replica(&self, name: &str) -> Option<&crate::test::TestClient> {
+        self.replica_index(name)
+            .and_then(|index| self.replicas[index].client.as_ref())
+    }
+
+    /// The names of the live replicas, in mount order.
+    #[must_use]
+    pub fn replica_names(&self) -> Vec<&str> {
+        self.replicas
+            .iter()
+            .filter(|slot| slot.client.is_some())
+            .map(|slot| slot.name.as_str())
+            .collect()
+    }
+
+    /// The clock settings of the replica `name` (alive or killed), or `None`.
+    #[must_use]
+    pub fn replica_clock(&self, name: &str) -> Option<ReplicaClock> {
+        self.replica_index(name)
+            .map(|index| self.replicas[index].clock.settings())
+    }
+
+    /// Jump the wall clock of the replica `name` by `by`, as an NTP step does.
+    /// `by` can be negative: a step can go back. The monotonic clock does not
+    /// move. Timers the replica already set do not move.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no replica with this name was mounted.
+    pub fn step_replica_clock(&self, name: &str, by: chrono::TimeDelta) {
+        let index = self.expect_replica_index(name);
+        self.replicas[index].clock.step(by);
+    }
+
+    /// Let `duration` of virtual time pass, one event at a time (issue #3067).
+    ///
+    /// The sim sleeps. Tokio moves its paused clock to the next timer only
+    /// when all tasks wait and no blocking work is queued, such as a `SQLite`
+    /// query. So database work ends before time moves on, and a seed replays
+    /// the same order. With replicas on `SQLite`, use it, not
+    /// [`advance`](Sim::advance).
+    ///
+    /// Replica clocks move with each step. The clock of the app from
+    /// [`build`](Sim::build) moves once, at the end.
+    pub async fn run_for(&self, duration: std::time::Duration) {
+        let guard_start = self.wall_clock_guard_start();
+        let start = tokio::time::Instant::now();
+        tokio::time::sleep(duration).await;
+        let moved = tokio::time::Instant::now().saturating_duration_since(start);
+        // Tokio time already moved, so this is not an explicit advance: the
+        // ambient clock counts it as auto-advanced time.
+        self.clock.advance(moved);
+        self.enforce_wall_clock_budget(guard_start);
+    }
+
+    /// The database link of the replica `name`, made on first use and seeded
+    /// from the sim seed and the name. Pass it to
+    /// [`SqliteSubstrate::replica_pool`](substrate::SqliteSubstrate::replica_pool),
+    /// then fault the replica's database through it. See [`DbLink`].
+    ///
+    /// The link must exist before the mount, so this does not check the name.
+    /// A wrong name gives a link that no replica uses.
+    #[cfg(feature = "sqlite")]
+    #[must_use]
+    pub fn db_link(&self, name: &str) -> DbLink {
+        self.db_links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(name.to_owned())
+            .or_insert_with(|| {
+                DbLink::new(name, derive_seed(self.seed, &format!("sim-db-link:{name}")))
+            })
+            .clone()
+    }
+
+    /// The app from [`build`](Sim::build), then each live replica.
+    fn live_clients(&self) -> impl Iterator<Item = &crate::test::TestClient> {
+        self.app
+            .try_client()
+            .into_iter()
+            .chain(self.replicas.iter().filter_map(|slot| slot.client.as_ref()))
+    }
+
+    fn replica_index(&self, name: &str) -> Option<usize> {
+        self.replicas.iter().position(|slot| slot.name == name)
+    }
+
+    fn expect_replica_index(&self, name: &str) -> usize {
+        self.replica_index(name)
+            .unwrap_or_else(|| panic!("no replica `{name}` was mounted"))
+    }
+
+    /// Build `app` for the replica slot `index` and store its client.
+    fn mount_replica_at(
+        &mut self,
+        index: usize,
+        app: crate::test::TestApp,
+    ) -> &crate::test::TestClient {
+        let mount_seed = mount_entropy_seed(self.seed, self.mounts);
+        let first_mount = self.mounts == 0;
+        let app = app.with_default_entropy(SeededEntropy::shared(mount_seed));
+        self.mounts += 1;
+        // One network for every replica: only the first mount seeds it.
+        #[cfg(feature = "http-client")]
+        let app = match &self.net {
+            Some(net) => {
+                if first_mount {
+                    net.reseed(mount_seed);
+                }
+                app.with_sim_net(net.clone())
+            }
+            None => app,
+        };
+        #[cfg(not(feature = "http-client"))]
+        let _ = first_mount;
+        let slot = &mut self.replicas[index];
+        #[cfg(feature = "http-client")]
+        let app = if self.net.is_some() {
+            app.trust_host(&slot.name)
+        } else {
+            app
+        };
+        let client = app.with_clock(slot.clock.clone()).build();
+        #[cfg(feature = "http-client")]
+        if let Some(net) = &self.net {
+            net.insert_host(&slot.name, client.router());
+        }
+        slot.client.insert(client)
     }
 
     /// Run `ops` concurrently and poll them in a seeded order (issue #2967).
@@ -759,6 +1075,9 @@ impl Sim {
         // real elapsed against the budget before returning. `advance_to` routes
         // through here, so it inherits the guard for free.
         let guard_start = self.wall_clock_guard_start();
+        // `advance` yields and never parks, so database work runs without the
+        // gate's turns, as before the gate (#3067).
+        let _open = gate::Open::new();
         // Let every ready task take one step at the current instant before time
         // moves. A task spawned since the last yield (a `#[scheduled]` loop that
         // `build` started, a job worker) then registers its first timer at the
@@ -954,16 +1273,19 @@ impl Sim {
         // sample a REAL instant at entry and enforce the budget before
         // returning, catching a real blocking sleep in a drained task.
         let guard_start = self.wall_clock_guard_start();
+        // The drain yields and never parks, so database work runs without the
+        // gate's turns, as before the gate (#3067).
+        let _open = gate::Open::new();
 
         // Resolve the mounted app's DB pool once (a cheap, cloned Arc-backed
         // handle). Durable repository commit hooks are rows, so there is
         // nothing to drain when the app was built without a database (e.g. the
         // in-memory job DoD path) — the lane is skipped entirely then.
         #[cfg(feature = "db")]
-        let commit_hook_pool = self
-            .app
-            .try_client()
-            .and_then(|client| crate::db::DbState::pool(client.state()).cloned());
+        let commit_hook_pools: Vec<_> = self
+            .live_clients()
+            .filter_map(|client| crate::db::DbState::pool(client.state()).cloned())
+            .collect();
 
         // Run the full `MAX_DRAIN_STEPS`. Then stop at the first
         // `STALL_WINDOW` quiet rounds in a row; work that ends late still
@@ -992,7 +1314,7 @@ impl Sim {
             // itself enqueue a job, so draining inside the settle loop lets a
             // subsequent iteration pick that job up.
             #[cfg(feature = "db")]
-            if let Some(pool) = commit_hook_pool.as_ref() {
+            for pool in &commit_hook_pools {
                 let hooks_drained =
                     crate::test::drain_ready_repository_commit_hooks(pool, MAX_DRAIN_STEPS).await;
                 if hooks_drained > 0 {
@@ -1003,9 +1325,8 @@ impl Sim {
             // Fourth source: the transactional outbox (issue #3062). The same
             // claim → handle → mark path the relay worker runs, worker-free.
             #[cfg(feature = "db")]
-            if let Some(state) = self
-                .app
-                .try_client()
+            for state in self
+                .live_clients()
                 .map(crate::test::TestClient::state)
                 .filter(|state| state.extension::<crate::outbox::OutboxRelay>().is_some())
             {
@@ -1031,6 +1352,14 @@ impl Sim {
             });
         }
         Ok(())
+    }
+}
+
+impl Drop for Sim {
+    fn drop(&mut self) {
+        // The runtime drops the app tasks after the sim. A task with a query
+        // in flight then waits for it, so let gated queries run (#3067).
+        self.gate_seat.leave();
     }
 }
 
@@ -1080,6 +1409,78 @@ fn drain_fingerprint() -> (u64, usize) {
     let tasks = tokio::runtime::Handle::try_current()
         .map_or(0, |handle| handle.metrics().num_alive_tasks());
     (DRAIN_PROGRESS.with(std::cell::Cell::get), tasks)
+}
+
+/// The fixed sim epoch as a `DateTime`.
+fn sim_epoch() -> DateTime<Utc> {
+    Utc.timestamp_opt(SIM_EPOCH_UNIX_SECS, 0)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_nanos(0))
+}
+
+/// A `u64` derived from `seed` and `purpose`.
+#[cfg(feature = "sqlite")]
+fn derive_seed(seed: u64, purpose: &str) -> u64 {
+    SeededEntropy::new(seed)
+        .derive_uuid(purpose)
+        .as_u64_pair()
+        .0
+}
+
+/// The background tasks one app spawned (issue #3067).
+///
+/// `TestApp::build` puts one in the app state. The job and scheduler loops
+/// register here, so a sim kill can stop them as a process death does. A
+/// production app has none, and its tasks run as before.
+#[derive(Default)]
+pub(crate) struct AppTasks {
+    handles: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+}
+
+impl AppTasks {
+    fn track(&self, handle: tokio::task::AbortHandle) {
+        let mut handles = self
+            .handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handles.retain(|handle| !handle.is_finished());
+        handles.push(handle);
+    }
+
+    fn abort_all(&self) {
+        let handles = std::mem::take(
+            &mut *self
+                .handles
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for handle in handles {
+            handle.abort();
+        }
+    }
+}
+
+/// Spawn an app background task. In a test app, a sim kill stops it.
+pub(crate) fn spawn_app_task<F>(
+    state: &crate::state::AppState,
+    future: F,
+) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let handle = tokio::spawn(future);
+    if let Some(tasks) = state.extension::<AppTasks>() {
+        tasks.track(handle.abort_handle());
+    }
+    handle
+}
+
+/// Stop every background task of the app behind `client`.
+fn abort_app_tasks(client: &crate::test::TestClient) {
+    if let Some(tasks) = client.state().extension::<AppTasks>() {
+        tasks.abort_all();
+    }
 }
 
 /// The entropy seed for the `mount`-th app a simulation mounts.

@@ -827,6 +827,7 @@ Halt and **freeze** instead of compensating: every host is left exactly as it is
 — including the ones already on the new release — and named in the final state
 table, so you can inspect the failure before anything else moves. Use it when you
 would rather diagnose a half-rolled fleet than automatically reverse it.
+A failed [bake](#bake-roll-back-on-post-cutover-metrics) is frozen the same way.
 
 #### Topologies a fleet deploy refuses
 
@@ -943,6 +944,87 @@ post-cutover failure prints the same message as before.
 
 `autumn deploy --help` was also rewritten, and `up`/`rollback` gained `--only`
 and `--no-rollback`; no existing flag changed meaning.
+
+### Bake: roll back on post-cutover metrics
+
+The `/ready` gate finds a release that does not start. It does not find a
+release that starts and then fails real requests. The bake finds this problem
+(issue #3069). After each host cuts over, `autumn deploy up` samples the new
+release. It rolls the host back on a bad result.
+
+The bake is off by default. Turn it on in `autumn.toml`:
+
+```toml
+[deploy.bake]
+duration_secs = 300      # bake each host for 5 minutes (0: off)
+interval_secs = 10       # sample every 10 s
+min_requests = 20        # give no verdict on fewer new responses
+# max_error_rate = 0.01  # default: from [[slo]], else 0.05
+# max_p99_ms = 500       # default: from [[slo]], else no latency check
+```
+
+Or turn it on for one deploy:
+
+```bash
+autumn deploy up --bake-secs 300
+```
+
+How it works:
+
+1. On the host, the bake runs `curl` against the new release's slot port. It
+   reads `/actuator/metrics` under your `[actuator] prefix`. It sends the first
+   `[security.trusted_hosts]` entry as the `Host` header, because the `prod`
+   profile rejects `127.0.0.1`.
+2. The first sample is the baseline. Each later sample counts the responses
+   since the baseline. The bake does not count its own metric requests, and
+   it does not count a failed one as a 5xx.
+3. Each sample also reads the systemd restart count of the slot unit.
+4. The bake fails when one of these occurs:
+   - The 5xx ratio is above the limit, with at least 2 new 5xx responses.
+   - A latency quantile is above its limit.
+   - The process restarted.
+   - A sample fails two times in a row. The bake tries a failed sample again
+     one time at once.
+5. Fewer than `min_requests` new responses never fail the bake. A quiet host
+   passes with a warning.
+
+The latency check uses the app's current p50, p95 or p99. The app computes
+them over its last 10,000 requests, not over the bake window only. These
+quantiles count every response: also 5xx, unmatched paths and the bake's own
+requests. So a limit from an SLO only approximates that SLO, and
+`autumn deploy up` says so. The Prometheus burn-rate alerts measure the SLO
+itself.
+
+When you do not set the limits, they come from your
+[SLOs](slo.md#bake-and-roll-back). The 5xx limit is the 14.4× burn rate of the
+strictest all-routes availability SLO. For a 99.9 % objective, it is 1.44 %.
+
+The output shows the limits, then one line for each sample:
+
+```text
+bake for 300 s, sample every 10 s; roll back when the 5xx ratio is above 1.44% (after 20 responses; limits from SLO availability at 14.4x burn)
+
+bake 10/300 s: 212 responses, 0 5xx, p99 41 ms
+bake 20/300 s: 431 responses, 37 5xx, p99 44 ms
+
+❌ bake failed: 37 of 431 responses were 5xx (8.5846%), above the limit of 1.44%
+```
+
+What happens next:
+
+| Deploy | Result |
+|---|---|
+| One host | The host rolls back to the previous release. The command fails with `the bake failed on <host>`. |
+| One host, unsafe rollback target | The host keeps the new release. The command prints the recovery steps and fails. |
+| A fleet | The rollout halts at that host, with the step `bake`. Each host on the new release rolls back, newest first. The remaining hosts are not touched. |
+| `--no-rollback` | The new release stays live. The command fails and tells you to run `autumn deploy rollback`. |
+| A first deploy | No bake. There is no previous release to roll back to. |
+
+A host that serves the new release with a housekeeping failure (`Degraded`)
+also bakes.
+
+The rollback restores binaries only. A migration that already ran stays
+applied, as for every other automatic rollback. The error message says so.
 
 ### Rollback
 

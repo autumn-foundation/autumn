@@ -106,6 +106,7 @@ pub type RuntimeBackend = diesel::pg::Pg;
 #[cfg(feature = "sqlite")]
 pub type RuntimeBackend = diesel::sqlite::Sqlite;
 
+pub mod pooler;
 /// `TEXT`-backed newtypes for foreign model-field types on `SQLite` (#1924).
 #[cfg(feature = "sqlite")]
 pub mod sqlite_types;
@@ -308,7 +309,7 @@ where
     Ok(())
 }
 
-/// `SET LOCAL` is Postgres syntax. SQLite has no such settings.
+/// `SET LOCAL` is Postgres syntax. `SQLite` has no such settings.
 #[cfg(feature = "sqlite")]
 #[allow(
     clippy::unused_async,
@@ -554,6 +555,10 @@ pub(crate) struct RequestQueryTimer {
     /// connections that actually carry a timer, which `Db::checkout` installs
     /// solely while a query observer is scoped.
     clock: std::sync::Arc<dyn crate::time::ClockSource>,
+    /// The sim gate's turn for the running statement. This timer replaces the
+    /// gate's own instrumentation on a connection, so it takes the turn too
+    /// (issue #3067). Off a sim runtime it does nothing.
+    turn: crate::sim::gate::QueryTurn,
 }
 
 #[cfg(feature = "db")]
@@ -576,6 +581,7 @@ impl Default for RequestQueryTimer {
         Self {
             pending: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            turn: crate::sim::gate::QueryTurn::default(),
         }
     }
 }
@@ -599,6 +605,7 @@ impl RequestQueryTimer {
         Self {
             pending: None,
             clock,
+            turn: crate::sim::gate::QueryTurn::default(),
         }
     }
 
@@ -702,8 +709,10 @@ impl diesel::connection::Instrumentation for RequestQueryTimer {
                 // opted-out timer never pays the allocation — see `on_start`.
                 let now = self.clock.monotonic();
                 self.on_start(now, || query.to_string());
+                self.turn.start();
             }
             InstrumentationEvent::FinishQuery { .. } => {
+                self.turn.finish();
                 let now = self.clock.monotonic();
                 self.on_finish(now);
             }
@@ -1535,7 +1544,7 @@ static SQLITE_REPLICATION_ACTIVE: std::sync::atomic::AtomicBool =
 ///   `sqlite3_unlock_notify`), so the pragma is inert for that one lock class —
 ///   harmless, not harmful (issue #2881).
 #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
-const fn sqlite_connection_pragmas(read_only: bool, replicating: bool) -> &'static str {
+pub(crate) const fn sqlite_connection_pragmas(read_only: bool, replicating: bool) -> &'static str {
     if read_only {
         "PRAGMA busy_timeout = 5000; \
          PRAGMA foreign_keys = ON;"
@@ -2948,6 +2957,104 @@ where
 
 /// Connection type managed by the deadpool pool.
 pub type PooledConnection = diesel_async::pooled_connection::deadpool::Object<RuntimeConnection>;
+
+/// Replica lag query (issue #3065).
+///
+/// - Not in recovery (a primary, or a plain database): lag is `0`.
+/// - The WAL receiver runs, it got a message from the primary within the lag
+///   limit (`$1`, in ms), and all received WAL is replayed: lag is `0`. An
+///   idle primary writes no new transactions, so the replay timestamp alone
+///   would grow without limit. A disconnected or stalled receiver keeps its
+///   last receive LSN, so the LSN check alone would read as fresh. A message
+///   older than the limit proves nothing within the limit, so then the branch
+///   below applies. A role
+///   without `pg_read_all_stats` sees `last_msg_receipt_time` as `NULL`. That
+///   is not proof of freshness, so the branch below applies.
+/// - Else: time since the last replayed transaction. `NULL` when nothing has
+///   been replayed yet, which means "unknown". The `NULL` check comes before
+///   `GREATEST`, because `GREATEST(0, NULL)` is `0` in Postgres.
+#[cfg(not(feature = "sqlite"))]
+const REPLICA_LAG_SQL: &str = "SELECT CASE \
+     WHEN NOT pg_is_in_recovery() THEN 0::BIGINT \
+     WHEN EXISTS (SELECT 1 FROM pg_stat_wal_receiver \
+          WHERE last_msg_receipt_time > clock_timestamp() - make_interval(secs => $1::DOUBLE PRECISION / 1000)) \
+          AND pg_last_wal_receive_lsn() IS NOT NULL \
+          AND pg_last_wal_replay_lsn() >= pg_last_wal_receive_lsn() THEN 0::BIGINT \
+     WHEN pg_last_xact_replay_timestamp() IS NULL THEN NULL \
+     ELSE GREATEST(0, FLOOR(EXTRACT(EPOCH FROM \
+          (clock_timestamp() - pg_last_xact_replay_timestamp())) * 1000))::BIGINT \
+     END AS lag_ms";
+
+/// Measure the replica lag on `conn`, for the lag limit `max_lag`. See
+/// [`REPLICA_LAG_SQL`].
+#[cfg(not(feature = "sqlite"))]
+pub(crate) async fn measure_replica_lag(
+    conn: &mut PooledConnection,
+    max_lag: std::time::Duration,
+) -> Result<std::time::Duration, String> {
+    use diesel_async::RunQueryDsl as _;
+
+    #[derive(diesel::QueryableByName)]
+    struct LagRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+        lag_ms: Option<i64>,
+    }
+
+    let window_ms = i64::try_from(max_lag.as_millis()).unwrap_or(i64::MAX);
+    let row: LagRow = diesel::sql_query(REPLICA_LAG_SQL)
+        .bind::<diesel::sql_types::BigInt, _>(window_ms)
+        .get_result(&mut **conn)
+        .await
+        .map_err(|error| error.to_string())?;
+    let lag_ms = row
+        .lag_ms
+        .ok_or_else(|| "replica has not replayed a transaction yet".to_owned())?;
+    Ok(std::time::Duration::from_millis(
+        u64::try_from(lag_ms).unwrap_or(0),
+    ))
+}
+
+#[cfg(all(test, not(feature = "sqlite")))]
+mod replica_lag_sql_tests {
+    #[test]
+    fn the_receiver_window_is_the_lag_limit() {
+        let sql = super::REPLICA_LAG_SQL;
+        assert!(
+            !sql.contains("60 seconds"),
+            "a fixed window lets a stalled receiver read as fresh past the limit"
+        );
+        assert!(
+            sql.contains("last_msg_receipt_time > clock_timestamp() - make_interval(secs => $1"),
+            "the receiver must have heard from the primary within the lag limit: {sql}"
+        );
+    }
+
+    #[test]
+    fn unknown_replay_time_stays_null() {
+        let sql = super::REPLICA_LAG_SQL;
+        let null_check = sql
+            .find("pg_last_xact_replay_timestamp() IS NULL THEN NULL")
+            .expect("a replica with no replayed transaction must read as unknown");
+        let greatest = sql.find("GREATEST(").expect("negative lag is clamped");
+        assert!(
+            null_check < greatest,
+            "GREATEST(0, NULL) is 0, so the NULL check must come first"
+        );
+    }
+}
+
+/// `SQLite` has no replicas, so the lag is always `0`.
+#[cfg(feature = "sqlite")]
+#[allow(
+    clippy::unused_async,
+    reason = "same signature as the Postgres variant"
+)]
+pub(crate) async fn measure_replica_lag(
+    _conn: &mut PooledConnection,
+    _max_lag: std::time::Duration,
+) -> Result<std::time::Duration, String> {
+    Ok(std::time::Duration::ZERO)
+}
 
 struct TxDepthGuard<'a> {
     depth: &'a mut usize,

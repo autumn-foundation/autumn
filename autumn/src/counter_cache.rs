@@ -643,6 +643,12 @@ async fn serialize_table(_conn: &mut RuntimeConnection, _table: &str) -> AutumnR
     Ok(())
 }
 
+/// Refuse counter upkeep on a ledgered parent. The `UPDATE` records no revision
+/// (#2319).
+fn refuse_ledgered_parent(view: &SqlView) -> AutumnResult<()> {
+    crate::ledger::refuse_out_of_band_write(view.parent_table, "counter cache")
+}
+
 /// Apply `delta` to one parent's counter with a single atomic statement.
 ///
 /// This is the primitive AC5 rests on: `SET c = c + $1` is resolved by the
@@ -661,6 +667,7 @@ pub async fn counter_cache_apply_delta<M: 'static>(
 ) -> AutumnResult<()> {
     let view = view(spec);
     assert_spec_idents(&view);
+    refuse_ledgered_parent(&view)?;
     let Quoted {
         parent_table,
         parent_pk,
@@ -722,6 +729,7 @@ pub async fn counter_cache_apply_delta_by_child_id<M: 'static>(
 ) -> AutumnResult<()> {
     let view = view(spec);
     assert_spec_idents(&view);
+    refuse_ledgered_parent(&view)?;
     let state_predicate = match child_state {
         ChildState::Any => String::new(),
         ChildState::Live => live_predicate(&view, true),
@@ -1225,6 +1233,7 @@ pub async fn counter_cache_before_delete_many<M: 'static>(
     for index in specs_in_lock_order(specs) {
         let view = view(&specs[index]);
         assert_spec_idents(&view);
+        refuse_ledgered_parent(&view)?;
         let sql = bulk_decrement_sql(&view, &id_list);
         diesel::sql_query(sql)
             .execute(conn)
@@ -1961,6 +1970,7 @@ pub async fn recompute_batch_statements(
         return Ok(0);
     }
     assert_spec_idents(view);
+    refuse_ledgered_parent(view)?;
     let id_list = id_list(ids);
     let parent_table = quote_ident(view.parent_table);
     let parent_pk = quote_ident(view.parent_pk);

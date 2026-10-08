@@ -1161,6 +1161,8 @@ pub(crate) async fn wait_while_deferred(
             waited.store(true, Ordering::Release);
         }
         tokio::select! {
+            // Fixed branch order, so a sim replays it (#3067).
+            biased;
             () = shutdown.cancelled() => {
                 resumed = false;
                 break;

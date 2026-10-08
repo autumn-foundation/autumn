@@ -494,73 +494,226 @@ fn upsert_schema_block(
     }
 }
 
-/// Byte range `[start, end)` of the `table!` block (qualified `diesel::table!`
-/// or the bare `table!` re-export) that declares `table`, including any path
-/// qualifier so a replacement isn't double-prefixed. `None` if not found.
-fn schema_block_range(existing: &str, table: &str) -> Option<(usize, usize)> {
-    let needle = format!("{table} (");
-    let bytes = existing.as_bytes();
-    let mut search_from = 0;
-    while let Some(macro_rel) = existing[search_from..].find("table!") {
-        let name_start = search_from + macro_rel;
-        // Walk back over an optional path qualifier (e.g. `diesel::`).
-        let mut macro_start = name_start;
-        while macro_start > 0 {
-            let c = bytes[macro_start - 1];
-            if c.is_ascii_alphanumeric() || c == b'_' || c == b':' {
-                macro_start -= 1;
-            } else {
-                break;
+/// Call `f` with the position and byte of each code byte of `text`, from
+/// `from` (which must be in code). Comments (`//`, nested `/* */`), string
+/// literals (`"..."`, raw `r#"..."#`) and char literals are not code. `f`
+/// returns `true` to stop.
+pub fn scan_code(text: &str, from: usize, mut f: impl FnMut(usize, u8) -> bool) {
+    let b = text.as_bytes();
+    let find = |from: usize, pat: &[u8]| {
+        b.get(from..)
+            .and_then(|rest| rest.windows(pat.len()).position(|w| w == pat))
+            .map(|p| from + p)
+    };
+    let mut i = from;
+    while i < b.len() {
+        let c = b[i];
+        let next = b.get(i + 1).copied();
+        if c == b'/' && next == Some(b'/') {
+            i = find(i, b"\n").unwrap_or(b.len());
+        } else if c == b'/' && next == Some(b'*') {
+            let mut depth = 1;
+            i += 2;
+            while i < b.len() && depth > 0 {
+                if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    i += 2;
+                } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
-        }
-        // Find the opening brace of this macro invocation.
-        let Some(brace_rel) = existing[name_start..].find('{') else {
-            break;
-        };
-        let open = name_start + brace_rel;
-        // Match braces to find the end of the macro body, ignoring `{`/`}` that
-        // appear inside a `//` line comment or a "..." string (Diesel blocks can
-        // carry `///` doc comments and `#[sql_name = "..."]` attributes).
-        let mut depth = 0usize;
-        let mut end = None;
-        let mut in_string = false;
-        let mut in_line_comment = false;
-        let region = &existing.as_bytes()[open..];
-        let mut i = 0;
-        while i < region.len() {
-            let b = region[i];
-            if in_line_comment {
-                if b == b'\n' {
-                    in_line_comment = false;
-                }
-            } else if in_string {
-                if b == b'\\' {
-                    i += 1; // skip the escaped byte
-                } else if b == b'"' {
-                    in_string = false;
-                }
-            } else if b == b'/' && region.get(i + 1) == Some(&b'/') {
-                in_line_comment = true;
-                i += 1;
-            } else if b == b'"' {
-                in_string = true;
-            } else if b == b'{' {
-                depth += 1;
-            } else if b == b'}' {
-                depth -= 1;
-                if depth == 0 {
-                    end = Some(open + i + 1);
-                    break;
-                }
+        } else if c == b'"' {
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                i += if b[i] == b'\\' { 2 } else { 1 };
+            }
+            i += 1;
+        } else if let Some(end) = raw_string_end(b, i, &find) {
+            i = end;
+        } else if c == b'\'' && next == Some(b'\\') {
+            i = find(i + 2, b"'").map_or(b.len(), |p| p + 1);
+        } else if c == b'\'' && b.get(i + 2) == Some(&b'\'') {
+            i += 3;
+        } else {
+            if f(i, c) {
+                return;
             }
             i += 1;
         }
-        let Some(end) = end else { break };
-        // Does this macro define the table we're looking for?
-        if existing[open..end]
-            .lines()
-            .any(|l| l.trim().starts_with(&needle))
-        {
+    }
+}
+
+/// The end of the raw string literal (`r"..."`, `r#"..."#`) that starts at
+/// `i`, or `None` when no raw string starts there.
+fn raw_string_end(
+    b: &[u8],
+    i: usize,
+    find: &impl Fn(usize, &[u8]) -> Option<usize>,
+) -> Option<usize> {
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    // `r"..."`, the raw byte string `br"..."` or the raw C string `cr"..."`.
+    let starts_word = i == 0
+        || !ident(b[i - 1])
+        || (matches!(b[i - 1], b'b' | b'c') && (i == 1 || !ident(b[i - 2])));
+    if b[i] != b'r' || !starts_word {
+        return None;
+    }
+    let hashes = b[i + 1..].iter().take_while(|&&c| c == b'#').count();
+    if b.get(i + 1 + hashes) != Some(&b'"') {
+        return None;
+    }
+    let mut close = vec![b'"'];
+    close.extend(std::iter::repeat_n(b'#', hashes));
+    Some(find(i + 2 + hashes, &close).map_or(b.len(), |p| p + close.len()))
+}
+
+/// True when `text` ends with an identifier character: a macro name found
+/// after it is the end of a longer name. Every non-ASCII character counts,
+/// so all Unicode identifier characters (combining marks too) are covered.
+#[must_use]
+pub fn ends_in_word(text: &str) -> bool {
+    text.chars()
+        .next_back()
+        .is_some_and(|c| !c.is_ascii() || c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The start of the macro path that ends at `at`: `diesel::` before
+/// `table!`, also with spaces (`diesel :: table!`).
+#[must_use]
+pub fn macro_path_start(text: &str, at: usize) -> usize {
+    let mut start = at;
+    while let Some(rest) = text[..start].trim_end().strip_suffix("::") {
+        let segment = rest.trim_end();
+        let word = segment
+            .trim_end_matches(|c: char| !c.is_ascii() || c.is_ascii_alphanumeric() || c == '_');
+        // A raw identifier segment: `r#type::`.
+        let word = word
+            .strip_suffix("r#")
+            .filter(|w| !ends_in_word(w))
+            .unwrap_or(word);
+        if word.len() == segment.len() {
+            // A leading `::` (an absolute path).
+            return rest.len();
+        }
+        start = word.len();
+    }
+    start
+}
+
+/// True when byte `at` of `text` is not code (see [`scan_code`]): in a
+/// comment, a string literal, or a char literal.
+#[must_use]
+pub fn is_in_comment_or_string(text: &str, at: usize) -> bool {
+    let mut code = false;
+    scan_code(text, 0, |i, _| {
+        code = i == at;
+        i >= at
+    });
+    !code
+}
+
+/// The table name of the `table!` block whose body opens at `open`: the
+/// first code word after attributes (`#[...]`). Doc comments are not code.
+fn block_table_name(text: &str, open: usize) -> Option<String> {
+    let mut name: Vec<u8> = Vec::new();
+    let mut brackets = 0usize;
+    // In a `use ...;` declaration (diesel `print-schema` writes them first).
+    let mut in_use = false;
+    scan_code(text, open + 1, |_, c| {
+        if in_use {
+            in_use = c != b';';
+            return false;
+        }
+        // An attribute (`#[...]`) before the name: skip it whole.
+        if brackets > 0 || name.is_empty() && matches!(c, b'#' | b'[') {
+            match c {
+                b'[' => brackets += 1,
+                b']' => brackets = brackets.saturating_sub(1),
+                _ => {}
+            }
+            return false;
+        }
+        // A byte of a non-ASCII character is part of a Unicode identifier.
+        if c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80 || (c == b'#' && name == b"r") {
+            name.push(c);
+            return false;
+        }
+        if name.is_empty() {
+            return !c.is_ascii_whitespace();
+        }
+        if name == b"use" {
+            name.clear();
+            in_use = c != b';';
+            return false;
+        }
+        true
+    });
+    String::from_utf8(name).ok().filter(|n| !n.is_empty())
+}
+
+/// Byte range `[start, end)` of the `table!` block (qualified `diesel::table!`
+/// or the bare `table!` re-export) that declares `table`, including any path
+/// qualifier so a replacement isn't double-prefixed. `None` if not found.
+pub fn schema_block_range(existing: &str, table: &str) -> Option<(usize, usize)> {
+    let unraw = |name: &str| name.strip_prefix("r#").unwrap_or(name).to_owned();
+    let bytes = existing.as_bytes();
+    let want = unraw(table);
+    let mut search_from = 0;
+    while let Some(macro_rel) = existing[search_from..].find("table!") {
+        let name_start = search_from + macro_rel;
+        search_from = name_start + "table!".len();
+        // A `table!` in a comment or a string, or the end of a longer name
+        // (`my_table!`), is not a diesel block.
+        let in_word = ends_in_word(&existing[..name_start]);
+        if in_word || is_in_comment_or_string(existing, name_start) {
+            continue;
+        }
+        let macro_start = macro_path_start(existing, name_start);
+        // The delimiter of this call (`{`, `(` or `[`), then its match.
+        // Delimiters in comments and literals (doc comments,
+        // `#[sql_name = "..."]`) do not count.
+        let mut open = None;
+        let mut end = None;
+        let mut depth = 0usize;
+        scan_code(existing, search_from, |i, c| {
+            if open.is_none() && !matches!(c, b'{' | b'(' | b'[') {
+                // Not a macro call: stop unless this is white space.
+                return !c.is_ascii_whitespace();
+            }
+            match c {
+                b'{' | b'(' | b'[' => {
+                    open.get_or_insert(i);
+                    depth += 1;
+                }
+                b'}' | b')' | b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + 1);
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+            false
+        });
+        let (Some(open), Some(mut end)) = (open, end) else {
+            break;
+        };
+        // A `(...)` or `[...]` call ends with `;` (also after spaces): it is
+        // part of the call.
+        let gap = bytes[end..]
+            .iter()
+            .take_while(|&&c| c == b' ' || c == b'\t')
+            .count();
+        if bytes[open] != b'{' && bytes.get(end + gap) == Some(&b';') {
+            end += gap + 1;
+        }
+        // Does this macro define the table we're looking for? The name may sit
+        // on its own line, before the key (`posts\n(id) {`).
+        if block_table_name(existing, open).is_some_and(|name| unraw(&name) == want) {
             return Some((macro_start, end));
         }
         search_from = end;
