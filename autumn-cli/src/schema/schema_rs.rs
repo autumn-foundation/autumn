@@ -26,7 +26,7 @@ use autumn_schema_core::{Backend, Column, ColumnType, Table};
 
 use super::diff::{MigrationPlan, SchemaChange};
 use super::parse::ParsedSchema;
-use crate::generate::introspect::{is_in_comment, schema_block_range};
+use crate::generate::introspect::{is_in_comment_or_string, schema_block_range};
 
 /// The path of the diesel schema file, from the project root.
 pub const SCHEMA_RS_PATH: &str = "src/schema.rs";
@@ -130,25 +130,15 @@ fn plan_edits(plan: &MigrationPlan) -> PlanEdits {
     edits
 }
 
-/// Apply the table and column edits, then write the managed tables of
-/// `desired`. Last, remove each `joinable!` that names a column that its
-/// managed table no longer has.
+/// Apply the table edits, then write the managed tables of `desired`. Then
+/// apply the column renames to `joinable!`, and remove each `joinable!` that
+/// names a column that its managed table no longer has.
 fn sync(existing: &str, desired: &ParsedSchema, edits: &PlanEdits) -> SchemaRsSync {
     let mut out = SchemaRsSync {
         text: existing.to_owned(),
         ..SchemaRsSync::default()
     };
     let held = apply_removals(&mut out, &edits.tables);
-    for (table, from, to) in &edits.columns {
-        let to = ident_token(to).unwrap_or_else(|| to.clone());
-        out.text = edit_joinables(&out.text, |left, right, column| {
-            if unraw(left) == table && unraw(column) == from {
-                JoinEdit::Replace(left.to_owned(), right.to_owned(), to.clone())
-            } else {
-                JoinEdit::Keep
-            }
-        });
-    }
     // Managed tables whose block now has the model's columns.
     let mut current: Vec<&Table> = Vec::new();
 
@@ -212,6 +202,22 @@ fn sync(existing: &str, desired: &ParsedSchema, edits: &PlanEdits) -> SchemaRsSy
         }
         out.written.push(table.name.clone());
         current.push(table);
+    }
+    // Column renames move a `joinable!` only when the block of its table now
+    // has the new column. A skipped block keeps the old column, so its
+    // `joinable!` keeps it too.
+    for (table, from, to) in &edits.columns {
+        if !current.iter().any(|t| t.name == *table) {
+            continue;
+        }
+        let to = ident_token(to).unwrap_or_else(|| to.clone());
+        out.text = edit_joinables(&out.text, |left, right, column| {
+            if unraw(left) == table && unraw(column) == from {
+                JoinEdit::Replace(left.to_owned(), right.to_owned(), to.clone())
+            } else {
+                JoinEdit::Keep
+            }
+        });
     }
     out.text = edit_joinables(&out.text, |left, _, column| {
         let stale = current
@@ -548,7 +554,7 @@ fn edit_joinables(text: &str, edit: impl Fn(&str, &str, &str) -> JoinEdit) -> St
 const ALLOW: &str = "allow_tables_to_appear_in_same_query!";
 
 /// Each call of the macro `name` (for example `joinable!`) in `text`, not in a
-/// comment: `(start, open, close, end)`. `start` includes the path,
+/// comment or a string: `(start, open, close, end)`. `start` includes the path,
 /// `open` and `close` are the outer parentheses, and `end` includes a `;` and
 /// a line end.
 fn macro_calls(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> {
@@ -557,7 +563,7 @@ fn macro_calls(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> {
     while let Some(rel) = text[from..].find(name) {
         let at = from + rel;
         from = at + name.len();
-        if is_in_comment(text, at) {
+        if is_in_comment_or_string(text, at) {
             continue;
         }
         let Some(open) = text[from..]
@@ -1299,6 +1305,39 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
     fn a_macro_in_a_block_comment_is_not_a_call() {
         let head =
             "/* generated with diesel::table! and\n   joinable!(comments -> posts (post_id)) */\n";
+        let stale = "diesel::table! {\n    posts (id) {\n        id -> Int8,\n    }\n}\n";
+        let out = sync_for_plan(
+            &format!("{head}{stale}"),
+            &parsed(vec![posts(Backend::Postgres)]),
+            &plan(vec![SchemaChange::DropTable(Table::new(
+                "comments",
+                Backend::Postgres,
+            ))]),
+        );
+        assert_eq!(out.text, format!("{head}{POSTS_BLOCK}"));
+    }
+
+    /// A column rename does not change the `joinable!` when the block of
+    /// its table is skipped (attributes), so the two stay in step.
+    #[test]
+    fn a_column_rename_on_a_skipped_block_keeps_its_joinable() {
+        let existing = "diesel::table! {\n    comments (id) {\n        id -> Int8,\n        #[sql_name = \"PostId\"]\n        post_id -> Int8,\n    }\n}\n\ndiesel::joinable!(comments -> posts (post_id));\n";
+        let out = sync_for_plan(
+            existing,
+            &parsed(vec![comments("article_id")]),
+            &plan(vec![SchemaChange::RenameColumn {
+                table: "comments".to_owned(),
+                from: "post_id".to_owned(),
+                to: "article_id".to_owned(),
+            }]),
+        );
+        assert_eq!(out.text, existing);
+    }
+
+    /// A macro name in a string literal is not a call.
+    #[test]
+    fn a_macro_in_a_string_is_not_a_call() {
+        let head = "const NOTE: &str = \"diesel::table! and \\\" joinable!(comments -> posts (post_id))\";\nconst RAW: &str = r#\"diesel::table! { x }\"#;\n";
         let stale = "diesel::table! {\n    posts (id) {\n        id -> Int8,\n    }\n}\n";
         let out = sync_for_plan(
             &format!("{head}{stale}"),

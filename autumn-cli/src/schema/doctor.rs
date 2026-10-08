@@ -707,8 +707,13 @@ fn schema_rs_check(state: &SchemaRsState) -> Check {
             } else {
                 format!("; not checked: {}", unchecked.join(", "))
             };
-            if check.stale.is_empty() {
-                (Status::Ok, format!("the managed blocks match{note}"))
+            if check.stale.is_empty() && check.unchecked.is_empty() {
+                (Status::Ok, "the managed blocks match".to_owned())
+            } else if check.stale.is_empty() {
+                (
+                    Status::Warn,
+                    format!("the other managed blocks match{note}"),
+                )
             } else {
                 (
                     Status::Warn,
@@ -752,10 +757,15 @@ fn unmanaged_check(state: &UnmanagedState) -> Check {
                     drift.unchecked.join(", ")
                 )
             };
-            if drift.drifted.is_empty() {
+            if drift.drifted.is_empty() && drift.unchecked.is_empty() {
                 (
                     Status::Ok,
-                    format!("the unmanaged models match their tables{note}"),
+                    "the unmanaged models match their tables".to_owned(),
+                )
+            } else if drift.drifted.is_empty() {
+                (
+                    Status::Warn,
+                    format!("the other unmanaged models match their tables{note}"),
                 )
             } else {
                 let list: Vec<String> = drift
@@ -1709,7 +1719,7 @@ mod tests {
         );
     }
 
-    /// A table that the check cannot compare is named, and is not a WARN.
+    /// A table that the check cannot compare is named, as a WARN.
     #[test]
     fn schema_rs_drift_names_unchecked_tables() {
         let check = SchemaRsCheck {
@@ -1717,7 +1727,7 @@ mod tests {
             unchecked: vec![("posts".to_owned(), "enum field".to_owned())],
         };
         let row = schema_rs_check(&SchemaRsState::Checked(check));
-        assert_eq!(row.status, Status::Ok, "{row:?}");
+        assert_eq!(row.status, Status::Warn, "{row:?}");
         assert!(
             row.detail.contains("not checked: posts (enum field)"),
             "{row:?}"
@@ -1779,6 +1789,7 @@ mod tests {
         assert!(drift.drifted.is_empty(), "{drift:?}");
         assert_eq!(drift.unchecked, vec!["posts".to_owned()]);
         let row = unmanaged_check(&UnmanagedState::Checked(drift));
+        assert_eq!(row.status, Status::Warn, "{row:?}");
         assert!(row.detail.contains("not checked: posts"), "{row:?}");
     }
 

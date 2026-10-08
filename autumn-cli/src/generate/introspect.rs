@@ -494,16 +494,85 @@ fn upsert_schema_block(
     }
 }
 
-/// True when byte `at` of `text` is in a comment: after `//` on its line, or
-/// after a `/*` that no `*/` closes before `at`.
+/// True when byte `at` of `text` is in a comment (`//`, nested `/* */`) or in
+/// a string literal (`"..."`, raw `r#"..."#`). A short lexer from the start of
+/// `text`; char literals are skipped so `'"'` does not open a string.
 #[must_use]
-pub fn is_in_comment(text: &str, at: usize) -> bool {
-    let before = &text[..at];
-    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
-    before[line_start..].contains("//")
-        || before
-            .rfind("/*")
-            .is_some_and(|open| !before[open..].contains("*/"))
+pub fn is_in_comment_or_string(text: &str, at: usize) -> bool {
+    let b = text.as_bytes();
+    let find = |from: usize, pat: &[u8]| {
+        b.get(from..)
+            .and_then(|rest| rest.windows(pat.len()).position(|w| w == pat))
+            .map(|p| from + p)
+    };
+    let mut i = 0;
+    while i < at {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                let end = find(i, b"\n").unwrap_or(b.len());
+                if at < end {
+                    return true;
+                }
+                i = end;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let mut depth = 1;
+                i += 2;
+                while i < b.len() && depth > 0 {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if depth > 0 || at < i {
+                    return true;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                if at <= i {
+                    return true;
+                }
+                i += 1;
+            }
+            b'r' if (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+                && matches!(b.get(i + 1), Some(b'"' | b'#')) =>
+            {
+                let hashes = b[i + 1..].iter().take_while(|&&c| c == b'#').count();
+                if b.get(i + 1 + hashes) != Some(&b'"') {
+                    i += 1;
+                    continue;
+                }
+                let mut close = vec![b'"'];
+                close.extend(std::iter::repeat_n(b'#', hashes));
+                let end = find(i + 2 + hashes, &close).map_or(b.len(), |p| p + close.len());
+                if at < end {
+                    return true;
+                }
+                i = end;
+            }
+            b'\'' => {
+                // A char literal (`'x'`, `'\n'`) is skipped; a lifetime is not.
+                if b.get(i + 1) == Some(&b'\\') {
+                    i = find(i + 2, b"'").map_or(b.len(), |p| p + 1);
+                } else if b.get(i + 2) == Some(&b'\'') {
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 /// Byte range `[start, end)` of the `table!` block (qualified `diesel::table!`
@@ -515,8 +584,8 @@ pub fn schema_block_range(existing: &str, table: &str) -> Option<(usize, usize)>
     let mut search_from = 0;
     while let Some(macro_rel) = existing[search_from..].find("table!") {
         let name_start = search_from + macro_rel;
-        // A `table!` in a comment is not a block.
-        if is_in_comment(existing, name_start) {
+        // A `table!` in a comment or a string is not a block.
+        if is_in_comment_or_string(existing, name_start) {
             search_from = name_start + "table!".len();
             continue;
         }

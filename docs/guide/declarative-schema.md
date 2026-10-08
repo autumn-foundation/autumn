@@ -450,8 +450,9 @@ checks are:
 - **snapshot-drift** — the declared models match the snapshot baseline.
 - **schema-rs-drift** — each managed model has a matching block in
   `src/schema.rs`. A missing or stale block is a **WARN**. To fix it, run
-  `autumn schema diff --write-migration`. The row names each table that it
-  cannot compare (for example a model with an enum field). Without a managed
+  `autumn schema diff --write-migration`. A table that the row cannot compare
+  (for example a model with an enum field) is also a **WARN**, and the row
+  names it. Without a managed
   model, the row is **OK**.
 - **provider-lock** — the snapshot's backend tag matches the detected backend.
 - **snapshot-dialect-vs-db** — the snapshot dialect matches the configured
@@ -467,9 +468,9 @@ checks are:
   does not have, and a different type or `NULL` rule. It does not compare
   columns that only the table has, indexes, defaults or constraints. It does
   not compare a type that the CLI keeps as an opaque type (for example
-  `VARCHAR(40)`, or `BOOLEAN` on SQLite). The row names each model that has
-  a field the parser cannot read (for example an enum): the check cannot
-  compare that column. Drift is a **WARN**. To fix it, write a migration with `autumn generate migration`, or
+  `VARCHAR(40)`, or `BOOLEAN` on SQLite). A model with a field that the parser
+  cannot read (for example an enum) is also a **WARN**, and the row names it:
+  the check cannot compare that column. Drift is a **WARN**. To fix it, write a migration with `autumn generate migration`, or
   change the model.
 
 ---
