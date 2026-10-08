@@ -241,10 +241,13 @@ impl Exempt {
     }
 }
 
-/// `true` when `path` is `base` or a sub-path of it.
+/// `true` when `path` is `base` or a sub-path of it. An empty `base` (a
+/// blank probe path) matches nothing.
 fn under(path: &str, base: &str) -> bool {
-    path.strip_prefix(base)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    !base.is_empty()
+        && path
+            .strip_prefix(base)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// The stop window.
@@ -802,6 +805,15 @@ mod tests {
         };
         assert!(exempt.contains("/loggers/autumn_web"));
         assert!(!exempt.contains("/loggersx"));
+    }
+
+    #[test]
+    fn a_blank_exempt_path_exempts_nothing() {
+        let exempt = Exempt {
+            paths: vec![String::new()],
+            actuator_prefix: "/actuator".to_owned(),
+        };
+        assert!(!exempt.contains("/api/orders"));
     }
 
     #[test]
