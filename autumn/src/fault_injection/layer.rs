@@ -29,7 +29,7 @@ use axum::http::{HeaderValue, Request, Response};
 use axum::response::IntoResponse;
 use tower::{Layer, Service};
 
-use super::{FAULT_HEADER, FaultTarget, Injector, RequestScope, RouteFault, SCOPE};
+use super::{FAULT_HEADER, FaultDelay, FaultTarget, Injector, RequestScope, RouteFault, SCOPE};
 
 type BoxFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send>>;
 
@@ -204,7 +204,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<B>) -> Self::Future {
+    fn call(&mut self, mut req: Request<B>) -> Self::Future {
         let mut fault = SCOPE
             .try_with(|scope| {
                 if scope.route_rolled.swap(true, Ordering::AcqRel) {
@@ -237,6 +237,10 @@ where
         // place.
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
+        if self.deadline.is_some() {
+            // Outside the timeout layer: the wait uses part of the deadline.
+            req.extensions_mut().insert(FaultDelay(fault.latency));
+        }
         Box::pin(async move {
             tokio::time::sleep(fault.latency).await;
             inner.call(req).await
@@ -465,6 +469,36 @@ mod tests {
         let started = tokio::time::Instant::now();
         assert_eq!(status(app, "/x").await, 503);
         assert_eq!(started.elapsed(), Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_outer_latency_tells_the_timeout_layer_its_wait() {
+        let mut rule = error_rule(1_000_000);
+        rule.kind = FaultKind::Latency;
+        rule.latency = Duration::from_millis(900);
+        let injector = injector(vec![rule], 1_000);
+        let app = axum::Router::new()
+            .route(
+                "/x",
+                get(|req: Request<Body>| async move {
+                    req.extensions()
+                        .get::<FaultDelay>()
+                        .map_or(0, |spent| spent.0.as_millis())
+                        .to_string()
+                }),
+            )
+            .layer((
+                FaultScopeLayer::new(Arc::clone(&injector)),
+                FaultInjectionLayer::new(Some(Duration::from_secs(1))),
+            ));
+        let response = app
+            .oneshot(Request::get("/x").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 64)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"900");
     }
 
     #[tokio::test]

@@ -65,7 +65,8 @@ In an app with pre-rendered (SSG/ISG) pages, both fault layers also go outside
 the static cache, so a cached page can get a route fault too. There, a route
 fault occurs before rate limiting and load shedding. The injected latency is
 at most `server.timeouts.request_timeout_ms`; at that limit the request fails
-with `503`, as a timeout does. A request gets its route faults one time.
+with `503`, as a timeout does. The handler gets only the time that is left.
+A request gets its route faults one time.
 
 A dependency fault applies only in a request that matches `routes`. Work that
 runs outside a request (jobs, the scheduler, spawned tasks) gets no faults.

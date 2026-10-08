@@ -63,6 +63,13 @@ pub use layer::{FaultInjectionLayer, FaultInjectionService};
 /// The header on a response from an injected route error.
 pub const FAULT_HEADER: &str = "x-autumn-fault";
 
+/// Request extension: the time that an outer route fault waited.
+///
+/// The request timeout layer subtracts it from the deadline, so the wait and
+/// the handler share one request timeout.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FaultDelay(pub(crate) Duration);
+
 /// The audit actor when the framework arms or disarms the faults.
 const SYSTEM_ACTOR: &str = "autumn";
 
