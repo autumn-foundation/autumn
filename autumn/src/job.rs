@@ -5480,6 +5480,12 @@ pub fn start_runtime(
         tracing::warn!("jobs.max_backoff_ms = 0: every job retry is due at once, with no backoff");
     }
     state.insert_extension(JobMaxBackoff(config.max_backoff_ms));
+    if config.tenants != crate::config::JobTenantsConfig::default() && config.backend != "local" {
+        tracing::warn!(
+            backend = %config.backend,
+            "[jobs.tenants] applies to the local backend only; it has no effect here"
+        );
+    }
 
     match config.backend.as_str() {
         "local" => {
