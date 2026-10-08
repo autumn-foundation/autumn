@@ -284,12 +284,6 @@ impl Provenance {
         })
     }
 
-    /// Whether `path` has any recorded owner.
-    #[must_use]
-    pub fn is_recorded(&self, root: &Path, path: &Path) -> bool {
-        key(root, path).is_some_and(|k| self.entries.contains_key(&k))
-    }
-
     /// Whether ANY command wrote exactly `digest` to `path`.
     ///
     /// For a file several resources share: only the first writer is recorded,

@@ -2750,23 +2750,11 @@ fn plan_scaffold_with_options_impl(
     // Issue #2328: when a run drops a flag, the scaffold no longer emits that code.
     // Remove the feature that the code needed. `destroy` uses its own reverts.
     // Keep `i18n` and `maud`. `.i18n_auto()` and the shared layout use them.
-    // Only a regenerate releases. It needs a record that a scaffold wrote the
-    // routes and repository files. A first run, a hand-made model, or a
-    // controller keeps every feature.
+    // Only a feature that the files this run overwrites used before is released.
+    // A first run, a hand-made model, or a controller keeps every feature.
     let released_routes_dir = project_root.join("src").join("routes");
     let released_own_routes = released_routes_dir.join(format!("{plural}.rs"));
-    // The repository file is written by the scaffold alone. A controller can
-    // own the same routes path.
-    let released_own_repo = project_root
-        .join("src")
-        .join("repositories")
-        .join(format!("{snake_name}.rs"));
-    let was_scaffolded = || {
-        let recorded = super::provenance::Provenance::load(project_root);
-        recorded.is_recorded(project_root, &released_own_routes)
-            && recorded.is_recorded(project_root, &released_own_repo)
-    };
-    if !for_revert && was_scaffolded() {
+    if !for_revert {
         let cargo_path = project_root.join("Cargo.toml");
         let attachments = has_attachment_fields(&fields);
         let htmx_needed = (search_enabled && !options_with_key.api)
@@ -27327,23 +27315,6 @@ exempt_paths = [
         }
 
         #[test]
-        fn a_routes_file_alone_is_not_scaffold_provenance() {
-            let tmp = project();
-            run(&tmp, "Post", POST, &searchable());
-            // A controller owns the routes file but writes no repository.
-            let repo = tmp.path().join("src/repositories/post.rs");
-            let mut recorded = crate::generate::provenance::Provenance::load(tmp.path());
-            recorded.forget(tmp.path(), &repo);
-            recorded.save(tmp.path()).unwrap();
-            run(&tmp, "Post", POST, &ScaffoldOptions::default());
-            assert!(
-                autumn_web_line(&tmp).contains("htmx"),
-                "{}",
-                autumn_web_line(&tmp)
-            );
-        }
-
-        #[test]
         fn keeps_ws_for_code_that_uses_the_prelude_types() {
             let tmp = project();
             let live = ScaffoldOptions {
@@ -27377,6 +27348,80 @@ exempt_paths = [
             run(&tmp, "Post", POST, &ScaffoldOptions::default());
             assert!(
                 autumn_web_line(&tmp).contains("htmx"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn dropping_an_attachment_from_an_api_scaffold_releases_storage() {
+            let tmp = project();
+            let api = ScaffoldOptions {
+                api: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", &["title:String", "cover:attachment"], &api);
+            assert!(autumn_web_line(&tmp).contains("storage"));
+            run(&tmp, "Post", POST, &api);
+            let line = autumn_web_line(&tmp);
+            assert!(
+                !line.contains("storage") && !line.contains("multipart"),
+                "{line}"
+            );
+        }
+
+        #[test]
+        fn keeps_ws_for_a_resumable_sse_route() {
+            let tmp = project();
+            let live = ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", POST, &live);
+            fs::write(
+                tmp.path().join("src/support.rs"),
+                "pub use autumn_web::sse::stream_resumable;\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("\"ws\""),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn another_dependency_with_default_features_off_does_not_pin_htmx() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                format!("{cargo}serde = {{ version = \"1\", default-features = false }}\n"),
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                !autumn_web_line(&tmp).contains("htmx"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn a_feature_the_old_files_never_used_is_not_released() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                cargo.replace("features = [", "features = [\"multipart\", "),
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("multipart"),
                 "{}",
                 autumn_web_line(&tmp)
             );

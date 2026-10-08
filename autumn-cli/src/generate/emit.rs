@@ -685,11 +685,33 @@ impl Plan {
             let by_sibling = r.owner.as_ref().is_some_and(|(dir, own)| {
                 resource_dir_has_other_files(dir, std::slice::from_ref(own))
             });
+            // Release only what this run takes away. Some file it overwrites
+            // used the feature before. A feature that no such file used was
+            // not this scaffold's, so keep it.
+            // An attachment column enables `multipart` and `storage` together,
+            // and an `--api` scaffold uses only `storage` in code.
+            let mut used_markers = markers.clone().unwrap_or_default();
+            if r.feature == "multipart" {
+                used_markers.extend(release_markers("storage").unwrap_or_default());
+            }
+            let was_used = Some(used_markers.as_slice())
+                .filter(|m| !m.is_empty())
+                .is_some_and(|m| {
+                    self.actions.iter().any(|a| {
+                        a.path() != r.path
+                            && fs::read_to_string(a.path()).is_ok_and(|old| {
+                                m.iter().any(|marker| old.contains(marker.as_str()))
+                            })
+                    })
+                });
             // `htmx` is a default feature. Without default features, other
             // code may need it in ways no marker shows, so keep it.
             let defaults_off = r.feature == "htmx" && base_disables_defaults(&base);
-            let needed =
-                by_marker || by_sibling || defaults_off || (markers.is_none() && r.owner.is_none());
+            let needed = !was_used
+                || by_marker
+                || by_sibling
+                || defaults_off
+                || (markers.is_none() && r.owner.is_none());
             if needed {
                 continue;
             }
@@ -1526,7 +1548,7 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
         // uses `autumn_web::prelude::*` names none of the paths above.
         "ws" => &[
             "#[ws]",
-            "autumn_web::sse::stream(",
+            "autumn_web::sse::stream",
             "Channels",
             "Broadcast",
             "ChannelMessage",
@@ -1620,11 +1642,23 @@ fn autumn_web_feature_still_needed_elsewhere(
     markers_in_project(&markers, project_root, excluding, overrides)
 }
 
-/// Whether the manifest turns off default features for a dependency.
+/// Whether the manifest turns off default features for `autumn-web`.
+///
+/// Reads an inline entry, or the lines under a `[dependencies.autumn-web]`
+/// style table. Another dependency's setting does not count.
 fn base_disables_defaults(manifest: &str) -> bool {
-    manifest
-        .lines()
-        .any(|l| l.replace(' ', "").contains("default-features=false"))
+    let is_off = |line: &str| line.replace(' ', "").contains("default-features=false");
+    let names_web = |text: &str| text.contains("autumn-web") || text.contains("autumn_web");
+    let mut in_web_table = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_web_table = names_web(trimmed);
+        } else if (in_web_table || names_web(trimmed)) && is_off(trimmed) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether any of `markers` appears in `src/`, `tests/`, `benches/` or `examples/`.
