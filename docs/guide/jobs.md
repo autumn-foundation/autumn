@@ -471,10 +471,10 @@ too. The timeout stops a handler only at an `.await`. A handler that blocks its
 thread does not stop.
 
 For a tracked job, the timeout also covers the `mark_running` call to the
-tracking store. If the store stalls, the run fails with the timeout error and
-retries. The final `complete` or `fail` call has its own cap: the timeout or 5
-seconds, whichever is shorter. When the cap is reached, the worker logs a
-warning and continues. The tracked record then expires through its TTL.
+tracking store. If the store stalls, the run fails with the timeout error. The
+normal retry rules apply. The final `complete` or `fail` call has its own cap
+of 5 seconds. When the cap is reached, the worker logs a warning and continues.
+The tracked record then expires through its TTL.
 
 When the worker stops a run (lost lease or timeout), it drops the handler
 future. Work that the handler spawned continues, so check the signal there:

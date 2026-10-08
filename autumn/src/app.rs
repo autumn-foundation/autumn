@@ -3543,7 +3543,7 @@ impl AppBuilder {
     /// developer error.
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::cognitive_complexity)]
-    // `run` is one long-lived future, boxed by the caller. Its frame is fine.
+    // Large frame is expected: the caller boxes this long-lived future.
     #[allow(clippy::large_stack_frames)]
     pub async fn run(self) {
         // Remember the binary this process was started from, before a deploy
