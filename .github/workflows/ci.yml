@@ -156,7 +156,10 @@ jobs:
         # globally, so one such edge swaps `db::RuntimeConnection` for every
         # consumer in the graph. Until this gate, that invariant was prose plus
         # the `sqlite`-excluding feature lists below, and nothing read the
-        # manifests. No toolchain, ~1 second, self-testing.
+        # manifests. ~2 seconds, self-testing. The resolver layer asks
+        # `cargo metadata` what cargo resolves, so it is required here.
+        env:
+          SQLITE_GATE_REQUIRE_RESOLVE: "1"
         run: ./scripts/check-sqlite-unification.sh
       - name: Example binary-name collision gate
         # Two workspace members producing the same binary file name break the
@@ -2406,6 +2409,16 @@ jobs:
           grep -qE 'test result: ok\. [1-9][0-9]* passed' \
             "${RUNNER_TEMP}/admin-plugin-sqlite.log" \
             || { echo "::error::no admin-plugin sqlite test ran — the #[ignore] or the target name changed"; exit 1; }
+      - name: Clippy autumn-search under the sqlite backend
+        # Issue #2539 §5. The Postgres store binds a `BIGINT[]`, which SQLite
+        # does not have, so the crate did not compile under the flip. It now
+        # does, and the store refuses SQLite at boot and on every query. The
+        # flip is explicit here, as for the admin plugin above.
+        run: cargo clippy -p autumn-search --features autumn-web/sqlite --all-targets -- -D warnings
+      - name: Run the autumn-search lib tests under sqlite
+        # Runs the SQLite arm of the refusal tests. A bare `--lib` has no
+        # filter, so a pass-count check is not needed.
+        run: cargo test -p autumn-search --features autumn-web/sqlite --lib
       - name: Run the sqlite integration suite
         # Named sqlite `[[test]]` targets only. `test-support` is required by the
         # TestApp/Db-extractor-based tests (sqlite_db_extractor, sqlite_read_only_tx,

@@ -2514,7 +2514,10 @@ impl AppBuilder {
     /// use std::time::Duration;
     /// use autumn_web::feature_flags::pg::PgFlagStore;
     ///
-    /// let store = Arc::new(PgFlagStore::new(&config.database.primary_url));
+    /// // `None` when no primary target is set, or it is not Postgres.
+    /// let store = Arc::new(
+    ///     PgFlagStore::from_database_config(&config.database).expect("a Postgres target"),
+    /// );
     /// PgFlagStore::spawn_poll_listener(Arc::clone(&store), Duration::from_secs(1));
     /// autumn_web::app()
     ///     .with_flag_store(Arc::clone(&store))
@@ -2617,7 +2620,10 @@ impl AppBuilder {
     /// use std::time::Duration;
     /// use autumn_web::experiments::pg::PgExperimentStore;
     ///
-    /// let store = Arc::new(PgExperimentStore::new(&config.database.primary_url));
+    /// // `None` when no primary target is set, or it is not Postgres.
+    /// let store = Arc::new(
+    ///     PgExperimentStore::from_database_config(&config.database).expect("a Postgres target"),
+    /// );
     /// PgExperimentStore::spawn_poll_listener(Arc::clone(&store), Duration::from_secs(5));
     /// autumn_web::app()
     ///     .with_experiment_store(Arc::clone(&store))
