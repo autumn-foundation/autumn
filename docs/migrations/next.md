@@ -596,7 +596,7 @@ codemod rewrites struct literals.
 **Before (`{X.Y}`):**
 
 ```rust
-let body = autumn_web::tenancy::TenantPropagatingBody {
+let body = TenantPropagatingBody {
     inner,
     tenant_id,
     handle: None,
@@ -606,7 +606,7 @@ let body = autumn_web::tenancy::TenantPropagatingBody {
 **After (`{(X+1).0}`):** add `db_bulkhead: None`.
 
 ```rust
-let body = autumn_web::tenancy::TenantPropagatingBody {
+let body = TenantPropagatingBody {
     inner,
     tenant_id,
     handle: None,
