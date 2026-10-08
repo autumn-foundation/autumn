@@ -1232,6 +1232,20 @@ path = "tests/sim_fault_plan_db.rs"
 name = "sim_chaos_crash"
 path = "tests/sim_chaos_crash.rs"
 
+# Issue #3067: several replicas on one sim clock and one SQLite database.
+# SQLite-only (the sim substrate), so a standalone target like the others.
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sim_replicas`.
+[[test]]
+name = "sim_replicas"
+path = "tests/sim_replicas.rs"
+
+# Issue #3067: the same-seed trace check. Its own binary, because `tracing`
+# caches callsite interest for the whole process.
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sim_fleet_trace`.
+[[test]]
+name = "sim_fleet_trace"
+path = "tests/sim_fleet_trace.rs"
+
 # Issue #3062: transactional outbox crash sweep and `deliver_later` restart.
 # SQLite-only (the sim substrate), so a standalone target like the others.
 [[test]]

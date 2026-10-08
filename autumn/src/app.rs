@@ -9014,13 +9014,15 @@ pub(crate) fn start_task_scheduler_with_config(
             crate::task::Schedule::FixedDelay(delay) => {
                 let coordinator = Arc::clone(&coordinator);
                 let shutdown = shutdown.child_token();
-                tokio::spawn(async move {
+                crate::sim::spawn_app_task(&state.clone(), async move {
                     loop {
                         state.task_registry.record_next_run_at(
                             &name,
                             &format_next_task_run_after(state.clock().now(), delay),
                         );
                         tokio::select! {
+                            // Fixed branch order, so a sim replays it (#3067).
+                            biased;
                             () = shutdown.cancelled() => break,
                             () = tokio::time::sleep(delay) => {
                                 execute_fixed_delay_task(
@@ -9574,7 +9576,7 @@ fn run_cron_scheduler(
         let state = state.clone();
         let coordinator = Arc::clone(coordinator);
         let shutdown = shutdown.child_token();
-        tokio::spawn(async move {
+        crate::sim::spawn_app_task(&state.clone(), async move {
             run_cron_task_loop(task, state, shutdown, coordinator, lease_ttl).await;
         });
     }
@@ -9633,6 +9635,8 @@ async fn run_cron_task_loop(
         );
         let sleep_for = cron_sleep_duration_until(state.clock().now(), &scheduled_at);
         tokio::select! {
+            // Fixed branch order, so a sim replays it (#3067).
+            biased;
             () = shutdown.cancelled() => break,
             () = tokio::time::sleep(sleep_for) => {
                 let woke_at = state.clock().now().with_timezone(&timezone);
@@ -9671,7 +9675,7 @@ async fn run_cron_task_loop(
                     unix_secs: u64::try_from(scheduled_at.timestamp()).unwrap_or_default(),
                     window: cron_occurrence_window(&cron, &scheduled_at),
                 };
-                tokio::spawn(execute_cron_task(
+                crate::sim::spawn_app_task(&state, execute_cron_task(
                     name.clone(),
                     state.clone(),
                     handler,
