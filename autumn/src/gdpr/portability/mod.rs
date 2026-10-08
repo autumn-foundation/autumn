@@ -463,6 +463,28 @@ pub(super) async fn check_target(
                 described.iter().find(|d| d.name == field.name),
             )?;
         }
+        // A column that was nullable in the capsule can be NOT NULL in the
+        // target now. A row without a value there would fail at the insert,
+        // after its blobs are written.
+        let required: Vec<&str> = model
+            .fields
+            .iter()
+            .filter(|f| !f.generated)
+            .filter(|f| described.iter().any(|d| d.name == f.name && !d.nullable))
+            .map(|f| f.name.as_str())
+            .collect();
+        for row in capsule.records(&model.table) {
+            if let Some(column) = required
+                .iter()
+                .find(|c| row.get(**c).is_none_or(serde_json::Value::is_null))
+            {
+                return Err(DataCapsuleError::InvalidInput(format!(
+                    "{}.{column} is NOT NULL in the target table, but a row of the capsule \
+                     has no value in it",
+                    model.table
+                )));
+            }
+        }
     }
     Ok(())
 }

@@ -940,6 +940,26 @@ async fn import_refuses_a_domain_whose_base_type_the_target_changed() {
 }
 
 #[tokio::test]
+async fn import_refuses_a_null_in_a_column_that_the_target_now_requires() {
+    // `bio` was nullable when the capsule was made, and Ada's is empty now.
+    // The target has made the column NOT NULL: the insert would fail after
+    // the blobs are written, so import must refuse it first.
+    let mut capsule = export_ada(&seeded_store()).await;
+    capsule.records.get_mut("users").unwrap()[0].insert("bio".to_owned(), Value::Null);
+    let err = import_capsule(
+        &capsule,
+        registry().capsule_models(),
+        &store_with_bio(FieldSpec::new("bio", "text")),
+    )
+    .await
+    .expect_err("null in a NOT NULL column");
+    assert!(
+        matches!(&err, DataCapsuleError::InvalidInput(m) if m.contains("users.bio")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
 async fn import_refuses_a_column_that_the_target_no_longer_generates() {
     // `bio` was generated when the capsule was made, so import would skip
     // it. The target writes it now, and would take a default instead of

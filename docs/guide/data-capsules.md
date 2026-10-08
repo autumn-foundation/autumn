@@ -235,8 +235,8 @@ capsule directory and to each directory above it.
   domain, also the same base type) and the same generated status: a capsule
   made before you dropped, renamed, or retyped a column, or made it generated
   or ordinary, is refused (`400`) before any blob is written. A row column
-  that the manifest does not describe, and a row without a value in a
-  `NOT NULL` column, are refused too. If a blob key holds different bytes or
+  that the manifest does not describe, and a row without a value in a column
+  that is `NOT NULL` in the capsule or in the target table, are refused too. If a blob key holds different bytes or
   a different MIME type, import stops and writes no blob. If a blob changes
   while import reads it, or another writer takes a key during the import,
   import stops with a conflict (`409`).
