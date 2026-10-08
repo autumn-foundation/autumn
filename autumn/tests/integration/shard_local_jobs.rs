@@ -14,8 +14,7 @@ mod shard_local_job_tests {
     use diesel::prelude::*;
     use diesel_async::pooled_connection::AsyncDieselConnectionManager;
     use diesel_async::pooled_connection::deadpool::Pool;
-    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
-    use scoped_futures::ScopedFutureExt as _;
+    use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 
     /// The job migrations, applied to the control database only. The shard
     /// gets its job table from the runtime.
@@ -83,32 +82,28 @@ mod shard_local_job_tests {
             .map_or(-1, |row| row.n)
     }
 
-    async fn sign_up(
-        pool: &Pool<AsyncPgConnection>,
-        account: &str,
-        commit: bool,
-    ) -> Result<(), diesel::result::Error> {
+    /// Write an account and enqueue its job in one shard transaction, then
+    /// commit or roll back.
+    async fn sign_up(pool: &Pool<AsyncPgConnection>, account: &str, commit: bool) {
         let mut pooled = pool.get().await.expect("shard connection");
         let conn: &mut AsyncPgConnection = &mut pooled;
-        let account = account.to_owned();
-        conn.transaction::<(), diesel::result::Error, _>(|conn| {
-            async move {
-                diesel::sql_query("INSERT INTO accounts (name) VALUES ($1)")
-                    .bind::<diesel::sql_types::Text, _>(&account)
-                    .execute(conn)
-                    .await?;
-                job::enqueue_in_tx(JOB_NAME, WelcomeArgs { account }, conn)
-                    .await
-                    .expect("enqueue_in_tx on the shard connection");
-                if commit {
-                    Ok(())
-                } else {
-                    Err(diesel::result::Error::RollbackTransaction)
-                }
-            }
-            .scope_boxed()
-        })
+        conn.batch_execute("BEGIN").await.expect("begin");
+        diesel::sql_query("INSERT INTO accounts (name) VALUES ($1)")
+            .bind::<diesel::sql_types::Text, _>(account)
+            .execute(conn)
+            .await
+            .expect("insert account");
+        job::enqueue_in_tx(
+            JOB_NAME,
+            WelcomeArgs {
+                account: account.to_owned(),
+            },
+            conn,
+        )
         .await
+        .expect("enqueue_in_tx on the shard connection");
+        let end = if commit { "COMMIT" } else { "ROLLBACK" };
+        conn.batch_execute(end).await.expect("end transaction");
     }
 
     #[tokio::test]
@@ -161,7 +156,7 @@ mod shard_local_job_tests {
         assert!(ready, "the shard must get an autumn_jobs table");
 
         // Rollback: neither the account nor the job exists.
-        assert!(sign_up(&shard, "rolled-back", false).await.is_err());
+        sign_up(&shard, "rolled-back", false).await;
         assert_eq!(count(&shard, "SELECT COUNT(*) AS n FROM accounts").await, 0);
         assert_eq!(
             count(&shard, "SELECT COUNT(*) AS n FROM autumn_jobs").await,
@@ -170,7 +165,7 @@ mod shard_local_job_tests {
         );
 
         // Commit: both exist, on the shard and not on the control database.
-        sign_up(&shard, "committed", true).await.expect("commit");
+        sign_up(&shard, "committed", true).await;
         assert_eq!(count(&shard, "SELECT COUNT(*) AS n FROM accounts").await, 1);
         assert_eq!(
             count(&shard, "SELECT COUNT(*) AS n FROM autumn_jobs").await,
