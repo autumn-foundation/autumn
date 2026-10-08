@@ -100,7 +100,8 @@ pub struct ETag {
 impl ETag {
     /// Construct a **strong** `ETag` from any tag string.
     ///
-    /// Strong `ETag`s assert byte-for-byte equivalence.
+    /// Strong `ETag`s assert byte-for-byte equivalence. The tag must not
+    /// contain `"`. If it does, the `ETag` never matches.
     #[must_use]
     pub fn strong(tag: impl Into<String>) -> Self {
         Self {
@@ -114,6 +115,7 @@ impl ETag {
     /// Weak `ETag`s (prefixed `W/`) assert semantic equivalence: same content,
     /// possibly different encoding. Use them when the response can vary by
     /// `Accept-Encoding` or when comparing bodies with minor byte differences.
+    /// The tag must not contain `"`. If it does, the `ETag` never matches.
     #[must_use]
     pub fn weak(tag: impl Into<String>) -> Self {
         Self {
@@ -148,29 +150,89 @@ impl ETag {
         HeaderValue::from_str(&formatted).unwrap_or_else(|_| HeaderValue::from_static(""))
     }
 
-    /// Returns `true` if the given raw `If-None-Match` header value matches
-    /// this `ETag` according to RFC 7232 §3.2 weak comparison.
-    ///
-    /// `*` matches any `ETag`. Both strong and weak `ETag`s are compared by
-    /// their opaque tag string.
+    /// Returns `true` if one raw `If-None-Match` field matches this `ETag`.
+    #[cfg(test)]
     fn matches_if_none_match(&self, if_none_match: &str) -> bool {
-        let if_none_match = if_none_match.trim();
-        if if_none_match == "*" {
-            return true;
-        }
-        for candidate in if_none_match.split(',') {
-            let candidate = candidate.trim();
-            // Strip W/ prefix then quotes for weak comparison.
-            let tag = candidate
-                .strip_prefix("W/")
-                .unwrap_or(candidate)
-                .trim_matches('"');
-            if tag == self.tag {
-                return true;
-            }
-        }
-        false
+        fields_match(Some(&self.tag), [Some(if_none_match)])
     }
+}
+
+/// Returns `true` if the `If-None-Match` fields match `tag`.
+///
+/// Uses weak comparison (RFC 9110 §8.8.3.2). It parses each field
+/// separately, so a malformed field cannot hide a match in a different
+/// field. `*` matches only when no field has a tag (RFC 9110 §13.1.2).
+/// A `None` field is not UTF-8. A `None` tag is a current `ETag` that
+/// the parser cannot read: only `*` matches it.
+fn fields_match<'a>(tag: Option<&str>, fields: impl IntoIterator<Item = Option<&'a str>>) -> bool {
+    let (mut star, mut tags, mut matched) = (false, false, false);
+    for field in fields {
+        match field.map(|f| f.trim_matches(OWS)) {
+            Some("*") => star = true,
+            Some("") => {}
+            Some(list) => {
+                tags = true;
+                matched =
+                    matched || tag.is_some_and(|tag| entity_tags(list).any(|t| t == Some(tag)));
+            }
+            None => tags = true,
+        }
+    }
+    if star { !tags } else { matched }
+}
+
+/// Returns the tag of a response `ETag` value (RFC 9110 §8.8.3).
+///
+/// The value must be exactly one quoted entity-tag. This parser is strict:
+/// it does not accept a list, a stray comma, or a tag without quotes.
+fn single_tag(value: &str) -> Option<&str> {
+    let value = value.trim_matches(OWS);
+    let quoted = value.strip_prefix("W/").unwrap_or(value);
+    let tag = quoted.strip_prefix('"')?.strip_suffix('"')?;
+    (!tag.contains('"')).then_some(tag)
+}
+
+/// HTTP optional whitespace (RFC 9110 §5.6.3): only SP and HTAB.
+const OWS: [char; 2] = [' ', '\t'];
+
+/// Reads a header value as UTF-8. Unlike `to_str`, this keeps obs-text.
+fn header_str(value: &HeaderValue) -> Option<&str> {
+    std::str::from_utf8(value.as_bytes()).ok()
+}
+
+/// Splits an `If-None-Match` list into opaque tags (RFC 9110 §13.1.2).
+///
+/// A comma in quotes is part of the tag. A malformed member gives `None`,
+/// so it never matches. The parser also accepts a tag without quotes,
+/// because some clients send this form.
+fn entity_tags(list: &str) -> impl Iterator<Item = Option<&str>> {
+    let mut rest = list;
+    std::iter::from_fn(move || {
+        rest = rest.trim_start_matches(|c| OWS.contains(&c) || c == ',');
+        if rest.is_empty() {
+            return None;
+        }
+        let member = rest.strip_prefix("W/").unwrap_or(rest);
+        let Some(quoted) = member.strip_prefix('"') else {
+            let end = member.find(',').unwrap_or(member.len());
+            let tag = member[..end].trim_end_matches(OWS);
+            rest = &member[end..];
+            return Some((!tag.is_empty() && !tag.contains('"')).then_some(tag));
+        };
+        let Some(close) = quoted.find('"') else {
+            rest = "";
+            return Some(None);
+        };
+        let after = quoted[close + 1..].trim_start_matches(OWS);
+        if after.is_empty() || after.starts_with(',') {
+            rest = after;
+            return Some(Some(&quoted[..close]));
+        }
+        // Text follows the closing quote, so the member is malformed.
+        // Skip to the next comma.
+        rest = after.find(',').map_or("", |end| &after[end..]);
+        Some(None)
+    })
 }
 
 // ── IntoETag trait ────────────────────────────────────────────────────────────
@@ -469,11 +531,10 @@ pub fn fresh_when<E: IntoETag>(request_headers: &HeaderMap, etag: E) -> FreshWhe
 }
 
 fn check_if_none_match(headers: &HeaderMap, etag: &ETag) -> bool {
-    // Iterate all If-None-Match header fields (there may be more than one).
-    headers
-        .get_all(IF_NONE_MATCH)
-        .iter()
-        .any(|v| v.to_str().is_ok_and(|s| etag.matches_if_none_match(s)))
+    fields_match(
+        Some(&etag.tag),
+        headers.get_all(IF_NONE_MATCH).iter().map(header_str),
+    )
 }
 
 fn not_modified_response(
@@ -866,24 +927,18 @@ where
     }
 
     fn call(&mut self, req: http::Request<ReqBody>) -> Self::Future {
-        // Collect all If-None-Match header fields and join them so that a match
-        // in any field is honoured (multiple fields are equivalent to one
-        // comma-separated list per RFC 7230 §3.2.2).
-        let if_none_match: Option<String> = {
-            let vals: Vec<&str> = req
-                .headers()
+        let is_get = req.method() == http::Method::GET;
+        // Do not join the If-None-Match fields. A malformed field must not
+        // hide a match in a different field.
+        let if_none_match: Vec<HeaderValue> = if is_get {
+            req.headers()
                 .get_all(IF_NONE_MATCH)
                 .iter()
-                .filter_map(|v| v.to_str().ok())
-                .collect();
-            if vals.is_empty() {
-                None
-            } else {
-                Some(vals.join(", "))
-            }
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
         };
-
-        let is_get = req.method() == http::Method::GET;
         let fut = self.inner.call(req);
 
         Box::pin(async move {
@@ -891,7 +946,7 @@ where
             if !is_get || response.status() != StatusCode::OK {
                 return Ok(response);
             }
-            Ok(apply_etag(response, if_none_match.as_deref()).await)
+            Ok(apply_etag(response, &if_none_match).await)
         })
     }
 }
@@ -913,25 +968,20 @@ fn copy_304_headers(src: &http::HeaderMap, dst: &mut Response<Body>) {
 }
 
 /// Core `ETag` logic applied to a confirmed `GET 200` response.
-async fn apply_etag(response: Response<Body>, if_none_match: Option<&str>) -> Response<Body> {
+async fn apply_etag(response: Response<Body>, if_none_match: &[HeaderValue]) -> Response<Body> {
     // If the handler already set an ETag, check If-None-Match against it
     // before buffering the body.
     if let Some(existing_etag) = response.headers().get(ETAG).cloned() {
-        if let Some(inm) = if_none_match {
-            let existing_tag = existing_etag.to_str().unwrap_or("");
-            let tag = existing_tag
-                .strip_prefix("W/")
-                .unwrap_or(existing_tag)
-                .trim_matches('"');
-            let candidate_etag = ETag::strong(tag.to_owned());
-            if candidate_etag.matches_if_none_match(inm) {
-                let (parts, _body) = response.into_parts();
-                let mut not_modified = not_modified_response(&candidate_etag, None);
-                copy_304_headers(&parts.headers, &mut not_modified);
-                not_modified.headers_mut().remove(SET_COOKIE);
-                not_modified.headers_mut().insert(ETAG, existing_etag);
-                return not_modified;
-            }
+        // An unreadable or malformed handler ETag matches only `*`.
+        let tag = header_str(&existing_etag).and_then(single_tag);
+        if fields_match(tag, if_none_match.iter().map(header_str)) {
+            let candidate_etag = ETag::strong(tag.unwrap_or_default().to_owned());
+            let (parts, _body) = response.into_parts();
+            let mut not_modified = not_modified_response(&candidate_etag, None);
+            copy_304_headers(&parts.headers, &mut not_modified);
+            not_modified.headers_mut().remove(SET_COOKIE);
+            not_modified.headers_mut().insert(ETAG, existing_etag);
+            return not_modified;
         }
         return response;
     }
@@ -1006,7 +1056,7 @@ async fn apply_etag(response: Response<Body>, if_none_match: Option<&str>) -> Re
         ETag::weak(format!("{:016x}", hasher.finish()))
     };
 
-    if if_none_match.is_some_and(|inm| etag.matches_if_none_match(inm)) {
+    if fields_match(Some(&etag.tag), if_none_match.iter().map(header_str)) {
         let mut not_modified = not_modified_response(&etag, None);
         copy_304_headers(&parts.headers, &mut not_modified);
         not_modified.headers_mut().remove(SET_COOKIE);
@@ -1890,5 +1940,284 @@ mod tests {
         let values: Vec<_> = response.headers().get_all(CACHE_CONTROL).iter().collect();
         assert_eq!(values.len(), 1, "exactly one Cache-Control on 304");
         assert_eq!(values[0].to_str().unwrap(), "public, max-age=60");
+    }
+
+    // ── RED: commas inside quoted tags (issue #3080) ─────────────────────────
+
+    /// Sends one `GET` through `EtagLayer` and returns the status. The
+    /// handler sets the `ETag` header to `etag`.
+    async fn layer_status(etag: &'static str, if_none_match: &[&'static str]) -> StatusCode {
+        let svc =
+            EtagLayer::new().layer(tower::service_fn(move |_req: Request<Body>| async move {
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(ETAG, etag)
+                        .body(Body::from("body"))
+                        .unwrap(),
+                )
+            }));
+        let mut req = Request::builder().method(Method::GET).uri("/");
+        for value in if_none_match {
+            req = req.header(IF_NONE_MATCH, *value);
+        }
+        svc.oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[test]
+    fn etag_with_comma_matches_its_own_header_value() {
+        let etag = ETag::strong("a,b");
+        let echo = etag.header_value();
+        assert!(etag.matches_if_none_match(echo.to_str().unwrap()));
+    }
+
+    #[test]
+    fn comma_inside_quotes_is_not_a_list_separator() {
+        assert!(!ETag::strong("a").matches_if_none_match(r#""a,b""#));
+        assert!(!ETag::strong("b").matches_if_none_match(r#""a,b""#));
+    }
+
+    #[test]
+    fn etag_with_comma_matches_inside_a_list() {
+        let etag = ETag::strong("a,b");
+        assert!(etag.matches_if_none_match(r#""x", W/"a,b", "y""#));
+    }
+
+    #[test]
+    fn unterminated_quote_never_matches() {
+        assert!(!ETag::strong("abc").matches_if_none_match(r#""abc"#));
+    }
+
+    #[test]
+    fn text_after_closing_quote_never_matches() {
+        assert!(!ETag::strong("a").matches_if_none_match(r#""a"b"#));
+        // The tag is `a, `. The text `b"` makes the member malformed.
+        assert!(!ETag::strong("b").matches_if_none_match(r#""a, "b""#));
+        assert!(ETag::strong("c").matches_if_none_match(r#""a"b, "c""#));
+    }
+
+    #[test]
+    fn empty_members_do_not_match_empty_tag() {
+        assert!(!ETag::strong("").matches_if_none_match(" , ,"));
+        assert!(ETag::strong("abc").matches_if_none_match(r#", ,"abc","#));
+    }
+
+    #[test]
+    fn unquoted_tag_still_matches() {
+        assert!(ETag::strong("abc").matches_if_none_match("abc"));
+        assert!(ETag::strong("def").matches_if_none_match(r#"abc, "def""#));
+        assert!(ETag::strong("abc").matches_if_none_match("W/abc"));
+    }
+
+    #[test]
+    fn fresh_when_with_comma_tag_is_fresh_on_echo() {
+        let etag = ETag::strong("v1,2");
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, etag.header_value());
+        assert!(fresh_when(&headers, etag).is_fresh());
+    }
+
+    #[test]
+    fn fresh_when_is_stale_when_tag_is_prefix_of_comma_tag() {
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, HeaderValue::from_static(r#""a,b""#));
+        assert!(!fresh_when(&headers, ETag::strong("a")).is_fresh());
+    }
+
+    #[tokio::test]
+    async fn etag_layer_304s_for_handler_etag_with_comma() {
+        let status = layer_status(r#""a,b""#, &[r#""a,b""#]).await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn etag_layer_200s_when_handler_etag_is_prefix_of_comma_tag() {
+        let status = layer_status(r#""a""#, &[r#""a,b""#]).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A fix that joins the fields fails this test.
+    #[tokio::test]
+    async fn etag_layer_bad_field_does_not_hide_next_field() {
+        let status = layer_status(r#""def""#, &[r#""abc"#, r#""def""#]).await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED);
+    }
+
+    #[test]
+    fn tab_is_list_whitespace() {
+        assert!(ETag::strong("b").matches_if_none_match("\"a\",\t\"b\""));
+    }
+
+    #[test]
+    fn star_with_tag_field_is_not_a_wildcard() {
+        let mut headers = HeaderMap::new();
+        headers.append(IF_NONE_MATCH, HeaderValue::from_static(r#""a""#));
+        headers.append(IF_NONE_MATCH, HeaderValue::from_static("*"));
+        assert!(!fresh_when(&headers, ETag::strong("zzz")).is_fresh());
+    }
+
+    #[test]
+    fn star_in_each_field_is_a_wildcard() {
+        let mut headers = HeaderMap::new();
+        headers.append(IF_NONE_MATCH, HeaderValue::from_static("*"));
+        headers.append(IF_NONE_MATCH, HeaderValue::from_static(" * "));
+        assert!(fresh_when(&headers, ETag::strong("zzz")).is_fresh());
+    }
+
+    #[test]
+    fn star_with_non_http_whitespace_is_not_a_wildcard() {
+        let mut headers = HeaderMap::new();
+        let value = HeaderValue::from_bytes("\u{a0}*\u{a0}".as_bytes()).unwrap();
+        headers.insert(IF_NONE_MATCH, value);
+        assert!(!fresh_when(&headers, ETag::strong("zzz")).is_fresh());
+    }
+
+    #[tokio::test]
+    async fn etag_layer_star_with_tag_field_is_not_a_wildcard() {
+        let status = layer_status(r#""zzz""#, &[r#""a""#, "*"]).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[test]
+    fn obs_text_tag_does_not_hide_other_tags() {
+        let mut headers = HeaderMap::new();
+        let value = HeaderValue::from_bytes("\"caf\u{e9}\", \"abc\"".as_bytes()).unwrap();
+        headers.insert(IF_NONE_MATCH, value);
+        assert!(fresh_when(&headers, ETag::strong("abc")).is_fresh());
+    }
+
+    #[test]
+    fn obs_text_tag_matches_its_echo() {
+        let etag = ETag::strong("caf\u{e9}");
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, etag.header_value());
+        assert!(fresh_when(&headers, etag).is_fresh());
+    }
+
+    #[tokio::test]
+    async fn etag_layer_multi_value_handler_etag_never_304s() {
+        let status = layer_status(r#""a", "b""#, &[r#""a""#]).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn etag_layer_handler_etag_with_stray_comma_never_304s() {
+        for etag in [r#""a","#, r#","a""#] {
+            assert_eq!(layer_status(etag, &[r#""a""#]).await, StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn etag_layer_star_matches_unreadable_handler_etag() {
+        let svc = EtagLayer::new().layer(tower::service_fn(|_req: Request<Body>| async {
+            Ok::<_, std::convert::Infallible>(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(ETAG, HeaderValue::from_bytes(b"\"\xff\"").unwrap())
+                    .body(Body::from("body"))
+                    .unwrap(),
+            )
+        }));
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(IF_NONE_MATCH, "*")
+            .body(Body::empty())
+            .unwrap();
+        let status = svc.oneshot(req).await.unwrap().status();
+        assert_eq!(status, StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn etag_layer_unreadable_handler_etag_never_304s() {
+        let svc = EtagLayer::new().layer(tower::service_fn(|_req: Request<Body>| async {
+            Ok::<_, std::convert::Infallible>(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(ETAG, HeaderValue::from_bytes(b"\"\xff\"").unwrap())
+                    .body(Body::from("body"))
+                    .unwrap(),
+            )
+        }));
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(IF_NONE_MATCH, r#""""#)
+            .body(Body::empty())
+            .unwrap();
+        let status = svc.oneshot(req).await.unwrap().status();
+        assert_eq!(status, StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    //! Property tests for `If-None-Match` list parsing (issue #3080).
+    use super::*;
+    use proptest::prelude::*;
+
+    /// An RFC 9110 `etagc` string. It contains visible ASCII characters other
+    /// than `"`. It can contain `,`.
+    const ETAGC: &str = "[\\x21\\x23-\\x7E]{0,12}";
+
+    /// Formats a list of tags as an `If-None-Match` value.
+    fn list(members: &[(String, bool)]) -> String {
+        members
+            .iter()
+            .map(|(tag, weak)| {
+                let etag = if *weak {
+                    ETag::weak(tag.clone())
+                } else {
+                    ETag::strong(tag.clone())
+                };
+                etag.header_value().to_str().unwrap().to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// A tag always matches its own header value, at all positions in a list.
+        #[test]
+        fn tag_matches_its_echo(
+            tag in ETAGC,
+            weak: bool,
+            others in proptest::collection::vec((ETAGC, any::<bool>()), 0..4),
+            at in any::<prop::sample::Index>(),
+        ) {
+            let etag = if weak { ETag::weak(tag.clone()) } else { ETag::strong(tag.clone()) };
+            let mut members = others;
+            members.insert(at.index(members.len() + 1), (tag, weak));
+            prop_assert!(etag.matches_if_none_match(&list(&members)));
+        }
+
+        /// A tag never matches a list that does not contain it.
+        #[test]
+        fn tag_does_not_match_other_tags(
+            tag in ETAGC,
+            others in proptest::collection::vec((ETAGC, any::<bool>()), 0..4),
+        ) {
+            prop_assume!(others.iter().all(|(other, _)| *other != tag));
+            prop_assert!(!ETag::strong(tag).matches_if_none_match(&list(&others)));
+        }
+
+        /// A tag never matches a longer tag that contains it before or after a comma.
+        #[test]
+        fn tag_does_not_match_a_longer_tag_with_comma(tag in ETAGC, other in ETAGC, tag_first: bool) {
+            let joined = if tag_first { format!("{tag},{other}") } else { format!("{other},{tag}") };
+            let value = ETag::strong(joined).header_value();
+            prop_assert!(!ETag::strong(tag).matches_if_none_match(value.to_str().unwrap()));
+        }
+
+        /// The parser never panics.
+        #[test]
+        fn parser_never_panics(value in "[ -~\\t\\x{e9}]{0,40}") {
+            let _ = ETag::strong("a").matches_if_none_match(&value);
+        }
     }
 }

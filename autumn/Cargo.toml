@@ -320,6 +320,10 @@ bytes = "1.9"
 # SCRAM-auth crate), so this adds no new entry to the dependency graph.
 unicode-normalization = "0.1"
 http-body = "1"
+# Own serve loop for `[server.http]` limits (issue #3065). axum::serve gives
+# no access to the hyper builder. Same versions axum already resolves.
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util.workspace = true
 http-body-util = "0.1"
 # Both already resolved transitively via tower-http's compression-gzip/
 # compression-br features (used to precompute static CSS encodings once
@@ -518,10 +522,6 @@ rust_decimal = { workspace = true, features = ["db-diesel2-postgres"] }
 filetime = "0.2"
 futures.workspace = true
 http.workspace = true
-# Compile-probe behind `serve_stack_speaks_http2` (see tls.rs): pins the
-# `axum/http2` feature the ALPN `h2` advertisement depends on. Deliberately
-# without `http2` — see the workspace dependency comment.
-hyper-util.workspace = true
 serde_json = "1"
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
@@ -1010,6 +1010,12 @@ path = "tests/sqlite_version_history.rs"
 [[test]]
 name = "sqlite_ledger"
 path = "tests/sqlite_ledger.rs"
+
+# Separate binary: `inventory` descriptors are per binary, and the fixtures
+# register their own ledgered `lgo_*` tables (#2319). Runs in the sqlite lane.
+[[test]]
+name = "sqlite_ledger_out_of_band"
+path = "tests/sqlite_ledger_out_of_band.rs"
 
 # SQLite durable commit-hook worker end-to-end proof (issue #1996 item 5). Drives
 # the ported worker (BEGIN IMMEDIATE claim + in-process Notify kick + retry/backoff

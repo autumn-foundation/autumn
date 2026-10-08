@@ -3884,9 +3884,8 @@ mod tests {
 
     fn parsed(tables: Vec<Table>, diagnostics: Vec<SchemaDiagnostic>) -> ParsedSchema {
         ParsedSchema {
-            tables,
             diagnostics,
-            renames: Vec::new(),
+            ..ParsedSchema::from_tables(tables)
         }
     }
 

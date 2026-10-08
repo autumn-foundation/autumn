@@ -241,3 +241,103 @@ async fn preload_routes_through_read_role_and_fails_fast_on_unavailable() {
          unavailable, got: {err}"
     );
 }
+
+// ── Replica lag (issue #3065) ─────────────────────────────────────
+
+/// A replica that passed its connection and migration checks, with a lag
+/// limit of one second.
+fn lag_limited_state(fallback: ReplicaFallback) -> AppState {
+    let state = two_pool_state();
+    state.probes().configure_replica_dependency(fallback);
+    state.probes().mark_replica_ready();
+    state
+        .probes()
+        .configure_replica_max_lag(Some(std::time::Duration::from_secs(1)));
+    state
+}
+
+#[tokio::test]
+async fn reads_fall_back_to_primary_when_lag_exceeds_the_limit() {
+    // Even under `fail_readiness`: lag makes the replica stale, not down, and
+    // the primary has the fresh rows.
+    for fallback in [ReplicaFallback::FailReadiness, ReplicaFallback::Primary] {
+        let state = lag_limited_state(fallback);
+        state
+            .probes()
+            .record_replica_lag(std::time::Duration::from_secs(30));
+
+        let repo: PgReplicaNoteRepository = extract(&state).await;
+        assert_eq!(
+            read_pool_size(repo.__autumn_read_route()),
+            Some(PRIMARY_POOL_SIZE),
+            "a replica 30s behind must not serve reads ({fallback:?})"
+        );
+        assert_eq!(
+            state.probes().replica_status().map(|s| s.lag_ms),
+            Some(Some(30_000))
+        );
+        assert!(
+            state.probes().replica_status().is_some_and(|s| !s.ready),
+            "lag over the limit makes the replica not ready"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reads_return_to_the_replica_when_lag_recovers() {
+    let state = lag_limited_state(ReplicaFallback::FailReadiness);
+    state
+        .probes()
+        .record_replica_lag(std::time::Duration::from_secs(30));
+    state
+        .probes()
+        .record_replica_lag(std::time::Duration::from_millis(40));
+
+    let repo: PgReplicaNoteRepository = extract(&state).await;
+    assert_eq!(
+        read_pool_size(repo.__autumn_read_route()),
+        Some(REPLICA_POOL_SIZE),
+        "a replica inside the lag limit serves reads"
+    );
+}
+
+#[tokio::test]
+async fn unmeasured_lag_routes_reads_to_primary() {
+    let state = lag_limited_state(ReplicaFallback::FailReadiness);
+    let repo: PgReplicaNoteRepository = extract(&state).await;
+    assert_eq!(
+        read_pool_size(repo.__autumn_read_route()),
+        Some(PRIMARY_POOL_SIZE),
+        "no lag sample yet, so freshness is unknown"
+    );
+
+    state
+        .probes()
+        .mark_replica_lag_unknown("lag query failed: boom");
+    let repo: PgReplicaNoteRepository = extract(&state).await;
+    assert_eq!(
+        read_pool_size(repo.__autumn_read_route()),
+        Some(PRIMARY_POOL_SIZE)
+    );
+    let status = state.probes().replica_status().expect("replica configured");
+    assert_eq!(status.lag_ms, None);
+    assert!(status.detail.unwrap().contains("boom"));
+}
+
+#[tokio::test]
+async fn no_lag_limit_keeps_routing_unchanged() {
+    let state = two_pool_state();
+    state
+        .probes()
+        .configure_replica_dependency(ReplicaFallback::FailReadiness);
+    state.probes().mark_replica_ready();
+    state
+        .probes()
+        .record_replica_lag(std::time::Duration::from_secs(3600));
+
+    let repo: PgReplicaNoteRepository = extract(&state).await;
+    assert_eq!(
+        read_pool_size(repo.__autumn_read_route()),
+        Some(REPLICA_POOL_SIZE)
+    );
+}

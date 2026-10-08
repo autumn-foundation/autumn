@@ -13,7 +13,7 @@
 //! actually run against the second backend the docs say it supports.
 //!
 //! This proves the #2275 refusal, and the plain subtree-removal path it
-//! guards, against a real SQLite connection: no Docker, in-memory database.
+//! guards, against a real `SQLite` connection: no Docker, in-memory database.
 //!
 //! It also proves that a copy of a registered spec finds the repository of
 //! its model (issue #2286).

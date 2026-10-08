@@ -1235,10 +1235,18 @@ shutdown_timeout_secs = 30   # default (prod: 35), seconds to drain in-flight re
 # `#[get("/slow", timeout_ms = 120000)]` or `timeout = "off"`.
 # request_timeout_ms = 30000
 
+[server.http]
+# Connection limits. The prod profile sets these and more.
+# See docs/guide/connection-limits.md.
+# header_read_timeout_ms = 10000
+# keep_alive_timeout_ms = 75000
+# max_connections = 10000
+
 [database]
 primary_url = "postgres://user:pass@localhost:5432/my_app"
 # url = "postgres://…"       # single-primary alias for primary_url
 # replica_url = "postgres://user:pass@localhost:5433/my_app"
+# replica_max_lag_ms = 5000  # reads use the primary above this lag
 pool_size = 10               # default, max connections per role
 # primary_pool_size = 10
 # replica_pool_size = 5

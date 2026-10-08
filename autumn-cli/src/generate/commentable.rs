@@ -22,12 +22,13 @@
 //! already has an unrelated `comments` table (a `Comment` resource scaffolded
 //! the ordinary way, say) is a real conflict the author has to resolve, and
 //! `IF NOT EXISTS` would turn it into a silent no-op whose only symptom is a
-//! `column "commentable_type" does not exist` at request time. Failing the
-//! migration says so at `migrate`, where it is fixable.
+//! `column "commentable_type" does not exist` at request time. So generation
+//! refuses instead, before it writes any file.
 
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::generate::GenerateError;
 use crate::generate::emit::Plan;
 
 /// The shared comments table's name. Not configurable from the DSL token: the
@@ -161,20 +162,34 @@ pub fn already_migrated(project_root: &Path) -> bool {
     exists && polymorphic
 }
 
-/// A `comments` table that exists but is NOT the polymorphic one.
+/// Refuse when a `comments` table exists but is NOT the polymorphic one.
 ///
-/// A `Comment` model scaffolded the ordinary way creates exactly that, and the
-/// shared table takes the same name — so emitting ours produces a second
-/// `CREATE TABLE comments` and `migrate` stops on "already exists". Skipping
-/// ours instead would be worse (every helper would query discriminator columns
-/// that are not there), so generation still emits and the caller warns. See
-/// #2283 for turning this into a refusal at generate time.
-pub fn conflicting_comments_table(project_root: &Path) -> bool {
+/// A `Comment` model scaffolded the ordinary way creates that table. Emitting
+/// the shared table then gives two `CREATE TABLE comments`, and `migrate` stops.
+/// Skipping it breaks every helper at run time. So generation stops before it
+/// writes any file.
+///
+/// # Errors
+/// [`GenerateError::CommentsTableConflict`] when the name is taken.
+pub fn ensure_no_comments_conflict(project_root: &Path) -> Result<(), GenerateError> {
     let (exists, polymorphic) = comments_table_state(project_root);
-    exists && !polymorphic
+    if exists && !polymorphic {
+        return Err(GenerateError::CommentsTableConflict);
+    }
+    Ok(())
 }
 
-/// Replay the history once: does a `comments` table exist, and is it polymorphic.
+/// Refuse a model whose own table is the shared `comments` table.
+///
+/// # Errors
+/// [`GenerateError::CommentsTableConflict`] when `own_table` is `comments`.
+pub fn ensure_own_table_is_not_comments(own_table: &str) -> Result<(), GenerateError> {
+    if own_table == COMMENTS_TABLE {
+        return Err(GenerateError::CommentsTableConflict);
+    }
+    Ok(())
+}
+
 /// Replay the history once: does a `comments` table exist, and is it the
 /// polymorphic one (every helper's column present).
 fn comments_table_state(project_root: &Path) -> (bool, bool) {
@@ -239,7 +254,91 @@ enum TableEvent {
     Drop(TableRef),
     /// `ALTER TABLE old RENAME TO new`: the record moves with the table, so a
     /// rename INTO `comments` carries the source table's columns across.
-    Rename { from: TableRef, to: TableRef },
+    /// With `IF EXISTS`, an absent source makes it a no-op.
+    Rename {
+        from: TableRef,
+        to: TableRef,
+        if_exists: bool,
+    },
+    /// `ALTER TABLE [IF EXISTS] name SET SCHEMA other`: same name, new schema.
+    /// With `IF EXISTS`, an absent source makes it a no-op.
+    Move {
+        from: TableRef,
+        to: TableRef,
+        if_exists: bool,
+    },
+}
+
+/// Apply one event to the running picture of every table.
+fn apply_table_event(tables: &mut HashMap<TableRef, TableState>, event: TableEvent) {
+    match event {
+        TableEvent::Create(table, columns) => {
+            tables.insert(
+                table,
+                TableState {
+                    exists: true,
+                    columns,
+                },
+            );
+        }
+        TableEvent::Add(table, column) => {
+            let state = tables.entry(table).or_default();
+            if !state.columns.contains(&column) {
+                state.columns.push(column);
+            }
+        }
+        TableEvent::Remove(table, column) => {
+            if let Some(state) = tables.get_mut(&table) {
+                state.columns.retain(|held| *held != column);
+            }
+        }
+        TableEvent::Drop(table) => {
+            let state = tables.entry(table).or_default();
+            state.exists = false;
+            state.columns.clear();
+        }
+        TableEvent::Rename {
+            from,
+            to,
+            if_exists,
+        } => {
+            if if_exists && tables.get(&from).is_some_and(|state| !state.exists) {
+                return;
+            }
+            // A rename is positive evidence the table exists: the
+            // author just renamed it, and in a valid history the
+            // statement would fail otherwise. The old scan read every
+            // `RENAME TO comments` as the table existing; the
+            // generalisation keeps that and additionally carries the
+            // source table's columns across (#2282). When the history
+            // never saw the source, its columns are unknown — present
+            // but not polymorphic, so generation stays loud instead of
+            // claiming a reuse it cannot verify.
+            //
+            // `RENAME TO` takes a bare relation name: the table stays
+            // in its schema, so `archive.legacy_comments RENAME TO
+            // comments` yields `archive.comments`, not `comments`.
+            let to = TableRef {
+                schema: to.schema.or_else(|| from.schema.clone()),
+                name: to.name,
+            };
+            let mut state = tables.remove(&from).unwrap_or_default();
+            state.exists = true;
+            tables.insert(to, state);
+        }
+        TableEvent::Move {
+            from,
+            to,
+            if_exists,
+        } => {
+            if if_exists && tables.get(&from).is_some_and(|state| !state.exists) {
+                return;
+            }
+            let mut state = tables.remove(&from).unwrap_or_default();
+            state.exists = true;
+            tables.insert(to, state);
+        }
+    }
 }
 
 /// Replay every migration's `up.sql` in version order: for every table, does it
@@ -276,9 +375,30 @@ fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
             }
         }
         for (at, table, statement) in alter_tables(sql) {
+            let if_exists = sql[at + "alter table".len()..]
+                .trim_start()
+                .starts_with("if exists");
             // A table rename moves the whole record; it mentions no column.
             if let Some(to) = table_rename_target(statement) {
-                events.push((at, TableEvent::Rename { from: table, to }));
+                events.push((
+                    at,
+                    TableEvent::Rename {
+                        from: table,
+                        to,
+                        if_exists,
+                    },
+                ));
+                continue;
+            }
+            if let Some(to) = table_set_schema_target(statement, &table) {
+                events.push((
+                    at,
+                    TableEvent::Move {
+                        from: table,
+                        to,
+                        if_exists,
+                    },
+                ));
                 continue;
             }
             // An ALTER naming the column may be adding it, dropping it, or
@@ -298,55 +418,7 @@ fn replay_migration_history(files: &[String]) -> HashMap<TableRef, TableState> {
         }
         events.sort_by_key(|(at, _)| *at);
         for (_, event) in events {
-            match event {
-                TableEvent::Create(table, columns) => {
-                    tables.insert(
-                        table,
-                        TableState {
-                            exists: true,
-                            columns,
-                        },
-                    );
-                }
-                TableEvent::Add(table, column) => {
-                    let state = tables.entry(table).or_default();
-                    if !state.columns.contains(&column) {
-                        state.columns.push(column);
-                    }
-                }
-                TableEvent::Remove(table, column) => {
-                    if let Some(state) = tables.get_mut(&table) {
-                        state.columns.retain(|held| *held != column);
-                    }
-                }
-                TableEvent::Drop(table) => {
-                    let state = tables.entry(table).or_default();
-                    state.exists = false;
-                    state.columns.clear();
-                }
-                TableEvent::Rename { from, to } => {
-                    // A rename is positive evidence the table exists: the
-                    // author just renamed it, and in a valid history the
-                    // statement would fail otherwise. The old scan read every
-                    // `RENAME TO comments` as the table existing; the
-                    // generalisation keeps that and additionally carries the
-                    // source table's columns across (#2282). When the history
-                    // never saw the source, its columns are unknown — present
-                    // but not polymorphic, so generation stays loud instead of
-                    // claiming a reuse it cannot verify.
-                    //
-                    // `RENAME TO` takes a bare relation name: the table stays
-                    // in its schema, so `archive.legacy_comments RENAME TO
-                    // comments` yields `archive.comments`, not `comments`.
-                    let to = TableRef {
-                        schema: to.schema.or_else(|| from.schema.clone()),
-                        name: to.name,
-                    };
-                    let mut state = tables.remove(&from).unwrap_or_default();
-                    state.exists = true;
-                    tables.insert(to, state);
-                }
-            }
+            apply_table_event(&mut tables, event);
         }
     }
     tables
@@ -453,6 +525,7 @@ fn parse_table_ref(text: &str) -> Option<(TableRef, usize)> {
 const CREATE_VERBS: &[&str] = &["table", "unlogged table"];
 
 /// Every persistent `CREATE TABLE` in `sql`: (offset, table, column-list body).
+/// The body is empty when the statement has no column list.
 fn create_tables(sql: &str) -> Vec<(usize, TableRef, &str)> {
     let mut found = Vec::new();
     let mut base = 0usize;
@@ -477,9 +550,9 @@ fn create_tables(sql: &str) -> Vec<(usize, TableRef, &str)> {
             continue;
         };
         let body_start = start + "create ".len() + verb.len() + used;
-        let Some(body) = create_table_body(sql, body_start) else {
-            continue;
-        };
+        // No column list (`CREATE TABLE x AS SELECT …`): the name is taken,
+        // and the columns are unknown.
+        let body = create_table_body(sql, body_start).unwrap_or("");
         found.push((start, table, body));
     }
     found
@@ -602,6 +675,17 @@ fn table_rename_target(statement: &str) -> Option<TableRef> {
     parse_table_ref(&statement[at + " rename to ".len()..]).map(|(table, _)| table)
 }
 
+/// The new home of `table` after `ALTER TABLE … SET SCHEMA <schema>`, if
+/// `statement` (the text after the table name) is one.
+fn table_set_schema_target(statement: &str, table: &TableRef) -> Option<TableRef> {
+    let at = statement.find(" set schema ")?;
+    let (schema, _) = parse_ident_segment(&statement[at + " set schema ".len()..])?;
+    Some(TableRef {
+        schema: Some(schema).filter(|schema| schema != "public"),
+        name: table.name.clone(),
+    })
+}
+
 /// Whether `haystack` mentions `column` as a complete SQL identifier.
 ///
 /// A bare `contains` would accept `legacy_commentable_type` as
@@ -681,9 +765,7 @@ fn mentions_column(haystack: &str, column: &str) -> bool {
 /// generation would have SAID it was reusing the table.
 ///
 /// So the whole schema is the question. A table missing any of these is not the
-/// shared table: the generator emits its own and, if the name is taken, says so
-/// (see `conflicting_comments_table`). A loud collision at migrate time beats a
-/// reassuring message and an app that breaks on its first comment.
+/// shared table, and generation refuses (see `ensure_no_comments_conflict`).
 const REQUIRED_COLUMNS: &[&str] = &[
     "id",
     "commentable_type",
@@ -878,6 +960,14 @@ fn migration_up_sql(project_root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Push one space, unless `out` already ends in one. Keyword phrases such as
+/// `drop table` then match whatever whitespace or comment split them.
+fn push_space(out: &mut String) {
+    if !out.ends_with(' ') {
+        out.push(' ');
+    }
+}
+
 /// `sql` with `--` line comments and `/* … */` blocks removed.
 ///
 /// Matching runs over raw text, so a commented-out example — `-- CREATE TABLE
@@ -1057,20 +1147,19 @@ fn strip_sql_comments(sql: &str) -> String {
             }
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
                 let end = sql[i..].find('\n').map_or(bytes.len(), |nl| i + nl);
-                // Blanked, not dropped, so offsets survive.
-                for _ in i..end {
-                    out.push(' ');
-                }
+                push_space(&mut out);
                 i = end;
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
                 let end = sql[i + 2..]
                     .find("*/")
                     .map_or(bytes.len(), |e| i + 2 + e + 2);
-                for _ in i..end {
-                    out.push(' ');
-                }
+                push_space(&mut out);
                 i = end;
+            }
+            _ if bytes[i].is_ascii_whitespace() => {
+                push_space(&mut out);
+                i += 1;
             }
             _ => {
                 let ch = sql[i..].chars().next().unwrap_or(' ');
@@ -2023,9 +2112,154 @@ mod tests {
             "the source table carried no discriminator columns"
         );
         assert!(
-            conflicting_comments_table(tmp.path()),
-            "the name is taken, loudly, rather than silently reused"
+            ensure_no_comments_conflict(tmp.path()).is_err(),
+            "the name is taken, so generation refuses"
         );
+    }
+
+    /// `SET SCHEMA` moves the table out of the default schema, which frees the
+    /// name. Moving it back takes the name again.
+    #[test]
+    fn set_schema_moves_the_table_out_of_and_back_into_the_default_schema() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let migrations = tmp.path().join("migrations");
+        let first = migrations.join("0001_create");
+        std::fs::create_dir_all(&first).expect("mkdir");
+        std::fs::write(
+            first.join("up.sql"),
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT);\n\
+             ALTER TABLE comments SET SCHEMA archive;\n",
+        )
+        .expect("write");
+        assert!(
+            ensure_no_comments_conflict(tmp.path()).is_ok(),
+            "the table now lives in `archive`, so the default name is free"
+        );
+
+        let back = migrations.join("0002_back");
+        std::fs::create_dir_all(&back).expect("mkdir");
+        std::fs::write(
+            back.join("up.sql"),
+            "ALTER TABLE archive.comments SET SCHEMA public;\n",
+        )
+        .expect("write");
+        assert!(
+            ensure_no_comments_conflict(tmp.path()).is_err(),
+            "the plain table is back in the default schema"
+        );
+    }
+
+    /// Keywords may be split by any SQL whitespace, not one space.
+    #[test]
+    fn schema_moves_and_renames_accept_any_whitespace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_create");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT);\n\
+             ALTER TABLE comments\nSET\tSCHEMA   archive;\n",
+        )
+        .expect("write");
+        assert!(ensure_no_comments_conflict(tmp.path()).is_ok());
+
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT);\n\
+             ALTER TABLE comments\nRENAME\tTO   legacy;\n",
+        )
+        .expect("write");
+        assert!(ensure_no_comments_conflict(tmp.path()).is_ok());
+    }
+
+    /// `IF EXISTS` makes a schema move of a dropped table a no-op.
+    #[test]
+    fn a_conditional_schema_move_of_a_dropped_table_changes_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_move");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE archive.comments (id BIGINT);\n\
+             DROP TABLE archive.comments;\n\
+             ALTER TABLE IF EXISTS archive.comments SET SCHEMA public;\n",
+        )
+        .expect("write");
+        assert!(
+            ensure_no_comments_conflict(tmp.path()).is_ok(),
+            "nothing moved, so `comments` is still free"
+        );
+    }
+
+    /// `IF EXISTS` makes a rename of a dropped table a no-op too. A source the
+    /// replay never saw may exist (`CREATE TABLE … AS SELECT`), so it counts.
+    #[test]
+    fn a_conditional_rename_only_skips_a_known_absent_table() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_rename");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE legacy_comments (id BIGINT);\n\
+             DROP TABLE legacy_comments;\n\
+             ALTER TABLE IF EXISTS legacy_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        assert!(
+            ensure_no_comments_conflict(tmp.path()).is_ok(),
+            "the source was dropped, so nothing was renamed"
+        );
+
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE legacy_comments AS SELECT 1 AS id;\n\
+             ALTER TABLE IF EXISTS legacy_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        assert!(
+            ensure_no_comments_conflict(tmp.path()).is_err(),
+            "an untracked source may exist, so `comments` may be taken"
+        );
+    }
+
+    /// A `CREATE TABLE … AS` has no column list, but it still takes the name.
+    #[test]
+    fn create_table_as_occupies_the_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_ctas");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments AS SELECT 1 AS id;\n",
+        )
+        .expect("write");
+        assert!(!already_migrated(tmp.path()), "its columns are unknown");
+        assert!(
+            ensure_no_comments_conflict(tmp.path()).is_err(),
+            "the name is taken"
+        );
+    }
+
+    /// DDL verbs may be split by any whitespace too, and by a comment.
+    #[test]
+    fn ddl_verbs_accept_any_whitespace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_create");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let create = "CREATE\n  TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT);\n";
+        for undo in [
+            "DROP\nTABLE comments;\n",
+            "ALTER\nTABLE comments RENAME TO archived_comments;\n",
+            "DROP /* old */ TABLE\tcomments;\n",
+        ] {
+            std::fs::write(dir.join("up.sql"), format!("{create}{undo}")).expect("write");
+            assert!(
+                ensure_no_comments_conflict(tmp.path()).is_ok(),
+                "the name is free after: {undo}"
+            );
+        }
+        std::fs::write(dir.join("up.sql"), create).expect("write");
+        assert!(ensure_no_comments_conflict(tmp.path()).is_err());
     }
 
     /// `RENAME TO` keeps the table in its schema: a table renamed within
@@ -2246,9 +2480,8 @@ mod tests {
             "the scan cannot verify columns it never saw"
         );
         assert!(
-            conflicting_comments_table(tmp.path()),
-            "the name is taken: generation emits and migrate fails loudly \
-             rather than claiming a reuse"
+            ensure_no_comments_conflict(tmp.path()).is_err(),
+            "the name is taken, so generation refuses"
         );
     }
 
@@ -2763,9 +2996,8 @@ mod tests {
             !already_migrated(tmp.path()),
             "`user_id` is not `author_id`, so the helpers would 42703"
         );
-        // It IS a name collision, so the caller warns rather than silently
-        // emitting a second `CREATE TABLE comments`.
-        assert!(conflicting_comments_table(tmp.path()));
+        // The name is taken, so generation refuses.
+        assert!(ensure_no_comments_conflict(tmp.path()).is_err());
 
         // Every other required column, one at a time, for the same reason.
         for missing in REQUIRED_COLUMNS.iter().copied() {
@@ -2796,15 +3028,46 @@ mod tests {
         )
         .expect("write");
         assert!(already_migrated(tmp.path()));
-        assert!(!conflicting_comments_table(tmp.path()));
+        assert!(ensure_no_comments_conflict(tmp.path()).is_ok());
+    }
+
+    /// A same-named, non-polymorphic table is refused with the remedies. The
+    /// shared table and a clean slate pass.
+    #[test]
+    fn a_conflicting_comments_table_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_create_comments");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT NOT NULL);\n",
+        )
+        .expect("write");
+        let err = ensure_no_comments_conflict(tmp.path()).expect_err("must refuse");
+        let message = err.to_string();
+        assert!(message.contains("comments"), "{message}");
+        assert!(
+            message.contains("commentable_type"),
+            "names the remedy: {message}"
+        );
+
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (commentable_type TEXT NOT NULL, commentable_id BIGINT NOT NULL, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n",
+        )
+        .expect("write");
+        assert!(ensure_no_comments_conflict(tmp.path()).is_ok());
+
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert!(ensure_no_comments_conflict(empty.path()).is_ok());
     }
 
     /// A `Comment` model scaffolded the ordinary way owns a `comments` table
     /// with no discriminator columns. That is neither "already migrated" (the
     /// helpers would query columns that are not there) nor a clean slate — the
-    /// names collide, so the caller must be able to say so.
+    /// names collide, so generation refuses.
     #[test]
-    fn a_plain_comments_table_is_reported_as_conflicting() {
+    fn a_plain_comments_table_is_refused() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().join("migrations").join("0001_create_comments");
         std::fs::create_dir_all(&dir).expect("mkdir");
@@ -2815,8 +3078,8 @@ mod tests {
         .expect("write");
         assert!(!already_migrated(tmp.path()), "no discriminator columns");
         assert!(
-            conflicting_comments_table(tmp.path()),
-            "a same-named non-polymorphic table must be reported"
+            ensure_no_comments_conflict(tmp.path()).is_err(),
+            "a same-named non-polymorphic table must be refused"
         );
 
         // The polymorphic table is NOT a conflict — it is the thing we reuse.
@@ -2827,7 +3090,7 @@ mod tests {
         .expect("write");
         assert!(already_migrated(tmp.path()));
         assert!(
-            !conflicting_comments_table(tmp.path()),
+            ensure_no_comments_conflict(tmp.path()).is_ok(),
             "the shared table is reused, not a collision"
         );
 
@@ -2835,7 +3098,7 @@ mod tests {
         let empty = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(empty.path().join("migrations")).expect("mkdir");
         assert!(!already_migrated(empty.path()));
-        assert!(!conflicting_comments_table(empty.path()));
+        assert!(ensure_no_comments_conflict(empty.path()).is_ok());
     }
 
     /// Quoting makes an identifier case-SENSITIVE: `PostgreSQL` treats

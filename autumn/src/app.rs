@@ -4096,6 +4096,17 @@ impl AppBuilder {
                      database.max_connections_warn_threshold = 0 to silence."
                 );
             }
+            // A transaction-mode pooler breaks session state (issue #3065).
+            for warning in crate::db::pooler::pooler_warnings(&config.database) {
+                tracing::warn!("{warning}");
+            }
+            if config.database.replica_max_lag_ms.is_some_and(|ms| ms > 0)
+                && config.database.replica_url.is_none()
+            {
+                tracing::warn!(
+                    "database.replica_max_lag_ms has no effect: database.replica_url is not set"
+                );
+            }
         } else {
             tracing::info!("Database not configured");
         }
@@ -5300,6 +5311,11 @@ impl AppBuilder {
             }
         }
 
+        // Replica lag (issue #3065): measure in the background, so a replica
+        // that falls behind leaves read rotation without waiting for `/ready`.
+        #[cfg(feature = "db")]
+        let _replica_lag_monitor = spawn_replica_lag_monitor(&state, server_shutdown.child_token());
+
         #[cfg(feature = "presence")]
         {
             let presence = state.presence().clone();
@@ -5446,12 +5462,18 @@ impl AppBuilder {
             for challenge_listener in challenge_listeners {
                 let router = challenge_router.clone();
                 let challenge_shutdown = server_shutdown.child_token();
+                // A public listener: same `[server.http]` limits (issue #3065).
+                let limits = crate::http_server::HttpLimits::from(&config.server.http);
                 tokio::spawn(async move {
-                    if let Err(e) = axum::serve(challenge_listener, router)
-                        .with_graceful_shutdown(async move {
+                    if let Err(e) = crate::http_server::serve(
+                        challenge_listener,
+                        router.into_make_service(),
+                        limits,
+                        async move {
                             challenge_shutdown.cancelled().await;
-                        })
-                        .await
+                        },
+                    )
+                    .await
                     {
                         tracing::error!(
                             error = %e,
@@ -5605,6 +5627,8 @@ impl AppBuilder {
         // immediately, as before, so `/live` and `/startup` stay reachable
         // behind the startup barrier while the hooks run — a hook that
         // outlasts a probe threshold must not read as a dead pod.
+        // `[server.http]` limits for every listener kind (issue #3065).
+        let http_limits = crate::http_server::HttpLimits::from(&config.server.http);
         let server_future: std::pin::Pin<
             Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'static>,
         > = match bound_listener {
@@ -5621,14 +5645,15 @@ impl AppBuilder {
                         crate::accept_drain::TcpPeer,
                     >(service);
                 Box::pin(async move {
-                    axum::serve(
+                    crate::http_server::serve(
                         crate::accept_drain::StopAcceptingOnShutdown::new(
                             listener,
                             server_shutdown_wait.clone(),
                         ),
                         make_service,
+                        http_limits,
+                        crate::accept_drain::drain_signal(server_shutdown_wait),
                     )
-                    .with_graceful_shutdown(crate::accept_drain::drain_signal(server_shutdown_wait))
                     .await
                 })
             }
@@ -5647,14 +5672,15 @@ impl AppBuilder {
                         UdsConnectInfo,
                     >(service);
                 Box::pin(async move {
-                    axum::serve(
+                    crate::http_server::serve(
                         crate::accept_drain::StopAcceptingOnShutdown::new(
                             listener,
                             server_shutdown_wait.clone(),
                         ),
                         make_service,
+                        http_limits,
+                        crate::accept_drain::drain_signal(server_shutdown_wait),
                     )
-                    .with_graceful_shutdown(crate::accept_drain::drain_signal(server_shutdown_wait))
                     .await
                 })
             }
@@ -5667,7 +5693,12 @@ impl AppBuilder {
             // shutdown wiring all behave exactly as on plain TCP. Only the
             // rustls handshake inside the listener's `accept` differs.
             #[cfg(feature = "tls")]
-            BoundListener::Tls(listener) => {
+            BoundListener::Tls(mut listener) => {
+                // The listener takes the `max_connections` slots before TCP
+                // accept, so a connection counts during its TLS handshake too.
+                let handoff = http_limits
+                    .max_connections
+                    .and_then(|max| listener.limit_connections(max));
                 // Applied inside the connect-info layer (which
                 // `into_make_service_with_connect_info` installs outermost), so
                 // this sees `ConnectInfo<TlsConnectInfo>` and everything below
@@ -5687,14 +5718,16 @@ impl AppBuilder {
                         crate::tls::TlsConnectInfo,
                     >(service);
                 Box::pin(async move {
-                    axum::serve(
+                    crate::http_server::serve_with_handoff(
                         crate::accept_drain::StopAcceptingOnShutdown::new(
                             listener,
                             server_shutdown_wait.clone(),
                         ),
                         make_service,
+                        http_limits,
+                        handoff,
+                        crate::accept_drain::drain_signal(server_shutdown_wait),
                     )
-                    .with_graceful_shutdown(crate::accept_drain::drain_signal(server_shutdown_wait))
                     .await
                 })
             }
@@ -10824,6 +10857,100 @@ impl
     }
 }
 
+#[cfg(unix)]
+impl
+    axum::extract::connect_info::Connected<
+        crate::http_server::IncomingStream<
+            '_,
+            crate::accept_drain::StopAcceptingOnShutdown<tokio::net::UnixListener>,
+        >,
+    > for UdsConnectInfo
+{
+    fn connect_info(
+        _stream: crate::http_server::IncomingStream<
+            '_,
+            crate::accept_drain::StopAcceptingOnShutdown<tokio::net::UnixListener>,
+        >,
+    ) -> Self {
+        Self
+    }
+}
+
+/// Interval between replica lag checks: half the limit, from 250ms to 5s.
+#[cfg(feature = "db")]
+fn replica_lag_check_interval(max_lag: std::time::Duration) -> std::time::Duration {
+    (max_lag / 2).clamp(
+        std::time::Duration::from_millis(250),
+        std::time::Duration::from_secs(5),
+    )
+}
+
+/// Measure the replica lag once and record it. One step of the monitor.
+#[cfg(feature = "db")]
+async fn sample_replica_lag(
+    replica: &diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
+    probes: &crate::probe::ProbeState,
+    max_lag: std::time::Duration,
+    budget: std::time::Duration,
+) {
+    match replica.get().await {
+        Ok(conn) => {
+            crate::probe::refresh_replica_lag_bounded(probes, conn, budget, |conn| {
+                Box::pin(crate::db::measure_replica_lag(conn, max_lag))
+            })
+            .await;
+        }
+        // A full pool is not a stale replica. Keep the last sample: it ages
+        // out on its own (see `ProbeState::replica_status`).
+        Err(error) => tracing::debug!(
+            target: "autumn::db",
+            error = %crate::db_url::redact_targets_in_message(&error.to_string()),
+            "replica lag check skipped: no replica connection"
+        ),
+    }
+}
+
+#[cfg(all(feature = "db", feature = "test-support"))]
+impl AppState {
+    /// Take one replica lag sample, as the background monitor does. For
+    /// tests that do not run the monitor. Does nothing without a replica
+    /// pool or `database.replica_max_lag_ms`.
+    #[doc(hidden)]
+    pub async fn sample_replica_lag_for_test(&self) {
+        let (Some(replica), Some(max_lag)) = (self.replica_pool(), self.probes().replica_max_lag())
+        else {
+            return;
+        };
+        let budget = crate::probe::replica_lag_query_budget(max_lag);
+        sample_replica_lag(replica, self.probes(), max_lag, budget).await;
+    }
+}
+
+/// Measure the replica lag until `shutdown`. `None` when there is no replica
+/// or no `database.replica_max_lag_ms`.
+#[cfg(feature = "db")]
+fn spawn_replica_lag_monitor(
+    state: &AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let replica = state.replica_pool()?.clone();
+    let max_lag = state.probes().replica_max_lag()?;
+    let probes = state.probes().clone();
+    let interval = replica_lag_check_interval(max_lag);
+    // A query that hangs (for example on a half-open TCP connection) must not
+    // keep the monitor from its next sample.
+    let budget = crate::probe::replica_lag_query_budget(max_lag);
+    Some(tokio::spawn(async move {
+        loop {
+            sample_replica_lag(&replica, &probes, max_lag, budget).await;
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                () = shutdown.cancelled() => break,
+            }
+        }
+    }))
+}
+
 /// Stamp a loopback peer (`127.0.0.1`) on Unix-domain-socket requests.
 ///
 /// A UDS connection has no TCP peer `SocketAddr`, so without this the
@@ -14306,6 +14433,13 @@ fn build_state(
         state
             .probes()
             .configure_replica_dependency(config.database.replica_fallback);
+        state.probes().configure_replica_max_lag(
+            config
+                .database
+                .replica_max_lag_ms
+                .filter(|ms| *ms > 0)
+                .map(std::time::Duration::from_millis),
+        );
     }
     // Surface every shard in /ready and /actuator/health as a
     // `db:shard:<name>` component (replica readiness refresh + pool stats).
@@ -16661,7 +16795,7 @@ mod tests {
             "the replay handler exits with the verdict's code"
         );
         assert!(
-            !handler.contains("axum::serve"),
+            !handler.contains("axum::serve") && !handler.contains("http_server::serve"),
             "the replay one-shot must never start the server"
         );
 
