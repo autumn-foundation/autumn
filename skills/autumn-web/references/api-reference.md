@@ -118,7 +118,7 @@ copy of the publish order.
 
 | Macro | Purpose |
 |---|---|
-| `#[get]`, `#[post]`, `#[put]`, `#[patch]`, `#[delete]` | HTTP route handlers; optional args `name`, `api_version`, `sunset_opt_out`, `timeout_ms`, `timeout = "off"`, and `seo(...)` |
+| `#[get]`, `#[post]`, `#[put]`, `#[patch]`, `#[delete]` | HTTP route handlers; optional args `name`, `api_version`, `sunset_opt_out`, `timeout_ms`, `timeout = "off"`, `criticality` (`"critical"`, `"default"` or `"sheddable"`; admission class, #3068), and `seo(...)` |
 | `routes![...]` | Collect route handlers |
 | `#[autumn_web::main]` | Tokio runtime + Autumn profile bootstrap; optional runtime args `flavor` (`"multi_thread"` default / `"current_thread"`), `worker_threads`, `max_blocking_threads`, `thread_name`, `thread_stack_size`, `thread_keep_alive = "30s"`, and `configure = path::to::fn` — a `fn(&mut tokio::runtime::Builder)` run last, the escape hatch for `Builder` methods the args don't name (0.8.0). Numeric args take expressions, not only literals. No args = tokio defaults; an unknown/duplicate/zero arg, or `worker_threads` under `current_thread`, is a compile error |
 | `#[static_get]`, `static_routes![...]` | Static pre-render routes for `autumn build`; also accepts `params`, `revalidate`, and `seo(...)`. The `Content-Type` the handler declares is recorded per route in `dist/manifest.json` and served verbatim (0.8.0, #1832) — set it explicitly for non-HTML routes (`application/xml`, `application/rss+xml`) since the serve path no longer infers it from the route slug |
@@ -386,6 +386,15 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `Model::__AUTUMN_CONFIDENTIAL_COLUMNS`. See
   `docs/guide/confidential-fields.md` for the threat model, including what
   sealing does not hide.
+- NUL byte (`0x00`) in text (issues #2423, #2439) — Postgres cannot store it.
+  `ChangesetForm` and `NestedChangesetForm` add a field error. The message is
+  `form::NUL_CHARACTER_FIELD_ERROR`. With an `i18n` bundle, they look up
+  `form::NUL_CHARACTER_MESSAGE_KEY` (`common.error.nul_character`) in the
+  request locale. A NUL that reaches the database is a `422`, for `TEXT` and
+  for `JSONB`. `error::is_nul_byte_violation` detects it. The generated
+  `#[repository(api = ...)]` create and update handlers name the field in
+  `errors[]`. `error::nul_byte_json_fields` finds the field in a JSON body.
+  See `docs/guide/forms.md`.
 - `#[normalize(trim, downcase, upcase, squish, strip_nul, with = path::to::fn)]` (issue
   #1379) — canonicalizes a `String` column, composing normalizers
   left-to-right. Built-ins live in `autumn_web::normalize`
@@ -1376,6 +1385,26 @@ even inside a `#[sim_test]`. For a deadline whose counterparty is
 | `sim::crash_at(index, op)` → `CrashOutcome` | Drop `op` at its `index`-th suspension. Pair with `CrashPoint::await_index` and `Sim::kill` / `Sim::restart` |
 | `Sim::try_run_to_idle()` → `Result<(), SimStall>` | `run_to_idle` panics with the seed when the drain never settles (a job that re-enqueues itself); this returns the `SimStall` instead |
 | `http_client::ClientError::SimNetwork` | A sim drop, partition, timeout or unknown host. `ClientError` is `#[non_exhaustive]` |
+
+## Multi-replica simulation (`autumn_web::sim`, #3067)
+
+Two or three apps on one sim clock and one `SQLite` database, for tests of
+jobs, the scheduler and locks across nodes.
+
+| API | Use |
+|---|---|
+| `Sim::mount_replica(name_or_Replica, app)` / `replica(name)` / `try_replica(name)` | Mount named apps next to each other. Each has its own state, job runtime and scheduled tasks |
+| `Sim::kill_replica(name)` / `restart_replica(name, app)` | Stop a replica's tasks as a crash does; mount it again |
+| `Replica::named("b").clock_ahead(d)` / `clock_behind(d)` / `clock_drift_ppm(p)` / `seeded_clock(max, ppm)` | A clock per replica. `Sim::step_replica_clock(name, TimeDelta)` is an NTP step. Keep the skew below `scheduler.lease_ttl_secs` |
+| `Sim::db_link(name)` + `SqliteSubstrate::replica_pool(&link)` | One replica's own pool on the shared database. `link.lose_session()` / `restore_session()`, `mid_query_errors(table, p)`, `commit_ambiguity(table, p)`, `clear_faults()`, `events()` |
+| `Sim::run_for(d)` | Move time one event at a time; time does not move while a query runs. Use it, not `advance`, with replicas |
+| `sim::runtime()` | The runtime `#[sim_test]` uses (one blocking thread, gated DB work), for a sim outside the macro |
+| `sim::trace::capture(fut)` → `(T, Trace)` / `Trace::diff` | Record framework `tracing` events with sim time; run one seed twice and diff. Run trace checks in their own test binary |
+
+Rules for code a sim drives: `biased;` in `tokio::select!`; no database
+`random()`; never drop a `SQLite` query in flight (pin it outside the
+`select!`, spawn it if another branch wins). See
+`docs/guide/simulation-testing.md` → "Multiple replicas".
 
 ## Authored fault scenarios (`autumn_web::sim::FaultPlan`, #1680)
 

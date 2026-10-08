@@ -19,10 +19,7 @@
 //! #[test]
 //! fn my_test() {
 //!     let seed = ::autumn_web::sim::__seed_from_env();
-//!     let runtime = ::autumn_web::reexports::tokio::runtime::Builder::new_current_thread()
-//!         .enable_all()
-//!         .start_paused(true)
-//!         .build()
+//!     let runtime = ::autumn_web::sim::runtime()
 //!         .expect("failed to build paused sim runtime");
 //!     let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
 //!         let mut sim = ::autumn_web::sim::Sim::from_seed(seed);
@@ -41,8 +38,9 @@
 //! }
 //! ```
 //!
-//! The paused runtime (`start_paused(true)`) freezes the tokio virtual clock at
-//! start so tests run deterministically. `Sim::advance` drives that clock.
+//! `sim::runtime()` is a current-thread runtime with the tokio clock paused at
+//! start, one blocking thread, and gated database work, so tests run
+//! deterministically. `Sim::advance` drives that clock.
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -107,13 +105,9 @@ pub fn sim_test_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
             // A current-thread runtime with the virtual clock paused at start,
             // so time never advances on its own — the executor is deterministic.
-            // `start_paused(true)` requires tokio's `test-util` feature.
-            let __autumn_sim_runtime =
-                ::autumn_web::reexports::tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .start_paused(true)
-                    .build()
-                    .expect("failed to build paused sim runtime");
+            // One blocking thread, and gated database work (issue #3067).
+            let __autumn_sim_runtime = ::autumn_web::sim::runtime()
+                .expect("failed to build paused sim runtime");
 
             // Run the user body with the fn argument bound to the constructed
             // Sim, catching a panic so we can print the deterministic replay
@@ -162,12 +156,8 @@ mod tests {
             "expansion must be a #[test] fn: {rendered}"
         );
         assert!(
-            rendered.contains("new_current_thread"),
-            "expansion must build a current-thread runtime: {rendered}"
-        );
-        assert!(
-            rendered.contains("start_paused"),
-            "expansion must pause the runtime clock: {rendered}"
+            rendered.contains("sim :: runtime"),
+            "expansion must build the paused sim runtime: {rendered}"
         );
         assert!(
             rendered.contains("from_seed"),

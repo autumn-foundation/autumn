@@ -105,6 +105,7 @@ impl Finding {
 #[must_use]
 pub fn diff(base: &PostureManifest, head: &PostureManifest) -> Vec<Finding> {
     let mut findings = Vec::new();
+    diff_build(base, head, &mut findings);
     diff_routes(base, head, &mut findings);
     diff_authorization_policies(base, head, &mut findings);
     diff_csrf(base, head, &mut findings);
@@ -281,61 +282,41 @@ pub fn widening(findings: &[Finding]) -> Vec<&Finding> {
         .collect()
 }
 
-/// Index routes by `(path, method)`, **merging** duplicate keys into the widest
-/// posture their entries jointly describe.
+/// A build change: the two manifests come from different Cargo builds.
 ///
-/// A manifest should never carry the same key twice, but "should never" is not
-/// a guarantee about a file on disk, and letting either entry win makes the
-/// verdict depend on array order — with the order that hides the wider entry
-/// being the one that passes.
-///
-/// Picking a winner cannot work, because two postures can be *incomparable*:
-/// `roles: ["admin"]` and `roles: ["editor"]` neither contains the other, so
-/// any ranking of them is arbitrary and one of the two orders hides a newly
-/// admitted role. Merging has no such gap: the union of the two is at least as
-/// wide as either, so the diff can only ever over-report.
-fn route_index(m: &PostureManifest) -> BTreeMap<RouteKey, RouteEntry> {
-    let mut index: BTreeMap<RouteKey, RouteEntry> = BTreeMap::new();
-    for entry in &m.dimensions.routes.entries {
-        index
-            .entry(entry.key())
-            .and_modify(|existing| *existing = widest_of(existing, entry))
-            .or_insert_with(|| entry.clone());
+/// Two builds can mount different routes with different guards. A route
+/// that is public in the base build and gated only in the head build shows
+/// no change, so a diff across builds can hide a widening. It blocks until a
+/// human acknowledges it (#2472).
+fn diff_build(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Finding>) {
+    if base.build == head.build {
+        return;
     }
-    index
+    out.push(Finding {
+        kind: "build_changed",
+        severity: Severity::Widening,
+        method: "*".to_owned(),
+        path: "*".to_owned(),
+        before: base.build.label(),
+        after: head.build.label(),
+        fingerprint: format!(
+            "build:{}",
+            escape_list(&[base.build.canonical(), head.build.canonical()])
+        ),
+        detail: "the manifests come from different Cargo builds, and a diff across \
+                 builds can hide a widening; audit both with the build you deploy"
+            .to_owned(),
+    });
 }
 
-/// The posture that admits every caller either of these two does, dimension by
-/// dimension, in the direction the framework's own semantics give it.
-fn widest_of(a: &RouteEntry, b: &RouteEntry) -> RouteEntry {
-    // Roles are OR-ed, so the union admits at least as many principals — and an
-    // *empty* list is widest of all, since `#[secured]` with no roles admits
-    // every authenticated session.
-    let roles = if a.roles.is_empty() || b.roles.is_empty() {
-        Vec::new()
-    } else {
-        a.role_set().union(&b.role_set()).cloned().collect()
-    };
-    // Scopes are AND-ed, so requiring only what both require admits at least as
-    // many tokens.
-    let scopes = a
-        .scope_set()
-        .intersection(&b.scope_set())
-        .cloned()
-        .collect();
-    RouteEntry {
-        path: a.path.clone(),
-        method: a.method.clone(),
-        classification: if is_open(&a.classification) {
-            a.classification.clone()
-        } else {
-            b.classification.clone()
-        },
-        roles,
-        scopes,
-        // A record-level check only holds if every entry claims it.
-        policy: a.policy && b.policy,
-    }
+/// Index routes by `(path, method)`. Parsing refuses a duplicate key.
+fn route_index(m: &PostureManifest) -> BTreeMap<RouteKey, RouteEntry> {
+    m.dimensions
+        .routes
+        .entries
+        .iter()
+        .map(|entry| (entry.key(), entry.clone()))
+        .collect()
 }
 
 fn diff_routes(base: &PostureManifest, head: &PostureManifest, out: &mut Vec<Finding>) {
@@ -1625,9 +1606,9 @@ fn csrf_index(m: &PostureManifest) -> BTreeMap<RouteKey, (bool, bool, String)> {
         index
             .entry(key)
             .and_modify(|(enforced, exempt, _)| {
-                // Two entries for one route shape merge to the *widest* of
-                // them, exactly as duplicate route entries do: whichever sorts
-                // last must not get to declare the route protected.
+                // Parsing refuses two rows for one route shape. Merge to the
+                // widest reading anyway, so no row order can declare the route
+                // protected.
                 *enforced = *enforced && e.csrf_enforced;
                 *exempt = *exempt || e.exempt;
             })
@@ -3003,50 +2984,67 @@ mod tests {
         );
     }
 
-    /// A manifest should never carry the same `(path, method)` twice, but "should
-    /// never" is not a guarantee about a file on disk. If the last entry won,
-    /// the verdict would depend on array order — and the order that hides a
-    /// public route would be the one that passes.
-    #[test]
-    fn a_duplicate_route_key_merges_to_the_most_open_posture_either_way() {
-        let base = routes_only(&route("/a", "GET", "gated", &["admin"], &[], false));
-        let gated = route("/a", "GET", "gated", &["admin"], &[], false);
-        let public = route("/a", "GET", "public", &[], &[], false);
-
-        let gated_first = routes_only(&format!("{gated},{public}"));
-        let public_first = routes_only(&format!("{public},{gated}"));
-
-        for head in [&gated_first, &public_first] {
-            let f = only(diff(&base, head));
-            assert_eq!(
-                f.kind, "classification_downgraded",
-                "a duplicate key must not let the open entry hide behind the gated one"
-            );
-        }
-        assert_eq!(diff(&base, &gated_first), diff(&base, &public_first));
+    /// A manifest with a `build` object (schema v5).
+    fn built(routes: &str, build: &str) -> PostureManifest {
+        let json = format!(
+            r#"{{"schema_version":5,"build":{build},"dimensions":{{
+                 "routes":{{"provenance":"provable","source":"m","entries":[{routes}]}}
+               }},"excluded":[]}}"#
+        );
+        PostureManifest::parse(&json, "test.json").expect("fixture parses")
     }
 
-    /// Two duplicate `gated` entries differing only in roles must not let array
-    /// order decide: an empty role list admits every authenticated session,
-    /// so it is the wider of the two and has to win either way.
+    /// Two builds can mount different routes with different guards, so a diff
+    /// across builds can hide a widening. It blocks until a human looks
+    /// (#2472).
     #[test]
-    fn a_duplicate_route_key_merges_roles_too() {
-        let base = routes_only(&route("/a", "GET", "gated", &["admin"], &[], false));
-        let with_role = route("/a", "GET", "gated", &["admin"], &[], false);
-        let no_roles = route("/a", "GET", "gated", &[], &[], false);
+    fn a_changed_build_is_a_widening() {
+        let r = route("/a", "GET", "gated", &["admin"], &[], false);
+        let base = routes_only(&r);
+        let head = built(&r, r#"{"profile":"release","features":["embed-assets"]}"#);
+        let f = only(diff(&base, &head));
+        assert_eq!(f.kind, "build_changed");
+        assert_eq!(f.severity, Severity::Widening);
+        assert_eq!((f.method.as_str(), f.path.as_str()), ("*", "*"));
+        assert!(f.before.contains("dev"), "{f:?}");
+        assert!(
+            f.after.contains("release") && f.after.contains("embed-assets"),
+            "{f:?}"
+        );
+    }
 
-        let role_first = routes_only(&format!("{with_role},{no_roles}"));
-        let none_first = routes_only(&format!("{no_roles},{with_role}"));
+    /// The same build spelled another way is no change.
+    #[test]
+    fn the_same_build_is_not_a_finding() {
+        let r = route("/a", "GET", "gated", &["admin"], &[], false);
+        let base = built(&r, r#"{"profile":"release","features":["b","a"]}"#);
+        let head = built(&r, r#"{"profile":"release","features":["a","b","a"]}"#);
+        assert!(diff(&base, &head).is_empty());
+        assert!(diff(&routes_only(&r), &built(&r, r#"{"profile":"dev"}"#)).is_empty());
+    }
 
-        for head in [&role_first, &none_first] {
-            let f = only(diff(&base, head));
-            assert_eq!(
-                f.kind, "roles_cleared",
-                "the entry admitting every authenticated session must win"
-            );
-            assert_eq!(f.severity, Severity::Widening);
-        }
-        assert_eq!(diff(&base, &role_first), diff(&base, &none_first));
+    /// Each build change is its own widening: an acknowledgment for one does
+    /// not cover another.
+    #[test]
+    fn two_build_changes_do_not_share_a_fingerprint() {
+        let r = route("/a", "GET", "gated", &["admin"], &[], false);
+        let base = routes_only(&r);
+        let release = only(diff(&base, &built(&r, r#"{"profile":"release"}"#)));
+        let dist = only(diff(&base, &built(&r, r#"{"profile":"dist"}"#)));
+        assert_ne!(release.canonical(), dist.canonical());
+    }
+
+    /// The fingerprint keeps the direction, and ignores feature order.
+    #[test]
+    fn a_build_change_fingerprint_is_directed_and_stable() {
+        let r = route("/a", "GET", "gated", &["admin"], &[], false);
+        let dev = routes_only(&r);
+        let release = built(&r, r#"{"profile":"release","features":["a","b"]}"#);
+        let reordered = built(&r, r#"{"profile":"release","features":["b","a"]}"#);
+        let up = only(diff(&dev, &release));
+        let down = only(diff(&release, &dev));
+        assert_ne!(up.canonical(), down.canonical());
+        assert_eq!(up.canonical(), only(diff(&dev, &reordered)).canonical());
     }
 
     /// The router matches on shape, not on what the author called a capture:
@@ -4398,33 +4396,6 @@ mod tests {
         assert_eq!(findings[0].path, "/{{bar}}");
     }
 
-    /// Normalizing the key widens the class of entries that can collide, so
-    /// two csrf entries for the same route shape must merge to the *widest*
-    /// reading — as duplicate route entries already do — rather than letting
-    /// whichever sorts last decide whether the route is protected.
-    #[test]
-    fn duplicate_csrf_entries_merge_to_the_widest() {
-        let routes = route("/pay/{id}", "POST", "gated", &["user"], &[], false);
-        let base = manifest(
-            &routes,
-            r#"{"path":"/pay/{id}","method":"POST","csrf_enforced":true,"exempt":false}"#,
-            "",
-            "",
-        );
-        let off = r#"{"path":"/pay/{id}","method":"POST","csrf_enforced":false,"exempt":true}"#;
-        let on = r#"{"path":"/pay/{other}","method":"POST","csrf_enforced":true,"exempt":false}"#;
-
-        for entries in [format!("{off},{on}"), format!("{on},{off}")] {
-            let head = manifest(&routes, &entries, "", "");
-            let findings = diff(&base, &head);
-            assert_eq!(
-                kinds(&findings),
-                vec!["csrf_enforcement_removed"],
-                "one entry says the route is unprotected, so it is: {findings:#?}"
-            );
-        }
-    }
-
     /// The same rename, one dimension over. CSRF entries were keyed on the raw
     /// path, so renaming the capture in the change that turned CSRF off left
     /// the head entry unable to match the base entry — and the disappearance
@@ -4497,56 +4468,6 @@ mod tests {
             &binding("/notes/{note_id}"),
         );
         assert!(diff(&base, &head).is_empty(), "{:#?}", diff(&base, &head));
-    }
-
-    /// Two duplicate entries can be *incomparable*: `["admin"]` and `["editor"]`
-    /// neither contains the other, so no ranking of them is principled and one
-    /// of the two array orders would hide the newly admitted role. Merging the
-    /// sets has no such gap.
-    #[test]
-    fn incomparable_duplicate_roles_merge_instead_of_racing() {
-        let base = routes_only(&route("/a", "GET", "gated", &["admin"], &[], false));
-        let admin = route("/a", "GET", "gated", &["admin"], &[], false);
-        let editor = route("/a", "GET", "gated", &["editor"], &[], false);
-
-        let admin_first = routes_only(&format!("{admin},{editor}"));
-        let editor_first = routes_only(&format!("{editor},{admin}"));
-
-        for head in [&admin_first, &editor_first] {
-            let f = only(diff(&base, head));
-            assert_eq!(f.kind, "roles_widened");
-            assert!(
-                f.detail.contains("editor"),
-                "the newly admitted role must be named whichever order it appears in: {f:?}"
-            );
-        }
-        assert_eq!(diff(&base, &admin_first), diff(&base, &editor_first));
-    }
-
-    /// The same, for the AND-ed dimension: requiring only what both entries
-    /// require is the wider reading.
-    #[test]
-    fn duplicate_scope_sets_merge_to_what_both_require() {
-        let base = routes_only(&route(
-            "/a",
-            "POST",
-            "gated",
-            &[],
-            &["read", "write"],
-            false,
-        ));
-        let read = route("/a", "POST", "gated", &[], &["read"], false);
-        let write = route("/a", "POST", "gated", &[], &["write"], false);
-
-        let read_first = routes_only(&format!("{read},{write}"));
-        let write_first = routes_only(&format!("{write},{read}"));
-
-        for head in [&read_first, &write_first] {
-            let f = only(diff(&base, head));
-            assert_eq!(f.kind, "scopes_widened");
-            assert_eq!(f.severity, Severity::Widening);
-        }
-        assert_eq!(diff(&base, &read_first), diff(&base, &write_first));
     }
 
     /// The acknowledgment digest must describe the *set* of widenings, not the

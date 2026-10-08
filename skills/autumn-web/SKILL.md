@@ -129,6 +129,7 @@ the framework almost certainly already generates or ships it:
 | Triaging the same production bug twice because the first fix had no test pinning it | `autumn capsule test <capsule>` converts a capsule into a committed regression test: it copies the capsule's bytes **verbatim** into `tests/capsules/` (so whatever redaction removed stays removed), generates a `#[tokio::test]` beside it, registers both in `tests/integration/mod.rs`, and scaffolds a `capsule_support::router` hook once. The test drives the same replay engine `autumn replay` does and runs under plain `cargo test` with **zero live dependencies** — no network, DB, queue or Docker. `autumn capsule verify` replays the whole committed corpus, which doubles as an upgrade gate: run it against a new Autumn before deploying that version. Job capsules are refused here (no request to drive) — replay those with `autumn replay`. See `docs/guide/failure-capsules.md` (0.8.0, #1634) |
 | Proving a retry path survives "the 3rd DB checkout fails" or "the 2nd `send_invoice` execution fails" with a real-clock test that can only hope for the timing, or with `Chaos` rates that never reproduce the exact failure | `autumn_web::sim::FaultPlan` — an **authored**, seed-deterministic fault scenario attached with `TestApp::with_fault_plan(plan)`: `FaultPlan::from_seed(seed).fail_db_checkout(3).fail_job("send_invoice", 2)` fails exactly those effects through the existing interceptor seams (no app code changes), `only_between(from, to)` gates faults on the injected clock, `random_*_faults(n, 1..=k)` picks ordinals from the seed. `client.fault_outcome().await` returns a serializable `FaultOutcome` (`fired` / `suppressed` / `unfired` / `server_errors` via reporting / `final_state`); `to_json_string()` is byte-identical on every replay of a seed under `#[sim_test]`. Drain jobs with `Sim::run_to_idle` (not `perform_enqueued_jobs`, which bypasses `intercept_execute`). See `docs/guide/simulation-testing.md` → "Authored fault scenarios" (#1680) |
 | A `#[sim_test]` that calls a real downstream service, hopes for a timing race, or reads `Utc::now()` / `Instant::now()` in code with no clock in scope | `Sim::net(SimNet::new().host("payments", router).latency(..).drop_rate(..))` serves outbound `http_client` calls in-process with seeded latency, drops and `partition`/`heal`; `Sim::interleave` / `Sim::spawn` reorder ready work from the seed; `sim::crash_at(i, op)` drops an op at any await; `time::ambient_now()` / `ambient_instant()` follow the running `Sim`. See `docs/guide/simulation-testing.md` (#2967) |
+| Testing job, scheduler or lock coordination with one app, or with two real processes and sleeps | `Sim::mount_replica("a", app)` / `mount_replica("b", app)` on one sim clock and one `SqliteSubstrate`; per-replica clocks (`Replica::named("b").clock_ahead(d)`, `Sim::step_replica_clock`), per-replica DB faults (`Sim::db_link(name)`: `lose_session`, `mid_query_errors`, `commit_ambiguity`), `kill_replica` / `restart_replica`, and `Sim::run_for(d)` to move time. See `docs/guide/simulation-testing.md` → "Multiple replicas" (#3067) |
 | Hand-assembled `Cache-Control` header strings on a handler | `etag::cache_for(Duration)` → `CacheControl`; attach as a tuple `(cache_for(dur).public(), html!{…})` or `.wrap(resp)`. Chain `public`/`private`, `max_age`, `s_maxage`, `stale_while_revalidate`, `no_store`, `no_cache`, `must_revalidate`, `immutable`; `header_value()` renders a deterministic value. Defaults to `private` (a secured page can't be silently made public); composes with `fresh_when` — the directives ride the `200` and the preserved `304` (0.6.0, issue #1344). See `docs/guide/conditional-get.md` |
 
 When none of these fit, dropping to raw Axum (`.merge()`/`.nest()`/`.layer()`)
@@ -2920,6 +2921,41 @@ autumn canary promote   # clear the rollback flag after traffic is moved
 The rollback flag file lives at `tmp/autumn-canary-rollback.json`. A controller
 that cannot exec into the replica can write it directly. The flag is sticky
 across restarts — clear it with `autumn canary promote` once traffic has moved.
+
+## SLOs, deploy bake and Kubernetes (issue #3069)
+
+Declare SLOs in `autumn.toml`. The app does not read them at run time.
+
+```toml
+[[slo]]
+name = "availability"     # lowercase letters, digits, '-'
+objective = 99.9          # percent, at most 4 decimals
+sli = "availability"      # or "latency" (needs threshold_ms, a bucket bound)
+# route = "/api/orders/{id}"
+```
+
+```bash
+autumn slo generate --selector 'job="shop"'   # writes deploy/slo/ (6 files)
+autumn slo generate --check                   # CI: fail on drift
+```
+
+The files are Prometheus burn-rate rules and alerts (14.4x over 1h/5m, 6x over
+6h/30m, 1x over 3d/6h), a `PrometheusRule`, a Grafana dashboard, an Argo
+Rollouts `AnalysisTemplate`, Flagger `MetricTemplate`s and Helm values. Route
+and latency SLOs read the request-duration histogram (issue #3064).
+
+Bake each host after its cutover; roll it back on a 5xx or latency breach or a
+restart (off by default):
+
+```toml
+[deploy.bake]
+duration_secs = 300   # or: autumn deploy up --bake-secs 300
+```
+
+Kubernetes: `autumn release init --target kubernetes` writes a Helm chart
+(`deploy/helm/`, set `trustedHosts`) and a Kustomize base with probes, a
+`preStop` hook, a safe grace period, a PDB, and opt-in Argo Rollouts or Flagger
+canaries. See `docs/guide/slo.md` and `docs/guide/kubernetes.md`.
 
 ## Shadow (differential) deploys
 

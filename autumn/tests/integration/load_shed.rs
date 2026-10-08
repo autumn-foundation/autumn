@@ -482,6 +482,116 @@ mod mcp_admission {
         held.await.unwrap().assert_ok();
     }
 
+    // ── #3068: an MCP tool call is admitted at its tool route's class ──
+
+    static GATE_CLASS: LazyLock<Notify> = LazyLock::new(Notify::new);
+    static ENTERED_CLASS: AtomicUsize = AtomicUsize::new(0);
+
+    #[get("/hold")]
+    async fn hold_class() -> &'static str {
+        ENTERED_CLASS.fetch_add(1, Ordering::SeqCst);
+        GATE_CLASS.notified().await;
+        "released"
+    }
+
+    static GATE_SHED: LazyLock<Notify> = LazyLock::new(Notify::new);
+    static ENTERED_SHED: AtomicUsize = AtomicUsize::new(0);
+
+    #[get("/hold-shed")]
+    async fn hold_shed() -> &'static str {
+        ENTERED_SHED.fetch_add(1, Ordering::SeqCst);
+        GATE_SHED.notified().await;
+        "released"
+    }
+
+    #[autumn_web::api_doc(mcp, summary = "Critical tool (#3068)")]
+    #[get("/critical-tool", criticality = "critical")]
+    async fn critical_tool() -> autumn_web::Json<serde_json::Value> {
+        autumn_web::Json(serde_json::json!({"ok": true}))
+    }
+
+    #[autumn_web::api_doc(mcp, summary = "Sheddable tool (#3068)")]
+    #[get("/sheddable-tool", criticality = "sheddable")]
+    async fn sheddable_tool() -> autumn_web::Json<serde_json::Value> {
+        autumn_web::Json(serde_json::json!({"ok": true}))
+    }
+
+    fn tools_call(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": {}}
+        })
+    }
+
+    /// With `default = 0.5` and a limit of 2, one held request fills the
+    /// `default` share. A `critical` tool must still be admitted through
+    /// `/mcp`: the envelope admits up to the full limit.
+    #[tokio::test]
+    async fn mcp_critical_tool_is_admitted_past_the_default_share() {
+        let mut config = config_with_ceiling(2);
+        config.server.admission.partitions.default = 0.5;
+        let client = Arc::new(
+            TestApp::new()
+                .config(config)
+                .routes(routes![hold_class, critical_tool])
+                .mount_mcp("/mcp")
+                .build(),
+        );
+        let held = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.get("/hold").send().await })
+        };
+        wait_for_entered(&ENTERED_CLASS, 1).await;
+
+        let resp = client
+            .post("/mcp")
+            .json(&tools_call("critical_tool"))
+            .send()
+            .await;
+        resp.assert_ok();
+        let body: serde_json::Value = resp.json();
+        assert_ne!(
+            body["result"]["isError"], true,
+            "a critical tool must not be shed at the default share: {body}"
+        );
+
+        GATE_CLASS.notify_waiters();
+        held.await.unwrap().assert_ok();
+    }
+
+    /// With a limit of 2, `sheddable = 0.5` gives one slot. One held
+    /// request plus the envelope's own slot is over it, so the replay of a
+    /// `sheddable` tool is shed.
+    #[tokio::test]
+    async fn mcp_sheddable_tool_is_shed_at_its_share() {
+        let client = Arc::new(
+            TestApp::new()
+                .config(config_with_ceiling(2))
+                .routes(routes![hold_shed, sheddable_tool])
+                .mount_mcp("/mcp")
+                .build(),
+        );
+        let held = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.get("/hold-shed").send().await })
+        };
+        wait_for_entered(&ENTERED_SHED, 1).await;
+
+        let resp = client
+            .post("/mcp")
+            .json(&tools_call("sheddable_tool"))
+            .send()
+            .await;
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["result"]["isError"], true,
+            "a sheddable tool over its share must be shed: {body}"
+        );
+
+        GATE_SHED.notify_waiters();
+        held.await.unwrap().assert_ok();
+    }
+
     #[autumn_web::api_doc(mcp, summary = "Ping (MCP double-count regression, #1577)")]
     #[get("/mcp-ping")]
     async fn mcp_ping() -> autumn_web::Json<serde_json::Value> {

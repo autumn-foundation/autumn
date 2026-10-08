@@ -20,8 +20,6 @@
 //!
 //! See `docs/guide/posture-gate.md` and `docs/plans/2026-09-03-posture-gate.md`.
 
-use std::fmt::Write as _;
-
 pub mod ack;
 pub mod diff;
 pub mod model;
@@ -54,6 +52,9 @@ pub struct DiffOptions<'a> {
     pub acks: &'a [String],
     /// File of harvested pull-request text to scan for acknowledgment markers.
     pub ack_file: Option<&'a str>,
+    /// Directory with one file per pull-request comment. The file boundary
+    /// is the comment boundary, so no comment text can fake one.
+    pub ack_dir: Option<&'a str>,
     /// Treat a missing base manifest as "no baseline yet" instead of an error.
     pub allow_missing_base: bool,
 }
@@ -105,7 +106,7 @@ impl Evaluation {
 pub fn evaluate(
     base: Option<&PostureManifest>,
     head: &PostureManifest,
-    ack_text: &str,
+    acks: &[Acknowledgment],
 ) -> Evaluation {
     let findings = base.map(|b| diff::diff(b, head)).unwrap_or_default();
     let widening = diff::widening(&findings);
@@ -116,7 +117,7 @@ pub fn evaluate(
     let acknowledged = if widening.is_empty() {
         None
     } else {
-        ack::matching(&ack::parse_acks(ack_text), &ack_digest).cloned()
+        ack::matching(acks, &ack_digest).cloned()
     };
     Evaluation {
         findings,
@@ -144,22 +145,42 @@ pub fn render(evaluation: &Evaluation, format: &str) -> Result<String, String> {
     }
 }
 
-/// Collect acknowledgment text from `--ack` values and `--ack-file`.
-fn harvested_ack_text(opts: &DiffOptions<'_>) -> Result<String, String> {
-    let mut text = String::new();
+/// Collect acknowledgments from `--ack`, `--ack-file` and `--ack-dir`.
+fn harvested_acks(opts: &DiffOptions<'_>) -> Result<Vec<Acknowledgment>, String> {
+    let mut acks = Vec::new();
     for ack in opts.acks {
         // An inline `--ack <digest>` is the phrase, without the ceremony of
         // typing it: normalize it into a marker line so there is exactly one
-        // parser for both entry points.
-        let _ = writeln!(text, "{} {}", ack::ACK_PHRASE, ack.trim());
+        // parser for every entry point.
+        acks.extend(ack::parse_comment(&format!(
+            "{} {}",
+            ack::ACK_PHRASE,
+            ack.trim()
+        )));
     }
     if let Some(path) = opts.ack_file {
         let harvested = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read acknowledgment file {path}: {e}"))?;
-        text.push_str(&harvested);
-        text.push('\n');
+        acks.extend(ack::parse_acks(&harvested));
     }
-    Ok(text)
+    if let Some(dir) = opts.ack_dir {
+        let read_error =
+            |e: std::io::Error| format!("cannot read acknowledgment directory {dir}: {e}");
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).map_err(read_error)? {
+            let entry = entry.map_err(read_error)?;
+            if entry.file_type().map_err(read_error)?.is_file() {
+                files.push(entry.path());
+            }
+        }
+        files.sort();
+        for file in files {
+            let bytes = std::fs::read(&file)
+                .map_err(|e| format!("cannot read acknowledgment file {}: {e}", file.display()))?;
+            acks.extend(ack::parse_comment(&String::from_utf8_lossy(&bytes)));
+        }
+    }
+    Ok(acks)
 }
 
 /// `autumn routes posture diff`.
@@ -182,8 +203,8 @@ pub fn run_diff(opts: &DiffOptions<'_>) -> i32 {
         }
         Err(e) => return fail(&e.to_string()),
     };
-    let ack_text = match harvested_ack_text(opts) {
-        Ok(t) => t,
+    let acks = match harvested_acks(opts) {
+        Ok(a) => a,
         Err(e) => return fail(&e),
     };
 
@@ -197,7 +218,8 @@ pub fn run_diff(opts: &DiffOptions<'_>) -> i32 {
     {
         return fail(&format!(
             "{} lists no routes at all while {} lists {} \u{2014} refusing to score that as a \
-             narrowing. Rebuild the manifest with `autumn routes audit --manifest {}`.",
+             narrowing. Rebuild the manifest with `autumn routes audit --manifest {}` and \
+             the build flags of the base manifest.",
             opts.head,
             opts.base,
             base_manifest.dimensions.routes.entries.len(),
@@ -205,7 +227,7 @@ pub fn run_diff(opts: &DiffOptions<'_>) -> i32 {
         ));
     }
 
-    let evaluation = evaluate(base.as_ref(), &head, &ack_text);
+    let evaluation = evaluate(base.as_ref(), &head, &acks);
     let rendered = match render(&evaluation, opts.format) {
         Ok(r) => r,
         Err(e) => return fail(&e),
@@ -291,6 +313,15 @@ mod tests {
         PostureManifest::parse(json, "test.json").expect("fixture parses")
     }
 
+    /// A manifest document; `build` is spliced in before `dimensions`.
+    fn manifest_json(routes: &str, build: &str) -> String {
+        format!(
+            r#"{{"schema_version":5,{build}"dimensions":{{
+                 "routes":{{"provenance":"provable","source":"m","entries":[{routes}]}}
+               }},"excluded":[]}}"#
+        )
+    }
+
     fn manifest(routes: &str) -> PostureManifest {
         parse(&format!(
             r#"{{"schema_version":3,"dimensions":{{
@@ -318,7 +349,7 @@ mod tests {
     fn an_unchanged_posture_neither_blocks_nor_says_anything() {
         let base = manifest(&route("/admin", "gated", &["admin"]));
         let head = manifest(&route("/admin", "gated", &["admin"]));
-        let e = evaluate(Some(&base), &head, "");
+        let e = evaluate(Some(&base), &head, &[]);
         assert!(!e.blocked());
         assert_eq!(e.exit_code(), 0);
         assert!(e.findings.is_empty());
@@ -330,12 +361,12 @@ mod tests {
         let base = manifest(&route("/admin", "gated", &["admin"]));
         let head = manifest(&route("/admin", "public", &[]));
 
-        let blocked = evaluate(Some(&base), &head, "");
+        let blocked = evaluate(Some(&base), &head, &[]);
         assert!(blocked.blocked());
         assert_eq!(blocked.exit_code(), EXIT_BLOCKED);
 
         let comment = format!("{} {}", ack::ACK_PHRASE, ack::short(&blocked.ack_digest));
-        let acknowledged = evaluate(Some(&base), &head, &comment);
+        let acknowledged = evaluate(Some(&base), &head, &ack::parse_acks(&comment));
         assert!(!acknowledged.blocked());
         assert_eq!(acknowledged.exit_code(), 0);
         assert!(acknowledged.acknowledged.is_some());
@@ -350,9 +381,9 @@ mod tests {
         let comment = format!(
             "{} {}",
             ack::ACK_PHRASE,
-            ack::short(&evaluate(Some(&base), &first, "").ack_digest)
+            ack::short(&evaluate(Some(&base), &first, &[]).ack_digest)
         );
-        assert!(!evaluate(Some(&base), &first, &comment).blocked());
+        assert!(!evaluate(Some(&base), &first, &ack::parse_acks(&comment)).blocked());
 
         let second = manifest(&format!(
             "{},{}",
@@ -360,7 +391,7 @@ mod tests {
             route("/internal", "public", &[])
         ));
         assert!(
-            evaluate(Some(&base), &second, &comment).blocked(),
+            evaluate(Some(&base), &second, &ack::parse_acks(&comment)).blocked(),
             "a new widening must not inherit the old acknowledgment"
         );
     }
@@ -374,7 +405,7 @@ mod tests {
         let comment = format!(
             "{} {}",
             ack::ACK_PHRASE,
-            ack::short(&evaluate(Some(&base), &first, "").ack_digest)
+            ack::short(&evaluate(Some(&base), &first, &[]).ack_digest)
         );
 
         // A later commit adds a *gated* route: neutral, so the widening set is
@@ -384,7 +415,7 @@ mod tests {
             route("/admin", "public", &[]),
             route("/reports", "gated", &["admin"])
         ));
-        let e = evaluate(Some(&base), &later, &comment);
+        let e = evaluate(Some(&base), &later, &ack::parse_acks(&comment));
         assert!(!e.blocked());
         assert!(
             e.acknowledged.is_some(),
@@ -398,7 +429,7 @@ mod tests {
     fn narrowing_only_changes_never_block() {
         let base = manifest(&route("/admin", "public", &[]));
         let head = manifest(&route("/admin", "gated", &["admin"]));
-        let e = evaluate(Some(&base), &head, "");
+        let e = evaluate(Some(&base), &head, &[]);
         assert!(!e.blocked());
         assert!(!e.findings.is_empty(), "but they are still reported");
     }
@@ -406,7 +437,7 @@ mod tests {
     #[test]
     fn with_no_baseline_nothing_blocks() {
         let head = manifest(&route("/admin", "public", &[]));
-        let e = evaluate(None, &head, "");
+        let e = evaluate(None, &head, &[]);
         assert!(e.bootstrap);
         assert!(!e.blocked());
         assert!(e.findings.is_empty());
@@ -416,14 +447,14 @@ mod tests {
     #[test]
     fn the_head_posture_digest_is_the_manifests_own() {
         let head = manifest(&route("/admin", "gated", &["admin"]));
-        let e = evaluate(None, &head, "");
+        let e = evaluate(None, &head, &[]);
         assert_eq!(e.head_posture_digest, head.posture_digest());
     }
 
     #[test]
     fn an_unknown_format_is_a_usage_error_not_a_silent_fallback() {
         let head = manifest(&route("/a", "gated", &["admin"]));
-        let e = evaluate(None, &head, "");
+        let e = evaluate(None, &head, &[]);
         assert!(render(&e, "markdwon").is_err());
     }
 
@@ -457,6 +488,7 @@ mod tests {
             output: None,
             acks: &[],
             ack_file: None,
+            ack_dir: None,
             allow_missing_base: true,
         });
         assert_eq!(code, EXIT_USAGE, "must not be scored as a clean bootstrap");
@@ -490,6 +522,7 @@ mod tests {
             output: None,
             acks: &[],
             ack_file: None,
+            ack_dir: None,
             allow_missing_base: true,
         });
         assert_eq!(code, EXIT_USAGE);
@@ -524,6 +557,7 @@ mod tests {
             output: Some(report.to_str().unwrap()),
             acks: &[],
             ack_file: None,
+            ack_dir: None,
             allow_missing_base: false,
         };
         assert_eq!(run_diff(&opts), EXIT_BLOCKED);
@@ -544,8 +578,149 @@ mod tests {
     fn an_acknowledgment_for_a_different_digest_does_not_unblock() {
         let base = manifest(&route("/admin", "gated", &["admin"]));
         let head = manifest(&route("/admin", "public", &[]));
-        let e = evaluate(Some(&base), &head, "/ack-posture 0000000000000000");
+        let e = evaluate(
+            Some(&base),
+            &head,
+            &ack::parse_acks("/ack-posture 0000000000000000"),
+        );
         assert!(e.blocked());
         assert!(e.acknowledged.is_none());
+    }
+
+    /// `--ack-dir` reads one file per comment, so the file boundary is the
+    /// comment boundary. No text in a comment can forge it (#2472).
+    #[test]
+    fn the_ack_dir_parses_each_comment_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.json");
+        let head = dir.path().join("head.json");
+        let write = |path: &std::path::Path, classification: &str, roles: &str| {
+            std::fs::write(
+                path,
+                format!(
+                    r#"{{"schema_version":3,"dimensions":{{"routes":{{"entries":[
+                       {{"path":"/admin","method":"GET","classification":"{classification}","roles":[{roles}]}}]}}}}}}"#
+                ),
+            )
+            .unwrap();
+        };
+        write(&base, "gated", "\"admin\"");
+        write(&head, "public", "");
+        let digest = ack::short(
+            &evaluate(
+                Some(&PostureManifest::read(base.to_str().unwrap()).unwrap()),
+                &PostureManifest::read(head.to_str().unwrap()).unwrap(),
+                &[],
+            )
+            .ack_digest,
+        );
+
+        let acks = dir.path().join("acks");
+        std::fs::create_dir(&acks).unwrap();
+        let opts = DiffOptions {
+            base: base.to_str().unwrap(),
+            head: head.to_str().unwrap(),
+            format: "text",
+            output: None,
+            acks: &[],
+            ack_file: None,
+            ack_dir: Some(acks.to_str().unwrap()),
+            allow_missing_base: false,
+        };
+
+        // The old in-band separator inside a fence is inert text now: it
+        // must not reset the fence and make the marker after it live.
+        std::fs::write(
+            acks.join("1.md"),
+            format!(
+                "```\n{}\n{} {digest}\n```\n",
+                ack::SOURCE_SEPARATOR,
+                ack::ACK_PHRASE
+            ),
+        )
+        .unwrap();
+        assert_eq!(run_diff(&opts), EXIT_BLOCKED);
+
+        // An unclosed fence in one comment does not swallow the next one.
+        std::fs::write(acks.join("1.md"), "log:\n```\noops\n").unwrap();
+        std::fs::write(acks.join("2.md"), format!("{} {digest}\n", ack::ACK_PHRASE)).unwrap();
+        assert_eq!(run_diff(&opts), 0);
+    }
+
+    #[test]
+    fn a_missing_ack_dir_is_a_usage_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let head = dir.path().join("head.json");
+        std::fs::write(&head, r#"{"schema_version":3}"#).unwrap();
+        let missing = dir.path().join("no-such-dir");
+        let code = run_diff(&DiffOptions {
+            base: head.to_str().unwrap(),
+            head: head.to_str().unwrap(),
+            format: "text",
+            output: None,
+            acks: &[],
+            ack_file: None,
+            ack_dir: Some(missing.to_str().unwrap()),
+            allow_missing_base: false,
+        });
+        assert_eq!(code, EXIT_USAGE);
+    }
+
+    /// `--ack-dir` reads only regular files. A marker in a subdirectory is
+    /// not a comment the workflow wrote.
+    #[test]
+    fn the_ack_dir_skips_subdirectories() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.json");
+        let head = dir.path().join("head.json");
+        std::fs::write(
+            &base,
+            manifest_json(&route("/admin", "gated", &["admin"]), ""),
+        )
+        .unwrap();
+        std::fs::write(&head, manifest_json(&route("/admin", "public", &[]), "")).unwrap();
+        let digest = ack::short(
+            &evaluate(
+                Some(&PostureManifest::read(base.to_str().unwrap()).unwrap()),
+                &PostureManifest::read(head.to_str().unwrap()).unwrap(),
+                &[],
+            )
+            .ack_digest,
+        );
+        let acks = dir.path().join("acks");
+        std::fs::create_dir_all(acks.join("sub")).unwrap();
+        std::fs::write(
+            acks.join("sub").join("1.md"),
+            format!("{} {digest}\n", ack::ACK_PHRASE),
+        )
+        .unwrap();
+        let code = run_diff(&DiffOptions {
+            base: base.to_str().unwrap(),
+            head: head.to_str().unwrap(),
+            format: "text",
+            output: None,
+            acks: &[],
+            ack_file: None,
+            ack_dir: Some(acks.to_str().unwrap()),
+            allow_missing_base: false,
+        });
+        assert_eq!(code, EXIT_BLOCKED);
+    }
+
+    /// A build change blocks, a marker for its digest unblocks it, and the
+    /// JSON report names it the way `scripts/check-posture-gate.sh` greps.
+    #[test]
+    fn a_build_change_blocks_until_acknowledged() {
+        let r = route("/admin", "gated", &["admin"]);
+        let base = parse(&manifest_json(&r, ""));
+        let head = parse(&manifest_json(&r, r#""build":{"profile":"release"},"#));
+
+        let blocked = evaluate(Some(&base), &head, &[]);
+        assert!(blocked.blocked());
+        let json = render(&blocked, "json").unwrap();
+        assert!(json.contains(r#""kind": "build_changed""#), "{json}");
+
+        let comment = format!("{} {}", ack::ACK_PHRASE, ack::short(&blocked.ack_digest));
+        assert!(!evaluate(Some(&base), &head, &ack::parse_acks(&comment)).blocked());
     }
 }

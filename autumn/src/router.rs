@@ -658,6 +658,10 @@ fn build_router_pre_state(
     // Build the per-route timeout override table before `route_list` and the
     // scoped groups are consumed by the mounting steps below.
     let route_timeouts = build_route_timeout_table(&route_list, &ctx.scoped_groups, config);
+    let criticality_layer = crate::middleware::criticality::CriticalityLayer::from_table(
+        build_route_criticality_table(&route_list, &ctx.scoped_groups, config),
+        config.server.admission.trust_criticality_header,
+    );
 
     let idempotency_layers = build_idempotency_layers(config, state)?;
     // Both `.layer(..)` custom layers and `.static_gate(..)` gate layers are
@@ -765,6 +769,7 @@ fn build_router_pre_state(
         ctx.error_page_renderer,
         ctx.session_store,
         route_timeouts,
+        criticality_layer,
         load_shed_layer,
         defer_security_headers,
     )?;
@@ -961,7 +966,13 @@ fn build_router_pre_state(
             // a second, independently-counting layer — see that call site's
             // comment. `None` (the default) is a no-op, matching direct routes.
             if let Some(load_shed) = mcp_load_shed_layer {
-                mcp_router = mcp_router.layer(load_shed);
+                // The envelope does not know the tool yet, so it admits as
+                // `critical` (up to the full limit). The `tools/call` replay
+                // then checks the tool route's own class (#3068), so a
+                // `default` or `sheddable` tool is still shed at its share.
+                mcp_router = mcp_router
+                    .layer(load_shed)
+                    .layer(axum::Extension(crate::admission::Criticality::Critical));
             }
             // Stamp `ResolvedClientIdentity` on the *outer* `/mcp` request too. The
             // MCP route is merged after `apply_middleware`, so the centralized
@@ -3964,6 +3975,9 @@ fn build_maintenance_layer(
 ///
 /// Reuses the same probe/actuator bypass list as [`build_maintenance_layer`]
 /// so health/liveness/readiness probes are never shed under load (#1006).
+///
+/// With `server.admission.mode = "adaptive"` the layer is always installed.
+/// The static ceiling, if any, is the default `max_limit` (#3068).
 fn build_load_shed_layer(
     config: &AutumnConfig,
     state: &AppState,
@@ -3979,6 +3993,33 @@ fn build_load_shed_layer(
         config.server.capacity_contract.as_deref(),
         config.profile_admission_default(),
     );
+    let admission = &config.server.admission;
+    let shares = admission.partition_shares().unwrap_or_else(|error| {
+        // `AutumnConfig::validate` rejects this at boot; keep a router built
+        // without it working.
+        tracing::warn!(%error, "invalid server.admission.partitions; using the defaults");
+        crate::admission::PartitionShares::default()
+    });
+    if admission.mode == crate::config::AdmissionMode::Adaptive {
+        match crate::admission::AdaptiveLimiter::from_config(admission, resolved.limit()) {
+            Ok(limiter) => {
+                tracing::info!(
+                    algorithm = ?admission.algorithm,
+                    initial_limit = limiter.limit(),
+                    "admission control uses an adaptive limit"
+                );
+                return Some(finish_load_shed_layer(
+                    crate::middleware::LoadShedLayer::adaptive(limiter, state.metrics.clone()),
+                    shares,
+                    config,
+                ));
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                "invalid server.admission limits; using the static ceiling"
+            ),
+        }
+    }
     let limit = resolved.limit()?;
     match resolved {
         crate::capacity::AdmissionLimit::Contract(_) => tracing::info!(
@@ -4006,14 +4047,27 @@ fn build_load_shed_layer(
     // readable 503. Harmless (but redundant) at the `/mcp` mount point, since
     // that shares this same layer instance yet sits *inside* its own
     // `CorsLayer`, which overwrites these headers with its own regardless.
+    Some(finish_load_shed_layer(
+        crate::middleware::LoadShedLayer::new(limit, state.metrics.clone()),
+        shares,
+        config,
+    ))
+}
+
+/// Add the partitions, probe exemptions and CORS mirroring that both
+/// admission modes share.
+fn finish_load_shed_layer(
+    layer: crate::middleware::LoadShedLayer,
+    shares: crate::admission::PartitionShares,
+    config: &AutumnConfig,
+) -> crate::middleware::LoadShedLayer {
     let cors =
         (!config.cors.allowed_origins.is_empty()).then(|| std::sync::Arc::new(config.cors.clone()));
-    Some(
-        crate::middleware::LoadShedLayer::new(limit, state.metrics.clone())
-            .with_health_prefix(config.actuator.prefix.clone())
-            .with_probe_paths(probe_bypass_paths(config))
-            .with_cors(cors),
-    )
+    layer
+        .with_partitions(shares)
+        .with_health_prefix(config.actuator.prefix.clone())
+        .with_probe_paths(probe_bypass_paths(config))
+        .with_cors(cors)
 }
 
 /// Build the shadow-mirroring layer, or `None` when `[shadow]` is off.
@@ -4141,12 +4195,12 @@ fn build_shadow_layer(
 /// any allocation on exempt/disabled routes. Built once at router-assembly time
 /// from each [`Route`]'s `timeout` field and shared (cheaply cloned) into the
 /// global timeout middleware.
-type RouteTimeoutTable = std::sync::Arc<
-    std::collections::HashMap<
-        String,
-        std::collections::HashMap<http::Method, crate::route::RouteTimeout>,
-    >,
->;
+type RouteTimeoutTable = RouteAttrTable<crate::route::RouteTimeout>;
+
+/// A per-route attribute lookup table, keyed like [`RouteTimeoutTable`]:
+/// route template (as [`axum::extract::MatchedPath`]), then HTTP method.
+pub type RouteAttrTable<T> =
+    std::sync::Arc<std::collections::HashMap<String, std::collections::HashMap<http::Method, T>>>;
 
 /// Error surfaced as the cause of the `503` when an inbound request exceeds its
 /// wall-clock deadline. Carried into [`crate::error::AutumnError::service_unavailable`]
@@ -4192,17 +4246,38 @@ pub struct RequestDeadlineCancelled;
 fn build_route_timeout_table(
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
-    #[cfg_attr(not(feature = "i18n"), allow(unused_variables))] config: &AutumnConfig,
+    config: &AutumnConfig,
 ) -> RouteTimeoutTable {
-    let mut table: std::collections::HashMap<
-        String,
-        std::collections::HashMap<http::Method, crate::route::RouteTimeout>,
-    > = std::collections::HashMap::new();
-    let mut insert = |path: String, method: &http::Method, timeout: crate::route::RouteTimeout| {
-        // `Inherit` carries no override, so it never needs a table entry.
-        if matches!(timeout, crate::route::RouteTimeout::Inherit) {
-            return;
-        }
+    // `Inherit` carries no override, so it never needs a table entry.
+    build_route_attr_table(route_list, scoped_groups, config, |route| {
+        (!matches!(route.timeout, crate::route::RouteTimeout::Inherit)).then_some(route.timeout)
+    })
+}
+
+/// Build the per-route criticality table (issue #3068). Routes with the
+/// default criticality get no entry, so an app without `criticality = ...`
+/// gets an empty table and no `CriticalityLayer`.
+fn build_route_criticality_table(
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+    config: &AutumnConfig,
+) -> RouteAttrTable<crate::admission::Criticality> {
+    build_route_attr_table(route_list, scoped_groups, config, |route| {
+        (route.criticality != crate::admission::Criticality::Default).then_some(route.criticality)
+    })
+}
+
+/// Build a [`RouteAttrTable`] from the values `value` returns. A route for
+/// which `value` returns `None` gets no entry.
+fn build_route_attr_table<T: Copy>(
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+    #[cfg_attr(not(feature = "i18n"), allow(unused_variables))] config: &AutumnConfig,
+    value: impl Fn(&Route) -> Option<T>,
+) -> RouteAttrTable<T> {
+    let mut table: std::collections::HashMap<String, std::collections::HashMap<http::Method, T>> =
+        std::collections::HashMap::new();
+    let mut insert = |path: String, method: &http::Method, timeout: T| {
         // Key by (path, effective request method) so an override on one handler
         // never bleeds onto sibling methods sharing the template, while still
         // resolving through a method alias. `RequestTimeoutService` looks up
@@ -4226,15 +4301,19 @@ fn build_route_timeout_table(
         }
     };
     for route in route_list {
-        insert(route.path.to_owned(), &route.method, route.timeout);
+        if let Some(v) = value(route) {
+            insert(route.path.to_owned(), &route.method, v);
+        }
     }
     for group in scoped_groups {
         for route in &group.routes {
-            insert(
-                join_nested_path(&group.prefix, route.path),
-                &route.method,
-                route.timeout,
-            );
+            if let Some(v) = value(route) {
+                insert(
+                    join_nested_path(&group.prefix, route.path),
+                    &route.method,
+                    v,
+                );
+            }
         }
     }
     #[cfg(feature = "i18n")]
@@ -4254,11 +4333,8 @@ fn build_route_timeout_table(
 /// deliberately excluded: they mount after locale-prefix nesting and are never
 /// locale-prefixed themselves (see `scoped_group_routes_are_not_locale_prefixed`).
 #[cfg(feature = "i18n")]
-fn expand_route_timeout_table_for_locale_prefix(
-    table: &mut std::collections::HashMap<
-        String,
-        std::collections::HashMap<http::Method, crate::route::RouteTimeout>,
-    >,
+fn expand_route_timeout_table_for_locale_prefix<T: Clone>(
+    table: &mut std::collections::HashMap<String, std::collections::HashMap<http::Method, T>>,
     route_list: &[Route],
     i18n: &crate::i18n::I18nConfig,
 ) {
@@ -4385,7 +4461,15 @@ fn build_request_timeout_settings(
         .values()
         .flat_map(std::collections::HashMap::values)
         .any(|t| matches!(t, crate::route::RouteTimeout::Override(_)));
-    if global.is_none() && !has_override {
+    // Adaptive admission must see `timeout = "off"` routes, to skip their
+    // latency samples (#3068).
+    let has_off_for_admission = config.server.admission.mode
+        == crate::config::AdmissionMode::Adaptive
+        && route_timeouts
+            .values()
+            .flat_map(std::collections::HashMap::values)
+            .any(|t| matches!(t, crate::route::RouteTimeout::Disabled));
+    if global.is_none() && !has_override && !has_off_for_admission {
         return None;
     }
     if let Some(duration) = global {
@@ -4481,6 +4565,15 @@ impl<S> RequestTimeoutService<S> {
             crate::route::RouteTimeout::Inherit => self.settings.global,
         }
     }
+
+    /// `true` when the matched route has `timeout = "off"`.
+    fn route_timeout_is_off<B>(&self, req: &Request<B>) -> bool {
+        req.extensions()
+            .get::<axum::extract::MatchedPath>()
+            .and_then(|p| self.settings.route_timeouts.get(p.as_str()))
+            .and_then(|by_method| by_method.get(req.method()))
+            .is_some_and(|t| matches!(t, crate::route::RouteTimeout::Disabled))
+    }
 }
 
 impl<S> tower::Service<Request<axum::body::Body>> for RequestTimeoutService<S>
@@ -4498,14 +4591,26 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<axum::body::Body>) -> Self::Future {
+    fn call(&mut self, mut req: Request<axum::body::Body>) -> Self::Future {
         let Some(duration) = self.deadline_for(&req) else {
             // Exempt (disabled route, or global off with a non-Override route)
             // — no timer and no allocation on this hot path.
+            if self.route_timeout_is_off(&req) {
+                // Tell adaptive admission that this route's latency is not a
+                // capacity signal (#3068).
+                req.extensions_mut()
+                    .insert(crate::admission::InboundDeadline::Off);
+            }
             return RequestTimeoutFuture::Unbounded {
                 inner: self.inner.call(req),
             };
         };
+        // Adaptive admission tells a cancel at this deadline (overload) from a
+        // client that goes away (#3068).
+        if let Some(at) = tokio::time::Instant::now().checked_add(duration) {
+            req.extensions_mut()
+                .insert(crate::admission::InboundDeadline::At(at));
+        }
 
         // A deadline is active: now it's worth owning the path for the warn log.
         let matched_path = req
@@ -4987,6 +5092,9 @@ fn apply_middleware(
     #[cfg(feature = "maud")] error_page_renderer: Option<SharedRenderer>,
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
     route_timeouts: RouteTimeoutTable,
+    // Sets the `Criticality` extension and task-local (#3068). Passive when no
+    // route sets a criticality and the header is not trusted.
+    criticality_layer: crate::middleware::criticality::CriticalityLayer,
     // Built once by the caller (`build_router_pre_state`) and cloned into the
     // late-mounted `/mcp` envelope too, so both ingress surfaces admit
     // against the SAME shared in-flight counter — constructing a second
@@ -5076,6 +5184,10 @@ fn apply_middleware(
         // `server.max_concurrent_requests` configured) contributes an `Either`
         // branch that forwards straight to the inner service: no allocation and
         // no extra nesting level.
+        // Request criticality (#3068). Outer to load shedding, which reads the
+        // `Criticality` extension that this layer sets. Always installed: an
+        // outer user layer can set the class. Passive when nothing does.
+        criticality_layer,
         tower::util::option_layer(load_shed_layer),
         // Maintenance mode (shared construction with the late-mounted `/mcp`
         // envelope — see `build_maintenance_layer`).
@@ -6930,6 +7042,32 @@ mod tests {
     // ── #3057: the prod profile turns load shedding on ───────────────────────
 
     #[test]
+    fn adaptive_mode_installs_the_load_shed_layer_without_a_ceiling() {
+        let mut config = AutumnConfig::default();
+        assert!(build_load_shed_layer(&config, &test_state()).is_none());
+        config.server.admission.mode = crate::config::AdmissionMode::Adaptive;
+        let state = test_state();
+        assert!(build_load_shed_layer(&config, &state).is_some());
+        assert_eq!(
+            state.metrics.snapshot().http.admission.limit,
+            20,
+            "the gauge shows the initial adaptive limit"
+        );
+    }
+
+    #[test]
+    fn adaptive_mode_with_bad_bounds_falls_back_to_the_static_ceiling() {
+        let mut config = AutumnConfig::default();
+        config.server.admission.mode = crate::config::AdmissionMode::Adaptive;
+        config.server.admission.min_limit = 0;
+        assert!(build_load_shed_layer(&config, &test_state()).is_none());
+        config.server.max_concurrent_requests = Some(7);
+        let state = test_state();
+        assert!(build_load_shed_layer(&config, &state).is_some());
+        assert_eq!(state.metrics.snapshot().http.admission.limit, 7);
+    }
+
+    #[test]
     fn prod_profile_installs_the_load_shed_layer() {
         let mut config = AutumnConfig {
             profile: Some("prod".into()),
@@ -7167,6 +7305,7 @@ mod tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -7717,6 +7856,7 @@ mod tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -8323,6 +8463,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -8411,6 +8552,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -8433,6 +8575,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -8455,6 +8598,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -8813,6 +8957,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -9565,6 +9710,7 @@ enabled = true
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -9775,6 +9921,7 @@ enabled = true
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -9843,6 +9990,7 @@ enabled = true
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -10017,6 +10165,7 @@ enabled = true
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -10098,6 +10247,7 @@ enabled = true
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -10433,6 +10583,7 @@ enabled = true
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -12420,6 +12571,7 @@ enabled = true
             repository: None,
             idempotency: crate::route::RouteIdempotency::default(),
             timeout: crate::route::RouteTimeout::default(),
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
         };
 
@@ -12770,6 +12922,7 @@ enabled = true
             repository: None,
             idempotency: crate::route::RouteIdempotency::default(),
             timeout: crate::route::RouteTimeout::default(),
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
         };
 
@@ -14003,6 +14156,7 @@ mod trusted_host_tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout,
+            criticality: crate::admission::Criticality::Default,
             api_version: None,
             sunset_opt_out: false,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
@@ -14090,6 +14244,89 @@ mod trusted_host_tests {
             table.get("/api").and_then(|m| m.get(&http::Method::GET)),
             Some(&override_5s),
         );
+    }
+
+    #[test]
+    fn build_route_criticality_table_keys_scoped_routes_and_head() {
+        let mut shed = timeout_route(
+            http::Method::GET,
+            "/export",
+            crate::route::RouteTimeout::Inherit,
+        );
+        shed.criticality = crate::admission::Criticality::Sheddable;
+        let plain = timeout_route(
+            http::Method::POST,
+            "/export",
+            crate::route::RouteTimeout::Inherit,
+        );
+        let group = crate::app::ScopedGroup {
+            prefix: "/admin".to_owned(),
+            routes: vec![{
+                let mut r = timeout_route(
+                    http::Method::POST,
+                    "/pay",
+                    crate::route::RouteTimeout::Inherit,
+                );
+                r.criticality = crate::admission::Criticality::Critical;
+                r
+            }],
+            source: crate::route_listing::RouteSource::User,
+            apply_layer: Box::new(|r| r),
+        };
+        let table =
+            build_route_criticality_table(&[shed, plain], &[group], &AutumnConfig::default());
+        let get = |p: &str, m: http::Method| table.get(p).and_then(|t| t.get(&m)).copied();
+        assert_eq!(
+            get("/export", http::Method::GET),
+            Some(crate::admission::Criticality::Sheddable)
+        );
+        assert_eq!(
+            get("/export", http::Method::HEAD),
+            Some(crate::admission::Criticality::Sheddable),
+            "a GET route is also served for HEAD"
+        );
+        assert_eq!(
+            get("/export", http::Method::POST),
+            None,
+            "default gets no entry"
+        );
+        assert_eq!(
+            get("/admin/pay", http::Method::POST),
+            Some(crate::admission::Criticality::Critical)
+        );
+        assert!(
+            build_route_criticality_table(&[], &[], &AutumnConfig::default()).is_empty(),
+            "no criticality routes: empty table, so a passive layer"
+        );
+    }
+
+    /// Regression (#3183 review): with the global timeout off, a table of only
+    /// `timeout = "off"` routes still installs the timeout service under
+    /// adaptive admission, so those routes get `InboundDeadline::Off` and give
+    /// no latency sample.
+    #[test]
+    fn timeout_off_only_routes_install_the_service_for_adaptive_admission() {
+        let mut by_method = std::collections::HashMap::new();
+        by_method.insert(http::Method::GET, crate::route::RouteTimeout::Disabled);
+        let mut table = std::collections::HashMap::new();
+        table.insert("/poll".to_owned(), by_method);
+        let table: RouteTimeoutTable = Arc::new(table);
+        let build = |config: &AutumnConfig| {
+            build_request_timeout_settings(
+                config,
+                crate::middleware::MetricsCollector::new(),
+                table.clone(),
+                false,
+            )
+            .is_some()
+        };
+
+        let mut config = AutumnConfig::default();
+        config.server.timeouts.request_timeout_ms = None;
+        assert!(!build(&config), "static admission: nothing to do");
+
+        config.server.admission.mode = crate::config::AdmissionMode::Adaptive;
+        assert!(build(&config), "adaptive admission needs the Off marker");
     }
 
     /// Codex review (P1): `Router::nest("/{locale}", ...)` mounts each locale
@@ -14375,6 +14612,7 @@ mod trusted_host_tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -14529,6 +14767,7 @@ mod trusted_host_tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -14687,6 +14926,7 @@ mod trusted_host_tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
@@ -14809,6 +15049,7 @@ mod trusted_host_tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,

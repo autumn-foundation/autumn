@@ -133,6 +133,12 @@ Set the TTL longer than both the spread between the processes' timers and the
 longest a tick body can take. The Postgres coordinator keeps its tick row in
 the same way.
 
+Each process stamps and reaps leases with its own clock. Processes on one host
+use one clock, so this is safe. If the clocks can differ (for example, in VMs
+with their own clocks), keep the difference below the TTL. A process with a
+fast clock reaps a live lease early, and a second process then runs the tick
+again. The multi-replica simulation sweep found this limit (issue #3067).
+
 `backend = "sqlite"` requires the `sqlite` cargo feature, and a **file-backed**
 database: an in-memory target is private to each process, so every replica would
 claim the same tick and run it. That is refused at boot.

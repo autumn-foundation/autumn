@@ -975,10 +975,15 @@ impl LeaseHeartbeat {
             claimed_at,
             lease_give_up_after(visibility_timeout_ms),
         );
+        // Keep the renewal outside the select, as `spawn` does.
+        let mut renewing = Box::pin(renew());
         let renewal = tokio::select! {
             biased;
-            renewal = renew() => Some(renewal),
-            () = tokio::time::sleep_until(give_up_at) => None,
+            renewal = &mut renewing => Some(renewal),
+            () = tokio::time::sleep_until(give_up_at) => {
+                tokio::spawn(renewing);
+                None
+            }
         };
         match renewal {
             Some(LeaseRenewal::Renewed) => Self::spawn(started, visibility_timeout_ms, renew),
@@ -1030,7 +1035,9 @@ impl LeaseHeartbeat {
                 let mut next_attempt =
                     crate::time_math::saturating_tokio_deadline(last_renewed, interval);
                 loop {
+                    // Biased: stop goes first, so a sim gets the same order each run.
                     tokio::select! {
+                        biased;
                         () = stop.cancelled() => return,
                         () = tokio::time::sleep_until(next_attempt) => {}
                     }
@@ -1041,16 +1048,28 @@ impl LeaseHeartbeat {
                     // The give-up time also bounds a renewal that stalls.
                     let give_up_at =
                         crate::time_math::saturating_tokio_deadline(last_renewed, give_up_after);
+                    // Keep the renewal outside the select. `select!` drops the
+                    // losing futures before it runs a branch. diesel-async
+                    // panics when it drops a `SQLite` query in flight on a
+                    // current-thread runtime.
+                    let mut renewing = Box::pin(renew());
                     // Biased: a renewal that completes at the give-up time counts.
                     let renewal = tokio::select! {
                         biased;
-                        () = stop.cancelled() => return,
-                        renewal = renew() => renewal,
+                        () = stop.cancelled() => None,
+                        renewal = &mut renewing => Some(renewal),
                         () = tokio::time::sleep_until(give_up_at) => {
                             tracing::warn!("job lease renewal stalled too long; stopping the job");
                             lost.cancel();
-                            return;
+                            None
                         }
+                    };
+                    let Some(renewal) = renewal else {
+                        // Let the renewal in flight finish on its own task.
+                        // Do not drop it. A late renewal never moves a claim
+                        // time back.
+                        tokio::spawn(renewing);
+                        return;
                     };
                     match renewal {
                         LeaseRenewal::Renewed => last_renewed = started,
@@ -1088,7 +1107,8 @@ impl LeaseHeartbeat {
     /// Run `settle` (the ack or nack) while the heartbeat still renews the
     /// claim, then stop it. A settle that stalls past the lease must not let
     /// stale recovery requeue a job whose handler already finished. A renewal
-    /// that lands after the settle matches no claim, so it changes nothing.
+    /// that lands after the settle matches no claim, or only moves a new
+    /// claim's time forward.
     async fn stop_after<F: Future>(self, settle: F) -> F::Output {
         let settled = settle.await;
         self.stop().await;
@@ -5921,9 +5941,11 @@ pub(crate) fn start_local_runtime_inner(
     if run_workers {
         let buffer = Arc::clone(&buffer);
         let shutdown = shutdown.clone();
-        tokio::spawn(async move {
+        crate::sim::spawn_app_task(state, async move {
             loop {
                 tokio::select! {
+                    // Fixed branch order, so a sim replays it (#3067).
+                    biased;
                     () = shutdown.cancelled() => break,
                     maybe = rx.recv() => {
                         match maybe {
@@ -5947,7 +5969,7 @@ pub(crate) fn start_local_runtime_inner(
         let slots = Arc::clone(&slots);
         let mut cursor = schedule.cursor();
 
-        tokio::spawn(async move {
+        crate::sim::spawn_app_task(&state.clone(), async move {
             loop {
                 // Register interest before checking so an enqueue that lands
                 // between the pop attempt and the await is never lost.
@@ -6005,6 +6027,8 @@ pub(crate) fn start_local_runtime_inner(
                     }
                 }
                 tokio::select! {
+                    // Fixed branch order, so a sim replays it (#3067).
+                    biased;
                     () = shutdown.cancelled() => break,
                     () = notified => {}
                 }
@@ -10271,9 +10295,11 @@ struct PgEnqueuedCounts {
 ///
 /// Claims that expire together (handlers that hung on one dependency) must
 /// not all run again at once (issue #3054). The SQL draws a per-row jitter in
-/// `[0, min(cap, initial_backoff_ms * 2^(attempt-1))]` with the database's
-/// own `random()`, as the recovery updates many rows in one statement. The
-/// cap is clamped like a relative enqueue, so the SQL cannot overflow.
+/// `[0, min(cap, initial_backoff_ms * 2^(attempt-1))]`, as the recovery
+/// updates many rows in one statement. Postgres uses its own `random()`.
+/// `SQLite` mixes the row id with one draw from the app's entropy, so a sim
+/// replays it (issue #3067). The cap is clamped like a relative enqueue, so
+/// the SQL cannot overflow.
 #[cfg(feature = "db")]
 pub(crate) fn stale_requeue_cap_ms(state: &AppState) -> i64 {
     let cap = state
@@ -25210,6 +25236,95 @@ mod lease_tests {
             "a stalled renewal must not keep the run alive past the give-up time"
         );
         heartbeat.stop().await;
+    }
+
+    /// A renewal that records a drop before it finishes. diesel-async panics
+    /// when it drops a `SQLite` query in flight on a current-thread runtime.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    fn renewal_that_records_a_drop(
+        dropped: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> impl FnMut() -> std::pin::Pin<Box<dyn Future<Output = LeaseRenewal> + Send>> + Send + 'static
+    {
+        struct InFlight(Arc<std::sync::atomic::AtomicBool>, bool);
+        impl Drop for InFlight {
+            fn drop(&mut self) {
+                if !self.1 {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        let dropped = Arc::clone(dropped);
+        move || {
+            let dropped = Arc::clone(&dropped);
+            Box::pin(async move {
+                let mut query = InFlight(dropped, false);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                query.1 = true;
+                LeaseRenewal::Failed("slow".to_owned())
+            })
+        }
+    }
+
+    /// The heartbeat must not drop a renewal in flight at the give-up time.
+    /// `select!` drops the losing futures before it runs a branch. On a
+    /// `SQLite` renewal, the drop panicked before `lost.cancel()`. The run
+    /// continued without a claim, and a peer ran the job again (#3067 sweep).
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_gives_up_without_dropping_a_renewal_in_flight() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let heartbeat = LeaseHeartbeat::spawn(
+            tokio::time::Instant::now(),
+            300,
+            renewal_that_records_a_drop(&dropped),
+        );
+        let lost = heartbeat.lost_token();
+        tokio::time::sleep(Duration::from_millis(210)).await;
+        assert!(
+            lost.is_cancelled(),
+            "the heartbeat stops the run at the give-up time"
+        );
+        assert!(!dropped.load(Ordering::SeqCst), "the renewal was dropped");
+        // Let the renewal finish on its own.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        heartbeat.stop().await;
+        assert!(!dropped.load(Ordering::SeqCst), "the renewal was dropped");
+    }
+
+    /// A stop must not drop a renewal in flight either.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_stops_without_dropping_a_renewal_in_flight() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let heartbeat = LeaseHeartbeat::spawn(
+            tokio::time::Instant::now(),
+            300,
+            renewal_that_records_a_drop(&dropped),
+        );
+        // The first renewal starts at 100ms and runs for 1s.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        heartbeat.stop().await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!dropped.load(Ordering::SeqCst), "the renewal was dropped");
+    }
+
+    /// An overdue first renewal in `start` must not be dropped at the give-up
+    /// time.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn an_overdue_first_renewal_is_not_dropped_at_the_give_up_time() {
+        let claimed_at = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let heartbeat =
+            LeaseHeartbeat::start(claimed_at, 300, renewal_that_records_a_drop(&dropped)).await;
+        assert!(
+            heartbeat.lost_token().is_cancelled(),
+            "no renewal before the give-up time: the handler must not run"
+        );
+        assert!(!dropped.load(Ordering::SeqCst), "the renewal was dropped");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!dropped.load(Ordering::SeqCst), "the renewal was dropped");
     }
 
     /// The claim's deadline starts when the backend writes the claim, before

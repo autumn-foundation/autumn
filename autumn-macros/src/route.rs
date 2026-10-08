@@ -236,6 +236,17 @@ pub fn route_macro(
             quote! { ::autumn_web::RouteTimeout::Disabled }
         }
     };
+    let route_criticality = match route_args.criticality {
+        crate::parse::RouteCriticalityAttr::Critical => {
+            quote! { ::autumn_web::Criticality::Critical }
+        }
+        crate::parse::RouteCriticalityAttr::Default => {
+            quote! { ::autumn_web::Criticality::Default }
+        }
+        crate::parse::RouteCriticalityAttr::Sheddable => {
+            quote! { ::autumn_web::Criticality::Sheddable }
+        }
+    };
     let has_policy_val = has_policy_only(&input_fn);
     // Source order is preserved here on purpose: `ApiDoc` stays faithful to the
     // handler as written, and the route listing canonicalizes (sorts/dedupes)
@@ -321,6 +332,7 @@ pub fn route_macro(
                 repository: ::core::option::Option::None,
                 idempotency: #route_idempotency,
                 timeout: #route_timeout,
+                criticality: #route_criticality,
                 seo: #seo_defaults,
             }
         }
@@ -1822,6 +1834,60 @@ mod tests {
         assert!(
             generated.contains("RouteTimeout :: Disabled"),
             "timeout = \"off\" must emit RouteTimeout::Disabled: {generated}"
+        );
+    }
+
+    // ── criticality (#3068) ─────────────────────────────────────────────────
+
+    #[test]
+    fn route_macro_defaults_criticality_to_default() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/x" },
+            quote! { async fn x() -> &'static str { "x" } },
+        )
+        .to_string();
+        assert!(
+            generated.contains("criticality : :: autumn_web :: Criticality :: Default"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_parses_each_criticality() {
+        for (value, variant) in [
+            ("critical", "Critical"),
+            ("default", "Default"),
+            ("sheddable", "Sheddable"),
+        ] {
+            let generated = route_macro(
+                "POST",
+                "post",
+                quote! { "/x", criticality = #value },
+                quote! { async fn x() -> &'static str { "x" } },
+            )
+            .to_string();
+            assert!(
+                generated.contains(&format!("Criticality :: {variant}")),
+                "criticality = {value:?}: {generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_macro_rejects_an_unknown_criticality() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/x", criticality = "urgent" },
+            quote! { async fn x() -> &'static str { "x" } },
+        )
+        .to_string();
+        assert!(generated.contains("compile_error"), "{generated}");
+        assert!(
+            generated.contains("invalid `criticality` value"),
+            "{generated}"
         );
     }
 

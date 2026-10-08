@@ -828,7 +828,7 @@ async fn recover_stale_claims(
                            ELSE '{STATUS_FAILED}' END, \
              attempt = CASE WHEN attempt < max_attempts THEN attempt + 1 ELSE attempt END, \
              run_at = CASE WHEN attempt < max_attempts THEN ? + \
-               ((random() & 9223372036854775807) % (MIN(?, \
+               (((? * 1103515245 + rowid * 12345) % 2147483647) % (MIN(?, \
                  initial_backoff_ms * (1 << MIN(MAX(attempt - 1, 0), 62))) + 1)) \
                ELSE run_at END, \
              started_at = NULL, \
@@ -858,10 +858,16 @@ async fn recover_stale_claims(
          RETURNING id, name, status, payload, attempt"
     );
     // A per-row jitter, so claims that expire together do not all run again
-    // at once (issue #3054). See `stale_requeue_cap_ms`.
+    // at once (issue #3054). See `stale_requeue_cap_ms`. The row id mixes one
+    // draw from the app's entropy, not SQLite's `random()`, so a sim replays
+    // the same jitter for a seed (issue #3067). The draw is below 2^31, so the
+    // SQL products cannot overflow. The hash is below 2^31 too, so a jitter
+    // never passes about 24.8 days, whatever the cap.
     let cap_ms = super::stale_requeue_cap_ms(state);
+    let jitter_seed = i64::try_from(state.entropy().next_u64() & 0x7fff_ffff).unwrap_or(0);
     let recovered = diesel::sql_query(sql)
         .bind::<diesel::sql_types::BigInt, _>(now)
+        .bind::<diesel::sql_types::BigInt, _>(jitter_seed)
         .bind::<diesel::sql_types::BigInt, _>(cap_ms)
         .bind::<diesel::sql_types::BigInt, _>(now)
         .bind::<diesel::sql_types::BigInt, _>(cutoff)
@@ -953,6 +959,8 @@ async fn wait_ready(
             Err(error) => {
                 tracing::error!(error = %error, "sqlite job queue schema setup failed; retrying");
                 tokio::select! {
+                    // Fixed branch order, so a sim replays it (#3067).
+                    biased;
                     () = shutdown.cancelled() => return None,
                     () = tokio::time::sleep(retry_after) => {}
                 }
@@ -1160,8 +1168,10 @@ async fn queue_depth_survey_loop(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            _ = interval.tick() => update_queue_depth_gauges(&pool, &state).await,
+            // Fixed branch order, so a sim replays it (#3067).
+            biased;
             () = shutdown.cancelled() => break,
+            _ = interval.tick() => update_queue_depth_gauges(&pool, &state).await,
         }
     }
 }
@@ -1180,10 +1190,12 @@ async fn renew_claim(
         Err(error) => return LeaseRenewal::Failed(format!("sqlite jobs pool error: {error}")),
     };
     // Read the time after the wait for a connection, so the wait does not
-    // make the new claim time older than it is.
+    // make the new claim time older than it is. `MAX` keeps a late renewal
+    // (one that waited on the write lock, or one of an earlier attempt of
+    // this worker) from moving the claim time back.
     let now = clock.now().timestamp_millis();
     match diesel::sql_query(format!(
-        "UPDATE autumn_jobs SET claimed_at = ? \
+        "UPDATE autumn_jobs SET claimed_at = MAX(COALESCE(claimed_at, 0), ?) \
          WHERE id = ? AND claimed_by = ? AND status = '{STATUS_RUNNING}'"
     ))
     .bind::<diesel::sql_types::BigInt, _>(now)
@@ -1490,6 +1502,8 @@ async fn worker_loop(
         }
         if !handled {
             tokio::select! {
+                // Fixed branch order, so a sim replays it (#3067).
+                biased;
                 () = shutdown.cancelled() => break,
                 () = queue_handle.wake.notified() => {}
                 () = tokio::time::sleep(poll_interval) => {}
@@ -1526,6 +1540,10 @@ async fn maintenance_loop(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            // Fixed branch order, so a sim replays it (#3067). Both intervals
+            // tick at once at the start.
+            biased;
+            () = shutdown.cancelled() => break,
             _ = interval.tick() => {
                 recover_stale_claims(&pool, visibility_timeout_ms, &state, &job_admin).await;
                 if survey_blocked {
@@ -1538,7 +1556,6 @@ async fn maintenance_loop(
                     prune_job_history(&pool, &state, window).await;
                 }
             }
-            () = shutdown.cancelled() => break,
         }
     }
 }
@@ -1669,7 +1686,7 @@ pub(super) fn start_runtime(
         let queue_handle = queue_handle.clone();
         let state = state.clone();
         let shutdown = shutdown.clone();
-        tokio::spawn(async move {
+        crate::sim::spawn_app_task(&state.clone(), async move {
             queue_depth_survey_loop(queue_handle, state, shutdown).await;
         });
     }
@@ -1695,7 +1712,7 @@ pub(super) fn start_runtime(
         let state = state.clone();
         let job_admin = job_admin.clone();
         let shutdown = shutdown.clone();
-        tokio::spawn(async move {
+        crate::sim::spawn_app_task(&state.clone(), async move {
             maintenance_loop(
                 queue_handle,
                 visibility_timeout_ms,
@@ -1716,7 +1733,7 @@ pub(super) fn start_runtime(
         let shutdown = shutdown.clone();
         let schedule = schedule.clone();
         let slots = Arc::clone(&slots);
-        tokio::spawn(async move {
+        crate::sim::spawn_app_task(&state.clone(), async move {
             let worker_id = format!("{}:{}", std::process::id(), state.entropy().uuid_v4());
             worker_loop(
                 queue_handle,
