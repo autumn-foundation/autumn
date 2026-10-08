@@ -326,6 +326,11 @@ handler. The upload is checked by extension **and** declared content type. Not e
 (the export omits that column but the form requires it) — the generator warns
 and emits nothing, naming the reason and what to drop.
 
+A `Bytea` column is written as `\x` + lowercase hex (the Postgres text form) in
+the CSV export, the import and the edit form (issue #2330). The import decodes
+it byte-identically. A cell without the `\x` prefix, or with bad hex, fails its
+row. The index and show views still show the column as lossy text.
+
 **Scaffold Trash view (trunk-dev)**: a `--soft-delete` standard HTML scaffold
 also ships the recover-from-trash UI — a `#[secured] GET /<plural>/trash` page
 listing deleted rows through the repository's generated `page_only_deleted`
