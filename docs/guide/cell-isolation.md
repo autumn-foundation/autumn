@@ -156,8 +156,9 @@ Know these limits before you turn it on:
   it.
 - `#[job]` concurrency limits and uniqueness keys apply in each shard's
   table, not across shards.
-- The job dashboard, the queue-depth gauges and the retention sweep read the
-  control database only.
+- The job dashboard, the job metrics, the queue-depth gauges and the
+  retention sweep cover the control database only. Shard runs do not change
+  them.
 - An in-transaction enqueue does not use the `job_queue` circuit breaker.
 
 See [ADR 0018](../adr/0018-shard-local-framework-state.md) for the table of

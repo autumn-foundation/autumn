@@ -12729,9 +12729,24 @@ impl ShardJobWorkers {
         if self.worker_count == 0 {
             return;
         }
+        // The control registry backs the control queue gauges, which the
+        // control survey sets. Shard runs use a registry of their own, so
+        // they do not change those gauges.
+        let mut shard_state = self.state.clone();
+        shard_state.job_registry = crate::actuator::JobRegistry::new();
+        for job in self
+            .jobs_by_name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+        {
+            shard_state
+                .job_registry
+                .register_on_queue(&job.name, &normalize_queue_name(&job.queue));
+        }
         {
             let pool = self.pool.clone();
-            let state = self.state.clone();
+            let state = shard_state.clone();
             let job_admin = self.job_admin.clone();
             let shutdown = self.shutdown.clone();
             let visibility_timeout_ms = self.visibility_timeout_ms;
@@ -12752,7 +12767,7 @@ impl ShardJobWorkers {
         for _ in 0..self.worker_count {
             let pool = self.pool.clone();
             let jobs_by_name = Arc::clone(&self.jobs_by_name);
-            let state = self.state.clone();
+            let state = shard_state.clone();
             let job_admin = self.job_admin.clone();
             let shutdown = self.shutdown.clone();
             let schedule = self.schedule.clone();

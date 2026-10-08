@@ -63,9 +63,10 @@ The state of each framework table before this ADR:
 
 ### Negative
 
-- The job dashboard, the queue-depth gauges and the retention sweep read the
-  control database only. Shard queues are not in them, and finished shard
-  jobs stay until you delete them.
+- The job dashboard, the job metrics, the queue-depth gauges and the
+  retention sweep cover the control database only. Shard workers use a job
+  registry of their own, so shard runs do not change the control gauges.
+  Finished shard jobs stay until you delete them.
 - Each shard gets `jobs.workers` loops and slots. Up to `jobs.workers` ×
   (shards + 1) jobs run at the same time, and the idle poll load grows with
   the shard count.
