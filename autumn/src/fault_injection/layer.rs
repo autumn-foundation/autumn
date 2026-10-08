@@ -161,13 +161,32 @@ impl Drop for Pending {
 /// request, also when two of these layers are in the path.
 #[derive(Clone, Debug, Default)]
 pub struct FaultInjectionLayer {
-    /// The request timeout, when the layer is outside the timeout layer.
-    deadline: Option<Duration>,
+    placement: Placement,
+}
+
+/// Where a route layer sits.
+#[derive(Clone, Copy, Debug, Default)]
+enum Placement {
+    /// Inside the request timeout layer: it applies route faults.
+    #[default]
+    Inner,
+    /// Outside it, on the SSG/ISG path: it hands route faults to the inner
+    /// layer. A cached page gets them here, with the wait capped at
+    /// `deadline` (the global request timeout) when there is one.
+    Outer { deadline: Option<Duration> },
 }
 
 impl FaultInjectionLayer {
-    pub(super) const fn new(deadline: Option<Duration>) -> Self {
-        Self { deadline }
+    pub(super) const fn inner() -> Self {
+        Self {
+            placement: Placement::Inner,
+        }
+    }
+
+    pub(super) const fn outer(deadline: Option<Duration>) -> Self {
+        Self {
+            placement: Placement::Outer { deadline },
+        }
     }
 }
 
@@ -177,7 +196,7 @@ impl<S> Layer<S> for FaultInjectionLayer {
     fn layer(&self, inner: S) -> Self::Service {
         FaultInjectionService {
             inner,
-            deadline: self.deadline,
+            placement: self.placement,
         }
     }
 }
@@ -186,7 +205,7 @@ impl<S> Layer<S> for FaultInjectionLayer {
 #[derive(Clone, Debug)]
 pub struct FaultInjectionService<S> {
     inner: S,
-    deadline: Option<Duration>,
+    placement: Placement,
 }
 
 impl<S, B> Service<Request<B>> for FaultInjectionService<S>
@@ -214,7 +233,7 @@ where
                 }
             })
             .unwrap_or_default();
-        if self.deadline.is_none()
+        if matches!(self.placement, Placement::Inner)
             && let Some(deferred) = req.extensions().get::<DeferredFault>()
             && deferred.take()
         {
@@ -233,7 +252,7 @@ where
         // place.
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
-        let Some(deadline) = self.deadline else {
+        let Placement::Outer { deadline } = self.placement else {
             return Box::pin(async move {
                 tokio::time::sleep(fault.latency).await;
                 match fault.error {
@@ -253,7 +272,9 @@ where
             if !deferred.take() {
                 return Ok(response);
             }
-            if fault.latency >= deadline {
+            if let Some(deadline) = deadline
+                && fault.latency >= deadline
+            {
                 tokio::time::sleep(deadline).await;
                 return Ok(injected_error(axum::http::StatusCode::SERVICE_UNAVAILABLE));
             }
@@ -307,7 +328,7 @@ mod tests {
             .route("/actuator/health", get(|| async { "ok" }))
             .layer((
                 FaultScopeLayer::new(Arc::clone(injector)),
-                FaultInjectionLayer::new(None),
+                FaultInjectionLayer::inner(),
             ))
     }
 
@@ -384,11 +405,11 @@ mod tests {
             .route("/x", get(|| async { "ok" }))
             .layer((
                 FaultScopeLayer::new(Arc::clone(&injector)),
-                FaultInjectionLayer::new(None),
+                FaultInjectionLayer::inner(),
             ))
             .layer((
                 FaultScopeLayer::new(Arc::clone(&injector)),
-                FaultInjectionLayer::new(None),
+                FaultInjectionLayer::inner(),
             ));
         assert_eq!(status(app, "/x").await, 503);
         assert_eq!(injector.injected.load(Ordering::Relaxed), 1);
@@ -409,7 +430,7 @@ mod tests {
             .route("/api/x", get(|| async { "ok" }))
             .layer((
                 FaultScopeLayer::new(Arc::clone(&injector)),
-                FaultInjectionLayer::new(None),
+                FaultInjectionLayer::inner(),
             ));
         let replay = inner.clone();
         let outer = axum::Router::new()
@@ -422,7 +443,7 @@ mod tests {
             )
             .layer((
                 FaultScopeLayer::new(Arc::clone(&injector)),
-                FaultInjectionLayer::new(None),
+                FaultInjectionLayer::inner(),
             ));
         let response = outer
             .oneshot(Request::get("/mcp").body(Body::empty()).unwrap())
@@ -481,7 +502,7 @@ mod tests {
             .route("/x", get(|| async { "ok" }))
             .layer((
                 FaultScopeLayer::new(Arc::clone(&injector)),
-                FaultInjectionLayer::new(Some(Duration::from_secs(2))),
+                FaultInjectionLayer::outer(Some(Duration::from_secs(2))),
             ));
         let started = tokio::time::Instant::now();
         assert_eq!(status(app, "/x").await, 503);
@@ -498,9 +519,18 @@ mod tests {
     /// The SSG/ISG shape: the outer pair, outside an inner router with its
     /// own route timeout and the inner route layer.
     fn static_path_app(injector: &Arc<Injector>, route_timeout: Option<Duration>) -> axum::Router {
+        static_path_app_with(injector, route_timeout, Some(Duration::from_secs(1)))
+    }
+
+    /// [`static_path_app`] with the global request timeout `global`.
+    fn static_path_app_with(
+        injector: &Arc<Injector>,
+        route_timeout: Option<Duration>,
+        global: Option<Duration>,
+    ) -> axum::Router {
         let inner = axum::Router::new()
             .route("/x", get(|| async { "ok" }))
-            .layer(FaultInjectionLayer::new(None));
+            .layer(FaultInjectionLayer::inner());
         let inner = match route_timeout {
             Some(limit) => inner.layer(axum::middleware::from_fn(
                 move |req: Request<Body>, next: axum::middleware::Next| async move {
@@ -515,7 +545,7 @@ mod tests {
         };
         inner.layer((
             FaultScopeLayer::new(Arc::clone(injector)),
-            FaultInjectionLayer::new(Some(Duration::from_secs(1))),
+            FaultInjectionLayer::outer(global),
         ))
     }
 
@@ -523,6 +553,17 @@ mod tests {
     async fn a_route_timeout_bounds_an_outer_latency() {
         let injector = latency_injector(Duration::from_millis(900));
         let app = static_path_app(&injector, Some(Duration::from_millis(500)));
+        let started = tokio::time::Instant::now();
+        assert_eq!(status(app, "/x").await, 503);
+        assert_eq!(started.elapsed(), Duration::from_millis(500));
+    }
+
+    /// With no global timeout, the outer layer still hands its latency to
+    /// the inner layer, so a route timeout bounds it.
+    #[tokio::test(start_paused = true)]
+    async fn a_route_timeout_bounds_an_outer_latency_with_no_global_timeout() {
+        let injector = latency_injector(Duration::from_millis(900));
+        let app = static_path_app_with(&injector, Some(Duration::from_millis(500)), None);
         let started = tokio::time::Instant::now();
         assert_eq!(status(app, "/x").await, 503);
         assert_eq!(started.elapsed(), Duration::from_millis(500));
@@ -549,7 +590,7 @@ mod tests {
             .route("/x", get(|| async { "ok" }))
             .layer((
                 FaultScopeLayer::new(Arc::clone(&injector)),
-                FaultInjectionLayer::new(Some(Duration::from_secs(2))),
+                FaultInjectionLayer::outer(Some(Duration::from_secs(2))),
             ));
         let started = tokio::time::Instant::now();
         assert_eq!(status(app, "/x").await, 503);
@@ -590,7 +631,7 @@ mod tests {
             .route("/x", get(|| async { "ok" }))
             .layer((
                 FaultScopeLayer::new(Arc::clone(&injector)),
-                FaultInjectionLayer::new(Some(Duration::from_secs(1))),
+                FaultInjectionLayer::outer(Some(Duration::from_secs(1))),
             ));
         let started = tokio::time::Instant::now();
         assert_eq!(status(app, "/x").await, 200);

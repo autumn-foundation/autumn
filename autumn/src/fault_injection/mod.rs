@@ -809,7 +809,7 @@ pub(crate) fn build(
     });
     Some((
         FaultScopeLayer::new(Arc::clone(&injector)),
-        FaultInjectionLayer::new(None),
+        FaultInjectionLayer::inner(),
         FaultInjection { inner: injector },
     ))
 }
@@ -846,15 +846,16 @@ pub(crate) fn announce(handle: &FaultInjection) {
 
 impl FaultInjection {
     /// Both layers again, on the same injector, for the SSG/ISG path. The
-    /// route layer caps injected latency at `deadline` (the request
-    /// timeout) and then fails with `503`, as the timeout layer does.
+    /// outer route layer hands route faults to the inner one. A cached page
+    /// gets them in the outer layer: the wait stops at `deadline` (the global
+    /// request timeout), if any, and then fails with `503`.
     pub(crate) fn layers(
         &self,
         deadline: Option<Duration>,
     ) -> (FaultScopeLayer, FaultInjectionLayer) {
         (
             FaultScopeLayer::new(Arc::clone(&self.inner)),
-            FaultInjectionLayer::new(deadline),
+            FaultInjectionLayer::outer(deadline),
         )
     }
 }
