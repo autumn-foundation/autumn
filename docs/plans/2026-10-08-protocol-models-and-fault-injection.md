@@ -42,8 +42,8 @@
 
 Selected: 1, 6, 7, 10. Item 2 needs Java in CI and a second language.
 Item 3 needs its own proof of correctness. Item 4 does not explore
-interleavings. Item 5 needs the database. Item 8 changes "last one wins".
-Item 9 adds an attack surface; a programmatic handle is sufficient.
+interleavings. Item 5 needs the database. Item 8 changes which interceptor runs when two are installed.
+Item 9 adds an attack surface. A programmatic handle is sufficient.
 
 ## Reverse brainstorming ("how do we make this fail?")
 
@@ -53,22 +53,22 @@ Item 9 adds an attack surface; a programmatic handle is sufficient.
 | A model does not match the SQL. | Each action names its statement. The guard is a plain function. |
 | The state space grows, and CI is slow. | Small bounds. A test asserts an upper limit on states. |
 | Faults run in production by accident. | Config validation and the layer builder both refuse `prod`. Only `allow_in_production = true` overrides it. |
-| Faults keep running while users suffer. | A burn-rate stop condition. It latches off until an operator re-arms it. |
+| Faults keep running while users suffer. | A burn-rate stop condition. It stays disarmed until an operator arms it again. |
 | Injected latency causes a timeout that the stop condition does not see. | A dropped request with an injected fault counts as an error. |
 | A health probe fails, and the orchestrator kills the pod. | Probe and actuator paths are never faulted. |
 | A toggle leaves no trace. | Each toggle writes an audit event and a `warn` log. |
-| Tests are not deterministic. | Rolls use the app entropy. Windows use the app clock. |
+| Tests are not deterministic. | Random decisions use the app entropy. Windows use tokio time, which a paused test runtime controls. |
 | A new dependency adds an advisory. | `cargo deny` passes with Stateright. |
 
 ## Six thinking hats
 
 - **White:** see "Facts".
 - **Red:** fault injection in a framework is alarming. The refusal and the
-  logs must be loud.
-- **Black:** new dependency, model drift, scope growth. Redis is limited to
+  logs must be easy to see.
+- **Black:** the risks are a new dependency, model drift and scope growth. Redis is limited to
   the session store; other Redis users are out of scope.
-- **Yellow:** seeded bugs prove that the checks work. Teams get staging chaos
-  with no mesh.
+- **Yellow:** seeded bugs prove that the checks work. Teams can inject faults
+  in staging without a service mesh.
 - **Green:** reuse `slo::max_error_ppm` for the stop rule, so one burn rule
   exists.
 - **Blue:** TDD order: model tests (red), models (green), layer tests (red),
@@ -77,10 +77,17 @@ Item 9 adds an attack surface; a programmatic handle is sufficient.
 ## Decisions
 
 1. Crate `autumn-protocol-models` at `verification/models`. It is not
-   published. `cargo test --workspace` runs it. A CI job also runs it in
-   release mode.
+   published. `cargo test --workspace` runs it. The `Protocol models` CI job
+   also runs it.
 2. Each model has a `Variant`. `Correct` passes. Each seeded bug fails one
    named property.
-3. `[fault_injection]` config. `FaultInjectionLayer` is inside the timeout
-   layer. A task-local scope gives dependency faults to `Db::checkout`, to
-   `http_client::Client::send` and to the Redis session store.
+3. `[fault_injection]` config. `FaultInjectionLayer` is the innermost
+   framework layer. A task-local scope gives dependency faults to the
+   database checkouts, to `http_client::Client::send` and to the Redis
+   session store.
+
+## Result
+
+The tick model found a bug. A cron task that waited in the cost gate past its
+window could claim a pruned tick row and run the occurrence twice.
+`execute_cron_task` now checks the window after the wait.

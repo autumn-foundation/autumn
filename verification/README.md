@@ -1,9 +1,9 @@
-# Verus specifications
+# Verification
 
 This directory contains small mathematical shadows of critical runtime state.
 It also contains the protocol models in `models/` (see "Protocol models").
-The Verus specs are intentionally separate from the Cargo workspace because Verus uses an
-extended Rust dialect. Verify the tenant arena spine with:
+The Verus specs are not in the Cargo workspace, because Verus uses an extended
+Rust dialect. Verify the tenant arena spine with:
 
 ```sh
 verus verification/tenant_arena.rs
@@ -115,12 +115,12 @@ examine them.
 
 | Model | Production code | Properties |
 | --- | --- | --- |
-| `job_claim` | `autumn/src/job.rs` (ADR 0016) | A stale holder's settle is rejected. At most one execution runs at a time. |
-| `tick_election` | `autumn/src/scheduler.rs` (#3052) | Each tick runs at most once. |
-| `lease_lock` | `autumn/src/lock/lease.rs` (ADR 0015) | A stale holder's write is rejected. Tokens are unique per grant. At most one holder trusts its lease. |
+| `job_claim` | `autumn/src/job.rs` (`docs/adr/0016-durable-job-claim-lease.md`) | A stale holder's settle is rejected. At most one execution runs at a time. |
+| `tick_election` | `autumn/src/scheduler.rs`, `execute_cron_task` (#3052) | Each tick runs at most once. |
+| `lease_lock` | `autumn/src/lock/lease.rs` (`docs/adr/0015-fencing-lease-lock.md`) | A stale holder's write is rejected. Tokens are unique per grant. At most one holder trusts its lease. |
 
 The Verus specs above prove one step at a time. The models check every
-interleaving of workers, replicas, late messages and clock steps, in small
+interleaving of workers, replicas, late messages and clock steps, within small
 bounds. Run them with:
 
 ```sh
@@ -129,9 +129,14 @@ cargo test -p autumn-protocol-models
 
 Each model has a `Variant`. `Correct` must hold every `always` property and
 reach every `sometimes` property. Each seeded bug (for example
-`SettleWithoutOwnerFence`) must give a counterexample. A test fails if a
-seeded bug passes, so a check that cannot fail does not pass.
+`SettleWithoutOwnerFence`) must give a counterexample. If a seeded bug gives
+no counterexample, its test fails.
+
+The tick model found a bug: a cron task that waited in the cost gate past its
+window could claim a pruned tick and run it twice. `execute_cron_task` now
+checks the window after the wait. The seeded bug `NoLatenessCheck` keeps that
+path.
 
 When a protocol changes, change its model in the same PR. `cargo test
 --workspace` runs the models. The `Protocol models` job in `ci.yml` also runs
-them in release mode.
+them.

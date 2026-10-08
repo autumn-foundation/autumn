@@ -9,7 +9,11 @@
 //! - free: `DELETE … WHERE tick_key = $3 AND generation = $4`. A replica
 //!   frees an unrun claim when the cost gate rises, then claims again.
 //!
-//! A replica tries the tick only while the tick is current (`now < PERIOD`).
+//! A replica can wait (the cost gate) between the choice of the tick and the
+//! claim. Before it claims, it checks on its own clock that the tick is not
+//! past its window (`execute_cron_task`). The check is closed (`<=`), which
+//! over-approximates continuous time. Each replica clock has a skew of up to
+//! `RETENTION`; the database clock decides the row expiry.
 //! A free can be sent again after it applied (a retry after a lost reply).
 //! Release keeps the row, so it is not an action.
 
@@ -25,10 +29,12 @@ pub const FREED_TICK_IS_RECLAIMED: &str = "a freed tick is claimed again";
 pub const ROW_IS_PRUNED: &str = "the tick row is pruned";
 
 const REPLICAS: u8 = 3;
-/// The tick period. The tick is current while `now < PERIOD`.
+/// The tick period: the window of the tick.
 const PERIOD: u8 = 3;
-/// `scheduler.tick_retention`.
+/// `scheduler.tick_retention`. It covers the clock skew between replicas.
 const RETENTION: u8 = 1;
+/// The clock skew of each replica, from `-RETENTION` to `RETENTION`.
+const SKEW: [i8; 3] = [-1, 0, 1];
 const MAX_TIME: u8 = 6;
 
 /// The protocol, or one seeded bug.
@@ -38,8 +44,13 @@ pub enum Variant {
     Correct,
     /// The claim uses `ON CONFLICT DO UPDATE`: it takes an existing row.
     OverwriteOnConflict,
-    /// The row expires at the claim time, not after `retention + period`.
+    /// The row expires one step before the end of the window.
     HoldShorterThanPeriod,
+    /// The row holds for `max(retention, period)`, not their sum.
+    HoldIsMax,
+    /// A replica claims after a long wait with no window check (the bug
+    /// that this model found in `execute_cron_task`).
+    NoLatenessCheck,
     /// Free deletes the row of the tick with no generation check.
     FreeWithoutGeneration,
 }
@@ -123,9 +134,23 @@ impl TickElectionModel {
 
     const fn hold(&self) -> u8 {
         match self.variant {
-            Variant::HoldShorterThanPeriod => 0,
+            Variant::HoldShorterThanPeriod => PERIOD.saturating_sub(1),
+            Variant::HoldIsMax => {
+                if RETENTION > PERIOD {
+                    RETENTION
+                } else {
+                    PERIOD
+                }
+            }
             _ => RETENTION.saturating_add(PERIOD),
         }
+    }
+
+    /// The window check of replica `r`, on its own clock.
+    fn in_window(&self, state: &State, r: u8) -> bool {
+        let skew = SKEW.get(usize::from(r)).copied().unwrap_or(0);
+        self.variant == Variant::NoLatenessCheck
+            || i16::from(state.now) + i16::from(skew) <= i16::from(PERIOD)
     }
 
     fn free(&self, state: &mut State, generation: u8) {
@@ -161,7 +186,7 @@ impl Model for TickElectionModel {
         }
         for (r, phase) in (0..REPLICAS).zip(&state.replicas) {
             match phase {
-                Phase::Idle if state.now < PERIOD => actions.push(Action::Claim(r)),
+                Phase::Idle if self.in_window(state, r) => actions.push(Action::Claim(r)),
                 Phase::Holding(_) => {
                     actions.push(Action::Run(r));
                     if state.freed & (1 << r) == 0 {

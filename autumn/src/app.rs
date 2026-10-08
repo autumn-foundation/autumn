@@ -9850,6 +9850,15 @@ struct CronTick {
     window: std::time::Duration,
 }
 
+impl CronTick {
+    /// `true` when `now_unix_secs` is at or after the next occurrence. A zero
+    /// window (no next occurrence) is never past.
+    const fn is_past_window(self, now_unix_secs: u64) -> bool {
+        !self.window.is_zero()
+            && now_unix_secs >= self.unix_secs.saturating_add(self.window.as_secs())
+    }
+}
+
 /// Handle the execution of a single cron task.
 #[allow(clippy::cognitive_complexity)]
 #[allow(
@@ -9873,6 +9882,14 @@ async fn execute_cron_task(
     let tick_key = scheduled_key;
     let lease = loop {
         if wait_first && !gate.wait(&state, &name).await {
+            gate.release();
+            return;
+        }
+        // A cost wait can outlast the tick row (#3071). Another replica can
+        // have run this occurrence, and the prune can have deleted its row.
+        // Do not claim the occurrence after its window.
+        if gate.waited() && occurrence.is_past_window(crate::time::clock_unix_secs(state.clock())) {
+            tracing::debug!(task = %name, tick = %tick_key, "Cron task tick is past its window after a cost wait");
             gate.release();
             return;
         }
@@ -21210,6 +21227,54 @@ mod tests {
             tick_keys.lock().unwrap().as_slice(),
             ["cron_review_task:1700000000"]
         );
+    }
+
+    /// #3071: a cost wait can outlast the tick row. Another replica can have
+    /// run the occurrence, and the prune can have deleted its row. After a
+    /// wait, an occurrence past its window is not claimed.
+    #[tokio::test]
+    async fn execute_cron_task_skips_an_occurrence_that_a_cost_wait_made_late() {
+        async fn claims(scheduled_unix_secs: u64) -> Vec<String> {
+            let state = AppState::for_test();
+            state.task_registry.register_scheduled(
+                "late_cron_task",
+                "cron */10 * * * * *",
+                crate::task::TaskCoordination::Fleet,
+                "postgres",
+                "replica-a",
+            );
+            let tick_keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let coordinator = std::sync::Arc::new(GrantingSchedulerCoordinator {
+                backend: "postgres",
+                tick_keys: std::sync::Arc::clone(&tick_keys),
+                release_count: None,
+            });
+            let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
+            super::execute_cron_task(
+                "late_cron_task".to_owned(),
+                state.clone(),
+                handler,
+                crate::task::TaskCoordination::Fleet,
+                coordinator,
+                std::time::Duration::from_secs(30),
+                super::CronTick {
+                    unix_secs: scheduled_unix_secs,
+                    window: std::time::Duration::from_secs(10),
+                },
+                super::CostGate {
+                    shutdown: tokio_util::sync::CancellationToken::new(),
+                    waiting: None,
+                    // The gate waited for this tick.
+                    waited: std::sync::atomic::AtomicBool::new(true),
+                },
+            )
+            .await;
+            tick_keys.lock().unwrap().clone()
+        }
+
+        let now = crate::time::clock_unix_secs(AppState::for_test().clock());
+        assert!(claims(1_700_000_000).await.is_empty(), "late: not claimed");
+        assert_eq!(claims(now).await, [format!("late_cron_task:{now}")]);
     }
 
     #[tokio::test]

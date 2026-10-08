@@ -223,6 +223,43 @@ app that does not set `[cost]` behaves as before. `CostConfig` is
 **Automation:** `manual` — a codemod cannot know which fields a struct literal
 means to leave at their defaults.
 
+### Config: `AutumnConfig` gains a `fault_injection` field
+
+**Why:** Staging fault injection (issue #3071) needs its own
+`[fault_injection]` section. `AutumnConfig` is not `#[non_exhaustive]`, so a
+new field breaks a struct literal. `Default` and `..AutumnConfig::default()`
+keep working.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::config::AutumnConfig;
+
+let config = AutumnConfig {
+    server: my_server_config,
+    // …every other field spelled out…
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::config::AutumnConfig;
+
+let config = AutumnConfig {
+    server: my_server_config,
+    ..AutumnConfig::default()
+};
+```
+
+The new field is `pub fault_injection: FaultInjectionConfig`. The default is
+off, so an app with no `[fault_injection]` section does not change.
+`FaultInjectionConfig` is `#[non_exhaustive]`: set its fields on a default
+value.
+
+**Automation:** `manual` — a codemod cannot know which fields a struct literal
+leaves at their defaults.
+
 ### Admission: `Route`, `ServerConfig` and `HttpClientConfig` have new fields
 
 **Why:** Adaptive admission control (issue #3068) adds a route criticality,

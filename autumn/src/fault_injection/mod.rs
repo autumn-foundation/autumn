@@ -6,16 +6,17 @@
 //!
 //! - an outer scope layer, outside the session layer. It selects the faults
 //!   for the request path, puts them in a task-local scope for the database,
-//!   Redis and HTTP client seams, and counts the final status for the stop
+//!   Redis and HTTP client seams, and counts the result for the stop
 //!   condition;
-//! - [`FaultInjectionLayer`], inside the timeout layer. It applies the route
-//!   faults. The access log, error reporting and the timeout see an injected
-//!   fault as a real one.
+//! - [`FaultInjectionLayer`], the innermost framework layer. It applies the
+//!   route faults after rate limiting and load shedding. The access log,
+//!   error reporting and the timeout see an injected fault as a real one.
 //!
 //! Safety rules:
 //!
-//! - In `prod`, config validation fails and the router does not install the
-//!   layers, unless `allow_in_production = true`.
+//! - Config validation fails, and the router does not install the layers,
+//!   when the profile is `prod` or not set, unless `allow_in_production =
+//!   true`.
 //! - The stop condition disarms the faults when the error ratio burns the
 //!   error budget too fast. They stay disarmed until [`FaultInjection::arm`].
 //! - Probe and actuator paths are never faulted.
@@ -58,10 +59,10 @@ pub use config::{FaultInjectionConfig, FaultKind, FaultRule, FaultStopConfig, Fa
 pub(crate) use layer::FaultScopeLayer;
 pub use layer::{FaultInjectionLayer, FaultInjectionService};
 
-/// The response header on a response that an injected route error made.
+/// The header on a response from an injected route error.
 pub const FAULT_HEADER: &str = "x-autumn-fault";
 
-/// The actor of a toggle that the framework makes.
+/// The audit actor when the framework arms or disarms the faults.
 const SYSTEM_ACTOR: &str = "autumn";
 
 /// The handle of the installed faults. Clones share one state.
@@ -78,7 +79,7 @@ impl std::fmt::Debug for FaultInjection {
     }
 }
 
-/// A point-in-time view of the installed faults.
+/// A snapshot of the installed faults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FaultSnapshot {
@@ -86,9 +87,9 @@ pub struct FaultSnapshot {
     pub armed: bool,
     /// The number of faults that fired since boot.
     pub injected: u64,
-    /// The requests in the current stop window.
+    /// The faulted requests in the current stop window.
     pub window_requests: u64,
-    /// The `5xx` responses in the current stop window.
+    /// The bad results in the current stop window.
     pub window_errors: u64,
 }
 
@@ -124,23 +125,34 @@ impl FaultInjection {
     /// No event is written when the faults are already disarmed.
     pub async fn disarm(&self, actor: &str, reason: &str) {
         if self.inner.armed.swap(false, Ordering::AcqRel) {
-            self.inner.audit(actor, false, reason).await;
+            let sequence = self.inner.next_sequence();
+            self.inner.audit(sequence, actor, false, reason).await;
         }
     }
 
     /// Start the faults again, with an empty stop window, and write an audit
     /// event for `actor`.
     ///
-    /// No event is written when the faults are already armed.
+    /// It does nothing when the faults are already armed.
     pub async fn arm(&self, actor: &str) {
-        *self.inner.lock_window() = Window::default();
-        if !self.inner.armed.swap(true, Ordering::AcqRel) {
-            self.inner.audit(actor, true, "armed by operator").await;
-        }
+        // Reset the window and arm under one lock, so no request counts into
+        // the old window after the arm. Release the lock before the await.
+        let sequence = {
+            let mut window = self.inner.lock_window();
+            if self.inner.armed.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            *window = Window::default();
+            drop(window);
+            self.inner.next_sequence()
+        };
+        self.inner
+            .audit(sequence, actor, true, "armed by operator")
+            .await;
     }
 }
 
-/// One fault, ready to roll.
+/// One fault rule, with its rate in ppm.
 #[derive(Debug, Clone)]
 struct CompiledRule {
     routes: Vec<RoutePattern>,
@@ -194,15 +206,21 @@ impl CompiledRule {
 #[derive(Debug, Clone)]
 struct Exempt {
     paths: Vec<String>,
+    /// The normalized actuator prefix. Empty when the actuator is at the
+    /// root; then only `paths` are exempt.
     actuator_prefix: String,
-    actuator_prefix_slash: String,
 }
 
 impl Exempt {
     fn contains(&self, path: &str) -> bool {
-        self.paths.iter().any(|exempt| exempt == path)
-            || path == self.actuator_prefix
-            || path.starts_with(self.actuator_prefix_slash.as_str())
+        if self.paths.iter().any(|exempt| exempt == path) {
+            return true;
+        }
+        if self.actuator_prefix.is_empty() {
+            return false;
+        }
+        path.strip_prefix(self.actuator_prefix.as_str())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
     }
 }
 
@@ -215,6 +233,7 @@ struct Window {
 }
 
 struct Injector {
+    /// At most `config::MAX_RULES` rules, so a `u64` mask selects them.
     rules: Vec<CompiledRule>,
     exempt: Exempt,
     max_error_ppm: u32,
@@ -226,9 +245,14 @@ struct Injector {
     entropy: Arc<dyn Entropy>,
     audit: Option<Arc<AuditLogger>>,
     profile: String,
-    /// The boot audit write, until a later toggle waits for it. Thus the
-    /// events stay in toggle order.
+    allow_in_production: bool,
+    /// The pending boot audit write. The next toggle waits for it.
     boot: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// One audit write at a time.
+    audit_order: tokio::sync::Mutex<()>,
+    /// The toggle count. Each audit event has its number, so a reader can
+    /// put the events in toggle order. The boot toggle is `0`.
+    sequence: AtomicU64,
 }
 
 impl Injector {
@@ -250,26 +274,32 @@ impl Injector {
             .is_some_and(|draw| draw < u64::from(ppm))
     }
 
-    /// The scope for a request to `path`, or `None` when nothing can fire.
+    /// The scope for a request to `path`. `None` when the faults are
+    /// disarmed, the path is exempt, or no rule matches it.
     fn scope_for(self: &Arc<Self>, path: &str) -> Option<Arc<RequestScope>> {
         if !self.armed.load(Ordering::Acquire) || self.exempt.contains(path) {
             return None;
         }
-        let rules = self
+        let matched = self
             .rules
             .iter()
-            .filter(|rule| rule.matches(path))
-            .cloned()
-            .collect();
-        Some(Arc::new(RequestScope {
-            injector: Arc::clone(self),
-            rules,
-            fired: AtomicBool::new(false),
-        }))
+            .zip(0_u32..)
+            .filter(|(rule, _)| rule.matches(path))
+            .fold(0_u64, |mask, (_, bit)| {
+                mask | 1_u64.checked_shl(bit).unwrap_or(0)
+            });
+        (matched != 0).then(|| {
+            Arc::new(RequestScope {
+                injector: Arc::clone(self),
+                matched,
+                fired: AtomicBool::new(false),
+                errored: AtomicBool::new(false),
+            })
+        })
     }
 
-    /// Count one response. Returns `true` when this response trips the stop
-    /// condition.
+    /// Count one faulted request. Returns `true` when this request trips the
+    /// stop condition.
     fn record(&self, error: bool) -> bool {
         let now = tokio::time::Instant::now();
         let mut window = self.lock_window();
@@ -296,17 +326,27 @@ impl Injector {
         errors_ppm > limit_ppm && self.armed.swap(false, Ordering::AcqRel)
     }
 
+    /// The number of the next toggle.
+    fn next_sequence(&self) -> u64 {
+        self.sequence.fetch_add(1, Ordering::AcqRel)
+    }
+
     /// Write a toggle, after the boot toggle.
-    async fn audit(&self, actor: &str, armed: bool, reason: &str) {
-        let boot = self.boot.lock().unwrap_or_else(PoisonError::into_inner).take();
+    async fn audit(&self, sequence: u64, actor: &str, armed: bool, reason: &str) {
+        let boot = self
+            .boot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         if let Some(boot) = boot {
             // A failed boot write is already logged; continue.
             let _ = boot.await;
         }
-        self.write_audit(actor, armed, reason).await;
+        self.write_audit(sequence, actor, armed, reason).await;
     }
 
-    async fn write_audit(&self, actor: &str, armed: bool, reason: &str) {
+    async fn write_audit(&self, sequence: u64, actor: &str, armed: bool, reason: &str) {
+        let _order = self.audit_order.lock().await;
         let action = if armed {
             "fault_injection.armed"
         } else {
@@ -317,7 +357,9 @@ impl Injector {
             actor,
             action,
             reason,
+            sequence,
             profile = %self.profile,
+            allow_in_production = self.allow_in_production,
             "fault injection toggled"
         );
         let Some(logger) = &self.audit else {
@@ -325,7 +367,16 @@ impl Injector {
         };
         let event = AuditEvent::new(actor, action, "fault_injection", None, AuditStatus::Success)
             .with_metadata("reason", reason)
-            .with_metadata("profile", self.profile.as_str());
+            .with_metadata("sequence", sequence.to_string())
+            .with_metadata("profile", self.profile.as_str())
+            .with_metadata(
+                "allow_in_production",
+                if self.allow_in_production {
+                    "true"
+                } else {
+                    "false"
+                },
+            );
         if let Err(error) = logger.write(event).await {
             tracing::error!(
                 target: "autumn.fault_injection",
@@ -334,16 +385,42 @@ impl Injector {
             );
         }
     }
+
+    /// Write a stop trip in the background. The request does not wait for
+    /// the audit sink, and a dropped request cannot lose the event.
+    fn audit_stop(self: &Arc<Self>, reason: &'static str) {
+        let sequence = self.next_sequence();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let injector = Arc::clone(self);
+            runtime.spawn(async move {
+                injector.audit(sequence, SYSTEM_ACTOR, false, reason).await;
+            });
+        } else {
+            tracing::warn!(
+                target: "autumn.fault_injection",
+                actor = SYSTEM_ACTOR,
+                action = "fault_injection.disarmed",
+                reason,
+                sequence,
+                profile = %self.profile,
+                "fault injection toggled; no runtime, so no audit event"
+            );
+        }
+    }
 }
 
 /// The faults that matched one request.
 struct RequestScope {
     injector: Arc<Injector>,
-    rules: Vec<CompiledRule>,
+    /// Bit `i` is set when rule `i` matches the path.
+    matched: u64,
+    /// A fault fired in this request.
     fired: AtomicBool,
+    /// An error fault fired in this request.
+    errored: AtomicBool,
 }
 
-/// A route fault decision.
+/// A fault decision.
 #[derive(Debug, Default)]
 struct RouteFault {
     latency: Duration,
@@ -360,14 +437,22 @@ impl RequestScope {
         self.injector.injected.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Roll each rule for `target`: the sum of the latencies, and an error if
-    /// one fired.
+    /// Test each matched rule for `target` against its rate. Return the sum
+    /// of the latencies (capped), and an error if one fired.
     fn roll(&self, target: FaultTarget) -> RouteFault {
         let mut fault = RouteFault::default();
         if !self.armed() {
             return fault;
         }
-        for rule in self.rules.iter().filter(|rule| rule.target == target) {
+        let rules = self
+            .injector
+            .rules
+            .iter()
+            .zip(0_u32..)
+            .filter(|(rule, bit)| {
+                rule.target == target && self.matched & 1_u64.checked_shl(*bit).unwrap_or(0) != 0
+            });
+        for (rule, _) in rules {
             if !self.injector.roll(rule.rate_ppm) {
                 continue;
             }
@@ -375,10 +460,12 @@ impl RequestScope {
             match rule.kind {
                 FaultKind::Latency => fault.latency = fault.latency.saturating_add(rule.latency),
                 FaultKind::Error => {
+                    self.errored.store(true, Ordering::Relaxed);
                     fault.error.get_or_insert(rule.status);
                 }
             }
         }
+        fault.latency = fault.latency.min(config::MAX_LATENCY);
         fault
     }
 }
@@ -408,8 +495,20 @@ pub(crate) async fn inject(target: FaultTarget) -> Result<(), InjectedFault> {
     }
 }
 
+/// The database seam for generated repositories. Not public API.
+///
+/// # Errors
+///
+/// Returns a `503` when an injected `database` error fires.
+#[doc(hidden)]
+pub async fn __database_fault() -> crate::AutumnResult<()> {
+    inject(FaultTarget::Database)
+        .await
+        .map_err(|fault| crate::AutumnError::service_unavailable_msg(fault.to_string()))
+}
+
 /// Build the two layers and the handle, or `None` when the section is
-/// disabled or refused. It has no side effects; call [`announce`] when the
+/// disabled or refused. It has no side effects. Call [`announce`] after the
 /// router is built.
 pub(crate) fn build(
     config: &crate::config::AutumnConfig,
@@ -431,13 +530,19 @@ pub(crate) fn build(
         );
         return None;
     }
-    let actuator_prefix = crate::actuator::normalize_actuator_prefix(&config.actuator.prefix);
+    let audit = state.extension::<AuditLogger>();
+    if audit.is_none() {
+        tracing::warn!(
+            target: "autumn.fault_injection",
+            "fault injection has no audit sink; toggles go to the log only. \
+             Install one with `AppBuilder::with_audit_sink`"
+        );
+    }
     let injector = Arc::new(Injector {
         rules: section.faults.iter().map(CompiledRule::new).collect(),
         exempt: Exempt {
             paths: exempt_paths,
-            actuator_prefix_slash: format!("{actuator_prefix}/"),
-            actuator_prefix,
+            actuator_prefix: crate::actuator::normalize_actuator_prefix(&config.actuator.prefix),
         },
         max_error_ppm: section.stop.max_error_ppm(),
         window_len: Duration::from_secs(section.stop.window_secs),
@@ -446,17 +551,17 @@ pub(crate) fn build(
         injected: AtomicU64::new(0),
         window: Mutex::new(Window::default()),
         entropy: state.entropy_arc(),
-        audit: state.extension::<AuditLogger>(),
-        profile: profile.unwrap_or("dev").to_owned(),
+        audit,
+        profile: profile.unwrap_or_default().to_owned(),
+        allow_in_production: section.allow_in_production,
         boot: Mutex::new(None),
+        audit_order: tokio::sync::Mutex::new(()),
+        sequence: AtomicU64::new(1),
     });
-    let handle = FaultInjection {
-        inner: Arc::clone(&injector),
-    };
     Some((
         FaultScopeLayer::new(Arc::clone(&injector)),
         FaultInjectionLayer::new(),
-        handle,
+        FaultInjection { inner: injector },
     ))
 }
 
@@ -469,7 +574,7 @@ pub(crate) fn announce(handle: &FaultInjection) {
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         let task = runtime.spawn(async move {
             injector
-                .write_audit(SYSTEM_ACTOR, true, "enabled by config")
+                .write_audit(0, SYSTEM_ACTOR, true, "enabled by config")
                 .await;
         });
         *handle
@@ -480,8 +585,12 @@ pub(crate) fn announce(handle: &FaultInjection) {
     } else {
         tracing::warn!(
             target: "autumn.fault_injection",
+            actor = SYSTEM_ACTOR,
             action = "fault_injection.armed",
-            "fault injection toggled"
+            reason = "enabled by config",
+            profile = %injector.profile,
+            allow_in_production = injector.allow_in_production,
+            "fault injection toggled; no runtime, so no audit event"
         );
     }
 }
@@ -492,24 +601,91 @@ pub(crate) async fn with_faults<F: std::future::Future>(
     rules: &[FaultRule],
     future: F,
 ) -> F::Output {
-    let injector = Arc::new(Injector {
-        rules: rules.iter().map(CompiledRule::new).collect(),
+    let injector = test_injector(rules.iter().map(CompiledRule::new).collect(), u64::MAX);
+    let scope = injector
+        .scope_for("/")
+        .expect("an armed injector scopes `/`");
+    SCOPE.scope(scope, future).await
+}
+
+/// An injector for tests: `/live` and `/actuator` are exempt, and the stop
+/// trips above 14.4% errors.
+#[cfg(test)]
+fn test_injector(rules: Vec<CompiledRule>, min_requests: u64) -> Arc<Injector> {
+    Arc::new(Injector {
+        rules,
         exempt: Exempt {
-            paths: Vec::new(),
+            paths: vec!["/live".to_owned()],
             actuator_prefix: "/actuator".to_owned(),
-            actuator_prefix_slash: "/actuator/".to_owned(),
         },
-        max_error_ppm: PPM,
+        max_error_ppm: 144_000,
         window_len: Duration::from_secs(60),
-        min_requests: u64::MAX,
+        min_requests,
         armed: AtomicBool::new(true),
         injected: AtomicU64::new(0),
         window: Mutex::new(Window::default()),
-        entropy: Arc::new(crate::entropy::SeededEntropy::new(1)),
+        entropy: Arc::new(crate::entropy::SeededEntropy::new(7)),
         audit: None,
         profile: "test".to_owned(),
+        allow_in_production: false,
         boot: Mutex::new(None),
-    });
-    let scope = injector.scope_for("/").expect("an armed injector scopes `/`");
-    SCOPE.scope(scope, future).await
+        audit_order: tokio::sync::Mutex::new(()),
+        sequence: AtomicU64::new(1),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_actuator_prefix_does_not_exempt_every_path() {
+        let exempt = Exempt {
+            paths: vec!["/health".to_owned()],
+            actuator_prefix: String::new(),
+        };
+        assert!(exempt.contains("/health"));
+        assert!(!exempt.contains("/api/orders"));
+    }
+
+    #[test]
+    fn the_actuator_prefix_matches_on_a_segment_boundary() {
+        let exempt = Exempt {
+            paths: Vec::new(),
+            actuator_prefix: "/actuator".to_owned(),
+        };
+        assert!(exempt.contains("/actuator"));
+        assert!(exempt.contains("/actuator/metrics"));
+        assert!(!exempt.contains("/actuators"));
+    }
+
+    #[test]
+    fn a_path_with_no_matching_rule_gets_no_scope() {
+        let mut rule = FaultRule::new(FaultTarget::Route, FaultKind::Error, 1.0);
+        rule.routes = vec!["/api/*".to_owned()];
+        let injector = test_injector(vec![CompiledRule::new(&rule)], 1);
+        assert!(injector.scope_for("/api/orders").is_some());
+        assert!(injector.scope_for("/other").is_none());
+    }
+
+    #[test]
+    fn latency_is_capped_per_request() {
+        let mut rule = FaultRule::new(FaultTarget::Route, FaultKind::Latency, 1.0);
+        rule.latency_ms = 300_000;
+        let rules = vec![CompiledRule::new(&rule), CompiledRule::new(&rule)];
+        let injector = test_injector(rules, 1);
+        let scope = injector.scope_for("/").unwrap();
+        assert_eq!(scope.roll(FaultTarget::Route).latency, config::MAX_LATENCY);
+    }
+
+    #[tokio::test]
+    async fn arm_does_not_reset_an_armed_window() {
+        let injector = test_injector(Vec::new(), 100);
+        let handle = FaultInjection {
+            inner: Arc::clone(&injector),
+        };
+        assert!(!injector.record(true));
+        handle.arm("ops").await;
+        assert_eq!(handle.snapshot().window_requests, 1);
+    }
 }

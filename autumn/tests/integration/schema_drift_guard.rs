@@ -505,10 +505,8 @@ fn fault_injection_child_keys_are_strictly_validated() {
     }
 
     let schema = AutumnConfig::get_schema_keys();
-    let errors = AutumnConfig::validate_toml(
-        "[fault_injection]\nallow_in_prodution = true\n",
-        &schema,
-    );
+    let errors =
+        AutumnConfig::validate_toml("[fault_injection]\nallow_in_prodution = true\n", &schema);
     assert!(
         errors
             .iter()

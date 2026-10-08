@@ -3,14 +3,14 @@
 //! Each module models one protocol from its SQL statements. Time is one
 //! integer clock: the database clock. Each model has a [`Variant`]: the
 //! correct protocol, or a seeded bug. A seeded bug must give a
-//! counterexample, so the check is not vacuous.
+//! counterexample, so the check can fail.
 //!
 //! - [`job_claim`]: claim, heartbeat, recovery and settle of a durable job
-//!   (`autumn/src/job.rs`, ADR 0016).
+//!   (`autumn/src/job.rs`, `docs/adr/0016-durable-job-claim-lease.md`).
 //! - [`tick_election`]: the scheduler tick record
 //!   (`autumn/src/scheduler.rs`, #3052).
 //! - [`lease_lock`]: acquire, renew and expire of `LeaseLock`, with fencing
-//!   (`autumn/src/lock/lease.rs`, ADR 0015).
+//!   (`autumn/src/lock/lease.rs`, `docs/adr/0015-fencing-lease-lock.md`).
 //!
 //! [`Variant`]: job_claim::Variant
 
@@ -91,9 +91,20 @@ where
         match (property.expectation, found) {
             (Expectation::Always | Expectation::Eventually, Some(path)) => {
                 report.violations.insert(property.name);
+                // Cut the trace at the first state that breaks the property.
+                let steps = path.into_vec();
+                let end = steps
+                    .iter()
+                    .position(|(state, _)| !(property.condition)(checker.model(), state))
+                    .unwrap_or(steps.len());
+                let actions: Vec<_> = steps
+                    .into_iter()
+                    .take(end)
+                    .filter_map(|(_, action)| action)
+                    .collect();
                 report
                     .traces
-                    .push(format!("{}: {:?}", property.name, path.into_actions()));
+                    .push(format!("{}: {actions:?}", property.name));
             }
             (Expectation::Sometimes, Some(_)) => {
                 report.reached.insert(property.name);

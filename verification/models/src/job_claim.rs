@@ -1,4 +1,5 @@
-//! Durable job claim, heartbeat, recovery and settle (ADR 0016, #3051).
+//! Durable job claim, heartbeat, recovery and settle (#3051,
+//! `docs/adr/0016-durable-job-claim-lease.md`).
 //!
 //! Two workers race for one job row. The fence is `claimed_by = $me AND
 //! status = 'running'`; the job has no generation column. Statements:
@@ -25,8 +26,8 @@ pub const ONE_EXECUTION_AT_A_TIME: &str = "at most one effective execution per j
 pub const JOB_IS_RECOVERED: &str = "a claim is recovered";
 /// Non-vacuity: a second worker claims the job after a recovery.
 pub const JOB_IS_RECLAIMED: &str = "a second worker claims the job";
-/// Non-vacuity: a settle that arrives after a recovery is attempted.
-pub const LATE_SETTLE_ARRIVES: &str = "a late settle arrives after a recovery";
+/// Non-vacuity: a settle arrives while another worker holds the row.
+pub const LATE_SETTLE_ARRIVES: &str = "a late settle arrives for another worker's claim";
 /// Non-vacuity: the job completes.
 pub const JOB_COMPLETES: &str = "the job completes";
 
@@ -149,7 +150,7 @@ pub struct State {
     pub recovered: bool,
     /// Ghost: the workers that claimed the job.
     pub claimers: u8,
-    /// Ghost: a settle arrived when its sender no longer held the row.
+    /// Ghost: a settle arrived while another worker held the running row.
     pub late_settle: bool,
 }
 
@@ -380,9 +381,9 @@ impl Model for JobClaimModel {
                 let Msg::Settle { worker, attempt } = s.net.remove(i) else {
                     return None;
                 };
-                if !Self::holds(&s.row, worker) {
-                    s.late_settle |= s.recovered;
-                }
+                // The fence matters: another worker holds the running row.
+                s.late_settle |=
+                    s.row.status == Status::Running && s.row.claimed_by != Some(worker);
                 if self.settle_guard(&s.row, worker) {
                     if !Self::holds(&s.row, worker) || s.row.attempt != attempt {
                         s.stale_settle = true;

@@ -1,16 +1,16 @@
 //! Bounded model checks of the coordination protocols (issue #3071).
 //!
 //! Each correct model must satisfy every `always` property and reach every
-//! `sometimes` property. Each seeded bug must give a counterexample. Thus a
-//! check that cannot fail does not pass.
+//! `sometimes` property. Each seeded bug must give a counterexample. If a
+//! seeded bug gives no counterexample, the test fails.
 
 use autumn_protocol_models::job_claim::{self, JobClaimModel};
 use autumn_protocol_models::lease_lock::{self, LeaseLockModel};
 use autumn_protocol_models::tick_election::{self, TickElectionModel};
 use autumn_protocol_models::{Report, check};
 
-/// An upper limit on the states of one model. A larger state space makes CI
-/// slow; reduce the bounds of the model.
+/// An upper limit on the states of one model. If a model exceeds this limit,
+/// reduce its bounds.
 const MAX_STATES: usize = 2_000_000;
 
 fn assert_holds(report: &Report) {
@@ -88,6 +88,21 @@ fn tick_election_hold_shorter_than_period_runs_a_tick_twice() {
 }
 
 #[test]
+fn tick_election_hold_of_the_larger_value_runs_a_tick_twice_under_skew() {
+    let report = check(TickElectionModel::new(tick_election::Variant::HoldIsMax));
+    assert_counterexample(&report, tick_election::TICK_RUNS_AT_MOST_ONCE);
+}
+
+/// The bug that this model found: a cost wait outlasts the tick row.
+#[test]
+fn tick_election_claim_with_no_lateness_check_runs_a_tick_twice() {
+    let report = check(TickElectionModel::new(
+        tick_election::Variant::NoLatenessCheck,
+    ));
+    assert_counterexample(&report, tick_election::TICK_RUNS_AT_MOST_ONCE);
+}
+
+#[test]
 fn tick_election_free_without_generation_runs_a_tick_twice() {
     let report = check(TickElectionModel::new(
         tick_election::Variant::FreeWithoutGeneration,
@@ -117,7 +132,21 @@ fn lease_lock_acquire_without_increment_reuses_a_token() {
     assert_counterexample(&report, lease_lock::STALE_WRITE_REJECTED);
 }
 
-/// ADR 0015: fencing makes an overlap of holders safe. An acquire that takes
+#[test]
+fn lease_lock_release_that_deletes_the_row_reuses_a_token() {
+    let report = check(LeaseLockModel::new(lease_lock::Variant::ReleaseDeletesRow));
+    assert_counterexample(&report, lease_lock::TOKENS_ARE_UNIQUE);
+}
+
+#[test]
+fn lease_lock_renew_without_generation_lets_two_holders_trust_the_lease() {
+    let report = check(LeaseLockModel::new(
+        lease_lock::Variant::RenewIgnoresGeneration,
+    ));
+    assert_counterexample(&report, lease_lock::LIVE_HOLDERS_EXCLUSIVE);
+}
+
+/// `docs/adr/0015-fencing-lease-lock.md`: fencing makes an overlap of holders safe. An acquire that takes
 /// a live lease is a bug, but the resource still rejects the stale write.
 #[test]
 fn lease_lock_fencing_tolerates_overlapping_holders() {

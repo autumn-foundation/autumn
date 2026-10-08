@@ -1,5 +1,5 @@
-//! `LeaseLock` acquire, renew, release and expiry with fencing (ADR 0015,
-//! #3053).
+//! `LeaseLock` acquire, renew, release and expiry with fencing (#3053,
+//! `docs/adr/0015-fencing-lease-lock.md`).
 //!
 //! Two holders race for one lock name. A resource stores the last admitted
 //! token. Statements (`autumn/src/lock/lease.rs`):
@@ -12,7 +12,8 @@
 //! - resource write: `WHERE fencing_token <= $token` (`FencingToken::admits`).
 //!
 //! A holder trusts its lease until `ttl - ttl / 3` after the last send. It
-//! can write at any time, also after its lease is gone (a paused process).
+//! can write at any time, also after its lease expires (for example, in a
+//! paused process).
 //! That stale write is what the fence must reject.
 
 use stateright::{Model, Property};
@@ -46,6 +47,10 @@ pub enum Variant {
     AcquireKeepsGeneration,
     /// Acquire takes a live lease. Fencing must still reject stale writes.
     AcquireWhileHeld,
+    /// Release deletes the row, so the next grant starts at token 1 again.
+    ReleaseDeletesRow,
+    /// Renew does not check the generation.
+    RenewIgnoresGeneration,
 }
 
 /// The `autumn_lease_locks` row.
@@ -71,7 +76,10 @@ pub struct Held {
 }
 
 /// The global state.
-#[allow(clippy::struct_excessive_bools, reason = "the ghost flags are separate facts")]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the ghost flags are separate facts"
+)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct State {
     /// The database clock.
@@ -194,7 +202,8 @@ impl Model for LeaseLockModel {
             }
             Action::Renew(h) => {
                 let held = s.holders[usize::from(h)].as_mut()?;
-                if s.row.generation == held.token
+                if (s.row.generation == held.token
+                    || self.variant == Variant::RenewIgnoresGeneration)
                     && s.row.owner.is_some()
                     && s.row.expires_at > s.now
                 {
@@ -209,6 +218,9 @@ impl Model for LeaseLockModel {
                 let held = s.holders[usize::from(h)].take()?;
                 if s.row.generation == held.token && s.row.owner.is_some() {
                     s.row.owner = None;
+                    if self.variant == Variant::ReleaseDeletesRow {
+                        s.row.generation = 0;
+                    }
                 }
             }
             Action::Write(h) => {
@@ -216,9 +228,9 @@ impl Model for LeaseLockModel {
                 let admits = self.variant == Variant::ResourceIgnoresToken
                     || s.stored.is_none_or(|(token, _)| token <= held.token);
                 if admits {
-                    if let Some((token, grant)) = s.stored {
-                        s.stale_admitted |=
-                            held.token < token || (held.token == token && held.grant != grant);
+                    // Stale: an older grant than the one that wrote last.
+                    if let Some((_, grant)) = s.stored {
+                        s.stale_admitted |= held.grant < grant;
                     }
                     s.stored = Some((held.token, held.grant));
                 } else {

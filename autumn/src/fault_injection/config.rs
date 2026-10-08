@@ -5,6 +5,15 @@ use serde::Deserialize;
 /// The largest injected latency, in milliseconds (5 minutes).
 const MAX_LATENCY_MS: u64 = 300_000;
 
+/// The largest injected latency for one request or one dependency call.
+pub const MAX_LATENCY: std::time::Duration = std::time::Duration::from_millis(MAX_LATENCY_MS);
+
+/// The largest number of fault rules.
+pub const MAX_RULES: usize = 64;
+
+/// The largest `stop.min_requests`.
+const MAX_MIN_REQUESTS: u64 = 1_000_000;
+
 /// `[fault_injection]`: faults for a staging environment.
 ///
 /// ```toml
@@ -25,7 +34,7 @@ const MAX_LATENCY_MS: u64 = 300_000;
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct FaultInjectionConfig {
-    /// Master switch. Default: `false`.
+    /// Turns on the faults. Default: `false`.
     #[serde(default)]
     pub enabled: bool,
     /// Allow faults when the profile is `prod`. Default: `false`.
@@ -161,7 +170,8 @@ pub enum FaultTarget {
     /// The request, before the handler runs.
     #[default]
     Route,
-    /// A database checkout through `Db::checkout`.
+    /// A database connection checkout: the `Db` extractor, `LazyDb::checkout`,
+    /// the shard paths and the generated repositories.
     Database,
     /// A Redis session store operation.
     Redis,
@@ -189,7 +199,7 @@ impl FaultTarget {
 pub enum FaultKind {
     /// Wait `latency_ms`, then continue.
     Latency,
-    /// Fail. A route fault returns `status`; a dependency fault returns an
+    /// Fail. A route fault returns `status`. A dependency fault returns an
     /// error.
     Error,
 }
@@ -209,10 +219,16 @@ impl FaultInjectionConfig {
         }
         if is_production(profile) && !self.allow_in_production {
             return Err(
-                "fault_injection.enabled = true is refused in prod; set \
-                 fault_injection.allow_in_production = true to allow it"
+                "fault_injection.enabled = true is refused in prod (or with no profile); \
+                 set fault_injection.allow_in_production = true to allow it"
                     .to_owned(),
             );
+        }
+        if self.faults.len() > MAX_RULES {
+            return Err(format!(
+                "fault_injection.faults has {} rules; the limit is {MAX_RULES}",
+                self.faults.len()
+            ));
         }
         self.stop.validate()?;
         for (index, rule) in self.faults.iter().enumerate() {
@@ -239,8 +255,18 @@ impl FaultStopConfig {
         if self.window_secs == 0 {
             return Err("fault_injection.stop.window_secs must be greater than 0".to_owned());
         }
-        if self.min_requests == 0 {
-            return Err("fault_injection.stop.min_requests must be greater than 0".to_owned());
+        if self.min_requests == 0 || self.min_requests > MAX_MIN_REQUESTS {
+            return Err(format!(
+                "fault_injection.stop.min_requests = {} must be from 1 to {MAX_MIN_REQUESTS}",
+                self.min_requests
+            ));
+        }
+        if self.max_error_ppm() >= crate::slo::PPM {
+            return Err(
+                "fault_injection.stop: objective and max_burn_rate allow 100% errors, so the \
+                 stop condition can never trip; lower max_burn_rate"
+                    .to_owned(),
+            );
         }
         Ok(())
     }
@@ -263,10 +289,7 @@ impl FaultStopConfig {
 impl FaultRule {
     fn validate(&self) -> Result<(), String> {
         if !self.rate.is_finite() || !(0.0..=1.0).contains(&self.rate) {
-            return Err(format!(
-                "rate = {} must be from 0.0 to 1.0",
-                self.rate
-            ));
+            return Err(format!("rate = {} must be from 0.0 to 1.0", self.rate));
         }
         for route in &self.routes {
             if !route.starts_with('/') {
@@ -284,10 +307,7 @@ impl FaultRule {
             }
             FaultKind::Error => {
                 if self.target == FaultTarget::Route && !(400..=599).contains(&self.status) {
-                    return Err(format!(
-                        "status = {} must be from 400 to 599",
-                        self.status
-                    ));
+                    return Err(format!("status = {} must be from 400 to 599", self.status));
                 }
             }
         }
@@ -307,9 +327,12 @@ impl FaultRule {
     }
 }
 
-/// `true` for the `prod` profile and its `production` alias.
-pub(crate) fn is_production(profile: Option<&str>) -> bool {
-    matches!(profile, Some("prod" | "production"))
+/// `true` for the `prod` profile and its `production` alias, in any case.
+/// Also `true` when no profile is set: the check fails closed.
+pub fn is_production(profile: Option<&str>) -> bool {
+    profile.is_none_or(|profile| {
+        profile.eq_ignore_ascii_case("prod") || profile.eq_ignore_ascii_case("production")
+    })
 }
 
 #[cfg(test)]
@@ -334,9 +357,12 @@ mod tests {
     #[test]
     fn prod_is_refused_without_the_override() {
         let config = enabled(error_rule());
-        for profile in ["prod", "production"] {
-            let error = config.validate(Some(profile)).unwrap_err();
-            assert!(error.contains("allow_in_production"), "{error}");
+        for profile in [Some("prod"), Some("production"), Some("Prod"), None] {
+            let error = config.validate(profile).unwrap_err();
+            assert!(
+                error.contains("allow_in_production"),
+                "{profile:?}: {error}"
+            );
         }
     }
 
@@ -350,7 +376,7 @@ mod tests {
     #[test]
     fn other_profiles_are_allowed() {
         let config = enabled(error_rule());
-        for profile in [None, Some("dev"), Some("staging"), Some("test")] {
+        for profile in [Some("dev"), Some("staging"), Some("test")] {
             config.validate(profile).unwrap();
         }
     }
@@ -414,6 +440,15 @@ mod tests {
                 min_requests: 0,
                 ..FaultStopConfig::default()
             },
+            FaultStopConfig {
+                min_requests: MAX_MIN_REQUESTS + 1,
+                ..FaultStopConfig::default()
+            },
+            // A 1% budget at 100x allows 100% errors: it never trips.
+            FaultStopConfig {
+                max_burn_rate: 100.0,
+                ..FaultStopConfig::default()
+            },
         ] {
             let config = FaultInjectionConfig {
                 stop: stop.clone(),
@@ -421,6 +456,15 @@ mod tests {
             };
             assert!(config.validate(Some("staging")).is_err(), "{stop:?}");
         }
+    }
+
+    #[test]
+    fn too_many_rules_are_refused() {
+        let config = FaultInjectionConfig {
+            faults: vec![error_rule(); MAX_RULES + 1],
+            ..enabled(error_rule())
+        };
+        assert!(config.validate(Some("staging")).is_err());
     }
 
     #[test]

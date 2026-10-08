@@ -2,7 +2,7 @@
 //!
 //! The `[fault_injection]` section adds latency and errors to routes and
 //! dependencies. It is refused in `prod` unless `allow_in_production = true`.
-//! A burn-rate stop condition disables it. Each toggle writes an audit event.
+//! A burn-rate stop condition disarms it. Each toggle writes an audit event.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -78,6 +78,13 @@ fn config_with(faults: Vec<FaultRule>) -> AutumnConfig {
     config
 }
 
+/// The prod host policy refuses unknown hosts; allow the test host.
+fn prod_config(faults: Vec<FaultRule>) -> AutumnConfig {
+    let mut config = config_with(faults);
+    config.security.trusted_hosts.hosts = vec!["example.com".to_owned()];
+    config
+}
+
 fn build(config: AutumnConfig, profile: &str, audit: &Captured) -> TestClient {
     let sink = audit.clone();
     #[cfg(feature = "http-client")]
@@ -112,7 +119,9 @@ async fn settle() {
 fn config_validation_refuses_prod_by_default() {
     let mut config = config_with(vec![rule(FaultTarget::Route, FaultKind::Error, 1.0)]);
     config.profile = Some("prod".to_owned());
-    let error = config.validate().expect_err("prod must refuse fault injection");
+    let error = config
+        .validate()
+        .expect_err("prod must refuse fault injection");
     assert!(
         error.to_string().contains("allow_in_production"),
         "the error names the override: {error}"
@@ -132,25 +141,32 @@ fn config_validation_accepts_staging() {
 #[tokio::test]
 async fn prod_profile_does_not_install_faults_by_default() {
     let audit = Captured::default();
-    let config = config_with(vec![rule(FaultTarget::Route, FaultKind::Error, 1.0)]);
+    let config = prod_config(vec![rule(FaultTarget::Route, FaultKind::Error, 1.0)]);
     let client = build(config, "prod", &audit);
 
     assert!(handle(&client).is_none(), "no handle in prod");
-    // The prod host policy can refuse the test host; only the fault matters.
-    let response = client.get("/api/orders").send().await;
-    assert_ne!(response.status.as_u16(), 503);
-    assert_eq!(response.header("x-autumn-fault"), None);
+    client
+        .get("/api/orders")
+        .header("host", "example.com")
+        .send()
+        .await
+        .assert_ok();
 }
 
 #[tokio::test]
 async fn prod_profile_installs_faults_with_the_override() {
     let audit = Captured::default();
-    let mut config = config_with(vec![rule(FaultTarget::Route, FaultKind::Error, 1.0)]);
+    let mut config = prod_config(vec![rule(FaultTarget::Route, FaultKind::Error, 1.0)]);
     config.fault_injection.allow_in_production = true;
     let client = build(config, "prod", &audit);
 
     assert!(handle(&client).is_some());
-    client.get("/api/orders").send().await.assert_status(503);
+    client
+        .get("/api/orders")
+        .header("host", "example.com")
+        .send()
+        .await
+        .assert_status(503);
 }
 
 #[tokio::test]

@@ -2,14 +2,20 @@
 
 - **fault injection:** an opt-in `[fault_injection]` section for staging
   (issue #3071). It adds latency or errors to routes, database checkouts,
-  Redis session operations and outbound HTTP calls, at a rate, on matched
-  paths. It is refused in `prod` unless `allow_in_production = true`. A
-  burn-rate stop condition disarms it. Each toggle writes an audit event.
-  See `docs/guide/fault-injection.md`.
+  Redis session operations and outbound HTTP calls. Each fault has a rate and
+  a list of paths. It is refused in `prod` unless `allow_in_production =
+  true`. A burn-rate stop condition disarms it. Each arm or disarm writes an
+  audit event. See `docs/guide/fault-injection.md`.
 
-### Testing
+### Fixed
 
-- **verification:** Stateright models of job claims, scheduler tick election
-  and lease locks (issue #3071), in the `autumn-protocol-models` crate. Each
-  seeded bug, for example a settle with no owner fence, must give a
-  counterexample. The `Protocol models` CI job runs them.
+- **scheduler:** a cron task that waits in the cost gate longer than its
+  window no longer claims that occurrence (issue #3071). Before, the claim
+  could succeed after the tick row expired, so the occurrence ran twice. The
+  tick-election protocol model found this bug.
+
+### Breaking Changes
+
+- **Breaking:** `AutumnConfig` gains a public `fault_injection` field. A
+  struct literal needs `..AutumnConfig::default()`
+  ([migration guide](docs/migrations/next.md)).

@@ -5124,6 +5124,27 @@ fn apply_middleware(
     let (body_limit, upload_config) = build_upload_layers(config);
     let trusted_host_policy = TrustedHostPolicy::from_config_with_state(config, state);
     let (rate_limit_layer, rate_limit_principal_keying) = build_rate_limit_layers(config, state);
+    // Staging fault injection (#3071). The scope layer goes directly outside
+    // the session layer, so the Redis session store is in the request scope
+    // and the stop condition sees the final status. The route layer is the
+    // innermost member of `inner_stack`: it runs after rate limiting and load
+    // shedding, and the timeout, the access log and error reporting see an
+    // injected fault as a real one. Probe and actuator paths are exempt, as
+    // for `[shadow]`. `build` has no side effects.
+    let fault_injection = {
+        let mut exempt_paths = probe_bypass_paths(config);
+        exempt_paths.extend(crate::actuator::actuator_endpoint_paths(
+            &config.actuator.prefix,
+            config.actuator.sensitive,
+            config.actuator.prometheus,
+        ));
+        crate::fault_injection::build(config, state, exempt_paths)
+    };
+    let (fault_scope_layer, fault_route_layer, fault_handle) = match fault_injection {
+        Some((scope, route, handle)) => (Some(scope), Some(route), Some(handle)),
+        None => (None, None, None),
+    };
+
     let inner_stack = (
         // Insert UploadConfig into extensions so the Multipart extractor can
         // read per-file limits and the allowed MIME-type list.
@@ -5182,6 +5203,7 @@ fn apply_middleware(
         tower::util::option_layer(submit_token_layer),
         TrustedHostLayer::new(trusted_host_policy),
         tower::util::option_layer(build_ingress_cors_layer(config)),
+        tower::util::option_layer(fault_route_layer),
     );
 
     // User-registered Tower layers (`AppBuilder::layer`) wrap the group above.
@@ -5356,26 +5378,6 @@ fn apply_middleware(
             )
         });
 
-    // Staging fault injection (#3071). The scope layer goes directly outside
-    // the session layer, so the Redis session store is in the request scope
-    // and the stop condition sees the final status. The route layer goes
-    // inside the timeout layer, so a timeout, the access log and error
-    // reporting see an injected fault as a real one. Probe and actuator paths
-    // are exempt, as for `[shadow]`.
-    let fault_injection = {
-        let mut exempt_paths = probe_bypass_paths(config);
-        exempt_paths.extend(crate::actuator::actuator_endpoint_paths(
-            &config.actuator.prefix,
-            config.actuator.sensitive,
-            config.actuator.prometheus,
-        ));
-        crate::fault_injection::build(config, state, exempt_paths)
-    };
-    let (fault_scope_layer, fault_route_layer, fault_handle) = match fault_injection {
-        Some((scope, route, handle)) => (Some(scope), Some(route), Some(handle)),
-        None => (None, None, None),
-    };
-
     let tenancy_layer = config.tenancy.enabled.then(|| {
         tracing::debug!("Multi-tenancy middleware enabled");
         axum::middleware::from_fn_with_state(state.clone(), crate::tenancy::tenancy_middleware)
@@ -5416,7 +5418,6 @@ fn apply_middleware(
         capture_layer,
         reporting_layer,
         tower::util::option_layer(timeout_layer),
-        tower::util::option_layer(fault_route_layer),
         tower::util::option_layer(tenancy_layer),
         tower::util::option_layer(tx_timeouts_layer),
         build_trusted_proxies_layer(config),

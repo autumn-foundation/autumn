@@ -1,5 +1,22 @@
 //! The two fault injection layers. See the module docs in `mod.rs`.
 
+// autumn-panic-gate: request-path module — production code path must be panic-free.
+// See CONTRIBUTING.md "Request-path panic gate".
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::arithmetic_side_effects,
+    )
+)]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -11,7 +28,7 @@ use axum::http::{HeaderValue, Request, Response};
 use axum::response::IntoResponse;
 use tower::{Layer, Service};
 
-use super::{FAULT_HEADER, FaultTarget, Injector, RequestScope, SCOPE, SYSTEM_ACTOR};
+use super::{FAULT_HEADER, FaultTarget, Injector, RequestScope, SCOPE};
 
 type BoxFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send>>;
 
@@ -21,7 +38,7 @@ const STOP_REASON: &str = "stop condition: the error budget burns too fast";
 /// The outer layer. It scopes the matched faults for the request and counts
 /// the final status for the stop condition.
 #[derive(Clone)]
-pub(crate) struct FaultScopeLayer {
+pub struct FaultScopeLayer {
     injector: Arc<Injector>,
 }
 
@@ -44,7 +61,7 @@ impl<S> Layer<S> for FaultScopeLayer {
 
 /// Tower [`Service`] of the outer fault scope layer.
 #[derive(Clone)]
-pub(crate) struct FaultScopeService<S> {
+pub struct FaultScopeService<S> {
     inner: S,
     injector: Arc<Injector>,
 }
@@ -68,17 +85,22 @@ where
         let Some(scope) = self.injector.scope_for(req.uri().path()) else {
             return Box::pin(self.inner.call(req));
         };
-        let inner = SCOPE.scope(Arc::clone(&scope), self.inner.call(req));
+        // Build the inner future in the scope too: an inner layer can read
+        // the scope in its `call`, before the future is polled.
+        let inner = SCOPE.sync_scope(Arc::clone(&scope), || self.inner.call(req));
+        let inner = SCOPE.scope(Arc::clone(&scope), inner);
+        // Before the first poll: a fault can fire in `call` already.
+        let mut pending = Pending(Some(scope));
         Box::pin(async move {
-            let mut pending = Pending(Some(scope));
             let result = inner.await;
             if let Some(scope) = pending.0.take() {
-                let error = match &result {
-                    Ok(response) => response.status().is_server_error(),
-                    Err(_) => true,
-                };
+                // An injected error is bad at any status (a `4xx` too).
+                let error = scope.errored.load(Ordering::Relaxed)
+                    || result
+                        .as_ref()
+                        .map_or(true, |response| response.status().is_server_error());
                 if scope.injector.record(error) {
-                    scope.injector.audit(SYSTEM_ACTOR, false, STOP_REASON).await;
+                    scope.injector.audit_stop(STOP_REASON);
                 }
             }
             result
@@ -87,8 +109,8 @@ where
 }
 
 /// Counts a request that is dropped before it completes (a timeout, or a
-/// client that went away). It counts as an error only when a fault fired, so
-/// injected latency that causes a timeout burns the budget.
+/// closed client connection). It counts as an error only when a fault fired,
+/// so injected latency that causes a timeout counts against the error budget.
 struct Pending(Option<Arc<RequestScope>>);
 
 impl Drop for Pending {
@@ -96,14 +118,8 @@ impl Drop for Pending {
         let Some(scope) = self.0.take() else {
             return;
         };
-        if !scope.fired.load(Ordering::Relaxed) || !scope.injector.record(true) {
-            return;
-        }
-        let injector = Arc::clone(&scope.injector);
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                injector.audit(SYSTEM_ACTOR, false, STOP_REASON).await;
-            });
+        if scope.fired.load(Ordering::Relaxed) && scope.injector.record(true) {
+            scope.injector.audit_stop(STOP_REASON);
         }
     }
 }
@@ -167,7 +183,8 @@ where
         if fault.latency.is_zero() {
             return Box::pin(self.inner.call(req));
         }
-        // Take the service that `poll_ready` readied; leave a clone behind.
+        // Use the service that `poll_ready` made ready. Keep a clone in its
+        // place.
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         Box::pin(async move {
@@ -192,34 +209,15 @@ fn injected_error(status: axum::http::StatusCode) -> Response<Body> {
 mod tests {
     use super::*;
 
-    use std::sync::atomic::{AtomicBool, AtomicU64};
-    use std::sync::Mutex;
     use std::time::Duration;
 
     use axum::routing::get;
     use tower::ServiceExt;
 
-    use crate::fault_injection::{CompiledRule, Exempt, FaultKind, Window};
+    use crate::fault_injection::{CompiledRule, FaultKind};
 
     fn injector(rules: Vec<CompiledRule>, min_requests: u64) -> Arc<Injector> {
-        Arc::new(Injector {
-            rules,
-            exempt: Exempt {
-                paths: vec!["/live".to_owned()],
-                actuator_prefix: "/actuator".to_owned(),
-                actuator_prefix_slash: "/actuator/".to_owned(),
-            },
-            max_error_ppm: 144_000,
-            window_len: Duration::from_secs(60),
-            min_requests,
-            armed: AtomicBool::new(true),
-            injected: AtomicU64::new(0),
-            window: Mutex::new(Window::default()),
-            entropy: Arc::new(crate::entropy::SeededEntropy::new(7)),
-            audit: None,
-            profile: "test".to_owned(),
-            boot: Mutex::new(None),
-        })
+        crate::fault_injection::test_injector(rules, min_requests)
     }
 
     fn error_rule(rate_ppm: u32) -> CompiledRule {
@@ -271,7 +269,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_partial_rate_fires_some_of_the_time() {
-        let injector = injector(vec![error_rule(500_000)], 1_000);
+        let injector = injector(vec![error_rule(500_000)], 100_000);
         let mut failed = 0;
         for _ in 0..200 {
             if status(app(&injector), "/x").await == 503 {
@@ -283,7 +281,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_stop_condition_counts_real_errors_too() {
-        let injector = injector(Vec::new(), 4);
+        // A matched rule that never fires: only real errors count.
+        let injector = injector(vec![error_rule(0)], 4);
         let failing = axum::Router::new()
             .route(
                 "/x",
@@ -310,7 +309,11 @@ mod tests {
 
     #[tokio::test]
     async fn the_dependency_seam_is_inert_outside_a_scope() {
-        assert!(crate::fault_injection::inject(FaultTarget::Database).await.is_ok());
+        assert!(
+            crate::fault_injection::inject(FaultTarget::Database)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
