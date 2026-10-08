@@ -627,7 +627,8 @@ fn block_table_name(text: &str, open: usize) -> Option<String> {
             in_use = c != b';';
             return false;
         }
-        if brackets > 0 || c == b'#' && name.is_empty() {
+        // An attribute (`#[...]`) before the name: skip it whole.
+        if brackets > 0 || name.is_empty() && matches!(c, b'#' | b'[') {
             match c {
                 b'[' => brackets += 1,
                 b']' => brackets = brackets.saturating_sub(1),
