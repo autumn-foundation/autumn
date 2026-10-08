@@ -494,6 +494,18 @@ fn upsert_schema_block(
     }
 }
 
+/// True when byte `at` of `text` is in a comment: after `//` on its line, or
+/// after a `/*` that no `*/` closes before `at`.
+#[must_use]
+pub fn is_in_comment(text: &str, at: usize) -> bool {
+    let before = &text[..at];
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    before[line_start..].contains("//")
+        || before
+            .rfind("/*")
+            .is_some_and(|open| !before[open..].contains("*/"))
+}
+
 /// Byte range `[start, end)` of the `table!` block (qualified `diesel::table!`
 /// or the bare `table!` re-export) that declares `table`, including any path
 /// qualifier so a replacement isn't double-prefixed. `None` if not found.
@@ -503,9 +515,8 @@ pub fn schema_block_range(existing: &str, table: &str) -> Option<(usize, usize)>
     let mut search_from = 0;
     while let Some(macro_rel) = existing[search_from..].find("table!") {
         let name_start = search_from + macro_rel;
-        // A `table!` after `//` on its line is in a comment, not a block.
-        let line_start = existing[..name_start].rfind('\n').map_or(0, |i| i + 1);
-        if existing[line_start..name_start].contains("//") {
+        // A `table!` in a comment is not a block.
+        if is_in_comment(existing, name_start) {
             search_from = name_start + "table!".len();
             continue;
         }

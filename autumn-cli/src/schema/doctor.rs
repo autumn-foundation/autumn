@@ -162,10 +162,18 @@ enum UnmanagedState {
     ModelsError(String),
     /// The database could not be read (secret-free reason).
     Unreachable(String),
-    /// Each unmanaged model matches its table.
-    Clean,
-    /// These tables differ from their models: `(table, difference count)`.
-    Drifted(Vec<(String, usize)>),
+    /// The result of the comparison.
+    Checked(UnmanagedDrift),
+}
+
+/// The result of [`compute_unmanaged_drift`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct UnmanagedDrift {
+    /// Tables that differ from their models: `(table, difference count)`.
+    drifted: Vec<(String, usize)>,
+    /// Tables whose model has a field that the parser skipped. The check
+    /// cannot compare that column.
+    unchecked: Vec<String>,
 }
 
 /// Filesystem/snapshot/backend facts gathered without touching the database.
@@ -252,8 +260,15 @@ fn probe_schema_rs(project_root: &Path, backend: Backend) -> SchemaRsState {
 /// shapes: a model column the table does not have, another type, or another
 /// `NULL` rule. Columns that only the table has, indexes, defaults and
 /// constraints are not compared.
-fn compute_unmanaged_drift(models: &ParsedSchema, db: &[Table]) -> Vec<(String, usize)> {
-    models
+fn compute_unmanaged_drift(models: &ParsedSchema, db: &[Table]) -> UnmanagedDrift {
+    let mut unchecked: Vec<String> = models
+        .tables
+        .iter()
+        .filter(|t| !t.managed && models.diagnostics.iter().any(|d| d.table == t.name))
+        .map(|t| t.name.clone())
+        .collect();
+    unchecked.dedup();
+    let drifted = models
         .tables
         .iter()
         .filter(|t| !t.managed)
@@ -309,7 +324,8 @@ fn compute_unmanaged_drift(models: &ParsedSchema, db: &[Table]) -> Vec<(String, 
             };
             (count > 0).then(|| (model.name.clone(), count))
         })
-        .collect()
+        .collect();
+    UnmanagedDrift { drifted, unchecked }
 }
 
 /// Load the snapshot and, if it loads, compute model drift against it using the
@@ -488,12 +504,7 @@ fn gather_db_facts_with(
         (None, _) => models_error.unwrap_or(UnmanagedState::NoUnmanaged),
         (Some(_), Err(e)) => UnmanagedState::Unreachable(e),
         (Some(models), Ok(tables)) => {
-            let drift = compute_unmanaged_drift(&models, &tables);
-            if drift.is_empty() {
-                UnmanagedState::Clean
-            } else {
-                UnmanagedState::Drifted(drift)
-            }
+            UnmanagedState::Checked(compute_unmanaged_drift(&models, &tables))
         }
     };
     (schema, unmanaged)
@@ -725,22 +736,37 @@ fn schema_rs_check(state: &SchemaRsState) -> Check {
 /// The `unmanaged-drift` row.
 fn unmanaged_check(state: &UnmanagedState) -> Check {
     let (status, detail) = match state {
-        UnmanagedState::Clean => (
-            Status::Ok,
-            "each unmanaged model matches its table".to_owned(),
-        ),
-        UnmanagedState::NoUnmanaged => (Status::Ok, "no unmanaged model".to_owned()),
-        UnmanagedState::Drifted(tables) => {
-            let list: Vec<String> = tables.iter().map(|(t, n)| format!("{t} ({n})")).collect();
-            (
-                Status::Warn,
+        UnmanagedState::Checked(drift) => {
+            let note = if drift.unchecked.is_empty() {
+                String::new()
+            } else {
                 format!(
-                    "unmanaged model(s) differ from the database: {} — write a migration \
-                     with `autumn generate migration`, or change the model",
-                    list.join(", ")
-                ),
-            )
+                    "; not checked: {} (a field the parser cannot read)",
+                    drift.unchecked.join(", ")
+                )
+            };
+            if drift.drifted.is_empty() {
+                (
+                    Status::Ok,
+                    format!("the unmanaged models match their tables{note}"),
+                )
+            } else {
+                let list: Vec<String> = drift
+                    .drifted
+                    .iter()
+                    .map(|(t, n)| format!("{t} ({n})"))
+                    .collect();
+                (
+                    Status::Warn,
+                    format!(
+                        "unmanaged model(s) differ from the database: {} — write a migration \
+                         with `autumn generate migration`, or change the model{note}",
+                        list.join(", ")
+                    ),
+                )
+            }
         }
+        UnmanagedState::NoUnmanaged => (Status::Ok, "no unmanaged model".to_owned()),
         UnmanagedState::NotConfigured => {
             (Status::Warn, "no database configured — skipped".to_owned())
         }
@@ -1514,21 +1540,25 @@ mod tests {
 
     #[test]
     fn unmanaged_drift_is_empty_when_the_table_matches() {
-        assert!(compute_unmanaged_drift(&unmanaged_posts(), &[db_posts()]).is_empty());
+        assert!(
+            compute_unmanaged_drift(&unmanaged_posts(), &[db_posts()])
+                .drifted
+                .is_empty()
+        );
     }
 
     #[test]
     fn unmanaged_drift_reports_a_missing_table_column_type_or_null_rule() {
         let models = unmanaged_posts();
         assert_eq!(
-            compute_unmanaged_drift(&models, &[]),
+            compute_unmanaged_drift(&models, &[]).drifted,
             vec![("posts".to_owned(), 1)]
         );
 
         let mut no_title = db_posts();
         no_title.columns.retain(|c| c.name != "title");
         assert_eq!(
-            compute_unmanaged_drift(&models, &[no_title]),
+            compute_unmanaged_drift(&models, &[no_title]).drifted,
             vec![("posts".to_owned(), 1)]
         );
 
@@ -1541,7 +1571,7 @@ mod tests {
         title.ty = autumn_schema_core::ColumnType::Int32;
         title.nullable = true;
         assert_eq!(
-            compute_unmanaged_drift(&models, &[other]),
+            compute_unmanaged_drift(&models, &[other]).drifted,
             vec![("posts".to_owned(), 2)]
         );
     }
@@ -1559,21 +1589,28 @@ mod tests {
             vec!["title".to_owned()],
             false,
         ));
-        assert!(compute_unmanaged_drift(&models, &[wider]).is_empty());
+        assert!(
+            compute_unmanaged_drift(&models, &[wider])
+                .drifted
+                .is_empty()
+        );
 
         let managed =
             crate::schema::parse::parse_model_source(POST_MODEL, Backend::Postgres).expect("parse");
-        assert!(compute_unmanaged_drift(&managed, &[]).is_empty());
+        assert!(compute_unmanaged_drift(&managed, &[]).drifted.is_empty());
     }
 
     #[test]
     fn unmanaged_drift_states_map_to_expected_status() {
-        let row = unmanaged_check(&UnmanagedState::Clean);
+        let row = unmanaged_check(&UnmanagedState::Checked(UnmanagedDrift::default()));
         assert_eq!(
             (row.name.as_str(), row.status),
             ("unmanaged-drift", Status::Ok)
         );
-        let row = unmanaged_check(&UnmanagedState::Drifted(vec![("posts".to_owned(), 2)]));
+        let row = unmanaged_check(&UnmanagedState::Checked(UnmanagedDrift {
+            drifted: vec![("posts".to_owned(), 2)],
+            unchecked: Vec::new(),
+        }));
         assert_eq!(row.status, Status::Warn);
         assert!(row.detail.contains("posts (2)"), "{row:?}");
         assert!(row.detail.contains("autumn generate migration"), "{row:?}");
@@ -1603,7 +1640,10 @@ mod tests {
         assert_eq!(schema, DbSchemaState::SnapshotMissing);
         assert_eq!(
             models,
-            UnmanagedState::Drifted(vec![("posts".to_owned(), 1)])
+            UnmanagedState::Checked(UnmanagedDrift {
+                drifted: vec![("posts".to_owned(), 1)],
+                unchecked: Vec::new(),
+            })
         );
 
         let root = scaffold(&unmanaged, Some(&posts_snapshot("Postgres")));
@@ -1612,7 +1652,7 @@ mod tests {
                 Ok(vec![db_posts()])
             });
         assert_eq!(schema, DbSchemaState::Clean);
-        assert_eq!(models, UnmanagedState::Clean);
+        assert_eq!(models, UnmanagedState::Checked(UnmanagedDrift::default()));
 
         let (schema, models) =
             gather_db_facts_with(root.path(), "postgres://db", Backend::Postgres, |_| {
@@ -1646,7 +1686,7 @@ mod tests {
         let models = unmanaged_posts();
         let mut db = db_posts();
         db.columns.retain(|c| c.name != "created_at");
-        assert!(compute_unmanaged_drift(&models, &[db]).is_empty());
+        assert!(compute_unmanaged_drift(&models, &[db]).drifted.is_empty());
 
         // A declared `created_at` still counts.
         let declared = crate::schema::parse::parse_model_source(
@@ -1657,7 +1697,7 @@ mod tests {
         let mut db = db_posts();
         db.columns.retain(|c| c.name != "created_at");
         assert_eq!(
-            compute_unmanaged_drift(&declared, &[db]),
+            compute_unmanaged_drift(&declared, &[db]).drifted,
             vec![("posts".to_owned(), 1)]
         );
     }
@@ -1686,7 +1726,11 @@ mod tests {
         title.ty = autumn_schema_core::ColumnType::Opaque {
             pg_type: "varchar(40)".to_owned(),
         };
-        assert!(compute_unmanaged_drift(&unmanaged_posts(), &[db]).is_empty());
+        assert!(
+            compute_unmanaged_drift(&unmanaged_posts(), &[db])
+                .drifted
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1713,5 +1757,21 @@ mod tests {
             "{models:?}"
         );
         assert_eq!(unmanaged_check(&models).status, Status::Warn);
+    }
+
+    /// A model with a field that the parser skipped is named as not checked,
+    /// not reported as clean.
+    #[test]
+    fn unmanaged_drift_names_a_model_with_a_skipped_field() {
+        let models = crate::schema::parse::parse_model_source(
+            "#[model] pub struct Post { #[id] pub id: i64, pub title: String, pub status: PostStatus }",
+            Backend::Postgres,
+        )
+        .expect("parse");
+        let drift = compute_unmanaged_drift(&models, &[db_posts()]);
+        assert!(drift.drifted.is_empty(), "{drift:?}");
+        assert_eq!(drift.unchecked, vec!["posts".to_owned()]);
+        let row = unmanaged_check(&UnmanagedState::Checked(drift));
+        assert!(row.detail.contains("not checked: posts"), "{row:?}");
     }
 }

@@ -26,7 +26,7 @@ use autumn_schema_core::{Backend, Column, ColumnType, Table};
 
 use super::diff::{MigrationPlan, SchemaChange};
 use super::parse::ParsedSchema;
-use crate::generate::introspect::schema_block_range;
+use crate::generate::introspect::{is_in_comment, schema_block_range};
 
 /// The path of the diesel schema file, from the project root.
 pub const SCHEMA_RS_PATH: &str = "src/schema.rs";
@@ -548,7 +548,7 @@ fn edit_joinables(text: &str, edit: impl Fn(&str, &str, &str) -> JoinEdit) -> St
 const ALLOW: &str = "allow_tables_to_appear_in_same_query!";
 
 /// Each call of the macro `name` (for example `joinable!`) in `text`, not in a
-/// `//` comment: `(start, open, close, end)`. `start` includes the path,
+/// comment: `(start, open, close, end)`. `start` includes the path,
 /// `open` and `close` are the outer parentheses, and `end` includes a `;` and
 /// a line end.
 fn macro_calls(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> {
@@ -557,8 +557,7 @@ fn macro_calls(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> {
     while let Some(rel) = text[from..].find(name) {
         let at = from + rel;
         from = at + name.len();
-        let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
-        if text[line_start..at].contains("//") {
+        if is_in_comment(text, at) {
             continue;
         }
         let Some(open) = text[from..]
@@ -1293,5 +1292,22 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
         );
         assert!(!out.text.contains("joinable"), "{}", out.text);
         assert!(out.text.contains("author_id -> Int8"), "{}", out.text);
+    }
+
+    /// A `table!` or a macro name in a `/* */` comment is not a call.
+    #[test]
+    fn a_macro_in_a_block_comment_is_not_a_call() {
+        let head =
+            "/* generated with diesel::table! and\n   joinable!(comments -> posts (post_id)) */\n";
+        let stale = "diesel::table! {\n    posts (id) {\n        id -> Int8,\n    }\n}\n";
+        let out = sync_for_plan(
+            &format!("{head}{stale}"),
+            &parsed(vec![posts(Backend::Postgres)]),
+            &plan(vec![SchemaChange::DropTable(Table::new(
+                "comments",
+                Backend::Postgres,
+            ))]),
+        );
+        assert_eq!(out.text, format!("{head}{POSTS_BLOCK}"));
     }
 }

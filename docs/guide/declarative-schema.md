@@ -467,7 +467,9 @@ checks are:
   does not have, and a different type or `NULL` rule. It does not compare
   columns that only the table has, indexes, defaults or constraints. It does
   not compare a type that the CLI keeps as an opaque type (for example
-  `VARCHAR(40)`, or `BOOLEAN` on SQLite). Drift is a **WARN**. To fix it, write a migration with `autumn generate migration`, or
+  `VARCHAR(40)`, or `BOOLEAN` on SQLite). The row names each model that has
+  a field the parser cannot read (for example an enum): the check cannot
+  compare that column. Drift is a **WARN**. To fix it, write a migration with `autumn generate migration`, or
   change the model.
 
 ---
