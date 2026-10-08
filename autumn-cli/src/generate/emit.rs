@@ -707,11 +707,9 @@ impl Plan {
             // `htmx` is a default feature. Without default features, other
             // code may need it in ways no marker shows, so keep it.
             let defaults_off = r.feature == "htmx" && base_disables_defaults(&base);
-            // A `[storage]` block in `autumn.toml` runs the blob service with
-            // no source marker, so it counts as use.
-            let configured = r.feature == "storage"
-                && fs::read_to_string(self.project_root.join("autumn.toml"))
-                    .is_ok_and(|toml| toml.lines().any(|l| l.trim().starts_with("[storage")));
+            // Config can run the blob service with no source marker: a
+            // `[storage]` block, or `AUTUMN_STORAGE__*` in `.env`.
+            let configured = r.feature == "storage" && storage_is_configured(&self.project_root);
             let needed = !was_used
                 || by_marker
                 || by_sibling
@@ -1555,6 +1553,7 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
         "ws" => &[
             "#[ws]",
             "autumn_web::sse::stream",
+            "autumn_web::channels",
             "Channels",
             "Broadcast",
             "ChannelMessage",
@@ -1646,6 +1645,21 @@ fn autumn_web_feature_still_needed_elsewhere(
     }
     let markers: Vec<String> = markers.iter().map(|m| (*m).to_owned()).collect();
     markers_in_project(&markers, project_root, excluding, overrides)
+}
+
+/// Whether project config turns on blob storage.
+///
+/// Reads `autumn.toml` and `.env`. Variables set only in a deployment are not
+/// visible here.
+fn storage_is_configured(root: &Path) -> bool {
+    let toml = fs::read_to_string(root.join("autumn.toml")).unwrap_or_default();
+    let env = fs::read_to_string(root.join(".env")).unwrap_or_default();
+    toml.lines().any(|l| l.trim().starts_with("[storage"))
+        || env.lines().any(|l| {
+            l.trim_start()
+                .trim_start_matches("export ")
+                .starts_with("AUTUMN_STORAGE__")
+        })
 }
 
 /// Whether the manifest turns off default features for `autumn-web`.

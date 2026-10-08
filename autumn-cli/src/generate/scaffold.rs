@@ -27483,6 +27483,41 @@ exempt_paths = [
         }
 
         #[test]
+        fn keeps_storage_while_dot_env_configures_it() {
+            let tmp = project();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            fs::write(tmp.path().join(".env"), "AUTUMN_STORAGE__BACKEND=local\n").unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("storage"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_ws_for_a_channels_module_use() {
+            let tmp = project();
+            let live = ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", POST, &live);
+            fs::write(
+                tmp.path().join("src/support.rs"),
+                "use autumn_web::channels::Sender;\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("\"ws\""),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
         fn a_first_run_keeps_a_hand_added_feature() {
             let tmp = project();
             fs::write(
