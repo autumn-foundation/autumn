@@ -191,9 +191,9 @@ impl RoomStore for DbRoomStore {
 
             // Registry-capacity backstop (a transient 503 once at capacity).
             // Non-transactional: a rare race can admit one extra room above the
-            // cap, an accepted backstop-only imprecision (the host app owns real
-            // create-rate limiting — see the module-level security note on the
-            // in-memory store).
+            // cap, an accepted backstop-only imprecision (the per-IP route limit
+            // and authentication are the real controls — see the module-level
+            // security note on the in-memory store).
             let count: i64 = media_rooms::table
                 .count()
                 .get_result(&mut conn)

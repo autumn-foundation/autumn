@@ -34,15 +34,16 @@
 //! session to create or join a room (`POST {prefix}/rooms` and `POST
 //! {prefix}/rooms/{room_id}/join` are `#[secured]`). Hosts must install the
 //! framework's session middleware and authenticate callers before enabling
-//! rooms. Hosts should also apply rate limiting: as a defense-in-depth backstop
-//! against unbounded memory growth from a create loop
+//! rooms. Set `[media] room_rate_limit_per_minute` to limit each client IP per
+//! route (off by default; see [`RoomService::with_rate_limit`]). As a
+//! defense-in-depth backstop against unbounded memory growth from a create loop
 //! (a created-but-never-joined room is only reaped when its last participant
 //! leaves), [`InMemoryRoomStore`] caps the registry at [`MAX_ROOMS`] rooms and
 //! rejects further creation with [`RoomError::RegistryFull`] (mapped to a
 //! transient `503`). The background reaper ([`spawn_room_reaper_loop`]) also
 //! reclaims idle/created-never-joined rooms (see *Known limitations*), but the
-//! cap remains the hard backstop — neither is a substitute for the host
-//! auth/rate-limit layer.
+//! cap remains the hard backstop — neither is a substitute for authentication
+//! and a rate limit.
 //!
 //! # Operator requirements
 //!
@@ -80,7 +81,8 @@
 //! - **Advisory token expiry**: `token_expires_at` is returned to the joiner but
 //!   is **not** enforced anywhere yet (`MediaMTX` does not verify these tokens),
 //!   so it never gates a lifecycle operation — a participant can always leave
-//!   with a value-correct token regardless of its age.
+//!   with a value-correct token regardless of its age. A heartbeat never renews
+//!   it past `joined_at + room_session_max_seconds` (see [`renewed_expiry`]).
 //!
 //! # Single-process limitation
 //!
@@ -619,7 +621,7 @@ pub fn renewed_expiry(
 /// leaves, so a high-volume authenticated create loop could grow process memory
 /// for the lifetime of the process. This cap is a defense-in-depth backstop
 /// against that (mirroring the workspace's `MAX_BUCKETS` capacity-cap idiom for
-/// in-memory registries), **not** a substitute for host rate limiting — see the
+/// in-memory registries), **not** a substitute for a rate limit — see the
 /// module-level *Security & host responsibilities* note.
 pub const MAX_ROOMS: usize = 10_000;
 

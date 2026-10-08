@@ -1609,7 +1609,8 @@ enabled = true                 # off by default; the controller is a no-op when 
 # playback_port = 9996   # recording playback
 # webrtc_local_udp = 8189
 # config_path = "/etc/mediamtx/mediamtx.yml"   # where the rendered config is written
-# binary_path = "/usr/local/bin/mediamtx"      # host bootstrap installs it; deploy does not download it
+# binary_path = "/usr/local/bin/mediamtx"      # deploy installs the pinned MediaMTX here if it is absent
+# install_binary = true                         # set false to install MediaMTX yourself
 # unit_name = "mediamtx"                        # systemd unit name (no .service suffix)
 
 [media.ffmpeg]
@@ -1623,7 +1624,8 @@ When `enabled = true`, `autumn deploy up`:
    listener port matches the app-side `[media.mediamtx] *_base` URL that calls it
    (so a customized port cannot strand the app on an origin the daemon no longer
    binds). Four then probe the host: FFmpeg resolves (the concrete
-   `[media.ffmpeg] bin`), the MediaMTX binary is executable, the recordings
+   `[media.ffmpeg] bin`), the MediaMTX binary is executable — or absent, with
+   `install_binary = true` — the recordings
    directory is writable — or absent under a writable parent, which provisioning
    then creates — and the MediaMTX ports are free. Any blocking failure
    **aborts the deploy**, rather
@@ -1632,12 +1634,14 @@ When `enabled = true`, `autumn deploy up`:
    env/interpolation-indirected path (an empty value, or one carrying a `${...}`
    placeholder such as `${AUTUMN_MEDIA__FFMPEG__BIN}`) is resolved by the deployed
    service from its own environment, so it is **deferred to runtime** — surfaced as
-   a non-blocking warning that does **not** abort the deploy. These checks require a
-   live host executor and run **only at `deploy up`**.
-2. After the app cutover succeeds, renders `mediamtx.yml` (LL-HLS window, fmp4
+   a non-blocking warning that does **not** abort the deploy. `autumn doctor`
+   runs the two pure checks, and all six over SSH with `--online`.
+2. Before cutover, installs MediaMTX if nothing is at `binary_path` (see below).
+3. After the app cutover succeeds, renders `mediamtx.yml` (LL-HLS window, fmp4
    recording under `recordings_dir`, WebRTC config, and a `~^room/.+$` path
    matcher for autumn-media Rooms) plus the systemd unit, then runs
-   `daemon-reload && enable --now && restart`.
+   `daemon-reload && enable`. It restarts the unit only when the config or unit
+   changed, or when the unit is not running.
 
 `autumn deploy plan` is a pure dry-run: it surfaces the media unit, its
 provisioning steps, the names of the host preflight checks that **will** run at
@@ -1666,11 +1670,14 @@ be allowed in `media-src` for recorded playback.
 by hand; the preflight passes an absent dir whose nearest existing parent is
 writable and fails closed on anything it cannot verify.
 
-**Deferred (host-bootstrap prerequisites, not done by `autumn deploy`):**
-installing/pinning the MediaMTX binary itself (like the kamal-proxy binary, it is
-a host-bootstrap step), and wiring the host preflight checks into the offline
-`autumn doctor` CLI (they run only in the executor-holding `deploy up` path
-today; `deploy plan` names them but never executes them).
+**MediaMTX binary.** When nothing is at `binary_path`, `deploy up` installs
+MediaMTX 1.19.3 there before cutover. It copies `/mediamtx` out of the
+`bluenviron/mediamtx` image, pinned by digest, and installs `docker.io` with apt
+if the host has no Docker. It checks that the copy prints `v1.19.3` before it
+moves it into place. It keeps an executable that is already there, and it stops
+with an error if any other file is there. Set `install_binary = false` to
+install MediaMTX yourself; the preflight then fails when the binary is
+absent.
 
 ### How the deploy path is validated in CI
 
