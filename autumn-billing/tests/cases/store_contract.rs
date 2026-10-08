@@ -1039,10 +1039,35 @@ pub async fn link_subscription_adopts_pending_invoices_and_dunning(store: &dyn B
         .unwrap()
         .into_inner();
 
+    // Linked before its dunning row was opened.
+    let late = store
+        .upsert_invoice(
+            invoice_upsert("adopt", &customer, "late", InvoiceStatus::Open, 100)
+                .with_provider_subscription(sub.clone())
+                .with_subscription("adopt-sub"),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    store
+        .upsert_dunning(DunningAttempt::new(
+            late.id.clone(),
+            customer.clone(),
+            1,
+            at(300),
+            DunningState::Pending,
+            at(0),
+        ))
+        .await
+        .unwrap();
+
     store
         .link_subscription(&sub, "adopt-sub", at(2000))
         .await
         .unwrap();
+
+    let late_row = store.dunning_by_invoice(&late.id).await.unwrap().unwrap();
+    assert_eq!(late_row.subscription_id.as_deref(), Some("adopt-sub"));
 
     let by_id =
         |id: String| async move { store.invoice_by_id(&id).await.unwrap().expect("invoice") };

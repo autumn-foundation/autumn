@@ -973,13 +973,19 @@ impl BillingStore for DbBillingStore {
             let mut conn = self.conn().await?;
             let now = to_naive(now);
             conn.transaction(async move |conn| -> Result<(), TxError> {
-                let unlinked = billing_invoices::table
-                    .filter(billing_invoices::subscription_id.is_null())
+                // Invoices already linked here are candidates too: their
+                // dunning row may have been opened after the link.
+                let candidates = billing_invoices::table
+                    .filter(
+                        billing_invoices::subscription_id
+                            .is_null()
+                            .or(billing_invoices::subscription_id.eq(subscription_id)),
+                    )
                     .filter(
                         billing_invoices::provider_subscription_id
                             .eq(provider_subscription_id.as_str()),
                     );
-                let ids: Vec<String> = unlinked.select(billing_invoices::id).load(conn).await?;
+                let ids: Vec<String> = candidates.select(billing_invoices::id).load(conn).await?;
                 if ids.is_empty() {
                     return Ok(());
                 }

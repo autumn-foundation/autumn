@@ -418,15 +418,20 @@ impl BillingStore for MemoryBillingStore {
         now: DateTime<Utc>,
     ) -> StoreFuture<'a, ()> {
         ready(self.lock().map(|mut inner| {
+            // Invoices already linked here are candidates too: their dunning
+            // row may have been opened after the link.
             let mut linked = Vec::new();
             for invoice in inner.invoices.values_mut() {
-                if invoice.subscription_id.is_none()
-                    && invoice.provider_subscription_id.as_ref() == Some(provider_subscription_id)
-                {
+                if invoice.provider_subscription_id.as_ref() != Some(provider_subscription_id) {
+                    continue;
+                }
+                if invoice.subscription_id.is_none() {
                     invoice.subscription_id = Some(subscription_id.to_owned());
                     invoice.updated_at = now;
-                    linked.push(invoice.id.clone());
+                } else if invoice.subscription_id.as_deref() != Some(subscription_id) {
+                    continue;
                 }
+                linked.push(invoice.id.clone());
             }
             for id in linked {
                 if let Some(row) = inner.dunning.get_mut(&id)

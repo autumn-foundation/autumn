@@ -524,8 +524,9 @@ pub trait BillingStore: Send + Sync + 'static {
     ) -> StoreFuture<'a, Option<Invoice>>;
 
     /// Link the invoices of `provider_subscription_id` that have no local
-    /// subscription to `subscription_id`. Their `Pending` or `Running`
-    /// dunning rows are linked too. Existing links stay. Idempotent.
+    /// subscription to `subscription_id`. Link the unlinked `Pending` or
+    /// `Running` dunning rows of those invoices, and of invoices already
+    /// linked to `subscription_id`. Other links stay. Idempotent.
     ///
     /// The default is a no-op. An older store still compiles and keeps the
     /// old behavior. A custom store must override this method to get the fix.
