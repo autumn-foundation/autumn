@@ -466,13 +466,14 @@ checks are:
   `sqlite` build.
 - **unmanaged-drift** — each unmanaged model matches its table in the live
   database. The check finds a missing table, a model column that the table
-  does not have, and a different type or `NULL` rule. It does not compare
-  columns that only the table has, indexes, defaults or constraints. It does
-  not compare a type that the CLI keeps as an opaque type (for example
-  `VARCHAR(40)`, or `BOOLEAN` on SQLite). A model with a field that the parser
-  cannot read (for example an enum) is also a **WARN**, and the row names it:
-  the check cannot compare that column. Drift is a **WARN**. To fix it, write a migration with `autumn generate migration`, or
-  change the model.
+  does not have, a different primary key, and a different type or `NULL`
+  rule. It does not compare columns that only the table has, indexes,
+  defaults or constraints. It does not compare a type that the CLI keeps as
+  an opaque type (for example `VARCHAR(40)`, or `BOOLEAN` on SQLite). A model
+  with a field that the parser cannot read (for example an enum) is also a
+  **WARN**, and the row names it: the check cannot compare that column.
+  Drift is a **WARN**. To fix it, write a migration with
+  `autumn generate migration`, or change the model.
 
 ---
 

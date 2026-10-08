@@ -260,8 +260,8 @@ fn probe_schema_rs(project_root: &Path, backend: Backend) -> SchemaRsState {
 }
 
 /// The unmanaged models whose table in `db` is missing or has other column
-/// shapes: a model column the table does not have, another type, or another
-/// `NULL` rule. Columns that only the table has, indexes, defaults and
+/// shapes: a model column the table does not have, another primary key,
+/// another type, or another `NULL` rule. Columns that only the table has, indexes, defaults and
 /// constraints are not compared.
 fn compute_unmanaged_drift(models: &ParsedSchema, db: &[Table]) -> UnmanagedDrift {
     let mut unchecked: Vec<String> = models
@@ -319,6 +319,7 @@ fn compute_unmanaged_drift(models: &ParsedSchema, db: &[Table]) -> UnmanagedDrif
                             !matches!(from, ColumnType::Opaque { .. })
                         }
                         SchemaChange::AddColumn { .. }
+                        | SchemaChange::PrimaryKeyChange { .. }
                         | SchemaChange::SetNotNull { .. }
                         | SchemaChange::DropNotNull { .. } => true,
                         _ => false,
@@ -1816,5 +1817,20 @@ mod tests {
         let row = schema_rs_check(&SchemaRsState::Checked(check));
         assert_eq!(row.status, Status::Warn, "{row:?}");
         assert!(row.detail.contains("joinable!"), "{row:?}");
+    }
+
+    /// A different primary key is drift.
+    #[test]
+    fn unmanaged_drift_counts_a_primary_key_change() {
+        let mut db = db_posts();
+        db.primary_key = vec!["title".to_owned()];
+        for c in &mut db.columns {
+            c.primary_key = c.name == "title";
+            c.serial = None;
+        }
+        assert_eq!(
+            compute_unmanaged_drift(&unmanaged_posts(), &[db]).drifted,
+            vec![("posts".to_owned(), 1)]
+        );
     }
 }

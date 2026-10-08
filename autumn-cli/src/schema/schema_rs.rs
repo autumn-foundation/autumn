@@ -605,7 +605,8 @@ fn edit_joinables(text: &str, edit: impl Fn(&str, &str, &str) -> JoinEdit) -> St
             JoinEdit::Keep => {}
             JoinEdit::Remove => text.replace_range(start..end, ""),
             JoinEdit::Replace(left, right, column) => {
-                let call = format!("{}({left} -> {right} ({column}))", &text[start..open]);
+                let (o, c) = (&text[open..=open], &text[close..=close]);
+                let call = format!("{}{o}{left} -> {right} ({column}){c}", &text[start..open]);
                 text.replace_range(start..=close, &call);
             }
         }
@@ -618,7 +619,7 @@ const ALLOW: &str = "allow_tables_to_appear_in_same_query!";
 
 /// Each call of the macro `name` (for example `joinable!`) in `text`, not in a
 /// comment or a string: `(start, open, close, end)`. `start` includes the path,
-/// `open` and `close` are the outer parentheses, and `end` includes a `;` and
+/// `open` and `close` are the outer delimiters, and `end` includes a `;` and
 /// a line end.
 fn macro_calls(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> {
     let mut calls = Vec::new();
@@ -634,11 +635,11 @@ fn macro_calls(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> {
         let Some(open) = text[from..]
             .find(|c: char| !c.is_whitespace())
             .map(|i| from + i)
-            .filter(|&i| text[i..].starts_with('('))
+            .filter(|&i| text[i..].starts_with(['(', '[', '{']))
         else {
             continue;
         };
-        let Some(close) = matching_paren(text, open) else {
+        let Some(close) = matching_delim(text, open) else {
             break;
         };
         // The call with its outer attributes, so a removal takes them too.
@@ -656,15 +657,16 @@ fn macro_calls(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> {
     calls
 }
 
-/// The position of the `)` that closes the `(` at `open`. Skips comments
-/// and string literals.
-fn matching_paren(text: &str, open: usize) -> Option<usize> {
+/// The position of the delimiter that closes the `(`, `[` or `{` at `open`.
+/// Skips comments and string literals. Rust delimiters are balanced, so one
+/// depth counts all three kinds.
+fn matching_delim(text: &str, open: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut close = None;
     scan_code(text, open, |i, c| {
         match c {
-            b'(' => depth += 1,
-            b')' => {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
                 depth -= 1;
                 if depth == 0 {
                     close = Some(i);
@@ -1568,6 +1570,24 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
             out.text.starts_with("diesel::table! {\n    users (id)"),
             "{}",
             out.text
+        );
+    }
+
+    /// Brace and bracket delimiters are macro calls too.
+    #[test]
+    fn brace_and_bracket_macro_calls_are_edited() {
+        let existing = "diesel::joinable!{comments -> posts (post_id)}\ndiesel::joinable![users -> comments (comment_id)];\ndiesel::allow_tables_to_appear_in_same_query![comments, posts, users];\n";
+        let out = sync_for_plan(
+            existing,
+            &parsed(vec![]),
+            &plan(vec![SchemaChange::RenameTable {
+                from: "comments".to_owned(),
+                to: "notes".to_owned(),
+            }]),
+        );
+        assert_eq!(
+            out.text,
+            "diesel::joinable!{notes -> posts (post_id)}\ndiesel::joinable![users -> notes (comment_id)];\ndiesel::allow_tables_to_appear_in_same_query![notes, posts, users];\n"
         );
     }
 }
