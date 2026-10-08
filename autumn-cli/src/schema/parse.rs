@@ -726,7 +726,11 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
 /// A field lifted out of the struct with its name, parsed attributes, and Rust
 /// type (already split on `Option<…>`).
 struct RawField {
+    /// The SQL column name.
     name: String,
+    /// The Rust field name, without `r#`. A bare `#[references]` infers its
+    /// target table from it.
+    field: String,
     attrs: FieldAttrs,
     nullable: bool,
     rust_type: String,
@@ -755,6 +759,7 @@ fn build_table(
             let (nullable, inner_ty) = strip_option(&field.ty);
             raw_fields.push(RawField {
                 name: field_column_name(field, ident),
+                field: unraw(ident),
                 attrs: parse_field_attrs(field),
                 nullable,
                 rust_type: type_to_string(inner_ty),
@@ -860,11 +865,11 @@ fn build_table(
             .or_else(|| convention_default(&raw.name, &ty, is_pk, raw.attrs.is_default, backend));
 
         // Foreign key: infer the target table from the generator's convention
-        // (`<name>` minus a trailing `_id`, pluralized) unless overridden.
+        // (the field name minus a trailing `_id`, pluralized) unless overridden.
         match &raw.attrs.reference {
             ReferenceSpec::None => {}
             ReferenceSpec::Inferred => {
-                let base = raw.name.strip_suffix("_id").unwrap_or(&raw.name);
+                let base = raw.field.strip_suffix("_id").unwrap_or(&raw.field);
                 column.references = Some(ForeignKey::new(naming::pluralize(base), "id"));
             }
             ReferenceSpec::Explicit(target) => {
@@ -2143,5 +2148,26 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(col(&parsed.tables[0], "blob_data").ty, ColumnType::Bytes);
+    }
+
+    /// `#[references]` infers the target table from the field name, not from
+    /// the `column_name` value.
+    #[test]
+    fn references_target_comes_from_the_field_name() {
+        let parsed = parse_model_source(
+            r#"#[model(managed)] pub struct Post {
+                #[id] pub id: i64,
+                #[diesel(column_name = owner_id)]
+                #[references]
+                pub author_id: i64,
+            }"#,
+            Backend::Postgres,
+        )
+        .expect("parse");
+        let fk = col(&parsed.tables[0], "owner_id")
+            .references
+            .clone()
+            .unwrap();
+        assert_eq!(fk.table, "authors");
     }
 }

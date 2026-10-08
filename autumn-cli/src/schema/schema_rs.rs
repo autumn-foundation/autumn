@@ -592,36 +592,36 @@ fn macro_calls(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> {
     calls
 }
 
-/// The position of the `)` that closes the `(` at `open`. Skips `//`
-/// comments.
+/// The position of the `)` that closes the `(` at `open`. Skips comments
+/// and string literals.
 fn matching_paren(text: &str, open: usize) -> Option<usize> {
     let mut depth = 0usize;
-    let mut in_comment = false;
-    let mut prev = '\0';
     for (i, c) in text[open..].char_indices() {
-        if in_comment {
-            in_comment = c != '\n';
-        } else if c == '/' && prev == '/' {
-            in_comment = true;
-        } else if c == '(' {
+        if !matches!(c, '(' | ')') || is_in_comment_or_string(text, open + i) {
+            continue;
+        }
+        if c == '(' {
             depth += 1;
-        } else if c == ')' {
+        } else {
             depth -= 1;
             if depth == 0 {
                 return Some(open + i);
             }
         }
-        prev = c;
     }
     None
 }
 
-/// `text` without its `//` comments.
+/// `text` without its comments (`//`, `/* */`) and string literals.
 fn strip_comments(text: &str) -> String {
-    text.lines()
-        .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let bytes = text.as_bytes();
+    text.char_indices()
+        .filter(|&(i, c)| {
+            let opens_comment = c == '/' && matches!(bytes.get(i + 1), Some(b'/' | b'*'));
+            !opens_comment && !is_in_comment_or_string(text, i)
+        })
+        .map(|(_, c)| c)
+        .collect()
 }
 
 #[cfg(test)]
@@ -1348,5 +1348,23 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
             ))]),
         );
         assert_eq!(out.text, format!("{head}{POSTS_BLOCK}"));
+    }
+
+    /// A `)` in a block comment inside a call does not end the call.
+    #[test]
+    fn a_paren_in_a_block_comment_does_not_end_a_call() {
+        let existing = "diesel::joinable!(comments -> posts (post_id) /* ) note */);\ndiesel::allow_tables_to_appear_in_same_query!(comments, /* ( */ posts, users);\n";
+        let out = sync_for_plan(
+            existing,
+            &parsed(vec![]),
+            &plan(vec![SchemaChange::DropTable(Table::new(
+                "comments",
+                Backend::Postgres,
+            ))]),
+        );
+        assert_eq!(
+            out.text,
+            "diesel::allow_tables_to_appear_in_same_query!(posts, users);\n"
+        );
     }
 }
