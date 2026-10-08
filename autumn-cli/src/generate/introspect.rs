@@ -503,6 +503,12 @@ pub fn schema_block_range(existing: &str, table: &str) -> Option<(usize, usize)>
     let mut search_from = 0;
     while let Some(macro_rel) = existing[search_from..].find("table!") {
         let name_start = search_from + macro_rel;
+        // A `table!` after `//` on its line is in a comment, not a block.
+        let line_start = existing[..name_start].rfind('\n').map_or(0, |i| i + 1);
+        if existing[line_start..name_start].contains("//") {
+            search_from = name_start + "table!".len();
+            continue;
+        }
         // Walk back over an optional path qualifier (e.g. `diesel::`).
         let mut macro_start = name_start;
         while macro_start > 0 {

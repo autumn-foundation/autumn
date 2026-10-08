@@ -171,6 +171,10 @@ pub struct ParsedSchema {
     /// `#[renamed_from("...")]` hints, in source order. Diff input only; a
     /// snapshot never stores them.
     pub renames: Vec<RenameHint>,
+    /// `(table, column)` for each column that the parser adds and the struct
+    /// does not declare (the convention `created_at`). The `#[model]` macro
+    /// does not read these columns.
+    pub implicit_columns: Vec<(String, String)>,
 }
 
 /// A `#[renamed_from("old")]` hint on a model or a field.
@@ -204,6 +208,7 @@ impl ParsedSchema {
             tables,
             diagnostics: Vec::new(),
             renames: Vec::new(),
+            implicit_columns: Vec::new(),
         }
     }
 }
@@ -216,17 +221,22 @@ impl ParsedSchema {
 /// Returns [`SchemaParseError::Syntax`] if `src` is not valid Rust.
 pub fn parse_model_source(src: &str, backend: Backend) -> Result<ParsedSchema, SchemaParseError> {
     let file = syn::parse_file(src).map_err(|e| SchemaParseError::from_syn(&e))?;
-    let mut out = ParsedSchema {
-        tables: Vec::new(),
-        diagnostics: Vec::new(),
-        renames: Vec::new(),
-    };
+    let mut out = ParsedSchema::from_tables(Vec::new());
     for item in &file.items {
         if let syn::Item::Struct(item_struct) = item
             && let Some(model_attr) = find_model_attr(&item_struct.attrs)
         {
             let table = build_table(item_struct, model_attr, backend, &mut out.diagnostics);
             out.renames.extend(rename_hints(item_struct, &table.name));
+            let declares_created_at = item_struct.fields.iter().any(|f| {
+                f.ident
+                    .as_ref()
+                    .is_some_and(|ident| field_column_name(f, ident) == "created_at")
+            });
+            if !declares_created_at && table.columns.iter().any(|c| c.name == "created_at") {
+                out.implicit_columns
+                    .push((table.name.clone(), "created_at".to_owned()));
+            }
             out.tables.push(table);
         }
     }
@@ -266,11 +276,7 @@ pub fn parse_models_dir(dir: &Path, backend: Backend) -> Result<ParsedSchema, Sc
     // Deterministic aggregation regardless of directory iteration order.
     paths.sort();
 
-    let mut out = ParsedSchema {
-        tables: Vec::new(),
-        diagnostics: Vec::new(),
-        renames: Vec::new(),
-    };
+    let mut out = ParsedSchema::from_tables(Vec::new());
     for path in paths {
         let src = std::fs::read_to_string(&path).map_err(|source| SchemaParseError::Io {
             path: path.display().to_string(),
@@ -280,6 +286,7 @@ pub fn parse_models_dir(dir: &Path, backend: Backend) -> Result<ParsedSchema, Sc
         out.tables.append(&mut parsed.tables);
         out.diagnostics.append(&mut parsed.diagnostics);
         out.renames.append(&mut parsed.renames);
+        out.implicit_columns.append(&mut parsed.implicit_columns);
     }
     Ok(out)
 }
@@ -498,27 +505,35 @@ fn rename_hints(item: &syn::ItemStruct, table: &str) -> Vec<RenameHint> {
 
 /// The SQL column of a field: the `#[diesel(column_name = ...)]` value, else
 /// the field name without a raw `r#` prefix. Same rule as the `#[model]` macro.
+///
+/// The scan reads the tokens of the list, so another key with a type value
+/// (`deserialize_as = Vec<u8>`) does not stop it.
 fn field_column_name(field: &syn::Field, ident: &syn::Ident) -> String {
-    let mut found = None;
+    use proc_macro2::TokenTree;
     for attr in field.attrs.iter().filter(|a| a.path().is_ident("diesel")) {
-        let _ = attr.parse_nested_meta(|meta| {
-            let value = meta
-                .value()
-                .and_then(syn::parse::ParseBuffer::parse::<syn::Expr>);
-            if meta.path.is_ident("column_name") {
-                found = match value {
-                    Ok(syn::Expr::Path(path)) => path.path.get_ident().map(unraw),
-                    Ok(syn::Expr::Lit(syn::ExprLit {
-                        lit: syn::Lit::Str(lit),
-                        ..
-                    })) => Some(lit.value()),
-                    _ => None,
-                };
+        let syn::Meta::List(list) = &attr.meta else {
+            continue;
+        };
+        let tokens: Vec<TokenTree> = list.tokens.clone().into_iter().collect();
+        for window in tokens.windows(3) {
+            let [TokenTree::Ident(key), TokenTree::Punct(eq), value] = window else {
+                continue;
+            };
+            if key != "column_name" || eq.as_char() != '=' {
+                continue;
             }
-            Ok(())
-        });
+            match value {
+                TokenTree::Ident(name) => return unraw(name),
+                TokenTree::Literal(literal) => {
+                    if let Ok(text) = syn::parse_str::<syn::LitStr>(&literal.to_string()) {
+                        return text.value();
+                    }
+                }
+                _ => {}
+            }
+        }
     }
-    found.unwrap_or_else(|| unraw(ident))
+    unraw(ident)
 }
 
 /// The identifier without a raw `r#` prefix.
@@ -2111,5 +2126,20 @@ mod tests {
         assert!(!table.columns.iter().any(|c| c.name == "title"));
         // The rename hint names the new column, not the field.
         assert_eq!(parsed.renames[0].column.as_deref(), Some("body_text"));
+    }
+
+    /// Another `diesel(...)` key before `column_name` does not hide it.
+    #[test]
+    fn diesel_column_name_after_another_key_is_read() {
+        let parsed = parse_model_source(
+            r#"#[model] pub struct Doc {
+                #[id] pub id: i64,
+                #[diesel(deserialize_as = Vec<u8>, column_name = "blob_data")]
+                pub data: Vec<u8>,
+            }"#,
+            Backend::Postgres,
+        )
+        .expect("parse");
+        assert_eq!(col(&parsed.tables[0], "blob_data").ty, ColumnType::Bytes);
     }
 }

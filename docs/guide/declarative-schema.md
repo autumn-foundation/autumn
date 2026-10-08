@@ -26,8 +26,9 @@ There are three sources of truth the commands reconcile:
    engine compares against.
 3. **The database** — the live schema, evolved by applying migration files.
 
-You write only (1). The CLI derives the migration, the snapshot, and the
-`diesel::table!` blocks in `src/schema.rs` from it.
+For a managed model (see [below](#adopt-a-model-modelmanaged)), you write
+only (1). The CLI derives the migration, the snapshot, and the
+`diesel::table!` block in `src/schema.rs` from it.
 
 `autumn schema diff` compares (1) against (2) and emits the migration that
 converges the database on (1). `autumn schema migrate` applies pending migration
@@ -48,10 +49,10 @@ Postgres by accident.
 
 ## Adopt a model: `#[model(managed)]`
 
-The declarative workflow is opt-in for each model.
+You select the declarative workflow for each model.
 
-- A **managed** model, `#[model(managed)]`, owns its table. `schema diff`
-  writes the migrations for it, and `src/schema.rs` gets its block.
+- The CLI controls the table of a **managed** model, `#[model(managed)]`.
+  `schema diff` writes its migrations and its `src/schema.rs` block.
 - An **unmanaged** model, plain `#[model]`, is the default. You write its
   migrations by hand (`autumn generate migration`). `schema diff` does not
   change its table or its `src/schema.rs` block.
@@ -62,23 +63,28 @@ for both kinds (see [below](#autumn-schema-doctor)).
 To adopt a model:
 
 1. Add `managed` to its `#[model]` attribute.
-2. Run `autumn schema snapshot` (first time only) or
-   `autumn schema diff --write-migration`.
+2. If the project has no snapshot, run `autumn schema snapshot`.
+3. Run `autumn schema diff --write-migration`. The command records the model
+   as managed in the snapshot and writes its `src/schema.rs` block.
 
 These field attributes change the table of a managed model:
 
 | Attribute | Table effect |
 | --- | --- |
 | `#[id]` | The primary key column. |
-| `#[indexed]` | An index `idx_<table>_<field>`. |
-| `#[unique]` | A `UNIQUE` column and an index `idx_<table>_<field>_unique`. |
-| `#[references]` | A foreign key to the table that the name gives (`author_id` → `authors`). Use `#[references(table = "users")]` for another table. The column also gets an index. |
+| `#[indexed]` | An index `idx_<table>_<column>`. |
+| `#[unique]` | A `UNIQUE` column and an index `idx_<table>_<column>_unique`. |
+| `#[references]` | A foreign key. The field name gives the target table (`author_id` → `authors`). Use `#[references(table = "users")]` for another table. The column also gets an index. |
 | `#[renamed_from("old")]` | A rename. See [Renames](#renames-renamed_from). |
 | `#[diesel(column_name = "...")]` | The SQL name of the column. |
 
 `Option<T>` makes a column nullable. The `#[model]` macro accepts `managed`,
-`#[unique]`, `#[references]` and `#[renamed_from]`, and refuses a bad shape at
-compile time.
+`#[unique]`, `#[references]` and `#[renamed_from]`. It rejects an incorrect
+attribute at compile time.
+
+A table stays managed in the snapshot after you remove `managed` from its
+model. If you then delete the model, `schema diff --allow-destructive` drops
+the table.
 
 ---
 
@@ -162,18 +168,18 @@ retry regenerates a single migration rather than a duplicate.
 command:
 
 - writes the `diesel::table!` block when it is missing or stale;
-- keeps a block that has the same columns, types and key (aliases such as
-  `BigInt` for `Int8`, paths and column order do not count);
-- removes the block of a dropped table, and the block under the old name of a
-  renamed table;
+- keeps a block that has the same columns, types and key. The comparison
+  ignores type aliases (`BigInt` for `Int8`), type paths and column order;
+- removes the block of a dropped table;
+- gives the block of a renamed table the new name, and keeps its attributes;
 - removes or renames the table in `joinable!` and
-  `allow_tables_to_appear_in_same_query!`.
+  `allow_tables_to_appear_in_same_query!`. A changed call loses its comments.
 
 The command does not change the block of an unmanaged model.
 
-The command also syncs `src/schema.rs` when the plan is empty. Thus, after you
-add `managed` to a model, `schema diff --write-migration` writes its block
-with no migration.
+The command also updates `src/schema.rs` when the plan has no changes. Thus,
+after you add `managed` to a model, `schema diff --write-migration` writes its
+block with no migration.
 
 The command does not write a block in these conditions. It shows a warning:
 
@@ -181,10 +187,13 @@ The command does not write a block in these conditions. It shows a warning:
 - A name is not a Rust identifier, or a column type has no diesel type.
 - The block has attributes (for example `#[sql_name]`) and is different. Edit
   that block by hand.
+- The command cannot read the block (for example a header with no key,
+  `posts {`). Edit that block by hand.
 
-Without `src/schema.rs`, the command does not make one. If the
-`src/schema.rs` write fails, the command puts the migration and the snapshot
-back as they were.
+Without `src/schema.rs`, the command does not make one. If the command cannot
+write `src/schema.rs`, it removes the new migration and restores the
+snapshot. The command writes the file through a temporary file, so a failed
+write does not change it.
 
 ### Renames: `#[renamed_from]`
 
@@ -433,14 +442,16 @@ checks are:
 - **project-root** — the command is running inside an Autumn project.
 - **snapshot-present** — `.autumn/schema-snapshot.json` exists and is readable.
 - **snapshot-drift** — the declared models match the snapshot baseline.
+- **schema-rs-drift** — each managed model has a matching block in
+  `src/schema.rs`. A missing or stale block is a **WARN**. To fix it, run
+  `autumn schema diff --write-migration`. The row names each table that it
+  cannot compare (for example a model with an enum field). Without a managed
+  model, the row is **OK**.
 - **provider-lock** — the snapshot's backend tag matches the detected backend.
 - **snapshot-dialect-vs-db** — the snapshot dialect matches the configured
   database URL's backend.
 - **pending-migrations** — whether generated migration files are still unapplied
   (Postgres).
-- **schema-rs-drift** — each managed model has a matching block in
-  `src/schema.rs`. A missing or stale block is a **WARN**. To fix it, run
-  `autumn schema diff --write-migration`.
 - **database-schema-drift** (#2045) — when the database is reachable, the
   snapshot is introspected against the live schema bidirectionally; drift is an
   actionable **WARN**. Offline, it stays a non-failing WARN. SQLite needs the
@@ -448,8 +459,9 @@ checks are:
 - **unmanaged-drift** — each unmanaged model matches its table in the live
   database. The check finds a missing table, a model column that the table
   does not have, and a different type or `NULL` rule. It does not compare
-  columns that only the table has, indexes, defaults or constraints. Drift is
-  a **WARN**. To fix it, write a migration with `autumn generate migration`, or
+  columns that only the table has, indexes, defaults or constraints. It does
+  not compare a type that the CLI keeps as an opaque type (for example
+  `VARCHAR(40)`, or `BOOLEAN` on SQLite). Drift is a **WARN**. To fix it, write a migration with `autumn generate migration`, or
   change the model.
 
 ---

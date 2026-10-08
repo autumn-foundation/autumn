@@ -1,15 +1,9 @@
-//! Declarative-schema tooling (wave-15, tracking issue #1975).
+//! Declarative-schema tooling (tracking issue #1975).
 //!
-//! Slice 2 lives here: [`parse`], a `syn`-backed reader that lifts an app's
-//! `#[model]` structs into the shared [`autumn_schema_core`] IR — the
-//! **desired state** later slices (a checked-in snapshot, then the diff engine
-//! and the full `autumn schema` command group) build on.
-//!
-//! The experimental [`run`] entrypoint backs `autumn schema parse <path>` (slice
-//! 2) and `autumn schema snapshot` (slice 3). `parse` prints the parsed IR as
-//! JSON; `snapshot` writes the canonical, checked-in [`snapshot`] baseline the
-//! later diff engine consumes. These are the first actions of the eventual full
-//! `autumn schema` group.
+//! [`parse`] reads the `#[model]` structs into the [`autumn_schema_core`] IR:
+//! the desired state. [`snapshot`] holds the checked-in baseline. [`diff`]
+//! compares the two and writes the migration. [`run`] backs the
+//! `autumn schema parse|snapshot|diff|pull|migrate|doctor` commands.
 //!
 //! [`rename`] applies `#[renamed_from]` hints in the diff. [`shadow`] replays
 //! the migrations on an empty dev database for `schema diff --dev-url`.
@@ -58,8 +52,7 @@ impl From<BackendArg> for Backend {
 /// The environment variable that `schema diff --dev-url` also reads.
 const DEV_URL_ENV: &str = "AUTUMN_DEV_URL";
 
-/// The `autumn schema` subcommand actions (experimental). Slices 2–3 ship
-/// `parse` and `snapshot`; `diff`/… arrive in later slices.
+/// The `autumn schema` subcommand actions (experimental).
 #[derive(clap::Subcommand, Debug)]
 pub enum SchemaAction {
     /// Parse `#[model]` structs at PATH (a `.rs` file or a directory of them)
@@ -93,7 +86,8 @@ pub enum SchemaAction {
     },
     /// Diff the declared `#[model]` structs against the checked-in snapshot and
     /// either print the pending migration (default) or write it as a diesel
-    /// `up.sql`/`down.sql` pair (`--write-migration`). Destructive drops are
+    /// `up.sql`/`down.sql` pair (`--write-migration`). `--write-migration` also
+    /// advances the snapshot and writes `src/schema.rs`. Destructive drops are
     /// refused unless `--allow-destructive` is passed.
     Diff {
         /// Models source (a `.rs` file or a directory). Defaults to `src/models`
@@ -106,7 +100,8 @@ pub enum SchemaAction {
         /// The dialect. Defaults to the project's configured backend.
         #[arg(long, value_enum)]
         backend: Option<BackendArg>,
-        /// Write `migrations/<timestamp>_<name>/{up,down}.sql` instead of printing.
+        /// Write `migrations/<timestamp>_<name>/{up,down}.sql` instead of
+        /// printing. Also advance the snapshot and update `src/schema.rs`.
         #[arg(long)]
         write_migration: bool,
         /// Migration directory suffix when writing. Defaults to `schema_update`.
@@ -708,7 +703,20 @@ fn run_diff(args: &DiffArgs<'_>) -> Result<(), String> {
 /// process CWD) so the command wiring is testable without mutating the current
 /// directory.
 fn diff_at(project_root: &Path, args: &DiffArgs<'_>) -> Result<(), String> {
-    diff_at_with(project_root, args, &|path, text| std::fs::write(path, text))
+    diff_at_with(project_root, args, &write_file_atomic)
+}
+
+/// Write `text` to `path` through a temporary file and a rename, so a failed
+/// write never leaves a part of the file. Keeps the permissions of the old
+/// file.
+fn write_file_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    std::io::Write::write_all(&mut tmp, text.as_bytes())?;
+    if let Ok(meta) = std::fs::metadata(path) {
+        tmp.as_file().set_permissions(meta.permissions())?;
+    }
+    tmp.persist(path).map(|_| ()).map_err(|e| e.error)
 }
 
 /// [`diff_at`] with the `src/schema.rs` writer as a parameter, so a test can
@@ -769,7 +777,10 @@ fn diff_at_with(
             (replay.tables, replay.other_relations)
         }
         None => (
-            snapshot.map(|s| s.tables).unwrap_or_default(),
+            snapshot
+                .as_ref()
+                .map(|s| s.tables.clone())
+                .unwrap_or_default(),
             std::collections::BTreeSet::new(),
         ),
     };
@@ -783,10 +794,14 @@ fn diff_at_with(
     if plan.is_empty() {
         println!("No schema changes — models match the baseline.");
         if write_migration {
-            // A newly managed model can need a block with no SQL change.
             let sync = plan_schema_rs(project_root, &desired, &plan);
-            apply_schema_rs(sync.as_ref(), write_schema_rs)?;
-            report_schema_rs(sync.as_ref());
+            commit_empty_plan(
+                &snapshot_path,
+                snapshot.as_ref(),
+                &desired,
+                sync.as_ref(),
+                write_schema_rs,
+            )?;
         }
         return Ok(());
     }
@@ -833,25 +848,18 @@ fn diff_at_with(
     // regenerate the same SQL as a second migration (baseline never advanced)
     // and applying both would fail on duplicate DDL. Roll the migration dir back
     // on a snapshot-write failure so the pre-command state is left intact.
-    let target_tables = project_plan_target(&baseline_tables, &plan);
-    let old_snapshot = std::fs::read(&snapshot_path).ok();
-    if let Err(e) =
-        snapshot::write_snapshot(&snapshot_path, &SchemaSnapshot::new(backend, target_tables))
-    {
-        let _ = std::fs::remove_dir_all(&dir);
-        return Err(e.to_string());
-    }
+    let mut target_tables = project_plan_target(&baseline_tables, &plan);
+    mark_managed(&mut target_tables, &desired);
 
-    // (h) Write `src/schema.rs`. On failure, put the snapshot and the
-    // migrations back as they were, so a retry starts clean.
+    // (h) Then write `src/schema.rs` (see `commit_outputs`).
     let sync = plan_schema_rs(project_root, &desired, &plan);
-    if let Err(e) = apply_schema_rs(sync.as_ref(), write_schema_rs) {
-        restore_file(&snapshot_path, old_snapshot.as_deref());
-        let _ = std::fs::remove_dir_all(&dir);
-        return Err(format!(
-            "{e}; the migration and the snapshot were not changed"
-        ));
-    }
+    commit_outputs(
+        &snapshot_path,
+        Some(&SchemaSnapshot::new(backend, target_tables)),
+        Some(&dir),
+        sync.as_ref(),
+        write_schema_rs,
+    )?;
 
     println!(
         "wrote migration {} ({} change(s))",
@@ -863,10 +871,85 @@ fn diff_at_with(
     Ok(())
 }
 
+/// `--write-migration` with no SQL change. A newly managed model needs no
+/// migration, but the snapshot records its `managed` flag and `src/schema.rs`
+/// can need its block.
+fn commit_empty_plan(
+    snapshot_path: &Path,
+    snapshot: Option<&SchemaSnapshot>,
+    desired: &parse::ParsedSchema,
+    sync: Option<&(PathBuf, schema_rs::SchemaRsSync)>,
+    write_schema_rs: &dyn Fn(&Path, &str) -> std::io::Result<()>,
+) -> Result<(), String> {
+    let adopted = snapshot.and_then(|s| {
+        let mut tables = s.tables.clone();
+        mark_managed(&mut tables, desired);
+        (tables != s.tables).then(|| SchemaSnapshot::new(s.backend, tables))
+    });
+    commit_outputs(snapshot_path, adopted.as_ref(), None, sync, write_schema_rs)?;
+    if adopted.is_some() {
+        println!("recorded the managed models in {}", snapshot_path.display());
+    }
+    report_schema_rs(sync);
+    Ok(())
+}
+
+/// Mark each table that a managed model declares as managed. A model that
+/// becomes managed is then recorded in the snapshot, and a later delete of
+/// the model drops its table. The flag never goes back to unmanaged.
+fn mark_managed(tables: &mut [Table], desired: &parse::ParsedSchema) {
+    for table in tables {
+        if desired
+            .tables
+            .iter()
+            .any(|t| t.managed && t.name == table.name)
+        {
+            table.managed = true;
+        }
+    }
+}
+
+/// Write the snapshot (when given), then `src/schema.rs` (when given). If a
+/// write fails, restore the old snapshot and remove `migration`. Then a new
+/// run starts from the same state.
+fn commit_outputs(
+    snapshot_path: &Path,
+    snapshot: Option<&SchemaSnapshot>,
+    migration: Option<&Path>,
+    sync: Option<&(PathBuf, schema_rs::SchemaRsSync)>,
+    write_schema_rs: &dyn Fn(&Path, &str) -> std::io::Result<()>,
+) -> Result<(), String> {
+    let remove_migration = || {
+        if let Some(dir) = migration {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    };
+    let old_snapshot = std::fs::read(snapshot_path).ok();
+    if let Some(snapshot) = snapshot
+        && let Err(e) = snapshot::write_snapshot(snapshot_path, snapshot)
+    {
+        remove_migration();
+        return Err(e.to_string());
+    }
+    if let Err(e) = apply_schema_rs(sync, write_schema_rs) {
+        remove_migration();
+        if snapshot.is_some() && restore_file(snapshot_path, old_snapshot.as_deref()).is_err() {
+            return Err(format!(
+                "{e}; could not restore the snapshot at {} — check it",
+                snapshot_path.display()
+            ));
+        }
+        return Err(format!(
+            "{e}; the migration and the snapshot were not changed"
+        ));
+    }
+    Ok(())
+}
+
 /// The `src/schema.rs` sync for `plan`: the path and the result, when the
 /// file exists and the text changes. `None` when the project has no
-/// `src/schema.rs` or the text stays the same. The skipped tables are
-/// reported in both cases.
+/// `src/schema.rs` or the text stays the same. Prints the skipped tables of
+/// an existing file.
 fn plan_schema_rs(
     project_root: &Path,
     desired: &parse::ParsedSchema,
@@ -889,7 +972,7 @@ fn plan_schema_rs(
             schema_rs::SCHEMA_RS_PATH
         );
     }
-    sync.changed().then_some((path, sync))
+    (sync.text != existing).then_some((path, sync))
 }
 
 /// Write the `src/schema.rs` sync from [`plan_schema_rs`], if any.
@@ -904,11 +987,11 @@ fn apply_schema_rs(
 }
 
 /// Put `path` back to the bytes in `old`. Remove it when `old` is `None`.
-fn restore_file(path: &Path, old: Option<&[u8]>) {
-    let _ = old.map_or_else(
+fn restore_file(path: &Path, old: Option<&[u8]>) -> std::io::Result<()> {
+    old.map_or_else(
         || std::fs::remove_file(path),
         |bytes| std::fs::write(path, bytes),
-    );
+    )
 }
 
 /// Print what the `src/schema.rs` sync changed.
@@ -920,6 +1003,12 @@ fn report_schema_rs(sync: Option<&(PathBuf, schema_rs::SchemaRsSync)>) {
     }
     if !sync.removed.is_empty() {
         parts.push(format!("removed {}", sync.removed.join(", ")));
+    }
+    for (old, new) in &sync.renamed {
+        parts.push(format!("renamed {old} to {new}"));
+    }
+    if parts.is_empty() {
+        parts.push("updated the table lists".to_owned());
     }
     println!("updated {} ({})", path.display(), parts.join("; "));
 }
@@ -2057,6 +2146,41 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         diff_at(root.path(), &write_args()).expect("write ok");
         assert!(!path.exists());
+    }
+
+    /// Adding `managed` to a model records it in the snapshot, so a later
+    /// delete of the model drops the table.
+    #[test]
+    fn adopting_a_model_records_it_as_managed_in_the_snapshot() {
+        let root = scaffold_project(
+            POST_MODEL,
+            &posts_snapshot("Postgres").replace("\"managed\": true", "\"managed\": false"),
+        );
+        diff_at(root.path(), &write_args()).expect("adopt ok");
+        let snapshot =
+            snapshot::load_snapshot(&root.path().join(SNAPSHOT_DEFAULT_PATH)).expect("load");
+        assert!(snapshot.tables[0].managed, "{:?}", snapshot.tables[0]);
+        assert!(!root.path().join("migrations").exists());
+    }
+
+    /// An edit to the macros alone (the dropped table has no block) is
+    /// written.
+    #[test]
+    fn a_macro_only_schema_rs_change_is_written() {
+        let root = scaffold_project("", &posts_snapshot("Postgres"));
+        let path = write_schema_rs(
+            root.path(),
+            "diesel::allow_tables_to_appear_in_same_query!(posts, users);\n",
+        );
+        diff_at(
+            root.path(),
+            &DiffArgs {
+                allow_destructive: true,
+                ..write_args()
+            },
+        )
+        .expect("drop ok");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "");
     }
 
     /// A failed `schema.rs` write leaves the migration and the snapshot as

@@ -28,7 +28,7 @@
 
 use std::path::Path;
 
-use autumn_schema_core::{Backend, Table};
+use autumn_schema_core::{Backend, ColumnType, Table};
 use diesel_migrations::FileBasedMigrations;
 use serde::Serialize;
 
@@ -37,7 +37,7 @@ use super::introspect::introspect_postgres;
 #[cfg(feature = "sqlite")]
 use super::introspect::introspect_sqlite;
 use super::parse::{ParsedSchema, parse_models_path};
-use super::schema_rs::{SCHEMA_RS_PATH, stale_tables};
+use super::schema_rs::{SCHEMA_RS_PATH, SchemaRsCheck, check_tables};
 use super::snapshot::{SNAPSHOT_DEFAULT_PATH, SnapshotError, load_snapshot};
 
 /// A single diagnostic check outcome.
@@ -138,14 +138,12 @@ enum DbSchemaState {
 /// `src/schema.rs` against the managed models (offline).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SchemaRsState {
-    /// The project has no `src/schema.rs`.
+    /// The project has no `src/schema.rs`, and a model is managed.
     NoFile,
     /// No model is managed.
     NoManaged,
-    /// Each managed model has a matching block.
-    Clean,
-    /// These managed tables have a missing or stale block.
-    Stale(Vec<String>),
+    /// The result of the comparison.
+    Checked(SchemaRsCheck),
     /// The models could not be parsed.
     ModelsError(String),
 }
@@ -155,11 +153,13 @@ enum SchemaRsState {
 enum UnmanagedState {
     /// No database URL is configured.
     NotConfigured,
-    /// The build cannot read this backend. Not made on a `sqlite` build.
+    /// The build cannot read this backend. A `sqlite` build does not use it.
     #[cfg_attr(feature = "sqlite", allow(dead_code))]
     Skipped(String),
-    /// No model is unmanaged (or the models could not be parsed).
+    /// No model is unmanaged.
     NoUnmanaged,
+    /// The models could not be parsed.
+    ModelsError(String),
     /// The database could not be read (secret-free reason).
     Unreachable(String),
     /// Each unmanaged model matches its table.
@@ -232,9 +232,6 @@ fn gather_local_facts(project_root: &Path, profile: Option<&str>) -> LocalFacts 
 
 /// Compare `src/schema.rs` with the managed models.
 fn probe_schema_rs(project_root: &Path, backend: Backend) -> SchemaRsState {
-    let Ok(existing) = std::fs::read_to_string(project_root.join(SCHEMA_RS_PATH)) else {
-        return SchemaRsState::NoFile;
-    };
     let Some(models_path) = super::existing_models_path(project_root) else {
         return SchemaRsState::NoManaged;
     };
@@ -245,12 +242,10 @@ fn probe_schema_rs(project_root: &Path, backend: Backend) -> SchemaRsState {
     if !desired.tables.iter().any(|t| t.managed) {
         return SchemaRsState::NoManaged;
     }
-    let stale = stale_tables(&existing, &desired);
-    if stale.is_empty() {
-        SchemaRsState::Clean
-    } else {
-        SchemaRsState::Stale(stale)
-    }
+    std::fs::read_to_string(project_root.join(SCHEMA_RS_PATH))
+        .map_or(SchemaRsState::NoFile, |existing| {
+            SchemaRsState::Checked(check_tables(&existing, &desired))
+        })
 }
 
 /// The unmanaged models whose table in `db` is missing or has other column
@@ -263,10 +258,17 @@ fn compute_unmanaged_drift(models: &ParsedSchema, db: &[Table]) -> Vec<(String, 
         .iter()
         .filter(|t| !t.managed)
         .filter_map(|model| {
-            // Diff one table at a time, both sides marked managed, so the
-            // engine compares them and no other table shows as a drop.
+            // Mark both sides managed so that the engine compares them. Diff
+            // one table at a time so that no other table shows as a drop.
             let mut want = model.clone();
             want.managed = true;
+            // The model does not read a column that the parser adds.
+            want.columns.retain(|c| {
+                !models
+                    .implicit_columns
+                    .iter()
+                    .any(|(t, col)| *t == model.name && *col == c.name)
+            });
             let base: Vec<Table> = db
                 .iter()
                 .filter(|t| t.name == model.name)
@@ -280,21 +282,31 @@ fn compute_unmanaged_drift(models: &ParsedSchema, db: &[Table]) -> Vec<(String, 
                 &ParsedSchema::from_tables(vec![want]),
                 DiffOptions::default(),
             );
-            let count = plan
-                .changes
-                .iter()
-                .filter(|c| {
-                    matches!(
-                        c,
-                        SchemaChange::CreateTable(_)
-                            | SchemaChange::CreateTableBlockedBySkippedField { .. }
-                            | SchemaChange::AddColumn { .. }
-                            | SchemaChange::AlterColumnType { .. }
-                            | SchemaChange::SetNotNull { .. }
-                            | SchemaChange::DropNotNull { .. }
-                    )
-                })
-                .count();
+            // A missing table counts once. An `Opaque` database type
+            // (`VARCHAR(40)`, SQLite `BOOLEAN`) cannot be compared.
+            let missing = plan.changes.iter().any(|c| {
+                matches!(
+                    c,
+                    SchemaChange::CreateTable(_)
+                        | SchemaChange::CreateTableBlockedBySkippedField { .. }
+                )
+            });
+            let count = if missing {
+                1
+            } else {
+                plan.changes
+                    .iter()
+                    .filter(|c| match c {
+                        SchemaChange::AlterColumnType { from, .. } => {
+                            !matches!(from, ColumnType::Opaque { .. })
+                        }
+                        SchemaChange::AddColumn { .. }
+                        | SchemaChange::SetNotNull { .. }
+                        | SchemaChange::DropNotNull { .. } => true,
+                        _ => false,
+                    })
+                    .count()
+            };
             (count > 0).then(|| (model.name.clone(), count))
         })
         .collect()
@@ -446,38 +458,44 @@ fn gather_db_facts_with(
     introspect: impl Fn(&str) -> Result<Vec<Table>, super::introspect::IntrospectError>,
 ) -> (DbSchemaState, UnmanagedState) {
     let snapshot = load_snapshot(&project_root.join(SNAPSHOT_DEFAULT_PATH)).ok();
-    let models = super::existing_models_path(project_root)
-        .and_then(|path| parse_models_path(&path, backend).ok())
-        .filter(|m| m.tables.iter().any(|t| !t.managed));
+    let (models, models_error) = match super::existing_models_path(project_root)
+        .map(|path| parse_models_path(&path, backend))
+    {
+        Some(Ok(models)) if models.tables.iter().any(|t| !t.managed) => (Some(models), None),
+        Some(Err(e)) => (None, Some(UnmanagedState::ModelsError(e.to_string()))),
+        _ => (None, None),
+    };
     if snapshot.is_none() && models.is_none() {
-        return (DbSchemaState::SnapshotMissing, UnmanagedState::NoUnmanaged);
+        return (
+            DbSchemaState::SnapshotMissing,
+            models_error.unwrap_or(UnmanagedState::NoUnmanaged),
+        );
     }
-    let tables = match introspect(url) {
-        Ok(tables) => tables,
-        // IntrospectError Display is credential-safe.
-        Err(e) => {
-            return (
-                DbSchemaState::Unreachable(e.to_string()),
-                UnmanagedState::Unreachable(e.to_string()),
-            );
+    let read = introspect(url).map_err(|e| e.to_string()); // credential-safe
+    let schema = match (&snapshot, &read) {
+        (None, _) => DbSchemaState::SnapshotMissing,
+        (Some(_), Err(e)) => DbSchemaState::Unreachable(e.clone()),
+        (Some(snapshot), Ok(tables)) => {
+            let drift = compute_db_schema_drift(&snapshot.tables, tables);
+            if drift.is_clean() {
+                DbSchemaState::Clean
+            } else {
+                DbSchemaState::Drifted(drift.reported_count())
+            }
         }
     };
-    let schema = snapshot.map_or(DbSchemaState::SnapshotMissing, |snapshot| {
-        let drift = compute_db_schema_drift(&snapshot.tables, &tables);
-        if drift.is_clean() {
-            DbSchemaState::Clean
-        } else {
-            DbSchemaState::Drifted(drift.reported_count())
+    let unmanaged = match (models, read) {
+        (None, _) => models_error.unwrap_or(UnmanagedState::NoUnmanaged),
+        (Some(_), Err(e)) => UnmanagedState::Unreachable(e),
+        (Some(models), Ok(tables)) => {
+            let drift = compute_unmanaged_drift(&models, &tables);
+            if drift.is_empty() {
+                UnmanagedState::Clean
+            } else {
+                UnmanagedState::Drifted(drift)
+            }
         }
-    });
-    let unmanaged = models.map_or(UnmanagedState::NoUnmanaged, |models| {
-        let drift = compute_unmanaged_drift(&models, &tables);
-        if drift.is_empty() {
-            UnmanagedState::Clean
-        } else {
-            UnmanagedState::Drifted(drift)
-        }
-    });
+    };
     (schema, unmanaged)
 }
 
@@ -664,20 +682,33 @@ fn drift_check(snapshot: &SnapshotState) -> Check {
 /// The `schema-rs-drift` row.
 fn schema_rs_check(state: &SchemaRsState) -> Check {
     let (status, detail) = match state {
-        SchemaRsState::Clean => (
-            Status::Ok,
-            "each managed model has a matching block".to_owned(),
-        ),
+        SchemaRsState::Checked(check) => {
+            let unchecked: Vec<String> = check
+                .unchecked
+                .iter()
+                .map(|(table, reason)| format!("{table} ({reason})"))
+                .collect();
+            let note = if unchecked.is_empty() {
+                String::new()
+            } else {
+                format!("; not checked: {}", unchecked.join(", "))
+            };
+            if check.stale.is_empty() {
+                (Status::Ok, format!("the managed blocks match{note}"))
+            } else {
+                (
+                    Status::Warn,
+                    format!(
+                        "missing or stale block for {} — run `autumn schema diff \
+                         --write-migration`{note}",
+                        check.stale.join(", ")
+                    ),
+                )
+            }
+        }
         SchemaRsState::NoManaged => (
             Status::Ok,
             "no managed model — nothing to compare".to_owned(),
-        ),
-        SchemaRsState::Stale(tables) => (
-            Status::Warn,
-            format!(
-                "missing or stale block for {} — run `autumn schema diff --write-migration`",
-                tables.join(", ")
-            ),
         ),
         SchemaRsState::NoFile => (Status::Warn, format!("no {SCHEMA_RS_PATH} — skipped")),
         SchemaRsState::ModelsError(reason) => {
@@ -718,6 +749,9 @@ fn unmanaged_check(state: &UnmanagedState) -> Check {
             format!("could not reach the database: {reason}"),
         ),
         UnmanagedState::Skipped(reason) => (Status::Warn, reason.clone()),
+        UnmanagedState::ModelsError(reason) => {
+            (Status::Warn, format!("could not read the models: {reason}"))
+        }
     };
     Check {
         name: "unmanaged-drift".to_owned(),
@@ -1456,9 +1490,9 @@ mod tests {
         assert_eq!(row.status, Status::Warn, "{row:?}");
         assert!(row.detail.contains("no src/schema.rs"), "{row:?}");
 
+        // Without a managed model, a missing file is not a problem.
         let unmanaged = POST_MODEL.replace("model(managed)", "model");
         let root = scaffold(&unmanaged, Some(&posts_snapshot("Postgres")));
-        std::fs::write(root.path().join("src/schema.rs"), "").unwrap();
         let row = schema_rs_row(root.path());
         assert_eq!(row.status, Status::Ok, "{row:?}");
         assert!(row.detail.contains("no managed model"), "{row:?}");
@@ -1603,5 +1637,81 @@ mod tests {
             });
         assert_eq!(schema, DbSchemaState::SnapshotMissing);
         assert_eq!(models, UnmanagedState::NoUnmanaged);
+    }
+
+    /// The parser adds `created_at` to a model that omits it. A hand-made
+    /// table without that column is not drift: the model does not read it.
+    #[test]
+    fn unmanaged_drift_ignores_the_implicit_created_at() {
+        let models = unmanaged_posts();
+        let mut db = db_posts();
+        db.columns.retain(|c| c.name != "created_at");
+        assert!(compute_unmanaged_drift(&models, &[db]).is_empty());
+
+        // A declared `created_at` still counts.
+        let declared = crate::schema::parse::parse_model_source(
+            "#[model] pub struct Post { #[id] pub id: i64, pub created_at: chrono::NaiveDateTime }",
+            Backend::Postgres,
+        )
+        .expect("parse");
+        let mut db = db_posts();
+        db.columns.retain(|c| c.name != "created_at");
+        assert_eq!(
+            compute_unmanaged_drift(&declared, &[db]),
+            vec![("posts".to_owned(), 1)]
+        );
+    }
+
+    /// A table that the check cannot compare is named, and is not a WARN.
+    #[test]
+    fn schema_rs_drift_names_unchecked_tables() {
+        let check = SchemaRsCheck {
+            stale: Vec::new(),
+            unchecked: vec![("posts".to_owned(), "enum field".to_owned())],
+        };
+        let row = schema_rs_check(&SchemaRsState::Checked(check));
+        assert_eq!(row.status, Status::Ok, "{row:?}");
+        assert!(
+            row.detail.contains("not checked: posts (enum field)"),
+            "{row:?}"
+        );
+    }
+
+    /// A database type that the IR keeps as `Opaque` (`VARCHAR(40)`, `SQLite`
+    /// `BOOLEAN`) is not drift: the engine cannot compare it.
+    #[test]
+    fn unmanaged_drift_ignores_an_opaque_database_type() {
+        let mut db = db_posts();
+        let title = db.columns.iter_mut().find(|c| c.name == "title").unwrap();
+        title.ty = autumn_schema_core::ColumnType::Opaque {
+            pg_type: "varchar(40)".to_owned(),
+        };
+        assert!(compute_unmanaged_drift(&unmanaged_posts(), &[db]).is_empty());
+    }
+
+    #[test]
+    fn database_rows_keep_their_reason_when_the_database_is_down() {
+        // No snapshot: the snapshot row keeps its hint, even offline.
+        let unmanaged = POST_MODEL.replace("model(managed)", "model");
+        let root = scaffold(&unmanaged, None);
+        let (schema, _) =
+            gather_db_facts_with(root.path(), "postgres://db", Backend::Postgres, |_| {
+                Err(crate::schema::introspect::IntrospectError::Query(
+                    "refused".to_owned(),
+                ))
+            });
+        assert_eq!(schema, DbSchemaState::SnapshotMissing);
+
+        // Models that do not parse are a WARN, not an OK.
+        let root = scaffold("pub struct {", Some(&posts_snapshot("Postgres")));
+        let (_, models) =
+            gather_db_facts_with(root.path(), "postgres://db", Backend::Postgres, |_| {
+                Ok(vec![db_posts()])
+            });
+        assert!(
+            matches!(models, UnmanagedState::ModelsError(_)),
+            "{models:?}"
+        );
+        assert_eq!(unmanaged_check(&models).status, Status::Warn);
     }
 }

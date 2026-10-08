@@ -4,8 +4,9 @@
 //!
 //! - writes a `diesel::table!` block for each managed model;
 //! - keeps a block that already has the same columns, types and key;
-//! - removes the block of a dropped managed table, and the block under the old
-//!   name of a renamed one;
+//! - removes the block of a dropped managed table;
+//! - gives the block of a renamed table the new name, and keeps its attributes;
+//! - updates `joinable!` and `allow_tables_to_appear_in_same_query!`;
 //! - never changes the block of an unmanaged table.
 //!
 //! The sync does not write a block in these conditions. It reports the table
@@ -13,9 +14,10 @@
 //!
 //! - the parser skipped a field of the model (for example an enum field);
 //! - a name is not a Rust identifier, or a column type has no diesel type;
-//! - the block has attributes (for example `#[sql_name]`) and does not match.
+//! - the block has attributes (for example `#[sql_name]`) and does not match;
+//! - the scanner cannot read the block (for example `posts {` with no key).
 //!
-//! `schema doctor` uses [`stale_tables`] for its `schema-rs-drift` row.
+//! `schema doctor` uses [`check_tables`] for its `schema-rs-drift` row.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -38,16 +40,19 @@ pub struct SchemaRsSync {
     pub written: Vec<String>,
     /// Tables whose block the sync removed.
     pub removed: Vec<String>,
+    /// `(old, new)` for each block that the sync gave a new table name.
+    pub renamed: Vec<(String, String)>,
     /// Tables the sync did not write, with the reason.
     pub skipped: Vec<(String, String)>,
 }
 
-impl SchemaRsSync {
-    /// True when the text changed.
-    #[must_use]
-    pub const fn changed(&self) -> bool {
-        !self.written.is_empty() || !self.removed.is_empty()
-    }
+/// The result of [`check_tables`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SchemaRsCheck {
+    /// Managed tables whose block is missing or stale.
+    pub stale: Vec<String>,
+    /// Managed tables that the check cannot compare, with the reason.
+    pub unchecked: Vec<(String, String)>,
 }
 
 /// Render the `diesel::table!` block for `table`.
@@ -79,17 +84,21 @@ pub fn render_block(table: &Table) -> Result<String, String> {
     Ok(out)
 }
 
-/// Sync `existing` (the `src/schema.rs` text) with the managed tables of
-/// `desired`, after the table drops and renames in `plan`.
+/// Update `existing` (the `src/schema.rs` text). First, apply the table drops
+/// and renames of `plan`. Then write the managed tables of `desired`.
 #[must_use]
 pub fn sync_for_plan(existing: &str, desired: &ParsedSchema, plan: &MigrationPlan) -> SchemaRsSync {
     sync(existing, desired, &removals(plan))
 }
 
-/// The managed tables whose block in `existing` is missing or stale.
+/// Compare the blocks in `existing` with the managed tables of `desired`.
 #[must_use]
-pub fn stale_tables(existing: &str, desired: &ParsedSchema) -> Vec<String> {
-    sync(existing, desired, &[]).written
+pub fn check_tables(existing: &str, desired: &ParsedSchema) -> SchemaRsCheck {
+    let sync = sync(existing, desired, &[]);
+    SchemaRsCheck {
+        stale: sync.written,
+        unchecked: sync.skipped,
+    }
 }
 
 /// The `(old name, new name)` pairs of the dropped (`None`) and renamed
@@ -105,8 +114,8 @@ fn removals(plan: &MigrationPlan) -> Vec<(String, Option<String>)> {
         .collect()
 }
 
-/// Remove the blocks in `removals`, then write the managed tables of
-/// `desired`.
+/// Apply `removals` (`None` drops, `Some` renames), then write the managed
+/// tables of `desired`.
 fn sync(
     existing: &str,
     desired: &ParsedSchema,
@@ -117,9 +126,21 @@ fn sync(
         ..SchemaRsSync::default()
     };
     for (old, new) in removals {
-        if let Some(text) = remove_block(&out.text, old) {
+        let new = new
+            .as_deref()
+            .map(|n| ident_token(n).unwrap_or_else(|| n.to_owned()));
+        // A rename keeps the block and its attributes under the new name. The
+        // table loop below then updates the columns, if it can.
+        let text = match &new {
+            Some(new) => rename_header(&out.text, old, new),
+            None => remove_block(&out.text, old),
+        };
+        if let Some(text) = text {
             out.text = text;
-            out.removed.push(old.clone());
+            match &new {
+                Some(new) => out.renamed.push((old.clone(), unraw(new).to_owned())),
+                None => out.removed.push(old.clone()),
+            }
         }
         out.text = retarget_macros(&out.text, old, new.as_deref());
     }
@@ -164,6 +185,15 @@ fn sync(
                     block.trim_end(),
                     &out.text[end..]
                 );
+            }
+            // A block that the scanner cannot find, such as `posts {` with no
+            // key: do not add a second block for the same table.
+            None if has_header(&out.text, &token) => {
+                out.skipped.push((
+                    table.name.clone(),
+                    "the block has an unknown shape; edit it by hand".to_owned(),
+                ));
+                continue;
             }
             None if out.text.trim().is_empty() => out.text = block,
             None => out.text = format!("{}\n\n{block}", out.text.trim_end()),
@@ -321,41 +351,71 @@ fn remove_block(text: &str, table: &str) -> Option<String> {
     Some(format!("{prefix}{suffix}"))
 }
 
-/// The diesel macro that lists the tables one query can join.
-const ALLOW: &str = "allow_tables_to_appear_in_same_query!";
+/// Give the block of `old` the table name `new` (an identifier token).
+/// `None` when the text has no block for `old`.
+fn rename_header(text: &str, old: &str, new: &str) -> Option<String> {
+    let token = ident_token(old).unwrap_or_else(|| old.to_owned());
+    let (start, end) = schema_block_range(text, &token)?;
+    let block = &text[start..end];
+    let needle = format!("{token} (");
+    let at = block.find(&needle)?;
+    Some(format!(
+        "{}{}{new}{}{}",
+        &text[..start],
+        &block[..at],
+        &block[at + token.len()..],
+        &text[end..]
+    ))
+}
+
+/// True when a line of `text` starts with `token` and then `(` or `{`: a
+/// `table!` header in any spacing.
+fn has_header(text: &str, token: &str) -> bool {
+    text.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix(token)
+            .is_some_and(|rest| rest.trim_start().starts_with(['(', '{']))
+    })
+}
 
 /// Update the `joinable!` and `allow_tables_to_appear_in_same_query!` macros
-/// for a renamed (`Some(new)`) or dropped (`None`) table `old`. A `joinable!`
-/// of a dropped table goes. An allow list with fewer than two tables goes.
+/// for a renamed (`Some(new)`) or dropped (`None`) table `old`. The function
+/// removes each `joinable!` of a dropped table. It removes an allow list that
+/// has fewer than two tables. A rewritten call loses its comments.
 fn retarget_macros(text: &str, old: &str, new: Option<&str>) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    for line in text.split_inclusive('\n') {
-        if line.contains("joinable!") && has_ident(line, old) {
-            if let Some(new) = new {
-                lines.push(replace_ident(line, old, new));
-            }
-        } else {
-            lines.push(line.to_owned());
+    let mut text = text.to_owned();
+    for (start, open, close, end) in macro_calls(&text, "joinable!").into_iter().rev() {
+        let inner = strip_comments(&text[open + 1..close]);
+        let Some((left, right)) = inner.split_once("->") else {
+            continue;
+        };
+        let (left, right) = (left.trim(), right.trim());
+        let (right_table, column) = right.split_once('(').unwrap_or((right, ""));
+        let right_table = right_table.trim();
+        if unraw(left) != old && unraw(right_table) != old {
+            continue;
         }
+        let Some(new) = new else {
+            text.replace_range(start..end, "");
+            continue;
+        };
+        let pick = |name: &str| if unraw(name) == old { new } else { name }.to_owned();
+        let call = format!(
+            "{}({} -> {} ({column})",
+            &text[start..open],
+            pick(left),
+            pick(right_table)
+        );
+        text.replace_range(start..=close, &call);
     }
-    let mut text = lines.concat();
-
-    let mut from = 0;
-    while let Some(rel) = text[from..].find(ALLOW) {
-        let at = from + rel;
-        let Some(open) = text[at..].find('(').map(|i| at + i) else {
-            break;
-        };
-        let Some(close) = text[open..].find(')').map(|i| open + i) else {
-            break;
-        };
-        let names: Vec<&str> = text[open + 1..close]
+    for (start, open, close, end) in macro_calls(&text, ALLOW).into_iter().rev() {
+        let inner = strip_comments(&text[open + 1..close]);
+        let names: Vec<&str> = inner
             .split(',')
             .map(str::trim)
             .filter(|n| !n.is_empty())
             .collect();
         if !names.iter().any(|n| unraw(n) == old) {
-            from = close;
             continue;
         }
         let kept: Vec<&str> = names
@@ -363,54 +423,87 @@ fn retarget_macros(text: &str, old: &str, new: Option<&str>) -> String {
             .filter_map(|n| if unraw(n) == old { new } else { Some(n) })
             .collect();
         if kept.len() < 2 {
-            // Remove the whole call, with its path, `;` and line end.
-            let start = text[..at]
-                .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == ':')
-                .len();
-            let mut end = close + 1;
-            if text[end..].starts_with(';') {
-                end += 1;
-            }
-            if text[end..].starts_with('\n') {
-                end += 1;
-            }
             text.replace_range(start..end, "");
-            from = start;
         } else {
-            let list = kept.join(", ");
-            text.replace_range(open + 1..close, &list);
-            from = open + 1 + list.len();
+            text.replace_range(open + 1..close, &kept.join(", "));
         }
     }
     text
 }
 
-/// True when `text` holds `name` as a whole identifier.
-fn has_ident(text: &str, name: &str) -> bool {
-    ident_positions(text, name).next().is_some()
-}
+/// The diesel macro that lists the tables one query can join.
+const ALLOW: &str = "allow_tables_to_appear_in_same_query!";
 
-/// `text` with each whole identifier `old` replaced by `new`.
-fn replace_ident(text: &str, old: &str, new: &str) -> String {
-    let mut out = String::new();
-    let mut last = 0;
-    for at in ident_positions(text, old) {
-        out.push_str(&text[last..at]);
-        out.push_str(new);
-        last = at + old.len();
+/// Each call of the macro `name` (for example `joinable!`) in `text`, not in a
+/// `//` comment: `(start, open, close, end)`. `start` includes the path,
+/// `open` and `close` are the outer parentheses, and `end` includes a `;` and
+/// a line end.
+fn macro_calls(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> {
+    let mut calls = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(name) {
+        let at = from + rel;
+        from = at + name.len();
+        let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+        if text[line_start..at].contains("//") {
+            continue;
+        }
+        let Some(open) = text[from..]
+            .find(|c: char| !c.is_whitespace())
+            .map(|i| from + i)
+            .filter(|&i| text[i..].starts_with('('))
+        else {
+            continue;
+        };
+        let Some(close) = matching_paren(text, open) else {
+            break;
+        };
+        let start = text[..at]
+            .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+            .len();
+        let mut end = close + 1;
+        if text[end..].starts_with(';') {
+            end += 1;
+        }
+        if text[end..].starts_with('\n') {
+            end += 1;
+        }
+        calls.push((start, open, close, end));
+        from = end;
     }
-    out.push_str(&text[last..]);
-    out
+    calls
 }
 
-/// The byte positions of `name` as a whole identifier in `text`.
-fn ident_positions<'a>(text: &'a str, name: &'a str) -> impl Iterator<Item = usize> + 'a {
-    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
-    text.match_indices(name).filter_map(move |(at, _)| {
-        let before = text[..at].chars().next_back();
-        let after = text[at + name.len()..].chars().next();
-        (!before.is_some_and(is_ident) && !after.is_some_and(is_ident)).then_some(at)
-    })
+/// The position of the `)` that closes the `(` at `open`. Skips `//`
+/// comments.
+fn matching_paren(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_comment = false;
+    let mut prev = '\0';
+    for (i, c) in text[open..].char_indices() {
+        if in_comment {
+            in_comment = c != '\n';
+        } else if c == '/' && prev == '/' {
+            in_comment = true;
+        } else if c == '(' {
+            depth += 1;
+        } else if c == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(open + i);
+            }
+        }
+        prev = c;
+    }
+    None
+}
+
+/// `text` without its `//` comments.
+fn strip_comments(text: &str) -> String {
+    text.lines()
+        .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -556,7 +649,7 @@ mod tests {
             &plan(vec![]),
         );
         assert_eq!(out.text, existing);
-        assert!(!out.changed(), "{out:?}");
+        assert!(out.written.is_empty(), "{out:?}");
     }
 
     #[test]
@@ -585,7 +678,7 @@ mod tests {
         t.managed = false;
         let out = sync_for_plan(stale, &parsed(vec![t]), &plan(vec![]));
         assert_eq!(out.text, stale);
-        assert!(!out.changed());
+        assert!(out.written.is_empty());
     }
 
     #[test]
@@ -705,7 +798,10 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
             "{}",
             out.text
         );
-        assert_eq!(out.removed, vec!["articles".to_owned()]);
+        assert_eq!(
+            out.renamed,
+            vec![("articles".to_owned(), "posts".to_owned())]
+        );
     }
 
     #[test]
@@ -733,7 +829,7 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
     }
 
     #[test]
-    fn stale_tables_lists_missing_and_changed_managed_blocks() {
+    fn check_tables_lists_missing_and_changed_managed_blocks() {
         let mut users = Table::new("users", Backend::Postgres);
         let mut id = Column::new("id", ColumnType::Int64);
         id.primary_key = true;
@@ -746,9 +842,12 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
             "{POSTS_BLOCK}\ndiesel::table! {{\n    users (id) {{\n        id -> Int4,\n    }}\n}}\n"
         );
         let desired = parsed(vec![posts(Backend::Postgres), users, legacy]);
-        assert_eq!(stale_tables(&existing, &desired), vec!["users".to_owned()]);
         assert_eq!(
-            stale_tables("", &desired),
+            check_tables(&existing, &desired).stale,
+            vec!["users".to_owned()]
+        );
+        assert_eq!(
+            check_tables("", &desired).stale,
             vec!["posts".to_owned(), "users".to_owned()]
         );
     }
@@ -805,7 +904,7 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
         let mut desired = parse_model_source(&model, Backend::Postgres).expect("parse");
         assert!(desired.diagnostics.is_empty(), "{:?}", desired.diagnostics);
         desired.tables[0].managed = true;
-        assert_eq!(stale_tables(&schema, &desired), Vec::<String>::new());
+        assert_eq!(check_tables(&schema, &desired).stale, Vec::<String>::new());
     }
 
     /// Each example app's `schema.rs` agrees with its models.
@@ -843,9 +942,132 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
                 }
             }
             checked += desired.tables.len();
-            let stale = stale_tables(&schema, &desired);
+            let stale = check_tables(&schema, &desired).stale;
             assert!(stale.is_empty(), "{}: {stale:?}", app.display());
         }
         assert!(checked > 0, "no example table was checked");
+    }
+
+    // -- review findings ------------------------------------------------------
+
+    /// A rename keeps the old block, with its attributes, under the new name
+    /// when the new block cannot be rendered.
+    #[test]
+    fn a_rename_keeps_the_block_when_the_new_block_cannot_render() {
+        let existing = "diesel::table! {\n    articles (id) {\n        id -> Int8,\n        #[sql_name = \"Status\"]\n        status -> Text,\n    }\n}\n\ndiesel::allow_tables_to_appear_in_same_query!(articles, users);\n";
+        let mut desired = parsed(vec![posts(Backend::Postgres)]);
+        desired.diagnostics.push(SchemaDiagnostic {
+            model: "Post".to_owned(),
+            table: "posts".to_owned(),
+            field: "status".to_owned(),
+            rust_type: "PostStatus".to_owned(),
+            message: "unsupported".to_owned(),
+        });
+        let out = sync_for_plan(
+            existing,
+            &desired,
+            &plan(vec![SchemaChange::RenameTable {
+                from: "articles".to_owned(),
+                to: "posts".to_owned(),
+            }]),
+        );
+        assert_eq!(out.text, existing.replace("articles", "posts"));
+        assert_eq!(
+            out.renamed,
+            vec![("articles".to_owned(), "posts".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_multi_line_joinable_is_removed_or_renamed_on_table_names_only() {
+        let existing = "diesel::joinable!(\n    comments -> users (user_id)\n);\ndiesel::joinable!(posts -> category (category));\n";
+        let drop = plan(vec![SchemaChange::DropTable(Table::new(
+            "comments",
+            Backend::Postgres,
+        ))]);
+        let out = sync_for_plan(existing, &parsed(vec![]), &drop);
+        assert_eq!(
+            out.text,
+            "diesel::joinable!(posts -> category (category));\n"
+        );
+
+        let rename = plan(vec![SchemaChange::RenameTable {
+            from: "category".to_owned(),
+            to: "type".to_owned(),
+        }]);
+        let out = sync_for_plan(existing, &parsed(vec![]), &rename);
+        assert!(
+            out.text
+                .contains("diesel::joinable!(posts -> r#type (category));"),
+            "{}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn an_allow_list_with_comments_drops_the_right_name() {
+        let existing = "diesel::allow_tables_to_appear_in_same_query!(\n    a, // first (old)\n    // legacy\n    b,\n    c,\n);\n";
+        let drop = |name: &str| {
+            plan(vec![SchemaChange::DropTable(Table::new(
+                name,
+                Backend::Postgres,
+            ))])
+        };
+        let out = sync_for_plan(existing, &parsed(vec![]), &drop("b"));
+        assert_eq!(
+            out.text,
+            "diesel::allow_tables_to_appear_in_same_query!(a, c);\n"
+        );
+        let out = sync_for_plan(existing, &parsed(vec![]), &drop("c"));
+        assert_eq!(
+            out.text,
+            "diesel::allow_tables_to_appear_in_same_query!(a, b);\n"
+        );
+    }
+
+    /// A block that the scanner cannot read is not appended a second time.
+    #[test]
+    fn an_unreadable_block_is_skipped_not_duplicated() {
+        for existing in [
+            "diesel::table! {\n    posts {\n        id -> Int8,\n    }\n}\n",
+            "diesel::table! {\n    posts(id) {\n        id -> Int8,\n    }\n}\n",
+        ] {
+            let out = sync_for_plan(
+                existing,
+                &parsed(vec![posts(Backend::Postgres)]),
+                &plan(vec![]),
+            );
+            assert_eq!(out.text, existing);
+            assert_eq!(out.skipped.len(), 1, "{out:?}");
+        }
+    }
+
+    #[test]
+    fn a_table_macro_in_a_comment_is_not_a_block() {
+        let head = "// see the diesel::table! docs\nuse x;\n\n";
+        let stale = "diesel::table! {\n    posts (id) {\n        id -> Int8,\n    }\n}\n";
+        let out = sync_for_plan(
+            &format!("{head}{stale}"),
+            &parsed(vec![posts(Backend::Postgres)]),
+            &plan(vec![]),
+        );
+        assert_eq!(out.text, format!("{head}{POSTS_BLOCK}"));
+    }
+
+    /// A skipped table is unchecked, not stale.
+    #[test]
+    fn skipped_tables_are_reported_as_unchecked() {
+        let mut desired = parsed(vec![posts(Backend::Postgres)]);
+        desired.diagnostics.push(SchemaDiagnostic {
+            model: "Post".to_owned(),
+            table: "posts".to_owned(),
+            field: "status".to_owned(),
+            rust_type: "PostStatus".to_owned(),
+            message: "unsupported".to_owned(),
+        });
+        let check = check_tables("", &desired);
+        assert!(check.stale.is_empty());
+        assert_eq!(check.unchecked.len(), 1);
+        assert_eq!(check.unchecked[0].0, "posts");
     }
 }
