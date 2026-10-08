@@ -1280,6 +1280,7 @@ async fn execute_job(
         return;
     }
     state.job_registry.record_start(&row.name);
+    job_admin.note_local_claim(&row.id, attempt);
 
     let job_info_snapshot = jobs_by_name
         .read()

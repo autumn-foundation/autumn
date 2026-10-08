@@ -1131,13 +1131,17 @@ impl Drop for LeaseHeartbeat {
     }
 }
 
-/// Record that a durable worker starts `attempt`, and note the claim. When it
-/// replaces an earlier attempt this process started, balance that attempt's
-/// start here: recovery and the old worker's lease loss then find no note and
-/// count nothing (see `record_lease_lost`).
+/// Record that a durable worker starts `attempt`. When it replaces an earlier
+/// attempt this process started, balance that attempt's start here: recovery
+/// and the old worker's lease loss then find no note and count nothing (see
+/// `record_lease_lost`).
 ///
-/// The note, not the admin record, tells which starts are this process's: a
-/// job another replica enqueued has no admin record here.
+/// The caller notes the claim (`note_local_claim`) after its registry
+/// `record_start`. Recovery must not take a note before the gauge counts the
+/// start.
+///
+/// Use the note, not the admin record, to find the starts of this process. A
+/// job that another replica enqueued has no admin record here.
 #[cfg(any(feature = "db", feature = "redis"))]
 fn record_attempt_start(
     name: &str,
@@ -1155,7 +1159,6 @@ fn record_attempt_start(
                 attempt.saturating_sub(1),
             );
         }
-        job_admin.note_local_claim(id, attempt);
     }
     decision
 }
@@ -1181,9 +1184,9 @@ fn record_recovered_requeue(
     }
 }
 
-/// Record a claim that stale recovery dead-lettered at `attempt`. It counts
-/// the failure. It balances `in_flight` only when this process started that
-/// attempt: the claim may belong to another replica's worker.
+/// Record a claim that stale recovery dead-lettered at `attempt`. Count the
+/// failure. Balance `in_flight` only if this process started that attempt.
+/// Another replica's worker can own the claim.
 #[cfg(any(feature = "db", feature = "redis"))]
 fn record_recovered_failure(
     name: &str,
@@ -1223,8 +1226,9 @@ fn settle_redis_record(
 }
 
 /// A Redis ack for attempt `attempt` of job `id` returned. Drop the note of
-/// the claim. When the ack applied to nothing, the claim changed hands: balance
-/// the start, unless recovery in this process did already.
+/// the claim. If the ack applied to nothing, another worker or recovery took
+/// the claim. Then balance the start, unless recovery in this process already
+/// did.
 #[cfg(feature = "redis")]
 fn settle_redis_claim(
     state: &AppState,
@@ -1782,8 +1786,8 @@ impl JobAdminMemoryBackend {
     }
 
     /// Drop the note for `attempt` of job `id`. Returns `true` when this
-    /// process started it and had not balanced it yet: the caller then owns
-    /// the `in_flight` balance.
+    /// process started it and had not balanced it yet: the caller must balance
+    /// `in_flight`.
     #[cfg(any(feature = "db", feature = "redis"))]
     fn take_local_claim(&self, id: &str, attempt: u32) -> bool {
         let Ok(mut inner) = self.inner.write() else {
@@ -9718,6 +9722,7 @@ async fn process_redis_job_record(
         return;
     }
     state.job_registry.record_start(&record.name);
+    job_admin.note_local_claim(&record.id, record.attempt);
 
     let maybe_info = {
         let guard = jobs_by_name
@@ -10133,8 +10138,8 @@ fn record_pg_lifecycle_after_ack(
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
 ) -> bool {
-    // Either way the worker is done with this claim. The note says whether
-    // anything else balanced its start already.
+    // The worker is done with this claim. The note shows if something else
+    // already balanced its start.
     let started_here = job_admin.take_local_claim(job_id, attempt);
     if !ack_applied {
         // The claim was evicted by stale-claim recovery before this ack ran.
@@ -11732,6 +11737,7 @@ async fn pg_execute_job(
         return;
     }
     state.job_registry.record_pg_start(&row.name, &row.id);
+    job_admin.note_local_claim(&row.id, attempt);
 
     let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
     let job_info_snapshot = jobs_by_name
@@ -25701,6 +25707,7 @@ mod lease_tests {
             JobAdminStartDecision::Started
         );
         state.job_registry.record_start("leased"); // attempt 2
+        admin.note_local_claim(&id, 2);
         record_lease_lost("leased", &id, 2, &state, &admin);
         assert_eq!(in_flight(&state), 0, "the replacement's start is balanced");
     }
@@ -25719,6 +25726,7 @@ mod lease_tests {
         let decision = record_attempt_start("leased", &id, 2, &state, &admin);
         assert_eq!(decision, JobAdminStartDecision::Superseded);
         state.job_registry.record_start("leased"); // attempt 2
+        admin.note_local_claim(&id, 2);
         let record = admin.snapshot_record_for_test(&id).expect("record");
         assert_eq!(record.status, JobAdminStatus::Running);
         assert_eq!(record.attempt, 2);
@@ -25754,6 +25762,7 @@ mod lease_tests {
         let decision = record_attempt_start("leased", &id, 2, &state, &admin);
         assert_eq!(decision, JobAdminStartDecision::Started);
         state.job_registry.record_start("leased"); // attempt 2
+        admin.note_local_claim(&id, 2);
         record_lease_lost("leased", &id, 2, &state, &admin);
         assert_eq!(in_flight(&state), 0, "the replacement's start is balanced");
     }
@@ -25790,6 +25799,7 @@ mod lease_tests {
         // leaves it alone.
         state.job_registry.record_start("leased");
         record_attempt_start("leased", &id, 2, &state, &admin);
+        admin.note_local_claim(&id, 2);
         record_pg_lifecycle_ack_result(
             Ok(false),
             "leased",
@@ -25853,6 +25863,7 @@ mod lease_tests {
         let decision = record_attempt_start("leased", &id, 2, &state, &admin);
         assert_eq!(decision, JobAdminStartDecision::Superseded);
         state.job_registry.record_start("leased"); // attempt 2
+        admin.note_local_claim(&id, 2);
         assert_eq!(in_flight(&state), 1);
         let queued_before = queued(&state);
 
@@ -25956,6 +25967,7 @@ mod lease_tests {
     ) {
         record_attempt_start("leased", id, attempt, state, admin);
         state.job_registry.record_start("leased");
+        admin.note_local_claim(id, attempt);
     }
 
     #[cfg(any(feature = "db", feature = "redis"))]
@@ -26176,22 +26188,6 @@ mod lease_tests {
         assert_eq!(in_flight(&state), 1);
     }
 
-    /// A canceled start never ran, so it leaves no note.
-    #[cfg(any(feature = "db", feature = "redis"))]
-    #[test]
-    fn a_canceled_start_leaves_no_note() {
-        let state = AppState::for_test();
-        state.job_registry.register("leased");
-        let (admin, id) = admin_with_running_job(1);
-        assert!(admin.take_local_claim(&id, 1));
-        admin.record_cancelled(&id);
-
-        let decision = record_attempt_start("leased", &id, 2, &state, &admin);
-
-        assert_eq!(decision, JobAdminStartDecision::Canceled);
-        assert!(!admin.take_local_claim(&id, 2));
-    }
-
     /// A Redis ack that applied to nothing balances the start once, whether
     /// recovery ran here or elsewhere.
     #[cfg(feature = "redis")]
@@ -26202,7 +26198,7 @@ mod lease_tests {
         state.job_registry.record_start("leased"); // another run, same type
         let admin = JobAdminMemoryBackend::new_for_test(16);
         start_elsewhere_enqueued(&state, &admin, "elsewhere", 1);
-        // Recovery elsewhere: the ack applies to nothing, twice over.
+        // Recovery elsewhere: both acks apply to nothing.
         settle_redis_claim(&state, &admin, "leased", "elsewhere", 1, false);
         settle_redis_claim(&state, &admin, "leased", "elsewhere", 1, false);
         assert_eq!(in_flight(&state), 1, "only the other run remains");

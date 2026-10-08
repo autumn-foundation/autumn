@@ -1765,7 +1765,8 @@ impl JobRegistry {
     }
 
     /// Record a terminal failure of a run this process did not start.
-    /// Counts the failure, but leaves `in_flight` alone.
+    /// Count the failure. Leave `in_flight` alone.
+    #[cfg(any(feature = "db", feature = "redis"))]
     pub(crate) fn record_failure_not_started(
         &self,
         name: &str,
