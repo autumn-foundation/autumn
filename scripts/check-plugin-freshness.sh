@@ -91,7 +91,7 @@ unreleased_added_changed() {
     in_unreleased && in_wanted {
       if ($0 ~ /^[-*][[:space:]]/) { flush(); bullet = $0 }
       else if (NF && bullet != "" && $0 ~ /^[[:space:]]/) { bullet = bullet " " $0 }
-      else if (NF) { flush(); print }
+      else if (NF) { flush(); if ($0 !~ /^Nothing yet\.?$/) print }
     }
     END { flush() }
   '

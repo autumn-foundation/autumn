@@ -1644,18 +1644,35 @@ fn autumn_web_feature_still_needed_elsewhere(
 
 /// Whether the manifest turns off default features for `autumn-web`.
 ///
-/// Reads an inline entry, or the lines under a `[dependencies.autumn-web]`
-/// style table. Another dependency's setting does not count.
+/// Reads an inline entry (also over many lines), or the lines under a
+/// `[dependencies.autumn-web]` style table. Another dependency's setting does
+/// not count.
 fn base_disables_defaults(manifest: &str) -> bool {
     let is_off = |line: &str| line.replace(' ', "").contains("default-features=false");
     let names_web = |text: &str| text.contains("autumn-web") || text.contains("autumn_web");
+    let depth = |text: &str| {
+        i32::try_from(text.matches('{').count()).unwrap_or(0)
+            - i32::try_from(text.matches('}').count()).unwrap_or(0)
+    };
     let mut in_web_table = false;
+    // Brace depth left open by an `autumn-web = {` entry.
+    let mut open_entry = 0;
     for line in manifest.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with('[') {
+        if open_entry > 0 {
+            if is_off(trimmed) {
+                return true;
+            }
+            open_entry += depth(trimmed);
+        } else if trimmed.starts_with('[') {
             in_web_table = names_web(trimmed);
-        } else if (in_web_table || names_web(trimmed)) && is_off(trimmed) {
-            return true;
+        } else if in_web_table || names_web(trimmed) {
+            if is_off(trimmed) {
+                return true;
+            }
+            if !in_web_table {
+                open_entry = depth(trimmed).max(0);
+            }
         }
     }
     false
@@ -1668,9 +1685,20 @@ fn markers_in_project(
     excluding: &[PathBuf],
     overrides: &HashMap<PathBuf, String>,
 ) -> bool {
-    ["src", "tests", "benches", "examples"]
-        .iter()
-        .any(|dir| rs_tree_contains_marker(&project_root.join(dir), markers, excluding, overrides))
+    // Targets whose `path` sits outside the four conventional trees count too.
+    let named = crate::plugin::install::explicit_target_sources(project_root);
+    let in_named = named.iter().any(|path| {
+        let content = overrides.get(path).cloned().or_else(|| {
+            (!excluding.contains(path))
+                .then(|| fs::read_to_string(path).ok())
+                .flatten()
+        });
+        content.is_some_and(|text| markers.iter().any(|m| text.contains(m.as_str())))
+    });
+    in_named
+        || ["src", "tests", "benches", "examples"].iter().any(|dir| {
+            rs_tree_contains_marker(&project_root.join(dir), markers, excluding, overrides)
+        })
 }
 
 /// Markers that show `feature` is in use, for a regenerate run.

@@ -27428,6 +27428,43 @@ exempt_paths = [
         }
 
         #[test]
+        fn keeps_htmx_for_a_multiline_autumn_web_entry_without_defaults() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = {\n    version = \"0.7.0\",\n    \
+                 default-features = false,\n    features = [\"maud\", \"csv\", \"htmx\"],\n}\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            assert!(cargo.contains("htmx"), "{cargo}");
+        }
+
+        #[test]
+        fn keeps_a_feature_a_pathed_cargo_target_uses() {
+            let tmp = project();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                format!("{cargo}\n[[bin]]\nname = \"srv\"\npath = \"cmd/server.rs\"\n"),
+            )
+            .unwrap();
+            fs::create_dir_all(tmp.path().join("cmd")).unwrap();
+            fs::write(
+                tmp.path().join("cmd/server.rs"),
+                "use autumn_web::storage::Blob;\nfn main() {}\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            assert!(cargo.contains("storage"), "{cargo}");
+        }
+
+        #[test]
         fn a_first_run_keeps_a_hand_added_feature() {
             let tmp = project();
             fs::write(
