@@ -2308,9 +2308,7 @@ impl RequestBuilder {
         // review, round 10).
         let is_half_open = breaker.state() == crate::circuit_breaker::CircuitState::HalfOpen;
         let res = self.send_custom(is_half_open).await;
-        if let Some(ticket) = ticket {
-            ticket.record(matches!(&res, Ok(r) if throttle_accepts(r.status.as_u16())));
-        }
+        record_call(ticket, &res);
         match &res {
             Ok(resp) if resp.status().as_u16() < 500 => guard.success(),
             // The caller ran out of time, not the upstream (issue #3058): a
@@ -2463,8 +2461,7 @@ impl RequestBuilder {
     ) -> Result<Response, ClientError> {
         // The hops and their retries run inside `send_one`, so the throttle
         // (issue #3068) counts the call once, as on the breaker-scoped custom
-        // path. A call that the caller's deadline stopped says nothing about
-        // the host: its ticket is dropped, which counts as an accept.
+        // path.
         let ticket = self.throttle_attempt(None)?;
         let client = self.client.clone();
         let res = self
@@ -2476,11 +2473,7 @@ impl RequestBuilder {
                 gate,
             )
             .await;
-        if let Some(ticket) = ticket
-            && !matches!(res, Err(ClientError::DeadlineExceeded))
-        {
-            ticket.record(matches!(&res, Ok(r) if throttle_accepts(r.status.as_u16())));
-        }
+        record_call(ticket, &res);
         res
     }
 
@@ -3683,6 +3676,17 @@ impl Drop for ThrottleTicket {
             self.throttle
                 .record(&self.host, crate::time::ambient_instant(), true);
         }
+    }
+}
+
+/// Count a whole call that took one throttle `ticket`. A call that the
+/// caller's deadline stopped says nothing about the host (issue #3058): its
+/// ticket is dropped, which counts as an accept.
+fn record_call(ticket: Option<ThrottleTicket>, res: &Result<Response, ClientError>) {
+    if let Some(ticket) = ticket
+        && !matches!(res, Err(ClientError::DeadlineExceeded))
+    {
+        ticket.record(matches!(res, Ok(r) if throttle_accepts(r.status.as_u16())));
     }
 }
 
@@ -7332,6 +7336,42 @@ mod tests {
                 "no retry ran, so none is paid for: {}",
                 budget.available()
             );
+        }
+
+        #[tokio::test]
+        #[allow(clippy::await_holding_lock)]
+        async fn a_deadline_stop_on_the_custom_path_is_not_a_throttle_reject() {
+            let _lock = crate::circuit_breaker::TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::circuit_breaker::global_registry().clear();
+            let (url, _hits) = counting(None, &[]).await;
+            let throttle = Arc::new(crate::admission::AdaptiveThrottle::new(
+                2.0,
+                Duration::from_secs(120),
+            ));
+            let client = Client {
+                resilience_config: Some(Arc::new(crate::config::ResilienceConfig::default())),
+                throttle: Some(Arc::clone(&throttle)),
+                ..Client::new()
+            };
+            for _ in 0..10 {
+                let result = with_deadline(
+                    Duration::from_millis(30),
+                    client.get(&url).no_redirect().breaker_scoped().send(),
+                )
+                .await;
+                assert!(
+                    matches!(result, Err(ClientError::DeadlineExceeded)),
+                    "{result:?}"
+                );
+            }
+            let host = throttle_host(&url).unwrap();
+            assert!(
+                throttle.reject_probability(&host, crate::time::ambient_instant()) < f64::EPSILON,
+                "the caller's deadline is not the host's reject"
+            );
+            crate::circuit_breaker::global_registry().clear();
         }
 
         #[tokio::test]
