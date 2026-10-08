@@ -667,15 +667,16 @@ impl Plan {
         }
         let pending = pending_contents(self);
         for r in released {
-            let needed = match release_markers(&r.feature) {
-                // Keep the feature if marked code uses it.
-                Some(markers) => markers_in_project(&markers, &self.project_root, &[], &pending),
-                // No marker. Keep the feature unless the owner directory
-                // holds no file except `own_file`. Keep it without an owner directory.
-                None => r.owner.as_ref().is_none_or(|(dir, own)| {
-                    resource_dir_has_other_files(dir, std::slice::from_ref(own))
-                }),
-            };
+            // Marked code or a file next to this one: either keeps the feature.
+            // With neither a marker nor an owner, keep it.
+            let markers = release_markers(&r.feature);
+            let by_marker = markers
+                .as_deref()
+                .is_some_and(|m| markers_in_project(m, &self.project_root, &[], &pending));
+            let by_sibling = r.owner.as_ref().is_some_and(|(dir, own)| {
+                resource_dir_has_other_files(dir, std::slice::from_ref(own))
+            });
+            let needed = by_marker || by_sibling || (markers.is_none() && r.owner.is_none());
             if needed {
                 continue;
             }
@@ -1604,14 +1605,14 @@ fn autumn_web_feature_still_needed_elsewhere(
     markers_in_project(&markers, project_root, excluding, overrides)
 }
 
-/// Whether any of `markers` appears in `src/`, `tests/` or `benches/`.
+/// Whether any of `markers` appears in `src/`, `tests/`, `benches/` or `examples/`.
 fn markers_in_project(
     markers: &[String],
     project_root: &Path,
     excluding: &[PathBuf],
     overrides: &HashMap<PathBuf, String>,
 ) -> bool {
-    ["src", "tests", "benches"]
+    ["src", "tests", "benches", "examples"]
         .iter()
         .any(|dir| rs_tree_contains_marker(&project_root.join(dir), markers, excluding, overrides))
 }

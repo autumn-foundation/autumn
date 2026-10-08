@@ -2747,24 +2747,24 @@ fn plan_scaffold_with_options_impl(
         }
     }
 
-    let own_model_path = project_root
-        .join("src")
-        .join("models")
-        .join(format!("{snake_name}.rs"));
     // Issue #2328: when a run drops a flag, the scaffold no longer emits that code.
     // Remove the feature that the code needed. `destroy` uses its own reverts.
     // Keep `i18n` and `maud`. `.i18n_auto()` and the shared layout use them.
-    // Only a regenerate releases. A first run must not remove a hand-added feature.
-    if !for_revert && own_model_path.exists() {
+    // Only a regenerate releases. It needs a record that a scaffold wrote the
+    // routes file. A first run, or a hand-made model, keeps every feature.
+    let released_routes_dir = project_root.join("src").join("routes");
+    let released_own_routes = released_routes_dir.join(format!("{plural}.rs"));
+    if !for_revert
+        && super::provenance::Provenance::load(project_root)
+            .is_recorded(project_root, &released_own_routes)
+    {
         let cargo_path = project_root.join("Cargo.toml");
-        let routes_dir = project_root.join("src").join("routes");
-        let own_routes = routes_dir.join(format!("{plural}.rs"));
         let attachments = has_attachment_fields(&fields);
         let htmx_needed = (search_enabled && !options_with_key.api)
             || options_with_key.live
             || options_with_key.live_validation;
         // Only `htmx` has no source marker, so only it names an owner.
-        let htmx_owner = Some((routes_dir, own_routes));
+        let htmx_owner = Some((released_routes_dir, released_own_routes));
         let released = [
             ("csv", !export_enabled, None),
             ("multipart", !import_enabled && !attachments, None),
@@ -27255,6 +27255,63 @@ exempt_paths = [
             run(&tmp, "Post", POST, &ScaffoldOptions::default());
             assert!(
                 !autumn_web_line(&tmp).contains("\"ws\""),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn a_hand_made_model_is_not_a_scaffold_to_regenerate() {
+            let tmp = project();
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                CARGO.replace(
+                    "autumn-web = \"0.7.0\"",
+                    "autumn-web = { version = \"0.7.0\", features = [\"htmx\"] }",
+                ),
+            )
+            .unwrap();
+            fs::create_dir_all(tmp.path().join("src/models")).unwrap();
+            fs::write(tmp.path().join("src/models/post.rs"), "// by hand\n").unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("htmx"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_a_feature_an_example_uses() {
+            let tmp = project();
+            fs::create_dir_all(tmp.path().join("examples")).unwrap();
+            fs::write(
+                tmp.path().join("examples/demo.rs"),
+                "use autumn_web::storage::Blob;\nfn main() {}\n",
+            )
+            .unwrap();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("storage"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_htmx_for_a_sibling_route_that_names_no_marker() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            fs::write(
+                tmp.path().join("src/routes/hand.rs"),
+                "pub fn a() { let _ = autumn_web::htmx::OobSwap::default(); }\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("htmx"),
                 "{}",
                 autumn_web_line(&tmp)
             );

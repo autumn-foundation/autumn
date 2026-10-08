@@ -60,7 +60,9 @@ fail() {
 # Extract the bullets that land inside the `## [Unreleased]` section's
 # `### Added` / `### Changed` subsections, given file content on stdin.
 # Each multi-line bullet is joined into one whitespace-normalized logical
-# line. The caller takes the set difference between base and HEAD, so pure
+# line. Only indented lines continue a bullet. A flush-left line, such as the
+# `Nothing yet.` placeholder, ends it. Otherwise a new `###` heading after the
+# last bullet would reword that bullet and flag it as new. The caller takes the set difference between base and HEAD, so pure
 # moves AND pure rewraps of existing bullets don't count as additions —
 # only genuinely new (or reworded) bullets do. Heading matches are tolerant
 # of trailing whitespace and CRLF line endings so stray whitespace can't
@@ -88,8 +90,8 @@ unreleased_added_changed() {
     }
     in_unreleased && in_wanted {
       if ($0 ~ /^[-*][[:space:]]/) { flush(); bullet = $0 }
-      else if (NF && bullet != "") { bullet = bullet " " $0 }
-      else if (NF) { print }
+      else if (NF && bullet != "" && $0 ~ /^[[:space:]]/) { bullet = bullet " " $0 }
+      else if (NF) { flush(); print }
     }
     END { flush() }
   '
