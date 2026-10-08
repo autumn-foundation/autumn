@@ -4,9 +4,11 @@
 //! dependencies. It is refused in `prod` unless `allow_in_production = true`.
 //! A burn-rate stop condition disables it. Each toggle writes an audit event.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use autumn_web::audit::{AuditEvent, AuditLogger, AuditSink, AuditWriteFuture};
+use autumn_web::audit::{AuditError, AuditEvent, AuditLogger, AuditSink};
 use autumn_web::config::AutumnConfig;
 use autumn_web::fault_injection::{
     FaultInjection, FaultInjectionConfig, FaultKind, FaultRule, FaultTarget,
@@ -42,7 +44,10 @@ async fn call() -> String {
 struct Captured(Arc<Mutex<Vec<AuditEvent>>>);
 
 impl AuditSink for Captured {
-    fn write(&self, event: AuditEvent) -> AuditWriteFuture<'_> {
+    fn write(
+        &self,
+        event: AuditEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AuditError>> + Send + '_>> {
         self.0.lock().unwrap().push(event);
         Box::pin(async { Ok(()) })
     }
