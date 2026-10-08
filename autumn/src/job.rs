@@ -1131,10 +1131,13 @@ impl Drop for LeaseHeartbeat {
     }
 }
 
-/// Record that a durable worker starts `attempt`. When it replaces an
-/// earlier attempt this process still showed as running, balance that
-/// attempt's start here: recovery and the old worker's lease loss then see a
-/// newer attempt and count nothing (see `record_lease_lost`).
+/// Record that a durable worker starts `attempt`, and note the claim. When it
+/// replaces an earlier attempt this process started, balance that attempt's
+/// start here: recovery and the old worker's lease loss then find no note and
+/// count nothing (see `record_lease_lost`).
+///
+/// The note, not the admin record, tells which starts are this process's: a
+/// job another replica enqueued has no admin record here.
 #[cfg(any(feature = "db", feature = "redis"))]
 fn record_attempt_start(
     name: &str,
@@ -1144,18 +1147,21 @@ fn record_attempt_start(
     job_admin: &JobAdminMemoryBackend,
 ) -> JobAdminStartDecision {
     let decision = job_admin.try_record_start(id, attempt);
-    if decision == JobAdminStartDecision::Superseded {
-        state.job_registry.record_retry(
-            name,
-            "visibility timeout expired",
-            attempt.saturating_sub(1),
-        );
+    if decision != JobAdminStartDecision::Canceled {
+        for _ in 0..job_admin.take_older_local_claims(id, attempt) {
+            state.job_registry.record_retry(
+                name,
+                "visibility timeout expired",
+                attempt.saturating_sub(1),
+            );
+        }
+        job_admin.note_local_claim(id, attempt);
     }
     decision
 }
 
 /// Record a row that Postgres or `SQLite` stale recovery requeued at
-/// `new_attempt`. When this process was running the previous attempt, this
+/// `new_attempt`. When this process started the previous attempt, this
 /// balances its start, so a later lease loss of either attempt is counted
 /// once (see `record_lease_lost`).
 #[cfg(feature = "db")]
@@ -1167,10 +1173,69 @@ fn record_recovered_requeue(
     job_admin: &JobAdminMemoryBackend,
 ) {
     const ERROR: &str = "visibility timeout expired";
-    if job_admin.settle_recovered_requeue(id, new_attempt, ERROR) {
+    let previous = new_attempt.saturating_sub(1);
+    let started_here = job_admin.take_local_claim(id, previous);
+    job_admin.settle_recovered_requeue(id, new_attempt, ERROR);
+    if started_here {
+        state.job_registry.record_retry(name, ERROR, previous);
+    }
+}
+
+/// Record a claim that stale recovery dead-lettered at `attempt`. It counts
+/// the failure. It balances `in_flight` only when this process started that
+/// attempt: the claim may belong to another replica's worker.
+#[cfg(any(feature = "db", feature = "redis"))]
+fn record_recovered_failure(
+    name: &str,
+    id: &str,
+    attempt: u32,
+    error: &str,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+) {
+    if job_admin.take_local_claim(id, attempt) {
         state
             .job_registry
-            .record_retry(name, ERROR, new_attempt.saturating_sub(1));
+            .record_failure(name, error.to_owned(), true);
+    } else {
+        state
+            .job_registry
+            .record_failure_not_started(name, error.to_owned(), true);
+    }
+}
+
+/// [`settle_redis_claim`] for the claim `record` holds.
+#[cfg(feature = "redis")]
+fn settle_redis_record(
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+    record: &RedisJobRecord,
+    applied: bool,
+) {
+    settle_redis_claim(
+        state,
+        job_admin,
+        &record.name,
+        &record.id,
+        record.attempt,
+        applied,
+    );
+}
+
+/// A Redis ack for attempt `attempt` of job `id` returned. Drop the note of
+/// the claim. When the ack applied to nothing, the claim changed hands: balance
+/// the start, unless recovery in this process did already.
+#[cfg(feature = "redis")]
+fn settle_redis_claim(
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+    name: &str,
+    id: &str,
+    attempt: u32,
+    applied: bool,
+) {
+    if job_admin.take_local_claim(id, attempt) && !applied {
+        state.job_registry.record_retry(name, LEASE_LOST_ERROR, 0);
     }
 }
 
@@ -1187,11 +1252,11 @@ fn record_redis_recovered_requeue(
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
 ) {
+    let previous = new_attempt.saturating_sub(1);
+    let started_here = job_admin.take_local_claim(id, previous);
     let settled = job_admin.settle_redis_recovered_requeue(id, new_attempt, error, immediate);
-    if settled == RedisRecoveredRequeue::BalancePrevious {
-        state
-            .job_registry
-            .record_retry(name, error, new_attempt.saturating_sub(1));
+    if started_here {
+        state.job_registry.record_retry(name, error, previous);
     }
     // A replacement that started here already took the job off the queue.
     if immediate && settled != RedisRecoveredRequeue::ReplacementStarted {
@@ -1204,10 +1269,7 @@ fn record_redis_recovered_requeue(
 #[cfg(feature = "redis")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RedisRecoveredRequeue {
-    /// The record showed the previous attempt running: this process started
-    /// it, so the caller balances the registry.
-    BalancePrevious,
-    /// The record was moved on, or this process has none. Nothing to balance.
+    /// The record was moved to the new attempt, or this process has none.
     Requeued,
     /// The record already shows the new attempt or a later one: the
     /// replacement started here and was left alone.
@@ -1218,8 +1280,8 @@ enum RedisRecoveredRequeue {
 /// not settled: the worker that holds the claim now owns that.
 ///
 /// Stale recovery in this process can have recorded the job already, and a
-/// replacement attempt can be running. So this records only while this
-/// process's admin record still shows `attempt` as running.
+/// replacement attempt can be running. So this balances the start only while
+/// this process still holds the note of `attempt`.
 #[cfg(any(feature = "db", feature = "redis"))]
 fn record_lease_lost(
     name: &str,
@@ -1229,7 +1291,9 @@ fn record_lease_lost(
     job_admin: &JobAdminMemoryBackend,
 ) {
     tracing::warn!(job = %name, job_id = %id, "{LEASE_LOST_ERROR}; handler stopped");
-    if job_admin.settle_lease_lost(id, attempt, LEASE_LOST_ERROR) {
+    let started_here = job_admin.take_local_claim(id, attempt);
+    job_admin.settle_lease_lost(id, attempt, LEASE_LOST_ERROR);
+    if started_here {
         // Balances this worker's `record_start`.
         state.job_registry.record_retry(name, LEASE_LOST_ERROR, 0);
     }
@@ -1545,6 +1609,12 @@ struct JobAdminMemoryInner {
     /// fired so the spawned timer task exits immediately and releases the unique
     /// lock rather than holding it until the original due time fires.
     delay_cancelers: HashMap<String, tokio_util::sync::CancellationToken>,
+    /// Attempts of each job this process started and has not yet balanced in
+    /// the `in_flight` gauge. Unlike `records`, it covers jobs another
+    /// replica enqueued. Each attempt is balanced once: by the worker's
+    /// settle, by recovery, or by a newer attempt.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    local_claims: HashMap<String, Vec<u32>>,
 }
 
 /// Bounded process-local job dashboard backend used by the built-in runtime.
@@ -1573,6 +1643,8 @@ impl JobAdminMemoryBackend {
                 order: VecDeque::new(),
                 history_limit: history_limit.max(1),
                 delay_cancelers: HashMap::new(),
+                #[cfg(any(feature = "db", feature = "redis"))]
+                local_claims: HashMap::new(),
             })),
             clock: Arc::new(crate::time::SystemClock),
         }
@@ -1697,6 +1769,58 @@ impl JobAdminMemoryBackend {
         }
     }
 
+    /// Note that this process started `attempt` of job `id`.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    fn note_local_claim(&self, id: &str, attempt: u32) {
+        if let Ok(mut inner) = self.inner.write() {
+            inner
+                .local_claims
+                .entry(id.to_owned())
+                .or_default()
+                .push(attempt);
+        }
+    }
+
+    /// Drop the note for `attempt` of job `id`. Returns `true` when this
+    /// process started it and had not balanced it yet: the caller then owns
+    /// the `in_flight` balance.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    fn take_local_claim(&self, id: &str, attempt: u32) -> bool {
+        let Ok(mut inner) = self.inner.write() else {
+            return false;
+        };
+        let Some(attempts) = inner.local_claims.get_mut(id) else {
+            return false;
+        };
+        let Some(index) = attempts.iter().position(|noted| *noted == attempt) else {
+            return false;
+        };
+        attempts.swap_remove(index);
+        if attempts.is_empty() {
+            inner.local_claims.remove(id);
+        }
+        true
+    }
+
+    /// Drop the notes for attempts of job `id` older than `attempt`. Returns
+    /// how many there were.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    fn take_older_local_claims(&self, id: &str, attempt: u32) -> usize {
+        let Ok(mut inner) = self.inner.write() else {
+            return 0;
+        };
+        let Some(attempts) = inner.local_claims.get_mut(id) else {
+            return 0;
+        };
+        let before = attempts.len();
+        attempts.retain(|noted| *noted >= attempt);
+        let taken = before.saturating_sub(attempts.len());
+        if attempts.is_empty() {
+            inner.local_claims.remove(id);
+        }
+        taken
+    }
+
     /// `true` when an operator canceled the job `id`.
     fn is_canceled(&self, id: &str) -> bool {
         self.inner.read().is_ok_and(|inner| {
@@ -1736,17 +1860,17 @@ impl JobAdminMemoryBackend {
 
     /// Move a running record to `Retrying` after its worker lost the claim.
     ///
-    /// Returns `true` when the caller must also balance the registry: the
-    /// record showed `attempt` as running, or this process has no record.
-    /// Returns `false` when stale recovery or a later attempt already moved
-    /// the record on.
+    /// Returns `true` when the record showed `attempt` as running and moved.
+    /// Returns `false` when this process has no record, or stale recovery or
+    /// a later attempt already moved it on. The `in_flight` balance does not
+    /// depend on this: see `take_local_claim`.
     #[cfg(any(feature = "db", feature = "redis"))]
     fn settle_lease_lost(&self, id: &str, attempt: u32, error: &str) -> bool {
         let Ok(mut inner) = self.inner.write() else {
             return false;
         };
         let Some(record) = inner.records.get_mut(id) else {
-            return true;
+            return false;
         };
         if record.status != JobAdminStatus::Running || record.attempt != attempt {
             return false;
@@ -1760,21 +1884,19 @@ impl JobAdminMemoryBackend {
     /// Move a record that stale recovery requeued to `Enqueued` at
     /// `new_attempt`, so the replacement attempt can start.
     ///
-    /// Returns `true` when the record showed the previous attempt as running:
-    /// this process started it, so the caller balances the registry. A
-    /// missing record, or one already moved on, returns `false`.
+    /// A missing record, or one already moved on, stays as it is.
     #[cfg(feature = "db")]
-    fn settle_recovered_requeue(&self, id: &str, new_attempt: u32, error: &str) -> bool {
+    fn settle_recovered_requeue(&self, id: &str, new_attempt: u32, error: &str) {
         let Ok(mut inner) = self.inner.write() else {
-            return false;
+            return;
         };
         let Some(record) = inner.records.get_mut(id) else {
-            return false;
+            return;
         };
         if record.status != JobAdminStatus::Running
             || record.attempt.saturating_add(1) != new_attempt
         {
-            return false;
+            return;
         }
         record.status = JobAdminStatus::Enqueued;
         record.enqueued_at = Some(self.clock.now());
@@ -1782,7 +1904,6 @@ impl JobAdminMemoryBackend {
         record.finished_at = None;
         record.attempt = new_attempt;
         record.last_error = Some(error.to_owned());
-        true
     }
 
     /// Move a record that Redis stale recovery requeued at `new_attempt` to
@@ -1808,13 +1929,6 @@ impl JobAdminMemoryBackend {
         if record.attempt >= new_attempt {
             return RedisRecoveredRequeue::ReplacementStarted;
         }
-        let settled = if record.status == JobAdminStatus::Running
-            && record.attempt.saturating_add(1) == new_attempt
-        {
-            RedisRecoveredRequeue::BalancePrevious
-        } else {
-            RedisRecoveredRequeue::Requeued
-        };
         let now = self.clock.now();
         record.last_error = Some(error.to_owned());
         if immediate {
@@ -1828,7 +1942,7 @@ impl JobAdminMemoryBackend {
             record.status = JobAdminStatus::Retrying;
             record.finished_at = Some(now);
         }
-        settled
+        RedisRecoveredRequeue::Requeued
     }
 
     fn record_failure(&self, id: &str, error: String) {
@@ -2085,6 +2199,8 @@ impl JobAdminMemoryBackend {
     #[cfg(test)]
     fn record_start_for_test(&self, id: &str, attempt: u32) {
         let _ = self.try_record_start(id, attempt);
+        #[cfg(any(feature = "db", feature = "redis"))]
+        self.note_local_claim(id, attempt);
     }
 
     #[cfg(test)]
@@ -9074,6 +9190,7 @@ async fn redis_lease_heartbeat(
 }
 
 #[cfg(feature = "redis")]
+#[allow(clippy::too_many_lines)]
 async fn recover_stale_redis_jobs(
     connection: &mut redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
@@ -9167,9 +9284,14 @@ async fn recover_stale_redis_jobs(
                         .last_error
                         .clone()
                         .unwrap_or_else(|| "visibility timeout expired".to_string());
-                    state
-                        .job_registry
-                        .record_failure(&dead.name, error.clone(), true);
+                    record_recovered_failure(
+                        &dead.name,
+                        &dead.id,
+                        dead.attempt,
+                        &error,
+                        state,
+                        job_admin,
+                    );
                     crate::alerts::notify_dead_lettered_job(state, &dead.name, &dead.id, &error);
                     job_admin.record_failure(&dead.id, error);
                     // The worker that held this claim is gone and the job is
@@ -9395,12 +9517,14 @@ async fn settle_failed_redis_job(
         RedisFailureAction::Retry(schedule) => {
             match schedule_redis_retry(connection, worker_config, record, &schedule).await {
                 Ok(RedisRetryOutcome::Applied) => {
+                    settle_redis_record(state, job_admin, record, true);
                     state
                         .job_registry
                         .record_retry(&schedule.record.name, &error, record.attempt);
                     job_admin.record_retrying(&schedule.record.id, &error);
                 }
                 Ok(RedisRetryOutcome::DroppedByDuplicate) => {
+                    settle_redis_record(state, job_admin, record, true);
                     // A duplicate already claimed the pending-window unique lock
                     // while this job ran, so the retry was coalesced into it —
                     // deleted, not requeued. This job will never run again, so its
@@ -9420,12 +9544,15 @@ async fn settle_failed_redis_job(
                     )
                     .await;
                 }
-                Ok(RedisRetryOutcome::ClaimChanged) => tracing::warn!(
-                    job = %record.name,
-                    job_id = %record.id,
-                    outcome = %outcome,
-                    "redis job retry skipped because claim changed"
-                ),
+                Ok(RedisRetryOutcome::ClaimChanged) => {
+                    settle_redis_record(state, job_admin, record, false);
+                    tracing::warn!(
+                        job = %record.name,
+                        job_id = %record.id,
+                        outcome = %outcome,
+                        "redis job retry skipped because claim changed"
+                    );
+                }
                 Err(error) => tracing::warn!(
                     job = %record.name,
                     job_id = %record.id,
@@ -9446,18 +9573,22 @@ async fn settle_failed_redis_job(
             .await
             {
                 Ok(true) => {
+                    settle_redis_record(state, job_admin, record, true);
                     state
                         .job_registry
                         .record_failure(&dead.name, error.clone(), true);
                     crate::alerts::notify_dead_lettered_job(state, &dead.name, &dead.id, &error);
                     job_admin.record_failure(&dead.id, error);
                 }
-                Ok(false) => tracing::warn!(
-                    job = %record.name,
-                    job_id = %record.id,
-                    outcome = %outcome,
-                    "redis job dead-letter skipped because claim changed"
-                ),
+                Ok(false) => {
+                    settle_redis_record(state, job_admin, record, false);
+                    tracing::warn!(
+                        job = %record.name,
+                        job_id = %record.id,
+                        outcome = %outcome,
+                        "redis job dead-letter skipped because claim changed"
+                    );
+                }
                 Err(error) => tracing::warn!(
                     job = %record.name,
                     job_id = %record.id,
@@ -9494,17 +9625,21 @@ async fn dead_letter_panicked_redis_job(
     .await
     {
         Ok(true) => {
+            settle_redis_record(state, job_admin, record, true);
             state
                 .job_registry
                 .record_failure(&dead.name, error.clone(), true);
             crate::alerts::notify_dead_lettered_job(state, &dead.name, &dead.id, &error);
             job_admin.record_failure(&dead.id, error);
         }
-        Ok(false) => tracing::warn!(
-            job = %record.name,
-            job_id = %record.id,
-            "redis job panic dead-letter skipped because claim changed"
-        ),
+        Ok(false) => {
+            settle_redis_record(state, job_admin, record, false);
+            tracing::warn!(
+                job = %record.name,
+                job_id = %record.id,
+                "redis job panic dead-letter skipped because claim changed"
+            );
+        }
         Err(error) => tracing::warn!(
             job = %record.name,
             job_id = %record.id,
@@ -9531,21 +9666,23 @@ async fn dead_letter_invalid_redis_job(
     // (`Ok(false)`), the job was NOT dead-lettered, so alerting here would be a
     // false page — mirror the sibling redis dead-letter paths that gate all of
     // this on the confirmed `Ok(true)` result.
-    if dead_letter_redis_job(
+    let moved = dead_letter_redis_job(
         connection,
         worker_config,
         &state.job_registry,
         record,
         &dead,
     )
-    .await
-        == Ok(true)
-    {
+    .await;
+    if moved == Ok(true) {
+        settle_redis_record(state, job_admin, record, true);
         state
             .job_registry
             .record_failure(&record.name, error.to_owned(), true);
         crate::alerts::notify_dead_lettered_job(state, &record.name, &record.id, error);
         job_admin.record_failure(&record.id, error.to_owned());
+    } else if moved == Ok(false) {
+        settle_redis_record(state, job_admin, record, false);
     }
     crate::job_tracking::settle_tracked_payload_as_failed(
         state,
@@ -9674,14 +9811,18 @@ async fn process_redis_job_record(
             JobExecutionOutcome::Succeeded => {
                 match ack_redis_success(connection, worker_config, &record).await {
                     Ok(true) => {
+                        settle_redis_record(state, job_admin, &record, true);
                         state.job_registry.record_success(&record.name);
                         job_admin.record_success(&record.id);
                     }
-                    Ok(false) => tracing::warn!(
-                        job = %record.name,
-                        job_id = %record.id,
-                        "redis job success ack skipped because claim changed"
-                    ),
+                    Ok(false) => {
+                        settle_redis_record(state, job_admin, &record, false);
+                        tracing::warn!(
+                            job = %record.name,
+                            job_id = %record.id,
+                            "redis job success ack skipped because claim changed"
+                        );
+                    }
                     Err(error) => tracing::warn!(
                         job = %record.name,
                         job_id = %record.id,
@@ -9992,6 +10133,9 @@ fn record_pg_lifecycle_after_ack(
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
 ) -> bool {
+    // Either way the worker is done with this claim. The note says whether
+    // anything else balanced its start already.
+    let started_here = job_admin.take_local_claim(job_id, attempt);
     if !ack_applied {
         // The claim was evicted by stale-claim recovery before this ack ran.
         // The recovery task already transitioned the row in the database:
@@ -10000,21 +10144,23 @@ fn record_pg_lifecycle_after_ack(
         //
         // Recovery owns the dead-letter accounting (failure counters, alert),
         // so record none here. This worker's own `record_start` is balanced
-        // once: only while this process's admin record still shows this
-        // attempt as running (issue #3051). Recovery in this process, or a
-        // replacement attempt that started here, already moved the record on
-        // and owns the count (see `record_lease_lost`). Recovery in another
-        // process leaves it, so it is balanced here: `record_retry` decrements
-        // `in_flight` without touching the failure counters.
+        // once: only while this process still holds the note of this attempt
+        // (issues #3051, #3166). Recovery in this process, or a replacement
+        // attempt that started here, already took the note and owns the count
+        // (see `record_lease_lost`). Recovery in another process leaves it, so
+        // it is balanced here: `record_retry` decrements `in_flight` without
+        // touching the failure counters.
         let error = match lifecycle {
             PgLifecycleRecord::Failure { error } => error,
             _ => "visibility timeout expired",
         };
-        if job_admin.settle_lease_lost(job_id, attempt, error) {
+        if started_here {
             state.job_registry.record_retry(job_name, error, 0);
-            if matches!(lifecycle, PgLifecycleRecord::Failure { .. }) {
-                job_admin.record_failure(job_id, error.to_owned());
-            }
+        }
+        if job_admin.settle_lease_lost(job_id, attempt, error)
+            && matches!(lifecycle, PgLifecycleRecord::Failure { .. })
+        {
+            job_admin.record_failure(job_id, error.to_owned());
         }
         return false;
     }
@@ -11464,10 +11610,13 @@ async fn pg_recover_stale_claims(
                 // which is backed by `JobRegistry::snapshot()`, so without this a
                 // crashed-worker dead-letter would page but not appear where the alert
                 // says to look.
-                state.job_registry.record_failure(
+                record_recovered_failure(
                     &row.name,
-                    "visibility timeout expired".to_owned(),
-                    true,
+                    &row.id,
+                    u32::try_from(row.attempt).unwrap_or(0),
+                    "visibility timeout expired",
+                    state,
+                    job_admin,
                 );
                 // Also tells a lease-lost worker in this process that the job
                 // is already recorded (see `record_lease_lost`).
@@ -19400,10 +19549,13 @@ mod tests {
             // 1) Stale-claim recovery dead-letters the final-attempt row, mirroring
             //    the exact two-line sequence `pg_recover_stale_claims` runs per
             //    `failed` row it flips.
-            state.job_registry().record_failure(
+            record_recovered_failure(
                 "slow_resumer",
-                "visibility timeout expired".to_owned(),
-                true,
+                &job_id,
+                1,
+                "visibility timeout expired",
+                &state,
+                &job_admin,
             );
             crate::alerts::notify_dead_lettered_job(
                 &state,
@@ -25498,6 +25650,7 @@ mod lease_tests {
         state
             .job_registry
             .record_retry("leased", "visibility timeout expired", 1);
+        assert!(admin.take_local_claim(&id, 1), "recovery took the note");
         admin.record_retrying(&id, "visibility timeout expired");
         admin.record_requeued(&id, 2);
         state.job_registry.record_start("leased"); // the replacement
@@ -25516,6 +25669,7 @@ mod lease_tests {
 
         // A dead letter recorded by recovery is not overwritten either.
         let (admin, id) = admin_with_running_job(1);
+        assert!(admin.take_local_claim(&id, 1), "recovery took the note");
         admin.record_failure_for_test(&id, "visibility timeout expired");
         record_lease_lost("leased", &id, 1, &state, &admin);
         let record = admin.snapshot_record_for_test(&id).expect("record");
@@ -25542,11 +25696,11 @@ mod lease_tests {
         record_lease_lost("leased", &id, 1, &state, &admin);
         assert_eq!(in_flight(&state), 0, "the old worker does not count again");
 
-        state.job_registry.record_start("leased"); // attempt 2
         assert_eq!(
-            admin.try_record_start(&id, 2),
+            record_attempt_start("leased", &id, 2, &state, &admin),
             JobAdminStartDecision::Started
         );
+        state.job_registry.record_start("leased"); // attempt 2
         record_lease_lost("leased", &id, 2, &state, &admin);
         assert_eq!(in_flight(&state), 0, "the replacement's start is balanced");
     }
@@ -25763,6 +25917,7 @@ mod lease_tests {
         state.job_registry.record_start("leased"); // some other job of this name
         let (admin, id) = admin_with_running_job(1);
         admin.record_retrying(&id, "lease lost"); // already balanced here
+        assert!(admin.take_local_claim(&id, 1));
 
         record_redis_recovered_requeue("leased", &id, 2, "expired", true, &state, &admin);
         assert_eq!(in_flight(&state), 1);
@@ -25782,6 +25937,7 @@ mod lease_tests {
         state.job_registry.record_start("leased"); // some other job of this name
         let (admin, id) = admin_with_running_job(1);
         admin.record_retrying(&id, "earlier failure"); // not running here
+        assert!(admin.take_local_claim(&id, 1));
 
         record_recovered_requeue("leased", &id, 2, &state, &admin);
         assert_eq!(in_flight(&state), 1);
@@ -25789,17 +25945,225 @@ mod lease_tests {
         assert_eq!(in_flight(&state), 1);
     }
 
+    /// Start `attempt` of `id` here, as a durable worker does, for a job with
+    /// no admin record in this process.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    fn start_elsewhere_enqueued(
+        state: &AppState,
+        admin: &JobAdminMemoryBackend,
+        id: &str,
+        attempt: u32,
+    ) {
+        record_attempt_start("leased", id, attempt, state, admin);
+        state.job_registry.record_start("leased");
+    }
+
     #[cfg(any(feature = "db", feature = "redis"))]
     #[test]
     fn lease_loss_balances_in_flight_when_this_process_has_no_admin_record() {
         let state = AppState::for_test();
         state.job_registry.register("leased");
-        state.job_registry.record_start("leased");
         let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 1);
 
         record_lease_lost("leased", "enqueued-elsewhere", 1, &state, &admin);
 
         assert_eq!(in_flight(&state), 0);
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn lease_loss_of_a_claim_started_elsewhere_leaves_in_flight_alone() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // a run of this type
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+
+        record_lease_lost("leased", "never-started-here", 1, &state, &admin);
+
+        assert_eq!(in_flight(&state), 1);
+    }
+
+    /// Issue #3166: terminal recovery, then the old worker loses its lease.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn terminal_recovery_then_lease_loss_balances_once_without_a_record() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // another run, same type
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 3);
+        assert_eq!(in_flight(&state), 2);
+
+        record_recovered_failure("leased", "enqueued-elsewhere", 3, "expired", &state, &admin);
+        assert_eq!(in_flight(&state), 1, "recovery balanced attempt 3");
+
+        record_lease_lost("leased", "enqueued-elsewhere", 3, &state, &admin);
+        assert_eq!(in_flight(&state), 1, "the old worker does not count again");
+    }
+
+    /// Issue #3166: terminal recovery, then the old worker's ack applies to
+    /// nothing.
+    #[cfg(feature = "db")]
+    #[test]
+    fn terminal_recovery_then_lost_ack_balances_once_without_a_record() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // another run, same type
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 3);
+
+        record_recovered_failure("leased", "enqueued-elsewhere", 3, "expired", &state, &admin);
+        record_pg_lifecycle_ack_result(
+            Ok(false),
+            "leased",
+            "enqueued-elsewhere",
+            3,
+            "failure",
+            PgLifecycleRecord::Failure { error: "boom" },
+            &state,
+            &admin,
+        );
+
+        assert_eq!(in_flight(&state), 1, "attempt 3 is balanced once");
+    }
+
+    /// A lost ack for a claim that recovery in another process took still
+    /// balances this process's start.
+    #[cfg(feature = "db")]
+    #[test]
+    fn lost_ack_after_recovery_elsewhere_balances_the_start_once() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 1);
+
+        for _ in 0..2 {
+            record_pg_lifecycle_ack_result(
+                Ok(false),
+                "leased",
+                "enqueued-elsewhere",
+                1,
+                "success",
+                PgLifecycleRecord::Success,
+                &state,
+                &admin,
+            );
+        }
+
+        assert_eq!(in_flight(&state), 0);
+    }
+
+    /// Recovery of a claim another process started changes no gauge here
+    /// except the failure counters.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn terminal_recovery_of_a_claim_started_elsewhere_leaves_in_flight_alone() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // a run of this type
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+
+        record_recovered_failure("leased", "started-elsewhere", 3, "expired", &state, &admin);
+
+        let status = state.job_registry.snapshot()["leased"].clone();
+        assert_eq!(status.in_flight, 1);
+        assert_eq!(status.total_failures, 1, "the dead letter still counts");
+        assert_eq!(status.dead_letters, 1);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn requeue_recovery_of_a_claim_started_here_balances_it_once_without_a_record() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 1);
+
+        record_recovered_requeue("leased", "enqueued-elsewhere", 2, &state, &admin);
+        assert_eq!(in_flight(&state), 0, "recovery balanced attempt 1");
+
+        record_lease_lost("leased", "enqueued-elsewhere", 1, &state, &admin);
+        assert_eq!(in_flight(&state), 0, "the old worker does not count again");
+    }
+
+    /// A newer attempt starts here while an older one still counts, and this
+    /// process has no admin record for the job.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn a_superseded_start_is_balanced_without_an_admin_record() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 1);
+        start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 2);
+        assert_eq!(in_flight(&state), 1, "attempt 1 is balanced");
+
+        record_lease_lost("leased", "enqueued-elsewhere", 1, &state, &admin);
+        assert_eq!(in_flight(&state), 1, "late lease loss counts nothing");
+        record_lease_lost("leased", "enqueued-elsewhere", 2, &state, &admin);
+        assert_eq!(in_flight(&state), 0);
+    }
+
+    /// A settled claim leaves no note behind.
+    #[cfg(feature = "db")]
+    #[test]
+    fn an_applied_ack_drops_the_claim_note() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 1);
+
+        record_pg_lifecycle_ack_result(
+            Ok(true),
+            "leased",
+            "enqueued-elsewhere",
+            1,
+            "success",
+            PgLifecycleRecord::Success,
+            &state,
+            &admin,
+        );
+
+        assert_eq!(in_flight(&state), 0);
+        assert!(!admin.take_local_claim("enqueued-elsewhere", 1));
+    }
+
+    /// A Redis ack that applied to nothing balances the start once, whether
+    /// recovery ran here or elsewhere.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn a_lost_redis_ack_balances_the_start_once() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "elsewhere", 1);
+        // Recovery elsewhere: the ack applies to nothing, twice over.
+        settle_redis_claim(&state, &admin, "leased", "elsewhere", 1, false);
+        settle_redis_claim(&state, &admin, "leased", "elsewhere", 1, false);
+        assert_eq!(in_flight(&state), 0);
+
+        // Recovery here took the claim first.
+        state.job_registry.record_start("leased"); // a run of this type
+        start_elsewhere_enqueued(&state, &admin, "here", 3);
+        record_recovered_failure("leased", "here", 3, "expired", &state, &admin);
+        settle_redis_claim(&state, &admin, "leased", "here", 3, false);
+        assert_eq!(in_flight(&state), 1);
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn an_applied_redis_ack_drops_the_claim_note() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "elsewhere", 1);
+        state.job_registry.record_success("leased");
+
+        settle_redis_claim(&state, &admin, "leased", "elsewhere", 1, true);
+
+        assert_eq!(in_flight(&state), 0, "an applied ack balances nothing");
+        assert!(!admin.take_local_claim("elsewhere", 1));
     }
 
     #[cfg(any(feature = "db", feature = "redis"))]

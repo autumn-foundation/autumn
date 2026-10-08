@@ -887,10 +887,13 @@ async fn recover_stale_claims(
                 job_id = %row.id,
                 "sqlite job dead-lettered after its visibility timeout expired"
             );
-            state.job_registry.record_failure(
+            super::record_recovered_failure(
                 &row.name,
-                "visibility timeout expired".to_owned(),
-                true,
+                &row.id,
+                u32::try_from(row.attempt).unwrap_or(0),
+                "visibility timeout expired",
+                state,
+                job_admin,
             );
             // Also tells a lease-lost worker in this process that the job is
             // already recorded (see `record_lease_lost`).

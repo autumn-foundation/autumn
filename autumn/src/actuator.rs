@@ -1761,10 +1761,27 @@ impl JobRegistry {
 
     /// Record a terminal failure.
     pub fn record_failure(&self, name: &str, error: String, dead_lettered: bool) {
+        self.record_failure_inner(name, error, dead_lettered, true);
+    }
+
+    /// Record a terminal failure of a run this process did not start.
+    /// Counts the failure, but leaves `in_flight` alone.
+    pub(crate) fn record_failure_not_started(
+        &self,
+        name: &str,
+        error: String,
+        dead_lettered: bool,
+    ) {
+        self.record_failure_inner(name, error, dead_lettered, false);
+    }
+
+    fn record_failure_inner(&self, name: &str, error: String, dead_lettered: bool, started: bool) {
         if let Ok(mut guard) = self.inner.write()
             && let Some(status) = guard.get_mut(name)
         {
-            status.in_flight = status.in_flight.saturating_sub(1);
+            if started {
+                status.in_flight = status.in_flight.saturating_sub(1);
+            }
             status.total_failures = status.total_failures.saturating_add(1);
             status.last_error = Some(error);
             if dead_lettered {
