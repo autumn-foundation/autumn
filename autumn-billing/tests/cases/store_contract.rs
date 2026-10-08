@@ -1039,35 +1039,10 @@ pub async fn link_subscription_adopts_pending_invoices_and_dunning(store: &dyn B
         .unwrap()
         .into_inner();
 
-    // Linked before its dunning row was opened.
-    let late = store
-        .upsert_invoice(
-            invoice_upsert("adopt", &customer, "late", InvoiceStatus::Open, 100)
-                .with_provider_subscription(sub.clone())
-                .with_subscription("adopt-sub"),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-    store
-        .upsert_dunning(DunningAttempt::new(
-            late.id.clone(),
-            customer.clone(),
-            1,
-            at(300),
-            DunningState::Pending,
-            at(0),
-        ))
-        .await
-        .unwrap();
-
     store
         .link_subscription(&sub, "adopt-sub", at(2000))
         .await
         .unwrap();
-
-    let late_row = store.dunning_by_invoice(&late.id).await.unwrap().unwrap();
-    assert_eq!(late_row.subscription_id.as_deref(), Some("adopt-sub"));
 
     let by_id =
         |id: String| async move { store.invoice_by_id(&id).await.unwrap().expect("invoice") };
@@ -1117,6 +1092,39 @@ pub async fn settle_dunning_keeps_a_concurrent_link(store: &dyn BillingStore) {
         .unwrap();
     assert_eq!(row.state, DunningState::Exhausted);
     assert_eq!(row.subscription_id.as_deref(), Some("settle-link-sub"));
+}
+
+/// An invoice linked before its dunning row was opened still gets the row
+/// linked.
+pub async fn link_subscription_adopts_dunning_opened_after_the_link(store: &dyn BillingStore) {
+    let customer = seed_customer(store, "late", None).await;
+    let sub = ProviderId::new("sub_late");
+    let late = store
+        .upsert_invoice(
+            invoice_upsert("late", &customer, "k", InvoiceStatus::Open, 100)
+                .with_provider_subscription(sub.clone())
+                .with_subscription("late-sub"),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    store
+        .upsert_dunning(DunningAttempt::new(
+            late.id.clone(),
+            customer.clone(),
+            1,
+            at(300),
+            DunningState::Pending,
+            at(0),
+        ))
+        .await
+        .unwrap();
+    store
+        .link_subscription(&sub, "late-sub", at(2000))
+        .await
+        .unwrap();
+    let row = store.dunning_by_invoice(&late.id).await.unwrap().unwrap();
+    assert_eq!(row.subscription_id.as_deref(), Some("late-sub"));
 }
 
 // ── Fix round 2 properties ──────────────────────────────────────────────
@@ -1551,6 +1559,7 @@ pub async fn run_contract(store: &dyn BillingStore) {
     subscription_missing_fields_keep_stored_values(store).await;
     invoice_unchanged_redelivery(store).await;
     link_subscription_adopts_pending_invoices_and_dunning(store).await;
+    link_subscription_adopts_dunning_opened_after_the_link(store).await;
     settle_dunning_is_compare_and_set(store).await;
     settle_dunning_keeps_a_concurrent_link(store).await;
     prune_events_deletes_applied_rows_before(store).await;
@@ -1598,6 +1607,7 @@ mod memory {
         subscription_missing_fields_keep_stored_values,
         invoice_unchanged_redelivery,
         link_subscription_adopts_pending_invoices_and_dunning,
+        link_subscription_adopts_dunning_opened_after_the_link,
         settle_dunning_is_compare_and_set,
         settle_dunning_keeps_a_concurrent_link,
         prune_events_deletes_applied_rows_before,
