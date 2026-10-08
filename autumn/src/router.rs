@@ -14548,8 +14548,10 @@ mod trusted_host_tests {
     #[tokio::test]
     async fn route_fault_reaches_a_cached_static_page() {
         let (_tmp, dist) = build_cached_dist("<h1>cached</h1>");
-        let mut config = AutumnConfig::default();
-        config.profile = Some("staging".to_owned());
+        let mut config = AutumnConfig {
+            profile: Some("staging".to_owned()),
+            ..AutumnConfig::default()
+        };
         config.fault_injection.enabled = true;
         config.fault_injection.faults = vec![crate::fault_injection::FaultRule::new(
             crate::fault_injection::FaultTarget::Route,

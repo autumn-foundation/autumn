@@ -292,7 +292,7 @@ mod tests {
         for _ in 0..4 {
             let _ = status(failing.clone(), "/x").await;
         }
-        assert!(!injector.armed.load(Ordering::Acquire));
+        assert!(!crate::fault_injection::FaultInjection::for_test(&injector).is_armed());
     }
 
     #[tokio::test]
@@ -304,7 +304,7 @@ mod tests {
         let request = status(app(&injector), "/x");
         let timed_out = tokio::time::timeout(Duration::from_millis(10), request).await;
         assert!(timed_out.is_err());
-        assert!(!injector.armed.load(Ordering::Acquire));
+        assert!(!crate::fault_injection::FaultInjection::for_test(&injector).is_armed());
     }
 
     #[tokio::test]

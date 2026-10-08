@@ -9857,6 +9857,15 @@ impl CronTick {
         !self.window.is_zero()
             && now_unix_secs >= self.unix_secs.saturating_add(self.window.as_secs())
     }
+
+    /// `true`, with a debug log, when the state clock is past the window.
+    fn is_late(self, state: &AppState, name: &str, tick_key: &str) -> bool {
+        let late = self.is_past_window(crate::time::clock_unix_secs(state.clock()));
+        if late {
+            tracing::debug!(task = %name, tick = %tick_key, "Cron task tick is past its window");
+        }
+        late
+    }
 }
 
 /// Handle the execution of a single cron task.
@@ -9888,8 +9897,7 @@ async fn execute_cron_task(
         // A cost wait can outlast the tick row (#3071). Another replica can
         // have run this occurrence, and the prune can have deleted its row.
         // Do not claim the occurrence after its window.
-        if gate.waited() && occurrence.is_past_window(crate::time::clock_unix_secs(state.clock())) {
-            tracing::debug!(task = %name, tick = %tick_key, "Cron task tick is past its window after a cost wait");
+        if gate.waited() && occurrence.is_late(&state, &name, &tick_key) {
             gate.release();
             return;
         }
@@ -9920,8 +9928,7 @@ async fn execute_cron_task(
     // The claim can wait too (a pool checkout, a slow query). Check the window
     // again: a claim after the window can have found a pruned row of a tick
     // that ran (#3071). Keep the row, so no replica runs the tick again.
-    if occurrence.is_past_window(crate::time::clock_unix_secs(state.clock())) {
-        tracing::debug!(task = %name, tick = %tick_key, "Cron task tick is past its window after the claim");
+    if occurrence.is_late(&state, &name, &tick_key) {
         gate.release();
         release_task_lease(lease, &name, &tick_key).await;
         return;

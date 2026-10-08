@@ -105,7 +105,7 @@ impl FaultInjection {
     /// `true` while faults can fire.
     #[must_use]
     pub fn is_armed(&self) -> bool {
-        self.inner.armed.load(Ordering::Acquire)
+        is_armed(self.inner.state.load(Ordering::Acquire))
     }
 
     /// The counters.
@@ -124,7 +124,7 @@ impl FaultInjection {
     ///
     /// No event is written when the faults are already disarmed.
     pub async fn disarm(&self, actor: &str, reason: &str) {
-        if self.inner.armed.swap(false, Ordering::AcqRel) {
+        if self.inner.disarm_any() {
             let sequence = self.inner.next_sequence();
             self.inner.audit(sequence, actor, false, reason).await;
         }
@@ -139,14 +139,17 @@ impl FaultInjection {
         // the old window after the arm. Release the lock before the await.
         let sequence = {
             let mut window = self.inner.lock_window();
-            if self.inner.armed.swap(true, Ordering::AcqRel) {
+            let state = self.inner.state.load(Ordering::Acquire);
+            if is_armed(state) {
                 return;
             }
             *window = Window::default();
-            // Under the window lock: `record` checks the generation under the
-            // same lock, so no request of the earlier arm counts in the new
-            // window.
-            self.inner.generation.fetch_add(1, Ordering::AcqRel);
+            // One store publishes the new generation and the armed bit
+            // together, under the window lock that `record` also takes.
+            self.inner.state.store(
+                armed_state(generation_of(state).wrapping_add(1)),
+                Ordering::Release,
+            );
             drop(window);
             self.inner.next_sequence()
         };
@@ -243,7 +246,9 @@ struct Injector {
     max_error_ppm: u32,
     window_len: Duration,
     min_requests: u64,
-    armed: AtomicBool,
+    /// The arm state: the arm generation in the high bits, and the armed
+    /// flag in bit 0. One word, so each transition is one atomic step.
+    state: AtomicU64,
     injected: AtomicU64,
     window: Mutex<Window>,
     entropy: Arc<dyn Entropy>,
@@ -257,8 +262,19 @@ struct Injector {
     /// The toggle count. Each audit event has its number, so a reader can
     /// put the events in toggle order. The boot toggle is `0`.
     sequence: AtomicU64,
-    /// The arm count. A request scope keeps the value of its arm.
-    generation: AtomicU64,
+}
+
+/// The state word of `generation`, armed.
+const fn armed_state(generation: u64) -> u64 {
+    generation.wrapping_shl(1) | 1
+}
+
+const fn is_armed(state: u64) -> bool {
+    state & 1 == 1
+}
+
+const fn generation_of(state: u64) -> u64 {
+    state.wrapping_shr(1)
 }
 
 impl Injector {
@@ -283,7 +299,8 @@ impl Injector {
     /// The scope for a request to `path`. `None` when the faults are
     /// disarmed, the path is exempt, or no rule matches it.
     fn scope_for(self: &Arc<Self>, path: &str) -> Option<Arc<RequestScope>> {
-        if !self.armed.load(Ordering::Acquire) || self.exempt.contains(path) {
+        let state = self.state.load(Ordering::Acquire);
+        if !is_armed(state) || self.exempt.contains(path) {
             return None;
         }
         let matched = self
@@ -297,7 +314,7 @@ impl Injector {
         (matched != 0).then(|| {
             Arc::new(RequestScope {
                 injector: Arc::clone(self),
-                generation: self.generation.load(Ordering::Acquire),
+                generation: generation_of(state),
                 matched,
                 fired: AtomicBool::new(false),
                 errored: AtomicBool::new(false),
@@ -311,7 +328,7 @@ impl Injector {
     fn record(&self, generation: u64, error: bool) -> bool {
         let now = tokio::time::Instant::now();
         let mut window = self.lock_window();
-        if generation != self.generation.load(Ordering::Acquire) {
+        if generation_of(self.state.load(Ordering::Acquire)) != generation {
             return false;
         }
         let expired = window
@@ -333,8 +350,28 @@ impl Injector {
         }
         let errors_ppm = u128::from(window.errors).saturating_mul(u128::from(PPM));
         let limit_ppm = u128::from(self.max_error_ppm).saturating_mul(u128::from(window.requests));
+        // Disarm under the window lock, and only the arm of this request: a
+        // re-arm between the check and the disarm cannot be undone.
+        let tripped = errors_ppm > limit_ppm && self.disarm_generation(generation);
         drop(window);
-        errors_ppm > limit_ppm && self.armed.swap(false, Ordering::AcqRel)
+        tripped
+    }
+
+    /// Disarm the current arm. Returns `true` when this call disarmed it.
+    fn disarm_any(&self) -> bool {
+        self.state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                is_armed(state).then_some(state & !1)
+            })
+            .is_ok()
+    }
+
+    /// Disarm only when arm `generation` is current and armed.
+    fn disarm_generation(&self, generation: u64) -> bool {
+        let armed = armed_state(generation);
+        self.state
+            .compare_exchange(armed, armed & !1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     /// The number of the next toggle.
@@ -444,8 +481,7 @@ impl RequestScope {
     /// `true` while the arm that started this request is current. A request
     /// of an earlier arm fires no more faults: its result does not count.
     fn armed(&self) -> bool {
-        self.injector.armed.load(Ordering::Acquire)
-            && self.injector.generation.load(Ordering::Acquire) == self.generation
+        self.injector.state.load(Ordering::Acquire) == armed_state(self.generation)
     }
 
     fn mark_fired(&self) {
@@ -563,7 +599,7 @@ pub(crate) fn build(
         max_error_ppm: section.stop.max_error_ppm(),
         window_len: Duration::from_secs(section.stop.window_secs),
         min_requests: section.stop.min_requests,
-        armed: AtomicBool::new(true),
+        state: AtomicU64::new(armed_state(0)),
         injected: AtomicU64::new(0),
         window: Mutex::new(Window::default()),
         entropy: state.entropy_arc(),
@@ -573,7 +609,6 @@ pub(crate) fn build(
         boot: Mutex::new(None),
         audit_order: tokio::sync::Mutex::new(()),
         sequence: AtomicU64::new(1),
-        generation: AtomicU64::new(0),
     });
     Some((
         FaultScopeLayer::new(Arc::clone(&injector)),
@@ -612,6 +647,16 @@ pub(crate) fn announce(handle: &FaultInjection) {
     }
 }
 
+#[cfg(test)]
+impl FaultInjection {
+    /// The handle of a test injector.
+    pub(crate) fn for_test(inner: &Arc<Injector>) -> Self {
+        Self {
+            inner: Arc::clone(inner),
+        }
+    }
+}
+
 /// Run `future` in a fault scope with `rules`, as a request to `/` would.
 #[cfg(test)]
 pub(crate) async fn with_faults<F: std::future::Future>(
@@ -638,7 +683,7 @@ fn test_injector(rules: Vec<CompiledRule>, min_requests: u64) -> Arc<Injector> {
         max_error_ppm: 144_000,
         window_len: Duration::from_secs(60),
         min_requests,
-        armed: AtomicBool::new(true),
+        state: AtomicU64::new(armed_state(0)),
         injected: AtomicU64::new(0),
         window: Mutex::new(Window::default()),
         entropy: Arc::new(crate::entropy::SeededEntropy::new(7)),
@@ -648,7 +693,6 @@ fn test_injector(rules: Vec<CompiledRule>, min_requests: u64) -> Arc<Injector> {
         boot: Mutex::new(None),
         audit_order: tokio::sync::Mutex::new(()),
         sequence: AtomicU64::new(1),
-        generation: AtomicU64::new(0),
     })
 }
 
