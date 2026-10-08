@@ -1173,7 +1173,7 @@ pub(crate) async fn apply_retry_reset(payload: &Value, snapshot: Option<RetrySna
     let Some(store) = global_tracking_store() else {
         return;
     };
-    let _ = capped_settle(store.reset_for_retry(key, owner, expected_updated_at)).await;
+    let _ = store.reset_for_retry(key, owner, expected_updated_at).await;
 }
 
 // ── enqueue_tracked ────────────────────────────────────────────────────────────
