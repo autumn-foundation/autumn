@@ -233,6 +233,11 @@ same key and another body gets `422` from `recovery_point`,
 `set_recovery_point` and `commit`. It cannot skip a step done for the first
 body.
 
+If the session is gone by the time of the retry (it expired, or was deleted),
+the retry runs under a new key: the one an anonymous request has. Before the
+handler runs, the middleware copies the recovery point from the old session's
+key to the new key, so the retry still skips the steps that are done.
+
 Lock expiry uses the app clock, not the database clock. Keep replica clocks
 in sync, and keep `in_flight_ttl_secs` much larger than the clock skew.
 

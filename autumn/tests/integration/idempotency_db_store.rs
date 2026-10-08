@@ -10,6 +10,7 @@
 //! | `db_store_crash_after_commit_replays` | AC1 on Postgres: a crash after the commit replays the committed response |
 //! | `db_store_fences_a_stale_lock_owner` | a handler whose lock expired cannot commit; one payment only |
 //! | `db_store_recovery_point_survives_a_crash` | a multi-step handler reads the last recovery point on retry |
+//! | `db_store_stale_cookie_retry_keeps_the_recovery_point` | a retry whose session went away still sees the recovery point |
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -366,5 +367,91 @@ async fn db_store_recovery_point_survives_a_crash() {
     let response = retry(&client, "/steps", "multi").await;
     response.assert_status(201);
     assert_eq!(payments(&pool).await, 1, "the retry skipped step 1");
+    assert_eq!(calls.get(), 2);
+}
+
+/// The first attempt records a step under its session's key and fails. The
+/// session is deleted, so the retry runs under the anonymous key and must
+/// still see the step.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn db_store_stale_cookie_retry_keeps_the_recovery_point() {
+    use autumn_web::idempotency::IdempotencyLayer;
+    use autumn_web::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore as _};
+    use diesel_async::AsyncConnection as _;
+    use tower::ServiceExt as _;
+
+    let (pool, _container) = setup_pool().await;
+    let calls = Calls::default();
+    let store = Arc::new(DbIdempotencyStore::new(
+        pool.clone(),
+        Duration::from_secs(60),
+    ));
+    let handler_pool = pool.clone();
+    let handler_calls = calls.clone();
+    let handler = move |idem: IdempotencyTx| {
+        let pool = handler_pool.clone();
+        let calls = handler_calls.clone();
+        async move {
+            let first = calls.get() == 0;
+            calls.add();
+            let mut conn = pool.get().await.expect("conn");
+            if let Some(point) = idem
+                .recovery_point(&mut conn)
+                .await
+                .expect("recovery point")
+            {
+                return (StatusCode::OK, format!("resumed after {point}"));
+            }
+            if first {
+                let step = idem.clone();
+                conn.transaction::<_, autumn_web::AutumnError, _>(async move |conn| {
+                    step.set_recovery_point(conn, "charged").await
+                })
+                .await
+                .expect("transaction");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "failed".to_owned());
+            }
+            (StatusCode::OK, "charged again".to_owned())
+        }
+    };
+    let sessions = MemoryStore::new();
+    sessions
+        .save(
+            "old-session",
+            std::collections::HashMap::from([("guest".to_owned(), "1".to_owned())]),
+        )
+        .await
+        .expect("seed session");
+    let app = axum::Router::new()
+        .route("/step", axum::routing::post(handler))
+        .layer(IdempotencyLayer::new(store))
+        .layer(SessionLayer::new(
+            sessions.clone(),
+            SessionConfig::default(),
+        ));
+    let with_cookie = || {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("/step")
+            .header("idempotency-key", "charge")
+            .header("cookie", "autumn.sid=old-session")
+            .body(axum::body::Body::from("A"))
+            .expect("request")
+    };
+
+    let first = app
+        .clone()
+        .oneshot(with_cookie())
+        .await
+        .expect("infallible");
+    assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    sessions.destroy("old-session").await.expect("destroy");
+    let retry = app.oneshot(with_cookie()).await.expect("infallible");
+    let body = axum::body::to_bytes(retry.into_body(), 1024)
+        .await
+        .expect("body");
+    assert_eq!(&body[..], b"resumed after charged");
     assert_eq!(calls.get(), 2);
 }

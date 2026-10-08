@@ -156,6 +156,58 @@ impl DbIdempotencyStore {
             .map(|row| row.is_some())
             .map_err(|e| db_error("read idempotency record", e))
     }
+
+    /// Copy the recovery point of the row `from_owner` holds on `from` to the
+    /// row `to_owner` holds on `to`, with its body hash and TTL, unless that
+    /// row has one already. The copy lives one TTL past `to`'s lock, as a
+    /// recovery point set under it does.
+    ///
+    /// The middleware calls this for a retry whose session cookie went stale:
+    /// the retry runs under its new session's key, and must still see the
+    /// steps the first attempt committed under the old one.
+    pub(super) async fn adopt_recovery_point(
+        &self,
+        from: &str,
+        from_owner: &str,
+        to: &str,
+        to_owner: &str,
+    ) -> Result<(), IdempotencyStoreError> {
+        let mut conn = self.conn().await?;
+        let point: Option<(Option<String>, Option<Vec<u8>>, i64)> = keys::autumn_idempotency_keys
+            .filter(keys::storage_key.eq(from))
+            .filter(keys::locked_by.eq(from_owner))
+            .filter(keys::recovery_point.is_not_null())
+            .select((keys::recovery_point, keys::recovery_body_hash, keys::ttl_ms))
+            .first(&mut conn)
+            .await
+            .optional()
+            .map_err(|e| db_error("read idempotency recovery point", e))?;
+        let Some((point, body_hash, ttl_ms)) = point else {
+            return Ok(());
+        };
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "a SQL expression, evaluated by the database"
+        )]
+        let crash_expiry = keys::locked_until_ms + ttl_ms;
+        let expiry = diesel::dsl::case_when(keys::expires_at_ms.lt(crash_expiry), crash_expiry)
+            .otherwise(keys::expires_at_ms);
+        let target = keys::autumn_idempotency_keys
+            .filter(keys::storage_key.eq(to))
+            .filter(keys::locked_by.eq(to_owner))
+            .filter(keys::recovery_point.is_null());
+        diesel::update(target)
+            .set((
+                keys::recovery_point.eq(point),
+                keys::recovery_body_hash.eq(body_hash),
+                keys::ttl_ms.eq(ttl_ms),
+                keys::expires_at_ms.eq(expiry),
+            ))
+            .execute(&mut conn)
+            .await
+            .map(drop)
+            .map_err(|e| db_error("copy idempotency recovery point", e))
+    }
 }
 
 /// Keep `owner`'s lock on `key` until the record expires. A lock that already

@@ -31,7 +31,8 @@
 - **idempotency:** `IdempotencyTx::set_recovery_point` and
   `IdempotencyTx::recovery_point` let a multi-step handler resume after a
   crash. A recovery point belongs to its request body: a retry with another
-  body gets `422`.
+  body gets `422`. A retry whose session has gone away still sees the
+  recovery point.
 - **idempotency:** a boot warning when `in_flight_ttl_secs` is shorter than
   `server.timeouts.request_timeout_ms`, and a boot note when no request
   timeout is set.

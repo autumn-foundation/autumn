@@ -1622,29 +1622,111 @@ async fn acquire_lock(
     }
 }
 
-async fn stale_cookie_fallback_in_flight(
+/// The key of the stale session cookie is in flight: another attempt holds it.
+struct StaleKeyInFlight;
+
+/// Lock the key of the request's stale session cookie, if it has one.
+///
+/// The lock is held until the request's own key is locked, so a recovery
+/// point the first attempt committed under the old key can be carried over
+/// (see [`adopt_stale_recovery_point`]).
+async fn lock_stale_cookie_key(
     store: &Arc<dyn IdempotencyStore>,
     prepared: &PreparedIdempotencyRequest,
     in_flight_ttl: Duration,
     entropy: &dyn crate::entropy::Entropy,
-) -> bool {
+) -> Result<Option<InFlightLock>, StaleKeyInFlight> {
     let Some(key) = prepared.stale_cookie_storage_key.as_deref() else {
-        return false;
+        return Ok(None);
     };
 
     let owner = in_flight_lock_owner(entropy);
     if acquire_lock(store.as_ref(), key, &owner, in_flight_ttl).await {
-        InFlightLock {
+        Ok(Some(InFlightLock {
             store: Arc::clone(store),
             key: key.to_owned(),
             owner,
-        }
-        .release()
-        .await;
-        false
+        }))
     } else {
-        true
+        Err(StaleKeyInFlight)
     }
+}
+
+/// Lock the stale session cookie's key, if the request has one, then the
+/// request's own key. `None` when either is in flight: the caller answers
+/// `409`. The second value is the stale key's lock.
+async fn lock_request_keys(
+    store: &Arc<dyn IdempotencyStore>,
+    prepared: &PreparedIdempotencyRequest,
+    in_flight_ttl: Duration,
+    entropy: &dyn crate::entropy::Entropy,
+) -> Option<(InFlightLock, Option<InFlightLock>)> {
+    let Ok(stale_lock) = lock_stale_cookie_key(store, prepared, in_flight_ttl, entropy).await
+    else {
+        tracing::debug!(
+            idempotency.key = %prepared.idempotency_key,
+            "Stale session cookie idempotency key already in flight — returning 409"
+        );
+        return None;
+    };
+    let owner = in_flight_lock_owner(entropy);
+    if !acquire_lock(store.as_ref(), &prepared.storage_key, &owner, in_flight_ttl).await {
+        release_stale_lock(stale_lock).await;
+        tracing::debug!(
+            idempotency.key = %prepared.idempotency_key,
+            "Idempotency key already in flight — returning 409"
+        );
+        return None;
+    }
+    let lock = InFlightLock {
+        store: Arc::clone(store),
+        key: prepared.storage_key.clone(),
+        owner,
+    };
+    Some((lock, stale_lock))
+}
+
+async fn release_stale_lock(stale: Option<InFlightLock>) {
+    if let Some(stale) = stale {
+        stale.release().await;
+    }
+}
+
+/// Carry the recovery point of the stale cookie's key over to the request's
+/// own key, then free the stale key.
+///
+/// A retry whose session went away runs under a new session's key. Without
+/// the copy, its [`IdempotencyTx`] would not see the steps the first attempt
+/// committed, and would run them again. A failed copy is a store error: the
+/// request fails closed with `500`, and the stale key keeps its point.
+#[cfg(feature = "db")]
+async fn adopt_stale_recovery_point(
+    stale: Option<InFlightLock>,
+    lock: &InFlightLock,
+) -> Result<(), IdempotencyStoreError> {
+    let Some(stale) = stale else {
+        return Ok(());
+    };
+    let store: &dyn std::any::Any = lock.store.as_ref();
+    let adopted = match store.downcast_ref::<DbIdempotencyStore>() {
+        Some(db) => {
+            db.adopt_recovery_point(&stale.key, &stale.owner, &lock.key, &lock.owner)
+                .await
+        }
+        None => Ok(()),
+    };
+    stale.release().await;
+    adopted
+}
+
+#[cfg(not(feature = "db"))]
+#[allow(clippy::unused_async, reason = "same signature as the db build")]
+async fn adopt_stale_recovery_point(
+    stale: Option<InFlightLock>,
+    _lock: &InFlightLock,
+) -> Result<(), IdempotencyStoreError> {
+    release_stale_lock(stale).await;
+    Ok(())
 }
 
 /// Tells the middleware whether the handler stored the record in its own
@@ -1788,42 +1870,20 @@ where
         }
     }
 
-    if stale_cookie_fallback_in_flight(&store, &prepared, in_flight_ttl, entropy.as_ref()).await {
-        tracing::debug!(
-            idempotency.key = %prepared.idempotency_key,
-            "Stale session cookie idempotency key already in flight — returning 409"
-        );
-        return Ok(in_flight_conflict(metrics.as_ref()));
-    }
-
     // ── In-flight check (concurrent duplicate) ─────────────────────────────
-    let lock_owner = in_flight_lock_owner(entropy.as_ref());
-    if !acquire_lock(
-        store.as_ref(),
-        &prepared.storage_key,
-        &lock_owner,
-        in_flight_ttl,
-    )
-    .await
-    {
-        tracing::debug!(
-            idempotency.key = %prepared.idempotency_key,
-            "Idempotency key already in flight — returning 409"
-        );
+    let Some((lock, stale_lock)) =
+        lock_request_keys(&store, &prepared, in_flight_ttl, entropy.as_ref()).await
+    else {
         return Ok(in_flight_conflict(metrics.as_ref()));
-    }
-    let lock_deadline_ms = lock_deadline_bound_ms(in_flight_ttl);
-    let lock = InFlightLock {
-        store: store.clone(),
-        key: prepared.storage_key.clone(),
-        owner: lock_owner,
     };
+    let lock_deadline_ms = lock_deadline_bound_ms(in_flight_ttl);
 
     // Double-check after acquiring the lock: a concurrent request may have
     // completed between our miss check and lock acquisition.
     match lookup_prepared_entry(store.as_ref(), &prepared).await {
         Ok(Some(entry)) => {
             lock.release().await;
+            release_stale_lock(stale_lock).await;
             return replay_cache_hit(
                 &mut inner,
                 entry,
@@ -1837,6 +1897,7 @@ where
         Ok(None) => {}
         Err(error) => {
             lock.hold_until_ttl();
+            release_stale_lock(stale_lock).await;
             tracing::error!(
                 idempotency.key = %prepared.idempotency_key,
                 error = %error,
@@ -1844,6 +1905,16 @@ where
             );
             return Ok(persistence_failed_response());
         }
+    }
+
+    if let Err(error) = adopt_stale_recovery_point(stale_lock, &lock).await {
+        lock.hold_until_ttl();
+        tracing::error!(
+            idempotency.key = %prepared.idempotency_key,
+            error = %error,
+            "Idempotency recovery point copy failed; failing closed"
+        );
+        return Ok(persistence_failed_response());
     }
 
     let probe = TxProbe::attach(&store, &mut prepared, &lock.owner, ttl, lock_deadline_ms);
