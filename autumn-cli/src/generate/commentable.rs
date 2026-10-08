@@ -28,6 +28,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::generate::GenerateError;
 use crate::generate::emit::Plan;
 
 /// The shared comments table's name. Not configurable from the DSL token: the
@@ -161,20 +162,23 @@ pub fn already_migrated(project_root: &Path) -> bool {
     exists && polymorphic
 }
 
-/// A `comments` table that exists but is NOT the polymorphic one.
+/// Refuse when a `comments` table exists but is NOT the polymorphic one.
 ///
-/// A `Comment` model scaffolded the ordinary way creates exactly that, and the
-/// shared table takes the same name — so emitting ours produces a second
-/// `CREATE TABLE comments` and `migrate` stops on "already exists". Skipping
-/// ours instead would be worse (every helper would query discriminator columns
-/// that are not there), so generation still emits and the caller warns. See
-/// #2283 for turning this into a refusal at generate time.
-pub fn conflicting_comments_table(project_root: &Path) -> bool {
+/// A `Comment` model scaffolded the ordinary way creates that table. Emitting
+/// the shared table then gives two `CREATE TABLE comments`, and `migrate` stops.
+/// Skipping it breaks every helper at run time. So generation stops before it
+/// writes any file.
+///
+/// # Errors
+/// [`GenerateError::CommentsTableConflict`] when the name is taken.
+pub fn ensure_no_comments_conflict(project_root: &Path) -> Result<(), GenerateError> {
     let (exists, polymorphic) = comments_table_state(project_root);
-    exists && !polymorphic
+    if exists && !polymorphic {
+        return Err(GenerateError::CommentsTableConflict);
+    }
+    Ok(())
 }
 
-/// Replay the history once: does a `comments` table exist, and is it polymorphic.
 /// Replay the history once: does a `comments` table exist, and is it the
 /// polymorphic one (every helper's column present).
 fn comments_table_state(project_root: &Path) -> (bool, bool) {
@@ -681,9 +685,7 @@ fn mentions_column(haystack: &str, column: &str) -> bool {
 /// generation would have SAID it was reusing the table.
 ///
 /// So the whole schema is the question. A table missing any of these is not the
-/// shared table: the generator emits its own and, if the name is taken, says so
-/// (see `conflicting_comments_table`). A loud collision at migrate time beats a
-/// reassuring message and an app that breaks on its first comment.
+/// shared table, and generation refuses (see `ensure_no_comments_conflict`).
 const REQUIRED_COLUMNS: &[&str] = &[
     "id",
     "commentable_type",
@@ -2023,7 +2025,7 @@ mod tests {
             "the source table carried no discriminator columns"
         );
         assert!(
-            conflicting_comments_table(tmp.path()),
+            ensure_no_comments_conflict(tmp.path()).is_err(),
             "the name is taken, loudly, rather than silently reused"
         );
     }
@@ -2246,7 +2248,7 @@ mod tests {
             "the scan cannot verify columns it never saw"
         );
         assert!(
-            conflicting_comments_table(tmp.path()),
+            ensure_no_comments_conflict(tmp.path()).is_err(),
             "the name is taken: generation emits and migrate fails loudly \
              rather than claiming a reuse"
         );
@@ -2765,7 +2767,7 @@ mod tests {
         );
         // It IS a name collision, so the caller warns rather than silently
         // emitting a second `CREATE TABLE comments`.
-        assert!(conflicting_comments_table(tmp.path()));
+        assert!(ensure_no_comments_conflict(tmp.path()).is_err());
 
         // Every other required column, one at a time, for the same reason.
         for missing in REQUIRED_COLUMNS.iter().copied() {
@@ -2796,7 +2798,38 @@ mod tests {
         )
         .expect("write");
         assert!(already_migrated(tmp.path()));
-        assert!(!conflicting_comments_table(tmp.path()));
+        assert!(ensure_no_comments_conflict(tmp.path()).is_ok());
+    }
+
+    /// A same-named, non-polymorphic table is refused with the remedies. The
+    /// shared table and a clean slate pass.
+    #[test]
+    fn a_conflicting_comments_table_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_create_comments");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT NOT NULL);\n",
+        )
+        .expect("write");
+        let err = ensure_no_comments_conflict(tmp.path()).expect_err("must refuse");
+        let message = err.to_string();
+        assert!(message.contains("comments"), "{message}");
+        assert!(
+            message.contains("commentable_type"),
+            "names the remedy: {message}"
+        );
+
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments (commentable_type TEXT NOT NULL, commentable_id BIGINT NOT NULL, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n",
+        )
+        .expect("write");
+        assert!(ensure_no_comments_conflict(tmp.path()).is_ok());
+
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert!(ensure_no_comments_conflict(empty.path()).is_ok());
     }
 
     /// A `Comment` model scaffolded the ordinary way owns a `comments` table
@@ -2815,7 +2848,7 @@ mod tests {
         .expect("write");
         assert!(!already_migrated(tmp.path()), "no discriminator columns");
         assert!(
-            conflicting_comments_table(tmp.path()),
+            ensure_no_comments_conflict(tmp.path()).is_err(),
             "a same-named non-polymorphic table must be reported"
         );
 
@@ -2827,7 +2860,7 @@ mod tests {
         .expect("write");
         assert!(already_migrated(tmp.path()));
         assert!(
-            !conflicting_comments_table(tmp.path()),
+            ensure_no_comments_conflict(tmp.path()).is_ok(),
             "the shared table is reused, not a collision"
         );
 
@@ -2835,7 +2868,7 @@ mod tests {
         let empty = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(empty.path().join("migrations")).expect("mkdir");
         assert!(!already_migrated(empty.path()));
-        assert!(!conflicting_comments_table(empty.path()));
+        assert!(ensure_no_comments_conflict(empty.path()).is_ok());
     }
 
     /// Quoting makes an identifier case-SENSITIVE: `PostgreSQL` treats

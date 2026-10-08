@@ -852,6 +852,9 @@ fn plan_scaffold_with_options_impl(
         // On a revert, the shared table stays as long as ANY other model still
         // declares `#[commentable]` — it is one table for all of them, so
         // taking it out with this model would break every other one.
+        if !for_revert {
+            super::commentable::ensure_no_comments_conflict(project_root)?;
+        }
         let revert_would_orphan_another_model = for_revert
             && super::commentable::another_model_is_still_commentable(project_root, &snake_name);
         let emitted = !revert_would_orphan_another_model
@@ -864,19 +867,6 @@ fn plan_scaffold_with_options_impl(
             );
         if !for_revert {
             if emitted {
-                if super::commentable::conflicting_comments_table(project_root) {
-                    plan.warn(format!(
-                        "This project already has a `{table}` table that is NOT the \
-                         polymorphic one — a `Comment` model scaffolded the ordinary \
-                         way creates exactly that, and the shared table takes the same \
-                         name. Both `CREATE TABLE {table}` statements will be applied \
-                         and `migrate` will stop on \"already exists\". Rename or drop \
-                         the existing table, or add `commentable_type TEXT NOT NULL` \
-                         and `commentable_id BIGINT NOT NULL` to it and delete the \
-                         migration just written.",
-                        table = super::commentable::COMMENTS_TABLE,
-                    ));
-                }
                 plan.warn(format!(
                     "Added the shared `{table}` table. Every `#[commentable]` model \
                      attaches to it, so later models need no migration of their own. \
