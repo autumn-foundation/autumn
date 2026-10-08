@@ -498,6 +498,10 @@ fn outer_attrs_start(text: &str, start: usize) -> usize {
             let mut depth = 0usize;
             let mut open = None;
             for i in (0..bytes.len()).rev() {
+                // A bracket in a string or a comment is not structure.
+                if matches!(bytes[i], b'[' | b']') && is_in_comment_or_string(text, i) {
+                    continue;
+                }
                 match bytes[i] {
                     b']' => depth += 1,
                     b'[' => {
@@ -681,8 +685,10 @@ fn macro_calls(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> {
         // The call with its outer attributes, so a removal takes them too.
         let start = outer_attrs_start(text, macro_path_start(text, at));
         let mut end = close + 1;
-        if text[end..].starts_with(';') {
-            end += 1;
+        // The `;` of the call, also after spaces, then the line end.
+        let gap = text[end..].len() - text[end..].trim_start_matches([' ', '\t']).len();
+        if text[end + gap..].starts_with(';') {
+            end += gap + 1;
         }
         if text[end..].starts_with('\n') {
             end += 1;
@@ -1662,5 +1668,24 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
         let twice = format!("{POSTS_BLOCK}\n{POSTS_BLOCK}");
         assert!(validate(&twice).unwrap_err().contains("posts"));
         assert!(validate("diesel::table! {").is_err());
+    }
+
+    /// A space before `;` and a bracket in an attribute string do not leave
+    /// part of a removed call behind.
+    #[test]
+    fn a_spaced_semicolon_and_a_bracket_in_an_attribute_string_are_removed() {
+        let existing = "diesel::table! {\n    users (id) {\n        id -> Int8,\n    }\n}\n\n#[doc = \"]\"]\ndiesel::joinable!(comments -> users (user_id)) ;\n";
+        let out = sync_for_plan(
+            existing,
+            &parsed(vec![]),
+            &plan(vec![SchemaChange::DropTable(Table::new(
+                "comments",
+                Backend::Postgres,
+            ))]),
+        );
+        assert_eq!(
+            out.text,
+            "diesel::table! {\n    users (id) {\n        id -> Int8,\n    }\n}\n\n"
+        );
     }
 }
