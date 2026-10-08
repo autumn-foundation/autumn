@@ -29,9 +29,7 @@ use axum::http::{HeaderValue, Request, Response};
 use axum::response::IntoResponse;
 use tower::{Layer, Service};
 
-use super::{
-    DeferredLatency, FAULT_HEADER, FaultTarget, Injector, RequestScope, RouteFault, SCOPE,
-};
+use super::{DeferredFault, FAULT_HEADER, FaultTarget, Injector, RequestScope, RouteFault, SCOPE};
 
 type BoxFuture<T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send>>;
 
@@ -217,27 +215,19 @@ where
             })
             .unwrap_or_default();
         if self.deadline.is_none()
-            && let Some(deferred) = req.extensions().get::<DeferredLatency>()
+            && let Some(deferred) = req.extensions().get::<DeferredFault>()
             && deferred.take()
         {
-            // The outer layer rolled this latency. Wait for it here, inside
-            // the request timeout of the route.
-            fault.latency = deferred.latency;
-        }
-        if let Some(status) = fault.error {
-            // Outside the timeout layer, the wait stops at the deadline.
-            let wait = self
-                .deadline
-                .map_or(fault.latency, |deadline| fault.latency.min(deadline));
-            return Box::pin(async move {
-                if !wait.is_zero() {
-                    tokio::time::sleep(wait).await;
-                }
-                Ok(injected_error(status))
-            });
+            // The outer layer rolled this fault. Apply it here, inside the
+            // request timeout of the route.
+            fault.latency = deferred.fault.latency;
+            fault.error = fault.error.or(deferred.fault.error);
         }
         if fault.latency.is_zero() {
-            return Box::pin(self.inner.call(req));
+            return match fault.error {
+                Some(status) => Box::pin(async move { Ok(injected_error(status)) }),
+                None => Box::pin(self.inner.call(req)),
+            };
         }
         // Use the service that `poll_ready` made ready. Keep a clone in its
         // place.
@@ -246,13 +236,17 @@ where
         let Some(deadline) = self.deadline else {
             return Box::pin(async move {
                 tokio::time::sleep(fault.latency).await;
-                inner.call(req).await
+                match fault.error {
+                    Some(status) => Ok(injected_error(status)),
+                    None => inner.call(req).await,
+                }
             });
         };
-        // Outside the timeout layer: let the inner route layer wait. A
-        // response that did not pass it (a cached page) waits here, at most
-        // the request timeout, and then fails as a timeout does.
-        let deferred = DeferredLatency::new(fault.latency);
+        // Outside the timeout layer: let the inner route layer apply the
+        // fault. A response that did not pass it (a cached page) gets the
+        // fault here: a wait of at most the request timeout, then a failure
+        // as a timeout gives.
+        let deferred = DeferredFault::new(fault);
         req.extensions_mut().insert(deferred.clone());
         Box::pin(async move {
             let response = inner.call(req).await?;
@@ -264,7 +258,7 @@ where
                 return Ok(injected_error(axum::http::StatusCode::SERVICE_UNAVAILABLE));
             }
             tokio::time::sleep(fault.latency).await;
-            Ok(response)
+            Ok(fault.error.map_or(response, injected_error))
         })
     }
 }
@@ -560,6 +554,31 @@ mod tests {
         let started = tokio::time::Instant::now();
         assert_eq!(status(app, "/x").await, 503);
         assert_eq!(started.elapsed(), Duration::from_secs(2));
+    }
+
+    fn latency_and_error_injector(latency: Duration) -> Arc<Injector> {
+        let mut slow = error_rule(1_000_000);
+        slow.kind = FaultKind::Latency;
+        slow.latency = latency;
+        injector(vec![slow, error_rule(1_000_000)], 1_000)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_route_timeout_bounds_an_outer_latency_with_an_error() {
+        let injector = latency_and_error_injector(Duration::from_millis(900));
+        let app = static_path_app(&injector, Some(Duration::from_millis(500)));
+        let started = tokio::time::Instant::now();
+        assert_eq!(status(app, "/x").await, 503);
+        assert_eq!(started.elapsed(), Duration::from_millis(500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_route_with_no_timeout_keeps_a_long_latency_with_an_error() {
+        let injector = latency_and_error_injector(Duration::from_secs(3));
+        let app = static_path_app(&injector, None);
+        let started = tokio::time::Instant::now();
+        assert_eq!(status(app, "/x").await, 503);
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
     }
 
     /// A cached page does not reach the inner route layer. It waits in the

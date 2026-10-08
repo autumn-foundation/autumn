@@ -66,25 +66,26 @@ pub use layer::{FaultInjectionLayer, FaultInjectionService};
 /// The header on a response from an injected route error.
 pub const FAULT_HEADER: &str = "x-autumn-fault";
 
-/// Request extension: a route latency that the outer layer rolled.
+/// Request extension: a route fault that the outer layer rolled.
 ///
-/// The inner route layer waits for it, inside the request timeout of the
-/// route. When no inner layer takes it (a cached page), the outer layer waits.
+/// The inner route layer applies it, inside the request timeout of the
+/// route. When no inner layer takes it (a cached page), the outer layer
+/// applies it.
 #[derive(Clone, Debug)]
-struct DeferredLatency {
-    latency: Duration,
+struct DeferredFault {
+    fault: RouteFault,
     taken: Arc<AtomicBool>,
 }
 
-impl DeferredLatency {
-    fn new(latency: Duration) -> Self {
+impl DeferredFault {
+    fn new(fault: RouteFault) -> Self {
         Self {
-            latency,
+            fault,
             taken: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Takes the wait. Only the first call gets `true`.
+    /// Takes the fault. Only the first call gets `true`.
     fn take(&self) -> bool {
         !self.taken.swap(true, Ordering::AcqRel)
     }
@@ -600,7 +601,7 @@ struct RequestScope {
 }
 
 /// A fault decision.
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 struct RouteFault {
     latency: Duration,
     error: Option<StatusCode>,
@@ -679,7 +680,7 @@ pub(crate) fn replay_roll(target: FaultTarget) {
 ///
 /// Returns [`InjectedFault`] when an error fault for `target` fires.
 pub(crate) async fn inject(target: FaultTarget) -> Result<(), InjectedFault> {
-    let Ok(mut fault) = SCOPE.try_with(|scope| {
+    let Ok((mut fault, deadline_at)) = SCOPE.try_with(|scope| {
         let mut fault = scope.roll(target);
         // A seam can be outside the timeout layer (the Redis session store
         // is). All waits of a request share the request timeout: a wait gets
@@ -696,12 +697,18 @@ pub(crate) async fn inject(target: FaultTarget) -> Result<(), InjectedFault> {
             fault.error = Some(StatusCode::SERVICE_UNAVAILABLE);
             scope.errored.store(true, Ordering::Relaxed);
         }
-        fault
+        (fault, scope.deadline_at)
     }) else {
         return Ok(());
     };
     if !fault.latency.is_zero() {
         tokio::time::sleep(std::mem::take(&mut fault.latency)).await;
+        // A timer can wake late. Past the deadline, fail as a timeout would.
+        if fault.error.is_none() && deadline_at.is_some_and(|at| tokio::time::Instant::now() >= at)
+        {
+            fault.error = Some(StatusCode::SERVICE_UNAVAILABLE);
+            let _marked = SCOPE.try_with(|scope| scope.errored.store(true, Ordering::Relaxed));
+        }
     }
     match fault.error {
         Some(_) => Err(InjectedFault { target }),
@@ -989,6 +996,26 @@ mod tests {
             .await;
         assert!(result.is_err(), "the capped wait fails");
         assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert!(scope.errored.load(Ordering::Relaxed));
+    }
+
+    /// A timer that wakes after the deadline fails the wait, as a timeout
+    /// would.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_wake_past_the_deadline_fails() {
+        let mut rule = FaultRule::new(FaultTarget::Redis, FaultKind::Latency, 1.0);
+        rule.latency_ms = 900;
+        let injector = test_injector_with(
+            vec![CompiledRule::new(&rule)],
+            1_000,
+            Deadlines::new(Some(Duration::from_secs(1)), &Arc::default()),
+        );
+        let scope = injector.scope_for("/", &Method::GET).unwrap();
+        let mut wait = Box::pin(SCOPE.scope(Arc::clone(&scope), inject(FaultTarget::Redis)));
+        assert!(futures::poll!(&mut wait).is_pending());
+        // The timer fires late: the clock is past the deadline on wake.
+        tokio::time::advance(Duration::from_millis(1_500)).await;
+        assert!(wait.await.is_err(), "a late wake fails");
         assert!(scope.errored.load(Ordering::Relaxed));
     }
 
