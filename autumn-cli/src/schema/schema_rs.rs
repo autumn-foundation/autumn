@@ -125,32 +125,18 @@ fn sync(
         text: existing.to_owned(),
         ..SchemaRsSync::default()
     };
-    for (old, new) in removals {
-        let new = new
-            .as_deref()
-            .map(|n| ident_token(n).unwrap_or_else(|| n.to_owned()));
-        // A rename keeps the block and its attributes under the new name. The
-        // table loop below then updates the columns, if it can.
-        let text = match &new {
-            Some(new) => rename_header(&out.text, old, new),
-            None => remove_block(&out.text, old),
-        };
-        if let Some(text) = text {
-            out.text = text;
-            match &new {
-                Some(new) => out.renamed.push((old.clone(), unraw(new).to_owned())),
-                None => out.removed.push(old.clone()),
-            }
-        }
-        out.text = retarget_macros(&out.text, old, new.as_deref());
-    }
+    let held = apply_removals(&mut out, removals);
 
     let blocked: BTreeSet<&str> = desired
         .diagnostics
         .iter()
         .map(|d| d.table.as_str())
         .collect();
-    for table in desired.tables.iter().filter(|t| t.managed) {
+    for table in desired
+        .tables
+        .iter()
+        .filter(|t| t.managed && !held.contains(&t.name))
+    {
         if blocked.contains(table.name.as_str()) {
             out.skipped.push((
                 table.name.clone(),
@@ -201,6 +187,59 @@ fn sync(
         out.written.push(table.name.clone());
     }
     out
+}
+
+/// Drop or rename the blocks in `removals` (`None` drops, `Some` renames),
+/// and update the macros. Returns the new names of the renames it did not
+/// do. The table loop does not write those, so the file never gets a second
+/// block for one table.
+fn apply_removals(
+    out: &mut SchemaRsSync,
+    removals: &[(String, Option<String>)],
+) -> BTreeSet<String> {
+    let mut held = BTreeSet::new();
+    for (old, new) in removals {
+        let new_token = match new.as_deref().map(|n| (n, ident_token(n))) {
+            Some((n, None)) => {
+                out.skipped.push((
+                    old.clone(),
+                    format!("the new name `{n}` is not a Rust identifier"),
+                ));
+                held.insert(n.to_owned());
+                continue;
+            }
+            Some((_, token)) => token,
+            None => None,
+        };
+        // A rename keeps the block and its attributes under the new name. The
+        // table loop of `sync` then updates the columns, if it can.
+        let text = match &new_token {
+            Some(token) => rename_header(&out.text, old, token),
+            None => remove_block(&out.text, old),
+        };
+        match text {
+            Some(text) => {
+                out.text = text;
+                match new {
+                    Some(new) => out.renamed.push((old.clone(), new.clone())),
+                    None => out.removed.push(old.clone()),
+                }
+            }
+            None if has_header(&out.text, &ident_token(old).unwrap_or_else(|| old.clone())) => {
+                out.skipped.push((
+                    old.clone(),
+                    "the block has an unknown shape; edit it by hand".to_owned(),
+                ));
+                if let Some(new) = new {
+                    held.insert(new.clone());
+                }
+                continue;
+            }
+            None => {}
+        }
+        out.text = retarget_macros(&out.text, old, new_token.as_deref());
+    }
+    held
 }
 
 /// The diesel type of `column`, with `Nullable<...>` for a nullable column.
@@ -357,8 +396,20 @@ fn rename_header(text: &str, old: &str, new: &str) -> Option<String> {
     let token = ident_token(old).unwrap_or_else(|| old.to_owned());
     let (start, end) = schema_block_range(text, &token)?;
     let block = &text[start..end];
+    // The header line, found with the test `schema_block_range` uses. A doc
+    // comment that names the table does not match.
     let needle = format!("{token} (");
-    let at = block.find(&needle)?;
+    let mut offset = 0;
+    let mut at = None;
+    for line in block.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(&needle) {
+            at = Some(offset + line.len() - trimmed.len());
+            break;
+        }
+        offset += line.len();
+    }
+    let at = at?;
     Some(format!(
         "{}{}{new}{}{}",
         &text[..start],
@@ -418,10 +469,16 @@ fn retarget_macros(text: &str, old: &str, new: Option<&str>) -> String {
         if !names.iter().any(|n| unraw(n) == old) {
             continue;
         }
-        let kept: Vec<&str> = names
+        let mut kept: Vec<&str> = Vec::new();
+        for name in names
             .into_iter()
             .filter_map(|n| if unraw(n) == old { new } else { Some(n) })
-            .collect();
+        {
+            // A rename to a listed name must not list it twice.
+            if !kept.iter().any(|k| unraw(k) == unraw(name)) {
+                kept.push(name);
+            }
+        }
         if kept.len() < 2 {
             text.replace_range(start..end, "");
         } else {
@@ -1069,5 +1126,60 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
         assert!(check.stale.is_empty());
         assert_eq!(check.unchecked.len(), 1);
         assert_eq!(check.unchecked[0].0, "posts");
+    }
+
+    fn rename(from: &str, to: &str) -> MigrationPlan {
+        plan(vec![SchemaChange::RenameTable {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        }])
+    }
+
+    /// The rename changes the header line only, not a doc comment.
+    #[test]
+    fn a_rename_changes_the_header_not_a_doc_comment() {
+        let existing = "diesel::table! {\n    /// Legacy articles (v1).\n    articles (id) {\n        id -> Int8,\n    }\n}\n";
+        let mut t = posts(Backend::Postgres);
+        t.columns.truncate(1);
+        let out = sync_for_plan(existing, &parsed(vec![t]), &rename("articles", "posts"));
+        assert_eq!(
+            out.text,
+            "diesel::table! {\n    /// Legacy articles (v1).\n    posts (id) {\n        id -> Int8,\n    }\n}\n"
+        );
+    }
+
+    /// A block that the scanner cannot read is not renamed, and no second
+    /// block is added.
+    #[test]
+    fn a_rename_of_an_unreadable_block_is_skipped() {
+        let existing = "diesel::table! {\n    articles(id) {\n        id -> Int8,\n    }\n}\n";
+        let out = sync_for_plan(
+            existing,
+            &parsed(vec![posts(Backend::Postgres)]),
+            &rename("articles", "posts"),
+        );
+        assert_eq!(out.text, existing);
+        assert!(out.skipped.iter().any(|(t, _)| t == "articles"), "{out:?}");
+    }
+
+    /// A new name that is not a Rust identifier is not written.
+    #[test]
+    fn a_rename_to_a_non_identifier_is_skipped() {
+        let existing = "diesel::table! {\n    users (id) {\n        id -> Int8,\n    }\n}\n\ndiesel::allow_tables_to_appear_in_same_query!(users, posts);\n";
+        let out = sync_for_plan(existing, &parsed(vec![]), &rename("users", "auth.users"));
+        assert_eq!(out.text, existing);
+        assert!(out.skipped.iter().any(|(t, _)| t == "users"), "{out:?}");
+    }
+
+    /// A rename to a name that the allow list already has does not list it
+    /// twice.
+    #[test]
+    fn an_allow_list_never_lists_a_table_twice() {
+        let existing = "diesel::allow_tables_to_appear_in_same_query!(articles, posts, users);\n";
+        let out = sync_for_plan(existing, &parsed(vec![]), &rename("articles", "posts"));
+        assert_eq!(
+            out.text,
+            "diesel::allow_tables_to_appear_in_same_query!(posts, users);\n"
+        );
     }
 }

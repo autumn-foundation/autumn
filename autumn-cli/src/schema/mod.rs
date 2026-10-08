@@ -708,15 +708,17 @@ fn diff_at(project_root: &Path, args: &DiffArgs<'_>) -> Result<(), String> {
 
 /// Write `text` to `path` through a temporary file and a rename, so a failed
 /// write never leaves a part of the file. Keeps the permissions of the old
-/// file.
+/// file. A symbolic link stays a link: the write goes to its target.
 fn write_file_atomic(path: &Path, text: &str) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     std::io::Write::write_all(&mut tmp, text.as_bytes())?;
-    if let Ok(meta) = std::fs::metadata(path) {
+    if let Ok(meta) = std::fs::metadata(&target) {
         tmp.as_file().set_permissions(meta.permissions())?;
     }
-    tmp.persist(path).map(|_| ()).map_err(|e| e.error)
+    tmp.as_file().sync_all()?;
+    tmp.persist(&target).map(|_| ()).map_err(|e| e.error)
 }
 
 /// [`diff_at`] with the `src/schema.rs` writer as a parameter, so a test can

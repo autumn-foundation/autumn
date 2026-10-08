@@ -504,10 +504,12 @@ fn rename_hints(item: &syn::ItemStruct, table: &str) -> Vec<RenameHint> {
 }
 
 /// The SQL column of a field: the `#[diesel(column_name = ...)]` value, else
-/// the field name without a raw `r#` prefix. Same rule as the `#[model]` macro.
+/// the field name without a raw `r#` prefix. This is the rule of the `#[model]`
+/// macro and of diesel.
 ///
 /// The scan reads the tokens of the list, so another key with a type value
-/// (`deserialize_as = Vec<u8>`) does not stop it.
+/// (`deserialize_as = Vec<u8>`) does not stop it. (The macro's own detector
+/// stops at such a key; diesel does not.)
 fn field_column_name(field: &syn::Field, ident: &syn::Ident) -> String {
     use proc_macro2::TokenTree;
     for attr in field.attrs.iter().filter(|a| a.path().is_ident("diesel")) {
