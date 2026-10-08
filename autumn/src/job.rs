@@ -25178,7 +25178,7 @@ mod lease_tests {
         let lost = heartbeat.lost_token();
         let settled = heartbeat
             .stop_after(async {
-                tokio::time::sleep(Duration::from_millis(1_000)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
                 "settled"
             })
             .await;

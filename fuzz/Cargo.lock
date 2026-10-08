@@ -262,6 +262,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "hyper",
+ "hyper-util",
  "indexmap",
  "infer",
  "instant-acme",

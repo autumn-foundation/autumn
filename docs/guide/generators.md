@@ -1416,6 +1416,10 @@ autumn generate scaffold Post title:String comments:commentable
   and render a thread with `autumn_web::widgets::comment_thread`. Adding a
   third commentable model needs no change there.
 
+If the project already has a `comments` table that is not the shared one,
+generation stops and writes no file. Rename that resource, or add every
+missing column of the shared table (`id`, `commentable_type`, `commentable_id`, `parent_id`, `author_id`, `body`, `created_at` and `deleted_at`), then run the command again.
+
 At most one `commentable` field per model, and it takes no `{…}` modifiers —
 everything else is configured on the model's `#[commentable(...)]` attribute.
 See [Threaded Comments on Anything](commentable.md) for the full option list.

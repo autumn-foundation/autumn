@@ -243,6 +243,7 @@ const ORIGIN_ONLY_EXTRACTORS: &[(&str, &str)] = &[
     ("ClientScheme", "the client connection"),
     ("ClientCert", "the client connection"),
     ("OptionalClientCert", "the client connection"),
+    ("KeepTunnel", "the client connection"),
     ("CurrentPath", "request data the edge does not pass"),
     ("HxRequest", "request data the edge does not pass"),
     ("LastEventId", "request data the edge does not pass"),
