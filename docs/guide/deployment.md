@@ -1620,23 +1620,28 @@ enabled = true                 # off by default; the controller is a no-op when 
 When `enabled = true`, `autumn deploy up`:
 
 1. Runs **six fail-closed preflight checks before touching the host**. Two are
-   pure config and run first: the MediaMTX listener ports are distinct, and each
+   config-only and run first: the MediaMTX listener ports are distinct, and each
    listener port matches the app-side `[media.mediamtx] *_base` URL that calls it
    (so a customized port cannot strand the app on an origin the daemon no longer
-   binds). Four then probe the host: FFmpeg resolves (the concrete
-   `[media.ffmpeg] bin`), the MediaMTX binary is executable — or absent, with
-   `install_binary = true` — the recordings
-   directory is writable — or absent under a writable parent, which provisioning
-   then creates — and the MediaMTX ports are free. Any blocking failure
-   **aborts the deploy**, rather
+   binds). Four then probe the host:
+   - FFmpeg resolves (the concrete `[media.ffmpeg] bin`).
+   - The MediaMTX binary is executable. With `install_binary = true`, an absent
+     binary also passes. `binary_path` must be absolute.
+   - The recordings directory is writable, or absent under a writable parent.
+     Provisioning then creates it.
+   - The MediaMTX ports are free.
+
+   Any blocking failure **aborts the deploy**, rather
    than shipping a half-provisioned box. One caveat on the FFmpeg check: only a
    **concrete literal** `[media.ffmpeg] bin` is probed and fail-closed here; an
    env/interpolation-indirected path (an empty value, or one carrying a `${...}`
    placeholder such as `${AUTUMN_MEDIA__FFMPEG__BIN}`) is resolved by the deployed
    service from its own environment, so it is **deferred to runtime** — surfaced as
-   a non-blocking warning that does **not** abort the deploy. `autumn doctor`
-   runs the two pure checks, and all six over SSH with `--online`.
-2. Before cutover, installs MediaMTX if nothing is at `binary_path` (see below).
+   a non-blocking warning that does **not** abort the deploy. When `[deploy]` is
+   set, `autumn doctor` runs the two config-only checks, and all six over SSH
+   with `--online`.
+2. Before cutover, installs MediaMTX if nothing is at `binary_path` and
+   `install_binary = true` (the default). See below.
 3. After the app cutover succeeds, renders `mediamtx.yml` (LL-HLS window, fmp4
    recording under `recordings_dir`, WebRTC config, and a `~^room/.+$` path
    matcher for autumn-media Rooms) plus the systemd unit, then runs
@@ -1678,6 +1683,11 @@ moves it into place. It keeps an executable that is already there, and it stops
 with an error if any other file is there. Set `install_binary = false` to
 install MediaMTX yourself; the preflight then fails when the binary is
 absent.
+
+Docker, the pulled image and any apt packages stay on the host after the
+install. Deploy does not upgrade a binary that is already there, so a later
+change of the pinned version does not reach that host. To upgrade, remove the
+binary, then deploy again.
 
 ### How the deploy path is validated in CI
 

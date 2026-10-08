@@ -128,8 +128,9 @@ limit each client IP per route (off by default). Behind a reverse proxy, also
 set `[security.trusted_proxies]`, or all clients share the proxy's IP.
 
 A heartbeat renews the token expiry, but never past `joined_at +
-room_session_max_seconds` (default 12 hours). After that, the heartbeat returns
-`404` and the client must join again.
+room_session_max_seconds` (default 12 hours). After that, heartbeat and roster
+return `404`. The client leaves (leave accepts a token of any age), then joins
+again.
 
 A background reaper reclaims seats and rooms that go quiet. A client holds its
 seat by sending a heartbeat, or by polling the roster, on any interval under the

@@ -3988,16 +3988,16 @@ or CDN-fronted base is skipped (its public port is its own), and an unset base
 only warns, because the app may take it from `AUTUMN_MEDIA__MEDIAMTX__*_BASE`
 (Rooms since 0.6.0, this preflight 0.8.0, issue #1974). `deploy up` creates the config parent and
 `recordings_dir` (mode `0750`); an absent recordings dir under a writable parent
-passes, so a fresh host is not blocked. When `binary_path` is empty, `deploy up`
-installs the digest-pinned MediaMTX 1.19.3 before cutover; it never replaces a
-file that is there (`[media.mediamtx] install_binary = false` turns this off).
-`autumn doctor` runs the pure media checks, and all six over SSH with
-`--online`. Mesh rooms hold a seat by
+passes, so a fresh host is not blocked. When nothing is at `binary_path`,
+`deploy up` installs the digest-pinned MediaMTX 1.19.3 before cutover; it never
+replaces a file that is there (`[media.mediamtx] install_binary = false` turns
+this off). When `[deploy]` is set, `autumn doctor` runs the config-only media
+checks, and all six over SSH with `--online`. Mesh rooms hold a seat by
 `POST {api_prefix}/rooms/{room_id}/heartbeat` or a roster poll, on any interval
 under the idle TTL (default 15 min); a client that does neither is reaped from
-signaling, though its live WebRTC path survives and it can re-join. A heartbeat
-never renews past `joined_at + [media] room_session_max_seconds` (default 12 h);
-after that the client must join again. `[media] room_rate_limit_per_minute`
+signaling, though its live WebRTC path survives and it can re-join. After
+`joined_at + [media] room_session_max_seconds` (default 12 h), heartbeat and
+roster return `404`; the client leaves, then joins again. `[media] room_rate_limit_per_minute`
 (default `0` = off) limits each client IP per room route.
 
 `autumn deploy status [--json] [--strict]` is read-only and safe mid-incident:

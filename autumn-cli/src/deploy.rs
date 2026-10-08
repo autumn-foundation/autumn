@@ -4353,9 +4353,10 @@ where
                 ),
             );
         }
-        // MediaMTX binary (#1974): spliced before the proxy install below, so it
-        // runs right after it and before everything else. It only adds a file at an
-        // empty path, so it is safe before cutover. Empty unless media is enabled.
+        // Install the MediaMTX binary (#1974). The proxy install below goes in
+        // front, so the order is: proxy install, MediaMTX install, other ops. This
+        // op only adds a file at an empty path, so it is safe before cutover. It is
+        // empty when media is off.
         ops.splice(0..0, media_binary_install_ops(input.media_cfg));
         // Host preparation goes in AFTER the repair insert so it ends up ahead of
         // it: a host needing both is one with no proxy binary AND a drifted marker,
@@ -9694,7 +9695,7 @@ mod tests {
     #[test]
     fn media_binary_install_runs_before_cutover_in_up() {
         // The MediaMTX binary install (#1974) only adds a file at an empty path,
-        // so it runs BEFORE cutover, as the first media step of the host's turn.
+        // so it runs BEFORE cutover, as the first media op on the host.
         // A failed install then halts the rollout like any pre-cutover failure,
         // and the app is never live without its media daemon.
         let src = include_str!("deploy.rs");

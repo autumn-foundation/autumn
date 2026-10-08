@@ -9159,12 +9159,22 @@ fn media_check_result(check: crate::deploy::PreflightCheck) -> CheckResult {
 /// The SSH target for the media host checks: the one `[deploy]` host.
 ///
 /// Media provisioning supports one host, so a fleet or an empty host list is
-/// an error.
+/// an error. A user or host that starts with `-` is an error too.
 fn media_ssh_target(
     hosts: &Result<Vec<String>, String>,
     deploy_cfg: &DeployConfig,
 ) -> Result<crate::deploy::exec::SshTarget, String> {
+    // `ssh` reads a leading `-` as an option, so refuse it.
+    if deploy_cfg.user.starts_with('-') {
+        return Err(format!(
+            "`[deploy] user` {:?} starts with `-`; ssh would read it as an option",
+            deploy_cfg.user
+        ));
+    }
     match hosts.as_ref()?.as_slice() {
+        [host] if host.starts_with('-') => Err(format!(
+            "`[deploy]` host {host:?} starts with `-`; ssh would read it as an option"
+        )),
         [host] => Ok(crate::deploy::exec::SshTarget {
             host: host.clone(),
             user: deploy_cfg.user.clone(),
@@ -9179,9 +9189,9 @@ fn media_ssh_target(
 
 /// Doctor tasks for an enabled `[media.mediamtx]` section (#1974).
 ///
-/// The two pure config checks always run. `host` is `None` without
-/// `--online`. With `--online`, the four host checks run over executors from
-/// the factory in `Ok`, or fail with the text in `Err`.
+/// The two config-only checks always run. Offline, `host` is `None`. With
+/// `--online`, `Some(Ok(factory))` runs the four host checks on executors from
+/// `factory`. `Some(Err(text))` fails each host check with `text`.
 fn media_doctor_tasks<E, F>(
     cfg: &crate::deploy::media::MediaMtxHostConfig,
     ffmpeg_bin: &str,
@@ -10007,7 +10017,7 @@ pub fn run(opts: DoctorOptions) {
         }));
 
         // MediaMTX host checks (#1974), from the same `[media]` subtree `deploy
-        // up` reads. Offline: the pure config checks. `--online`: all six over SSH.
+        // up` reads. Offline: the config-only checks. `--online`: all six over SSH.
         match crate::deploy::media::media_host_config_from_value(toml::Value::Table(
             merged_deploy_toml,
         )) {
@@ -12137,6 +12147,18 @@ mod media_doctor_tests {
             media_ssh_target(&Err("bad hosts".to_owned()), &deploy).unwrap_err(),
             "bad hosts"
         );
+    }
+
+    #[test]
+    fn media_ssh_target_refuses_an_option_shaped_user_or_host() {
+        // `ssh` would read these as options, not as a destination.
+        let bad_user = DeployConfig {
+            user: "-oProxyCommand=touch /tmp/x".to_owned(),
+            ..DeployConfig::default()
+        };
+        assert!(media_ssh_target(&Ok(vec!["app.example.com".to_owned()]), &bad_user).is_err());
+        let deploy = DeployConfig::default();
+        assert!(media_ssh_target(&Ok(vec!["-oProxyCommand=x".to_owned()]), &deploy).is_err());
     }
 
     #[test]

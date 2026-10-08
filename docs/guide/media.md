@@ -194,14 +194,17 @@ prefix (default `/api/media`) and installs a `RoomService` on `AppState`:
 > authenticated session (the app's `auth.session_key` in the session), and an
 > anonymous request gets `401 Unauthorized`. Call them from a signed-in browser
 > session, or send the session cookie with API clients. Leave, heartbeat and the
-> roster are authorized by the per-room session token `join` returns. Set
-> `[media] room_rate_limit_per_minute` to limit each client IP per route; it is
-> off by default. An over-limit request gets `429` before its body is read. The
-> limit uses the core `#[throttle]` limiter, so the client IP comes from
-> `[security.trusted_proxies]`. Behind a reverse proxy, set that too, or all
-> clients share the proxy's IP and one bucket. An `InMemoryRoomStore` caps the registry at 10,000
-> rooms as a defense-in-depth backstop, and a background reaper reclaims idle
-> rooms.
+> roster are authorized by the per-room session token `join` returns.
+>
+> Set `[media] room_rate_limit_per_minute` to limit each client IP on each
+> route. It is off by default. An over-limit request gets `429` before its body
+> is read. On create and join, the session check runs first, so an anonymous
+> caller gets `401`. The limit uses the core `#[throttle]` limiter, so the
+> client IP comes from `[security.trusted_proxies]`. Behind a reverse proxy, set
+> that too. If you do not, all clients share the proxy's IP and one bucket.
+>
+> An `InMemoryRoomStore` caps the registry at 10,000 rooms as a backstop, and a
+> background reaper removes idle rooms.
 
 A `join` response gives the joiner its own `publish` target (the WHIP URL for
 its `MediaMTX` path) plus one `subscribe` target (a WHEP URL) per existing peer.
@@ -284,12 +287,16 @@ POST /api/media/rooms/{room_id}/heartbeat
 
 It answers `{"alive": true, "token_expires_at": "..."}` with the expiry renewed
 to `now + room_token_ttl_seconds`; the token **value** never rotates, so an
-in-flight roster poll keeps working. The renewal stops at `joined_at +
-room_session_max_seconds` (default 12 hours): the expiry is never later than
-that, and a heartbeat after it gets `404`. A captured token therefore cannot be
-kept alive forever; the client joins again for a new one. Like the roster, it is fail-closed: an
-unknown room, unknown participant and wrong token are one indistinguishable
-`404`. Liveness is client-driven, not media-derived — a participant that neither
+in-flight roster poll keeps working.
+
+The session ends at `joined_at + room_session_max_seconds` (default 12 hours).
+The expiry is never later than that. After it, heartbeat and roster get `404`,
+so a captured token stops working. The client leaves (leave accepts a token of
+any age), then joins again for a new token. Leave first: in a full room, the old
+seat blocks the new join until the reaper removes it.
+
+Like the roster, the heartbeat is fail-closed: an unknown room, unknown
+participant and wrong token are one indistinguishable `404`. Liveness is client-driven, not media-derived — a participant that neither
 heartbeats nor polls for a full idle TTL loses its signaling record (its live
 `MediaMTX` path is untouched, so it can simply re-join).
 

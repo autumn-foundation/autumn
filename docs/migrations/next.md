@@ -622,11 +622,11 @@ a warning. `extension::<MediaWorkflows>()` then returns `None`, jobs on the
 **Automation:** `manual` — this is a runtime behavior change. The code still
 compiles, so a codemod cannot know which primitive your app uses.
 
-### Media: `RoomStore::heartbeat` takes a `max_session` limit
+### Media: `RoomStore::heartbeat` and `RoomStore::roster` take a `session_max` limit
 
-**Why:** A heartbeat renewed the room token with no limit, so a captured token
-stayed valid for as long as someone sent heartbeats. A heartbeat now never
-renews past `joined_at + max_session`. Issue #1974.
+**Why:** A heartbeat renewed the room token with no limit, and a roster poll
+accepted a token of any age. So a captured token stayed valid for as long as
+someone used it. Now neither works past `joined_at + session_max`. Issue #1974.
 
 **Before (`{X.Y}`):**
 
@@ -651,20 +651,28 @@ fn heartbeat<'a>(
     participant_id: &'a str,
     token: &'a str,
     token_ttl: Duration,
-    max_session: Duration,
+    session_max: Duration,
 ) -> RoomStoreFuture<'a, DateTime<Utc>>;
 ```
 
+`roster` gains the same last argument:
+`fn roster<'a>(&'a self, namespace: &'a str, room_id: &'a str, auth_token: &'a str, session_max: Duration)`.
+
 In an out-of-tree store, compute the new expiry with
-`autumn_media_plugin::rooms::renewed_expiry(joined_at, now, token_ttl,
-max_session)`. When it returns `None`, return `RoomError::RoomNotFound` and
-change nothing.
+`autumn_media_plugin::renewed_expiry(joined_at, now, token_ttl, session_max)`.
+When it returns `None`, return `RoomError::RoomNotFound` and change nothing. In
+`roster`, refuse a matching member when `now >= joined_at + session_max`, and
+do not refresh its `last_seen_at`.
 
 `MediaConfig` also has two new public fields, `room_session_max_seconds`
 (default `43200`) and `room_rate_limit_per_minute` (default `0`, off). A
 struct literal that lists every field must add them, or use
-`..MediaConfig::default()`. Boot fails when `room_session_max_seconds` is less
-than `room_token_ttl_seconds`.
+`..MediaConfig::default()`. With rooms enabled, boot fails when
+`room_session_max_seconds` is less than `room_token_ttl_seconds`.
+
+A client that stays in a room for more than 12 hours now gets `404` from
+heartbeat and roster. It must leave, then join again. To keep longer sessions,
+set a larger `room_session_max_seconds`.
 
 **Automation:** `manual` — a codemod cannot write your store's renewal logic.
 

@@ -76,8 +76,8 @@ pub use rooms::{
     HeartbeatRequest, HeartbeatResponse, InMemoryRoomStore, JoinRecord, JoinRequest, JoinResponse,
     LeaveRequest, ParticipantView, PublishTarget, ReapFuture, ReapStats, RoomError,
     RoomLeaveResponse, RoomService, RoomSnapshot, RoomStore, RoomStoreFuture, SessionToken,
-    SubscribeTarget, room_participant_path, room_route_infos, room_router, spawn_room_reaper_loop,
-    validate_room_segment,
+    SubscribeTarget, renewed_expiry, room_participant_path, room_route_infos, room_router,
+    spawn_room_reaper_loop, validate_room_segment,
 };
 pub use rooms_db::DbRoomStore;
 pub use sink::{
@@ -115,8 +115,9 @@ pub mod prelude {
     };
     pub use crate::{
         HeartbeatResponse, InMemoryRoomStore, JoinRecord, JoinResponse, ParticipantView, ReapStats,
-        RoomError, RoomService, RoomSnapshot, RoomStore, SessionToken, room_participant_path,
-        room_route_infos, room_router, spawn_room_reaper_loop, validate_room_segment,
+        RoomError, RoomService, RoomSnapshot, RoomStore, SessionToken, renewed_expiry,
+        room_participant_path, room_route_infos, room_router, spawn_room_reaper_loop,
+        validate_room_segment,
     };
     pub use crate::{
         IngestStatus, MediaMtxClient, MediaUrls, StreamQualityStats, StreamStatus, ViewerCount,
@@ -289,6 +290,14 @@ impl MediaPlugin {
         self
     }
 
+    /// Override the maximum room session length, in seconds (shortcut for
+    /// `config.room_session_max_seconds`). It must be at least the token TTL.
+    #[must_use]
+    pub const fn room_session_max_seconds(mut self, seconds: u32) -> Self {
+        self.config.room_session_max_seconds = seconds;
+        self
+    }
+
     /// Override the mesh-room `MediaMTX` path namespace (shortcut for
     /// `config.room_namespace`).
     #[must_use]
@@ -445,7 +454,8 @@ impl Plugin for MediaPlugin {
         // another config that can never serve a request. It fails fast here too,
         // via the same `on_startup` abort but its own specific message.
         // The storage backend keeps its own degrade path below (unchanged), so
-        // this only fails fast on the room cap and room namespace.
+        // this fails fast only on the room cap, the room namespace and the
+        // session limit.
         //
         // Gated on `enable_rooms`: a broadcast-only plugin (`with_broadcast()`
         // without `with_rooms()`) mounts no room router / `RoomService`, so a
@@ -540,8 +550,8 @@ impl Plugin for MediaPlugin {
                         room_token_ttl,
                         room_max_participants,
                     )
-                    .with_max_session(room_max_session)
-                    .with_rate_limit(room_rate_limit);
+                    .with_session_max(room_max_session)
+                    .with_rate_limit_per_minute(room_rate_limit);
                     state.insert_extension(room_service);
                 })
                 // Spawn from `on_startup` so the reaper shares the running app's
@@ -703,8 +713,8 @@ fn room_config_boot_error(
 
 /// Reject a session limit shorter than the token TTL.
 ///
-/// A join mints a token for `room_token_ttl_seconds`. A shorter session limit
-/// makes every first heartbeat fail, so the room can never hold a seat.
+/// A join mints a token that lives `room_token_ttl_seconds`. A shorter session
+/// limit ends the session before that token expires.
 fn room_session_max_error(config: &MediaConfig) -> Option<String> {
     let session_max = config.room_session_max_seconds;
     let token_ttl = config.room_token_ttl_seconds;
@@ -1281,7 +1291,7 @@ mod primitive_surface_tests {
         };
         let (rate, session) = probe(MediaPlugin::new().config(config).with_rooms(), |state| {
             let rooms = state.extension::<RoomService>().expect("rooms installed");
-            (rooms.rate_limit_per_minute(), rooms.max_session())
+            (rooms.rate_limit_per_minute(), rooms.session_max())
         });
         assert_eq!(rate, 30);
         assert_eq!(session, chrono::Duration::hours(1));

@@ -94,9 +94,9 @@
 //!
 //! ## Where the checks run
 //!
-//! `deploy up` runs all six before cutover. `autumn doctor` runs the two pure
-//! checks offline, and all six over SSH with `--online`
-//! ([`collect_media_doctor_checks`]).
+//! `deploy up` runs all six before cutover. When `[deploy]` is set,
+//! `autumn doctor` runs the two config-only checks offline, and all six over
+//! SSH with `--online` ([`collect_media_doctor_checks`]).
 //!
 //! ## Placement
 //!
@@ -326,9 +326,13 @@ impl Default for MediaMtxHostConfig {
     }
 }
 
+/// Label of the op that installs the `MediaMTX` binary. It runs before
+/// `migrate`, so it is in [`super::exec::PRE_MIGRATE_LABELS`].
+pub const MEDIA_INSTALL_BINARY_LABEL: &str = "media-install-binary";
+
 /// The `MediaMTX` release `deploy up` installs on a host that has none.
 ///
-/// The rendered `mediamtx.yml` is checked against this release line.
+/// The `mediamtx.yml` renderer targets this release line (v1.19.x).
 pub const MEDIAMTX_KNOWN_GOOD_VERSION: &str = "1.19.3";
 
 /// OCI image-index digest of the `bluenviron/mediamtx` image at
@@ -684,21 +688,24 @@ impl MediaMtxController {
     ///    never replaces an operator's binary.
     /// 2. If any other file, directory or symlink is there, stop with an error.
     /// 3. Install `docker.io` with apt if `docker` is missing, and start it.
-    /// 4. Copy `/mediamtx` out of `bluenviron/mediamtx:<version>@<digest>` to a
-    ///    staged path next to `binary_path`, and remove the scratch container.
+    ///    apt waits up to 5 minutes for its lock.
+    /// 4. Remove any old staged path (a symlink is removed, not followed).
+    ///    Copy `/mediamtx` out of `bluenviron/mediamtx:<version>@<digest>` to
+    ///    the staged path next to `binary_path`, and remove the scratch container.
     /// 5. Make sure the staged file prints `v<version>` for `--version`. If not,
     ///    delete it and stop with an error.
     /// 6. Move the staged file into place.
     ///
-    /// Each step ends in `|| exit 1`. `set -e` is not used: a shell ignores it
-    /// inside a `( … ) || …` list.
+    /// Each step that must succeed ends in `|| exit 1`. Cleanup steps end in
+    /// `|| true`. `set -e` is not used: a shell ignores it inside a
+    /// `( … ) || …` list.
     #[must_use]
     pub fn binary_install_ops(&self) -> Vec<DeployOp> {
         if !self.cfg.enabled || !self.cfg.install_binary {
             return Vec::new();
         }
         vec![DeployOp::Run(RemoteCommand::new(
-            "media-install-binary",
+            MEDIA_INSTALL_BINARY_LABEL,
             self.binary_install_shell(),
         ))]
     }
@@ -715,29 +722,35 @@ impl MediaMtxController {
         let mkdir = parent_dir(path)
             .map(|parent| format!("mkdir -p {} || exit 1; ", quote(parent)))
             .unwrap_or_default();
+        // Exit 2 = a refusal with its own message; the outer handler then
+        // skips the apt / Docker Hub text.
         format!(
             "( if [ -f {bin} ] && [ -x {bin} ]; then exit 0; fi; \
              if [ -e {bin} ] || [ -L {bin} ]; then \
-             echo 'refusing to replace '{bin}': it is not an executable file' >&2; exit 1; fi; \
+             echo 'refusing to replace '{bin}': it is not an executable file' >&2; exit 2; fi; \
              if ! command -v docker >/dev/null 2>&1; then \
              export DEBIAN_FRONTEND=noninteractive; \
-             apt-get update -qq || exit 1; \
-             apt-get install -y -qq --no-install-recommends docker.io || exit 1; fi; \
+             apt-get -o DPkg::Lock::Timeout=300 update -qq || exit 1; \
+             apt-get -o DPkg::Lock::Timeout=300 install -y -qq --no-install-recommends docker.io \
+             || exit 1; fi; \
              systemctl start docker >/dev/null 2>&1 || true; \
              {mkdir}\
+             rm -rf {staged} || exit 1; \
              cid=$(docker create {image}) || exit 1; \
              rc=0; docker cp \"$cid:/mediamtx\" {staged} || rc=1; \
              docker rm -f \"$cid\" >/dev/null 2>&1 || true; \
-             [ \"$rc\" -eq 0 ] || exit 1; \
+             if [ \"$rc\" -ne 0 ]; then rm -rf {staged}; exit 1; fi; \
              chmod 755 {staged} || exit 1; \
              if [ \"$({staged} --version 2>/dev/null)\" != {want} ]; then \
              rm -f {staged}; \
-             echo 'the copied MediaMTX is not '{want}' or does not run on this host' >&2; exit 1; fi; \
+             echo 'the copied MediaMTX is not '{want}' or does not run on this host' >&2; exit 2; fi; \
              mv -f {staged} {bin} || exit 1 \
-             ) || {{ \
+             ) || {{ rc=$?; \
+             if [ \"$rc\" -ne 2 ]; then \
              echo 'autumn deploy could not install MediaMTX {MEDIAMTX_KNOWN_GOOD_VERSION}. It needs an \
              apt-based (Debian/Ubuntu) host, outbound HTTPS to the distro mirrors and to Docker Hub, \
-             and an SSH user that can install packages. Install MediaMTX at '{bin}' yourself and set \
+             and an SSH user that can install packages.' >&2; fi; \
+             echo 'Install MediaMTX at '{bin}' yourself and set \
              `[media.mediamtx] install_binary = false` in autumn.toml.' >&2; \
              exit 1; }}"
         )
@@ -898,6 +911,10 @@ const PORTS_DISTINCT_HINT: &str = "Give each MediaMTX TCP listener (`rtmp_port`/
 /// Remediation hint shown when the `MediaMTX` binary is missing / not executable.
 const MEDIAMTX_BINARY_HINT: &str = "Set `[media.mediamtx] install_binary = true` to let `deploy up` install the pinned \
      MediaMTX, or put an executable MediaMTX at `binary_path` yourself";
+
+/// Hint for a `binary_path` that holds something other than an executable.
+const MEDIAMTX_BINARY_OCCUPIED_HINT: &str =
+    "Remove the file at `binary_path`, or replace it with an executable MediaMTX";
 
 /// Remediation hint shown when `[media.ffmpeg] bin` is env/interpolation
 /// indirected and therefore deferred to the service's own runtime resolution.
@@ -1422,6 +1439,21 @@ pub fn mediamtx_binary_preflight(
     cfg: &MediaMtxHostConfig,
 ) -> PreflightCheck {
     let bin = &cfg.binary_path;
+    // systemd needs an absolute `ExecStart`, and the install needs a real
+    // directory. Fail before the probe, so a bad path never reaches cutover.
+    if !bin.starts_with('/') {
+        return PreflightCheck {
+            name: CHECK_MEDIAMTX_BINARY,
+            scope: None,
+            passed: false,
+            deferred: false,
+            detail: format!(
+                "`[media.mediamtx] binary_path` {bin:?} must be an absolute path — systemd \
+                 cannot start a relative `ExecStart`"
+            ),
+            hint: Some("Set `[media.mediamtx] binary_path` to an absolute path"),
+        };
+    }
     let quoted = super::exec::shell_quote(bin);
     let cmd = RemoteCommand::new(
         "media-mediamtx-binary",
@@ -1474,7 +1506,7 @@ pub fn mediamtx_binary_preflight(
                 "`{bin}` exists but is not an executable file — deploy does not replace it, \
                  and the post-cutover `systemctl restart` would fail"
             ),
-            MEDIAMTX_BINARY_HINT,
+            MEDIAMTX_BINARY_OCCUPIED_HINT,
         ),
         other => fail(
             format!(
@@ -2723,6 +2755,34 @@ unit_name = \"mediamtx-prod\"
     }
 
     #[test]
+    fn mediamtx_binary_preflight_fails_on_a_relative_or_empty_path() {
+        // systemd needs an absolute `ExecStart`, so these fail before cutover
+        // and the host is not probed.
+        for path in ["", "mediamtx", "bin/mediamtx"] {
+            let exec = binary_probe("absent\n");
+            let cfg = MediaMtxHostConfig {
+                binary_path: path.to_owned(),
+                ..MediaMtxHostConfig::default()
+            };
+            let check = mediamtx_binary_preflight(&exec, &cfg);
+            assert!(check.blocking(), "{path:?}: {}", check.detail);
+            assert!(check.detail.contains("absolute"), "{}", check.detail);
+            assert!(exec.labels().is_empty(), "{path:?} must not be probed");
+        }
+    }
+
+    #[test]
+    fn mediamtx_binary_preflight_hint_for_an_occupied_path_says_remove() {
+        let check =
+            mediamtx_binary_preflight(&binary_probe("occupied\n"), &MediaMtxHostConfig::default());
+        assert!(
+            check.hint.is_some_and(|hint| hint.contains("Remove")),
+            "{:?}",
+            check.hint
+        );
+    }
+
+    #[test]
     fn mediamtx_binary_preflight_fails_closed_when_it_cannot_tell() {
         for exec in [
             RecordingExecutor::failing_on("media-mediamtx-binary"),
@@ -2955,6 +3015,74 @@ unit_name = \"mediamtx-prod\"
                 .is_symlink()
         );
         assert!(run.docker_log().is_empty(), "docker must not run");
+    }
+
+    #[test]
+    fn install_shell_waits_for_the_apt_lock() {
+        let shell = install_shell_for("/usr/local/bin/mediamtx");
+        assert_eq!(
+            shell.matches("-o DPkg::Lock::Timeout=300").count(),
+            2,
+            "{shell}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_shell_removes_a_leftover_staged_path_without_following_it() {
+        let run = InstallRun::new();
+        std::fs::create_dir_all(run.bin.parent().unwrap()).unwrap();
+        // A symlink at the staged path must not redirect the copy.
+        let victim = run.dir.path().join("victim");
+        std::fs::write(&victim, "keep me").unwrap();
+        std::os::unix::fs::symlink(&victim, run.staged()).unwrap();
+        let out = run.run(&format!("v{MEDIAMTX_KNOWN_GOOD_VERSION}"));
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        assert!(
+            !std::fs::symlink_metadata(&run.bin)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        // A leftover directory must not block the next install.
+        let run = InstallRun::new();
+        std::fs::create_dir_all(run.staged()).unwrap();
+        let out = run.run(&format!("v{MEDIAMTX_KNOWN_GOOD_VERSION}"));
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!run.staged().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_shell_names_the_real_cause_of_a_refusal() {
+        let run = InstallRun::new();
+        std::fs::create_dir_all(run.bin.parent().unwrap()).unwrap();
+        std::fs::write(&run.bin, "not a binary").unwrap();
+        let refused = run.run(&format!("v{MEDIAMTX_KNOWN_GOOD_VERSION}"));
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(stderr.contains("refusing to replace"), "{stderr}");
+        assert!(
+            !stderr.contains("apt-based"),
+            "no apt hint for a refusal: {stderr}"
+        );
+
+        let wrong = InstallRun::new().run("v1.18.0");
+        let stderr = String::from_utf8_lossy(&wrong.stderr);
+        assert!(stderr.contains("v1.19.3"), "{stderr}");
+        assert!(
+            !stderr.contains("apt-based"),
+            "no apt hint for a version mismatch: {stderr}"
+        );
     }
 
     #[cfg(unix)]

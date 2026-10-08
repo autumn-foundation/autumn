@@ -418,8 +418,8 @@ pub struct MediaConfig {
     /// Maximum seconds one room session lasts, counted from the join.
     ///
     /// A heartbeat does not renew the token expiry past `joined_at` plus this
-    /// value. After it, the heartbeat fails and the client must join again.
-    /// Must be at least `room_token_ttl_seconds`.
+    /// value. After it, heartbeat and roster fail, and the client leaves and
+    /// joins again. Must be at least `room_token_ttl_seconds`.
     #[serde(default = "default_room_session_max_seconds")]
     pub room_session_max_seconds: u32,
     /// Requests each client IP may send to each room route per minute.

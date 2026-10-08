@@ -402,6 +402,7 @@ impl RoomStore for DbRoomStore {
         namespace: &'a str,
         room_id: &'a str,
         auth_token: &'a str,
+        session_max: Duration,
     ) -> RoomStoreFuture<'a, RoomSnapshot> {
         Box::pin(async move {
             let mut conn = self.pool.get().await.map_err(map_db_err)?;
@@ -434,14 +435,16 @@ impl RoomStore for DbRoomStore {
             // member gets the same `RoomNotFound` as a nonexistent room (no
             // membership oracle). On a match, refresh that member's liveness
             // clock so the reaper never reclaims an actively-polling participant.
+            // A member past `joined_at + session_max` is refused the same way.
             let now = Utc::now();
-            let member_id = rows.iter().find_map(|row| {
-                autumn_web::auth::constant_time_eq(auth_token.as_bytes(), row.token.as_bytes())
-                    .then(|| row.participant_id.clone())
-            });
-            let Some(member_id) = member_id else {
-                return Err(RoomError::RoomNotFound);
-            };
+            let member_id = rows
+                .iter()
+                .find(|row| {
+                    autumn_web::auth::constant_time_eq(auth_token.as_bytes(), row.token.as_bytes())
+                })
+                .filter(|row| now < row.joined_at.and_utc() + session_max)
+                .map(|row| row.participant_id.clone())
+                .ok_or(RoomError::RoomNotFound)?;
 
             diesel::update(
                 media_room_participants::table.filter(
@@ -467,7 +470,7 @@ impl RoomStore for DbRoomStore {
         participant_id: &'a str,
         token: &'a str,
         token_ttl: Duration,
-        max_session: Duration,
+        session_max: Duration,
     ) -> RoomStoreFuture<'a, DateTime<Utc>> {
         Box::pin(async move {
             let mut conn = self.pool.get().await.map_err(map_db_err)?;
@@ -497,7 +500,7 @@ impl RoomStore for DbRoomStore {
             }
 
             let now = Utc::now();
-            let renewed = renewed_expiry(joined_at.and_utc(), now, token_ttl, max_session)
+            let renewed = renewed_expiry(joined_at.and_utc(), now, token_ttl, session_max)
                 .ok_or(RoomError::RoomNotFound)?;
             // Truncate to microseconds — the `Timestamp` column's resolution —
             // so the expiry this call returns is exactly the one another process
