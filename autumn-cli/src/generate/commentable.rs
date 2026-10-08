@@ -620,7 +620,6 @@ fn alter_tables(sql: &str) -> Vec<(usize, TableRef, &str)> {
 /// Scanned by destination because a rename INTO `comments` begins with whatever
 /// the table used to be called, which the caller has no other way to know.
 fn table_rename_target(statement: &str) -> Option<TableRef> {
-    let statement = &squash_whitespace(statement);
     let at = statement.find(" rename to ")?;
     // `RENAME COLUMN … TO …` is a column rename, classified with the columns.
     if statement[..at].contains("rename column") {
@@ -629,17 +628,9 @@ fn table_rename_target(statement: &str) -> Option<TableRef> {
     parse_table_ref(&statement[at + " rename to ".len()..]).map(|(table, _)| table)
 }
 
-/// `statement` with every whitespace run as one space, and one space at each
-/// end, so keyword phrases match whatever whitespace split them.
-fn squash_whitespace(statement: &str) -> String {
-    let words: Vec<&str> = statement.split_whitespace().collect();
-    format!(" {} ", words.join(" "))
-}
-
 /// The new home of `table` after `ALTER TABLE … SET SCHEMA <schema>`, if
 /// `statement` (the text after the table name) is one.
 fn table_set_schema_target(statement: &str, table: &TableRef) -> Option<TableRef> {
-    let statement = &squash_whitespace(statement);
     let at = statement.find(" set schema ")?;
     let (schema, _) = parse_ident_segment(&statement[at + " set schema ".len()..])?;
     Some(TableRef {
@@ -922,6 +913,14 @@ fn migration_up_sql(project_root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Push one space, unless `out` already ends in one. Keyword phrases such as
+/// `drop table` then match whatever whitespace or comment split them.
+fn push_space(out: &mut String) {
+    if !out.ends_with(' ') {
+        out.push(' ');
+    }
+}
+
 /// `sql` with `--` line comments and `/* … */` blocks removed.
 ///
 /// Matching runs over raw text, so a commented-out example — `-- CREATE TABLE
@@ -1101,20 +1100,19 @@ fn strip_sql_comments(sql: &str) -> String {
             }
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
                 let end = sql[i..].find('\n').map_or(bytes.len(), |nl| i + nl);
-                // Blanked, not dropped, so offsets survive.
-                for _ in i..end {
-                    out.push(' ');
-                }
+                push_space(&mut out);
                 i = end;
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
                 let end = sql[i + 2..]
                     .find("*/")
                     .map_or(bytes.len(), |e| i + 2 + e + 2);
-                for _ in i..end {
-                    out.push(' ');
-                }
+                push_space(&mut out);
                 i = end;
+            }
+            _ if bytes[i].is_ascii_whitespace() => {
+                push_space(&mut out);
+                i += 1;
             }
             _ => {
                 let ch = sql[i..].chars().next().unwrap_or(' ');
@@ -2125,6 +2123,28 @@ mod tests {
         )
         .expect("write");
         assert!(ensure_no_comments_conflict(tmp.path()).is_ok());
+    }
+
+    /// DDL verbs may be split by any whitespace too, and by a comment.
+    #[test]
+    fn ddl_verbs_accept_any_whitespace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_create");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let create = "CREATE\n  TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT);\n";
+        for undo in [
+            "DROP\nTABLE comments;\n",
+            "ALTER\nTABLE comments RENAME TO archived_comments;\n",
+            "DROP /* old */ TABLE\tcomments;\n",
+        ] {
+            std::fs::write(dir.join("up.sql"), format!("{create}{undo}")).expect("write");
+            assert!(
+                ensure_no_comments_conflict(tmp.path()).is_ok(),
+                "the name is free after: {undo}"
+            );
+        }
+        std::fs::write(dir.join("up.sql"), create).expect("write");
+        assert!(ensure_no_comments_conflict(tmp.path()).is_err());
     }
 
     /// `RENAME TO` keeps the table in its schema: a table renamed within

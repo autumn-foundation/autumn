@@ -77,7 +77,7 @@ pub enum GenerateError {
          The shared comments table needs that name.\n\
          Do one of these, then run the command again:\n  \
          - rename or drop the existing table (for example, rename the `Comment` resource);\n  \
-         - add every missing shared-table column to it: commentable_type, \
+         - add every missing shared-table column to it: id, commentable_type, \
          commentable_id, parent_id, author_id, body, created_at, deleted_at."
     )]
     CommentsTableConflict,
