@@ -428,6 +428,11 @@ kubectl exec deploy/myapp-canary -- autumn canary rollback --reason "error budge
 #    failing. Then `kubectl scale deploy/myapp-canary --replicas=0`.
 ```
 
+`autumn release init --target kubernetes` writes a Helm chart that can render
+an Argo Rollouts `Rollout` or a Flagger `Canary`. `autumn slo generate` writes
+the analysis templates that gate it on your SLO burn rate. See
+[Kubernetes](kubernetes.md#canary-deploys) and [SLOs as Code](slo.md).
+
 In both examples Autumn never moves the traffic weight itself — it supplies the
 version-labelled signals the controller gates on and the clean-drain rollback
 the controller triggers.

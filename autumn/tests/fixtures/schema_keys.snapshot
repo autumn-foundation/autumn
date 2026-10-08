@@ -138,6 +138,12 @@ database.url
 deploy
 deploy.app_dir
 deploy.app_name
+deploy.bake
+deploy.bake.duration_secs
+deploy.bake.interval_secs
+deploy.bake.max_error_rate
+deploy.bake.max_p99_ms
+deploy.bake.min_requests
 deploy.host
 deploy.hosts
 deploy.install_proxy
@@ -503,6 +509,13 @@ shadow.routes
 shadow.sample_rate
 shadow.target
 shadow.timeout_ms
+slo
+slo.description
+slo.name
+slo.objective
+slo.route
+slo.sli
+slo.threshold_ms
 storage
 storage.allow_local_in_production
 storage.backend
