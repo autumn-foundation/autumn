@@ -472,8 +472,8 @@ thread does not stop.
 
 For a tracked job, the timeout also covers the `mark_running` call to the
 tracking store. If the store stalls, the run fails with the timeout error. The
-normal retry rules apply. The final `complete` or `fail` call has its own cap
-of 5 seconds. When the cap is reached, the worker logs a warning and continues.
+normal retry rules apply. Each terminal `complete` or `fail` call has its own
+cap of 5 seconds. This includes the `fail` call for a cancelled job. When the cap is reached, the worker logs a warning and continues.
 The tracked record then expires through its TTL.
 
 When the worker stops a run (lost lease or timeout), it drops the handler

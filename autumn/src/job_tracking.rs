@@ -1086,6 +1086,10 @@ pub(crate) async fn settle_tracked_payload_as_failed_globally(payload: &Value, m
     settle_tracked_payload_with_store(global_tracking_store(), payload, message).await;
 }
 
+/// Longest wait for one terminal write to the tracking store. A stalled store
+/// must not hold a worker. The record then expires through its TTL.
+pub(crate) const TRACKING_SETTLE_CAP: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn settle_tracked_payload_with_store(
     store: Option<Arc<dyn JobTrackingStore>>,
     payload: &Value,
@@ -1096,7 +1100,8 @@ async fn settle_tracked_payload_with_store(
         return;
     };
     if let Some(store) = store {
-        let _ = store.fail(key, message.to_owned()).await;
+        let _ =
+            tokio::time::timeout(TRACKING_SETTLE_CAP, store.fail(key, message.to_owned())).await;
     }
 }
 

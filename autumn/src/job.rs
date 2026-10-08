@@ -870,9 +870,6 @@ fn job_timeout_message(limit: std::time::Duration) -> String {
     format!("job timed out after {}ms", limit.as_millis())
 }
 
-/// Longest wait for one settle call to the tracking store.
-const TRACKING_SETTLE_CAP: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// Shortest visibility timeout a durable backend uses. The heartbeat renews
 /// every third of it, so this keeps renewals at least 10ms apart. A shorter
 /// configured value is raised to this one.
@@ -3086,13 +3083,13 @@ async fn run_job_handler_inner(
             }
         };
         // A stalled store must not hold the worker. The record expires by TTL.
-        if tokio::time::timeout(TRACKING_SETTLE_CAP, settle)
+        if tokio::time::timeout(crate::job_tracking::TRACKING_SETTLE_CAP, settle)
             .await
             .is_err()
         {
             tracing::warn!(
                 job = name,
-                cap_ms = TRACKING_SETTLE_CAP.as_millis(),
+                cap_ms = crate::job_tracking::TRACKING_SETTLE_CAP.as_millis(),
                 "tracking settle timed out"
             );
         }
@@ -26092,7 +26089,7 @@ mod lease_tests {
         )
         .await;
         assert_eq!(outcome, JobExecutionOutcome::Succeeded);
-        assert_eq!(start.elapsed(), TRACKING_SETTLE_CAP);
+        assert_eq!(start.elapsed(), crate::job_tracking::TRACKING_SETTLE_CAP);
     }
 
     #[tokio::test(start_paused = true)]
@@ -26109,7 +26106,28 @@ mod lease_tests {
         )
         .await;
         assert!(matches!(outcome, JobExecutionOutcome::Panicked(_)));
-        assert_eq!(start.elapsed(), TRACKING_SETTLE_CAP);
+        assert_eq!(start.elapsed(), crate::job_tracking::TRACKING_SETTLE_CAP);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_terminal_write_outside_the_handler_is_capped() {
+        let state = AppState::for_test().with_profile("dev");
+        state.insert_extension(crate::job_tracking::JobTrackingStoreEntry(Arc::new(
+            StalledTrackingStore {
+                stall_mark_running: false,
+                stall_settle: true,
+            },
+        )));
+        let payload =
+            crate::job_tracking::wrap_tracked_payload("tracked-key", &serde_json::json!({}));
+        let start = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(3600),
+            crate::job_tracking::settle_tracked_payload_as_failed(&state, &payload, "cancelled"),
+        )
+        .await
+        .expect("a stalled tracking store must not hold the caller");
+        assert_eq!(start.elapsed(), crate::job_tracking::TRACKING_SETTLE_CAP);
     }
 
     #[tokio::test(start_paused = true)]
