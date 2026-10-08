@@ -427,18 +427,7 @@ fn remove_block(text: &str, table: &str) -> Option<String> {
     let (mut start, end) = schema_block_range(text, &token)?;
     // Take the outer attributes (`#[cfg(...)]`) and doc comments of the call
     // too, or they would apply to the next item.
-    let line_start = |at: usize| text[..at].rfind('\n').map_or(0, |i| i + 1);
-    if text[line_start(start)..start].trim().is_empty() {
-        start = line_start(start);
-        while start > 0 {
-            let prev = line_start(start - 1);
-            let line = text[prev..start].trim();
-            if !(line.starts_with("#[") || line.starts_with("///")) {
-                break;
-            }
-            start = prev;
-        }
-    }
+    start = outer_attrs_start(text, start);
     let prefix = &text[..start];
     let rest = &text[end..];
     let mut suffix = rest.strip_prefix('\n').unwrap_or(rest);
@@ -454,6 +443,57 @@ fn remove_block(text: &str, table: &str) -> Option<String> {
         });
     }
     Some(format!("{prefix}{suffix}"))
+}
+
+/// The start of the outer attributes (`#[...]`, also over several lines) and
+/// `///` doc comments directly above the item at `start`, when the item starts
+/// its line. Else `start`.
+fn outer_attrs_start(text: &str, start: usize) -> usize {
+    let line_start = |at: usize| text[..at].rfind('\n').map_or(0, |i| i + 1);
+    if !text[line_start(start)..start].trim().is_empty() {
+        return start;
+    }
+    let mut start = line_start(start);
+    loop {
+        let before = text[..start].trim_end();
+        let bytes = before.as_bytes();
+        if before.ends_with(']') {
+            // Walk back to the `[` that opens this attribute.
+            let mut depth = 0usize;
+            let mut open = None;
+            for i in (0..bytes.len()).rev() {
+                match bytes[i] {
+                    b']' => depth += 1,
+                    b'[' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            open = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // An outer attribute only: `#[`, not `#![`, at the start of a line.
+            let Some(hash) = open
+                .filter(|&o| o > 0 && bytes[o - 1] == b'#')
+                .map(|o| o - 1)
+            else {
+                break;
+            };
+            if !text[line_start(hash)..hash].trim().is_empty() {
+                break;
+            }
+            start = line_start(hash);
+        } else {
+            let line = line_start(before.len());
+            if !before[line..].trim_start().starts_with("///") {
+                break;
+            }
+            start = line;
+        }
+    }
+    start
 }
 
 /// Give the block of `old` the table name `new` (an identifier token).
@@ -601,7 +641,8 @@ fn macro_calls(text: &str, name: &str) -> Vec<(usize, usize, usize, usize)> {
         let Some(close) = matching_paren(text, open) else {
             break;
         };
-        let start = macro_path_start(text, at);
+        // The call with its outer attributes, so a removal takes them too.
+        let start = outer_attrs_start(text, macro_path_start(text, at));
         let mut end = close + 1;
         if text[end..].starts_with(';') {
             end += 1;
@@ -1507,5 +1548,26 @@ diesel::allow_tables_to_appear_in_same_query!(articles, users);
             ))]),
         );
         assert_eq!(out.text, existing);
+    }
+
+    /// A drop removes a multi-line outer attribute too.
+    #[test]
+    fn a_drop_removes_a_multi_line_outer_attribute() {
+        let existing = "diesel::table! {\n    users (id) {\n        id -> Int8,\n    }\n}\n\n#[cfg(\n    feature = \"comments\"\n)]\ndiesel :: joinable!(comments -> users (user_id));\n#[cfg(\n    feature = \"comments\"\n)]\ndiesel::table! {\n    comments (id) {\n        id -> Int8,\n    }\n}\n";
+        let out = sync_for_plan(
+            existing,
+            &parsed(vec![]),
+            &plan(vec![SchemaChange::DropTable(Table::new(
+                "comments",
+                Backend::Postgres,
+            ))]),
+        );
+        assert!(!out.text.contains("cfg"), "{}", out.text);
+        assert!(!out.text.contains("joinable"), "{}", out.text);
+        assert!(
+            out.text.starts_with("diesel::table! {\n    users (id)"),
+            "{}",
+            out.text
+        );
     }
 }
