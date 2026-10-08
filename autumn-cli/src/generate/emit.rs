@@ -707,10 +707,16 @@ impl Plan {
             // `htmx` is a default feature. Without default features, other
             // code may need it in ways no marker shows, so keep it.
             let defaults_off = r.feature == "htmx" && base_disables_defaults(&base);
+            // A `[storage]` block in `autumn.toml` runs the blob service with
+            // no source marker, so it counts as use.
+            let configured = r.feature == "storage"
+                && fs::read_to_string(self.project_root.join("autumn.toml"))
+                    .is_ok_and(|toml| toml.lines().any(|l| l.trim().starts_with("[storage")));
             let needed = !was_used
                 || by_marker
                 || by_sibling
                 || defaults_off
+                || configured
                 || (markers.is_none() && r.owner.is_none());
             if needed {
                 continue;

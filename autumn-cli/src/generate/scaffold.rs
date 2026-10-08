@@ -27465,6 +27465,24 @@ exempt_paths = [
         }
 
         #[test]
+        fn keeps_storage_while_autumn_toml_configures_it() {
+            let tmp = project();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            fs::write(
+                tmp.path().join("autumn.toml"),
+                "[storage]\nbackend = \"local\"\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("storage"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
         fn a_first_run_keeps_a_hand_added_feature() {
             let tmp = project();
             fs::write(
