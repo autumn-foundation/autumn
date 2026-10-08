@@ -27518,6 +27518,60 @@ exempt_paths = [
         }
 
         #[test]
+        fn keeps_storage_while_a_profile_overlay_configures_it() {
+            let tmp = project();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            fs::write(
+                tmp.path().join("autumn-prod.toml"),
+                "[storage]\nbackend = \"s3\"\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("storage"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_htmx_for_a_workspace_inherited_autumn_web() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                "[package]\nname = \"x\"\n\n[dependencies]\n\
+                 autumn-web = { workspace = true, features = [\"maud\", \"csv\", \"htmx\"] }\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            assert!(cargo.contains("htmx"), "{cargo}");
+        }
+
+        #[test]
+        fn keeps_csv_for_the_root_reexport() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            fs::write(
+                tmp.path().join("src/support.rs"),
+                "pub fn a(r: Vec<u8>) { let _ = autumn_web::Csv(r); }\n",
+            )
+            .unwrap();
+            let live = ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", POST, &live);
+            assert!(
+                autumn_web_line(&tmp).contains("csv"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
         fn a_first_run_keeps_a_hand_added_feature() {
             let tmp = project();
             fs::write(

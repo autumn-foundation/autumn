@@ -1612,7 +1612,12 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
         //
         // `Csv<T>` is the extractor and responder gated by the same feature. It
         // lives in `autumn_web::extract` and is not in the prelude.
-        "csv" => &["autumn_web::data::csv", "extract::Csv", "Csv<"],
+        "csv" => &[
+            "autumn_web::data::csv",
+            "extract::Csv",
+            "autumn_web::Csv",
+            "Csv<",
+        ],
         _ => &[],
     }
 }
@@ -1647,28 +1652,40 @@ fn autumn_web_feature_still_needed_elsewhere(
     markers_in_project(&markers, project_root, excluding, overrides)
 }
 
-/// Whether project config turns on blob storage.
+/// Whether project config may turn on blob storage.
 ///
-/// Reads `autumn.toml` and `.env`. Variables set only in a deployment are not
-/// visible here.
+/// Reads every `autumn*.toml` and `.env*` file in the project root. That
+/// covers profile overlays and local overrides without listing each name. Any
+/// mention of storage keeps the feature. Variables set only in a deployment
+/// are not visible here.
 fn storage_is_configured(root: &Path) -> bool {
-    let toml = fs::read_to_string(root.join("autumn.toml")).unwrap_or_default();
-    let env = fs::read_to_string(root.join(".env")).unwrap_or_default();
-    toml.lines().any(|l| l.trim().starts_with("[storage"))
-        || env.lines().any(|l| {
-            l.trim_start()
-                .trim_start_matches("export ")
-                .starts_with("AUTUMN_STORAGE__")
-        })
+    let Ok(entries) = fs::read_dir(root) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_toml = entry
+            .path()
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"));
+        let is_config = (name.starts_with("autumn") && is_toml) || name.starts_with(".env");
+        is_config
+            && fs::read_to_string(entry.path())
+                .is_ok_and(|text| text.to_ascii_lowercase().contains("storage"))
+    })
 }
 
 /// Whether the manifest turns off default features for `autumn-web`.
 ///
 /// Reads an inline entry (also over many lines), or the lines under a
 /// `[dependencies.autumn-web]` style table. Another dependency's setting does
-/// not count.
+/// not count. An entry that inherits from the workspace (`workspace = true`)
+/// counts as off, because the workspace manifest is not read here.
 fn base_disables_defaults(manifest: &str) -> bool {
-    let is_off = |line: &str| line.replace(' ', "").contains("default-features=false");
+    let is_off = |line: &str| {
+        let squeezed = line.replace(' ', "");
+        squeezed.contains("default-features=false") || squeezed.contains("workspace=true")
+    };
     let names_web = |text: &str| text.contains("autumn-web") || text.contains("autumn_web");
     let depth = |text: &str| {
         i32::try_from(text.matches('{').count()).unwrap_or(0)
