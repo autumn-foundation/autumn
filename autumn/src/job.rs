@@ -18718,11 +18718,11 @@ mod tests {
             assert_eq!(pg_due_from(None, None), PgDueAt::Immediate);
             assert_eq!(pg_due_from(None, Some(at)), PgDueAt::Absolute(at));
             assert_eq!(
-                pg_due_from(Some(Duration::from_millis(2_000)), None),
+                pg_due_from(Some(Duration::from_secs(2)), None),
                 PgDueAt::RelativeMs(2_000)
             );
             assert_eq!(
-                pg_due_from(Some(Duration::from_millis(2_000)), Some(at)),
+                pg_due_from(Some(Duration::from_secs(2)), Some(at)),
                 PgDueAt::RelativeMs(2_000)
             );
         }
@@ -18755,7 +18755,7 @@ mod tests {
                 "any positive sub-millisecond delay must round up to 1ms, never down to 0"
             );
             assert_eq!(
-                pg_due_from(Some(Duration::from_millis(2_000)), None),
+                pg_due_from(Some(Duration::from_secs(2)), None),
                 PgDueAt::RelativeMs(2_000),
                 "an exact millisecond value must round-trip unchanged"
             );
@@ -19814,7 +19814,7 @@ mod tests {
 
             let job_id = uuid::Uuid::new_v4().to_string();
             let relative_delay =
-                RelativeDelay::new(Duration::from_millis(2_000), crate::time::monotonic_now());
+                RelativeDelay::new(Duration::from_secs(2), crate::time::monotonic_now());
             pg_enqueue_job_at(
                 &pool,
                 job_id.clone(),
@@ -19886,7 +19886,7 @@ mod tests {
                         tokio::time::sleep(Duration::from_secs(3)).await;
                         let call_time = chrono::Utc::now();
                         let relative_delay = RelativeDelay::new(
-                            Duration::from_millis(2_000),
+                            Duration::from_secs(2),
                             crate::time::monotonic_now(),
                         );
                         pg_enqueue_on_conn_at(

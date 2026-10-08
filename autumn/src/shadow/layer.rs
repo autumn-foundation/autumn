@@ -23,7 +23,11 @@
 //! `max_in_flight` reserves a slot before dispatch and releases it when the
 //! detached task ends, so a candidate that stops answering costs at most that
 //! many outstanding requests rather than one per inbound request. `timeout`
-//! bounds each attempt. `max_body_bytes` bounds what either side may buffer —
+//! is ONE deadline per mirror, covering the shadow request, the wait for the
+//! primary body and the comparison. `max_in_flight` therefore bounds
+//! outstanding *mirrors*, end to end (decision for issue #2333). The CPU work
+//! runs on the blocking pool; at the deadline it is abandoned, counted as
+//! `abandoned`, and records nothing. `max_body_bytes` bounds what either side may buffer —
 //! an oversize body is not partially captured, it is abandoned and counted, so
 //! a streaming endpoint cannot grow the process.
 
@@ -55,7 +59,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -89,7 +93,8 @@ use crate::time::ClockSource;
 /// of `match`, `diverged`, `error`, `timeout`, `skipped` (a body over the
 /// capture budget), `dropped` (the in-flight ceiling was full), `refused` (the
 /// live build answered `429`/`503`, so the request never reached a handler), or
-/// `incomplete` (the client never finished reading the primary response), or
+/// `incomplete` (the client never finished reading the primary response),
+/// `abandoned` (the comparison did not finish by the deadline), or
 /// `primary_error` (the LIVE build's own response could not be decoded — not a
 /// candidate failure, and counted apart from one).
 pub const COMPARISONS_METRIC: &str = "autumn_shadow_comparisons_total";
@@ -125,6 +130,9 @@ struct MirrorContext {
     entropy: Arc<dyn Entropy>,
     clock: Arc<dyn ClockSource>,
     in_flight: Arc<AtomicUsize>,
+    /// Blocking time added to each comparison, so tests can model a large body.
+    #[cfg(test)]
+    compare_delay: Duration,
 }
 
 impl std::fmt::Debug for MirrorContext {
@@ -172,6 +180,8 @@ impl ShadowMirrorLayer {
                 entropy,
                 clock,
                 in_flight: Arc::new(AtomicUsize::new(0)),
+                #[cfg(test)]
+                compare_delay: Duration::ZERO,
             }),
         }
     }
@@ -369,19 +379,9 @@ async fn run_mirror(
     // The permit is released when this task ends, whatever the outcome.
     let _permit = permit;
 
-    // ONE deadline for the mirror's WAITING, stamped at dispatch and shared by
-    // both waits below. Two independent `timeout(settings.timeout, ..)` calls
-    // would let a shadow that answers just under the deadline be followed by a
-    // fresh full deadline on the primary wait — up to `2 * timeout_ms` holding
-    // a slot, which at capacity keeps every later mirror dropped for twice as
-    // long as the operator configured.
-    //
-    // KNOWN LIMITATION: it does NOT cover the comparison that follows. Decoding,
-    // canonicalising and digesting both bodies is bounded work (`max_body_bytes`
-    // caps each side) but runs with the permit still held, so a mirror can
-    // outlive `timeout_ms` by that much. Whether `max_in_flight` should bound
-    // outstanding *requests* or outstanding *mirrors* is the open question in
-    // issue #2333.
+    // ONE deadline, stamped at dispatch, covers every stage: the shadow
+    // request, the wait for the primary body, and the comparison. Independent
+    // timeouts would let a mirror hold a slot for a multiple of `timeout_ms`.
     let now = tokio::time::Instant::now();
     // `checked_add`, not `+`: this module's panic gate denies arithmetic that
     // can panic, and `Instant + Duration` does on overflow. An absurd
@@ -431,24 +431,101 @@ async fn run_mirror(
         return;
     };
 
-    // Decode BOTH sides, here in the detached task rather than on the response
-    // path. A handler can serve a precompressed representation, so the primary
-    // tee captures encoded bytes just as the candidate's response can arrive
-    // encoded — decoding only one of them would report two identical builds as
-    // divergent on every such route.
-    // Decoded separately, and their failures told apart: a body that expands
-    // past the budget is a *size* skip, while a body whose declared encoding
-    // does not decode is an *error*. Folding both into `skipped_oversize` would
-    // show an operator a size-budget skip for what is actually a malformed
-    // encoding, and lose the reason entirely.
-    let Some(primary_body) = decode_side(&ctx, &context, PRIMARY, &primary) else {
-        return;
+    // Decode, compare and record on the blocking pool, under the SAME deadline.
+    // Those steps are CPU work with no await point, so only a join under
+    // `timeout_at` can bound them (issue #2333). At the deadline the mirror is
+    // counted as `abandoned` and the slot is freed; `state` makes the work stop
+    // at its next step and record nothing.
+    let state = Arc::new(AtomicU8::new(RUNNING));
+    let mut work = crate::time::spawn_blocking({
+        let ctx = Arc::clone(&ctx);
+        let context = context.clone();
+        let state = Arc::clone(&state);
+        move || compare_and_record(&ctx, &context, &state, &primary, &shadow)
+    });
+    if tokio::time::timeout_at(deadline, &mut work).await.is_err() {
+        let won = state
+            .compare_exchange(RUNNING, ABANDONED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if won {
+            ctx.registry.record_comparison_abandoned();
+            record_outcome(&ctx.registry, &context.route, "abandoned");
+        } else {
+            // The work already began recording. Recording is short; let it end.
+            let _ = work.await;
+        }
+    }
+}
+
+/// The mirror work is still running and may record.
+const RUNNING: u8 = 0;
+/// The deadline fired first; the work must record nothing.
+const ABANDONED: u8 = 1;
+/// The work won the race and is recording.
+const COMMITTED: u8 = 2;
+
+/// Claim the right to record. `false` means the deadline already fired.
+fn commit(state: &AtomicU8) -> bool {
+    state
+        .compare_exchange(RUNNING, COMMITTED, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+/// Decode both bodies, compare them and record the result.
+///
+/// Runs on the blocking pool. It checks `state` between steps and records only
+/// after it wins [`commit`].
+fn compare_and_record(
+    ctx: &MirrorContext,
+    context: &RequestContext,
+    state: &AtomicU8,
+    primary: &ResponseFacts,
+    shadow: &ResponseFacts,
+) {
+    // Decode BOTH sides. A handler can serve a precompressed representation, so
+    // the primary tee captures encoded bytes just as the candidate's response
+    // can arrive encoded; decoding only one side would report two identical
+    // builds as divergent. The failures are told apart: a body that expands past
+    // the budget is a *size* skip, a body that does not decode is an *error*.
+    let primary_body = match decode_side(ctx, primary) {
+        Ok(body) => body,
+        Err(error) => {
+            if commit(state) {
+                record_decode_failure(ctx, context, PRIMARY, &error);
+            }
+            return;
+        }
     };
-    let Some(shadow_body) = decode_side(&ctx, &context, SHADOW, &shadow) else {
+    if state.load(Ordering::Acquire) != RUNNING {
         return;
+    }
+    let shadow_body = match decode_side(ctx, shadow) {
+        Ok(body) => body,
+        Err(error) => {
+            if commit(state) {
+                record_decode_failure(ctx, context, SHADOW, &error);
+            }
+            return;
+        }
     };
-    let primary = ResponseFacts::encoded(primary.status, primary.content_type, None, primary_body);
-    let shadow = ResponseFacts::encoded(shadow.status, shadow.content_type, None, shadow_body);
+    if state.load(Ordering::Acquire) != RUNNING {
+        return;
+    }
+    let primary = ResponseFacts::encoded(
+        primary.status,
+        primary.content_type.clone(),
+        None,
+        primary_body,
+    );
+    let shadow = ResponseFacts::encoded(
+        shadow.status,
+        shadow.content_type.clone(),
+        None,
+        shadow_body,
+    );
+
+    #[cfg(test)]
+    std::thread::sleep(ctx.compare_delay);
 
     let comparison = compare(
         &primary,
@@ -456,6 +533,9 @@ async fn run_mirror(
         &ctx.filter,
         ctx.settings.max_sample_bytes,
     );
+    if !commit(state) {
+        return;
+    }
     record_outcome(&ctx.registry, &context.route, comparison.outcome_label());
     let kind = match &comparison {
         Comparison::Match => None,
@@ -468,13 +548,11 @@ async fn run_mirror(
     let observed_at_ms = ctx.clock.now().timestamp_millis().unsigned_abs();
     let recorded = ctx
         .registry
-        .record_comparison(&context, comparison, observed_at_ms);
+        .record_comparison(context, comparison, observed_at_ms);
 
-    // One WARN per distinct divergence, not per occurrence. A candidate with a
-    // systematic regression diverges on EVERY mirrored request; at production
-    // rates that is a log line per request, drowning the warnings an operator
-    // actually needs. The registry already collapses repeats by fingerprint,
-    // so this reuses that decision. The recurrence count is in the actuator
+    // One WARN per distinct divergence, not per occurrence: a systematic
+    // regression diverges on EVERY mirrored request. The registry already
+    // collapses repeats by fingerprint. The recurrence count is in the actuator
     // payload and in `autumn_shadow_divergences_total`.
     if let Recorded::NewDivergence(divergence) = recorded {
         tracing::warn!(
@@ -497,48 +575,44 @@ const PRIMARY: &str = "primary";
 /// Label for the candidate build in [`decode_side`].
 const SHADOW: &str = "shadow";
 
-/// Decode one side's body, counting the failure modes distinctly.
-///
-/// `None` means the comparison cannot proceed and has already been counted.
-fn decode_side(
-    ctx: &MirrorContext,
-    context: &RequestContext,
-    side: &'static str,
-    facts: &ResponseFacts,
-) -> Option<Bytes> {
-    match crate::shadow::transport::decode_body(
+/// Decode one side's body.
+fn decode_side(ctx: &MirrorContext, facts: &ResponseFacts) -> Result<Bytes, ShadowError> {
+    crate::shadow::transport::decode_body(
         facts.content_encoding.as_deref(),
         facts.body.clone(),
         ctx.settings.max_body_bytes,
-    ) {
-        Ok(body) => Some(body),
-        Err(ShadowError::Oversize) => {
-            ctx.registry.record_skipped_oversize();
-            record_outcome(&ctx.registry, &context.route, "skipped");
-            None
-        }
-        Err(error) => {
-            // Attributed to the side that produced it. `shadow_errors` is
-            // documented as candidate failures, so counting the live build's
-            // own malformed response there would send an operator hunting
-            // candidate connectivity for a body their own handler emitted.
-            if side == PRIMARY {
-                ctx.registry.record_primary_error();
-                record_outcome(&ctx.registry, &context.route, "primary_error");
-            } else {
-                ctx.registry.record_shadow_error();
-                record_outcome(&ctx.registry, &context.route, error.as_str());
-            }
-            tracing::debug!(
-                target: "autumn::shadow",
-                route = %context.route,
-                side,
-                %error,
-                "could not decode a mirrored response body"
-            );
-            None
-        }
+    )
+}
+
+/// Count a decode failure, telling the failure modes apart.
+fn record_decode_failure(
+    ctx: &MirrorContext,
+    context: &RequestContext,
+    side: &'static str,
+    error: &ShadowError,
+) {
+    if matches!(error, ShadowError::Oversize) {
+        ctx.registry.record_skipped_oversize();
+        record_outcome(&ctx.registry, &context.route, "skipped");
+        return;
     }
+    // Attributed to the side that produced it. `shadow_errors` is documented as
+    // candidate failures, so counting the live build's own malformed response
+    // there would send an operator hunting candidate connectivity.
+    if side == PRIMARY {
+        ctx.registry.record_primary_error();
+        record_outcome(&ctx.registry, &context.route, "primary_error");
+    } else {
+        ctx.registry.record_shadow_error();
+        record_outcome(&ctx.registry, &context.route, error.as_str());
+    }
+    tracing::debug!(
+        target: "autumn::shadow",
+        route = %context.route,
+        side,
+        %error,
+        "could not decode a mirrored response body"
+    );
 }
 
 /// Record one comparison outcome against the `{route, outcome}` series the
@@ -1364,6 +1438,96 @@ mod tests {
             elapsed < Duration::from_millis(360),
             "the mirror lived {elapsed:?}, close to twice the 200ms deadline"
         );
+    }
+
+    /// Layer whose comparison step takes `delay` of blocking time, standing in
+    /// for a large compressed body (issue #2333).
+    fn layer_with_slow_comparison(
+        transport: Arc<dyn ShadowTransport>,
+        registry: &ShadowRegistry,
+        settings: MirrorSettings,
+        delay: Duration,
+    ) -> ShadowMirrorLayer {
+        let mut layer = layer(transport, registry, settings);
+        Arc::get_mut(&mut layer.ctx)
+            .expect("sole owner")
+            .compare_delay = delay;
+        layer
+    }
+
+    #[tokio::test]
+    async fn a_slow_comparison_is_abandoned_at_the_deadline() {
+        let transport = FakeTransport::new(Behaviour::Reply {
+            status: 200,
+            body: r#"{"ok":true}"#,
+        });
+        let registry = ShadowRegistry::new(10);
+        let mut settings = settings();
+        settings.timeout = Duration::from_millis(100);
+        settings.max_in_flight = 1;
+        let layer =
+            layer_with_slow_comparison(transport, &registry, settings, Duration::from_millis(600));
+        let in_flight = Arc::clone(&layer.ctx.in_flight);
+        let service = layer.layer(primary(r#"{"ok":true}"#));
+
+        let request = Request::builder()
+            .uri("/api/orders")
+            .body(Body::empty())
+            .expect("request");
+        let response = service.oneshot(request).await.expect("response");
+        let _ = read_body(response).await;
+        let started = std::time::Instant::now();
+
+        settle("the comparison to be abandoned", || {
+            registry.stats().comparisons_abandoned == 1
+        })
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "the mirror outlived its deadline: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(in_flight.load(Ordering::Acquire), 0, "the slot is free");
+        assert!(
+            registry
+                .comparisons_by_route()
+                .iter()
+                .any(|c| c.label == "abandoned" && c.count == 1)
+        );
+
+        // The late work finishes but must record nothing.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let stats = registry.stats();
+        assert_eq!(stats.compared, 0);
+        assert_eq!(stats.matched, 0);
+        assert_eq!(stats.comparisons_abandoned, 1);
+    }
+
+    #[tokio::test]
+    async fn a_comparison_inside_the_deadline_is_recorded() {
+        let transport = FakeTransport::new(Behaviour::Reply {
+            status: 200,
+            body: r#"{"ok":true}"#,
+        });
+        let registry = ShadowRegistry::new(10);
+        let mut settings = settings();
+        settings.timeout = Duration::from_millis(500);
+        let service =
+            layer_with_slow_comparison(transport, &registry, settings, Duration::from_millis(20))
+                .layer(primary(r#"{"ok":true}"#));
+
+        let request = Request::builder()
+            .uri("/api/orders")
+            .body(Body::empty())
+            .expect("request");
+        let response = service.oneshot(request).await.expect("response");
+        let _ = read_body(response).await;
+
+        settle("the comparison to be recorded", || {
+            registry.stats().matched == 1
+        })
+        .await;
+        assert_eq!(registry.stats().comparisons_abandoned, 0);
     }
 
     #[tokio::test]

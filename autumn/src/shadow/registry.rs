@@ -89,6 +89,9 @@ pub struct ShadowStats {
     /// without this an operator sees `mirrored` far exceed every other counter
     /// with nothing explaining the gap.
     pub primary_incomplete: u64,
+    /// Comparisons not finished by the deadline. They are neither a match nor a
+    /// divergence, and not `skipped_oversize` or `primary_incomplete`.
+    pub comparisons_abandoned: u64,
 }
 
 /// The request a divergence was observed on.
@@ -251,6 +254,7 @@ struct Counters {
     skipped_refused: AtomicU64,
     skipped_conditional: AtomicU64,
     primary_incomplete: AtomicU64,
+    comparisons_abandoned: AtomicU64,
 }
 
 /// Saturating increment: a long-lived replica must not wrap a counter back to
@@ -364,6 +368,11 @@ impl ShadowRegistry {
         bump(&self.counters.primary_incomplete);
     }
 
+    /// Count a comparison abandoned at the deadline.
+    pub fn record_comparison_abandoned(&self) {
+        bump(&self.counters.comparisons_abandoned);
+    }
+
     /// Record the outcome of one comparison, observed at `observed_at_ms`.
     ///
     /// The return value distinguishes a divergence seen for the first time from
@@ -438,6 +447,7 @@ impl ShadowRegistry {
             skipped_refused: self.counters.skipped_refused.load(Ordering::Relaxed),
             skipped_conditional: self.counters.skipped_conditional.load(Ordering::Relaxed),
             primary_incomplete: self.counters.primary_incomplete.load(Ordering::Relaxed),
+            comparisons_abandoned: self.counters.comparisons_abandoned.load(Ordering::Relaxed),
         }
     }
 
@@ -633,7 +643,9 @@ mod tests {
         registry.record_skipped_refused();
         registry.record_skipped_conditional();
         registry.record_primary_incomplete();
+        registry.record_comparison_abandoned();
         let stats = registry.stats();
+        assert_eq!(stats.comparisons_abandoned, 1);
         assert_eq!(stats.skipped_refused, 1);
         assert_eq!(stats.skipped_conditional, 1);
         assert_eq!(stats.primary_incomplete, 1);
