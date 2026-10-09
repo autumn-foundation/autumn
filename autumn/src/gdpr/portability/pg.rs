@@ -560,17 +560,16 @@ fn money_expr(field: &FieldSpec) -> String {
 /// The `INSERT` records no ledger revision, so the ledger would not match the
 /// table.
 fn refuse_ledgered(batches: &[ImportBatch<'_>]) -> Result<(), DataCapsuleError> {
-    match batches
+    batches
         .iter()
         .find(|b| !b.records.is_empty() && crate::ledger::is_ledgered_table(&b.model.table))
-    {
-        Some(batch) => Err(DataCapsuleError::InvalidInput(format!(
-            "table {} is ledgered: a capsule import records no ledger revision, so it \
-             cannot write to that table",
-            batch.model.table
-        ))),
-        None => Ok(()),
-    }
+        .map_or(Ok(()), |batch| {
+            Err(DataCapsuleError::InvalidInput(format!(
+                "table {} is ledgered: a capsule import records no ledger revision, so it \
+                 cannot write to that table",
+                batch.model.table
+            )))
+        })
 }
 
 /// The `INSERT` of one batch. Generated columns are skipped.
