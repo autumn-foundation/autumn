@@ -558,7 +558,19 @@ fn judge(
     // The same two halves for the effect seams: `finish` returns the
     // divergences logged during the run *plus* every recorded effect the run
     // never asked for.
-    let effect_entries = fixtures.effects.finish();
+    let mut effect_entries = fixtures.effects.finish();
+    // A draw of another width is consumed in place, so the counts stay level
+    // and only this check sees it (#2351 item 11).
+    effect_entries.extend(fixtures.entropy.width_mismatches().into_iter().map(
+        |(index, recorded, requested)| {
+            crate::capsule::effects::random_width_divergence(index, recorded, requested)
+        },
+    ));
+    // A value that stood behind a placeholder in a matched effect is masked in
+    // the recorded outcome. Mask it in the actual outcome too, before the
+    // comparison and before anything prints it (#2351 item 16).
+    let actual =
+        crate::capsule::persist::scrub_outcome(actual, &fixtures.effects.observed_redactions());
     let verdict = if entries.is_empty() && effect_entries.is_empty() {
         if outcomes_match(&capsule.outcome, &actual) {
             Verdict::Reproduced
@@ -1145,12 +1157,30 @@ pub fn refusal_reason(capsule: &Capsule) -> Option<String> {
     // field that no longer parses, a string that takes the wrong arm — and the
     // verdict would describe a run that never happened. The masking is not
     // reversible, so this is a refusal rather than a warning.
+    // Compared effect data that held the placeholder text before redaction
+    // ran. Replay reads that text as a wildcard, so a changed value there
+    // would match anything (#2351 item 5).
+    let literal: Vec<&str> = capsule
+        .request
+        .redacted_keys
+        .iter()
+        .filter_map(|key| key.strip_suffix(crate::capsule::redact::LITERAL_PLACEHOLDER_SUFFIX))
+        .collect();
+    if !literal.is_empty() {
+        return Some(format!(
+            "recorded effect data already held the text `[FILTERED]` ({}). Replay reads that \
+             text in a compared field as a redaction wildcard, so a changed value there would \
+             match anything and the verdict could not be trusted. Debug it from the recorded \
+             outcome instead.",
+            literal.join(", ")
+        ));
+    }
     let masked_input: Vec<&str> = capsule
         .request
         .redacted_keys
         .iter()
         .filter(|key| {
-            key.starts_with("cache[")
+            is_masked_cache_read(capsule, key)
                 || key == &"tenant.id"
                 || (key.starts_with("http[")
                     && (key.contains("].response_body")
@@ -1200,6 +1230,22 @@ pub fn refusal_reason(capsule: &Capsule) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether a `redacted_keys` entry names a masked cache *read*.
+///
+/// Only a read is input. A masked write is output, and compares through the
+/// wildcard rules (#2351 item 12). An index that resolves to no entry fails
+/// closed.
+fn is_masked_cache_read(capsule: &Capsule, key: &str) -> bool {
+    let Some(rest) = key.strip_prefix("cache[") else {
+        return false;
+    };
+    let entry = rest
+        .split_once(']')
+        .and_then(|(index, _)| index.parse::<usize>().ok())
+        .and_then(|index| capsule.effects.cache.get(index));
+    entry.is_none_or(crate::capsule::schema::CacheEffect::is_read)
 }
 
 /// Exit code for a capsule this build refuses to replay.

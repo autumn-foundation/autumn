@@ -77,7 +77,7 @@ static GLOBAL_CACHE: RwLock<Option<Arc<dyn Cache>>> = RwLock::new(None);
 ///
 /// Panics if the internal `RwLock` is poisoned.
 pub fn set_global_cache(cache: Arc<dyn Cache>) {
-    *GLOBAL_CACHE.write().expect("global cache lock poisoned") = Some(cache);
+    *GLOBAL_CACHE.write().expect("global cache lock poisoned") = Some(with_capsule_seam(cache));
 }
 
 /// Return a clone of the process-level shared cache, if one is registered.
@@ -301,6 +301,13 @@ pub trait Cache: Send + Sync + 'static {
     ///
     /// [`InvalidationError`] when the backend cannot drop a namespace, or its
     /// sweep failed. Entries of the namespace can still be served.
+    /// Whether this backend is the framework's failure-capsule wrapper.
+    /// Framework internal; do not override.
+    #[doc(hidden)]
+    fn is_capsule_seam(&self) -> bool {
+        false
+    }
+
     fn invalidate_namespace_async<'a>(
         &'a self,
         namespace: &'a str,
@@ -342,9 +349,17 @@ pub enum FillLockStatus {
 /// For cross-replica backends (Redis) use [`get_cached`] instead, which
 /// also handles JSON deserialization of [`RawCacheBytes`].
 pub fn get<V: Clone + Send + Sync + 'static>(cache: &dyn Cache, key: &str) -> Option<V> {
-    cache
+    // Failure-capsule seam (#2351 item 2). The value is not serializable, so
+    // a replay serves only a recorded miss, and capture can record only a
+    // miss.
+    if replayed_untyped_get(key) {
+        return None;
+    }
+    let value = cache
         .get_value(key)
-        .and_then(|arc| arc.downcast_ref::<V>().cloned())
+        .and_then(|arc| arc.downcast_ref::<V>().cloned());
+    record_untyped_get(key, value.is_some());
+    value
 }
 
 /// Typed insert: wrap the value in an `Arc` and store it.
@@ -354,6 +369,11 @@ pub fn get<V: Clone + Send + Sync + 'static>(cache: &dyn Cache, key: &str) -> Op
 /// For cross-replica backends (Redis) use [`insert_cached`] instead,
 /// which also serializes the value for storage across process boundaries.
 pub fn insert<V: Clone + Send + Sync + 'static>(cache: &dyn Cache, key: &str, value: V) {
+    // Failure-capsule seam (#2351 item 2): a replay never writes, and capture
+    // cannot record the value.
+    if record_or_replay_untyped_insert(key) {
+        return;
+    }
     cache.insert_value(key, Arc::new(value));
 }
 
@@ -575,13 +595,229 @@ const fn record_or_replay_cache_insert(
     false
 }
 
-// ── Capsule seam for the removal methods (#2351) ─────────────────────────
+/// Serve an untyped read during a replay. Returns `true` when a replay
+/// handled it; the read is then a miss.
+#[cfg(feature = "reporting")]
+fn replayed_untyped_get(key: &str) -> bool {
+    let Some(tape) = crate::capsule::effects::current_tape() else {
+        return false;
+    };
+    // A recorded untyped read is always a miss: capture marks a capsule with
+    // an untyped hit incomplete. An unrecorded key is logged by the tape.
+    let _ = tape.cache_get(key);
+    true
+}
+
+/// No capsule support compiled in: never a replay.
+#[cfg(not(feature = "reporting"))]
+const fn replayed_untyped_get(_key: &str) -> bool {
+    false
+}
+
+/// Record an untyped read. A miss records like a typed miss. A hit has no
+/// value the capsule can hold, so the capsule is marked incomplete.
+#[cfg(feature = "reporting")]
+fn record_untyped_get(key: &str, hit: bool) {
+    let Some(scope) = crate::capsule::current_scope() else {
+        return;
+    };
+    if hit {
+        scope.note(UNRECORDABLE_CACHE_HIT_NOTE);
+        scope.mark_truncated();
+    }
+    scope.record_cache(crate::capsule::CacheEffect::Get {
+        key: key.to_owned(),
+        value: None,
+    });
+}
+
+/// No capsule support compiled in: nothing to record.
+#[cfg(not(feature = "reporting"))]
+const fn record_untyped_get(_key: &str, _hit: bool) {}
+
+/// Record an untyped write, or divert it during a replay. Returns `true` when
+/// a replay handled it and the backend must not be touched.
+#[cfg(feature = "reporting")]
+fn record_or_replay_untyped_insert(key: &str) -> bool {
+    if let Some(tape) = crate::capsule::effects::current_tape() {
+        tape.cache_untyped_insert(key);
+        return true;
+    }
+    if let Some(scope) = crate::capsule::current_scope() {
+        scope.note(UNRECORDABLE_CACHE_WRITE_NOTE);
+        scope.mark_truncated();
+    }
+    false
+}
+
+/// No capsule support compiled in: the backend always takes the write.
+#[cfg(not(feature = "reporting"))]
+const fn record_or_replay_untyped_insert(_key: &str) -> bool {
+    false
+}
+
+// ── Capsule seam for the removal methods (#2351 item 2) ──────────────────
 
 /// Wrap `cache` so a capsule records its removals and a replay never reaches
-/// it. Idempotent.
+/// it. Idempotent: a wrapped backend is returned as it is, so `Arc` identity
+/// (which single-flight keys on) stays stable.
+#[cfg(feature = "reporting")]
+#[must_use]
+pub(crate) fn with_capsule_seam(cache: Arc<dyn Cache>) -> Arc<dyn Cache> {
+    if cache.is_capsule_seam() {
+        return cache;
+    }
+    Arc::new(CapsuleSeamCache(cache))
+}
+
+/// No capsule support compiled in: the backend is used as it is.
+#[cfg(not(feature = "reporting"))]
 #[must_use]
 pub(crate) fn with_capsule_seam(cache: Arc<dyn Cache>) -> Arc<dyn Cache> {
     cache
+}
+
+/// The installed backend, with the removal methods on the capsule seam.
+///
+/// Reads and writes pass through: `get_cached` / `insert_cached` and the
+/// untyped functions carry their own seam.
+#[cfg(feature = "reporting")]
+struct CapsuleSeamCache(Arc<dyn Cache>);
+
+#[cfg(feature = "reporting")]
+impl CapsuleSeamCache {
+    /// Record a removal, with the result the backend gave.
+    fn record(effect: crate::capsule::CacheEffect) {
+        if let Some(scope) = crate::capsule::current_scope() {
+            scope.record_cache(effect);
+        }
+    }
+}
+
+/// A recorded [`InvalidationError`].
+#[cfg(feature = "reporting")]
+fn recorded_error(
+    result: &Result<(), InvalidationError>,
+) -> Option<crate::capsule::CacheInvalidationError> {
+    result
+        .as_ref()
+        .err()
+        .map(|error| crate::capsule::CacheInvalidationError {
+            attempts: error.attempts(),
+            reason: error.reason().to_owned(),
+        })
+}
+
+#[cfg(feature = "reporting")]
+impl Cache for CapsuleSeamCache {
+    fn get_value(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.0.get_value(key)
+    }
+
+    fn insert_value(&self, key: &str, value: Arc<dyn Any + Send + Sync>) {
+        self.0.insert_value(key, value);
+    }
+
+    fn invalidate(&self, key: &str) {
+        if let Some(tape) = crate::capsule::effects::current_tape() {
+            let _ = tape.cache_invalidate(key);
+            return;
+        }
+        Self::record(crate::capsule::CacheEffect::Invalidate {
+            key: key.to_owned(),
+            error: None,
+        });
+        self.0.invalidate(key);
+    }
+
+    fn clear(&self) {
+        if let Some(tape) = crate::capsule::effects::current_tape() {
+            tape.cache_clear();
+            return;
+        }
+        Self::record(crate::capsule::CacheEffect::Clear);
+        self.0.clear();
+    }
+
+    fn invalidate_namespace(&self, namespace: &str) -> bool {
+        if let Some(tape) = crate::capsule::effects::current_tape() {
+            return tape.cache_invalidate_namespace(namespace).is_ok();
+        }
+        let done = self.0.invalidate_namespace(namespace);
+        let result = if done {
+            Ok(())
+        } else {
+            Err(InvalidationError::new(
+                1,
+                "the backend cannot drop a namespace, or its sweep failed",
+            ))
+        };
+        Self::record(crate::capsule::CacheEffect::InvalidateNamespace {
+            namespace: namespace.to_owned(),
+            error: recorded_error(&result),
+        });
+        done
+    }
+
+    fn insert_raw_bytes(&self, key: &str, bytes: Vec<u8>, ttl: Option<Duration>) {
+        self.0.insert_raw_bytes(key, bytes, ttl);
+    }
+
+    fn try_acquire_fill_lock(&self, key: &str, token: &str, ttl: Duration) -> FillLockStatus {
+        self.0.try_acquire_fill_lock(key, token, ttl)
+    }
+
+    fn release_fill_lock(&self, key: &str, token: &str) {
+        self.0.release_fill_lock(key, token);
+    }
+
+    fn invalidate_async<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> CacheFuture<'a, Result<(), InvalidationError>> {
+        if let Some(tape) = crate::capsule::effects::current_tape() {
+            let result = tape.cache_invalidate(key);
+            return Box::pin(async move { result });
+        }
+        // The capture scope is a task-local, so it is read here, on the
+        // calling task, and carried into the future.
+        let scope = crate::capsule::current_scope();
+        Box::pin(async move {
+            let result = self.0.invalidate_async(key).await;
+            if let Some(scope) = scope {
+                scope.record_cache(crate::capsule::CacheEffect::Invalidate {
+                    key: key.to_owned(),
+                    error: recorded_error(&result),
+                });
+            }
+            result
+        })
+    }
+
+    fn invalidate_namespace_async<'a>(
+        &'a self,
+        namespace: &'a str,
+    ) -> CacheFuture<'a, Result<(), InvalidationError>> {
+        if let Some(tape) = crate::capsule::effects::current_tape() {
+            let result = tape.cache_invalidate_namespace(namespace);
+            return Box::pin(async move { result });
+        }
+        let scope = crate::capsule::current_scope();
+        Box::pin(async move {
+            let result = self.0.invalidate_namespace_async(namespace).await;
+            if let Some(scope) = scope {
+                scope.record_cache(crate::capsule::CacheEffect::InvalidateNamespace {
+                    namespace: namespace.to_owned(),
+                    error: recorded_error(&result),
+                });
+            }
+            result
+        })
+    }
+
+    fn is_capsule_seam(&self) -> bool {
+        true
+    }
 }
 
 // ── CacheableResult trait ────────────────────────────────────────────

@@ -352,11 +352,80 @@ pub const LITERAL_PLACEHOLDER_SUFFIX: &str = ":<literal placeholder>";
 ///
 /// Replay reads the placeholder in a compared field as a wildcard. Text that
 /// held it before redaction is not a redaction, so the capsule is refused.
+///
+/// Only compared fields are scanned. A response body, a cache hit and the
+/// tenant are served to the code, never matched as a wildcard. Run it on the
+/// effects as recorded, before [`redact_effects`].
 #[must_use]
 pub fn literal_placeholder_locations(
-    _effects: &crate::capsule::schema::CapsuleEffects,
+    effects: &crate::capsule::schema::CapsuleEffects,
 ) -> Vec<String> {
-    Vec::new()
+    use crate::capsule::schema::CacheEffect;
+
+    fn holds(text: &str) -> bool {
+        text.contains(FILTERED_PLACEHOLDER) || text.contains("%5BFILTERED%5D")
+    }
+    fn body_holds(body: &CapsuleBody) -> bool {
+        match body {
+            CapsuleBody::Text(text) => holds(text),
+            CapsuleBody::Base64(encoded) => STANDARD
+                .decode(encoded.as_bytes())
+                .is_ok_and(|bytes| holds(&String::from_utf8_lossy(&bytes))),
+            CapsuleBody::Absent | CapsuleBody::Skipped { .. } => false,
+        }
+    }
+    fn headers_hold(headers: &[(String, String)]) -> bool {
+        headers.iter().any(|(_, value)| holds(value))
+    }
+
+    let mut found = Vec::new();
+    for (index, exchange) in effects.http.iter().enumerate() {
+        if holds(&exchange.url) {
+            found.push(format!("http[{index}].url"));
+        }
+        if headers_hold(&exchange.request_headers) {
+            found.push(format!("http[{index}].request_header"));
+        }
+        if body_holds(&exchange.request_body) {
+            found.push(format!("http[{index}].request_body"));
+        }
+    }
+    for (index, job) in effects.jobs.iter().enumerate() {
+        if holds(&job.payload.to_string()) {
+            found.push(format!("job[{index}].payload"));
+        }
+    }
+    for (index, mail) in effects.mail.iter().enumerate() {
+        let text_fields = mail
+            .to
+            .iter()
+            .map(String::as_str)
+            .chain([mail.subject.as_str()])
+            .chain(mail.from.as_deref())
+            .chain(mail.reply_to.as_deref())
+            .chain(mail.list_unsubscribe.as_deref())
+            .chain(mail.attachments.iter().map(|a| a.filename.as_str()));
+        if text_fields.into_iter().any(holds)
+            || body_holds(&mail.body)
+            || body_holds(&mail.alternate_body)
+            || headers_hold(&mail.extra_headers)
+        {
+            found.push(format!("mail[{index}]"));
+        }
+    }
+    for (index, entry) in effects.cache.iter().enumerate() {
+        let key_holds = holds(entry.key());
+        let value_holds = match entry {
+            CacheEffect::Insert { value, .. } => STANDARD
+                .decode(value.as_bytes())
+                .is_ok_and(|bytes| holds(&String::from_utf8_lossy(&bytes))),
+            _ => false,
+        };
+        if key_holds || value_holds {
+            found.push(format!("cache[{index}]"));
+        }
+    }
+    found
 }
 
 /// Redact everything the effect tape recorded, in place.
@@ -515,16 +584,26 @@ pub fn redact_effects(
     }
 
     // Echo pass — everything free-form, with the fully-seeded set.
-    for exchange in &mut effects.http {
+    //
+    // A field replay hands to the code (a response body or header, a cache
+    // hit, the job entry payload) records a key when this pass changes it, as
+    // the filter pass does. Replay refuses a capsule with masked input
+    // (#2351 item 8).
+    for (index, exchange) in effects.http.iter_mut().enumerate() {
         exchange.url = mask_echoes(&exchange.url, values);
         mask_body_echoes(&mut exchange.request_body, values);
-        mask_body_echoes(&mut exchange.response_body, values);
-        for (_, value) in exchange
-            .request_headers
-            .iter_mut()
-            .chain(exchange.response_headers.iter_mut())
-        {
+        if mask_body_echoes(&mut exchange.response_body, values) {
+            keys.insert(format!("http[{index}].response_body:<echo>"));
+        }
+        for (_, value) in &mut exchange.request_headers {
             *value = mask_echoes(value, values);
+        }
+        for (name, value) in &mut exchange.response_headers {
+            let masked = mask_echoes(value, values);
+            if masked != *value {
+                keys.insert(format!("http[{index}].response_header:{name}"));
+            }
+            *value = masked;
         }
         if let Some(error) = exchange.error.as_mut() {
             *error = mask_echoes(error, values);
@@ -602,13 +681,21 @@ pub fn redact_effects(
         }
     }
     if let Some(job) = job.as_mut() {
-        job.payload = mask_json_echoes(&job.payload, values);
+        let masked = mask_json_echoes(&job.payload, values);
+        if masked != job.payload {
+            keys.insert("job_entry.<echo>".to_owned());
+        }
+        job.payload = masked;
     }
-    for entry in &mut effects.cache {
+    for (index, entry) in effects.cache.iter_mut().enumerate() {
         match entry {
             crate::capsule::schema::CacheEffect::Get { value, .. } => {
                 if let Some(encoded) = value.as_mut() {
-                    *encoded = mask_encoded_json_echoes(encoded, values);
+                    let masked = mask_encoded_json_echoes(encoded, values);
+                    if masked != *encoded {
+                        keys.insert(format!("cache[{index}]:<echo>"));
+                    }
+                    *encoded = masked;
                 }
             }
             crate::capsule::schema::CacheEffect::Insert { value, .. } => {
@@ -805,10 +892,15 @@ fn redact_effect_body(
 }
 
 /// Sweep a recorded body for values redaction removed elsewhere.
-fn mask_body_echoes(body: &mut CapsuleBody, values: &RedactedValues) {
-    if let CapsuleBody::Text(text) = body {
-        *text = mask_echoes(text, values);
-    }
+/// Returns whether the body changed.
+fn mask_body_echoes(body: &mut CapsuleBody, values: &RedactedValues) -> bool {
+    let CapsuleBody::Text(text) = body else {
+        return false;
+    };
+    let masked = mask_echoes(text, values);
+    let changed = masked != *text;
+    *text = masked;
+    changed
 }
 
 /// Scrub base64-encoded JSON (the form cache values are recorded in) by key,
@@ -1687,7 +1779,7 @@ fn scrub_value(
 }
 
 /// Retain the bytes of a masked JSON leaf so a bind echoing it is masked too.
-fn record_masked_value(value: &serde_json::Value, values: &mut RedactedValues) {
+pub(crate) fn record_masked_value(value: &serde_json::Value, values: &mut RedactedValues) {
     match value {
         serde_json::Value::String(text) => values.insert(text.as_bytes()),
         serde_json::Value::Null => {}

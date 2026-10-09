@@ -105,8 +105,19 @@ pub async fn extract_tenant_from_parts_with_domains(
     config: &crate::config::AutumnConfig,
     domains: Option<&crate::custom_domain::CustomDomainRegistry>,
 ) -> Result<String, crate::AutumnError> {
-    if let Some(tenant_id) = replayed_tenant() {
-        return Ok(tenant_id);
+    match replayed_tenant() {
+        ReplayedTenant::NoTape | ReplayedTenant::RecordedFailure => {}
+        ReplayedTenant::Resolved(tenant_id) => return Ok(tenant_id),
+        // The capsule has no tenant lookup. Live resolution would succeed on
+        // input the recording never had, so fail closed (#2351 item 13).
+        ReplayedTenant::Unrecorded => {
+            return Err(crate::AutumnError::internal_server_error(
+                std::io::Error::other(
+                    "the replayed run resolved a tenant, which the capsule has no recording for; \
+                     live tenant resolution was not consulted",
+                ),
+            ));
+        }
     }
     // Only under `source = "subdomain"`, where the `Host` header is ALREADY the
     // tenant signal. Under `header`/`session`/`jwt` the tenant comes from a
@@ -119,52 +130,68 @@ pub async fn extract_tenant_from_parts_with_domains(
         && let Some(host) = request_host(parts)
         && let Some(tenant_id) = registry.tenant_for_host(&host)
     {
-        record_tenant(&tenant_id);
+        record_tenant(Some(&tenant_id));
         return Ok(tenant_id);
     }
-    // A capsule with no recorded tenant falls through to the real resolver.
-    // That is not a gap: the recorded request's headers are restored verbatim,
-    // so a run whose recorded failure *was* a tenant-resolution error
-    // reproduces that error instead of being handed a different 503 saying the
-    // capsule is too old.
+    // A recorded failed lookup runs the real resolver again. The recorded
+    // request's headers are restored verbatim, so a run whose recorded failure
+    // *was* a tenant-resolution error reproduces that error.
     let resolved = extract_tenant_from_parts_inner(parts, config).await;
-    if let Ok(tenant_id) = resolved.as_ref() {
-        record_tenant(tenant_id);
-    }
+    // A failure is recorded too, so replay can tell it from a lookup the
+    // recording never made.
+    record_tenant(resolved.as_ref().ok().map(String::as_str));
     resolved
 }
 
 // The `capsule` module is behind the `reporting` feature, so both halves of the
 // seam have a no-op twin for builds without it.
 
+/// What a capsule replay says about the tenant lookup.
+enum ReplayedTenant {
+    /// No replay serves this task.
+    NoTape,
+    /// The recording resolved this tenant.
+    Resolved(String),
+    /// The recording tried and failed.
+    RecordedFailure,
+    /// The recording has no tenant lookup. The tape logged a divergence.
+    Unrecorded,
+}
+
 /// The tenant a capsule replay serves, when one is serving this task.
 #[cfg(feature = "reporting")]
-fn replayed_tenant() -> Option<String> {
-    crate::capsule::effects::current_tape().and_then(|tape| match tape.tenant() {
-        crate::capsule::effects::TenantVerdict::Resolved(id) => Some(id),
-        _ => None,
-    })
+fn replayed_tenant() -> ReplayedTenant {
+    use crate::capsule::effects::TenantVerdict;
+    let Some(tape) = crate::capsule::effects::current_tape() else {
+        return ReplayedTenant::NoTape;
+    };
+    match tape.tenant() {
+        TenantVerdict::Resolved(id) => ReplayedTenant::Resolved(id),
+        TenantVerdict::RecordedFailure => ReplayedTenant::RecordedFailure,
+        TenantVerdict::Unrecorded => ReplayedTenant::Unrecorded,
+    }
 }
 
 /// No capsule support compiled in: never a replay.
 #[cfg(not(feature = "reporting"))]
-const fn replayed_tenant() -> Option<String> {
-    None
+const fn replayed_tenant() -> ReplayedTenant {
+    ReplayedTenant::NoTape
 }
 
-/// Tee the resolved tenant into the in-flight request's capsule.
+/// Tee the lookup's result into the in-flight request's capsule. `None` is a
+/// failed lookup.
 #[cfg(feature = "reporting")]
-fn record_tenant(tenant_id: &str) {
+fn record_tenant(tenant_id: Option<&str>) {
     if let Some(scope) = crate::capsule::current_scope() {
         scope.record_tenant(crate::capsule::TenantEffect {
-            id: Some(tenant_id.to_owned()),
+            id: tenant_id.map(ToOwned::to_owned),
         });
     }
 }
 
 /// No capsule support compiled in: nothing to record.
 #[cfg(not(feature = "reporting"))]
-const fn record_tenant(_tenant_id: &str) {}
+const fn record_tenant(_tenant_id: Option<&str>) {}
 
 /// The request's effective host, preferring the proxy-resolved one.
 ///

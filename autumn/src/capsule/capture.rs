@@ -852,10 +852,13 @@ impl CaptureScope {
 
     /// Complete a reserved job-enqueue slot with the backend's outcome.
     pub fn fill_job_enqueue(&self, index: usize, effect: JobEffect) {
+        // Every retained field is charged, the error text included: replay
+        // hands it back verbatim, so it is kept whole (#2351 item 19).
         let weight = effect
             .name
             .len()
-            .saturating_add(json_weight(&effect.payload));
+            .saturating_add(json_weight(&effect.payload))
+            .saturating_add(effect.error.as_ref().map_or(0, String::len));
         let budget = self.settings.max_capsule_bytes;
         let _ = self.with_effects(|buffer| {
             buffer.fill(|effects| &mut effects.jobs, index, effect, weight, budget);
@@ -875,8 +878,11 @@ impl CaptureScope {
     /// Complete a reserved mail slot.
     pub fn fill_mail(&self, index: usize, mut effect: MailEffect) {
         let cap = self.settings.max_body_bytes;
-        let over = body_weight(&effect.body) > cap;
+        // Both halves of a multipart message have the same cap (#2351 item
+        // 10).
+        let over = body_weight(&effect.body) > cap || body_weight(&effect.alternate_body) > cap;
         effect.body = clamp_body(effect.body, cap);
+        effect.alternate_body = clamp_body(effect.alternate_body, cap);
         // A skipped body is a wildcard to the replay comparison — it has to be,
         // there being nothing recorded to compare against — so a capsule
         // holding one must not present as complete. Otherwise the message
@@ -886,10 +892,31 @@ impl CaptureScope {
             self.note(MAIL_BODY_SKIPPED_NOTE);
             self.mark_truncated();
         }
+        // Every retained field is charged against the capsule budget.
         let weight = effect
             .subject
             .len()
-            .saturating_add(body_weight(&effect.body));
+            .saturating_add(body_weight(&effect.body))
+            .saturating_add(body_weight(&effect.alternate_body))
+            .saturating_add(headers_weight(&effect.extra_headers))
+            .saturating_add(
+                effect
+                    .to
+                    .iter()
+                    .fold(0, |total: usize, to| total.saturating_add(to.len())),
+            )
+            .saturating_add(effect.from.as_ref().map_or(0, String::len))
+            .saturating_add(effect.reply_to.as_ref().map_or(0, String::len))
+            .saturating_add(effect.list_unsubscribe.as_ref().map_or(0, String::len))
+            .saturating_add(effect.error.as_ref().map_or(0, String::len))
+            .saturating_add(
+                effect
+                    .attachments
+                    .iter()
+                    .fold(0, |total: usize, attachment| {
+                        total.saturating_add(attachment.filename.len())
+                    }),
+            );
         let budget = self.settings.max_capsule_bytes;
         let _ = self.with_effects(|buffer| {
             buffer.fill(|effects| &mut effects.mail, index, effect, weight, budget);

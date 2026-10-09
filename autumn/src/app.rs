@@ -4460,6 +4460,8 @@ impl AppBuilder {
         #[cfg(feature = "db")]
         apply_replica_migration_readiness(&state, replica_readiness);
         if let Some(cache) = cache_backend {
+            // Wrapped once, so the global and the state hold the same `Arc`.
+            let cache = crate::cache::with_capsule_seam(cache);
             crate::cache::set_global_cache(cache.clone());
             state.shared_cache = Some(cache);
         } else {
@@ -6492,6 +6494,8 @@ impl AppBuilder {
         #[cfg(feature = "db")]
         apply_replica_migration_readiness(&state, replica_readiness);
         if let Some(cache) = cache_backend {
+            // Wrapped once, so the global and the state hold the same `Arc`.
+            let cache = crate::cache::with_capsule_seam(cache);
             crate::cache::set_global_cache(cache.clone());
             state.shared_cache = Some(cache);
         } else {
@@ -8049,6 +8053,8 @@ impl AppBuilder {
         #[cfg(feature = "db")]
         apply_replica_migration_readiness(&state, replica_readiness);
         if let Some(cache) = cache_backend {
+            // Wrapped once, so the global and the state hold the same `Arc`.
+            let cache = crate::cache::with_capsule_seam(cache);
             crate::cache::set_global_cache(cache.clone());
             state.shared_cache = Some(cache);
         } else {
@@ -8298,11 +8304,13 @@ impl AppBuilder {
     ///   request to a live service.
     /// * No job runtime, no scheduler, no startup/shutdown hooks, and only
     ///   *sync* event listeners (a durable listener needs the job runtime).
-    /// * No storage preflight, no mailer, no fail-fast configuration gates: a
-    ///   machine replaying a production capsule generally has none of that
-    ///   configured, and none of it is on the recorded path. A handler that
-    ///   extracts one of those subsystems is reported as a mismatch rather than
-    ///   killing the replay.
+    /// * A replay mailer, whose sends are served from the capsule and never
+    ///   delivered (`mail::install_replay_mailer`).
+    /// * No storage preflight, no fail-fast configuration gates: a machine
+    ///   replaying a production capsule generally has none of that configured,
+    ///   and none of it is on the recorded path. A handler that extracts one of
+    ///   those subsystems is reported as a mismatch rather than killing the
+    ///   replay.
     /// * No port is bound.
     #[cfg(feature = "reporting")]
     #[allow(clippy::too_many_lines)]
@@ -8485,6 +8493,11 @@ impl AppBuilder {
 
         install_webhook_registry(&state, &config);
         run_state_initializers(state_initializers, &state);
+        // After the initializers, so it replaces a live `Mailer` one of them
+        // installed; before the router state is cloned, so a job replay gets
+        // it too (#2351 item 7).
+        #[cfg(feature = "mail")]
+        crate::mail::install_replay_mailer(&state, &config.mail);
         crate::cost::install(&state, &config);
         // Durable listeners need the job runtime this path never starts, so —
         // as in static builds — only sync listeners are registered, and a
@@ -9279,6 +9292,8 @@ fn force_offline_replay_config(config: &mut AutumnConfig) {
     // the debugging session. A per-route `#[timeout(...)]` override still applies —
     // it is part of the route table, not the configuration.
     config.server.timeouts.request_timeout_ms = None;
+    // A shadow mirror has its own client and is not a handler effect.
+    config.shadow.enabled = false;
 }
 
 /// The database topology a replay runs against: an in-process pool answering

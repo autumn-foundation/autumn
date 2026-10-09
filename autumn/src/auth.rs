@@ -1698,6 +1698,11 @@ fn run_http_chain(
 
 #[cfg(feature = "oauth2")]
 fn oauth_http_client() -> crate::AutumnResult<HttpClient> {
+    // This client is not the recorded outbound seam (#2351 item 1). Every
+    // OAuth2 call builds one, so the guard sits here.
+    #[cfg(feature = "reporting")]
+    crate::capsule::guard_egress("oauth2", "POST", "oauth2 provider")
+        .map_err(|refused| crate::AutumnError::service_unavailable_msg(refused.to_string()))?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(OAUTH_HTTP_TIMEOUT_SECS))
         .build()

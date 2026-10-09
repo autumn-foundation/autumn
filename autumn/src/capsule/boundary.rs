@@ -65,10 +65,34 @@ impl UnrecordedEgress {
 ///
 /// [`UnrecordedEgress`] during a replay.
 pub fn guard_egress(
-    _subsystem: &'static str,
-    _method: &str,
-    _url: &str,
+    subsystem: &'static str,
+    method: &str,
+    url: &str,
 ) -> Result<(), UnrecordedEgress> {
+    let refuse = || UnrecordedEgress {
+        subsystem,
+        method: method.to_owned(),
+        // The query string can hold a credential, and the error is printed.
+        target: url.split_once('?').map_or(url, |(head, _)| head).to_owned(),
+    };
+    if let Some(tape) = crate::capsule::effects::current_tape() {
+        tape.refuse_unrecorded_egress(subsystem, method, url);
+        return Err(refuse());
+    }
+    // `autumn replay` blocks the whole process, including a task that carries
+    // no tape.
+    #[cfg(feature = "http-client")]
+    if crate::http_client::outbound_blocked_for_replay() {
+        return Err(refuse());
+    }
+    if let Some(scope) = crate::capsule::current_scope() {
+        // No URL in the note: notes are persisted, and a URL can hold a token.
+        scope.note(format!(
+            "{subsystem} made an outbound call outside the recorded HTTP seam; the capsule \
+             cannot replay it"
+        ));
+        scope.mark_truncated();
+    }
     Ok(())
 }
 
@@ -90,7 +114,34 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    tokio::spawn(future)
+    note_detached_work();
+    tokio::spawn(carry_tape(future))
+}
+
+/// Why a capsule with detached work is not replayable.
+pub(crate) const DETACHED_WORK_NOTE: &str = "the run started work on a detached task; the \
+     task's effects are not on the tape";
+
+/// Mark the in-flight capsule incomplete: work it cannot see was started.
+pub(crate) fn note_detached_work() {
+    if let Some(scope) = crate::capsule::current_scope() {
+        scope.note(DETACHED_WORK_NOTE);
+        scope.mark_truncated();
+    }
+}
+
+/// Give `future` this task's replay tape, when one serves it.
+///
+/// Read on the calling task, before a spawn: a task-local does not cross
+/// `tokio::spawn`.
+pub(crate) fn carry_tape<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    let tape = crate::capsule::effects::current_tape();
+    async move {
+        match tape {
+            Some(tape) => crate::capsule::effects::with_effect_tape(tape, future).await,
+            None => future.await,
+        }
+    }
 }
 
 #[cfg(test)]

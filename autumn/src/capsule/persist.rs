@@ -269,6 +269,14 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
     // into the same echo set.
     let mut job = scope.job_entry();
     let mut effect_keys = std::collections::BTreeSet::new();
+    // Before redaction: here a placeholder can only be text the data held
+    // (#2351 item 5).
+    for location in crate::capsule::redact::literal_placeholder_locations(&effects) {
+        effect_keys.insert(format!(
+            "{location}{}",
+            crate::capsule::redact::LITERAL_PLACEHOLDER_SUFFIX
+        ));
+    }
     crate::capsule::redact::redact_effects(
         &mut effects,
         job.as_mut(),
@@ -408,7 +416,7 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
 /// it straight back into the capsule through the outcome. The outcome is
 /// free-form text, so this is a substring replacement rather than the
 /// whole-value comparison bind masking uses.
-fn scrub_outcome(outcome: CapsuleOutcome, redacted: &RedactedValues) -> CapsuleOutcome {
+pub(crate) fn scrub_outcome(outcome: CapsuleOutcome, redacted: &RedactedValues) -> CapsuleOutcome {
     use crate::capsule::redact::mask_echoes;
 
     match outcome {

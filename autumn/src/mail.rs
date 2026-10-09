@@ -2250,7 +2250,14 @@ impl Mailer {
         // When inside a db.tx, push the spawn as an after-commit callback so
         // the mail only fires if the transaction commits successfully.
         #[cfg(feature = "db")]
-        {
+        if crate::db::AFTER_COMMIT_REGISTRY.try_with(|_| ()).is_ok() {
+            // Failure-capsule seam (#2351 item 3). The callback runs on a
+            // detached task with no capture scope and no replay tape, so the
+            // seam is the registration, on this task.
+            if let Some(answer) = replayed_send(&mail) {
+                return answer;
+            }
+            record_send(&mail, None);
             let mailer = self.clone();
             let deferred = mail.clone();
             let mut f_opt: Option<(Self, Mail)> = Some((mailer, deferred));
@@ -2275,7 +2282,8 @@ impl Mailer {
                                         crate::AutumnError::internal_server_error_msg(e.to_string())
                                     })
                                 } else {
-                                    m.spawn_mail_delivery(m_mail).map_err(|e| {
+                                    // Recorded at registration already.
+                                    m.spawn_unrecorded_delivery(m_mail).map_err(|e| {
                                         crate::AutumnError::internal_server_error_msg(e.to_string())
                                     })
                                 }
@@ -2334,6 +2342,11 @@ impl Mailer {
         // capture scope either, so a `deliver_later` would otherwise be missing
         // from the capsule and then report an unrecorded-effect divergence.
         record_send(&mail, None);
+        self.spawn_unrecorded_delivery(mail)
+    }
+
+    /// Spawn delivery of mail the seam already answered or recorded.
+    fn spawn_unrecorded_delivery(&self, mail: Mail) -> Result<(), MailError> {
         // Honor the disabled-transport contract: if the operator turned mail off
         // for this profile, deliver_later must drop the message just like
         // immediate `send` does — even when a queue is attached.
@@ -3760,7 +3773,49 @@ impl MailTransport for InterceptedMailTransport {
 /// A send on the replayed request is served from the tape by the mail seam.
 /// A send that reaches the transport ran with no tape, and is refused.
 #[cfg(feature = "reporting")]
-pub(crate) fn install_replay_mailer(_state: &AppState, _config: &MailConfig) {}
+pub(crate) fn install_replay_mailer(state: &AppState, config: &MailConfig) {
+    let mut mailer = Mailer::with_transport(ReplayTransport {
+        // `try_deliver_later` stops before the seam on a disabled transport.
+        // Keep the recorded run's answer.
+        disabled: config.transport == Transport::Disabled,
+    });
+    // Defaults apply before the seam, so a recorded `reply_to` default is
+    // matched.
+    mailer.defaults = Arc::new(MailerDefaults {
+        from: config.from.clone(),
+        reply_to: config.reply_to.clone(),
+    });
+    mailer.inline_css_default = config.inline_css;
+    state.insert_extension(mailer);
+}
+
+/// The transport of the replay mailer: it refuses every send.
+///
+/// A send on the replayed request is answered by the mail seam before it
+/// reaches a transport. A send that reaches this one ran with no tape.
+#[cfg(feature = "reporting")]
+struct ReplayTransport {
+    disabled: bool,
+}
+
+#[cfg(feature = "reporting")]
+impl MailTransport for ReplayTransport {
+    fn send<'a>(
+        &'a self,
+        mail: Mail,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+        Box::pin(async move {
+            Err(MailError::RuntimeUnavailable(format!(
+                "mail ({:?}) was sent outside the capsule's replay scope; nothing was delivered",
+                mail.subject
+            )))
+        })
+    }
+
+    fn is_disabled(&self) -> bool {
+        self.disabled
+    }
+}
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn install_mailer(

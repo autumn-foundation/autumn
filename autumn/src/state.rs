@@ -674,7 +674,7 @@ impl AppState {
     /// Register a global cache backend (builder / test helper, build-time).
     #[must_use]
     pub fn with_cache(mut self, cache: Arc<dyn Cache>) -> Self {
-        self.shared_cache = Some(cache);
+        self.shared_cache = Some(crate::cache::with_capsule_seam(cache));
         self
     }
 
@@ -811,6 +811,8 @@ impl AppState {
     /// Updates both the process-level global (used by `#[cached]` functions) and
     /// the extension map (used by `CacheResponseLayer::from_app` and `state.cache()`).
     pub fn set_cache(&self, cache: Arc<dyn Cache>) {
+        // Wrapped once, so the global and the extension are the same `Arc`.
+        let cache = crate::cache::with_capsule_seam(cache);
         crate::cache::set_global_cache(cache.clone());
         self.insert_extension(GlobalCacheEntry(cache));
     }

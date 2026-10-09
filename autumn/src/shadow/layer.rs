@@ -325,6 +325,16 @@ impl MirrorContext {
         self: &Arc<Self>,
         pending: PendingMirror,
     ) -> Option<oneshot::Sender<Option<ResponseFacts>>> {
+        // A mirror is not a handler effect, and its client is not the recorded
+        // outbound seam: a replay starts none (#2351 item 1).
+        #[cfg(feature = "reporting")]
+        if crate::capsule::effects::tape_active() {
+            return None;
+        }
+        #[cfg(feature = "http-client")]
+        if crate::http_client::outbound_blocked_for_replay() {
+            return None;
+        }
         let Some(permit) =
             InFlightPermit::try_acquire(&self.in_flight, self.settings.max_in_flight)
         else {

@@ -791,36 +791,41 @@ pub(crate) fn spawn_committed_after_commit_callbacks(
     }
 
     let timeouts = TxTimeouts::current().unwrap_or_default();
-    Some(tokio::task::spawn(TX_TIMEOUTS.scope(
-        timeouts,
-        async move {
-            for cb in callbacks {
-                let result = match std::panic::catch_unwind(AssertUnwindSafe(cb)) {
-                    Ok(callback) => AssertUnwindSafe(callback).catch_unwind().await,
-                    Err(panic) => Err(panic),
-                };
+    let callbacks_run = async move {
+        for cb in callbacks {
+            let result = match std::panic::catch_unwind(AssertUnwindSafe(cb)) {
+                Ok(callback) => AssertUnwindSafe(callback).catch_unwind().await,
+                Err(panic) => Err(panic),
+            };
 
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        let failures_total = record_after_commit_failure();
-                        tracing::error!(
-                            autumn.after_commit.failures_total = failures_total,
-                            "after_commit callback failed (tx already committed): {e}"
-                        );
-                    }
-                    Err(panic) => {
-                        let failures_total = record_after_commit_failure();
-                        let panic = after_commit_panic_message(&*panic);
-                        tracing::error!(
-                            autumn.after_commit.failures_total = failures_total,
-                            "after_commit callback panicked (tx already committed): {panic}"
-                        );
-                    }
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    let failures_total = record_after_commit_failure();
+                    tracing::error!(
+                        autumn.after_commit.failures_total = failures_total,
+                        "after_commit callback failed (tx already committed): {e}"
+                    );
+                }
+                Err(panic) => {
+                    let failures_total = record_after_commit_failure();
+                    let panic = after_commit_panic_message(&*panic);
+                    tracing::error!(
+                        autumn.after_commit.failures_total = failures_total,
+                        "after_commit callback panicked (tx already committed): {panic}"
+                    );
                 }
             }
-        },
-    )))
+        }
+    };
+    // During a capsule replay the callbacks get the replay tape, so their
+    // effects are served or refused and never reach live services (#2351
+    // item 3).
+    #[cfg(feature = "reporting")]
+    let callbacks_run = crate::capsule::boundary::carry_tape(callbacks_run);
+    Some(tokio::task::spawn(
+        TX_TIMEOUTS.scope(timeouts, callbacks_run),
+    ))
 }
 
 fn after_commit_panic_message(payload: &(dyn Any + Send)) -> String {
@@ -882,6 +887,12 @@ where
             registry.lock().expect("registry lock").push(boxed);
         })
         .ok();
+    // A registered callback runs on a detached task, where capture cannot
+    // see its effects (#2351 item 3).
+    #[cfg(feature = "reporting")]
+    if f_opt.is_none() {
+        crate::capsule::boundary::note_detached_work();
+    }
 
     // If still Some, the task-local wasn't set — we're outside a tx; run eagerly.
     if let Some(f) = f_opt {
