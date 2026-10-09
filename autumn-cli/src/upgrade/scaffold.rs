@@ -645,15 +645,24 @@ fn read_text(absolute: &Path) -> Option<String> {
         .map(|text| normalize(&text))
 }
 
+/// What the app-code codemods plan for one file.
+#[derive(Debug, Clone)]
+pub struct Planned {
+    /// The text the codemods read.
+    pub original: String,
+    /// The text the codemods write.
+    pub updated: String,
+}
+
 /// Reconcile `files` against what is on disk under `root`.
 ///
-/// `migrated` maps each path the app-code codemods rewrite to its planned text.
+/// `migrated` maps each path the codemods rewrite to its plan.
 #[must_use]
 pub fn classify(
     root: &Path,
     files: &BTreeMap<&'static str, String>,
     manifest: Option<&Manifest>,
-    migrated: &BTreeMap<String, String>,
+    migrated: &BTreeMap<String, Planned>,
 ) -> Vec<Entry> {
     let recorded = |path: &str| manifest.and_then(|manifest| manifest.digests.get(path));
     let pinned = |path: &str| manifest.is_some_and(|manifest| manifest.pinned.contains(path));
@@ -664,10 +673,15 @@ pub fn classify(
             let absolute = root.join(path);
             let current = read_current(root, path);
             // A migrated file is judged by its planned text. In a preview, the
-            // old file is still on disk. In `--apply`, the new file is already there.
+            // old file is still on disk. In `--apply`, the new file is already
+            // there. Any other text is a later edit, so the disk wins.
             let planned = migrated.get(*path);
             let seen = match (&current, planned) {
-                (OnDisk::Text(_), Some(planned)) => OnDisk::Text(normalize(planned)),
+                (OnDisk::Text(text), Some(plan))
+                    if *text == normalize(&plan.original) || *text == normalize(&plan.updated) =>
+                {
+                    OnDisk::Text(normalize(&plan.updated))
+                }
                 _ => current.clone(),
             };
             let normalized = normalize(template);
@@ -944,7 +958,7 @@ pub fn plan(root: &Path, target: &str) -> ScaffoldReport {
 pub fn plan_after(
     root: &Path,
     _target: &str,
-    migrated: &BTreeMap<String, String>,
+    migrated: &BTreeMap<String, Planned>,
 ) -> ScaffoldReport {
     let target = env!("CARGO_PKG_VERSION").to_owned();
     let manifest = Manifest::load(root);
@@ -2683,7 +2697,7 @@ mod tests {
             &Status::Update
         );
 
-        let migrated = BTreeMap::from([("build.rs".to_owned(), stale.to_owned())]);
+        let migrated = BTreeMap::from([("build.rs".to_owned(), plan_of(stale, stale))]);
         let previewed = plan_after(tmp.path(), "0.7.0", &migrated);
         assert_eq!(
             status_of(&previewed.entries, "build.rs"),
@@ -2707,7 +2721,7 @@ mod tests {
         let before = "fn main() { old_call(); }\n";
         let after = "fn main() { new_call(); }\n";
         write(tmp.path(), "build.rs", before);
-        let migrated = BTreeMap::from([("build.rs".to_owned(), after.to_owned())]);
+        let migrated = BTreeMap::from([("build.rs".to_owned(), plan_of(before, after))]);
 
         let preview = plan_after(tmp.path(), "0.7.0", &migrated);
         write(tmp.path(), "build.rs", after);
@@ -2727,11 +2741,18 @@ mod tests {
         assert!(!diff_of(&preview).contains("old_call"));
     }
 
+    fn plan_of(original: &str, updated: &str) -> Planned {
+        Planned {
+            original: original.to_owned(),
+            updated: updated.to_owned(),
+        }
+    }
+
     /// The verdict for `build.rs` before and after the codemods write it.
     fn build_rs_verdicts(before: &str, planned: &str) -> (Status, Status) {
         let tmp = scaffolded(GenerateOptions::default());
         write(tmp.path(), "build.rs", before);
-        let migrated = BTreeMap::from([("build.rs".to_owned(), planned.to_owned())]);
+        let migrated = BTreeMap::from([("build.rs".to_owned(), plan_of(before, planned))]);
         let verdict = |tmp: &TempDir| {
             let report = plan_after(tmp.path(), "0.7.0", &migrated);
             *status_of(&report.entries, "build.rs")
@@ -2773,7 +2794,10 @@ mod tests {
         let tmp = scaffolded(GenerateOptions::default());
         write(tmp.path(), "build.rs", "fn main() { old_call(); }\n");
         let diff = |planned: &str| {
-            let migrated = BTreeMap::from([("build.rs".to_owned(), planned.to_owned())]);
+            let migrated = BTreeMap::from([(
+                "build.rs".to_owned(),
+                plan_of("fn main() { old_call(); }\n", planned),
+            )]);
             let report = plan_after(tmp.path(), "0.7.0", &migrated);
             report
                 .entries
@@ -2788,9 +2812,34 @@ mod tests {
     }
 
     #[test]
+    fn a_file_changed_after_the_scan_keeps_its_real_diff() {
+        // The plan names neither the bytes on disk nor the bytes it writes. The
+        // report must not claim `up to date` for a file nobody wrote.
+        let tmp = scaffolded(GenerateOptions::default());
+        let template =
+            current_files(tmp.path(), GenerateOptions::default()).unwrap()["build.rs"].clone();
+        write(tmp.path(), "build.rs", "fn main() { edited_since(); }\n");
+        let migrated = BTreeMap::from([(
+            "build.rs".to_owned(),
+            plan_of("fn main() { old_call(); }\n", &template),
+        )]);
+        let report = plan_after(tmp.path(), "0.7.0", &migrated);
+        let entry = report
+            .entries
+            .iter()
+            .find(|entry| entry.path == "build.rs")
+            .unwrap();
+        assert_eq!(
+            entry.status,
+            Status::Conflict(ConflictReason::MigratedThisRun)
+        );
+        assert!(entry.diff.contains("edited_since"));
+    }
+
+    #[test]
     fn a_migrated_path_the_scaffold_does_not_own_is_ignored() {
         let tmp = scaffolded(GenerateOptions::default());
-        let migrated = BTreeMap::from([("src/main.rs".to_owned(), "fn main() {}\n".to_owned())]);
+        let migrated = BTreeMap::from([("src/main.rs".to_owned(), plan_of("", "fn main() {}\n"))]);
         let report = plan_after(tmp.path(), "0.7.0", &migrated);
         assert!(
             report

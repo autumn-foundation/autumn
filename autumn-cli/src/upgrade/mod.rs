@@ -1426,10 +1426,16 @@ mod write_guard_tests {
 /// The plan also carries each file's planned text. The scaffold diff uses that
 /// text, so preview and apply show the same diff.
 fn plan_scaffold(root: &Path, target: &str, report: &Report) -> Option<scaffold::ScaffoldReport> {
-    let migrated: BTreeMap<String, String> = report
+    let migrated: BTreeMap<String, scaffold::Planned> = report
         .files
         .iter()
-        .map(|file| (file.path.clone(), file.updated.clone()))
+        .map(|file| {
+            let plan = scaffold::Planned {
+                original: file.original.clone(),
+                updated: file.updated.clone(),
+            };
+            (file.path.clone(), plan)
+        })
         .collect();
     scaffold::is_project(root).then(|| scaffold::plan_after(root, target, &migrated))
 }
