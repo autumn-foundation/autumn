@@ -1080,3 +1080,43 @@ async fn a_join_dropped_while_it_waits_for_the_pool_does_no_work() {
     release(&mut holder).await;
     assert_eq!(seat_rows(&pool, "room-1").await, 0);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_leave_dropped_while_it_waits_for_the_pool_does_no_work() {
+    // Leave needs no session. With the pool exhausted, a dropped leave must
+    // stop waiting, so dropped requests add no hidden backlog.
+    let (pool, _container) = setup_pool().await;
+    let store = Arc::new(DbRoomStore::new(pool.clone(), 6));
+    seed(
+        &pool,
+        "",
+        "room-1",
+        Utc::now(),
+        &[("p1", "tok", Utc::now())],
+    )
+    .await;
+
+    let mut holder = hold_room_row(&pool, "room-1").await;
+    let mut rest = Vec::new();
+    for _ in 0..4 {
+        rest.push(pool.get().await.expect("conn"));
+    }
+    let dropped = {
+        let store = store.clone();
+        tokio::spawn(async move { store.leave_room("", "room-1", "p1", "tok").await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    dropped.abort();
+    let _ = dropped.await;
+    drop(rest);
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        lock_waiters(&pool).await,
+        0,
+        "the dropped leave queued on the room lock"
+    );
+    release(&mut holder).await;
+    assert_eq!(seat_rows(&pool, "room-1").await, 1, "the seat stays");
+}

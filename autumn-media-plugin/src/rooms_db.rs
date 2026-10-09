@@ -493,9 +493,11 @@ impl RoomStore for DbRoomStore {
     ) -> RoomStoreFuture<'a, ()> {
         let pool = self.pool.clone();
         let owned = [namespace, room_id, participant_id, token].map(str::to_owned);
-        Box::pin(detached(move |_caller| async move {
+        Box::pin(detached(move |mut caller| async move {
             let [namespace, room_id, participant_id, token] = owned.each_ref().map(String::as_str);
-            let mut conn = pool.get().await.map_err(map_db_err)?;
+            // A caller that goes while it waits for the pool gets no connection.
+            // After the checkout, the leave runs to the end: the user asked for it.
+            let mut conn = caller.checkout(&pool).await?;
             // Check the token before the lock, so a bad request takes no lock.
             check_seat(&mut conn, namespace, room_id, participant_id, token)
                 .await
