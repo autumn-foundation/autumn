@@ -33,6 +33,8 @@ pub struct NegotiateConfig {
     pub home_link: Option<HeaderValue>,
     /// `Content-Signal` header for Markdown responses.
     pub content_signal: Option<HeaderValue>,
+    /// `WWW-Authenticate` value for a `401` (RFC 9728 `resource_metadata`).
+    pub resource_metadata: Option<HeaderValue>,
 }
 
 /// Tower layer for [`NegotiateConfig`].
@@ -88,10 +90,11 @@ where
         let flags = Flags {
             is_home: readable && req.uri().path() == "/",
             readable,
-            wants_markdown: self.config.markdown && is_get && prefers_markdown(req.headers()),
+            wants_markdown: self.config.markdown && readable && prefers_markdown(req.headers()),
+            is_head: !is_get && readable,
         };
-        // The future owns only the inner future: no clone of the inner
-        // service, and no box unless the page is converted.
+        // The future holds only the inner future. It does not clone the
+        // service. It boxes only a page that it converts.
         NegotiateFuture {
             inner: self.inner.call(req),
             config: Arc::clone(&self.config),
@@ -102,10 +105,12 @@ where
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)] // request facts, read once
 struct Flags {
     is_home: bool,
     readable: bool,
     wants_markdown: bool,
+    is_head: bool,
 }
 
 type ConvertFuture = Pin<Box<dyn Future<Output = Response> + Send>>;
@@ -134,6 +139,18 @@ where
         }
         let mut res = std::task::ready!(this.inner.poll(cx))?;
         let config = &**this.config;
+        if res.extensions().get::<super::AeoDocument>().is_some() {
+            res.headers_mut().remove(axum::http::header::SET_COOKIE);
+        }
+        if res.status() == StatusCode::UNAUTHORIZED
+            && let Some(hint) = &config.resource_metadata
+            && !res
+                .headers()
+                .contains_key(axum::http::header::WWW_AUTHENTICATE)
+        {
+            res.headers_mut()
+                .insert(axum::http::header::WWW_AUTHENTICATE, hint.clone());
+        }
         if this.flags.is_home
             && res.status().is_success()
             && let Some(link) = &config.home_link
@@ -147,6 +164,11 @@ where
         if !this.flags.wants_markdown {
             return Poll::Ready(Ok(res));
         }
+        if this.flags.is_head {
+            // HEAD carries the headers a GET would get; there is no body.
+            markdown_headers(res.headers_mut(), config, None);
+            return Poll::Ready(Ok(res));
+        }
         let config = Arc::clone(this.config);
         let mut convert: ConvertFuture = Box::pin(async move { to_markdown(res, &config).await });
         let poll = convert.as_mut().poll(cx);
@@ -155,8 +177,8 @@ where
     }
 }
 
-/// `true` when `Accept` ranks `text/markdown` at least as high as
-/// `text/html`, with a non-zero weight.
+/// `true` when `Accept` names `text/markdown` with a weight at least as
+/// high as the best range that covers HTML (`text/html`, `text/*`, `*/*`).
 #[must_use]
 pub fn prefers_markdown(headers: &HeaderMap) -> bool {
     let mut markdown = 0.0_f32;
@@ -166,18 +188,35 @@ pub fn prefers_markdown(headers: &HeaderMap) -> bool {
         for range in value.split(',') {
             let mut parts = range.split(';');
             let media = parts.next().unwrap_or("").trim();
-            let q = parts
-                .filter_map(|p| p.trim().strip_prefix("q="))
-                .find_map(|q| q.trim().parse::<f32>().ok())
-                .unwrap_or(1.0);
+            let q = accept_weight(parts);
             if media.eq_ignore_ascii_case("text/markdown") {
                 markdown = markdown.max(q);
-            } else if media.eq_ignore_ascii_case("text/html") {
+            } else if ["text/html", "text/*", "*/*"]
+                .iter()
+                .any(|m| media.eq_ignore_ascii_case(m))
+            {
                 html = html.max(q);
             }
         }
     }
     markdown > 0.0 && markdown >= html
+}
+
+/// The `q` weight of one media range (RFC 9110 §12.4.2). A missing `q` is
+/// 1; a `q` that does not parse is 0.
+fn accept_weight<'a>(params: impl Iterator<Item = &'a str>) -> f32 {
+    for param in params {
+        let Some((key, value)) = param.split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("q") {
+            return value
+                .trim()
+                .parse::<f32>()
+                .map_or(0.0, |q| q.clamp(0.0, 1.0));
+        }
+    }
+    1.0
 }
 
 /// A whole `200` HTML document: not encoded, not a range, not a download.
@@ -230,8 +269,34 @@ async fn to_markdown(res: Response, config: &NegotiateConfig) -> Response {
         Ok(bytes) => bytes,
         Err(body) => return Response::from_parts(parts, body),
     };
-    let markdown = super::markdown::html_to_markdown(&String::from_utf8_lossy(&bytes));
-    let headers = &mut parts.headers;
+    let markdown = if bytes.len() > BLOCKING_THRESHOLD {
+        // A large page converts off the async worker threads.
+        let html = bytes.clone();
+        match tokio::task::spawn_blocking(move || {
+            super::markdown::html_to_markdown(&String::from_utf8_lossy(&html))
+        })
+        .await
+        {
+            Ok(markdown) => markdown,
+            Err(_) => return Response::from_parts(parts, Body::from(bytes)),
+        }
+    } else {
+        super::markdown::html_to_markdown(&String::from_utf8_lossy(&bytes))
+    };
+    markdown_headers(
+        &mut parts.headers,
+        config,
+        Some(super::markdown::estimate_tokens(&markdown)),
+    );
+    Response::from_parts(parts, Body::from(markdown))
+}
+
+/// Pages larger than this convert on a blocking thread.
+const BLOCKING_THRESHOLD: usize = 256 * 1024;
+
+/// Turn HTML response headers into Markdown ones. `tokens` is `None` for
+/// `HEAD`, which has no body to count.
+fn markdown_headers(headers: &mut HeaderMap, config: &NegotiateConfig, tokens: Option<usize>) {
     headers.insert(
         CONTENT_TYPE,
         HeaderValue::from_static("text/markdown; charset=utf-8"),
@@ -249,18 +314,24 @@ async fn to_markdown(res: Response, config: &NegotiateConfig) -> Response {
             }
         }
     }
-    headers.insert(
-        "x-markdown-tokens",
-        HeaderValue::from(super::markdown::estimate_tokens(&markdown)),
-    );
+    // Some CDNs ignore `Vary` on HTML. With no cache policy from the app,
+    // keep the Markdown copy out of shared caches.
+    if !headers.contains_key(axum::http::header::CACHE_CONTROL) {
+        headers.insert(
+            axum::http::header::CACHE_CONTROL,
+            HeaderValue::from_static("private"),
+        );
+    }
+    if let Some(tokens) = tokens {
+        headers.insert("x-markdown-tokens", HeaderValue::from(tokens));
+    }
     if let Some(signal) = &config.content_signal {
         headers.insert("content-signal", signal.clone());
     }
-    Response::from_parts(parts, Body::from(markdown))
 }
 
-/// Read `body` up to `limit` bytes. Past the limit, give back a body that
-/// replays the read bytes and streams the rest.
+/// Read `body` up to `limit` bytes. Over the limit, return a body that
+/// sends the bytes read, then the remaining bytes.
 async fn collect_limited(mut body: Body, limit: usize) -> Result<Bytes, Body> {
     let mut chunks: Vec<Bytes> = Vec::new();
     let mut total = 0usize;
@@ -314,6 +385,13 @@ mod tests {
         assert!(!prefers_markdown(&accept("text/html, text/markdown;q=0.5")));
         assert!(!prefers_markdown(&accept("text/markdown;q=0")));
         assert!(!prefers_markdown(&accept("*/*")));
+        assert!(!prefers_markdown(&accept("text/markdown;q=0.5, */*")));
+        assert!(!prefers_markdown(&accept("text/markdown;q=0.5, text/*")));
+        assert!(prefers_markdown(&accept("text/markdown, */*;q=0.8")));
+        assert!(prefers_markdown(&accept(
+            "text/markdown;Q=0.9, text/html;q=0.5"
+        )));
+        assert!(!prefers_markdown(&accept("text/markdown;q=abc")));
         assert!(!prefers_markdown(&HeaderMap::new()));
     }
 

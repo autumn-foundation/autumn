@@ -2,20 +2,19 @@
 //!
 //! An app cannot publish DNS records itself. This command writes the zone
 //! file lines for the site's `_agents` namespace. It reads `[seo] base_url`
-//! from `autumn.toml` when `--base-url` is not given. See
-//! `docs/guide/aeo.md`.
+//! from `autumn.toml` (with the profile overlay) when `--base-url` is not
+//! given. See `docs/guide/aeo.md`.
 
 use autumn_web::aeo::dns_aid::{DnsAidInput, records};
 
 /// Run `autumn aeo dns` and print the zone lines.
-pub fn dns(base_url: Option<String>, mcp_path: Option<String>, ttl: u32) {
+pub fn dns(base_url: Option<String>, mcp_path: Option<String>, ttl: u32, profile: Option<&str>) {
     let base_url = base_url.or_else(|| {
-        crate::migrate::read_autumn_toml_table()
-            .as_ref()
-            .and_then(|t| t.get("seo"))
-            .and_then(|s| s.get("base_url"))
-            .and_then(toml::Value::as_str)
-            .map(str::to_owned)
+        let profile = crate::migrate::effective_profile(profile);
+        configured_base_url(
+            crate::migrate::read_autumn_toml_table_with_profile_from_config_dir(Some(&profile))
+                .as_ref(),
+        )
     });
     match render(base_url.as_deref(), mcp_path.as_deref(), ttl) {
         Ok(zone) => print!("{zone}"),
@@ -26,15 +25,24 @@ pub fn dns(base_url: Option<String>, mcp_path: Option<String>, ttl: u32) {
     }
 }
 
+/// `[seo] base_url` from a parsed `autumn.toml`.
+fn configured_base_url(table: Option<&toml::Table>) -> Option<String> {
+    table?
+        .get("seo")?
+        .get("base_url")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 /// The zone text for `base_url`, with a DNSSEC reminder.
 fn render(base_url: Option<&str>, mcp_path: Option<&str>, ttl: u32) -> Result<String, String> {
     let base_url = base_url
         .ok_or("no base URL: pass --base-url or set [seo] base_url in autumn.toml".to_owned())?;
-    let mut input = DnsAidInput::new(base_url, mcp_path);
-    input.ttl = Some(ttl);
-    let lines = records(&input);
+    let lines = records(&DnsAidInput::new(base_url, mcp_path).ttl(ttl));
     if lines.is_empty() {
-        return Err(format!("{base_url:?} is not an absolute URL with a host"));
+        return Err(format!(
+            "{base_url:?} is not an absolute URL with a DNS host name"
+        ));
     }
     let mut zone = String::from(
         "; DNS-AID records (draft-mozleywilliams-dnsop-dnsaid).\n\
@@ -63,6 +71,17 @@ mod tests {
             zone.contains("_catalog._agents.example.com. 600 IN TXT"),
             "{zone}"
         );
+    }
+
+    #[test]
+    fn base_url_comes_from_the_seo_table() {
+        let table: toml::Table =
+            toml::from_str("[seo]\nbase_url = \"https://example.com\"\n").unwrap();
+        assert_eq!(
+            configured_base_url(Some(&table)).as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(configured_base_url(None), None);
     }
 
     #[test]

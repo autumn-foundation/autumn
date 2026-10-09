@@ -4684,10 +4684,10 @@ impl AppBuilder {
         state.insert_extension(commerce_docs);
 
         // Register SEO routes (/robots.txt and /sitemap.xml) when any SEO
-        // configuration is present, dynamic sources are registered, or AEO is
-        // on (the default).
-        if !seo_sources.is_empty() || crate::seo::has_seo_config(&config.seo) || config.aeo.enabled
-        {
+        // configuration is present or dynamic sources are registered. With
+        // neither, AEO serves a default `/robots.txt` from the router
+        // fallback, so an application route at that path always wins.
+        if !seo_sources.is_empty() || crate::seo::has_seo_config(&config.seo) {
             let seo_cfg = &config.seo;
             let raw_profile = config.profile.as_deref().unwrap_or("dev");
             let profile = crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all);
@@ -6704,7 +6704,9 @@ impl AppBuilder {
 
         eprintln!("Building {} static route(s)...", static_metas.len());
 
-        match crate::static_gen::render_static_routes(router, &static_metas, &dist_dir).await {
+        match crate::static_gen::render_static_routes(router.clone(), &static_metas, &dist_dir)
+            .await
+        {
             Ok(()) => {
                 eprintln!(
                     "\n  \u{2713} Static build complete \u{2192} {}",
@@ -6718,6 +6720,28 @@ impl AppBuilder {
             }
         }
 
+        // Agent documents (llms.txt, skills, ARD, ...). Their URLs are
+        // absolute, so they need `[seo] base_url`.
+        if config.aeo.enabled {
+            match crate::aeo::write_static_documents(
+                router,
+                config.seo.base_url.as_deref(),
+                &dist_dir,
+            )
+            .await
+            {
+                Ok(paths) if paths.is_empty() && config.seo.base_url.is_none() => {
+                    eprintln!("  \u{2139} AEO: set [seo] base_url to write the agent documents");
+                }
+                Ok(paths) => {
+                    for path in paths {
+                        eprintln!("  \u{2713} AEO: {path} written");
+                    }
+                }
+                Err(e) => eprintln!("  \u{26A0} Failed to write the agent documents: {e}"),
+            }
+        }
+
         // When OpenAPI is configured, write the spec to dist/ so consumers
         // can retrieve a machine-readable API contract alongside the HTML.
         #[cfg(feature = "openapi")]
@@ -6727,7 +6751,9 @@ impl AppBuilder {
                 openapi_config.session_cookie_name(config.session.cookie_name.clone());
             let docs: Vec<&crate::openapi::ApiDoc> = api_docs_snapshot.iter().collect();
             let spec = crate::openapi::generate_spec(&openapi_config, &docs);
-            match crate::openapi::write_openapi_spec_to_dist(&spec, &dist_dir) {
+            let written = crate::openapi::write_openapi_spec_to_dist(&spec, &dist_dir)
+                .and_then(|()| crate::aeo::commerce::write_mpp_spec(&spec, &config, &dist_dir));
+            match written {
                 Ok(()) => {
                     eprintln!(
                         "  \u{2713} OpenAPI spec written \u{2192} {}/openapi.json",
@@ -7172,13 +7198,13 @@ impl AppBuilder {
 
         let mut openapi_config = openapi_config;
         openapi_config.api_versions = api_versions;
-        let openapi_config = openapi_config.session_cookie_name(config.session.cookie_name);
+        let openapi_config = openapi_config.session_cookie_name(config.session.cookie_name.clone());
 
         let docs = crate::router::collect_openapi_docs(&routes, &scoped_groups);
         let refs: Vec<&crate::openapi::ApiDoc> = docs.iter().collect();
         let spec = crate::openapi::generate_spec(&openapi_config, &refs);
 
-        let json = serde_json::to_string_pretty(&spec).unwrap_or_else(|e| {
+        let json = crate::aeo::commerce::spec_json_with_mpp(&spec, &config).unwrap_or_else(|e| {
             eprintln!("Failed to serialize OpenAPI spec: {e}");
             std::process::exit(1);
         });
@@ -8420,6 +8446,8 @@ impl AppBuilder {
             #[cfg(all(feature = "embed-assets", feature = "i18n"))]
             embedded_locales,
             plugin_config_roots,
+            agent_skills,
+            commerce_docs,
             ..
         } = self;
 
@@ -8524,6 +8552,9 @@ impl AppBuilder {
         state.probes = crate::probe::ProbeState::default();
         state.apply_health_config(&config.health);
         state.insert_extension(RegisteredApiVersions(api_versions));
+        // The AEO documents must replay as captured.
+        state.insert_extension(crate::aeo::RegisteredAgentSkills(agent_skills));
+        state.insert_extension(commerce_docs);
         #[cfg(feature = "db")]
         if let Some(interceptor) = db_interceptor {
             state.insert_extension(interceptor);

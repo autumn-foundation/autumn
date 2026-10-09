@@ -64,6 +64,8 @@ pub struct SiteFacts {
     pub web_bot_auth: Option<super::web_bot_auth::WebBotAuthKey>,
     /// UCP and ACP documents.
     pub commerce: super::RegisteredCommerceDocs,
+    /// The default `robots.txt`, when AEO serves it (no `[seo]` routes).
+    pub robots_txt: Option<String>,
 }
 
 /// The mounted MCP server.
@@ -239,6 +241,8 @@ pub struct Origin {
     pub base: String,
     /// Host name without port, lowercase.
     pub host: String,
+    /// `true` when `base` comes from `[seo] base_url`, not from the request.
+    pub configured: bool,
 }
 
 impl Origin {
@@ -253,6 +257,7 @@ impl Origin {
             return Self {
                 base: base.to_owned(),
                 host: host.to_ascii_lowercase(),
+                configured: true,
             };
         }
         let authority = host_header
@@ -268,11 +273,27 @@ impl Origin {
         Self {
             base: format!("{scheme}://{authority}"),
             host,
+            configured: false,
         }
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
+    }
+
+    /// `host[:port]` of [`Origin::base`], lowercase, without a default port
+    /// (the RFC 9421 `@authority` form).
+    #[must_use]
+    pub fn signing_authority(&self) -> String {
+        let authority = self.authority().to_ascii_lowercase();
+        let default_port = if self.base.starts_with("https://") {
+            ":443"
+        } else {
+            ":80"
+        };
+        authority
+            .strip_suffix(default_port)
+            .map_or_else(|| authority.clone(), str::to_owned)
     }
 
     /// `host[:port]` of [`Origin::base`].
@@ -307,9 +328,44 @@ pub fn render(facts: &SiteFacts, origin: &Origin, path: &str) -> Option<Document
 }
 
 /// [`render`] at Unix time `now` (used to sign the key directory).
+///
+/// A document built from the request `Host` (no `[seo] base_url`) is never
+/// marked for shared caches: a cache could store a forged host for others.
 #[must_use]
 pub fn render_at(facts: &SiteFacts, origin: &Origin, path: &str, now: u64) -> Option<Document> {
+    let mut doc = render_inner(facts, origin, path, now)?;
+    if !origin.configured {
+        for (name, value) in &mut doc.headers {
+            if *name == "cache-control" {
+                "no-store".clone_into(value);
+            }
+        }
+    }
+    Some(doc)
+}
+
+/// `true` when `path` can name a generated document. The fallback checks
+/// this before it does any other work.
+#[must_use]
+pub fn is_document_path(path: &str) -> bool {
+    path.starts_with("/.well-known/")
+        || path.ends_with("/server-card")
+        || matches!(
+            path,
+            LLMS_TXT_PATH | AUTH_MD_PATH | ROBOTS_TXT_PATH | super::webmcp::WEBMCP_JS_PATH
+        )
+}
+
+/// Path of `robots.txt`.
+pub const ROBOTS_TXT_PATH: &str = "/robots.txt";
+
+fn render_inner(facts: &SiteFacts, origin: &Origin, path: &str, now: u64) -> Option<Document> {
     match path {
+        ROBOTS_TXT_PATH => facts.robots_txt.as_ref().map(|body| Document {
+            content_type: "text/plain; charset=utf-8",
+            headers: Vec::new(),
+            body: body.clone(),
+        }),
         super::webmcp::WEBMCP_JS_PATH => Some(Document {
             content_type: "text/javascript; charset=utf-8",
             headers: vec![("cache-control", "public, max-age=300".to_owned())],
@@ -319,16 +375,28 @@ pub fn render_at(facts: &SiteFacts, origin: &Origin, path: &str, now: u64) -> Op
         super::commerce::ACP_PATH => facts.commerce.acp.as_ref().map(|a| cors_json(a.as_json())),
         super::web_bot_auth::DIRECTORY_PATH => {
             let key = facts.web_bot_auth.as_ref()?;
-            let (input, signature) =
-                super::web_bot_auth::sign_directory(key, origin.authority(), now);
+            let body = super::web_bot_auth::directory_json(std::slice::from_ref(key));
+            let digest = super::web_bot_auth::content_digest(body.as_bytes());
+            let mut headers = vec![
+                ("content-digest", digest.clone()),
+                ("cache-control", "public, max-age=300".to_owned()),
+            ];
+            // Sign only for the configured site: a signature over a request
+            // `Host` would let anyone get a signature for any name.
+            if origin.configured {
+                let (input, signature) = super::web_bot_auth::sign_directory(
+                    key,
+                    &origin.signing_authority(),
+                    &digest,
+                    now,
+                );
+                headers.push(("signature-input", input));
+                headers.push(("signature", signature));
+            }
             Some(Document {
                 content_type: super::web_bot_auth::DIRECTORY_MEDIA_TYPE,
-                headers: vec![
-                    ("signature-input", input),
-                    ("signature", signature),
-                    ("cache-control", "public, max-age=300".to_owned()),
-                ],
-                body: super::web_bot_auth::directory_json(std::slice::from_ref(key)),
+                headers,
+                body,
             })
         }
         LLMS_TXT_PATH => llms_txt(facts, origin),
@@ -354,17 +422,21 @@ pub fn render_at(facts: &SiteFacts, origin: &Origin, path: &str, now: u64) -> Op
                     });
             }
             let mcp = facts.mcp.as_ref()?;
-            (path.strip_suffix("/server-card")? == mcp.path)
+            let mut card = (path.strip_suffix("/server-card")? == mcp.path)
                 .then(|| server_card(facts, origin))
-                .flatten()
+                .flatten()?;
+            // SEP-2127: the media type at the endpoint path. The
+            // `.well-known` copy stays `application/json` for scanners.
+            card.content_type = "application/mcp-server-card+json";
+            Some(card)
         }
     }
 }
 
-/// The homepage `Link` header value, or `None` when there is nothing to
-/// link.
+/// The homepage `Link` header value. It always holds a relation that
+/// scanners count (`describedby`).
 #[must_use]
-pub fn homepage_link_header(facts: &SiteFacts) -> Option<String> {
+pub fn homepage_link_header(facts: &SiteFacts) -> String {
     let mut links = Vec::new();
     if has_api(facts) {
         links.push(format!(
@@ -384,18 +456,23 @@ pub fn homepage_link_header(facts: &SiteFacts) -> Option<String> {
         links.push(format!(
             "<{LLMS_TXT_PATH}>; rel=\"describedby\"; type=\"text/plain\""
         ));
+    } else {
+        links.push(format!(
+            "<{}>; rel=\"describedby\"; type=\"application/ai-catalog+json\"",
+            super::AI_CATALOG_PATH
+        ));
     }
     links.push(format!(
-        "<{}>; rel=\"ai-catalog\"; type=\"application/json\"",
+        "<{}>; rel=\"ai-catalog\"; type=\"application/ai-catalog+json\"",
         super::AI_CATALOG_PATH
     ));
     links.push(format!(
-        "<{ARD_PATH}>; rel=\"ard\"; type=\"application/json\""
+        "<{ARD_PATH}>; rel=\"ard\"; type=\"application/ai-catalog+json\""
     ));
     if facts.markdown {
         links.push("</>; rel=\"alternate\"; type=\"text/markdown\"".to_owned());
     }
-    Some(links.join(", "))
+    links.join(", ")
 }
 
 const MARKDOWN: &str = "text/markdown; charset=utf-8";
@@ -627,6 +704,12 @@ fn server_card(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
     let mut doc = cors_json(&card);
     doc.headers
         .push(("access-control-allow-methods", "GET".to_owned()));
+    doc.headers.push((
+        "access-control-allow-headers",
+        "Content-Type, If-None-Match".to_owned(),
+    ));
+    doc.headers
+        .push(("access-control-expose-headers", "ETag".to_owned()));
     Some(doc)
 }
 
@@ -657,7 +740,10 @@ fn card_name(host: &str, display: &str) -> String {
     if slug.is_empty() {
         "app".clone_into(&mut slug);
     }
-    truncate_chars(&format!("{ns}/{slug}"), 200)
+    // The name must stay ASCII, so cut it without an ellipsis.
+    let mut name = format!("{ns}/{slug}");
+    name.truncate(200);
+    name
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -830,23 +916,12 @@ fn ard_manifest(facts: &SiteFacts, origin: &Origin) -> Document {
     let urn = |ns: &str, name: &str| format!("urn:air:{}:{ns}:{name}", origin.host);
     let mut entries = Vec::new();
     if let Some(mcp) = &facts.mcp {
-        let mut entry = json!({
+        entries.push(json!({
             "identifier": urn("mcp", "server"),
             "displayName": format!("{display} MCP server"),
             "type": "application/mcp-server-card+json",
             "url": origin.url(&format!("{}/server-card", mcp.path)),
-        });
-        let queries: Vec<String> = mcp
-            .tools
-            .iter()
-            .filter(|_| mcp.public_tools)
-            .filter_map(|t| t.description.as_deref().map(one_line))
-            .take(5)
-            .collect();
-        if queries.len() >= 2 {
-            entry["representativeQueries"] = json!(queries);
-        }
-        entries.push(entry);
+        }));
     }
     for skill in all_skills(facts, origin) {
         entries.push(json!({
@@ -921,9 +996,25 @@ fn protected_resource(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
     Some(cors_json(&prm))
 }
 
+/// The configured issuer, when this origin may publish its metadata: the
+/// issuer has no path, and its origin is the site origin (RFC 8414 §3).
+fn local_issuer<'a>(facts: &'a SiteFacts, origin: &Origin) -> Option<&'a str> {
+    let issuer = facts
+        .oauth
+        .authorization_server
+        .issuer
+        .as_deref()
+        .filter(|i| !i.trim().is_empty())?;
+    let url = url::Url::parse(issuer).ok()?;
+    let rooted = matches!(url.path(), "" | "/");
+    let same_origin = !origin.configured
+        || url::Url::parse(&origin.base).is_ok_and(|base| base.origin() == url.origin());
+    (rooted && same_origin).then_some(issuer)
+}
+
 fn authorization_server(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
     let c = &facts.oauth.authorization_server;
-    let issuer = c.issuer.as_deref().filter(|i| !i.trim().is_empty())?;
+    let issuer = local_issuer(facts, origin)?;
     let mut meta = serde_json::Map::new();
     meta.insert("issuer".into(), json!(issuer));
     let mut opt = |key: &str, value: &Option<String>| {
@@ -935,12 +1026,18 @@ fn authorization_server(facts: &SiteFacts, origin: &Origin) -> Option<Document> 
     opt("token_endpoint", &c.token_endpoint);
     opt("jwks_uri", &c.jwks_uri);
     opt("registration_endpoint", &c.registration_endpoint);
-    let response_types = if c.response_types_supported.is_empty() {
+    // `code` is the default only when there is an authorization endpoint
+    // for it.
+    let response_types = if !c.response_types_supported.is_empty() {
+        c.response_types_supported.clone()
+    } else if c.authorization_endpoint.is_some() {
         vec!["code".to_owned()]
     } else {
-        c.response_types_supported.clone()
+        Vec::new()
     };
-    meta.insert("response_types_supported".into(), json!(response_types));
+    if !response_types.is_empty() {
+        meta.insert("response_types_supported".into(), json!(response_types));
+    }
     for (key, list) in [
         ("scopes_supported", &c.scopes_supported),
         ("grant_types_supported", &c.grant_types_supported),
@@ -967,17 +1064,37 @@ fn authorization_server(facts: &SiteFacts, origin: &Origin) -> Option<Document> 
         if !c.agent_identity_types.is_empty() {
             agent["identity_types_supported"] = json!(c.agent_identity_types);
         }
+        if !c.agent_credential_types.is_empty() {
+            agent["credential_types_supported"] = json!(c.agent_credential_types);
+            if c.agent_identity_types.iter().any(|t| t == "anonymous") {
+                agent["anonymous"] =
+                    json!({ "credential_types_supported": c.agent_credential_types });
+            }
+        }
+        if !c.agent_assertion_types.is_empty() {
+            agent["identity_assertion"] = json!({
+                "assertion_types_supported": c.agent_assertion_types,
+                "credential_types_supported": c.agent_credential_types,
+            });
+        }
+        if let Some(revoke) = c.agent_revocation_endpoint.as_deref() {
+            agent["revocation_uri"] = json!(revoke);
+        }
+        if let Some(events) = c.agent_events_endpoint.as_deref() {
+            agent["events_endpoint"] = json!(events);
+        }
         meta.insert("agent_auth".into(), agent);
     }
     Some(cors_json(&Value::Object(meta)))
 }
 
+/// `/auth.md` needs a concrete way to get a credential: a registration
+/// page, or OAuth metadata.
 const fn auth_md_applies(facts: &SiteFacts) -> bool {
     facts.auth_md.enabled
-        && (has_api(facts)
+        && (facts.auth_md.registration_url.is_some()
             || !facts.oauth.authorization_servers.is_empty()
-            || facts.oauth.authorization_server.issuer.is_some()
-            || facts.auth_md.registration_url.is_some())
+            || facts.oauth.authorization_server.issuer.is_some())
 }
 
 fn auth_md(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
@@ -1046,7 +1163,7 @@ fn auth_md(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
         md.push_str(" and on each MCP request");
     }
     md.push_str(
-        ".\n\n## Errors\n\n- `401`: the credential is missing, expired, or not valid.\n         - `403`: the credential is valid but does not allow the action.\n",
+        ".\n\n## Errors\n\n- `401`: the credential is missing, expired, or not valid.\n- `403`: the credential is valid but does not allow the action.\n",
     );
     Some(Document {
         content_type: MARKDOWN,
@@ -1236,8 +1353,10 @@ mod tests {
 
     #[test]
     fn site_guide_points_at_what_the_app_has() {
+        let mut facts = api_site();
+        facts.auth_md.registration_url = Some("https://shop.example.com/tokens".to_owned());
         let doc = render(
-            &api_site(),
+            &facts,
             &origin(),
             "/.well-known/agent-skills/site-guide/SKILL.md",
         )
@@ -1339,9 +1458,12 @@ mod tests {
 
     #[test]
     fn server_card_is_served_at_both_paths_in_hybrid_form() {
-        for path in [SERVER_CARD_PATH, "/mcp/server-card"] {
+        for (path, media) in [
+            (SERVER_CARD_PATH, "application/json"),
+            ("/mcp/server-card", "application/mcp-server-card+json"),
+        ] {
             let (doc, card) = json_doc(&api_site(), path);
-            assert_eq!(doc.content_type, "application/json", "{path}");
+            assert_eq!(doc.content_type, media, "{path}");
             assert!(
                 doc.headers
                     .contains(&("access-control-allow-origin", "*".to_owned()))
@@ -1447,6 +1569,8 @@ mod tests {
         let as_cfg = &mut facts.oauth.authorization_server;
         as_cfg.issuer = Some("https://shop.example.com".to_owned());
         as_cfg.token_endpoint = Some("https://shop.example.com/oauth/token".to_owned());
+        as_cfg.authorization_endpoint = Some("https://shop.example.com/oauth/authorize".to_owned());
+        as_cfg.agent_credential_types = vec!["api_key".to_owned()];
         as_cfg.agent_identity_endpoint = Some("https://shop.example.com/agent/identity".to_owned());
         as_cfg.agent_identity_types = vec!["anonymous".to_owned()];
         let (_, meta) = json_doc(&facts, OAUTH_SERVER_PATH);
@@ -1463,6 +1587,10 @@ mod tests {
         assert_eq!(
             meta["agent_auth"]["register_uri"],
             meta["agent_auth"]["identity_endpoint"]
+        );
+        assert_eq!(
+            meta["agent_auth"]["anonymous"]["credential_types_supported"][0],
+            "api_key"
         );
         assert!(meta.get("jwks_uri").is_none());
     }
@@ -1495,6 +1623,84 @@ mod tests {
         assert!(render(&facts, &origin(), AUTH_MD_PATH).is_none());
     }
 
+    #[test]
+    fn authorization_server_metadata_stays_honest() {
+        let mut facts = api_site();
+        let c = &mut facts.oauth.authorization_server;
+        c.issuer = Some("https://shop.example.com".to_owned());
+        let (_, meta) = json_doc(&facts, OAUTH_SERVER_PATH);
+        assert!(
+            meta.get("response_types_supported").is_none(),
+            "no `code` without an authorization endpoint: {meta}"
+        );
+        for foreign in ["https://auth.other.com", "https://shop.example.com/tenant"] {
+            facts.oauth.authorization_server.issuer = Some(foreign.to_owned());
+            assert!(
+                render(&facts, &origin(), OAUTH_SERVER_PATH).is_none(),
+                "{foreign}"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_md_needs_a_concrete_way_to_get_a_credential() {
+        assert!(render(&api_site(), &origin(), AUTH_MD_PATH).is_none());
+    }
+
+    #[test]
+    fn host_derived_documents_are_never_publicly_cached() {
+        let host_origin = Origin::resolve(None, Some("evil.example"));
+        assert!(!host_origin.configured);
+        let doc = render(&api_site(), &host_origin, ARD_PATH).unwrap();
+        assert!(
+            doc.headers
+                .contains(&("cache-control", "no-store".to_owned())),
+            "{:?}",
+            doc.headers
+        );
+        let doc = render(&api_site(), &origin(), ARD_PATH).unwrap();
+        assert!(
+            doc.headers
+                .contains(&("cache-control", "public, max-age=3600".to_owned()))
+        );
+    }
+
+    #[test]
+    fn robots_txt_is_served_only_when_aeo_owns_it() {
+        let mut facts = content_site();
+        assert!(render(&facts, &origin(), ROBOTS_TXT_PATH).is_none());
+        facts.robots_txt = Some("User-agent: *\nAllow: /\n".to_owned());
+        let doc = render(&facts, &origin(), ROBOTS_TXT_PATH).unwrap();
+        assert_eq!(doc.content_type, "text/plain; charset=utf-8");
+    }
+
+    #[test]
+    fn link_header_keeps_a_counted_relation_without_llms_txt() {
+        let mut facts = content_site();
+        facts.llms_txt = false;
+        let link = homepage_link_header(&facts);
+        assert!(
+            link.contains("</.well-known/ai-catalog.json>; rel=\"describedby\""),
+            "{link}"
+        );
+    }
+
+    #[test]
+    fn document_paths_are_recognized_cheaply() {
+        for p in [
+            "/llms.txt",
+            "/auth.md",
+            "/robots.txt",
+            "/.well-known/ard.json",
+            "/mcp/server-card",
+        ] {
+            assert!(is_document_path(p), "{p}");
+        }
+        for p in ["/", "/favicon.ico", "/about"] {
+            assert!(!is_document_path(p), "{p}");
+        }
+    }
+
     // ── WebMCP and Web Bot Auth ─────────────────────────────────────────
 
     #[test]
@@ -1516,7 +1722,17 @@ mod tests {
             )
             .unwrap(),
         );
+        let unsigned = render_at(&facts, &Origin::resolve(None, Some("x.test")), path, 1).unwrap();
+        assert!(
+            !unsigned.headers.iter().any(|(k, _)| *k == "signature"),
+            "no signature for a request-derived host"
+        );
         let doc = render_at(&facts, &origin(), path, 1_700_000_000).unwrap();
+        assert!(
+            doc.headers
+                .iter()
+                .any(|(k, v)| *k == "content-digest" && v.starts_with("sha-256=:"))
+        );
         assert_eq!(
             doc.content_type,
             "application/http-message-signatures-directory+json"
@@ -1536,7 +1752,7 @@ mod tests {
 
     #[test]
     fn homepage_link_header_lists_agent_relations() {
-        let link = homepage_link_header(&api_site()).unwrap();
+        let link = homepage_link_header(&api_site());
         for want in [
             "</.well-known/api-catalog>; rel=\"api-catalog\"",
             "</openapi.json>; rel=\"service-desc\"",
@@ -1547,7 +1763,7 @@ mod tests {
         ] {
             assert!(link.contains(want), "missing {want}: {link}");
         }
-        let content = homepage_link_header(&content_site()).unwrap();
+        let content = homepage_link_header(&content_site());
         assert!(content.contains("rel=\"describedby\""), "{content}");
         assert!(!content.contains("api-catalog"), "{content}");
     }

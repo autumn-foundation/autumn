@@ -2,7 +2,7 @@
 //!
 //! | Protocol | What Autumn does |
 //! |---|---|
-//! | x402 | Priced routes answer `402` with `PAYMENT-REQUIRED`. A retry with `PAYMENT-SIGNATURE` is verified and settled by the facilitator. |
+//! | x402 | Priced routes answer `402` with `PAYMENT-REQUIRED`. The facilitator verifies and settles a retry that has `PAYMENT-SIGNATURE`. |
 //! | MPP | Priced routes with an `mpp_method` get `x-payment-info` in `/openapi.json`. The app runs the MPP payment itself. |
 //! | UCP | [`UcpProfile`] is served at `/.well-known/ucp`. |
 //! | ACP | [`AcpDiscovery`] is served at `/.well-known/acp.json`. |
@@ -25,6 +25,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::Digest as _;
 
 /// Path of the UCP profile.
 pub const UCP_PATH: &str = "/.well-known/ucp";
@@ -87,27 +88,111 @@ pub struct PaidRoute {
 }
 
 impl PaidRoute {
+    /// A priced route. `amount` is in the asset's smallest unit.
+    #[must_use]
+    pub fn new(
+        method: impl Into<String>,
+        path: impl Into<String>,
+        amount: impl Into<String>,
+    ) -> Self {
+        Self {
+            method: method.into(),
+            path: path.into(),
+            amount: amount.into(),
+            ..Self::default()
+        }
+    }
+
     /// `true` when `method` and `path` match this route.
+    ///
+    /// `HEAD` matches a `GET` route (axum runs the `GET` handler for it). One
+    /// trailing `/` is ignored, as the static page layer does. `{name}`
+    /// matches one segment; `{*name}` matches the rest of the path.
     #[must_use]
     pub fn matches(&self, method: &str, path: &str) -> bool {
-        if !self.method.eq_ignore_ascii_case(method) {
-            return false;
-        }
-        let mut want = self.path.split('/');
-        let mut got = path.split('/');
-        loop {
-            match (want.next(), got.next()) {
-                (None, None) => return true,
-                (Some(w), Some(g)) => {
-                    let is_param = w.starts_with('{') && w.ends_with('}');
-                    if (is_param && g.is_empty()) || (!is_param && w != g) {
-                        return false;
-                    }
+        self.method_matches(method) && template_matches(&self.path, path)
+    }
+
+    fn method_matches(&self, method: &str) -> bool {
+        self.method.eq_ignore_ascii_case(method)
+            || (method.eq_ignore_ascii_case("HEAD") && self.method.eq_ignore_ascii_case("GET"))
+    }
+
+    /// `true` for a route x402 charges: an MPP route is paid through the
+    /// app's own MPP flow instead.
+    #[must_use]
+    pub const fn is_x402(&self) -> bool {
+        self.mpp_method.is_none()
+    }
+}
+
+/// Strip one trailing `/` (but keep `/`).
+fn normalize(path: &str) -> &str {
+    if path.len() > 1 {
+        path.strip_suffix('/').unwrap_or(path)
+    } else {
+        path
+    }
+}
+
+/// Match a concrete `path` against a route `template`.
+fn template_matches(template: &str, path: &str) -> bool {
+    let mut want = normalize(template).split('/');
+    let mut got = normalize(path).split('/');
+    loop {
+        match (want.next(), got.next()) {
+            (None, None) => return true,
+            (Some(w), Some(g)) => {
+                if w.starts_with("{*") && w.ends_with('}') {
+                    return !g.is_empty();
                 }
-                _ => return false,
+                let is_param = w.starts_with('{') && w.ends_with('}');
+                if (is_param && g.is_empty()) || (!is_param && w != g) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// `true` for an amount in the smallest unit: ASCII digits, no leading zero.
+#[must_use]
+pub fn valid_amount(amount: &str) -> bool {
+    !amount.is_empty()
+        && amount.bytes().all(|b| b.is_ascii_digit())
+        && (amount == "0" || !amount.starts_with('0'))
+}
+
+/// Problems in `[[aeo.paid_routes]]`, one message each. Autumn skips a
+/// route with a problem.
+#[must_use]
+pub fn paid_route_problems(routes: &[PaidRoute]) -> Vec<String> {
+    let mut problems = Vec::new();
+    for r in routes {
+        if !valid_amount(&r.amount) {
+            problems.push(format!(
+                "{} {}: amount {:?} is not digits",
+                r.method, r.path, r.amount
+            ));
+        }
+        if let Some(m) = &r.mpp_method {
+            if m.is_empty() || m.bytes().any(|b| !(b.is_ascii_lowercase() || b == b'-')) {
+                problems.push(format!(
+                    "{} {}: mpp_method {m:?} must be lowercase",
+                    r.method, r.path
+                ));
+            }
+            if r.mpp_amount.as_deref().is_some_and(|a| !valid_amount(a)) {
+                problems.push(format!("{} {}: mpp_amount is not digits", r.method, r.path));
             }
         }
     }
+    problems
+}
+
+fn route_is_valid(r: &PaidRoute) -> bool {
+    paid_route_problems(std::slice::from_ref(r)).is_empty()
 }
 
 impl X402Config {
@@ -172,7 +257,7 @@ pub fn decode_header(header: &str) -> Option<Value> {
 
 /// `true` when the client's `accepted` requirements are the ones offered.
 #[must_use]
-pub fn accepted_matches(accepted: &Value, offered: &Value) -> bool {
+pub(crate) fn accepted_matches(accepted: &Value, offered: &Value) -> bool {
     ["scheme", "network", "amount", "asset", "payTo"]
         .iter()
         .all(|k| accepted.get(k).is_some() && accepted.get(k) == offered.get(k))
@@ -180,8 +265,8 @@ pub fn accepted_matches(accepted: &Value, offered: &Value) -> bool {
 
 /// Add MPP `x-payment-info` and a `402` response to each priced operation
 /// in an `OpenAPI` document.
-pub fn apply_mpp(spec: &mut Value, routes: &[PaidRoute]) {
-    for route in routes {
+pub(crate) fn apply_mpp(spec: &mut Value, routes: &[PaidRoute]) {
+    for route in routes.iter().filter(|r| route_is_valid(r)) {
         let Some(method) = route.mpp_method.as_deref() else {
             continue;
         };
@@ -215,13 +300,64 @@ pub fn apply_mpp(spec: &mut Value, routes: &[PaidRoute]) {
     }
 }
 
+/// The `OpenAPI` JSON for `spec`, with MPP `x-payment-info` when a priced
+/// route has an `mpp_method`. A spec with no MPP route keeps its key order
+/// (`serde_json` sorts the keys of a `Value` map).
+///
+/// # Errors
+///
+/// A `serde_json` error when the spec does not serialize.
+pub fn spec_json_with_mpp(
+    spec: &impl serde::Serialize,
+    config: &crate::config::AutumnConfig,
+) -> serde_json::Result<String> {
+    if !has_mpp(config) {
+        return serde_json::to_string_pretty(spec);
+    }
+    let mut value = serde_json::to_value(spec)?;
+    apply_mpp(&mut value, &config.aeo.paid_routes);
+    serde_json::to_string_pretty(&value)
+}
+
+/// Rewrite `dist/openapi.json` and `dist/openapi.yaml` with MPP
+/// `x-payment-info`, when a priced route has an `mpp_method`.
+///
+/// # Errors
+///
+/// An I/O error when a file cannot be written.
+#[cfg(feature = "openapi")]
+pub fn write_mpp_spec(
+    spec: &crate::openapi::OpenApiSpec,
+    config: &crate::config::AutumnConfig,
+    dist_dir: &std::path::Path,
+) -> std::io::Result<()> {
+    if !has_mpp(config) {
+        return Ok(());
+    }
+    let mut value = serde_json::to_value(spec).map_err(std::io::Error::other)?;
+    apply_mpp(&mut value, &config.aeo.paid_routes);
+    let json = serde_json::to_string_pretty(&value).map_err(std::io::Error::other)?;
+    std::fs::write(dist_dir.join("openapi.json"), json)?;
+    let yaml = serde_yaml::to_string(&value).map_err(std::io::Error::other)?;
+    std::fs::write(dist_dir.join("openapi.yaml"), yaml)
+}
+
+fn has_mpp(config: &crate::config::AutumnConfig) -> bool {
+    config.aeo.enabled
+        && config
+            .aeo
+            .paid_routes
+            .iter()
+            .any(|r| r.mpp_method.is_some())
+}
+
 /// An invalid commerce document.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CommerceError {
-    /// A required field is missing or empty.
-    #[error("{doc}: `{field}` is required")]
-    Missing {
+    /// A required field is missing, empty, or has a wrong value.
+    #[error("{doc}: `{field}` is missing or not valid")]
+    Invalid {
         /// Document name.
         doc: &'static str,
         /// Field path.
@@ -239,9 +375,9 @@ impl UcpProfile {
     ///
     /// # Errors
     ///
-    /// [`CommerceError::Missing`] for the first missing field.
+    /// [`CommerceError::Invalid`] for the first missing field.
     pub fn new(profile: Value) -> Result<Self, CommerceError> {
-        let missing = |field| CommerceError::Missing {
+        let missing = |field| CommerceError::Invalid {
             doc: "UCP profile",
             field,
         };
@@ -280,9 +416,9 @@ impl AcpDiscovery {
     ///
     /// # Errors
     ///
-    /// [`CommerceError::Missing`] for the first missing field.
+    /// [`CommerceError::Invalid`] for the first missing field.
     pub fn new(document: Value) -> Result<Self, CommerceError> {
-        let missing = |field| CommerceError::Missing {
+        let missing = |field| CommerceError::Invalid {
             doc: "ACP discovery",
             field,
         };
@@ -329,13 +465,17 @@ impl AcpDiscovery {
 /// Tower layer that charges for [`PaidRoute`]s with x402.
 ///
 /// 1. A request without `PAYMENT-SIGNATURE` gets `402` and `PAYMENT-REQUIRED`.
-/// 2. A request with it is verified by the facilitator (`POST /verify`).
-/// 3. The handler runs. Only a `2xx` answer is settled (`POST /settle`).
-/// 4. The response carries `PAYMENT-RESPONSE`. A failed settlement turns
-///    into `402`, and the handler body is not sent.
+/// 2. The facilitator verifies a request that has it (`POST /verify`).
+/// 3. `GET` and `HEAD`: the handler runs, then the facilitator settles any
+///    answer below `400`. Other methods: the facilitator settles first, then
+///    the handler runs.
+/// 4. The response carries `PAYMENT-RESPONSE` and `Cache-Control: private,
+///    no-store`. If settlement fails, Autumn sends `402` and no handler body.
+///
+/// One payment header works once per process: a second use gets `402`.
 #[cfg(feature = "http-client")]
 #[derive(Clone)]
-pub struct X402Layer {
+pub(crate) struct X402Layer {
     state: std::sync::Arc<X402State>,
 }
 
@@ -345,6 +485,54 @@ struct X402State {
     routes: Vec<PaidRoute>,
     client: crate::http_client::Client,
     base_url: Option<String>,
+    /// Supported locales when locale-prefixed routing is on: `/en/x` is the
+    /// route `/x`.
+    locales: Vec<String>,
+    /// SHA-256 of each payment header already used.
+    used: std::sync::Mutex<lru::LruCache<[u8; 32], ()>>,
+}
+
+/// Marks a request that one x402 layer already handled, so the second copy
+/// (SSG path: one outside the static layer, one inside) does not charge
+/// again.
+#[cfg(feature = "http-client")]
+#[derive(Debug, Clone, Copy)]
+struct X402Handled;
+
+#[cfg(feature = "http-client")]
+impl X402State {
+    /// The priced route for `req`, if any. Uses the route template axum
+    /// matched when it is known.
+    fn route_for(&self, req: &axum::http::Request<axum::body::Body>) -> Option<&PaidRoute> {
+        let method = req.method().as_str();
+        let template = req
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(axum::extract::MatchedPath::as_str);
+        let path = req.uri().path();
+        self.routes.iter().find(|r| {
+            r.method_matches(method)
+                && (template.is_some_and(|t| normalize(&r.path) == normalize(self.strip_locale(t)))
+                    || template_matches(&r.path, self.strip_locale(path)))
+        })
+    }
+
+    fn strip_locale<'a>(&self, path: &'a str) -> &'a str {
+        for locale in &self.locales {
+            if let Some(rest) = path
+                .strip_prefix('/')
+                .and_then(|p| p.strip_prefix(locale.as_str()))
+            {
+                if rest.is_empty() {
+                    return "/";
+                }
+                if rest.starts_with('/') {
+                    return rest;
+                }
+            }
+        }
+        path
+    }
 }
 
 #[cfg(feature = "http-client")]
@@ -352,31 +540,78 @@ impl X402Layer {
     /// The layer for `[aeo.x402]` and `[[aeo.paid_routes]]`, or `None` when
     /// no route is priced or the x402 settings are incomplete.
     #[must_use]
-    pub fn from_config(
+    pub(crate) fn from_config(
         config: &crate::config::AutumnConfig,
         state: &crate::state::AppState,
     ) -> Option<Self> {
         let aeo = &config.aeo;
-        if !aeo.enabled || aeo.paid_routes.is_empty() {
+        let routes: Vec<PaidRoute> = aeo
+            .paid_routes
+            .iter()
+            .filter(|r| r.is_x402() && route_is_valid(r))
+            .cloned()
+            .collect();
+        if !aeo.enabled || routes.is_empty() {
             return None;
         }
         if !aeo.x402.is_complete() {
             tracing::warn!(
-                "aeo: [[aeo.paid_routes]] is set but [aeo.x402] needs facilitator_url, \
-                 pay_to, network, and asset; x402 is off"
+                "aeo: [[aeo.paid_routes]] has x402 routes but [aeo.x402] needs \
+                 facilitator_url, pay_to, network, and asset; x402 is off"
             );
             return None;
         }
+        if !facilitator_url_is_safe(aeo.x402.facilitator_url.as_deref().unwrap_or_default()) {
+            tracing::warn!(
+                "aeo: [aeo.x402] facilitator_url must be https (http only for localhost); \
+                 x402 is off"
+            );
+            return None;
+        }
+        #[cfg(feature = "i18n")]
+        let locales = if config.i18n.locale_prefix_enabled {
+            config.i18n.supported_locales.clone()
+        } else {
+            Vec::new()
+        };
+        #[cfg(not(feature = "i18n"))]
+        let locales = Vec::new();
         Some(Self {
             state: std::sync::Arc::new(X402State {
                 config: aeo.x402.clone(),
-                routes: aeo.paid_routes.clone(),
+                routes,
                 client: crate::http_client::Client::from_state(state).named("x402"),
                 base_url: config.seo.base_url.clone(),
+                locales,
+                used: std::sync::Mutex::new(lru::LruCache::new(
+                    std::num::NonZeroUsize::new(10_000).unwrap_or(std::num::NonZeroUsize::MIN),
+                )),
             }),
         })
     }
 }
+
+#[cfg(feature = "http-client")]
+impl X402Layer {
+    /// [`X402Layer::from_config`], built once per app state. Every copy of
+    /// the layer then shares one used-payment cache.
+    #[must_use]
+    pub(crate) fn shared(
+        config: &crate::config::AutumnConfig,
+        state: &crate::state::AppState,
+    ) -> Option<Self> {
+        if let Some(shared) = state.extension::<SharedX402>() {
+            return shared.0.clone();
+        }
+        let layer = Self::from_config(config, state);
+        state.insert_extension(SharedX402(layer.clone()));
+        layer
+    }
+}
+
+/// The app's one [`X402Layer`] (an `AppState` extension).
+#[cfg(feature = "http-client")]
+struct SharedX402(Option<X402Layer>);
 
 #[cfg(feature = "http-client")]
 impl<S> tower::Layer<S> for X402Layer {
@@ -393,7 +628,7 @@ impl<S> tower::Layer<S> for X402Layer {
 /// Service made by [`X402Layer`].
 #[cfg(feature = "http-client")]
 #[derive(Clone)]
-pub struct X402Service<S> {
+pub(crate) struct X402Service<S> {
     inner: S,
     state: std::sync::Arc<X402State>,
 }
@@ -426,17 +661,18 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: axum::http::Request<axum::body::Body>) -> Self::Future {
+    #[allow(clippy::too_many_lines)]
+    fn call(&mut self, mut req: axum::http::Request<axum::body::Body>) -> Self::Future {
         // An unpriced request costs no clone and no box.
-        let Some(route) = self
-            .state
-            .routes
-            .iter()
-            .find(|r| r.matches(req.method().as_str(), req.uri().path()))
-            .cloned()
-        else {
+        let route = if req.extensions().get::<X402Handled>().is_some() {
+            None
+        } else {
+            self.state.route_for(&req).cloned()
+        };
+        let Some(route) = route else {
             return futures::future::Either::Left(self.inner.call(req));
         };
+        req.extensions_mut().insert(X402Handled);
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let state = std::sync::Arc::clone(&self.state);
@@ -477,6 +713,22 @@ where
                 "paymentPayload": payload,
                 "paymentRequirements": offered,
             });
+            // One payment header works once. Claim it before any call.
+            let key: [u8; 32] = sha2::Sha256::digest(header.as_bytes()).into();
+            {
+                let mut used = state
+                    .used
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if used.put(key, ()).is_some() {
+                    return Ok(payment_required(
+                        &state,
+                        &route,
+                        &resource,
+                        "payment already used",
+                    ));
+                }
+            }
             let verify = match facilitator(&state, "verify", &body).await {
                 Ok(v) => v,
                 Err(status) => return Ok(plain(status, "payment facilitator unavailable")),
@@ -490,29 +742,75 @@ where
                 return Ok(payment_required(&state, &route, &resource, &reason));
             }
 
-            let res = inner.call(req).await?;
-            if !res.status().is_success() {
-                return Ok(res);
-            }
-            let settled = match facilitator(&state, "settle", &body).await {
-                Ok(v) => v,
-                Err(status) => return Ok(plain(status, "payment facilitator unavailable")),
-            };
-            let header = axum::http::HeaderValue::from_str(&encode_header(&settled)).ok();
-            if settled.get("success").and_then(Value::as_bool) != Some(true) {
-                let mut failed = payment_required(&state, &route, &resource, "settlement failed");
-                if let Some(h) = header {
-                    failed.headers_mut().insert("payment-response", h);
+            // A safe method settles after a successful answer. Any other
+            // method settles first, so its side effects are always paid.
+            let safe = matches!(
+                *req.method(),
+                axum::http::Method::GET | axum::http::Method::HEAD
+            );
+            let early = if safe {
+                None
+            } else {
+                match settle(&state, &route, &resource, &body).await {
+                    Ok(receipt) => Some(receipt),
+                    Err(failed) => return Ok(*failed),
                 }
-                return Ok(failed);
+            };
+            let mut res = inner.call(req).await?;
+            let receipt = match early {
+                Some(receipt) => receipt,
+                None if res.status().as_u16() < 400 => {
+                    match settle(&state, &route, &resource, &body).await {
+                        Ok(receipt) => receipt,
+                        Err(failed) => return Ok(*failed),
+                    }
+                }
+                None => return Ok(res),
+            };
+            let headers = res.headers_mut();
+            if let Some(h) = receipt {
+                headers.insert("payment-response", h);
             }
-            let mut res = res;
-            if let Some(h) = header {
-                res.headers_mut().insert("payment-response", h);
-            }
+            headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("private, no-store"),
+            );
             Ok(res)
         }))
     }
+}
+
+/// Settle a verified payment. `Ok` carries the `PAYMENT-RESPONSE` value;
+/// `Err` is the response to send instead (boxed: the error path is rare).
+#[cfg(feature = "http-client")]
+async fn settle(
+    state: &X402State,
+    route: &PaidRoute,
+    resource: &str,
+    body: &Value,
+) -> Result<Option<axum::http::HeaderValue>, Box<axum::response::Response>> {
+    let settled = facilitator(state, "settle", body)
+        .await
+        .map_err(|status| Box::new(plain(status, "payment facilitator unavailable")))?;
+    let header = axum::http::HeaderValue::from_str(&encode_header(&settled)).ok();
+    if settled.get("success").and_then(Value::as_bool) == Some(true) {
+        return Ok(header);
+    }
+    let mut failed = payment_required(state, route, resource, "settlement failed");
+    if let Some(h) = header {
+        failed.headers_mut().insert("payment-response", h);
+    }
+    Err(Box::new(failed))
+}
+
+/// `true` for an `https` facilitator, or `http` on a loopback host.
+#[cfg(feature = "http-client")]
+fn facilitator_url_is_safe(raw: &str) -> bool {
+    url::Url::parse(raw).is_ok_and(|u| match u.scheme() {
+        "https" => true,
+        "http" => matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")),
+        _ => false,
+    })
 }
 
 #[cfg(feature = "http-client")]
@@ -617,6 +915,34 @@ mod tests {
     }
 
     #[test]
+    fn route_matching_normalizes_head_slash_and_wildcards() {
+        let r = route();
+        assert!(r.matches("HEAD", "/api/reports/7"));
+        assert!(r.matches("GET", "/api/reports/7/"));
+        let files = PaidRoute::new("GET", "/files/{*path}", "1");
+        assert!(files.matches("GET", "/files/a/b"));
+        assert!(!files.matches("GET", "/files/"));
+        assert!(!PaidRoute::new("POST", "/x", "1").matches("HEAD", "/x"));
+    }
+
+    #[test]
+    fn paid_route_problems_flag_bad_amounts_and_methods() {
+        assert!(valid_amount("10000") && valid_amount("0"));
+        assert!(!valid_amount("010") && !valid_amount("1.5") && !valid_amount(""));
+        let mut r = PaidRoute::new("GET", "/x", "01");
+        r.mpp_method = Some("Stripe".to_owned());
+        assert_eq!(paid_route_problems(&[r]).len(), 2);
+    }
+
+    #[test]
+    fn facilitator_must_be_https_or_loopback() {
+        assert!(facilitator_url_is_safe("https://x402.org/facilitator"));
+        assert!(facilitator_url_is_safe("http://localhost:8080"));
+        assert!(!facilitator_url_is_safe("http://facilitator.example"));
+        assert!(!facilitator_url_is_safe("not a url"));
+    }
+
+    #[test]
     fn route_matching() {
         let r = route();
         assert!(r.matches("GET", "/api/reports/7"));
@@ -716,7 +1042,7 @@ mod tests {
             UcpProfile::new(json!({"ucp": {"version": "2026-08-25", "services": {}}})).unwrap_err();
         assert_eq!(
             err,
-            CommerceError::Missing {
+            CommerceError::Invalid {
                 doc: "UCP profile",
                 field: "ucp.payment_handlers"
             }
@@ -750,7 +1076,7 @@ mod tests {
                 doc[k] = v.clone();
             }
             assert!(
-                matches!(AcpDiscovery::new(doc), Err(CommerceError::Missing { field: f, .. }) if f == field),
+                matches!(AcpDiscovery::new(doc), Err(CommerceError::Invalid { field: f, .. }) if f == field),
                 "{field}"
             );
         }

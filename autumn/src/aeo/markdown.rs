@@ -1,8 +1,8 @@
 //! HTML to Markdown, for `Accept: text/markdown` negotiation.
 //!
-//! The converter is small and has no dependencies. It reads the HTML that
-//! Autumn pages send (Maud output, mostly well formed) and writes `CommonMark`
-//! with GFM tables. It keeps content and drops chrome:
+//! The converter is small and has no dependencies. It reads Autumn page HTML.
+//! It writes `CommonMark` with GFM tables. It keeps the content and removes
+//! navigation and controls:
 //!
 //! - It converts `<main>` when the page has one, else `<body>`.
 //! - It drops `script`, `style`, `nav`, `form` controls, `svg`, `template`,
@@ -51,8 +51,8 @@ pub fn html_to_markdown(html: &str) -> String {
         out.push_str("---\n\n");
     }
     let root = doc
-        .find("main")
-        .or_else(|| doc.find("body"))
+        .find_visible("main")
+        .or_else(|| doc.find_visible("body"))
         .unwrap_or(ROOT);
     let mut w = Writer::default();
     w.children(&doc, root, 0);
@@ -112,6 +112,24 @@ impl Doc {
     /// First element named `name`, in document order.
     fn find(&self, name: &str) -> Option<usize> {
         (1..self.nodes.len()).find(|&id| self.name(id) == Some(name))
+    }
+
+    /// First element named `name` that is not hidden and not inside a
+    /// hidden or dropped element (such as `<template>`).
+    fn find_visible(&self, name: &str) -> Option<usize> {
+        let mut stack = vec![ROOT];
+        while let Some(id) = stack.pop() {
+            if let Some(n) = self.name(id) {
+                if id != ROOT && (is_hidden(self, id) || DROP.contains(&n) || n == "template") {
+                    continue;
+                }
+                if n == name {
+                    return Some(id);
+                }
+            }
+            stack.extend(self.nodes[id].children.iter().rev());
+        }
+        None
     }
 
     fn meta_description(&self) -> Option<String> {
@@ -179,9 +197,9 @@ fn parse(html: &str) -> Doc {
         }],
     };
     let mut stack: Vec<usize> = vec![ROOT];
-    // Start tags past `MAX_DEPTH` are not kept; this counts them so their end
-    // tags do not close kept elements.
-    let mut dropped = 0usize;
+    // Names of the start tags past `MAX_DEPTH`. The parser does not keep
+    // them. Their end tags close only these, never a kept element.
+    let mut dropped: Vec<String> = Vec::new();
     let bytes = html.as_bytes();
     let mut i = 0;
 
@@ -215,16 +233,23 @@ fn parse(html: &str) -> Doc {
             i = rest.find('>').map_or(bytes.len(), |n| i + n + 1);
             continue;
         }
-        let Some(tag) = read_tag(rest) else {
-            // A lone `<` is text.
-            push(&mut doc, &stack, Kind::Text("<".to_owned()));
-            i += 1;
-            continue;
+        let tag = match read_tag(rest) {
+            TagRead::Tag(tag) => tag,
+            TagRead::Text => {
+                // A lone `<` is text.
+                push(&mut doc, &stack, Kind::Text("<".to_owned()));
+                i += 1;
+                continue;
+            }
+            // An unterminated tag runs to the end, as in a browser.
+            TagRead::Eof => break,
         };
         i += tag.len;
         if tag.end {
-            if dropped > 0 {
-                dropped -= 1;
+            if !dropped.is_empty() {
+                if let Some(pos) = dropped.iter().rposition(|n| *n == tag.name) {
+                    dropped.truncate(pos);
+                }
                 continue;
             }
             if let Some(pos) = stack
@@ -255,11 +280,20 @@ fn parse(html: &str) -> Doc {
         }
 
         let is_void = VOID.contains(&tag.name.as_str()) || tag.self_closing;
-        if !is_void && stack.len() > MAX_DEPTH {
-            dropped += 1;
+        let raw = RAW_TEXT.contains(&tag.name.as_str()) && !tag.self_closing;
+        if !is_void && (stack.len() > MAX_DEPTH || !dropped.is_empty()) {
+            if raw {
+                // Skip the raw text: its content is never markup.
+                let close = format!("</{}", tag.name);
+                let body_end = find_ascii_ci(&html[i..], &close).map_or(bytes.len(), |n| i + n);
+                i = html[body_end..]
+                    .find('>')
+                    .map_or(bytes.len(), |n| body_end + n + 1);
+            } else {
+                dropped.push(tag.name);
+            }
             continue;
         }
-        let raw = RAW_TEXT.contains(&tag.name.as_str()) && !tag.self_closing;
         let name = tag.name.clone();
         let id = push(
             &mut doc,
@@ -305,8 +339,18 @@ struct Tag {
     len: usize,
 }
 
+/// Result of [`read_tag`].
+enum TagRead {
+    Tag(Tag),
+    /// Not a tag: the `<` is text. The scan stopped at or before the next
+    /// `<`, so the parse stays linear.
+    Text,
+    /// The tag does not end before the input ends.
+    Eof,
+}
+
 /// Read one tag at the start of `s` (which starts with `<`).
-fn read_tag(s: &str) -> Option<Tag> {
+fn read_tag(s: &str) -> TagRead {
     let b = s.as_bytes();
     let mut i = 1;
     let end = b.get(i) == Some(&b'/');
@@ -318,7 +362,7 @@ fn read_tag(s: &str) -> Option<Tag> {
         i += 1;
     }
     if i == name_start || !b[name_start].is_ascii_alphabetic() {
-        return None;
+        return TagRead::Text;
     }
     let name = s[name_start..i].to_ascii_lowercase();
     let mut attrs = Vec::new();
@@ -328,7 +372,8 @@ fn read_tag(s: &str) -> Option<Tag> {
             i += 1;
         }
         match b.get(i) {
-            None => return None,
+            None => return TagRead::Eof,
+            Some(b'<') => return TagRead::Text,
             Some(b'>') => {
                 i += 1;
                 break;
@@ -341,7 +386,10 @@ fn read_tag(s: &str) -> Option<Tag> {
             Some(_) => {}
         }
         let key_start = i;
-        while i < b.len() && !b[i].is_ascii_whitespace() && !matches!(b[i], b'=' | b'>' | b'/') {
+        while i < b.len()
+            && !b[i].is_ascii_whitespace()
+            && !matches!(b[i], b'=' | b'>' | b'/' | b'<')
+        {
             i += 1;
         }
         let key = s[key_start..i].to_ascii_lowercase();
@@ -356,25 +404,28 @@ fn read_tag(s: &str) -> Option<Tag> {
             }
             match b.get(i) {
                 Some(&q @ (b'"' | b'\'')) => {
-                    let close = memchr(q, &b[i + 1..])?;
+                    let Some(close) = memchr(q, &b[i + 1..]) else {
+                        return TagRead::Eof;
+                    };
                     value = decode_entities(&s[i + 1..i + 1 + close]);
                     i += close + 2;
                 }
                 Some(_) => {
                     let start = i;
-                    while i < b.len() && !b[i].is_ascii_whitespace() && b[i] != b'>' {
+                    while i < b.len() && !b[i].is_ascii_whitespace() && !matches!(b[i], b'>' | b'<')
+                    {
                         i += 1;
                     }
                     value = decode_entities(&s[start..i]);
                 }
-                None => return None,
+                None => return TagRead::Eof,
             }
         }
         if !key.is_empty() {
             attrs.push((key, value));
         }
     }
-    Some(Tag {
+    TagRead::Tag(Tag {
         name,
         attrs,
         end,
@@ -546,7 +597,7 @@ impl Writer {
         let text = tidy_inline(&self.line);
         self.line.clear();
         if !text.is_empty() {
-            self.blocks.push(text);
+            self.blocks.push(escape_line_start(text));
         }
     }
 
@@ -592,31 +643,35 @@ impl Writer {
             "code" | "kbd" | "samp" => {
                 let text = collapse_ws(&doc.text_of(id));
                 if !text.is_empty() {
-                    let fence = if text.contains('`') { "``" } else { "`" };
-                    let _ = write!(self.line, "{fence}{text}{fence}");
+                    let fence = "`".repeat(longest_backtick_run(&text) + 1);
+                    let pad = if text.starts_with('`') || text.ends_with('`') {
+                        " "
+                    } else {
+                        ""
+                    };
+                    let _ = write!(self.line, "{fence}{pad}{text}{pad}{fence}");
                 }
             }
             "a" => {
-                let text = Self::inline_of(doc, id, depth);
-                match doc.attr(id, "href").map(str::trim) {
-                    Some(href)
-                        if !href.is_empty()
-                            && !href.to_ascii_lowercase().starts_with("javascript:") =>
-                    {
+                let (lead, text, trail) = Self::inline_parts(doc, id, depth);
+                self.line.push_str(lead);
+                match doc.attr(id, "href").and_then(|h| safe_url(h, true)) {
+                    Some(href) => {
                         let label = if text.is_empty() {
-                            href.to_owned()
+                            escape_inline(&href)
                         } else {
                             text
                         };
-                        let _ = write!(self.line, "[{label}]({})", escape_url(href));
+                        let _ = write!(self.line, "[{label}]({href})");
                     }
-                    _ => self.line.push_str(&text),
+                    None => self.line.push_str(&text),
                 }
+                self.line.push_str(trail);
             }
             "img" => {
-                if let Some(src) = doc.attr(id, "src").filter(|s| !s.trim().is_empty()) {
+                if let Some(src) = doc.attr(id, "src").and_then(|s| safe_url(s, false)) {
                     let alt = escape_inline(&collapse_ws(doc.attr(id, "alt").unwrap_or("")));
-                    let _ = write!(self.line, "![{alt}]({})", escape_url(src.trim()));
+                    let _ = write!(self.line, "![{alt}]({src})");
                 }
             }
             "pre" => {
@@ -634,7 +689,7 @@ impl Writer {
                             .find_map(|c| c.strip_prefix("language-"))
                     })
                     .unwrap_or("");
-                let fence = if code.contains("```") { "````" } else { "```" };
+                let fence = "`".repeat((longest_backtick_run(code) + 1).max(3));
                 self.blocks.push(format!("{fence}{lang}\n{code}\n{fence}"));
             }
             "blockquote" => {
@@ -689,18 +744,34 @@ impl Writer {
     }
 
     fn wrap(&mut self, doc: &Doc, id: usize, depth: usize, mark: &str) {
-        let text = Self::inline_of(doc, id, depth);
+        let (lead, text, trail) = Self::inline_parts(doc, id, depth);
         if !text.is_empty() {
-            let _ = write!(self.line, "{mark}{text}{mark}");
+            let _ = write!(self.line, "{lead}{mark}{text}{mark}{trail}");
         }
     }
 
-    /// Render the children of `id` as one inline string.
+    /// Render the children of `id` as one inline string, on one line.
     fn inline_of(doc: &Doc, id: usize, depth: usize) -> String {
+        Self::inline_parts(doc, id, depth).1
+    }
+
+    /// [`Self::inline_of`], plus the space that sat at each edge, so a
+    /// marker never glues two words together.
+    fn inline_parts(doc: &Doc, id: usize, depth: usize) -> (&'static str, String, &'static str) {
         let mut sub = Self::default();
         sub.children(doc, id, depth);
+        let edge = |c: Option<char>| {
+            if c.is_some_and(char::is_whitespace) {
+                " "
+            } else {
+                ""
+            }
+        };
+        let lead = edge(sub.line.chars().next());
+        let trail = edge(sub.line.chars().last());
         sub.flush();
-        sub.blocks.join(" ")
+        let text = sub.blocks.join(" ").replace("  \n", " ").replace('\n', " ");
+        (lead, text, trail)
     }
 
     /// Render the children of `id` as finished blocks.
@@ -831,21 +902,107 @@ fn tidy_inline(s: &str) -> String {
         .to_owned()
 }
 
+/// Escape Markdown syntax in text. `<` is escaped too, so decoded text
+/// never becomes raw HTML in a Markdown renderer.
 fn escape_inline(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if matches!(c, '\\' | '*' | '_' | '`' | '[' | ']') {
+        if matches!(c, '\\' | '*' | '_' | '`' | '[' | ']' | '<') {
             out.push('\\');
+        }
+        out.push(c);
+    }
+    escape_entity_like(&out)
+}
+
+/// A link or image URL that is safe to write, percent-encoded for a
+/// Markdown link. Relative URLs and `http`/`https` pass; `mailto` passes for
+/// links. Every other scheme (`javascript:`, `data:`, ...) gives `None`.
+fn safe_url(raw: &str, link: bool) -> Option<String> {
+    let url = raw.trim();
+    if url.is_empty() {
+        return None;
+    }
+    // Browsers drop tabs and newlines inside a scheme (`java\tscript:`).
+    let squeezed: String = url
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace() && !c.is_control())
+        .take(16)
+        .collect();
+    let scheme_end = squeezed.find([':', '/', '?', '#']);
+    if let Some(end) = scheme_end.filter(|&e| squeezed[e..].starts_with(':')) {
+        let scheme = squeezed[..end].to_ascii_lowercase();
+        let allowed = matches!(scheme.as_str(), "http" | "https") || (link && scheme == "mailto");
+        if !allowed {
+            return None;
+        }
+    }
+    let mut out = String::with_capacity(url.len());
+    for c in url.chars() {
+        match c {
+            ' ' => out.push_str("%20"),
+            '(' => out.push_str("%28"),
+            ')' => out.push_str("%29"),
+            '<' => out.push_str("%3C"),
+            '>' => out.push_str("%3E"),
+            c if c.is_control() => {
+                let mut buf = [0u8; 4];
+                for b in c.encode_utf8(&mut buf).bytes() {
+                    let _ = write!(out, "%{b:02X}");
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    Some(out)
+}
+
+/// Escape `&` where it starts text a renderer would read as an entity
+/// (`&lt;`, `&#60;`).
+fn escape_entity_like(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len() + 4);
+    for (i, c) in s.char_indices() {
+        if c == '&' {
+            let rest = &s[i + 1..];
+            let name_len = rest
+                .bytes()
+                .take_while(|b| b.is_ascii_alphanumeric() || *b == b'#')
+                .count();
+            if name_len > 0 && rest.as_bytes().get(name_len) == Some(&b';') {
+                out.push('\\');
+            }
         }
         out.push(c);
     }
     out
 }
 
-fn escape_url(url: &str) -> String {
-    url.replace(' ', "%20")
-        .replace('(', "%28")
-        .replace(')', "%29")
+/// Escape a marker at the start of a paragraph that Markdown would read as
+/// a heading, quote, list, or rule.
+fn escape_line_start(text: String) -> String {
+    let first = text.chars().next();
+    if matches!(first, Some('#' | '>' | '-' | '+' | '=')) {
+        return format!("\\{text}");
+    }
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    if digits > 0
+        && matches!(text.as_bytes().get(digits), Some(b'.' | b')'))
+        && text
+            .as_bytes()
+            .get(digits + 1)
+            .is_none_or(u8::is_ascii_whitespace)
+    {
+        return format!("{}\\{}", &text[..digits], &text[digits..]);
+    }
+    text
+}
+
+/// Length of the longest run of backticks in `s`.
+fn longest_backtick_run(s: &str) -> usize {
+    s.split(|c| c != '`').map(str::len).max().unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -957,7 +1114,7 @@ mod tests {
     fn entities_decode() {
         assert_eq!(
             md("<p>&lt;&gt;&amp;&#39;&#x41;&nbsp;&copy;&unknown;</p>"),
-            "<>&'A\u{a0}©&unknown;\n"
+            "\\<>&'A\u{a0}©\\&unknown;\n"
         );
     }
 
@@ -970,6 +1127,69 @@ mod tests {
             ),
             "Name\n"
         );
+    }
+
+    #[test]
+    fn unsafe_urls_are_dropped_and_text_cannot_become_html() {
+        assert_eq!(
+            md("<p><a href=\"java&#9;script:alert(1)\">a</a> \
+                <a href=\"data:text/html,x\">b</a> <img src=\"data:x\" alt=\"c\"> \
+                <a href=\"mailto:me@example.com\">d</a> \
+                <a href=\"/x y(1)\">e</a> &lt;img src=x onerror=1&gt;</p>"),
+            "a b [d](mailto:me@example.com) [e](/x%20y%281%29) \\<img src=x onerror=1>\n"
+        );
+    }
+
+    #[test]
+    fn paragraph_markers_and_entity_text_are_escaped() {
+        assert_eq!(md("<p># of items</p>"), "\\# of items\n");
+        assert_eq!(md("<p>1. Intro</p>"), "1\\. Intro\n");
+        assert_eq!(md("<p>&amp;lt;</p>"), "\\&lt;\n");
+        assert_eq!(md("<p>AT&amp;T</p>"), "AT&T\n");
+    }
+
+    #[test]
+    fn inline_edges_keep_their_spaces() {
+        assert_eq!(
+            md("<p>Hello<strong> world</strong>!</p>"),
+            "Hello **world**!\n"
+        );
+        assert_eq!(
+            md("<p>See<a href=\"/x\"> this </a>now</p>"),
+            "See [this](/x) now\n"
+        );
+        assert_eq!(md("<h2>a<br>b</h2>"), "## a b\n");
+    }
+
+    #[test]
+    fn hidden_and_template_mains_are_skipped() {
+        assert_eq!(md("<main hidden>secret</main><main>real</main>"), "real\n");
+        assert_eq!(
+            md("<template><main>tpl</main></template><main>real</main>"),
+            "real\n"
+        );
+    }
+
+    #[test]
+    fn raw_text_past_the_depth_limit_stays_dropped() {
+        let html = "<div>".repeat(300) + "<script>var s='</div>'; secret()</script>ok";
+        let out = md(&html);
+        assert!(!out.contains("secret"), "{out}");
+        assert!(out.contains("ok"), "{out}");
+    }
+
+    #[test]
+    fn fences_outgrow_backticks_in_code() {
+        assert_eq!(md("<p><code>a``b</code></p>"), "```a``b```\n");
+        assert_eq!(md("<pre>````x</pre>"), "`````\n````x\n`````\n");
+    }
+
+    #[test]
+    fn unterminated_tags_parse_in_linear_time() {
+        let started = std::time::Instant::now();
+        let _ = md(&"<a b".repeat(200_000));
+        let _ = md(&"<a b=\"".repeat(200_000));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]

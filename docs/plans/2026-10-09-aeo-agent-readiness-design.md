@@ -6,7 +6,7 @@
 
 ## Goal
 
-An Autumn app is AEO-ready (Answer/Agent Engine Optimization) with no code.
+An Autumn app is AEO-ready (Agent Engine Optimization) with no code.
 Agents find the site, read it as Markdown, know the content rules, and find
 the MCP server, the APIs, the skills, and the auth rules.
 
@@ -18,8 +18,8 @@ gives none of these. All protocol-discovery checks fail.
 
 | # | Category | Criterion |
 |---|---|---|
-| AC1 | Discoverability | `/robots.txt` is served by default, with `User-agent` groups. |
-| AC2 | Discoverability | `/sitemap.xml` is served by default; `robots.txt` names it when `base_url` is set. |
+| AC1 | Discoverability | `/robots.txt` is served by default (from the router fallback when no `[seo]` route serves it), with `User-agent` groups. |
+| AC2 | Discoverability | With `[seo] base_url` set, `/sitemap.xml` is served and `robots.txt` names it. |
 | AC3 | Discoverability | The homepage sends `Link` headers with agent relations (`api-catalog`, `service-desc`, `service-doc`, `describedby`). |
 | AC4 | Discoverability | DNS-AID: the app cannot publish DNS. Autumn generates the SVCB records to publish. |
 | AC5 | Content | `Accept: text/markdown` on an HTML page returns `Content-Type: text/markdown`. HTML stays the default. |
@@ -77,7 +77,7 @@ Ideas, no filter:
 | x402 settles a payment for a failed request. | Settle only after a `2xx` handler response. |
 | x402 trusts the client. | The facilitator verifies; no local trust. |
 | WebMCP calls bypass CSRF. | The script sends the page CSRF token; the route pipeline checks it. |
-| A private key appears in logs. | Keys load from the credentials store; `Debug` is redacted. |
+| A private key appears in logs. | The key loads from the env var that `private_key_env` names; `Debug` shows only the key id. |
 
 ## Six thinking hats
 
@@ -123,10 +123,14 @@ Ideas, no filter:
 
 ### Where it mounts
 
-- `robots.txt` and `sitemap.xml` stay in `seo.rs`. They now mount when
-  `[aeo] enabled` (default), not only when `[seo]` is set.
-- The other documents mount in `build_router_pre_state`, after MCP and
-  OpenAPI are known, so `TestApp` gets them too.
+- With `[seo]` settings, `robots.txt` and `sitemap.xml` stay normal routes
+  in `seo.rs`. Without them, the AEO fallback serves a default `robots.txt`.
+- `build_router_pre_state` takes the site snapshot after MCP and OpenAPI
+  are known. The router fallback (set in `apply_middleware`) serves the
+  documents, so `TestApp` gets them too.
+- x402 sits innermost, after rate limits, CSRF, the trusted-host check, the
+  timeout, and CORS. The SSG/ISR path adds a second copy outside the
+  static-first layer; the copies share one used-payment cache.
 - The response layer sits inside compression, outside the exception filter,
   on both the dynamic and the static (SSG/ISR) paths.
 

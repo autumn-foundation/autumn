@@ -134,14 +134,14 @@ impl WebBotAuthKey {
 
     /// Sign `data`, as standard base64.
     #[must_use]
-    pub fn sign_b64(&self, data: &[u8]) -> String {
+    pub(crate) fn sign_b64(&self, data: &[u8]) -> String {
         STANDARD.encode(self.signing.sign(data).to_bytes())
     }
 }
 
 /// RFC 7638 thumbprint of an Ed25519 public key in base64url form.
 #[must_use]
-pub fn ed25519_thumbprint(x_b64url: &str) -> String {
+pub(crate) fn ed25519_thumbprint(x_b64url: &str) -> String {
     // RFC 7638: required members only, sorted, no whitespace.
     let canonical = format!(r#"{{"crv":"Ed25519","kty":"OKP","x":"{x_b64url}"}}"#);
     URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()))
@@ -149,19 +149,19 @@ pub fn ed25519_thumbprint(x_b64url: &str) -> String {
 
 /// One HTTP message component for an RFC 9421 signature base.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Component<'a> {
+pub(crate) struct Component<'a> {
     /// Component name, e.g. `@authority` or `content-type`.
-    pub name: &'a str,
+    pub(crate) name: &'a str,
     /// Parameters written after the name, e.g. `;req`.
-    pub params: &'a str,
+    pub(crate) params: &'a str,
     /// Component value.
-    pub value: &'a str,
+    pub(crate) value: &'a str,
 }
 
 /// Build an RFC 9421 signature base and the matching `@signature-params`
 /// value (the `Signature-Input` member value).
 #[must_use]
-pub fn signature_base(components: &[Component<'_>], params: &str) -> (String, String) {
+pub(crate) fn signature_base(components: &[Component<'_>], params: &str) -> (String, String) {
     let list: Vec<String> = components
         .iter()
         .map(|c| format!("\"{}\"{}", c.name, c.params))
@@ -181,6 +181,7 @@ pub fn signature_base(components: &[Component<'_>], params: &str) -> (String, St
 
 /// Headers for a signed outbound request.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SignedHeaders {
     /// `Signature-Agent`.
     pub signature_agent: String,
@@ -201,11 +202,19 @@ pub struct WebBotAuthSigner {
 impl WebBotAuthSigner {
     /// Build a signer. `signature_agent` is the origin that serves the key
     /// directory.
+    ///
+    /// A path or query on `signature_agent` is dropped: verifiers look the
+    /// directory up at the origin.
     #[must_use]
     pub fn new(key: WebBotAuthKey, signature_agent: impl Into<String>) -> Self {
+        let agent = signature_agent.into();
+        let signature_agent = url::Url::parse(&agent)
+            .ok()
+            .filter(url::Url::has_host)
+            .map_or(agent, |u| u.origin().ascii_serialization());
         Self {
             key,
-            signature_agent: signature_agent.into(),
+            signature_agent,
             expires_secs: 60,
         }
     }
@@ -283,15 +292,29 @@ impl WebBotAuthSigner {
 
 /// The key directory body: a JWKS with the public key.
 #[must_use]
-pub fn directory_json(keys: &[WebBotAuthKey]) -> String {
+pub(crate) fn directory_json(keys: &[WebBotAuthKey]) -> String {
     let keys: Vec<Value> = keys.iter().map(WebBotAuthKey::public_jwk).collect();
     serde_json::to_string_pretty(&json!({ "keys": keys })).unwrap_or_else(|_| "{}".to_owned())
 }
 
+/// `Content-Digest` (RFC 9530) of `body`: `sha-256=:<base64>:`.
+#[must_use]
+pub(crate) fn content_digest(body: &[u8]) -> String {
+    format!("sha-256=:{}:", STANDARD.encode(Sha256::digest(body)))
+}
+
 /// `Signature-Input` and `Signature` for a directory response served to
 /// `authority`, as the directory draft recommends.
+///
+/// The signature covers `@authority` (as the verifier requested it) and
+/// `content-digest`, as the directory draft requires.
 #[must_use]
-pub fn sign_directory(key: &WebBotAuthKey, authority: &str, now: u64) -> (String, String) {
+pub(crate) fn sign_directory(
+    key: &WebBotAuthKey,
+    authority: &str,
+    content_digest: &str,
+    now: u64,
+) -> (String, String) {
     let params = format!(
         ";created={now};expires={};keyid=\"{}\";alg=\"ed25519\";\
          tag=\"http-message-signatures-directory\"",
@@ -299,11 +322,18 @@ pub fn sign_directory(key: &WebBotAuthKey, authority: &str, now: u64) -> (String
         key.kid()
     );
     let (base, signature_params) = signature_base(
-        &[Component {
-            name: "@authority",
-            params: ";req",
-            value: authority,
-        }],
+        &[
+            Component {
+                name: "@authority",
+                params: ";req",
+                value: authority,
+            },
+            Component {
+                name: "content-digest",
+                params: "",
+                value: content_digest,
+            },
+        ],
         &params,
     );
     (
@@ -462,6 +492,16 @@ mod tests {
     }
 
     #[test]
+    fn signature_agent_is_an_origin() {
+        let key = WebBotAuthKey::from_seed_b64(RFC8037_D).unwrap();
+        let signer = WebBotAuthSigner::new(key, "https://Bot.Example.com/bots/x?y=1");
+        assert_eq!(
+            signer.sign("a.b", 1).signature_agent,
+            "\"https://bot.example.com\""
+        );
+    }
+
+    #[test]
     fn sign_url_uses_the_authority() {
         let key = WebBotAuthKey::from_seed_b64(RFC8037_D).unwrap();
         let signer = WebBotAuthSigner::new(key, "https://bot.example.com").expires_secs(5);
@@ -477,9 +517,12 @@ mod tests {
         assert_eq!(dir["keys"][0]["kid"], key.kid());
         assert!(dir["keys"][0].get("d").is_none());
 
-        let (input, signature) = sign_directory(&key, "shop.example.com", 1_700_000_000);
+        let digest = content_digest(b"{}");
+        let (input, signature) = sign_directory(&key, "shop.example.com", &digest, 1_700_000_000);
         assert!(
-            input.starts_with("binding0=(\"@authority\";req);created=1700000000;"),
+            input.starts_with(
+                "binding0=(\"@authority\";req \"content-digest\");created=1700000000;"
+            ),
             "{input}"
         );
         assert!(
@@ -488,11 +531,18 @@ mod tests {
         );
         let params = &input[input.find(')').unwrap() + 1..];
         let (base, _) = signature_base(
-            &[Component {
-                name: "@authority",
-                params: ";req",
-                value: "shop.example.com",
-            }],
+            &[
+                Component {
+                    name: "@authority",
+                    params: ";req",
+                    value: "shop.example.com",
+                },
+                Component {
+                    name: "content-digest",
+                    params: "",
+                    value: &digest,
+                },
+            ],
             params,
         );
         let sig = signature

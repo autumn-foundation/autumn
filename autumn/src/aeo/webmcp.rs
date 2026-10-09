@@ -17,7 +17,7 @@ pub const WEBMCP_JS_PATH: &str = "/_autumn/webmcp.js";
 
 /// The `WebMCP` script for `facts`. With no public MCP tools it does nothing.
 #[must_use]
-pub fn script(facts: &SiteFacts, csrf_header: &str) -> String {
+pub(crate) fn script(facts: &SiteFacts, csrf_header: &str) -> String {
     let (endpoint, tools) = facts.mcp.as_ref().map_or_else(
         || (String::new(), Vec::new()),
         |mcp| {
@@ -26,6 +26,14 @@ pub fn script(facts: &SiteFacts, csrf_header: &str) -> String {
                 .iter()
                 .filter(|_| mcp.public_tools)
                 .filter(|t| valid_tool_name(&t.name))
+                // A destructive tool stays off the page: an in-browser agent
+                // runs with the visitor's session.
+                .filter(|t| {
+                    t.annotations
+                        .get("destructiveHint")
+                        .and_then(Value::as_bool)
+                        != Some(true)
+                })
                 .map(|t| {
                     json!({
                         "name": t.name,
@@ -67,8 +75,7 @@ const SCRIPT: &str = r#"// Autumn WebMCP: register this site's MCP tools with in
     try {
       return JSON.parse(text);
     } catch (_) {
-      const data = text.split("
-").filter((l) => l.startsWith("data:"));
+      const data = text.split("\n").filter((l) => l.startsWith("data:"));
       return JSON.parse(data[data.length - 1].slice(5));
     }
   };
@@ -106,7 +113,7 @@ const SCRIPT: &str = r#"// Autumn WebMCP: register this site's MCP tools with in
 
 /// `true` for a valid `WebMCP` tool name: 1–128 of `A-Z a-z 0-9 _ . -`.
 #[must_use]
-pub fn valid_tool_name(name: &str) -> bool {
+pub(crate) fn valid_tool_name(name: &str) -> bool {
     (1..=128).contains(&name.len())
         && name
             .bytes()
@@ -115,7 +122,7 @@ pub fn valid_tool_name(name: &str) -> bool {
 
 /// Map MCP annotations to `WebMCP` annotations.
 #[must_use]
-pub fn webmcp_annotations(mcp: &Value) -> Value {
+pub(crate) fn webmcp_annotations(mcp: &Value) -> Value {
     let flag = |key: &str| mcp.get(key).and_then(Value::as_bool).unwrap_or(false);
     json!({
         "readOnlyHint": flag("readOnlyHint"),
@@ -184,6 +191,22 @@ mod tests {
             !js.contains("</script>"),
             "no raw end tag in the script: {js}"
         );
+    }
+
+    #[test]
+    fn destructive_tools_are_not_registered() {
+        let mut f = facts(true);
+        f.mcp.as_mut().unwrap().tools[0].annotations = json!({"destructiveHint": true});
+        assert!(!script(&f, "x-csrf-token").contains("list_todos"));
+    }
+
+    #[test]
+    fn script_lines_never_open_a_string_across_a_newline() {
+        // A JS string cannot hold a raw newline. An odd count of `"` on a
+        // line means one string runs past the line end.
+        for line in script(&facts(true), "x-csrf-token").lines() {
+            assert_eq!(line.matches('"').count() % 2, 0, "{line}");
+        }
     }
 
     #[test]

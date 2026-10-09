@@ -1,8 +1,8 @@
 # AEO — agent readiness by default
 
-AI agents read, cite, and use web sites. Agent Engine Optimization (AEO)
-makes a site easy for them to find, read, and use. Autumn does most of this
-for you. The checks follow [isitagentready.com](https://isitagentready.com).
+AI agents find, read, and use web sites. Agent Engine Optimization (AEO)
+helps them. Autumn does most AEO tasks automatically. The checks follow
+[isitagentready.com](https://isitagentready.com).
 
 You do one thing: set the site base URL.
 
@@ -15,7 +15,8 @@ Autumn then serves the items in the table below.
 
 | Category | Item | Default |
 |---|---|---|
-| Discoverability | `/robots.txt` and `/sitemap.xml` | On |
+| Discoverability | `/robots.txt` | On |
+| Discoverability | `/sitemap.xml` | When `[seo] base_url` is set |
 | Discoverability | Agent `Link` headers on `/` | On |
 | Discoverability | DNS-AID records | You publish them (see below) |
 | Content | `Accept: text/markdown` returns Markdown | On |
@@ -27,12 +28,14 @@ Autumn then serves the items in the table below.
 | Protocols | WebMCP script | On (add the head tags) |
 | Protocols | API catalog (RFC 9727) | When OpenAPI or MCP is mounted |
 | Protocols | ARD manifest | On |
-| Protocols | OAuth metadata and `/auth.md` | When configured, or when an API exists |
+| Protocols | OAuth metadata and `/auth.md` | When configured |
 | Commerce | x402 payments, MPP discovery | When `[[aeo.paid_routes]]` is set |
 | Commerce | UCP and ACP documents | When registered |
 
-Every generated path is served from the router fallback. An application
-route at the same path always wins, so you can replace any document.
+The router fallback serves each generated document. The fallback runs only
+when no route matches, so an application route at the same path always
+wins. With `[seo]` settings or a `SitemapSource`, `/robots.txt` and
+`/sitemap.xml` are normal routes; see [SEO](seo.md).
 
 ---
 
@@ -46,6 +49,7 @@ markdown_max_bytes = 2097152
 link_headers = true
 llms_txt = true
 site_guide_skill = true
+publish_tools = true    # false when a proxy guards /mcp
 name = "Example Shop"   # default: the OpenAPI title, else the host name
 description = "Hand-made things."
 ```
@@ -74,8 +78,9 @@ Sitemap: https://example.com/sitemap.xml
 Agentmap: https://example.com/.well-known/ai-catalog.json
 ```
 
-The AI crawlers share the `*` group. Thus they obey the same
-`[seo.robots] additional_rules`.
+The AI crawlers are in the `*` group. The `[seo.robots] additional_rules`
+also apply to them. A bot that `additional_rules` names (for example
+`User-agent: GPTBot`) keeps only your group.
 
 - `search`: use the content for a search index.
 - `ai-input`: use the content as input to AI answers.
@@ -99,9 +104,13 @@ user_fetch = "allow"  # ChatGPT-User, Claude-User, Perplexity-User
 training = "disallow" # GPTBot, ClaudeBot, Google-Extended, CCBot, ...
 ```
 
-A disallowed class gets its own group with `Disallow: /`.
+A disallowed class gets its own group with `Disallow: /` and the same
+`Content-Signal` line.
 
-The `dev` and `test` profiles keep `Disallow: /` for all crawlers.
+The default `robots.txt` (no `[seo]` settings) says `Disallow: /` only for
+the `dev` and `test` profiles, and when no profile is set. With `[seo]`
+settings, every profile except `prod` and `production` disallows, unless
+`[seo.robots] allow_all` is set.
 
 ---
 
@@ -127,10 +136,13 @@ The response carries these headers:
 | `Vary` | `Accept` |
 | `x-markdown-tokens` | Token estimate |
 | `Content-Signal` | The `robots.txt` signals |
-| `ETag` | A weak tag for the Markdown form |
+| `ETag` | A weak tag for the Markdown form, when the HTML has an `ETag` |
+| `Cache-Control` | `private`, when the app set no cache policy |
 
-Browsers still get HTML. Every negotiable HTML page carries `Vary: Accept`,
-so a cache keeps the two forms apart.
+`HEAD` gets the same headers as `GET`, with no body. Browsers get HTML. Each
+HTML page that Autumn can convert sends `Vary: Accept`. A cache then keeps
+the HTML and Markdown copies apart. Some CDNs ignore `Vary` for HTML; for
+those, add `Accept` to the cache key.
 
 Autumn does not convert:
 
@@ -159,8 +171,22 @@ Call the converter yourself with `autumn_web::aeo::markdown::html_to_markdown`.
 | `/_autumn/webmcp.js` | WebMCP tool registration |
 | `/.well-known/ucp`, `/.well-known/acp.json` | Commerce documents |
 
+Each document has a strong `ETag` and answers `304` to a matching
+`If-None-Match`. A document never carries a `Set-Cookie`.
+
 Set `[seo] base_url` in production. Without it, Autumn builds absolute URLs
-from the request `Host` header.
+from the request `Host` header and sends `Cache-Control: no-store`, so no
+shared cache keeps a forged host. Autumn logs a warning in production when
+`base_url` is not set.
+
+### Static builds
+
+`autumn build` writes `llms.txt`, the skills, the ARD manifest, `auth.md`,
+the OAuth metadata, and the commerce documents into `dist/` when
+`[seo] base_url` is set. A file that a static route wrote stays. A static
+build has no MCP server or API, so it has no server card or API catalog.
+The build does not write the Web Bot Auth directory, because its signature
+expires. Markdown negotiation and x402 need the server.
 
 ### Agent skills
 
@@ -181,7 +207,8 @@ A skill named `site-guide` replaces the generated one.
 
 When you call `mount_mcp`, Autumn serves the server card at two paths. The
 card lists the tools. When `secure_mcp` gates the endpoint, the card does not
-list the tools and says that auth is required.
+list the tools and says that auth is required. When a proxy or an app-wide
+layer guards `/mcp`, set `[aeo] publish_tools = false`.
 
 ### OAuth and `auth.md`
 
@@ -205,10 +232,15 @@ authorization_endpoint = "https://example.com/oauth/authorize"
 token_endpoint = "https://example.com/oauth/token"
 agent_identity_endpoint = "https://example.com/agent/identity"
 agent_identity_types = ["anonymous"]
+agent_credential_types = ["api_key"]
 ```
 
-`/auth.md` is served when the app has an MCP server, an OpenAPI document,
-or OAuth settings.
+The issuer must be this site's origin with no path. Autumn does not publish
+metadata for another issuer.
+
+Autumn serves `/auth.md` when `[aeo.auth_md] registration_url` or OAuth
+settings give an agent a way to get a credential. `[aeo.auth_md] enabled =
+false` turns it off.
 
 ---
 
@@ -226,9 +258,10 @@ html! {
 ```
 
 Pass the CSP nonce when your policy uses nonces. On page load, the script
-calls `document.modelContext.registerTool()` for each public tool. A call
-goes to the MCP endpoint with the page cookies and CSRF token, so the route
-pipeline checks it as usual.
+calls `document.modelContext.registerTool()` for each public tool. It does
+not register a tool marked `destructiveHint`. The script sends each call to
+the MCP endpoint with the page cookies and the CSRF token. Auth, CSRF, and
+rate limits apply to the call.
 
 For a plain HTML form, add the declarative attributes:
 
@@ -246,7 +279,8 @@ html! {
 
 Web Bot Auth proves that requests from your app's bots come from you.
 
-1. Make an Ed25519 seed: `openssl rand 32 | basenc --base64url`.
+1. Make an Ed25519 seed:
+   `openssl rand 32 | base64 | tr '+/' '-_' | tr -d '='`.
 2. Put it in an environment variable.
 3. Name the variable in `autumn.toml`:
 
@@ -257,7 +291,8 @@ signature_agent = "https://example.com"   # default: [seo] base_url
 ```
 
 Autumn then serves the public key at
-`/.well-known/http-message-signatures-directory`, and signs that response.
+`/.well-known/http-message-signatures-directory`. With `[seo] base_url` set,
+Autumn signs that response (`@authority` and `content-digest`).
 Sign an outbound request:
 
 ```rust
@@ -268,7 +303,8 @@ client.get("https://example.org/").sign_web_bot_auth(&signer).send().await?;
 ```
 
 The signature covers the first request only. Autumn does not sign a
-redirect to another host.
+redirect again. `Signature-Agent` uses the quoted-string form that
+Cloudflare verifies, not the draft's dictionary form.
 
 ---
 
@@ -277,8 +313,10 @@ redirect to another host.
 ### x402
 
 Price a route. A request without payment gets `402` and a
-`PAYMENT-REQUIRED` header. A retry with `PAYMENT-SIGNATURE` goes to the
-facilitator for checks. The handler runs, then Autumn settles the payment.
+`PAYMENT-REQUIRED` header. The facilitator verifies a retry that has
+`PAYMENT-SIGNATURE`. For `GET` and `HEAD`, the handler runs, then Autumn
+settles any answer below `400`. For other methods, Autumn settles first,
+then runs the handler.
 
 ```toml
 [aeo.x402]
@@ -294,19 +332,23 @@ amount = "10000"           # smallest unit: 0.01 USDC
 description = "One report"
 ```
 
-Autumn settles only after a `2xx` handler response. A failed settlement
-returns `402`, and the handler body is not sent. The facilitator rejects a
-second settlement of the same payment. But a replayed payment can run a
-mutating handler again before that settlement fails. Make priced `POST`,
-`PUT`, `PATCH`, and `DELETE` handlers idempotent (see
-[idempotency](idempotency.md)). Scanners probe `GET /api`
+If settlement fails, Autumn sends `402` and discards the handler body. If
+the facilitator does not answer, Autumn sends `502`. A paid answer carries
+`Cache-Control: private, no-store`. One payment header works once per
+process; a second use gets `402`. With several replicas, a client can use a
+header once on each replica before settlement fails. Make priced handlers
+idempotent (see [idempotency](idempotency.md)).
+
+The route match ignores one trailing `/`, a locale prefix (`/en/...`), and
+treats `HEAD` as `GET`. `{name}` matches one segment, `{*name}` the rest.
+The facilitator URL must use `https` (`http` only for `localhost`). Scanners probe `GET /api`
 and `GET /api/v1`, so price one of these to show x402 support.
 
 ### MPP
 
 Add `mpp_method` to a priced route. `/openapi.json` then carries
-`x-payment-info` and a `402` response for that operation. Your handler (or
-`autumn-billing`) runs the MPP payment.
+`x-payment-info` and a `402` response for that operation. x402 skips that
+route: your handler (or `autumn-billing`) runs the MPP payment.
 
 ```toml
 [[aeo.paid_routes]]
@@ -319,7 +361,8 @@ mpp_currency = "usd"
 
 ### UCP and ACP
 
-Register the documents. Autumn checks the required fields at startup.
+Register the documents. `UcpProfile::new` and `AcpDiscovery::new` check the
+required fields.
 
 ```rust
 use autumn_web::aeo::commerce::{AcpDiscovery, UcpProfile};
@@ -340,8 +383,9 @@ publish. Run the CLI in the project directory:
 autumn aeo dns --mcp-path /mcp
 ```
 
-It reads `[seo] base_url` from `autumn.toml`. Pass `--base-url` to set it
-on the command line. The same lines come from the library:
+It reads `[seo] base_url` from `autumn.toml`, with the profile overlay.
+Pass `--base-url` to set it on the command line. The same lines come from
+the library:
 
 ```rust
 use autumn_web::aeo::dns_aid::{DnsAidInput, records};
@@ -354,7 +398,6 @@ for line in records(&DnsAidInput::new("https://example.com", Some("/mcp"))) {
 ```text
 _mcp._agents.example.com. 3600 IN SVCB 1 example.com. alpn="mcp,h2" port=443 mandatory=alpn,port key65400="https://example.com/mcp/server-card"
 _index._agents.example.com. 3600 IN SVCB 1 example.com. alpn="h2" port=443
-_index._agents.example.com. 3600 IN TXT "agents=mcp:mcp"
 _catalog._agents.example.com. 3600 IN TXT "url=https://example.com/.well-known/ai-catalog.json"
 ```
 

@@ -85,8 +85,23 @@ pub fn robots_txt_with_policy(
                 ]
             });
 
+    // A bot that `additional_rules` names already has the operator's own
+    // group. Listing it here too would merge the two groups (RFC 9309
+    // §2.2.1), and `Allow: /` could then cancel the operator's `Disallow`.
+    let named = named_user_agents(additional_rules);
+    let keep = |bot: &&str| !named.iter().any(|n| n.eq_ignore_ascii_case(bot));
+    let classes = classes.map(|(bots, access)| {
+        (
+            bots.iter().copied().filter(keep).collect::<Vec<&str>>(),
+            access,
+        )
+    });
+    let signal = policy
+        .content_signals
+        .map(|s| format!("Content-Signal: {}\n", content_signal_value(s)));
+
     let mut txt = String::new();
-    if policy.content_signals.is_some() {
+    if signal.is_some() {
         txt.push_str(CONTENT_SIGNAL_COMMENT);
     }
     txt.push_str("User-agent: *\n");
@@ -102,10 +117,8 @@ pub fn robots_txt_with_policy(
     } else {
         "Disallow: /\n"
     });
-    if let Some(signals) = policy.content_signals {
-        txt.push_str("Content-Signal: ");
-        txt.push_str(&content_signal_value(signals));
-        txt.push('\n');
+    if let Some(signal) = &signal {
+        txt.push_str(signal);
     }
     for rule in additional_rules {
         txt.push_str(rule);
@@ -118,6 +131,11 @@ pub fn robots_txt_with_policy(
                 txt.push('\n');
                 push_user_agents(&mut txt, bots);
                 txt.push_str("Disallow: /\n");
+                // A bot obeys only its own group, so the group repeats the
+                // signals.
+                if let Some(signal) = &signal {
+                    txt.push_str(signal);
+                }
             }
         }
     }
@@ -171,6 +189,19 @@ const CONTENT_SIGNAL_COMMENT: &str = "\
 # IN THE DIGITAL SINGLE MARKET.
 
 ";
+
+/// The `User-agent` names in `rules`.
+fn named_user_agents(rules: &[String]) -> Vec<&str> {
+    rules
+        .iter()
+        .filter_map(|r| {
+            let (key, value) = r.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case("user-agent")
+                .then(|| value.trim())
+        })
+        .collect()
+}
 
 fn push_user_agents(txt: &mut String, bots: &[&str]) {
     for bot in bots {
@@ -277,6 +308,36 @@ mod tests {
             !training.contains("User-agent: OAI-SearchBot"),
             "{training}"
         );
+    }
+
+    #[test]
+    fn operator_bot_groups_keep_their_rules() {
+        let rules = ["User-agent: GPTBot".to_owned(), "Disallow: /".to_owned()];
+        let txt = robots_txt_with_policy(
+            "prod",
+            None,
+            &rules,
+            &BotPolicy::from_config(&AeoConfig::default()),
+        );
+        assert_eq!(txt.matches("User-agent: GPTBot").count(), 1, "{txt}");
+        assert!(txt.contains("User-agent: ClaudeBot"), "{txt}");
+    }
+
+    #[test]
+    fn disallowed_groups_repeat_the_signal() {
+        let config = AeoConfig {
+            ai_crawlers: AiCrawlersConfig {
+                training: CrawlerAccess::Disallow,
+                ..AiCrawlersConfig::default()
+            },
+            ..AeoConfig::default()
+        };
+        let txt = robots_txt_with_policy("prod", None, &[], &BotPolicy::from_config(&config));
+        let group = txt
+            .split("\n\n")
+            .find(|g| g.contains("User-agent: GPTBot"))
+            .unwrap();
+        assert!(group.contains("Content-Signal: "), "{group}");
     }
 
     #[test]

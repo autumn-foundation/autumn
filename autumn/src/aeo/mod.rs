@@ -1,6 +1,6 @@
 //! Agent readiness (AEO) by default.
 //!
-//! AEO means "Answer/Agent Engine Optimization". An Autumn app tells AI
+//! AEO means "Agent Engine Optimization". An Autumn app tells AI
 //! agents what it is, how to read it, and what they can do, with no code.
 //! The checks follow <https://isitagentready.com>.
 //!
@@ -30,9 +30,9 @@
 
 pub mod commerce;
 pub mod dns_aid;
-pub mod documents;
+pub(crate) mod documents;
 pub mod markdown;
-pub mod negotiate;
+pub(crate) mod negotiate;
 pub mod robots;
 pub mod web_bot_auth;
 pub mod webmcp;
@@ -93,6 +93,12 @@ pub struct AeoConfig {
     #[serde(default = "default_true")]
     pub site_guide_skill: bool,
 
+    /// Publish the MCP tool list (server card, `WebMCP`, `site-guide`). Set
+    /// `false` when a proxy or an app-wide layer guards `/mcp`. A
+    /// `secure_mcp` endpoint never publishes its tools.
+    #[serde(default = "default_true")]
+    pub publish_tools: bool,
+
     /// `/auth.md` settings.
     #[serde(default)]
     pub auth_md: AuthMdConfig,
@@ -127,6 +133,7 @@ impl Default for AeoConfig {
             link_headers: true,
             llms_txt: true,
             site_guide_skill: true,
+            publish_tools: true,
             auth_md: AuthMdConfig::default(),
             oauth: OAuthConfig::default(),
             web_bot_auth: web_bot_auth::WebBotAuthConfig::default(),
@@ -225,6 +232,19 @@ pub struct AuthorizationServerConfig {
     /// Auth.md identity types (`anonymous`, `identity_assertion`, ...).
     #[serde(default)]
     pub agent_identity_types: Vec<String>,
+    /// Auth.md credential types an agent gets (`api_key`, `access_token`).
+    #[serde(default)]
+    pub agent_credential_types: Vec<String>,
+    /// Auth.md assertion types (`urn:ietf:params:oauth:token-type:id-jag`,
+    /// `verified_email`).
+    #[serde(default)]
+    pub agent_assertion_types: Vec<String>,
+    /// Auth.md revocation endpoint.
+    #[serde(default)]
+    pub agent_revocation_endpoint: Option<String>,
+    /// Auth.md events endpoint.
+    #[serde(default)]
+    pub agent_events_endpoint: Option<String>,
 }
 
 /// `[aeo.content_signals]`: the `Content-Signal` line in `robots.txt`.
@@ -281,6 +301,7 @@ pub struct AiCrawlersConfig {
 /// Access for one class of AI crawler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum CrawlerAccess {
     /// Same rules as `User-agent: *`.
     #[default]
@@ -291,40 +312,40 @@ pub enum CrawlerAccess {
 
 /// Skills registered with `AppBuilder::agent_skill` (an `AppState`
 /// extension).
-#[doc(hidden)]
 #[derive(Debug, Clone, Default)]
-pub struct RegisteredAgentSkills(pub Vec<AgentSkill>);
+pub(crate) struct RegisteredAgentSkills(pub Vec<AgentSkill>);
 
 /// UCP and ACP documents registered on the app builder (an `AppState`
 /// extension).
-#[doc(hidden)]
 #[derive(Debug, Clone, Default)]
-pub struct RegisteredCommerceDocs {
+pub(crate) struct RegisteredCommerceDocs {
     /// `/.well-known/ucp`.
-    pub ucp: Option<commerce::UcpProfile>,
+    pub(crate) ucp: Option<commerce::UcpProfile>,
     /// `/.well-known/acp.json`.
-    pub acp: Option<commerce::AcpDiscovery>,
+    pub(crate) acp: Option<commerce::AcpDiscovery>,
 }
 
 /// What AEO serves for one router: the site facts and the layer settings.
 /// Stored as an `AppState` extension at router build time.
 #[derive(Debug, Clone, Default)]
-#[doc(hidden)]
-pub struct AeoSite {
+pub(crate) struct AeoSite {
     /// `[aeo] enabled`.
-    pub enabled: bool,
+    pub(crate) enabled: bool,
     /// `[seo] base_url`.
-    pub base_url: Option<String>,
+    pub(crate) base_url: Option<String>,
     /// The facts the documents render from.
-    pub facts: documents::SiteFacts,
+    pub(crate) facts: documents::SiteFacts,
     /// Settings for [`negotiate::NegotiateLayer`].
-    pub negotiate: negotiate::NegotiateConfig,
+    pub(crate) negotiate: negotiate::NegotiateConfig,
 }
 
 impl AeoSite {
     /// Build the site from config and the facts the router collected.
     #[must_use]
-    pub fn new(config: &crate::config::AutumnConfig, mut facts: documents::SiteFacts) -> Self {
+    pub(crate) fn new(
+        config: &crate::config::AutumnConfig,
+        mut facts: documents::SiteFacts,
+    ) -> Self {
         let aeo = &config.aeo;
         if aeo.name.is_some() {
             facts.name.clone_from(&aeo.name);
@@ -340,6 +361,14 @@ impl AeoSite {
         facts
             .csrf_header
             .clone_from(&config.security.csrf.token_header);
+        if !aeo.publish_tools
+            && let Some(mcp) = facts.mcp.as_mut()
+        {
+            mcp.public_tools = false;
+            mcp.tools.clear();
+        }
+        facts.robots_txt = aeo.enabled.then(|| default_robots_txt(config));
+        warn_on_config(config);
         facts.web_bot_auth = match web_bot_auth::WebBotAuthKey::from_config(
             &aeo.web_bot_auth,
             &crate::config::OsEnv,
@@ -354,13 +383,24 @@ impl AeoSite {
         let home_link = aeo
             .link_headers
             .then(|| documents::homepage_link_header(&facts))
-            .flatten()
             .and_then(|v| HeaderValue::from_str(&v).ok());
         let content_signal = aeo
             .content_signals
             .enabled
             .then(|| HeaderValue::from_str(&robots::content_signal_value(aeo.content_signals)).ok())
             .flatten();
+        // RFC 9728 §5.1: a `401` points at the protected resource metadata.
+        let resource_metadata = (!aeo.oauth.authorization_servers.is_empty())
+            .then_some(config.seo.base_url.as_deref())
+            .flatten()
+            .and_then(|base| {
+                HeaderValue::from_str(&format!(
+                    "Bearer resource_metadata=\"{}{}\"",
+                    base.trim_end_matches('/'),
+                    documents::OAUTH_RESOURCE_PATH
+                ))
+                .ok()
+            });
         Self {
             enabled: aeo.enabled,
             base_url: config.seo.base_url.clone(),
@@ -370,6 +410,7 @@ impl AeoSite {
                 max_bytes: aeo.markdown_max_bytes,
                 home_link,
                 content_signal,
+                resource_metadata,
             },
         }
     }
@@ -379,7 +420,7 @@ impl AeoSite {
     /// `Signature-Agent` is `[aeo.web_bot_auth] signature_agent`, else
     /// `[seo] base_url`.
     #[must_use]
-    pub fn web_bot_auth_signer(
+    pub(crate) fn web_bot_auth_signer(
         &self,
         config: &crate::config::AutumnConfig,
     ) -> Option<web_bot_auth::WebBotAuthSigner> {
@@ -398,7 +439,7 @@ impl AeoSite {
 
     /// The response layer, or `None` when AEO is off.
     #[must_use]
-    pub fn layer(&self) -> Option<negotiate::NegotiateLayer> {
+    pub(crate) fn layer(&self) -> Option<negotiate::NegotiateLayer> {
         self.enabled
             .then(|| negotiate::NegotiateLayer::new(self.negotiate.clone()))
     }
@@ -412,8 +453,10 @@ impl AeoSite {
 pub(crate) async fn fallback(site: Option<Arc<AeoSite>>, req: Request<Body>) -> Response {
     let method = req.method().clone();
     let uri = req.uri().clone();
+    let readable = method == Method::GET || method == Method::HEAD;
     if let Some(site) = site.filter(|s| s.enabled)
-        && (method == Method::GET || method == Method::HEAD)
+        && (readable || method == Method::OPTIONS)
+        && documents::is_document_path(uri.path())
     {
         let host = req
             .headers()
@@ -422,25 +465,195 @@ pub(crate) async fn fallback(site: Option<Arc<AeoSite>>, req: Request<Body>) -> 
             .or_else(|| uri.authority().map(axum::http::uri::Authority::as_str));
         let origin = documents::Origin::resolve(site.base_url.as_deref(), host);
         if let Some(doc) = documents::render(&site.facts, &origin, uri.path()) {
-            let mut res = doc.body.into_response();
-            let headers = res.headers_mut();
-            headers.insert(
-                axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_static(doc.content_type),
-            );
-            for (name, value) in doc.headers {
-                if let Ok(value) = HeaderValue::from_str(&value) {
-                    headers.append(name, value);
-                }
-            }
-            return res;
+            return document_response(doc, &method, req.headers());
         }
     }
     crate::middleware::error_page_filter::fallback_404_handler(method, uri).await
 }
 
+/// Marks a generated document, so the response layer removes any
+/// `Set-Cookie` that an inner layer (CSRF, session) added: a public
+/// document must not carry one visitor's cookie to the next.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AeoDocument;
+
+/// Turn a rendered document into a response: `OPTIONS` preflight for CORS
+/// documents, a strong `ETag`, and `304` for a matching `If-None-Match`.
+fn document_response(
+    doc: documents::Document,
+    method: &Method,
+    request_headers: &axum::http::HeaderMap,
+) -> Response {
+    use axum::http::{StatusCode, header};
+
+    let etag = format!(
+        "\"{}\"",
+        &documents::sha256_digest(doc.body.as_bytes())["sha256:".len()..][..32]
+    );
+    let not_modified = request_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim() == etag || t.trim() == "*"));
+    let mut res = if *method == Method::OPTIONS {
+        if !doc
+            .headers
+            .iter()
+            .any(|(k, _)| *k == "access-control-allow-origin")
+        {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        StatusCode::NO_CONTENT.into_response()
+    } else if not_modified {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        let mut res = doc.body.into_response();
+        res.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(doc.content_type),
+        );
+        res
+    };
+    let headers = res.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(&etag) {
+        headers.insert(header::ETAG, v);
+    }
+    for (name, value) in doc.headers {
+        if let Ok(value) = HeaderValue::from_str(&value) {
+            headers.append(name, value);
+        }
+    }
+    res.extensions_mut().insert(AeoDocument);
+    res
+}
+
+/// The `robots.txt` AEO serves when no `[seo]` route does. Only the `dev`
+/// and `test` profiles close the site: a custom profile name (`staging`,
+/// `live`) must not hide a public site from search engines by accident.
+fn default_robots_txt(config: &crate::config::AutumnConfig) -> String {
+    let profile = match config.profile.as_deref() {
+        Some("dev" | "test") | None => "dev",
+        Some(_) => "prod",
+    };
+    robots::robots_txt_with_policy(profile, None, &[], &robots_policy(config))
+}
+
+/// Log the `[aeo]` settings that cannot work as written.
+fn warn_on_config(config: &crate::config::AutumnConfig) {
+    let aeo = &config.aeo;
+    if !aeo.enabled {
+        return;
+    }
+    let prod = matches!(config.profile.as_deref(), Some("prod" | "production"));
+    if prod && config.seo.base_url.is_none() {
+        tracing::warn!(
+            "aeo: set [seo] base_url in production; without it the agent documents use \
+             the request Host and are not cached"
+        );
+    }
+    for problem in commerce::paid_route_problems(&aeo.paid_routes) {
+        tracing::warn!("aeo: [[aeo.paid_routes]] {problem}; Autumn skips this route");
+    }
+    if let Some(issuer) = aeo.oauth.authorization_server.issuer.as_deref() {
+        let origin = documents::Origin::resolve(config.seo.base_url.as_deref(), None);
+        let facts = documents::SiteFacts {
+            oauth: aeo.oauth.clone(),
+            ..documents::SiteFacts::default()
+        };
+        if documents::render(&facts, &origin, documents::OAUTH_SERVER_PATH).is_none() {
+            tracing::warn!(
+                issuer,
+                "aeo: [aeo.oauth.authorization_server] issuer must be this site's origin \
+                 with no path; Autumn does not publish its metadata"
+            );
+        }
+    }
+}
+
 /// Path of the ARD manifest.
 pub const AI_CATALOG_PATH: &str = "/.well-known/ai-catalog.json";
+
+/// The agent documents a static build writes. The key directory is not
+/// here: its signature expires.
+const STATIC_DOCUMENT_PATHS: &[&str] = &[
+    documents::LLMS_TXT_PATH,
+    documents::SKILLS_INDEX_PATH,
+    AI_CATALOG_PATH,
+    documents::ARD_PATH,
+    documents::API_CATALOG_PATH,
+    documents::SERVER_CARD_PATH,
+    documents::OAUTH_RESOURCE_PATH,
+    documents::OAUTH_SERVER_PATH,
+    documents::AUTH_MD_PATH,
+    commerce::UCP_PATH,
+    commerce::ACP_PATH,
+];
+
+/// Write the agent documents of `router` into the static build `dist`.
+///
+/// The documents hold absolute URLs, so this writes nothing without
+/// `[seo] base_url` (`base_url` is `None`). A file that is already in
+/// `dist` stays. Returns the paths it wrote.
+///
+/// # Errors
+///
+/// Returns an I/O error when a file cannot be written.
+pub(crate) async fn write_static_documents(
+    router: axum::Router,
+    base_url: Option<&str>,
+    dist: &std::path::Path,
+) -> std::io::Result<Vec<String>> {
+    use tower::ServiceExt as _;
+
+    if base_url.is_none_or(|b| b.trim().is_empty()) {
+        return Ok(Vec::new());
+    }
+    let mut queue: Vec<String> = STATIC_DOCUMENT_PATHS
+        .iter()
+        .map(|p| (*p).to_owned())
+        .collect();
+    let mut written = Vec::new();
+    while let Some(path) = queue.pop() {
+        let Ok(req) = Request::get(path.as_str()).body(Body::empty()) else {
+            continue;
+        };
+        let Ok(res) = router.clone().oneshot(req).await;
+        if res.status() != axum::http::StatusCode::OK
+            || res.extensions().get::<AeoDocument>().is_none()
+        {
+            continue;
+        }
+        let Ok(body) = axum::body::to_bytes(res.into_body(), usize::MAX).await else {
+            continue;
+        };
+        if path == documents::SKILLS_INDEX_PATH {
+            queue.extend(skill_paths(&body));
+        }
+        let file = dist.join(path.trim_start_matches('/'));
+        if tokio::fs::try_exists(&file).await.unwrap_or(false) {
+            continue;
+        }
+        if let Some(parent) = file.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&file, &body).await?;
+        written.push(path);
+    }
+    written.sort();
+    Ok(written)
+}
+
+/// The local `SKILL.md` paths that a skills index names.
+fn skill_paths(index: &[u8]) -> Vec<String> {
+    serde_json::from_slice::<serde_json::Value>(index)
+        .ok()
+        .and_then(|v| v.get("skills")?.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|s| s.get("url")?.as_str())
+        .filter(|u| u.starts_with('/') && !u.starts_with("//") && !u.contains(".."))
+        .map(str::to_owned)
+        .collect()
+}
 
 /// The `robots.txt` [`BotPolicy`] for `config`, with `Agentmap:` when
 /// `[seo] base_url` is set.
@@ -461,4 +674,50 @@ const fn default_markdown_max_bytes() -> usize {
 
 const fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn site_router(config: &crate::config::AutumnConfig) -> axum::Router {
+        let site = Arc::new(AeoSite::new(config, documents::SiteFacts::default()));
+        axum::Router::new().fallback(move |req| fallback(Some(Arc::clone(&site)), req))
+    }
+
+    #[tokio::test]
+    async fn a_static_build_writes_the_agent_documents() {
+        let mut config = crate::config::AutumnConfig::default();
+        config.seo.base_url = Some("https://example.com".to_owned());
+        let dist = tempfile::tempdir().unwrap();
+        std::fs::write(dist.path().join("llms.txt"), "mine").unwrap();
+
+        let written = write_static_documents(
+            site_router(&config),
+            config.seo.base_url.as_deref(),
+            dist.path(),
+        )
+        .await
+        .unwrap();
+
+        let read = |p: &str| std::fs::read_to_string(dist.path().join(p)).unwrap();
+        assert_eq!(read("llms.txt"), "mine", "a file in dist stays");
+        assert!(!written.iter().any(|p| p == "/llms.txt"), "{written:?}");
+        assert!(read(".well-known/ai-catalog.json").contains("https://example.com"));
+        let index: serde_json::Value =
+            serde_json::from_str(&read(".well-known/agent-skills/index.json")).unwrap();
+        let skill = index["skills"][0]["url"].as_str().unwrap();
+        assert!(read(skill.trim_start_matches('/')).starts_with("---\n"));
+        assert!(!dist.path().join(".well-known/api-catalog").exists());
+    }
+
+    #[tokio::test]
+    async fn a_static_build_needs_a_base_url() {
+        let config = crate::config::AutumnConfig::default();
+        let dist = tempfile::tempdir().unwrap();
+        let written = write_static_documents(site_router(&config), None, dist.path())
+            .await
+            .unwrap();
+        assert!(written.is_empty(), "{written:?}");
+    }
 }

@@ -275,6 +275,99 @@ async fn disabled_aeo_serves_nothing() {
     assert!(md.header("content-type").unwrap().starts_with("text/html"));
 }
 
+#[get("/robots.txt")]
+async fn custom_robots() -> &'static str {
+    "User-agent: *\nDisallow: /private\n"
+}
+
+#[get("/private")]
+async fn private_page() -> impl IntoResponse {
+    (
+        autumn_web::reexports::http::StatusCode::UNAUTHORIZED,
+        "sign in",
+    )
+}
+
+#[tokio::test]
+async fn robots_txt_is_served_by_default_and_an_app_route_wins() {
+    let res = client().get("/robots.txt").send().await;
+    res.assert_ok();
+    let body = res.text();
+    assert!(body.contains("User-agent: *"), "{body}");
+    assert!(body.contains("User-agent: GPTBot"), "{body}");
+    assert!(body.contains("Content-Signal: search=yes"), "{body}");
+
+    let custom = TestApp::new()
+        .routes(routes![custom_robots])
+        .build()
+        .get("/robots.txt")
+        .send()
+        .await;
+    assert_eq!(custom.text(), "User-agent: *\nDisallow: /private\n");
+}
+
+#[tokio::test]
+async fn documents_carry_an_etag_and_answer_304() {
+    let c = client();
+    let first = c.get("/llms.txt").send().await;
+    let etag = first.header("etag").expect("etag").to_owned();
+    let again = c
+        .get("/llms.txt")
+        .header("if-none-match", &etag)
+        .send()
+        .await;
+    assert_eq!(again.status, 304);
+}
+
+#[tokio::test]
+async fn head_with_markdown_accept_mirrors_get_headers() {
+    let res = client()
+        .head("/about")
+        .header("accept", "text/markdown")
+        .send()
+        .await;
+    res.assert_ok();
+    assert_eq!(
+        res.header("content-type"),
+        Some("text/markdown; charset=utf-8")
+    );
+    assert!(vary_has_accept(res.header("vary")));
+}
+
+#[tokio::test]
+async fn documents_never_carry_a_set_cookie() {
+    let mut config = AutumnConfig::default();
+    config.security.csrf.enabled = true;
+    let c = client_with(config);
+    let page = c.get("/about").send().await;
+    let doc = c.get("/llms.txt").send().await;
+    doc.assert_ok();
+    assert!(doc.header("set-cookie").is_none(), "{:?}", doc.headers);
+    // Control: the CSRF layer does set its cookie on a page.
+    assert!(page.header("set-cookie").is_some(), "{:?}", page.headers);
+}
+
+#[tokio::test]
+async fn a_401_points_at_the_protected_resource_metadata() {
+    let mut config = AutumnConfig::default();
+    config.seo.base_url = Some("https://shop.example.com".to_owned());
+    config.aeo.oauth.authorization_servers = vec!["https://auth.example.com".to_owned()];
+    let res = TestApp::new()
+        .config(config)
+        .routes(routes![private_page])
+        .build()
+        .get("/private")
+        .send()
+        .await;
+    assert_eq!(res.status, 401);
+    assert_eq!(
+        res.header("www-authenticate"),
+        Some(
+            "Bearer resource_metadata=\"https://shop.example.com/.well-known/oauth-protected-resource\""
+        )
+    );
+}
+
 #[cfg(feature = "mcp")]
 mod with_mcp {
     use super::*;
@@ -286,7 +379,10 @@ mod with_mcp {
     }
 
     fn mcp_client(secure: bool) -> TestClient {
+        let mut config = AutumnConfig::default();
+        config.aeo.auth_md.registration_url = Some("https://todos.example/tokens".to_owned());
         let app = TestApp::new()
+            .config(config)
             .routes(routes![home, list_todos])
             .openapi(autumn_web::openapi::OpenApiConfig::new("Todos", "3.0.0"))
             .mount_mcp("/mcp");
@@ -328,6 +424,10 @@ mod with_mcp {
         auth.assert_ok();
         assert!(auth.text().starts_with("# Todos auth.md\n"));
 
+        let preflight = c.options("/mcp/server-card").send().await;
+        assert_eq!(preflight.status, 204);
+        assert_eq!(preflight.header("access-control-allow-origin"), Some("*"));
+
         let js = c.get("/_autumn/webmcp.js").send().await;
         js.assert_ok();
         assert!(js.text().contains("registerTool"));
@@ -363,6 +463,7 @@ async fn registered_skills_are_published() {
 
 // ── Commerce ─────────────────────────────────────────────────────────────
 
+#[cfg(feature = "http-client")]
 mod commerce {
     use super::*;
     use autumn_web::aeo::commerce::{
@@ -525,6 +626,104 @@ mod commerce {
         assert_eq!(res.status, 500);
         verify.expect_called(1);
         settle.expect_called(0);
+    }
+
+    #[post("/api/render")]
+    async fn render_job() -> Json<serde_json::Value> {
+        RENDERED.store(true, std::sync::atomic::Ordering::SeqCst);
+        Json(json!({ "rendered": true }))
+    }
+
+    static RENDERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    #[tokio::test]
+    async fn head_and_trailing_slash_requests_are_charged() {
+        let c = TestApp::new()
+            .config(paid_config())
+            .routes(routes![api])
+            .build();
+        assert_eq!(c.head("/api").send().await.status, 402);
+        assert_eq!(c.get("/api/").send().await.status, 402);
+    }
+
+    #[tokio::test]
+    async fn a_payment_header_works_once_and_paid_answers_are_private() {
+        let mut app = TestApp::new().config(paid_config()).routes(routes![api]);
+        let _verify = app
+            .http_mock("x402")
+            .post("/verify")
+            .respond_with(200, json!({ "isValid": true }));
+        let _settle = app
+            .http_mock("x402")
+            .post("/settle")
+            .respond_with(200, json!({ "success": true, "transaction": "0xtx" }));
+        let c = app.build();
+        let required = decode_header(
+            c.get("/api")
+                .send()
+                .await
+                .header("payment-required")
+                .unwrap(),
+        )
+        .unwrap();
+        let sig = signature(&required["accepts"][0]);
+        let paid = c.get("/api").header("payment-signature", &sig).send().await;
+        paid.assert_ok();
+        assert_eq!(paid.header("cache-control"), Some("private, no-store"));
+        let replay = c.get("/api").header("payment-signature", &sig).send().await;
+        assert_eq!(replay.status, 402);
+        let again = decode_header(replay.header("payment-required").unwrap()).unwrap();
+        assert_eq!(again["error"], "payment already used");
+    }
+
+    #[tokio::test]
+    async fn an_unsafe_method_settles_before_its_handler_runs() {
+        let mut config = paid_config();
+        config.aeo.paid_routes = vec![PaidRoute::new("POST", "/api/render", "500")];
+        let mut app = TestApp::new().config(config).routes(routes![render_job]);
+        let _verify = app
+            .http_mock("x402")
+            .post("/verify")
+            .respond_with(200, json!({ "isValid": true }));
+        let _settle = app.http_mock("x402").post("/settle").respond_with(
+            200,
+            json!({ "success": false, "errorReason": "insufficient_funds" }),
+        );
+        let c = app.build();
+        let required = decode_header(
+            c.post("/api/render")
+                .send()
+                .await
+                .header("payment-required")
+                .unwrap(),
+        )
+        .unwrap();
+        let res = c
+            .post("/api/render")
+            .header("payment-signature", &signature(&required["accepts"][0]))
+            .send()
+            .await;
+        assert_eq!(res.status, 402);
+        assert!(
+            !RENDERED.load(std::sync::atomic::Ordering::SeqCst),
+            "the handler must not run when settlement fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_mpp_route_is_left_to_the_app() {
+        let mut config = paid_config();
+        for route in &mut config.aeo.paid_routes {
+            route.mpp_method = Some("stripe".to_owned());
+        }
+        let res = TestApp::new()
+            .config(config)
+            .routes(routes![api])
+            .build()
+            .get("/api")
+            .send()
+            .await;
+        res.assert_ok();
     }
 
     #[tokio::test]

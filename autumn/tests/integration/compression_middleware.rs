@@ -177,7 +177,15 @@ async fn vary_accept_encoding_set_on_compressible_response() {
     let resp = app.get("/html").send().await;
 
     resp.assert_ok();
-    let vary = resp.header("vary").unwrap_or("");
+    // An HTML page carries `Vary: Accept` too (AEO Markdown negotiation), so
+    // read every `Vary` header.
+    let vary = resp
+        .headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("vary"))
+        .map(|(_, v)| v.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     assert!(
         vary.to_lowercase().contains("accept-encoding"),
         "Vary: Accept-Encoding must be set on compressible responses; got Vary: {vary:?}"

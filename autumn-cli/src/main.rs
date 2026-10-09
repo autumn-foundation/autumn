@@ -576,6 +576,10 @@ pub enum AeoSubcommands {
         /// Record TTL in seconds.
         #[arg(long, default_value_t = 3600)]
         ttl: u32,
+        /// Profile whose `autumn.toml` overlay to read (default: the active
+        /// profile).
+        #[arg(long)]
+        profile: Option<String>,
     },
 }
 
@@ -2323,8 +2327,8 @@ enum Commands {
     /// Agent readiness (AEO) tooling.
     ///
     /// `autumn aeo dns` prints the DNS for AI Discovery (DNS-AID) records
-    /// for the site. An app cannot publish DNS itself, so you add these lines
-    /// to your zone and sign it with DNSSEC.
+    /// for the site. An app cannot publish DNS itself. Add these lines to
+    /// your zone. Sign the zone with DNSSEC.
     ///
     /// # Examples
     ///
@@ -5569,7 +5573,8 @@ fn run_command(command: Commands) {
             base_url,
             mcp_path,
             ttl,
-        }) => aeo::dns(base_url, mcp_path, ttl),
+            profile,
+        }) => aeo::dns(base_url, mcp_path, ttl, profile.as_deref()),
         Commands::Agents(AgentsSubcommands::Manifest(args)) => {
             let features = routes::CargoFeatures {
                 features: args.features,

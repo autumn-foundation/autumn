@@ -25,9 +25,13 @@ aeo.markdown_max_bytes
 aeo.name
 aeo.oauth
 aeo.oauth.authorization_server
+aeo.oauth.authorization_server.agent_assertion_types
 aeo.oauth.authorization_server.agent_claim_endpoint
+aeo.oauth.authorization_server.agent_credential_types
+aeo.oauth.authorization_server.agent_events_endpoint
 aeo.oauth.authorization_server.agent_identity_endpoint
 aeo.oauth.authorization_server.agent_identity_types
+aeo.oauth.authorization_server.agent_revocation_endpoint
 aeo.oauth.authorization_server.authorization_endpoint
 aeo.oauth.authorization_server.code_challenge_methods_supported
 aeo.oauth.authorization_server.grant_types_supported
@@ -47,6 +51,7 @@ aeo.paid_routes.mpp_amount
 aeo.paid_routes.mpp_currency
 aeo.paid_routes.mpp_method
 aeo.paid_routes.path
+aeo.publish_tools
 aeo.site_guide_skill
 aeo.web_bot_auth
 aeo.web_bot_auth.expires_secs

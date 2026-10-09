@@ -1077,10 +1077,34 @@ pub(crate) fn robots_directive_is_noindex(directive: &str) -> bool {
 /// `#[static_get]` route paths it would otherwise add automatically. Entries
 /// coming from a [`SitemapSource`] the application registered via
 /// [`AppBuilder::seo_source`](crate::app::AppBuilder::seo_source) are passed
-/// through untouched; see [`assemble_seo_bodies`] for why.
+/// through untouched; see [`assemble_seo_bodies_with_policy`] for why.
 #[must_use]
 pub(crate) fn defaults_exclude_from_sitemap(defaults: SeoRouteDefaults) -> bool {
     defaults.robots.is_some_and(robots_directive_is_noindex)
+}
+
+/// [`assemble_seo_bodies_with_policy`] with the default AI bot policy.
+#[cfg(test)]
+pub(crate) async fn assemble_seo_bodies(
+    profile: &str,
+    base_url: Option<&str>,
+    sitemap_url_override: Option<&str>,
+    additional_rules: &[String],
+    sources: &[Arc<dyn SitemapSource>],
+    static_paths: &[&str],
+    locale: Option<SitemapLocaleConfig<'_>>,
+) -> (String, String) {
+    assemble_seo_bodies_with_policy(
+        profile,
+        base_url,
+        sitemap_url_override,
+        additional_rules,
+        sources,
+        static_paths,
+        locale,
+        &crate::aeo::BotPolicy::default(),
+    )
+    .await
 }
 
 /// Collect sitemap entries from dynamic sources and static path hints, then
@@ -1119,31 +1143,9 @@ pub(crate) fn defaults_exclude_from_sitemap(defaults: SeoRouteDefaults) -> bool 
 /// instead of a single unprefixed entry, since only the prefixed URLs are
 /// actually reachable. Paths matching `locale.exclude_prefixes` are listed
 /// unprefixed, same as when `locale` is `None`.
-#[cfg(test)]
-pub(crate) async fn assemble_seo_bodies(
-    profile: &str,
-    base_url: Option<&str>,
-    sitemap_url_override: Option<&str>,
-    additional_rules: &[String],
-    sources: &[Arc<dyn SitemapSource>],
-    static_paths: &[&str],
-    locale: Option<SitemapLocaleConfig<'_>>,
-) -> (String, String) {
-    assemble_seo_bodies_with_policy(
-        profile,
-        base_url,
-        sitemap_url_override,
-        additional_rules,
-        sources,
-        static_paths,
-        locale,
-        &crate::aeo::BotPolicy::default(),
-    )
-    .await
-}
-
-/// [`assemble_seo_bodies`] with an AI [`BotPolicy`](crate::aeo::BotPolicy)
-/// for `robots.txt`.
+///
+/// `policy` sets the AI crawler groups and the `Content-Signal` line in
+/// `robots.txt`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn assemble_seo_bodies_with_policy(
     profile: &str,
@@ -1200,7 +1202,7 @@ pub(crate) async fn assemble_seo_bodies_with_policy(
     (robots_body, sitemap_body)
 }
 
-/// Locale-prefix routing config passed to [`assemble_seo_bodies`] so the
+/// Locale-prefix routing config passed to [`assemble_seo_bodies_with_policy`] so the
 /// sitemap lists each localized URL instead of a single unprefixed one
 /// (issue #1251's sitemap acceptance criterion).
 pub(crate) struct SitemapLocaleConfig<'a> {
