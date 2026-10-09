@@ -1379,9 +1379,13 @@ fn aeo_x402_layer(
     tower::util::option_layer(crate::aeo::commerce::X402Layer::shared(config, state))
 }
 
+/// Without `http-client`, priced routes fail closed (`503`).
 #[cfg(not(feature = "http-client"))]
-const fn aeo_x402_layer(_config: &AutumnConfig, _state: &AppState) -> tower::layer::util::Identity {
-    tower::layer::util::Identity::new()
+fn aeo_x402_layer(
+    config: &AutumnConfig,
+    _state: &AppState,
+) -> tower::util::Either<crate::aeo::commerce::X402Unavailable, tower::layer::util::Identity> {
+    tower::util::option_layer(crate::aeo::commerce::X402Unavailable::from_config(config))
 }
 
 /// Build the AEO site snapshot from the route registry, the `OpenAPI` config,

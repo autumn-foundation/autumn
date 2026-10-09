@@ -1007,8 +1007,7 @@ fn local_issuer<'a>(facts: &'a SiteFacts, origin: &Origin) -> Option<&'a str> {
         .filter(|i| !i.trim().is_empty())?;
     let url = url::Url::parse(issuer).ok()?;
     let rooted = matches!(url.path(), "" | "/");
-    let same_origin = !origin.configured
-        || url::Url::parse(&origin.base).is_ok_and(|base| base.origin() == url.origin());
+    let same_origin = url::Url::parse(&origin.base).is_ok_and(|base| base.origin() == url.origin());
     (rooted && same_origin).then_some(issuer)
 }
 
@@ -1640,6 +1639,12 @@ mod tests {
                 "{foreign}"
             );
         }
+        // With no `base_url`, the request `Host` must match the issuer too.
+        facts.oauth.authorization_server.issuer = Some("https://auth.example".to_owned());
+        let api_host = Origin::resolve(None, Some("api.example"));
+        assert!(render(&facts, &api_host, OAUTH_SERVER_PATH).is_none());
+        let auth_host = Origin::resolve(None, Some("auth.example"));
+        assert!(render(&facts, &auth_host, OAUTH_SERVER_PATH).is_some());
     }
 
     #[test]

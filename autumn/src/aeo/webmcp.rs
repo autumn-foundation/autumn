@@ -26,14 +26,9 @@ pub(crate) fn script(facts: &SiteFacts, csrf_header: &str) -> String {
                 .iter()
                 .filter(|_| mcp.public_tools)
                 .filter(|t| valid_tool_name(&t.name))
-                // A destructive tool stays off the page: an in-browser agent
-                // runs with the visitor's session.
-                .filter(|t| {
-                    t.annotations
-                        .get("destructiveHint")
-                        .and_then(Value::as_bool)
-                        != Some(true)
-                })
+                // An in-browser agent runs with the visitor's session, so
+                // only a tool marked safe goes on the page.
+                .filter(|t| marked_safe(&t.annotations))
                 .map(|t| {
                     json!({
                         "name": t.name,
@@ -123,11 +118,23 @@ pub(crate) fn valid_tool_name(name: &str) -> bool {
 /// Map MCP annotations to `WebMCP` annotations.
 #[must_use]
 pub(crate) fn webmcp_annotations(mcp: &Value) -> Value {
-    let flag = |key: &str| mcp.get(key).and_then(Value::as_bool).unwrap_or(false);
+    let read_only = hint(mcp, "readOnlyHint") == Some(true);
     json!({
-        "readOnlyHint": flag("readOnlyHint"),
-        "consequentialHint": flag("destructiveHint"),
+        "readOnlyHint": read_only,
+        // A write needs the visitor's consent unless it is read-only.
+        "consequentialHint": !read_only || hint(mcp, "destructiveHint") == Some(true),
     })
+}
+
+/// `true` when the tool is read-only, or says it is not destructive. A
+/// missing hint is not safety.
+fn marked_safe(mcp: &Value) -> bool {
+    hint(mcp, "destructiveHint") != Some(true)
+        && (hint(mcp, "readOnlyHint") == Some(true) || hint(mcp, "destructiveHint") == Some(false))
+}
+
+fn hint(mcp: &Value, key: &str) -> Option<bool> {
+    mcp.get(key).and_then(Value::as_bool)
 }
 
 /// `<head>` tags for agents: the ARD link and the `WebMCP` script.
@@ -201,6 +208,23 @@ mod tests {
     }
 
     #[test]
+    fn only_tools_marked_safe_are_registered() {
+        // A POST tool has no `destructiveHint`: absence is not safety.
+        let mut f = facts(true);
+        f.mcp.as_mut().unwrap().tools[0].annotations = json!({"readOnlyHint": false});
+        assert!(!script(&f, "x-csrf-token").contains("list_todos"));
+
+        f.mcp.as_mut().unwrap().tools[0].annotations =
+            json!({"readOnlyHint": false, "destructiveHint": false});
+        let js = script(&f, "x-csrf-token");
+        assert!(js.contains("list_todos"), "{js}");
+        assert!(
+            js.contains("\"consequentialHint\":true"),
+            "a write needs consent: {js}"
+        );
+    }
+
+    #[test]
     fn script_lines_never_open_a_string_across_a_newline() {
         // A JS string cannot hold a raw newline. An odd count of `"` on a
         // line means one string runs past the line end.
@@ -232,8 +256,12 @@ mod tests {
             json!({"readOnlyHint": true, "consequentialHint": true})
         );
         assert_eq!(
+            webmcp_annotations(&json!({"readOnlyHint": true})),
+            json!({"readOnlyHint": true, "consequentialHint": false})
+        );
+        assert_eq!(
             webmcp_annotations(&json!({})),
-            json!({"readOnlyHint": false, "consequentialHint": false})
+            json!({"readOnlyHint": false, "consequentialHint": true})
         );
     }
 

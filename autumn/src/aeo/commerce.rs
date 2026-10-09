@@ -466,9 +466,9 @@ impl AcpDiscovery {
 ///
 /// 1. A request without `PAYMENT-SIGNATURE` gets `402` and `PAYMENT-REQUIRED`.
 /// 2. The facilitator verifies a request that has it (`POST /verify`).
-/// 3. `GET` and `HEAD`: the handler runs, then the facilitator settles any
-///    answer below `400`. Other methods: the facilitator settles first, then
-///    the handler runs.
+/// 3. `GET` and `HEAD`: the handler runs, then the facilitator settles a
+///    `2xx` answer. Other methods: the facilitator settles first, then the
+///    handler runs.
 /// 4. The response carries `PAYMENT-RESPONSE` and `Cache-Control: private,
 ///    no-store`. If settlement fails, Autumn sends `402` and no handler body.
 ///
@@ -482,12 +482,9 @@ pub(crate) struct X402Layer {
 #[cfg(feature = "http-client")]
 struct X402State {
     config: X402Config,
-    routes: Vec<PaidRoute>,
+    priced: PricedRoutes,
     client: crate::http_client::Client,
     base_url: Option<String>,
-    /// Supported locales when locale-prefixed routing is on: `/en/x` is the
-    /// route `/x`.
-    locales: Vec<String>,
     /// SHA-256 of each payment header already used.
     used: std::sync::Mutex<lru::LruCache<[u8; 32], ()>>,
 }
@@ -499,8 +496,39 @@ struct X402State {
 #[derive(Debug, Clone, Copy)]
 struct X402Handled;
 
-#[cfg(feature = "http-client")]
-impl X402State {
+/// The valid x402 routes, and the locale prefixes to strip.
+#[derive(Debug, Clone)]
+struct PricedRoutes {
+    routes: Vec<PaidRoute>,
+    /// Supported locales when locale-prefixed routing is on: `/en/x` is the
+    /// route `/x`.
+    locales: Vec<String>,
+}
+
+impl PricedRoutes {
+    /// The priced routes, or `None` when AEO is off or no route is priced.
+    fn from_config(config: &crate::config::AutumnConfig) -> Option<Self> {
+        let aeo = &config.aeo;
+        let routes: Vec<PaidRoute> = aeo
+            .paid_routes
+            .iter()
+            .filter(|r| r.is_x402() && route_is_valid(r))
+            .cloned()
+            .collect();
+        if !aeo.enabled || routes.is_empty() {
+            return None;
+        }
+        #[cfg(feature = "i18n")]
+        let locales = if config.i18n.locale_prefix_enabled {
+            config.i18n.supported_locales.clone()
+        } else {
+            Vec::new()
+        };
+        #[cfg(not(feature = "i18n"))]
+        let locales = Vec::new();
+        Some(Self { routes, locales })
+    }
+
     /// The priced route for `req`, if any. Uses the route template axum
     /// matched when it is known.
     fn route_for(&self, req: &axum::http::Request<axum::body::Body>) -> Option<&PaidRoute> {
@@ -545,15 +573,7 @@ impl X402Layer {
         state: &crate::state::AppState,
     ) -> Option<Self> {
         let aeo = &config.aeo;
-        let routes: Vec<PaidRoute> = aeo
-            .paid_routes
-            .iter()
-            .filter(|r| r.is_x402() && route_is_valid(r))
-            .cloned()
-            .collect();
-        if !aeo.enabled || routes.is_empty() {
-            return None;
-        }
+        let priced = PricedRoutes::from_config(config)?;
         if !aeo.x402.is_complete() {
             tracing::warn!(
                 "aeo: [[aeo.paid_routes]] has x402 routes but [aeo.x402] needs \
@@ -568,21 +588,12 @@ impl X402Layer {
             );
             return None;
         }
-        #[cfg(feature = "i18n")]
-        let locales = if config.i18n.locale_prefix_enabled {
-            config.i18n.supported_locales.clone()
-        } else {
-            Vec::new()
-        };
-        #[cfg(not(feature = "i18n"))]
-        let locales = Vec::new();
         Some(Self {
             state: std::sync::Arc::new(X402State {
                 config: aeo.x402.clone(),
-                routes,
+                priced,
                 client: crate::http_client::Client::from_state(state).named("x402"),
                 base_url: config.seo.base_url.clone(),
-                locales,
                 used: std::sync::Mutex::new(lru::LruCache::new(
                     std::num::NonZeroUsize::new(10_000).unwrap_or(std::num::NonZeroUsize::MIN),
                 )),
@@ -606,6 +617,84 @@ impl X402Layer {
         let layer = Self::from_config(config, state);
         state.insert_extension(SharedX402(layer.clone()));
         layer
+    }
+}
+
+/// Without the `http-client` feature Autumn cannot reach a facilitator, so
+/// a priced route fails closed: it answers `503` and is never served free.
+#[cfg(not(feature = "http-client"))]
+#[derive(Clone)]
+pub(crate) struct X402Unavailable {
+    priced: std::sync::Arc<PricedRoutes>,
+}
+
+#[cfg(not(feature = "http-client"))]
+impl X402Unavailable {
+    /// The layer, or `None` when no route is priced.
+    #[must_use]
+    pub(crate) fn from_config(config: &crate::config::AutumnConfig) -> Option<Self> {
+        let priced = PricedRoutes::from_config(config)?;
+        tracing::error!(
+            "aeo: [[aeo.paid_routes]] has x402 routes, but x402 needs the `http-client` \
+             feature; those routes answer 503"
+        );
+        Some(Self {
+            priced: std::sync::Arc::new(priced),
+        })
+    }
+}
+
+#[cfg(not(feature = "http-client"))]
+impl<S> tower::Layer<S> for X402Unavailable {
+    type Service = X402UnavailableService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        X402UnavailableService {
+            inner,
+            priced: std::sync::Arc::clone(&self.priced),
+        }
+    }
+}
+
+/// Service made by [`X402Unavailable`].
+#[cfg(not(feature = "http-client"))]
+#[derive(Clone)]
+pub(crate) struct X402UnavailableService<S> {
+    inner: S,
+    priced: std::sync::Arc<PricedRoutes>,
+}
+
+#[cfg(not(feature = "http-client"))]
+impl<S> tower::Service<axum::http::Request<axum::body::Body>> for X402UnavailableService<S>
+where
+    S: tower::Service<axum::http::Request<axum::body::Body>, Response = axum::response::Response>,
+{
+    type Response = axum::response::Response;
+    type Error = S::Error;
+    type Future = futures::future::Either<
+        std::future::Ready<Result<axum::response::Response, S::Error>>,
+        S::Future,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<axum::body::Body>) -> Self::Future {
+        use axum::response::IntoResponse as _;
+
+        if self.priced.route_for(&req).is_some() {
+            let res = (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "payments are not available",
+            )
+                .into_response();
+            return futures::future::Either::Left(std::future::ready(Ok(res)));
+        }
+        futures::future::Either::Right(self.inner.call(req))
     }
 }
 
@@ -667,7 +756,7 @@ where
         let route = if req.extensions().get::<X402Handled>().is_some() {
             None
         } else {
-            self.state.route_for(&req).cloned()
+            self.state.priced.route_for(&req).cloned()
         };
         let Some(route) = route else {
             return futures::future::Either::Left(self.inner.call(req));
@@ -759,7 +848,7 @@ where
             let mut res = inner.call(req).await?;
             let receipt = match early {
                 Some(receipt) => receipt,
-                None if res.status().as_u16() < 400 => {
+                None if res.status().is_success() => {
                     match settle(&state, &route, &resource, &body).await {
                         Ok(receipt) => receipt,
                         Err(failed) => return Ok(*failed),
@@ -912,6 +1001,30 @@ mod tests {
             mpp_currency: Some("usd".to_owned()),
             ..PaidRoute::default()
         }
+    }
+
+    #[cfg(not(feature = "http-client"))]
+    #[tokio::test]
+    async fn without_the_http_client_priced_routes_fail_closed() {
+        use tower::{Layer as _, ServiceExt as _};
+
+        let mut config = crate::config::AutumnConfig::default();
+        config.aeo.x402 = x402();
+        config.aeo.paid_routes.push(route());
+        let layer = X402Unavailable::from_config(&config).expect("a route is priced");
+        let inner = tower::service_fn(|_req: axum::http::Request<axum::body::Body>| async {
+            Ok::<_, std::convert::Infallible>(axum::response::Response::new(
+                axum::body::Body::empty(),
+            ))
+        });
+        let call = |path: &str| {
+            let req = axum::http::Request::get(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            layer.layer(inner).oneshot(req)
+        };
+        assert_eq!(call("/api/reports/7").await.unwrap().status(), 503);
+        assert_eq!(call("/free").await.unwrap().status(), 200);
     }
 
     #[test]

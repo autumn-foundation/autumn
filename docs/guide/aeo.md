@@ -258,8 +258,10 @@ html! {
 ```
 
 Pass the CSP nonce when your policy uses nonces. On page load, the script
-calls `document.modelContext.registerTool()` for each public tool. It does
-not register a tool marked `destructiveHint`. The script sends each call to
+calls `document.modelContext.registerTool()` for each public tool that is
+marked safe: `readOnlyHint: true` (a `GET` tool), or `destructiveHint:
+false`. A write tool gets `consequentialHint: true`, so the browser can ask the
+visitor first. The script sends each call to
 the MCP endpoint with the page cookies and the CSRF token. Auth, CSRF, and
 rate limits apply to the call.
 
@@ -315,8 +317,8 @@ Cloudflare verifies, not the draft's dictionary form.
 Price a route. A request without payment gets `402` and a
 `PAYMENT-REQUIRED` header. The facilitator verifies a retry that has
 `PAYMENT-SIGNATURE`. For `GET` and `HEAD`, the handler runs, then Autumn
-settles any answer below `400`. For other methods, Autumn settles first,
-then runs the handler.
+settles only a `2xx` answer (a redirect is not paid). For other methods,
+Autumn settles first, then runs the handler.
 
 ```toml
 [aeo.x402]

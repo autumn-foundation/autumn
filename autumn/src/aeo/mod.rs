@@ -554,7 +554,10 @@ fn warn_on_config(config: &crate::config::AutumnConfig) {
         tracing::warn!("aeo: [[aeo.paid_routes]] {problem}; Autumn skips this route");
     }
     if let Some(issuer) = aeo.oauth.authorization_server.issuer.as_deref() {
-        let origin = documents::Origin::resolve(config.seo.base_url.as_deref(), None);
+        // With no `base_url` the origin comes from each request; check only
+        // the issuer path here.
+        let origin =
+            documents::Origin::resolve(config.seo.base_url.as_deref().or(Some(issuer)), None);
         let facts = documents::SiteFacts {
             oauth: aeo.oauth.clone(),
             ..documents::SiteFacts::default()

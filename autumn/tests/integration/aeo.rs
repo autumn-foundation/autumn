@@ -481,6 +481,11 @@ mod commerce {
         autumn_web::reexports::http::StatusCode::INTERNAL_SERVER_ERROR
     }
 
+    #[get("/api/moved")]
+    async fn moved() -> autumn_web::reexports::axum::response::Redirect {
+        autumn_web::reexports::axum::response::Redirect::to("/login")
+    }
+
     fn paid_config() -> AutumnConfig {
         let mut config = AutumnConfig::default();
         config.aeo.x402 = toml::from_str(
@@ -492,7 +497,7 @@ mod commerce {
             "#,
         )
         .unwrap();
-        for path in ["/api", "/api/broken"] {
+        for path in ["/api", "/api/broken", "/api/moved"] {
             config.aeo.paid_routes.push(
                 toml::from_str::<PaidRoute>(&format!(
                     "method = \"GET\"\npath = \"{path}\"\namount = \"10000\"\ndescription = \"Data\""
@@ -599,8 +604,10 @@ mod commerce {
     }
 
     #[tokio::test]
-    async fn a_failed_handler_is_never_settled() {
-        let mut app = TestApp::new().config(paid_config()).routes(routes![broken]);
+    async fn a_failed_or_redirected_handler_is_never_settled() {
+        let mut app = TestApp::new()
+            .config(paid_config())
+            .routes(routes![broken, moved]);
         let verify = app
             .http_mock("x402")
             .post("/verify")
@@ -610,21 +617,18 @@ mod commerce {
             .post("/settle")
             .respond_with(200, json!({ "success": true }));
         let c = app.build();
-        let required = decode_header(
-            c.get("/api/broken")
+        for (path, status) in [("/api/broken", 500), ("/api/moved", 303)] {
+            let required =
+                decode_header(c.get(path).send().await.header("payment-required").unwrap())
+                    .unwrap();
+            let res = c
+                .get(path)
+                .header("payment-signature", &signature(&required["accepts"][0]))
                 .send()
-                .await
-                .header("payment-required")
-                .unwrap(),
-        )
-        .unwrap();
-        let res = c
-            .get("/api/broken")
-            .header("payment-signature", &signature(&required["accepts"][0]))
-            .send()
-            .await;
-        assert_eq!(res.status, 500);
-        verify.expect_called(1);
+                .await;
+            assert_eq!(res.status, status, "{path}");
+        }
+        verify.expect_called(2);
         settle.expect_called(0);
     }
 
