@@ -166,7 +166,9 @@ where
         }
         if this.flags.is_head {
             // HEAD carries the headers a GET would get; there is no body.
-            markdown_headers(res.headers_mut(), config, None);
+            if !too_large(&res, config.max_bytes) {
+                markdown_headers(res.headers_mut(), config, None);
+            }
             return Poll::Ready(Ok(res));
         }
         let config = Arc::clone(this.config);
@@ -255,13 +257,22 @@ fn add_vary_accept(headers: &mut HeaderMap) {
     }
 }
 
-async fn to_markdown(res: Response, config: &NegotiateConfig) -> Response {
-    let declared_len = res
-        .headers()
+/// `true` when the body is known to be larger than `max`: from
+/// `Content-Length`, else from an exact body size. `GET` and `HEAD` use the
+/// same test, so `HEAD` describes the representation `GET` sends.
+fn too_large(res: &Response, max: usize) -> bool {
+    use http_body::Body as _;
+
+    res.headers()
         .get(CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok());
-    if declared_len.is_some_and(|len| len > config.max_bytes) {
+        .and_then(|v| v.parse::<u64>().ok())
+        .or_else(|| res.body().size_hint().exact())
+        .is_some_and(|len| len > max as u64)
+}
+
+async fn to_markdown(res: Response, config: &NegotiateConfig) -> Response {
+    if too_large(&res, config.max_bytes) {
         return res;
     }
     let (mut parts, body) = res.into_parts();

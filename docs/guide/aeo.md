@@ -318,7 +318,9 @@ Price a route. A request without payment gets `402` and a
 `PAYMENT-REQUIRED` header. The facilitator verifies a retry that has
 `PAYMENT-SIGNATURE`. For `GET` and `HEAD`, the handler runs, then Autumn
 settles only a `2xx` answer (a redirect is not paid). For other methods,
-Autumn settles first, then runs the handler.
+Autumn settles first, then runs the handler. A priced route never runs free: when
+`[aeo.x402]` is incomplete, or the build has no `http-client` feature, it
+answers `503`.
 
 ```toml
 [aeo.x402]

@@ -938,7 +938,8 @@ impl AppBuilder {
     /// Publish an agent skill at `/.well-known/agent-skills/<name>/SKILL.md`
     /// and list it in `/.well-known/agent-skills/index.json`.
     ///
-    /// A skill with the name `site-guide` replaces the generated one.
+    /// A skill with the name `site-guide` replaces the generated one. A second
+    /// skill with a name already registered is ignored.
     ///
     /// ```rust,no_run
     /// use autumn_web::aeo::AgentSkill;

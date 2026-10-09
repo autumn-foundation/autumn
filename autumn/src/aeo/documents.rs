@@ -757,8 +757,15 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 // ── Agent skills ────────────────────────────────────────────────────────────
 
+/// The registered skills and the `site-guide` skill. A name is published
+/// once: the first skill with that name wins, as its path serves it.
 fn all_skills(facts: &SiteFacts, origin: &Origin) -> Vec<AgentSkill> {
-    let mut skills = facts.skills.clone();
+    let mut skills: Vec<AgentSkill> = Vec::with_capacity(facts.skills.len() + 1);
+    for skill in &facts.skills {
+        if !skills.iter().any(|s| s.name == skill.name) {
+            skills.push(skill.clone());
+        }
+    }
     if facts.site_guide_skill && !skills.iter().any(|s| s.name == SITE_GUIDE_SKILL) {
         skills.push(site_guide(facts, origin));
     }
@@ -1348,6 +1355,25 @@ mod tests {
             assert_eq!(served.content_type, "text/markdown; charset=utf-8");
             assert_eq!(entry["digest"], sha256_digest(served.body.as_bytes()));
         }
+    }
+
+    #[test]
+    fn a_duplicate_skill_name_is_published_once() {
+        let mut facts = content_site();
+        facts.skills = vec![
+            AgentSkill::new("refunds", "First.", "One").unwrap(),
+            AgentSkill::new("refunds", "Second.", "Two").unwrap(),
+        ];
+        let (_, index) = json_doc(&facts, SKILLS_INDEX_PATH);
+        let refunds: Vec<&Value> = index["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["name"] == "refunds")
+            .collect();
+        assert_eq!(refunds.len(), 1, "{index}");
+        let served = render(&facts, &origin(), refunds[0]["url"].as_str().unwrap()).unwrap();
+        assert_eq!(refunds[0]["digest"], sha256_digest(served.body.as_bytes()));
     }
 
     #[test]

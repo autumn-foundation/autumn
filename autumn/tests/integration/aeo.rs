@@ -162,6 +162,20 @@ async fn oversized_pages_stay_html() {
 }
 
 #[tokio::test]
+async fn oversized_pages_stay_html_for_head_too() {
+    let mut config = AutumnConfig::default();
+    config.aeo.markdown_max_bytes = 1024;
+    let res = client_with(config)
+        .head("/big")
+        .header("accept", "text/markdown")
+        .send()
+        .await;
+    res.assert_ok();
+    assert!(res.header("content-type").unwrap().starts_with("text/html"));
+    assert!(res.header("x-markdown-tokens").is_none());
+}
+
+#[tokio::test]
 async fn non_html_and_error_responses_are_untouched() {
     let c = client();
     let json = c
@@ -531,6 +545,20 @@ mod commerce {
         assert_eq!(required["x402Version"], 2);
         assert_eq!(required["accepts"][0]["amount"], "10000");
         assert_eq!(required["resource"]["url"], "http://localhost/api");
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_x402_config_fails_closed() {
+        let mut config = paid_config();
+        config.aeo.x402.pay_to = None;
+        let res = TestApp::new()
+            .config(config)
+            .routes(routes![api])
+            .build()
+            .get("/api")
+            .send()
+            .await;
+        assert_eq!(res.status, 503, "a priced route is never served free");
     }
 
     #[tokio::test]

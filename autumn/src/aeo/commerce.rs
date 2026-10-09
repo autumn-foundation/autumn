@@ -484,6 +484,9 @@ pub(crate) struct X402Layer {
 struct X402State {
     config: X402Config,
     priced: PricedRoutes,
+    /// `false` when `[aeo.x402]` cannot work as written: priced routes then
+    /// answer `503`, never free.
+    available: bool,
     client: crate::http_client::Client,
     base_url: Option<String>,
     /// SHA-256 of each payment header already used.
@@ -567,7 +570,8 @@ impl PricedRoutes {
 #[cfg(feature = "http-client")]
 impl X402Layer {
     /// The layer for `[aeo.x402]` and `[[aeo.paid_routes]]`, or `None` when
-    /// no route is priced or the x402 settings are incomplete.
+    /// no route is priced. With incomplete or unsafe x402 settings, priced
+    /// routes answer `503`.
     #[must_use]
     pub(crate) fn from_config(
         config: &crate::config::AutumnConfig,
@@ -575,24 +579,24 @@ impl X402Layer {
     ) -> Option<Self> {
         let aeo = &config.aeo;
         let priced = PricedRoutes::from_config(config)?;
-        if !aeo.x402.is_complete() {
-            tracing::warn!(
+        let complete = aeo.x402.is_complete();
+        let safe = facilitator_url_is_safe(aeo.x402.facilitator_url.as_deref().unwrap_or_default());
+        if !complete {
+            tracing::error!(
                 "aeo: [[aeo.paid_routes]] has x402 routes but [aeo.x402] needs \
-                 facilitator_url, pay_to, network, and asset; x402 is off"
+                 facilitator_url, pay_to, network, and asset; those routes answer 503"
             );
-            return None;
-        }
-        if !facilitator_url_is_safe(aeo.x402.facilitator_url.as_deref().unwrap_or_default()) {
-            tracing::warn!(
+        } else if !safe {
+            tracing::error!(
                 "aeo: [aeo.x402] facilitator_url must be https (http only for localhost); \
-                 x402 is off"
+                 priced routes answer 503"
             );
-            return None;
         }
         Some(Self {
             state: std::sync::Arc::new(X402State {
                 config: aeo.x402.clone(),
                 priced,
+                available: complete && safe,
                 client: crate::http_client::Client::from_state(state).named("x402"),
                 base_url: config.seo.base_url.clone(),
                 used: std::sync::Mutex::new(lru::LruCache::new(
@@ -767,6 +771,12 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let state = std::sync::Arc::clone(&self.state);
         futures::future::Either::Right(Box::pin(async move {
+            if !state.available {
+                return Ok(plain(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "payments are not available",
+                ));
+            }
             let resource = resource_url(&state, &req);
             let offered = state.config.requirements(&route);
             let Some(header) = req
