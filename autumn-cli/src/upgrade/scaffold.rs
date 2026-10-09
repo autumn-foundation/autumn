@@ -289,13 +289,13 @@ impl Manifest {
     /// none of their protection: following the link would truncate a file
     /// outside the project, invisibly to that project's own `git diff`.
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
-        Self::update(root, |_| self.clone()).map(drop)
+        Self::update(root, |_| Ok(self.clone())).map(drop)
     }
 
     /// Read, change and write the manifest as one compare-and-swap.
     ///
     /// `change` gets the current manifest (`None` if absent or unparsable) and
-    /// returns the new one. If another writer changes the file first, `change`
+    /// returns the new one, or an error to stop with nothing written. If another writer changes the file first, `change`
     /// runs again on the new state, so that writer's pins are kept.
     ///
     /// # Errors
@@ -304,7 +304,7 @@ impl Manifest {
     /// upgrade, or [`SWAP_ATTEMPTS`] lost swaps.
     pub fn update(
         root: &Path,
-        mut change: impl FnMut(Option<Self>) -> Self,
+        mut change: impl FnMut(Option<Self>) -> Result<Self, String>,
     ) -> std::io::Result<Self> {
         let path = root.join(MANIFEST_PATH);
         for attempt in 1..=SWAP_ATTEMPTS {
@@ -338,7 +338,7 @@ impl Manifest {
                 },
                 OnDisk::Text(text) => (Self::parse(&text), Publish::Swap(text)),
             };
-            let next = change(current);
+            let next = change(current).map_err(std::io::Error::other)?;
             let rendered = next.render();
             // An identical rewrite would only touch the mtime.
             if matches!(&mode, Publish::Swap(text) if normalize(text) == normalize(&rendered)) {
@@ -1159,27 +1159,32 @@ fn prerelease_precedence(left: &str, right: &str) -> std::cmp::Ordering {
 /// changes nothing. Accepting a path is a promise that reconciliation will skip
 /// it, and a promise about a file this command never touches is meaningless.
 pub fn accept(root: &Path, paths: &[String]) -> Result<Manifest, String> {
-    let manifest = Manifest::load(root);
-    let options = resolve_options(root, manifest.as_ref());
-    let owned = current_files(root, options).ok_or_else(|| {
-        "this project's `Cargo.toml` gives no usable `[package] name`, so the scaffold \
-         cannot be rendered and there is nothing to accept against"
-            .to_owned()
-    })?;
-    let unknown: Vec<&str> = paths
-        .iter()
-        .map(String::as_str)
-        .filter(|path| !owned.contains_key(path))
-        .collect();
-    if !unknown.is_empty() {
-        return Err(format!(
-            "not framework-owned in this project, so there is nothing to accept: {}",
-            unknown.join(", ")
-        ));
-    }
-
-    Manifest::update(root, |current| {
+    // Judged inside the update, on the manifest it actually read. A load made
+    // earlier can miss a manifest that a concurrent swap holds aside, and the
+    // options inferred without it can disown a file the project owns.
+    let mut refusal = None;
+    let updated = Manifest::update(root, |current| {
         let options = resolve_options(root, current.as_ref());
+        let Some(owned) = current_files(root, options) else {
+            refusal = Some(
+                "this project's `Cargo.toml` gives no usable `[package] name`, so the \
+                 scaffold cannot be rendered and there is nothing to accept against"
+                    .to_owned(),
+            );
+            return Err(String::new());
+        };
+        let unknown: Vec<&str> = paths
+            .iter()
+            .map(String::as_str)
+            .filter(|path| !owned.contains_key(path))
+            .collect();
+        if !unknown.is_empty() {
+            refusal = Some(format!(
+                "not framework-owned in this project, so there is nothing to accept: {}",
+                unknown.join(", ")
+            ));
+            return Err(String::new());
+        }
         let mut manifest = current.unwrap_or_else(|| Manifest {
             version: None,
             written_by: None,
@@ -1189,9 +1194,13 @@ pub fn accept(root: &Path, paths: &[String]) -> Result<Manifest, String> {
         });
         manifest.options = options;
         manifest.pinned.extend(paths.iter().cloned());
-        manifest
-    })
-    .map_err(|error| format!("could not write {MANIFEST_PATH}: {error}"))
+        Ok(manifest)
+    });
+    match (refusal, updated) {
+        (Some(refusal), _) => Err(refusal),
+        (None, Ok(manifest)) => Ok(manifest),
+        (None, Err(error)) => Err(format!("could not write {MANIFEST_PATH}: {error}")),
+    }
 }
 
 /// Write the additions and updates in `report`, then refresh the manifest.
@@ -1259,7 +1268,7 @@ fn record_baseline(report: &ScaffoldReport) -> Result<(), String> {
         return Ok(());
     }
     Manifest::update(&report.root, |previous| {
-        report.next_manifest(previous.as_ref())
+        Ok(report.next_manifest(previous.as_ref()))
     })
     .map(drop)
     .map_err(|error| {
@@ -2854,7 +2863,7 @@ mod tests {
                 fs::write(root.join(MANIFEST_PATH), theirs.render()).unwrap();
             }
             manifest.pinned.insert("build.rs".to_owned());
-            manifest
+            Ok(manifest)
         })
         .expect("update");
         assert_eq!(runs, 2);
@@ -2875,7 +2884,7 @@ mod tests {
             theirs.pinned.insert(format!("racer-{runs}"));
             fs::write(root.join(MANIFEST_PATH), theirs.render()).unwrap();
             manifest.pinned.insert("mine".to_owned());
-            manifest
+            Ok(manifest)
         })
         .expect_err("must stop");
         assert_eq!(runs, SWAP_ATTEMPTS);
@@ -2895,12 +2904,39 @@ mod tests {
         let mut runs = 0;
         let error = Manifest::update(tmp.path(), |current| {
             runs += 1;
-            current.unwrap_or_else(|| panic!("built from nothing"))
+            Ok(current.unwrap_or_else(|| panic!("built from nothing")))
         })
         .expect_err("must not build from nothing");
         assert!(error.to_string().contains("interrupted"), "{error}");
         assert_eq!(runs, 0);
         assert!(held.exists(), "the held copy is never deleted");
+    }
+
+    #[test]
+    fn an_accept_judges_ownership_by_the_manifest_not_by_a_claim_gap() {
+        // While a swap holds the manifest, a plain load sees nothing and infers
+        // the API flavor, which does not own the Tailwind files.
+        let tmp = scaffolded(GenerateOptions::default());
+        for marker in [
+            "tailwind.config.js",
+            "static/css/input.css",
+            "static/js/htmx.min.js",
+        ] {
+            let _ = fs::remove_file(tmp.path().join(marker));
+        }
+        let manifest_path = tmp.path().join(MANIFEST_PATH);
+        let held = manifest_path.with_file_name(".autumn-upgrade-claim.old");
+        fs::rename(&manifest_path, &held).unwrap();
+        let restore = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            fs::rename(&held, &manifest_path).unwrap();
+        });
+
+        let accepted = accept(tmp.path(), &["tailwind.config.js".to_owned()]);
+        restore.join().unwrap();
+        let manifest = accepted.expect("owned by the recorded flavor");
+        assert!(manifest.pinned.contains("tailwind.config.js"));
+        assert!(!manifest.digests.is_empty(), "the history survives");
     }
 
     #[test]
