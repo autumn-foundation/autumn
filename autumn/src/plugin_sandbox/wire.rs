@@ -482,9 +482,26 @@ impl From<serde_json::Error> for WireError {
 ///
 /// Returns [`WireError::Json`] if the frame cannot be serialized.
 pub(crate) fn to_line<T: Serialize>(frame: &T) -> Result<String, WireError> {
-    let mut line = serde_json::to_string(frame)?;
-    line.push('\n');
-    Ok(line)
+    // Measure first, then write into a buffer of exactly that size. A growing
+    // buffer keeps up to twice its length, and the line lives for the whole
+    // request, so that spare room would be unbudgeted memory.
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, frame)?;
+    let mut line = Vec::with_capacity(count.0.saturating_add(1));
+    serde_json::to_writer(&mut line, frame)?;
+    line.push(b'\n');
+    // JSON output is UTF-8, so this cannot fail.
+    String::from_utf8(line).map_err(|err| WireError::Json(serde::ser::Error::custom(err)))
 }
 
 /// Parse one NDJSON line into a frame.
@@ -1821,6 +1838,17 @@ mod tests {
             panic!("a request frame must parse back as a request");
         };
         assert_eq!(body, big.body);
+    }
+
+    #[test]
+    fn a_line_holds_no_spare_capacity() {
+        // The line stays resident for the whole request. A buffer that grew by
+        // doubling would keep up to twice its length, which the footprint does
+        // not count.
+        let mut big = request();
+        big.body = vec![0x5A; (1 << 20) + 17];
+        let line = to_line(&HostFrame::request(&big, &[])).expect("serializes");
+        assert_eq!(line.capacity(), line.len());
     }
 
     #[test]

@@ -356,7 +356,8 @@ impl ResourceLimits {
         (self.memory_bytes as u128)
             // Four. At `to_line` the body is live twice (caller, frame clone) and
             // the base64 text is written straight into the line (4/3). That is
-            // 10/3 of the body. There is no encode temporary.
+            // 10/3 of the body. There is no encode temporary, and `to_line`
+            // sizes the line exactly, so it holds no spare capacity.
             .saturating_add((self.max_request_body_bytes as u128).saturating_mul(4))
             .saturating_add((self.max_response_bytes as u128).saturating_mul(5))
             // The instance's tables, bounded by `MAX_TABLE_ELEMENTS` at a
