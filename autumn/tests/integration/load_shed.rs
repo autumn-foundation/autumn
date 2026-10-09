@@ -560,8 +560,7 @@ mod mcp_admission {
     }
 
     /// With a limit of 2, `sheddable = 0.5` gives one slot. One held
-    /// request plus the envelope's own slot is over it, so the replay of a
-    /// `sheddable` tool is shed.
+    /// request takes it, so the replay of a `sheddable` tool is shed.
     #[tokio::test]
     async fn mcp_sheddable_tool_is_shed_at_its_share() {
         let client = Arc::new(
