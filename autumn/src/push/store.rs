@@ -562,7 +562,11 @@ impl PushSubscriptionStore for MemoryPushSubscriptionStore {
             return Err(PushError::EndpointClaimed);
         }
 
-        let is_new = !rows.iter().any(|row| row.endpoint == subscription.endpoint);
+        // New to the DESTINATION principal: a move from another principal
+        // adds a row to them, so the cap applies.
+        let is_new = !rows.iter().any(|row| {
+            row.endpoint == subscription.endpoint && row.principal_id == subscription.principal_id
+        });
         if is_new
             && rows
                 .iter()
@@ -691,6 +695,29 @@ mod db_store {
                 endpoint: row.endpoint,
             })
         }
+    }
+
+    /// Convert rows one by one, skipping any that do not decode.
+    ///
+    /// One corrupt row (a bad import, storage damage) must not silence the
+    /// healthy devices. The skip is logged, so the row still gets repaired.
+    fn usable_subscriptions(
+        principal_id: &str,
+        rows: Vec<SubscriptionRow>,
+    ) -> Vec<StoredSubscription> {
+        let total = rows.len();
+        let usable: Vec<StoredSubscription> = rows
+            .into_iter()
+            .filter_map(|row| StoredSubscription::try_from(row).ok())
+            .collect();
+        if usable.len() < total {
+            tracing::warn!(
+                principal_id = %principal_id,
+                count = total - usable.len(),
+                "skipping unusable push subscription rows; key material did not decode",
+            );
+        }
+        usable
     }
 
     /// [`PushSubscriptionStore`] backed by the app's database pool.
@@ -838,7 +865,7 @@ mod db_store {
                 .load(&mut conn)
                 .await
                 .map_err(|e| store_err(&e))?;
-            rows.into_iter().map(StoredSubscription::try_from).collect()
+            Ok(usable_subscriptions(principal_id, rows))
         }
 
         async fn remove(
@@ -866,6 +893,35 @@ mod db_store {
             }
             .map_err(|e| store_err(&e))?;
             Ok(affected as u64)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn row(endpoint: &str, key: &str) -> SubscriptionRow {
+            SubscriptionRow {
+                principal_id: "1".to_owned(),
+                endpoint: endpoint.to_owned(),
+                p256dh: key.to_owned(),
+                auth: key.to_owned(),
+            }
+        }
+
+        #[test]
+        fn a_corrupt_row_does_not_hide_the_healthy_ones() {
+            let rows = vec![
+                row("https://push.example.com/a", "AAAA"),
+                row("https://push.example.com/bad", "not base64!"),
+                row("https://push.example.com/b", "AAAA"),
+            ];
+            let usable = usable_subscriptions("1", rows);
+            let endpoints: Vec<&str> = usable.iter().map(StoredSubscription::endpoint).collect();
+            assert_eq!(
+                endpoints,
+                ["https://push.example.com/a", "https://push.example.com/b"]
+            );
         }
     }
 }
@@ -1418,6 +1474,32 @@ mod tests {
             MAX_SUBSCRIPTIONS_PER_PRINCIPAL,
             "one notification must never fan out past the cap"
         );
+    }
+
+    #[tokio::test]
+    async fn a_move_into_a_full_principal_is_refused() {
+        // A shared-device move is new to the destination, so the cap applies.
+        let store = MemoryPushSubscriptionStore::new();
+        store
+            .save(stored(1_i64, "https://push.example.com/shared"))
+            .await
+            .expect("owner A saves");
+        for i in 0..MAX_SUBSCRIPTIONS_PER_PRINCIPAL {
+            store
+                .save(stored(2_i64, &format!("https://push.example.com/d{i}")))
+                .await
+                .expect("fill B to the cap");
+        }
+        assert!(
+            matches!(
+                store
+                    .save(stored(2_i64, "https://push.example.com/shared"))
+                    .await,
+                Err(PushError::TooManySubscriptions { .. })
+            ),
+            "a move into a full principal must not exceed the cap"
+        );
+        assert_eq!(store.list_for("1").await.expect("list").len(), 1);
     }
 
     #[tokio::test]

@@ -222,36 +222,34 @@ impl PushTransport for HttpPushTransport {
             // reachable on another address.
             let addrs = resolve_and_validate_endpoint(&request.endpoint).await?;
 
-            let mut last_error = None;
-            for addr in addrs {
-                let mut builder = self
-                    .client
-                    .post(&request.endpoint)
-                    // See the type docs: pin the checked address and refuse to
-                    // follow a redirect, so neither DNS rebinding nor a `307`
-                    // can steer this POST at an internal host.
-                    .pin_to(addr)
-                    .no_redirect()
-                    // The endpoint host is client-chosen and this transport
-                    // reads only the status. Without this, a registered
-                    // endpoint that streams indefinitely costs one unbounded
-                    // allocation per notification until the timeout fires.
-                    .discard_response_body();
-                for (name, value) in &request.headers {
-                    builder = builder.header(name, value);
-                }
-                // A `410 Gone` is a normal, expected answer that must reach
-                // the pruning logic, so a status code is never an error here
-                // — and never a reason to try another address either. Only a
-                // genuine transport failure falls through to the next one.
-                match builder.bytes_body(request.body.clone()).send().await {
-                    Ok(response) => return Ok(response.status().as_u16()),
-                    Err(e) => last_error = Some(e.to_string()),
-                }
+            // One request over the whole validated set. reqwest falls back to
+            // the next address only when a connection cannot be made, so a
+            // failure after the body went out is never retried — a push is not
+            // idempotent, and a retry could show the notification twice.
+            let mut builder = self
+                .client
+                .post(&request.endpoint)
+                // See the type docs: pin the checked addresses and refuse to
+                // follow a redirect, so neither DNS rebinding nor a `307`
+                // can steer this POST at an internal host.
+                .pin_to_addrs(addrs)
+                .no_redirect()
+                // The endpoint host is client-chosen and this transport
+                // reads only the status. Without this, a registered
+                // endpoint that streams indefinitely costs one unbounded
+                // allocation per notification until the timeout fires.
+                .discard_response_body();
+            for (name, value) in &request.headers {
+                builder = builder.header(name, value);
             }
-            Err(PushError::Transport(last_error.unwrap_or_else(|| {
-                "the push endpoint host resolved to no usable address".to_owned()
-            })))
+            // A `410 Gone` is a normal, expected answer that must reach the
+            // pruning logic, so a status code is never an error here.
+            builder
+                .bytes_body(request.body.clone())
+                .send()
+                .await
+                .map(|response| response.status().as_u16())
+                .map_err(|e| PushError::Transport(e.to_string()))
         })
     }
 }
@@ -264,7 +262,7 @@ impl PushTransport for HttpPushTransport {
 /// filtered down to its public addresses, since a resolver returning both is
 /// exactly the shape a rebinding attack produces.
 ///
-/// All of them are returned, not just the first, so the caller can fall back
+/// All of them are returned, not just the first, so the client can fall back
 /// to the next when one is unreachable — see [`HttpPushTransport`].
 #[cfg(feature = "http-client")]
 async fn resolve_and_validate_endpoint(

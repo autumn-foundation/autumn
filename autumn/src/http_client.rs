@@ -1824,7 +1824,7 @@ pub struct RequestBuilder {
     redirect_mode: RedirectMode,
     /// When set, connect directly to this socket, skipping DNS resolution while
     /// preserving the original `Host` header + SNI. See [`RequestBuilder::pin_to`].
-    pin_addr: Option<SocketAddr>,
+    pin_addr: Option<Vec<SocketAddr>>,
     /// When `true`, use the composed SSRF-safe send path (resolve→validate→pin
     /// with per-hop redirect validation). Set by [`Client::get_ssrf_safe`].
     ssrf_safe: bool,
@@ -2072,8 +2072,23 @@ impl RequestBuilder {
     /// `resolve()` override applies, so a configured proxy would otherwise
     /// receive the request and re-resolve the host — defeating the pin.
     #[must_use]
-    pub const fn pin_to(mut self, addr: SocketAddr) -> Self {
-        self.pin_addr = Some(addr);
+    pub fn pin_to(self, addr: SocketAddr) -> Self {
+        self.pin_to_addrs([addr])
+    }
+
+    /// Like [`pin_to`](Self::pin_to), but with several addresses for the one
+    /// host.
+    ///
+    /// The whole set goes to a single request, and reqwest falls back to the
+    /// next address only when a connection cannot be made. Looping over
+    /// [`pin_to`](Self::pin_to) instead would re-send the body after a failure
+    /// that came later, which can deliver a non-idempotent `POST` twice.
+    ///
+    /// An empty set pins nothing. Every other rule of `pin_to` applies.
+    #[must_use]
+    pub fn pin_to_addrs(mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
+        let addrs: Vec<SocketAddr> = addrs.into_iter().collect();
+        self.pin_addr = (!addrs.is_empty()).then_some(addrs);
         self
     }
 
@@ -2893,10 +2908,8 @@ impl RequestBuilder {
 
     /// Compute the `(host, addr)` resolve override for a pinned request, if any.
     fn pin_resolve(&self) -> Result<Option<(String, Vec<SocketAddr>)>, ClientError> {
-        match self.pin_addr {
-            // Single-address pin routed through the same set-based path as the
-            // multi-address SSRF-safe pin (a one-element slice).
-            Some(addr) => Ok(Some((host_of(&self.url)?, vec![addr]))),
+        match &self.pin_addr {
+            Some(addrs) => Ok(Some((host_of(&self.url)?, addrs.clone()))),
             None => Ok(None),
         }
     }
@@ -2930,8 +2943,8 @@ impl RequestBuilder {
         for hop in 0.. {
             // Pin only applies to the first hop's original target.
             let resolve = if hop == 0 {
-                match self.pin_addr {
-                    Some(addr) => Some((host_of(&current)?, vec![addr])),
+                match &self.pin_addr {
+                    Some(addrs) => Some((host_of(&current)?, addrs.clone())),
                     None => None,
                 }
             } else {
@@ -6490,6 +6503,28 @@ mod tests {
             .expect("pinned request should reach the loopback listener");
 
         assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(resp.text(), "pong");
+    }
+
+    // `pin_to_addrs` hands the whole set to one request, so a refused first
+    // address falls back inside reqwest instead of re-sending the body.
+    #[tokio::test]
+    async fn pin_to_addrs_falls_back_to_the_next_address_on_connect_failure() {
+        use axum::{Router, routing::get};
+        let addr = spawn(Router::new().route("/ping", get(|| async { "pong" }))).await;
+        let port = addr.port();
+
+        let resp = Client::new()
+            .get(format!("http://pinned.invalid:{port}/ping"))
+            .pin_to_addrs([
+                // Nothing listens on this loopback alias.
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), port),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            ])
+            .send()
+            .await
+            .expect("the second pinned address must serve the request");
+
         assert_eq!(resp.text(), "pong");
     }
 

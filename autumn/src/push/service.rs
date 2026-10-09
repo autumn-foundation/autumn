@@ -51,6 +51,9 @@ pub const DEFAULT_TTL_SECS: u32 = 4 * 7 * 24 * 60 * 60;
 /// fan-out from opening one connection per subscription at once.
 const MAX_CONCURRENT_DELIVERIES: usize = 8;
 
+/// How many principals [`WebPush::send_many`] serves at once.
+const MAX_CONCURRENT_PRINCIPALS: usize = 4;
+
 // ── Message ─────────────────────────────────────────────────────────────────
 
 /// What the user sees: the payload delivered to the service worker's `push`
@@ -174,7 +177,7 @@ impl WebPush {
         Self {
             store: Arc::new(store),
             vapid: Some(Arc::new(vapid)),
-            subject: subject.into().into(),
+            subject: subject.into().trim().into(),
             transport: Arc::new(transport),
             ttl_secs: DEFAULT_TTL_SECS,
             clock: Arc::new(crate::time::SystemClock),
@@ -197,7 +200,7 @@ impl WebPush {
         Self {
             store: Arc::new(store),
             vapid: None,
-            subject: subject.into().into(),
+            subject: subject.into().trim().into(),
             transport: Arc::new(transport),
             ttl_secs: DEFAULT_TTL_SECS,
             clock: Arc::new(crate::time::SystemClock),
@@ -376,10 +379,23 @@ impl WebPush {
     where
         P: Into<PushPrincipal> + Send,
     {
+        // Bounded like the per-device fan-out in `send`, and smaller, so the
+        // two together cap connections at
+        // `MAX_CONCURRENT_PRINCIPALS * MAX_CONCURRENT_DELIVERIES`. A recipient
+        // whose endpoints all time out must not delay the others.
         let mut report = PushDeliveryReport::default();
-        for principal in principals {
-            report.merge(self.send(principal, message).await?);
+        let mut sends = futures::stream::iter(
+            principals
+                .into_iter()
+                .map(|principal| self.send(principal, message)),
+        )
+        .buffer_unordered(MAX_CONCURRENT_PRINCIPALS);
+        while let Some(outcome) = futures::StreamExt::next(&mut sends).await {
+            report.merge(outcome?);
         }
+        drop(sends);
+        // Same stable order as `send`, whichever recipient answered first.
+        report.pruned.sort();
         Ok(report)
     }
 
@@ -1318,6 +1334,133 @@ mod tests {
         assert!(
             transport.requests().is_empty(),
             "nothing may be dispatched with a sub every push service will refuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_padded_subject_is_signed_without_the_padding() {
+        // A secret file or env var often ends in a newline. Validation trims,
+        // so signing must see the same trimmed string.
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let transport = RecordingPushTransport::new();
+        let push = WebPush::new(
+            MemoryPushSubscriptionStore::new(),
+            VapidKey::generate(),
+            "  mailto:ops@example.com\n",
+            transport.clone(),
+        );
+        push.subscribe(7_i64, &browser_subscription("https://push.example.com/a"))
+            .await
+            .expect("subscribe");
+        push.send(7_i64, &PushMessage::new("Hi", "There"))
+            .await
+            .expect("send");
+
+        let requests = transport.requests();
+        let authorization = requests[0].header("authorization").expect("authorization");
+        let jwt = authorization
+            .strip_prefix("vapid t=")
+            .and_then(|rest| rest.split_once(','))
+            .map(|(jwt, _)| jwt)
+            .expect("vapid header");
+        let claims = URL_SAFE_NO_PAD
+            .decode(jwt.split('.').nth(1).expect("claims"))
+            .expect("claims base64url");
+        let claims: serde_json::Value = serde_json::from_slice(&claims).expect("json");
+        assert_eq!(claims["sub"], "mailto:ops@example.com");
+    }
+
+    #[tokio::test]
+    async fn send_many_does_not_queue_principals_behind_a_stalled_one() {
+        // One recipient whose device never answers must not hold the rest.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct StallingTransport {
+            others_done: Arc<AtomicUsize>,
+            stall_saw_others: Arc<AtomicBool>,
+        }
+
+        impl PushTransport for StallingTransport {
+            fn deliver<'a>(
+                &'a self,
+                request: &'a crate::push::PushRequest,
+            ) -> crate::push::transport::PushTransportFuture<'a> {
+                Box::pin(async move {
+                    if request.endpoint.contains("stall") {
+                        for _ in 0..1_000 {
+                            if self.others_done.load(Ordering::SeqCst) >= 2 {
+                                self.stall_saw_others.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                        return Ok(201);
+                    }
+                    self.others_done.fetch_add(1, Ordering::SeqCst);
+                    Ok(201)
+                })
+            }
+        }
+
+        let saw = Arc::new(AtomicBool::new(false));
+        let push = WebPush::new(
+            MemoryPushSubscriptionStore::new(),
+            VapidKey::generate(),
+            "mailto:ops@example.com",
+            StallingTransport {
+                others_done: Arc::new(AtomicUsize::new(0)),
+                stall_saw_others: saw.clone(),
+            },
+        );
+        for (id, endpoint) in [
+            (1_i64, "https://push.example.com/stall"),
+            (2, "https://push.example.com/live-a"),
+            (3, "https://push.example.com/live-b"),
+        ] {
+            push.subscribe(id, &browser_subscription(endpoint))
+                .await
+                .expect("subscribe");
+        }
+
+        let report = push
+            .send_many([1_i64, 2, 3], &PushMessage::new("Hi", "There"))
+            .await
+            .expect("send_many");
+        assert_eq!(report.delivered, 3);
+        assert!(
+            saw.load(Ordering::SeqCst),
+            "later principals must run while an earlier one is stalled"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_many_reports_pruned_endpoints_in_a_stable_order() {
+        let transport = RecordingPushTransport::new()
+            .responding_with("https://push.example.com/dead-a", 410)
+            .responding_with("https://push.example.com/dead-b", 410);
+        let (push, _) = web_push_with(transport);
+        for (id, endpoint) in [
+            (1_i64, "https://push.example.com/dead-b"),
+            (2, "https://push.example.com/dead-a"),
+        ] {
+            push.subscribe(id, &browser_subscription(endpoint))
+                .await
+                .expect("subscribe");
+        }
+        let report = push
+            .send_many([1_i64, 2], &PushMessage::new("Hi", "There"))
+            .await
+            .expect("send_many");
+        assert_eq!(
+            report.pruned,
+            vec![
+                "https://push.example.com/dead-a".to_owned(),
+                "https://push.example.com/dead-b".to_owned(),
+            ]
         );
     }
 
