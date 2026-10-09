@@ -13766,14 +13766,9 @@ mod trusted_host_tests {
                 "ok"
             }),
         );
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            no_route_timeouts(),
-            false,
-        )
-        .with_state(state);
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), false)
+                .with_state(state);
 
         let request = Request::builder().uri("/slow").body(Body::empty()).unwrap();
         let response = crate::fault_injection::with_request_budget(
