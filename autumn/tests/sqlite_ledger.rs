@@ -3310,3 +3310,41 @@ async fn a_duplicate_seq_on_a_page_edge_is_not_skipped() {
     assert_eq!(broken.kind, LedgerBreak::DuplicateSeq);
     assert_eq!(broken.seq, 2);
 }
+
+/// A forged revision at the lowest possible `(seq, id)` is on the first page,
+/// and `ledger_verify` reports it.
+#[tokio::test]
+async fn a_forged_revision_at_the_minimum_cursor_is_not_skipped() {
+    let pool = boot_pool("lg_page_min").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "INSERT INTO _autumn_ledger_revisions \
+             (id, table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, \
+              valid_from, recorded_at, prev_hash, hash) \
+             SELECT -9223372036854775808, table_name, 'forged', record_id, \
+                    -9223372036854775808, op, actor, request_id, snapshot, valid_from, \
+                    recorded_at, prev_hash, hash \
+             FROM _autumn_ledger_revisions \
+             WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = 1",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("insert a forged revision at the minimum cursor");
+    }
+
+    let page = repo
+        .ledger_revisions_page(id, LedgerPageRequest::first(10))
+        .await
+        .expect("page");
+    assert_eq!(
+        page.revisions.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        vec![i64::MIN, 1, 2, 3]
+    );
+    let report = repo.ledger_verify(id).await.expect("verify");
+    assert!(!report.is_intact(), "{report:?}");
+    assert_eq!(report.revisions_checked, 4);
+}
