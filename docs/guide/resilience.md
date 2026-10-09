@@ -293,8 +293,10 @@ is not `default`. A server reads that header only when
 `trust_criticality_header = true`. Set it only when you trust all callers, or
 when an edge proxy removes or sets the header. If you do not, a public client
 can set its requests to `critical`. The `/mcp` endpoint admits a call up to
-the full limit, before it knows the tool. Then it checks the class of the
-tool's route, so each tool is shed at its own share.
+the full limit, before it knows the tool. Then the call claims a slot at the
+class of the tool's route, so each tool is shed at its own share. N+1
+concurrent calls to a tool with N slots shed exactly one. See "MCP
+`tools/call` admission" in the ADR.
 
 The handler can read the class with
 `autumn_web::admission::current_criticality()`. A task that the handler

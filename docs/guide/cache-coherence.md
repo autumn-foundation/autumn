@@ -275,10 +275,23 @@ insert of a reader that read the old row before the commit.
 | Each write | One namespace sweep per declared read. On Redis this is a `SCAN MATCH` over the keyspace, so write latency grows with the keyspace. |
 | A write inside `Db::tx` | The repository write uses its own connection and commits on its own, so it invalidates at its own commit. |
 
-The fence is per process. A fill on **another replica** that read the old row
-before the commit can still write it back. A fill that starts after the
-invalidation but reads a **lagging read replica** can also cache the old row.
-A TTL bounds both cases.
+The local fence is per process. `RedisCache` also keeps a fill epoch in Redis.
+An invalidation raises it before the sweep. A fill reads it on a miss and
+stores its value only if it did not change. So a fill on **another replica**
+that read the old row before the commit cannot write it back. A backend with no
+shared epoch has only the per-process fence. On that backend, the stale
+write-back can still happen.
+
+A fill that starts after the invalidation but reads a **lagging read replica**
+can cache the old row. A TTL bounds this case.
+
+The shared epoch costs one `GET` on each miss. A hit costs nothing extra. The
+store is one Lua call, in place of the plain `SET`.
+
+The Lua call needs scripting. If you use a Redis ACL, the cache user needs
+`+eval`, `+evalsha` and `+script|load`, and the key pattern `~{prefix}:*`. With
+no scripting permission, no value is stored and every miss recomputes.
+`RedisCache` logs one `warn!` when this happens.
 
 ### 2. Or acknowledge the staleness
 
@@ -366,7 +379,9 @@ autumn_web::cache::coherence::register_namespace_store(
 It returns the namespace's fill epoch. Sample it before computing a value, then
 insert through `with_fill_fence` — `#[cached]` does this for you — or a fill
 already in flight when an invalidation lands will write its stale value back
-afterwards:
+afterwards. For a shared backend, also read `Cache::fill_epoch` and store with
+`insert_cached_fenced`. See "The fill fence" in the `invalidate_namespace`
+rustdoc.
 
 ```rust
 let sampled = epoch.load(std::sync::atomic::Ordering::Acquire);
@@ -533,10 +548,20 @@ tell "we checked and it was fine" from "we never looked".
 * **A fill that reads a lagging read replica.** A fill that starts after the
   invalidation reads the database again. If that read goes to a replica that
   has not applied the write, the old row is cached with a current epoch.
-* **A fill in flight on another replica.** The epoch fence stops a fill *this
-  process* started before an invalidation from writing its stale value back
-  after it. It cannot speak for another replica's in-flight fill into a shared
-  backend, so a `true` is a claim about this process, not the fleet.
+* **A fill in flight on another replica.** With `RedisCache`, the shared epoch
+  fences it out, and a `true` is valid for all replicas. With a custom backend
+  that has no `fill_epoch`, the fence is per process. Another replica's fill
+  that started before the invalidation can then write a stale value back, and a
+  `true` is valid for this process only. The shared fence covers `#[cached]` and
+  `cache_fragment_in`. It does not cover `get_or_compute`, `Cache::clear`, or a
+  key-level `invalidate`.
+* **Loss of the epoch key.** Redis must keep the epoch keys
+  (`{prefix}:__autumn_epoch__:*`). Eviction, `FLUSHDB`, or a failover to a replica that
+  missed the bump can reset one to 0. A stale fill that sampled 0 can then
+  pass. Do not let an eviction policy remove these keys.
+* **A snapshot taken before the call.** The shared epoch is read after the
+  miss. If the caller read its data in an earlier transaction or snapshot, an
+  invalidation between that read and the miss is not fenced.
 * **Which writes exist.** Only `#[repository]` write methods are in the mutated
   set. A hand-rolled repository, a raw diesel `update`/`insert`/`delete`, a
   migration, or a job that writes directly is invisible to the gate — so a

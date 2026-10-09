@@ -1283,6 +1283,14 @@ impl crate::actuator::ProvideActuatorState for AppState {
     fn shards(&self) -> Option<&crate::sharding::ShardSet> {
         self.shards.as_ref()
     }
+
+    #[cfg(feature = "db")]
+    fn replica_pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
+    {
+        self.replica_pool.as_ref()
+    }
     // a11y_posture() uses the trait default (all-false) intentionally: AppState
     // cannot know whether the application's layout is accessible.  Override this
     // method on your own state type — or in a custom ProvideActuatorState impl —
