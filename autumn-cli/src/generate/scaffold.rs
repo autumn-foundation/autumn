@@ -2725,6 +2725,37 @@ fn plan_scaffold_with_options_impl(
         }
     }
 
+    // Issue #2328: when a run drops a flag, the scaffold no longer emits that code.
+    // Remove the feature that the code needed. `destroy` uses its own reverts.
+    // Keep `i18n` and `maud`. `.i18n_auto()` and the shared layout use them.
+    // Only a feature that the files this run overwrites used before is released.
+    // A first run, a hand-made model, or a controller keeps every feature.
+    let released_routes_dir = project_root.join("src").join("routes");
+    let released_own_routes = released_routes_dir.join(format!("{plural}.rs"));
+    if !for_revert {
+        let cargo_path = project_root.join("Cargo.toml");
+        let attachments = has_attachment_fields(&fields);
+        let htmx_needed = (search_enabled && !options_with_key.api)
+            || options_with_key.live
+            || options_with_key.live_validation;
+        // Only `htmx` has no source marker, so only it names an owner.
+        let htmx_owner = Some((released_routes_dir, released_own_routes));
+        let released = [
+            ("csv", !export_enabled, None),
+            ("multipart", !import_enabled && !attachments, None),
+            ("storage", !attachments, None),
+            ("markdown", !rich_text_views, None),
+            ("ws", !options_with_key.live, None),
+            ("htmx", !htmx_needed, htmx_owner),
+        ];
+        for (feature, unused, owner) in released {
+            if unused {
+                plan.release_feature(cargo_path.clone(), feature, owner);
+            }
+        }
+        plan.settle_released_features();
+    }
+
     Ok(plan)
 }
 
@@ -27055,5 +27086,617 @@ exempt_paths = [
             routes.matches("\"post.field.author_name\"").count() >= 3,
             "the field key must serve index, show, and form:\n{routes}"
         );
+    }
+
+    /// Regenerating a scaffold without a flag releases the `autumn-web`
+    /// feature that flag enabled (issue #2328).
+    mod feature_release {
+        use super::*;
+
+        const CARGO: &str = "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = \"0.7.0\"\n";
+
+        fn project() -> TempDir {
+            let tmp = project_with_main(default_main());
+            fs::write(tmp.path().join("Cargo.toml"), CARGO).unwrap();
+            tmp
+        }
+
+        fn run(tmp: &TempDir, name: &str, fields: &[&str], options: &ScaffoldOptions) {
+            let tokens: Vec<String> = fields.iter().map(|f| (*f).to_owned()).collect();
+            plan_scaffold_with_options(tmp.path(), name, &tokens, "20260827000000", options)
+                .unwrap()
+                .execute(Flags {
+                    force: true,
+                    ..Flags::default()
+                })
+                .unwrap();
+        }
+
+        fn autumn_web_line(tmp: &TempDir) -> String {
+            fs::read_to_string(tmp.path().join("Cargo.toml"))
+                .unwrap()
+                .lines()
+                .find(|l| l.starts_with("autumn-web"))
+                .unwrap()
+                .to_owned()
+        }
+
+        fn searchable() -> ScaffoldOptions {
+            ScaffoldOptions {
+                model: ModelOptions {
+                    searchable: vec!["title".to_owned()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+
+        fn importing() -> ScaffoldOptions {
+            ScaffoldOptions {
+                import: true,
+                ..Default::default()
+            }
+        }
+
+        const POST: &[&str] = &["title:String", "body:Text"];
+
+        #[test]
+        fn dropping_searchable_releases_htmx() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            assert!(autumn_web_line(&tmp).contains("htmx"));
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                !autumn_web_line(&tmp).contains("htmx"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn dropping_import_releases_multipart_and_keeps_csv() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &importing());
+            assert!(autumn_web_line(&tmp).contains("multipart"));
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let line = autumn_web_line(&tmp);
+            assert!(!line.contains("multipart"), "{line}");
+            assert!(line.contains("csv"), "the export still needs csv: {line}");
+        }
+
+        #[test]
+        fn dropping_attachment_releases_storage_and_multipart() {
+            let tmp = project();
+            run(
+                &tmp,
+                "Post",
+                &["title:String", "cover:attachment"],
+                &ScaffoldOptions::default(),
+            );
+            assert!(autumn_web_line(&tmp).contains("storage"));
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let line = autumn_web_line(&tmp);
+            assert!(
+                !line.contains("storage") && !line.contains("multipart"),
+                "{line}"
+            );
+        }
+
+        #[test]
+        fn dropping_richtext_releases_markdown() {
+            let tmp = project();
+            run(
+                &tmp,
+                "Post",
+                &["title:String", "body:richtext"],
+                &ScaffoldOptions::default(),
+            );
+            assert!(autumn_web_line(&tmp).contains("markdown"));
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                !autumn_web_line(&tmp).contains("markdown"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn going_live_releases_csv() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(autumn_web_line(&tmp).contains("csv"));
+            let live = ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", POST, &live);
+            assert!(
+                !autumn_web_line(&tmp).contains("csv"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_feature_a_sibling_scaffold_uses() {
+            let tmp = project();
+            run(&tmp, "Note", POST, &importing());
+            run(&tmp, "Post", POST, &importing());
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("multipart"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_htmx_when_a_sibling_route_exists() {
+            let tmp = project();
+            run(&tmp, "Note", POST, &searchable());
+            run(&tmp, "Post", POST, &searchable());
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("htmx"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_feature_hand_written_code_uses() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &importing());
+            fs::write(
+                tmp.path().join("src/upload.rs"),
+                "pub async fn up(_m: autumn_web::extract::Multipart) {}\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("multipart"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn plan_edits_cargo_toml_but_leaves_the_disk_alone() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            let plan = plan_scaffold_with_options(
+                tmp.path(),
+                "Post",
+                &POST.iter().map(|f| (*f).to_owned()).collect::<Vec<_>>(),
+                "20260827000000",
+                &ScaffoldOptions::default(),
+            )
+            .unwrap();
+            let edit = plan.actions.iter().find_map(|a| match a {
+                Action::Modify { path, contents } if path.ends_with("Cargo.toml") => Some(contents),
+                _ => None,
+            });
+            assert!(!edit.expect("a Cargo.toml edit").contains("htmx"));
+            assert!(autumn_web_line(&tmp).contains("htmx"));
+        }
+
+        #[test]
+        fn keeps_storage_for_a_sibling_attachment_scaffold() {
+            let tmp = project();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Note", &with_file, &ScaffoldOptions::default());
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("storage"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_markdown_and_csv_for_hand_written_code() {
+            let tmp = project();
+            run(
+                &tmp,
+                "Post",
+                &["title:String", "body:richtext"],
+                &ScaffoldOptions::default(),
+            );
+            fs::write(
+                tmp.path().join("src/hand.rs"),
+                "use autumn_web::extract::Csv;\n\
+                 pub fn a(_c: Csv<Vec<u8>>) { let _ = autumn_web::markdown::render(\"x\"); }\n",
+            )
+            .unwrap();
+            let live = ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", POST, &live);
+            let kept = autumn_web_line(&tmp);
+            assert!(kept.contains("markdown") && kept.contains("csv"), "{kept}");
+        }
+
+        #[test]
+        fn keeps_multipart_when_only_the_import_is_dropped() {
+            let tmp = project();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Post", &with_file, &importing());
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("multipart"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_htmx_for_code_outside_the_routes_dir() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            fs::create_dir_all(tmp.path().join("src/channels")).unwrap();
+            fs::write(
+                tmp.path().join("src/channels/chat.rs"),
+                "pub const J: &str = autumn_web::htmx::HTMX_JS_PATH;\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("htmx"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn dropping_live_releases_ws() {
+            let tmp = project();
+            let live = ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", POST, &live);
+            assert!(autumn_web_line(&tmp).contains("ws"));
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                !autumn_web_line(&tmp).contains("\"ws\""),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn a_hand_made_model_is_not_a_scaffold_to_regenerate() {
+            let tmp = project();
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                CARGO.replace(
+                    "autumn-web = \"0.7.0\"",
+                    "autumn-web = { version = \"0.7.0\", features = [\"htmx\"] }",
+                ),
+            )
+            .unwrap();
+            fs::create_dir_all(tmp.path().join("src/models")).unwrap();
+            fs::write(tmp.path().join("src/models/post.rs"), "// by hand\n").unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("htmx"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_a_feature_an_example_uses() {
+            let tmp = project();
+            fs::create_dir_all(tmp.path().join("examples")).unwrap();
+            fs::write(
+                tmp.path().join("examples/demo.rs"),
+                "use autumn_web::storage::Blob;\nfn main() {}\n",
+            )
+            .unwrap();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("storage"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_htmx_for_a_sibling_route_that_names_no_marker() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            fs::write(
+                tmp.path().join("src/routes/hand.rs"),
+                "pub fn a() { let _ = autumn_web::htmx::OobSwap::default(); }\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("htmx"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_ws_for_code_that_uses_the_prelude_types() {
+            let tmp = project();
+            let live = ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", POST, &live);
+            fs::write(
+                tmp.path().join("src/support.rs"),
+                "use autumn_web::prelude::*;\npub fn a(_c: Channels) {}\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("\"ws\""),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_htmx_when_default_features_are_off() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                cargo.replace("features = [", "default-features = false, features = ["),
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("htmx"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn dropping_an_attachment_from_an_api_scaffold_releases_storage() {
+            let tmp = project();
+            let api = ScaffoldOptions {
+                api: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", &["title:String", "cover:attachment"], &api);
+            assert!(autumn_web_line(&tmp).contains("storage"));
+            run(&tmp, "Post", POST, &api);
+            let line = autumn_web_line(&tmp);
+            assert!(
+                !line.contains("storage") && !line.contains("multipart"),
+                "{line}"
+            );
+        }
+
+        #[test]
+        fn keeps_ws_for_a_resumable_sse_route() {
+            let tmp = project();
+            let live = ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", POST, &live);
+            fs::write(
+                tmp.path().join("src/support.rs"),
+                "pub use autumn_web::sse::stream_resumable;\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("\"ws\""),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn another_dependency_with_default_features_off_does_not_pin_htmx() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                format!("{cargo}serde = {{ version = \"1\", default-features = false }}\n"),
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                !autumn_web_line(&tmp).contains("htmx"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn a_feature_the_old_files_never_used_is_not_released() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                cargo.replace("features = [", "features = [\"multipart\", "),
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("multipart"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_htmx_for_a_multiline_autumn_web_entry_without_defaults() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = {\n    version = \"0.7.0\",\n    \
+                 default-features = false,\n    features = [\"maud\", \"csv\", \"htmx\"],\n}\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            assert!(cargo.contains("htmx"), "{cargo}");
+        }
+
+        #[test]
+        fn keeps_a_feature_a_pathed_cargo_target_uses() {
+            let tmp = project();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                format!("{cargo}\n[[bin]]\nname = \"srv\"\npath = \"cmd/server.rs\"\n"),
+            )
+            .unwrap();
+            fs::create_dir_all(tmp.path().join("cmd")).unwrap();
+            fs::write(
+                tmp.path().join("cmd/server.rs"),
+                "use autumn_web::storage::Blob;\nfn main() {}\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            assert!(cargo.contains("storage"), "{cargo}");
+        }
+
+        #[test]
+        fn keeps_storage_while_autumn_toml_configures_it() {
+            let tmp = project();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            fs::write(
+                tmp.path().join("autumn.toml"),
+                "[storage]\nbackend = \"local\"\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("storage"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_storage_while_dot_env_configures_it() {
+            let tmp = project();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            fs::write(tmp.path().join(".env"), "AUTUMN_STORAGE__BACKEND=local\n").unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("storage"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_ws_for_a_channels_module_use() {
+            let tmp = project();
+            let live = ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", POST, &live);
+            fs::write(
+                tmp.path().join("src/support.rs"),
+                "use autumn_web::channels::Sender;\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("\"ws\""),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_storage_while_a_profile_overlay_configures_it() {
+            let tmp = project();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            fs::write(
+                tmp.path().join("autumn-prod.toml"),
+                "[storage]\nbackend = \"s3\"\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("storage"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_htmx_for_a_workspace_inherited_autumn_web() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                "[package]\nname = \"x\"\n\n[dependencies]\n\
+                 autumn-web = { workspace = true, features = [\"maud\", \"csv\", \"htmx\"] }\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            assert!(cargo.contains("htmx"), "{cargo}");
+        }
+
+        #[test]
+        fn keeps_csv_for_the_root_reexport() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            fs::write(
+                tmp.path().join("src/support.rs"),
+                "pub fn a(r: Vec<u8>) { let _ = autumn_web::Csv(r); }\n",
+            )
+            .unwrap();
+            let live = ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", POST, &live);
+            assert!(
+                autumn_web_line(&tmp).contains("csv"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn a_first_run_keeps_a_hand_added_feature() {
+            let tmp = project();
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                CARGO.replace(
+                    "autumn-web = \"0.7.0\"",
+                    "autumn-web = { version = \"0.7.0\", features = [\"multipart\"] }",
+                ),
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("multipart"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
     }
 }
