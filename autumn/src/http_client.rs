@@ -6523,8 +6523,9 @@ mod tests {
         let resp = Client::new()
             .get(format!("http://pinned.invalid:{port}/ping"))
             .pin_to_addrs([
-                // Nothing listens on this loopback alias.
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), port),
+                // The listener is IPv4 only, so this address refuses at once.
+                // `127.0.0.2` is not portable: macOS does not route it.
+                SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port),
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
             ])
             .send()
