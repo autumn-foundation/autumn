@@ -13769,7 +13769,7 @@ mod trusted_host_tests {
         let router = apply_request_timeout_middleware(
             router,
             &config,
-            state.metrics.clone(),
+            &state,
             no_route_timeouts(),
             false,
         )
