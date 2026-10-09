@@ -1047,6 +1047,16 @@ pub struct WriteFailure {
     pub written: usize,
 }
 
+/// The release a manifest names, when it is newer than this CLI.
+fn newer_release_recorded(manifest: Option<&Manifest>) -> Option<String> {
+    manifest
+        .and_then(|manifest| match (&manifest.written_by, &manifest.version) {
+            (Some(written_by), Some(version)) => Some(newest(Some(version), written_by)),
+            (recorded, None) | (None, recorded) => recorded.clone(),
+        })
+        .filter(|recorded| is_newer_than_this_cli(recorded))
+}
+
 /// Plan a reconciliation of the project at `root`.
 ///
 /// `_target` is accepted and ignored for the scaffold half, deliberately. This
@@ -1082,13 +1092,7 @@ pub fn plan_after(root: &Path, _target: &str, migrated: &BTreeSet<String>) -> Sc
     // the newer of the two costs nothing, covers a manifest written before the
     // mark existed, and refuses an incoherent manifest whose `version` somehow
     // exceeds it rather than reasoning about which field to believe.
-    let scaffolded_by_newer = manifest
-        .as_ref()
-        .and_then(|manifest| match (&manifest.written_by, &manifest.version) {
-            (Some(written_by), Some(version)) => Some(newest(Some(version), written_by)),
-            (recorded, None) | (None, recorded) => recorded.clone(),
-        })
-        .filter(|recorded| is_newer_than_this_cli(recorded));
+    let scaffolded_by_newer = newer_release_recorded(manifest.as_ref());
     let files = scaffolded_by_newer
         .is_none()
         .then(|| current_files(root, options))
@@ -1321,6 +1325,11 @@ fn record_baseline(report: &ScaffoldReport) -> Result<(), String> {
         return Ok(());
     }
     Manifest::update(&report.root, |previous| {
+        // The plan is older than this manifest. Recording from it would move
+        // a newer release's baseline backwards.
+        if let Some(newer) = newer_release_recorded(previous.as_ref()) {
+            return Err(format!("a newer release ({newer}) updated this project"));
+        }
         Ok(report.next_manifest(previous.as_ref()))
     })
     .map(drop)
@@ -1577,11 +1586,20 @@ fn swap(
         }
         Err(error) => {
             // Restore the old file. If the path is taken, the new file stays
-            // and the old copy is kept beside it.
-            if let Err(restore) = claim.persist_noclobber(absolute) {
-                let _ = restore.path.keep();
-            }
-            Err(error.error.into())
+            // and the old copy is kept beside it, and the error says where.
+            let staging = error.error.to_string();
+            Err(match claim.persist_noclobber(absolute) {
+                Ok(()) => PublishError::Failed(staging),
+                Err(restore) => match restore.path.keep() {
+                    Ok(path) => PublishError::Late(format!(
+                        "{staging}; the earlier copy is at {}",
+                        path.display()
+                    )),
+                    Err(kept) => PublishError::Failed(format!(
+                        "{staging}; the earlier copy could not be kept: {kept}"
+                    )),
+                },
+            })
         }
     }
 }
@@ -3173,6 +3191,31 @@ mod tests {
 
         let report = plan_in(tmp.path());
         assert_eq!(*status_of(&report.entries, "rustfmt.toml"), Status::Add);
+    }
+
+    #[test]
+    fn an_apply_planned_before_a_newer_release_wrote_refuses_to_record() {
+        // The plan was made against older digests. A newer release then
+        // rewrote the manifest. Recording now would move it backwards.
+        let tmp = scaffolded(GenerateOptions::default());
+        let stale = "# older\n";
+        write(tmp.path(), "clippy.toml", stale);
+        let mut manifest = Manifest::load(tmp.path()).unwrap();
+        manifest
+            .digests
+            .insert("clippy.toml".to_owned(), digest(stale));
+        manifest.save(tmp.path()).unwrap();
+        let mut report = plan_in(tmp.path());
+
+        let mut newer = Manifest::load(tmp.path()).unwrap();
+        newer.version = Some("99.0.0".to_owned());
+        newer.written_by = Some("99.0.0".to_owned());
+        newer.save(tmp.path()).unwrap();
+
+        let failure = apply(&mut report).expect_err("must not record over a newer manifest");
+        assert_eq!(failure.path, MANIFEST_PATH);
+        let kept = Manifest::load(tmp.path()).unwrap();
+        assert_eq!(kept.written_by.as_deref(), Some("99.0.0"));
     }
 
     #[test]
