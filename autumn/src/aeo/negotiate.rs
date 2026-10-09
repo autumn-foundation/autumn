@@ -180,11 +180,14 @@ where
 }
 
 /// `true` when `Accept` names `text/markdown` with a weight at least as
-/// high as the best range that covers HTML (`text/html`, `text/*`, `*/*`).
+/// high as the HTML weight. The HTML weight comes from the most specific
+/// range that covers HTML (`text/html`, then `text/*`, then `*/*`).
 #[must_use]
 pub fn prefers_markdown(headers: &HeaderMap) -> bool {
     let mut markdown = 0.0_f32;
-    let mut html = 0.0_f32;
+    // (specificity, q) of the most specific range that covers HTML. RFC 9110
+    // §12.5.1: `text/html` overrides `text/*`, which overrides `*/*`.
+    let mut html = (0_u8, 0.0_f32);
     for value in headers.get_all(axum::http::header::ACCEPT) {
         let Ok(value) = value.to_str() else { continue };
         for range in value.split(',') {
@@ -193,15 +196,24 @@ pub fn prefers_markdown(headers: &HeaderMap) -> bool {
             let q = accept_weight(parts);
             if media.eq_ignore_ascii_case("text/markdown") {
                 markdown = markdown.max(q);
-            } else if ["text/html", "text/*", "*/*"]
-                .iter()
-                .any(|m| media.eq_ignore_ascii_case(m))
-            {
-                html = html.max(q);
+                continue;
+            }
+            let specificity = if media.eq_ignore_ascii_case("text/html") {
+                3
+            } else if media.eq_ignore_ascii_case("text/*") {
+                2
+            } else if media == "*/*" {
+                1
+            } else {
+                continue;
+            };
+            if specificity > html.0 || (specificity == html.0 && q > html.1) {
+                html = (specificity, q);
             }
         }
     }
-    markdown > 0.0 && markdown >= html
+    // Markdown must be named: `*/*` alone still gets HTML.
+    markdown > 0.0 && markdown >= html.1
 }
 
 /// The `q` weight of one media range (RFC 9110 §12.4.2). A missing `q` is
@@ -314,6 +326,11 @@ fn markdown_headers(headers: &mut HeaderMap, config: &NegotiateConfig, tokens: O
     );
     headers.remove(CONTENT_LENGTH);
     headers.remove(LAST_MODIFIED);
+    // These describe the HTML bytes, not the Markdown.
+    for name in ["content-digest", "repr-digest", "digest", "content-md5"] {
+        headers.remove(name);
+    }
+    headers.remove(axum::http::header::ACCEPT_RANGES);
     if let Some(etag) = headers.get(ETAG).and_then(|v| v.to_str().ok()) {
         let opaque = etag.trim_start_matches("W/").trim_matches('"');
         match HeaderValue::from_str(&format!("W/\"{opaque}-md\"")) {
@@ -404,6 +421,54 @@ mod tests {
         )));
         assert!(!prefers_markdown(&accept("text/markdown;q=abc")));
         assert!(!prefers_markdown(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn the_most_specific_range_sets_the_html_weight() {
+        // RFC 9110 §12.5.1: `text/html;q=0` overrides `*/*`.
+        assert!(prefers_markdown(&accept(
+            "text/html;q=0, text/markdown;q=0.5, */*;q=1"
+        )));
+        assert!(prefers_markdown(&accept(
+            "text/*;q=0.2, text/markdown;q=0.5, */*"
+        )));
+        assert!(!prefers_markdown(&accept(
+            "text/html;q=0.9, text/markdown;q=0.5, */*;q=0.1"
+        )));
+    }
+
+    #[test]
+    fn conversion_drops_metadata_about_the_html_bytes() {
+        let mut h = HeaderMap::new();
+        for name in [
+            "content-digest",
+            "repr-digest",
+            "digest",
+            "content-md5",
+            "accept-ranges",
+        ] {
+            h.insert(
+                axum::http::HeaderName::from_static(name),
+                HeaderValue::from_static("x"),
+            );
+        }
+        let config = NegotiateConfig {
+            markdown: true,
+            max_bytes: 1024,
+            home_link: None,
+            content_signal: None,
+            resource_metadata: None,
+        };
+        markdown_headers(&mut h, &config, Some(1));
+        for name in [
+            "content-digest",
+            "repr-digest",
+            "digest",
+            "content-md5",
+            "accept-ranges",
+        ] {
+            assert!(h.get(name).is_none(), "{name}");
+        }
     }
 
     #[tokio::test]
