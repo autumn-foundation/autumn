@@ -1115,6 +1115,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Pull Docker Hub images through a mirror
+        # The runner's unauthenticated Docker Hub pull limit is often spent.
+        run: ./scripts/ci-docker-hub-mirror.sh
+
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
