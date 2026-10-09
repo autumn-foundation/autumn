@@ -482,9 +482,22 @@ impl From<serde_json::Error> for WireError {
 ///
 /// Returns [`WireError::Json`] if the frame cannot be serialized.
 pub(crate) fn to_line<T: Serialize>(frame: &T) -> Result<String, WireError> {
-    // Measure first, then write into a buffer of exactly that size. A growing
-    // buffer keeps up to twice its length, and the line lives for the whole
-    // request, so that spare room would be unbudgeted memory.
+    let mut line = serde_json::to_string(frame)?;
+    line.push('\n');
+    Ok(line)
+}
+
+/// Like [`to_line`], but the buffer has no spare capacity.
+///
+/// Used for the request frame only. It is the one large line, and it stays
+/// resident for the whole request, so doubling slack would be memory the
+/// footprint does not count. It serialises twice (count, then write), and
+/// `encoding_fuel` charges for both passes.
+///
+/// # Errors
+///
+/// Returns [`WireError::Json`] if the frame cannot be serialized.
+pub(crate) fn to_exact_line<T: Serialize>(frame: &T) -> Result<String, WireError> {
     struct Count(usize);
     impl std::io::Write for Count {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -1847,7 +1860,7 @@ mod tests {
         // not count.
         let mut big = request();
         big.body = vec![0x5A; (1 << 20) + 17];
-        let line = to_line(&HostFrame::request(&big, &[])).expect("serializes");
+        let line = to_exact_line(&HostFrame::request(&big, &[])).expect("serializes");
         assert_eq!(line.capacity(), line.len());
     }
 

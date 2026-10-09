@@ -69,7 +69,9 @@ use wasmi::{Caller, Config, Engine, Linker, Module, Store};
 
 use super::artifact::SandboxArtifact;
 use super::manifest::{ResourceLimits, SandboxManifest};
-use super::wire::{GuestFrame, HostFrame, SandboxRequest, SandboxResponse, from_line, to_line};
+use super::wire::{
+    GuestFrame, HostFrame, SandboxRequest, SandboxResponse, from_line, to_exact_line, to_line,
+};
 
 /// The WASI module name every import in the shim lives under.
 const WASI: &str = "wasi_snapshot_preview1";
@@ -1681,7 +1683,14 @@ impl SandboxHost {
         // reuses the allocation, and the `String` is gone afterwards. For a
         // plugin with a large body ceiling that is a whole base64-expanded copy
         // of the request that no longer exists at the same time as the others.
-        let line = match to_line(&frame()) {
+        let frame = frame();
+        // Only the request frame is large, and only its encoding is priced for
+        // the second pass above. Render frames keep the single pass.
+        let line = match if matches!(frame, HostFrame::Request { .. }) {
+            to_exact_line(&frame)
+        } else {
+            to_line(&frame)
+        } {
             Ok(line) => line,
             Err(err) => {
                 // The host could not encode its own frame. Reported as a
