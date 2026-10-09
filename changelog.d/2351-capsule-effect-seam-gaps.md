@@ -5,8 +5,11 @@
   through the framework HTTP client. A replay refuses the call, and capture
   marks the capsule incomplete. CAPTCHA, `OAuth2`, SES inbound mail,
   `autumn-storage-s3` and the media plugin call it. `spawn` replaces
-  `tokio::spawn` for detached work. Capture marks the capsule incomplete, and a
-  replay gives the task the tape.
+  `tokio::spawn` for detached work. Capture marks the capsule incomplete. A
+  replay logs a divergence and gives the task the tape.
+- **capsule:** `autumn replay` keeps startup code off live services. Cache
+  backends stay offline, a mail send with no tape is refused, and a task that
+  startup code spawns gets a tape that refuses every call.
 - **capsule:** `autumn replay` installs a mailer. A mail-sending route reaches
   the mail seam and replays from the capsule. Nothing is delivered.
 - **capsule:** a capsule records whether the app builder installed a cache
@@ -56,8 +59,8 @@
 ### Breaking Changes
 
 - **Breaking:** `capsule::CacheEffect` has new variants `Invalidate`,
-  `InvalidateNamespace` and `Clear`; `capsule::EffectSeam` has a new variant
-  `Random`; `capsule::schema::MailErrorKind` has a new variant
+  `InvalidateNamespace` and `Clear`; `capsule::EffectSeam` has new variants
+  `Random` and `Detached`; `capsule::schema::MailErrorKind` has a new variant
   `NoDurableQueueInProduction`; `capsule::JobEffect` has a new public field
   `requested_due_at`; `capsule::CapsuleEffects` has a new public field
   `builder_cache`

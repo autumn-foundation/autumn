@@ -976,7 +976,7 @@ let job = JobEffect {
 ```
 
 The new variants are `CacheEffect::Invalidate`, `CacheEffect::InvalidateNamespace`,
-`CacheEffect::Clear`, `EffectSeam::Random` and
+`CacheEffect::Clear`, `EffectSeam::Random`, `EffectSeam::Detached` and
 `MailErrorKind::NoDurableQueueInProduction`. An exhaustive `match` on
 `EffectSeam` or `MailErrorKind` needs a new arm.
 

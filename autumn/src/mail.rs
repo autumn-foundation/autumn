@@ -654,7 +654,17 @@ pub struct Mail {
 fn replayed_send(mail: &Mail) -> Option<Result<(), MailError>> {
     use crate::capsule::effects::MailVerdict;
 
-    let tape = crate::capsule::effects::current_tape()?;
+    let Some(tape) = crate::capsule::effects::current_tape() else {
+        // Startup code (a state initializer) runs with no tape. In a
+        // replaying process it must not reach a live transport.
+        return crate::capsule::boundary::replaying().then(|| {
+            Err(MailError::RuntimeUnavailable(format!(
+                "mail to {} recipient(s) was sent during a capsule replay outside the replayed \
+                 request; nothing was delivered",
+                mail.to.len()
+            )))
+        });
+    };
     // Derived by `capsule_body`, the same rule the recorder applies, so the
     // comparison is like with like.
     let body = capsule_body(mail);
@@ -6688,6 +6698,29 @@ mod tests {
         );
         assert!(replay.inline_css_default);
         assert!(replay.is_disabled());
+    }
+
+    /// Codex review on #3222: in a replaying process, a send with no tape
+    /// (startup code) does not reach the transport.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_send_with_no_tape_in_a_replaying_process_is_refused() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mailer = Mailer::with_transport(CapturingTransport {
+            sent: Arc::clone(&sent),
+        });
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Startup")
+            .text("hello")
+            .build()
+            .unwrap();
+        crate::capsule::boundary::TEST_REPLAYING.with(|replaying| replaying.set(true));
+        let result = mailer.send(mail).await;
+        crate::capsule::boundary::TEST_REPLAYING.with(|replaying| replaying.set(false));
+        assert!(result.is_err(), "{result:?}");
+        assert!(sent.lock().unwrap().is_empty());
     }
 
     /// Codex review on #3222: a queue the builder gave the production

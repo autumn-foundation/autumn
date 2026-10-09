@@ -70,6 +70,8 @@ pub enum EffectSeam {
     Tenant,
     /// A draw from the framework's entropy source.
     Random,
+    /// Work started on a detached task (`capsule::spawn`).
+    Detached,
 }
 
 impl EffectSeam {
@@ -83,6 +85,7 @@ impl EffectSeam {
             Self::Mail => "mail",
             Self::Tenant => "tenancy",
             Self::Random => "randomness",
+            Self::Detached => "detached task",
         }
     }
 }
@@ -894,16 +897,38 @@ impl ReplayEffects {
         if self.legacy_v3 {
             return;
         }
+        // No recorded key teaches the verdict what to mask, and a key can
+        // hold a secret, so it is not printed.
+        let _ = key;
         self.diverge(EffectDivergence {
             seam: EffectSeam::Cache,
             kind: EffectDivergenceKind::Unrecorded,
             index: 0,
             expected: None,
-            actual: key.to_owned(),
-            detail: format!(
-                "the replayed run wrote an untyped value to cache key {key:?}; a capsule cannot \
-                 record one, so the write was not applied"
-            ),
+            actual: "an untyped cache write (key withheld)".to_owned(),
+            detail: "the replayed run wrote an untyped cache value; a capsule cannot record \
+                     one, so the write was not applied"
+                .to_owned(),
+        });
+    }
+
+    /// Log work the replayed run started on a detached task. Capture marks
+    /// a capsule with detached work incomplete, so the recording had none.
+    /// It is logged at the spawn, so the verdict sees it even when the task
+    /// runs after the response.
+    pub(crate) fn detached_work_started(&self) {
+        if self.legacy_v3 {
+            return;
+        }
+        self.diverge(EffectDivergence {
+            seam: EffectSeam::Detached,
+            kind: EffectDivergenceKind::Unrecorded,
+            index: 0,
+            expected: None,
+            actual: "a detached task".to_owned(),
+            detail: "the replayed run started work on a detached task; the recorded run \
+                     started none"
+                .to_owned(),
         });
     }
 

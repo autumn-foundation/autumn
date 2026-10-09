@@ -1401,7 +1401,7 @@ impl Drop for InvalidateAfterWrite {
             #[cfg(feature = "reporting")]
             let invalidation = {
                 crate::capsule::boundary::note_detached_work();
-                crate::capsule::boundary::carry_tape((self.make)())
+                crate::capsule::boundary::carry_detached((self.make)())
             };
             #[cfg(not(feature = "reporting"))]
             let invalidation = (self.make)();

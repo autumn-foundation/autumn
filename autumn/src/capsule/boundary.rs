@@ -41,6 +41,24 @@ pub(crate) fn block_egress_for_replay() {
     EGRESS_BLOCKED.store(true, Ordering::SeqCst);
 }
 
+/// Whether this process replays a capsule. Startup code (a state
+/// initializer) and detached tasks run with no tape, so a seam checks this
+/// too.
+pub(crate) fn replaying() -> bool {
+    #[cfg(test)]
+    if TEST_REPLAYING.with(std::cell::Cell::get) {
+        return true;
+    }
+    EGRESS_BLOCKED.load(Ordering::SeqCst)
+}
+
+// The process-wide marker cannot be set in a unit test: it would affect
+// every other test. This thread's marker stands in for it.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_REPLAYING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Egress that a replay refused because the capsule cannot answer it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
@@ -146,8 +164,11 @@ fn printable_target(url: &str) -> String {
 ///
 /// * During capture, the capsule is noted and marked incomplete: the task's
 ///   effects are not on the tape.
-/// * During a replay, the task gets the replay tape, so its effects are
-///   served from the capsule or refused, and never reach live services.
+/// * During a replay, the spawn is a divergence: the recording had no
+///   detached work. The task gets the replay tape, so its effects are served
+///   from the capsule or refused, and never reach live services.
+/// * In a replaying process with no tape (startup code), the task gets an
+///   empty tape, so every seam in it refuses.
 ///
 /// # Panics
 ///
@@ -158,18 +179,43 @@ where
     F::Output: Send + 'static,
 {
     note_detached_work();
-    tokio::spawn(carry_tape(future))
+    tokio::spawn(carry_detached(future))
+}
+
+/// A tape with no recorded effects: every seam call on it is refused.
+fn refusing_tape() -> std::sync::Arc<crate::capsule::effects::ReplayEffects> {
+    std::sync::Arc::new(crate::capsule::effects::ReplayEffects::new(
+        crate::capsule::schema::CapsuleEffects::default(),
+    ))
 }
 
 /// Why a capsule with detached work is not replayable.
 pub(crate) const DETACHED_WORK_NOTE: &str = "the run started work on a detached task; the \
      task's effects are not on the tape";
 
-/// Mark the in-flight capsule incomplete: work it cannot see was started.
+/// Note that the run started detached work. During capture the capsule is
+/// marked incomplete. During a replay it is a divergence, logged now so the
+/// verdict sees it even when the task runs after the response.
 pub(crate) fn note_detached_work() {
     if let Some(scope) = crate::capsule::current_scope() {
         scope.note(DETACHED_WORK_NOTE);
         scope.mark_truncated();
+    }
+    if let Some(tape) = crate::capsule::effects::current_tape() {
+        tape.detached_work_started();
+    }
+}
+
+/// Give a detached task this task's replay tape. In a replaying process
+/// with no tape (startup code), give it an empty tape, so every seam in it
+/// refuses and nothing reaches a live service.
+pub(crate) fn carry_detached<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    let tape = crate::capsule::effects::current_tape().or_else(|| replaying().then(refusing_tape));
+    async move {
+        match tape {
+            Some(tape) => crate::capsule::effects::with_effect_tape(tape, future).await,
+            None => future.await,
+        }
     }
 }
 
@@ -355,5 +401,37 @@ mod tests {
         })
         .await;
         assert!(carried, "the spawned task must see the replay tape");
+        // The recording had no detached work, so the spawn is a divergence,
+        // logged at the spawn (Codex review on #3222).
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert_eq!(divergences[0].seam, EffectSeam::Detached);
+        assert_eq!(divergences[0].kind, EffectDivergenceKind::Unrecorded);
+    }
+
+    /// Codex review on #3222: in a replaying process, a task spawned with no
+    /// tape (startup code) gets an empty tape, so its seams refuse.
+    #[tokio::test]
+    async fn a_spawn_with_no_tape_in_a_replaying_process_gets_a_refusing_tape() {
+        TEST_REPLAYING.with(|replaying| replaying.set(true));
+        let handle = spawn(async { current_tape().is_some() });
+        TEST_REPLAYING.with(|replaying| replaying.set(false));
+        assert!(handle.await.expect("task runs"));
+        let handle = spawn(async { current_tape().is_some() });
+        assert!(
+            !handle.await.expect("task runs"),
+            "outside a replay, no tape"
+        );
+    }
+
+    /// Codex review on #3222: an unrecorded untyped write prints no key.
+    #[test]
+    fn an_unrecorded_untyped_write_prints_no_key() {
+        let tape = ReplayEffects::new(CapsuleEffects::default());
+        tape.cache_untyped_insert("token:sk-live-42");
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert!(!divergences[0].actual.contains("sk-live-42"));
+        assert!(!divergences[0].detail.contains("sk-live-42"));
     }
 }

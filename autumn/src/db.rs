@@ -825,7 +825,7 @@ pub(crate) fn spawn_committed_after_commit_callbacks(
     // effects are served or refused and never reach live services (#2351
     // item 3).
     #[cfg(feature = "reporting")]
-    let callbacks_run = crate::capsule::boundary::carry_tape(callbacks_run);
+    let callbacks_run = crate::capsule::boundary::carry_detached(callbacks_run);
     Some(tokio::task::spawn(
         TX_TIMEOUTS.scope(timeouts, callbacks_run),
     ))
