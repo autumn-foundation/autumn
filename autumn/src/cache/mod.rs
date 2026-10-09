@@ -523,6 +523,11 @@ where
 {
     use crate::capsule::effects::CachedValue;
     let Some(tape) = crate::capsule::effects::current_tape() else {
+        // Replay startup code has no tape. A raw backend it holds must not
+        // be read, so the read is a miss.
+        if replay_blocked() {
+            return ReplayedRead::Miss;
+        }
         return ReplayedRead::NoTape;
     };
     match tape.cache_get(key) {
@@ -611,6 +616,11 @@ fn record_or_replay_cache_insert(
         }
         return true;
     }
+    // Replay startup code has no tape. A raw backend it holds must not be
+    // written.
+    if replay_blocked() {
+        return true;
+    }
     if let Some(scope) = crate::capsule::current_scope() {
         if let Some(bytes) = bytes {
             use base64::Engine as _;
@@ -646,7 +656,8 @@ const fn record_or_replay_cache_insert(
 #[cfg(feature = "reporting")]
 fn replayed_untyped_get(key: &str) -> bool {
     let Some(tape) = crate::capsule::effects::current_tape() else {
-        return false;
+        // Replay startup code: a raw backend is not read.
+        return replay_blocked();
     };
     tape.cache_untyped_get(key);
     true
@@ -685,6 +696,10 @@ const fn record_untyped_get(_key: &str, _hit: bool) {}
 fn record_or_replay_untyped_insert(key: &str) -> bool {
     if let Some(tape) = crate::capsule::effects::current_tape() {
         tape.cache_untyped_insert(key);
+        return true;
+    }
+    // Replay startup code: a raw backend is not written.
+    if replay_blocked() {
         return true;
     }
     if let Some(scope) = crate::capsule::current_scope() {
@@ -1483,6 +1498,21 @@ mod tests {
                 FillLockStatus::Unsupported
             );
         });
+        TEST_REPLAY_BLOCKED.with(|blocked| blocked.set(false));
+        assert!(spy.calls().is_empty(), "{:?}", spy.calls());
+    }
+
+    /// Codex review on #3222: during `autumn replay`, the cache helpers do
+    /// not reach a raw backend that startup code holds, with no tape.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn the_replay_block_keeps_a_raw_backend_offline_in_the_helpers() {
+        let spy = SpyBackend::default();
+        TEST_REPLAY_BLOCKED.with(|blocked| blocked.set(true));
+        assert_eq!(get::<u32>(&spy, "k"), None);
+        insert(&spy, "k", 1_u32);
+        assert_eq!(get_cached::<u32>(&spy, "k"), None);
+        insert_cached(&spy, "k", 1_u32, None);
         TEST_REPLAY_BLOCKED.with(|blocked| blocked.set(false));
         assert!(spy.calls().is_empty(), "{:?}", spy.calls());
     }

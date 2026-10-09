@@ -424,6 +424,17 @@ mod tests {
         );
     }
 
+    /// Codex review on #3222: an unrecorded untyped read prints no key.
+    #[test]
+    fn an_unrecorded_untyped_read_prints_no_key() {
+        let tape = ReplayEffects::new(CapsuleEffects::default());
+        tape.cache_untyped_get("token:sk-live-42");
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert!(!divergences[0].actual.contains("sk-live-42"));
+        assert!(!divergences[0].detail.contains("sk-live-42"));
+    }
+
     /// Codex review on #3222: an unrecorded untyped write prints no key.
     #[test]
     fn an_unrecorded_untyped_write_prints_no_key() {

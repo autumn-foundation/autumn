@@ -792,6 +792,11 @@ pub(crate) fn spawn_committed_after_commit_callbacks(
     if callbacks.is_empty() {
         return None;
     }
+    // The callbacks run on a detached task, where capture cannot see their
+    // effects (#2351 item 3). Noted at the commit, not at the registration:
+    // a rolled-back transaction drops its callbacks, and nothing escapes.
+    #[cfg(feature = "reporting")]
+    crate::capsule::boundary::note_detached_work();
 
     let timeouts = TxTimeouts::current().unwrap_or_default();
     let callbacks_run = async move {
@@ -890,13 +895,6 @@ where
             registry.lock().expect("registry lock").push(boxed);
         })
         .ok();
-    // A registered callback runs on a detached task, where capture cannot
-    // see its effects (#2351 item 3).
-    #[cfg(feature = "reporting")]
-    if f_opt.is_none() {
-        crate::capsule::boundary::note_detached_work();
-    }
-
     // If still Some, the task-local wasn't set — we're outside a tx; run eagerly.
     if let Some(f) = f_opt {
         tracing::debug!("register_after_commit: no active transaction; running callback eagerly");
@@ -4559,7 +4557,17 @@ mod tests {
             }),
         )
         .await;
-        assert!(scope.is_truncated());
+        // Codex review on #3222: a registration alone is not detached work.
+        // A rolled-back transaction drops its callbacks.
+        assert!(!scope.is_truncated());
+        let callbacks = std::mem::take(&mut *registry.lock().expect("registry"));
+        let drain =
+            crate::capsule::capture::with_capture_scope(std::sync::Arc::clone(&scope), async {
+                super::spawn_committed_after_commit_callbacks(callbacks)
+            })
+            .await;
+        drain.expect("a callback was spawned").await.expect("runs");
+        assert!(scope.is_truncated(), "the commit spawns detached work");
     }
 
     /// #2351 item 3: during a replay, the callbacks get the replay tape, so

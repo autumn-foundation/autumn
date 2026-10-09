@@ -758,16 +758,17 @@ impl ReplayEffects {
             .and_then(|recorded| cache.get_mut(recorded))
         else {
             drop(cache);
+            // No recorded key teaches the verdict what to mask, and a key can
+            // hold a secret, so it is not printed.
             self.diverge(EffectDivergence {
                 seam: EffectSeam::Cache,
                 kind: EffectDivergenceKind::Unrecorded,
                 index: 0,
                 expected: None,
-                actual: key.to_owned(),
-                detail: format!(
-                    "the replayed run read cache key {key:?}, which the capsule has no \
-                     recording for; it was served as a miss"
-                ),
+                actual: "a cache read (key withheld)".to_owned(),
+                detail: "the replayed run read a cache key the capsule has no recording for; \
+                         it was served as a miss"
+                    .to_owned(),
             });
             return CachedValue::Unrecorded;
         };
