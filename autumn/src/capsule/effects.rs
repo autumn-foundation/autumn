@@ -1201,9 +1201,18 @@ impl ReplayEffects {
         if spans.is_empty() {
             return;
         }
+        // A URL-encoded placeholder stood for an encoded value. Capture kept
+        // its decoded spelling too, so keep it here.
+        let encoded = !recorded.contains(FILTERED) && recorded.contains(FILTERED_URLENCODED);
         if let Ok(mut observed) = self.observed.lock() {
             for span in spans {
                 observed.insert(span.as_bytes());
+                if encoded {
+                    let decoded = form_decoded(span);
+                    if !decoded.is_empty() && decoded != span {
+                        observed.insert(decoded.as_bytes());
+                    }
+                }
             }
         }
     }
@@ -1533,6 +1542,14 @@ const FILTERED_URLENCODED: &str = "%5BFILTERED%5D";
 /// be asserted about them.
 fn matches_redacted(recorded: &str, actual: &str) -> bool {
     redacted_spans(recorded, actual).is_some()
+}
+
+/// A form-encoded value, decoded as capture decodes a query or form value.
+fn form_decoded(value: &str) -> String {
+    url::form_urlencoded::parse(format!("={value}").as_bytes())
+        .next()
+        .map(|(_, decoded)| decoded.into_owned())
+        .unwrap_or_default()
 }
 
 /// [`matches_redacted`], and on a match the text each placeholder stood for.
@@ -2323,6 +2340,33 @@ mod tests {
             &tape.observed_redactions(),
         );
         assert!(!masked.contains("sk-live-42"), "{masked}");
+    }
+
+    /// Codex review on #3222: a URL-encoded masked value is observed in its
+    /// decoded spelling too, as capture kept both.
+    #[test]
+    fn a_url_encoded_masked_value_is_observed_decoded() {
+        let tape = ReplayEffects::new(CapsuleEffects {
+            http: vec![http(
+                "GET",
+                "https://api.example/x?token=%5BFILTERED%5D",
+                502,
+            )],
+            ..CapsuleEffects::default()
+        });
+        let body = CapsuleBody::Absent;
+        let served = tape.next_http(&OutboundRequest {
+            method: "GET",
+            url: "https://api.example/x?token=sk%2Flive+42",
+            headers: &[],
+            body: &body,
+        });
+        assert!(served.is_some());
+        let masked = crate::capsule::redact::mask_echoes(
+            "upstream rejected sk/live 42",
+            &tape.observed_redactions(),
+        );
+        assert!(!masked.contains("sk/live"), "{masked}");
     }
 
     /// #2351 item 13: an active tape with no tenant entry fails closed.
