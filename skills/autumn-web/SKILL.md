@@ -1760,6 +1760,10 @@ encryption (RFC 8291) are the framework's.
   &PushMessage::new(title, body).url(target))`.
 - **`WebPush` is an extractor** (like `Session`/`Db`/`Notifications`):
   `send`, `send_many`, `subscribe`, `unsubscribe`, `vapid_public_key`.
+  `send_many` serves up to four principals at once and finishes every one
+  before it returns an error. For a pinned outbound request to a host with
+  several checked addresses, use `RequestBuilder::pin_to_addrs`. Do not loop
+  over `pin_to`: a loop can send a `POST` body twice.
 - **`PushPrincipal` accepts both id shapes** — `i64` (as the notification feed
   uses) and `&str`/`String` (as auth tokens carry) — so composing with #1148
   needs no conversion.
