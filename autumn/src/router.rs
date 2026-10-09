@@ -2749,7 +2749,7 @@ fn is_valid_locale_segment(locale: &str) -> bool {
 /// that was silently skipped and has no nest, trading a config typo's
 /// build-time no-op for a runtime 404 (Codex review).
 #[cfg(feature = "i18n")]
-pub(crate) fn validated_locale_prefix_locales(i18n: &crate::i18n::I18nConfig) -> Vec<String> {
+pub fn validated_locale_prefix_locales(i18n: &crate::i18n::I18nConfig) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     i18n.supported_locales
         .iter()

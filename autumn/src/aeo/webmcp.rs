@@ -251,7 +251,7 @@ mod tests {
     fn script_is_a_no_op_without_public_tools() {
         for f in [facts(false), SiteFacts::default()] {
             let js = script(&f, "x-csrf-token");
-            assert!(js.contains("const tools = [];"), "{js}");
+            assert!(js.contains("const tools = [].filter("), "{js}");
         }
     }
 
