@@ -4526,6 +4526,54 @@ mod tests {
         );
     }
 
+    /// #2351 item 3: a callback the application registers runs on a detached
+    /// task. Capture cannot see its effects, so the capsule says so.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_registered_after_commit_callback_marks_the_capsule_incomplete() {
+        let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+            std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let registry: std::sync::Arc<std::sync::Mutex<Vec<super::CommitCallback>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::capsule::capture::with_capture_scope(
+            std::sync::Arc::clone(&scope),
+            super::AFTER_COMMIT_REGISTRY.scope(std::sync::Arc::clone(&registry), async {
+                super::register_after_commit(|| async { Ok(()) }).await;
+            }),
+        )
+        .await;
+        assert!(scope.is_truncated());
+    }
+
+    /// #2351 item 3: during a replay, the callbacks get the replay tape, so
+    /// their effects are served or refused and never reach live services.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn after_commit_callbacks_keep_the_replay_tape() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let seen_in_callback = std::sync::Arc::clone(&seen);
+        let callback: super::CommitCallback = Box::new(move || {
+            Box::pin(async move {
+                *seen_in_callback.lock().expect("lock") =
+                    crate::capsule::effects::current_tape().is_some();
+                Ok(())
+            })
+        });
+        let tape = std::sync::Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects::default(),
+        ));
+        let drain = crate::capsule::with_effect_tape(tape, async move {
+            super::spawn_committed_after_commit_callbacks(vec![callback])
+        })
+        .await
+        .expect("a callback was registered");
+        drain.await.expect("callback task");
+        assert!(*seen.lock().expect("lock"));
+    }
+
     #[test]
     fn replication_adds_the_auto_checkpoint_lock_to_the_pooled_pragmas() {
         // Continuous replication (#1628) needs the replicator to be the only

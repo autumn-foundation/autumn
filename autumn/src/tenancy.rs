@@ -140,7 +140,10 @@ pub async fn extract_tenant_from_parts_with_domains(
 /// The tenant a capsule replay serves, when one is serving this task.
 #[cfg(feature = "reporting")]
 fn replayed_tenant() -> Option<String> {
-    crate::capsule::effects::current_tape().and_then(|tape| tape.tenant())
+    crate::capsule::effects::current_tape().and_then(|tape| match tape.tenant() {
+        crate::capsule::effects::TenantVerdict::Resolved(id) => Some(id),
+        _ => None,
+    })
 }
 
 /// No capsule support compiled in: never a replay.
@@ -1037,6 +1040,50 @@ mod tests {
         let mut parts = make_parts("tenant1.example.com");
         let result = extract_tenant_from_parts(&mut parts, &config).await;
         assert_eq!(result.unwrap(), "tenant1");
+    }
+
+    /// #2351 item 13: an active replay tape with no tenant entry fails closed.
+    /// Live resolution would succeed here, and the run would depend on input
+    /// the recording never had.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_replay_with_no_recorded_tenant_fails_closed() {
+        let config = subdomain_config();
+        let mut parts = make_parts("tenant1.example.com");
+        let tape = std::sync::Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects::default(),
+        ));
+        let result = crate::capsule::with_effect_tape(
+            std::sync::Arc::clone(&tape),
+            extract_tenant_from_parts(&mut parts, &config),
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(tape.divergences().len(), 1);
+    }
+
+    /// #2351 item 13: capture records a failed lookup, so replay can tell it
+    /// from a lookup the recording never made.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_failed_tenant_lookup_is_recorded() {
+        let config = subdomain_config();
+        let mut parts = make_parts("example.com");
+        let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+            "tenant-test".to_owned(),
+            std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+            std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let result = crate::capsule::capture::with_capture_scope(
+            std::sync::Arc::clone(&scope),
+            extract_tenant_from_parts(&mut parts, &config),
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(
+            scope.effects_snapshot().tenant,
+            Some(crate::capsule::TenantEffect { id: None })
+        );
     }
 
     /// When `ResolvedClientIdentity.host` is present, subdomain mode uses it instead

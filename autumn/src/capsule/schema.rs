@@ -617,6 +617,12 @@ pub struct JobEffect {
     /// terms is what lets a changed deadline be noticed at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The absolute instant the caller asked for, when it was already past.
+    ///
+    /// Capture runs a past deadline at once, so `due_at` is `None`. Replay
+    /// compares the deadline the caller gave against this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_due_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The error the backend returned, when the enqueue **failed**.
     ///
     /// A handler whose recorded 500 was caused by `enqueue(..).await?` — the
@@ -635,6 +641,7 @@ impl Default for JobEffect {
             payload: serde_json::Value::Null,
             delay_secs: None,
             due_at: None,
+            requested_due_at: None,
             error: None,
         }
     }
@@ -650,6 +657,7 @@ impl JobEffect {
             payload: serde_json::Value::Null,
             delay_secs: None,
             due_at: None,
+            requested_due_at: None,
             error: Some(PENDING_EFFECT.to_owned()),
         }
     }
@@ -699,15 +707,56 @@ pub enum CacheEffect {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ttl_secs: Option<u64>,
     },
+    /// A removal of one key ([`Cache::invalidate`](crate::cache::Cache::invalidate)
+    /// or [`Cache::invalidate_async`](crate::cache::Cache::invalidate_async)).
+    Invalidate {
+        /// Cache key removed.
+        key: String,
+        /// The failure the async form returned, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<CacheInvalidationError>,
+    },
+    /// A removal of one namespace
+    /// ([`Cache::invalidate_namespace`](crate::cache::Cache::invalidate_namespace)
+    /// or its async form).
+    InvalidateNamespace {
+        /// Namespace removed.
+        namespace: String,
+        /// The failure the backend returned, if any. The sync form maps
+        /// `false` to a failure.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<CacheInvalidationError>,
+    },
+    /// A removal of all entries ([`Cache::clear`](crate::cache::Cache::clear)).
+    Clear,
+}
+
+/// A recorded [`InvalidationError`](crate::cache::InvalidationError).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheInvalidationError {
+    /// Attempts the backend made.
+    pub attempts: u32,
+    /// Why it failed.
+    pub reason: String,
 }
 
 impl CacheEffect {
-    /// The key this interaction touched.
+    /// The key (or namespace) this interaction touched. Empty for
+    /// [`Clear`](Self::Clear).
     #[must_use]
     pub fn key(&self) -> &str {
         match self {
-            Self::Get { key, .. } | Self::Insert { key, .. } => key,
+            Self::Get { key, .. } | Self::Insert { key, .. } | Self::Invalidate { key, .. } => key,
+            Self::InvalidateNamespace { namespace, .. } => namespace,
+            Self::Clear => "",
         }
+    }
+
+    /// Whether replay hands this entry to the code as input. Only a read
+    /// is input; every other entry is a write that replay compares.
+    #[must_use]
+    pub const fn is_read(&self) -> bool {
+        matches!(self, Self::Get { .. })
     }
 }
 
@@ -1048,6 +1097,7 @@ mod tests {
             payload: serde_json::json!({"order": 7}),
             delay_secs: Some(30),
             due_at: None,
+            requested_due_at: None,
             error: None,
         });
         capsule.effects.cache.push(CacheEffect::Get {

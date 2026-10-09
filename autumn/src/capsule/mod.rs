@@ -23,6 +23,7 @@
 //! # Layout
 //!
 //! * [`schema`] — the on-disk document and its version gate.
+//! * [`boundary`] — egress and spawned work that leave the recorded seams.
 //! * [`redact`] — masking, and the redacted-value set that feeds bind masking.
 //! * [`persist`] — writing, pruning, and reading capsules back.
 //! * [`capture`] — the request-scoped buffer and the Tower layer.
@@ -34,6 +35,7 @@
 //! * [`regression`] — replaying a committed capsule as an ordinary test.
 //! * `replay_db` — the in-process stub `PostgreSQL` server replay reads from.
 
+pub mod boundary;
 pub mod capture;
 pub mod clock;
 pub mod effects;
@@ -54,6 +56,7 @@ pub(crate) mod replay_db;
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 pub(crate) mod wire;
 
+pub use boundary::{UnrecordedEgress, guard_egress, spawn};
 #[cfg(feature = "test-support")]
 pub use capture::with_capture_scope;
 pub use capture::{
@@ -105,9 +108,10 @@ pub fn note_backend_capture_gap() {
     }
 }
 pub use schema::{
-    AppInfo, BindValue, CAPSULE_FORMAT_VERSION, CacheEffect, Capsule, CapsuleBody, CapsuleDb,
-    CapsuleEffects, CapsuleError, CapsuleJob, CapsuleOutcome, CapsuleRequest, ConnectionTape,
-    Exchange, ExchangeProtocol, HttpEffect, JobEffect, MailEffect, RandomEffect, TenantEffect,
+    AppInfo, BindValue, CAPSULE_FORMAT_VERSION, CacheEffect, CacheInvalidationError, Capsule,
+    CapsuleBody, CapsuleDb, CapsuleEffects, CapsuleError, CapsuleJob, CapsuleOutcome,
+    CapsuleRequest, ConnectionTape, Exchange, ExchangeProtocol, HttpEffect, JobEffect, MailEffect,
+    RandomEffect, TenantEffect,
 };
 
 /// Build the capture settings the layer and the persistence path share.

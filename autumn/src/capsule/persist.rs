@@ -789,6 +789,58 @@ mod tests {
         );
     }
 
+    /// #2351 item 5: compared effect data that held the placeholder text
+    /// before redaction is named in `redacted_keys`, so replay refuses it.
+    #[test]
+    fn a_literal_placeholder_in_an_effect_is_named_for_refusal() {
+        use std::sync::Arc;
+
+        use crate::capsule::CaptureSettings;
+        use crate::capsule::capture::CaptureScope;
+        use crate::capsule::redact::RawRequest;
+        use crate::log::filter::ParameterFilter;
+
+        let scope = CaptureScope::new(
+            "req-literal".to_owned(),
+            Arc::new(CaptureSettings::default()),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        );
+        scope.set_request(RawRequest {
+            method: "GET".to_owned(),
+            uri: "/boom".parse().expect("uri parses"),
+            version: axum::http::Version::HTTP_11,
+            headers: axum::http::HeaderMap::new(),
+            route: None,
+        });
+        let slot = scope.reserve_job_enqueue().expect("slot");
+        scope.fill_job_enqueue(
+            slot,
+            crate::capsule::JobEffect {
+                name: "n".to_owned(),
+                payload: serde_json::json!({"note": "[FILTERED]"}),
+                ..Default::default()
+            },
+        );
+        let capsule = assemble(
+            &scope,
+            CapsuleOutcome::Status {
+                code: 500,
+                message: "boom".to_owned(),
+                problem_type: None,
+            },
+        )
+        .expect("capsule assembles");
+        assert!(
+            capsule.request.redacted_keys.contains(&format!(
+                "job[0].payload{}",
+                crate::capsule::redact::LITERAL_PLACEHOLDER_SUFFIX
+            )),
+            "{:?}",
+            capsule.request.redacted_keys
+        );
+        assert!(crate::capsule::replay::refusal_reason(&capsule).is_some());
+    }
+
     /// Refusal is the price of suppressing a value that existed. Filtering a
     /// header the request resolved nothing from suppresses nothing, so it must
     /// cost nothing — otherwise a broad `filter_parameters` would refuse every

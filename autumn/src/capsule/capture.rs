@@ -901,6 +901,11 @@ impl CaptureScope {
         let weight = effect.key().len().saturating_add(match &effect {
             CacheEffect::Get { value, .. } => value.as_ref().map_or(0, String::len),
             CacheEffect::Insert { value, .. } => value.len(),
+            CacheEffect::Invalidate { error, .. }
+            | CacheEffect::InvalidateNamespace { error, .. } => {
+                error.as_ref().map_or(0, |error| error.reason.len())
+            }
+            CacheEffect::Clear => 0,
         });
         let budget = self.settings.max_capsule_bytes;
         let _ = self.with_effects(|buffer| {
@@ -1878,6 +1883,92 @@ mod tests {
             "{:?}",
             scope.notes()
         );
+    }
+
+    /// #2351 item 10: the alternate half of a multipart message has the same
+    /// per-body cap as the main body.
+    #[test]
+    fn an_oversized_alternate_mail_body_is_skipped_and_truncates() {
+        let settings = CaptureSettings {
+            max_body_bytes: 8,
+            ..CaptureSettings::default()
+        };
+        let scope = CaptureScope::new(
+            "mail".to_owned(),
+            Arc::new(settings),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        );
+        let slot = scope.reserve_mail().expect("a slot is available");
+        scope.fill_mail(
+            slot,
+            MailEffect {
+                to: vec!["a@example.com".to_owned()],
+                subject: "Receipt".to_owned(),
+                body: CapsuleBody::Text("short".to_owned()),
+                alternate_body: CapsuleBody::Text("<p>an html half past the cap</p>".to_owned()),
+                ..Default::default()
+            },
+        );
+        let effects = scope.effects_snapshot();
+        assert!(
+            matches!(effects.mail[0].alternate_body, CapsuleBody::Skipped { .. }),
+            "{:?}",
+            effects.mail[0].alternate_body
+        );
+        assert!(scope.is_truncated());
+    }
+
+    /// #2351 item 10: every retained mail field counts against the capsule
+    /// budget.
+    #[test]
+    fn the_alternate_mail_body_is_charged_against_the_capsule_budget() {
+        let settings = CaptureSettings {
+            max_body_bytes: 1 << 20,
+            max_capsule_bytes: 256,
+            ..CaptureSettings::default()
+        };
+        let scope = CaptureScope::new(
+            "mail".to_owned(),
+            Arc::new(settings),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        );
+        let slot = scope.reserve_mail().expect("a slot is available");
+        scope.fill_mail(
+            slot,
+            MailEffect {
+                to: vec!["a@example.com".to_owned()],
+                subject: "Receipt".to_owned(),
+                body: CapsuleBody::Text("short".to_owned()),
+                alternate_body: CapsuleBody::Text("x".repeat(4096)),
+                ..Default::default()
+            },
+        );
+        assert!(scope.is_truncated());
+    }
+
+    /// #2351 item 19: an enqueue error is retained, so it is charged.
+    #[test]
+    fn an_enqueue_error_is_charged_against_the_capsule_budget() {
+        let settings = CaptureSettings {
+            max_capsule_bytes: 256,
+            ..CaptureSettings::default()
+        };
+        let scope = CaptureScope::new(
+            "job".to_owned(),
+            Arc::new(settings),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        );
+        let slot = scope.reserve_job_enqueue().expect("a slot is available");
+        scope.fill_job_enqueue(
+            slot,
+            JobEffect {
+                name: "j".to_owned(),
+                payload: serde_json::json!({}),
+                error: Some("x".repeat(4096)),
+                ..Default::default()
+            },
+        );
+        assert!(scope.is_truncated());
     }
 
     /// A seam reserves its tape position when the effect starts and fills it

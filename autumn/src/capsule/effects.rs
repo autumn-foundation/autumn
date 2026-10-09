@@ -68,6 +68,8 @@ pub enum EffectSeam {
     Mail,
     /// The tenant context the run resolved.
     Tenant,
+    /// A draw from the framework's entropy source.
+    Random,
 }
 
 impl EffectSeam {
@@ -80,6 +82,7 @@ impl EffectSeam {
             Self::Cache => "cache",
             Self::Mail => "mail",
             Self::Tenant => "tenancy",
+            Self::Random => "randomness",
         }
     }
 }
@@ -172,6 +175,19 @@ pub(crate) enum MailVerdict {
     Failed(String, Option<crate::capsule::schema::MailErrorKind>),
     /// Did not match the recording. A divergence has been logged.
     Diverged,
+}
+
+/// What the tape can say about a tenant lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TenantVerdict {
+    /// The recording resolved this tenant.
+    Resolved(String),
+    /// The recording tried and failed. The caller runs the resolver again on
+    /// the restored request, so the same error comes back.
+    RecordedFailure,
+    /// The recording has no tenant lookup. A divergence has been logged; the
+    /// caller fails closed.
+    Unrecorded,
 }
 
 // ── The tape ────────────────────────────────────────────────────────────────
@@ -292,7 +308,10 @@ impl ReplayEffects {
                     value: decode(value),
                     ttl_secs: *ttl_secs,
                 }),
-                CacheEffect::Get { .. } => None,
+                CacheEffect::Get { .. }
+                | CacheEffect::Invalidate { .. }
+                | CacheEffect::InvalidateNamespace { .. }
+                | CacheEffect::Clear => None,
             })
             .collect();
         let recorded = effects
@@ -637,6 +656,32 @@ impl ReplayEffects {
         self.served.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Apply a key removal made during replay, and check it against the
+    /// recording. Returns the recorded result.
+    pub(crate) fn cache_invalidate(
+        &self,
+        _key: &str,
+    ) -> Result<(), crate::cache::InvalidationError> {
+        Ok(())
+    }
+
+    /// Apply a namespace removal made during replay, and check it against the
+    /// recording. Returns the recorded result.
+    pub(crate) fn cache_invalidate_namespace(
+        &self,
+        _namespace: &str,
+    ) -> Result<(), crate::cache::InvalidationError> {
+        Ok(())
+    }
+
+    /// Apply a removal of all entries made during replay, and check it
+    /// against the recording.
+    pub(crate) fn cache_clear(&self) {}
+
+    /// Log an untyped write made during replay. Capture cannot record one,
+    /// so a replayed one is always unrecorded.
+    pub(crate) fn cache_untyped_insert(&self, _key: &str) {}
+
     /// Whether the next recorded mail send is the one the run just made, and
     /// the delivery error the recording produced for it.
     ///
@@ -758,11 +803,13 @@ impl ReplayEffects {
 
     /// The tenant the recording resolved, when it resolved one.
     #[must_use]
-    pub(crate) fn tenant(&self) -> Option<String> {
+    pub(crate) fn tenant(&self) -> TenantVerdict {
         if self.tenant.is_some() {
             self.tenant_read.store(true, Ordering::SeqCst);
         }
-        self.tenant.clone()
+        self.tenant
+            .clone()
+            .map_or(TenantVerdict::Unrecorded, TenantVerdict::Resolved)
     }
 
     /// Close the tape and report every recorded effect the run never asked
@@ -1319,6 +1366,7 @@ mod tests {
                 payload: serde_json::json!({"to": "a@example.com", "token": "[FILTERED]"}),
                 delay_secs: None,
                 due_at: None,
+                requested_due_at: None,
                 error: None,
             }],
             ..CapsuleEffects::default()
@@ -1369,6 +1417,7 @@ mod tests {
                 payload: serde_json::json!({"token": "[FILTERED]"}),
                 delay_secs: None,
                 due_at: None,
+                requested_due_at: None,
                 error: None,
             }],
             ..CapsuleEffects::default()
@@ -1468,6 +1517,7 @@ mod tests {
                 payload: serde_json::json!({"order": 7}),
                 delay_secs: None,
                 due_at: None,
+                requested_due_at: None,
                 error: None,
             }],
             ..CapsuleEffects::default()
@@ -1504,6 +1554,7 @@ mod tests {
                 payload: serde_json::json!({}),
                 delay_secs: None,
                 due_at: None,
+                requested_due_at: None,
                 error: None,
             }],
             ..CapsuleEffects::default()
@@ -1517,6 +1568,115 @@ mod tests {
             EnqueueVerdict::Diverged
         );
         assert_eq!(tape.divergences().len(), 1);
+    }
+
+    /// #2351 item 17: a plain `enqueue` must not consume a recorded delayed
+    /// or future-deadline entry.
+    #[test]
+    fn an_immediate_enqueue_does_not_satisfy_a_recorded_delayed_one() {
+        let delayed = JobEffect {
+            name: "send_receipt".to_owned(),
+            payload: serde_json::json!({}),
+            delay_secs: Some(3600),
+            ..JobEffect::default()
+        };
+        let future = JobEffect {
+            due_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            ..delayed.clone()
+        };
+        for recorded in [delayed, future] {
+            let tape = ReplayEffects::new(CapsuleEffects {
+                jobs: vec![recorded],
+                ..CapsuleEffects::default()
+            });
+            assert_eq!(
+                tape.next_job(
+                    "send_receipt",
+                    &serde_json::json!({}),
+                    crate::job::EnqueueSchedule::Immediate
+                ),
+                EnqueueVerdict::Diverged
+            );
+        }
+        // A zero delay is still immediate.
+        let tape = ReplayEffects::new(CapsuleEffects {
+            jobs: vec![JobEffect {
+                name: "send_receipt".to_owned(),
+                payload: serde_json::json!({}),
+                delay_secs: Some(0),
+                ..JobEffect::default()
+            }],
+            ..CapsuleEffects::default()
+        });
+        assert_eq!(
+            tape.next_job(
+                "send_receipt",
+                &serde_json::json!({}),
+                crate::job::EnqueueSchedule::Immediate
+            ),
+            EnqueueVerdict::Queued
+        );
+    }
+
+    /// #2351 item 18: capture records a past deadline as an immediate
+    /// enqueue, and keeps the deadline the caller asked for. Replay compares
+    /// the same deadline.
+    #[test]
+    fn a_past_deadline_enqueue_at_matches_its_normalized_recording() {
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        let recorded = JobEffect {
+            name: "send_receipt".to_owned(),
+            payload: serde_json::json!({}),
+            requested_due_at: Some(past),
+            ..JobEffect::default()
+        };
+        let tape = ReplayEffects::new(CapsuleEffects {
+            jobs: vec![recorded.clone()],
+            ..CapsuleEffects::default()
+        });
+        assert_eq!(
+            tape.next_job(
+                "send_receipt",
+                &serde_json::json!({}),
+                crate::job::EnqueueSchedule::At(past)
+            ),
+            EnqueueVerdict::Queued,
+            "{:?}",
+            tape.divergences()
+        );
+        // A different past deadline is a changed call.
+        let tape = ReplayEffects::new(CapsuleEffects {
+            jobs: vec![recorded],
+            ..CapsuleEffects::default()
+        });
+        assert_eq!(
+            tape.next_job(
+                "send_receipt",
+                &serde_json::json!({}),
+                crate::job::EnqueueSchedule::At(past - chrono::Duration::hours(1))
+            ),
+            EnqueueVerdict::Diverged
+        );
+    }
+
+    /// #2351 item 13: an active tape with no tenant entry fails closed.
+    #[test]
+    fn a_tenant_lookup_the_capsule_never_recorded_is_a_divergence() {
+        let tape = ReplayEffects::new(CapsuleEffects::default());
+        assert_eq!(tape.tenant(), super::TenantVerdict::Unrecorded);
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert_eq!(divergences[0].seam, EffectSeam::Tenant);
+        assert_eq!(divergences[0].kind, EffectDivergenceKind::Unrecorded);
+
+        // A recorded failure is not a divergence: the resolver runs again on
+        // the restored request.
+        let tape = ReplayEffects::new(CapsuleEffects {
+            tenant: Some(TenantEffect { id: None }),
+            ..CapsuleEffects::default()
+        });
+        assert_eq!(tape.tenant(), super::TenantVerdict::RecordedFailure);
+        assert!(tape.finish().is_empty());
     }
 
     #[test]
@@ -2018,6 +2178,7 @@ mod tests {
                 payload: serde_json::json!({}),
                 delay_secs: None,
                 due_at: None,
+                requested_due_at: None,
                 error: Some("queue is down".to_owned()),
             }],
             ..CapsuleEffects::default()
@@ -2067,13 +2228,154 @@ mod tests {
     }
 
     #[test]
-    fn a_matching_cache_write_is_consumed_and_readable_back() {
+    fn a_read_of_a_key_the_recording_only_wrote_diverges() {
+        // #2351 item 15: the recording wrote the key and did not read it. A
+        // new read is a new cache dependency, not a read-back.
         let tape = ReplayEffects::new(CapsuleEffects {
             cache: vec![CacheEffect::Insert {
                 key: "widgets".to_owned(),
                 value: base64_of(b"41"),
                 ttl_secs: None,
             }],
+            ..CapsuleEffects::default()
+        });
+        tape.cache_insert("widgets", b"41", None);
+        let _ = tape.cache_get("widgets");
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert_eq!(divergences[0].kind, EffectDivergenceKind::Unrecorded);
+        assert_eq!(divergences[0].seam, EffectSeam::Cache);
+    }
+
+    #[test]
+    fn a_masked_fill_then_read_back_is_not_a_divergence() {
+        // The key is masked on disk. The fill and the read-back on replay use
+        // the clear key, and must find the one recorded slot.
+        let tape = ReplayEffects::new(CapsuleEffects {
+            cache: vec![
+                CacheEffect::Get {
+                    key: "user:[FILTERED]".to_owned(),
+                    value: None,
+                },
+                CacheEffect::Insert {
+                    key: "user:[FILTERED]".to_owned(),
+                    value: base64_of(b"41"),
+                    ttl_secs: None,
+                },
+                CacheEffect::Get {
+                    key: "user:[FILTERED]".to_owned(),
+                    value: Some(base64_of(b"41")),
+                },
+            ],
+            ..CapsuleEffects::default()
+        });
+        assert_eq!(tape.cache_get("user:alice"), CachedValue::Miss);
+        tape.cache_insert("user:alice", b"41", None);
+        assert_eq!(
+            tape.cache_get("user:alice"),
+            CachedValue::Hit(b"41".to_vec())
+        );
+        let divergences = tape.finish();
+        assert!(divergences.is_empty(), "{divergences:?}");
+    }
+
+    #[test]
+    fn a_recorded_invalidate_is_consumed_and_the_next_read_misses() {
+        // #2351 item 2: an invalidate is a write. Replay consumes it and
+        // never reaches a backend.
+        let tape = ReplayEffects::new(CapsuleEffects {
+            cache: vec![
+                CacheEffect::Get {
+                    key: "widgets".to_owned(),
+                    value: Some(base64_of(b"41")),
+                },
+                CacheEffect::Invalidate {
+                    key: "widgets".to_owned(),
+                    error: None,
+                },
+                CacheEffect::Clear,
+            ],
+            ..CapsuleEffects::default()
+        });
+        assert_eq!(tape.cache_get("widgets"), CachedValue::Hit(b"41".to_vec()));
+        assert_eq!(tape.cache_invalidate("widgets"), Ok(()));
+        assert_eq!(tape.cache_get("widgets"), CachedValue::Miss);
+        tape.cache_clear();
+        let divergences = tape.finish();
+        assert!(divergences.is_empty(), "{divergences:?}");
+    }
+
+    #[test]
+    fn a_dropped_or_added_invalidate_is_a_divergence() {
+        let tape = ReplayEffects::new(CapsuleEffects {
+            cache: vec![CacheEffect::Invalidate {
+                key: "widgets".to_owned(),
+                error: None,
+            }],
+            ..CapsuleEffects::default()
+        });
+        let divergences = tape.finish();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert_eq!(divergences[0].kind, EffectDivergenceKind::Unconsumed);
+
+        let tape = ReplayEffects::new(CapsuleEffects::default());
+        let _ = tape.cache_invalidate("widgets");
+        tape.cache_clear();
+        let _ = tape.cache_invalidate_namespace("widgets");
+        tape.cache_untyped_insert("widgets");
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 4, "{divergences:?}");
+        assert!(
+            divergences
+                .iter()
+                .all(|d| d.kind == EffectDivergenceKind::Unrecorded)
+        );
+    }
+
+    #[test]
+    fn a_recorded_invalidate_failure_replays_as_a_failure() {
+        let tape = ReplayEffects::new(CapsuleEffects {
+            cache: vec![
+                CacheEffect::Invalidate {
+                    key: "widgets".to_owned(),
+                    error: Some(crate::capsule::schema::CacheInvalidationError {
+                        attempts: 3,
+                        reason: "READONLY".to_owned(),
+                    }),
+                },
+                CacheEffect::InvalidateNamespace {
+                    namespace: "widgets".to_owned(),
+                    error: Some(crate::capsule::schema::CacheInvalidationError {
+                        attempts: 1,
+                        reason: "no sweep".to_owned(),
+                    }),
+                },
+            ],
+            ..CapsuleEffects::default()
+        });
+        let err = tape
+            .cache_invalidate("widgets")
+            .expect_err("recorded failure");
+        assert_eq!(err.attempts(), 3);
+        assert_eq!(err.reason(), "READONLY");
+        assert!(tape.cache_invalidate_namespace("widgets").is_err());
+        assert!(tape.finish().is_empty());
+    }
+
+    #[test]
+    fn a_matching_cache_write_is_consumed_and_readable_back() {
+        let tape = ReplayEffects::new(CapsuleEffects {
+            cache: vec![
+                CacheEffect::Insert {
+                    key: "widgets".to_owned(),
+                    value: base64_of(b"41"),
+                    ttl_secs: None,
+                },
+                CacheEffect::Get {
+                    key: "widgets".to_owned(),
+                    value: Some(base64_of(b"41")),
+                },
+            ],
             ..CapsuleEffects::default()
         });
         tape.cache_insert("widgets", b"41", None);
@@ -2109,7 +2411,10 @@ mod tests {
             }),
             ..CapsuleEffects::default()
         });
-        assert_eq!(tape.tenant().as_deref(), Some("acme"));
+        assert_eq!(
+            tape.tenant(),
+            super::TenantVerdict::Resolved("acme".to_owned())
+        );
     }
 
     fn base64_of(bytes: &[u8]) -> String {

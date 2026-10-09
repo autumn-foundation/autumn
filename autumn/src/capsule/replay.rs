@@ -1770,6 +1770,171 @@ mod tests {
         assert!(refusal_reason(&capsule).is_none());
     }
 
+    /// #2351 item 12: only a cache *read* is input. A masked write is output
+    /// and compares through the wildcard rules.
+    #[test]
+    fn a_masked_cache_write_is_output_and_still_replays() {
+        use crate::capsule::schema::CacheEffect;
+        let mut capsule = fixture(status(500));
+        capsule.effects.cache = vec![
+            CacheEffect::Get {
+                key: "k".to_owned(),
+                value: None,
+            },
+            CacheEffect::Insert {
+                key: "t".to_owned(),
+                value: "e30=".to_owned(),
+                ttl_secs: None,
+            },
+        ];
+        capsule.request.redacted_keys = vec!["cache[1].token".to_owned()];
+        assert!(
+            refusal_reason(&capsule).is_none(),
+            "a masked cache write is output, not input"
+        );
+        capsule.request.redacted_keys = vec!["cache[0].token".to_owned()];
+        assert!(refusal_reason(&capsule).is_some(), "a masked read is input");
+        capsule.request.redacted_keys = vec!["cache[9].token".to_owned()];
+        assert!(
+            refusal_reason(&capsule).is_some(),
+            "an index that resolves to nothing fails closed"
+        );
+    }
+
+    /// #2351 item 5: a literal `[FILTERED]` that the recorded data already
+    /// held is not a redaction. Replay would read it as a wildcard.
+    #[test]
+    fn a_capsule_whose_compared_data_held_a_literal_placeholder_is_refused() {
+        let mut capsule = fixture(status(500));
+        capsule.request.redacted_keys = vec![format!(
+            "http[0].request_body{}",
+            crate::capsule::redact::LITERAL_PLACEHOLDER_SUFFIX
+        )];
+        let reason = refusal_reason(&capsule).expect("a literal placeholder is refused");
+        assert!(reason.contains("[FILTERED]"), "{reason}");
+        assert!(reason.contains("http[0].request_body"), "{reason}");
+    }
+
+    /// #2351 item 11: a draw of a different width than the recording is a
+    /// divergence, not a silent truncation.
+    #[tokio::test]
+    async fn a_draw_of_a_different_width_than_recorded_diverges() {
+        let mut capsule = job_capsule("mint", serde_json::json!({}), status(500));
+        capsule.effects.random = vec![crate::capsule::schema::RandomEffect { bytes: vec![7; 16] }];
+        let fixtures = ReplayFixtures::from_capsule(&capsule);
+        let entropy = fixtures.entropy();
+        let dispatch: crate::capsule::JobDispatch = Box::new(move |_| {
+            Box::pin(async move {
+                let mut wide = [0u8; 32];
+                entropy.fill_bytes(&mut wide);
+                Err(crate::AutumnError::internal_server_error_msg("boom"))
+            })
+        });
+        let outcome = execute_job(
+            dispatch,
+            &capsule,
+            Arc::new(DivergenceLog::new()),
+            &fixtures,
+        )
+        .await;
+        assert_eq!(outcome.verdict, Verdict::Diverged, "{outcome:?}");
+        assert!(
+            outcome
+                .effect_divergences
+                .iter()
+                .any(|d| d.seam == crate::capsule::EffectSeam::Random),
+            "{outcome:?}"
+        );
+    }
+
+    /// #2351 item 16: a secret that reached the capsule only through an output
+    /// effect is masked in the recorded outcome. The replayed outcome holds the
+    /// clear value. Unchanged code reproduces, and the clear value is not
+    /// printed.
+    #[tokio::test]
+    async fn an_outcome_quoting_an_effect_seeded_secret_reproduces_without_printing_it() {
+        let mut capsule = job_capsule(
+            "sync",
+            serde_json::json!({"order": 7}),
+            CapsuleOutcome::Status {
+                code: 500,
+                message: "key [FILTERED] rejected".to_owned(),
+                problem_type: None,
+            },
+        );
+        capsule.effects.jobs = vec![crate::capsule::schema::JobEffect {
+            name: "notify".to_owned(),
+            payload: serde_json::json!({"api_key": "[FILTERED]"}),
+            ..Default::default()
+        }];
+        let fixtures = ReplayFixtures::from_capsule(&capsule);
+        let dispatch: crate::capsule::JobDispatch = Box::new(|_| {
+            Box::pin(async move {
+                let tape = crate::capsule::effects::current_tape().expect("tape");
+                let _ = tape.next_job(
+                    "notify",
+                    &serde_json::json!({"api_key": "sk-live-42"}),
+                    crate::job::EnqueueSchedule::Immediate,
+                );
+                Err(crate::AutumnError::internal_server_error_msg(
+                    "key sk-live-42 rejected",
+                ))
+            })
+        });
+        let outcome = execute_job(
+            dispatch,
+            &capsule,
+            Arc::new(DivergenceLog::new()),
+            &fixtures,
+        )
+        .await;
+        assert_eq!(outcome.verdict, Verdict::Reproduced, "{outcome:?}");
+        let printed = serde_json::to_string(&outcome.actual).expect("serializes");
+        assert!(!printed.contains("sk-live-42"), "{printed}");
+    }
+
+    /// The scrub only covers values that stood behind a placeholder. A changed
+    /// message is still a mismatch.
+    #[tokio::test]
+    async fn a_changed_outcome_is_still_a_mismatch_after_the_scrub() {
+        let mut capsule = job_capsule(
+            "sync",
+            serde_json::json!({}),
+            CapsuleOutcome::Status {
+                code: 500,
+                message: "key [FILTERED] rejected".to_owned(),
+                problem_type: None,
+            },
+        );
+        capsule.effects.jobs = vec![crate::capsule::schema::JobEffect {
+            name: "notify".to_owned(),
+            payload: serde_json::json!({"api_key": "[FILTERED]"}),
+            ..Default::default()
+        }];
+        let fixtures = ReplayFixtures::from_capsule(&capsule);
+        let dispatch: crate::capsule::JobDispatch = Box::new(|_| {
+            Box::pin(async move {
+                let tape = crate::capsule::effects::current_tape().expect("tape");
+                let _ = tape.next_job(
+                    "notify",
+                    &serde_json::json!({"api_key": "sk-live-42"}),
+                    crate::job::EnqueueSchedule::Immediate,
+                );
+                Err(crate::AutumnError::internal_server_error_msg(
+                    "key OTHER rejected",
+                ))
+            })
+        });
+        let outcome = execute_job(
+            dispatch,
+            &capsule,
+            Arc::new(DivergenceLog::new()),
+            &fixtures,
+        )
+        .await;
+        assert_eq!(outcome.verdict, Verdict::Mismatch, "{outcome:?}");
+    }
+
     #[test]
     fn redaction_is_named_when_a_recorded_server_error_replays_as_401() {
         let mut capsule = fixture(status(500));

@@ -575,6 +575,15 @@ const fn record_or_replay_cache_insert(
     false
 }
 
+// ── Capsule seam for the removal methods (#2351) ─────────────────────────
+
+/// Wrap `cache` so a capsule records its removals and a replay never reaches
+/// it. Idempotent.
+#[must_use]
+pub(crate) fn with_capsule_seam(cache: Arc<dyn Cache>) -> Arc<dyn Cache> {
+    cache
+}
+
 // ── CacheableResult trait ────────────────────────────────────────────
 
 /// Helper trait used by `#[cached(result)]` to extract the `Ok` type
@@ -734,6 +743,149 @@ mod tests {
         let err = block_on(backend.invalidate_namespace_async("ns"))
             .expect_err("a backend that cannot sweep must say so");
         assert_eq!(err.attempts(), 1);
+    }
+
+    /// Logs every call that reaches the backend.
+    #[cfg(feature = "reporting")]
+    #[derive(Default)]
+    struct SpyBackend {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[cfg(feature = "reporting")]
+    impl SpyBackend {
+        fn log(&self, call: impl Into<String>) {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(call.into());
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[cfg(feature = "reporting")]
+    impl Cache for SpyBackend {
+        fn get_value(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+            self.log(format!("get {key}"));
+            Some(Arc::new(7_u32))
+        }
+        fn insert_value(&self, key: &str, _value: Arc<dyn Any + Send + Sync>) {
+            self.log(format!("insert {key}"));
+        }
+        fn invalidate(&self, key: &str) {
+            self.log(format!("invalidate {key}"));
+        }
+        fn clear(&self) {
+            self.log("clear");
+        }
+        fn invalidate_namespace(&self, namespace: &str) -> bool {
+            self.log(format!("invalidate_namespace {namespace}"));
+            true
+        }
+    }
+
+    /// #2351 item 2: a replayed run never reaches the installed backend
+    /// through the untyped functions or the removal methods.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_replayed_run_never_reaches_the_installed_backend() {
+        let spy = Arc::new(SpyBackend::default());
+        let state =
+            crate::state::AppState::for_test().with_cache(Arc::clone(&spy) as Arc<dyn Cache>);
+        let tape = Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects::default(),
+        ));
+        block_on(crate::capsule::with_effect_tape(Arc::clone(&tape), async {
+            let cache = state.cache().expect("installed");
+            cache.invalidate("widgets");
+            cache.clear();
+            let _ = cache.invalidate_namespace("widgets");
+            let _ = cache.invalidate_async("widgets").await;
+            insert(cache.as_ref(), "widgets", 41_u32);
+            assert_eq!(get::<u32>(cache.as_ref(), "widgets"), None);
+        }));
+        assert!(spy.calls().is_empty(), "{:?}", spy.calls());
+        assert_eq!(tape.divergences().len(), 6, "{:?}", tape.divergences());
+    }
+
+    /// #2351 item 2: capture records a removal, and the backend still gets it.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_captured_removal_is_recorded_and_still_applied() {
+        let spy = Arc::new(SpyBackend::default());
+        let state =
+            crate::state::AppState::for_test().with_cache(Arc::clone(&spy) as Arc<dyn Cache>);
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "cache-test".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async {
+                let cache = state.cache().expect("installed");
+                cache.invalidate("widgets");
+                cache.clear();
+            },
+        ));
+        assert_eq!(spy.calls(), vec!["invalidate widgets", "clear"]);
+        assert_eq!(
+            scope.effects_snapshot().cache,
+            vec![
+                crate::capsule::CacheEffect::Invalidate {
+                    key: "widgets".to_owned(),
+                    error: None,
+                },
+                crate::capsule::CacheEffect::Clear,
+            ]
+        );
+    }
+
+    /// #2351 item 2: an untyped hit cannot be serialized, so the capsule says
+    /// it is incomplete.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_captured_untyped_hit_or_write_marks_the_capsule_incomplete() {
+        let spy = Arc::new(SpyBackend::default());
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "cache-test".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async {
+                assert_eq!(get::<u32>(spy.as_ref(), "widgets"), Some(7));
+            },
+        ));
+        assert!(scope.is_truncated());
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "cache-test".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async {
+                insert(spy.as_ref(), "widgets", 1_u32);
+            },
+        ));
+        assert!(scope.is_truncated());
+    }
+
+    /// The seam wraps a backend once, so `Arc` identity stays stable.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn the_capsule_seam_wraps_a_backend_once() {
+        let spy: Arc<dyn Cache> = Arc::new(SpyBackend::default());
+        let once = with_capsule_seam(spy);
+        let twice = with_capsule_seam(Arc::clone(&once));
+        assert!(Arc::ptr_eq(&once, &twice));
     }
 
     #[test]

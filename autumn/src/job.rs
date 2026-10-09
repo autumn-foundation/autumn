@@ -2991,6 +2991,19 @@ async fn run_job_handler(
         .await
 }
 
+/// The capture settings and filter a job capsule uses, built once per app.
+#[cfg(feature = "reporting")]
+struct JobCaptureContext {
+    settings: Arc<crate::capsule::CaptureSettings>,
+    filter: Arc<crate::log::filter::ParameterFilter>,
+}
+
+/// The app's [`JobCaptureContext`], when failure capture is on.
+#[cfg(feature = "reporting")]
+fn job_capture_context(_state: &AppState) -> Option<Arc<JobCaptureContext>> {
+    None
+}
+
 async fn run_job_handler_unmetered(
     name: &str,
     handler: JobHandler,
@@ -3418,6 +3431,7 @@ fn record_after_commit_enqueue(name: &str, payload: &Value, schedule: EnqueueSch
             payload: capsule_job_payload(payload),
             delay_secs,
             due_at,
+            requested_due_at: None,
             error: None,
         },
     );
@@ -3563,6 +3577,7 @@ fn fill_enqueue(
             // `DateTime` is not total.
             delay_secs: due_at.map(|due| due.signed_duration_since(now).num_seconds()),
             due_at,
+            requested_due_at: None,
             // `message`, not `Display`: recorded on the capsule tape.
             error: error.map(crate::AutumnError::message),
         },
@@ -14259,6 +14274,78 @@ mod tests {
                 .contains("only failed jobs can be retried"),
             "unexpected second retry error: {second}"
         );
+    }
+
+    /// #2351 item 6: the capture settings and filter are built once per app,
+    /// not on every job execution.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn job_capture_context_is_built_once_per_app() {
+        let state = AppState::for_test();
+        let mut config = crate::config::AutumnConfig::default();
+        config.failure_capture.enabled = true;
+        state.insert_extension(config);
+        let first = job_capture_context(&state).expect("capture is on");
+        let second = job_capture_context(&state).expect("capture is on");
+        assert!(Arc::ptr_eq(&first, &second));
+        let off = AppState::for_test();
+        assert!(job_capture_context(&off).is_none());
+    }
+
+    /// #2351 item 14: a replayed job runs in the event app it ran in
+    /// during production, so a free `publish` reaches the same app.
+    #[tokio::test]
+    async fn replay_dispatch_publishes_against_the_replayed_app() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct ReplayProbe {
+            n: u8,
+        }
+        impl crate::events::Event for ReplayProbe {
+            const NAME: &'static str = "replay_probe";
+        }
+        fn publishing_handler(
+            _state: AppState,
+            _payload: Value,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+            Box::pin(async move { crate::events::publish(ReplayProbe { n: 1 }).await })
+        }
+        let state = AppState::for_test();
+        state.insert_extension(crate::events::EventRecorder::default());
+        run_handler_with_interceptor(
+            "probe",
+            publishing_handler,
+            state.clone(),
+            serde_json::json!({}),
+        )
+        .await
+        .expect("publish succeeds");
+        let recorder = state
+            .extension::<crate::events::EventRecorder>()
+            .expect("installed");
+        assert_eq!(recorder.count::<ReplayProbe>(), 1);
+    }
+
+    /// #2351 item 9: a registration that fails is recorded as the failure
+    /// it was, not as a queued job.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_failed_after_commit_registration_is_recorded_as_a_failure() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let result = crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            enqueue_after_commit("never_registered", serde_json::json!({})),
+        )
+        .await;
+        let error = result.expect_err("no job runtime");
+        let jobs = scope.effects_snapshot().jobs;
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert_eq!(jobs[0].error.as_deref(), Some(error.message().as_str()));
     }
 
     #[tokio::test]

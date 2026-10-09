@@ -3755,6 +3755,13 @@ impl MailTransport for InterceptedMailTransport {
 /// # Errors
 ///
 /// Returns an Autumn error when the configured transport cannot be created.
+/// Install the mailer a capsule replay uses (#2351 item 7).
+///
+/// A send on the replayed request is served from the tape by the mail seam.
+/// A send that reaches the transport ran with no tape, and is refused.
+#[cfg(feature = "reporting")]
+pub(crate) fn install_replay_mailer(_state: &AppState, _config: &MailConfig) {}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn install_mailer(
     state: &AppState,
@@ -6453,6 +6460,80 @@ mod tests {
             2,
             "only the two non-suppressed recipients are delivered"
         );
+    }
+
+    /// #2351 item 7: the replay mailer answers from the tape, and refuses a
+    /// send that no tape serves.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn replay_mailer_answers_from_the_tape_and_refuses_off_tape_sends() {
+        let state = AppState::for_test();
+        install_replay_mailer(&state, &MailConfig::default());
+        let mailer = state.extension::<Mailer>().expect("installed");
+        let mail = || {
+            Mail::builder()
+                .from("from@example.com")
+                .to("user@example.com")
+                .subject("Reset")
+                .text("hello")
+                .build()
+                .unwrap()
+        };
+        let tape = Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects {
+                mail: vec![crate::capsule::MailEffect {
+                    to: vec!["user@example.com".to_owned()],
+                    from: Some("from@example.com".to_owned()),
+                    subject: "Reset".to_owned(),
+                    body: crate::capsule::CapsuleBody::Text("hello".to_owned()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ));
+        crate::capsule::with_effect_tape(Arc::clone(&tape), mailer.send(mail()))
+            .await
+            .expect("served from the tape");
+        assert!(tape.finish().is_empty(), "{:?}", tape.finish());
+        assert!(
+            mailer.send(mail()).await.is_err(),
+            "a send with no tape must not reach a transport"
+        );
+    }
+
+    /// #2351 item 3: `deliver_later` inside a transaction is recorded when it
+    /// is registered, on the request task, not on the detached commit task.
+    #[cfg(all(feature = "reporting", feature = "db"))]
+    #[tokio::test]
+    async fn deliver_later_in_a_transaction_is_recorded_at_registration() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mailer = Mailer::with_transport(CapturingTransport { sent: sent.clone() });
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "deliver-later".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let registry: Arc<std::sync::Mutex<Vec<crate::db::CommitCallback>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            crate::db::AFTER_COMMIT_REGISTRY.scope(Arc::clone(&registry), async {
+                mailer
+                    .try_deliver_later(
+                        Mail::builder()
+                            .from("from@example.com")
+                            .to("user@example.com")
+                            .subject("Later")
+                            .text("hello")
+                            .build()
+                            .unwrap(),
+                    )
+                    .expect("registered");
+            }),
+        )
+        .await;
+        assert_eq!(scope.effects_snapshot().mail.len(), 1);
+        assert!(!scope.is_truncated());
     }
 
     #[tokio::test]

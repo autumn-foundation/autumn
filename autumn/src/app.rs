@@ -17307,6 +17307,25 @@ mod tests {
             forcer.contains("config.server.timeouts.request_timeout_ms = None;"),
             "replay must clear the wall-clock request deadline"
         );
+        // #2351 item 1: a shadow mirror has its own client and is not a
+        // handler effect.
+        assert!(
+            forcer.contains("config.shadow.enabled = false;"),
+            "replay must not mirror traffic to a shadow target"
+        );
+    }
+
+    /// #2351 item 7: a replayed mail-sending route reaches the mail seam. The
+    /// replay installs a mailer whose sends are served from the tape.
+    #[cfg(all(feature = "reporting", feature = "mail"))]
+    #[test]
+    fn replay_installs_a_tape_backed_mailer() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let handler = replay_mode_source(&source);
+        assert!(
+            handler.contains("crate::mail::install_replay_mailer(&state, &config.mail);"),
+            "the replay handler must install the tape-backed mailer"
+        );
     }
 
     /// The knobs the helper forces, checked on a real configuration rather than
