@@ -551,7 +551,7 @@ tell "we checked and it was fine" from "we never looked".
   `cache_fragment_in`. It does not cover `get_or_compute`, `Cache::clear`, or a
   key-level `invalidate`.
 * **Loss of the epoch key.** Redis must keep the epoch keys
-  (`__autumn_epoch__:*`). Eviction, `FLUSHDB`, or a failover to a replica that
+  (`{prefix}:__autumn_epoch__:*`). Eviction, `FLUSHDB`, or a failover to a replica that
   missed the bump can reset one to 0. A stale fill that sampled 0 can then
   pass. Do not let an eviction policy remove these keys.
 * **A snapshot taken before the call.** The shared epoch is read after the

@@ -529,9 +529,12 @@ pub fn sample_fill_epoch(cache: &dyn Cache, namespace: &str) -> FillEpoch {
 }
 
 /// Whether an effect tape serves the current task.
+///
+/// Not `tape_active`: that marks the replay scope as entered. Only the
+/// reporting layer may do that.
 #[cfg(feature = "reporting")]
 fn replaying() -> bool {
-    crate::capsule::effects::tape_active()
+    crate::capsule::effects::current_tape().is_some()
 }
 
 /// No capsule support compiled in: there is no replay.
@@ -880,6 +883,27 @@ mod shared_fence_tests {
             maud::html! { "new" }
         });
         assert_eq!(again.0, "new", "the stale markup must not be cached");
+    }
+
+    /// A caller-owned shared store, registered with `register_namespace_store`,
+    /// must get its epoch raised by the namespace invalidation. A plain
+    /// `clear` would sweep it and leave the epoch alone.
+    #[test]
+    fn invalidating_a_registered_shared_store_raises_its_epoch() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_global_cache();
+        let store = Replica::default();
+        let handle = Arc::new(store.clone());
+        let _ = coherence::register_namespace_store("tests::shared_fence_ns", handle);
+        let before = store.fill_epoch("tests::shared_fence_ns");
+        assert!(coherence::invalidate_namespace("tests::shared_fence_ns"));
+        assert_ne!(
+            store.fill_epoch("tests::shared_fence_ns"),
+            before,
+            "an in-flight fill on another replica must be fenced out"
+        );
     }
 
     /// A replay serves cache effects from the tape. It must not read the live

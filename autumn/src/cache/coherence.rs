@@ -1257,6 +1257,8 @@ pub fn with_fill_fence<R>(
 #[must_use = "a `false` means stale entries can still be served"]
 pub fn invalidate_namespace(namespace: &str) -> bool {
     for store in fence_and_collect_stores(namespace) {
+        // A shared store raises its epoch here. `clear` alone would not.
+        let _ = store.invalidate_namespace(namespace);
         store.clear();
     }
 
@@ -1309,6 +1311,8 @@ pub async fn invalidate_namespace_async(namespace: &str) -> bool {
         }
     };
     for store in stores {
+        // A shared store raises its epoch here. `clear` alone would not.
+        let _ = store.invalidate_namespace_async(namespace).await;
         store.clear();
     }
     let Some(global) = super::global_cache() else {

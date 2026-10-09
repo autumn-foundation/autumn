@@ -81,6 +81,10 @@ return 1
 static FENCED_INSERT: std::sync::LazyLock<redis::Script> =
     std::sync::LazyLock::new(|| redis::Script::new(FENCED_INSERT_SCRIPT));
 
+/// Key segment that marks a shared fill epoch. [`RedisCache::sweep`] never
+/// deletes a key that has it.
+const EPOCH_SEGMENT: &str = "__autumn_epoch__:";
+
 /// Errors that can occur when constructing or using a [`RedisCache`].
 #[derive(Debug, Error)]
 pub enum RedisCacheError {
@@ -283,12 +287,12 @@ impl RedisCache {
 
     /// Key of a namespace's shared fill epoch.
     ///
-    /// Outside `key_prefix:`, like [`Self::fill_lock_key`]. This matters here:
-    /// [`Cache::clear`] sweeps `{key_prefix}:*`. If `clear` removed an epoch,
-    /// the counter would restart at 0, and a stale fill that sampled 0 would
-    /// pass.
+    /// Inside `key_prefix:`, so a Redis ACL scoped to the prefix still works.
+    /// [`Cache::clear`] sweeps `{key_prefix}:*`, so [`Self::sweep`] skips these
+    /// keys. If `clear` removed an epoch, the counter would restart at 0, and a
+    /// stale fill that sampled 0 would pass.
     fn epoch_key(&self, namespace: &str) -> String {
-        format!("__autumn_epoch__:{}:{}", self.key_prefix, namespace)
+        self.prefixed(&format!("{EPOCH_SEGMENT}{namespace}"))
     }
 
     /// Raise the namespace's shared epoch, with retries.
@@ -365,6 +369,11 @@ impl RedisCache {
                 .arg(100u32)
                 .query_async(&mut conn)
                 .await?;
+            let epoch_prefix = self.prefixed(EPOCH_SEGMENT);
+            let keys: Vec<String> = keys
+                .into_iter()
+                .filter(|key| !key.starts_with(&epoch_prefix))
+                .collect();
             if !keys.is_empty() {
                 conn.del::<_, ()>(keys).await?;
             }
@@ -1216,6 +1225,10 @@ mod tests {
         // match again after a bump.
         cache.clear();
         assert_eq!(cache.fill_epoch("a"), FillEpoch::Sampled(1));
+
+        // The key sits inside the prefix, so a prefix-scoped ACL still works.
+        let mut admin = admin_conn(&url).await;
+        assert!(key_exists(&mut admin, "fence-ns:__autumn_epoch__:a").await);
     }
 
     #[tokio::test(flavor = "multi_thread")]
