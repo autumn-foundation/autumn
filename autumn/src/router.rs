@@ -8473,6 +8473,30 @@ mod tests {
         );
     }
 
+    /// #2353: an `hx-*` story page loads htmx, and loads it before the
+    /// widget runtime.
+    #[cfg(all(feature = "maud", feature = "htmx"))]
+    #[tokio::test]
+    async fn story_detail_route_loads_htmx_for_hx_stories() {
+        let router = build_router(
+            Vec::new(),
+            &story_gallery_config(),
+            stories_state_with_builtin(),
+        );
+
+        let response = get_with_host(router, "/_stories/active-search").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("hx-get"), "story must use htmx: {body}");
+        let htmx_at = body
+            .find(crate::htmx::HTMX_JS_PATH)
+            .unwrap_or_else(|| panic!("page must load htmx.min.js: {body}"));
+        let widgets_at = body
+            .find(crate::htmx::AUTUMN_WIDGETS_JS_PATH)
+            .unwrap_or_else(|| panic!("page must load autumn-widgets.js: {body}"));
+        assert!(htmx_at < widgets_at, "htmx must load first: {body}");
+    }
+
     /// T3 (AC4): a mounted gallery 404s unknown slugs while the index stays up.
     #[cfg(feature = "maud")]
     #[tokio::test]
