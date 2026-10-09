@@ -801,12 +801,13 @@ impl Cache for CapsuleSeamCache {
         if let Some(tape) = crate::capsule::effects::current_tape() {
             return Box::pin(async move { tape.cache_invalidate(key) });
         }
-        // The tape position is taken now and filled when the removal ends, so
-        // concurrent writes keep their order, and a cancelled removal leaves
-        // an unfilled slot that marks the capsule incomplete.
-        let slot = crate::capsule::current_scope()
-            .and_then(|scope| scope.reserve_cache().map(|index| (scope, index)));
+        // The scope is read now; the tape position is taken when the future
+        // first runs, which is when replay consumes its entry. It is filled
+        // when the removal ends, so a cancelled removal leaves an unfilled
+        // slot that marks the capsule incomplete.
+        let scope = crate::capsule::current_scope();
         Box::pin(async move {
+            let slot = scope.and_then(|scope| scope.reserve_cache().map(|index| (scope, index)));
             let result = self.0.invalidate_async(key).await;
             if let Some((scope, index)) = slot {
                 scope.fill_cache(
@@ -828,9 +829,9 @@ impl Cache for CapsuleSeamCache {
         if let Some(tape) = crate::capsule::effects::current_tape() {
             return Box::pin(async move { tape.cache_invalidate_namespace(namespace) });
         }
-        let slot = crate::capsule::current_scope()
-            .and_then(|scope| scope.reserve_cache().map(|index| (scope, index)));
+        let scope = crate::capsule::current_scope();
         Box::pin(async move {
+            let slot = scope.and_then(|scope| scope.reserve_cache().map(|index| (scope, index)));
             let result = self.0.invalidate_namespace_async(namespace).await;
             if let Some((scope, index)) = slot {
                 scope.fill_cache(
@@ -1167,10 +1168,11 @@ mod tests {
         assert!(spy.calls().is_empty(), "{:?}", spy.calls());
     }
 
-    /// Review fix: an async removal takes its tape position when it starts.
+    /// An async removal takes its tape position when it first runs, the
+    /// point where replay consumes its entry (Codex review on #3222).
     #[cfg(feature = "reporting")]
     #[test]
-    fn an_async_removal_is_recorded_in_start_order() {
+    fn an_async_removal_is_recorded_when_it_first_runs() {
         let spy = Arc::new(SpyBackend::default());
         let cache = with_capsule_seam(Arc::clone(&spy) as Arc<dyn Cache>);
         let scope = Arc::new(crate::capsule::CaptureScope::new(
@@ -1189,11 +1191,11 @@ mod tests {
         assert_eq!(
             scope.effects_snapshot().cache,
             vec![
+                crate::capsule::CacheEffect::Clear,
                 crate::capsule::CacheEffect::Invalidate {
                     key: "a".to_owned(),
                     error: None,
                 },
-                crate::capsule::CacheEffect::Clear,
             ]
         );
     }

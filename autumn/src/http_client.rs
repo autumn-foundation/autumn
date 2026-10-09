@@ -710,6 +710,10 @@ pub(crate) fn outbound_blocked_for_replay() -> bool {
 /// W3C trace context, and any default the underlying `reqwest::Client` was
 /// built with — are deliberately outside it, so a client-side default can
 /// never be read as the handler changing its request.
+/// The prefix of a recorded header value that is escaped bytes.
+#[cfg(feature = "reporting")]
+const OPAQUE_HEADER_PREFIX: &str = "[bytes] ";
+
 #[cfg(feature = "reporting")]
 fn caller_headers(builder: &RequestBuilder) -> Vec<(String, String)> {
     builder
@@ -718,8 +722,13 @@ fn caller_headers(builder: &RequestBuilder) -> Vec<(String, String)> {
         .map(|(name, value)| {
             (
                 name.as_str().to_owned(),
-                // Lossy, not empty: a changed opaque value must still differ.
-                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                // An opaque value is kept as escaped bytes, so two different
+                // values never record the same text. A text value with the
+                // prefix is escaped too, so it cannot look like bytes.
+                match value.to_str() {
+                    Ok(text) if !text.starts_with(OPAQUE_HEADER_PREFIX) => text.to_owned(),
+                    _ => format!("{OPAQUE_HEADER_PREFIX}{}", value.as_bytes().escape_ascii()),
+                },
             )
         })
         .collect()
@@ -4462,6 +4471,24 @@ mod tests {
             ClientError::ThrottledLocally { host } => assert_eq!(host, "api.example.com:8443"),
             other => panic!("rebuilt as {other:?}"),
         }
+    }
+
+    /// Codex review on #3222: two different opaque header values record
+    /// different text, and a text value cannot look like bytes.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn opaque_header_values_record_without_collision() {
+        let recorded = |value: HeaderValue| {
+            let mut builder = Client::new().get("http://example.test/");
+            builder.extra_headers.insert("x-sig", value);
+            caller_headers(&builder).remove(0).1
+        };
+        let first = recorded(HeaderValue::from_bytes(b"a\xfe").expect("value"));
+        let second = recorded(HeaderValue::from_bytes(b"a\xff").expect("value"));
+        assert_ne!(first, second);
+        assert_eq!(recorded(HeaderValue::from_static("plain")), "plain");
+        let look_alike = recorded(HeaderValue::from_static("[bytes] a\\xfe"));
+        assert_ne!(look_alike, first);
     }
 
     /// Issue #3071: a capsule replays an injected fault as the same variant.

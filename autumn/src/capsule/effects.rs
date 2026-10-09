@@ -363,11 +363,16 @@ impl CacheWrite {
 /// [`make_cache_key`](crate::cache::make_cache_key) makes. A recorded key can
 /// be masked, so its prefix compares like other redacted text.
 fn in_namespace(key: &str, namespace: &str) -> bool {
-    key.strip_prefix(namespace)
+    if key
+        .strip_prefix(namespace)
         .is_some_and(|rest| rest.starts_with(':'))
-        || key
-            .rsplit_once(':')
-            .is_some_and(|(prefix, _)| matches_redacted(prefix, namespace))
+    {
+        return true;
+    }
+    // The key suffix can hold a colon too, so try each boundary.
+    key.match_indices(':')
+        .filter_map(|(index, _)| key.get(..index))
+        .any(|prefix| matches_redacted(prefix, namespace))
 }
 
 /// Which read-map slots a replayed write changes.
@@ -2254,6 +2259,18 @@ mod tests {
         let divergences = tape.finish();
         assert_eq!(divergences.len(), 1, "{divergences:?}");
         assert_eq!(divergences[0].kind, EffectDivergenceKind::Unconsumed);
+    }
+
+    /// Codex review on #3222: a masked namespace matches when the key
+    /// suffix holds a colon.
+    #[test]
+    fn a_masked_namespace_matches_a_key_with_a_colon_in_its_suffix() {
+        assert!(super::in_namespace(
+            "tenant:[FILTERED]:user:42",
+            "tenant:secret"
+        ));
+        assert!(super::in_namespace("ns:k", "ns"));
+        assert!(!super::in_namespace("other:k", "ns"));
     }
 
     /// Review fix: a namespace removal clears a recorded key that is masked.
