@@ -2256,6 +2256,13 @@ jobs:
           # instrumented library build is shared.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sim_idempotency_db
+          # Its lib unit tests (the `SQLite` store, the copy and lock fencing,
+          # `IdempotencyTx`) are measured here too, or Codecov reads the store's
+          # in-file tests and the paths only they reach as uncovered. A filter
+          # that matches nothing exits 0, so check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --lib -- idempotency:: | tee "$RUNNER_TEMP/idempotency-sqlite-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/idempotency-sqlite-cov.log"
           # Issue #2108: the admin plugin's `backend_select!` sqlite arms and
           # the cross-backend model suite. Without this lane Codecov reads them
           # as a new uncovered surface. No Docker, ~0.01s of runtime.
@@ -2287,6 +2294,18 @@ jobs:
             --test integration_tests -- --ignored shard_local_jobs:: tenant_db_bulkhead:: \
             | tee "$RUNNER_TEMP/isolation-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/isolation-cov.log"
+          # Issue #3061: the Postgres side of the database idempotency store
+          # runs only in these Docker tests, the `--lib` pg_tests and the
+          # consolidated binary's idempotency suites. Both filters are checked
+          # for a non-zero count.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --lib -- --ignored idempotency::db_store::pg_tests:: \
+            | tee "$RUNNER_TEMP/idempotency-pg-lib-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/idempotency-pg-lib-cov.log"
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored idempotency_ \
+            | tee "$RUNNER_TEMP/idempotency-pg-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/idempotency-pg-cov.log"
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_db -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \
