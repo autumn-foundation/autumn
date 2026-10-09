@@ -282,8 +282,7 @@ fn parse(html: &str) -> Doc {
         if !is_void && (stack.len() > MAX_DEPTH || !dropped.is_empty()) {
             if raw {
                 // Skip the raw text: its content is never markup.
-                let close = format!("</{}", tag.name);
-                let body_end = find_ascii_ci(&html[i..], &close).map_or(bytes.len(), |n| i + n);
+                let body_end = raw_text_end(&html[i..], &tag.name).map_or(bytes.len(), |n| i + n);
                 i = html[body_end..]
                     .find('>')
                     .map_or(bytes.len(), |n| body_end + n + 1);
@@ -302,8 +301,7 @@ fn parse(html: &str) -> Doc {
             },
         );
         if raw {
-            let close = format!("</{name}");
-            let body_end = find_ascii_ci(&html[i..], &close).map_or(bytes.len(), |n| i + n);
+            let body_end = raw_text_end(&html[i..], &name).map_or(bytes.len(), |n| i + n);
             let content = &html[i..body_end];
             if !content.is_empty() {
                 let text = if name == "title" || name == "textarea" {
@@ -437,6 +435,22 @@ fn memchr(needle: u8, hay: &[u8]) -> Option<usize> {
 }
 
 /// Find `needle` (ASCII) in `hay`, ignoring ASCII case.
+/// Offset of the end tag that closes the raw-text element `name`. As in the
+/// HTML tokenizer, `</name` counts only when the tag name ends there, so
+/// `</scripture>` inside a script is still script text.
+fn raw_text_end(hay: &str, name: &str) -> Option<usize> {
+    let close = format!("</{name}");
+    let mut from = 0;
+    while let Some(n) = find_ascii_ci(&hay[from..], &close) {
+        let at = from + n;
+        match hay.as_bytes().get(at + close.len()) {
+            None | Some(b'>' | b'/' | b' ' | b'\t' | b'\n' | b'\r' | b'\x0c') => return Some(at),
+            Some(_) => from = at + close.len(),
+        }
+    }
+    None
+}
+
 fn find_ascii_ci(hay: &str, needle: &str) -> Option<usize> {
     let h = hay.as_bytes();
     let n = needle.as_bytes();
@@ -1210,6 +1224,17 @@ mod tests {
     fn raw_text_past_the_depth_limit_stays_dropped() {
         let html = "<div>".repeat(300) + "<script>var s='</div>'; secret()</script>ok";
         let out = md(&html);
+        assert!(!out.contains("secret"), "{out}");
+        assert!(out.contains("ok"), "{out}");
+    }
+
+    #[test]
+    fn raw_text_ends_only_at_its_own_tag_name() {
+        let out = md("<script>\"</scripture><main>injected</main>\"</script>\
+             <main>real</main>");
+        assert_eq!(out, "real\n");
+        let deep = "<div>".repeat(300) + "<script>'</scripts><p>secret</p>'</SCRIPT >ok";
+        let out = md(&deep);
         assert!(!out.contains("secret"), "{out}");
         assert!(out.contains("ok"), "{out}");
     }

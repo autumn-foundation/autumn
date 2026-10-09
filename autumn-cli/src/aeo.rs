@@ -5,7 +5,7 @@
 //! from `autumn.toml` (with the profile overlay) when `--base-url` is not
 //! given. See `docs/guide/aeo.md`.
 
-use autumn_web::aeo::dns_aid::{DnsAidInput, records};
+use autumn_web::aeo::dns_aid::{DnsAidInput, records, valid_mcp_path};
 
 /// Run `autumn aeo dns` and print the zone lines.
 pub fn dns(base_url: Option<String>, mcp_path: Option<&str>, ttl: u32, profile: Option<&str>) {
@@ -39,6 +39,12 @@ fn render(base_url: Option<&str>, mcp_path: Option<&str>, ttl: u32) -> Result<St
     let base_url = base_url.ok_or_else(|| {
         "no base URL: pass --base-url or set [seo] base_url in autumn.toml".to_owned()
     })?;
+    if let Some(path) = mcp_path.filter(|p| !valid_mcp_path(p)) {
+        return Err(format!(
+            "--mcp-path {path:?} is not an absolute path without a query, fragment, \
+             quote or whitespace"
+        ));
+    }
     let lines = records(&DnsAidInput::new(base_url, mcp_path).ttl(ttl));
     if lines.is_empty() {
         return Err(format!(
@@ -89,5 +95,12 @@ mod tests {
     fn needs_an_absolute_base_url() {
         assert!(render(None, None, 3600).unwrap_err().contains("--base-url"));
         assert!(render(Some("example.com"), None, 3600).is_err());
+    }
+
+    #[test]
+    fn needs_an_absolute_mcp_path() {
+        let err = render(Some("https://example.com"), Some("mcp"), 3600).unwrap_err();
+        assert!(err.contains("--mcp-path"), "{err}");
+        assert!(render(Some("https://example.com"), Some("/mcp?tenant=a"), 3600).is_err());
     }
 }

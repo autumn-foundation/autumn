@@ -40,12 +40,40 @@ impl DnsAidInput {
     }
 }
 
-/// Zone file lines for the DNS-AID records. Empty when `base_url` is not an
+/// Whether `path` can be written into a record as an MCP mount path.
+///
+/// It must start with `/` and hold only visible ASCII other than `?`, `#`,
+/// `"` and `\`. A query or a fragment would swallow the appended
+/// `/server-card`, and a quote or a backslash would break the zone file
+/// string.
+#[must_use]
+pub fn valid_mcp_path(path: &str) -> bool {
+    path.starts_with('/') && zone_safe(path) && !path.contains(['?', '#'])
+}
+
+/// Visible ASCII other than `"` and `\`: safe inside a quoted zone string.
+fn zone_safe(s: &str) -> bool {
+    s.bytes()
+        .all(|b| b.is_ascii_graphic() && b != b'"' && b != b'\\')
+}
+
+/// Zone file lines for the DNS-AID records.
+///
+/// Empty when `base_url` is not an
 /// `http` or `https` URL with a DNS host name (an IP address has no zone),
-/// or has a query or a fragment.
+/// has a query or a fragment, or holds a character a zone file string
+/// cannot carry; or when `mcp_path` fails [`valid_mcp_path`].
 #[must_use]
 pub fn records(input: &DnsAidInput) -> Vec<String> {
     let base = input.base_url.trim().trim_end_matches('/');
+    if !zone_safe(base)
+        || input
+            .mcp_path
+            .as_deref()
+            .is_some_and(|p| !valid_mcp_path(p))
+    {
+        return Vec::new();
+    }
     let Ok(url) = url::Url::parse(base) else {
         return Vec::new();
     };
@@ -123,5 +151,28 @@ mod tests {
         assert!(records(&DnsAidInput::new("ftp://example.com", None)).is_empty());
         assert!(records(&DnsAidInput::new("https://example.com?tenant=a", None)).is_empty());
         assert!(records(&DnsAidInput::new("https://example.com#top", None)).is_empty());
+        assert!(records(&DnsAidInput::new("https://exa\nmple.com", None)).is_empty());
+        assert!(records(&DnsAidInput::new("https://example.com/a\"b", None)).is_empty());
+    }
+
+    #[test]
+    fn mcp_path_must_be_a_plain_absolute_path() {
+        for bad in [
+            "mcp",
+            "/mcp?tenant=a",
+            "/mcp#x",
+            "/m\"cp",
+            "/m cp",
+            "/mcp\n",
+            "",
+        ] {
+            assert!(!valid_mcp_path(bad), "{bad:?}");
+            assert!(
+                records(&DnsAidInput::new("https://example.com", Some(bad))).is_empty(),
+                "{bad:?}"
+            );
+        }
+        assert!(valid_mcp_path("/mcp"));
+        assert!(valid_mcp_path("/api/mcp/"));
     }
 }
