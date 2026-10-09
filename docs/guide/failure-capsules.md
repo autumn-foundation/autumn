@@ -962,6 +962,11 @@ What capsules do not do, stated plainly:
   gets the event, transaction-timeout and job contexts of a production run. A
   handler that reads `JobContext` would take a path production did not take,
   so capture marks the capsule incomplete.
+- **Some cache calls refuse the capsule.** A sync `invalidate` or `clear`
+  returns no result. When the backend counts a failed removal during the call,
+  capture marks the capsule incomplete. A cache fill that meets a distributed
+  fill lock (`Acquired` or `Held`) also marks it incomplete: replay has no
+  lock, so it cannot take the same path.
 - **Only failures are captured.** There is no way to capsule a successful
   request, by design: the buffer for a request that succeeds is dropped at the
   response boundary.
