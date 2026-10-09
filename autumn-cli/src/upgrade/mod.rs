@@ -1426,18 +1426,36 @@ mod write_guard_tests {
 /// The plan also carries each file's planned text. The scaffold diff uses that
 /// text, so preview and apply show the same diff.
 fn plan_scaffold(root: &Path, target: &str, report: &Report) -> Option<scaffold::ScaffoldReport> {
-    let migrated: BTreeMap<String, scaffold::Planned> = report
+    let migrated = scaffold_plans(report);
+    scaffold::is_project(root).then(|| scaffold::plan_after(root, target, &migrated))
+}
+
+/// What the codemods plan for each file, as the scaffold half sees it.
+///
+/// After a partial apply, a file past the failure was never written. Its plan
+/// is its own text, so it is judged by what is on disk.
+fn scaffold_plans(report: &Report) -> BTreeMap<String, scaffold::Planned> {
+    let written = match report.outcome {
+        Outcome::Partial { written } => written,
+        Outcome::Preview | Outcome::Applied => usize::MAX,
+    };
+    report
         .files
         .iter()
-        .map(|file| {
+        .enumerate()
+        .map(|(index, file)| {
+            let updated = if index < written {
+                &file.updated
+            } else {
+                &file.original
+            };
             let plan = scaffold::Planned {
                 original: file.original.clone(),
-                updated: file.updated.clone(),
+                updated: updated.clone(),
             };
             (file.path.clone(), plan)
         })
-        .collect();
-    scaffold::is_project(root).then(|| scaffold::plan_after(root, target, &migrated))
+        .collect()
 }
 
 /// Reject flag combinations whose meanings contradict each other.
@@ -1838,6 +1856,33 @@ mod tests {
             manual: Vec::new(),
             skipped: Vec::new(),
         }
+    }
+
+    fn rewrite(path: &str, original: &str, updated: &str) -> FileReport {
+        FileReport {
+            path: path.into(),
+            sites: Vec::new(),
+            diff: String::new(),
+            updated: updated.into(),
+            original: original.into(),
+            absolute: PathBuf::from(path),
+        }
+    }
+
+    #[test]
+    fn a_partial_apply_plans_only_the_files_it_wrote() {
+        let mut report = empty(Outcome::Partial { written: 1 });
+        report.files = vec![
+            rewrite("a.rs", "a\n", "A\n"),
+            rewrite("build.rs", "b\n", "B\n"),
+        ];
+        let plans = scaffold_plans(&report);
+        assert_eq!(plans["a.rs"].updated, "A\n");
+        // Not written, so the disk text is still the one to judge.
+        assert_eq!(plans["build.rs"].updated, "b\n");
+
+        report.outcome = Outcome::Preview;
+        assert_eq!(scaffold_plans(&report)["build.rs"].updated, "B\n");
     }
 
     #[test]
