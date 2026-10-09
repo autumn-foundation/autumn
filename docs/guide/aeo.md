@@ -240,7 +240,8 @@ agent_identity_types = ["anonymous"]
 agent_credential_types = ["api_key"]
 ```
 
-The issuer must be this site's origin with no path. Autumn does not publish
+The issuer must be this site's origin with no path: an `https` URL with no
+query or fragment (RFC 8414). Autumn does not publish
 metadata for another issuer.
 
 Autumn serves `/auth.md` when `[aeo.auth_md] registration_url` or OAuth

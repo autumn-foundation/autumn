@@ -277,10 +277,12 @@ fn parse(html: &str) -> Doc {
             }
         }
 
-        // Browsers ignore `/>` on a raw-text element: `<script/>` still runs
-        // to `</script>`, and everything up to it is script text.
+        // Browsers ignore `/>` on an HTML element: `<template/>` stays open
+        // to `</template>`, and `<script/>` runs to `</script>`. Only a foreign
+        // root (`<svg/>`, `<math/>`) closes itself.
         let raw = RAW_TEXT.contains(&tag.name.as_str());
-        let is_void = VOID.contains(&tag.name.as_str()) || (tag.self_closing && !raw);
+        let is_void = VOID.contains(&tag.name.as_str())
+            || (tag.self_closing && matches!(tag.name.as_str(), "svg" | "math"));
         if !is_void && (stack.len() > MAX_DEPTH || !dropped.is_empty()) {
             if raw {
                 // Skip the raw text: its content is never markup.
@@ -1241,6 +1243,14 @@ mod tests {
         let out = md(&html);
         assert!(!out.contains("secret"), "{out}");
         assert!(out.contains("ok"), "{out}");
+    }
+
+    #[test]
+    fn a_self_closing_html_tag_stays_open() {
+        let out = md("<template/><main>hidden</main></template><main>real</main>");
+        assert_eq!(out, "real\n");
+        // A foreign root does close itself.
+        assert_eq!(md("<p>a<svg/>b</p>"), "ab\n");
     }
 
     #[test]

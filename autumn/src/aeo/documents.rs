@@ -81,6 +81,8 @@ pub struct SiteFacts {
     /// The home page paths: `/`, or `/{locale}` for each locale when the
     /// root is locale-prefixed. Empty means `/`.
     pub home_paths: Vec<String>,
+    /// The home page says `noindex`: the sitemap leaves it out.
+    pub home_noindex: bool,
 }
 
 /// The mounted MCP server.
@@ -316,6 +318,21 @@ impl Origin {
             .map_or_else(|| authority.clone(), str::to_owned)
     }
 
+    /// `true` when a request `Host` names this origin, as the RFC 9421
+    /// `@authority` a verifier rebuilds from that request.
+    #[must_use]
+    pub(crate) fn is_request_authority(&self, host: Option<&str>) -> bool {
+        let Some(host) = host.map(|h| h.trim().to_ascii_lowercase()) else {
+            return false;
+        };
+        let default_port = if self.base.starts_with("https://") {
+            ":443"
+        } else {
+            ":80"
+        };
+        host.strip_suffix(default_port).unwrap_or(&host) == self.signing_authority()
+    }
+
     /// `host[:port]` of [`Origin::base`].
     #[must_use]
     pub fn authority(&self) -> &str {
@@ -392,7 +409,9 @@ fn sitemap(facts: &SiteFacts, origin: &Origin) -> Document {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
     );
-    let mut paths: Vec<&str> = if facts.home_paths.is_empty() {
+    let mut paths: Vec<&str> = if facts.home_noindex {
+        Vec::new()
+    } else if facts.home_paths.is_empty() {
         vec!["/"]
     } else {
         facts.home_paths.iter().map(String::as_str).collect()
@@ -1078,7 +1097,9 @@ fn local_issuer<'a>(facts: &'a SiteFacts, origin: &Origin) -> Option<&'a str> {
         .as_deref()
         .filter(|i| !i.trim().is_empty())?;
     let url = url::Url::parse(issuer).ok()?;
-    let rooted = matches!(url.path(), "" | "/");
+    // RFC 8414 §2: an `https` URL with no query or fragment.
+    let valid = url.scheme() == "https" && url.query().is_none() && url.fragment().is_none();
+    let rooted = valid && matches!(url.path(), "" | "/");
     let same_origin = url::Url::parse(&origin.base).is_ok_and(|base| base.origin() == url.origin());
     (rooted && same_origin).then_some(issuer)
 }
@@ -1748,6 +1769,45 @@ mod tests {
             "api_key"
         );
         assert!(meta.get("jwks_uri").is_none());
+
+        // RFC 8414 §2: https, no query, no fragment.
+        for bad in [
+            "https://shop.example.com?tenant=a",
+            "https://shop.example.com#x",
+        ] {
+            facts.oauth.authorization_server.issuer = Some(bad.to_owned());
+            assert!(
+                render(&facts, &origin(), OAUTH_SERVER_PATH).is_none(),
+                "{bad}"
+            );
+        }
+        facts.oauth.authorization_server.issuer = Some("http://localhost:3000".to_owned());
+        let local = Origin::resolve(Some("http://localhost:3000"), None);
+        assert!(render(&facts, &local, OAUTH_SERVER_PATH).is_none());
+    }
+
+    #[test]
+    fn the_request_authority_must_match_the_signed_one() {
+        let o = Origin::resolve(Some("https://Example.com"), None);
+        assert!(o.is_request_authority(Some("example.com")));
+        assert!(o.is_request_authority(Some("Example.com:443")));
+        assert!(!o.is_request_authority(Some("www.example.com")));
+        assert!(!o.is_request_authority(Some("example.com:8443")));
+        assert!(!o.is_request_authority(None));
+    }
+
+    #[test]
+    fn a_noindex_home_is_not_in_the_fallback_sitemap() {
+        let mut facts = content_site();
+        facts.sitemap = true;
+        facts.home_noindex = true;
+        let doc = render(&facts, &origin(), SITEMAP_PATH).unwrap();
+        assert!(
+            !doc.body.contains("<loc>https://shop.example.com/</loc>"),
+            "{}",
+            doc.body
+        );
+        assert!(doc.body.contains("/about</loc>"), "{}", doc.body);
     }
 
     #[test]

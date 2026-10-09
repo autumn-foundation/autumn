@@ -518,7 +518,13 @@ pub(crate) async fn fallback(site: Option<Arc<AeoSite>>, req: Request<Body>) -> 
             .and_then(|v| v.to_str().ok())
             .or_else(|| uri.authority().map(axum::http::uri::Authority::as_str));
         let origin = documents::Origin::resolve(site.base_url.as_deref(), host);
-        if let Some(doc) = documents::render(&site.facts, &origin, uri.path()) {
+        if let Some(mut doc) = documents::render(&site.facts, &origin, uri.path()) {
+            // The directory signature covers `@authority`: through another
+            // trusted host a verifier would rebuild a different one.
+            if uri.path() == web_bot_auth::DIRECTORY_PATH && !origin.is_request_authority(host) {
+                doc.headers
+                    .retain(|(name, _)| !matches!(*name, "signature" | "signature-input"));
+            }
             return document_response(doc, &method, req.headers());
         }
     }
