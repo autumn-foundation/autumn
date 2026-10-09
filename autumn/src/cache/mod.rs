@@ -1468,31 +1468,23 @@ mod tests {
         assert!(!capture_scope().had_global_cache());
     }
 
-    /// Codex review on #3222: a run records what `AppState::cache()` gave,
-    /// apart from the global cache.
+    /// Codex review on #3222: only a cache the builder put in the state is
+    /// recorded. A cache an initializer installs with `set_cache` is
+    /// installed again by the initializer during a replay.
     #[cfg(feature = "reporting")]
     #[test]
-    fn a_capture_scope_records_the_state_cache_apart() {
-        let with_cache = crate::state::AppState::for_test()
+    fn only_a_builder_state_cache_is_recorded() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let builder = crate::state::AppState::for_test()
             .with_cache(Arc::new(SpyBackend::default()) as Arc<dyn Cache>);
-        let scope = capture_scope();
-        block_on(crate::capsule::capture::with_capture_scope(
-            Arc::clone(&scope),
-            async {
-                assert!(with_cache.cache().is_some());
-            },
-        ));
-        assert!(scope.had_state_cache());
-
-        let without = crate::state::AppState::for_test();
-        let scope = capture_scope();
-        block_on(crate::capsule::capture::with_capture_scope(
-            Arc::clone(&scope),
-            async {
-                assert!(without.cache().is_none());
-            },
-        ));
-        assert!(!scope.had_state_cache());
+        assert!(builder.has_builder_cache());
+        let initializer = crate::state::AppState::for_test();
+        initializer.set_cache(Arc::new(SpyBackend::default()));
+        clear_global_cache();
+        assert!(initializer.cache().is_some());
+        assert!(!initializer.has_builder_cache());
     }
 
     /// Codex review on #3222: during `autumn replay`, a cache call with no

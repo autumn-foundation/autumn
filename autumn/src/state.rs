@@ -669,17 +669,18 @@ impl AppState {
     /// [`Self::with_cache`]).
     #[must_use]
     pub fn cache(&self) -> Option<Arc<dyn Cache>> {
-        let cache = self
-            .extension::<GlobalCacheEntry>()
+        self.extension::<GlobalCacheEntry>()
             .map(|e| e.0.clone())
-            .or_else(|| self.shared_cache.clone());
-        // A failure capsule records this apart from the global cache, so a
-        // replay gives the state the same answer (#2351).
-        #[cfg(feature = "reporting")]
-        if let Some(scope) = crate::capsule::current_scope() {
-            scope.note_state_cache(cache.is_some());
-        }
-        cache
+            .or_else(|| self.shared_cache.clone())
+    }
+
+    /// Whether the builder put a cache in the state
+    /// (`AppBuilder::with_cache_backend`), before the state initializers ran.
+    /// A failure capsule records it, and a replay installs a cache there
+    /// before the initializers run again (#2351).
+    #[cfg(feature = "reporting")]
+    pub(crate) const fn has_builder_cache(&self) -> bool {
+        self.shared_cache.is_some()
     }
 
     /// Register a global cache backend (builder / test helper, build-time).

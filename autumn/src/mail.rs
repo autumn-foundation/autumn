@@ -3800,7 +3800,7 @@ impl MailTransport for InterceptedMailTransport {
 /// A send on the replayed request is served from the tape by the mail seam.
 /// A send that reaches the transport ran with no tape, and is refused.
 #[cfg(feature = "reporting")]
-pub(crate) fn install_replay_mailer(state: &AppState, config: &MailConfig) {
+pub(crate) fn install_replay_mailer(state: &AppState, config: &MailConfig, builder_queue: bool) {
     // A state initializer can install its own mailer. Its defaults, CSS
     // inlining and `is_disabled()` apply before the seam, so the replay
     // mailer keeps them. Only the transport changes. With no installed
@@ -3811,15 +3811,20 @@ pub(crate) fn install_replay_mailer(state: &AppState, config: &MailConfig) {
         || config.transport == Transport::Disabled,
         |mailer| mailer.is_disabled(),
     );
+    // `has_durable_delivery_queue()` is observable too. Production gets a
+    // queue from the builder (`with_mail_delivery_queue`) or from a handle in
+    // the state. The replay queue refuses, so the live queue is never reached.
+    let durable = installed.as_ref().map_or_else(
+        || builder_queue || state.extension::<MailDeliveryQueueHandle>().is_some(),
+        |mailer| mailer.has_durable_delivery_queue(),
+    );
     let mut mailer = Mailer::with_transport(ReplayTransport { disabled });
+    if durable {
+        mailer.delivery_queue = Some(Arc::new(ReplayTransport { disabled }));
+    }
     if let Some(installed) = installed {
         mailer.defaults = Arc::clone(&installed.defaults);
         mailer.inline_css_default = installed.inline_css_default;
-        // `has_durable_delivery_queue()` is observable too. The replay queue
-        // refuses, so the live queue is never reached.
-        if installed.has_durable_delivery_queue() {
-            mailer.delivery_queue = Some(Arc::new(ReplayTransport { disabled }));
-        }
     } else {
         mailer.defaults = Arc::new(MailerDefaults {
             from: config.from.clone(),
@@ -6596,7 +6601,7 @@ mod tests {
     #[tokio::test]
     async fn replay_mailer_answers_from_the_tape_and_refuses_off_tape_sends() {
         let state = AppState::for_test();
-        install_replay_mailer(&state, &MailConfig::default());
+        install_replay_mailer(&state, &MailConfig::default(), false);
         let mailer = state.extension::<Mailer>().expect("installed");
         let mail = || {
             Mail::builder()
@@ -6639,7 +6644,7 @@ mod tests {
             transport: Transport::Disabled,
             ..MailConfig::default()
         };
-        install_replay_mailer(&state, &config);
+        install_replay_mailer(&state, &config, false);
         let mailer = state.extension::<Mailer>().expect("installed");
         let mail = Mail::builder()
             .from("from@example.com")
@@ -6674,7 +6679,7 @@ mod tests {
             .build()
             .unwrap();
         state.insert_extension(installed);
-        install_replay_mailer(&state, &MailConfig::default());
+        install_replay_mailer(&state, &MailConfig::default(), false);
         let replay = state.extension::<Mailer>().expect("installed");
         assert_eq!(replay.defaults.from.as_deref(), Some("app@example.com"));
         assert_eq!(
@@ -6683,6 +6688,29 @@ mod tests {
         );
         assert!(replay.inline_css_default);
         assert!(replay.is_disabled());
+    }
+
+    /// Codex review on #3222: a queue the builder gave the production
+    /// mailer is kept as a refusing replay queue.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn replay_mailer_keeps_a_builder_queue_capability() {
+        let state = AppState::for_test();
+        install_replay_mailer(&state, &MailConfig::default(), true);
+        assert!(
+            state
+                .extension::<Mailer>()
+                .expect("installed")
+                .has_durable_delivery_queue()
+        );
+        let state = AppState::for_test();
+        install_replay_mailer(&state, &MailConfig::default(), false);
+        assert!(
+            !state
+                .extension::<Mailer>()
+                .expect("installed")
+                .has_durable_delivery_queue()
+        );
     }
 
     /// Codex review on #3222: the replay mailer keeps
@@ -6694,7 +6722,7 @@ mod tests {
         let mut installed = Mailer::with_transport(DisabledTransport);
         installed.delivery_queue = Some(Arc::new(ReplayTransport { disabled: false }));
         state.insert_extension(installed);
-        install_replay_mailer(&state, &MailConfig::default());
+        install_replay_mailer(&state, &MailConfig::default(), false);
         let replay = state.extension::<Mailer>().expect("installed");
         assert!(replay.has_durable_delivery_queue());
         let queue = replay.delivery_queue.clone().expect("queue");
@@ -6744,7 +6772,7 @@ mod tests {
         assert_eq!(effects.mail.len(), 1);
 
         let state = AppState::for_test();
-        install_replay_mailer(&state, &MailConfig::default());
+        install_replay_mailer(&state, &MailConfig::default(), false);
         let replay = state.extension::<Mailer>().expect("installed");
         let tape = Arc::new(crate::capsule::ReplayEffects::new(effects));
         let replayed = crate::capsule::with_effect_tape(Arc::clone(&tape), async {

@@ -465,8 +465,10 @@ pub struct CapsuleEffects {
     /// stores nothing when this is `true`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub global_cache: bool,
-    /// Whether `AppState::cache()` returned a cache in the run. It is held
-    /// apart from the global cache, so it is recorded apart.
+    /// Whether the builder put a cache in the app state
+    /// (`AppBuilder::with_cache_backend`). Replay installs one there before
+    /// the state initializers run. An initializer installs its own cache
+    /// again during the replay.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub state_cache: bool,
 }

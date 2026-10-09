@@ -8373,8 +8373,14 @@ impl AppBuilder {
             #[cfg(all(feature = "embed-assets", feature = "i18n"))]
             embedded_locales,
             plugin_config_roots,
+            // Read only for whether it is set: calling it could reach a live
+            // queue. The replay mailer gets a refusing queue in its place.
+            #[cfg(feature = "mail")]
+            mail_delivery_queue_factory,
             ..
         } = self;
+        #[cfg(feature = "mail")]
+        let builder_mail_queue = mail_delivery_queue_factory.is_some();
 
         // Nothing outside the capsule may be reached from here on: the router
         // this rebuilds is the real one, with the application's real outbound
@@ -8505,7 +8511,7 @@ impl AppBuilder {
         // installed; before the router state is cloned, so a job replay gets
         // it too (#2351 item 7).
         #[cfg(feature = "mail")]
-        crate::mail::install_replay_mailer(&state, &config.mail);
+        crate::mail::install_replay_mailer(&state, &config.mail, builder_mail_queue);
         crate::cost::install(&state, &config);
         // Durable listeners need the job runtime this path never starts, so —
         // as in static builds — only sync listeners are registered, and a
@@ -17354,7 +17360,9 @@ mod tests {
         let source = include_str!("app.rs").replace("\r\n", "\n");
         let handler = replay_mode_source(&source);
         assert!(
-            handler.contains("crate::mail::install_replay_mailer(&state, &config.mail);"),
+            handler.contains(
+                "crate::mail::install_replay_mailer(&state, &config.mail, builder_mail_queue);"
+            ),
             "the replay handler must install the tape-backed mailer"
         );
     }

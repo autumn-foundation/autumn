@@ -510,8 +510,7 @@ pub struct CaptureScope {
     closed: AtomicBool,
     /// Whether a global cache was installed when the run started.
     global_cache: bool,
-    /// Whether the app state held a cache: at the request start, or when the
-    /// run called `AppState::cache()`.
+    /// Whether the builder put a cache in the app state.
     state_cache: AtomicBool,
 }
 
@@ -540,14 +539,15 @@ impl CaptureScope {
         }
     }
 
-    /// Note whether the app state held a cache. Any `true` is kept.
+    /// Note whether the builder put a cache in the app state. Any `true` is
+    /// kept.
     pub(crate) fn note_state_cache(&self, present: bool) {
         if present {
             self.state_cache.store(true, Ordering::Relaxed);
         }
     }
 
-    /// Whether the app state held a cache in the run.
+    /// Whether the builder put a cache in the app state.
     #[must_use]
     pub(crate) fn had_state_cache(&self) -> bool {
         self.state_cache.load(Ordering::Relaxed)
@@ -1286,9 +1286,9 @@ impl CaptureLayer {
         }
     }
 
-    /// Read at each request start whether the app state holds a cache. Code
-    /// can resolve `state.cache()` when the app is built, before a request
-    /// scope exists, so the request alone cannot tell (#2351).
+    /// Read at each request start whether the builder put a cache in the app
+    /// state. Code can resolve `state.cache()` when the app is built, before
+    /// a request scope exists, so the request alone cannot tell (#2351).
     #[must_use]
     pub(crate) fn with_state_cache_probe(mut self, probe: StateCacheProbe) -> Self {
         self.state_cache = Some(probe);
