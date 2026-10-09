@@ -732,7 +732,32 @@ impl CapsuleSeamCache {
             scope.record_cache(effect);
         }
     }
+
+    /// Run a removal that returns no result. A backend counts a failed one
+    /// with [`record_invalidation_failure`]. When the count goes up, replay
+    /// cannot know the result, so the capsule is marked incomplete. A failure
+    /// on another task can also do this; replay then only refuses.
+    fn unchecked_removal(remove: impl FnOnce()) {
+        let before = invalidation_failures_total();
+        remove();
+        if invalidation_failures_total() != before
+            && let Some(scope) = crate::capsule::current_scope()
+        {
+            scope.note(UNCHECKED_REMOVAL_NOTE);
+            scope.mark_truncated();
+        }
+    }
 }
+
+/// Why a capsule with a removal of unknown result is not replayable.
+#[cfg(feature = "reporting")]
+const UNCHECKED_REMOVAL_NOTE: &str = "a cache removal with no result reported a failure; \
+     replay cannot know whether the entry stayed";
+
+/// Why a capsule that met a distributed fill lock is not replayable.
+#[cfg(feature = "reporting")]
+const FILL_LOCK_NOTE: &str = "a cache fill met a distributed fill lock; the lock outcome \
+     is not recorded, so replay cannot take the same path";
 
 /// A recorded [`InvalidationError`].
 #[cfg(feature = "reporting")]
@@ -776,7 +801,7 @@ impl Cache for CapsuleSeamCache {
             key: key.to_owned(),
             error: None,
         });
-        self.0.invalidate(key);
+        Self::unchecked_removal(|| self.0.invalidate(key));
     }
 
     fn clear(&self) {
@@ -785,7 +810,7 @@ impl Cache for CapsuleSeamCache {
             return;
         }
         Self::record(crate::capsule::CacheEffect::Clear);
-        self.0.clear();
+        Self::unchecked_removal(|| self.0.clear());
     }
 
     fn invalidate_namespace(&self, namespace: &str) -> bool {
@@ -819,7 +844,15 @@ impl Cache for CapsuleSeamCache {
         if crate::capsule::effects::tape_active() {
             return FillLockStatus::Unsupported;
         }
-        self.0.try_acquire_fill_lock(key, token, ttl)
+        let status = self.0.try_acquire_fill_lock(key, token, ttl);
+        // Replay answers `Unsupported`, so a lock path cannot replay.
+        if status != FillLockStatus::Unsupported
+            && let Some(scope) = crate::capsule::current_scope()
+        {
+            scope.note(FILL_LOCK_NOTE);
+            scope.mark_truncated();
+        }
+        status
     }
 
     fn release_fill_lock(&self, key: &str, token: &str) {
@@ -1266,6 +1299,88 @@ mod tests {
 
         assert!(install_replay_cache(&crate::capsule::CapsuleEffects::default()).is_none());
         assert!(global_cache().is_none());
+    }
+
+    /// A backend whose sync removals fail, and whose fill lock is held.
+    #[cfg(feature = "reporting")]
+    struct FailingSyncBackend;
+
+    #[cfg(feature = "reporting")]
+    impl Cache for FailingSyncBackend {
+        fn get_value(&self, _key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+            None
+        }
+        fn insert_value(&self, _key: &str, _value: Arc<dyn Any + Send + Sync>) {}
+        fn invalidate(&self, _key: &str) {
+            record_invalidation_failure();
+        }
+        fn clear(&self) {
+            record_invalidation_failure();
+        }
+        fn try_acquire_fill_lock(
+            &self,
+            _key: &str,
+            _token: &str,
+            _ttl: Duration,
+        ) -> FillLockStatus {
+            FillLockStatus::Held
+        }
+    }
+
+    #[cfg(feature = "reporting")]
+    fn capture_scope() -> Arc<crate::capsule::CaptureScope> {
+        Arc::new(crate::capsule::CaptureScope::new(
+            "cache-test".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ))
+    }
+
+    /// Codex review on #3222: a sync removal that reports a failure marks
+    /// the capsule incomplete.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_failed_sync_removal_marks_the_capsule_incomplete() {
+        for remove in [
+            (|cache: &dyn Cache| cache.invalidate("k")) as fn(&dyn Cache),
+            |cache: &dyn Cache| cache.clear(),
+        ] {
+            let cache = with_capsule_seam(Arc::new(FailingSyncBackend));
+            let scope = capture_scope();
+            block_on(crate::capsule::capture::with_capture_scope(
+                Arc::clone(&scope),
+                async { remove(cache.as_ref()) },
+            ));
+            assert!(scope.is_truncated());
+        }
+    }
+
+    /// Codex review on #3222: a fill lock outcome other than `Unsupported`
+    /// marks the capsule incomplete.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_distributed_fill_lock_marks_the_capsule_incomplete() {
+        let cache = with_capsule_seam(Arc::new(FailingSyncBackend));
+        let scope = capture_scope();
+        let status = block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async { cache.try_acquire_fill_lock("k", "t", Duration::from_secs(1)) },
+        ));
+        assert_eq!(status, FillLockStatus::Held);
+        assert!(scope.is_truncated());
+
+        let moka = with_capsule_seam(Arc::new(SpyBackend::default()));
+        let scope = capture_scope();
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async {
+                let _ = moka.try_acquire_fill_lock("k", "t", Duration::from_secs(1));
+            },
+        ));
+        assert!(
+            !scope.is_truncated(),
+            "a backend with no lock is replayable"
+        );
     }
 
     /// The seam wraps a backend once, so `Arc` identity stays stable.
