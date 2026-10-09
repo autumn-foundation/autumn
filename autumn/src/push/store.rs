@@ -245,23 +245,10 @@ impl BrowserSubscription {
         let p256dh = decode_base64url(self.keys.p256dh.trim()).ok_or_else(|| {
             PushError::InvalidSubscriptionKey("`p256dh` is not valid base64url".to_owned())
         })?;
-        // Parsing as a curve point rejects both a wrong length and a value
-        // that merely looks like one, so no off-curve key reaches the ECDH.
-        p256::PublicKey::from_sec1_bytes(&p256dh).map_err(|_| {
-            PushError::InvalidSubscriptionKey(
-                "`p256dh` is not an uncompressed P-256 public key on the curve".to_owned(),
-            )
-        })?;
-
         let auth = decode_base64url(self.keys.auth.trim()).ok_or_else(|| {
             PushError::InvalidSubscriptionKey("`auth` is not valid base64url".to_owned())
         })?;
-        if auth.len() != AUTH_SECRET_LEN {
-            return Err(PushError::InvalidSubscriptionKey(format!(
-                "`auth` must be exactly {AUTH_SECRET_LEN} bytes, got {}",
-                auth.len()
-            )));
-        }
+        check_key_material(&p256dh, &auth)?;
 
         Ok(StoredSubscription {
             principal_id: principal.0.clone(),
@@ -270,6 +257,27 @@ impl BrowserSubscription {
             auth,
         })
     }
+}
+
+/// Check decoded key material: a P-256 point and a 16-byte `auth` secret.
+///
+/// Shared by [`BrowserSubscription::decode`] and the database path, so a row
+/// written by other means is held to the same rules as one from the API.
+pub(crate) fn check_key_material(p256dh: &[u8], auth: &[u8]) -> Result<(), PushError> {
+    // Parsing as a curve point rejects both a wrong length and a value
+    // that merely looks like one, so no off-curve key reaches the ECDH.
+    p256::PublicKey::from_sec1_bytes(p256dh).map_err(|_| {
+        PushError::InvalidSubscriptionKey(
+            "`p256dh` is not an uncompressed P-256 public key on the curve".to_owned(),
+        )
+    })?;
+    if auth.len() != AUTH_SECRET_LEN {
+        return Err(PushError::InvalidSubscriptionKey(format!(
+            "`auth` must be exactly {AUTH_SECRET_LEN} bytes, got {}",
+            auth.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Check an endpoint URL and return it in normalized form.
@@ -709,9 +717,17 @@ mod db_store {
                     ))
                 })
             };
+            let p256dh = decode("p256dh", &row.p256dh)?;
+            let auth = decode("auth", &row.auth)?;
+            super::check_key_material(&p256dh, &auth).map_err(|e| {
+                PushError::Store(format!(
+                    "stored keys for {} are unusable: {e}",
+                    row.endpoint
+                ))
+            })?;
             Ok(Self {
-                p256dh: decode("p256dh", &row.p256dh)?,
-                auth: decode("auth", &row.auth)?,
+                p256dh,
+                auth,
                 principal_id: row.principal_id,
                 endpoint: row.endpoint,
             })
@@ -967,13 +983,26 @@ mod db_store {
         use super::super::MAX_SUBSCRIPTIONS_PER_PRINCIPAL;
         use super::*;
 
-        fn row(endpoint: &str, key: &str) -> SubscriptionRow {
+        const P256DH: &str = "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4";
+        const AUTH: &str = "BTBZMqHH6r4Tts7J_aSIgg";
+
+        fn row_with(endpoint: &str, p256dh: &str, auth: &str) -> SubscriptionRow {
             SubscriptionRow {
                 principal_id: "1".to_owned(),
                 endpoint: endpoint.to_owned(),
-                p256dh: key.to_owned(),
-                auth: key.to_owned(),
+                p256dh: p256dh.to_owned(),
+                auth: auth.to_owned(),
             }
+        }
+
+        /// A row with valid keys.
+        fn good(endpoint: &str) -> SubscriptionRow {
+            row_with(endpoint, P256DH, AUTH)
+        }
+
+        /// A row whose keys are not even base64url.
+        fn bad(endpoint: &str) -> SubscriptionRow {
+            row_with(endpoint, "not base64!", "not base64!")
         }
 
         #[test]
@@ -981,16 +1010,16 @@ mod db_store {
             // More rows than the cap is a supported state, and the first
             // page can be all corrupt. Paging must go on to the next one.
             let mut usable = Vec::new();
-            let bad: Vec<SubscriptionRow> = (0..MAX_SUBSCRIPTIONS_PER_PRINCIPAL)
-                .map(|i| row(&format!("https://push.example.com/bad{i}"), "not base64!"))
+            let first: Vec<SubscriptionRow> = (0..MAX_SUBSCRIPTIONS_PER_PRINCIPAL)
+                .map(|i| bad(&format!("https://push.example.com/bad{i}")))
                 .collect();
             assert!(
-                absorb_page("1", &mut usable, bad),
+                absorb_page("1", &mut usable, first),
                 "a full page with no usable row needs the next page"
             );
-            let good = vec![row("https://push.example.com/good", "AAAA")];
+            let last = vec![good("https://push.example.com/good")];
             assert!(
-                !absorb_page("1", &mut usable, good),
+                !absorb_page("1", &mut usable, last),
                 "a short page is the last"
             );
             assert_eq!(usable.len(), 1);
@@ -1000,18 +1029,33 @@ mod db_store {
         fn paging_stops_once_the_cap_of_usable_rows_is_collected() {
             let mut usable = Vec::new();
             let page: Vec<SubscriptionRow> = (0..MAX_SUBSCRIPTIONS_PER_PRINCIPAL)
-                .map(|i| row(&format!("https://push.example.com/ok{i}"), "AAAA"))
+                .map(|i| good(&format!("https://push.example.com/ok{i}")))
                 .collect();
             assert!(!absorb_page("1", &mut usable, page));
             assert_eq!(usable.len(), MAX_SUBSCRIPTIONS_PER_PRINCIPAL);
         }
 
         #[test]
+        fn decodable_but_invalid_key_material_is_not_usable() {
+            // Valid base64, but not a P-256 point, and an auth of the wrong
+            // length. `deliver_one` would reject both, so they must not take
+            // a slot in the cap.
+            let rows = vec![
+                row_with("https://push.example.com/short-key", "AAAA", AUTH),
+                row_with("https://push.example.com/short-auth", P256DH, "AAAA"),
+                good("https://push.example.com/ok"),
+            ];
+            let usable = usable_subscriptions("1", rows);
+            assert_eq!(usable.len(), 1);
+            assert_eq!(usable[0].endpoint(), "https://push.example.com/ok");
+        }
+
+        #[test]
         fn a_corrupt_row_does_not_hide_the_healthy_ones() {
             let rows = vec![
-                row("https://push.example.com/a", "AAAA"),
-                row("https://push.example.com/bad", "not base64!"),
-                row("https://push.example.com/b", "AAAA"),
+                good("https://push.example.com/a"),
+                bad("https://push.example.com/bad"),
+                good("https://push.example.com/b"),
             ];
             let usable = usable_subscriptions("1", rows);
             let endpoints: Vec<&str> = usable.iter().map(StoredSubscription::endpoint).collect();
