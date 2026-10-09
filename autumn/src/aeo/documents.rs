@@ -78,6 +78,9 @@ pub struct SiteFacts {
     /// Serve a `/sitemap.xml` of the known pages when no route does, so the
     /// links in `llms.txt` and the site guide always resolve.
     pub sitemap: bool,
+    /// The locale prefixes, when locale-prefixed routing is on: the home
+    /// page is `/{locale}`, not `/`.
+    pub locales: Vec<String>,
 }
 
 /// The mounted MCP server.
@@ -384,13 +387,17 @@ fn sitemap(facts: &SiteFacts, origin: &Origin) -> Document {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
     );
-    let paths = std::iter::once("/").chain(
-        facts
-            .pages
-            .iter()
-            .map(|p| p.path.as_str())
-            .filter(|p| *p != "/"),
-    );
+    let homes: Vec<String> = if facts.locales.is_empty() {
+        vec!["/".to_owned()]
+    } else {
+        facts.locales.iter().map(|l| format!("/{l}")).collect()
+    };
+    let mut paths: Vec<&str> = homes.iter().map(String::as_str).collect();
+    for page in &facts.pages {
+        if !paths.contains(&page.path.as_str()) {
+            paths.push(&page.path);
+        }
+    }
     for path in paths {
         let loc = origin
             .url(path)
@@ -1453,6 +1460,26 @@ mod tests {
                 .contains("<loc>https://shop.example.com/about</loc>"),
             "{}",
             doc.body
+        );
+    }
+
+    #[test]
+    fn a_locale_prefixed_sitemap_lists_each_locale_home() {
+        let mut facts = content_site();
+        facts.sitemap = true;
+        facts.locales = vec!["en".to_owned(), "fr".to_owned()];
+        let body = render(&facts, &origin(), SITEMAP_PATH).unwrap().body;
+        assert!(
+            body.contains("<loc>https://shop.example.com/en</loc>"),
+            "{body}"
+        );
+        assert!(
+            body.contains("<loc>https://shop.example.com/fr</loc>"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("<loc>https://shop.example.com/</loc>"),
+            "{body}"
         );
     }
 

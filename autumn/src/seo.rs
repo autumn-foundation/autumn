@@ -1226,7 +1226,7 @@ pub(crate) struct SitemapLocaleConfig<'a> {
 /// Mirrors `router::matches_locale_exclude_prefix` — kept as a separate copy
 /// so this module doesn't need a hard dependency on the `i18n`-feature-gated
 /// router internals for what is a few lines of string matching.
-fn matches_locale_exclude_prefix(path: &str, prefixes: &[String]) -> bool {
+pub(crate) fn matches_locale_exclude_prefix(path: &str, prefixes: &[String]) -> bool {
     prefixes.iter().any(|raw| {
         let prefix = raw.strip_suffix("/*").unwrap_or(raw.as_str());
         let prefix = if prefix == "/" {

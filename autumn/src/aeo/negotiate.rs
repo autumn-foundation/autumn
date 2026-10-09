@@ -544,8 +544,14 @@ async fn collect_limited(mut body: Body, limit: usize) -> Result<Bytes, Body> {
                 total += data.len();
                 chunks.push(data);
                 if total > limit {
-                    let head = futures::stream::iter(chunks.into_iter().map(Ok::<_, axum::Error>));
-                    return Err(Body::from_stream(head.chain(body.into_data_stream())));
+                    // Replay every frame, trailers too: the response stays HTML.
+                    let head = futures::stream::iter(
+                        chunks
+                            .into_iter()
+                            .map(|b| Ok::<_, axum::Error>(http_body::Frame::data(b))),
+                    );
+                    let rest = http_body_util::BodyStream::new(body);
+                    return Err(Body::new(http_body_util::StreamBody::new(head.chain(rest))));
                 }
             }
             Some(Err(err)) => {
@@ -689,6 +695,27 @@ mod tests {
         ] {
             assert!(h.get(name).is_none(), "{name}");
         }
+    }
+
+    #[tokio::test]
+    async fn collect_limited_keeps_trailers_of_an_oversized_body() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("x-digest", HeaderValue::from_static("abc"));
+        let frames = futures::stream::iter([
+            Ok::<_, std::io::Error>(http_body::Frame::data(Bytes::from("aaaa"))),
+            Ok(http_body::Frame::data(Bytes::from("bbbb"))),
+            Ok(http_body::Frame::trailers(trailers)),
+        ]);
+        let body = Body::new(http_body_util::StreamBody::new(frames));
+        let Err(body) = collect_limited(body, 6).await else {
+            panic!("over the limit")
+        };
+        let collected = body.collect().await.unwrap();
+        assert_eq!(
+            collected.trailers().and_then(|t| t.get("x-digest")),
+            Some(&HeaderValue::from_static("abc"))
+        );
+        assert_eq!(&collected.to_bytes()[..], b"aaaabbbb");
     }
 
     #[tokio::test]

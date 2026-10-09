@@ -1434,9 +1434,27 @@ fn build_aeo_site<O: AeoOpenApiFacts, M: AeoMcpFacts>(
     }
     pages.sort_by(|a, b| a.path.cmp(&b.path));
     pages.dedup_by(|a, b| a.path == b.path);
+    // With locale-prefixed routing the bare paths only redirect: list the
+    // localized pages, as the `[seo]` sitemap does.
+    #[cfg(feature = "i18n")]
+    let locales = if config.i18n.locale_prefix_enabled {
+        config.i18n.supported_locales.clone()
+    } else {
+        Vec::new()
+    };
+    #[cfg(not(feature = "i18n"))]
+    let locales: Vec<String> = Vec::new();
+    #[cfg(feature = "i18n")]
+    let pages = crate::aeo::localize_pages(
+        pages,
+        &locales,
+        &config.i18n.locale_prefix_exclude,
+        &config.i18n.locale_prefix_exclude_exact,
+    );
 
     let mut facts = SiteFacts {
         pages,
+        locales,
         health_path: config.health.enabled.then(|| config.health.path.clone()),
         skills: state
             .extension::<crate::aeo::RegisteredAgentSkills>()

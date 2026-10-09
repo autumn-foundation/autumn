@@ -309,9 +309,17 @@ pub(crate) fn apply_mpp(spec: &mut Value, routes: &[PaidRoute]) {
         let Some(method) = route.mpp_method.as_deref() else {
             continue;
         };
+        // Match the operation as `PaidRoute` matches a request: one trailing
+        // `/` does not count.
         let Some(op) = spec
             .get_mut("paths")
-            .and_then(|p| p.get_mut(&route.path))
+            .and_then(Value::as_object_mut)
+            .and_then(|paths| {
+                paths
+                    .iter_mut()
+                    .find(|(k, _)| normalize(k) == normalize(&route.path))
+                    .map(|(_, v)| v)
+            })
             .and_then(|p| p.get_mut(route.method.to_ascii_lowercase()))
             .and_then(Value::as_object_mut)
         else {
@@ -1239,6 +1247,16 @@ mod tests {
             spec["paths"]["/api/free"]["get"]
                 .get("x-payment-info")
                 .is_none()
+        );
+
+        // A trailing `/` in the config still finds the operation.
+        let mut slashed = route();
+        slashed.path = "/api/free/".to_owned();
+        apply_mpp(&mut spec, &[slashed]);
+        assert!(
+            spec["paths"]["/api/free"]["get"]
+                .get("x-payment-info")
+                .is_some()
         );
     }
 

@@ -499,6 +499,42 @@ pub(crate) async fn fallback(site: Option<Arc<AeoSite>>, req: Request<Body>) -> 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AeoDocument;
 
+/// With locale-prefixed routing, each page that is not excluded from it is
+/// served at `/{locale}{path}` (the bare path only redirects), so it is
+/// listed once per locale, as the `[seo]` sitemap lists it.
+#[cfg_attr(not(feature = "i18n"), allow(dead_code))]
+pub(crate) fn localize_pages(
+    pages: Vec<documents::PageFacts>,
+    locales: &[String],
+    exclude_prefixes: &[String],
+    exclude_exact: &[String],
+) -> Vec<documents::PageFacts> {
+    if locales.is_empty() {
+        return pages;
+    }
+    let mut out = Vec::with_capacity(pages.len() * locales.len());
+    for page in pages {
+        if exclude_exact.iter().any(|p| *p == page.path)
+            || crate::seo::matches_locale_exclude_prefix(&page.path, exclude_prefixes)
+        {
+            out.push(page);
+            continue;
+        }
+        for locale in locales {
+            let path = if page.path == "/" {
+                format!("/{locale}")
+            } else {
+                format!("/{locale}{}", page.path)
+            };
+            out.push(documents::PageFacts {
+                path,
+                ..page.clone()
+            });
+        }
+    }
+    out
+}
+
 /// Turn a rendered document into a response: `OPTIONS` preflight for CORS
 /// documents, a strong `ETag`, and `304` for a matching `If-None-Match`.
 fn document_response(
@@ -749,6 +785,35 @@ mod tests {
         let skill = index["skills"][0]["url"].as_str().unwrap();
         assert!(read(skill.trim_start_matches('/')).starts_with("---\n"));
         assert!(!dist.path().join(".well-known/api-catalog").exists());
+    }
+
+    #[test]
+    fn localized_pages_get_one_entry_per_locale() {
+        let page = |path: &str| documents::PageFacts {
+            path: path.to_owned(),
+            title: "T".to_owned(),
+            description: None,
+        };
+        let locales = ["en".to_owned(), "fr".to_owned()];
+        let out = localize_pages(
+            vec![page("/"), page("/about"), page("/api/docs"), page("/legal")],
+            &locales,
+            &["/api".to_owned()],
+            &["/legal".to_owned()],
+        );
+        let paths: Vec<&str> = out.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "/en",
+                "/fr",
+                "/en/about",
+                "/fr/about",
+                "/api/docs",
+                "/legal"
+            ]
+        );
+        assert_eq!(localize_pages(vec![page("/x")], &[], &[], &[]).len(), 1);
     }
 
     #[tokio::test]
