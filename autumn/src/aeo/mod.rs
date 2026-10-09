@@ -430,6 +430,8 @@ impl AeoSite {
                 max_bytes: aeo.markdown_max_bytes,
                 home_link,
                 content_signal,
+                resource_metadata_from_host: !aeo.oauth.authorization_servers.is_empty()
+                    && resource_metadata.is_none(),
                 resource_metadata,
             },
         }

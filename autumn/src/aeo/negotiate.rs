@@ -35,6 +35,9 @@ pub struct NegotiateConfig {
     pub content_signal: Option<HeaderValue>,
     /// `WWW-Authenticate` value for a `401` (RFC 9728 `resource_metadata`).
     pub resource_metadata: Option<HeaderValue>,
+    /// Build the `401` hint from the request `Host` (OAuth is set, `[seo]
+    /// base_url` is not), as the metadata document itself is.
+    pub resource_metadata_from_host: bool,
 }
 
 /// Tower layer for [`NegotiateConfig`].
@@ -101,6 +104,11 @@ where
         } else {
             None
         };
+        let host = if self.config.resource_metadata_from_host {
+            req.headers().get(axum::http::header::HOST).cloned()
+        } else {
+            None
+        };
         // The future holds only the inner future. It does not clone the
         // service. It boxes only a page that it converts.
         NegotiateFuture {
@@ -108,6 +116,7 @@ where
             config: Arc::clone(&self.config),
             flags,
             validators,
+            host,
             convert: None,
         }
     }
@@ -171,6 +180,7 @@ pin_project_lite::pin_project! {
         config: Arc<NegotiateConfig>,
         flags: Flags,
         validators: Option<Box<Validators>>,
+        host: Option<HeaderValue>,
         convert: Option<ConvertFuture>,
     }
 }
@@ -191,10 +201,16 @@ where
         if res.extensions().get::<super::AeoDocument>().is_some() {
             res.headers_mut().remove(axum::http::header::SET_COOKIE);
         }
-        if res.status() == StatusCode::UNAUTHORIZED
-            && let Some(hint) = &config.resource_metadata
-        {
-            add_resource_metadata(res.headers_mut(), hint);
+        if res.status() == StatusCode::UNAUTHORIZED {
+            let hint = config.resource_metadata.clone().or_else(|| {
+                config
+                    .resource_metadata_from_host
+                    .then(|| host_resource_metadata(this.host.as_ref()))
+                    .flatten()
+            });
+            if let Some(hint) = hint {
+                add_resource_metadata(res.headers_mut(), &hint);
+            }
         }
         if this.flags.is_home
             && res.status().is_success()
@@ -233,6 +249,17 @@ where
         *this.convert = Some(convert);
         poll.map(Ok)
     }
+}
+
+/// The `401` hint for a site with no `[seo] base_url`: the metadata URL at
+/// the request's own origin.
+fn host_resource_metadata(host: Option<&HeaderValue>) -> Option<HeaderValue> {
+    let origin = super::documents::Origin::resolve(None, host.and_then(|h| h.to_str().ok()));
+    HeaderValue::from_str(&format!(
+        "Bearer resource_metadata=\"{}\"",
+        origin.url(super::documents::OAUTH_RESOURCE_PATH)
+    ))
+    .ok()
 }
 
 /// Point a `401` at the RFC 9728 metadata. With no challenge, `hint` (a
@@ -650,6 +677,7 @@ mod tests {
             home_link: None,
             content_signal: None,
             resource_metadata: None,
+            resource_metadata_from_host: false,
         };
         markdown_headers(&mut h, &config, Some(1));
         for name in [

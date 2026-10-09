@@ -185,9 +185,16 @@ pub fn unmatchable_route(route: &PaidRoute) -> Option<String> {
             METHODS.join(", ")
         ));
     }
-    if !route.path.starts_with('/') || route.path.chars().any(char::is_whitespace) {
+    // Matching reads only the request path: a query or a fragment in the
+    // template never matches.
+    if !route.path.starts_with('/')
+        || route
+            .path
+            .chars()
+            .any(|c| c.is_whitespace() || c == '?' || c == '#')
+    {
         return Some(format!(
-            "{} {:?}: path must start with `/` and have no spaces",
+            "{} {:?}: path must start with `/`, with no spaces, query, or fragment",
             route.method, route.path
         ));
     }
@@ -873,7 +880,15 @@ where
             }
             let verify = match facilitator(&state, "verify", &body).await {
                 Ok(v) => v,
-                Err(status) => return Ok(plain(status, "payment facilitator unavailable")),
+                Err(status) => {
+                    // Not verified, so not used: the client may retry it.
+                    state
+                        .used
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .pop(&key);
+                    return Ok(plain(status, "payment facilitator unavailable"));
+                }
             };
             if verify.get("isValid").and_then(Value::as_bool) != Some(true) {
                 let reason = verify
@@ -1117,6 +1132,8 @@ mod tests {
             PaidRoute::new("FETCH", "/x", "1"),
             PaidRoute::new(" GET ", "/x", "1"),
             PaidRoute::new("GET", "/x ", "1"),
+            PaidRoute::new("GET", "/api?plan=pro", "1"),
+            PaidRoute::new("GET", "/api#top", "1"),
             PaidRoute::new("GET", "api", "1"),
             PaidRoute::new("GET", "", "1"),
         ] {

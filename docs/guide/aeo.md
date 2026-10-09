@@ -324,8 +324,8 @@ Autumn settles first, then runs the handler. A priced route never runs free: whe
 `[aeo.x402]` is incomplete, the route's `amount` is invalid, or the build has
 no `http-client` feature, it answers `503`. A facilitator error answer is a
 `502`. An entry that can never match a request (a method that is not an HTTP
-method, or a `path` without a leading `/` or with a space) stops the app at
-startup.
+method, or a `path` without a leading `/`, or with a space, a `?` query, or a
+`#` fragment) stops the app at startup.
 
 ```toml
 [aeo.x402]

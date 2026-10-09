@@ -412,6 +412,27 @@ async fn private_page() -> impl IntoResponse {
     )
 }
 
+#[tokio::test]
+async fn without_a_base_url_the_401_hint_uses_the_request_host() {
+    let mut config = AutumnConfig::default();
+    config.aeo.oauth.authorization_servers = vec!["https://auth.example.com".to_owned()];
+    let res = TestApp::new()
+        .config(config)
+        .routes(routes![private_page])
+        .build()
+        .get("/private")
+        .header("host", "shop.example.com")
+        .send()
+        .await;
+    assert_eq!(res.status, 401);
+    assert_eq!(
+        res.header("www-authenticate"),
+        Some(
+            "Bearer resource_metadata=\"https://shop.example.com/.well-known/oauth-protected-resource\""
+        )
+    );
+}
+
 #[get("/bearer")]
 async fn bearer_page() -> impl IntoResponse {
     (
@@ -735,6 +756,34 @@ mod commerce {
         assert_eq!(res.status(), 200, "a build render is internal");
         let live = Request::get("/api").body(Body::empty()).unwrap();
         assert_eq!(router.oneshot(live).await.unwrap().status(), 402);
+    }
+
+    #[tokio::test]
+    async fn an_unverified_payment_can_be_retried_after_a_facilitator_outage() {
+        let mut app = TestApp::new().config(paid_config()).routes(routes![api]);
+        let verify = app
+            .http_mock("x402")
+            .post("/verify")
+            .respond_with(500, json!({ "error": "down" }));
+        let c = app.build();
+        let required = decode_header(
+            c.get("/api")
+                .send()
+                .await
+                .header("payment-required")
+                .unwrap(),
+        )
+        .unwrap();
+        let payment = signature(&required["accepts"][0]);
+        for _ in 0..2 {
+            let res = c
+                .get("/api")
+                .header("payment-signature", &payment)
+                .send()
+                .await;
+            assert_eq!(res.status, 502, "never `payment already used`");
+        }
+        verify.expect_called(2);
     }
 
     #[tokio::test]
