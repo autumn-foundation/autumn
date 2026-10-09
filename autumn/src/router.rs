@@ -968,10 +968,13 @@ fn build_router_pre_state(
             if let Some(load_shed) = mcp_load_shed_layer {
                 // The envelope does not know the tool yet, so it admits as
                 // `critical` (up to the full limit). The `tools/call` replay
-                // then checks the tool route's own class (#3068), so a
-                // `default` or `sheddable` tool is still shed at its share.
+                // then claims a slot at the tool route's own class (#3068,
+                // #3186), so a `default` or `sheddable` tool is still shed at
+                // its share. The marker gives the replay a handle to the
+                // envelope's admission.
                 mcp_router = mcp_router
                     .layer(load_shed)
+                    .layer(axum::Extension(crate::middleware::LoadShedEnvelope))
                     .layer(axum::Extension(crate::admission::Criticality::Critical));
             }
             // Stamp `ResolvedClientIdentity` on the *outer* `/mcp` request too. The

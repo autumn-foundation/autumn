@@ -560,8 +560,7 @@ mod mcp_admission {
     }
 
     /// With a limit of 2, `sheddable = 0.5` gives one slot. One held
-    /// request plus the envelope's own slot is over it, so the replay of a
-    /// `sheddable` tool is shed.
+    /// request takes it, so the replay of a `sheddable` tool is shed.
     #[tokio::test]
     async fn mcp_sheddable_tool_is_shed_at_its_share() {
         let client = Arc::new(
@@ -590,6 +589,55 @@ mod mcp_admission {
 
         GATE_SHED.notify_waiters();
         held.await.unwrap().assert_ok();
+    }
+
+    static GATE_BURST: LazyLock<Notify> = LazyLock::new(Notify::new);
+    static ENTERED_BURST: AtomicUsize = AtomicUsize::new(0);
+
+    #[autumn_web::api_doc(mcp, summary = "Blocking sheddable tool (#3186)")]
+    #[get("/burst-tool", criticality = "sheddable")]
+    async fn burst_tool() -> autumn_web::Json<serde_json::Value> {
+        ENTERED_BURST.fetch_add(1, Ordering::SeqCst);
+        GATE_BURST.notified().await;
+        autumn_web::Json(serde_json::json!({"ok": true}))
+    }
+
+    /// With a limit of 10, `sheddable = 0.5` gives five slots. Six
+    /// concurrent `sheddable` calls shed exactly one (#3186).
+    #[tokio::test]
+    async fn mcp_sheddable_burst_sheds_only_the_excess() {
+        let client = Arc::new(
+            TestApp::new()
+                .config(config_with_ceiling(10))
+                .routes(routes![burst_tool])
+                .mount_mcp("/mcp")
+                .build(),
+        );
+        let calls: Vec<_> = (0..6)
+            .map(|_| {
+                let client = Arc::clone(&client);
+                tokio::spawn(async move {
+                    let resp = client
+                        .post("/mcp")
+                        .json(&tools_call("burst_tool"))
+                        .send()
+                        .await;
+                    resp.json::<serde_json::Value>()
+                })
+            })
+            .collect();
+        wait_for_entered(&ENTERED_BURST, 5).await;
+        // The shed call answers at once; the five others wait on the gate.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(ENTERED_BURST.load(Ordering::SeqCst), 5);
+        GATE_BURST.notify_waiters();
+        let mut shed = 0;
+        for call in calls {
+            if call.await.unwrap()["result"]["isError"] == true {
+                shed += 1;
+            }
+        }
+        assert_eq!(shed, 1, "exactly one call is over the share");
     }
 
     #[autumn_web::api_doc(mcp, summary = "Ping (MCP double-count regression, #1577)")]
