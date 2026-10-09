@@ -65,6 +65,17 @@ async fn setup_pool() -> (
     Pool<AsyncPgConnection>,
     testcontainers::ContainerAsync<Postgres>,
 ) {
+    let (pool, _url, container) = setup_db().await;
+    (pool, container)
+}
+
+/// [`setup_pool`], plus the database URL, so a test can open a second pool
+/// over the same database (the shape of a second app process).
+async fn setup_db() -> (
+    Pool<AsyncPgConnection>,
+    String,
+    testcontainers::ContainerAsync<Postgres>,
+) {
     let container = Postgres::default()
         .start()
         .await
@@ -97,7 +108,7 @@ async fn setup_pool() -> (
             .expect("create table");
     }
 
-    (pool, container)
+    (pool, url, container)
 }
 
 /// Seed a room and its participants with explicit timestamps via raw SQL, so the
@@ -703,4 +714,262 @@ struct ClockRow {
     token_expires_at: chrono::NaiveDateTime,
     #[diesel(sql_type = diesel::sql_types::Timestamp)]
     last_seen_at: chrono::NaiveDateTime,
+}
+
+// ── Concurrency: the seat cap and a returned seat hold (#2864, #3104, #2407) ──
+
+/// A pool of `size` connections over `url`, all opened before it is returned,
+/// so a burst of callers does not wait on connection setup.
+async fn warm_pool(url: &str, size: usize) -> Pool<AsyncPgConnection> {
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    let pool = Pool::builder(manager).max_size(size).build().expect("pool");
+    let mut held = Vec::with_capacity(size);
+    for _ in 0..size {
+        held.push(pool.get().await.expect("warm conn"));
+    }
+    drop(held);
+    pool
+}
+
+/// A checked-out test connection.
+type PooledConn = diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>;
+
+/// One `COUNT(*)` result.
+#[derive(diesel::QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    n: i64,
+}
+
+/// Seat rows stored for `room_id`, in any namespace.
+async fn seat_rows(pool: &Pool<AsyncPgConnection>, room_id: &str) -> i64 {
+    let mut conn = pool.get().await.expect("conn");
+    diesel::sql_query(format!(
+        "SELECT COUNT(*) AS n FROM media_room_participants WHERE room_id = '{room_id}'"
+    ))
+    .get_result::<CountRow>(&mut conn)
+    .await
+    .expect("count seats")
+    .n
+}
+
+/// Sessions that wait on a lock right now.
+async fn lock_waiters(pool: &Pool<AsyncPgConnection>) -> i64 {
+    let mut conn = pool.get().await.expect("conn");
+    diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM pg_stat_activity \
+         WHERE wait_event_type = 'Lock' AND datname = current_database()",
+    )
+    .get_result::<CountRow>(&mut conn)
+    .await
+    .expect("count lock waiters")
+    .n
+}
+
+/// Wait until `waiters` sessions wait on a lock, or `task` is done.
+async fn settle<T>(
+    pool: &Pool<AsyncPgConnection>,
+    task: &tokio::task::JoinHandle<T>,
+    waiters: i64,
+) {
+    for _ in 0..500 {
+        if task.is_finished() || lock_waiters(pool).await >= waiters {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("neither {waiters} lock waiters nor a finished task after 5s");
+}
+
+/// Hold the row of `room_id` from a connection outside every store, as an
+/// in-flight writer does. Release it with `COMMIT`.
+async fn hold_room_row(pool: &Pool<AsyncPgConnection>, room_id: &str) -> PooledConn {
+    use diesel_async::SimpleAsyncConnection as _;
+    let mut conn = pool.get().await.expect("conn");
+    conn.batch_execute("BEGIN").await.expect("begin");
+    conn.batch_execute(&format!(
+        "UPDATE media_rooms SET max_participants = max_participants WHERE room_id = '{room_id}'"
+    ))
+    .await
+    .expect("lock room row");
+    conn
+}
+
+/// End the transaction that [`hold_room_row`] opened.
+async fn release(holder: &mut PooledConn) {
+    use diesel_async::SimpleAsyncConnection as _;
+    holder.batch_execute("COMMIT").await.expect("release");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn concurrent_joins_from_two_processes_never_pass_the_seat_cap() {
+    // #2864 / #3104: two pools over one database are two app processes. The
+    // join was a COUNT, then a separate INSERT, so racers all saw a free seat.
+    let (_pool, url, _container) = setup_db().await;
+    let pool_a = warm_pool(&url, 8).await;
+    let pool_b = warm_pool(&url, 8).await;
+    let store_a = Arc::new(DbRoomStore::new(pool_a.clone(), 6));
+    let store_b = Arc::new(DbRoomStore::new(pool_b, 6));
+
+    for trial in 0..20 {
+        let room = store_a.create_room("", 1).await.expect("create");
+        let barrier = Arc::new(tokio::sync::Barrier::new(16));
+        let mut joins = Vec::new();
+        for racer in 0..16 {
+            let store = if racer % 2 == 0 {
+                store_a.clone()
+            } else {
+                store_b.clone()
+            };
+            let barrier = barrier.clone();
+            let room_id = room.id.clone();
+            joins.push(tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .join_room("", &room_id, None, Duration::seconds(300))
+                    .await
+            }));
+        }
+
+        let mut admitted = 0;
+        for join in joins {
+            match join.await.expect("join task") {
+                Ok(_) => admitted += 1,
+                Err(RoomError::RoomFull { max: 1 }) => {}
+                Err(other) => panic!("trial {trial}: unexpected join error: {other}"),
+            }
+        }
+        let rows = seat_rows(&pool_a, &room.id).await;
+        assert_eq!(
+            (admitted, rows),
+            (1, 1),
+            "trial {trial}: a 1-seat room admitted {admitted} joins and stores {rows} seats"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn join_racing_the_reaper_never_returns_a_seat_that_is_gone() {
+    // #2407: the reaper deletes an idle empty room. A join that lands while
+    // the delete waits must either keep its seat or fail; it must never return
+    // a seat the cascade then deletes.
+    let (pool, _container) = setup_pool().await;
+    let store = Arc::new(DbRoomStore::new(pool.clone(), 6));
+    seed(&pool, "", "room-1", Utc::now() - Duration::hours(1), &[]).await;
+
+    let mut holder = hold_room_row(&pool, "room-1").await;
+    let reaper = {
+        let store = store.clone();
+        tokio::spawn(async move { store.reap_stale(Utc::now(), Duration::minutes(30)).await })
+    };
+    settle(&pool, &reaper, 1).await;
+    let join = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            store
+                .join_room("", "room-1", None, Duration::seconds(300))
+                .await
+        })
+    };
+    settle(&pool, &join, 2).await;
+    release(&mut holder).await;
+
+    reaper.await.expect("reaper task");
+    match join.await.expect("join task") {
+        Ok(_) => assert_eq!(
+            seat_rows(&pool, "room-1").await,
+            1,
+            "the join returned a seat that the reaper deleted"
+        ),
+        Err(RoomError::RoomNotFound) => {
+            assert_eq!(seat_rows(&pool, "room-1").await, 0);
+        }
+        Err(other) => panic!("unexpected join error: {other}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn join_racing_the_last_leave_never_returns_a_seat_that_is_gone() {
+    // The last leave deletes its room. A join that lands between the leave's
+    // count and its delete must not have its seat deleted by the cascade.
+    let (pool, _container) = setup_pool().await;
+    let store = Arc::new(DbRoomStore::new(pool.clone(), 6));
+    seed(
+        &pool,
+        "",
+        "room-1",
+        Utc::now(),
+        &[("p1", "tok", Utc::now())],
+    )
+    .await;
+
+    let mut holder = hold_room_row(&pool, "room-1").await;
+    let leave = {
+        let store = store.clone();
+        tokio::spawn(async move { store.leave_room("", "room-1", "p1", "tok").await })
+    };
+    settle(&pool, &leave, 1).await;
+    let join = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            store
+                .join_room("", "room-1", None, Duration::seconds(300))
+                .await
+        })
+    };
+    settle(&pool, &join, 2).await;
+    release(&mut holder).await;
+
+    leave.await.expect("leave task").expect("leave");
+    match join.await.expect("join task") {
+        Ok(_) => assert_eq!(
+            seat_rows(&pool, "room-1").await,
+            1,
+            "the join returned a seat that the leave deleted"
+        ),
+        Err(RoomError::RoomNotFound) => {
+            assert_eq!(seat_rows(&pool, "room-1").await, 0);
+        }
+        Err(other) => panic!("unexpected join error: {other}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn reaper_claim_on_a_room_a_join_fills_keeps_the_room_and_its_cap() {
+    // The join gets the room row first, then the reaper claims the same row.
+    // The reaper must keep the room, and restore its seat cap.
+    let (pool, _container) = setup_pool().await;
+    let store = Arc::new(DbRoomStore::new(pool.clone(), 6));
+    seed(&pool, "", "room-1", Utc::now() - Duration::hours(1), &[]).await;
+
+    let mut holder = hold_room_row(&pool, "room-1").await;
+    let join = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            store
+                .join_room("", "room-1", None, Duration::seconds(300))
+                .await
+        })
+    };
+    settle(&pool, &join, 1).await;
+    let reaper = {
+        let store = store.clone();
+        tokio::spawn(async move { store.reap_stale(Utc::now(), Duration::minutes(30)).await })
+    };
+    settle(&pool, &reaper, 2).await;
+    release(&mut holder).await;
+
+    let joined = join.await.expect("join task").expect("join gets the seat");
+    let stats = reaper.await.expect("reaper task");
+    assert_eq!(stats.rooms_reaped, 0, "a room with a seat is kept");
+    assert_eq!(seat_rows(&pool, "room-1").await, 1);
+    let roster = store
+        .roster("", "room-1", joined.token.expose(), Duration::hours(12))
+        .await
+        .expect("roster");
+    assert_eq!(roster.max_participants, 6, "the claim is restored");
 }
