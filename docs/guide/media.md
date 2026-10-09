@@ -185,7 +185,7 @@ prefix (default `/api/media`) and installs a `RoomService` on `AppState`:
 | Method | Path | Purpose |
 |--------|------|---------|
 | `POST` | `/api/media/rooms` | Create a room; returns a token-free `RoomSnapshot`. |
-| `POST` | `/api/media/rooms/{room_id}/join` | Join a room; returns a `JoinResponse` (session token + mesh transport targets). An optional `display_name` has at most 64 characters, or the join is a `400`. |
+| `POST` | `/api/media/rooms/{room_id}/join` | Join a room; returns a `JoinResponse` (session token + mesh transport targets). A `display_name` longer than 64 characters gets `400`. |
 | `POST` | `/api/media/rooms/{room_id}/leave` | Leave a room (verifies the session token). |
 | `POST` | `/api/media/rooms/{room_id}/heartbeat` | Hold the seat: refresh liveness and renew the advisory token expiry. |
 | `GET`  | `/api/media/rooms/{room_id}` | The **member-gated** roster (`Authorization: Bearer <session token>`). |
@@ -274,10 +274,11 @@ last-write-wins sweep, so concurrent reapers across processes converge with no
 corruption.
 
 On the `db` backend, join, leave and the reaper's room delete each lock the
-room row in one transaction. Thus joins from two processes for the last seat
-cannot both get it, and a join never returns a seat that a concurrent room
-delete removes. A join that loses that race gets `404`, as for a room that is
-gone. No migration is necessary.
+room row in one transaction. Two joins for the last seat cannot both get it:
+one gets `409`. A join never returns a seat that a room delete then removes.
+If the room delete runs first, the join gets `404`, as for a room that is gone.
+The tables do not change. On Postgres, two reapers can deadlock. Then one logs
+a warning and deletes no rooms on that tick.
 
 Two client signals refresh `last_seen_at`: an explicit heartbeat, and — as a
 side effect — a member-gated roster poll. Do either on any interval well under

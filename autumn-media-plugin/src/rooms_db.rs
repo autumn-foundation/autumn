@@ -23,25 +23,32 @@
 //! # Seat cap and room deletes
 //!
 //! Join, leave and the reaper's room delete each run in one transaction that
-//! first locks the room row (see `lock_room`). Thus two processes that join
-//! the last seat run one after the other, and the room never has more seats
-//! than its cap (#2864, #3104). A delete of an empty room cannot remove a seat
-//! that a join returned (#2407). The lock is a no-op `UPDATE`, so it works the
-//! same on Postgres (row lock) and `SQLite` (database write lock). No schema
-//! change is necessary.
+//! first locks the room row. Thus two processes that join the last seat run one
+//! after the other, and the room never has more seats than its cap (#2864,
+//! #3104). A room delete cannot remove a seat that a join returned (#2407). The
+//! lock is a no-op `UPDATE`, so it works the same on Postgres (row lock) and
+//! `SQLite` (database write lock). The schema does not change.
+//!
+//! Join and leave run on their own task. Thus a dropped caller future (a client
+//! disconnect) cannot leave a transaction open with the room locked. Leave
+//! checks the token before it takes the lock, so a bad request takes no lock.
+//!
+//! With a Postgres default isolation level above READ COMMITTED, a join that
+//! waits for the lock fails with `503` (serialization error), not a passed cap.
 //!
 //! # Reaper concurrency — last-write-wins (idempotent)
 //!
 //! [`reap_stale`](DbRoomStore::reap_stale) is a **last-write-wins** sweep, not a
-//! lease: it deletes every participant whose `last_seen_at` is older than the
-//! injected `now - idle_ttl` cutoff, then deletes every room that is now empty
-//! and whose `created_at` is older than the same cutoff. Both are unconditional
-//! deletes keyed only on the injected clock, so **concurrent reapers across
-//! processes converge with no corruption** — a second reaper's delete simply
-//! affects zero rows. There is no shared lease row to time out and no leader
-//! election to get wrong. If two reapers claim the same rooms at the same time,
-//! Postgres can stop one with a deadlock error. That reaper logs a warning and
-//! deletes no rooms on that tick. Deletes are keyed on the exact `(namespace, room_id)`
+//! lease. Phase 1 deletes each participant whose `last_seen_at` is older than
+//! the injected `now - idle_ttl` cutoff. Phase 2, in one transaction, claims
+//! each empty room whose `created_at` is older than the same cutoff, deletes the
+//! claimed rooms that are still empty, and restores each claimed room that a
+//! join filled. A second reaper finds no rows to delete, so **concurrent
+//! reapers across processes converge with no corruption**. There is no shared
+//! lease row to time out and no leader election to get wrong. Two reapers with
+//! different query plans can lock rows in a different order. Then Postgres can
+//! stop one with a deadlock error. That reaper logs a warning and deletes no
+//! rooms on that tick. Deletes are keyed on the exact `(namespace, room_id)`
 //! pair, so reaping **never crosses namespaces** (tenant isolation), exactly
 //! like the in-memory sweep.
 
@@ -214,6 +221,61 @@ async fn lock_room(
     Ok(locked > 0)
 }
 
+/// Run `work` on its own task, so its transaction ends with `COMMIT` or
+/// `ROLLBACK` even if the caller drops the future (a client disconnect or a
+/// timeout). Without this, the pool gets the connection back with the
+/// transaction open, and the room row stays locked.
+async fn detached<T: Send + 'static>(
+    work: impl Future<Output = Result<T, RoomError>> + Send + 'static,
+) -> Result<T, RoomError> {
+    tokio::spawn(work)
+        .await
+        .unwrap_or_else(|err| Err(map_db_err(err)))
+}
+
+/// Check that `participant_id` holds a seat in the room, with `token`.
+///
+/// The errors are the same as the in-memory store: `RoomNotFound`, then
+/// `ParticipantNotFound`, then `Unauthorized`. The compare is value-only and
+/// constant-time. Expiry is advisory: a value-correct token always leaves.
+async fn check_seat(
+    conn: &mut RuntimeConnection,
+    namespace: &str,
+    room_id: &str,
+    participant_id: &str,
+    token: &str,
+) -> Result<(), TxError> {
+    let room_exists: Option<String> = media_rooms::table
+        .filter(
+            media_rooms::namespace
+                .eq(namespace)
+                .and(media_rooms::room_id.eq(room_id)),
+        )
+        .select(media_rooms::room_id)
+        .first(conn)
+        .await
+        .optional()?;
+    if room_exists.is_none() {
+        return Err(RoomError::RoomNotFound.into());
+    }
+    let stored: String = media_room_participants::table
+        .filter(
+            media_room_participants::namespace
+                .eq(namespace)
+                .and(media_room_participants::room_id.eq(room_id))
+                .and(media_room_participants::participant_id.eq(participant_id)),
+        )
+        .select(media_room_participants::token)
+        .first(conn)
+        .await
+        .optional()?
+        .ok_or(RoomError::ParticipantNotFound)?;
+    if !autumn_web::auth::constant_time_eq(token.as_bytes(), stored.as_bytes()) {
+        return Err(RoomError::Unauthorized.into());
+    }
+    Ok(())
+}
+
 /// Build a token-free [`RoomSnapshot`] from a room row and its participant rows,
 /// with the same deterministic roster ordering (`joined_at`, then `id`) as the
 /// in-memory store.
@@ -304,8 +366,11 @@ impl RoomStore for DbRoomStore {
         display_name: Option<String>,
         token_ttl: Duration,
     ) -> RoomStoreFuture<'a, JoinRecord> {
-        Box::pin(async move {
-            let mut conn = self.pool.get().await.map_err(map_db_err)?;
+        let pool = self.pool.clone();
+        let (namespace, room_id) = (namespace.to_owned(), room_id.to_owned());
+        Box::pin(detached(async move {
+            let (namespace, room_id) = (namespace.as_str(), room_id.as_str());
+            let mut conn = pool.get().await.map_err(map_db_err)?;
             // One transaction that holds the room row: two joins for the last
             // seat run one after the other, so the count never goes stale.
             conn.transaction(async move |conn| {
@@ -377,7 +442,7 @@ impl RoomStore for DbRoomStore {
             })
             .await
             .map_err(TxError::into_room)
-        })
+        }))
     }
 
     fn leave_room<'a>(
@@ -387,35 +452,23 @@ impl RoomStore for DbRoomStore {
         participant_id: &'a str,
         token: &'a str,
     ) -> RoomStoreFuture<'a, ()> {
-        Box::pin(async move {
-            let mut conn = self.pool.get().await.map_err(map_db_err)?;
+        let pool = self.pool.clone();
+        let owned = [namespace, room_id, participant_id, token].map(str::to_owned);
+        Box::pin(detached(async move {
+            let [namespace, room_id, participant_id, token] = owned.each_ref().map(String::as_str);
+            let mut conn = pool.get().await.map_err(map_db_err)?;
+            // Check the token before the lock, so a bad request takes no lock.
+            check_seat(&mut conn, namespace, room_id, participant_id, token)
+                .await
+                .map_err(TxError::into_room)?;
             // One transaction that holds the room row, so a join cannot add a
             // seat between the last leave's count and its room delete.
             conn.transaction(async move |conn| {
-                // Distinguish "no such room" from "no such participant" the
-                // same way the in-memory store does.
                 if !lock_room(conn, namespace, room_id).await? {
                     return Err(RoomError::RoomNotFound.into());
                 }
-
-                let stored: String = media_room_participants::table
-                    .filter(
-                        media_room_participants::namespace
-                            .eq(namespace)
-                            .and(media_room_participants::room_id.eq(room_id))
-                            .and(media_room_participants::participant_id.eq(participant_id)),
-                    )
-                    .select(media_room_participants::token)
-                    .first(conn)
-                    .await
-                    .optional()?
-                    .ok_or(RoomError::ParticipantNotFound)?;
-
-                // Value-only, constant-time verify (expiry is advisory, never
-                // checked — a value-correct token always leaves).
-                if !autumn_web::auth::constant_time_eq(token.as_bytes(), stored.as_bytes()) {
-                    return Err(RoomError::Unauthorized.into());
-                }
+                // Check again under the lock: the seat can go between the two.
+                check_seat(conn, namespace, room_id, participant_id, token).await?;
 
                 diesel::delete(
                     media_room_participants::table.filter(
@@ -453,7 +506,7 @@ impl RoomStore for DbRoomStore {
             })
             .await
             .map_err(TxError::into_room)
-        })
+        }))
     }
 
     fn roster<'a>(
@@ -669,14 +722,25 @@ impl RoomStore for DbRoomStore {
                     .execute(conn)
                     .await?;
                     let reaped = diesel::delete(
-                        media_rooms::table.filter(media_rooms::max_participants.lt(0).and(empty())),
+                        media_rooms::table.filter(
+                            media_rooms::created_at
+                                .lt(cutoff)
+                                .and(media_rooms::max_participants.lt(0))
+                                .and(empty()),
+                        ),
                     )
                     .execute(conn)
                     .await?;
-                    diesel::update(media_rooms::table.filter(media_rooms::max_participants.lt(0)))
-                        .set(media_rooms::max_participants.eq(media_rooms::max_participants * -1))
-                        .execute(conn)
-                        .await?;
+                    diesel::update(
+                        media_rooms::table.filter(
+                            media_rooms::created_at
+                                .lt(cutoff)
+                                .and(media_rooms::max_participants.lt(0)),
+                        ),
+                    )
+                    .set(media_rooms::max_participants.eq(media_rooms::max_participants * -1))
+                    .execute(conn)
+                    .await?;
                     Ok::<_, diesel::result::Error>(reaped)
                 })
                 .await;

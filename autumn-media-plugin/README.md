@@ -116,7 +116,7 @@ installs a `RoomService` on `AppState`:
 | Method | Path | Purpose |
 |--------|------|---------|
 | `POST` | `/api/media/rooms` | Create a room. |
-| `POST` | `/api/media/rooms/{room_id}/join` | Join; returns a session token and mesh WHIP/WHEP targets. A `display_name` has at most 64 characters (else `400`). |
+| `POST` | `/api/media/rooms/{room_id}/join` | Join; returns a session token and mesh WHIP/WHEP targets. A `display_name` longer than 64 characters gets `400`. |
 | `POST` | `/api/media/rooms/{room_id}/leave` | Leave. |
 | `POST` | `/api/media/rooms/{room_id}/heartbeat` | Hold the seat: refresh liveness, renew the token expiry. |
 | `GET`  | `/api/media/rooms/{room_id}` | Member-gated roster (`Authorization: Bearer <token>`). |

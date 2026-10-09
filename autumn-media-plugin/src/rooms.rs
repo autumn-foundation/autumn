@@ -84,9 +84,8 @@
 //! # Single-process limitation
 //!
 //! [`InMemoryRoomStore`] keeps all room state in process memory, so it is
-//! **single-process only** — a multi-process / multi-replica deployment needs a
-//! shared backing store. [`RoomStore`] is the swap seam for that: a networked
-//! (and necessarily async) store would revisit these synchronous signatures.
+//! **single-process only**. For more than one process, use
+//! [`DbRoomStore`](crate::rooms_db::DbRoomStore) (`room_store_backend = "db"`).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -501,6 +500,9 @@ pub trait RoomStore: Send + Sync {
     /// Join the room `(namespace, room_id)`, minting a participant + token that
     /// stays valid for `token_ttl`.
     ///
+    /// A store does not check the `display_name` length.
+    /// [`RoomService::join`] does (see [`MAX_DISPLAY_NAME_CHARS`]).
+    ///
     /// # Errors
     ///
     /// [`RoomError::RoomNotFound`] (including a namespace mismatch) or
@@ -635,12 +637,12 @@ pub fn renewed_expiry(
 /// module-level *Security & host responsibilities* note.
 pub const MAX_ROOMS: usize = 10_000;
 
-/// The longest join `display_name`, in characters (`char`s, not bytes).
+/// The longest join `display_name`, in `char`s (not bytes).
 ///
-/// A store keeps the name until the seat leaves or the reaper removes it, and
-/// copies it into every snapshot. The seat cap limits seats, not bytes, so
-/// [`RoomService::join`] refuses a longer name with
-/// [`RoomError::DisplayNameTooLong`] (`400`).
+/// A store keeps the name until the seat leaves or the reaper removes it. Each
+/// snapshot copies the name. [`RoomService::join`] refuses a longer name with
+/// [`RoomError::DisplayNameTooLong`] (`400`). A direct
+/// [`RoomStore::join_room`] call does not check the limit.
 pub const MAX_DISPLAY_NAME_CHARS: usize = 64;
 
 /// A single-process, in-memory [`RoomStore`].
@@ -1175,7 +1177,8 @@ impl RoomService {
     /// # Errors
     ///
     /// Returns [`RoomError::DisplayNameTooLong`] if `display_name` has more
-    /// than [`MAX_DISPLAY_NAME_CHARS`] characters; the store sees nothing.
+    /// than [`MAX_DISPLAY_NAME_CHARS`] characters. Then it does not call the
+    /// store.
     /// Propagates any [`RoomError`] from the store, or
     /// [`RoomError::InvalidSegment`] if a path cannot be composed.
     pub async fn join(
@@ -3004,15 +3007,15 @@ mod tests {
         let service = service_over(store.clone());
         let room = service.create().await.expect("create");
 
-        let name = "a".repeat(MAX_DISPLAY_NAME_CHARS + 1);
-        let result = service.join(&room.id, Some(name)).await;
-
-        assert!(matches!(
-            result,
-            Err(RoomError::DisplayNameTooLong {
-                max: MAX_DISPLAY_NAME_CHARS
-            })
-        ));
+        for name in ["a", "é"].map(|c| c.repeat(MAX_DISPLAY_NAME_CHARS + 1)) {
+            let result = service.join(&room.id, Some(name)).await;
+            assert!(matches!(
+                result,
+                Err(RoomError::DisplayNameTooLong {
+                    max: MAX_DISPLAY_NAME_CHARS
+                })
+            ));
+        }
         assert_eq!(seats_in(&store, &room.id), 0, "no seat is stored");
     }
 
@@ -3073,6 +3076,13 @@ mod tests {
             .expect("join response");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = autumn_web::reexports::axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(
+            String::from_utf8_lossy(&body).contains("display_name"),
+            "the 400 names the field, not a JSON parse error"
+        );
         assert_eq!(seats_in(&store, &room_id), 0, "no seat is stored");
     }
 

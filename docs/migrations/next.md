@@ -1077,11 +1077,12 @@ If nothing changed, delete this section.
 - **Media (#3104):** a room join with a `display_name` longer than 64
   characters is a `400` (`RoomError::DisplayNameTooLong`). Before, the store
   kept a name of any length. `RoomService::join` applies the limit, so a custom
-  handler that calls it gets the same error.
+  handler that calls it gets the same error. A direct `RoomStore::join_room`
+  call does not check the limit.
 - **Media (#2864, #2407):** on `room_store_backend = "db"`, a join that races
   the last leave or the reaper for the same room can now get `404`. Before,
-  it got `200` and then lost its seat. A client handles it as for a room that
-  is gone.
+  it got `200` and then lost its seat. Handle it as you handle a room that is
+  gone.
 
 ## Deprecations retained from `{X.Y}`
 
