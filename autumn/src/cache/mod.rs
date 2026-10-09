@@ -105,13 +105,19 @@ pub fn global_cache() -> Option<Arc<dyn Cache>> {
 /// When production had a global cache, replay installs the capsule seam over
 /// a backend that stores nothing. A cache call then takes the path it took in
 /// production, and the tape answers it. Otherwise replay has no global cache.
+///
+/// Returns the installed cache. The caller also puts it in the app state, as
+/// `AppBuilder::with_cache_backend` does in production.
 #[cfg(feature = "reporting")]
-pub(crate) fn install_replay_cache(recorded: &crate::capsule::CapsuleEffects) {
+pub(crate) fn install_replay_cache(
+    recorded: &crate::capsule::CapsuleEffects,
+) -> Option<Arc<dyn Cache>> {
     if recorded.global_cache {
         set_global_cache(Arc::new(ReplayBackend));
     } else {
         clear_global_cache();
     }
+    global_cache()
 }
 
 /// The backend under the replay seam. It stores nothing.
@@ -1247,7 +1253,8 @@ mod tests {
             global_cache: true,
             ..Default::default()
         };
-        install_replay_cache(&recorded);
+        let installed = install_replay_cache(&recorded).expect("installed");
+        assert!(installed.is_capsule_seam());
         let tape = Arc::new(crate::capsule::ReplayEffects::new(recorded));
         let complete = block_on(crate::capsule::with_effect_tape(
             Arc::clone(&tape),
@@ -1257,7 +1264,7 @@ mod tests {
         assert!(complete);
         assert!(tape.finish().is_empty(), "{:?}", tape.finish());
 
-        install_replay_cache(&crate::capsule::CapsuleEffects::default());
+        assert!(install_replay_cache(&crate::capsule::CapsuleEffects::default()).is_none());
         assert!(global_cache().is_none());
     }
 
