@@ -131,6 +131,9 @@ pub async fn extract_tenant_from_parts_with_domains(
         && let Some(host) = request_host(parts)
         && let Some(tenant_id) = registry.tenant_for_host(&host)
     {
+        if matches!(replayed, ReplayedTenant::RecordedFailure) {
+            return Err(tenant_resolved_after_recorded_failure());
+        }
         record_tenant(Some(&tenant_id));
         return Ok(tenant_id);
     }
@@ -141,12 +144,7 @@ pub async fn extract_tenant_from_parts_with_domains(
     // The recording failed here. A lookup that now succeeds would run the
     // request under a tenant production never had, so fail closed.
     if matches!(replayed, ReplayedTenant::RecordedFailure) && resolved.is_ok() {
-        note_tenant_resolved_after_recorded_failure();
-        return Err(crate::AutumnError::internal_server_error(
-            std::io::Error::other(
-                "the recorded tenant lookup failed, but the replayed run resolved a tenant",
-            ),
-        ));
+        return Err(tenant_resolved_after_recorded_failure());
     }
     // A failure is recorded too, so replay can tell it from a lookup the
     // recording never made.
@@ -156,6 +154,15 @@ pub async fn extract_tenant_from_parts_with_domains(
 
 // The `capsule` module is behind the `reporting` feature, so both halves of the
 // seam have a no-op twin for builds without it.
+
+/// Log a lookup that resolved where the recording failed, and return the
+/// error that fails the run closed.
+fn tenant_resolved_after_recorded_failure() -> crate::AutumnError {
+    note_tenant_resolved_after_recorded_failure();
+    crate::AutumnError::internal_server_error(std::io::Error::other(
+        "the recorded tenant lookup failed, but the replayed run resolved a tenant",
+    ))
+}
 
 /// What a capsule replay says about the tenant lookup.
 enum ReplayedTenant {

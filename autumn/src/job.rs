@@ -4401,6 +4401,8 @@ impl JobClient {
         // absent due time enqueues for immediate execution exactly as before.
         let due_at = due_at.filter(|due| *due > now);
 
+        // A past deadline is still compared as the deadline the caller gave
+        // (`requested_due_at`), so a plain `enqueue` cannot consume it.
         // Failure-capsule seam (#1634). The free enqueue functions guard ahead
         // of the client lookup (a replay starts no job runtime), so by the time
         // control reaches here a replay can only have come through a *held*
@@ -4410,7 +4412,9 @@ impl JobClient {
         if let Some(answer) = replayed_enqueue(
             name,
             &payload,
-            due_at.map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At),
+            due_at
+                .or(requested)
+                .map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At),
         ) {
             return answer.map(|()| EnqueueOutcome::Queued);
         }
@@ -4921,7 +4925,9 @@ impl JobClient {
             let now = self.due_origin();
             let requested = due_at;
             let due_at = due_at.filter(|due| *due > now);
-            let schedule = due_at.map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At);
+            let schedule = due_at
+                .or(requested)
+                .map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At);
             if let Some(answer) = replayed_enqueue(name, &payload, schedule) {
                 resolved.push((result_index, answer.map(|()| EnqueueOutcome::Queued)));
                 continue;
@@ -5601,7 +5607,9 @@ impl JobClient {
         if let Some(answer) = replayed_enqueue(
             name,
             &payload,
-            due_at.map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At),
+            due_at
+                .or(requested)
+                .map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At),
         ) {
             return answer;
         }

@@ -670,7 +670,9 @@ impl ReplayEffects {
             // at once: no positive delay and no future deadline (#2351 item
             // 17). A zero delay is still immediate.
             crate::job::EnqueueSchedule::Immediate => {
-                next.delay_secs.is_some_and(|delay| delay > 0) || next.due_at.is_some()
+                next.delay_secs.is_some_and(|delay| delay > 0)
+                    || next.due_at.is_some()
+                    || next.requested_due_at.is_some()
             }
             crate::job::EnqueueSchedule::After(delay) => next.delay_secs != Some(delay),
             // Capture runs a past deadline at once and records `due_at: None`.
@@ -2187,6 +2189,20 @@ mod tests {
             EnqueueVerdict::Queued,
             "{:?}",
             tape.divergences()
+        );
+        // A plain enqueue is not the recorded `enqueue_at` (Codex review on
+        // #3222).
+        let tape = ReplayEffects::new(CapsuleEffects {
+            jobs: vec![recorded.clone()],
+            ..CapsuleEffects::default()
+        });
+        assert_eq!(
+            tape.next_job(
+                "send_receipt",
+                &serde_json::json!({}),
+                crate::job::EnqueueSchedule::Immediate
+            ),
+            EnqueueVerdict::Diverged
         );
         // A different past deadline is a changed call.
         let tape = ReplayEffects::new(CapsuleEffects {
