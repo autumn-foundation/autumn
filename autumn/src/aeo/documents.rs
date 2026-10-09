@@ -78,9 +78,9 @@ pub struct SiteFacts {
     /// Serve a `/sitemap.xml` of the known pages when no route does, so the
     /// links in `llms.txt` and the site guide always resolve.
     pub sitemap: bool,
-    /// The locale prefixes, when locale-prefixed routing is on: the home
-    /// page is `/{locale}`, not `/`.
-    pub locales: Vec<String>,
+    /// The home page paths: `/`, or `/{locale}` for each locale when the
+    /// root is locale-prefixed. Empty means `/`.
+    pub home_paths: Vec<String>,
 }
 
 /// The mounted MCP server.
@@ -387,12 +387,11 @@ fn sitemap(facts: &SiteFacts, origin: &Origin) -> Document {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
     );
-    let homes: Vec<String> = if facts.locales.is_empty() {
-        vec!["/".to_owned()]
+    let mut paths: Vec<&str> = if facts.home_paths.is_empty() {
+        vec!["/"]
     } else {
-        facts.locales.iter().map(|l| format!("/{l}")).collect()
+        facts.home_paths.iter().map(String::as_str).collect()
     };
-    let mut paths: Vec<&str> = homes.iter().map(String::as_str).collect();
     for page in &facts.pages {
         if !paths.contains(&page.path.as_str()) {
             paths.push(&page.path);
@@ -1467,7 +1466,7 @@ mod tests {
     fn a_locale_prefixed_sitemap_lists_each_locale_home() {
         let mut facts = content_site();
         facts.sitemap = true;
-        facts.locales = vec!["en".to_owned(), "fr".to_owned()];
+        facts.home_paths = vec!["/en".to_owned(), "/fr".to_owned()];
         let body = render(&facts, &origin(), SITEMAP_PATH).unwrap().body;
         assert!(
             body.contains("<loc>https://shop.example.com/en</loc>"),

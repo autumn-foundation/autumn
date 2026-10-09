@@ -409,6 +409,7 @@ impl AeoSite {
             .enabled
             .then(|| HeaderValue::from_str(&robots::content_signal_value(aeo.content_signals)).ok())
             .flatten();
+        let home_paths = facts.home_paths.clone();
         // RFC 9728 §5.1: a `401` points at the protected resource metadata.
         let resource_metadata = (!aeo.oauth.authorization_servers.is_empty())
             .then_some(config.seo.base_url.as_deref())
@@ -429,6 +430,7 @@ impl AeoSite {
                 markdown: aeo.markdown,
                 max_bytes: aeo.markdown_max_bytes,
                 home_link,
+                home_paths,
                 content_signal,
                 resource_metadata_from_host: !aeo.oauth.authorization_servers.is_empty()
                     && resource_metadata.is_none(),

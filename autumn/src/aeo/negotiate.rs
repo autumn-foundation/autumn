@@ -29,8 +29,11 @@ pub struct NegotiateConfig {
     pub markdown: bool,
     /// Largest HTML body to convert.
     pub max_bytes: usize,
-    /// `Link` header for `/`.
+    /// `Link` header for the home page.
     pub home_link: Option<HeaderValue>,
+    /// The home page paths (`/{locale}` for each locale when the root is
+    /// locale-prefixed). Empty means `/`.
+    pub home_paths: Vec<String>,
     /// `Content-Signal` header for Markdown responses.
     pub content_signal: Option<HeaderValue>,
     /// `WWW-Authenticate` value for a `401` (RFC 9728 `resource_metadata`).
@@ -38,6 +41,16 @@ pub struct NegotiateConfig {
     /// Build the `401` hint from the request `Host` (OAuth is set, `[seo]
     /// base_url` is not), as the metadata document itself is.
     pub resource_metadata_from_host: bool,
+}
+
+impl NegotiateConfig {
+    fn is_home(&self, path: &str) -> bool {
+        if self.home_paths.is_empty() {
+            path == "/"
+        } else {
+            self.home_paths.iter().any(|h| h == path)
+        }
+    }
 }
 
 /// Tower layer for [`NegotiateConfig`].
@@ -91,7 +104,7 @@ where
         let is_get = req.method() == Method::GET;
         let readable = is_get || req.method() == Method::HEAD;
         let flags = Flags {
-            is_home: readable && req.uri().path() == "/",
+            is_home: readable && self.config.is_home(req.uri().path()),
             readable,
             wants_markdown: self.config.markdown && readable && prefers_markdown(req.headers()),
             is_head: !is_get && readable,
@@ -615,6 +628,14 @@ mod tests {
     }
 
     #[test]
+    fn localized_home_pages_are_home() {
+        let mut config = NegotiateConfig::default();
+        assert!(config.is_home("/") && !config.is_home("/en"));
+        config.home_paths = vec!["/en".to_owned(), "/fr".to_owned()];
+        assert!(config.is_home("/fr") && !config.is_home("/") && !config.is_home("/en/x"));
+    }
+
+    #[test]
     fn validators_are_checked_against_the_representation_sent() {
         let mut req = HeaderMap::new();
         req.insert(IF_NONE_MATCH, HeaderValue::from_static("W/\"v1-md\""));
@@ -684,6 +705,7 @@ mod tests {
             content_signal: None,
             resource_metadata: None,
             resource_metadata_from_host: false,
+            home_paths: Vec::new(),
         };
         markdown_headers(&mut h, &config, Some(1));
         for name in [
