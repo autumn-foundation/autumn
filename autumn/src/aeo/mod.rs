@@ -641,8 +641,8 @@ fn warn_on_config(config: &crate::config::AutumnConfig) {
     {
         tracing::warn!(
             base_url = base,
-            "aeo: [seo] base_url is not an absolute URL without a query or fragment; the \
-             agent documents use the request Host instead"
+            "aeo: [seo] base_url is not an http(s) URL without a query or fragment; the \
+             agent documents use the request Host instead, and a static build writes none"
         );
     }
     if prod && config.seo.base_url.is_none() {
@@ -711,7 +711,9 @@ pub(crate) async fn write_static_documents(
 ) -> std::io::Result<Vec<String>> {
     use tower::ServiceExt as _;
 
-    if base_url.is_none_or(|b| b.trim().is_empty()) {
+    // The build has no request `Host`: without a usable base URL every
+    // absolute link would point at localhost.
+    if !documents::Origin::resolve(base_url, None).configured {
         return Ok(Vec::new());
     }
     let mut queue: Vec<String> = STATIC_DOCUMENT_PATHS
@@ -822,6 +824,23 @@ mod tests {
         let skill = index["skills"][0]["url"].as_str().unwrap();
         assert!(read(skill.trim_start_matches('/')).starts_with("---\n"));
         assert!(!dist.path().join(".well-known/api-catalog").exists());
+    }
+
+    #[tokio::test]
+    async fn a_static_build_without_a_usable_base_url_writes_nothing() {
+        let config = crate::config::AutumnConfig::default();
+        let dist = tempfile::tempdir().unwrap();
+        for base in [
+            None,
+            Some("https://example.com?tenant=a"),
+            Some("ftp://example.com"),
+        ] {
+            let written = write_static_documents(site_router(&config), base, dist.path())
+                .await
+                .unwrap();
+            assert!(written.is_empty(), "{base:?}: {written:?}");
+        }
+        assert!(!dist.path().join("llms.txt").exists());
     }
 
     #[test]

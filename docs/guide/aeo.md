@@ -358,7 +358,8 @@ idempotent (see [idempotency](idempotency.md)).
 The route match ignores one trailing `/`, a locale prefix (`/en/...`), and
 capture names (`{rid}` matches a `{id}` route). A `GET` entry also prices
 `HEAD`, unless a `HEAD` entry for the same route sets its own price. `{name}` matches one segment, `{*name}` the rest.
-The facilitator URL must use `https` (`http` only for `localhost`). Scanners probe `GET /api`
+The facilitator URL must use `https` (`http` only for `localhost`), with no
+query or fragment. Scanners probe `GET /api`
 and `GET /api/v1`, so price one of these to show x402 support.
 
 A priced route that is also an MCP tool is paid the same way: send

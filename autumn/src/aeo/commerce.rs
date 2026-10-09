@@ -728,8 +728,8 @@ impl X402Layer {
             );
         } else if !safe {
             tracing::error!(
-                "aeo: [aeo.x402] facilitator_url must be https (http only for localhost); \
-                 priced routes answer 503"
+                "aeo: [aeo.x402] facilitator_url must be https (http only for localhost), \
+                 with no query or fragment; priced routes answer 503"
             );
         }
         Some(Self {
@@ -1060,13 +1060,18 @@ async fn settle(
     Err(Box::new(failed))
 }
 
-/// `true` for an `https` facilitator, or `http` on a loopback host.
+/// `true` for an `https` facilitator, or `http` on a loopback host, with no
+/// query or fragment: `/verify` and `/settle` are appended to it.
 #[cfg(feature = "http-client")]
 fn facilitator_url_is_safe(raw: &str) -> bool {
-    url::Url::parse(raw).is_ok_and(|u| match u.scheme() {
-        "https" => true,
-        "http" => matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")),
-        _ => false,
+    url::Url::parse(raw).is_ok_and(|u| {
+        u.query().is_none()
+            && u.fragment().is_none()
+            && match u.scheme() {
+                "https" => true,
+                "http" => matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")),
+                _ => false,
+            }
     })
 }
 
@@ -1330,6 +1335,8 @@ mod tests {
         assert!(facilitator_url_is_safe("http://localhost:8080"));
         assert!(!facilitator_url_is_safe("http://facilitator.example"));
         assert!(!facilitator_url_is_safe("not a url"));
+        assert!(!facilitator_url_is_safe("https://pay.example/api?key=x"));
+        assert!(!facilitator_url_is_safe("https://pay.example/api#v1"));
     }
 
     #[test]
