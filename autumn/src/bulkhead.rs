@@ -280,6 +280,47 @@ mod tests {
     }
 
     #[test]
+    fn debug_shows_the_cap_and_the_tenant() {
+        let bulkhead = TenantBulkhead::new(3);
+        assert_eq!(bulkhead.max_per_tenant(), 3);
+        let permit = bulkhead.try_acquire("acme").expect("permit");
+        assert_eq!(permit.tenant(), "acme");
+        let text = format!("{bulkhead:?} {permit:?}");
+        assert!(text.contains("max_per_tenant: 3"), "{text}");
+        assert!(text.contains("tracked_tenants: 1"), "{text}");
+        assert!(text.contains("\"acme\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn db_permit_needs_a_bulkhead_and_a_tenant() {
+        // No bulkhead in scope.
+        assert!(acquire_db_permit().expect("no cap").is_none());
+
+        let bulkhead = TenantBulkhead::new(1);
+        // A bulkhead, but no tenant.
+        let none = TENANT_DB_BULKHEAD
+            .scope(Arc::clone(&bulkhead), async { acquire_db_permit() })
+            .await;
+        assert!(none.expect("no tenant").is_none());
+
+        // A bulkhead and a tenant: one permit, then a 503.
+        let (first, second) = crate::tenancy::CURRENT_TENANT
+            .scope(
+                Some("acme".to_owned()),
+                TENANT_DB_BULKHEAD.scope(Arc::clone(&bulkhead), async {
+                    let first = acquire_db_permit();
+                    let second = acquire_db_permit();
+                    (first, second)
+                }),
+            )
+            .await;
+        let first = first.expect("first permit").expect("held");
+        assert_eq!(first.tenant(), "acme");
+        let err = second.expect_err("the tenant is at its cap");
+        assert_eq!(err.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
     fn shuffle_shard_gives_distinct_sorted_lanes_in_range() {
         for key in ["acme", "globex", "initech", ""] {
             let lanes = shuffle_shard(key, 8, 3);

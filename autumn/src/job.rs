@@ -18563,6 +18563,65 @@ mod tests {
         clear_global_job_client();
     }
 
+    /// Tenant lanes with per-queue slots on (#3072): every tenant's jobs run.
+    #[tokio::test]
+    async fn tenant_lanes_with_queue_slots_run_every_tenants_jobs() {
+        static RAN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        RAN.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut queues = crate::config::JobQueuesConfig::default();
+        queues.queues[0].concurrency = Some(2);
+        start_local_runtime_inner(
+            vec![JobInfo::new("lane_count", 1, 10, |_state, _payload| {
+                Box::pin(async move {
+                    RAN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+            })],
+            &state,
+            &shutdown,
+            2,
+            5,
+            250,
+            &queues,
+            &[],
+            &crate::config::JobTenantsConfig {
+                max_concurrent: 1,
+                lanes: 2,
+                lanes_per_tenant: 1,
+            },
+            true,
+        );
+
+        for tenant in ["a", "b", "c", "d"] {
+            for _ in 0..2 {
+                crate::tenancy::CURRENT_TENANT
+                    .scope(
+                        Some(tenant.to_owned()),
+                        enqueue("lane_count", serde_json::json!({})),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        enqueue("lane_count", serde_json::json!({})).await.unwrap();
+
+        timeout(Duration::from_secs(5), async {
+            while RAN.load(std::sync::atomic::Ordering::SeqCst) < 9 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("every tenant's jobs ran, and the job without a tenant");
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
     #[tokio::test]
     async fn enqueue_rejects_a_payload_that_collides_with_the_tracked_envelope_shape() {
         let _guard = global_job_runtime_test_lock().lock().await;

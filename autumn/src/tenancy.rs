@@ -945,6 +945,49 @@ mod tests {
         );
     }
 
+    /// A handler runs inside the tenant's database bulkhead (#3072).
+    #[tokio::test]
+    async fn a_handler_is_inside_the_db_bulkhead() {
+        use tower::ServiceExt as _;
+        let state = crate::AppState::for_test();
+        let mut config = crate::config::AutumnConfig::default();
+        config.tenancy.enabled = true;
+        config.tenancy.source = "header".to_string();
+        config.tenancy.header_name = "x-tenant-id".to_string();
+        config.tenancy.max_db_connections = 1;
+        state.insert_extension(config);
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::get(|| async {
+                    let first = crate::bulkhead::acquire_db_permit();
+                    let second = crate::bulkhead::acquire_db_permit();
+                    let held = matches!(first, Ok(Some(_)));
+                    if held && second.is_err() {
+                        axum::http::StatusCode::OK
+                    } else {
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                tenancy_middleware,
+            ))
+            .with_state(state);
+        let request = axum::http::Request::builder()
+            .uri("/")
+            .header("x-tenant-id", "acme")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "one permit, then a 503 for the same tenant"
+        );
+    }
+
     fn subdomain_config() -> crate::config::AutumnConfig {
         let mut c = crate::config::AutumnConfig::default();
         c.tenancy.enabled = true;
