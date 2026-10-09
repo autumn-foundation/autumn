@@ -273,8 +273,19 @@ impl Manifest {
         // something nobody vouched for. A manifest reachable only through a
         // link is treated as absent, which is the same conservative answer a
         // project that never had one gets.
-        if matches!(read_current(root, MANIFEST_PATH), OnDisk::Linked(_)) {
-            return None;
+        for attempt in 1..=SWAP_ATTEMPTS {
+            match read_current(root, MANIFEST_PATH) {
+                OnDisk::Linked(_) => return None,
+                // A swap in flight also leaves the path absent. Wait for it:
+                // "no manifest" would plan with no baseline.
+                OnDisk::Absent
+                    if attempt < SWAP_ATTEMPTS
+                        && claim_in_flight(&root.join(MANIFEST_PATH)).is_some() =>
+                {
+                    back_off(attempt);
+                }
+                _ => break,
+            }
         }
         Self::parse(&std::fs::read_to_string(root.join(MANIFEST_PATH)).ok()?)
     }
@@ -2937,6 +2948,24 @@ mod tests {
         let manifest = accepted.expect("owned by the recorded flavor");
         assert!(manifest.pinned.contains("tailwind.config.js"));
         assert!(!manifest.digests.is_empty(), "the history survives");
+    }
+
+    #[test]
+    fn a_load_waits_out_a_claim_instead_of_seeing_no_manifest() {
+        // `--check` and `--apply` plan from `load`. During a swap the path is
+        // absent, and "no manifest" would report spurious conflicts.
+        let tmp = scaffolded(GenerateOptions::default());
+        let manifest_path = tmp.path().join(MANIFEST_PATH);
+        let held = manifest_path.with_file_name(".autumn-upgrade-claim.old");
+        fs::rename(&manifest_path, &held).unwrap();
+        let restore = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            fs::rename(&held, &manifest_path).unwrap();
+        });
+
+        let loaded = Manifest::load(tmp.path());
+        restore.join().unwrap();
+        assert!(loaded.is_some(), "the manifest was only held aside");
     }
 
     #[test]
