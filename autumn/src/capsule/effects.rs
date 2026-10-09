@@ -357,6 +357,27 @@ impl CacheWrite {
             Self::Clear => "clear".to_owned(),
         }
     }
+
+    /// The key or namespace the write names.
+    fn identifier(&self) -> Option<&str> {
+        match self {
+            Self::Insert { key, .. } | Self::Invalidate { key, .. } => Some(key),
+            Self::InvalidateNamespace { namespace, .. } => Some(namespace),
+            Self::Clear => None,
+        }
+    }
+
+    /// [`describe`](Self::describe) with no key or namespace.
+    fn describe_withheld(&self) -> String {
+        match self {
+            Self::Insert { .. } => "a cache write (key withheld)".to_owned(),
+            Self::Invalidate { .. } => "invalidate (key withheld)".to_owned(),
+            Self::InvalidateNamespace { .. } => {
+                "invalidate namespace (namespace withheld)".to_owned()
+            }
+            Self::Clear => "clear".to_owned(),
+        }
+    }
 }
 
 /// Whether a recorded key is in `namespace`: `"{namespace}:..."`, the shape
@@ -974,8 +995,15 @@ impl ReplayEffects {
         };
         if !next.matches(actual) {
             let expected = next.describe();
+            let recorded_identifier = next.identifier().map(ToOwned::to_owned);
             drop(seam);
-            let described = actual.describe();
+            // The verdict masks a value it learned. A masked identifier that
+            // does not match teaches nothing, so it is not printed.
+            let described = if self.observe_identifier(recorded_identifier.as_deref(), actual) {
+                actual.describe()
+            } else {
+                actual.describe_withheld()
+            };
             self.diverge(EffectDivergence {
                 seam: EffectSeam::Cache,
                 kind: EffectDivergenceKind::Mismatch,
@@ -1294,6 +1322,22 @@ impl ReplayEffects {
         for (recorded, actual) in recorded.attachments.iter().zip(sent.attachments.iter()) {
             self.observe_text(&recorded.filename, &actual.filename);
         }
+    }
+
+    /// Learn what a masked recorded key or namespace stood for in `actual`.
+    /// Returns whether `actual`'s identifier is safe to print.
+    fn observe_identifier(&self, recorded: Option<&str>, actual: &CacheWrite) -> bool {
+        let (Some(recorded), Some(actual)) = (recorded, actual.identifier()) else {
+            return true;
+        };
+        if !recorded.contains(FILTERED) && !recorded.contains(FILTERED_URLENCODED) {
+            return true;
+        }
+        if redacted_spans(recorded, actual).is_none() {
+            return false;
+        }
+        self.observe_text(recorded, actual);
+        true
     }
 
     fn observe_write(&self, recorded: &CacheWrite, actual: &CacheWrite) {
@@ -2367,6 +2411,30 @@ mod tests {
             &tape.observed_redactions(),
         );
         assert!(!masked.contains("sk/live"), "{masked}");
+    }
+
+    /// Codex review on #3222: a cache write mismatch does not print a
+    /// secret that stood behind a masked recorded key.
+    #[test]
+    fn a_cache_write_mismatch_does_not_print_a_masked_key() {
+        let recorded = |key: &str| CapsuleEffects {
+            cache: vec![CacheEffect::Invalidate {
+                key: key.to_owned(),
+                error: None,
+            }],
+            ..CapsuleEffects::default()
+        };
+        // The identifier matches, so its value is learned and masked.
+        let tape = ReplayEffects::new(recorded("user:[FILTERED]"));
+        let _ = tape.cache_invalidate_namespace("user:sk-live-42");
+        assert!(tape.observed_redactions().contains(b"sk-live-42"));
+        // The identifier does not match, so it is not printed.
+        let tape = ReplayEffects::new(recorded("tok:[FILTERED]:x"));
+        let _ = tape.cache_invalidate_namespace("other:sk-live-42");
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert!(!divergences[0].actual.contains("sk-live-42"));
+        assert!(!divergences[0].detail.contains("sk-live-42"));
     }
 
     /// #2351 item 13: an active tape with no tenant entry fails closed.

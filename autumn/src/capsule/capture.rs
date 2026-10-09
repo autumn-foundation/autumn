@@ -508,6 +508,8 @@ pub struct CaptureScope {
     notes: Mutex<Vec<String>>,
     truncated: AtomicBool,
     closed: AtomicBool,
+    /// Whether a global cache was installed when the run started.
+    global_cache: bool,
 }
 
 impl CaptureScope {
@@ -530,7 +532,15 @@ impl CaptureScope {
             notes: Mutex::new(Vec::new()),
             truncated: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            global_cache: crate::cache::global_cache().is_some(),
         }
+    }
+
+    /// Whether a global cache was installed when the run started. Read at
+    /// the start, so a later change in the process does not alter it.
+    #[must_use]
+    pub(crate) const fn had_global_cache(&self) -> bool {
+        self.global_cache
     }
 
     /// The capsule id (the request id, when one was available).

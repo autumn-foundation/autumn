@@ -1383,6 +1383,21 @@ mod tests {
         );
     }
 
+    /// Codex review on #3222: a capture scope reads the global cache when the
+    /// run starts, so a later change does not alter the recorded flag.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_capture_scope_records_the_global_cache_at_the_start() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_global_cache(Arc::new(SpyBackend::default()));
+        let scope = capture_scope();
+        clear_global_cache();
+        assert!(scope.had_global_cache());
+        assert!(!capture_scope().had_global_cache());
+    }
+
     /// The seam wraps a backend once, so `Arc` identity stays stable.
     #[cfg(feature = "reporting")]
     #[test]
