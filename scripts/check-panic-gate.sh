@@ -128,6 +128,7 @@ REQUEST_PATH_MODULES=(
   autumn/src/capsule/clock.rs:reporting
   autumn/src/capsule/entropy.rs:reporting
   autumn/src/capsule/effects.rs:reporting
+  autumn/src/capsule/boundary.rs:reporting
   autumn/src/capsule/persist.rs:reporting
   autumn/src/capsule/redact.rs:reporting
   autumn/src/capsule/schema.rs:reporting
