@@ -55,8 +55,13 @@ fn now_ms() -> i64 {
     crate::time::ambient_now().timestamp_millis()
 }
 
+/// The longest span the store writes, in milliseconds: about 18 million
+/// years. The expiry arithmetic adds a few of these to the clock in SQL, so
+/// a longer TTL is clamped here rather than overflowing `BIGINT` there.
+const MAX_SPAN_MS: i64 = i64::MAX / 16;
+
 fn ms(duration: Duration) -> i64 {
-    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+    i64::try_from(duration.as_millis()).map_or(MAX_SPAN_MS, |ms| ms.min(MAX_SPAN_MS))
 }
 
 fn after(duration: Duration) -> i64 {
@@ -219,7 +224,7 @@ impl DbIdempotencyStore {
     /// `false` when `from_owner` no longer holds `from`: its lock expired and
     /// another request took the key. The old key may still hold a point this
     /// call cannot read, so the caller must not run the handler. `false` too
-    /// when a point was to be copied and `to_owner` no longer holds `to`.
+    /// when `to_owner` no longer holds `to`.
     pub(super) async fn adopt_recovery_point(
         &self,
         from: &str,
@@ -239,9 +244,6 @@ impl DbIdempotencyStore {
         let Some((point, body_hash, ttl_ms)) = held else {
             return Ok(false);
         };
-        let Some(point) = point else {
-            return Ok(true);
-        };
         let copied = HeldPoint {
             point,
             body_hash,
@@ -252,8 +254,9 @@ impl DbIdempotencyStore {
     }
 
     /// Write `copied` (read from `from`) to the row `to_owner` holds on `to`,
-    /// only while `from_owner` still holds `from` with that point. `false`
-    /// when it no longer does, or when `to_owner` no longer holds `to`.
+    /// only while `from_owner` still holds `from` with that point (or with
+    /// none, when `copied` has none). `false` when it no longer does, or when
+    /// `to_owner` no longer holds `to`.
     ///
     /// One transaction. It first rewrites the source row with its own values
     /// while `from_owner` still holds it with the point. That write locks the
@@ -287,42 +290,56 @@ impl DbIdempotencyStore {
                 } = copied;
                 let source = keys::autumn_idempotency_keys
                     .filter(keys::storage_key.eq(&from))
-                    .filter(keys::locked_by.eq(&from_owner))
-                    .filter(keys::recovery_point.eq(&point));
-                let fenced = diesel::update(source)
-                    .set(keys::locked_until_ms.eq(keys::locked_until_ms))
-                    .execute(&mut *conn)
-                    .await?;
+                    .filter(keys::locked_by.eq(&from_owner));
+                let unchanged = keys::locked_until_ms.eq(keys::locked_until_ms);
+                let fenced = match &point {
+                    Some(point) => {
+                        diesel::update(source.filter(keys::recovery_point.eq(point)))
+                            .set(unchanged)
+                            .execute(&mut *conn)
+                            .await?
+                    }
+                    None => {
+                        diesel::update(source.filter(keys::recovery_point.is_null()))
+                            .set(unchanged)
+                            .execute(&mut *conn)
+                            .await?
+                    }
+                };
                 if fenced == 0 {
                     return Ok(false);
                 }
-                #[allow(
-                    clippy::arithmetic_side_effects,
-                    reason = "a SQL expression, evaluated by the database"
-                )]
-                let crash_expiry = keys::locked_until_ms + ttl_ms;
-                // The point's own TTL from now, or past the lock if that is
-                // later; not the store default the lock set.
-                let fresh_expiry = now_ms().saturating_add(ttl_ms);
-                let expiry = diesel::dsl::case_when(crash_expiry.gt(fresh_expiry), crash_expiry)
-                    .otherwise(fresh_expiry);
                 let target = keys::autumn_idempotency_keys
                     .filter(keys::storage_key.eq(&to))
                     .filter(keys::locked_by.eq(&to_owner));
-                let copied = diesel::update(target.filter(keys::recovery_point.is_null()))
-                    .set((
-                        keys::recovery_point.eq(Some(point)),
-                        keys::recovery_body_hash.eq(body_hash),
-                        keys::ttl_ms.eq(ttl_ms),
-                        keys::expires_at_ms.eq(expiry),
-                    ))
-                    .execute(&mut *conn)
-                    .await?;
-                if copied == 1 {
-                    return Ok(true);
+                if let Some(point) = point {
+                    #[allow(
+                        clippy::arithmetic_side_effects,
+                        reason = "a SQL expression, evaluated by the database"
+                    )]
+                    let crash_expiry = keys::locked_until_ms + ttl_ms;
+                    // The point's own TTL from now, or past the lock if that
+                    // is later; not the store default the lock set.
+                    let fresh_expiry = now_ms().saturating_add(ttl_ms);
+                    let expiry =
+                        diesel::dsl::case_when(crash_expiry.gt(fresh_expiry), crash_expiry)
+                            .otherwise(fresh_expiry);
+                    let copied = diesel::update(target.filter(keys::recovery_point.is_null()))
+                        .set((
+                            keys::recovery_point.eq(Some(point)),
+                            keys::recovery_body_hash.eq(body_hash),
+                            keys::ttl_ms.eq(ttl_ms),
+                            keys::expires_at_ms.eq(expiry),
+                        ))
+                        .execute(&mut *conn)
+                        .await?;
+                    if copied == 1 {
+                        return Ok(true);
+                    }
                 }
-                // Nothing copied: the target has a point already, or lost its
-                // lock to another request. Only the first may go on.
+                // Nothing copied: there was no point, the target has one
+                // already, or it lost its lock to another request. Go on only
+                // while the target is held.
                 let target_held = target
                     .select(keys::storage_key)
                     .first::<String>(&mut *conn)
@@ -340,7 +357,9 @@ impl DbIdempotencyStore {
 
 /// A recovery point read from one key, to copy to another.
 struct HeldPoint {
-    point: String,
+    /// `None` when the source has no point: nothing to copy, but both locks
+    /// are still checked.
+    point: Option<String>,
     body_hash: Option<Vec<u8>>,
     ttl_ms: i64,
 }
@@ -1120,7 +1139,7 @@ mod tests {
         // What a1 read, before another request took the old key and moved
         // its point on.
         let read = || HeldPoint {
-            point: "charged".to_owned(),
+            point: Some("charged".to_owned()),
             body_hash: None,
             ttl_ms: 60_000,
         };
@@ -1148,7 +1167,7 @@ mod tests {
 
         // The holder's own snapshot still copies.
         let held = HeldPoint {
-            point: "shipped".to_owned(),
+            point: Some("shipped".to_owned()),
             body_hash: None,
             ttl_ms: 60_000,
         };
@@ -1198,7 +1217,7 @@ mod tests {
             .await
             .unwrap();
         let held = HeldPoint {
-            point: "charged".to_owned(),
+            point: Some("charged".to_owned()),
             body_hash: None,
             ttl_ms: 60_000,
         };
@@ -1216,6 +1235,79 @@ mod tests {
             .unwrap();
         assert_eq!(point, None, "nothing was written to c's key");
     }
+
+    /// The old key has no recovery point, and the new key's lock was lost to
+    /// another request. Adoption reports `false`, as it does when there is a
+    /// point to copy, so this request does not run the handler.
+    #[tokio::test]
+    async fn adopt_without_a_point_refuses_a_target_taken_by_another_request() {
+        let substrate = SqliteSubstrate::with_migrations(&[&crate::migrate::FRAMEWORK_MIGRATIONS])
+            .expect("substrate");
+        let store = DbIdempotencyStore::new(substrate.pool(), Duration::from_secs(60));
+        assert!(
+            store
+                .try_lock("old", "a1", Duration::from_secs(60))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .try_lock("new", "b", Duration::from_millis(5))
+                .await
+                .unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            store
+                .try_lock("new", "c", Duration::from_secs(60))
+                .await
+                .unwrap()
+        );
+
+        let adopted = store
+            .adopt_recovery_point("old", "a1", "new", "b")
+            .await
+            .unwrap();
+        assert!(!adopted, "b no longer holds the new key");
+        assert!(
+            store
+                .adopt_recovery_point("old", "a1", "new", "c")
+                .await
+                .unwrap(),
+            "the holder of both keys goes on"
+        );
+    }
+
+    /// A TTL too long for the clock's millisecond range still stores and
+    /// replays, as it does in the memory store, rather than overflowing the
+    /// expiry arithmetic in SQL.
+    #[tokio::test]
+    async fn a_ttl_past_the_millisecond_range_still_stores() {
+        let substrate = SqliteSubstrate::with_migrations(&[&crate::migrate::FRAMEWORK_MIGRATIONS])
+            .expect("substrate");
+        let store = DbIdempotencyStore::new(substrate.pool(), Duration::MAX);
+        huge_ttl_round_trip(&store).await;
+    }
+}
+
+/// Lock, store and release `key` with a TTL past the millisecond range, then
+/// read the record back. Shared by the `SQLite` and Postgres tests.
+#[cfg(test)]
+async fn huge_ttl_round_trip(store: &DbIdempotencyStore) {
+    let record = IdempotencyRecord {
+        status: 201,
+        headers: Vec::new(),
+        body: b"done".to_vec(),
+        metadata: Vec::new(),
+    };
+    assert!(store.try_lock("k", "a", Duration::MAX).await.unwrap());
+    store
+        .set("k", "a", record, Vec::new(), Duration::MAX)
+        .await
+        .unwrap();
+    store.unlock("k", "a").await.unwrap();
+    let entry = store.get("k").await.unwrap();
+    assert!(entry.is_some(), "the record replays");
 }
 
 /// Postgres-only: the row-lock behaviour `SQLite`, which serialises writers,
@@ -1304,5 +1396,32 @@ mod pg_tests {
             .await
             .unwrap();
         assert_eq!(point, None, "the point a2 now holds was not copied");
+    }
+
+    /// Postgres: a TTL past the millisecond range does not overflow `BIGINT`
+    /// in the expiry arithmetic.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn pg_a_ttl_past_the_millisecond_range_still_stores() {
+        use diesel_async::SimpleAsyncConnection as _;
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+        use testcontainers::runners::AsyncRunner as _;
+        use testcontainers_modules::postgres::Postgres;
+
+        let container = Postgres::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+        let manager = AsyncDieselConnectionManager::<RuntimeConnection>::new(url);
+        let pool = Pool::builder(manager).max_size(4).build().unwrap();
+        pool.get()
+            .await
+            .unwrap()
+            .batch_execute(include_str!(
+                "../../migrations/20261005200000_create_idempotency_keys/up.sql"
+            ))
+            .await
+            .unwrap();
+        let store = DbIdempotencyStore::new(pool, Duration::MAX);
+        huge_ttl_round_trip(&store).await;
     }
 }
