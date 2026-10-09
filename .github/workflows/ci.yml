@@ -2426,6 +2426,22 @@ jobs:
           grep -qE 'test result: ok\. [1-9][0-9]* passed' \
             "${RUNNER_TEMP}/admin-plugin-sqlite.log" \
             || { echo "::error::no admin-plugin sqlite test ran — the #[ignore] or the target name changed"; exit 1; }
+      - name: Run the autumn-cli declarative-schema suite under sqlite
+        # Issue #1975. The SQLite arm of `autumn schema` (`schema pull`
+        # introspection, `schema migrate`, the recreate emitter) compiles only
+        # with `--no-default-features --features sqlite`. No other job builds
+        # it. No Docker: the tests use a temporary SQLite file. The pass count
+        # is checked, because a filter that matches nothing exits 0.
+        run: |
+          set -o pipefail
+          cargo test -p autumn-cli --no-default-features --features sqlite \
+            --bin autumn schema:: | tee "${RUNNER_TEMP}/cli-schema-sqlite-unit.log"
+          cargo test -p autumn-cli --no-default-features --features sqlite \
+            --test cli_tests schema_ | tee "${RUNNER_TEMP}/cli-schema-sqlite-it.log"
+          for log in cli-schema-sqlite-unit cli-schema-sqlite-it; do
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/${log}.log" \
+              || { echo "::error::no autumn-cli sqlite schema test ran (${log})"; exit 1; }
+          done
       - name: Clippy autumn-search under the sqlite backend
         # Issue #2539 §5. The Postgres store binds a `BIGINT[]`, which SQLite
         # does not have, so the crate did not compile under the flip. It now

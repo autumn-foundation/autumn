@@ -7,9 +7,9 @@
 //! adds the other half of a diff: a durable, versioned, dialect-tagged file that
 //! records the schema's *last-known agreed shape*. At adoption time the declared
 //! models and the live database agree, so writing a snapshot of the models
-//! establishes the initial baseline; a later slice's diff engine compares the
-//! freshly-parsed desired state against this committed file to compute the
-//! pending migration.
+//! establishes the initial baseline. The diff engine ([`crate::schema::diff`])
+//! compares the parsed desired state against this committed file to compute
+//! the pending migration.
 //!
 //! # Why a bespoke envelope (not just `Vec<Table>`)
 //!
@@ -21,8 +21,8 @@
 //!   silently mis-parsed by an older CLI.
 //! - **A top-level `backend`** dialect tag (Decision 5 provider-lock): the same
 //!   logical schema renders different DDL per backend, so a snapshot is locked to
-//!   the provider it was generated against. [`SchemaSnapshot::ensure_backend_matches`]
-//!   is the guard a later slice's diff engine calls before diffing.
+//!   the provider it was generated against. `schema diff` and `schema migrate`
+//!   call [`SchemaSnapshot::ensure_backend_matches`] before they use it.
 //!
 //! # Canonical serialization
 //!

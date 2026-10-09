@@ -744,7 +744,7 @@ pub enum ForeignKeyAction {
     SetDefault,
 }
 
-/// The values that `#[references(on_delete = "...")]` accepts.
+/// The values that `on_delete` and `on_update` in `#[references(...)]` accept.
 pub const FOREIGN_KEY_ACTION_ATTR_VALUES: [&str; 5] = [
     "cascade",
     "restrict",
@@ -831,18 +831,18 @@ pub struct ForeignKey {
     pub table: String,
     /// The referenced column name (e.g. `id`).
     pub column: String,
-    /// The `ON DELETE` action. `None` is `NO ACTION`. Not serialized when
-    /// `None`, so an old snapshot keeps its bytes.
+    /// The `ON DELETE` action. `None` is `NO ACTION`. Serde skips the field
+    /// when it is `None`. Thus an old snapshot keeps the same bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_delete: Option<ForeignKeyAction>,
-    /// The `ON UPDATE` action. `None` is `NO ACTION`. Not serialized when
-    /// `None`.
+    /// The `ON UPDATE` action. `None` is `NO ACTION`. Serde skips the field
+    /// when it is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_update: Option<ForeignKeyAction>,
 }
 
 impl ForeignKey {
-    /// Construct a foreign key pointing at `table`.`column`, with no action.
+    /// Make a foreign key to `table`.`column` with no actions.
     pub fn new(table: impl Into<String>, column: impl Into<String>) -> Self {
         Self {
             table: table.into(),
@@ -867,7 +867,7 @@ impl ForeignKey {
     }
 
     /// The SQL that follows `REFERENCES t(c)`, for example
-    /// ` ON DELETE CASCADE`. Empty when there is no action.
+    /// ` ON DELETE CASCADE`. The string is empty when there is no action.
     #[must_use]
     pub fn action_clauses(&self) -> String {
         let mut out = String::new();
@@ -1832,6 +1832,10 @@ mod tests {
         );
         // `no_action` is the database default. It is `None`, the same as no value.
         assert_eq!(ForeignKeyAction::from_attr("no_action"), Ok(None));
+        // Each listed value reads. The macro accepts this same list.
+        for value in FOREIGN_KEY_ACTION_ATTR_VALUES {
+            assert!(ForeignKeyAction::from_attr(value).is_ok(), "{value}");
+        }
         let err = ForeignKeyAction::from_attr("Cascade").unwrap_err();
         assert!(err.to_string().contains("`Cascade`"), "{err}");
         assert!(err.to_string().contains("set_null"), "{err}");

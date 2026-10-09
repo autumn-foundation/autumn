@@ -917,8 +917,9 @@ pub struct Post {
 }
 
 /// #1975: SQLite marks the internal tables of a virtual table (for example
-/// rtree `_node`, `_parent`, `_rowid`) as `shadow`. The pull excludes them,
-/// and keeps an app table whose name only looks like one.
+/// rtree `_node`, `_parent`, `_rowid`) as `shadow`. The pull excludes them.
+/// It keeps `boxes_data`, an app table with an FTS5 shadow suffix: `boxes` is
+/// not an FTS5 table.
 #[test]
 fn schema_pull_excludes_rtree_shadow_tables() {
     let (_tmp, project) = fresh_project("pull_sqlite_rtree");
@@ -932,19 +933,21 @@ fn schema_pull_excludes_rtree_shadow_tables() {
         &project,
         "20260101000000_rtree",
         "CREATE VIRTUAL TABLE boxes USING rtree(id, min_x, max_x);\n\
-         CREATE TABLE places_node (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL);\n",
-        "DROP TABLE places_node;\nDROP TABLE boxes;\n",
+         CREATE TABLE boxes_data (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL);\n",
+        "DROP TABLE boxes_data;\nDROP TABLE boxes;\n",
     );
     run_autumn_ok(&project, &["schema", "migrate"], &envs);
     run_autumn_ok(&project, &["schema", "pull"], &envs);
 
     let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    for internal in ["boxes", "boxes_node", "boxes_parent", "boxes_rowid"] {
+        assert!(
+            !snap.contains(&format!("\"name\": \"{internal}\"")),
+            "no rtree virtual or shadow table `{internal}` in the snapshot: {snap}"
+        );
+    }
     assert!(
-        !snap.contains("\"name\": \"boxes"),
-        "no rtree virtual or shadow table in the snapshot: {snap}"
-    );
-    assert!(
-        snap.contains("\"name\": \"places_node\""),
-        "an app table that only looks like a shadow table is kept: {snap}"
+        snap.contains("\"name\": \"boxes_data\""),
+        "an app table with an FTS5 suffix on a non-FTS5 table is kept: {snap}"
     );
 }

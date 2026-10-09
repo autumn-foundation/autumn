@@ -2,8 +2,8 @@
 //
 // Acceptance-only: `#[model(managed)]`, `#[unique]`, and `#[references(...)]`
 // (the explicit `table = "..."` form with `on_delete` / `on_update` actions,
-// and the bare, inferred form) must be
-// ACCEPTED and validated by the `#[model]` macro, stripped from the generated
+// and the bare, inferred form) must be ACCEPTED and validated by the
+// `#[model]` macro, stripped from the generated
 // query struct, and change NO codegen — the model still generates its normal
 // New*/Update* types over the Diesel table below. `#[renamed_from("...")]` on
 // the model (after `#[model]`) and on a field is accepted and stripped too.

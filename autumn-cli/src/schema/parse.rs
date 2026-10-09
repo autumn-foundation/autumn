@@ -653,7 +653,8 @@ struct FieldAttrs {
     on_delete: Option<ForeignKeyAction>,
     /// `#[references(on_update = "...")]`. `None` is `NO ACTION`.
     on_update: Option<ForeignKeyAction>,
-    /// An unknown action value. The column is skipped with a diagnostic.
+    /// An unknown action value. The parser skips the column and records a
+    /// diagnostic.
     reference_error: Option<String>,
 }
 
@@ -707,9 +708,9 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
             "references" => {
                 let mut target = None;
                 if !matches!(attr.meta, syn::Meta::Path(_)) {
-                    // Extract `table`, `on_delete` and `on_update`, but consume any
-                    // other nested list / `key = value` pair so a future arg never
-                    // aborts target extraction.
+                    // Read `table`, `on_delete` and `on_update`. Consume each other
+                    // nested list or `key = value` pair. Then a new argument cannot
+                    // stop the read of the target.
                     let _ = attr.parse_nested_meta(|meta| {
                         let action_key = ["on_delete", "on_update"]
                             .into_iter()
@@ -744,16 +745,25 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
     out
 }
 
-/// Why the `#[references]` actions of `raw` are not valid, if they are not: an
-/// unknown value, or `set_null` on a required column.
+/// Return the problem with the `#[references]` actions of `raw`, or `None`. A
+/// problem is an unknown value, or `set_null` / `set_default` on a required
+/// column. A reference column has no default, so `SET DEFAULT` writes NULL.
 fn reference_action_problem(raw: &RawField) -> Option<String> {
     if let Some(error) = &raw.attrs.reference_error {
         return Some(error.clone());
     }
-    let set_null =
-        [raw.attrs.on_delete, raw.attrs.on_update].contains(&Some(ForeignKeyAction::SetNull));
-    (set_null && !raw.nullable)
-        .then(|| "foreign-key action `set_null` needs an `Option<_>` field".to_owned())
+    if raw.nullable {
+        return None;
+    }
+    [raw.attrs.on_delete, raw.attrs.on_update]
+        .into_iter()
+        .flatten()
+        .find_map(|action| match action {
+            ForeignKeyAction::SetNull => Some("set_null"),
+            ForeignKeyAction::SetDefault => Some("set_default"),
+            _ => None,
+        })
+        .map(|value| format!("foreign-key action `{value}` needs an `Option<_>` field"))
 }
 
 /// A field lifted out of the struct with its name, parsed attributes, and Rust
@@ -1968,8 +1978,8 @@ mod tests {
 
     #[test]
     fn references_unknown_kv_arg_is_ignored_and_target_survives() {
-        // A future `#[references(table = "...", key = "...")]` arg must not
-        // abort extraction of the `table` target.
+        // An unknown `future_key = "..."` argument must not stop the read of
+        // `table`.
         let src = r#"
             #[model]
             pub struct Comment {
@@ -2247,7 +2257,7 @@ mod tests {
             col(&table, "post_id").references,
             Some(ForeignKey::new("posts", "id").with_on_delete(Some(ForeignKeyAction::SetNull)))
         );
-        // `no_action` is the default: no action is recorded.
+        // `no_action` is the default. The IR records no action for it.
         assert_eq!(
             col(&table, "thread_id").references,
             Some(ForeignKey::new("threads", "id"))
@@ -2256,8 +2266,8 @@ mod tests {
 
     #[test]
     fn references_unknown_action_skips_the_column_with_a_diagnostic() {
-        // A typo must not become `NO ACTION`. The column is skipped, so the
-        // diff keeps the table as it is.
+        // A typo must not become `NO ACTION`. The parser skips the column.
+        // Then the diff does not change the table.
         let src = r#"
             #[model]
             pub struct Comment {
@@ -2281,29 +2291,34 @@ mod tests {
     }
 
     #[test]
-    fn references_set_null_on_a_required_column_skips_it_with_a_diagnostic() {
-        // `SET NULL` on a `NOT NULL` column fails at delete time.
-        let src = r#"
-            #[model]
-            pub struct Comment {
-                #[id]
-                pub id: i64,
-                #[references(on_update = "set_null")]
-                pub author_id: i64,
-            }
-        "#;
-        let parsed = parse_model_source(src, Backend::Postgres).expect("parse");
-        assert!(
-            parsed.tables[0]
-                .columns
-                .iter()
-                .all(|c| c.name != "author_id")
-        );
-        assert_eq!(parsed.diagnostics.len(), 1);
-        assert!(
-            parsed.diagnostics[0].message.contains("set_null"),
-            "{}",
-            parsed.diagnostics[0].message
-        );
+    fn references_null_writing_action_on_a_required_column_skips_it_with_a_diagnostic() {
+        // `SET NULL` on a `NOT NULL` column fails at delete time. The column has
+        // no default, so `SET DEFAULT` also writes NULL.
+        for action in ["set_null", "set_default"] {
+            let src = format!(
+                r#"
+                #[model]
+                pub struct Comment {{
+                    #[id]
+                    pub id: i64,
+                    #[references(on_update = "{action}")]
+                    pub author_id: i64,
+                }}
+            "#
+            );
+            let parsed = parse_model_source(&src, Backend::Postgres).expect("parse");
+            assert!(
+                parsed.tables[0]
+                    .columns
+                    .iter()
+                    .all(|c| c.name != "author_id")
+            );
+            assert_eq!(parsed.diagnostics.len(), 1);
+            assert!(
+                parsed.diagnostics[0].message.contains(action),
+                "{}",
+                parsed.diagnostics[0].message
+            );
+        }
     }
 }

@@ -53,9 +53,6 @@
 //!   full one — a pre-existing parser gap that makes a round-trip diff non-empty
 //!   for long field names. Introspection records the DB's identifier faithfully;
 //!   reconciling the two names is a later slice.
-//! - **Composite index key order**: resolved. The columns of a multi-column
-//!   index follow the `pg_index.indkey` order (`unnest ... WITH ORDINALITY`), not
-//!   `attnum`.
 //! - **Operator classes / collations / ordering on *simple* indexes**: a plain
 //!   column index with a non-default operator class, collation, or `ASC`/`DESC`
 //!   ordering is still recorded by its columns (matching what the model parser
@@ -78,8 +75,9 @@
 //!   single-column). The model parser never emits a composite FK.
 //! - **Foreign-key / constraint names**: the IR [`ForeignKey`] carries
 //!   `table`, `column` and the `ON DELETE` / `ON UPDATE` actions
-//!   (`confdeltype` / `confupdtype`), but not the constraint name. So the name is
-//!   never diffed.
+//!   (`confdeltype` / `confupdtype`). It does not carry the constraint name,
+//!   `DEFERRABLE` / `INITIALLY DEFERRED` or `MATCH`. The diff never compares
+//!   these, and a recreate does not write them.
 //! - **Enum `CHECK` constraints**: enum recovery from `CHECK` expressions is a
 //!   later slice; a `TEXT`-with-`CHECK` column pulls back as plain
 //!   [`Text`](ColumnType::Text).
@@ -775,8 +773,8 @@ fn fetch_foreign_keys(
     let rows: Vec<ForeignKeyRow> = sql_query(query)
         .load(conn)
         .map_err(|e| IntrospectError::Query(e.to_string()))?;
-    // Fail closed on an unknown action code, so `build_table` never reads one
-    // as `NO ACTION`.
+    // Refuse an unknown action code. Then `build_table` cannot read it as
+    // `NO ACTION`.
     for row in &rows {
         for code in [&row.on_delete, &row.on_update] {
             pg_fk_action(code).map_err(|e| {
@@ -1822,11 +1820,11 @@ mod sqlite {
         out
     }
 
-    /// List app tables (name + `CREATE TABLE` SQL), excluding `SQLite` internal
-    /// tables, the Diesel migrations table, framework-owned tables, every
-    /// **virtual table** and every **shadow table** (a `shadow` row of
-    /// `pragma_table_list`, for example rtree `_node`/`_parent`/`_rowid`). This
-    /// covers the `CREATE VIRTUAL TABLE "<table>__fts" USING fts5(…)`
+    /// List the app tables (name and `CREATE TABLE` SQL). The list excludes
+    /// `SQLite` internal tables, the Diesel migrations table, framework tables,
+    /// virtual tables and shadow tables. `pragma_table_list` gives a shadow
+    /// table the type `shadow`, for example rtree `_node`, `_parent` and
+    /// `_rowid`. This covers the `CREATE VIRTUAL TABLE "<table>__fts" USING fts5(…)`
     /// index a `--searchable` model generates (issue #1910) plus its internal shadow
     /// tables (`<vtab>_data`/`_idx`/`_content`/`_docsize`/`_config`). Those are stored
     /// in `sqlite_master` as `type = 'table'` with non-`sqlite_` names, but the model
@@ -1848,12 +1846,17 @@ mod sqlite {
         .load(conn)
         .map_err(|e| query_err(&e))?;
         // Virtual tables (their `sql` starts with `CREATE VIRTUAL TABLE`) are never
-        // model-expressible; collect them so their FTS5 shadow tables can be
-        // excluded alongside the vtab itself.
-        let virtual_tables: Vec<String> = rows
+        // model-expressible; collect them, and whether each is FTS5, so the FTS5
+        // shadow tables can be excluded alongside the vtab itself.
+        let virtual_tables: Vec<(String, bool)> = rows
             .iter()
-            .filter(|r| r.sql.as_deref().is_some_and(is_create_virtual_table))
-            .map(|r| r.name.clone())
+            .filter_map(|r| {
+                let sql = r
+                    .sql
+                    .as_deref()
+                    .filter(|sql| is_create_virtual_table(sql))?;
+                Some((r.name.clone(), is_fts5_virtual_table(sql)))
+            })
             .collect();
         Ok(rows
             .into_iter()
@@ -1873,17 +1876,29 @@ mod sqlite {
             .starts_with("CREATE VIRTUAL TABLE")
     }
 
+    /// Whether a `CREATE VIRTUAL TABLE` statement uses the `fts5` module.
+    fn is_fts5_virtual_table(sql: &str) -> bool {
+        sql.to_ascii_uppercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|w| w[0] == "USING" && (w[1] == "FTS5" || w[1].starts_with("FTS5(")))
+    }
+
     /// The FTS5 internal shadow-table suffixes appended to the virtual-table name.
     const FTS5_SHADOW_SUFFIXES: [&str; 5] = ["_data", "_idx", "_content", "_docsize", "_config"];
 
-    /// Whether `name` is one of the `virtual_tables` itself or one of its FTS5 shadow
-    /// tables (`<vtab>` + a [`FTS5_SHADOW_SUFFIXES`] suffix).
-    fn is_virtual_or_fts5_shadow_table(name: &str, virtual_tables: &[String]) -> bool {
-        virtual_tables.iter().any(|vtab| {
+    /// Whether `name` is one of the `virtual_tables` (name, is FTS5) or an FTS5
+    /// shadow table (an FTS5 `<vtab>` + a [`FTS5_SHADOW_SUFFIXES`] suffix). The
+    /// suffix rule applies to FTS5 tables only: `boxes_data` beside an rtree
+    /// `boxes` is an app table.
+    fn is_virtual_or_fts5_shadow_table(name: &str, virtual_tables: &[(String, bool)]) -> bool {
+        virtual_tables.iter().any(|(vtab, fts5)| {
             name == vtab
-                || FTS5_SHADOW_SUFFIXES
-                    .iter()
-                    .any(|suffix| name == format!("{vtab}{suffix}"))
+                || (*fts5
+                    && FTS5_SHADOW_SUFFIXES
+                        .iter()
+                        .any(|suffix| name == format!("{vtab}{suffix}")))
         })
     }
 
@@ -1984,7 +1999,7 @@ mod sqlite {
         )
         .load(conn)
         .map_err(|e| query_err(&e))?;
-        // Fail closed on an unknown action, so `build_table` never reads one as
+        // Refuse an unknown action. Then `build_table` cannot read it as
         // `NO ACTION`.
         for row in &rows {
             for action in [&row.on_delete, &row.on_update] {
@@ -2887,7 +2902,20 @@ mod sqlite {
                 "CREATE TABLE posts (id INTEGER PRIMARY KEY)"
             ));
 
-            let vtabs = vec!["posts__fts".to_owned()];
+            assert!(is_fts5_virtual_table(
+                "CREATE VIRTUAL TABLE \"posts__fts\" USING fts5(\"title\")"
+            ));
+            assert!(is_fts5_virtual_table(
+                "create virtual table x using FTS5 (a)"
+            ));
+            assert!(!is_fts5_virtual_table(
+                "CREATE VIRTUAL TABLE boxes USING rtree(id, a, b)"
+            ));
+            assert!(!is_fts5_virtual_table(
+                "CREATE VIRTUAL TABLE v USING fts5vocab(posts__fts, row)"
+            ));
+
+            let vtabs = vec![("posts__fts".to_owned(), true), ("boxes".to_owned(), false)];
             // The vtab itself and each FTS5 shadow table are excluded.
             for shadow in [
                 "posts__fts",
@@ -2905,6 +2933,9 @@ mod sqlite {
             // A real application table (and a lookalike that is not a shadow) is kept.
             assert!(!is_virtual_or_fts5_shadow_table("posts", &vtabs));
             assert!(!is_virtual_or_fts5_shadow_table("posts__fts_other", &vtabs));
+            // The FTS5 suffix rule does not apply to a non-FTS5 virtual table.
+            assert!(is_virtual_or_fts5_shadow_table("boxes", &vtabs));
+            assert!(!is_virtual_or_fts5_shadow_table("boxes_data", &vtabs));
         }
     }
 }

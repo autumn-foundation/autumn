@@ -205,7 +205,12 @@ my-app/
 > `managed`, then run `autumn schema diff --write-migration`.
 > `autumn schema doctor` reports a stale `src/schema.rs` block
 > (`schema-rs-drift`) and an unmanaged model that differs from its table
-> (`unmanaged-drift`). See `docs/guide/declarative-schema.md`.
+> (`unmanaged-drift`). For a referential action, write
+> `#[references(table = "users", on_delete = "cascade")]` (also `on_update`;
+> values `cascade`, `restrict`, `set_null`, `set_default`, `no_action`).
+> `set_null` and `set_default` need an `Option<_>` field. The diff refuses a
+> changed action on an existing foreign key. If the database already has the
+> action, declare it on the model. See `docs/guide/declarative-schema.md`.
 
 ## Cargo.toml
 
