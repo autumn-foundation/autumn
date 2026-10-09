@@ -26809,6 +26809,18 @@ mod lease_tests {
         Box::pin(hang_and_watch(&LEASE_SEEN))
     }
 
+    /// Hang, and record nothing. A test that uses `timeout_watch_handler`
+    /// adds to the shared `TIMEOUT_SEEN`, so only one test may use it.
+    fn hang_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move {
+            std::future::pending::<()>().await;
+            Ok(())
+        })
+    }
+
     fn boom_handler(
         _state: AppState,
         _payload: Value,
@@ -27028,7 +27040,7 @@ mod lease_tests {
                 stall_mark_running: false,
                 stall_settle: true,
             },
-            timeout_watch_handler,
+            hang_handler,
             true,
             Some(Duration::from_millis(250)),
         )
