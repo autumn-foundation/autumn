@@ -367,6 +367,8 @@ impl WebPush {
     ///
     /// Deduplication is *not* performed: passing the same principal twice
     /// sends twice. Principals with no subscriptions contribute nothing.
+    /// Up to four principals run at once. Every recipient finishes before an
+    /// error returns, and the error is the first one to occur.
     ///
     /// # Errors
     ///
@@ -379,11 +381,12 @@ impl WebPush {
     where
         P: Into<PushPrincipal> + Send,
     {
-        // Bounded like the per-device fan-out in `send`, and smaller, so the
-        // two together cap connections at
+        // Bounded like the per-device fan-out in `send`. The limit is smaller,
+        // so total connections stay at most
         // `MAX_CONCURRENT_PRINCIPALS * MAX_CONCURRENT_DELIVERIES`. A recipient
         // whose endpoints all time out must not delay the others.
         let mut report = PushDeliveryReport::default();
+        let mut first_error = None;
         let mut sends = futures::stream::iter(
             principals
                 .into_iter()
@@ -391,9 +394,17 @@ impl WebPush {
         )
         .buffer_unordered(MAX_CONCURRENT_PRINCIPALS);
         while let Some(outcome) = futures::StreamExt::next(&mut sends).await {
-            report.merge(outcome?);
+            // Let every recipient finish. An early `?` would drop the others
+            // mid-send and lose their pruning.
+            match outcome {
+                Ok(outcome) => report.merge(outcome),
+                Err(e) => first_error = first_error.or(Some(e)),
+            }
         }
         drop(sends);
+        if let Some(e) = first_error {
+            return Err(e);
+        }
         // Same stable order as `send`, whichever recipient answered first.
         report.pruned.sort();
         Ok(report)

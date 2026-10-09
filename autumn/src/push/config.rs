@@ -79,10 +79,10 @@ pub struct PushConfig {
 pub(super) fn is_valid_vapid_subject(subject: &str) -> bool {
     let subject = subject.trim();
     if let Some(rest) = subject.strip_prefix("mailto:") {
-        // One addr-spec: no whitespace, exactly one `@`, both halves
-        // non-empty. A dotless domain stays valid: the shipped default is
-        // `admin@localhost`. Not full RFC 5322 — only what a push service
-        // will certainly refuse.
+        // Accept one addr-spec: no whitespace, one `@`, and a non-empty local
+        // part and domain. A domain without a dot is valid, because the
+        // default is `admin@localhost`. This is not full RFC 5322. It rejects
+        // only what a push service refuses.
         return rest.split_once('@').is_some_and(|(local, domain)| {
             !local.is_empty()
                 && !domain.contains('@')

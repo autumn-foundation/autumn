@@ -222,10 +222,10 @@ impl PushTransport for HttpPushTransport {
             // reachable on another address.
             let addrs = resolve_and_validate_endpoint(&request.endpoint).await?;
 
-            // One request over the whole validated set. reqwest falls back to
-            // the next address only when a connection cannot be made, so a
-            // failure after the body went out is never retried — a push is not
-            // idempotent, and a retry could show the notification twice.
+            // Send one request over the whole checked set. reqwest tries the
+            // next address only when it cannot connect. It never retries after
+            // the body is sent, because a retry could show the notification
+            // twice.
             let mut builder = self
                 .client
                 .post(&request.endpoint)

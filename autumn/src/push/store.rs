@@ -562,8 +562,8 @@ impl PushSubscriptionStore for MemoryPushSubscriptionStore {
             return Err(PushError::EndpointClaimed);
         }
 
-        // New to the DESTINATION principal: a move from another principal
-        // adds a row to them, so the cap applies.
+        // A move from another principal adds a row to the destination, so the
+        // cap applies.
         let is_new = !rows.iter().any(|row| {
             row.endpoint == subscription.endpoint && row.principal_id == subscription.principal_id
         });
@@ -699,8 +699,8 @@ mod db_store {
 
     /// Convert rows one by one, skipping any that do not decode.
     ///
-    /// One corrupt row (a bad import, storage damage) must not silence the
-    /// healthy devices. The skip is logged, so the row still gets repaired.
+    /// One corrupt row must not silence the healthy devices. The skip is
+    /// logged, so the row still gets repaired.
     fn usable_subscriptions(
         principal_id: &str,
         rows: Vec<SubscriptionRow>,

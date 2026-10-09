@@ -2076,19 +2076,18 @@ impl RequestBuilder {
         self.pin_to_addrs([addr])
     }
 
-    /// Like [`pin_to`](Self::pin_to), but with several addresses for the one
+    /// Like [`pin_to`](Self::pin_to), but accepts several addresses for one
     /// host.
     ///
-    /// The whole set goes to a single request, and reqwest falls back to the
-    /// next address only when a connection cannot be made. Looping over
-    /// [`pin_to`](Self::pin_to) instead would re-send the body after a failure
-    /// that came later, which can deliver a non-idempotent `POST` twice.
+    /// All addresses go to one request. reqwest tries the next address only
+    /// if it cannot connect. A loop over `pin_to` could send a `POST` body
+    /// twice.
     ///
-    /// An empty set pins nothing. Every other rule of `pin_to` applies.
+    /// An empty set makes `send` fail. It never drops the pin. Every other
+    /// rule of `pin_to` applies.
     #[must_use]
     pub fn pin_to_addrs(mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
-        let addrs: Vec<SocketAddr> = addrs.into_iter().collect();
-        self.pin_addr = (!addrs.is_empty()).then_some(addrs);
+        self.pin_addr = Some(addrs.into_iter().collect());
         self
     }
 
@@ -2824,6 +2823,13 @@ impl RequestBuilder {
                  escaping the pin. Use get_ssrf_safe for pinned, per-hop-revalidated \
                  redirect following; pin_to alone (which returns the 3xx unfollowed); \
                  or follow_redirects without pin_to.",
+            ));
+        }
+
+        // An empty pin set would send the request unpinned. Fail closed.
+        if self.pin_addr.as_ref().is_some_and(Vec::is_empty) {
+            return Err(ClientError::InvalidUrl(
+                "pin_to_addrs needs at least one address".to_owned(),
             ));
         }
 
@@ -6526,6 +6532,19 @@ mod tests {
             .expect("the second pinned address must serve the request");
 
         assert_eq!(resp.text(), "pong");
+    }
+
+    #[tokio::test]
+    async fn pin_to_addrs_with_no_address_fails_instead_of_sending_unpinned() {
+        let result = Client::new()
+            .get("http://pinned.invalid:9/ping")
+            .pin_to_addrs([])
+            .send()
+            .await;
+        assert!(
+            matches!(result, Err(ClientError::InvalidUrl(_))),
+            "{result:?}"
+        );
     }
 
     // TEST 54: get_ssrf_safe rejects a host that resolves to a blocked IP BEFORE

@@ -395,8 +395,8 @@ self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   // Cross-origin targets are dropped: the payload travels through a third-party
   // push service, so a notification must never be able to navigate this app's
-  // users off-origin. A malformed URL makes `new URL()` throw, which would
-  // leave the click dead, so it falls back to the app root too.
+  // users off-origin. A malformed URL makes `new URL()` throw and the click
+  // does nothing. The handler falls back to the app root.
   let url = self.location.origin + '/';
   try {
     const target = new URL(
@@ -407,7 +407,7 @@ self.addEventListener('notificationclick', (event) => {
       url = target.href;
     }
   } catch (e) {
-    // Keep the root fallback.
+    // Use the root fallback.
   }
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windows) => {
@@ -725,11 +725,11 @@ window.autumnPushUnsubscribe = async function autumnPushUnsubscribe() {{
   try {{
     await window.autumnPushForget();
   }} catch (e) {{
-    // Offline or a transient error. The server row may stay behind; the push
-    // service reports it gone (410) on the next send and it is pruned.
+    // Offline or a transient error: the server row may stay. The push service
+    // reports 410 on the next send, and the row is pruned.
     console.error(e);
   }}
-  // Revoke regardless: the visitor asked to stop receiving here.
+  // Always revoke. The visitor asked to stop receiving here.
   const registration = await navigator.serviceWorker.ready;
   const subscription = await registration.pushManager.getSubscription();
   return subscription ? subscription.unsubscribe() : true;
@@ -2253,6 +2253,10 @@ async fn main() {
             "the parse must sit inside a try block:\n{handler}"
         );
         assert!(before_wait.contains("catch"), "{handler}");
+        assert!(
+            before_wait[..guard].contains("self.location.origin + '/'"),
+            "the root fallback must be set before the try:\n{handler}"
+        );
     }
 
     #[test]
@@ -2450,7 +2454,7 @@ async fn main() {
             );
             assert!(
                 push_router_already_mounted(&inject_pwa_into_main(&source)),
-                "…so injection must still happen"
+                "injection must still happen"
             );
         }
     }
