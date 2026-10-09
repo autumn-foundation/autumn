@@ -369,7 +369,8 @@ impl Manifest {
 fn interrupted(held: &Path) -> String {
     format!(
         "an interrupted upgrade left {} in place of {MANIFEST_PATH}; \
-         rename it back, or delete it to start again",
+         if {MANIFEST_PATH} is still missing, rename it back. Otherwise \
+         inspect it first: a newer manifest may have replaced it",
         held.display()
     )
 }
@@ -1280,10 +1281,12 @@ pub fn apply(report: &mut ScaffoldReport) -> Result<(), WriteFailure> {
         .enumerate()
     {
         if let Err(error) = write_one(entry) {
+            // A file that landed with a late write beside it still landed.
+            let written = written + usize::from(error.published);
             report.outcome = super::Outcome::Partial { written };
             return Err(WriteFailure {
                 path: entry.path.clone(),
-                error,
+                error: error.message,
                 written,
             });
         }
@@ -1351,17 +1354,17 @@ fn record_baseline(report: &ScaffoldReport) -> Result<(), String> {
 /// place, the way the app-code half of this command writes: a truncate-in-place
 /// interrupted by Ctrl-C or ENOSPC leaves a half-written `Dockerfile` and no
 /// copy of the original anywhere.
-fn write_one(entry: &Entry) -> Result<(), String> {
+fn write_one(entry: &Entry) -> Result<(), WriteError> {
     let on_disk = read_current_absolute(entry);
     if on_disk != entry.current {
-        return Err(match entry.current {
+        return Err(WriteError::from(match entry.current {
             OnDisk::Absent => "something appeared at this path after the preview was \
                                computed; it was left exactly as it is"
                 .to_owned(),
             _ => "this file changed after the preview was computed; \
                   it was left exactly as it is"
                 .to_owned(),
-        });
+        }));
     }
     // A plan is only ever built for `add` and `update`, and `read_current`
     // classifies a link or an unreadable file as a conflict, so reaching this
@@ -1369,9 +1372,9 @@ fn write_one(entry: &Entry) -> Result<(), String> {
     // the last line before a write, and the cost of being wrong is a file
     // outside the project.
     if matches!(on_disk, OnDisk::Opaque(_) | OnDisk::Linked(_)) {
-        return Err(
+        return Err(WriteError::from(
             "this path is a symlink or is unreadable; it was left exactly as it is".to_owned(),
-        );
+        ));
     }
 
     let directory = entry
@@ -1384,7 +1387,26 @@ fn write_one(entry: &Entry) -> Result<(), String> {
         OnDisk::Text(text) => Publish::Swap(text.clone()),
         _ => Publish::Create,
     };
-    publish(&entry.absolute, &entry.template, mode).map_err(|error| error.to_string())
+    publish(&entry.absolute, &entry.template, mode).map_err(|error| WriteError {
+        published: error.published(),
+        message: error.to_string(),
+    })
+}
+
+/// Why one file was not written cleanly.
+struct WriteError {
+    message: String,
+    /// The new file is on disk, and something else needs a look.
+    published: bool,
+}
+
+impl From<String> for WriteError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            published: false,
+        }
+    }
 }
 
 /// Whether a publish may take a destination that already exists.
@@ -1411,6 +1433,13 @@ enum PublishError {
     Late(String),
     /// The disk refused.
     Failed(String),
+}
+
+impl PublishError {
+    /// Whether the new file is already in place despite the error.
+    const fn published(&self) -> bool {
+        matches!(self, Self::Late(_))
+    }
 }
 
 impl From<std::io::Error> for PublishError {
@@ -3251,6 +3280,28 @@ mod tests {
         assert_eq!(failure.path, MANIFEST_PATH);
         let kept = Manifest::load(tmp.path()).unwrap();
         assert_eq!(kept.written_by.as_deref(), Some("99.0.0"));
+    }
+
+    #[test]
+    fn only_a_late_write_error_means_the_new_file_is_already_there() {
+        assert!(PublishError::Late("x".to_owned()).published());
+        assert!(!PublishError::Moved("x".to_owned()).published());
+        assert!(!PublishError::Failed("x".to_owned()).published());
+    }
+
+    #[test]
+    fn a_stalled_claim_is_not_advised_to_be_renamed_over_a_manifest() {
+        let tmp = scaffolded(GenerateOptions::default());
+        let manifest_path = tmp.path().join(MANIFEST_PATH);
+        fs::rename(
+            &manifest_path,
+            manifest_path.with_file_name(".autumn-upgrade-scaffold.toml.stalled.old"),
+        )
+        .unwrap();
+        let error =
+            Manifest::update(tmp.path(), |_| Err("unreachable".to_owned())).expect_err("must stop");
+        let text = error.to_string();
+        assert!(text.contains("still missing"), "{text}");
     }
 
     // Racy by design, and it needs the full swap, which Windows does not use.
