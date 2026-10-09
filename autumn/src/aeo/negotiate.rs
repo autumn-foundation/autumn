@@ -154,12 +154,8 @@ where
         }
         if res.status() == StatusCode::UNAUTHORIZED
             && let Some(hint) = &config.resource_metadata
-            && !res
-                .headers()
-                .contains_key(axum::http::header::WWW_AUTHENTICATE)
         {
-            res.headers_mut()
-                .insert(axum::http::header::WWW_AUTHENTICATE, hint.clone());
+            add_resource_metadata(res.headers_mut(), hint);
         }
         if this.flags.is_home
             && res.status().is_success()
@@ -187,6 +183,89 @@ where
         *this.convert = Some(convert);
         poll.map(Ok)
     }
+}
+
+/// Point a `401` at the RFC 9728 metadata. With no challenge, `hint` (a
+/// `Bearer resource_metadata=...` challenge) is the challenge. A `Bearer`
+/// challenge of the handler gets the `resource_metadata` parameter, and
+/// keeps its own. Any other scheme is left alone.
+fn add_resource_metadata(headers: &mut HeaderMap, hint: &HeaderValue) {
+    use axum::http::header::WWW_AUTHENTICATE;
+
+    if !headers.contains_key(WWW_AUTHENTICATE) {
+        headers.insert(WWW_AUTHENTICATE, hint.clone());
+        return;
+    }
+    let Some(param) = hint.to_str().ok().and_then(|h| h.strip_prefix("Bearer ")) else {
+        return;
+    };
+    let merged: Vec<HeaderValue> = headers
+        .get_all(WWW_AUTHENTICATE)
+        .iter()
+        .map(|v| {
+            v.to_str()
+                .ok()
+                .and_then(|s| with_bearer_param(s, param))
+                .and_then(|s| HeaderValue::from_str(&s).ok())
+                .unwrap_or_else(|| v.clone())
+        })
+        .collect();
+    headers.remove(WWW_AUTHENTICATE);
+    for v in merged {
+        headers.append(WWW_AUTHENTICATE, v);
+    }
+}
+
+/// `challenges` with `param` added to its `Bearer` challenge, or `None` when
+/// it has no `Bearer` challenge or already names `resource_metadata`.
+fn with_bearer_param(challenges: &str, param: &str) -> Option<String> {
+    if challenges
+        .to_ascii_lowercase()
+        .contains("resource_metadata")
+    {
+        return None;
+    }
+    // Split on commas outside quoted strings.
+    let mut items = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (i, c) in challenges.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                items.push(challenges[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(challenges[start..].trim());
+    // An item opens a challenge when its first token is not followed by `=`.
+    let opens = |item: &str| {
+        let token_end = item
+            .find(|c: char| c == '=' || c.is_whitespace())
+            .unwrap_or(item.len());
+        !item[token_end..].trim_start().starts_with('=')
+    };
+    let first = items.iter().position(|item| {
+        opens(item)
+            && item
+                .split_whitespace()
+                .next()
+                .is_some_and(|s| s.eq_ignore_ascii_case("Bearer"))
+    })?;
+    let end = items[first + 1..]
+        .iter()
+        .position(|item| opens(item))
+        .map_or(items.len(), |n| first + 1 + n);
+    let mut out: Vec<String> = items.iter().map(|s| (*s).to_owned()).collect();
+    if out[first].trim().eq_ignore_ascii_case("Bearer") {
+        out[first] = format!("Bearer {param}");
+    } else {
+        out.insert(end, param.to_owned());
+    }
+    Some(out.join(", "))
 }
 
 /// Rewrite the HTML `ETag` to its Markdown form, `W/"<tag>-md"`.
@@ -500,6 +579,31 @@ mod tests {
         h.insert(IF_NONE_MATCH, HeaderValue::from_static("\"html-only\""));
         markdown_validators(&mut h);
         assert!(h.get(IF_NONE_MATCH).is_none(), "an HTML tag is dropped");
+    }
+
+    #[test]
+    fn resource_metadata_joins_the_handlers_bearer_challenge() {
+        let p = "resource_metadata=\"https://s/m\"";
+        assert_eq!(
+            with_bearer_param("Bearer realm=\"api\", error=\"invalid_token\"", p).as_deref(),
+            Some(
+                "Bearer realm=\"api\", error=\"invalid_token\", resource_metadata=\"https://s/m\""
+            )
+        );
+        assert_eq!(
+            with_bearer_param("Bearer", p).as_deref(),
+            Some("Bearer resource_metadata=\"https://s/m\"")
+        );
+        // The parameter goes on the Bearer challenge, not the one after it.
+        assert_eq!(
+            with_bearer_param("Bearer realm=\"a, b\", Basic realm=\"x\"", p).as_deref(),
+            Some("Bearer realm=\"a, b\", resource_metadata=\"https://s/m\", Basic realm=\"x\"")
+        );
+        assert_eq!(with_bearer_param("Basic realm=\"x\"", p), None);
+        assert_eq!(
+            with_bearer_param("Bearer resource_metadata=\"https://o\"", p),
+            None
+        );
     }
 
     #[test]

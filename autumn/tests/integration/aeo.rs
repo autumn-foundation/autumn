@@ -321,8 +321,12 @@ async fn skills_and_ard_are_served() {
 #[tokio::test]
 async fn documents_answer_get_and_head_only() {
     let c = client();
+    let get = c.get("/llms.txt").send().await;
     let head = c.head("/llms.txt").send().await;
     head.assert_ok();
+    assert!(head.text().is_empty(), "HEAD has no body");
+    assert_eq!(head.header("content-length"), get.header("content-length"));
+    assert_eq!(head.header("content-type"), get.header("content-type"));
     let post = c.post("/llms.txt").send().await;
     assert_ne!(post.status, 200);
 }
@@ -349,6 +353,36 @@ async fn private_page() -> impl IntoResponse {
         autumn_web::reexports::http::StatusCode::UNAUTHORIZED,
         "sign in",
     )
+}
+
+#[get("/bearer")]
+async fn bearer_page() -> impl IntoResponse {
+    (
+        autumn_web::reexports::http::StatusCode::UNAUTHORIZED,
+        [("www-authenticate", "Bearer realm=\"api\"")],
+        "sign in",
+    )
+}
+
+#[tokio::test]
+async fn a_handlers_bearer_challenge_gets_the_resource_metadata() {
+    let mut config = AutumnConfig::default();
+    config.seo.base_url = Some("https://shop.example.com".to_owned());
+    config.aeo.oauth.authorization_servers = vec!["https://auth.example.com".to_owned()];
+    let res = TestApp::new()
+        .config(config)
+        .routes(routes![bearer_page])
+        .build()
+        .get("/bearer")
+        .send()
+        .await;
+    assert_eq!(res.status, 401);
+    assert_eq!(
+        res.header("www-authenticate"),
+        Some(
+            "Bearer realm=\"api\", resource_metadata=\"https://shop.example.com/.well-known/oauth-protected-resource\""
+        )
+    );
 }
 
 #[tokio::test]
@@ -608,6 +642,27 @@ mod commerce {
             .send()
             .await;
         assert_eq!(res.status, 503, "a priced route is never served free");
+    }
+
+    #[tokio::test]
+    async fn an_internal_static_render_is_not_charged() {
+        use autumn_web::reexports::axum::body::Body;
+        use autumn_web::reexports::http::Request;
+        use tower::ServiceExt as _;
+
+        let router = TestApp::new()
+            .config(paid_config())
+            .routes(routes![api])
+            .build()
+            .into_router();
+        let render = Request::get("/api")
+            .extension(autumn_web::static_gen::RenderDeadlineExempt)
+            .body(Body::empty())
+            .unwrap();
+        let res = router.clone().oneshot(render).await.unwrap();
+        assert_eq!(res.status(), 200, "a build render is internal");
+        let live = Request::get("/api").body(Body::empty()).unwrap();
+        assert_eq!(router.oneshot(live).await.unwrap().status(), 402);
     }
 
     #[tokio::test]

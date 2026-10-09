@@ -506,11 +506,19 @@ fn document_response(
     } else if not_modified {
         StatusCode::NOT_MODIFIED.into_response()
     } else {
-        let mut res = doc.body.into_response();
+        let len = doc.body.len();
+        // HEAD gets the headers GET gets, with no body.
+        let mut res = if *method == Method::HEAD {
+            axum::body::Body::empty().into_response()
+        } else {
+            doc.body.into_response()
+        };
         res.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static(doc.content_type),
         );
+        res.headers_mut()
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(len));
         res
     };
     let headers = res.headers_mut();

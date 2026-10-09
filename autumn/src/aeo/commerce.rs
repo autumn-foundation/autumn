@@ -694,7 +694,7 @@ where
     fn call(&mut self, req: axum::http::Request<axum::body::Body>) -> Self::Future {
         use axum::response::IntoResponse as _;
 
-        if self.priced.route_for(&req).is_some() {
+        if !is_internal_render(&req) && self.priced.route_for(&req).is_some() {
             let res = (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "payments are not available",
@@ -704,6 +704,13 @@ where
         }
         futures::future::Either::Right(self.inner.call(req))
     }
+}
+
+/// `true` for a build or ISR render: Autumn makes it, no client does.
+fn is_internal_render(req: &axum::http::Request<axum::body::Body>) -> bool {
+    req.extensions()
+        .get::<crate::static_gen::RenderDeadlineExempt>()
+        .is_some()
 }
 
 /// The app's one [`X402Layer`] (an `AppState` extension).
@@ -760,8 +767,10 @@ where
 
     #[allow(clippy::too_many_lines)]
     fn call(&mut self, mut req: axum::http::Request<axum::body::Body>) -> Self::Future {
-        // An unpriced request costs no clone and no box.
-        let route = if req.extensions().get::<X402Handled>().is_some() {
+        // An unpriced request costs no clone and no box. A build or ISR
+        // render is internal: the outer copy of this layer charges the live
+        // request that reads the page.
+        let route = if req.extensions().get::<X402Handled>().is_some() || is_internal_render(&req) {
             None
         } else {
             self.state.priced.route_for(&req).cloned()
