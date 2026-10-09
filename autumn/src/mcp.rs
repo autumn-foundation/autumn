@@ -2312,10 +2312,13 @@ async fn buffered_tool_response(
                     format!("handler response body failed mid-read: {error}")
                 }
             };
-            return (
-                json_response(&success(id, tool_error(&message))),
-                Some(failure),
-            );
+            // The handler already ran: its cookies and an x402 receipt for a
+            // payment already settled still reach the client.
+            let mut resp = json_response(&success(id, tool_error(&message)));
+            for (name, value) in replayed {
+                resp.headers_mut().append(name, value);
+            }
+            return (resp, Some(failure));
         }
     };
     // A streaming handler buffered for a non-SSE client: collapse the SSE wire
@@ -4429,6 +4432,23 @@ mod tests {
                 "payment-response: receipt"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_still_returns_the_payment_receipt() {
+        let t = tool("GET", "/api/report", false, false);
+        let body = Body::from_stream(futures::stream::iter([Err::<Bytes, _>(
+            std::io::Error::other("boom"),
+        )]));
+        let response = Response::builder()
+            .header("payment-response", "receipt")
+            .body(body)
+            .unwrap();
+        let replayed = Dispatched::inspect(&response).replayed;
+        let (resp, failure) =
+            buffered_tool_response(&t, json!(1), StatusCode::OK, false, replayed, response).await;
+        assert!(failure.is_some());
+        assert_eq!(resp.headers()["payment-response"], "receipt");
     }
 
     /// A trusted-Host policy that trusts the given hosts (plus dev loopback,

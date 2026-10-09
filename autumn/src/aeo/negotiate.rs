@@ -535,6 +535,8 @@ fn markdown_headers(headers: &mut HeaderMap, config: &NegotiateConfig, tokens: O
         headers.remove(name);
     }
     headers.remove(axum::http::header::ACCEPT_RANGES);
+    // The HTML's trailers are dropped with its body; none follow the Markdown.
+    headers.remove(axum::http::header::TRAILER);
     markdown_etag(headers);
     // Some CDNs ignore `Vary` on HTML. With no cache policy from the app,
     // keep the Markdown copy out of shared caches.
@@ -595,6 +597,17 @@ async fn collect_limited(mut body: Body, limit: usize) -> Result<Bytes, Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_drops_the_html_trailer_declaration() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::TRAILER,
+            HeaderValue::from_static("content-digest"),
+        );
+        markdown_headers(&mut headers, &NegotiateConfig::default(), None);
+        assert!(!headers.contains_key(axum::http::header::TRAILER));
+    }
 
     fn accept(v: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
