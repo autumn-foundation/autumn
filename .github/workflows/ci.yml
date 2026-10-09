@@ -1380,6 +1380,10 @@ jobs:
           cargo test -p autumn-web --features "tls,ws,test-support" \
             --test integration_tests tls_app_surface:: | tee "${RUNNER_TEMP}/tls-surface.log"
           assert_ran "${RUNNER_TEMP}/tls-surface.log" "tls_app_surface"
+          # ALPN `h2` negotiation and `wss://` over h2 extended CONNECT (#2321).
+          cargo test -p autumn-web --features "tls,ws,test-support" \
+            --test integration_tests tls_alpn:: | tee "${RUNNER_TEMP}/tls-alpn.log"
+          assert_ran "${RUNNER_TEMP}/tls-alpn.log" "tls_alpn"
           # The custom-domain SNI resolver + certificate cache (#1635) need
           # `tls` to compile at all, so the default `test` lane runs only the
           # feature-free half of `custom_domains`. Run the whole module here.
@@ -2215,6 +2219,12 @@ jobs:
           # tests are executed there, just not measured for coverage here.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --test sqlite_boot_serve
+          # The sqlite URI helpers in `db.rs` (#3032) are covered by lib unit
+          # tests only. Without this leg their lines are instrumented and
+          # never run, so Codecov reads them as uncovered. A name filter keeps
+          # the leg narrow.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
+            --lib -- db::tests::sqlite_ db::tests::percent_decode
           # The #1907 durable job queue and lease scheduler are a large slice of
           # sqlite-only code; without this lane Codecov reports all of it
           # uncovered.
@@ -2553,6 +2563,23 @@ jobs:
           RUSTFLAGS: "--cfg loom_models"
           LOOM_MAX_PREEMPTIONS: "3"
 
+  # Stateright models of job claims, tick election and lease locks (#3071).
+  # Each model checks all reachable states within small bounds.
+  # Each seeded bug must give a counterexample.
+  # `cargo test --workspace` also runs the models.
+  # This job gives them their own check name.
+  # `verus.yml` runs the Verus proofs.
+  protocol-models:
+    name: Protocol models
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Check the protocol models
+        run: cargo test -p autumn-protocol-models
+
   # Edge capsule conformance (issue #1790). The proof behind AC-1 to AC-3: the
   # `edge-greeting` fixture is compiled BOTH ways — natively and to a real
   # `wasm32-wasip1` artifact — and a shared request corpus is driven through
@@ -2618,6 +2645,14 @@ jobs:
         working-directory: examples/edge-greeting
         run: |
           cargo run -q -p autumn-cli --bin autumn -- build --debug --edge
+          test -s ../../target/wasm32-wasip1/release/edge-capsule.wasm
+      - name: autumn build --embed emits the capsule
+        # AC-1 for an embed build. Remove the artifact first, so only this
+        # build can make it again.
+        working-directory: examples/edge-greeting
+        run: |
+          rm -f ../../target/wasm32-wasip1/release/edge-capsule.wasm
+          cargo run -q -p autumn-cli --bin autumn -- build --debug --embed --edge
           test -s ../../target/wasm32-wasip1/release/edge-capsule.wasm
       - name: autumn edge serve and autumn edge ttfb, end to end
         # AC-3 with no glue: the real CLI puts the capsule in front of the

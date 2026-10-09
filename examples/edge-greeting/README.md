@@ -65,7 +65,7 @@ curl http://localhost:3000/note/greeting
 # => greeting: the origin published this note to the edge
 
 curl "http://localhost:3000/stats?tag=one&tag=two"
-# => routes=5 tags=[tag=one tag=two] ratio=0.666667
+# => routes=7 tags=[tag=one tag=two] ratio=0.666667
 
 curl -X POST http://localhost:3000/feedback -d 'nice'
 # => Thanks — the origin recorded 4 byte(s) of feedback.
@@ -167,5 +167,7 @@ handler, and a panic hook is process-global.
 | GET | `/note/{key}` | edge (`needs(kv)`) + origin | the cached note, or a miss message |
 | GET | `/stats` | edge + origin | route count, the query tags in order, a formatted float |
 | GET | `/stats/count` | edge + origin | a bare `usize` |
+| GET | `/whoami` | edge + origin | which credential headers the handler sees (none, on both lanes) |
+| GET | `/link/{name}` | edge + origin | a link from the typed path helper `paths::greet`, with a query |
 | GET | `/boom` | edge + origin | panics on purpose: a trap at the edge, a 500 at the origin |
 | POST | `/feedback` | origin only | the write path — declined at the edge with `method_not_edge_eligible` |

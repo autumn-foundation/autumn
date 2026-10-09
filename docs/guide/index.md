@@ -40,6 +40,7 @@ Looking for the API reference instead? That is
 - [Rate Limiting](rate-limiting.md) — capping how often a caller can hit a route
 - [Outbound HTTP Client](outbound-http.md) — calling another service from a handler
 - [Resilience and Circuit Breakers](resilience.md) — timeouts, retries and breakers on outbound calls
+- [Timeouts, Deadlines and Retry Budgets](timeouts-and-budgets.md) — sending the request deadline to outbound calls and capping retries
 
 ## Templates, forms and the browser UI
 
@@ -113,6 +114,7 @@ Looking for the API reference instead? That is
 - [Bot Protection and CAPTCHA](bot-protection.md) — keeping automated traffic off a form or route
 - [TLS and HTTPS](tls.md) — certificates, ACME, and terminating TLS
 - [CORS and Cross-Origin Requests](cors.md) — letting a browser on another origin read your responses
+- [Portable Data Capsules](data-capsules.md) — a signed export of one subject's data, with a viewer and import
 - [Data Retention for Framework-Owned Data](data-retention.md) — bounding the tables Autumn itself creates
 - [Data-Retention Sweeps](retention-sweeps.md) — auto-purging your own tables on a schedule
 - [Data Scrubbing](data-scrubbing.md) — turning a production backup into an anonymized staging copy
@@ -206,6 +208,7 @@ Looking for the API reference instead? That is
 - [Cloud-Native Autumn](cloud-native.md) — containers, Kubernetes, liveness/readiness probes, and the twelve-factor surface
 - [Kubernetes](kubernetes.md) — the generated Helm chart and Kustomize base, and Argo Rollouts or Flagger canaries
 - [SLOs as Code](slo.md) — `[[slo]]` objectives, burn-rate alerts, a Grafana dashboard, canary analysis, and the deploy bake
+- [Staging Fault Injection](fault-injection.md) — latency and errors on routes, the database, Redis and outbound HTTP, with a burn-rate stop
 - [Server Connection Limits](connection-limits.md) — header-read and idle timeouts, header size and connection caps
 - [Running behind PgBouncer / RDS Proxy](connection-poolers.md) — which features work behind a connection pooler
 - [Embedded Clustering](clustering.md) — two-node clustering with no external dependency

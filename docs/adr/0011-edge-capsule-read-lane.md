@@ -173,8 +173,9 @@ unfiltered CI job.
 - **An edge-safe module is a real constraint on layout.** Authors must split
   handlers by substrate, and a plain `#[get]` in the wrong module fails the wasm
   build with an error about `::autumn_web` rather than about the rule it broke.
-- **`paths::*` helpers are unavailable inside a capsule** — they live in the
-  cfg-gated native companion.
+- ~~**`paths::*` helpers are unavailable inside a capsule.**~~ Fixed
+  (2026-10-08): an `#[edge]` route's helper uses `autumn_edge::paths` and is
+  not gated. A test keeps its encoders equal to `autumn_web::paths`.
 - **`autumn-macros` emits `::autumn_edge::…` paths** for edge routes, so an app
   that marks a route must depend on `autumn-edge`. The macro crate itself does
   not.

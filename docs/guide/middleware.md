@@ -253,6 +253,10 @@ A timeout emits structured telemetry — a `request_timeouts_total` counter plus
 `tracing` warning (target `autumn::timeout`) carrying the `route` template and
 `elapsed_ms` — so you can alert on it.
 
+The timeout `503` has a `Retry-After` header of 1-3 s. The handler and its
+outbound calls can read the deadline. See
+[Timeouts, Deadlines and Retry Budgets](timeouts-and-budgets.md).
+
 ### What the deadline covers
 
 The deadline bounds the time to produce the **response head**, not the duration

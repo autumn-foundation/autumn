@@ -1363,6 +1363,17 @@ even inside a `#[sim_test]`. For a deadline whose counterparty is
 | `Sim::try_run_to_idle()` → `Result<(), SimStall>` | `run_to_idle` panics with the seed when the drain never settles (a job that re-enqueues itself); this returns the `SimStall` instead |
 | `http_client::ClientError::SimNetwork` | A sim drop, partition, timeout or unknown host. `ClientError` is `#[non_exhaustive]` |
 
+## Deadlines and retry budgets (#3058)
+
+| API | Purpose |
+|---|---|
+| `deadline::Deadline::current()` | The request deadline of the current task, set by the request timeout. `remaining()`, `is_expired()`, `clamp(limit)` |
+| `Deadline::scope(fut)` / `Deadline::after(d)` | Run `fut` with a deadline (the earlier one wins). Use it to carry the deadline into `tokio::spawn` |
+| `deadline::bounded(fut)` | Stop `fut` at the current deadline; `Err(DeadlineExceeded)` maps to `504` |
+| `deadline::DEADLINE_HEADER` | `x-autumn-deadline-ms`: time left in ms, sent by the outbound `Client` |
+| `http_client::ClientError::DeadlineExceeded` | The deadline stopped an outbound call. `504`; not a circuit-breaker failure |
+| `extract::ShutdownToken` | Extractor; cancelled when the server stops accepting connections |
+
 ## Multi-replica simulation (`autumn_web::sim`, #3067)
 
 Two or three apps on one sim clock and one `SQLite` database, for tests of
@@ -1686,6 +1697,8 @@ An `#[edge]` GET route also compiles into a `wasm32-wasip1` capsule
 | `node::ttfb::measure(&Probe)` | TTFB edge vs origin and a byte compare of each pair; `Report::passes(min_percent)` |
 | `autumn edge serve --origin URL` | CLI edge node; `--capsule`, `--listen`, `--kv FILE`, `--probe-path`, `--no-probe`, `--response-header`, `--trusted-proxy`, `--quiet`; stops on Ctrl-C or SIGTERM |
 | `autumn edge ttfb --edge URL --origin URL --path P` | CLI probe; exit 0 pass, 1 divergence or reduction < `--min-reduction` (50), 2 error; `--divergence-only` |
+| `paths![…]` / `paths::PathExt::with_query` | Typed path helpers of `#[edge]` routes; compile for wasm; same bytes as `autumn_web::paths` |
+| `autumn build --embed` | Embedded native binary, then the capsule (with `embed-assets`) |
 | `conformance::compare_capsule(origin, capsule)` | Raw capsule vs origin; excuses `VOLATILE_HEADERS`, `SECURITY_HEADERS` and `CORS_HEADERS` only |
 | `conformance::compare(origin, served)` | What the client gets vs origin; excuses `VOLATILE_HEADERS` only |
 

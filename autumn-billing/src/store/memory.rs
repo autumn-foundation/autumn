@@ -375,6 +375,9 @@ impl BillingStore for MemoryBillingStore {
                     id: current.id.clone(),
                     customer_id: upsert.customer_id,
                     subscription_id: upsert.subscription_id.or(current.subscription_id),
+                    provider_subscription_id: upsert
+                        .provider_subscription_id
+                        .or(current.provider_subscription_id),
                     provider_invoice_id: upsert.provider_invoice_id,
                     status: upsert.status,
                     amount_due: upsert.amount_due,
@@ -392,6 +395,7 @@ impl BillingStore for MemoryBillingStore {
                 id: upsert.new_id,
                 customer_id: upsert.customer_id,
                 subscription_id: upsert.subscription_id,
+                provider_subscription_id: upsert.provider_subscription_id,
                 provider_invoice_id: upsert.provider_invoice_id,
                 status: upsert.status,
                 amount_due: upsert.amount_due,
@@ -404,6 +408,40 @@ impl BillingStore for MemoryBillingStore {
             };
             inner.invoices.insert(row.id.clone(), row.clone());
             Write::Applied(row)
+        }))
+    }
+
+    fn link_subscription<'a>(
+        &'a self,
+        provider_subscription_id: &'a ProviderId,
+        subscription_id: &'a str,
+        now: DateTime<Utc>,
+    ) -> StoreFuture<'a, ()> {
+        ready(self.lock().map(|mut inner| {
+            // Invoices already linked here are candidates too: their dunning
+            // row may have been opened after the link.
+            let mut linked = Vec::new();
+            for invoice in inner.invoices.values_mut() {
+                if invoice.provider_subscription_id.as_ref() != Some(provider_subscription_id) {
+                    continue;
+                }
+                if invoice.subscription_id.is_none() {
+                    invoice.subscription_id = Some(subscription_id.to_owned());
+                    invoice.updated_at = now;
+                } else if invoice.subscription_id.as_deref() != Some(subscription_id) {
+                    continue;
+                }
+                linked.push(invoice.id.clone());
+            }
+            for id in linked {
+                if let Some(row) = inner.dunning.get_mut(&id)
+                    && row.subscription_id.is_none()
+                    && matches!(row.state, DunningState::Pending | DunningState::Running)
+                {
+                    row.subscription_id = Some(subscription_id.to_owned());
+                    row.updated_at = now;
+                }
+            }
         }))
     }
 
@@ -505,7 +543,12 @@ impl BillingStore for MemoryBillingStore {
             if current.attempt != expected_attempt || !from.contains(&current.state) {
                 return false;
             }
+            // A settle built before a link was added must not erase it.
+            let linked = current.subscription_id.take();
             *current = row;
+            if current.subscription_id.is_none() {
+                current.subscription_id = linked;
+            }
             true
         }))
     }

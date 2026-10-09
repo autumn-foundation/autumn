@@ -35,6 +35,7 @@ fn clear_competing_one_shot_env(command: &mut Command) {
         "AUTUMN_MIGRATE",
         "AUTUMN_RETENTION_DRY_RUN",
         "AUTUMN_DB_RETENTION",
+        "AUTUMN_DATA_CAPSULE",
     ] {
         command.env_remove(var);
     }

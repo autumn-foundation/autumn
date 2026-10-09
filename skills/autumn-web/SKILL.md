@@ -111,6 +111,7 @@ the framework almost certainly already generates or ships it:
 | Ad-hoc `tokio::spawn` / background threads for deferred work | `#[job]` (+ retries, backends, uniqueness/concurrency caps), `#[scheduled]` for recurring, `#[task]` for operator CLI work |
 | A hand-written `#[scheduled]` fn + batched `DELETE`/`UPDATE` to expire old sessions, drafts, or one-time codes | `#[repository(Model, retention(after = "30d", basis = created_at))]` (0.7.0, issue #1342) — batched, soft-delete-aware, fleet-coordinated sweep with zero SQL; `autumn retention --dry-run` to validate first. See `docs/guide/retention-sweeps.md` |
 | A cron job (or nothing at all) trimming `autumn_jobs`, `autumn_job_tracking`, `autumn_experiment_assignments`, or a JSONL audit archive | `[retention]` in `autumn.toml` (0.8.0, issue #1605) — one window per framework-owned dataset, enforced by a fleet-coordinated in-process sweep; `autumn db retention --dry-run` reports the effective policy and eligible rows. See `docs/guide/data-retention.md` |
+| A hand-written GDPR export job that zips CSV/JSON a user cannot open, verify, or import again | `GdprRegistry::capsule(CapsuleModel::new(table, subject_column).belongs_to(..))` + `autumn data capsule export --subject <id> --out <dir>` (issue #1811) — one signed directory with records, a `manifest.json`, blobs, and an offline HTML viewer; `autumn data capsule import` verifies every file, then imports with no loss of data. Use `.exclude(column)` for secrets. See `docs/guide/data-capsules.md` |
 | Hand-written memoization or cache-aside code | `#[cached]` on functions; `cache::get_or_compute` / `get_or_compute_with` for stampede-safe read-through fills (0.6.0); `.stale_if_error(window)` serves the last value when a fill fails |
 | Calling `cache.invalidate(key)` by hand after a repository write | `#[repository(Model, invalidates(cached_fn))]`: each generated write drops the read after it commits (#3056). Async code uses `Cache::invalidate_async`, which returns the error |
 | Hand-written transaction retry loops for serialization failures | `Db::tx(...)`; `Db::tx_with(TxOptions::serializable(), ...)` auto-retries 40001 (0.6.0) |
@@ -2763,6 +2764,31 @@ declares. Every contract failure — missing file, malformed document, a contrac
 measured on a different host class — falls back to *unlimited*, never to a
 ceiling. See `docs/guide/capacity-contracts.md`.
 
+## Resilience: deadlines and retry budgets (#3058)
+
+The request timeout sets a deadline for the handler task. Read it with
+`autumn_web::deadline::Deadline::current()`. The outbound `Client` uses it:
+each attempt gets `min(timeout_secs, time left)`, and no retry or
+`Retry-After` wait starts that the time left cannot hold. When the deadline
+stops a call, the client returns `ClientError::DeadlineExceeded` (`504`).
+`tokio::spawn` drops the deadline; carry it with `Deadline::scope`. Stop other
+calls with `deadline::bounded(fut)`.
+
+```toml
+[http.client.retry_budget]   # per-host token bucket, on by default
+capacity = 500
+transient_cost = 14          # 5xx, connect error, timeout
+throttling_cost = 5          # 429
+retry_ratio = 0.1            # retry share when the bucket is empty
+
+[server.timeouts]
+accept_deadline_header = false   # true: x-autumn-deadline-ms can shorten the deadline
+```
+
+A timeout `503` has `Retry-After: 1..=3`. The `prod` drain window is 35 s
+(request timeout + 5 s). `autumn_web::extract::ShutdownToken` is cancelled at
+shutdown. See `docs/guide/timeouts-and-budgets.md`.
+
 ## Connection limits, WebSocket limits, replica lag (issue #3065)
 
 Bound slow, idle and excess connections. Every key is optional; the `prod`
@@ -2822,6 +2848,38 @@ slow_call_rate_threshold = 0.5
 - A `CircuitBreakerPolicy` struct literal needs `..CircuitBreakerPolicy::default()`.
 
 See `docs/guide/resilience.md`.
+
+## Resilience: staging fault injection (issue #3071)
+
+Add latency or errors in staging with `[fault_injection]`. Do not use it in
+production.
+
+```toml
+[fault_injection]
+enabled = true                 # or AUTUMN_FAULT_INJECTION__ENABLED=true
+
+[[fault_injection.faults]]
+routes = ["/api/*"]            # empty = all paths; probes and actuator exempt
+target = "route"               # route | database | redis | http
+kind = "error"                 # error | latency (needs latency_ms)
+rate = 0.05
+status = 503
+
+[fault_injection.stop]         # disarm on a fast error-budget burn
+objective = 99.0
+max_burn_rate = 14.4
+```
+
+- Refused in `prod` (and with no profile) unless
+  `allow_in_production = true`. Put that key only under
+  `[profile.prod.fault_injection]`.
+- The stop condition latches. Re-arm with
+  `state.extension::<autumn_web::fault_injection::FaultInjection>()` and
+  `.arm(actor)`. Each arm and disarm writes an audit event.
+- An `AutumnConfig` struct literal needs `..AutumnConfig::default()`.
+- For deterministic tests, use `FaultPlan`, not this section.
+
+See `docs/guide/fault-injection.md`.
 
 ## Sharding (0.6.0)
 
@@ -3023,7 +3081,7 @@ enabled          = true
 target           = "http://127.0.0.1:9091"  # the candidate build (you run it)
 sample_rate      = 0.05    # of ELIGIBLE traffic. Default 1.0 — start low.
 routes           = ["/api/*"]  # empty (default) = every eligible route
-timeout_ms       = 2000    # bounds the shadow request AND the primary wait
+timeout_ms       = 2000    # one deadline per mirror: request, primary wait, comparison
 max_in_flight    = 8       # excess mirrors are dropped, never queued
 max_body_bytes   = 262144  # larger responses are not compared, either side
 max_records      = 50      # divergences kept for the actuator
@@ -3060,7 +3118,7 @@ Plus two built-in metric families on `/actuator/prometheus`:
 ```
 autumn_shadow_comparisons_total{version,route,outcome}  # match|diverged|error|
                                                         # timeout|skipped|dropped|
-                                                        # refused|incomplete
+                                                        # refused|incomplete|abandoned
 autumn_shadow_divergences_total{version,route,kind}     # the series to alert on
 ```
 
@@ -4036,11 +4094,17 @@ or CDN-fronted base is skipped (its public port is its own), and an unset base
 only warns, because the app may take it from `AUTUMN_MEDIA__MEDIAMTX__*_BASE`
 (Rooms since 0.6.0, this preflight 0.8.0, issue #1974). `deploy up` creates the config parent and
 `recordings_dir` (mode `0750`); an absent recordings dir under a writable parent
-passes, so a fresh host is not blocked. Installing the `mediamtx` binary stays a
-host-bootstrap step the deploy only preflights. Mesh rooms hold a seat by
+passes, so a fresh host is not blocked. When nothing is at `binary_path`,
+`deploy up` installs the digest-pinned MediaMTX 1.19.3 before cutover; it never
+replaces a file that is there (`[media.mediamtx] install_binary = false` turns
+this off). When `[deploy]` is set, `autumn doctor` runs the config-only media
+checks, and all six over SSH with `--online`. Mesh rooms hold a seat by
 `POST {api_prefix}/rooms/{room_id}/heartbeat` or a roster poll, on any interval
 under the idle TTL (default 15 min); a client that does neither is reaped from
-signaling, though its live WebRTC path survives and it can re-join.
+signaling, though its live WebRTC path survives and it can re-join. After
+`joined_at + [media] room_session_max_seconds` (default 12 h), heartbeat and
+roster return `404`; the client leaves, then joins again. `[media] room_rate_limit_per_minute`
+(default `0` = off) limits each client IP per room route.
 
 `autumn deploy status [--json] [--strict]` is read-only and safe mid-incident:
 one row per host (mode, release from the `current` symlink, live slot, `/ready`

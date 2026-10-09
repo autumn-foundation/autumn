@@ -223,6 +223,46 @@ app that does not set `[cost]` behaves as before. `CostConfig` is
 **Automation:** `manual` — a codemod cannot know which fields a struct literal
 means to leave at their defaults.
 
+### Config: `AutumnConfig` gains a `fault_injection` field
+
+**Why:** Staging fault injection (issue #3071) needs its own
+`[fault_injection]` section. `AutumnConfig` is not `#[non_exhaustive]`, so a
+new field breaks a struct literal. `Default` and `..AutumnConfig::default()`
+keep working.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::config::AutumnConfig;
+
+let config = AutumnConfig {
+    server: my_server_config,
+    // …every other field spelled out…
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::config::AutumnConfig;
+
+let config = AutumnConfig {
+    server: my_server_config,
+    ..AutumnConfig::default()
+};
+```
+
+The new field is `pub fault_injection: FaultInjectionConfig`. The default is
+off, so an app with no `[fault_injection]` section does not change.
+`FaultInjectionConfig` is `#[non_exhaustive]`: set its fields on a default
+value.
+
+`capsule::schema::HttpErrorKind` (feature `reporting`) has a new variant,
+`FaultInjected`. An exhaustive `match` on it needs a new arm.
+
+**Automation:** `manual` — a codemod cannot know which fields a struct literal
+leaves at their defaults.
+
 ### Admission: `Route`, `ServerConfig` and `HttpClientConfig` have new fields
 
 **Why:** Adaptive admission control (issue #3068) adds a route criticality,
@@ -709,6 +749,60 @@ a warning. `extension::<MediaWorkflows>()` then returns `None`, jobs on the
 **Automation:** `manual` — this is a runtime behavior change. The code still
 compiles, so a codemod cannot know which primitive your app uses.
 
+### Media: `RoomStore::heartbeat` and `RoomStore::roster` take a `session_max` limit
+
+**Why:** A heartbeat renewed the room token with no limit, and a roster poll
+accepted a token of any age. So a captured token stayed valid for as long as
+someone used it. Now neither works past `joined_at + session_max`. Issue #1974.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+fn heartbeat<'a>(
+    &'a self,
+    namespace: &'a str,
+    room_id: &'a str,
+    participant_id: &'a str,
+    token: &'a str,
+    token_ttl: Duration,
+) -> RoomStoreFuture<'a, DateTime<Utc>>;
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+fn heartbeat<'a>(
+    &'a self,
+    namespace: &'a str,
+    room_id: &'a str,
+    participant_id: &'a str,
+    token: &'a str,
+    token_ttl: Duration,
+    session_max: Duration,
+) -> RoomStoreFuture<'a, DateTime<Utc>>;
+```
+
+`roster` gains the same last argument:
+`fn roster<'a>(&'a self, namespace: &'a str, room_id: &'a str, auth_token: &'a str, session_max: Duration)`.
+
+In an out-of-tree store, compute the new expiry with
+`autumn_media_plugin::renewed_expiry(joined_at, now, token_ttl, session_max)`.
+When it returns `None`, return `RoomError::RoomNotFound` and change nothing. In
+`roster`, refuse a matching member when `now >= joined_at + session_max`, and
+do not refresh its `last_seen_at`.
+
+`MediaConfig` also has two new public fields, `room_session_max_seconds`
+(default `43200`) and `room_rate_limit_per_minute` (default `0`, off). A
+struct literal that lists every field must add them, or use
+`..MediaConfig::default()`. With rooms enabled, boot fails when
+`room_session_max_seconds` is less than `room_token_ttl_seconds`.
+
+A client that stays in a room for more than 12 hours now gets `404` from
+heartbeat and roster. It must leave, then join again. To keep longer sessions,
+set a larger `room_session_max_seconds`.
+
+**Automation:** `manual` — a codemod cannot write your store's renewal logic.
+
 ### Feature flags: `PgFlagStore::get` errors before the first load
 
 **Why:** `get` connected to the database on the request thread, and a store
@@ -743,6 +837,38 @@ means "refresh at each read", not "read the database at each read".
 **Automation:** `manual` - it is a behaviour change, and no code rewrite
 applies.
 
+### Config: `HttpClientConfig` and `RequestTimeoutsConfig` get new fields
+
+**Why:** Deadline propagation and the retry budget (issue #3058) need
+settings. Neither struct is `#[non_exhaustive]`, so a struct literal stops
+compiling.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+let client = autumn_web::config::HttpClientConfig {
+    timeout_secs: 10,
+    max_retries: 1,
+    max_retry_after_secs: 10,
+    base_urls: std::collections::HashMap::new(),
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+let client = autumn_web::config::HttpClientConfig {
+    timeout_secs: 10,
+    max_retries: 1,
+    ..autumn_web::config::HttpClientConfig::default()
+};
+```
+
+Do the same for `RequestTimeoutsConfig`, which gets `accept_deadline_header`.
+
+**Automation:** `manual` - the fix is a `..Default::default()` tail, which no
+codemod adds.
+
 ---
 
 ### Ledger: raw-SQL framework writes to a ledgered table are refused (#2319)
@@ -766,6 +892,37 @@ cascade, use `on_delete = destroy`: a ledgered child records a revision.
 
 **Automation:** `manual` - it is a behaviour change, and no code rewrite
 applies.
+
+---
+
+### Shadow: `ShadowStats` gains `comparisons_abandoned`
+
+**Why:** the mirror deadline now covers the comparison. A comparison that does
+not finish is counted apart from a match, a divergence and a skip (issue #2333).
+
+**Before (`{X.Y}`):** a struct literal listed every field.
+
+```rust
+let stats = autumn_web::shadow::ShadowStats {
+    mirrored: 0,
+    compared: 0,
+    // ... every other field ...
+    primary_incomplete: 0,
+};
+```
+
+**After (`{(X+1).0}`):** add `..ShadowStats::default()`. An exhaustive
+destructuring pattern needs `..` or the new field.
+
+```rust
+let stats = autumn_web::shadow::ShadowStats {
+    mirrored: 1,
+    ..autumn_web::shadow::ShadowStats::default()
+};
+```
+
+**Automation:** `manual` - the fix adds a struct update expression, and no
+codemod rewrites struct literals.
 
 ---
 
@@ -806,6 +963,15 @@ single most valuable section of the guide — keep it factual and short.
 - `autumn.toml` keys that were renamed, removed, or have new defaults.
 - New `AUTUMN_*` environment variables.
 - Default profile changes.
+
+Issue #3058:
+
+- The `prod` profile sets `server.shutdown_timeout_secs = 35` (was 30): the
+  30 s request timeout plus 5 s. Add 5 s to your orchestrator grace period.
+- New keys: `[http.client.retry_budget]` (on by default),
+  `http.client.send_deadline_header` (default `true`) and
+  `server.timeouts.accept_deadline_header` (default `false`,
+  `AUTUMN_SERVER__TIMEOUTS__ACCEPT_DEADLINE_HEADER`).
 
 If nothing changed, delete this section.
 
@@ -867,6 +1033,16 @@ Changes that still compile but behave differently at runtime. Examples:
   `_other /x`.
 - To stop `http_client` from sending the request id to a host, call
   `.without_request_id()` on the request builder.
+
+Issue #3058:
+
+- The outbound `Client` retries less. A retry must fit the request deadline,
+  and the retry budget limits retries to a host that fails all the time.
+  Set `[http.client.retry_budget] enabled = false` to keep the old count.
+- The outbound `Client` sends `x-autumn-deadline-ms` to every host when a
+  request deadline is set. Set `http.client.send_deadline_header = false` to
+  stop it.
+- A timeout `503` has a `Retry-After` header of 1-3 s.
 
 If nothing changed, delete this section.
 

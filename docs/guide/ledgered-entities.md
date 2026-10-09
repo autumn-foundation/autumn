@@ -159,7 +159,7 @@ model's public JSON. Encrypted columns are stored as recoverable ciphertext (the
 ledger table never holds plaintext the model chose to protect) and come back
 decrypted.
 
-Three consequences worth knowing:
+Some consequences worth knowing:
 
 - Declaring `#[version_history(sensitive = [...])]` columns on a ledgered
   repository is a **compile error** — see below.
@@ -176,6 +176,10 @@ Three consequences worth knowing:
   are covered there too. Key rotation is handled by the envelope's `key_id`, so a
   retired key still decrypts; only a column whose key is gone entirely drops out
   of the comparison, and the revision hash still covers it.
+- As-of reconstruction does not skip an encrypted column. If its key is gone,
+  `ledger_as_of` and `ledger_diff` return `LedgerError::ChainUnreadable`. The
+  error names the column and the revision. The model never holds ciphertext in a
+  plaintext field.
 
 ## Bitemporality
 
@@ -206,6 +210,10 @@ pub trait InvoiceRepository {}
 ```
 
 The column may be `DateTime<Utc>`, `NaiveDateTime`, or an `Option` of either.
+
+A delete or restore is valid from the instant you make it. It does not read your
+column, which holds the row's old value. Otherwise a valid-time query about an
+earlier instant would return the deleted state.
 
 Both axes are queryable:
 
@@ -388,6 +396,7 @@ it is refused at the repository seam — at compile time, not at runtime:
 | Calling `purge(id)` | Not generated. `purge` is soft-delete's hard-delete escape hatch — a raw `DELETE FROM` that writes no history at all. `delete_by_id` and `restore` — both of which record a revision — are the whole delete surface. |
 | A `dependent(..., on_delete = destroy)` cascade from a **soft**-deleting parent | The ledgered child is soft-deleted and records a revision, like any other delete. |
 | The same cascade from a **hard**-deleting parent | Refused at runtime with a typed `LedgerError::HardDeleteCascade`. Neither outcome is available: erasing the child destroys the record its ledger reconstructs, and soft-deleting it leaves a live foreign key pointing at a parent row about to disappear, which the database rejects. The parent's macro cannot see that the child is ledgered — they are separate `#[repository]` invocations — so this is a runtime guard, not a compile error. Make the parent `soft_delete`, or remove the `dependent(...)` clause. |
+| A `NaN` or infinite float in a ledgered write | Refused with `LedgerError::NonFiniteValue`. The error names the column. The write rolls back. A snapshot cannot store these values, because JSON cannot hold them. The check covers `f32`, `f64`, and `Option` or `Vec` of them. Floats inside other types, such as a JSON column, are not checked. |
 | `#[version_history(sensitive = [...])]` | Rejected: a redacted column cannot be reconstructed, so byte-for-byte as-of fidelity would be unprovable. |
 | `no_versioned_record_impl` | Rejected: the ledger snapshots through the generated `VersionedRecord` impl, and a hand-written one is not guaranteed to serialize every column. |
 | `retention(...)` / `position(...)` | Already rejected for `versioned = true`: both mutate rows outside the history-writing paths. |

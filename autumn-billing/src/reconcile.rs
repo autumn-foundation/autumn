@@ -44,6 +44,11 @@ use crate::{BillingService, EVENT_CLAIM_STALE_AFTER};
 /// The states a reconcile may close.
 const OPEN_STATES: &[DunningState] = &[DunningState::Pending, DunningState::Running];
 
+/// A subscription with nothing left to collect: dunning rows it owns close.
+fn is_ended(status: SubscriptionStatus) -> bool {
+    status.is_terminal() || status == SubscriptionStatus::Unpaid
+}
+
 /// What `apply` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -287,17 +292,25 @@ impl Ctx<'_> {
         if let Some(end) = snapshot.current_period_end {
             upsert = upsert.with_period_end(end);
         }
-        let subscription = match store.upsert_subscription(upsert).await? {
+        let written = store.upsert_subscription(upsert).await?;
+        // Every outcome has a stored row. This call is idempotent. A
+        // redelivery therefore links what the first delivery missed.
+        let (StoreWrite::Applied(stored)
+        | StoreWrite::Unchanged(stored)
+        | StoreWrite::Stale(stored)) = &written;
+        store
+            .link_subscription(&snapshot.provider_subscription_id, &stored.id, self.now)
+            .await?;
+        // The link may have adopted rows of an ended subscription.
+        if is_ended(stored.status) {
+            self.close_dunning_for(&stored.id).await?;
+        }
+        let subscription = match written {
             StoreWrite::Applied(subscription) => subscription,
             // A redelivery after a failure past the write: repeat the
             // idempotent step only. Notifications and hooks ran, or never
             // will, with the first delivery.
-            StoreWrite::Unchanged(subscription) => {
-                if subscription.status == SubscriptionStatus::Canceled {
-                    self.close_dunning_for(&subscription.id).await?;
-                }
-                return Ok(());
-            }
+            StoreWrite::Unchanged(_) => return Ok(()),
             StoreWrite::Stale(_) => {
                 tracing::debug!(
                     provider_subscription_id = %snapshot.provider_subscription_id,
@@ -307,7 +320,6 @@ impl Ctx<'_> {
             }
         };
         if subscription.status == SubscriptionStatus::Canceled {
-            self.close_dunning_for(&subscription.id).await?;
             notify::send_to_customer(
                 self.state,
                 self.service,
@@ -371,11 +383,45 @@ impl Ctx<'_> {
         if let Some(subscription) = subscription {
             upsert = upsert.with_subscription(subscription.id);
         }
+        // Kept even when the subscription is not mirrored yet, so mirroring
+        // it can link this invoice.
+        if let Some(id) = &snapshot.provider_subscription_id {
+            upsert = upsert.with_provider_subscription(id.clone());
+        }
         if let Some(next) = snapshot.next_payment_attempt {
             upsert = upsert.with_next_payment_attempt(next);
         }
         let write = store.upsert_invoice(upsert).await?;
         Ok((customer, write))
+    }
+
+    /// Re-check an invoice against its subscription after the writes. The
+    /// subscription event can land between the lookup in `upsert_invoice`
+    /// (or `open_dunning`) and the later writes, and its own link or close
+    /// pass then finds nothing. An unlinked invoice gets linked. Rows of an
+    /// ended subscription are closed.
+    async fn relink(&self, invoice: &Invoice) -> Result<(), BillingError> {
+        let store = self.service.store();
+        let subscription = match (&invoice.subscription_id, &invoice.provider_subscription_id) {
+            (Some(id), _) => store.subscription_by_id(id).await?,
+            (None, Some(provider_id)) => {
+                let Some(subscription) = store.subscription_by_provider_id(provider_id).await?
+                else {
+                    return Ok(());
+                };
+                store
+                    .link_subscription(provider_id, &subscription.id, self.now)
+                    .await?;
+                Some(subscription)
+            }
+            (None, None) => None,
+        };
+        if let Some(subscription) = subscription
+            && is_ended(subscription.status)
+        {
+            self.close_dunning_for(&subscription.id).await?;
+        }
+        Ok(())
     }
 
     async fn payment_failed(
@@ -401,6 +447,17 @@ impl Ctx<'_> {
             self.open_dunning(&invoice).await?
         } else {
             None
+        };
+        self.relink(&invoice).await?;
+        // Relinking can close the row. Hooks only see an open one.
+        let row = match row {
+            Some(row) => self
+                .service
+                .store()
+                .dunning_by_invoice(&row.invoice_id)
+                .await?
+                .filter(|current| OPEN_STATES.contains(&current.state)),
+            None => None,
         };
         if !applied {
             return Ok(());
@@ -506,6 +563,7 @@ impl Ctx<'_> {
             StoreWrite::Unchanged(invoice) => (invoice, false),
             StoreWrite::Stale(_) => return Ok(()),
         };
+        self.relink(&invoice).await?;
         let store = self.service.store();
         let Some(row) = store.dunning_by_invoice(&invoice.id).await? else {
             return Ok(());

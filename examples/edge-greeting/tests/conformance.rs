@@ -159,6 +159,14 @@ const CORPUS: &[ConformanceCase] = &[
         expect: Expectation::Served,
     },
     ConformanceCase {
+        name: "typed path helper encodes a slash and unicode the same way",
+        method: "GET",
+        uri: "/link/%C3%A9%2Fx%20y",
+        headers: &[],
+        provided_capabilities: &[],
+        expect: Expectation::Served,
+    },
+    ConformanceCase {
         name: "trailing slash",
         method: "GET",
         uri: "/greet/ada/",
@@ -597,21 +605,11 @@ fn tier_a_the_capsule_reproduces_the_native_edge_lane_byte_for_byte() {
 /// The origin app: the same routes `src/main.rs` mounts, with the same KV
 /// behind the same seam, driven through the full middleware stack.
 ///
-/// The route list is spelled out again rather than shared with `main.rs`
-/// because a `fn main` is not reachable from a test binary. `with_edge_kv` is
-/// one line — `self.layer(EdgeCache::layer(kv))` — so the layer call below
-/// wires exactly what the binary wires.
+/// `with_edge_kv` is one line — `self.layer(EdgeCache::layer(kv))` — so the
+/// layer call below wires exactly what the binary wires.
 fn origin() -> autumn_web::test::TestClient {
     autumn_web::test::TestApp::new()
-        .routes(autumn_web::routes![
-            edge_greeting::handlers::greet,
-            edge_greeting::handlers::note,
-            edge_greeting::handlers::stats,
-            edge_greeting::handlers::count,
-            edge_greeting::handlers::whoami,
-            edge_greeting::handlers::boom,
-            edge_greeting::origin::feedback,
-        ])
+        .routes(edge_greeting::origin::routes())
         .layer(autumn_edge::EdgeCache::layer(edge_greeting::demo_kv()))
         .with_entropy(autumn_web::entropy::SeededEntropy::new(0x1790))
         .build()
@@ -787,6 +785,16 @@ fn the_capsule_imports_nothing_that_could_reach_a_filesystem_or_a_socket() {
 }
 
 // ── the corpus itself ────────────────────────────────────────────────
+
+/// `/stats` renders `EDGE_ROUTE_COUNT`. Keep it equal to the real table.
+#[test]
+#[ignore = "requires wasm32-wasip1 target (edge-conformance CI job)"]
+fn the_edge_route_count_matches_the_route_table() {
+    assert_eq!(
+        edge_greeting::handlers::edge_routes().len(),
+        edge_greeting::handlers::EDGE_ROUTE_COUNT
+    );
+}
 
 #[test]
 #[ignore = "requires wasm32-wasip1 target (edge-conformance CI job)"]
@@ -1182,7 +1190,7 @@ impl Generator {
     }
 
     fn uri(&mut self) -> String {
-        match self.below(9) {
+        match self.below(10) {
             0 | 1 => format!("/greet/{}", self.segment()),
             2 => format!("/note/{}", self.pick(&["greeting", "release", "missing"])),
             3 => format!("/note/{}", self.segment()),
@@ -1190,6 +1198,7 @@ impl Generator {
             5 => "/stats/count".to_owned(),
             6 => "/whoami".to_owned(),
             7 => format!("/greet/{}/", self.segment()),
+            8 => format!("/link/{}", self.segment()),
             _ => format!("/{}", self.segment()),
         }
     }

@@ -1086,6 +1086,25 @@ pub(crate) async fn settle_tracked_payload_as_failed_globally(payload: &Value, m
     settle_tracked_payload_with_store(global_tracking_store(), payload, message).await;
 }
 
+/// Longest wait for one terminal write to the tracking store. A stalled store
+/// must not hold a worker. The record then expires through its TTL.
+pub(crate) const TRACKING_SETTLE_CAP: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run one terminal write to the tracking store, bounded by
+/// [`TRACKING_SETTLE_CAP`]. On a timeout, log a warning and return `Ok`: the
+/// record then expires through its TTL.
+pub(crate) async fn capped_settle(
+    write: impl Future<Output = AutumnResult<()>>,
+) -> AutumnResult<()> {
+    tokio::time::timeout(TRACKING_SETTLE_CAP, write)
+        .await
+        .unwrap_or_else(|_| {
+            let cap_ms = TRACKING_SETTLE_CAP.as_millis();
+            tracing::warn!(cap_ms, "tracking settle timed out");
+            Ok(())
+        })
+}
+
 async fn settle_tracked_payload_with_store(
     store: Option<Arc<dyn JobTrackingStore>>,
     payload: &Value,
@@ -1096,7 +1115,7 @@ async fn settle_tracked_payload_with_store(
         return;
     };
     if let Some(store) = store {
-        let _ = store.fail(key, message.to_owned()).await;
+        let _ = capped_settle(store.fail(key, message.to_owned())).await;
     }
 }
 
@@ -1228,25 +1247,21 @@ pub async fn enqueue_tracked_for(
     match client.enqueue_with_outcome(name, wrapped).await {
         Ok(crate::job::EnqueueOutcome::Queued) => {}
         Ok(crate::job::EnqueueOutcome::Deduplicated) => {
-            store
-                .fail(&key, "An equivalent job is already in progress.".to_owned())
+            capped_settle(store.fail(&key, "An equivalent job is already in progress.".to_owned()))
                 .await?;
         }
         Ok(crate::job::EnqueueOutcome::Skipped) => {
             // A JobInterceptor completed without ever delivering the job to
             // the backend — the record must not be left at Pending forever
             // for a job that will never actually run.
-            store
-                .fail(&key, "The job could not be enqueued.".to_owned())
-                .await?;
+            capped_settle(store.fail(&key, "The job could not be enqueued.".to_owned())).await?;
         }
         Err(error) => {
             // The job never entered the queue, so the `Pending` record
             // created above must not be left to linger until TTL expiry —
             // settle it the same way the `Deduplicated` outcome does.
-            let _ = store
-                .fail(&key, "The job could not be enqueued.".to_owned())
-                .await;
+            let _ =
+                capped_settle(store.fail(&key, "The job could not be enqueued.".to_owned())).await;
             return Err(error);
         }
     }
@@ -3043,5 +3058,20 @@ mod tests {
         // Falling back must not panic; the resulting store is still usable.
         let store = store_for_config(&state, &config);
         assert!(store.get("nope").await.unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capped_settle_returns_ok_when_the_write_stalls() {
+        let start = tokio::time::Instant::now();
+        let result = capped_settle(std::future::pending()).await;
+        assert!(result.is_ok());
+        assert_eq!(start.elapsed(), TRACKING_SETTLE_CAP);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capped_settle_passes_a_store_error_through() {
+        let result =
+            capped_settle(async { Err(AutumnError::bad_request_msg("store refused")) }).await;
+        assert!(result.is_err());
     }
 }

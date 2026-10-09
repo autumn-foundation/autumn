@@ -1609,7 +1609,8 @@ enabled = true                 # off by default; the controller is a no-op when 
 # playback_port = 9996   # recording playback
 # webrtc_local_udp = 8189
 # config_path = "/etc/mediamtx/mediamtx.yml"   # where the rendered config is written
-# binary_path = "/usr/local/bin/mediamtx"      # host bootstrap installs it; deploy does not download it
+# binary_path = "/usr/local/bin/mediamtx"      # deploy installs the pinned MediaMTX here if it is absent
+# install_binary = true                         # set false to install MediaMTX yourself
 # unit_name = "mediamtx"                        # systemd unit name (no .service suffix)
 
 [media.ffmpeg]
@@ -1619,25 +1620,33 @@ enabled = true                 # off by default; the controller is a no-op when 
 When `enabled = true`, `autumn deploy up`:
 
 1. Runs **six fail-closed preflight checks before touching the host**. Two are
-   pure config and run first: the MediaMTX listener ports are distinct, and each
+   config-only and run first: the MediaMTX listener ports are distinct, and each
    listener port matches the app-side `[media.mediamtx] *_base` URL that calls it
    (so a customized port cannot strand the app on an origin the daemon no longer
-   binds). Four then probe the host: FFmpeg resolves (the concrete
-   `[media.ffmpeg] bin`), the MediaMTX binary is executable, the recordings
-   directory is writable — or absent under a writable parent, which provisioning
-   then creates — and the MediaMTX ports are free. Any blocking failure
-   **aborts the deploy**, rather
+   binds). Four then probe the host:
+   - FFmpeg resolves (the concrete `[media.ffmpeg] bin`).
+   - The MediaMTX binary is executable. With `install_binary = true`, an absent
+     binary also passes. `binary_path` must be absolute.
+   - The recordings directory is writable, or absent under a writable parent.
+     Provisioning then creates it.
+   - The MediaMTX ports are free.
+
+   Any blocking failure **aborts the deploy**, rather
    than shipping a half-provisioned box. One caveat on the FFmpeg check: only a
    **concrete literal** `[media.ffmpeg] bin` is probed and fail-closed here; an
    env/interpolation-indirected path (an empty value, or one carrying a `${...}`
    placeholder such as `${AUTUMN_MEDIA__FFMPEG__BIN}`) is resolved by the deployed
    service from its own environment, so it is **deferred to runtime** — surfaced as
-   a non-blocking warning that does **not** abort the deploy. These checks require a
-   live host executor and run **only at `deploy up`**.
-2. After the app cutover succeeds, renders `mediamtx.yml` (LL-HLS window, fmp4
+   a non-blocking warning that does **not** abort the deploy. When `[deploy]` is
+   set, `autumn doctor` runs the two config-only checks, and all six over SSH
+   with `--online`.
+2. Before cutover, installs MediaMTX if nothing is at `binary_path` and
+   `install_binary = true` (the default). See below.
+3. After the app cutover succeeds, renders `mediamtx.yml` (LL-HLS window, fmp4
    recording under `recordings_dir`, WebRTC config, and a `~^room/.+$` path
    matcher for autumn-media Rooms) plus the systemd unit, then runs
-   `daemon-reload && enable --now && restart`.
+   `daemon-reload && enable`. It restarts the unit only when the config or unit
+   changed, or when the unit is not running.
 
 `autumn deploy plan` is a pure dry-run: it surfaces the media unit, its
 provisioning steps, the names of the host preflight checks that **will** run at
@@ -1666,11 +1675,19 @@ be allowed in `media-src` for recorded playback.
 by hand; the preflight passes an absent dir whose nearest existing parent is
 writable and fails closed on anything it cannot verify.
 
-**Deferred (host-bootstrap prerequisites, not done by `autumn deploy`):**
-installing/pinning the MediaMTX binary itself (like the kamal-proxy binary, it is
-a host-bootstrap step), and wiring the host preflight checks into the offline
-`autumn doctor` CLI (they run only in the executor-holding `deploy up` path
-today; `deploy plan` names them but never executes them).
+**MediaMTX binary.** When nothing is at `binary_path`, `deploy up` installs
+MediaMTX 1.19.3 there before cutover. It copies `/mediamtx` out of the
+`bluenviron/mediamtx` image, pinned by digest, and installs `docker.io` with apt
+if the host has no Docker. It checks that the copy prints `v1.19.3` before it
+moves it into place. It keeps an executable that is already there, and it stops
+with an error if any other file is there. Set `install_binary = false` to
+install MediaMTX yourself; the preflight then fails when the binary is
+absent.
+
+Docker, the pulled image and any apt packages stay on the host after the
+install. Deploy does not upgrade a binary that is already there, so a later
+change of the pinned version does not reach that host. To upgrade, remove the
+binary, then deploy again.
 
 ### How the deploy path is validated in CI
 
@@ -2019,7 +2036,7 @@ The generated `fly.toml` includes four first-class integrations:
 | Feature | What it does |
 |---|---|
 | `/live` + `/ready` checks | Fly uses `/live` to decide machine restarts; `/ready` to gate traffic routing. Autumn flips `/ready` to 503 at drain start so Fly deregisters before the listener closes. |
-| `kill_timeout = 45` | Fly waits 45 s after SIGTERM before SIGKILL — `prestop_grace_secs (5) + shutdown_timeout_secs (30) + 10 s buffer` for the process to log and exit cleanly. Value is an integer (seconds); Fly does not accept a string like `"45s"`. |
+| `kill_timeout = 50` | Fly waits 50 s after SIGTERM before SIGKILL — `prestop_grace_secs (5) + shutdown_timeout_secs (35 in the prod profile) + 10 s buffer` for the process to log and exit cleanly. Value is an integer (seconds); Fly does not accept a string like `"45s"`. |
 | `[metrics]` → `/actuator/prometheus` | Fly scrapes Autumn's Prometheus text endpoint and surfaces it in the dashboard. No extra agent needed. Controlled by `actuator.prometheus` (default on) and independent of `actuator.sensitive` — see [Prometheus metrics for platform scraping](#prometheus-metrics-for-platform-scraping). |
 | `[deploy]` `release_command` (opt-in) | When uncommented, migrations run in a one-shot machine before new app machines start; a failed migration aborts the deploy before any traffic-serving machine is replaced. |
 

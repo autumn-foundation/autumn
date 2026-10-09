@@ -14,6 +14,7 @@
 //! [media]
 //! room_max_participants = 6
 //! room_token_ttl_seconds = 300
+//! room_session_max_seconds = 43200   # heartbeats stop renewing after this
 //! # room_namespace = "tenant-a"   # optional MediaMTX path namespace
 //!
 //! [media.mediamtx]
@@ -88,6 +89,13 @@ const fn default_room_token_ttl_seconds() -> u32 {
     300
 }
 
+/// Default upper limit, in seconds, of one room session (12 hours).
+pub const DEFAULT_ROOM_SESSION_MAX_SECONDS: u32 = 43_200;
+
+const fn default_room_session_max_seconds() -> u32 {
+    DEFAULT_ROOM_SESSION_MAX_SECONDS
+}
+
 // ── Errors ──────────────────────────────────────────────────────────────────
 
 /// Errors returned while loading or validating a [`MediaConfig`].
@@ -129,6 +137,19 @@ pub enum MediaConfigError {
         requested: usize,
         /// The hard cap ([`DEFAULT_ROOM_MAX_PARTICIPANTS`]).
         cap: usize,
+    },
+    /// `[media].room_session_max_seconds` is less than
+    /// `room_token_ttl_seconds`. A join then mints a token that lives longer
+    /// than the session.
+    #[error(
+        "media.room_session_max_seconds ({session_max_seconds}) must be at least \
+         media.room_token_ttl_seconds ({token_ttl_seconds})"
+    )]
+    InvalidRoomSessionMax {
+        /// The rejected session limit.
+        session_max_seconds: u32,
+        /// The token TTL it must not be less than.
+        token_ttl_seconds: u32,
     },
     /// The TOML file could not be parsed.
     #[error("failed to parse media config TOML: {0}")]
@@ -394,6 +415,20 @@ pub struct MediaConfig {
     /// Seconds a minted room session token stays valid after a join.
     #[serde(default = "default_room_token_ttl_seconds")]
     pub room_token_ttl_seconds: u32,
+    /// Maximum seconds one room session lasts, counted from the join.
+    ///
+    /// A heartbeat does not renew the token expiry past `joined_at` plus this
+    /// value. After it, heartbeat and roster fail, and the client leaves and
+    /// joins again. Must be at least `room_token_ttl_seconds`.
+    #[serde(default = "default_room_session_max_seconds")]
+    pub room_session_max_seconds: u32,
+    /// Requests each client IP may send to each room route per minute.
+    ///
+    /// `0` (the default) turns the limit off. The client IP comes from
+    /// `[security.trusted_proxies]`, so set that behind a reverse proxy.
+    /// Otherwise all clients share the proxy's IP and one bucket.
+    #[serde(default)]
+    pub room_rate_limit_per_minute: u32,
     /// Optional `MediaMTX` path namespace isolating this deployment's rooms
     /// (empty / `None` inserts no namespace segment).
     #[serde(default)]
@@ -414,6 +449,8 @@ impl Default for MediaConfig {
             recording: RecordingConfig::default(),
             room_max_participants: default_room_max_participants(),
             room_token_ttl_seconds: default_room_token_ttl_seconds(),
+            room_session_max_seconds: default_room_session_max_seconds(),
+            room_rate_limit_per_minute: 0,
             room_namespace: None,
             room_store_backend: RoomStoreBackend::default(),
         }
@@ -434,6 +471,8 @@ impl MediaConfig {
     ///
     /// Returns [`MediaConfigError::InvalidRoomMaxParticipants`] when the mesh
     /// room cap is `0` or above [`DEFAULT_ROOM_MAX_PARTICIPANTS`],
+    /// [`MediaConfigError::InvalidRoomSessionMax`] when
+    /// `room_session_max_seconds` is less than `room_token_ttl_seconds`,
     /// [`MediaConfigError::MissingBucket`] when the S3 backend is selected
     /// without a bucket, [`MediaConfigError::MissingS3Credential`] when
     /// exactly one of the access-key / secret-key pair is set, and
@@ -445,6 +484,12 @@ impl MediaConfig {
             return Err(MediaConfigError::InvalidRoomMaxParticipants {
                 requested: max,
                 cap: DEFAULT_ROOM_MAX_PARTICIPANTS,
+            });
+        }
+        if self.room_session_max_seconds < self.room_token_ttl_seconds {
+            return Err(MediaConfigError::InvalidRoomSessionMax {
+                session_max_seconds: self.room_session_max_seconds,
+                token_ttl_seconds: self.room_token_ttl_seconds,
             });
         }
         if self.storage.backend != MediaStorageBackend::S3 {
@@ -655,6 +700,16 @@ impl MediaConfig {
             && let Ok(parsed) = value.parse::<u32>()
         {
             self.room_token_ttl_seconds = parsed;
+        }
+        if let Some(value) = env.get("AUTUMN_MEDIA__ROOM_SESSION_MAX_SECONDS")
+            && let Ok(parsed) = value.parse::<u32>()
+        {
+            self.room_session_max_seconds = parsed;
+        }
+        if let Some(value) = env.get("AUTUMN_MEDIA__ROOM_RATE_LIMIT_PER_MINUTE")
+            && let Ok(parsed) = value.parse::<u32>()
+        {
+            self.room_rate_limit_per_minute = parsed;
         }
         override_opt(
             &mut self.room_namespace,
@@ -1362,6 +1417,75 @@ mod tests {
         assert_eq!(config.storage.bucket.as_deref(), Some("env-bucket"));
         assert_eq!(config.recording.retention_days, 7);
         assert_eq!(config.room_max_participants, 3);
+    }
+
+    #[test]
+    fn room_rate_limit_is_off_by_default_and_the_env_override_wins() {
+        assert_eq!(MediaConfig::default().room_rate_limit_per_minute, 0);
+
+        let toml_str = "[media]\nroom_rate_limit_per_minute = 60\n";
+        let parsed = MediaConfig::from_toml_str_with_env(toml_str, &env(&[])).unwrap();
+        assert_eq!(parsed.room_rate_limit_per_minute, 60);
+
+        let overridden = MediaConfig::from_toml_str_with_env(
+            toml_str,
+            &env(&[("AUTUMN_MEDIA__ROOM_RATE_LIMIT_PER_MINUTE", "120")]),
+        )
+        .unwrap();
+        assert_eq!(overridden.room_rate_limit_per_minute, 120);
+    }
+
+    #[test]
+    fn room_session_max_defaults_to_twelve_hours() {
+        let config = MediaConfig::default();
+        assert_eq!(config.room_session_max_seconds, 43_200);
+        assert_eq!(
+            config.room_session_max_seconds,
+            DEFAULT_ROOM_SESSION_MAX_SECONDS
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn room_session_max_parses_and_the_env_override_wins() {
+        let toml_str = "[media]\nroom_session_max_seconds = 3600\n";
+        let parsed = MediaConfig::from_toml_str_with_env(toml_str, &env(&[])).unwrap();
+        assert_eq!(parsed.room_session_max_seconds, 3600);
+
+        let overridden = MediaConfig::from_toml_str_with_env(
+            toml_str,
+            &env(&[("AUTUMN_MEDIA__ROOM_SESSION_MAX_SECONDS", "7200")]),
+        )
+        .unwrap();
+        assert_eq!(overridden.room_session_max_seconds, 7200);
+    }
+
+    #[test]
+    fn validate_rejects_a_session_max_less_than_the_token_ttl() {
+        for session_max_seconds in [0, 299] {
+            let config = MediaConfig {
+                room_token_ttl_seconds: 300,
+                room_session_max_seconds: session_max_seconds,
+                ..MediaConfig::default()
+            };
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(MediaConfigError::InvalidRoomSessionMax {
+                        session_max_seconds: rejected,
+                        token_ttl_seconds: 300,
+                    }) if rejected == session_max_seconds
+                ),
+                "{session_max_seconds} < 300 must be rejected"
+            );
+        }
+
+        let equal = MediaConfig {
+            room_token_ttl_seconds: 300,
+            room_session_max_seconds: 300,
+            ..MediaConfig::default()
+        };
+        assert!(equal.validate().is_ok());
     }
 
     #[test]

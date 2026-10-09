@@ -7,10 +7,9 @@
 //! compile or link — and the scaffold's `Cargo.toml` deliberately has no
 //! dependencies, so nothing here may reach a real `cargo build`.
 //!
-//! That constraint is also the point of the build-path tests: the `--edge` and
-//! `--embed` refusals are specified to happen BEFORE the native cargo build, so
-//! they are driven through the empty-`PATH` runner (where a `cargo` invocation
-//! could not even spawn) and additionally assert that no compile was started.
+//! The `--edge` refusal must occur before the native cargo build. These tests
+//! use the empty-`PATH` runner, where `cargo` cannot start. They also assert
+//! that no compile started.
 
 use std::fs;
 use std::path::Path;
@@ -427,8 +426,10 @@ fn build_edge_flag_without_edge_routes_fails_before_compiling() {
     );
 }
 
+/// A build that makes a capsule checks for the WASI target before any cargo
+/// build (#1790). The empty `PATH` hides `rustc`, so the target is missing.
 #[test]
-fn build_embed_refuses_edge_routes_before_compiling() {
+fn build_with_edge_routes_checks_the_wasi_target_before_compiling() {
     let dir = project(&[
         ("src/main.rs", UNREGISTERED_EDGE_APP),
         (
@@ -436,17 +437,22 @@ fn build_embed_refuses_edge_routes_before_compiling() {
             "fn main() { autumn_edge::serve(edge_routes![greet]); }\n",
         ),
     ]);
-    let (stdout, stderr, code) = run_autumn(dir.path(), &["build", "--embed"], &[]);
-    let combined = format!("{stdout}{stderr}");
+    for args in [&["build"][..], &["build", "--embed"][..]] {
+        let (stdout, stderr, code) = run_autumn(dir.path(), args, &[]);
+        let combined = format!("{stdout}{stderr}");
 
-    assert_ne!(code, Some(0), "{combined}");
-    assert!(
-        combined.contains("edge capsule build is not yet supported with --embed"),
-        "{combined}"
-    );
-    assert!(combined.contains("#1790"), "{combined}");
-    assert!(
-        !combined.contains("Compiling"),
-        "the refusal must run before the native build: {combined}"
-    );
+        assert_ne!(code, Some(0), "{args:?}: {combined}");
+        assert!(
+            combined.contains("`wasm32-wasip1` target is not installed"),
+            "{args:?}: the error must name the missing target: {combined}"
+        );
+        assert!(
+            combined.contains("rustup target add wasm32-wasip1"),
+            "{args:?}: the error must say how to fix it: {combined}"
+        );
+        assert!(
+            !combined.contains("Compiling"),
+            "{args:?}: the check must run before the native build: {combined}"
+        );
+    }
 }

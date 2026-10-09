@@ -3696,7 +3696,11 @@ fn resolve_daemon_service_report() -> DaemonServiceReport {
         DaemonServiceReport {
             service_capable: true,
             daemon,
-            service: crate::service::registered_service_state(&identity),
+            // A failed query shows as "no service" here. `doctor` only reports.
+            // `serve restart` treats the same failure as an error.
+            service: crate::service::registered_service_state(&identity)
+                .ok()
+                .flatten(),
             missing_prerequisites: crate::service::missing_prerequisites(),
         }
     }
@@ -9134,6 +9138,129 @@ fn deploy_preflight_result(
     }
 }
 
+/// One `autumn doctor` check, run on its own thread.
+type DoctorTask = Box<dyn FnOnce() -> CheckResult + Send>;
+
+/// Map a media host check into a doctor result (#1974).
+///
+/// A deferred check (for example an env-indirected `[media.ffmpeg] bin`) is a
+/// warning, because `deploy up` does not stop on it either.
+fn media_check_result(check: crate::deploy::PreflightCheck) -> CheckResult {
+    CheckResult {
+        name: check.name,
+        status: if check.passed {
+            CheckStatus::Pass
+        } else if check.deferred {
+            CheckStatus::Warn
+        } else {
+            CheckStatus::Fail
+        },
+        detail: Some(check.detail),
+        hint: check.hint,
+    }
+}
+
+/// The SSH target for the media host checks: the one `[deploy]` host.
+///
+/// Media provisioning supports one host, so a fleet or an empty host list is
+/// an error. A user or host that starts with `-` is an error too.
+fn media_ssh_target(
+    hosts: &Result<Vec<String>, String>,
+    deploy_cfg: &DeployConfig,
+) -> Result<crate::deploy::exec::SshTarget, String> {
+    // `ssh` reads a leading `-` as an option, so refuse it.
+    if deploy_cfg.user.starts_with('-') {
+        return Err(format!(
+            "`[deploy] user` {:?} starts with `-`; ssh would read it as an option",
+            deploy_cfg.user
+        ));
+    }
+    match hosts.as_ref()?.as_slice() {
+        [host] if host.starts_with('-') => Err(format!(
+            "`[deploy]` host {host:?} starts with `-`; ssh would read it as an option"
+        )),
+        [host] => Ok(crate::deploy::exec::SshTarget {
+            host: host.clone(),
+            user: deploy_cfg.user.clone(),
+            port: deploy_cfg.ssh_port,
+        }),
+        others => Err(format!(
+            "MediaMTX provisioning needs exactly one `[deploy]` host; found {}",
+            others.len()
+        )),
+    }
+}
+
+/// Doctor tasks for an enabled `[media.mediamtx]` section (#1974).
+///
+/// The two config-only checks always run. Offline, `host` is `None`. With
+/// `--online`, `Some(Ok(factory))` runs the four host checks on executors from
+/// `factory`. `Some(Err(text))` fails each host check with `text`.
+fn media_doctor_tasks<E, F>(
+    cfg: &crate::deploy::media::MediaMtxHostConfig,
+    ffmpeg_bin: &str,
+    host: Option<Result<F, String>>,
+) -> Vec<DoctorTask>
+where
+    E: crate::deploy::exec::DeployExecutor + 'static,
+    F: Fn() -> E + Clone + Send + 'static,
+{
+    use crate::deploy::media;
+
+    let mut tasks: Vec<DoctorTask> = Vec::new();
+    for pure in [
+        media::mediamtx_ports_distinct,
+        media::mediamtx_ports_match_bases,
+    ] {
+        let cfg = cfg.clone();
+        tasks.push(Box::new(move || media_check_result(pure(&cfg))));
+    }
+    let Some(host) = host else {
+        return tasks;
+    };
+    let names = [
+        media::CHECK_FFMPEG_PREFLIGHT,
+        media::CHECK_MEDIAMTX_BINARY,
+        media::CHECK_RECORDINGS_DIR_WRITABLE,
+        media::CHECK_MEDIAMTX_PORTS_AVAILABLE,
+    ];
+    match host {
+        Ok(executor) => {
+            let ffmpeg_bin = ffmpeg_bin.to_owned();
+            let exec = executor.clone();
+            tasks.push(Box::new(move || {
+                media_check_result(media::ffmpeg_preflight(&exec(), &ffmpeg_bin))
+            }));
+            let host_checks: [fn(&E, &media::MediaMtxHostConfig) -> crate::deploy::PreflightCheck;
+                3] = [
+                media::mediamtx_binary_preflight,
+                media::recordings_dir_writable,
+                media::mediamtx_ports_available,
+            ];
+            for check in host_checks {
+                let (cfg, exec) = (cfg.clone(), executor.clone());
+                tasks.push(Box::new(move || media_check_result(check(&exec(), &cfg))));
+            }
+        }
+        Err(message) => {
+            for name in names {
+                let message = message.clone();
+                tasks.push(Box::new(move || CheckResult {
+                    name,
+                    status: CheckStatus::Fail,
+                    detail: Some(message),
+                    hint: Some(MEDIA_HOST_HINT),
+                }));
+            }
+        }
+    }
+    tasks
+}
+
+/// Hint for a media host check that has no single host to run on.
+const MEDIA_HOST_HINT: &str =
+    "Set one `[deploy] host` for MediaMTX provisioning (a media fleet is not supported)";
+
 /// Resolve the `[deploy]` doctor branch from the merged active-profile runtime
 /// table.
 ///
@@ -9783,6 +9910,7 @@ pub fn run(opts: DoctorOptions) {
         // detail rides in the detail text instead of multiplying names. See
         // `crate::deploy::DOCTOR_PREFLIGHT_GRADERS`.
         let deploy_hosts = crate::deploy::deploy_host_list(&deploy_cfg);
+        let media_hosts = deploy_hosts.clone();
         tasks.push(Box::new({
             let deploy_hosts = deploy_hosts.clone();
             move || match &deploy_hosts {
@@ -9891,6 +10019,27 @@ pub fn run(opts: DoctorOptions) {
                 crate::deploy::grade_migrate_check(std::path::Path::new("migrations")),
             )
         }));
+
+        // MediaMTX host checks (#1974), from the same `[media]` subtree `deploy
+        // up` reads. Offline: the config-only checks. `--online`: all six over SSH.
+        match crate::deploy::media::media_host_config_from_value(toml::Value::Table(
+            merged_deploy_toml,
+        )) {
+            Ok((media_cfg, ffmpeg_bin)) if media_cfg.enabled => {
+                let host = opts.online.then(|| {
+                    media_ssh_target(&media_hosts, &deploy_cfg)
+                        .map(|target| move || crate::deploy::exec::SshExecutor::new(target.clone()))
+                });
+                tasks.extend(media_doctor_tasks(&media_cfg, &ffmpeg_bin, host));
+            }
+            Ok(_) => {}
+            Err(err) => tasks.push(Box::new(move || CheckResult {
+                name: "media_config",
+                status: CheckStatus::Fail,
+                detail: Some(format!("[media] is present but invalid: {err}")),
+                hint: Some("Fix the `[media.mediamtx]` / `[media.ffmpeg]` keys in autumn.toml"),
+            })),
+        }
     }
 
     // 8a. Direct-HTTPS certificate readiness (#1603): validate `[server.tls]` cert and
@@ -11813,6 +11962,222 @@ pub fn check_edge_capabilities_impl(scan: &crate::edge_scan::EdgeScan) -> CheckR
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod media_doctor_tests {
+    use super::{
+        CheckResult, CheckStatus, media_check_result, media_doctor_tasks, media_ssh_target,
+    };
+    use crate::deploy::exec::test_support::RecordingExecutor;
+    use crate::deploy::media::{
+        CHECK_FFMPEG_PREFLIGHT, CHECK_MEDIAMTX_BINARY, CHECK_MEDIAMTX_PORTS_AVAILABLE,
+        CHECK_MEDIAMTX_PORTS_DISTINCT, CHECK_MEDIAMTX_PORTS_MATCH_BASES,
+        CHECK_RECORDINGS_DIR_WRITABLE, MediaMtxHostConfig,
+    };
+    use autumn_web::config::DeployConfig;
+
+    fn enabled() -> MediaMtxHostConfig {
+        MediaMtxHostConfig {
+            enabled: true,
+            ..MediaMtxHostConfig::default()
+        }
+    }
+
+    fn run(tasks: Vec<super::DoctorTask>) -> Vec<CheckResult> {
+        tasks.into_iter().map(|task| task()).collect()
+    }
+
+    fn status_of(results: &[CheckResult], name: &str) -> CheckStatus {
+        results
+            .iter()
+            .find(|result| result.name == name)
+            .unwrap_or_else(|| panic!("no `{name}` result in {results:?}"))
+            .status
+            .clone()
+    }
+
+    /// A healthy host: every probe answers as a passing one would.
+    fn healthy_host() -> RecordingExecutor {
+        RecordingExecutor::new()
+            .with_stdout("media-ffmpeg-preflight", "ffmpeg version 6.1")
+            .with_stdout("media-mediamtx-binary", "absent")
+            .with_stdout("media-recordings-dir", "present")
+            .with_stdout(
+                "media-ports",
+                "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=5,fd=3))\n",
+            )
+    }
+
+    #[test]
+    fn media_check_result_maps_pass_deferred_and_fail() {
+        let check = |passed, deferred| crate::deploy::PreflightCheck {
+            name: CHECK_FFMPEG_PREFLIGHT,
+            scope: None,
+            passed,
+            deferred,
+            detail: "d".to_owned(),
+            hint: None,
+        };
+        assert_eq!(
+            media_check_result(check(true, false)).status,
+            CheckStatus::Pass
+        );
+        assert_eq!(
+            media_check_result(check(false, true)).status,
+            CheckStatus::Warn
+        );
+        assert_eq!(
+            media_check_result(check(false, false)).status,
+            CheckStatus::Fail
+        );
+        assert_eq!(
+            media_check_result(check(true, false)).name,
+            CHECK_FFMPEG_PREFLIGHT
+        );
+    }
+
+    #[test]
+    fn offline_runs_only_the_pure_checks() {
+        let results = run(media_doctor_tasks::<
+            RecordingExecutor,
+            fn() -> RecordingExecutor,
+        >(&enabled(), "/usr/bin/ffmpeg", None));
+        let names: Vec<_> = results.iter().map(|result| result.name).collect();
+        assert_eq!(
+            names,
+            [
+                CHECK_MEDIAMTX_PORTS_DISTINCT,
+                CHECK_MEDIAMTX_PORTS_MATCH_BASES
+            ]
+        );
+        assert!(
+            results
+                .iter()
+                .all(|result| result.status == CheckStatus::Pass)
+        );
+    }
+
+    #[test]
+    fn offline_catches_a_port_clash() {
+        let cfg = MediaMtxHostConfig {
+            hls_port: 1935,
+            ..enabled()
+        };
+        let results = run(media_doctor_tasks::<
+            RecordingExecutor,
+            fn() -> RecordingExecutor,
+        >(&cfg, "/usr/bin/ffmpeg", None));
+        assert_eq!(
+            status_of(&results, CHECK_MEDIAMTX_PORTS_DISTINCT),
+            CheckStatus::Fail
+        );
+    }
+
+    #[test]
+    fn online_runs_all_six_over_the_executor() {
+        let results = run(media_doctor_tasks(
+            &enabled(),
+            "/usr/bin/ffmpeg",
+            Some(Ok(healthy_host)),
+        ));
+        for name in [
+            CHECK_MEDIAMTX_PORTS_DISTINCT,
+            CHECK_MEDIAMTX_PORTS_MATCH_BASES,
+            CHECK_FFMPEG_PREFLIGHT,
+            CHECK_MEDIAMTX_BINARY,
+            CHECK_RECORDINGS_DIR_WRITABLE,
+            CHECK_MEDIAMTX_PORTS_AVAILABLE,
+        ] {
+            assert_eq!(
+                status_of(&results, name),
+                CheckStatus::Pass,
+                "{name}: {results:?}"
+            );
+        }
+        assert_eq!(results.len(), 6);
+    }
+
+    #[test]
+    fn online_shows_a_deferred_ffmpeg_path_as_a_warning() {
+        let results = run(media_doctor_tasks(
+            &enabled(),
+            "${AUTUMN_MEDIA__FFMPEG__BIN}",
+            Some(Ok(healthy_host)),
+        ));
+        assert_eq!(
+            status_of(&results, CHECK_FFMPEG_PREFLIGHT),
+            CheckStatus::Warn
+        );
+    }
+
+    #[test]
+    fn online_fails_each_host_check_when_there_is_no_single_host() {
+        let results = run(media_doctor_tasks::<
+            RecordingExecutor,
+            fn() -> RecordingExecutor,
+        >(
+            &enabled(),
+            "/usr/bin/ffmpeg",
+            Some(Err("needs one host".to_owned())),
+        ));
+        for name in [
+            CHECK_FFMPEG_PREFLIGHT,
+            CHECK_MEDIAMTX_BINARY,
+            CHECK_RECORDINGS_DIR_WRITABLE,
+            CHECK_MEDIAMTX_PORTS_AVAILABLE,
+        ] {
+            assert_eq!(status_of(&results, name), CheckStatus::Fail, "{name}");
+        }
+        assert_eq!(results.len(), 6, "the pure checks still run");
+    }
+
+    #[test]
+    fn media_ssh_target_needs_exactly_one_host() {
+        let deploy = DeployConfig {
+            user: "deployer".to_owned(),
+            ssh_port: 2222,
+            ..DeployConfig::default()
+        };
+        let one = media_ssh_target(&Ok(vec!["app.example.com".to_owned()]), &deploy)
+            .expect("one host is a target");
+        assert_eq!(one.host, "app.example.com");
+        assert_eq!(one.user, "deployer");
+        assert_eq!(one.port, 2222);
+
+        let two = vec!["a.example.com".to_owned(), "b.example.com".to_owned()];
+        assert!(media_ssh_target(&Ok(two), &deploy).is_err());
+        assert!(media_ssh_target(&Ok(Vec::new()), &deploy).is_err());
+        assert_eq!(
+            media_ssh_target(&Err("bad hosts".to_owned()), &deploy).unwrap_err(),
+            "bad hosts"
+        );
+    }
+
+    #[test]
+    fn media_ssh_target_refuses_an_option_shaped_user_or_host() {
+        // `ssh` would read these as options, not as a destination.
+        let bad_user = DeployConfig {
+            user: "-oProxyCommand=touch /tmp/x".to_owned(),
+            ..DeployConfig::default()
+        };
+        assert!(media_ssh_target(&Ok(vec!["app.example.com".to_owned()]), &bad_user).is_err());
+        let deploy = DeployConfig::default();
+        assert!(media_ssh_target(&Ok(vec!["-oProxyCommand=x".to_owned()]), &deploy).is_err());
+    }
+
+    #[test]
+    fn doctor_runs_the_media_tasks_in_the_deploy_branch() {
+        let src = include_str!("doctor.rs");
+        let run_body = src
+            .split("pub fn run(opts: DoctorOptions)")
+            .nth(1)
+            .expect("run present");
+        assert!(
+            run_body.contains("tasks.extend(media_doctor_tasks("),
+            "doctor must add the media tasks"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -50,6 +50,9 @@ stripe   = "https://api.stripe.com"
 sendgrid = "https://api.sendgrid.com"
 ```
 
+The client also obeys the request deadline and a retry budget. See
+[Timeouts, Deadlines and Retry Budgets](timeouts-and-budgets.md).
+
 Base URL aliases let you name your upstream services and reference them by
 alias in handlers and tests:
 
@@ -69,6 +72,10 @@ methods) are retried up to three times on:
 | `503 Service Unavailable` | Same. With `Retry-After`, wait for the hint (see below) |
 | `429 Too Many Requests` | Wait for `Retry-After` (1 s when absent, see below) |
 | Connection / timeout error | Retry after the jittered backoff |
+
+A retry starts only when the request deadline has time for it and the retry
+budget has tokens for it. See
+[Timeouts, Deadlines and Retry Budgets](timeouts-and-budgets.md).
 
 **Backoff.** The wait before retry `n` (0 = first retry) is a random value in
 `[0, min(max_backoff, 100 ms × 2ⁿ)]` ("full jitter"). Callers that fail
@@ -121,7 +128,9 @@ serviceable.
 A rejected attempt ends the call with `ClientError::ThrottledLocally { host }`.
 With `?` in a handler, it maps to `503`. A local reject is not a
 circuit-breaker failure. Retries are attempts too, so the throttle also stops
-a retry. All `Client` extractors in an app use one set of counts.
+a retry. Under a request deadline the client follows redirects itself, so each
+redirect hop is an attempt on its own host. All `Client` extractors in an app
+use one set of counts.
 
 The custom send path (`pin_to`, `get_ssrf_safe`, `no_redirect`,
 `follow_redirects`) uses the throttle only with `breaker_scoped()`, once per

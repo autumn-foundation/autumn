@@ -89,6 +89,9 @@ mod cost_metering;
 mod custom_domain_issuance;
 mod custom_domains;
 mod custom_layer;
+mod data_capsule;
+#[cfg(feature = "db")]
+mod data_capsule_pg;
 #[cfg(feature = "db")]
 mod data_classification;
 mod db_telemetry_tests;
@@ -149,6 +152,7 @@ mod failure_capsule_overhead;
 #[cfg(all(feature = "reporting", feature = "db", not(feature = "sqlite")))]
 mod failure_capsule_replay;
 mod fake_generators;
+mod fault_injection;
 mod feature_flags_integration;
 mod feed;
 mod form_for_derive;
@@ -438,6 +442,8 @@ mod sim_clock_drain;
 mod sim_collab_convergence;
 mod sim_cost_deferral;
 mod sim_crash_at;
+#[cfg(feature = "http-client")]
+mod sim_deadline;
 mod sim_default_entropy;
 mod sim_delayed_enqueue;
 mod sim_deterministic_ids;
@@ -452,6 +458,8 @@ mod sim_monotonic_clock;
 #[cfg(feature = "http-client")]
 mod sim_net;
 mod sim_rate_limit_clock;
+#[cfg(feature = "http-client")]
+mod sim_retry_budget;
 mod sim_retry_storm;
 #[cfg(feature = "http-client")]
 mod sim_retry_storm_http;
@@ -491,6 +499,8 @@ mod test_app_integration;
 mod test_db_integration;
 mod throttle_route;
 mod time_zone_integration;
+#[cfg(feature = "tls")]
+mod tls_alpn;
 #[cfg(feature = "tls")]
 mod tls_app_surface;
 #[cfg(feature = "tls")]

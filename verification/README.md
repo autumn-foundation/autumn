@@ -1,8 +1,9 @@
-# Verus specifications
+# Verification
 
 This directory contains small mathematical shadows of critical runtime state.
-They are intentionally separate from the Cargo workspace because Verus uses an
-extended Rust dialect. Verify the tenant arena spine with:
+It also contains the protocol models in `models/` (see "Protocol models").
+The Verus specs are not in the Cargo workspace, because Verus uses an extended
+Rust dialect. Verify the tenant arena spine with:
 
 ```sh
 verus verification/tenant_arena.rs
@@ -106,3 +107,36 @@ keeps the limit in `min..=max`. The AIMD model rounds the back-off up; the
 runtime rounds it down. The clamp makes the property true for both. The model
 does not include the floating-point algorithms. Unit tests and sim tests
 examine them.
+
+## Protocol models
+
+`models/` is the `autumn-protocol-models` crate (issue #3071). It holds
+[Stateright](https://www.stateright.rs) models of three protocols:
+
+| Model | Production code | Properties |
+| --- | --- | --- |
+| `job_claim` | `autumn/src/job.rs` (`docs/adr/0016-durable-job-claim-lease.md`) | A stale holder's settle is rejected. At most one execution runs at a time. |
+| `tick_election` | `autumn/src/scheduler.rs`, `execute_cron_task` (#3052) | Each tick runs at most once. |
+| `lease_lock` | `autumn/src/lock/lease.rs` (`docs/adr/0015-fencing-lease-lock.md`) | A stale holder's write is rejected. Tokens are unique per grant. At most one holder trusts its lease. |
+
+The Verus specs above prove one step at a time. The models check every
+interleaving of workers, replicas, late messages and clock steps, within small
+bounds. Run them with:
+
+```sh
+cargo test -p autumn-protocol-models
+```
+
+Each model has a `Variant`. `Correct` must hold every `always` property and
+reach every `sometimes` property. Each seeded bug (for example
+`SettleWithoutOwnerFence`) must give a counterexample. If a seeded bug gives
+no counterexample, its test fails.
+
+The tick model found a bug: a cron task that waited in the cost gate past its
+window could claim a pruned tick and run it twice. `execute_cron_task` now
+checks the window after the wait. The seeded bug `NoLatenessCheck` keeps that
+path.
+
+When a protocol changes, change its model in the same PR. `cargo test
+--workspace` runs the models. The `Protocol models` job in `ci.yml` also runs
+them.

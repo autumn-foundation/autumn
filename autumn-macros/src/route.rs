@@ -273,15 +273,14 @@ pub fn route_macro(
         crate::graph::emit_route_descriptor(&input_fn, http_method, &quote! { #path }, false);
 
     // ── Path helper ─────────────────────────────────────────────
-    let path_helper = emit_path_helper(&path_helper_name, &path, &path_params);
-    // The alias re-exports the (possibly gated) helper, so it carries the same
-    // gate. An absent alias is an empty token stream — prefixing a `#[cfg]`
-    // onto nothing would emit a dangling attribute.
-    let fn_name_alias = if fn_name_alias.is_empty() {
-        fn_name_alias
+    // An `#[edge]` route's helper uses the `autumn_edge` encoders and is not
+    // gated, so a handler that builds a link compiles on both lanes (#1790).
+    let encoders = if edge.is_some() {
+        quote! { ::autumn_edge::paths }
     } else {
-        quote! { #native_cfg #fn_name_alias }
+        quote! { ::autumn_web::paths }
     };
+    let path_helper = emit_path_helper(&path_helper_name, &path, &path_params, &encoders);
 
     quote! {
         // A guard macro that already expanded above this route attribute
@@ -340,7 +339,6 @@ pub fn route_macro(
         #native_cfg
         #graph_descriptor
 
-        #native_cfg
         #path_helper
         #fn_name_alias
 
@@ -872,6 +870,7 @@ fn emit_path_helper(
     helper_name: &proc_macro2::Ident,
     path: &LitStr,
     params: &[String],
+    encoders: &TokenStream,
 ) -> TokenStream {
     // Build parameter idents: strip `*` catch-all prefix, replace `-` → `_`,
     // then emit as raw identifiers so Rust keywords are valid param names.
@@ -893,9 +892,9 @@ fn emit_path_helper(
         .zip(param_idents.iter())
         .map(|(param, ident)| {
             if param.starts_with('*') {
-                quote! { ::autumn_web::paths::encode_catch_all_param(#ident) }
+                quote! { #encoders::encode_catch_all_param(#ident) }
             } else {
-                quote! { ::autumn_web::paths::encode_path_segment(#ident) }
+                quote! { #encoders::encode_path_segment(#ident) }
             }
         })
         .collect();
@@ -2217,20 +2216,14 @@ mod tests {
         );
         assert!(
             generated.contains(&format!(
-                "{gate} # [doc (hidden)] pub fn __autumn_path_show"
-            )),
-            "the path helper must be gated too — it calls ::autumn_web::paths: {generated}"
-        );
-        assert!(
-            generated.contains(&format!(
                 "{gate} :: autumn_web :: reexports :: inventory :: submit !"
             )),
             "the architecture-graph node references ::autumn_web too (#1747): {generated}"
         );
         assert_eq!(
             generated.matches(gate).count(),
-            3,
-            "exactly the three native companions are gated: {generated}"
+            2,
+            "exactly the two native companions are gated: {generated}"
         );
         // The handler itself and the edge companion stay unconditional.
         assert!(
@@ -2239,8 +2232,67 @@ mod tests {
         );
     }
 
+    /// The path helper of an `#[edge]` route compiles on both lanes, so a
+    /// handler that builds a link does not change for the edge (#1790).
     #[test]
-    fn route_macro_edge_gates_the_path_helper_alias() {
+    fn route_macro_edge_path_helper_uses_autumn_edge_and_is_not_gated() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/files/{id}/{*rest}" },
+            quote! {
+                #[edge]
+                async fn file() -> &'static str { "f" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("pub fn __autumn_path_file"),
+            "the path helper must be emitted: {generated}"
+        );
+        assert!(
+            !generated.contains(
+                "# [cfg (not (target_arch = \"wasm32\"))] # [doc (hidden)] pub fn __autumn_path_file"
+            ),
+            "the edge path helper must not be gated off wasm32: {generated}"
+        );
+        assert!(
+            generated.contains(":: autumn_edge :: paths :: encode_path_segment (r#id)"),
+            "a segment must use the edge encoder: {generated}"
+        );
+        assert!(
+            generated.contains(":: autumn_edge :: paths :: encode_catch_all_param (r#rest)"),
+            "a catch-all must use the edge encoder: {generated}"
+        );
+        assert!(
+            !generated.contains(":: autumn_web :: paths"),
+            "the edge path helper must not name autumn_web: {generated}"
+        );
+    }
+
+    /// A plain route keeps the `autumn_web` encoders.
+    #[test]
+    fn route_macro_plain_path_helper_keeps_autumn_web() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/files/{id}" },
+            quote! {
+                async fn file() -> &'static str { "f" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains(":: autumn_web :: paths :: encode_path_segment (r#id)"),
+            "{generated}"
+        );
+        assert!(!generated.contains("autumn_edge"), "{generated}");
+    }
+
+    #[test]
+    fn route_macro_edge_path_helper_alias_is_not_gated() {
         let generated = route_macro(
             "GET",
             "get",
@@ -2254,17 +2306,16 @@ mod tests {
 
         assert!(
             generated.contains(
-                "# [cfg (not (target_arch = \"wasm32\"))] # [doc (hidden)] \
-                 pub use self :: __autumn_path_greeting as __autumn_path_greet ;"
+                "} # [doc (hidden)] pub use self :: __autumn_path_greeting as __autumn_path_greet ;"
             ),
-            "the alias re-exports a gated helper, so it must be gated too: {generated}"
+            "the alias re-exports an ungated helper, so it is not gated: {generated}"
         );
         assert_eq!(
             generated
                 .matches("# [cfg (not (target_arch = \"wasm32\"))]")
                 .count(),
-            4,
-            "route info + graph node + path helper + alias are all native-only: {generated}"
+            2,
+            "only route info and the graph node are native-only: {generated}"
         );
     }
 

@@ -1706,6 +1706,8 @@ pub const PRE_MIGRATE_LABELS: &[&str] = &[
     // The driver puts the live-slot marker repair ahead of every builder op, like
     // `install-proxy`.
     LIVE_SLOT_REPAIR_LABEL,
+    // The driver splices the MediaMTX binary install (#1974) ahead of the builder ops.
+    super::media::MEDIA_INSTALL_BINARY_LABEL,
 ];
 
 /// Whether a host that failed at `failed_step` had already run its migration.
@@ -7748,6 +7750,10 @@ mod tests {
         // everything, so both are pre-migrate even though no builder emits them.
         assert!(failed_before_migrating("install-proxy"));
         assert!(failed_before_migrating(LIVE_SLOT_REPAIR_LABEL));
+        // The MediaMTX binary install (#1974) is spliced the same way.
+        assert!(failed_before_migrating(
+            super::super::media::MEDIA_INSTALL_BINARY_LABEL
+        ));
         // Anything unrecognised errs toward "the schema may have moved".
         assert!(!failed_before_migrating("readiness-gate"));
         assert!(!failed_before_migrating("some-future-op"));

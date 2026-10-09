@@ -12,6 +12,22 @@
 
 use autumn_web::prelude::*;
 
+/// Every route the origin mounts: each `#[edge]` route and the origin-only
+/// ones. `src/main.rs` and the conformance suite both use this list.
+#[must_use]
+pub fn routes() -> Vec<autumn_web::Route> {
+    routes![
+        crate::handlers::greet,
+        crate::handlers::note,
+        crate::handlers::stats,
+        crate::handlers::count,
+        crate::handlers::whoami,
+        crate::handlers::link,
+        crate::handlers::boom,
+        feedback,
+    ]
+}
+
 /// `POST /feedback` — the write path, which never leaves the origin.
 ///
 /// There is no `#[edge]` here and there could not be: the macro refuses

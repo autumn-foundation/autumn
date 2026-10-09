@@ -704,9 +704,14 @@ fn report_response(response: &mut Response, context: RequestContext, chain: &Arc
     // be complete. A replay drains the body and would report divergences that
     // never happened. Probed only when a capsule is actually being written: with
     // capture off the response is handed on exactly as the handler produced it.
-    let body_is_materialized = context.capture.is_some() && materialize_body(response);
+    // A request in which a fault fired writes no capsule: a replay runs
+    // without the fault and would report a divergence (#3071).
+    let capture = context
+        .capture
+        .filter(|_| !crate::fault_injection::fault_fired());
+    let body_is_materialized = capture.is_some() && materialize_body(response);
 
-    let capture = context.capture.map(|handle| {
+    let capture = capture.map(|handle| {
         if !body_is_materialized {
             handle.scope().note(
                 "the failing response body was still being produced when the response \
@@ -932,20 +937,23 @@ fn handle_panic(
         .and_then(|captured| captured.backtrace);
 
     if let Some(context) = context {
-        let capture = context.capture.map(|handle| {
-            // Same reason as `report_response`: seal the scope before the
-            // capsule is built, so nothing can append to it while it is
-            // being written.
-            handle.scope().close();
-            CaptureContext {
-                handle,
-                outcome: crate::capsule::CapsuleOutcome::Panic {
-                    status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
-                    payload: message.clone(),
-                    backtrace: backtrace.clone(),
-                },
-            }
-        });
+        let capture = context
+            .capture
+            .filter(|_| !crate::fault_injection::fault_fired())
+            .map(|handle| {
+                // Same reason as `report_response`: seal the scope before the
+                // capsule is built, so nothing can append to it while it is
+                // being written.
+                handle.scope().close();
+                CaptureContext {
+                    handle,
+                    outcome: crate::capsule::CapsuleOutcome::Panic {
+                        status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                        payload: message.clone(),
+                        backtrace: backtrace.clone(),
+                    },
+                }
+            });
         chain.dispatch(
             ErrorEvent {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
