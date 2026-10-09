@@ -3505,6 +3505,7 @@ impl RetryGate {
             refill_pending: AtomicBool::new(false),
             pending_retry: std::sync::Mutex::new(None),
             caller_deadline: self.caller_deadline.clone(),
+            signer: self.signer.clone(),
         };
         hop.rekey(url);
         if url_host(url).is_some_and(|host| refilled.insert(host)) {
@@ -8784,6 +8785,7 @@ mod tests {
                 refill_pending: AtomicBool::new(false),
                 pending_retry: std::sync::Mutex::new(None),
                 caller_deadline: std::sync::OnceLock::new(),
+                signer: None,
             };
             assert!(gate.allow(RetryKind::Transient, Duration::ZERO));
             // The retry starts.
