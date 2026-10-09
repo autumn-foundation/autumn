@@ -41,6 +41,7 @@ pub const SITE_GUIDE_SKILL: &str = "site-guide";
 /// What the app has, captured once at router build time.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
+#[allow(clippy::struct_excessive_bools)] // independent switches from `[aeo]`
 pub struct SiteFacts {
     /// `[aeo] name`, else the `OpenAPI` title. `None` uses the host name.
     pub name: Option<String>,
