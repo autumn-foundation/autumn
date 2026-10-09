@@ -1267,7 +1267,7 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_millis(1500)).await;
         assert!(probes.should_route_reads_to_replica());
 
-        tokio::time::advance(std::time::Duration::from_millis(1000)).await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
         assert!(
             !probes.should_route_reads_to_replica(),
             "no new sample for 2.5s, so freshness is unknown"

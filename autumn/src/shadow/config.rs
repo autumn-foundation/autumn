@@ -2,7 +2,7 @@
 //!
 //! Off by default and inert until an operator sets both `enabled = true` and a
 //! `target`. Every knob here exists to bound the blast radius: mirroring copies
-//! production traffic, so the sample rate, the per-request deadline, the
+//! production traffic, so the sample rate, the per-mirror deadline, the
 //! in-flight ceiling, and the capture budgets are all first-class config rather
 //! than hard-coded constants.
 //!
@@ -53,13 +53,14 @@ pub struct ShadowConfig {
     #[serde(default)]
     pub routes: Vec<String>,
 
-    /// Wall-clock deadline for a single shadow request, in milliseconds.
-    /// A shadow that overruns it is abandoned and counted, never awaited by the
-    /// live request. Default: `2000`.
+    /// Wall-clock deadline for one mirror, in milliseconds. It covers the
+    /// shadow request, the primary body wait and the comparison. A mirror that
+    /// overruns it is abandoned and counted, never awaited by the live request.
+    /// Default: `2000`.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 
-    /// Ceiling on concurrently in-flight mirrored requests. Once reached,
+    /// Ceiling on concurrently in-flight mirrors, end to end. Once reached,
     /// further candidates are dropped (and counted) rather than queued, so a
     /// slow shadow can never accumulate work. Default: `8`.
     #[serde(default = "default_max_in_flight")]

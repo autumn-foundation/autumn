@@ -774,6 +774,37 @@ applies.
 
 ---
 
+### Shadow: `ShadowStats` gains `comparisons_abandoned`
+
+**Why:** the mirror deadline now covers the comparison. A comparison that does
+not finish is counted apart from a match, a divergence and a skip (issue #2333).
+
+**Before (`{X.Y}`):** a struct literal listed every field.
+
+```rust
+let stats = autumn_web::shadow::ShadowStats {
+    mirrored: 0,
+    compared: 0,
+    // ... every other field ...
+    primary_incomplete: 0,
+};
+```
+
+**After (`{(X+1).0}`):** add `..ShadowStats::default()`. An exhaustive
+destructuring pattern needs `..` or the new field.
+
+```rust
+let stats = autumn_web::shadow::ShadowStats {
+    mirrored: 1,
+    ..autumn_web::shadow::ShadowStats::default()
+};
+```
+
+**Automation:** `manual` - the fix adds a struct update expression, and no
+codemod rewrites struct literals.
+
+---
+
 ## Plugin authors
 
 Everything here is addressed to someone maintaining an `autumn-plugin-*` /
