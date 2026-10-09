@@ -9,10 +9,10 @@
   replay gives the task the tape.
 - **capsule:** `autumn replay` installs a mailer. A mail-sending route reaches
   the mail seam and replays from the capsule. Nothing is delivered.
-- **capsule:** a capsule records whether the app had a global cache, and
-  whether `AppState::cache()` returned one. `autumn replay` installs a cache
-  that stores nothing in each place production had one, so a cache call takes
-  the production path and the capsule answers it.
+- **capsule:** a capsule records whether the app builder installed a cache
+  (`with_cache_backend`). `autumn replay` then installs a cache that stores
+  nothing in the same places, so a cache call takes the production path and
+  the capsule answers it.
 - **capsule:** `CacheInvalidationError`, `CacheEffect::is_read`,
   `CacheEffect::pending`, `OLDEST_READABLE_FORMAT_VERSION`,
   `ReplayEffects::for_format_version` and `ReplayEntropy::width_mismatches`.
@@ -59,6 +59,6 @@
   `InvalidateNamespace` and `Clear`; `capsule::EffectSeam` has a new variant
   `Random`; `capsule::schema::MailErrorKind` has a new variant
   `NoDurableQueueInProduction`; `capsule::JobEffect` has a new public field
-  `requested_due_at`; `capsule::CapsuleEffects` has new public fields
-  `global_cache` and `state_cache`
+  `requested_due_at`; `capsule::CapsuleEffects` has a new public field
+  `builder_cache`
   ([migration guide](docs/migrations/next.md)).

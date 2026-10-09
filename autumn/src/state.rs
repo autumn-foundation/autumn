@@ -674,10 +674,10 @@ impl AppState {
             .or_else(|| self.shared_cache.clone())
     }
 
-    /// Whether the builder put a cache in the state
+    /// Whether the app builder installed a cache
     /// (`AppBuilder::with_cache_backend`), before the state initializers ran.
-    /// A failure capsule records it, and a replay installs a cache there
-    /// before the initializers run again (#2351).
+    /// A failure capsule records it, and a replay installs a cache in its
+    /// place before the initializers run again (#2351).
     #[cfg(feature = "reporting")]
     pub(crate) const fn has_builder_cache(&self) -> bool {
         self.shared_cache.is_some()

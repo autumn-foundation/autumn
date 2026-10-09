@@ -979,7 +979,9 @@ impl ReplayEffects {
         let index = seam.consumed;
         let Some(next) = seam.pending.front() else {
             drop(seam);
-            let described = actual.describe();
+            // No recorded identifier teaches the verdict what to mask, and a
+            // key can hold a secret, so it is not printed.
+            let described = actual.describe_withheld();
             self.diverge(EffectDivergence {
                 seam: EffectSeam::Cache,
                 kind: EffectDivergenceKind::Unrecorded,
@@ -2431,6 +2433,13 @@ mod tests {
         // The identifier does not match, so it is not printed.
         let tape = ReplayEffects::new(recorded("tok:[FILTERED]:x"));
         let _ = tape.cache_invalidate_namespace("other:sk-live-42");
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert!(!divergences[0].actual.contains("sk-live-42"));
+        assert!(!divergences[0].detail.contains("sk-live-42"));
+        // With no recorded write, the identifier is not printed.
+        let tape = ReplayEffects::new(CapsuleEffects::default());
+        let _ = tape.cache_invalidate("token:sk-live-42");
         let divergences = tape.divergences();
         assert_eq!(divergences.len(), 1, "{divergences:?}");
         assert!(!divergences[0].actual.contains("sk-live-42"));

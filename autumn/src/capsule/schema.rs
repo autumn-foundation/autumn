@@ -460,17 +460,14 @@ pub struct CapsuleEffects {
     /// in draw order.
     #[serde(default)]
     pub random: Vec<RandomEffect>,
-    /// Whether the app had a global cache. A cache call can take a
-    /// different path without one, so replay installs a global cache that
-    /// stores nothing when this is `true`.
+    /// Whether the app builder installed a cache
+    /// (`AppBuilder::with_cache_backend`). A cache call can take a different
+    /// path without one. Replay does not build the builder's backend, so it
+    /// installs a cache that stores nothing in the same places (the global
+    /// cache and the app state), before the state initializers run. Other
+    /// cache setup (`main`, a state initializer) runs again during a replay.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub global_cache: bool,
-    /// Whether the builder put a cache in the app state
-    /// (`AppBuilder::with_cache_backend`). Replay installs one there before
-    /// the state initializers run. An initializer installs its own cache
-    /// again during the replay.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub state_cache: bool,
+    pub builder_cache: bool,
 }
 
 impl CapsuleEffects {

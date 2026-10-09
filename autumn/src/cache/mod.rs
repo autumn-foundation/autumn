@@ -102,25 +102,26 @@ pub fn global_cache() -> Option<Arc<dyn Cache>> {
 
 /// Set the global cache for `autumn replay` (#2351).
 ///
-/// When production had a global cache, replay installs the capsule seam over
-/// a backend that stores nothing. A cache call then takes the path it took in
-/// production, and the tape answers it. Otherwise replay has no global cache.
+/// Replay does not build the builder's cache backend. When the app builder
+/// installed one in production, replay installs the capsule seam over a
+/// backend that stores nothing, in the same places: the global cache and the
+/// app state. A cache call then takes the path it took in production, and
+/// the tape answers it. Otherwise the global cache is cleared, as the build
+/// clears it in production. Other cache setup runs again during a replay.
 ///
-/// Returns the cache for the app state: one when `AppState::cache()` returned
-/// one in production. It is the same `Arc` as the global cache when both were
-/// present, as `AppBuilder::with_cache_backend` makes them.
+/// Returns the cache for the app state.
 #[cfg(feature = "reporting")]
 pub(crate) fn install_replay_cache(
     recorded: &crate::capsule::CapsuleEffects,
 ) -> Option<Arc<dyn Cache>> {
-    if recorded.global_cache {
-        set_global_cache(Arc::new(ReplayBackend));
-    } else {
+    if !recorded.builder_cache {
         clear_global_cache();
+        return None;
     }
-    recorded
-        .state_cache
-        .then(|| global_cache().unwrap_or_else(|| with_capsule_seam(Arc::new(ReplayBackend))))
+    // Wrapped once, so the global and the state hold the same `Arc`.
+    let cache = with_capsule_seam(Arc::new(ReplayBackend));
+    set_global_cache(Arc::clone(&cache));
+    Some(cache)
 }
 
 /// The backend under the replay seam. It stores nothing.
@@ -1328,7 +1329,7 @@ mod tests {
     /// answers a repository invalidation from the tape, so it is consumed.
     #[cfg(feature = "reporting")]
     #[test]
-    fn replay_installs_a_seam_cache_when_production_had_a_global_cache() {
+    fn replay_installs_a_seam_cache_when_the_builder_had_one() {
         let _guard = GLOBAL_CACHE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1337,12 +1338,15 @@ mod tests {
                 namespace: "posts".to_owned(),
                 error: None,
             }],
-            global_cache: true,
-            state_cache: true,
+            builder_cache: true,
             ..Default::default()
         };
         let installed = install_replay_cache(&recorded).expect("installed");
         assert!(installed.is_capsule_seam());
+        assert!(Arc::ptr_eq(
+            &installed,
+            &global_cache().expect("the global cache")
+        ));
         let tape = Arc::new(crate::capsule::ReplayEffects::new(recorded));
         let complete = block_on(crate::capsule::with_effect_tape(
             Arc::clone(&tape),
@@ -1354,21 +1358,6 @@ mod tests {
 
         assert!(install_replay_cache(&crate::capsule::CapsuleEffects::default()).is_none());
         assert!(global_cache().is_none());
-
-        // The two are recorded apart, so each is installed apart.
-        let only_state = crate::capsule::CapsuleEffects {
-            state_cache: true,
-            ..Default::default()
-        };
-        assert!(install_replay_cache(&only_state).is_some());
-        assert!(global_cache().is_none());
-        let only_global = crate::capsule::CapsuleEffects {
-            global_cache: true,
-            ..Default::default()
-        };
-        assert!(install_replay_cache(&only_global).is_none());
-        assert!(global_cache().is_some());
-        clear_global_cache();
     }
 
     /// A backend whose sync removals fail, and whose fill lock is held.
@@ -1453,22 +1442,7 @@ mod tests {
         );
     }
 
-    /// Codex review on #3222: a capture scope reads the global cache when the
-    /// run starts, so a later change does not alter the recorded flag.
-    #[cfg(feature = "reporting")]
-    #[test]
-    fn a_capture_scope_records_the_global_cache_at_the_start() {
-        let _guard = GLOBAL_CACHE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        set_global_cache(Arc::new(SpyBackend::default()));
-        let scope = capture_scope();
-        clear_global_cache();
-        assert!(scope.had_global_cache());
-        assert!(!capture_scope().had_global_cache());
-    }
-
-    /// Codex review on #3222: only a cache the builder put in the state is
+    /// Codex review on #3222: only a cache the builder installed is
     /// recorded. A cache an initializer installs with `set_cache` is
     /// installed again by the initializer during a replay.
     #[cfg(feature = "reporting")]

@@ -3057,6 +3057,7 @@ async fn run_job_handler_unmetered(
     if let Some(context) = job_capture_context(&state) {
         let payload_for_capsule = payload.clone();
         let tracked = tracked_key.is_some();
+        let builder_cache = state.has_builder_cache();
         // Boxed, so the capture branch does not add a second copy of the run
         // to this future.
         let run = Box::pin(run_job_handler_inner(
@@ -3078,9 +3079,12 @@ async fn run_job_handler_unmetered(
                 // handler untracked. A tracked handler can branch on
                 // `is_tracked()` or report progress, so its capsule says it
                 // cannot replay (#2351 item 14).
-                if tracked && let Some(scope) = crate::capsule::current_scope() {
-                    scope.note(TRACKED_JOB_CAPSULE_NOTE);
-                    scope.mark_truncated();
+                if let Some(scope) = crate::capsule::current_scope() {
+                    scope.note_builder_cache(builder_cache);
+                    if tracked {
+                        scope.note(TRACKED_JOB_CAPSULE_NOTE);
+                        scope.mark_truncated();
+                    }
                 }
                 run.await
             },
