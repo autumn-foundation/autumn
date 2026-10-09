@@ -77,6 +77,10 @@ end
 return 1
 ";
 
+/// Set after the first failed fenced insert has been logged at `warn`.
+static FENCED_INSERT_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// [`FENCED_INSERT_SCRIPT`], hashed once.
 static FENCED_INSERT: std::sync::LazyLock<redis::Script> =
     std::sync::LazyLock::new(|| redis::Script::new(FENCED_INSERT_SCRIPT));
@@ -432,6 +436,10 @@ impl RedisCache {
 
     /// `DEL` one key, with retries.
     async fn delete_key(&self, key: &str) -> Result<(), InvalidationError> {
+        if is_reserved_key(key) {
+            warn!(key, "RedisCache: refused to delete a reserved epoch key");
+            return Ok(());
+        }
         let prefixed = self.prefixed(key);
         self.retry_invalidation(key, || {
             let mut conn = self.manager.clone();
@@ -592,6 +600,16 @@ impl Cache for RedisCache {
         match result {
             Ok(stored) => stored == 1,
             Err(error) => {
+                // Most likely a Redis ACL that denies scripting. Every miss
+                // then recomputes, so say so once.
+                if !FENCED_INSERT_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    warn!(
+                        key,
+                        error = %error,
+                        "RedisCache: the fenced insert failed, so cached values are not stored. \
+                         The Redis user needs +eval, +evalsha and +script|load"
+                    );
+                }
                 debug!(key, error = %error, "RedisCache: fenced insert failed");
                 false
             }
@@ -1250,6 +1268,14 @@ mod tests {
         // `clear` sweeps the prefix. If it took the epoch, a sampled 0 would
         // match again after a bump.
         cache.clear();
+        assert_eq!(cache.fill_epoch("a"), FillEpoch::Sampled(1));
+
+        // A key-level delete cannot remove an epoch either.
+        cache
+            .invalidate_async("__autumn_epoch__:a")
+            .await
+            .expect("a refused delete is not an error");
+        cache.invalidate("__autumn_epoch__:a");
         assert_eq!(cache.fill_epoch("a"), FillEpoch::Sampled(1));
 
         // The key sits inside the prefix, so a prefix-scoped ACL still works.

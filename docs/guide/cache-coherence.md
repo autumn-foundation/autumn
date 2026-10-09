@@ -288,6 +288,11 @@ can cache the old row. A TTL bounds this case.
 The shared epoch costs one `GET` on each miss. A hit costs nothing extra. The
 store is one Lua call, in place of the plain `SET`.
 
+The Lua call needs scripting. If you use a Redis ACL, the cache user needs
+`+eval`, `+evalsha` and `+script|load`, and the key pattern `~{prefix}:*`. With
+no scripting permission, no value is stored and every miss recomputes.
+`RedisCache` logs one `warn!` when this happens.
+
 ### 2. Or acknowledge the staleness
 
 ```rust
