@@ -273,19 +273,8 @@ impl Manifest {
         // something nobody vouched for. A manifest reachable only through a
         // link is treated as absent, which is the same conservative answer a
         // project that never had one gets.
-        for attempt in 1..=SWAP_ATTEMPTS {
-            match read_current(root, MANIFEST_PATH) {
-                OnDisk::Linked(_) => return None,
-                // A swap in flight also leaves the path absent. Wait for it:
-                // "no manifest" would plan with no baseline.
-                OnDisk::Absent
-                    if attempt < SWAP_ATTEMPTS
-                        && claim_in_flight(&root.join(MANIFEST_PATH)).is_some() =>
-                {
-                    back_off(attempt);
-                }
-                _ => break,
-            }
+        if matches!(read_current(root, MANIFEST_PATH), OnDisk::Linked(_)) {
+            return None;
         }
         Self::parse(&std::fs::read_to_string(root.join(MANIFEST_PATH)).ok()?)
     }
@@ -331,19 +320,16 @@ impl Manifest {
                         "{MANIFEST_PATH} cannot be read as text; delete it to start again"
                     )));
                 }
-                // A swap in flight also leaves the path absent. Building from
-                // nothing then would erase the history, so wait for it.
+                // `read_current` already waited out a swap. A claim still here
+                // is left by a crash. Building from nothing would erase the
+                // history.
                 OnDisk::Absent => match claim_in_flight(&path) {
-                    Some(held) if attempt == SWAP_ATTEMPTS => {
+                    Some(held) => {
                         return Err(std::io::Error::other(format!(
                             "an interrupted upgrade left {} in place of {MANIFEST_PATH}; \
                              rename it back, or delete it to start again",
                             held.display()
                         )));
-                    }
-                    Some(_) => {
-                        back_off(attempt);
-                        continue;
                     }
                     None => (None, Publish::Create),
                 },
@@ -696,6 +682,20 @@ enum OnDisk {
 /// `--apply` would then create it outside the project, somewhere the project's
 /// own `git status` can never show.
 fn read_current(root: &Path, relative: &str) -> OnDisk {
+    // A swap in flight leaves its path absent for a moment. Wait it out, so a
+    // held file is not read as missing. A claim left by a crash costs only
+    // this bounded wait.
+    for attempt in 1..SWAP_ATTEMPTS {
+        let now = read_current_once(root, relative);
+        if now != OnDisk::Absent || claim_in_flight(&root.join(relative)).is_none() {
+            return now;
+        }
+        back_off(attempt);
+    }
+    read_current_once(root, relative)
+}
+
+fn read_current_once(root: &Path, relative: &str) -> OnDisk {
     let mut cursor = root.to_path_buf();
     let components: Vec<&str> = relative.split('/').collect();
     let (_leaf, parents) = components
@@ -2966,6 +2966,24 @@ mod tests {
         let loaded = Manifest::load(tmp.path());
         restore.join().unwrap();
         assert!(loaded.is_some(), "the manifest was only held aside");
+    }
+
+    #[test]
+    fn a_planning_read_waits_out_a_claim_on_a_scaffold_file() {
+        // The same gap hides any scaffold file a swap holds aside. Without the
+        // wait, its recorded digest and an absent file read as "removed".
+        let tmp = scaffolded(GenerateOptions::default());
+        let path = tmp.path().join("Dockerfile");
+        let held = path.with_file_name(".autumn-upgrade-claim.old");
+        fs::rename(&path, &held).unwrap();
+        let restore = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            fs::rename(&held, &path).unwrap();
+        });
+
+        let report = plan_in(tmp.path());
+        restore.join().unwrap();
+        assert_eq!(*status_of(&report.entries, "Dockerfile"), Status::UpToDate);
     }
 
     #[test]
