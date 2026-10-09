@@ -35,9 +35,9 @@ hierarchy advisory lock and the edited row's `FOR UPDATE`.
 
 | descendants | calls before | calls after | buffers before | buffers after | buffers delta |
 |---:|---:|---:|---:|---:|---:|
-| 10  |  56 | 14 |  416 |  305 | -27% |
-| 50  | 208 | 14 |  747 |  271 | -64% |
-| 250 | 968 | 14 | 3688 | 1089 | -70% |
+| 10  |  56 | 14 |  416 |  315 | -24% |
+| 50  | 208 | 14 |  747 |  275 | -63% |
+| 250 | 968 | 14 | 3688 | 1092 | -70% |
 
 Profile before the change: the per-page single-row lookup plus `descendant_ids`
 were 84% / 96% / 99% of the transaction's calls and 42% / 93% / 99% of its

@@ -1,6 +1,6 @@
    Compiling cms v0.8.0 (/home/user/autumn/examples/cms)
 warning: cms@0.8.0: Tailwind CSS CLI not found — CSS will not be compiled. Run `autumn setup` or install tailwindcss manually.
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 13s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 14s
      Running tests/page_paths_under_batch_profile.rs (target/debug/deps/page_paths_under_batch_profile-0f7e2119410fb9ed)
 
 running 1 test
@@ -10,118 +10,118 @@ test page_paths_under_batch_profile ...
 === pg_stat_statements: rename a nested page with 10 descendants (+1 trashed, +1 non-page) ===
 -- top 10 by calls --
 calls=3      buffers=30      (hit=30 read=0) temp_w=0 wal=0 rows=12 target=true :: SELECT "posts"."id" FROM "posts" WHERE ("posts"."parent_id" = ANY($1))
-calls=2      buffers=33      (hit=33 read=0) temp_w=0 wal=0 rows=14 target=false :: SELECT "posts"."id", "posts"."slug", "posts"."post_type", "posts"."parent_id" FROM "posts" WHERE ("posts"."id" = ANY($1))
-calls=1      buffers=156     (hit=154 read=2) temp_w=0 wal=612 rows=1 target=false :: INSERT INTO "revisions" ("post_id", "title", "excerpt", "body", "status", "author_id", "summary") VALUES ($1, $2, $3, $4, $5, $6, $7)
-calls=1      buffers=68      (hit=68 read=0) temp_w=0 wal=1029 rows=1 target=false :: UPDATE "posts" SET "title" = $1, "slug" = $2, "excerpt" = $3, "body" = $4, "status" = $5, "parent_id" = $6, "featured_media_id" = $7, "menu_order" = $8, "comment_status" = $9, "password" = $10, "sticky" = $11, "published_at" = $12, "lock_version" = $13, "updated_at" = $14 WHERE ("posts"."id" = $15) RETURNING "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at"
+calls=2      buffers=32      (hit=32 read=0) temp_w=0 wal=0 rows=14 target=true :: SELECT "posts"."id", "posts"."slug", "posts"."post_type", "posts"."parent_id" FROM "posts" WHERE ("posts"."id" = ANY($1))
+calls=1      buffers=157     (hit=155 read=2) temp_w=0 wal=612 rows=1 target=false :: INSERT INTO "revisions" ("post_id", "title", "excerpt", "body", "status", "author_id", "summary") VALUES ($1, $2, $3, $4, $5, $6, $7)
+calls=1      buffers=76      (hit=76 read=0) temp_w=0 wal=1077 rows=1 target=false :: UPDATE "posts" SET "title" = $1, "slug" = $2, "excerpt" = $3, "body" = $4, "status" = $5, "parent_id" = $6, "featured_media_id" = $7, "menu_order" = $8, "comment_status" = $9, "password" = $10, "sticky" = $11, "published_at" = $12, "lock_version" = $13, "updated_at" = $14 WHERE ("posts"."id" = $15) RETURNING "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at"
+calls=1      buffers=5       (hit=5 read=0) temp_w=0 wal=0 rows=1 target=false :: SELECT $2 FROM ONLY "public"."posts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
 calls=1      buffers=5       (hit=5 read=0) temp_w=0 wal=0 rows=1 target=false :: SELECT "revisions"."id" FROM "revisions" WHERE ("revisions"."post_id" = $1) ORDER BY "revisions"."created_at" DESC LIMIT $2
-calls=1      buffers=4       (hit=4 read=0) temp_w=0 wal=54 rows=1 target=false :: SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
-calls=1      buffers=4       (hit=4 read=0) temp_w=0 wal=0 rows=1 target=false :: SELECT $2 FROM ONLY "public"."posts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+calls=1      buffers=5       (hit=5 read=0) temp_w=0 wal=54 rows=1 target=false :: SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
 calls=1      buffers=3       (hit=3 read=0) temp_w=0 wal=54 rows=1 target=false :: SELECT $2 FROM ONLY "public"."users" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
 calls=1      buffers=2       (hit=2 read=0) temp_w=0 wal=0 rows=0 target=false :: DELETE FROM "revisions" WHERE (("revisions"."post_id" = $1) AND ("revisions"."id" != ALL($2)))
-calls=1      buffers=0       (hit=0 read=0) temp_w=0 wal=0 rows=0 target=false :: COMMIT
+calls=1      buffers=0       (hit=0 read=0) temp_w=0 wal=0 rows=0 target=false :: BEGIN
 -- top 10 by buffers --
-buffers=156     calls=1      target=false :: INSERT INTO "revisions" ("post_id", "title", "excerpt", "body", "status", "author_id", "summary") VALUES ($1, $2, $3, $4, $5, $6, $7)
-buffers=68      calls=1      target=false :: UPDATE "posts" SET "title" = $1, "slug" = $2, "excerpt" = $3, "body" = $4, "status" = $5, "parent_id" = $6, "featured_media_id" = $7, "menu_order" = $8, "comment_status" = $9, "password" = $10, "sticky" = $11, "published_at" = $12, "lock_version" = $13, "updated_at" = $14 WHERE ("posts"."id" = $15) RETURNING "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at"
-buffers=33      calls=2      target=false :: SELECT "posts"."id", "posts"."slug", "posts"."post_type", "posts"."parent_id" FROM "posts" WHERE ("posts"."id" = ANY($1))
+buffers=157     calls=1      target=false :: INSERT INTO "revisions" ("post_id", "title", "excerpt", "body", "status", "author_id", "summary") VALUES ($1, $2, $3, $4, $5, $6, $7)
+buffers=76      calls=1      target=false :: UPDATE "posts" SET "title" = $1, "slug" = $2, "excerpt" = $3, "body" = $4, "status" = $5, "parent_id" = $6, "featured_media_id" = $7, "menu_order" = $8, "comment_status" = $9, "password" = $10, "sticky" = $11, "published_at" = $12, "lock_version" = $13, "updated_at" = $14 WHERE ("posts"."id" = $15) RETURNING "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at"
+buffers=32      calls=2      target=true :: SELECT "posts"."id", "posts"."slug", "posts"."post_type", "posts"."parent_id" FROM "posts" WHERE ("posts"."id" = ANY($1))
 buffers=30      calls=3      target=true :: SELECT "posts"."id" FROM "posts" WHERE ("posts"."parent_id" = ANY($1))
+buffers=5       calls=1      target=false :: SELECT $2 FROM ONLY "public"."posts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
 buffers=5       calls=1      target=false :: SELECT "revisions"."id" FROM "revisions" WHERE ("revisions"."post_id" = $1) ORDER BY "revisions"."created_at" DESC LIMIT $2
-buffers=4       calls=1      target=false :: SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
-buffers=4       calls=1      target=false :: SELECT $2 FROM ONLY "public"."posts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+buffers=5       calls=1      target=false :: SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
 buffers=3       calls=1      target=false :: SELECT $2 FROM ONLY "public"."users" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
 buffers=2       calls=1      target=false :: DELETE FROM "revisions" WHERE (("revisions"."post_id" = $1) AND ("revisions"."id" != ALL($2)))
-buffers=0       calls=1      target=false :: COMMIT
--- TOTAL calls=14 buffers=305 temp_blks_written=0 wal_bytes=1749 | TARGET calls=3 (21.4%) buffers=30 (9.8%) --
+buffers=0       calls=1      target=false :: BEGIN
+-- TOTAL calls=14 buffers=315 temp_blks_written=0 wal_bytes=1797 | TARGET calls=5 (35.7%) buffers=62 (19.7%) --
 
 === pg_stat_statements: rename a nested page with 50 descendants (+1 trashed, +1 non-page) ===
 -- top 10 by calls --
 calls=3      buffers=110     (hit=110 read=0) temp_w=0 wal=0 rows=52 target=true :: SELECT "posts"."id" FROM "posts" WHERE ("posts"."parent_id" = ANY($1))
-calls=2      buffers=112     (hit=112 read=0) temp_w=0 wal=0 rows=54 target=false :: SELECT "posts"."id", "posts"."slug", "posts"."post_type", "posts"."parent_id" FROM "posts" WHERE ("posts"."id" = ANY($1))
-calls=1      buffers=21      (hit=21 read=0) temp_w=0 wal=857 rows=1 target=false :: UPDATE "posts" SET "title" = $1, "slug" = $2, "excerpt" = $3, "body" = $4, "status" = $5, "parent_id" = $6, "featured_media_id" = $7, "menu_order" = $8, "comment_status" = $9, "password" = $10, "sticky" = $11, "published_at" = $12, "lock_version" = $13, "updated_at" = $14 WHERE ("posts"."id" = $15) RETURNING "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at"
-calls=1      buffers=13      (hit=13 read=0) temp_w=0 wal=333 rows=1 target=false :: INSERT INTO "revisions" ("post_id", "title", "excerpt", "body", "status", "author_id", "summary") VALUES ($1, $2, $3, $4, $5, $6, $7)
-calls=1      buffers=4       (hit=4 read=0) temp_w=0 wal=54 rows=1 target=false :: SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
-calls=1      buffers=4       (hit=4 read=0) temp_w=0 wal=0 rows=1 target=false :: SELECT 1 FROM ONLY "public"."posts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+calls=2      buffers=112     (hit=112 read=0) temp_w=0 wal=0 rows=54 target=true :: SELECT "posts"."id", "posts"."slug", "posts"."post_type", "posts"."parent_id" FROM "posts" WHERE ("posts"."id" = ANY($1))
+calls=1      buffers=22      (hit=22 read=0) temp_w=0 wal=857 rows=1 target=false :: UPDATE "posts" SET "title" = $1, "slug" = $2, "excerpt" = $3, "body" = $4, "status" = $5, "parent_id" = $6, "featured_media_id" = $7, "menu_order" = $8, "comment_status" = $9, "password" = $10, "sticky" = $11, "published_at" = $12, "lock_version" = $13, "updated_at" = $14 WHERE ("posts"."id" = $15) RETURNING "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at"
+calls=1      buffers=14      (hit=14 read=0) temp_w=0 wal=333 rows=1 target=false :: INSERT INTO "revisions" ("post_id", "title", "excerpt", "body", "status", "author_id", "summary") VALUES ($1, $2, $3, $4, $5, $6, $7)
+calls=1      buffers=5       (hit=5 read=0) temp_w=0 wal=0 rows=1 target=false :: SELECT 1 FROM ONLY "public"."posts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+calls=1      buffers=5       (hit=5 read=0) temp_w=0 wal=54 rows=1 target=false :: SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
 calls=1      buffers=3       (hit=3 read=0) temp_w=0 wal=54 rows=1 target=false :: SELECT 1 FROM ONLY "public"."users" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
 calls=1      buffers=2       (hit=2 read=0) temp_w=0 wal=0 rows=1 target=false :: SELECT "revisions"."id" FROM "revisions" WHERE ("revisions"."post_id" = $1) ORDER BY "revisions"."created_at" DESC LIMIT $2
 calls=1      buffers=2       (hit=2 read=0) temp_w=0 wal=0 rows=0 target=false :: DELETE FROM "revisions" WHERE (("revisions"."post_id" = $1) AND ("revisions"."id" != ALL($2)))
-calls=1      buffers=0       (hit=0 read=0) temp_w=0 wal=0 rows=0 target=false :: COMMIT
+calls=1      buffers=0       (hit=0 read=0) temp_w=0 wal=0 rows=0 target=false :: BEGIN
 -- top 10 by buffers --
-buffers=112     calls=2      target=false :: SELECT "posts"."id", "posts"."slug", "posts"."post_type", "posts"."parent_id" FROM "posts" WHERE ("posts"."id" = ANY($1))
+buffers=112     calls=2      target=true :: SELECT "posts"."id", "posts"."slug", "posts"."post_type", "posts"."parent_id" FROM "posts" WHERE ("posts"."id" = ANY($1))
 buffers=110     calls=3      target=true :: SELECT "posts"."id" FROM "posts" WHERE ("posts"."parent_id" = ANY($1))
-buffers=21      calls=1      target=false :: UPDATE "posts" SET "title" = $1, "slug" = $2, "excerpt" = $3, "body" = $4, "status" = $5, "parent_id" = $6, "featured_media_id" = $7, "menu_order" = $8, "comment_status" = $9, "password" = $10, "sticky" = $11, "published_at" = $12, "lock_version" = $13, "updated_at" = $14 WHERE ("posts"."id" = $15) RETURNING "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at"
-buffers=13      calls=1      target=false :: INSERT INTO "revisions" ("post_id", "title", "excerpt", "body", "status", "author_id", "summary") VALUES ($1, $2, $3, $4, $5, $6, $7)
-buffers=4       calls=1      target=false :: SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
-buffers=4       calls=1      target=false :: SELECT 1 FROM ONLY "public"."posts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+buffers=22      calls=1      target=false :: UPDATE "posts" SET "title" = $1, "slug" = $2, "excerpt" = $3, "body" = $4, "status" = $5, "parent_id" = $6, "featured_media_id" = $7, "menu_order" = $8, "comment_status" = $9, "password" = $10, "sticky" = $11, "published_at" = $12, "lock_version" = $13, "updated_at" = $14 WHERE ("posts"."id" = $15) RETURNING "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at"
+buffers=14      calls=1      target=false :: INSERT INTO "revisions" ("post_id", "title", "excerpt", "body", "status", "author_id", "summary") VALUES ($1, $2, $3, $4, $5, $6, $7)
+buffers=5       calls=1      target=false :: SELECT 1 FROM ONLY "public"."posts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+buffers=5       calls=1      target=false :: SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
 buffers=3       calls=1      target=false :: SELECT 1 FROM ONLY "public"."users" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
 buffers=2       calls=1      target=false :: SELECT "revisions"."id" FROM "revisions" WHERE ("revisions"."post_id" = $1) ORDER BY "revisions"."created_at" DESC LIMIT $2
 buffers=2       calls=1      target=false :: DELETE FROM "revisions" WHERE (("revisions"."post_id" = $1) AND ("revisions"."id" != ALL($2)))
-buffers=0       calls=1      target=false :: COMMIT
--- TOTAL calls=14 buffers=271 temp_blks_written=0 wal_bytes=1298 | TARGET calls=3 (21.4%) buffers=110 (40.6%) --
+buffers=0       calls=1      target=false :: BEGIN
+-- TOTAL calls=14 buffers=275 temp_blks_written=0 wal_bytes=1298 | TARGET calls=5 (35.7%) buffers=222 (80.7%) --
 
 === pg_stat_statements: rename a nested page with 250 descendants (+1 trashed, +1 non-page) ===
 -- top 10 by calls --
 calls=3      buffers=518     (hit=518 read=0) temp_w=0 wal=0 rows=252 target=true :: SELECT "posts"."id" FROM "posts" WHERE ("posts"."parent_id" = ANY($1))
-calls=2      buffers=521     (hit=521 read=0) temp_w=0 wal=0 rows=254 target=false :: SELECT "posts"."id", "posts"."slug", "posts"."post_type", "posts"."parent_id" FROM "posts" WHERE ("posts"."id" = ANY($1))
-calls=1      buffers=22      (hit=22 read=0) temp_w=0 wal=1039 rows=1 target=false :: UPDATE "posts" SET "title" = $1, "slug" = $2, "excerpt" = $3, "body" = $4, "status" = $5, "parent_id" = $6, "featured_media_id" = $7, "menu_order" = $8, "comment_status" = $9, "password" = $10, "sticky" = $11, "published_at" = $12, "lock_version" = $13, "updated_at" = $14 WHERE ("posts"."id" = $15) RETURNING "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at"
-calls=1      buffers=13      (hit=13 read=0) temp_w=0 wal=333 rows=1 target=false :: INSERT INTO "revisions" ("post_id", "title", "excerpt", "body", "status", "author_id", "summary") VALUES ($1, $2, $3, $4, $5, $6, $7)
-calls=1      buffers=4       (hit=4 read=0) temp_w=0 wal=54 rows=1 target=false :: SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
-calls=1      buffers=4       (hit=4 read=0) temp_w=0 wal=0 rows=1 target=false :: SELECT 1 FROM ONLY "public"."posts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+calls=2      buffers=520     (hit=520 read=0) temp_w=0 wal=0 rows=254 target=true :: SELECT "posts"."id", "posts"."slug", "posts"."post_type", "posts"."parent_id" FROM "posts" WHERE ("posts"."id" = ANY($1))
+calls=1      buffers=23      (hit=23 read=0) temp_w=0 wal=1041 rows=1 target=false :: UPDATE "posts" SET "title" = $1, "slug" = $2, "excerpt" = $3, "body" = $4, "status" = $5, "parent_id" = $6, "featured_media_id" = $7, "menu_order" = $8, "comment_status" = $9, "password" = $10, "sticky" = $11, "published_at" = $12, "lock_version" = $13, "updated_at" = $14 WHERE ("posts"."id" = $15) RETURNING "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at"
+calls=1      buffers=14      (hit=14 read=0) temp_w=0 wal=333 rows=1 target=false :: INSERT INTO "revisions" ("post_id", "title", "excerpt", "body", "status", "author_id", "summary") VALUES ($1, $2, $3, $4, $5, $6, $7)
+calls=1      buffers=5       (hit=5 read=0) temp_w=0 wal=0 rows=1 target=false :: SELECT 1 FROM ONLY "public"."posts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+calls=1      buffers=5       (hit=5 read=0) temp_w=0 wal=54 rows=1 target=false :: SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
 calls=1      buffers=3       (hit=3 read=0) temp_w=0 wal=54 rows=1 target=false :: SELECT 1 FROM ONLY "public"."users" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
 calls=1      buffers=2       (hit=2 read=0) temp_w=0 wal=0 rows=1 target=false :: SELECT "revisions"."id" FROM "revisions" WHERE ("revisions"."post_id" = $1) ORDER BY "revisions"."created_at" DESC LIMIT $2
 calls=1      buffers=2       (hit=2 read=0) temp_w=0 wal=0 rows=0 target=false :: DELETE FROM "revisions" WHERE (("revisions"."post_id" = $1) AND ("revisions"."id" != ALL($2)))
-calls=1      buffers=0       (hit=0 read=0) temp_w=0 wal=0 rows=0 target=false :: COMMIT
+calls=1      buffers=0       (hit=0 read=0) temp_w=0 wal=0 rows=0 target=false :: BEGIN
 -- top 10 by buffers --
-buffers=521     calls=2      target=false :: SELECT "posts"."id", "posts"."slug", "posts"."post_type", "posts"."parent_id" FROM "posts" WHERE ("posts"."id" = ANY($1))
+buffers=520     calls=2      target=true :: SELECT "posts"."id", "posts"."slug", "posts"."post_type", "posts"."parent_id" FROM "posts" WHERE ("posts"."id" = ANY($1))
 buffers=518     calls=3      target=true :: SELECT "posts"."id" FROM "posts" WHERE ("posts"."parent_id" = ANY($1))
-buffers=22      calls=1      target=false :: UPDATE "posts" SET "title" = $1, "slug" = $2, "excerpt" = $3, "body" = $4, "status" = $5, "parent_id" = $6, "featured_media_id" = $7, "menu_order" = $8, "comment_status" = $9, "password" = $10, "sticky" = $11, "published_at" = $12, "lock_version" = $13, "updated_at" = $14 WHERE ("posts"."id" = $15) RETURNING "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at"
-buffers=13      calls=1      target=false :: INSERT INTO "revisions" ("post_id", "title", "excerpt", "body", "status", "author_id", "summary") VALUES ($1, $2, $3, $4, $5, $6, $7)
-buffers=4       calls=1      target=false :: SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
-buffers=4       calls=1      target=false :: SELECT 1 FROM ONLY "public"."posts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+buffers=23      calls=1      target=false :: UPDATE "posts" SET "title" = $1, "slug" = $2, "excerpt" = $3, "body" = $4, "status" = $5, "parent_id" = $6, "featured_media_id" = $7, "menu_order" = $8, "comment_status" = $9, "password" = $10, "sticky" = $11, "published_at" = $12, "lock_version" = $13, "updated_at" = $14 WHERE ("posts"."id" = $15) RETURNING "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at"
+buffers=14      calls=1      target=false :: INSERT INTO "revisions" ("post_id", "title", "excerpt", "body", "status", "author_id", "summary") VALUES ($1, $2, $3, $4, $5, $6, $7)
+buffers=5       calls=1      target=false :: SELECT 1 FROM ONLY "public"."posts" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+buffers=5       calls=1      target=false :: SELECT "posts"."id", "posts"."post_type", "posts"."title", "posts"."slug", "posts"."excerpt", "posts"."body", "posts"."status", "posts"."author_id", "posts"."parent_id", "posts"."featured_media_id", "posts"."menu_order", "posts"."comment_status", "posts"."password", "posts"."sticky", "posts"."comment_count", "posts"."published_at", "posts"."lock_version", "posts"."created_at", "posts"."updated_at" FROM "posts" WHERE ("posts"."id" = $1) LIMIT $2 FOR UPDATE
 buffers=3       calls=1      target=false :: SELECT 1 FROM ONLY "public"."users" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
 buffers=2       calls=1      target=false :: SELECT "revisions"."id" FROM "revisions" WHERE ("revisions"."post_id" = $1) ORDER BY "revisions"."created_at" DESC LIMIT $2
 buffers=2       calls=1      target=false :: DELETE FROM "revisions" WHERE (("revisions"."post_id" = $1) AND ("revisions"."id" != ALL($2)))
-buffers=0       calls=1      target=false :: COMMIT
--- TOTAL calls=14 buffers=1089 temp_blks_written=0 wal_bytes=1480 | TARGET calls=3 (21.4%) buffers=518 (47.6%) --
+buffers=0       calls=1      target=false :: BEGIN
+-- TOTAL calls=14 buffers=1092 temp_blks_written=0 wal_bytes=1482 | TARGET calls=5 (35.7%) buffers=1038 (95.1%) --
 
 === scaling across tiers (whole edit transaction) ===
  descendants  total calls  total buffers   target calls   target buffers
-          10           14            305              3               30
-          50           14            271              3              110
-         250           14           1089              3              518
+          10           14            315              5               62
+          50           14            275              5              222
+         250           14           1092              5             1038
 
 === EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): single-row page lookup (page_path_of, one per page and per ancestor) ===
 SELECT * FROM posts WHERE id = 10571
-Index Scan using posts_pkey on public.posts  (cost=0.29..8.30 rows=1 width=270) (actual time=0.024..0.024 rows=1 loops=1)
+Index Scan using posts_pkey on public.posts  (cost=0.29..8.30 rows=1 width=270) (actual time=0.013..0.013 rows=1 loops=1)
   Output: id, post_type, title, slug, excerpt, body, status, author_id, parent_id, featured_media_id, menu_order, comment_status, password, sticky, comment_count, published_at, lock_version, created_at, updated_at, search_vector
   Index Cond: (posts.id = 10571)
   Buffers: shared hit=3
-Query Identifier: -5571788540620234789
+Query Identifier: 2112339313472242073
 Planning:
-  Buffers: shared hit=53
-Planning Time: 0.219 ms
-Execution Time: 0.043 ms
+  Buffers: shared hit=64
+Planning Time: 0.212 ms
+Execution Time: 0.029 ms
 
 === EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): descendant_ids level query ===
 SELECT id FROM posts WHERE parent_id = ANY(ARRAY[10570])
-Index Scan using idx_posts_parent on public.posts  (cost=0.29..16.38 rows=52 width=8) (actual time=0.010..0.022 rows=52 loops=1)
+Index Scan using idx_posts_parent on public.posts  (cost=0.29..16.38 rows=52 width=8) (actual time=0.012..0.024 rows=52 loops=1)
   Output: id
   Index Cond: (posts.parent_id = ANY ('{10570}'::integer[]))
   Buffers: shared hit=5
-Query Identifier: -3563952532691433536
+Query Identifier: 7726085479349944370
 Planning:
   Buffers: shared hit=3
-Planning Time: 0.082 ms
-Execution Time: 0.031 ms
+Planning Time: 0.137 ms
+Execution Time: 0.035 ms
 
 === EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS): batched row lookup shape ===
 SELECT * FROM posts WHERE id = ANY(ARRAY[10571,10572,10573,10574,10575,10576,10577,10578,10579,10580,10581,10582,10583,10584,10585,10586,10587,10588,10589,10590,10591,10592,10593,10594,10595,10596,10597,10598,10599,10600,10601,10602,10603,10604,10605,10606,10607,10608,10609,10610,10611,10612,10613,10614,10615,10616,10617,10618,10619,10620])
-Index Scan using posts_pkey on public.posts  (cost=0.29..240.05 rows=50 width=270) (actual time=0.025..0.072 rows=50 loops=1)
+Index Scan using posts_pkey on public.posts  (cost=0.29..240.05 rows=50 width=270) (actual time=0.031..0.150 rows=50 loops=1)
   Output: id, post_type, title, slug, excerpt, body, status, author_id, parent_id, featured_media_id, menu_order, comment_status, password, sticky, comment_count, published_at, lock_version, created_at, updated_at, search_vector
   Index Cond: (posts.id = ANY ('{10571,10572,10573,10574,10575,10576,10577,10578,10579,10580,10581,10582,10583,10584,10585,10586,10587,10588,10589,10590,10591,10592,10593,10594,10595,10596,10597,10598,10599,10600,10601,10602,10603,10604,10605,10606,10607,10608,10609,10610,10611,10612,10613,10614,10615,10616,10617,10618,10619,10620}'::integer[]))
   Buffers: shared hit=105
-Query Identifier: -3184711725739598365
-Planning Time: 0.139 ms
-Execution Time: 0.085 ms
+Query Identifier: 4525953264729948609
+Planning Time: 0.095 ms
+Execution Time: 0.350 ms
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.36s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.69s
 

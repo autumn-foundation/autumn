@@ -340,13 +340,16 @@ fn normalized(q: &str) -> String {
 
 /// The statements `page_paths_under` issues: the per-page single-row
 /// `SELECT ... FROM posts WHERE id = $1` (no `FOR UPDATE`, which is the row
-/// lock at the top of the edit) and the `parent_id = ANY($1)` descendant walk.
+/// lock at the top of the edit), its batched `id = ANY($1)` replacement, and
+/// the `parent_id = ANY($1)` descendant walk.
 fn is_target(q: &str) -> bool {
     let q = normalized(q);
     q.starts_with("SELECT")
         && q.contains("FROM \"posts\"")
         && !q.contains("FOR UPDATE")
-        && (q.contains("\"posts\".\"id\" = $1") || q.contains("\"parent_id\" = ANY"))
+        && (q.contains("\"posts\".\"id\" = $1")
+            || q.contains("\"posts\".\"id\" = ANY")
+            || q.contains("\"parent_id\" = ANY"))
 }
 
 /// Prints the ranking by calls and by buffers, and the share the target
