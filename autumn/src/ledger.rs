@@ -1520,6 +1520,41 @@ impl LedgerRevisionPage {
     }
 }
 
+/// The page query of [`read_revisions_page`].
+///
+/// The first page binds `(i64::MIN, i64::MIN)` and takes `id >= $5`, so a row
+/// at exactly that pair is still read. Later pages take `id > $5`.
+#[cfg(feature = "db")]
+const fn revisions_page_sql(first: bool) -> &'static str {
+    macro_rules! page_sql {
+        ($tenant:literal, $id_cmp:literal) => {
+            concat!(
+                "SELECT id, table_name, tenant_id, record_id, seq, op, actor, \
+                 request_id, snapshot, valid_from, recorded_at, prev_hash, hash \
+                 FROM _autumn_ledger_revisions \
+                 WHERE table_name = $1 AND record_id = $2 AND (",
+                $tenant,
+                " IS NULL OR tenant_id = $3) AND seq >= $4 AND (seq > $4 OR id ",
+                $id_cmp,
+                " $5) ORDER BY seq ASC, id ASC LIMIT $6"
+            )
+        };
+    }
+    #[cfg(not(feature = "sqlite"))]
+    let sql = if first {
+        page_sql!("$3::text", ">=")
+    } else {
+        page_sql!("$3::text", ">")
+    };
+    #[cfg(feature = "sqlite")]
+    let sql = if first {
+        page_sql!("$3", ">=")
+    } else {
+        page_sql!("$3", ">")
+    };
+    sql
+}
+
 /// Read one keyset page of a record's chain (#2319).
 ///
 /// The generated `ledger_revisions_page` calls this. The filter
@@ -1577,41 +1612,12 @@ pub async fn read_revisions_page(
         hash: String,
     }
 
-    // The first page binds `(i64::MIN, i64::MIN)` and takes `id >= $5`, so a
-    // row at exactly that pair is still read. Later pages take `id > $5`.
-    macro_rules! page_sql {
-        ($tenant:literal, $id_cmp:literal) => {
-            concat!(
-                "SELECT id, table_name, tenant_id, record_id, seq, op, actor, \
-                 request_id, snapshot, valid_from, recorded_at, prev_hash, hash \
-                 FROM _autumn_ledger_revisions \
-                 WHERE table_name = $1 AND record_id = $2 AND (",
-                $tenant,
-                " IS NULL OR tenant_id = $3) AND seq >= $4 AND (seq > $4 OR id ",
-                $id_cmp,
-                " $5) ORDER BY seq ASC, id ASC LIMIT $6"
-            )
-        };
-    }
-    #[cfg(not(feature = "sqlite"))]
-    let sql = if page.after.is_some() {
-        page_sql!("$3::text", ">")
-    } else {
-        page_sql!("$3::text", ">=")
-    };
-    #[cfg(feature = "sqlite")]
-    let sql = if page.after.is_some() {
-        page_sql!("$3", ">")
-    } else {
-        page_sql!("$3", ">=")
-    };
-
     let limit = page.effective_limit();
     let (after_seq, after_id) = page.after.map_or((i64::MIN, i64::MIN), |c| (c.seq, c.id));
     // One extra row shows whether a next page exists.
     let fetch = i64::from(limit) + 1;
 
-    let rows: Vec<Row> = diesel::sql_query(sql)
+    let rows: Vec<Row> = diesel::sql_query(revisions_page_sql(page.after.is_none()))
         .bind::<Text, _>(table_name)
         .bind::<BigInt, _>(record_id)
         .bind::<Nullable<Text>, _>(tenant_id)
