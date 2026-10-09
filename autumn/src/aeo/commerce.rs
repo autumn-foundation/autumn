@@ -645,9 +645,19 @@ impl PricedRoutes {
     }
 
     /// The priced route for `req`, if any. Uses the route template axum
-    /// matched when it is known.
+    /// matched when it is known. An entry for the request's own method wins
+    /// over a `GET` entry that also prices `HEAD`.
     fn route_for(&self, req: &axum::http::Request<axum::body::Body>) -> Option<&PaidRoute> {
         let method = req.method().as_str();
+        self.lookup(req, |r| r.method.eq_ignore_ascii_case(method))
+            .or_else(|| self.lookup(req, |r| r.method_matches(method)))
+    }
+
+    fn lookup(
+        &self,
+        req: &axum::http::Request<axum::body::Body>,
+        accepts: impl Fn(&PaidRoute) -> bool,
+    ) -> Option<&PaidRoute> {
         let template = req
             .extensions()
             .get::<axum::extract::MatchedPath>()
@@ -656,7 +666,7 @@ impl PricedRoutes {
         // path) can itself start with a locale segment, so a path is matched
         // as it is and with the locale stripped. Both cannot name two
         // different routes: a localized `/x` is mounted at `/{locale}/x`.
-        let routes = self.routes.iter().filter(|r| r.method_matches(method));
+        let routes = self.routes.iter().filter(|r| accepts(r));
         if let Some(t) = template {
             // axum picked the route: price exactly that one, so a wildcard
             // listed first never prices a more specific static route.
@@ -1238,6 +1248,38 @@ mod tests {
         let amount = |path: &str| priced.route_for(&req(path)).map(|r| r.amount.clone());
         assert_eq!(amount("/reports/admin").as_deref(), Some("100"));
         assert_eq!(amount("/reports/7").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn an_explicit_head_price_beats_the_get_fallback() {
+        let priced = PricedRoutes {
+            routes: vec![
+                PaidRoute::new("GET", "/report", "1"),
+                PaidRoute::new("HEAD", "/report", "5"),
+            ],
+            locales: Vec::new(),
+        };
+        let amount = |method: &str| {
+            let req = axum::http::Request::builder()
+                .method(method)
+                .uri("/report")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            priced.route_for(&req).map(|r| r.amount.clone())
+        };
+        assert_eq!(amount("HEAD").as_deref(), Some("5"));
+        assert_eq!(amount("GET").as_deref(), Some("1"));
+        let get_only = PricedRoutes {
+            routes: vec![PaidRoute::new("GET", "/report", "1")],
+            locales: Vec::new(),
+        };
+        let head = axum::http::Request::head("/report")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            get_only.route_for(&head).map(|r| r.amount.as_str()),
+            Some("1")
+        );
     }
 
     #[test]

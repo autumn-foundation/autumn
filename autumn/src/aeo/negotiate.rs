@@ -464,27 +464,33 @@ fn add_vary_accept(headers: &mut HeaderMap) {
     }
 }
 
-/// The body length: `Content-Length`, else an exact body size.
-fn known_len(res: &Response) -> Option<u64> {
-    use http_body::Body as _;
-
+/// The declared `Content-Length`.
+fn content_length(res: &Response) -> Option<u64> {
     res.headers()
         .get(CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
-        .or_else(|| res.body().size_hint().exact())
 }
 
-/// `true` when the body is known to be larger than `max`.
+/// `true` when the body is known to be larger than `max`: from
+/// `Content-Length`, else from an exact body size.
 fn too_large(res: &Response, max: usize) -> bool {
-    known_len(res).is_some_and(|len| len > max as u64)
+    use http_body::Body as _;
+
+    content_length(res)
+        .or_else(|| res.body().size_hint().exact())
+        .is_some_and(|len| len > max as u64)
 }
 
 /// `true` when a `HEAD` response's `GET` body is known to fit in `max`.
-/// The `HEAD` body is already empty, so only `Content-Length`, or a
-/// non-empty exact size, says how long the `GET` body is.
+/// The `HEAD` body may already be empty, so an empty exact size says
+/// nothing; a `Content-Length`, even `0`, or a non-empty exact size does.
 fn known_to_fit(res: &Response, max: usize) -> bool {
-    known_len(res).is_some_and(|len| len > 0 && len <= max as u64)
+    use http_body::Body as _;
+
+    content_length(res)
+        .or_else(|| res.body().size_hint().exact().filter(|&n| n > 0))
+        .is_some_and(|len| len <= max as u64)
 }
 
 async fn to_markdown(res: Response, config: &NegotiateConfig) -> Response {
@@ -597,6 +603,26 @@ async fn collect_limited(mut body: Body, limit: usize) -> Result<Bytes, Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn head_knows_the_length_from_content_length_only() {
+        let res = |len: Option<&'static str>| {
+            let mut res = Response::new(Body::empty());
+            if let Some(len) = len {
+                res.headers_mut()
+                    .insert(CONTENT_LENGTH, HeaderValue::from_static(len));
+            }
+            res
+        };
+        assert!(known_to_fit(&res(Some("0")), 10), "an empty page fits");
+        assert!(known_to_fit(&res(Some("10")), 10));
+        assert!(!known_to_fit(&res(Some("11")), 10));
+        assert!(
+            !known_to_fit(&res(None), 10),
+            "a stripped body says nothing"
+        );
+        assert!(known_to_fit(&Response::new(Body::from("<p>x</p>")), 10));
+    }
 
     #[test]
     fn markdown_drops_the_html_trailer_declaration() {
