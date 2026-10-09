@@ -2929,7 +2929,9 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
 - With `[replication]` on, each open database ships its WAL under
   `fleet/tenant/<id>` / `fleet/slot/<n>` (health `replication:fleet`);
   `restore_missing = true` serves a missing database from its replica on a
-  fresh volume — only once the old host stopped writing.
+  fresh volume — only once the old host stopped writing. A replicated fleet
+  root is served by one process (one replicator per database).
+- The control database lives outside `root` (validation refuses it inside).
 - Outbox rows and derivation backfill stay on the control database.
 - Tests: `TestApp::new().with_db(control).with_fleet(fleet)`.
 

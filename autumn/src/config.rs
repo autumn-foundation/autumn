@@ -10918,8 +10918,60 @@ impl DatabaseConfig {
                     .to_owned(),
             ));
         }
+        if let Some(control_file) = control.and_then(sqlite_url_file) {
+            let root = lexical_absolute(Path::new(&fleet.root));
+            if control_file.starts_with(&root) {
+                return Err(ConfigError::Validation(format!(
+                    "the control database {} is inside database.fleet.root {}; a tenant or \
+                     slot path could resolve to it and migrate it as a tenant. Put the \
+                     control database outside the fleet root",
+                    control_file.display(),
+                    root.display()
+                )));
+            }
+        }
         Ok(())
     }
+}
+
+/// The file a file-backed `sqlite:` URL names, made absolute without touching
+/// the file system. `None` for an in-memory target. Mirrors how the pool
+/// normalizes a target (`sqlite://`, `sqlite:` or `file:`, query dropped).
+fn sqlite_url_file(url: &str) -> Option<PathBuf> {
+    if is_in_memory_sqlite_target(url) {
+        return None;
+    }
+    let rest = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))
+        .unwrap_or(url);
+    let rest = rest.strip_prefix("file:").map_or(rest, |uri| {
+        // `file:///abs` carries an empty authority.
+        uri.strip_prefix("//").unwrap_or(uri)
+    });
+    let path = rest.split('?').next().unwrap_or_default();
+    (!path.is_empty()).then(|| lexical_absolute(Path::new(path)))
+}
+
+/// `path` made absolute against the working directory, with `.` and `..`
+/// resolved lexically (no symlink resolution, no file system access).
+fn lexical_absolute(path: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+    };
+    let mut out = PathBuf::new();
+    for part in joined.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Whether `s` is an acceptable Postgres connection string: a
@@ -20068,6 +20120,38 @@ path = "/healthz"
                 .to_string();
             assert!(err.contains("sqlite: control database"), "{url:?}: {err}");
         }
+    }
+
+    #[test]
+    fn validate_rejects_a_control_database_inside_the_fleet_root() {
+        use crate::fleet_layout::FleetMode;
+        // A tenant named `control` under `{tenant}.db` would open the control
+        // database itself and migrate it as a tenant.
+        for url in [
+            "sqlite:///var/lib/app/control.db",
+            "sqlite:///var/lib/app/./sub/../control.db",
+            "sqlite:/var/lib/app/control.db?mode=rwc",
+            "sqlite:file:/var/lib/app/control.db?cache=private",
+            "sqlite:file:///var/lib/app/control.db",
+        ] {
+            let mut config = fleet_db(DatabaseFleetConfig {
+                root: "/var/lib/app".to_owned(),
+                path: Some("{tenant}.db".to_owned()),
+                ..fleet(FleetMode::Tenant)
+            });
+            config.url = Some(url.to_owned());
+            let err = config
+                .validate()
+                .expect_err("control database inside the fleet root")
+                .to_string();
+            assert!(err.contains("inside database.fleet.root"), "{url}: {err}");
+        }
+        // Beside the root (the documented layout) is fine, and so is a sibling
+        // whose name merely starts with the root's.
+        fleet_db(fleet(FleetMode::Tenant)).validate().unwrap();
+        let mut sibling = fleet_db(fleet(FleetMode::Tenant));
+        sibling.url = Some("sqlite:///var/lib/app/fleet-control.db".to_owned());
+        sibling.validate().unwrap();
     }
 
     #[test]

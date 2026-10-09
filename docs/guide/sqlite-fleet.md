@@ -39,6 +39,9 @@ idle_close_secs = 300           # close a database idle this long
 # restore_missing = false       # see "Replication" below
 ```
 
+The control database must live outside `root`: otherwise a tenant or slot
+path could resolve to it, so config validation refuses that layout.
+
 Every key has an `AUTUMN_DATABASE__FLEET__*` override. With no TOML section,
 setting both `AUTUMN_DATABASE__FLEET__MODE` and `AUTUMN_DATABASE__FLEET__ROOT`
 creates one.
@@ -183,6 +186,12 @@ control database, under `<prefix>/<profile>/fleet/tenant/<id>` or
 
 **Only turn on `restore_missing` for keys the previous owner has stopped
 writing**, or the two copies diverge. Ownership fencing is on the roadmap.
+
+**With replication on, serve a fleet root from one process.** A `web` and a
+`worker` role sharing the root would each replicate the same databases, and a
+restore could pick the generation that missed the other's commits. Electing one
+replicator per database is tracked in
+[#3230](https://github.com/autumn-foundation/autumn/issues/3230).
 
 `/actuator/health` reports `replication:fleet` with the number of databases
 replicating, the worst lag and which database has it.
