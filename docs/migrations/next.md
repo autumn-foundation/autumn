@@ -113,6 +113,52 @@ Do the same for `add_comment`, `delete_comment` and
 **Automation:** `manual` — the new argument depends on the calling
 repository. A codemod cannot know that repository.
 
+### Notifications and push: tables get a `tenant_id` column
+
+**Why:** both tables keyed rows on the bare user id. With `[tenancy]` on, two
+tenants can use the same id. Then they shared one feed and one set of devices
+(#2337). Each row now has a tenant. The framework fills it from the tenant it
+resolved for the request. It never reads it from the request body.
+
+The built-in stores query the new column. An old table gives an error that names
+`tenant_id`. Add the column and the index. Existing rows get `''`, the "no
+tenant" value. An app without tenancy needs nothing else.
+
+**Before (`0.8`):** no `tenant_id` column.
+
+**After (next release):**
+
+```sql
+ALTER TABLE notifications ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';
+CREATE INDEX idx_notifications_tenant_recipient
+    ON notifications (tenant_id, recipient_id);
+
+ALTER TABLE push_subscriptions ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';
+CREATE INDEX idx_push_subscriptions_tenant_principal
+    ON push_subscriptions (tenant_id, principal_id);
+```
+
+If tenancy is on, existing rows must get their real tenant. No tenant can see a row
+that keeps `''`. Set it in the same migration. Use your own rule. For example,
+join to your users table:
+
+```sql
+UPDATE notifications n SET tenant_id = u.tenant_id
+FROM users u WHERE u.id = n.recipient_id;
+```
+
+Two more changes apply when tenancy is on:
+
+- `Notifications::topic(id)` returns `notifications:{tenant}:{id}` inside a
+  tenant scope. Publishers and subscribers must run in the same scope.
+- A job or script that has no request must call the stores inside
+  `autumn_web::tenancy::with_tenant`. Without a tenant, the store uses `''`.
+
+A custom `NotificationStore` or `PushSubscriptionStore` must scope its queries
+by the same tenant.
+
+**Automation:** `manual` — the backfill rule depends on your data.
+
 Repeat the block below for each breaking change. Keep changes grouped by
 area (routing / config / database / …) so readers can skip to what they
 care about.
@@ -465,6 +511,54 @@ Redis stores do not.
 
 **Automation:** `manual` - it is a configuration default.
 
+### Metrics: `autumn_http_request_duration_seconds` is now a histogram
+
+**Why:** You cannot add summaries from different replicas (issue #3064). A
+histogram gives fleet p99 and SLO error ratios.
+
+**Before (`{X.Y}`):** the family was a summary with quantile lines.
+
+```promql
+autumn_http_request_duration_seconds{version="canary",quantile="0.99"}
+```
+
+**After (`{(X+1).0}`):** the family is a histogram with `method`, `route`
+and `status_class` labels. Compute a quantile from the buckets:
+
+```promql
+histogram_quantile(0.99,
+  sum by (le, version) (rate(autumn_http_request_duration_seconds_bucket[5m])))
+```
+
+The old quantile lines stay, deprecated, under a new name:
+`autumn_http_request_duration_quantiles_seconds`. For a quick fix, rename
+the family in your queries, alerts and canary gates. A later release removes
+the summary.
+
+**Automation:** `manual` - the change is in PromQL queries and dashboards,
+not in Rust code.
+
+### Telemetry: `TelemetryConfig` and `OtlpTraceRuntime` have a new field
+
+**Why:** The OTLP sampler takes a ratio now (issue #3064).
+
+**Before (`{X.Y}`):** a struct literal listed every field.
+
+```rust
+let telemetry = TelemetryConfig { enabled: true, /* every field */ strict: false };
+```
+
+**After (`{(X+1).0}`):** add `sample_ratio`, or fill the rest from
+`Default`.
+
+```rust
+let telemetry = TelemetryConfig { enabled: true, ..TelemetryConfig::default() };
+```
+
+`OtlpTraceRuntime` has a new `sample_ratio: SampleRatio` field too.
+
+**Automation:** `manual` - a codemod cannot pick the ratio for you.
+
 ### WebSockets: `ws::WebSocket` and `ws::WebSocketUpgrade` are Autumn types
 
 **Why:** axum's socket sends no close frame when a message is too large, and
@@ -650,6 +744,7 @@ let ceiling: Option<usize> = limit.limit();
 
 **Automation:** `manual` — a new enum variant needs a new match arm, and no
 safe rewrite can choose its body.
+
 ### Config: `HealthConfig` gains four public fields
 
 **Why:** `/ready` now pings the primary database. The new fields set the
@@ -1072,6 +1167,8 @@ If nothing changed, delete this section.
   HTTP client's retry backoff.
 - New: `[jobs] max_backoff_ms` and `AUTUMN_JOBS__MAX_BACKOFF_MS` (default
   `3600000`, 1 h). The cap on job retry backoff for every backend.
+- New key `telemetry.sample_ratio` (`AUTUMN_TELEMETRY__SAMPLE_RATIO`),
+  default `1.0`. See [Overload signals](../guide/observability/overload-signals.md).
 - New: `[jobs] default_timeout_ms` and `AUTUMN_JOBS__DEFAULT_TIMEOUT_MS`
   (default `0`, no limit). The longest one run of a job without
   `#[job(timeout)]` may take (issue #3051).
@@ -1113,6 +1210,17 @@ Changes that still compile but behave differently at runtime. Examples:
 - Error responses adopted a new JSON shape.
 - A default middleware is now ordered differently.
 - A scheduled task now runs on a different worker.
+
+- A trusted proxy can now set the request id. When
+  `[security.trusted_proxies]` trusts the peer and the peer sends a UUID in
+  `X-Request-Id`, the app keeps it. Before, the app always made a new id.
+- `http_client` sends the current request's id as `x-request-id`. A header
+  that you set on the request builder wins.
+- A metric `method` label shows `_other` for a non-standard HTTP method. The
+  `/actuator/metrics` JSON route keys change too: `PROPFIND /x` is now
+  `_other /x`.
+- To stop `http_client` from sending the request id to a host, call
+  `.without_request_id()` on the request builder.
 
 Issue #3058:
 

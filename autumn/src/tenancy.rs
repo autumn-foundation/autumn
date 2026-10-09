@@ -51,6 +51,19 @@ impl axum::extract::FromRequestParts<crate::AppState> for Tenant {
     }
 }
 
+/// The tenant of the current task, or `""` when none is in scope.
+///
+/// Framework-owned per-principal tables (notifications, push) store this in a
+/// `tenant_id` column. `""` is the "no tenant" value, so an app without
+/// tenancy keeps a plain `NOT NULL DEFAULT ''` column.
+pub(crate) fn current_tenant_id() -> String {
+    CURRENT_TENANT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
 // Helper to run in-test tenancy contexts
 pub async fn with_tenant<F, R>(tenant_id: String, future: F) -> R
 where
