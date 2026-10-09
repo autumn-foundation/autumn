@@ -355,6 +355,40 @@ impl DbIdempotencyStore {
     }
 }
 
+/// Run `owner`'s lock on `key` until `until`, and keep the row a TTL past it,
+/// as taking the lock does. `false` when `owner` no longer holds the key.
+async fn renew_lock(
+    conn: &mut RuntimeConnection,
+    key: &str,
+    owner: &str,
+    until: i64,
+    default_ttl: i64,
+) -> diesel::QueryResult<bool> {
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "a SQL expression, evaluated by the database"
+    )]
+    let crash_expires = || {
+        diesel::dsl::case_when(keys::ttl_ms.gt(0), keys::ttl_ms + until)
+            .otherwise(default_ttl.saturating_add(until))
+    };
+    let expiry =
+        diesel::dsl::case_when(keys::expires_at_ms.gt(crash_expires()), keys::expires_at_ms)
+            .otherwise(crash_expires());
+    let renewed = diesel::update(
+        keys::autumn_idempotency_keys
+            .filter(keys::storage_key.eq(key))
+            .filter(keys::locked_by.eq(owner)),
+    )
+    .set((
+        keys::locked_until_ms.eq(until),
+        keys::expires_at_ms.eq(expiry),
+    ))
+    .execute(conn)
+    .await?;
+    Ok(renewed == 1)
+}
+
 /// A recovery point read from one key, to copy to another.
 struct HeldPoint {
     /// `None` when the source has no point: nothing to copy, but both locks
@@ -573,7 +607,24 @@ impl IdempotencyStore for DbIdempotencyStore {
             .execute(&mut conn)
             .await
             .map_err(|e| db_error("acquire idempotency lock", e))?;
-            Ok(acquired == 1)
+            if acquired == 0 {
+                return Ok(false);
+            }
+            // The upsert can wait for another transaction that changed the
+            // row (a row lock on Postgres, the write lock on SQLite), and
+            // then writes the deadline set before the wait. After a wait of
+            // more than a tenth of the TTL, the lock runs a full TTL from
+            // now, and only while this owner still holds it: a lock that
+            // expired during the wait may already belong to a retry.
+            let lock_ms = ms(lock_ttl);
+            let now_after = now_ms();
+            if now_after.saturating_sub(now) <= lock_ms / 10 {
+                return Ok(true);
+            }
+            let until = now_after.saturating_add(lock_ms);
+            renew_lock(&mut conn, key, owner, until, default_ttl)
+                .await
+                .map_err(|e| db_error("renew idempotency lock", e))
         })
     }
 
@@ -1315,6 +1366,83 @@ async fn huge_ttl_round_trip(store: &DbIdempotencyStore) {
 #[cfg(all(test, not(feature = "sqlite")))]
 mod pg_tests {
     use super::*;
+
+    /// Postgres: the lock upsert waits for an open transaction that changed
+    /// the row, longer than the lock TTL, and then takes the lock. The lock
+    /// it reports runs a full TTL from when it was taken, not from before the
+    /// wait: an expired lock would let a retry take the key at once and run
+    /// alongside this request.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn pg_a_lock_taken_after_a_row_wait_runs_a_full_ttl() {
+        use diesel_async::SimpleAsyncConnection as _;
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+        use testcontainers::runners::AsyncRunner as _;
+        use testcontainers_modules::postgres::Postgres;
+
+        let container = Postgres::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+        let manager = AsyncDieselConnectionManager::<RuntimeConnection>::new(url);
+        let pool = Pool::builder(manager).max_size(4).build().unwrap();
+        pool.get()
+            .await
+            .unwrap()
+            .batch_execute(include_str!(
+                "../../migrations/20261005200000_create_idempotency_keys/up.sql"
+            ))
+            .await
+            .unwrap();
+        let store = Arc::new(DbIdempotencyStore::new(
+            pool.clone(),
+            Duration::from_secs(60),
+        ));
+        // A key whose lock expired, with no record: free to take.
+        let mut blocker = pool.get().await.unwrap();
+        diesel::insert_into(keys::autumn_idempotency_keys)
+            .values((
+                keys::storage_key.eq("k"),
+                keys::locked_by.eq(Some("a")),
+                keys::locked_until_ms.eq(0),
+                keys::expires_at_ms.eq(after(Duration::from_secs(600))),
+                keys::ttl_ms.eq(60_000),
+            ))
+            .execute(&mut blocker)
+            .await
+            .unwrap();
+        // Another request changes the row in a transaction still open.
+        blocker.batch_execute("BEGIN").await.unwrap();
+        diesel::update(keys::autumn_idempotency_keys.filter(keys::storage_key.eq("k")))
+            .set(keys::locked_by.eq(Some("b")))
+            .execute(&mut blocker)
+            .await
+            .unwrap();
+        let lock_ttl = Duration::from_secs(1);
+        let take = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move { store.try_lock("k", "c", lock_ttl).await }
+        });
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !take.is_finished(),
+            "the upsert waits for the open transaction"
+        );
+        blocker.batch_execute("ROLLBACK").await.unwrap();
+
+        assert!(take.await.unwrap().unwrap(), "c takes the free key");
+        let mut conn = pool.get().await.unwrap();
+        let (holder, until): (Option<String>, i64) = keys::autumn_idempotency_keys
+            .filter(keys::storage_key.eq("k"))
+            .select((keys::locked_by, keys::locked_until_ms))
+            .first(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(holder.as_deref(), Some("c"));
+        assert!(
+            until > now_ms(),
+            "the lock c reports runs past now, not from before the wait"
+        );
+    }
 
     /// Postgres: another request takes the old key in a transaction still
     /// open when the copy runs. The copy waits for that transaction, then
