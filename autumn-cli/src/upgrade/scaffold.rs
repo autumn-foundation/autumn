@@ -1509,6 +1509,9 @@ fn swap(
     absolute: &Path,
     expected: &str,
 ) -> Result<(), PublishError> {
+    // Close the staged file first. Windows moves a file with a live handle
+    // badly, and the published file must not keep one open.
+    let staged = temp.into_temp_path();
     let directory = absolute
         .parent()
         .ok_or_else(|| PublishError::Failed("no parent directory".to_owned()))?;
@@ -1544,6 +1547,8 @@ fn swap(
             ),
             Err(error) => {
                 // The displaced copy is the only one. Report it, never retry it.
+                let restore = error.error.to_string();
+                let present = error.path.exists();
                 match error.path.keep() {
                     Ok(path) => PublishError::Late(format!(
                         "this file changed twice after the preview was computed; \
@@ -1551,15 +1556,16 @@ fn swap(
                         path.display()
                     )),
                     Err(error) => PublishError::Failed(format!(
-                        "could not keep the displaced copy after a failed restore: {error}"
+                        "could not restore the displaced copy ({restore}) or keep it \
+                         (still there: {present}): {error}"
                     )),
                 }
             }
         });
     }
 
-    match temp.persist_noclobber(absolute) {
-        Ok(_) => finish_claim(claim, expected),
+    match staged.persist_noclobber(absolute) {
+        Ok(()) => finish_claim(claim, expected),
         Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
             // The old copy may have had a late write too. Keep it if so.
             finish_claim(claim, expected)?;
