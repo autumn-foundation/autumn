@@ -273,10 +273,11 @@ impl Manifest {
         // something nobody vouched for. A manifest reachable only through a
         // link is treated as absent, which is the same conservative answer a
         // project that never had one gets.
-        if matches!(read_current(root, MANIFEST_PATH), OnDisk::Linked(_)) {
-            return None;
+        // Parsed from the one snapshot: a second read could land in a swap.
+        match read_current(root, MANIFEST_PATH) {
+            OnDisk::Text(text) => Self::parse(&text),
+            _ => None,
         }
-        Self::parse(&std::fs::read_to_string(root.join(MANIFEST_PATH)).ok()?)
     }
 
     /// Write the manifest under `root`, creating `.autumn/` if needed.
@@ -687,8 +688,12 @@ fn read_current(root: &Path, relative: &str) -> OnDisk {
     // this bounded wait.
     for attempt in 1..SWAP_ATTEMPTS {
         let now = read_current_once(root, relative);
-        if now != OnDisk::Absent || claim_in_flight(&root.join(relative)).is_none() {
+        if now != OnDisk::Absent {
             return now;
+        }
+        if claim_in_flight(&root.join(relative)).is_none() {
+            // The swap may have ended after the read above. Read again.
+            return read_current_once(root, relative);
         }
         back_off(attempt);
     }
