@@ -310,8 +310,9 @@ enforces the parts it can:
 - **Only two effect classes**: database connection checkout and job execution.
   Mail, outbound HTTP and channels have no `FaultPlan` lane — for SMTP use
   `Chaos::smtp_faults`, which already takes an explicit 1-based schedule.
-- **Test-only.** `FaultPlan` attaches to a `TestApp`; there is no production
-  fault injection, by design.
+- **Test-only.** `FaultPlan` attaches to a `TestApp`. For a running staging
+  app, use [`[fault_injection]`](fault-injection.md). It is refused in `prod`
+  by default.
 - **`perform_enqueued_jobs` bypasses it.** `TestClient::perform_enqueued_jobs`
   invokes handlers directly and never crosses the `intercept_execute` seam, so
   job faults never fire under it. Drain with `sim.run_to_idle()` — plus

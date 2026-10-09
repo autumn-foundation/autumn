@@ -2219,6 +2219,12 @@ jobs:
           # tests are executed there, just not measured for coverage here.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --test sqlite_boot_serve
+          # The sqlite URI helpers in `db.rs` (#3032) are covered by lib unit
+          # tests only. Without this leg their lines are instrumented and
+          # never run, so Codecov reads them as uncovered. A name filter keeps
+          # the leg narrow.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
+            --lib -- db::tests::sqlite_ db::tests::percent_decode
           # The #1907 durable job queue and lease scheduler are a large slice of
           # sqlite-only code; without this lane Codecov reports all of it
           # uncovered.
@@ -2248,6 +2254,13 @@ jobs:
             --test feature_flags_pg_integration -- --ignored
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --test scoped_tokens_db -- --ignored
+          # Issue #3072: the shard-local job runtime and the tenant DB
+          # bulkhead run only in these Docker tests of the consolidated
+          # binary. A filter that matches nothing exits 0, so check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored shard_local_jobs:: tenant_db_bulkhead:: \
+            | tee "$RUNNER_TEMP/isolation-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/isolation-cov.log"
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_db -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \
@@ -2556,6 +2569,23 @@ jobs:
         env:
           RUSTFLAGS: "--cfg loom_models"
           LOOM_MAX_PREEMPTIONS: "3"
+
+  # Stateright models of job claims, tick election and lease locks (#3071).
+  # Each model checks all reachable states within small bounds.
+  # Each seeded bug must give a counterexample.
+  # `cargo test --workspace` also runs the models.
+  # This job gives them their own check name.
+  # `verus.yml` runs the Verus proofs.
+  protocol-models:
+    name: Protocol models
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Check the protocol models
+        run: cargo test -p autumn-protocol-models
 
   # Edge capsule conformance (issue #1790). The proof behind AC-1 to AC-3: the
   # `edge-greeting` fixture is compiled BOTH ways — natively and to a real

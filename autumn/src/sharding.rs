@@ -13,9 +13,11 @@
 //! Each shard is a full [`DatabaseTopology`] (primary + optional read
 //! replica), so the primary/replica story composes with sharding.
 //!
-//! Framework state (jobs, scheduler locks, sessions, feature flags) is
-//! **not** sharded; it lives on the control topology configured by
-//! `database.primary_url`/`database.url`.
+//! Most framework state (jobs, scheduler locks, sessions, feature flags)
+//! lives on the control topology configured by
+//! `database.primary_url`/`database.url`. The outbox, commit hooks, version
+//! history and derivation state are on each shard. With
+//! `jobs.postgres.shard_local = true`, jobs are on each shard too (ADR 0018).
 //!
 //! # Example
 //!
@@ -525,6 +527,8 @@ impl DirectoryShardRouter {
         use diesel::OptionalExtension as _;
         use diesel_async::RunQueryDsl;
 
+        // Staging fault injection (#3071). Inert outside a fault scope.
+        crate::fault_injection::__database_fault().await?;
         let mut conn = self.control_pool.get().await.map_err(|e| {
             AutumnError::service_unavailable_msg(format!(
                 "DirectoryShardRouter could not acquire a control connection: {e}"
@@ -2347,6 +2351,27 @@ mod tests {
         create_shard_set(&sharded_config(names), Arc::new(HashShardRouter))
             .expect("lazy pools should build")
             .expect("shards configured")
+    }
+
+    #[tokio::test]
+    async fn an_injected_database_fault_fails_the_directory_lookup() {
+        use crate::fault_injection::{FaultKind, FaultRule, FaultTarget, with_faults};
+
+        let config = DatabaseConfig {
+            primary_url: Some(crate::test_urls::primary("control")),
+            ..Default::default()
+        };
+        let control_pool = crate::db::create_pool(&config)
+            .expect("a lazy pool builds")
+            .expect("a URL is set");
+        let router = DirectoryShardRouter::new(control_pool);
+        let shards = shard_set(&["a"]);
+        let rules = [FaultRule::new(FaultTarget::Database, FaultKind::Error, 1.0)];
+        let Err(error) = with_faults(&rules, router.lookup_directory("tenant", &shards)).await
+        else {
+            panic!("the injected fault must fail the control checkout");
+        };
+        assert!(error.to_string().contains("fault injection"), "{error}");
     }
 
     // ── key→slot golden vectors ─────────────────────────────────────────

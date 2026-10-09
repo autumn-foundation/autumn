@@ -3696,7 +3696,11 @@ fn resolve_daemon_service_report() -> DaemonServiceReport {
         DaemonServiceReport {
             service_capable: true,
             daemon,
-            service: crate::service::registered_service_state(&identity),
+            // A failed query shows as "no service" here. `doctor` only reports.
+            // `serve restart` treats the same failure as an error.
+            service: crate::service::registered_service_state(&identity)
+                .ok()
+                .flatten(),
             missing_prerequisites: crate::service::missing_prerequisites(),
         }
     }

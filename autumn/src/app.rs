@@ -3585,6 +3585,8 @@ impl AppBuilder {
     /// developer error.
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::cognitive_complexity)]
+    // Large frame is expected: the caller boxes this long-lived future.
+    #[allow(clippy::large_stack_frames)]
     pub async fn run(self) {
         // Remember the binary this process was started from, before a deploy
         // can replace the file underneath it: an in-place upgrade (#1674) execs
@@ -5185,6 +5187,13 @@ impl AppBuilder {
         };
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
+        if let Some(warning) = config.server.drain_window_warning() {
+            tracing::warn!(
+                shutdown_timeout_secs = shutdown_timeout,
+                request_timeout_ms = config.server.timeouts.request_timeout_ms,
+                "{warning}"
+            );
+        }
         let prestop_grace = config.server.prestop_grace_secs;
 
         if let Err(error) = initialize_job_runtime(
@@ -5849,8 +5858,7 @@ impl AppBuilder {
 
         let shutdown_state = state.clone();
         let shutdown_signal_token = server_shutdown.clone();
-        #[cfg(feature = "ws")]
-        let websocket_shutdown = state.shutdown.clone();
+        let handler_shutdown = state.probes.shutdown_signal().clone();
         // Clone metrics so the drain-watchdog can record aborted requests.
         let shutdown_metrics = state.metrics.clone();
 
@@ -5928,9 +5936,9 @@ impl AppBuilder {
             }
             tracing::info!(phase = "listener_stopping", "shutdown: stopping listener");
 
-            // Phase 4: send WebSocket close frames.
-            #[cfg(feature = "ws")]
-            websocket_shutdown.cancel();
+            // Phase 4: send WebSocket close frames and cancel the
+            // `ShutdownToken` of running handlers.
+            handler_shutdown.cancel();
 
             // Phase 5: stop listener and signal jobs/scheduler to stop dequeuing.
             // Record drain-start before cancelling so main gets the right hook
@@ -9905,6 +9913,24 @@ struct CronTick {
     window: std::time::Duration,
 }
 
+impl CronTick {
+    /// `true` when `now_unix_secs` is at or after the next occurrence. A zero
+    /// window (no next occurrence) is never past.
+    const fn is_past_window(self, now_unix_secs: u64) -> bool {
+        !self.window.is_zero()
+            && now_unix_secs >= self.unix_secs.saturating_add(self.window.as_secs())
+    }
+
+    /// `true`, with a debug log, when the state clock is past the window.
+    fn is_late(self, state: &AppState, name: &str, tick_key: &str) -> bool {
+        let late = self.is_past_window(crate::time::clock_unix_secs(state.clock()));
+        if late {
+            tracing::debug!(task = %name, tick = %tick_key, "Cron task tick is past its window");
+        }
+        late
+    }
+}
+
 /// Handle the execution of a single cron task.
 #[allow(clippy::cognitive_complexity)]
 #[allow(
@@ -9928,6 +9954,13 @@ async fn execute_cron_task(
     let tick_key = scheduled_key;
     let lease = loop {
         if wait_first && !gate.wait(&state, &name).await {
+            gate.release();
+            return;
+        }
+        // A cost wait can outlast the tick row (#3071). Another replica can
+        // have run this occurrence, and the prune can have deleted its row.
+        // Do not claim the occurrence after its window.
+        if gate.waited() && occurrence.is_late(&state, &name, &tick_key) {
             gate.release();
             return;
         }
@@ -9955,6 +9988,14 @@ async fn execute_cron_task(
         }
         break lease;
     };
+    // The claim can wait too (a pool checkout, a slow query). Check the window
+    // again: a claim after the window can have found a pruned row of a tick
+    // that ran (#3071). Keep the row, so no replica runs the tick again.
+    if occurrence.is_late(&state, &name, &tick_key) {
+        gate.release();
+        release_task_lease(lease, &name, &tick_key).await;
+        return;
+    }
     state
         .task_registry
         .record_leader(&name, lease.leader_id(), &tick_key);
@@ -14798,16 +14839,18 @@ fn build_state(
     #[cfg(feature = "db")] shards: Option<crate::sharding::ShardSet>,
     #[cfg(feature = "ws")] channels_backend: Option<Arc<dyn crate::channels::ChannelsBackend>>,
 ) -> AppState {
-    #[cfg(feature = "ws")]
-    let shutdown = tokio_util::sync::CancellationToken::new();
+    let probes = crate::probe::ProbeState::pending_startup();
     #[cfg(feature = "ws")]
     let channels = channels_backend.map_or_else(
         || {
-            crate::channels::Channels::from_config(&config.channels, shutdown.child_token())
-                .unwrap_or_else(|error| {
-                    tracing::error!(error = %error, "Failed to configure channels backend");
-                    std::process::exit(1);
-                })
+            crate::channels::Channels::from_config(
+                &config.channels,
+                probes.shutdown_signal().child_token(),
+            )
+            .unwrap_or_else(|error| {
+                tracing::error!(error = %error, "Failed to configure channels backend");
+                std::process::exit(1);
+            })
         },
         crate::channels::Channels::with_shared_backend,
     );
@@ -14833,7 +14876,7 @@ fn build_state(
         role: config.role,
         started_at: crate::time::monotonic_now(),
         health_detailed: config.health.detailed,
-        probes: crate::probe::ProbeState::pending_startup(),
+        probes,
         metrics: crate::middleware::MetricsCollector::new(),
         log_levels: crate::actuator::LogLevels::new(&config.log.level),
         task_registry: crate::actuator::TaskRegistry::new(),
@@ -14847,8 +14890,6 @@ fn build_state(
         presence,
         #[cfg(feature = "ws")]
         channels,
-        #[cfg(feature = "ws")]
-        shutdown,
         policy_registry: crate::authorization::PolicyRegistry::default(),
         forbidden_response: config.security.forbidden_response,
         auth_session_key: Arc::from(config.auth.session_key.as_str()),
@@ -20776,7 +20817,7 @@ mod tests {
         for (backend, acquired_while_high) in [("sqlite", 0), ("postgres", 0), ("in_process", 1)] {
             let name = format!("cost_lease_order_{backend}");
             crate::cost::mark_deferrable(crate::cost::WorkKind::Task, &name);
-            let state = AppState::for_test();
+            let state = cron_test_state();
             let signal = crate::cost::CostSignal::new(Some(1.0));
             signal.set(5.0);
             state.insert_extension(signal.clone());
@@ -20871,7 +20912,7 @@ mod tests {
         static SEEN_RETRY_TICK: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
         let name = "cost_sqlite_rising_signal".to_owned();
         crate::cost::mark_deferrable(crate::cost::WorkKind::Task, &name);
-        let state = AppState::for_test();
+        let state = cron_test_state();
         let signal = crate::cost::CostSignal::new(Some(1.0));
         state.insert_extension(signal.clone());
         let acquired = std::sync::Arc::new(AtomicUsize::new(0));
@@ -20953,7 +20994,7 @@ mod tests {
     /// every later tick would fold into a wait that never happens (#1720).
     #[tokio::test]
     async fn execute_cron_task_clears_the_cost_flag_when_the_lease_is_taken() {
-        let state = AppState::for_test();
+        let state = cron_test_state();
         let waiting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
 
@@ -21180,7 +21221,7 @@ mod tests {
     // Issue #3052: the handler reads its tick and fencing token.
     #[tokio::test]
     async fn scheduled_handler_sees_its_tick_and_fencing_token() {
-        let state = AppState::for_test();
+        let state = cron_test_state();
         state.task_registry.register_scheduled(
             "cron_fence_task",
             "cron 0 * * * * *",
@@ -21265,6 +21306,76 @@ mod tests {
             tick_keys.lock().unwrap().as_slice(),
             ["cron_review_task:1700000000"]
         );
+    }
+
+    /// A test state whose clock is one second into the cron occurrence at
+    /// `1_700_000_000`, so the window check lets the occurrence run.
+    fn cron_test_state() -> AppState {
+        AppState::for_test().with_clock(std::sync::Arc::new(crate::time::FixedClock::at(
+            chrono::DateTime::from_timestamp(1_700_000_001, 0).expect("a valid timestamp"),
+        )))
+    }
+
+    /// #3071: a cost wait, or a slow claim, can outlast the tick row.
+    /// Another replica can have run the occurrence, and the prune can have
+    /// deleted its row. An occurrence past its window does not run.
+    #[tokio::test]
+    async fn execute_cron_task_skips_an_occurrence_past_its_window() {
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+
+        async fn claims(scheduled_unix_secs: u64, waited: bool) -> Vec<String> {
+            let state = AppState::for_test();
+            state.task_registry.register_scheduled(
+                "late_cron_task",
+                "cron */10 * * * * *",
+                crate::task::TaskCoordination::Fleet,
+                "postgres",
+                "replica-a",
+            );
+            let tick_keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let coordinator = std::sync::Arc::new(GrantingSchedulerCoordinator {
+                backend: "postgres",
+                tick_keys: std::sync::Arc::clone(&tick_keys),
+                release_count: None,
+            });
+            let handler: crate::task::TaskHandler = |_| {
+                RUNS.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            };
+            super::execute_cron_task(
+                "late_cron_task".to_owned(),
+                state.clone(),
+                handler,
+                crate::task::TaskCoordination::Fleet,
+                coordinator,
+                std::time::Duration::from_secs(30),
+                super::CronTick {
+                    unix_secs: scheduled_unix_secs,
+                    window: std::time::Duration::from_secs(10),
+                },
+                super::CostGate {
+                    shutdown: tokio_util::sync::CancellationToken::new(),
+                    waiting: None,
+                    waited: std::sync::atomic::AtomicBool::new(waited),
+                },
+            )
+            .await;
+            tick_keys.lock().unwrap().clone()
+        }
+
+        let now = crate::time::clock_unix_secs(AppState::for_test().clock());
+        // After a cost wait: not claimed.
+        assert!(claims(1_700_000_000, true).await.is_empty());
+        // A slow claim: claimed, but not run.
+        assert_eq!(claims(1_700_000_000, false).await.len(), 1);
+        assert_eq!(
+            RUNS.load(Ordering::SeqCst),
+            0,
+            "a late occurrence does not run"
+        );
+        // In the window: claimed and run.
+        assert_eq!(claims(now, true).await, [format!("late_cron_task:{now}")]);
+        assert_eq!(RUNS.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -21375,7 +21486,7 @@ mod tests {
 
         super::execute_cron_task(
             "daily_task".to_owned(),
-            AppState::for_test(),
+            cron_test_state(),
             handler,
             crate::task::TaskCoordination::Fleet,
             std::sync::Arc::clone(&coordinator) as _,

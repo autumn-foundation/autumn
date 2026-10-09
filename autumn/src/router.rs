@@ -1050,7 +1050,7 @@ fn build_router_pre_state(
             mcp_router = apply_request_timeout_middleware(
                 mcp_router,
                 config,
-                state.metrics.clone(),
+                state,
                 std::sync::Arc::new(std::collections::HashMap::new()),
                 false,
             );
@@ -4285,6 +4285,38 @@ fn finish_load_shed_layer(
 /// The clock and entropy source are taken from the app state rather than read
 /// ambiently, so a [`#[sim_test]`](crate::sim_test) controls both the sampling
 /// decision and the recorded timestamps.
+/// Paths that fault injection never faults: the probes and the actuator.
+fn fault_injection_exempt_paths(config: &AutumnConfig) -> Vec<String> {
+    let mut paths = probe_bypass_paths(config);
+    paths.extend(crate::actuator::actuator_endpoint_paths(
+        &config.actuator.prefix,
+        config.actuator.sensitive,
+        config.actuator.prometheus,
+    ));
+    paths
+}
+
+/// Install both fault injection layers again outside the static-first
+/// middleware (the SSG/ISG path), on the injector that `apply_middleware`
+/// built. A cached page is outside the request timeout, so the route layer
+/// caps injected latency at it.
+fn install_outer_fault_injection(
+    router: axum::Router<AppState>,
+    config: &AutumnConfig,
+    state: &AppState,
+) -> axum::Router<AppState> {
+    let Some(handle) = state.extension::<crate::fault_injection::FaultInjection>() else {
+        return router;
+    };
+    let deadline = config
+        .server
+        .timeouts
+        .request_timeout_ms
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis);
+    router.layer(handle.layers(deadline))
+}
+
 fn build_shadow_layer(
     config: &AutumnConfig,
     state: &AppState,
@@ -4612,12 +4644,11 @@ fn expand_route_timeout_table_for_locale_prefix<T: Clone>(
 fn apply_request_timeout_middleware(
     router: axum::Router<AppState>,
     config: &AutumnConfig,
-    metrics: crate::middleware::MetricsCollector,
+    state: &AppState,
     route_timeouts: RouteTimeoutTable,
     mirror_cors: bool,
 ) -> axum::Router<AppState> {
-    let Some(settings) =
-        build_request_timeout_settings(config, metrics, route_timeouts, mirror_cors)
+    let Some(settings) = build_request_timeout_settings(config, state, route_timeouts, mirror_cors)
     else {
         return router;
     };
@@ -4641,6 +4672,10 @@ struct RequestTimeoutSettings {
     route_timeouts: RouteTimeoutTable,
     metrics: crate::middleware::MetricsCollector,
     cors: Option<std::sync::Arc<crate::config::CorsConfig>>,
+    /// Read the caller's [`crate::deadline::DEADLINE_HEADER`] (issue #3058).
+    accept_deadline_header: bool,
+    /// The jitter source for the timeout `Retry-After` (seeded in a sim).
+    entropy: Arc<dyn crate::entropy::Entropy>,
 }
 
 /// Resolve the request-timeout settings, or `None` when no global timeout is
@@ -4656,7 +4691,7 @@ struct RequestTimeoutSettings {
 /// place the layer in the composed ingress stack (issue #2193).
 fn build_request_timeout_settings(
     config: &AutumnConfig,
-    metrics: crate::middleware::MetricsCollector,
+    state: &AppState,
     route_timeouts: RouteTimeoutTable,
     mirror_cors: bool,
 ) -> Option<RequestTimeoutSettings> {
@@ -4694,8 +4729,10 @@ fn build_request_timeout_settings(
     Some(RequestTimeoutSettings {
         global,
         route_timeouts,
-        metrics,
+        metrics: state.metrics.clone(),
         cors,
+        accept_deadline_header: config.server.timeouts.accept_deadline_header,
+        entropy: state.entropy_arc(),
     })
 }
 
@@ -4768,11 +4805,19 @@ impl<S> RequestTimeoutService<S> {
             .and_then(|by_method| by_method.get(req.method()))
             .copied()
             .unwrap_or(crate::route::RouteTimeout::Inherit);
-        match route_timeout {
+        let route_deadline = match route_timeout {
             crate::route::RouteTimeout::Disabled => None,
             crate::route::RouteTimeout::Override(d) => Some(d),
             crate::route::RouteTimeout::Inherit => self.settings.global,
-        }
+        }?;
+        // The caller's deadline header can only make the deadline shorter.
+        let caller_deadline = self
+            .settings
+            .accept_deadline_header
+            .then(|| req.headers().get(crate::deadline::DEADLINE_HEADER))
+            .flatten()
+            .and_then(crate::deadline::parse_header);
+        Some(caller_deadline.map_or(route_deadline, |caller| caller.min(route_deadline)))
     }
 
     /// `true` when the matched route has `timeout = "off"`.
@@ -4814,6 +4859,10 @@ where
                 inner: self.inner.call(req),
             };
         };
+        // In a fault scope, take only the time left: a fault wait before this
+        // layer used part of the request timeout (#3071).
+        let duration =
+            crate::fault_injection::time_left().map_or(duration, |left| duration.min(left));
         // Adaptive admission tells a cancel at this deadline (overload) from a
         // client that goes away (#3068).
         if let Some(at) = tokio::time::Instant::now().checked_add(duration) {
@@ -4839,22 +4888,40 @@ where
             .as_ref()
             .and_then(|_| req.headers().get(http::header::ORIGIN).cloned());
 
-        // Build the inner future first, then start the clock, then arm the timer,
-        // so `start` and the deadline measure the same interval. The `from_fn`
-        // form armed both inside an async block, before the downstream `call`
-        // chain ran; here that chain runs during `self.inner.call(req)`, so
-        // capturing `start` earlier would make `elapsed_ms` measure a longer span
-        // than `timeout_ms`.
+        // Start the clock and the deadline together, before the downstream
+        // `call` chain runs, so `start` and the deadline measure the same
+        // interval. The handler sees the deadline during `self.inner.call(req)`
+        // (issue #3058), so synchronous work there counts against it, as it
+        // did in the `from_fn` form, which armed both inside an async block
+        // before that chain ran.
         //
         // `tokio::time::timeout` needs a runtime handle, so this `call` must run
         // inside a Tokio runtime. `tower::timeout::Timeout::call` has the same
         // requirement, and every driver in this crate reaches it through
         // `ServiceExt::oneshot`, which calls `call` only from inside a poll.
-        let inner = self.inner.call(req);
+        //
+        // The handler sees the deadline through `Deadline::current()` (issue
+        // #3058). The task-local scope costs no allocation.
         let start = crate::time::ambient_instant();
+        // A deadline of 0 (from the caller's header) leaves no time: answer
+        // with the timeout response without calling the handler at all.
+        if duration.is_zero() {
+            return RequestTimeoutFuture::Elapsed {
+                response: Some(deadline_exceeded_response(
+                    &self.settings,
+                    duration,
+                    matched_path.as_deref(),
+                    request_id.as_ref(),
+                    cors_origin.as_ref(),
+                    start,
+                )),
+            };
+        }
+        let deadline = crate::deadline::Deadline::after(duration);
+        let inner = deadline.sync_scope(|| self.inner.call(req));
 
         RequestTimeoutFuture::Bounded {
-            inner: tokio::time::timeout(duration, inner),
+            inner: crate::deadline::Bounded::until(deadline, inner),
             settings: Arc::clone(&self.settings),
             duration,
             matched_path,
@@ -4869,12 +4936,14 @@ pin_project_lite::pin_project! {
     /// Future returned by [`RequestTimeoutService`].
     ///
     /// `Unbounded` is the exempt path and is literally the inner service's own
-    /// future; `Bounded` wraps it in `tokio::time::Timeout`, which is a named
-    /// type, so neither variant is heap-allocated.
+    /// future; `Bounded` wraps it in [`crate::deadline::Bounded`], which is a
+    /// named type, so neither variant is heap-allocated. It checks the
+    /// deadline before every poll of the handler, so a handler woken at or
+    /// after the deadline does not run on (issue #3058).
     ///
     /// `Elapsed` exists to make the deadline actually *cancel*.
-    /// `tokio::time::Timeout::poll` does not drop the future it wraps when the
-    /// timer fires — it just reports `Err(Elapsed)` — so a `Bounded` variant
+    /// `Bounded::poll` does not drop the future it wraps when the deadline
+    /// passes — it just reports `Err(DeadlineExceeded)` — so a `Bounded` variant
     /// that returned the `503` in place would keep the whole cancelled handler
     /// tree (its database connection guards, its load-shed slot, its webhook
     /// [`ReplayKeyGuard`](crate::webhook)) alive until whatever owns *this*
@@ -4891,7 +4960,7 @@ pin_project_lite::pin_project! {
         },
         Bounded {
             #[pin]
-            inner: tokio::time::Timeout<F>,
+            inner: crate::deadline::Bounded<F>,
             settings: Arc<RequestTimeoutSettings>,
             duration: Duration,
             matched_path: Option<String>,
@@ -4932,7 +5001,7 @@ where
                     start,
                 } => match std::task::ready!(inner.poll(cx)) {
                     Ok(response) => return std::task::Poll::Ready(response),
-                    Err(_elapsed) => Self::Elapsed {
+                    Err(crate::deadline::DeadlineExceeded) => Self::Elapsed {
                         response: Some(deadline_exceeded_response(
                             settings,
                             *duration,
@@ -4998,6 +5067,11 @@ fn deadline_exceeded_response(
     // Tag the 503 so the outer session layer skips persisting any partial
     // session mutation the cancelled handler made before the deadline.
     response.extensions_mut().insert(RequestDeadlineCancelled);
+    // Tell the client when to retry. Jitter spreads the retries (issue #3058).
+    response.headers_mut().insert(
+        http::header::RETRY_AFTER,
+        http::HeaderValue::from(timeout_retry_after_secs(settings.entropy.as_ref())),
+    );
     // This layer is outside `CorsLayer` in the main stack, so the 503
     // never passes back through it; mirror the CORS headers ourselves so
     // cross-origin browser clients can read the Problem Details body
@@ -5006,6 +5080,16 @@ fn deadline_exceeded_response(
         mirror_cors_headers(cors, cors_origin, &mut response);
     }
     response
+}
+
+/// The lowest and highest `Retry-After` seconds on a timeout `503`.
+const TIMEOUT_RETRY_AFTER_SECS: std::ops::RangeInclusive<u64> = 1..=3;
+
+/// A `Retry-After` value for a timeout `503`, from `entropy`. Each value in
+/// [`TIMEOUT_RETRY_AFTER_SECS`] has about the same chance.
+fn timeout_retry_after_secs(entropy: &dyn crate::entropy::Entropy) -> u64 {
+    let (low, high) = TIMEOUT_RETRY_AFTER_SECS.into_inner();
+    low + entropy.next_u64() % (high - low + 1)
 }
 
 struct BuiltIdempotencyLayers {
@@ -5324,6 +5408,28 @@ fn apply_middleware(
     let (body_limit, upload_config) = build_upload_layers(config);
     let trusted_host_policy = TrustedHostPolicy::from_config_with_state(config, state);
     let (rate_limit_layer, rate_limit_principal_keying) = build_rate_limit_layers(config, state);
+    // Staging fault injection (#3071). The scope layer goes outside the
+    // exception filters and the session layer, so the Redis session store is
+    // in the request scope and the stop condition sees the final status. The route layer is the
+    // innermost member of `inner_stack`: it runs after rate limiting and load
+    // shedding, and the timeout, the access log and error reporting see an
+    // injected fault as a real one. Probe and actuator paths are exempt, as
+    // for `[shadow]`. `build` has no side effects.
+    // On the SSG/ISG path, `install_outer_fault_injection` adds the layers
+    // again outside the static-first middleware, on the same injector. The
+    // inner ones stay for the MCP dispatch clone; a request keeps the first
+    // scope, and route faults roll once.
+    let fault_injection = crate::fault_injection::build(
+        config,
+        state,
+        fault_injection_exempt_paths(config),
+        &route_timeouts,
+    );
+    let (fault_scope_layer, fault_route_layer, fault_handle) = match fault_injection {
+        Some((scope, route, handle)) => (Some(scope), Some(route), Some(handle)),
+        None => (None, None, None),
+    };
+
     let inner_stack = (
         // Insert UploadConfig into extensions so the Multipart extractor can
         // read per-file limits and the allowed MIME-type list.
@@ -5382,6 +5488,7 @@ fn apply_middleware(
         tower::util::option_layer(submit_token_layer),
         TrustedHostLayer::new(trusted_host_policy),
         tower::util::option_layer(build_ingress_cors_layer(config)),
+        tower::util::option_layer(fault_route_layer),
     );
 
     // User-registered Tower layers (`AppBuilder::layer`) wrap the group above.
@@ -5435,9 +5542,8 @@ fn apply_middleware(
     //
     // `apply_request_timeout_middleware` installs the same layer type for the
     // `/mcp` envelope, so the two cannot drift.
-    let timeout_layer =
-        build_request_timeout_settings(config, state.metrics.clone(), route_timeouts, true)
-            .map(RequestTimeoutLayer::new);
+    let timeout_layer = build_request_timeout_settings(config, state, route_timeouts, true)
+        .map(RequestTimeoutLayer::new);
 
     // Failure-capsule capture (#1598). Outer to the reporting layer, because a
     // request's capture scope must exist before that layer snapshots its context;
@@ -5788,6 +5894,9 @@ fn apply_middleware(
         // x402 payments for `[[aeo.paid_routes]]`, inner to the AEO layer.
         aeo_x402_layer(config, state, defer_shadow),
         crate::middleware::MetricsLayer::new(state.metrics.clone()),
+        // Outside the exception filters, so the stop condition counts the
+        // final status that a filter may set (#3071).
+        tower::util::option_layer(fault_scope_layer),
         ExceptionFilterLayer::new(all_filters),
         crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev },
         ryw_layer,
@@ -5826,6 +5935,10 @@ fn apply_middleware(
     // by `build_router_pre_state` after this function returns and after the MCP
     // dispatch clone is taken, so a `tools/call` replay never traverses the
     // page-cache gate (matching the SSG/ISG path and the documented intent).
+    if let Some(handle) = fault_handle {
+        crate::fault_injection::announce(&handle);
+        state.insert_extension(handle);
+    }
     Ok(router)
 }
 
@@ -6410,6 +6523,12 @@ pub fn try_build_router_with_static_inner(
     // so where exactly it merges relative to the shadow/compression/
     // static_gate/security-headers wraps below doesn't matter; only staying
     // outside `custom_layers` does.
+    // Fault injection (#3071), for the same reason as shadow mirroring below:
+    // a pre-rendered page never reaches the inner router, so the layers also
+    // go here. Before the MCP merge, so they do not wrap the `/mcp` envelope;
+    // its replays go through the inner layers, as on the dynamic path.
+    router = install_outer_fault_injection(router, config, &state);
+
     if let Some(mcp_router) = deferred_mcp_router {
         router = router.merge(mcp_router);
     }
@@ -13822,15 +13941,10 @@ mod trusted_host_tests {
         );
 
         // Place timeout inner to RequestIdLayer (matches apply_middleware ordering).
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            no_route_timeouts(),
-            false,
-        )
-        .layer(RequestIdLayer::default())
-        .with_state(state);
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), false)
+                .layer(RequestIdLayer::default())
+                .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
@@ -13852,6 +13966,41 @@ mod trusted_host_tests {
         );
     }
 
+    /// In a fault scope, the timeout takes only the time left: a fault wait
+    /// before this layer (the Redis session load) uses part of it (#3071).
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout_takes_the_time_left_in_a_fault_scope() {
+        let mut config = AutumnConfig::default();
+        config.server.timeouts.request_timeout_ms = Some(1000);
+
+        let state = crate::state::AppState::for_test();
+        let router: axum::Router<AppState> = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                "ok"
+            }),
+        );
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+            false,
+        )
+        .with_state(state);
+
+        let request = Request::builder().uri("/slow").body(Body::empty()).unwrap();
+        let response = crate::fault_injection::with_request_budget(
+            std::time::Duration::from_millis(200),
+            router.oneshot(request),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn request_timeout_increments_metric() {
         let mut config = AutumnConfig::default();
@@ -13866,15 +14015,10 @@ mod trusted_host_tests {
             }),
         );
 
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            no_route_timeouts(),
-            false,
-        )
-        .layer(RequestIdLayer::default())
-        .with_state(state.clone());
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), false)
+                .layer(RequestIdLayer::default())
+                .with_state(state.clone());
 
         router
             .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
@@ -13904,15 +14048,10 @@ mod trusted_host_tests {
             }),
         );
 
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            no_route_timeouts(),
-            false,
-        )
-        .layer(RequestIdLayer::default())
-        .with_state(state);
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), false)
+                .layer(RequestIdLayer::default())
+                .with_state(state);
 
         // A live inbound request (no marker) is bounded by the deadline -> 503.
         let live = router
@@ -13964,15 +14103,10 @@ mod trusted_host_tests {
 
         // `mirror_cors = true`, matching the main ingress stack where the timeout
         // layer is outside `CorsLayer` and the 503 would otherwise be opaque.
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            no_route_timeouts(),
-            true,
-        )
-        .layer(RequestIdLayer::default())
-        .with_state(state);
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), true)
+                .layer(RequestIdLayer::default())
+                .with_state(state);
 
         let response = router
             .oneshot(
@@ -14027,15 +14161,10 @@ mod trusted_host_tests {
             }),
         );
 
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            no_route_timeouts(),
-            true,
-        )
-        .layer(RequestIdLayer::default())
-        .with_state(state);
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), true)
+                .layer(RequestIdLayer::default())
+                .with_state(state);
 
         let response = router
             .oneshot(
@@ -14072,15 +14201,10 @@ mod trusted_host_tests {
             }),
         );
 
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            no_route_timeouts(),
-            false,
-        )
-        .layer(RequestIdLayer::default())
-        .with_state(state);
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), false)
+                .layer(RequestIdLayer::default())
+                .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
@@ -14110,14 +14234,9 @@ mod trusted_host_tests {
         let router: axum::Router<AppState> =
             axum::Router::new().route("/fast", axum::routing::get(|| async { "pong" }));
 
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            no_route_timeouts(),
-            false,
-        )
-        .with_state(state);
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), false)
+                .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/fast").body(Body::empty()).unwrap())
@@ -14136,14 +14255,9 @@ mod trusted_host_tests {
         let router: axum::Router<AppState> =
             axum::Router::new().route("/fast", axum::routing::get(|| async { "pong" }));
 
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            no_route_timeouts(),
-            false,
-        )
-        .with_state(state);
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), false)
+                .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/fast").body(Body::empty()).unwrap())
@@ -14171,14 +14285,9 @@ mod trusted_host_tests {
 
         // No RequestIdLayer — exercises the `request_id: None` branch in
         // `RequestTimeoutService`.
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            no_route_timeouts(),
-            false,
-        )
-        .with_state(state);
+        let router =
+            apply_request_timeout_middleware(router, &config, &state, no_route_timeouts(), false)
+                .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
@@ -14209,9 +14318,8 @@ mod trusted_host_tests {
             "/export",
             crate::route::RouteTimeout::Override(std::time::Duration::from_secs(10)),
         );
-        let router =
-            apply_request_timeout_middleware(router, &config, state.metrics.clone(), table, false)
-                .with_state(state);
+        let router = apply_request_timeout_middleware(router, &config, &state, table, false)
+            .with_state(state);
 
         let response = router
             .oneshot(
@@ -14246,9 +14354,8 @@ mod trusted_host_tests {
         );
 
         let table = get_route_timeouts("/stream", crate::route::RouteTimeout::Disabled);
-        let router =
-            apply_request_timeout_middleware(router, &config, state.metrics.clone(), table, false)
-                .with_state(state.clone());
+        let router = apply_request_timeout_middleware(router, &config, &state, table, false)
+            .with_state(state.clone());
 
         let response = router
             .oneshot(
@@ -14286,9 +14393,8 @@ mod trusted_host_tests {
             "/export",
             crate::route::RouteTimeout::Override(std::time::Duration::from_millis(100)),
         );
-        let router =
-            apply_request_timeout_middleware(router, &config, state.metrics.clone(), table, false)
-                .with_state(state);
+        let router = apply_request_timeout_middleware(router, &config, &state, table, false)
+            .with_state(state);
 
         let response = router
             .oneshot(
@@ -14490,14 +14596,9 @@ mod trusted_host_tests {
         let mut table = std::collections::HashMap::new();
         table.insert("/poll".to_owned(), by_method);
         let table: RouteTimeoutTable = Arc::new(table);
+        let state = AppState::for_test();
         let build = |config: &AutumnConfig| {
-            build_request_timeout_settings(
-                config,
-                crate::middleware::MetricsCollector::new(),
-                table.clone(),
-                false,
-            )
-            .is_some()
+            build_request_timeout_settings(config, &state, table.clone(), false).is_some()
         };
 
         let mut config = AutumnConfig::default();
@@ -14711,6 +14812,48 @@ mod trusted_host_tests {
             #[cfg(feature = "mcp")]
             mcp: None,
         }
+    }
+
+    /// #3071: on the SSG/ISG path the fault layers go outside the static
+    /// cache, so a route fault reaches a cached page, and only once.
+    #[tokio::test]
+    async fn route_fault_reaches_a_cached_static_page() {
+        let (_tmp, dist) = build_cached_dist("<h1>cached</h1>");
+        let mut config = AutumnConfig {
+            profile: Some("staging".to_owned()),
+            ..AutumnConfig::default()
+        };
+        config.fault_injection.enabled = true;
+        config.fault_injection.faults = vec![crate::fault_injection::FaultRule::new(
+            crate::fault_injection::FaultTarget::Route,
+            crate::fault_injection::FaultKind::Error,
+            1.0,
+        )];
+        let state = crate::state::AppState::for_test();
+        let app = super::try_build_router_with_static_inner(
+            Vec::new(),
+            &config,
+            state.clone(),
+            Some(dist.as_path()),
+            ctx_with_static_gate(redirect_gate_registration()),
+        )
+        .expect("router builds");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("x-authed", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let faults = state
+            .extension::<crate::fault_injection::FaultInjection>()
+            .expect("the handle is installed");
+        assert_eq!(faults.snapshot().injected, 1, "one fault, not two");
     }
 
     #[tokio::test]

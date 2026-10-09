@@ -659,6 +659,21 @@ pub async fn tenancy_middleware(
     // automatically carries the resolved tenant id.
     crate::log::context::set_tenant_id(&tenant_id);
 
+    // Per-tenant bulkheads (#3072). The request permit lives until the
+    // response head is ready, as an admission permit does.
+    let bulkheads =
+        state.extension_or_insert_with(|| TenantBulkheads::from_config(&config.tenancy));
+    let acquired = bulkheads
+        .requests
+        .as_ref()
+        .map(|bulkhead| bulkhead.try_acquire(&tenant_id));
+    if matches!(acquired, Some(None)) {
+        state.metrics.record_tenant_request_rejection();
+        let origin = parts.headers.get(axum::http::header::ORIGIN);
+        return tenant_bulkhead_rejection(&tenant_id, &config.cors, origin);
+    }
+    let _request_permit = acquired.flatten();
+
     let request = Request::from_parts(parts, body);
     let tenant_id_clone = tenant_id.clone();
 
@@ -683,20 +698,69 @@ pub async fn tenancy_middleware(
     );
     let handle_for_body = Some(handle.clone());
 
-    let response = CURRENT_TENANT
-        .scope(
-            Some(tenant_id),
-            crate::tenant_cell::CURRENT_TENANT_CELL.scope(Some(handle), next.run(request)),
-        )
-        .await;
+    let run = crate::tenant_cell::CURRENT_TENANT_CELL.scope(Some(handle), next.run(request));
+    let response = match bulkheads.db.clone() {
+        Some(db) => {
+            CURRENT_TENANT
+                .scope(
+                    Some(tenant_id),
+                    crate::bulkhead::TENANT_DB_BULKHEAD.scope(db, run),
+                )
+                .await
+        }
+        None => CURRENT_TENANT.scope(Some(tenant_id), run).await,
+    };
 
     let (parts, body) = response.into_parts();
     let wrapped = TenantPropagatingBody {
         inner: body,
         tenant_id: tenant_id_clone,
         handle: handle_for_body,
+        db_bulkhead: bulkheads.db.clone(),
     };
     Response::from_parts(parts, axum::body::Body::new(wrapped))
+}
+
+/// The per-tenant bulkheads of an app (#3072), made once from
+/// `[tenancy]` and kept in the app state.
+struct TenantBulkheads {
+    /// `tenancy.max_concurrent_requests`.
+    requests: Option<std::sync::Arc<crate::bulkhead::TenantBulkhead>>,
+    /// `tenancy.max_db_connections`.
+    db: Option<std::sync::Arc<crate::bulkhead::TenantBulkhead>>,
+}
+
+impl TenantBulkheads {
+    fn from_config(config: &crate::config::TenancyConfig) -> Self {
+        let make = |max: usize| (max > 0).then(|| crate::bulkhead::TenantBulkhead::new(max));
+        Self {
+            requests: make(config.max_concurrent_requests),
+            db: make(config.max_db_connections),
+        }
+    }
+}
+
+/// The `503` for a request over its tenant's cap. Same shape as an
+/// admission shed: Problem Details, `Retry-After: 1` and the CORS headers.
+/// The tenancy layer runs outside `CorsLayer`, so it adds them itself.
+fn tenant_bulkhead_rejection(
+    tenant_id: &str,
+    cors: &crate::config::CorsConfig,
+    origin: Option<&axum::http::HeaderValue>,
+) -> Response {
+    tracing::debug!(tenant = %tenant_id, "tenant request cap reached");
+    let mut response = crate::AutumnError::service_unavailable_msg(
+        "Too many concurrent requests for this tenant; try again shortly.",
+    )
+    .into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("1"),
+    );
+    if !cors.allowed_origins.is_empty() {
+        crate::router::mirror_cors_headers(cors, origin, &mut response);
+    }
+    response
 }
 
 pin_project! {
@@ -708,6 +772,9 @@ pin_project! {
         pub inner: B,
         pub tenant_id: String,
         pub handle: Option<crate::tenant_cell::TenantCellHandle>,
+        // The `tenancy.max_db_connections` bulkhead (#3072). A checkout
+        // while the body is polled counts against it.
+        pub db_bulkhead: Option<std::sync::Arc<crate::bulkhead::TenantBulkhead>>,
     }
 }
 
@@ -725,8 +792,13 @@ where
         let this = self.project();
         let tenant_id = this.tenant_id.clone();
         let handle = this.handle.clone();
+        let inner = this.inner;
         CURRENT_TENANT.sync_scope(Some(tenant_id), || {
-            crate::tenant_cell::CURRENT_TENANT_CELL.sync_scope(handle, || this.inner.poll_frame(cx))
+            crate::tenant_cell::CURRENT_TENANT_CELL.sync_scope(handle, || match this.db_bulkhead {
+                Some(db) => crate::bulkhead::TENANT_DB_BULKHEAD
+                    .sync_scope(std::sync::Arc::clone(db), || inner.poll_frame(cx)),
+                None => inner.poll_frame(cx),
+            })
         })
     }
 
@@ -829,6 +901,92 @@ impl DisplayTenantId for Option<String> {
 mod tests {
     use super::*;
     use crate::security::ResolvedClientIdentity;
+
+    /// A body that takes a database permit each time it is polled (#3072).
+    struct PermitProbeBody {
+        outcome: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
+    }
+
+    impl HttpBody for PermitProbeBody {
+        type Data = bytes::Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            let rejected = crate::bulkhead::acquire_db_permit().is_err();
+            *self.outcome.lock().unwrap() = Some(rejected);
+            Poll::Ready(None)
+        }
+    }
+
+    /// A streaming body is in the database bulkhead too (#3072).
+    #[test]
+    fn a_streaming_body_poll_is_inside_the_db_bulkhead() {
+        let bulkhead = crate::bulkhead::TenantBulkhead::new(1);
+        let _held = bulkhead.try_acquire("acme").expect("the one permit");
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut wrapped = TenantPropagatingBody {
+            inner: PermitProbeBody {
+                outcome: std::sync::Arc::clone(&outcome),
+            },
+            tenant_id: "acme".to_owned(),
+            handle: None,
+            db_bulkhead: Some(bulkhead),
+        };
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let _ = Pin::new(&mut wrapped).poll_frame(&mut cx);
+        assert_eq!(
+            *outcome.lock().unwrap(),
+            Some(true),
+            "the body's checkout counts against the tenant's cap"
+        );
+    }
+
+    /// A handler runs inside the tenant's database bulkhead (#3072).
+    #[tokio::test]
+    async fn a_handler_is_inside_the_db_bulkhead() {
+        use tower::ServiceExt as _;
+        let state = crate::AppState::for_test();
+        let mut config = crate::config::AutumnConfig::default();
+        config.tenancy.enabled = true;
+        config.tenancy.source = "header".to_string();
+        config.tenancy.header_name = "x-tenant-id".to_string();
+        config.tenancy.max_db_connections = 1;
+        state.insert_extension(config);
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::get(|| async {
+                    let first = crate::bulkhead::acquire_db_permit();
+                    let second = crate::bulkhead::acquire_db_permit();
+                    let held = matches!(first, Ok(Some(_)));
+                    if held && second.is_err() {
+                        axum::http::StatusCode::OK
+                    } else {
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                tenancy_middleware,
+            ))
+            .with_state(state);
+        let request = axum::http::Request::builder()
+            .uri("/")
+            .header("x-tenant-id", "acme")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "one permit, then a 503 for the same tenant"
+        );
+    }
 
     fn subdomain_config() -> crate::config::AutumnConfig {
         let mut c = crate::config::AutumnConfig::default();

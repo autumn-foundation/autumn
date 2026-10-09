@@ -5,11 +5,11 @@ app = "{{project_name}}"
 primary_region = "iad"
 
 # Fly sends SIGKILL when kill_timeout expires.  Set this above Autumn's total
-# graceful-shutdown budget: prestop_grace_secs (5) + shutdown_timeout_secs (30)
-# = 35 s, plus 10 s buffer for the process to log and exit cleanly.
-# Value is in seconds (integer); Fly does not accept a string like "45s".
+# graceful-shutdown budget: prestop_grace_secs (5) + shutdown_timeout_secs (35
+# in the prod profile) = 40 s, plus 10 s buffer for the process to log and exit
+# cleanly. Value is in seconds (integer); Fly does not accept a string like "50s".
 kill_signal  = "SIGTERM"
-kill_timeout = 45
+kill_timeout = 50
 
 [build]
   dockerfile = "Dockerfile"

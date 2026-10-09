@@ -223,6 +223,46 @@ app that does not set `[cost]` behaves as before. `CostConfig` is
 **Automation:** `manual` — a codemod cannot know which fields a struct literal
 means to leave at their defaults.
 
+### Config: `AutumnConfig` gains a `fault_injection` field
+
+**Why:** Staging fault injection (issue #3071) needs its own
+`[fault_injection]` section. `AutumnConfig` is not `#[non_exhaustive]`, so a
+new field breaks a struct literal. `Default` and `..AutumnConfig::default()`
+keep working.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::config::AutumnConfig;
+
+let config = AutumnConfig {
+    server: my_server_config,
+    // …every other field spelled out…
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::config::AutumnConfig;
+
+let config = AutumnConfig {
+    server: my_server_config,
+    ..AutumnConfig::default()
+};
+```
+
+The new field is `pub fault_injection: FaultInjectionConfig`. The default is
+off, so an app with no `[fault_injection]` section does not change.
+`FaultInjectionConfig` is `#[non_exhaustive]`: set its fields on a default
+value.
+
+`capsule::schema::HttpErrorKind` (feature `reporting`) has a new variant,
+`FaultInjected`. An exhaustive `match` on it needs a new arm.
+
+**Automation:** `manual` — a codemod cannot know which fields a struct literal
+leaves at their defaults.
+
 ### Admission: `Route`, `ServerConfig` and `HttpClientConfig` have new fields
 
 **Why:** Adaptive admission control (issue #3068) adds a route criticality,
@@ -560,6 +600,62 @@ let health = autumn_web::config::HealthConfig {
 **Automation:** `manual` - the fix adds a struct update expression, and no
 codemod rewrites struct literals.
 
+### Config: `TenancyConfig`, `JobConfig` and `JobPostgresConfig` have new fields
+
+**Why:** per-tenant bulkheads, tenant job lanes and shard-local jobs (issue
+#3072). `TenancyConfig` gains `max_concurrent_requests` and
+`max_db_connections`. `JobConfig` gains `tenants`. `JobPostgresConfig` gains
+`shard_local`.
+
+**Before (`{X.Y}`):** a struct literal listed every field.
+
+```rust
+let postgres = autumn_web::config::JobPostgresConfig {
+    visibility_timeout_ms: 30_000,
+};
+```
+
+**After (`{(X+1).0}`):** add `..Default::default()`. Every new field is off
+by default (`0` or `false`).
+
+```rust
+let postgres = autumn_web::config::JobPostgresConfig {
+    visibility_timeout_ms: 30_000,
+    ..autumn_web::config::JobPostgresConfig::default()
+};
+```
+
+**Automation:** `manual` - the fix adds a struct update expression, and no
+codemod rewrites struct literals.
+
+### Tenancy: `TenantPropagatingBody` has a `db_bulkhead` field
+
+**Why:** a database checkout while a streaming body is polled counts against
+`tenancy.max_db_connections` (issue #3072).
+
+**Before (`{X.Y}`):**
+
+```rust
+let body = TenantPropagatingBody {
+    inner,
+    tenant_id,
+    handle: None,
+};
+```
+
+**After (`{(X+1).0}`):** add `db_bulkhead: None`.
+
+```rust
+let body = TenantPropagatingBody {
+    inner,
+    tenant_id,
+    handle: None,
+    db_bulkhead: None,
+};
+```
+
+**Automation:** `manual` - no codemod rewrites struct literals.
+
 ### Probes: `/ready` pings the primary database
 
 **Why:** pool saturation made a busy replica unready, and an idle pool made a
@@ -748,6 +844,38 @@ means "refresh at each read", not "read the database at each read".
 **Automation:** `manual` - it is a behaviour change, and no code rewrite
 applies.
 
+### Config: `HttpClientConfig` and `RequestTimeoutsConfig` get new fields
+
+**Why:** Deadline propagation and the retry budget (issue #3058) need
+settings. Neither struct is `#[non_exhaustive]`, so a struct literal stops
+compiling.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+let client = autumn_web::config::HttpClientConfig {
+    timeout_secs: 10,
+    max_retries: 1,
+    max_retry_after_secs: 10,
+    base_urls: std::collections::HashMap::new(),
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+let client = autumn_web::config::HttpClientConfig {
+    timeout_secs: 10,
+    max_retries: 1,
+    ..autumn_web::config::HttpClientConfig::default()
+};
+```
+
+Do the same for `RequestTimeoutsConfig`, which gets `accept_deadline_header`.
+
+**Automation:** `manual` - the fix is a `..Default::default()` tail, which no
+codemod adds.
+
 ---
 
 ### Ledger: raw-SQL framework writes to a ledgered table are refused (#2319)
@@ -771,6 +899,37 @@ cascade, use `on_delete = destroy`: a ledgered child records a revision.
 
 **Automation:** `manual` - it is a behaviour change, and no code rewrite
 applies.
+
+---
+
+### Shadow: `ShadowStats` gains `comparisons_abandoned`
+
+**Why:** the mirror deadline now covers the comparison. A comparison that does
+not finish is counted apart from a match, a divergence and a skip (issue #2333).
+
+**Before (`{X.Y}`):** a struct literal listed every field.
+
+```rust
+let stats = autumn_web::shadow::ShadowStats {
+    mirrored: 0,
+    compared: 0,
+    // ... every other field ...
+    primary_incomplete: 0,
+};
+```
+
+**After (`{(X+1).0}`):** add `..ShadowStats::default()`. An exhaustive
+destructuring pattern needs `..` or the new field.
+
+```rust
+let stats = autumn_web::shadow::ShadowStats {
+    mirrored: 1,
+    ..autumn_web::shadow::ShadowStats::default()
+};
+```
+
+**Automation:** `manual` - the fix adds a struct update expression, and no
+codemod rewrites struct literals.
 
 ---
 
@@ -811,6 +970,15 @@ single most valuable section of the guide — keep it factual and short.
 - `autumn.toml` keys that were renamed, removed, or have new defaults.
 - New `AUTUMN_*` environment variables.
 - Default profile changes.
+
+Issue #3058:
+
+- The `prod` profile sets `server.shutdown_timeout_secs = 35` (was 30): the
+  30 s request timeout plus 5 s. Add 5 s to your orchestrator grace period.
+- New keys: `[http.client.retry_budget]` (on by default),
+  `http.client.send_deadline_header` (default `true`) and
+  `server.timeouts.accept_deadline_header` (default `false`,
+  `AUTUMN_SERVER__TIMEOUTS__ACCEPT_DEADLINE_HEADER`).
 
 If nothing changed, delete this section.
 
@@ -859,6 +1027,16 @@ Changes that still compile but behave differently at runtime. Examples:
 - Error responses adopted a new JSON shape.
 - A default middleware is now ordered differently.
 - A scheduled task now runs on a different worker.
+
+Issue #3058:
+
+- The outbound `Client` retries less. A retry must fit the request deadline,
+  and the retry budget limits retries to a host that fails all the time.
+  Set `[http.client.retry_budget] enabled = false` to keep the old count.
+- The outbound `Client` sends `x-autumn-deadline-ms` to every host when a
+  request deadline is set. Set `http.client.send_deadline_header = false` to
+  stop it.
+- A timeout `503` has a `Retry-After` header of 1-3 s.
 
 If nothing changed, delete this section.
 

@@ -402,6 +402,9 @@ fn owner_only_acl_args(dir: &Path, owner: &str) -> Vec<std::ffi::OsString> {
 
 /// The `icacls` arguments that drop every **explicit** ACE on `dir`.
 ///
+/// `/T` makes it recursive. `/L` acts on a link, not its target. Without it, a file a stranger pre-created inside
+/// keeps its explicit ACE, because an inherited ACE does not replace an explicit one.
+///
 /// `/reset` replaces the DACL with the parent's inherited one, which is the only
 /// icacls operation that removes an ACE belonging to a trustee we cannot name in
 /// advance. It is a step, not a destination: it leaves the directory as
@@ -419,7 +422,13 @@ fn owner_only_acl_args(dir: &Path, owner: &str) -> Vec<std::ffi::OsString> {
     )
 )]
 fn reset_dacl_args(dir: &Path) -> Vec<std::ffi::OsString> {
-    vec![dir.as_os_str().to_os_string(), "/reset".into(), "/Q".into()]
+    vec![
+        dir.as_os_str().to_os_string(),
+        "/reset".into(),
+        "/T".into(),
+        "/L".into(),
+        "/Q".into(),
+    ]
 }
 
 /// The trustee to grant, parsed from `whoami /user /fo csv /nh` output.
@@ -538,6 +547,8 @@ fn restrict_to_owner(dir: &Path) -> std::io::Result<()> {
         dir.as_os_str().to_os_string(),
         "/setowner".into(),
         std::ffi::OsString::from(&owner),
+        "/T".into(),
+        "/L".into(),
         "/Q".into(),
     ];
     run_icacls(&icacls, dir, &take_ownership, &owner)?;
@@ -716,6 +727,10 @@ mod tests {
             .collect();
         assert_eq!(rendered[0], r"C:\state\demo");
         assert!(rendered.contains(&"/reset".to_owned()), "{rendered:?}");
+        // `/reset` alone skips files already inside the directory.
+        assert!(rendered.contains(&"/T".to_owned()), "{rendered:?}");
+        // `/L` acts on a link itself, so a planted junction is not followed.
+        assert!(rendered.contains(&"/L".to_owned()), "{rendered:?}");
         // It must not also grant: `/reset` restores INHERITED access, so it is a
         // step toward the owner-only DACL, never the DACL itself.
         assert!(

@@ -154,6 +154,7 @@ mod failure_capsule_overhead;
 #[cfg(all(feature = "reporting", feature = "db", not(feature = "sqlite")))]
 mod failure_capsule_replay;
 mod fake_generators;
+mod fault_injection;
 mod feature_flags_integration;
 mod feed;
 mod form_for_derive;
@@ -419,6 +420,8 @@ mod shadow_mirror;
 #[cfg(feature = "db")]
 mod shard_across_tenants_no_shard_set;
 #[cfg(feature = "db")]
+mod shard_local_jobs;
+#[cfg(feature = "db")]
 mod shard_map_guard;
 #[cfg(feature = "db")]
 mod sharding_across_tenants;
@@ -440,6 +443,8 @@ mod sim_clock_drain;
 mod sim_collab_convergence;
 mod sim_cost_deferral;
 mod sim_crash_at;
+#[cfg(feature = "http-client")]
+mod sim_deadline;
 mod sim_default_entropy;
 mod sim_delayed_enqueue;
 mod sim_deterministic_ids;
@@ -454,6 +459,8 @@ mod sim_monotonic_clock;
 #[cfg(feature = "http-client")]
 mod sim_net;
 mod sim_rate_limit_clock;
+#[cfg(feature = "http-client")]
+mod sim_retry_budget;
 mod sim_retry_storm;
 #[cfg(feature = "http-client")]
 mod sim_retry_storm_http;
@@ -463,6 +470,7 @@ mod sim_sla;
 #[cfg(feature = "sla")]
 mod sim_sla_replicas;
 mod sim_strict_wall_clock;
+mod sim_tenant_isolation;
 mod sim_test_smoke;
 mod sim_testapp_jobs;
 #[cfg(feature = "sla")]
@@ -487,8 +495,11 @@ mod system_test_api;
 #[cfg(feature = "db")]
 mod tenancy;
 mod tenancy_unit;
+mod tenant_bulkhead;
 mod tenant_cell_quota;
 mod tenant_cell_unit;
+#[cfg(feature = "db")]
+mod tenant_db_bulkhead;
 mod test_app_integration;
 mod test_db_integration;
 mod throttle_route;
