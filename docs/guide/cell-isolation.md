@@ -46,8 +46,10 @@ number of connections that one handler holds at the same time.
 The `autumn_tenant_bulkhead_rejections_total{kind="request"}` and
 `{kind="db"}` counters count the rejections. They have no tenant label.
 
-The caps count work in the request handler and in a streaming response
-body. They do not count:
+`max_concurrent_requests` counts a request until its response head is
+ready, as the admission limit does. Thus a long stream (for example SSE)
+does not hold a request permit. `max_db_connections` counts checkouts in
+the request handler and in a streaming response body. It does not count:
 
 - a connection that a spawned task takes;
 - a connection that does not come from `Db` or a shard extractor.
