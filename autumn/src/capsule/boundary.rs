@@ -148,6 +148,33 @@ pub(crate) fn note_detached_work() {
     }
 }
 
+/// Marks the in-flight capsule incomplete when it drops armed.
+///
+/// Hold one while the caller waits for a spawned task. If the caller is
+/// dropped first, the task continues without it.
+pub(crate) struct DetachGuard(Option<std::sync::Arc<crate::capsule::CaptureScope>>);
+
+impl DetachGuard {
+    /// Arm the guard for this task's capture scope.
+    pub(crate) fn arm() -> Self {
+        Self(crate::capsule::current_scope())
+    }
+
+    /// The wait ended: the task is not detached.
+    pub(crate) fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for DetachGuard {
+    fn drop(&mut self) {
+        if let Some(scope) = self.0.take() {
+            scope.note(DETACHED_WORK_NOTE);
+            scope.mark_truncated();
+        }
+    }
+}
+
 /// Give `future` this task's capture scope and replay tape.
 ///
 /// Only for work the calling task awaits at once: its effects then land in

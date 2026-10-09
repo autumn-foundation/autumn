@@ -3786,20 +3786,27 @@ impl MailTransport for InterceptedMailTransport {
 /// A send that reaches the transport ran with no tape, and is refused.
 #[cfg(feature = "reporting")]
 pub(crate) fn install_replay_mailer(state: &AppState, config: &MailConfig) {
-    // `is_disabled()` is observable to a handler, so it follows the app's
-    // config. A disabled `deliver_later` is answered at the seam either way.
-    // The production durability guard is not copied: replay answers its
-    // recorded refusal from the tape.
-    let mut mailer = Mailer::with_transport(ReplayTransport {
-        disabled: config.transport == Transport::Disabled,
-    });
-    // Defaults apply before the seam, so a recorded `reply_to` default is
-    // matched.
-    mailer.defaults = Arc::new(MailerDefaults {
-        from: config.from.clone(),
-        reply_to: config.reply_to.clone(),
-    });
-    mailer.inline_css_default = config.inline_css;
+    // A state initializer can install its own mailer. Its defaults, CSS
+    // inlining and `is_disabled()` apply before the seam, so the replay
+    // mailer keeps them. Only the transport changes. With no installed
+    // mailer, the app's config gives these values. The production durability
+    // guard is not copied: replay answers its recorded refusal from the tape.
+    let installed = state.extension::<Mailer>();
+    let disabled = installed.as_ref().map_or_else(
+        || config.transport == Transport::Disabled,
+        |mailer| mailer.is_disabled(),
+    );
+    let mut mailer = Mailer::with_transport(ReplayTransport { disabled });
+    if let Some(installed) = installed {
+        mailer.defaults = Arc::clone(&installed.defaults);
+        mailer.inline_css_default = installed.inline_css_default;
+    } else {
+        mailer.defaults = Arc::new(MailerDefaults {
+            from: config.from.clone(),
+            reply_to: config.reply_to.clone(),
+        });
+        mailer.inline_css_default = config.inline_css;
+    }
     state.insert_extension(mailer);
 }
 
@@ -6590,6 +6597,31 @@ mod tests {
             mailer.send(mail()).await.is_err(),
             "a send with no tape must not reach a transport"
         );
+    }
+
+    /// Codex review on #3222: the replay mailer keeps the defaults of a
+    /// mailer that a state initializer installed.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn replay_mailer_keeps_the_installed_mailer_defaults() {
+        let state = AppState::for_test();
+        let installed = Mailer::builder()
+            .transport(Transport::Disabled)
+            .from("app@example.com")
+            .reply_to("support@example.com")
+            .inline_css(true)
+            .build()
+            .unwrap();
+        state.insert_extension(installed);
+        install_replay_mailer(&state, &MailConfig::default());
+        let replay = state.extension::<Mailer>().expect("installed");
+        assert_eq!(replay.defaults.from.as_deref(), Some("app@example.com"));
+        assert_eq!(
+            replay.defaults.reply_to.as_deref(),
+            Some("support@example.com")
+        );
+        assert!(replay.inline_css_default);
+        assert!(replay.is_disabled());
     }
 
     /// Codex review on #3222: the production durability refusal is on the

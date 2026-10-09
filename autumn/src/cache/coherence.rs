@@ -1365,10 +1365,16 @@ impl InvalidateAfterWrite {
         let invalidation = crate::capsule::boundary::carry_scopes((self.make)());
         #[cfg(not(feature = "reporting"))]
         let invalidation = (self.make)();
-        handle.spawn(invalidation).await.unwrap_or_else(|_| {
+        // A caller dropped while it waits leaves the task detached.
+        #[cfg(feature = "reporting")]
+        let detached = crate::capsule::boundary::DetachGuard::arm();
+        let complete = handle.spawn(invalidation).await.unwrap_or_else(|_| {
             report_skipped_invalidation("the invalidation task panicked or was cancelled");
             false
-        })
+        });
+        #[cfg(feature = "reporting")]
+        detached.disarm();
+        complete
     }
 
     /// Flush at the end of the write.
@@ -2527,6 +2533,31 @@ mod tests {
             !scope.is_truncated(),
             "an awaited invalidation is not detached"
         );
+    }
+
+    #[cfg(feature = "reporting")]
+    fn never_ends() -> crate::cache::CacheFuture<'static, bool> {
+        Box::pin(std::future::pending())
+    }
+
+    /// Codex review on #3222: a caller dropped while it waits for a flushed
+    /// invalidation leaves the task detached, so the capsule is incomplete.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_flush_dropped_while_waiting_marks_the_capsule_incomplete() {
+        let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+            "coherence".to_owned(),
+            std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+            std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        crate::capsule::capture::with_capture_scope(std::sync::Arc::clone(&scope), async {
+            let mut guard = InvalidateAfterWrite::new(never_ends);
+            let waited =
+                tokio::time::timeout(std::time::Duration::from_millis(10), guard.flush()).await;
+            assert!(waited.is_err(), "the invalidation never ends");
+        })
+        .await;
+        assert!(scope.is_truncated(), "the invalidation runs detached");
     }
 
     #[tokio::test]
