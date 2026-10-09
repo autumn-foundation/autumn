@@ -3125,7 +3125,11 @@ async fn a_re_encoded_snapshot_is_refused() {
         .ledger_verify(id)
         .await
         .expect_err("same meaning, different bytes");
-    assert!(err.to_string().contains("canonical"), "{err}");
+    let text = err.to_string();
+    assert!(
+        text.contains("not in canonical form") && text.contains(&format!("revision {}", head.seq)),
+        "{text}"
+    );
 }
 
 #[tokio::test]
@@ -3159,7 +3163,7 @@ async fn a_snapshot_the_model_cannot_decode_reports_schema_drift() {
         .expect_err("cannot decode");
     let text = err.to_string();
     assert!(
-        text.contains("schema") && !text.contains("unreadable"),
+        text.contains("current model schema") && !text.contains("unreadable"),
         "must not read as tamper evidence: {text}"
     );
 }

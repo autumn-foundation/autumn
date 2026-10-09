@@ -1452,11 +1452,11 @@ pub enum LedgerError {
     /// A stored snapshot does not decode into the model's current shape (#2326).
     ///
     /// The model schema probably changed after the revision was written. This is
-    /// not proof of tampering: `ledger_verify` tells the two apart.
+    /// not proof of an edit: `ledger_verify` shows the difference.
     #[error(
         "ledger revision {seq} of {table}#{record_id} does not match the current model \
-         schema: {detail}. The model changed after this revision was written. Give a \
-         new field `#[serde(default)]`, or run `ledger_verify` to rule out an edit"
+         schema: {detail}. The model changed after this revision was written. Add \
+         `#[serde(default)]` to a new field. Or run `ledger_verify` to check for an edit"
     )]
     SnapshotSchemaMismatch {
         /// Table of the ledgered model.
@@ -1661,6 +1661,46 @@ pub fn parse_stored_snapshot(
         ));
     }
     Ok(value)
+}
+
+/// Replace each quoted value in a decode error with `"…"`.
+///
+/// A decode error can quote the value that failed. In a snapshot, that value
+/// can be a private column or ciphertext.
+#[doc(hidden)]
+#[must_use]
+pub fn redact_quoted(detail: &str) -> String {
+    let mut out = String::with_capacity(detail.len());
+    let mut in_quote = false;
+    let mut escaped = false;
+    for ch in detail.chars() {
+        if in_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_quote = false;
+                out.push_str("…\"");
+            }
+        } else {
+            out.push(ch);
+            in_quote = ch == '"';
+        }
+    }
+    out
+}
+
+/// The error for a snapshot that does not decode into the current model.
+#[doc(hidden)]
+#[must_use]
+pub fn schema_mismatch(table: &str, record_id: i64, seq: i64, detail: &str) -> crate::AutumnError {
+    crate::AutumnError::internal_server_error(LedgerError::SnapshotSchemaMismatch {
+        table: table.to_string(),
+        record_id,
+        seq,
+        detail: redact_quoted(detail),
+    })
 }
 
 /// Refuse to reconstruct a model from a snapshot whose `#[encrypted]` column
@@ -3695,5 +3735,21 @@ mod tests {
     fn stored_snapshot_refuses_invalid_json() {
         let err = parse_stored_snapshot("t", 1, 2, "{").expect_err("invalid");
         assert!(err.to_string().contains("unreadable"), "{err}");
+    }
+
+    #[test]
+    fn stored_snapshot_accepts_floats_the_writer_produced() {
+        // These parse one ULP off without serde_json's `float_roundtrip`.
+        for x in [4.536_315_785_538_721e-181_f64, 4.138_526_855_143_091e260] {
+            let text = canonical_json(&json!({ "x": x }));
+            parse_stored_snapshot("t", 1, 1, &text).expect(&text);
+        }
+    }
+
+    #[test]
+    fn schema_detail_hides_quoted_values() {
+        let shown = redact_quoted(r#"invalid type: string "sk-secret", expected i64"#);
+        assert!(!shown.contains("sk-secret"), "{shown}");
+        assert!(shown.contains("expected i64"), "{shown}");
     }
 }

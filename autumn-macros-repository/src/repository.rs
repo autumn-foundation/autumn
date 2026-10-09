@@ -2308,9 +2308,19 @@ fn ledger_append_ts(
                     .await
                     .optional()
                     .map_err(::autumn_web::AutumnError::from)?;
-                if let ::core::option::Option::Some(__lg_row) = __lg_after {
-                    __lg_snapshot = __lg_row.__autumn_commit_hook_to_value()?;
-                }
+                // A missing row would leave the stale pre-delete snapshot. Refuse.
+                let ::core::option::Option::Some(__lg_row) = __lg_after else {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::internal_server_error(
+                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
+                                table: #table_name_ts.to_string(),
+                                record_id: __lg_record_id,
+                                detail: "the deleted row cannot be read back".to_string(),
+                            },
+                        ),
+                    );
+                };
+                __lg_snapshot = __lg_row.__autumn_commit_hook_to_value()?;
             }
         }
     } else {
@@ -4989,13 +4999,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         &revision.snapshot,
                     )?;
                     #model_name::__autumn_commit_hook_from_value(revision.snapshot.clone())
-                        .map_err(|err| ::autumn_web::AutumnError::internal_server_error(
-                            ::autumn_web::ledger::LedgerError::SnapshotSchemaMismatch {
-                                table: #table_name.to_string(),
-                                record_id,
-                                seq: revision.seq,
-                                detail: format!("cannot decode into {}: {err}", stringify!(#model_name)),
-                            },
+                        .map_err(|err| ::autumn_web::ledger::schema_mismatch(
+                            #table_name,
+                            record_id,
+                            revision.seq,
+                            &format!("cannot decode into {}: {err}", stringify!(#model_name)),
                         ))
                 }
 
