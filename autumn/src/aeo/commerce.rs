@@ -572,7 +572,7 @@ impl PricedRoutes {
         }
         #[cfg(feature = "i18n")]
         let locales = if config.i18n.locale_prefix_enabled {
-            config.i18n.supported_locales.clone()
+            crate::router::validated_locale_prefix_locales(&config.i18n)
         } else {
             Vec::new()
         };
@@ -590,9 +590,18 @@ impl PricedRoutes {
             .get::<axum::extract::MatchedPath>()
             .map(axum::extract::MatchedPath::as_str);
         let path = req.uri().path();
+        // A route outside the locale nests (a scoped group, an excluded
+        // path) can itself start with a locale segment, so the path is
+        // matched as it is and with the locale stripped. Both cannot name two
+        // different routes: a localized `/x` is mounted at `/{locale}/x`.
+        let same = |r: &PaidRoute, t: &str| {
+            normalize(&r.path) == normalize(t)
+                || normalize(&r.path) == normalize(self.strip_locale(t))
+        };
         self.routes.iter().find(|r| {
             r.method_matches(method)
-                && (template.is_some_and(|t| normalize(&r.path) == normalize(self.strip_locale(t)))
+                && (template.is_some_and(|t| same(r, t))
+                    || template_matches(&r.path, path)
                     || template_matches(&r.path, self.strip_locale(path)))
         })
     }
@@ -1110,6 +1119,27 @@ mod tests {
         };
         assert_eq!(call("/api/reports/7").await.unwrap().status(), 503);
         assert_eq!(call("/free").await.unwrap().status(), 200);
+    }
+
+    #[test]
+    fn a_route_outside_the_locale_nests_keeps_its_locale_segment() {
+        let priced = PricedRoutes {
+            routes: vec![
+                PaidRoute::new("GET", "/en/admin", "1"),
+                PaidRoute::new("GET", "/api", "2"),
+            ],
+            locales: vec!["en".to_owned()],
+        };
+        let get = |path: &str| {
+            axum::http::Request::get(path)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let amount = |path: &str| priced.route_for(&get(path)).map(|r| r.amount.clone());
+        assert_eq!(amount("/en/admin").as_deref(), Some("1"), "unlocalized");
+        assert_eq!(amount("/en/api").as_deref(), Some("2"), "localized");
+        assert_eq!(amount("/api").as_deref(), Some("2"));
+        assert_eq!(amount("/admin"), None);
     }
 
     #[test]

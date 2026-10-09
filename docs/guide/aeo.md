@@ -254,12 +254,15 @@ tags to your layout:
 ```rust
 html! {
     head {
-        (autumn_web::aeo::webmcp::head_tags(None))
+        (autumn_web::aeo::webmcp::head_tags(None, csrf.as_ref().map(CsrfToken::token)))
     }
 }
 ```
 
-Pass the CSP nonce when your policy uses nonces. On page load, the script
+Pass the CSP nonce when your policy uses nonces, and the request's CSRF
+token (from the `Option<CsrfToken>` extractor). The token is written as
+`<meta name="csrf-token">`, which the htmx CSRF helper reads too. Without a
+token the script registers only the read-only tools. On page load, the script
 calls `document.modelContext.registerTool()` for each public tool that is
 marked safe: `readOnlyHint: true` (a `GET` tool), or `destructiveHint:
 false`. A write tool gets `consequentialHint: true`, so the browser can ask the

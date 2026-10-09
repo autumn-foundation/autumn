@@ -501,7 +501,7 @@ homepage sends agent `Link` headers; the router fallback serves `/robots.txt`
 (AI crawler groups + `Content-Signal`), `/llms.txt`, the agent skills index,
 the ARD manifest, and, when the app has them, the MCP server card, the RFC 9727
 API catalog, OAuth metadata, and `/auth.md`. An app route at the same path
-wins. Add `(autumn_web::aeo::webmcp::head_tags(None))` to the layout `<head>`
+wins. Add `(autumn_web::aeo::webmcp::head_tags(None, csrf_token))` to the layout `<head>`
 for WebMCP. Register skills with `.agent_skill(AgentSkill::parse(..)?)`. Price
 a route with `[[aeo.paid_routes]]` + `[aeo.x402]` (x402; MPP `x-payment-info`
 in `/openapi.json`). Sign outbound calls with

@@ -40,8 +40,10 @@ pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: mau
                 (javascript_include_tag("htmx"))
                 script src=(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH) defer {}
                 // Agent readiness: the ARD link and the WebMCP script, which
-                // lets in-browser AI agents call the app's MCP tools.
-                (autumn_web::aeo::webmcp::head_tags(None))
+                // lets in-browser AI agents call the app's read-only MCP
+                // tools. Pass the CSRF token as the second argument to allow
+                // write tools too.
+                (autumn_web::aeo::webmcp::head_tags(None, None))
             }
             body {
                 (skip_link("#main-content", "Skip to main content"))

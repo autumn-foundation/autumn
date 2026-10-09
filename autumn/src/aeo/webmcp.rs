@@ -6,7 +6,10 @@
 //! so the normal route pipeline (auth, CSRF, rate limits) applies.
 //!
 //! Add the script to the page `<head>` with [`head_tags`]. The scaffolded
-//! layout does this.
+//! layout does this. A tool that is not read-only needs the page's CSRF
+//! token: pass it to [`head_tags`], which writes the
+//! `<meta name="csrf-token">` tag. Without a token the script registers only
+//! the read-only tools.
 
 use serde_json::{Value, json};
 
@@ -64,7 +67,12 @@ const SCRIPT: &str = r#"// Autumn WebMCP: register this site's MCP tools with in
   if (!mc || typeof mc.registerTool !== "function") return;
   const endpoint = __ENDPOINT__;
   const csrfHeader = __CSRF_HEADER__;
-  const tools = __TOOLS__;
+  const meta = document.querySelector(
+    'meta[name="csrf-token"], meta[name="autumn-csrf-token"]'
+  );
+  const token = meta && meta.content;
+  // A write needs the CSRF token: without one, only read-only tools.
+  const tools = __TOOLS__.filter((t) => t.annotations.readOnlyHint || token);
   let nextId = 0;
   const parse = (text) => {
     try {
@@ -81,8 +89,7 @@ const SCRIPT: &str = r#"// Autumn WebMCP: register this site's MCP tools with in
         accept: "application/json, text/event-stream",
         "mcp-protocol-version": "2025-06-18",
       };
-      const meta = document.querySelector('meta[name="csrf-token"]');
-      if (meta && meta.content) headers[csrfHeader] = meta.content;
+      if (token) headers[csrfHeader] = token;
       const res = await fetch(endpoint, {
         method: "POST",
         credentials: "same-origin",
@@ -140,14 +147,21 @@ fn hint(mcp: &Value, key: &str) -> Option<bool> {
 /// `<head>` tags for agents: the ARD link and the `WebMCP` script.
 ///
 /// Pass the request's CSP nonce when the page uses a nonce-based policy.
+/// Pass the request's CSRF token (from the
+/// [`CsrfToken`](crate::security::CsrfToken) extractor) to let in-browser
+/// agents call tools that are not read-only; it is written as
+/// `<meta name="csrf-token">`, which the htmx CSRF helper reads too.
 ///
 /// ```rust,ignore
-/// html! { head { (autumn_web::aeo::webmcp::head_tags(None)) } }
+/// html! { head { (autumn_web::aeo::webmcp::head_tags(None, csrf.as_ref().map(CsrfToken::token))) } }
 /// ```
 #[cfg(feature = "maud")]
 #[must_use]
-pub fn head_tags(csp_nonce: Option<&str>) -> maud::Markup {
+pub fn head_tags(csp_nonce: Option<&str>, csrf_token: Option<&str>) -> maud::Markup {
     maud::html! {
+        @if let Some(token) = csrf_token {
+            meta name="csrf-token" content=(token);
+        }
         link rel="ai-catalog" href=(super::AI_CATALOG_PATH) type="application/json";
         script src=(WEBMCP_JS_PATH) defer nonce=[csp_nonce] {}
     }
@@ -268,11 +282,23 @@ mod tests {
     #[cfg(feature = "maud")]
     #[test]
     fn head_tags_render_the_script_and_the_ard_link() {
-        let html = head_tags(Some("abc")).into_string();
+        let html = head_tags(Some("abc"), None).into_string();
         assert!(
             html.contains("<script src=\"/_autumn/webmcp.js\" defer nonce=\"abc\">"),
             "{html}"
         );
         assert!(html.contains("rel=\"ai-catalog\""), "{html}");
+        assert!(!html.contains("csrf-token"), "{html}");
+        let html = head_tags(None, Some("t<1")).into_string();
+        assert!(
+            html.contains("<meta name=\"csrf-token\" content=\"t&lt;1\">"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn write_tools_wait_for_a_csrf_token() {
+        let js = script(&facts(true), "x-csrf-token");
+        assert!(js.contains("t.annotations.readOnlyHint || token"), "{js}");
     }
 }

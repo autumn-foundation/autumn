@@ -1429,7 +1429,8 @@ fn build_aeo_site<O: AeoOpenApiFacts, M: AeoMcpFacts>(
     // nests, so their pages keep their paths.
     #[cfg(feature = "i18n")]
     let locales = if config.i18n.locale_prefix_enabled {
-        config.i18n.supported_locales.clone()
+        // The locales that get a nest, so discovery lists reachable URLs.
+        validated_locale_prefix_locales(&config.i18n)
     } else {
         Vec::new()
     };
@@ -2748,7 +2749,7 @@ fn is_valid_locale_segment(locale: &str) -> bool {
 /// that was silently skipped and has no nest, trading a config typo's
 /// build-time no-op for a runtime 404 (Codex review).
 #[cfg(feature = "i18n")]
-fn validated_locale_prefix_locales(i18n: &crate::i18n::I18nConfig) -> Vec<String> {
+pub(crate) fn validated_locale_prefix_locales(i18n: &crate::i18n::I18nConfig) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     i18n.supported_locales
         .iter()
