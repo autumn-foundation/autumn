@@ -67,11 +67,11 @@ pub struct AeoConfig {
     /// Site name for `llms.txt`, the server card, and the ARD manifest.
     /// Default: the `OpenAPI` title, else the host name.
     #[serde(default)]
-    pub name: Option<String>,
+    pub site_name: Option<String>,
 
     /// One-line site summary. Default: the `OpenAPI` description.
     #[serde(default)]
-    pub description: Option<String>,
+    pub site_description: Option<String>,
 
     /// Answer `Accept: text/markdown` with a Markdown copy of HTML pages.
     #[serde(default = "default_true")]
@@ -126,8 +126,8 @@ impl Default for AeoConfig {
             enabled: true,
             content_signals: ContentSignalsConfig::default(),
             ai_crawlers: AiCrawlersConfig::default(),
-            name: None,
-            description: None,
+            site_name: None,
+            site_description: None,
             markdown: true,
             markdown_max_bytes: default_markdown_max_bytes(),
             link_headers: true,
@@ -347,11 +347,11 @@ impl AeoSite {
         mut facts: documents::SiteFacts,
     ) -> Self {
         let aeo = &config.aeo;
-        if aeo.name.is_some() {
-            facts.name.clone_from(&aeo.name);
+        if aeo.site_name.is_some() {
+            facts.name.clone_from(&aeo.site_name);
         }
-        if aeo.description.is_some() {
-            facts.description.clone_from(&aeo.description);
+        if aeo.site_description.is_some() {
+            facts.description.clone_from(&aeo.site_description);
         }
         facts.site_guide_skill = aeo.site_guide_skill;
         facts.llms_txt = aeo.llms_txt;

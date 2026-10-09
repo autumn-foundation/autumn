@@ -50,8 +50,8 @@ link_headers = true
 llms_txt = true
 site_guide_skill = true
 publish_tools = true    # false when a proxy guards /mcp
-name = "Example Shop"   # default: the OpenAPI title, else the host name
-description = "Hand-made things."
+site_name = "Example Shop"   # default: the OpenAPI title, else the host name
+site_description = "Hand-made things."
 ```
 
 ---

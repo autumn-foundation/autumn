@@ -25,6 +25,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use serde::Deserialize;
 use serde_json::{Value, json};
+#[cfg(feature = "http-client")]
 use sha2::Digest as _;
 
 /// Path of the UCP profile.
@@ -1047,6 +1048,7 @@ mod tests {
         assert_eq!(paid_route_problems(&[r]).len(), 2);
     }
 
+    #[cfg(feature = "http-client")]
     #[test]
     fn facilitator_must_be_https_or_loopback() {
         assert!(facilitator_url_is_safe("https://x402.org/facilitator"));

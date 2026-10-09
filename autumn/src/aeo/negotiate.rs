@@ -272,7 +272,7 @@ async fn to_markdown(res: Response, config: &NegotiateConfig) -> Response {
     let markdown = if bytes.len() > BLOCKING_THRESHOLD {
         // A large page converts off the async worker threads.
         let html = bytes.clone();
-        match tokio::task::spawn_blocking(move || {
+        match crate::time::spawn_blocking(move || {
             super::markdown::html_to_markdown(&String::from_utf8_lossy(&html))
         })
         .await

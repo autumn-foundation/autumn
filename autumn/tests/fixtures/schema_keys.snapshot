@@ -16,13 +16,11 @@ aeo.content_signals.ai_input
 aeo.content_signals.ai_train
 aeo.content_signals.enabled
 aeo.content_signals.search
-aeo.description
 aeo.enabled
 aeo.link_headers
 aeo.llms_txt
 aeo.markdown
 aeo.markdown_max_bytes
-aeo.name
 aeo.oauth
 aeo.oauth.authorization_server
 aeo.oauth.authorization_server.agent_assertion_types
@@ -52,7 +50,9 @@ aeo.paid_routes.mpp_currency
 aeo.paid_routes.mpp_method
 aeo.paid_routes.path
 aeo.publish_tools
+aeo.site_description
 aeo.site_guide_skill
+aeo.site_name
 aeo.web_bot_auth
 aeo.web_bot_auth.expires_secs
 aeo.web_bot_auth.private_key_env

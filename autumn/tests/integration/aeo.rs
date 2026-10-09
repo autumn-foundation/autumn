@@ -621,9 +621,15 @@ mod commerce {
             let required =
                 decode_header(c.get(path).send().await.header("payment-required").unwrap())
                     .unwrap();
+            // One payment per request: a header works only once.
+            let payment = encode_header(&json!({
+                "x402Version": 2,
+                "accepted": required["accepts"][0],
+                "payload": { "signature": format!("0xsig{path}") },
+            }));
             let res = c
                 .get(path)
-                .header("payment-signature", &signature(&required["accepts"][0]))
+                .header("payment-signature", &payment)
                 .send()
                 .await;
             assert_eq!(res.status, status, "{path}");
