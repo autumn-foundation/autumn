@@ -169,6 +169,7 @@ mod health_indicator_integration;
 mod hooks_lifecycle;
 #[cfg(feature = "htmx")]
 mod htmx_serving;
+mod http_latency_histogram;
 #[cfg(feature = "i18n")]
 mod i18n_integration;
 mod idempotency_middleware;
@@ -396,6 +397,8 @@ mod repository_scope_meta;
 mod repository_search;
 #[cfg(feature = "db")]
 mod repository_upsert_many_advisory_lock_batching_profile;
+#[cfg(feature = "http-client")]
+mod request_id_propagation;
 mod request_timeout;
 #[cfg(feature = "db")]
 mod retention;

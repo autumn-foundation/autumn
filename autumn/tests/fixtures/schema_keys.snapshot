@@ -650,6 +650,7 @@ telemetry.enabled
 telemetry.environment
 telemetry.otlp_endpoint
 telemetry.protocol
+telemetry.sample_ratio
 telemetry.service_name
 telemetry.service_namespace
 telemetry.service_version

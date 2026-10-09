@@ -42,6 +42,8 @@ pub use access_log::{
 };
 pub use cost::{CostFuture, CostLayer, CostService};
 pub use exception_filter::{AutumnErrorInfo, ExceptionFilter, ExceptionFilterLayer};
+#[cfg(feature = "mcp")]
+pub(crate) use load_shed::{EnvelopeAdmission, LoadShedEnvelope};
 pub use load_shed::{LoadShedExempt, LoadShedLayer, LoadShedService};
 pub use log_context::{LogContextLayer, LogContextService};
 pub use maintenance::{DEFAULT_HEALTH_PREFIX, MaintenanceLayer, MaintenanceService};
