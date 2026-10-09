@@ -741,6 +741,25 @@ mod db_store {
         usable
     }
 
+    /// How many pages `list_for` reads at most while it looks past corrupt rows.
+    const MAX_LIST_PAGES: i64 = 5;
+
+    /// Add the usable rows of one page. Returns `true` when the next page is
+    /// needed: this page was full and the cap is not reached yet.
+    ///
+    /// The SQL `LIMIT` runs before corrupt rows are skipped. Without paging,
+    /// corrupt rows at the front would hide healthy rows after them.
+    fn absorb_page(
+        principal_id: &str,
+        usable: &mut Vec<StoredSubscription>,
+        page: Vec<SubscriptionRow>,
+    ) -> bool {
+        let full = page.len() >= super::MAX_SUBSCRIPTIONS_PER_PRINCIPAL;
+        usable.extend(usable_subscriptions(principal_id, page));
+        usable.truncate(super::MAX_SUBSCRIPTIONS_PER_PRINCIPAL);
+        full && usable.len() < super::MAX_SUBSCRIPTIONS_PER_PRINCIPAL
+    }
+
     /// [`PushSubscriptionStore`] backed by the app's database pool.
     ///
     /// Expects the `push_subscriptions` table scaffolded by
@@ -890,19 +909,28 @@ mod db_store {
         async fn list_for(&self, principal_id: &str) -> Result<Vec<StoredSubscription>, PushError> {
             use push_subscriptions::dsl;
             let mut conn = self.conn().await?;
-            let rows: Vec<SubscriptionRow> = dsl::push_subscriptions
-                .filter(dsl::tenant_id.eq(crate::tenancy::current_tenant_id()))
-                .filter(dsl::principal_id.eq(principal_id))
-                .order(dsl::id.asc())
-                // The bound that actually caps per-notification work — applied
-                // in SQL so it holds however many rows the table contains. See
-                // `MAX_SUBSCRIPTIONS_PER_PRINCIPAL`.
-                .limit(i64::try_from(super::MAX_SUBSCRIPTIONS_PER_PRINCIPAL).unwrap_or(i64::MAX))
-                .select(SubscriptionRow::as_select())
-                .load(&mut conn)
-                .await
-                .map_err(|e| store_err(&e))?;
-            Ok(usable_subscriptions(principal_id, rows))
+            let page_size =
+                i64::try_from(super::MAX_SUBSCRIPTIONS_PER_PRINCIPAL).unwrap_or(i64::MAX);
+            let mut usable = Vec::new();
+            for page_no in 0..MAX_LIST_PAGES {
+                let page: Vec<SubscriptionRow> = dsl::push_subscriptions
+                    .filter(dsl::tenant_id.eq(crate::tenancy::current_tenant_id()))
+                    .filter(dsl::principal_id.eq(principal_id))
+                    .order(dsl::id.asc())
+                    // The bound that actually caps per-notification work —
+                    // applied in SQL so it holds however many rows the table
+                    // contains. See `MAX_SUBSCRIPTIONS_PER_PRINCIPAL`.
+                    .limit(page_size)
+                    .offset(page_no * page_size)
+                    .select(SubscriptionRow::as_select())
+                    .load(&mut conn)
+                    .await
+                    .map_err(|e| store_err(&e))?;
+                if !absorb_page(principal_id, &mut usable, page) {
+                    break;
+                }
+            }
+            Ok(usable)
         }
 
         async fn remove(
@@ -936,6 +964,7 @@ mod db_store {
 
     #[cfg(test)]
     mod tests {
+        use super::super::MAX_SUBSCRIPTIONS_PER_PRINCIPAL;
         use super::*;
 
         fn row(endpoint: &str, key: &str) -> SubscriptionRow {
@@ -945,6 +974,36 @@ mod db_store {
                 p256dh: key.to_owned(),
                 auth: key.to_owned(),
             }
+        }
+
+        #[test]
+        fn corrupt_rows_in_the_first_page_do_not_starve_healthy_rows_after_it() {
+            // More rows than the cap is a supported state, and the first
+            // page can be all corrupt. Paging must go on to the next one.
+            let mut usable = Vec::new();
+            let bad: Vec<SubscriptionRow> = (0..MAX_SUBSCRIPTIONS_PER_PRINCIPAL)
+                .map(|i| row(&format!("https://push.example.com/bad{i}"), "not base64!"))
+                .collect();
+            assert!(
+                absorb_page("1", &mut usable, bad),
+                "a full page with no usable row needs the next page"
+            );
+            let good = vec![row("https://push.example.com/good", "AAAA")];
+            assert!(
+                !absorb_page("1", &mut usable, good),
+                "a short page is the last"
+            );
+            assert_eq!(usable.len(), 1);
+        }
+
+        #[test]
+        fn paging_stops_once_the_cap_of_usable_rows_is_collected() {
+            let mut usable = Vec::new();
+            let page: Vec<SubscriptionRow> = (0..MAX_SUBSCRIPTIONS_PER_PRINCIPAL)
+                .map(|i| row(&format!("https://push.example.com/ok{i}"), "AAAA"))
+                .collect();
+            assert!(!absorb_page("1", &mut usable, page));
+            assert_eq!(usable.len(), MAX_SUBSCRIPTIONS_PER_PRINCIPAL);
         }
 
         #[test]
