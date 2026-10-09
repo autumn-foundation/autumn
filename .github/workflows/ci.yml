@@ -2285,6 +2285,10 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --test flags -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test config -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test experiments -- --ignored
+          # autumn-cli's own unit tests (the `autumn` bin target). No lane ran
+          # them, so a change under autumn-cli/src showed 0% patch coverage
+          # however well its unit tests covered it.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
