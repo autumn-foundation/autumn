@@ -2360,18 +2360,7 @@ impl RequestBuilder {
         let start = crate::time::ambient_instant();
         let max_attempts = self.max_attempts(suppress_retries);
         let mut gate = self.retry_gate(url_host(&self.url).as_deref());
-        // A caller's own deadline header also needs a new value per attempt
-        // and per hop, so the client follows redirects itself then too.
-        let caller_header = self
-            .extra_headers
-            .get(DEADLINE_HEADER)
-            .and_then(crate::deadline::parse_header)
-            .is_some();
-        // An HTTP message signature is a credential that the pooled
-        // client's redirects would carry to the next host; the manual
-        // follow strips it on a cross-origin hop.
-        let signed = self.extra_headers.contains_key("signature");
-        if gate.deadline.is_some() || caller_header || signed {
+        if gate.deadline.is_some() || self.follows_redirects_itself() {
             return self.follow_pooled(suppress_retries, &gate).await;
         }
         let mut last_retry = None;
@@ -2491,6 +2480,21 @@ impl RequestBuilder {
             host,
             self.retry.send_deadline_header,
         )
+    }
+
+    /// `true` when a header needs the client to follow redirects itself:
+    ///
+    /// - A caller's own deadline header needs a new value per attempt and
+    ///   per hop.
+    /// - An HTTP message signature is a credential that the pooled client's
+    ///   redirects would carry to the next host; the manual follow strips it
+    ///   on a cross-origin hop.
+    fn follows_redirects_itself(&self) -> bool {
+        self.extra_headers
+            .get(DEADLINE_HEADER)
+            .and_then(crate::deadline::parse_header)
+            .is_some()
+            || self.extra_headers.contains_key("signature")
     }
 
     /// The plain path under a request deadline. The pooled client does not

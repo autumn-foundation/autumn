@@ -258,6 +258,7 @@ pub fn decode_header(header: &str) -> Option<Value> {
 
 /// `true` when the client's `accepted` requirements are the ones offered.
 #[must_use]
+#[cfg_attr(not(feature = "http-client"), allow(dead_code))]
 pub(crate) fn accepted_matches(accepted: &Value, offered: &Value) -> bool {
     ["scheme", "network", "amount", "asset", "payTo"]
         .iter()

@@ -547,7 +547,7 @@ struct Dropped {
 }
 
 impl Dropped {
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.names.is_empty()
     }
 
