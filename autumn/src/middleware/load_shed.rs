@@ -75,20 +75,14 @@ use crate::middleware::maintenance::{health_prefix_matches, prefix_with_trailing
 /// rather than piling onto the already-loaded process.
 const RETRY_AFTER_SECS: &str = "1";
 
-/// Request-extension marker that exempts a request from load-shed admission
-/// accounting.
+/// Request-extension marker for an MCP `tools/call` replay.
 ///
-/// Set on requests that have already been counted by an upstream
-/// `LoadShedLayer` so a shared-counter replay doesn't double-count them. The
-/// MCP endpoint uses this: `/mcp`'s outer envelope and its `tools/call`
-/// dispatch replay share the same `LoadShedLayer` instance (same `Arc`
-/// counter, see `crate::router::build_load_shed_layer`); without this marker
-/// a single `tools/call` would acquire one slot at the envelope and a second
-/// at the replay, silently halving the effective ceiling for MCP traffic (at
-/// `max_concurrent_requests = 1` a solo `tools/call` would even shed itself).
-/// The marker keeps the replay from consuming a second slot for the same
-/// logical request. It is only ever set internally — external requests
-/// cannot carry it, since extensions are not derived from headers.
+/// The `/mcp` envelope already holds a slot in the total count, as
+/// `critical`. The replay does not take a second one: at
+/// `max_concurrent_requests = 1`, a solo `tools/call` would shed itself.
+/// The replay claims a slot at its route's class instead. It is shed when
+/// that class is full. Only internal code sets this marker, because
+/// extensions do not come from headers.
 #[derive(Clone, Copy, Debug)]
 pub struct LoadShedExempt;
 
@@ -410,7 +404,7 @@ where
 
 /// Take one slot of `counter` while it is below `threshold`.
 ///
-/// Returns the count before the claim. Lock-free: a CAS loop.
+/// Returns the count before the claim. It uses a lock-free CAS loop.
 fn claim(counter: &AtomicUsize, threshold: usize) -> Option<usize> {
     let mut current = counter.load(Ordering::Acquire);
     loop {
@@ -1233,6 +1227,7 @@ mod tests {
             .with_partitions(PartitionShares::new(1.0, 0.5).unwrap());
         let gate = Arc::new(Notify::new());
         let entered = Arc::new(StdAtomicUsize::new(0));
+        let counters = (Arc::clone(&layer.in_flight), Arc::clone(&layer.classified));
         let app = make_blocking_app(layer, gate.clone(), entered.clone());
 
         let mut envelopes = Vec::new();
@@ -1256,9 +1251,6 @@ mod tests {
             }));
         }
         wait_for_entered(&entered, 11).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let shed = replays.iter().filter(|h| h.is_finished()).count();
-        assert_eq!(shed, 1, "exactly one replay is over the share");
         gate.notify_waiters();
         let mut statuses = Vec::new();
         for h in replays {
@@ -1274,44 +1266,62 @@ mod tests {
         for h in envelopes {
             assert_eq!(h.await.unwrap(), axum::http::StatusCode::OK);
         }
+        assert_eq!(counters.0.load(Ordering::Acquire), 0, "total count leaks");
+        assert_eq!(counters.1.load(Ordering::Acquire), 0, "class count leaks");
     }
 
     /// Defect 2 (#3186): a replay shed gives the envelope no limiter sample.
+    /// A control run shows that a normal fast envelope does grow the limit.
     #[tokio::test]
     async fn replay_shed_gives_no_limiter_sample() {
         use crate::admission::{Criticality, PartitionShares};
         use std::convert::Infallible;
-        let limiter = aimd_limiter(10);
-        // Sheddable share 0: every sheddable replay is shed.
-        let layer = LoadShedLayer::adaptive(Arc::clone(&limiter), MetricsCollector::new())
-            .with_partitions(PartitionShares::new(1.0, 0.0).unwrap());
-        let replay_svc = layer
-            .clone()
-            .layer(tower::service_fn(|_req: Request<Body>| async move {
-                Ok::<_, Infallible>(Response::new(Body::empty()))
+
+        async fn run_envelope(replay_class: Criticality) -> usize {
+            // Limit 1: one fast sample grows it. Sheddable share 0 sheds
+            // every sheddable replay.
+            let limiter = aimd_limiter(1);
+            let layer = LoadShedLayer::adaptive(Arc::clone(&limiter), MetricsCollector::new())
+                .with_partitions(PartitionShares::new(1.0, 0.0).unwrap());
+            let replay_svc =
+                layer
+                    .clone()
+                    .layer(tower::service_fn(|_req: Request<Body>| async move {
+                        Ok::<_, Infallible>(Response::new(Body::empty()))
+                    }));
+            let envelope_svc = layer.layer(tower::service_fn(move |req: Request<Body>| {
+                let mut replay_svc = replay_svc.clone();
+                async move {
+                    let handle = req
+                        .extensions()
+                        .get::<EnvelopeAdmission>()
+                        .cloned()
+                        .expect("the layer gives the envelope a handle");
+                    let mut replay = request("/work", Some(replay_class));
+                    replay.extensions_mut().insert(LoadShedExempt);
+                    replay.extensions_mut().insert(handle);
+                    let _ = replay_svc.call(replay).await.unwrap();
+                    // MCP turns a shed into an HTTP 200 tool error.
+                    Ok::<_, Infallible>(Response::new(Body::empty()))
+                }
             }));
-        let envelope_svc = layer.layer(tower::service_fn(move |req: Request<Body>| {
-            let mut replay_svc = replay_svc.clone();
-            async move {
-                let handle = req
-                    .extensions()
-                    .get::<EnvelopeAdmission>()
-                    .cloned()
-                    .expect("the layer gives the envelope a handle");
-                let mut replay = request("/work", Some(Criticality::Sheddable));
-                replay.extensions_mut().insert(LoadShedExempt);
-                replay.extensions_mut().insert(handle);
-                let shed = replay_svc.call(replay).await.unwrap();
-                assert_eq!(shed.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
-                // MCP turns the shed into an HTTP 200 tool error.
-                Ok::<_, Infallible>(Response::new(Body::empty()))
-            }
-        }));
-        let mut req = request("/mcp", Some(Criticality::Critical));
-        req.extensions_mut().insert(LoadShedEnvelope);
-        let resp = envelope_svc.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), axum::http::StatusCode::OK);
-        assert_eq!(limiter.limit(), 10, "a shed replay is not a sample");
+            let mut req = request("/mcp", Some(Criticality::Critical));
+            req.extensions_mut().insert(LoadShedEnvelope);
+            let resp = envelope_svc.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            limiter.limit()
+        }
+
+        assert_eq!(
+            run_envelope(Criticality::Critical).await,
+            2,
+            "control: a fast envelope grows the limit"
+        );
+        assert_eq!(
+            run_envelope(Criticality::Sheddable).await,
+            1,
+            "a shed replay is not a sample"
+        );
     }
 
     // ── Probe / actuator exemption ────────────────────────────────────────

@@ -109,7 +109,7 @@ The replay must use its own class. Two rules (issue #3186):
 
 - **Class slots.** The layer keeps a count of classified requests: direct
   requests and replays. An envelope is not in it. A replay claims a slot with a
-  CAS on this count against the threshold of its class. Thus N+1 concurrent
+  CAS on this count against the threshold of its class. So N+1 concurrent
   `sheddable` calls shed exactly one, and other unclassified envelopes do not
   shed a replay. A replay keeps the slot of its envelope and does not take a
   second one in the total count.
