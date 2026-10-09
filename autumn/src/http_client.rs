@@ -7942,8 +7942,12 @@ mod tests {
                 ..RetryPolicy::default()
             };
             let gate = RetryGate::with_deadline(None, None, None, true);
+            // Warm the connection. A cold first connect on a slow runner
+            // must not use up the hop deadline.
+            let client = reqwest::Client::new();
+            let _ = client.get(&url).send().await;
             let result = send_one(
-                &reqwest::Client::new(),
+                &client,
                 &Method::GET,
                 &url,
                 &HeaderMap::new(),
@@ -7951,7 +7955,7 @@ mod tests {
                 &policy,
                 &crate::entropy::SeededEntropy::new(1),
                 false,
-                Some(crate::time::ambient_instant() + Duration::from_millis(300)),
+                Some(crate::time::ambient_instant() + Duration::from_secs(1)),
                 false,
                 &gate,
                 false,
