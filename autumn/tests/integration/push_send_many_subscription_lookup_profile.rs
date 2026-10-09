@@ -223,6 +223,7 @@ async fn push_send_many_subscription_lookup_profile() {
     conn.batch_execute(
         "CREATE TABLE push_subscriptions ( \
             id BIGSERIAL PRIMARY KEY, \
+            tenant_id TEXT NOT NULL DEFAULT '', \
             principal_id TEXT NOT NULL, \
             endpoint TEXT NOT NULL UNIQUE, \
             p256dh TEXT NOT NULL, \

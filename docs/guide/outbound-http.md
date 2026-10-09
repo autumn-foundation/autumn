@@ -174,6 +174,19 @@ automatically carries a `traceparent` header derived from the active span.
 This means the inbound trace ID from a `#[handler]` or `#[job]` propagates
 transparently to the upstream service — no extra wiring needed.
 
+Each attempt opens one `http.client.request` span (kind `CLIENT`). The
+`traceparent` header of the attempt names that span. A retry is a new span.
+A `4xx` or `5xx` response, or a failed attempt, sets the span status to
+`ERROR`.
+
+To send your own trace context, set `traceparent` on the request builder.
+If you set `traceparent` or `tracestate`, the client sends neither of its
+own. The two headers then always come from one context.
+
+During an inbound request, each outbound request also sends the request ID
+as `x-request-id`. A header that you set wins. Call `.without_request_id()`
+to send no ID. See [Overload signals](observability/overload-signals.md#request-ids).
+
 A `tracing::info!` event is emitted for every request with:
 
 ```

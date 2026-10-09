@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_web::cache::{
-    Cache, CacheFuture, FillLockStatus, InvalidationError, RawCacheBytes, jittered_ttl,
+    Cache, CacheFuture, FillEpoch, FillLockStatus, InvalidationError, RawCacheBytes, jittered_ttl,
     record_invalidation_failure,
 };
 use redis::AsyncCommands as _;
@@ -60,6 +60,40 @@ else
     return 0
 end
 ";
+
+/// Lua script for a fenced insert: store the value only if the namespace epoch
+/// still equals the one the fill sampled. One script call, so an `INCR` cannot
+/// land between the check and the store. `KEYS[2]` is the epoch key. `ARGV` is
+/// the sampled epoch, the value, and the TTL in ms (empty for none).
+const FENCED_INSERT_SCRIPT: &str = r"
+local current = redis.call('GET', KEYS[2])
+if not current then current = '0' end
+if current ~= ARGV[1] then return 0 end
+if ARGV[3] == '' then
+    redis.call('SET', KEYS[1], ARGV[2])
+else
+    redis.call('PSETEX', KEYS[1], ARGV[3], ARGV[2])
+end
+return 1
+";
+
+/// Set after the first failed fenced insert has been logged at `warn`.
+static FENCED_INSERT_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// [`FENCED_INSERT_SCRIPT`], hashed once.
+static FENCED_INSERT: std::sync::LazyLock<redis::Script> =
+    std::sync::LazyLock::new(|| redis::Script::new(FENCED_INSERT_SCRIPT));
+
+/// Key segment that marks a shared fill epoch. [`RedisCache::sweep`] never
+/// deletes a key that has it.
+const EPOCH_SEGMENT: &str = "__autumn_epoch__:";
+
+/// Whether an application key uses the reserved epoch segment. A write to such
+/// a key is refused, so it cannot overwrite an epoch.
+fn is_reserved_key(key: &str) -> bool {
+    key.starts_with(EPOCH_SEGMENT)
+}
 
 /// Errors that can occur when constructing or using a [`RedisCache`].
 #[derive(Debug, Error)]
@@ -261,6 +295,40 @@ impl RedisCache {
         format!("__autumn_fill_lock__:{}:{}", self.key_prefix, key)
     }
 
+    /// Key of a namespace's shared fill epoch.
+    ///
+    /// Inside `key_prefix:`, so a Redis ACL scoped to the prefix still works.
+    /// [`Cache::clear`] sweeps `{key_prefix}:*`, so [`Self::sweep`] skips these
+    /// keys. If `clear` removed an epoch, the counter would restart at 0, and a
+    /// stale fill that sampled 0 would pass.
+    fn epoch_key(&self, namespace: &str) -> String {
+        self.prefixed(&format!("{EPOCH_SEGMENT}{namespace}"))
+    }
+
+    /// Raise the namespace's shared epoch, with retries.
+    async fn bump_epoch(&self, namespace: &str) -> Result<(), InvalidationError> {
+        let key = self.epoch_key(namespace);
+        self.retry_invalidation(&key, || {
+            let mut conn = self.manager.clone();
+            let key = key.clone();
+            async move { conn.incr::<_, _, i64>(key, 1).await.map(|_| ()) }
+        })
+        .await
+    }
+
+    /// Drop a namespace for all replicas.
+    ///
+    /// The epoch rises first. Then a fill that sampled the old epoch is fenced
+    /// out, and the sweep removes anything stored before the bump. The sweep
+    /// runs even if the bump failed. The first error is returned.
+    async fn invalidate_namespace_fenced(&self, namespace: &str) -> Result<(), InvalidationError> {
+        let bumped = self.bump_epoch(namespace).await;
+        let swept = self
+            .sweep_with_retry(&self.namespace_pattern(namespace))
+            .await;
+        bumped.and(swept)
+    }
+
     fn redis_get(&self, key: &str) -> Option<Vec<u8>> {
         let prefixed = self.prefixed(key);
         let mut conn = self.manager.clone();
@@ -271,6 +339,10 @@ impl RedisCache {
     }
 
     fn redis_set(&self, key: &str, bytes: Vec<u8>, ttl: Option<std::time::Duration>) {
+        if is_reserved_key(key) {
+            warn!(key, "RedisCache: refused a write to a reserved epoch key");
+            return;
+        }
         let prefixed = self.prefixed(key);
         let mut conn = self.manager.clone();
         tokio::task::block_in_place(|| {
@@ -311,6 +383,11 @@ impl RedisCache {
                 .arg(100u32)
                 .query_async(&mut conn)
                 .await?;
+            let epoch_prefix = self.prefixed(EPOCH_SEGMENT);
+            let keys: Vec<String> = keys
+                .into_iter()
+                .filter(|key| !key.starts_with(&epoch_prefix))
+                .collect();
             if !keys.is_empty() {
                 conn.del::<_, ()>(keys).await?;
             }
@@ -359,6 +436,10 @@ impl RedisCache {
 
     /// `DEL` one key, with retries.
     async fn delete_key(&self, key: &str) -> Result<(), InvalidationError> {
+        if is_reserved_key(key) {
+            warn!(key, "RedisCache: refused to delete a reserved epoch key");
+            return Ok(());
+        }
         let prefixed = self.prefixed(key);
         self.retry_invalidation(key, || {
             let mut conn = self.manager.clone();
@@ -468,6 +549,73 @@ impl Cache for RedisCache {
         debug!(key, "RedisCache: inserted via insert_raw_bytes");
     }
 
+    /// `RedisCache` keeps a shared fill epoch per namespace.
+    fn shares_fill_epoch(&self) -> bool {
+        true
+    }
+
+    /// Reads the namespace's shared epoch (one `GET`). A missing key is 0. A
+    /// Redis error is [`FillEpoch::Unavailable`], so the fill skips its insert.
+    fn fill_epoch(&self, namespace: &str) -> FillEpoch {
+        let key = self.epoch_key(namespace);
+        let mut conn = self.manager.clone();
+        let read: Result<Option<u64>, _> = block_on(async move { conn.get(&key).await });
+        match read {
+            Ok(epoch) => FillEpoch::Sampled(epoch.unwrap_or(0)),
+            Err(error) => {
+                debug!(namespace, error = %error, "RedisCache: epoch read failed");
+                FillEpoch::Unavailable
+            }
+        }
+    }
+
+    /// Stores the bytes through one Lua call that compares the epoch first. An
+    /// error counts as not stored: the cost is one extra miss.
+    fn insert_raw_bytes_if_epoch(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        ttl: Option<std::time::Duration>,
+        namespace: &str,
+        sampled: u64,
+    ) -> bool {
+        if is_reserved_key(key) {
+            warn!(key, "RedisCache: refused a write to a reserved epoch key");
+            return false;
+        }
+        let prefixed = self.prefixed(key);
+        let epoch_key = self.epoch_key(namespace);
+        let ttl_ms = ttl.map_or_else(String::new, |ttl| ttl_millis_for_redis(ttl).to_string());
+        let mut conn = self.manager.clone();
+        let result: Result<i64, _> = block_on(async move {
+            FENCED_INSERT
+                .key(&prefixed)
+                .key(&epoch_key)
+                .arg(sampled.to_string())
+                .arg(bytes)
+                .arg(ttl_ms)
+                .invoke_async(&mut conn)
+                .await
+        });
+        match result {
+            Ok(stored) => stored == 1,
+            Err(error) => {
+                // Most likely a Redis ACL that denies scripting. Every miss
+                // then recomputes, so say so once.
+                if !FENCED_INSERT_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    warn!(
+                        key,
+                        error = %error,
+                        "RedisCache: the fenced insert failed, so cached values are not stored. \
+                         The Redis user needs +eval, +evalsha and +script|load"
+                    );
+                }
+                debug!(key, error = %error, "RedisCache: fenced insert failed");
+                false
+            }
+        }
+    }
+
     /// Sync `DEL` with retries. The final error is logged with `warn!` and
     /// counted, because this method cannot return it. Prefer
     /// [`Cache::invalidate_async`].
@@ -484,7 +632,7 @@ impl Cache for RedisCache {
         // Issue #1716: a declared invalidation edge must be complete on a
         // shared, cross-replica backend. The `bool` tells the caller whether
         // stale data can still be served.
-        match block_on(self.sweep_with_retry(&self.namespace_pattern(namespace))) {
+        match block_on(self.invalidate_namespace_fenced(namespace)) {
             Ok(()) => true,
             Err(error) => {
                 debug!(namespace, error = %error, "RedisCache: namespace sweep failed");
@@ -515,10 +663,7 @@ impl Cache for RedisCache {
         &'a self,
         namespace: &'a str,
     ) -> CacheFuture<'a, Result<(), InvalidationError>> {
-        Box::pin(async move {
-            self.sweep_with_retry(&self.namespace_pattern(namespace))
-                .await
-        })
+        Box::pin(self.invalidate_namespace_fenced(namespace))
     }
 
     /// Acquires a cross-replica fill lock via `SET NX PX`. Redis errors are
@@ -691,7 +836,7 @@ mod tests {
 
         assert!(!state.health_indicator_registry().contains("redis:cache"));
     }
-    use autumn_web::cache::{get_cached, insert_cached};
+    use autumn_web::cache::{FillEpoch, get_cached, insert_cached, insert_cached_fenced};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::redis::Redis as RedisImage;
@@ -886,6 +1031,13 @@ mod tests {
     };
 
     #[test]
+    fn application_keys_cannot_use_the_reserved_epoch_segment() {
+        assert!(is_reserved_key("__autumn_epoch__:orders"));
+        assert!(!is_reserved_key("orders:abc"));
+        assert!(!is_reserved_key("x:__autumn_epoch__:orders"));
+    }
+
+    #[test]
     fn default_retry_policy_is_bounded() {
         let retry = InvalidationRetry::default();
         assert_eq!(retry.max_attempts, 3);
@@ -1024,6 +1176,134 @@ mod tests {
             .await
             .expect("the sweep succeeds once Redis accepts writes");
         assert!(!key_exists(&mut admin, "inv-ns:reads:1").await);
+    }
+
+    // ── #2356: the fill fence is shared across replicas ─────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_fill_on_another_replica_cannot_resurrect_an_invalidated_value() {
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+        let mut admin = admin_conn(&url).await;
+        let replica_a = RedisCache::connect(&url, "fence").await.unwrap();
+        let replica_b = RedisCache::connect(&url, "fence").await.unwrap();
+
+        // B misses, samples the shared epoch, and starts computing.
+        let epoch = replica_b.fill_epoch("reads");
+        assert_eq!(epoch, FillEpoch::Sampled(0));
+
+        // A writes, invalidates, and is told it is complete.
+        replica_a
+            .invalidate_namespace_async("reads")
+            .await
+            .expect("invalidation");
+
+        // B finishes. Its insert must be fenced out.
+        let stored = insert_cached_fenced(
+            &replica_b,
+            "reads:k",
+            "old".to_string(),
+            None,
+            "reads",
+            epoch,
+        );
+        assert!(!stored, "the shared epoch moved");
+        assert!(!key_exists(&mut admin, "fence:reads:k").await);
+
+        // Without a TTL the entry has no expiry.
+        let epoch = replica_b.fill_epoch("reads");
+        assert!(insert_cached_fenced(
+            &replica_b,
+            "reads:forever",
+            1_i64,
+            None,
+            "reads",
+            epoch
+        ));
+        let left: i64 = redis::cmd("PTTL")
+            .arg("fence:reads:forever")
+            .query_async(&mut admin)
+            .await
+            .unwrap();
+        assert_eq!(left, -1, "no TTL means no expiry");
+
+        // A fill that starts after the invalidation is stored, with its TTL.
+        let epoch = replica_b.fill_epoch("reads");
+        assert_eq!(epoch, FillEpoch::Sampled(1));
+        let ttl = Some(Duration::from_secs(60));
+        assert!(insert_cached_fenced(
+            &replica_b,
+            "reads:k",
+            "new".to_string(),
+            ttl,
+            "reads",
+            epoch
+        ));
+        assert_eq!(
+            get_cached::<String>(&replica_a, "reads:k").as_deref(),
+            Some("new")
+        );
+        let left: i64 = redis::cmd("PTTL")
+            .arg("fence:reads:k")
+            .query_async(&mut admin)
+            .await
+            .unwrap();
+        assert!(left > 0, "the TTL must survive the Lua insert: {left}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_epoch_is_per_namespace_and_survives_clear() {
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+        let cache = RedisCache::connect(&url, "fence-ns").await.unwrap();
+
+        cache.invalidate_namespace_async("a").await.unwrap();
+        assert_eq!(cache.fill_epoch("a"), FillEpoch::Sampled(1));
+        assert_eq!(cache.fill_epoch("b"), FillEpoch::Sampled(0));
+
+        // `clear` sweeps the prefix. If it took the epoch, a sampled 0 would
+        // match again after a bump.
+        cache.clear();
+        assert_eq!(cache.fill_epoch("a"), FillEpoch::Sampled(1));
+
+        // A key-level delete cannot remove an epoch either.
+        cache
+            .invalidate_async("__autumn_epoch__:a")
+            .await
+            .expect("a refused delete is not an error");
+        cache.invalidate("__autumn_epoch__:a");
+        assert_eq!(cache.fill_epoch("a"), FillEpoch::Sampled(1));
+
+        // The key sits inside the prefix, so a prefix-scoped ACL still works.
+        let mut admin = admin_conn(&url).await;
+        assert!(key_exists(&mut admin, "fence-ns:__autumn_epoch__:a").await);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_failed_epoch_bump_fails_the_invalidation() {
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+        let mut admin = admin_conn(&url).await;
+        let cache = RedisCache::connect(&url, "fence-fail")
+            .await
+            .unwrap()
+            .with_invalidation_retry(FAST_RETRY);
+
+        // No key matches, so the sweep alone would succeed.
+        reject_writes(&mut admin).await;
+        assert!(
+            cache.invalidate_namespace_async("reads").await.is_err(),
+            "a `true` must not be reported when the shared fence did not move"
+        );
+        assert!(!cache.invalidate_namespace("reads"));
+        accept_writes(&mut admin).await;
+        assert!(cache.invalidate_namespace_async("reads").await.is_ok());
     }
 
     /// Serializes tests that read the process-global failure counter or set
