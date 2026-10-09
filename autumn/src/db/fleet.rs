@@ -159,6 +159,16 @@ pub enum FleetError {
         /// Detail.
         detail: String,
     },
+    /// Another process sharing the fleet root has the database open, so it
+    /// cannot be deleted or replaced from here (`409`).
+    #[error(
+        "fleet database {name} is open in another process; close it there (or stop that \
+         process) before deleting or restoring it"
+    )]
+    InUseElsewhere {
+        /// The database name.
+        name: String,
+    },
     /// Restoring the database from its replica failed (`503`).
     #[error("fleet database {name}: restore failed: {detail}")]
     Restore {
@@ -193,7 +203,7 @@ impl FleetError {
         match self {
             Self::InvalidKey(_) => StatusCode::BAD_REQUEST,
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
-            Self::AlreadyExists { .. } => StatusCode::CONFLICT,
+            Self::AlreadyExists { .. } | Self::InUseElsewhere { .. } => StatusCode::CONFLICT,
             Self::Deleting { .. } => StatusCode::GONE,
             Self::PendingMigrations { .. }
             | Self::Migration { .. }
@@ -225,6 +235,9 @@ pub struct FleetDatabase {
     path: Arc<Path>,
     pool: Pool<RuntimeConnection>,
     closed: CancellationToken,
+    /// Counts the holders of this database. The fleet's own copy is one; any
+    /// more and the database is in use, so it is never closed.
+    lease: Arc<()>,
 }
 
 impl FleetDatabase {
@@ -244,6 +257,13 @@ impl FleetDatabase {
     #[must_use]
     pub const fn pool(&self) -> &Pool<RuntimeConnection> {
         &self.pool
+    }
+
+    /// A lease that keeps this database open while it is held. See
+    /// [`ShardLease`](crate::sharding::ShardLease).
+    #[must_use]
+    pub fn lease(&self) -> crate::sharding::ShardLease {
+        Arc::clone(&self.lease) as crate::sharding::ShardLease
     }
 
     /// Cancelled when the fleet closes this database. Background work tied to
@@ -297,8 +317,13 @@ pub trait FleetLifecycle: Send + Sync + 'static {
         let _ = db;
     }
 
+    /// Before a delete or a restore touches the closed database's files.
+    /// Let go of anything that holds them open (a parked replicator does).
+    fn release(&self, key: &FleetDbKey) {
+        let _ = key;
+    }
+
     /// When a delete has closed the database, before its files are removed.
-    /// Release anything that holds them open.
     fn on_delete(&self, key: &FleetDbKey) {
         let _ = key;
     }
@@ -777,6 +802,22 @@ impl DatabaseFleet {
         Ok(key)
     }
 
+    /// Refuse a key this fleet cannot hold: another mode's, a slot out of
+    /// range, or a tenant key whose slot is not its id's (all constructible
+    /// by hand, since `FleetDbKey`'s variants are public).
+    fn check_key(&self, key: &FleetDbKey) -> Result<(), FleetError> {
+        let consistent = match key {
+            FleetDbKey::Slot(slot) => *slot < crate::config::SLOT_COUNT,
+            FleetDbKey::Tenant { id, slot } => {
+                *slot == crate::sharding::slot_for_key(id.as_str().into()).0
+            }
+        };
+        if key.mode() != self.mode() || !consistent {
+            return Err(FleetLayoutError::InvalidName(key.name()).into());
+        }
+        Ok(())
+    }
+
     /// The file of `key`, under the root.
     #[must_use]
     pub fn path_of(&self, key: &FleetDbKey) -> PathBuf {
@@ -819,6 +860,7 @@ impl DatabaseFleet {
     /// [`FleetError::AlreadyExists`] when the file is already there, or an
     /// [`open`](Self::open) error.
     pub async fn provision(&self, key: &FleetDbKey) -> Result<FleetDatabase, FleetError> {
+        self.check_key(key)?;
         if self.path_of(key).exists() {
             return Err(FleetError::AlreadyExists { name: key.name() });
         }
@@ -832,6 +874,7 @@ impl DatabaseFleet {
     }
 
     async fn open_with(&self, key: &FleetDbKey, create: bool) -> Result<FleetDatabase, FleetError> {
+        self.check_key(key)?;
         loop {
             let next = self.claim_entry(key)?;
             let entry = match next {
@@ -947,6 +990,7 @@ impl DatabaseFleet {
             path: Arc::from(path.as_path()),
             pool,
             closed: CancellationToken::new(),
+            lease: Arc::new(()),
         };
         // The file is complete here — published fully migrated, restored, or
         // already there — so a failure below closes the pool and never
@@ -1085,8 +1129,7 @@ impl DatabaseFleet {
                 })
                 .filter_map(|(key, entry)| {
                     let db = entry.cell.get()?;
-                    is_idle(&db.pool)
-                        .then(|| (entry.last_use_seq.load(Ordering::Relaxed), key.clone()))
+                    is_idle(db).then(|| (entry.last_use_seq.load(Ordering::Relaxed), key.clone()))
                 })
                 .collect();
             idle.sort_unstable();
@@ -1115,7 +1158,7 @@ impl DatabaseFleet {
                 .iter()
                 .filter(|(_, entry)| {
                     now.saturating_duration_since(entry.last_used()) >= idle_close
-                        && entry.cell.get().is_some_and(|db| is_idle(&db.pool))
+                        && entry.cell.get().is_some_and(is_idle)
                 })
                 .map(|(key, _)| key.clone())
                 .collect()
@@ -1291,6 +1334,7 @@ impl DatabaseFleet {
     /// [`FleetError::Deleting`] when a delete is already running, or
     /// [`FleetError::Io`].
     pub async fn delete(&self, key: &FleetDbKey) -> Result<bool, FleetError> {
+        self.check_key(key)?;
         self.settle_opening(key).await;
         let begun = self.begin_exclusive(key, true)?;
         let Some((key, db, drain)) = begun else {
@@ -1304,17 +1348,28 @@ impl DatabaseFleet {
         self.drain(&key, db).await;
         // Hooks let go of the files first (a parked replicator holds one open).
         for hook in self.hooks() {
+            hook.release(&key);
             hook.on_delete(&key);
         }
         let path = self.path_of(&key);
         let root = self.inner.root.clone();
-        let removed = crate::time::spawn_blocking(move || remove_database_files(&path, &root))
-            .await
-            .map_err(|e| FleetError::Io {
-                op: "delete database",
-                detail: e.to_string(),
-            })
-            .and_then(|r| r);
+        let name = key.name();
+        let removed = crate::time::spawn_blocking(move || {
+            // Another process sharing the root may still serve the file;
+            // unlinking it under that process would split the tenant's data
+            // between the old inode and a new file. The guard refuses then,
+            // and blocks new openers while the files go.
+            let guard = exclusive_guard(&path, &name)?;
+            let removed = remove_database_files(&path, &root);
+            drop(guard);
+            removed
+        })
+        .await
+        .map_err(|e| FleetError::Io {
+            op: "delete database",
+            detail: e.to_string(),
+        })
+        .and_then(|r| r);
         if matches!(removed, Ok(true)) {
             self.inner.counters.deleted.fetch_add(1, Ordering::Relaxed);
         }
@@ -1425,6 +1480,7 @@ impl DatabaseFleet {
         key: &FleetDbKey,
         target: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<crate::replication::RestoreOutcome, FleetError> {
+        self.check_key(key)?;
         let replication = self
             .inner
             .replication
@@ -1435,31 +1491,16 @@ impl DatabaseFleet {
             self.settle_opening(key).await;
             if let Some((key, db, drain)) = self.begin_exclusive(key, false)? {
                 self.drain(&key, db).await;
+                for hook in self.hooks() {
+                    hook.release(&key);
+                }
                 let path = self.path_of(&key);
                 let restore_key = key.clone();
                 // Everything after the claim runs to `finish_drain`, whatever
                 // fails: an error that skipped it would strand every later
                 // opener of this key on a drain that never finishes.
                 let restored = crate::time::spawn_blocking(move || {
-                    if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent).map_err(|e| FleetError::Io {
-                            op: "create database directory",
-                            detail: e.to_string(),
-                        })?;
-                    }
-                    replication
-                        .restore(&restore_key, target, &path)
-                        .map_err(|error| match error {
-                            crate::replication::RestoreError::NoReplica { .. } => {
-                                FleetError::NotFound {
-                                    name: restore_key.name(),
-                                }
-                            }
-                            error => FleetError::Restore {
-                                name: restore_key.name(),
-                                detail: error.to_string(),
-                            },
-                        })
+                    restore_in_place(&replication, &restore_key, target, &path)
                 })
                 .await
                 .map_err(|error| FleetError::Restore {
@@ -1678,10 +1719,11 @@ impl Entry {
     }
 }
 
-/// No connection checked out and nobody waiting for one.
-fn is_idle(pool: &Pool<RuntimeConnection>) -> bool {
-    let status = pool.status();
-    status.available >= status.size && status.waiting == 0
+/// Nobody holds a lease beyond the fleet's own, no connection is checked
+/// out, and nobody is waiting for one.
+fn is_idle(db: &FleetDatabase) -> bool {
+    let status = db.pool.status();
+    Arc::strong_count(&db.lease) == 1 && status.available >= status.size && status.waiting == 0
 }
 
 /// Record the database's name in the file on first use, and refuse a file
@@ -1728,6 +1770,133 @@ async fn check_identity(pool: &Pool<RuntimeConnection>, name: &str) -> Result<()
     Ok(())
 }
 
+/// A private path beside `path` that no template matches (it starts with a
+/// dot and does not end in the template's extension), unique per process and
+/// attempt: `.<file>.<tag>-<pid>-<n>`.
+pub(crate) fn staging_path(path: &Path, tag: &str) -> PathBuf {
+    static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+    let file_name = path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    path.with_file_name(format!(
+        ".{file_name}.{tag}-{}-{}",
+        std::process::id(),
+        STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Remove a staging file and any sidecars `SQLite` left beside it.
+pub(crate) fn discard_staging(staging: &Path) {
+    let _ = std::fs::remove_file(staging);
+    for sidecar in crate::fleet_layout::sidecar_paths(staging) {
+        let _ = std::fs::remove_file(sidecar);
+    }
+}
+
+/// Prove no other process has `path` open, and keep it that way while the
+/// returned connection lives. Blocking. `Ok(None)` when there is no file.
+///
+/// The connection takes `locking_mode = EXCLUSIVE` with no busy wait and
+/// switches the database out of WAL. `SQLite` refuses that switch while any
+/// other connection — in any process — has the file open, so a refusal is
+/// [`FleetError::InUseElsewhere`]. On success the database is in rollback
+/// mode with no `-wal`, and the exclusive lock keeps new openers out until
+/// the guard is dropped; closing it then cannot touch a `-wal` some later
+/// opener creates at the same path.
+fn exclusive_guard(
+    path: &Path,
+    name: &str,
+) -> Result<Option<diesel::SqliteConnection>, FleetError> {
+    use diesel::RunQueryDsl as _;
+    use diesel::connection::SimpleConnection as _;
+
+    #[derive(diesel::QueryableByName)]
+    struct JournalMode {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        journal_mode: String,
+    }
+
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let in_use = || FleetError::InUseElsewhere {
+        name: name.to_owned(),
+    };
+    let mut conn = crate::db::establish_sqlite_migration_connection(&DatabaseFleet::url_of(path))
+        .map_err(|e| FleetError::Unavailable {
+        name: name.to_owned(),
+        detail: e.to_string(),
+    })?;
+    conn.batch_execute("PRAGMA busy_timeout = 0; PRAGMA locking_mode = EXCLUSIVE;")
+        .map_err(|_| in_use())?;
+    let mode = diesel::sql_query("PRAGMA journal_mode = DELETE")
+        .get_result::<JournalMode>(&mut conn)
+        .map_err(|_| in_use())?;
+    if !mode.journal_mode.eq_ignore_ascii_case("delete") {
+        return Err(in_use());
+    }
+    conn.batch_execute("BEGIN EXCLUSIVE; COMMIT;")
+        .map_err(|_| in_use())?;
+    Ok(Some(conn))
+}
+
+/// Replace the database at `path` with its replica. Blocking.
+///
+/// The replica is rebuilt in a private staging file first, so a failed
+/// restore leaves the current file untouched. Then, under the exclusive
+/// guard (no other process may serve the old file), the old files are
+/// removed and the staging file is linked into place.
+fn restore_in_place(
+    replication: &super::fleet_replication::FleetReplication,
+    key: &FleetDbKey,
+    target: Option<chrono::DateTime<chrono::Utc>>,
+    path: &Path,
+) -> Result<crate::replication::RestoreOutcome, FleetError> {
+    let name = key.name();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(io_error("create database directory"))?;
+    }
+    let staging = staging_path(path, "restoring");
+    let restored = replication
+        .restore_to(key, target, &staging)
+        .map_err(|error| match error {
+            crate::replication::RestoreError::NoReplica { .. } => {
+                FleetError::NotFound { name: name.clone() }
+            }
+            error => FleetError::Restore {
+                name: name.clone(),
+                detail: error.to_string(),
+            },
+        });
+    let outcome = match restored {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            discard_staging(&staging);
+            return Err(error);
+        }
+    };
+    let published = (|| {
+        let guard = exclusive_guard(path, &name)?;
+        for file in
+            std::iter::once(path.to_path_buf()).chain(crate::fleet_layout::sidecar_paths(path))
+        {
+            match std::fs::remove_file(&file) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_error("replace database")(e)),
+            }
+        }
+        std::fs::hard_link(&staging, path).map_err(io_error("publish restored database"))?;
+        drop(guard);
+        Ok(())
+    })();
+    discard_staging(&staging);
+    published.map(|()| crate::replication::RestoreOutcome {
+        output: path.to_path_buf(),
+        ..outcome
+    })
+}
+
 /// Create a fleet database atomically. Blocking.
 ///
 /// The database is built — identity row, every migration — in a private
@@ -1741,26 +1910,13 @@ fn create_database_file(
     name: &str,
     migrations: &FleetMigrations,
 ) -> Result<bool, FleetError> {
-    static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
     let parent = path.parent().ok_or_else(|| FleetError::Io {
         op: "create database",
         detail: "database path has no parent directory".to_owned(),
     })?;
     std::fs::create_dir_all(parent).map_err(io_error("create database directory"))?;
-    let file_name = path
-        .file_name()
-        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-    let staging = parent.join(format!(
-        ".{file_name}.creating-{}-{}",
-        std::process::id(),
-        STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    let discard = |staging: &Path| {
-        let _ = std::fs::remove_file(staging);
-        for sidecar in crate::fleet_layout::sidecar_paths(staging) {
-            let _ = std::fs::remove_file(sidecar);
-        }
-    };
+    let staging = staging_path(path, "creating");
+    let discard = discard_staging;
     discard(&staging);
     let built = build_staged_database(&staging, name, migrations);
     if let Err(error) = built {
@@ -1855,8 +2011,14 @@ impl crate::actuator::HealthIndicator for FleetHealthIndicator {
             use crate::actuator::HealthCheckOutput;
             let root = self.fleet.root().to_path_buf();
             let writable = crate::time::spawn_blocking(move || {
-                let probe = root.join(".autumn-fleet-probe");
-                std::fs::write(&probe, b"ok").and_then(|()| std::fs::remove_file(&probe))
+                // Unique per check, created new and removed by this check only:
+                // concurrent probes (or processes) never race on one name.
+                let probe = staging_path(&root.join("fleet"), "probe");
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&probe)
+                    .and_then(|_| std::fs::remove_file(&probe))
             })
             .await;
             let stats = self.fleet.stats();
@@ -2203,13 +2365,108 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let fleet = fleet(tmp.path(), FleetMode::Slot, |c| c.idle_close_secs = 1);
         let db = fleet.open(&FleetDbKey::Slot(1)).await.unwrap();
+        let (pool, closed) = (db.pool().clone(), db.closed().clone());
+        drop(db);
         assert_eq!(fleet.close_idle(), 0, "not idle long enough yet");
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert_eq!(fleet.close_idle(), 1);
         settle(&fleet).await;
-        assert!(db.closed().is_cancelled());
-        assert!(db.pool().is_closed());
+        assert!(closed.is_cancelled());
+        assert!(pool.is_closed());
         assert!(fleet.open_keys().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_held_lease_keeps_a_database_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |c| {
+            c.idle_close_secs = 1;
+            c.max_open = 1;
+        });
+        // A lazily acquiring repository holds only the lease and a pool.
+        let db = fleet.open(&FleetDbKey::Slot(1)).await.unwrap();
+        let (lease, pool) = (db.lease(), db.pool().clone());
+        drop(db);
+        fleet.open(&FleetDbKey::Slot(2)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let _ = fleet.close_idle();
+        fleet.enforce_capacity(None);
+        settle(&fleet).await;
+        assert!(fleet.open_keys().contains(&FleetDbKey::Slot(1)));
+        assert!(pool.get().await.is_ok(), "the leased pool still checks out");
+        drop(lease);
+        let _ = fleet.close_idle();
+        settle(&fleet).await;
+        assert!(!fleet.open_keys().contains(&FleetDbKey::Slot(1)));
+    }
+
+    #[tokio::test]
+    async fn keys_of_another_mode_or_out_of_range_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let slots = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let tenant = FleetDbKey::Tenant {
+            id: TenantDbId::parse("acme").unwrap(),
+            slot: crate::sharding::slot_for_key("acme".into()).0,
+        };
+        for bad in [tenant.clone(), FleetDbKey::Slot(16384)] {
+            assert!(matches!(
+                slots.open(&bad).await,
+                Err(FleetError::InvalidKey(_))
+            ));
+            assert!(matches!(
+                slots.delete(&bad).await,
+                Err(FleetError::InvalidKey(_))
+            ));
+        }
+        let tenants = fleet(&tmp.path().join("t"), FleetMode::Tenant, |c| {
+            c.create_on_demand = Some(true);
+        });
+        let wrong_slot = FleetDbKey::Tenant {
+            id: TenantDbId::parse("acme").unwrap(),
+            slot: crate::sharding::slot_for_key("acme".into()).0 ^ 1,
+        };
+        for bad in [FleetDbKey::Slot(1), wrong_slot] {
+            assert!(matches!(
+                tenants.open(&bad).await,
+                Err(FleetError::InvalidKey(_))
+            ));
+            assert!(matches!(
+                tenants.provision(&bad).await,
+                Err(FleetError::InvalidKey(_))
+            ));
+        }
+        assert!(
+            entries(tenants.root()).is_empty(),
+            "nothing touched the disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_a_database_another_process_has_open() {
+        use diesel::connection::SimpleConnection as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let key = FleetDbKey::Slot(4);
+        let path = fleet.open(&key).await.unwrap().path().to_path_buf();
+        fleet.close(&key).await;
+        // Another process's connection (a separate handle to the same file).
+        let mut other = crate::db::establish_sqlite_migration_connection(&format!(
+            "sqlite://{}",
+            path.display()
+        ))
+        .unwrap();
+        other
+            .batch_execute("SELECT 1 FROM _autumn_fleet_identity")
+            .unwrap();
+        let err = fleet.delete(&key).await.unwrap_err();
+        assert!(matches!(err, FleetError::InUseElsewhere { .. }), "{err}");
+        assert_eq!(err.http_status(), http::StatusCode::CONFLICT);
+        assert!(path.is_file(), "nothing was unlinked");
+        fleet.open(&key).await.expect("the key is not stranded");
+        fleet.close(&key).await;
+        drop(other);
+        assert!(fleet.delete(&key).await.unwrap());
+        assert!(!path.exists());
     }
 
     #[tokio::test]

@@ -754,6 +754,13 @@ pub struct Shard {
     fleet_db: Option<crate::db::fleet::FleetDatabase>,
 }
 
+/// A handle that keeps a fleet database open while it is held (ADR 0019).
+///
+/// The fleet never closes a database while any lease on it is alive, so a
+/// connection acquired lazily — a generated repository's first query, a
+/// fan-out future — never finds its pool closed. Opaque on purpose.
+pub type ShardLease = Arc<dyn std::any::Any + Send + Sync>;
+
 /// The metric label of every fleet database. See [`Shard::metric_label`].
 pub const FLEET_METRIC_LABEL: &str = "fleet";
 
@@ -771,6 +778,27 @@ impl Shard {
     #[must_use]
     pub fn metric_label(&self) -> &str {
         &self.metric_label
+    }
+
+    /// A lease that keeps this shard's database open while held: `Some` for
+    /// a fleet database, `None` for a configured shard (always open).
+    #[must_use]
+    #[allow(
+        clippy::missing_const_for_fn,
+        clippy::unused_self,
+        reason = "reads the fleet handle under the sqlite feature"
+    )]
+    pub fn lease(&self) -> Option<ShardLease> {
+        #[cfg(feature = "sqlite")]
+        {
+            self.fleet_db
+                .as_ref()
+                .map(crate::db::fleet::FleetDatabase::lease)
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            None
+        }
     }
 
     /// The fleet database behind this shard, when the set is fleet-backed.
@@ -2152,6 +2180,9 @@ pub struct ShardRepositorySeed {
     /// replica when one is healthy (issue #1274). Built via
     /// [`Shard::read_route`].
     pub read_route: crate::repository::ReadRoute,
+    /// Keeps a fleet database open while a repository built from this seed
+    /// lives (see [`Shard::lease`]). `None` for configured shards.
+    pub lease: Option<ShardLease>,
 }
 
 impl ShardRepositorySeed {
@@ -2177,6 +2208,7 @@ impl ShardRepositorySeed {
                 .as_ref()
                 .map(|key| format!("{key} shard={shard_name}")),
             read_route,
+            lease: None,
         }
     }
 }
@@ -2381,12 +2413,15 @@ pub async fn __autumn_resolve_repo_seed(
     .await?;
     let key = resolve_shard_key(parts, state).await?;
     let shard = shards.set.resolve(&key).await?;
-    let seed = ShardRepositorySeed::from_ctx(
+    let mut seed = ShardRepositorySeed::from_ctx(
         shard.primary_pool(),
         &shards.ctx,
         shard.metric_label(),
         shard.read_route(),
     );
+    // A generated repository acquires its connection lazily, possibly long
+    // after this; the lease keeps a fleet database from closing meanwhile.
+    seed.lease = shard.lease();
     let set = shards.set.clone();
     Ok((seed, set))
 }
@@ -2404,12 +2439,13 @@ impl axum::extract::FromRequestParts<crate::AppState> for ShardedDb {
         let shard = shards.set.resolve(&key).await?;
         let shard_name = Arc::clone(&shard.name);
         let shard_id = shard.id();
-        let repo_seed = ShardRepositorySeed::from_ctx(
+        let mut repo_seed = ShardRepositorySeed::from_ctx(
             shard.primary_pool(),
             &shards.ctx,
             shard.metric_label(),
             shard.read_route(),
         );
+        repo_seed.lease = shard.lease();
         let shard_set = shards.set.clone();
         let db = shards.checkout_primary(&shard).await?;
         crate::read_your_writes::mark_write();

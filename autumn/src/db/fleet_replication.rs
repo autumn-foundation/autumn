@@ -238,26 +238,25 @@ impl FleetReplication {
         self.stopped.store(true, Ordering::Release);
     }
 
-    /// Rebuild `path` from the replica of `key`, as of `target` (latest when
-    /// `None`). Blocking. The database must be closed.
+    /// Rebuild the replica of `key`, as of `target` (latest when `None`),
+    /// into `output`. Blocking. `output` should be a fresh staging path: the
+    /// caller publishes it (see `DatabaseFleet::restore`).
     ///
     /// # Errors
     ///
     /// [`RestoreError::NoReplica`] when nothing was ever shipped for `key`, or
     /// any other restore failure.
-    pub fn restore(
+    pub fn restore_to(
         &self,
         key: &FleetDbKey,
         target: Option<DateTime<Utc>>,
-        path: &Path,
+        output: &Path,
     ) -> Result<RestoreOutcome, RestoreError> {
-        // A parked replicator of the old file must not outlive it.
-        self.parked().remove(key);
         crate::replication::restore::restore(
             self.destination.as_ref(),
             &self.root_for(key),
             target,
-            path,
+            output,
         )
     }
 
@@ -323,18 +322,29 @@ impl FleetLifecycle for FleetReplication {
         if !self.restore_missing {
             return Ok(false);
         }
-        match self.restore(key, None, path) {
-            Ok(outcome) => {
-                tracing::info!(
-                    database = %key,
-                    bytes = outcome.bytes,
-                    "fleet database restored from its replica"
-                );
-                Ok(true)
-            }
+        // Restore privately, then publish with a link that refuses an
+        // existing target: when two processes restore the same database at
+        // once, the first to publish wins and the other opens its file,
+        // rather than replacing it under a process already serving it.
+        let staging = super::fleet::staging_path(path, "restoring");
+        let result = match self.restore_to(key, None, &staging) {
+            Ok(outcome) => match std::fs::hard_link(&staging, path) {
+                Ok(()) => {
+                    tracing::info!(
+                        database = %key,
+                        bytes = outcome.bytes,
+                        "fleet database restored from its replica"
+                    );
+                    Ok(true)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(true),
+                Err(e) => Err(format!("could not publish the restored database: {e}")),
+            },
             Err(RestoreError::NoReplica { .. }) => Ok(false),
             Err(error) => Err(format!("restore from replica failed: {error}")),
-        }
+        };
+        super::fleet::discard_staging(&staging);
+        result
     }
 
     fn on_open(&self, db: &FleetDatabase) -> Result<(), String> {
@@ -393,8 +403,9 @@ impl FleetLifecycle for FleetReplication {
         }
     }
 
-    fn on_delete(&self, key: &FleetDbKey) {
-        // The files are about to go: a parked replicator must not hold them.
+    fn release(&self, key: &FleetDbKey) {
+        // The files are about to be removed or replaced: a parked replicator
+        // must not hold them open.
         self.parked().remove(key);
     }
 }
@@ -810,6 +821,66 @@ mod tests {
             reopened.is_ok(),
             "open must not hang after a failed restore"
         );
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_restore_keeps_the_winners_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let (old_host, _) = replicated_fleet(&tmp.path().join("old"), &replicas, false);
+        let key = old_host.key_for("acme").unwrap();
+        let db = old_host.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        drop(db);
+        old_host.close_all().await;
+
+        let (new_host, replication) = replicated_fleet(&tmp.path().join("new"), &replicas, true);
+        let path = new_host.path_of(&key);
+        // Another process published first.
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"the winner's file").unwrap();
+        let restored = crate::time::spawn_blocking({
+            let (key, path) = (key.clone(), path.clone());
+            move || replication.restore_missing(&key, &path)
+        })
+        .await
+        .unwrap();
+        assert_eq!(restored, Ok(true));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"the winner's file",
+            "not replaced"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers.len(), 1, "no staging left: {leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn restore_refuses_a_database_another_process_has_open() {
+        use diesel::connection::SimpleConnection as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, _) =
+            replicated_fleet(&tmp.path().join("a"), &tmp.path().join("replicas"), false);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        let path = db.path().to_path_buf();
+        drop(db);
+        fleet.close(&key).await;
+        let mut other = crate::db::establish_sqlite_migration_connection(&format!(
+            "sqlite://{}",
+            path.display()
+        ))
+        .unwrap();
+        other.batch_execute("SELECT 1 FROM notes").unwrap();
+        let err = fleet.restore(&key, None).await.unwrap_err();
+        assert!(matches!(err, FleetError::InUseElsewhere { .. }), "{err}");
+        drop(other);
+        fleet.restore(&key, None).await.unwrap();
+        assert_eq!(count(&fleet.open(&key).await.unwrap()).await, 0);
     }
 
     #[tokio::test]

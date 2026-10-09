@@ -119,12 +119,12 @@ async fn signup(shards: Shards, Path(tenant): Path<String>) -> AutumnResult<Stat
 | --- | --- |
 | `fleet.provision(&key)` | create and migrate (`409` when it exists) |
 | `fleet.open(&key)` | open (`404` when missing and not created on demand) |
-| `fleet.delete(&key)` | close, then remove the file, its sidecars and the emptied bucket; requests get `410` meanwhile |
+| `fleet.delete(&key)` | close, then remove the file, its sidecars and the emptied bucket; requests get `410` meanwhile; `409` when another process still has it open |
 | `fleet.backup(&key, &dest)` | consistent copy with `VACUUM INTO`; writers keep running |
 | `fleet.list()` | every database on disk |
 | `fleet.each(n, f)` | run `f` on every database, `n` at a time |
 | `fleet.migrate_all(n)` | migrate every database, report failures per database |
-| `fleet.restore(&key, at)` | rebuild from the replica (needs replication) |
+| `fleet.restore(&key, at)` | rebuild from the replica (needs replication); `409` when another process still has it open |
 | `fleet.stats()` | counters (also on `/actuator/health` as `db:fleet`) |
 
 ## Migrations
@@ -151,8 +151,9 @@ migrations expand-then-contract.
 - A file that records another key's name (it was copied or renamed by hand)
   is refused with `500` rather than served.
 - Past `max_open`, the least recently used idle database closes. A database
-  with a connection checked out, or used in the last two seconds, is never
-  closed, so the cap is soft under load.
+  with a connection checked out, used in the last two seconds, or held by a
+  request (a `ShardedDb`, a sharded repository) is never closed, so the cap is
+  soft under load.
 - A new database is built and migrated in a private staging file, then
   published in one step: it is absent or complete, never half made. When two
   processes on one volume create the same database, both end up on one file.

@@ -3075,27 +3075,41 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             #[doc(hidden)]
             __autumn_shards: ::core::option::Option<::autumn_web::sharding::ShardSet>,
+            // Pins a fleet database open while this repository lives, so a
+            // lazily acquired connection never finds its pool closed
+            // (ADR 0019). `None` for configured shards.
+            #[doc(hidden)]
+            __autumn_shard_lease: ::core::option::Option<::autumn_web::sharding::ShardLease>,
         }
     } else {
         quote! {}
     };
 
     let shards_clone_field = if config.sharded {
-        quote! { __autumn_shards: self.__autumn_shards.clone(), }
+        quote! {
+            __autumn_shards: self.__autumn_shards.clone(),
+            __autumn_shard_lease: self.__autumn_shard_lease.clone(),
+        }
     } else {
         quote! {}
     };
 
     // The non-sharded extractor and shard-unaware constructors always use None.
     let shards_none_field = if config.sharded {
-        quote! { __autumn_shards: ::core::option::Option::None, }
+        quote! {
+            __autumn_shards: ::core::option::Option::None,
+            __autumn_shard_lease: ::core::option::Option::None,
+        }
     } else {
         quote! {}
     };
 
     // The self-routing sharded extractor populates this from the resolved ShardSet.
     let shards_some_field = if config.sharded {
-        quote! { __autumn_shards: ::core::option::Option::Some(__shard_set), }
+        quote! {
+            __autumn_shards: ::core::option::Option::Some(__shard_set),
+            __autumn_shard_lease: ::core::clone::Clone::clone(&__seed.lease),
+        }
     } else {
         quote! {}
     };
@@ -3107,6 +3121,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             __autumn_shards: ::core::option::Option::Some(
                 ::core::clone::Clone::clone(db.__autumn_shard_set()),
+            ),
+            __autumn_shard_lease: ::core::clone::Clone::clone(
+                &db.__autumn_repository_seed().lease,
             ),
         }
     } else {
@@ -3223,6 +3240,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #idempotency_field
                     across_tenants: true,
                     __autumn_shards: ::core::option::Option::None,
+                    // The fan-out future acquires lazily after `__shard` is
+                    // gone: hold its lease so the fleet keeps it open.
+                    __autumn_shard_lease: __shard.lease(),
                     // Honor the shard's read routing (replica / fail-closed),
                     // but preserve an explicit parent primary-read override
                     // (`primary_reads` or `on_primary()`) so cross-shard
@@ -5826,6 +5846,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #idempotency_init
                         across_tenants: true,
                         __autumn_shards: ::core::option::Option::Some(__set),
+                        __autumn_shard_lease: ::core::option::Option::None,
                         __autumn_read_route: #cross_read_route,
                         __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
                         __autumn_slow_threshold: __seed.slow_query_threshold,

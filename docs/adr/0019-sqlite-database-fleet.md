@@ -85,10 +85,11 @@ Uppercase is refused, not folded: on a case-insensitive file system `Acme` and
   tenant another's data.
 - Past `max_open`, the least recently used *idle* database closes; past
   `idle_close_secs`, any idle database closes. A database with a checked-out
-  connection is never chosen, and neither is one used in the last two seconds:
-  a request resolves its database before it checks a connection out (a
-  generated repository does so lazily), and closing the pool in between would
-  fail the request. The sweeper re-checks `max_open` at least once per grace
+  connection is never chosen, nor one used in the last two seconds, nor one
+  somebody holds a lease on. A `Shard` resolved for a request carries a
+  `ShardLease`, and generated repositories keep it for their lifetime, so a
+  connection acquired lazily — long after the database was resolved — never
+  finds its pool closed. The sweeper re-checks `max_open` at least once per grace
   window, so a burst of opens does not stay over the cap.
 - A new database is built in a private staging file beside its path —
   identity row and every migration — and published with a hard link, which
@@ -97,6 +98,14 @@ Uppercase is refused, not folded: on a case-insensitive file system `Acme` and
   when two processes (say a `web` and a `worker` role on one volume) create
   the same database, the second opens the first one's file instead of
   deleting it.
+- Several processes may share one fleet root (a `web` and a `worker` role on
+  one volume). Delete and restore therefore prove no other process has the
+  file open before touching it: a guard connection switches the database out
+  of WAL under `locking_mode = EXCLUSIVE` with no busy wait, which `SQLite`
+  refuses while any other connection has the file open. A refusal is `409`;
+  a success also keeps new openers out until the files are replaced.
+- Keys are checked against the fleet (mode, slot range, a tenant's own slot)
+  before anything touches the disk.
 - Closing calls `Pool::close` (a stale handle can no longer check out), waits
   for in-flight connections, then runs lifecycle hooks. An opener for a
   draining key waits for the drain, then opens fresh. Deleting a key refuses
@@ -133,9 +142,12 @@ destination as the control database:
   destination is down, the replicator is parked rather than dropped: it keeps
   the file open, the loop keeps shipping until it catches up, health reports
   it under `closing`, and a reopen takes it back (one replicator per file);
-- `DatabaseFleet::restore` rebuilds one database on a fresh volume. With
-  `restore_missing = true`, opening a database whose file is missing restores
-  it first: a host that takes over a slot range serves it from the replicas.
+- `DatabaseFleet::restore` rebuilds one database: into a private staging file
+  first, then published under the guard above. With `restore_missing = true`,
+  opening a database whose file is missing restores it first: a host that
+  takes over a slot range serves it from the replicas. That restore also
+  publishes with a no-replace link, so two processes restoring the same
+  database at once end up on the first one's file.
 
 Taking over a slot range needs the old owner stopped first (a fencing epoch is
 roadmap item 2).
