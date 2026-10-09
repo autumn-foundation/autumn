@@ -4062,7 +4062,16 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
         .func_wrap(
             WASI,
             "fd_seek",
-            |_: Caller<'_, HostState>, _fd: i32, _offset: i64, _whence: i32, _out: i32| {
+            |mut caller: Caller<'_, HostState>, fd: i32, _offset: i64, _whence: i32, _out: i32| {
+                // Unknown descriptor: refuse and record, like `fd_read`.
+                if !(0..=2).contains(&fd) {
+                    caller.data_mut().deny(
+                        DeniedCapability::Filesystem,
+                        "fd_seek",
+                        "a sandboxed plugin has no descriptors beyond the request dialogue",
+                    );
+                    return errno::BADF;
+                }
                 // stdio is a pipe. Saying so is more useful than saying no.
                 errno::SPIPE
             },
@@ -4780,7 +4789,7 @@ path = "/hello/greet"
         let outcome = try_host_with(guests::ANSWER_THEN_SPIN, limits)
             .expect("loads")
             .run(&get("/hello/greet"));
-        assert_eq!(outcome.result.expect("answers").status, 200);
+        assert_eq!(outcome.result.as_ref().expect("answers").status, 200);
         assert!(
             outcome.fuel_used < 1_000_000,
             "the answer cost {} fuel; the guest was allowed to keep spinning",
@@ -5012,6 +5021,51 @@ path = "/hello/greet"
             denied(&outcome, DeniedCapability::Filesystem),
             vec!["fd_read".to_owned()]
         );
+    }
+
+    /// A guest that seeks `fd`, traps unless the answer is `errno`, then
+    /// writes a fixed 200 response.
+    fn seek_guest(fd: i32, errno: i32) -> String {
+        format!(
+            r#"(module
+  (import "wasi_snapshot_preview1" "fd_seek" (func $seek (param i32 i64 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1 1)
+  (data (i32.const 128) "{{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain\"]],\"body_b64\":\"b2s=\"}}\0a")
+  (func (export "_start")
+    (if (i32.ne (call $seek (i32.const {fd}) (i64.const 0) (i32.const 0) (i32.const 0)) (i32.const {errno}))
+      (then unreachable))
+    (i32.store (i32.const 0) (i32.const 128))
+    (i32.store (i32.const 4) (i32.const 91))
+    (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))"#
+        )
+    }
+
+    #[test]
+    fn seeking_an_unknown_descriptor_is_denied_and_recorded() {
+        let outcome = host(&seek_guest(99, 8)).run(&get("/hello/greet"));
+        assert_eq!(outcome.result.as_ref().expect("answers").status, 200);
+        assert_eq!(
+            denied(&outcome, DeniedCapability::Filesystem),
+            vec!["fd_seek".to_owned()]
+        );
+    }
+
+    #[test]
+    fn seeking_a_negative_descriptor_is_denied_too() {
+        let outcome = host(&seek_guest(-1, 8)).run(&get("/hello/greet"));
+        assert_eq!(outcome.result.as_ref().expect("answers").status, 200);
+        assert_eq!(
+            denied(&outcome, DeniedCapability::Filesystem),
+            vec!["fd_seek".to_owned()]
+        );
+    }
+
+    #[test]
+    fn seeking_stdio_is_a_pipe_and_not_a_denial() {
+        let outcome = host(&seek_guest(1, 70)).run(&get("/hello/greet"));
+        assert_eq!(outcome.result.as_ref().expect("answers").status, 200);
+        assert!(outcome.denials.is_empty(), "{:?}", outcome.denials);
     }
 
     #[test]

@@ -504,7 +504,9 @@ mod body_b64 {
     use serde::{Deserialize as _, Deserializer, Serializer};
 
     pub(super) fn serialize<S: Serializer>(bytes: &[u8], ser: S) -> Result<S::Ok, S::Error> {
-        ser.serialize_str(&BASE64.encode(bytes))
+        // Streamed, not encoded to a `String` first: that copy is 4/3 of the
+        // body and lives as long as the output line does.
+        ser.collect_str(&base64::display::Base64Display::new(bytes, &BASE64))
     }
 
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<u8>, D::Error> {
@@ -1781,6 +1783,44 @@ mod tests {
         let line = format!(r#"{{"status":200,"headers":[{headers}],"body_b64":""}}"#);
         let parsed = from_line::<SandboxResponse>(&line).expect("a frame at the cap parses");
         assert_eq!(parsed.headers.len(), MAX_RESPONSE_HEADERS);
+    }
+
+    /// Records the largest single `write` it was given.
+    struct WidestWrite(usize);
+
+    impl std::io::Write for WidestWrite {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.max(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_body_is_encoded_into_the_line_without_a_whole_body_temporary() {
+        // A base64 `String` of the whole body handed to serde reaches the
+        // writer as one piece. Streaming the encoding never does.
+        const BODY: usize = 1 << 20;
+        let mut big = request();
+        big.body = vec![0xA5; BODY];
+        let frame = HostFrame::request(&big, &[]);
+
+        let mut widest = WidestWrite(0);
+        serde_json::to_writer(&mut widest, &frame).expect("serializes");
+
+        assert!(
+            widest.0 < BODY / 16,
+            "one write carried {} bytes of a {BODY}-byte body",
+            widest.0
+        );
+        // And the output is unchanged: the same line decodes to the same body.
+        let line = to_line(&frame).expect("serializes");
+        let HostFrame::Request { body, .. } = from_line(line.trim_end()).expect("parses") else {
+            panic!("a request frame must parse back as a request");
+        };
+        assert_eq!(body, big.body);
     }
 
     #[test]
