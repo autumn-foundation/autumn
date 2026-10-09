@@ -248,6 +248,16 @@ pub trait Cache: Send + Sync + 'static {
     /// [`insert_value`]: Cache::insert_value
     fn insert_raw_bytes(&self, _key: &str, _bytes: Vec<u8>, _ttl: Option<std::time::Duration>) {}
 
+    /// Whether this backend keeps a shared fill epoch.
+    ///
+    /// Return `true` if you override [`fill_epoch`](Cache::fill_epoch). Then a
+    /// failed [`invalidate_namespace`](Cache::invalidate_namespace) on a store
+    /// registered with `coherence::register_namespace_store` makes the
+    /// invalidation incomplete. The default is `false`.
+    fn shares_fill_epoch(&self) -> bool {
+        false
+    }
+
     /// Read the namespace's **shared** fill epoch.
     ///
     /// A cross-replica backend keeps one epoch for each namespace in the
@@ -758,6 +768,7 @@ mod shared_fence_tests {
     struct Replica {
         shared: Arc<Mutex<Shared>>,
         epoch_down: bool,
+        sweep_fails: bool,
     }
 
     impl Cache for Replica {
@@ -775,6 +786,9 @@ mod shared_fence_tests {
             self.shared.lock().unwrap().data.clear();
         }
         fn invalidate_namespace(&self, namespace: &str) -> bool {
+            if self.sweep_fails {
+                return false;
+            }
             let mut shared = self.shared.lock().unwrap();
             *shared.epochs.entry(namespace.to_owned()).or_default() += 1;
             let prefix = format!("{namespace}:");
@@ -787,6 +801,9 @@ mod shared_fence_tests {
                 .unwrap()
                 .data
                 .insert(key.to_owned(), bytes);
+        }
+        fn shares_fill_epoch(&self) -> bool {
+            true
         }
         fn fill_epoch(&self, namespace: &str) -> FillEpoch {
             if self.epoch_down {
@@ -818,6 +835,7 @@ mod shared_fence_tests {
         let b = Replica {
             shared: Arc::clone(&a.shared),
             epoch_down: false,
+            sweep_fails: false,
         };
         // B misses and samples the shared epoch, then starts computing.
         let epoch = b.fill_epoch("ns");
@@ -872,6 +890,7 @@ mod shared_fence_tests {
         let b = Replica {
             shared: Arc::clone(&a.shared),
             epoch_down: false,
+            sweep_fails: false,
         };
         let html = fragment::cache_fragment_in(Some(&b), "ns", "id", "v1", None, || {
             // A writes and invalidates while B is still rendering.
@@ -904,6 +923,36 @@ mod shared_fence_tests {
             before,
             "an in-flight fill on another replica must be fenced out"
         );
+    }
+
+    /// A shared store that fails to bump its epoch makes the result `false`.
+    /// A store with no shared epoch keeps the old `clear` contract.
+    #[test]
+    fn a_failed_registered_shared_store_fails_the_invalidation() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_global_cache();
+        let failing = Replica {
+            sweep_fails: true,
+            ..Replica::default()
+        };
+        let _ = coherence::register_namespace_store("tests::failing_shared_ns", Arc::new(failing));
+        assert!(!coherence::invalidate_namespace("tests::failing_shared_ns"));
+    }
+
+    #[cfg(feature = "cache-moka")]
+    #[test]
+    fn a_registered_store_without_a_shared_epoch_still_counts_as_cleared() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_global_cache();
+        let _ = coherence::register_namespace_store(
+            "tests::plain_ns",
+            Arc::new(MokaCache::new(4, None)),
+        );
+        assert!(coherence::invalidate_namespace("tests::plain_ns"));
     }
 
     /// A replay serves cache effects from the tape. It must not read the live

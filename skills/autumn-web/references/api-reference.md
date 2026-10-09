@@ -1064,7 +1064,8 @@ must have no TTL, or a TTL of at least `ttl + window`.
   `invalidate_namespace` raises it before the sweep, so a `true` is valid for
   all replicas. It needs a Redis write (`INCR`), and `false` if that fails.
   Fills made by `#[cached]` and `cache_fragment_in` use it. A custom backend
-  opts in with `Cache::fill_epoch` and `Cache::insert_raw_bytes_if_epoch`.
+  opts in with `Cache::shares_fill_epoch`, `Cache::fill_epoch` and
+  `Cache::insert_raw_bytes_if_epoch`.
 
 ## Downloads (0.6.0)
 

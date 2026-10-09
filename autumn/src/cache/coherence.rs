@@ -1256,10 +1256,12 @@ pub fn with_fill_fence<R>(
 /// Panics if the internal `RwLock` is poisoned.
 #[must_use = "a `false` means stale entries can still be served"]
 pub fn invalidate_namespace(namespace: &str) -> bool {
+    let mut complete = true;
     for store in fence_and_collect_stores(namespace) {
         // A shared store raises its epoch here. `clear` alone would not.
-        let _ = store.invalidate_namespace(namespace);
+        let swept = store.invalidate_namespace(namespace);
         store.clear();
+        complete &= registered_store_complete(&*store, swept, namespace);
     }
 
     // The dedicated stores are only half the story: once a process-level backend
@@ -1267,7 +1269,7 @@ pub fn invalidate_namespace(namespace: &str) -> bool {
     // function store holds nothing. Ask the backend — `MokaCache` and
     // `RedisCache` both drop the namespace; a backend that cannot, or one whose
     // sweep failed, says so, and that `false` is what the caller reports.
-    super::global_cache().is_none_or(|global| {
+    let global_complete = super::global_cache().is_none_or(|global| {
         let complete = global.invalidate_namespace(namespace);
         if !complete {
             report_incomplete_invalidation(
@@ -1276,7 +1278,23 @@ pub fn invalidate_namespace(namespace: &str) -> bool {
             );
         }
         complete
-    })
+    });
+    complete && global_complete
+}
+
+/// Whether a registered store counts as invalidated.
+///
+/// A store with no shared epoch is cleared by `clear`, so its answer does not
+/// matter. A store with a shared epoch must have raised it.
+fn registered_store_complete(store: &dyn super::Cache, swept: bool, namespace: &str) -> bool {
+    if swept || !store.shares_fill_epoch() {
+        return true;
+    }
+    report_incomplete_invalidation(
+        namespace,
+        "a registered shared store could not raise its fill epoch",
+    );
+    false
 }
 
 /// Async form of [`invalidate_namespace`], with the same contract.
@@ -1310,16 +1328,18 @@ pub async fn invalidate_namespace_async(namespace: &str) -> bool {
             },
         }
     };
+    let mut complete = true;
     for store in stores {
         // A shared store raises its epoch here. `clear` alone would not.
-        let _ = store.invalidate_namespace_async(namespace).await;
+        let swept = store.invalidate_namespace_async(namespace).await.is_ok();
         store.clear();
+        complete &= registered_store_complete(&*store, swept, namespace);
     }
     let Some(global) = super::global_cache() else {
-        return true;
+        return complete;
     };
     match global.invalidate_namespace_async(namespace).await {
-        Ok(()) => true,
+        Ok(()) => complete,
         Err(error) => {
             report_incomplete_invalidation(namespace, error.reason());
             false

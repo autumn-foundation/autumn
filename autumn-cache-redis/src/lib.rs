@@ -85,6 +85,12 @@ static FENCED_INSERT: std::sync::LazyLock<redis::Script> =
 /// deletes a key that has it.
 const EPOCH_SEGMENT: &str = "__autumn_epoch__:";
 
+/// Whether an application key uses the reserved epoch segment. A write to such
+/// a key is refused, so it cannot overwrite an epoch.
+fn is_reserved_key(key: &str) -> bool {
+    key.starts_with(EPOCH_SEGMENT)
+}
+
 /// Errors that can occur when constructing or using a [`RedisCache`].
 #[derive(Debug, Error)]
 pub enum RedisCacheError {
@@ -329,6 +335,10 @@ impl RedisCache {
     }
 
     fn redis_set(&self, key: &str, bytes: Vec<u8>, ttl: Option<std::time::Duration>) {
+        if is_reserved_key(key) {
+            warn!(key, "RedisCache: refused a write to a reserved epoch key");
+            return;
+        }
         let prefixed = self.prefixed(key);
         let mut conn = self.manager.clone();
         tokio::task::block_in_place(|| {
@@ -531,6 +541,11 @@ impl Cache for RedisCache {
         debug!(key, "RedisCache: inserted via insert_raw_bytes");
     }
 
+    /// `RedisCache` keeps a shared fill epoch per namespace.
+    fn shares_fill_epoch(&self) -> bool {
+        true
+    }
+
     /// Reads the namespace's shared epoch (one `GET`). A missing key is 0. A
     /// Redis error is [`FillEpoch::Unavailable`], so the fill skips its insert.
     fn fill_epoch(&self, namespace: &str) -> FillEpoch {
@@ -556,6 +571,10 @@ impl Cache for RedisCache {
         namespace: &str,
         sampled: u64,
     ) -> bool {
+        if is_reserved_key(key) {
+            warn!(key, "RedisCache: refused a write to a reserved epoch key");
+            return false;
+        }
         let prefixed = self.prefixed(key);
         let epoch_key = self.epoch_key(namespace);
         let ttl_ms = ttl.map_or_else(String::new, |ttl| ttl_millis_for_redis(ttl).to_string());
@@ -992,6 +1011,13 @@ mod tests {
         base_backoff: Duration::from_millis(1),
         max_backoff: Duration::from_millis(5),
     };
+
+    #[test]
+    fn application_keys_cannot_use_the_reserved_epoch_segment() {
+        assert!(is_reserved_key("__autumn_epoch__:orders"));
+        assert!(!is_reserved_key("orders:abc"));
+        assert!(!is_reserved_key("x:__autumn_epoch__:orders"));
+    }
 
     #[test]
     fn default_retry_policy_is_bounded() {
