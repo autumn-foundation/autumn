@@ -8481,7 +8481,7 @@ impl AppBuilder {
         if let Some(interceptor) = db_interceptor {
             state.insert_extension(interceptor);
         }
-        crate::cache::clear_global_cache();
+        crate::cache::install_replay_cache(&capsule.effects.cache);
 
         for register in policy_registrations {
             register(state.policy_registry());

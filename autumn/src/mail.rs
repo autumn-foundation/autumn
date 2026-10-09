@@ -727,6 +727,17 @@ const fn replayed_send(_mail: &Mail) -> Option<Result<(), MailError>> {
     None
 }
 
+/// Whether a version 3 capsule is replaying on this task.
+#[cfg(feature = "reporting")]
+fn replaying_legacy_v3() -> bool {
+    crate::capsule::effects::current_tape().is_some_and(|tape| tape.legacy_v3())
+}
+
+#[cfg(not(feature = "reporting"))]
+const fn replaying_legacy_v3() -> bool {
+    false
+}
+
 /// The capsule record for one message.
 ///
 /// The plain-text body is preferred over the HTML one: it is the same content,
@@ -2355,6 +2366,10 @@ impl Mailer {
         reason = "the replayed answer is the recorded `Result`"
     )]
     fn disabled_deliver_later(&self, mail: Mail) -> Result<(), MailError> {
+        // A version 3 capsule did not record this call.
+        if replaying_legacy_v3() {
+            return Ok(());
+        }
         let mail = self.prepare_deferred(mail);
         if let Some(answer) = replayed_send(&mail) {
             return answer;
@@ -6597,6 +6612,37 @@ mod tests {
             mailer.send(mail()).await.is_err(),
             "a send with no tape must not reach a transport"
         );
+    }
+
+    /// Codex review on #3222: a version 3 capsule did not record a disabled
+    /// `deliver_later`, so its replay does not expect an entry.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_v3_capsule_replays_a_disabled_deliver_later_as_before() {
+        let state = AppState::for_test();
+        let config = MailConfig {
+            transport: Transport::Disabled,
+            ..MailConfig::default()
+        };
+        install_replay_mailer(&state, &config);
+        let mailer = state.extension::<Mailer>().expect("installed");
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Later")
+            .text("hello")
+            .build()
+            .unwrap();
+        let tape = Arc::new(
+            crate::capsule::ReplayEffects::new(crate::capsule::CapsuleEffects::default())
+                .for_format_version(3),
+        );
+        let replayed = crate::capsule::with_effect_tape(Arc::clone(&tape), async {
+            mailer.try_deliver_later(mail)
+        })
+        .await;
+        assert!(replayed.is_ok(), "{replayed:?}");
+        assert!(tape.finish().is_empty(), "{:?}", tape.finish());
     }
 
     /// Codex review on #3222: the replay mailer keeps the defaults of a

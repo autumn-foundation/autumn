@@ -100,6 +100,47 @@ pub fn global_cache() -> Option<Arc<dyn Cache>> {
         .clone()
 }
 
+/// Set the global cache for `autumn replay` (#2351).
+///
+/// Only a global cache records a removal, so a recorded removal shows that
+/// production had one. Replay then installs the capsule seam over a backend
+/// that stores nothing, and the tape answers the removal. With no recorded
+/// removal, replay has no global cache.
+#[cfg(feature = "reporting")]
+pub(crate) fn install_replay_cache(recorded: &[crate::capsule::CacheEffect]) {
+    use crate::capsule::CacheEffect;
+    let removal = recorded.iter().any(|effect| {
+        matches!(
+            effect,
+            CacheEffect::Invalidate { .. }
+                | CacheEffect::InvalidateNamespace { .. }
+                | CacheEffect::Clear
+        )
+    });
+    if removal {
+        set_global_cache(Arc::new(ReplayBackend));
+    } else {
+        clear_global_cache();
+    }
+}
+
+/// The backend under the replay seam. It stores nothing.
+#[cfg(feature = "reporting")]
+struct ReplayBackend;
+
+#[cfg(feature = "reporting")]
+impl Cache for ReplayBackend {
+    fn get_value(&self, _key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
+    fn insert_value(&self, _key: &str, _value: Arc<dyn Any + Send + Sync>) {}
+    fn invalidate(&self, _key: &str) {}
+    fn clear(&self) {}
+    fn invalidate_namespace(&self, _namespace: &str) -> bool {
+        true
+    }
+}
+
 /// Remove the process-level shared cache.
 ///
 /// Primarily useful in tests that need per-test isolation.
@@ -1198,6 +1239,37 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Codex review on #3222: a replay answers a recorded repository
+    /// invalidation from the tape, so it is consumed.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn replay_installs_a_seam_cache_when_the_capsule_recorded_a_removal() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let recorded = vec![crate::capsule::CacheEffect::InvalidateNamespace {
+            namespace: "posts".to_owned(),
+            error: None,
+        }];
+        install_replay_cache(&recorded);
+        let tape = Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects {
+                cache: recorded,
+                ..Default::default()
+            },
+        ));
+        let complete = block_on(crate::capsule::with_effect_tape(
+            Arc::clone(&tape),
+            coherence::invalidate_namespace_async("posts"),
+        ));
+        clear_global_cache();
+        assert!(complete);
+        assert!(tape.finish().is_empty(), "{:?}", tape.finish());
+
+        install_replay_cache(&[]);
+        assert!(global_cache().is_none());
     }
 
     /// The seam wraps a backend once, so `Arc` identity stays stable.
