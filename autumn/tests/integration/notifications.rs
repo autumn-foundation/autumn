@@ -231,6 +231,89 @@ fn topic_is_stable_per_recipient() {
     assert_eq!(Notifications::topic(7), "notifications:7");
 }
 
+// ── Tenant isolation (issue #2337) ────────────────────────────────────────
+
+mod tenant_isolation {
+    use super::*;
+    use autumn_web::tenancy::with_tenant;
+
+    fn tenant<F: std::future::Future>(
+        id: &str,
+        fut: F,
+    ) -> impl std::future::Future<Output = F::Output> {
+        with_tenant(id.to_owned(), fut)
+    }
+
+    #[tokio::test]
+    async fn same_recipient_id_in_two_tenants_sees_only_its_own_feed() {
+        let svc = service();
+        let (query, page) = default_list();
+        tenant("a", svc.notify(42, "x", json!({}))).await.unwrap();
+        tenant("b", svc.notify(42, "x", json!({}))).await.unwrap();
+        tenant("b", svc.notify(42, "y", json!({}))).await.unwrap();
+
+        let a = tenant("a", svc.list(42, &query, &page)).await.unwrap();
+        let b = tenant("b", svc.list(42, &query, &page)).await.unwrap();
+        assert_eq!(a.content.len(), 1);
+        assert_eq!(b.content.len(), 2);
+        assert_eq!(tenant("a", svc.unread_count(42)).await.unwrap(), 1);
+        assert_eq!(tenant("b", svc.unread_count(42)).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn untenanted_scope_does_not_see_tenant_rows() {
+        let svc = service();
+        let (query, page) = default_list();
+        tenant("a", svc.notify(42, "x", json!({}))).await.unwrap();
+
+        assert!(
+            svc.list(42, &query, &page)
+                .await
+                .unwrap()
+                .content
+                .is_empty()
+        );
+        assert_eq!(svc.unread_count(42).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn mark_all_read_stays_inside_the_tenant() {
+        let svc = service();
+        tenant("a", svc.notify(42, "x", json!({}))).await.unwrap();
+        tenant("b", svc.notify(42, "x", json!({}))).await.unwrap();
+
+        assert_eq!(tenant("a", svc.mark_all_read(42)).await.unwrap(), 1);
+        assert_eq!(tenant("b", svc.unread_count(42)).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn mark_read_cannot_reach_another_tenants_row() {
+        let svc = service();
+        let other = tenant("b", svc.notify(42, "x", json!({}))).await.unwrap();
+
+        tenant("a", svc.mark_read(other.id)).await.unwrap();
+        tenant("a", svc.mark_read_for(42, other.id)).await.unwrap();
+
+        assert_eq!(tenant("b", svc.unread_count(42)).await.unwrap(), 1);
+    }
+
+    #[test]
+    fn topic_is_scoped_by_tenant_and_unchanged_without_one() {
+        assert_eq!(Notifications::topic(7), "notifications:7");
+        let a = futures_lite_block(tenant("a", async { Notifications::topic(7) }));
+        let b = futures_lite_block(tenant("b", async { Notifications::topic(7) }));
+        assert_ne!(a, b);
+        assert_ne!(a, "notifications:7");
+    }
+
+    fn futures_lite_block<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+}
+
 // ── Extractor: end-to-end through TestApp (no DB → memory fallback) ───────
 
 mod extractor {
@@ -559,6 +642,7 @@ mod pg {
     /// two in sync.
     const CREATE_NOTIFICATIONS_SQL: &str = "CREATE TABLE notifications (\
          id BIGSERIAL PRIMARY KEY, \
+         tenant_id TEXT NOT NULL DEFAULT '', \
          recipient_id BIGINT NOT NULL, \
          kind TEXT NOT NULL, \
          payload TEXT NOT NULL, \
@@ -592,6 +676,37 @@ mod pg {
             pool,
             container,
         )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn db_store_isolates_the_same_recipient_id_across_tenants() {
+        use autumn_web::tenancy::with_tenant;
+        let (notifications, _pool, _container) = setup().await;
+        let (query, page) = (ListQuery::default(), PageRequest::default());
+
+        let a = with_tenant("a".to_owned(), notifications.notify(42, "x", json!({})))
+            .await
+            .expect("notify a");
+        with_tenant("b".to_owned(), notifications.notify(42, "x", json!({})))
+            .await
+            .expect("notify b");
+
+        let feed = with_tenant("a".to_owned(), notifications.list(42, &query, &page))
+            .await
+            .expect("list");
+        assert_eq!(feed.content.len(), 1);
+        assert_eq!(feed.content[0].id, a.id);
+        // The untenanted scope (`""`) sees neither.
+        assert_eq!(notifications.unread_count(42).await.expect("count"), 0);
+        // Tenant b cannot mark tenant a's row read.
+        with_tenant("b".to_owned(), notifications.mark_read(a.id))
+            .await
+            .expect("mark");
+        let unread = with_tenant("a".to_owned(), notifications.unread_count(42))
+            .await
+            .expect("count");
+        assert_eq!(unread, 1);
     }
 
     #[tokio::test]

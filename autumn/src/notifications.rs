@@ -69,6 +69,14 @@
 //!     .publish(&Notifications::topic(user.id), serde_json::to_string(&n)?);
 //! ```
 //!
+//! # Multi-tenancy
+//!
+//! Rows carry a `tenant_id` column, filled from the tenant the framework
+//! resolved for the request (`""` when tenancy is off). Two tenants that use
+//! the same `recipient_id` never see each other's feed, counts or channel
+//! topic. Outside a request (a job, a script) wrap the call in
+//! [`with_tenant`](crate::tenancy::with_tenant).
+//!
 //! # List filters and ordering
 //!
 //! [`Notifications::list`] understands two equality filters from
@@ -158,6 +166,10 @@ impl NotificationStoreError {
 ///
 /// - `unread_count` and the `unread` list filter count only rows whose
 ///   `read_at` is unset.
+/// - Rows belong to a tenant. The built-in stores read the tenant from the
+///   task-local [`CURRENT_TENANT`](crate::tenancy::CURRENT_TENANT), never from
+///   the request, and scope every method by it (`""` outside a tenant scope).
+///   A custom store must do the same.
 /// - `mark_read`/`mark_all_read` are idempotent: re-marking a read
 ///   notification is a no-op (it must not error and must not overwrite the
 ///   original `read_at`).
@@ -289,12 +301,18 @@ impl Notifications {
     }
 
     /// The conventional per-recipient channel topic
-    /// (`notifications:{recipient_id}`) used by
+    /// (`notifications:{recipient_id}`, or `notifications:{tenant}:{recipient_id}`
+    /// inside a tenant scope) used by
     /// [`notify_with_push`](Self::notify_with_push) and available to
     /// subscribers (e.g. a WebSocket feed handler).
     #[must_use]
     pub fn topic(recipient_id: i64) -> String {
-        format!("notifications:{recipient_id}")
+        let tenant = crate::tenancy::current_tenant_id();
+        if tenant.is_empty() {
+            format!("notifications:{recipient_id}")
+        } else {
+            format!("notifications:{tenant}:{recipient_id}")
+        }
     }
 
     /// Persist a new, unread notification for `recipient_id` and return it.
@@ -485,7 +503,8 @@ pub struct MemoryNotificationStore {
 #[derive(Debug, Default)]
 struct MemoryInner {
     next_id: i64,
-    rows: Vec<Notification>,
+    /// `(tenant_id, notification)`; see [`crate::tenancy::current_tenant_id`].
+    rows: Vec<(String, Notification)>,
 }
 
 impl MemoryNotificationStore {
@@ -509,6 +528,7 @@ impl NotificationStore for MemoryNotificationStore {
         kind: String,
         payload: Value,
     ) -> Result<Notification, NotificationStoreError> {
+        let tenant = crate::tenancy::current_tenant_id();
         let mut inner = self.lock()?;
         inner.next_id += 1;
         let notification = Notification {
@@ -519,7 +539,7 @@ impl NotificationStore for MemoryNotificationStore {
             read_at: None,
             created_at: crate::time::ambient_now(),
         };
-        inner.rows.push(notification.clone());
+        inner.rows.push((tenant, notification.clone()));
         drop(inner);
         Ok(notification)
     }
@@ -531,11 +551,13 @@ impl NotificationStore for MemoryNotificationStore {
         page: &PageRequest,
     ) -> Result<Page<Notification>, NotificationStoreError> {
         let filter = ListFilter::from_query(query);
+        let tenant = crate::tenancy::current_tenant_id();
         let inner = self.lock()?;
         let mut rows: Vec<Notification> = inner
             .rows
             .iter()
-            .filter(|n| n.recipient_id == recipient_id)
+            .filter(|(t, n)| *t == tenant && n.recipient_id == recipient_id)
+            .map(|(_, n)| n)
             .filter(|n| !filter.unread_only || n.read_at.is_none())
             .filter(|n| filter.kind.as_deref().is_none_or(|k| n.kind == k))
             .cloned()
@@ -563,11 +585,13 @@ impl NotificationStore for MemoryNotificationStore {
     }
 
     async fn unread_count(&self, recipient_id: i64) -> Result<u64, NotificationStoreError> {
+        let tenant = crate::tenancy::current_tenant_id();
         let inner = self.lock()?;
         let count = inner
             .rows
             .iter()
-            .filter(|n| n.recipient_id == recipient_id && n.read_at.is_none())
+            .filter(|(t, n)| *t == tenant && n.recipient_id == recipient_id)
+            .filter(|(_, n)| n.read_at.is_none())
             .count();
         drop(inner);
         Ok(count as u64)
@@ -579,14 +603,15 @@ impl NotificationStore for MemoryNotificationStore {
         recipient_id: Option<i64>,
     ) -> Result<u64, NotificationStoreError> {
         let now = crate::time::ambient_now();
+        let tenant = crate::tenancy::current_tenant_id();
         let mut inner = self.lock()?;
         let marked = inner
             .rows
             .iter_mut()
-            .filter(|n| n.id == id)
-            .filter(|n| recipient_id.is_none_or(|rid| n.recipient_id == rid))
-            .filter(|n| n.read_at.is_none())
-            .map(|n| n.read_at = Some(now))
+            .filter(|(t, n)| *t == tenant && n.id == id)
+            .filter(|(_, n)| recipient_id.is_none_or(|rid| n.recipient_id == rid))
+            .filter(|(_, n)| n.read_at.is_none())
+            .map(|(_, n)| n.read_at = Some(now))
             .count();
         drop(inner);
         Ok(marked as u64)
@@ -594,12 +619,14 @@ impl NotificationStore for MemoryNotificationStore {
 
     async fn mark_all_read(&self, recipient_id: i64) -> Result<u64, NotificationStoreError> {
         let now = crate::time::ambient_now();
+        let tenant = crate::tenancy::current_tenant_id();
         let mut inner = self.lock()?;
         let marked = inner
             .rows
             .iter_mut()
-            .filter(|n| n.recipient_id == recipient_id && n.read_at.is_none())
-            .map(|n| n.read_at = Some(now))
+            .filter(|(t, n)| *t == tenant && n.recipient_id == recipient_id)
+            .filter(|(_, n)| n.read_at.is_none())
+            .map(|(_, n)| n.read_at = Some(now))
             .count();
         drop(inner);
         Ok(marked as u64)
@@ -680,6 +707,7 @@ mod db_store {
         diesel::table! {
             notifications (id) {
                 id -> BigInt,
+                tenant_id -> Text,
                 recipient_id -> BigInt,
                 kind -> Text,
                 payload -> Text,
@@ -693,6 +721,7 @@ mod db_store {
         diesel::table! {
             notifications (id) {
                 id -> BigInt,
+                tenant_id -> Text,
                 recipient_id -> BigInt,
                 kind -> Text,
                 payload -> Text,
@@ -738,6 +767,7 @@ mod db_store {
     #[derive(Insertable)]
     #[diesel(table_name = notifications)]
     struct NewNotificationRow {
+        tenant_id: String,
         recipient_id: i64,
         kind: String,
         payload: String,
@@ -780,6 +810,12 @@ mod db_store {
         // the notifications feed — turn the bare SQL error into an
         // actionable one ("relation … does not exist" on Postgres, "no such
         // table" on SQLite).
+        if message.contains("tenant_id") {
+            return NotificationStoreError::new(format!(
+                "query failed: {e}. The `notifications` table has no `tenant_id` column — \
+                 see docs/migrations/next.md"
+            ));
+        }
         if message.contains("does not exist") || message.contains("no such table") {
             return NotificationStoreError::new(format!(
                 "query failed: {e}. The `notifications` table is missing — scaffold it \
@@ -801,6 +837,7 @@ mod db_store {
             let mut conn = self.conn().await?;
             let row: NotificationRow = diesel::insert_into(notifications::table)
                 .values(NewNotificationRow {
+                    tenant_id: crate::tenancy::current_tenant_id(),
                     recipient_id,
                     kind,
                     payload,
@@ -824,10 +861,13 @@ mod db_store {
             let filter = ListFilter::from_query(query);
             let mut conn = self.conn().await?;
 
+            let tenant = crate::tenancy::current_tenant_id();
             let mut count_query = dsl::notifications
+                .filter(dsl::tenant_id.eq(tenant.clone()))
                 .filter(dsl::recipient_id.eq(recipient_id))
                 .into_boxed();
             let mut select_query = dsl::notifications
+                .filter(dsl::tenant_id.eq(tenant))
                 .filter(dsl::recipient_id.eq(recipient_id))
                 .into_boxed();
             if filter.unread_only {
@@ -875,6 +915,7 @@ mod db_store {
             use notifications::dsl;
             let mut conn = self.conn().await?;
             let count: i64 = dsl::notifications
+                .filter(dsl::tenant_id.eq(crate::tenancy::current_tenant_id()))
                 .filter(dsl::recipient_id.eq(recipient_id))
                 .filter(dsl::read_at.is_null())
                 .count()
@@ -899,6 +940,7 @@ mod db_store {
                 Some(rid) => {
                     diesel::update(
                         dsl::notifications
+                            .filter(dsl::tenant_id.eq(crate::tenancy::current_tenant_id()))
                             .filter(dsl::id.eq(id))
                             .filter(dsl::recipient_id.eq(rid))
                             .filter(dsl::read_at.is_null()),
@@ -910,6 +952,7 @@ mod db_store {
                 None => {
                     diesel::update(
                         dsl::notifications
+                            .filter(dsl::tenant_id.eq(crate::tenancy::current_tenant_id()))
                             .filter(dsl::id.eq(id))
                             .filter(dsl::read_at.is_null()),
                     )
@@ -927,6 +970,7 @@ mod db_store {
             let mut conn = self.conn().await?;
             let affected = diesel::update(
                 dsl::notifications
+                    .filter(dsl::tenant_id.eq(crate::tenancy::current_tenant_id()))
                     .filter(dsl::recipient_id.eq(recipient_id))
                     .filter(dsl::read_at.is_null()),
             )

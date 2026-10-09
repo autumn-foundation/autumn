@@ -214,6 +214,7 @@ fn notification_fields() -> Vec<Field> {
         state_machine: None,
     };
     vec![
+        field("tenant_id", FieldKind::String, false),
         field("recipient_id", FieldKind::I64, false),
         field("kind", FieldKind::String, false),
         field("payload", FieldKind::String, false),
@@ -225,7 +226,7 @@ fn notification_fields() -> Vec<Field> {
 ///
 /// The column types must match the framework store's diesel `table!` in
 /// `autumn_web::notifications` (`BigInt`/`Text`/`Text`/
-/// `Nullable<Timestamptz>`/`Timestamptz`; `TimestamptzSqlite` — RFC 3339
+/// `Nullable<Timestamptz>`/`Timestamptz`, plus the leading `tenant_id` `Text`; `TimestamptzSqlite` — RFC 3339
 /// `TEXT` — on `SQLite`): that store, not any generated model, is what reads
 /// this table. The shared helper's stock `created_at` column is `TIMESTAMP`
 /// (the model generator's convention, paired with a `Timestamp` `schema.rs`
@@ -235,22 +236,31 @@ fn notification_fields() -> Vec<Field> {
 /// output already matches (`TEXT` + `CURRENT_TIMESTAMP` default) and is left
 /// exactly as the helper emits it.
 fn migration_up_sql(backend: DatabaseBackend) -> String {
-    let indexes: BTreeSet<String> = std::iter::once("recipient_id".to_owned()).collect();
     let sql = create_table_sql_with_metadata_and_id_for(
         backend,
         NOTIFICATIONS_TABLE,
         &notification_fields(),
-        &indexes,
+        &BTreeSet::new(),
         &BTreeMap::new(),
         IdType::BigSerial,
     );
-    match backend {
+    let sql = match backend {
         DatabaseBackend::Postgres => sql.replace(
             "created_at TIMESTAMP NOT NULL DEFAULT NOW()",
             "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
         ),
         DatabaseBackend::Sqlite => sql,
-    }
+    };
+    // `tenant_id` is `""` outside a tenant scope, so it is `NOT NULL DEFAULT ''`.
+    // The composite index serves every feed query: all filter on both columns.
+    let sql = sql.replace(
+        "tenant_id TEXT NOT NULL",
+        "tenant_id TEXT NOT NULL DEFAULT ''",
+    );
+    format!(
+        "{sql}CREATE INDEX idx_notifications_tenant_recipient ON notifications \
+         (tenant_id, recipient_id);\n"
+    )
 }
 
 /// The session key, `NotifyBody` type, `current_recipient_id` helper, and
@@ -771,13 +781,14 @@ async fn main() {
                 up,
                 "CREATE TABLE notifications (\n\
                  \x20   id BIGSERIAL PRIMARY KEY,\n\
+                 \x20   tenant_id TEXT NOT NULL DEFAULT '',\n\
                  \x20   recipient_id BIGINT NOT NULL,\n\
                  \x20   kind TEXT NOT NULL,\n\
                  \x20   payload TEXT NOT NULL,\n\
                  \x20   read_at TIMESTAMPTZ NULL,\n\
                  \x20   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n\
                  );\n\
-                 CREATE INDEX idx_notifications_recipient_id ON notifications (recipient_id);\n"
+                 CREATE INDEX idx_notifications_tenant_recipient ON notifications (tenant_id, recipient_id);\n"
             );
 
             let down = fs::read_to_string(dir.join("down.sql")).unwrap();
@@ -801,6 +812,7 @@ async fn main() {
 
             let up = fs::read_to_string(migration_dir(tmp.path()).join("up.sql")).unwrap();
             assert!(up.contains("id INTEGER PRIMARY KEY AUTOINCREMENT"), "{up}");
+            assert!(up.contains("tenant_id TEXT NOT NULL DEFAULT ''"), "{up}");
             assert!(up.contains("recipient_id INTEGER NOT NULL"), "{up}");
             assert!(up.contains("kind TEXT NOT NULL"), "{up}");
             assert!(up.contains("payload TEXT NOT NULL"), "{up}");
@@ -813,7 +825,7 @@ async fn main() {
                 "{up}"
             );
             assert!(
-                up.contains("CREATE INDEX idx_notifications_recipient_id"),
+                up.contains("CREATE INDEX idx_notifications_tenant_recipient"),
                 "{up}"
             );
             // No Postgres-only DDL may leak into a SQLite migration.

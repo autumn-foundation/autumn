@@ -94,7 +94,8 @@ per app:
 The `notifications` table stores `id`, `recipient_id`, `kind`, a JSON
 `payload` (TEXT-serialized, so it is identical on Postgres and SQLite), a
 nullable `read_at`, and `created_at`. Timestamps are `TIMESTAMPTZ` on
-Postgres and RFC 3339 `TEXT` on SQLite. Keep payloads small and
+Postgres and RFC 3339 `TEXT` on SQLite. Each row also has a
+`tenant_id` (see [Multi-tenancy](#multi-tenancy)). Keep payloads small and
 reference-shaped (`{"post": 42}`, not the post body): they are stored
 verbatim per recipient and re-sent on every feed page.
 
@@ -106,6 +107,20 @@ autumn_web::app()
     .run()
     .await;
 ```
+
+## Multi-tenancy
+
+With `[tenancy] enabled = true`, all tenants share one `notifications` table.
+Each row stores the tenant that wrote it. The store gets the tenant from the
+resolved tenant of the request. It never reads it from the request body.
+
+- Two tenants can use the same `recipient_id`. Their feeds, unread counts and
+  `mark_*` calls stay separate.
+- Without a tenant in scope, the tenant is `''`. A row written with a tenant
+  is not visible without it.
+- A job or script has no request. Wrap the call in
+  `autumn_web::tenancy::with_tenant(tenant_id, async { ... })`.
+- A custom `NotificationStore` must scope by tenant too.
 
 ## Realtime push over channels (optional, best-effort)
 
@@ -152,6 +167,9 @@ while let Ok(msg) = rx.recv().await {
     // forward msg (the notification JSON) to the client
 }
 ```
+
+Inside a tenant scope the topic is `notifications:{tenant}:{recipient_id}`.
+Subscribe from a request that runs in the same tenant.
 
 ## Out of scope (by design)
 

@@ -350,6 +350,7 @@ mod pg {
     /// pins the other direction, so the two cannot drift apart silently.
     const CREATE_PUSH_SUBSCRIPTIONS_SQL: &str = "CREATE TABLE push_subscriptions (\
          id BIGSERIAL PRIMARY KEY, \
+         tenant_id TEXT NOT NULL DEFAULT '', \
          principal_id TEXT NOT NULL, \
          endpoint TEXT NOT NULL, \
          p256dh TEXT NOT NULL, \
@@ -422,6 +423,30 @@ mod pg {
             rows[0].auth(),
             URL_SAFE_NO_PAD.decode(UA_AUTH).expect("decode").as_slice()
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn db_store_isolates_the_same_principal_across_tenants() {
+        use autumn_web::tenancy::with_tenant;
+        let (store, _pool, _container) = setup().await;
+
+        with_tenant("a".to_owned(), store.save(stored(7, LIVE_ENDPOINT)))
+            .await
+            .expect("save");
+
+        let other = with_tenant("b".to_owned(), store.list_for("7"))
+            .await
+            .expect("list");
+        assert!(other.is_empty(), "tenant b must not see tenant a's devices");
+        let own = with_tenant("a".to_owned(), store.list_for("7"))
+            .await
+            .expect("list");
+        assert_eq!(own.len(), 1);
+        let removed = with_tenant("b".to_owned(), store.remove(LIVE_ENDPOINT, Some("7")))
+            .await
+            .expect("remove");
+        assert_eq!(removed, 0);
     }
 
     #[tokio::test]
