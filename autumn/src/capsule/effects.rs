@@ -800,15 +800,20 @@ impl ReplayEffects {
         &self,
         key: &str,
     ) -> Result<(), crate::cache::InvalidationError> {
-        self.update_slots(SlotUpdate::Key(key), None);
-        if self.legacy_v3 {
-            // A v3 capsule did not record removals.
-            return Ok(());
+        // A v3 capsule did not record removals.
+        let result = if self.legacy_v3 {
+            Ok(())
+        } else {
+            self.removal_result(&CacheWrite::Invalidate {
+                key: key.to_owned(),
+                error: None,
+            })
+        };
+        // A removal that failed in production kept the entry.
+        if result.is_ok() {
+            self.update_slots(SlotUpdate::Key(key), None);
         }
-        self.removal_result(&CacheWrite::Invalidate {
-            key: key.to_owned(),
-            error: None,
-        })
+        result
     }
 
     /// Apply a namespace removal made during replay, and check it against the
@@ -821,14 +826,18 @@ impl ReplayEffects {
         &self,
         namespace: &str,
     ) -> Result<(), crate::cache::InvalidationError> {
-        self.update_slots(SlotUpdate::Namespace(namespace), None);
-        if self.legacy_v3 {
-            return Ok(());
+        let result = if self.legacy_v3 {
+            Ok(())
+        } else {
+            self.removal_result(&CacheWrite::InvalidateNamespace {
+                namespace: namespace.to_owned(),
+                error: None,
+            })
+        };
+        if result.is_ok() {
+            self.update_slots(SlotUpdate::Namespace(namespace), None);
         }
-        self.removal_result(&CacheWrite::InvalidateNamespace {
-            namespace: namespace.to_owned(),
-            error: None,
-        })
+        result
     }
 
     /// Apply a removal of all entries made during replay, and check it
@@ -2984,6 +2993,38 @@ mod tests {
         assert_eq!(err.reason(), "READONLY");
         assert!(tape.cache_invalidate_namespace("widgets").is_err());
         assert!(tape.finish().is_empty());
+    }
+
+    /// Codex review on #3222: a removal that failed in production kept the
+    /// entry, so a read after it still hits.
+    #[test]
+    fn a_failed_removal_keeps_the_entry() {
+        let failed = Some(crate::capsule::schema::CacheInvalidationError {
+            attempts: 1,
+            reason: "READONLY".to_owned(),
+        });
+        let tape = ReplayEffects::new(CapsuleEffects {
+            cache: vec![
+                CacheEffect::Get {
+                    key: "ns:k".to_owned(),
+                    value: Some(base64_of(b"41")),
+                },
+                CacheEffect::Invalidate {
+                    key: "ns:k".to_owned(),
+                    error: failed.clone(),
+                },
+                CacheEffect::InvalidateNamespace {
+                    namespace: "ns".to_owned(),
+                    error: failed,
+                },
+            ],
+            ..CapsuleEffects::default()
+        });
+        assert_eq!(tape.cache_get("ns:k"), CachedValue::Hit(b"41".to_vec()));
+        assert!(tape.cache_invalidate("ns:k").is_err());
+        assert!(tape.cache_invalidate_namespace("ns").is_err());
+        assert_eq!(tape.cache_get("ns:k"), CachedValue::Hit(b"41".to_vec()));
+        assert!(tape.finish().is_empty(), "{:?}", tape.finish());
     }
 
     #[test]
