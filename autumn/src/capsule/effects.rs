@@ -1259,9 +1259,8 @@ impl ReplayEffects {
         }
         // A URL-encoded placeholder stood for an encoded value. Capture kept
         // its decoded spelling too, so keep it here.
-        let encoded = !recorded.contains(FILTERED) && recorded.contains(FILTERED_URLENCODED);
         if let Ok(mut observed) = self.observed.lock() {
-            for span in spans {
+            for (span, encoded) in spans {
                 observed.insert(span.as_bytes());
                 if encoded {
                     let decoded = form_decoded(span);
@@ -1624,56 +1623,80 @@ fn form_decoded(value: &str) -> String {
         .unwrap_or_default()
 }
 
-/// [`matches_redacted`], and on a match the text each placeholder stood for.
+/// [`matches_redacted`], and on a match the text each placeholder stood for,
+/// with whether that placeholder was the URL-encoded one.
 ///
-/// Empty spans are left out: there is nothing to mask.
-fn redacted_spans<'a>(recorded: &str, actual: &'a str) -> Option<Vec<&'a str>> {
+/// A recorded text can hold both spellings (a value echoed into a path, and
+/// a masked query parameter), so both are matched. Empty spans are left out:
+/// there is nothing to mask.
+fn redacted_spans<'a>(recorded: &str, actual: &'a str) -> Option<Vec<(&'a str, bool)>> {
     if recorded == actual {
         return Some(Vec::new());
     }
-    let placeholder = if recorded.contains(FILTERED) {
-        FILTERED
-    } else if recorded.contains(FILTERED_URLENCODED) {
-        FILTERED_URLENCODED
-    } else {
+    let (segments, encoded) = split_placeholders(recorded);
+    if encoded.is_empty() {
         // No placeholder and not equal: an ordinary difference.
         return None;
-    };
+    }
     let mut spans = Vec::new();
-    let mut push = |span: &'a str| {
+    let mut push = |span: &'a str, encoded: bool| {
         if !span.is_empty() {
-            spans.push(span);
+            spans.push((span, encoded));
         }
     };
     let mut rest = actual;
-    let mut segments = recorded.split(placeholder).peekable();
-    let mut first = true;
-    while let Some(segment) = segments.next() {
+    let mut segments = segments.into_iter();
+    rest = rest.strip_prefix(segments.next().unwrap_or_default())?;
+    let mut segments = segments.zip(encoded).peekable();
+    while let Some((segment, encoded)) = segments.next() {
         let last = segments.peek().is_none();
-        if first {
-            rest = rest.strip_prefix(segment)?;
-            first = false;
-        } else if segment.is_empty() {
+        if segment.is_empty() {
             // Back-to-back placeholders, or one at the very end: nothing to
             // anchor on. At the end, the placeholder takes what remains.
             if last {
-                push(rest);
+                push(rest, encoded);
                 rest = "";
             }
         } else if last {
             // The final literal segment has to be the *tail*, or a recorded
             // `?a=1` would match an actual `?a=1&b=2`.
             let head = rest.strip_suffix(segment)?;
-            push(head);
+            push(head, encoded);
             rest = "";
         } else {
             let found = rest.find(segment)?;
-            push(rest.get(..found).unwrap_or_default());
+            push(rest.get(..found).unwrap_or_default(), encoded);
             let after = found.saturating_add(segment.len());
             rest = rest.get(after..).unwrap_or_default();
         }
     }
     Some(spans)
+}
+
+/// Split a recorded text at its placeholders, in either spelling. Returns
+/// the literal segments (one more than the placeholders), and for each
+/// placeholder whether it was the URL-encoded one.
+fn split_placeholders(recorded: &str) -> (Vec<&str>, Vec<bool>) {
+    let mut segments = Vec::new();
+    let mut encoded = Vec::new();
+    let mut rest = recorded;
+    loop {
+        let next = match (rest.find(FILTERED), rest.find(FILTERED_URLENCODED)) {
+            (Some(raw), Some(url)) if url < raw => Some((url, FILTERED_URLENCODED, true)),
+            (Some(raw), _) => Some((raw, FILTERED, false)),
+            (None, Some(url)) => Some((url, FILTERED_URLENCODED, true)),
+            (None, None) => None,
+        };
+        let Some((at, placeholder, is_encoded)) = next else {
+            segments.push(rest);
+            return (segments, encoded);
+        };
+        segments.push(rest.get(..at).unwrap_or_default());
+        encoded.push(is_encoded);
+        rest = rest
+            .get(at.saturating_add(placeholder.len())..)
+            .unwrap_or_default();
+    }
 }
 
 /// The request half of an outbound call, as replay sees it.
@@ -2470,6 +2493,23 @@ mod tests {
         assert_eq!(divergences.len(), 1, "{divergences:?}");
         assert!(!divergences[0].actual.contains("sk-live-42"));
         assert!(!divergences[0].detail.contains("sk-live-42"));
+    }
+
+    /// Codex review on #3222: one recorded text can hold both placeholder
+    /// spellings. Both match, and only the URL-encoded span is decoded.
+    #[test]
+    fn both_placeholder_spellings_match_in_one_text() {
+        let recorded = "https://api.example/u/[FILTERED]/x?token=%5BFILTERED%5D";
+        let actual = "https://api.example/u/alice/x?token=sk%2Flive";
+        assert!(super::matches_redacted(recorded, actual));
+        assert_eq!(
+            super::redacted_spans(recorded, actual),
+            Some(vec![("alice", false), ("sk%2Flive", true)])
+        );
+        assert!(!super::matches_redacted(
+            recorded,
+            "https://api.example/u/alice/y?token=sk%2Flive"
+        ));
     }
 
     /// #2351 item 13: an active tape with no tenant entry fails closed.
