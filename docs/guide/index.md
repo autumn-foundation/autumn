@@ -40,6 +40,7 @@ Looking for the API reference instead? That is
 - [Rate Limiting](rate-limiting.md) — capping how often a caller can hit a route
 - [Outbound HTTP Client](outbound-http.md) — calling another service from a handler
 - [Resilience and Circuit Breakers](resilience.md) — timeouts, retries and breakers on outbound calls
+- [Timeouts, Deadlines and Retry Budgets](timeouts-and-budgets.md) — sending the request deadline to outbound calls and capping retries
 
 ## Templates, forms and the browser UI
 

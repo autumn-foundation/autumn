@@ -748,6 +748,38 @@ means "refresh at each read", not "read the database at each read".
 **Automation:** `manual` - it is a behaviour change, and no code rewrite
 applies.
 
+### Config: `HttpClientConfig` and `RequestTimeoutsConfig` get new fields
+
+**Why:** Deadline propagation and the retry budget (issue #3058) need
+settings. Neither struct is `#[non_exhaustive]`, so a struct literal stops
+compiling.
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+let client = autumn_web::config::HttpClientConfig {
+    timeout_secs: 10,
+    max_retries: 1,
+    max_retry_after_secs: 10,
+    base_urls: std::collections::HashMap::new(),
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+let client = autumn_web::config::HttpClientConfig {
+    timeout_secs: 10,
+    max_retries: 1,
+    ..autumn_web::config::HttpClientConfig::default()
+};
+```
+
+Do the same for `RequestTimeoutsConfig`, which gets `accept_deadline_header`.
+
+**Automation:** `manual` - the fix is a `..Default::default()` tail, which no
+codemod adds.
+
 ---
 
 ### Ledger: raw-SQL framework writes to a ledgered table are refused (#2319)
@@ -843,6 +875,15 @@ single most valuable section of the guide — keep it factual and short.
 - New `AUTUMN_*` environment variables.
 - Default profile changes.
 
+Issue #3058:
+
+- The `prod` profile sets `server.shutdown_timeout_secs = 35` (was 30): the
+  30 s request timeout plus 5 s. Add 5 s to your orchestrator grace period.
+- New keys: `[http.client.retry_budget]` (on by default),
+  `http.client.send_deadline_header` (default `true`) and
+  `server.timeouts.accept_deadline_header` (default `false`,
+  `AUTUMN_SERVER__TIMEOUTS__ACCEPT_DEADLINE_HEADER`).
+
 If nothing changed, delete this section.
 
 - New: `[http.client] max_backoff_ms` (default `20000`). The cap on the
@@ -890,6 +931,16 @@ Changes that still compile but behave differently at runtime. Examples:
 - Error responses adopted a new JSON shape.
 - A default middleware is now ordered differently.
 - A scheduled task now runs on a different worker.
+
+Issue #3058:
+
+- The outbound `Client` retries less. A retry must fit the request deadline,
+  and the retry budget limits retries to a host that fails all the time.
+  Set `[http.client.retry_budget] enabled = false` to keep the old count.
+- The outbound `Client` sends `x-autumn-deadline-ms` to every host when a
+  request deadline is set. Set `http.client.send_deadline_header = false` to
+  stop it.
+- A timeout `503` has a `Retry-After` header of 1-3 s.
 
 If nothing changed, delete this section.
 

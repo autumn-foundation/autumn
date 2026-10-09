@@ -3796,6 +3796,10 @@ impl Db {
     /// shard-routed checkouts: span creation, checkout interceptors,
     /// `SET statement_timeout`, and the metrics captured for the
     /// slow-query warning on `Drop`.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one checkout sequence; the deadline wait (#3058) is one more step"
+    )]
     pub(crate) async fn checkout(params: DbCheckoutParams<'_>) -> Result<Self, AutumnError> {
         // `SET statement_timeout` (and its i32-cap arithmetic below) is a
         // Postgres session GUC. Under the `sqlite` feature the runtime backend
@@ -3861,7 +3865,18 @@ impl Db {
             checkout_future = interceptor.intercept_checkout(ctx, checkout_future);
         }
 
-        let mut conn = checkout_future.instrument(span.clone()).await?;
+        // The request deadline (issue #3058) limits the wait for a connection.
+        // It does not change `statement_timeout`: that is a session setting,
+        // so it would stay on the pooled connection for the next user.
+        // `bounded` checks the deadline before each poll, so an idle
+        // connection is not handed out once the deadline has passed.
+        let mut conn = crate::deadline::bounded(checkout_future.instrument(span.clone()))
+            .await
+            .map_err(|crate::deadline::DeadlineExceeded| {
+                AutumnError::service_unavailable(crate::deadline::DeadlineStopped(
+                    "request deadline exceeded while waiting for a database connection",
+                ))
+            })??;
 
         // Postgres statement_timeout is a signed 32-bit integer (milliseconds).
         // Cap at i32::MAX to avoid a confusing 503 for very large configured values.

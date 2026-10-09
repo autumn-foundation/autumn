@@ -1766,3 +1766,53 @@ mod trusted_proxy_extractor_tests {
         assert_eq!(&body[..], b"/admin/posts");
     }
 }
+
+/// The server shutdown signal, for a handler (issue #3058).
+///
+/// The token is cancelled when the server stops accepting connections. Use it
+/// to stop long work, for example a long poll, before the drain window ends.
+///
+/// ```rust,no_run
+/// use autumn_web::extract::ShutdownToken;
+/// use autumn_web::get;
+///
+/// #[get("/poll")]
+/// async fn poll(shutdown: ShutdownToken) -> &'static str {
+///     tokio::select! {
+///         () = shutdown.cancelled() => "stopping",
+///         () = tokio::time::sleep(std::time::Duration::from_secs(20)) => "no news",
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct ShutdownToken(tokio_util::sync::CancellationToken);
+
+impl ShutdownToken {
+    /// `true` after the shutdown signal.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
+    }
+
+    /// Wait for the shutdown signal.
+    pub async fn cancelled(&self) {
+        self.0.cancelled().await;
+    }
+
+    /// The token, to give to other tasks.
+    #[must_use]
+    pub fn into_inner(self) -> tokio_util::sync::CancellationToken {
+        self.0
+    }
+}
+
+impl FromRequestParts<crate::AppState> for ShutdownToken {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        _parts: &mut axum::http::request::Parts,
+        state: &crate::AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(state.shutdown_token()))
+    }
+}

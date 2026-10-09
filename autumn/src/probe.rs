@@ -98,11 +98,26 @@ pub trait ProvideProbeState {
 #[derive(Clone, Debug, Default)]
 pub struct ProbeState {
     startup_complete: Arc<AtomicBool>,
-    shutting_down: Arc<AtomicBool>,
+    shutdown: Arc<Shutdown>,
     #[cfg(feature = "db")]
     replica_dependency: Arc<RwLock<ReplicaDependency>>,
     #[cfg(feature = "db")]
     db_checks: Arc<DbChecks>,
+}
+
+/// The shutdown state, shared by all clones of a [`ProbeState`].
+///
+/// It holds the server's shutdown token here rather than in `AppState`:
+/// `AppState` is copied into many per-request futures, so a field there costs
+/// bytes on every request (`tests/config_alloc_gate.rs`).
+#[derive(Debug, Default)]
+struct Shutdown {
+    /// `true` once readiness drains.
+    draining: AtomicBool,
+    /// Cancelled when the server stops accepting connections. WebSocket
+    /// handlers and the [`crate::extract::ShutdownToken`] extractor get child
+    /// tokens.
+    signal: tokio_util::sync::CancellationToken,
 }
 
 /// Ping checks of the database roles, shared by all clones of a
@@ -271,7 +286,13 @@ impl ProbeState {
 
     /// Mark the application as shutting down so readiness flips false.
     pub fn begin_shutdown(&self) {
-        self.shutting_down.store(true, Ordering::Relaxed);
+        self.shutdown.draining.store(true, Ordering::Relaxed);
+    }
+
+    /// The server shutdown token. Cancelled when the server stops accepting
+    /// connections.
+    pub(crate) fn shutdown_signal(&self) -> &tokio_util::sync::CancellationToken {
+        &self.shutdown.signal
     }
 
     /// Alias for readiness drain used during graceful shutdown.
@@ -281,7 +302,7 @@ impl ProbeState {
 
     /// Override shutdown-draining state for tests.
     pub fn set_draining(&self, draining: bool) {
-        self.shutting_down.store(draining, Ordering::Relaxed);
+        self.shutdown.draining.store(draining, Ordering::Relaxed);
     }
 
     /// Configure runtime readiness behavior for a read replica.
@@ -502,7 +523,7 @@ impl ProbeState {
     /// Returns whether graceful shutdown has started.
     #[must_use]
     pub fn is_shutting_down(&self) -> bool {
-        self.shutting_down.load(Ordering::Relaxed)
+        self.shutdown.draining.load(Ordering::Relaxed)
     }
 
     /// Returns whether readiness is currently draining.

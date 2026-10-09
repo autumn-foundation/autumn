@@ -177,6 +177,8 @@ pub mod db;
 #[cfg(feature = "db")]
 pub(crate) mod db_ping;
 pub(crate) mod db_url;
+// Request deadlines (issue #3058). The module carries its own `//!` docs.
+pub mod deadline;
 pub mod dotenv;
 pub mod download;
 #[cfg(test)]
@@ -589,6 +591,9 @@ pub mod etag;
 pub mod http_client;
 #[cfg(feature = "http-client")]
 pub use http_client as http;
+// Retry budget for outbound HTTP (issue #3058). Internal: the client uses it.
+#[cfg(feature = "http-client")]
+pub(crate) mod retry_budget;
 
 #[cfg(feature = "flash")]
 pub mod flash;

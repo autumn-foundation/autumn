@@ -5138,6 +5138,13 @@ impl AppBuilder {
         };
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
+        if let Some(warning) = config.server.drain_window_warning() {
+            tracing::warn!(
+                shutdown_timeout_secs = shutdown_timeout,
+                request_timeout_ms = config.server.timeouts.request_timeout_ms,
+                "{warning}"
+            );
+        }
         let prestop_grace = config.server.prestop_grace_secs;
 
         if let Err(error) = initialize_job_runtime(
@@ -5802,8 +5809,7 @@ impl AppBuilder {
 
         let shutdown_state = state.clone();
         let shutdown_signal_token = server_shutdown.clone();
-        #[cfg(feature = "ws")]
-        let websocket_shutdown = state.shutdown.clone();
+        let handler_shutdown = state.probes.shutdown_signal().clone();
         // Clone metrics so the drain-watchdog can record aborted requests.
         let shutdown_metrics = state.metrics.clone();
 
@@ -5881,9 +5887,9 @@ impl AppBuilder {
             }
             tracing::info!(phase = "listener_stopping", "shutdown: stopping listener");
 
-            // Phase 4: send WebSocket close frames.
-            #[cfg(feature = "ws")]
-            websocket_shutdown.cancel();
+            // Phase 4: send WebSocket close frames and cancel the
+            // `ShutdownToken` of running handlers.
+            handler_shutdown.cancel();
 
             // Phase 5: stop listener and signal jobs/scheduler to stop dequeuing.
             // Record drain-start before cancelling so main gets the right hook
@@ -14745,16 +14751,18 @@ fn build_state(
     #[cfg(feature = "db")] shards: Option<crate::sharding::ShardSet>,
     #[cfg(feature = "ws")] channels_backend: Option<Arc<dyn crate::channels::ChannelsBackend>>,
 ) -> AppState {
-    #[cfg(feature = "ws")]
-    let shutdown = tokio_util::sync::CancellationToken::new();
+    let probes = crate::probe::ProbeState::pending_startup();
     #[cfg(feature = "ws")]
     let channels = channels_backend.map_or_else(
         || {
-            crate::channels::Channels::from_config(&config.channels, shutdown.child_token())
-                .unwrap_or_else(|error| {
-                    tracing::error!(error = %error, "Failed to configure channels backend");
-                    std::process::exit(1);
-                })
+            crate::channels::Channels::from_config(
+                &config.channels,
+                probes.shutdown_signal().child_token(),
+            )
+            .unwrap_or_else(|error| {
+                tracing::error!(error = %error, "Failed to configure channels backend");
+                std::process::exit(1);
+            })
         },
         crate::channels::Channels::with_shared_backend,
     );
@@ -14780,7 +14788,7 @@ fn build_state(
         role: config.role,
         started_at: crate::time::monotonic_now(),
         health_detailed: config.health.detailed,
-        probes: crate::probe::ProbeState::pending_startup(),
+        probes,
         metrics: crate::middleware::MetricsCollector::new(),
         log_levels: crate::actuator::LogLevels::new(&config.log.level),
         task_registry: crate::actuator::TaskRegistry::new(),
@@ -14794,8 +14802,6 @@ fn build_state(
         presence,
         #[cfg(feature = "ws")]
         channels,
-        #[cfg(feature = "ws")]
-        shutdown,
         policy_registry: crate::authorization::PolicyRegistry::default(),
         forbidden_response: config.security.forbidden_response,
         auth_session_key: Arc::from(config.auth.session_key.as_str()),
