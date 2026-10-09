@@ -370,6 +370,20 @@ mod tests {
     }
 
     #[test]
+    fn a_disabled_site_has_no_signer() {
+        let config = crate::config::AutumnConfig::default();
+        let mut site = super::super::AeoSite {
+            enabled: true,
+            base_url: Some("https://example.com".to_owned()),
+            ..Default::default()
+        };
+        site.facts.web_bot_auth = Some(WebBotAuthKey::from_seed_b64(RFC8037_D).unwrap());
+        assert!(site.web_bot_auth_signer(&config).is_some());
+        site.enabled = false;
+        assert!(site.web_bot_auth_signer(&config).is_none());
+    }
+
+    #[test]
     fn rfc8037_key_and_thumbprint() {
         let key = WebBotAuthKey::from_seed_b64(RFC8037_D).unwrap();
         let jwk = key.public_jwk();

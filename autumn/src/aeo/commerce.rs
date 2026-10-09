@@ -372,15 +372,15 @@ pub(crate) fn apply_mpp(spec: &mut Value, routes: &[PaidRoute]) {
         let Some(method) = route.mpp_method.as_deref() else {
             continue;
         };
-        // Match the operation as `PaidRoute` matches a request: one trailing
-        // `/` does not count.
+        // Match the operation as `PricedRoutes` matches a route: one
+        // trailing `/` and the capture names do not count.
         let Some(op) = spec
             .get_mut("paths")
             .and_then(Value::as_object_mut)
             .and_then(|paths| {
                 paths
                     .iter_mut()
-                    .find(|(k, _)| normalize(k) == normalize(&route.path))
+                    .find(|(k, _)| same_template(k, &route.path))
                     .map(|(_, v)| v)
             })
             .and_then(|p| p.get_mut(route.method.to_ascii_lowercase()))
@@ -1387,6 +1387,17 @@ mod tests {
         apply_mpp(&mut spec, &[slashed]);
         assert!(
             spec["paths"]["/api/free"]["get"]
+                .get("x-payment-info")
+                .is_some()
+        );
+
+        // Capture names do not count, as at request time.
+        let mut spec = json!({"paths": {"/api/reports/{id}": {"get": {}}}});
+        let mut renamed = route();
+        renamed.path = "/api/reports/{rid}".to_owned();
+        apply_mpp(&mut spec, &[renamed]);
+        assert!(
+            spec["paths"]["/api/reports/{id}"]["get"]
                 .get("x-payment-info")
                 .is_some()
         );

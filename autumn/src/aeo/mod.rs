@@ -389,10 +389,15 @@ impl AeoSite {
         facts.robots_txt = aeo.enabled.then(|| default_robots_txt(config));
         facts.sitemap = aeo.enabled;
         warn_on_config(config);
-        facts.web_bot_auth = match web_bot_auth::WebBotAuthKey::from_config(
-            &aeo.web_bot_auth,
-            &crate::config::OsEnv,
-        ) {
+        // The master switch covers signing too: with AEO off the key
+        // directory is not served, so a signature could not be verified.
+        let wba_key = aeo
+            .enabled
+            .then(|| {
+                web_bot_auth::WebBotAuthKey::from_config(&aeo.web_bot_auth, &crate::config::OsEnv)
+            })
+            .flatten();
+        facts.web_bot_auth = match wba_key {
             Some(Ok(key)) => Some(key),
             Some(Err(err)) => {
                 tracing::warn!(error = %err, "aeo: Web Bot Auth key not loaded");
@@ -450,7 +455,8 @@ impl AeoSite {
         }
     }
 
-    /// A signer for outbound requests, when a Web Bot Auth key is set.
+    /// A signer for outbound requests, when AEO is on and a Web Bot Auth
+    /// key is set.
     ///
     /// `Signature-Agent` is `[aeo.web_bot_auth] signature_agent`, else
     /// `[seo] base_url`.
@@ -459,6 +465,9 @@ impl AeoSite {
         &self,
         config: &crate::config::AutumnConfig,
     ) -> Option<web_bot_auth::WebBotAuthSigner> {
+        if !self.enabled {
+            return None;
+        }
         let key = self.facts.web_bot_auth.clone()?;
         let wba = &config.aeo.web_bot_auth;
         let agent = wba

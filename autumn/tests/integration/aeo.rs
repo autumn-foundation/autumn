@@ -251,6 +251,34 @@ async fn oversized_pages_stay_html_for_head_too() {
     assert!(res.header("x-markdown-tokens").is_none());
 }
 
+#[get("/streamed")]
+async fn streamed() -> impl IntoResponse {
+    let chunks = futures::stream::iter(["<p>", "streamed", "</p>"].map(|chunk| {
+        Ok::<_, std::io::Error>(autumn_web::reexports::axum::body::Bytes::from_static(
+            chunk.as_bytes(),
+        ))
+    }));
+    (
+        [("content-type", "text/html; charset=utf-8")],
+        autumn_web::reexports::axum::body::Body::from_stream(chunks),
+    )
+}
+
+#[tokio::test]
+async fn head_of_a_page_of_unknown_length_stays_html() {
+    // GET may outgrow the limit while it buffers, and then sends HTML, so
+    // HEAD cannot promise Markdown.
+    let c = TestApp::new().routes(routes![streamed]).build();
+    let res = c
+        .head("/streamed")
+        .header("accept", "text/markdown")
+        .send()
+        .await;
+    res.assert_ok();
+    assert!(res.header("content-type").unwrap().starts_with("text/html"));
+    assert!(vary_has_accept(res.header("vary")));
+}
+
 #[tokio::test]
 async fn non_html_and_error_responses_are_untouched() {
     let c = client();

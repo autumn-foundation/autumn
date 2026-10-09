@@ -141,7 +141,9 @@ The response carries these headers:
 | `ETag` | A weak tag for the Markdown form, when the HTML has an `ETag` |
 | `Cache-Control` | `private`, when the app set no cache policy |
 
-`HEAD` gets the same headers as `GET`, with no body. Browsers get HTML. Each
+`HEAD` gets the same headers as `GET`, with no body. A streamed page has no
+known length, and its `GET` may outgrow `markdown_max_bytes`, so its `HEAD`
+keeps the HTML headers. Browsers get HTML. Each
 HTML page that Autumn can convert sends `Vary: Accept`. A cache then keeps
 the HTML and Markdown copies apart. Some CDNs ignore `Vary` for HTML; for
 those, add `Accept` to the cache key.
@@ -309,7 +311,8 @@ let signer = WebBotAuthSigner::from_state(&state).expect("key set");
 client.get("https://example.org/").sign_web_bot_auth(&signer).send().await?;
 ```
 
-The signature covers the first request only. Autumn does not sign a
+With `[aeo] enabled = false`, Autumn loads no key and `from_state` returns
+`None`. The signature covers the first request only. Autumn does not sign a
 redirect again. `Signature-Agent` uses the quoted-string form that
 Cloudflare verifies, not the draft's dictionary form.
 
@@ -352,9 +355,14 @@ header once on each replica before settlement fails. Make priced handlers
 idempotent (see [idempotency](idempotency.md)).
 
 The route match ignores one trailing `/`, a locale prefix (`/en/...`), and
-treats `HEAD` as `GET`. `{name}` matches one segment, `{*name}` the rest.
+capture names (`{rid}` matches a `{id}` route), and treats `HEAD` as `GET`. `{name}` matches one segment, `{*name}` the rest.
 The facilitator URL must use `https` (`http` only for `localhost`). Scanners probe `GET /api`
 and `GET /api/v1`, so price one of these to show x402 support.
+
+A priced route that is also an MCP tool is paid the same way: send
+`PAYMENT-SIGNATURE` on the `POST /mcp` request. An unpaid call is a tool error
+that holds the `402` body, and the `/mcp` response carries `PAYMENT-REQUIRED`;
+a paid one carries `PAYMENT-RESPONSE`.
 
 ### MPP
 

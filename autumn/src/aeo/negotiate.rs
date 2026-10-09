@@ -244,7 +244,9 @@ where
         }
         if this.flags.is_head {
             // HEAD carries the headers a GET would get; there is no body.
-            if !too_large(&res, config.max_bytes) {
+            // Only a known length shows that GET's body fits: a stream of
+            // unknown length may outgrow the limit, and GET then sends HTML.
+            if known_to_fit(&res, config.max_bytes) {
                 markdown_headers(res.headers_mut(), config, None);
             }
             return Poll::Ready(Ok(checked(res)));
@@ -462,10 +464,8 @@ fn add_vary_accept(headers: &mut HeaderMap) {
     }
 }
 
-/// `true` when the body is known to be larger than `max`: from
-/// `Content-Length`, else from an exact body size. `GET` and `HEAD` use the
-/// same test, so `HEAD` describes the representation `GET` sends.
-fn too_large(res: &Response, max: usize) -> bool {
+/// The body length: `Content-Length`, else an exact body size.
+fn known_len(res: &Response) -> Option<u64> {
     use http_body::Body as _;
 
     res.headers()
@@ -473,7 +473,18 @@ fn too_large(res: &Response, max: usize) -> bool {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
         .or_else(|| res.body().size_hint().exact())
-        .is_some_and(|len| len > max as u64)
+}
+
+/// `true` when the body is known to be larger than `max`.
+fn too_large(res: &Response, max: usize) -> bool {
+    known_len(res).is_some_and(|len| len > max as u64)
+}
+
+/// `true` when a `HEAD` response's `GET` body is known to fit in `max`.
+/// The `HEAD` body is already empty, so only `Content-Length`, or a
+/// non-empty exact size, says how long the `GET` body is.
+fn known_to_fit(res: &Response, max: usize) -> bool {
+    known_len(res).is_some_and(|len| len > 0 && len <= max as u64)
 }
 
 async fn to_markdown(res: Response, config: &NegotiateConfig) -> Response {
