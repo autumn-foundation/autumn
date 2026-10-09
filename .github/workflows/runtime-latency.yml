@@ -107,7 +107,9 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16-alpine
+        # Docker Hub's official image, through Google's mirror: a shared
+        # runner's unauthenticated Docker Hub pull limit is often spent.
+        image: mirror.gcr.io/library/postgres:16-alpine
         env:
           POSTGRES_DB: benchmark
           POSTGRES_USER: benchmark

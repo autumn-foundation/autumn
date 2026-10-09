@@ -92,7 +92,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16-alpine
+        # Docker Hub's official image, through Google's mirror: a shared
+        # runner's unauthenticated Docker Hub pull limit is often spent.
+        image: mirror.gcr.io/library/postgres:16-alpine
         env:
           POSTGRES_USER: autumn
           POSTGRES_PASSWORD: autumn
@@ -142,7 +144,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16-alpine
+        # Docker Hub's official image, through Google's mirror: a shared
+        # runner's unauthenticated Docker Hub pull limit is often spent.
+        image: mirror.gcr.io/library/postgres:16-alpine
         env:
           POSTGRES_USER: autumn
           POSTGRES_PASSWORD: autumn
