@@ -16,7 +16,7 @@ Autumn then serves the items in the table below.
 | Category | Item | Default |
 |---|---|---|
 | Discoverability | `/robots.txt` | On |
-| Discoverability | `/sitemap.xml` | When `[seo] base_url` is set |
+| Discoverability | `/sitemap.xml` | On (`[seo]` gives the full one) |
 | Discoverability | Agent `Link` headers on `/` | On |
 | Discoverability | DNS-AID records | You publish them (see below) |
 | Content | `Accept: text/markdown` returns Markdown | On |
@@ -35,7 +35,9 @@ Autumn then serves the items in the table below.
 The router fallback serves each generated document. The fallback runs only
 when no route matches, so an application route at the same path always
 wins. With `[seo]` settings or a `SitemapSource`, `/robots.txt` and
-`/sitemap.xml` are normal routes; see [SEO](seo.md).
+`/sitemap.xml` are normal routes; see [SEO](seo.md). Without them, the
+fallback `/sitemap.xml` lists `/` and the pages that declare a
+`seo(title)`, so the sitemap link in `llms.txt` always resolves.
 
 ---
 
@@ -322,7 +324,8 @@ Autumn settles first, then runs the handler. A priced route never runs free: whe
 `[aeo.x402]` is incomplete, the route's `amount` is invalid, or the build has
 no `http-client` feature, it answers `503`. A facilitator error answer is a
 `502`. An entry that can never match a request (a method that is not an HTTP
-method, or a `path` without a leading `/`) stops the app at startup.
+method, or a `path` without a leading `/` or with a space) stops the app at
+startup.
 
 ```toml
 [aeo.x402]

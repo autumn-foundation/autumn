@@ -37,5 +37,6 @@
 
 - **seo:** an app with no `[seo]` settings now serves `/robots.txt` (from
   the router fallback, so an app route still wins). It says `Disallow: /`
-  for the `dev` and `test` profiles. Set `[aeo] enabled = false` for the old
-  `404`.
+  for the `dev` and `test` profiles. It also serves a `/sitemap.xml` of `/`
+  and the pages with a `seo(title)`. Set `[aeo] enabled = false` for the old
+  `404`s.

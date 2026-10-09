@@ -387,6 +387,7 @@ impl AeoSite {
             mcp.tools.clear();
         }
         facts.robots_txt = aeo.enabled.then(|| default_robots_txt(config));
+        facts.sitemap = aeo.enabled;
         warn_on_config(config);
         facts.web_bot_auth = match web_bot_auth::WebBotAuthKey::from_config(
             &aeo.web_bot_auth,

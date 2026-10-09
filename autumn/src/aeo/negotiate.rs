@@ -93,15 +93,21 @@ where
             wants_markdown: self.config.markdown && readable && prefers_markdown(req.headers()),
             is_head: !is_get && readable,
         };
-        if flags.wants_markdown {
-            markdown_validators(req.headers_mut());
-        }
+        // A Markdown request's validators are checked here, against the
+        // representation sent (Markdown, or the response as it is), not by
+        // the handler against its HTML.
+        let validators = if flags.wants_markdown {
+            Validators::take(req.headers_mut())
+        } else {
+            None
+        };
         // The future holds only the inner future. It does not clone the
         // service. It boxes only a page that it converts.
         NegotiateFuture {
             inner: self.inner.call(req),
             config: Arc::clone(&self.config),
             flags,
+            validators,
             convert: None,
         }
     }
@@ -118,6 +124,45 @@ struct Flags {
 
 type ConvertFuture = Pin<Box<dyn Future<Output = Response> + Send>>;
 
+/// The conditional headers of a Markdown request.
+#[derive(Debug)]
+struct Validators {
+    if_none_match: Vec<HeaderValue>,
+    if_modified_since: Option<HeaderValue>,
+}
+
+impl Validators {
+    /// Remove the request's validators, if it has any.
+    fn take(headers: &mut HeaderMap) -> Option<Box<Self>> {
+        let if_none_match: Vec<HeaderValue> = match headers.entry(IF_NONE_MATCH) {
+            axum::http::header::Entry::Occupied(e) => e.remove_entry_mult().1.collect(),
+            axum::http::header::Entry::Vacant(_) => Vec::new(),
+        };
+        let if_modified_since = headers.remove(IF_MODIFIED_SINCE);
+        (!if_none_match.is_empty() || if_modified_since.is_some()).then(|| {
+            Box::new(Self {
+                if_none_match,
+                if_modified_since,
+            })
+        })
+    }
+
+    /// `res` as a `304` when these validators match it.
+    fn apply(&self, res: Response) -> Response {
+        if res.status() == StatusCode::OK
+            && crate::etag::validators_match(
+                &self.if_none_match,
+                self.if_modified_since.as_ref(),
+                res.headers(),
+            )
+        {
+            crate::etag::not_modified_from(res.headers())
+        } else {
+            res
+        }
+    }
+}
+
 pin_project_lite::pin_project! {
     /// Future of [`NegotiateService`].
     pub struct NegotiateFuture<F> {
@@ -125,6 +170,7 @@ pin_project_lite::pin_project! {
         inner: F,
         config: Arc<NegotiateConfig>,
         flags: Flags,
+        validators: Option<Box<Validators>>,
         convert: Option<ConvertFuture>,
     }
 }
@@ -142,13 +188,6 @@ where
         }
         let mut res = std::task::ready!(this.inner.poll(cx))?;
         let config = &**this.config;
-        if this.flags.wants_markdown && res.status() == StatusCode::NOT_MODIFIED {
-            // The handler matched the HTML tag of a Markdown ETag: the
-            // Markdown copy is unchanged too.
-            add_vary_accept(res.headers_mut());
-            markdown_etag(res.headers_mut());
-            return Poll::Ready(Ok(res));
-        }
         if res.extensions().get::<super::AeoDocument>().is_some() {
             res.headers_mut().remove(axum::http::header::SET_COOKIE);
         }
@@ -163,8 +202,13 @@ where
         {
             res.headers_mut().append(LINK, link.clone());
         }
+        let validators = this.validators.take();
+        let checked = |res: Response| match &validators {
+            Some(v) => v.apply(res),
+            None => res,
+        };
         if !(config.markdown && this.flags.readable && is_negotiable(&res)) {
-            return Poll::Ready(Ok(res));
+            return Poll::Ready(Ok(checked(res)));
         }
         add_vary_accept(res.headers_mut());
         if !this.flags.wants_markdown {
@@ -175,10 +219,16 @@ where
             if !too_large(&res, config.max_bytes) {
                 markdown_headers(res.headers_mut(), config, None);
             }
-            return Poll::Ready(Ok(res));
+            return Poll::Ready(Ok(checked(res)));
         }
         let config = Arc::clone(this.config);
-        let mut convert: ConvertFuture = Box::pin(async move { to_markdown(res, &config).await });
+        let mut convert: ConvertFuture = Box::pin(async move {
+            let res = to_markdown(res, &config).await;
+            match validators {
+                Some(v) => v.apply(res),
+                None => res,
+            }
+        });
         let poll = convert.as_mut().poll(cx);
         *this.convert = Some(convert);
         poll.map(Ok)
@@ -279,38 +329,6 @@ fn markdown_etag(headers: &mut HeaderMap) {
             Err(_) => {
                 headers.remove(ETAG);
             }
-        }
-    }
-}
-
-/// Make the validators of a Markdown request ask about the Markdown copy.
-/// A `-md` tag becomes the HTML tag it came from, so the handler can answer
-/// `304`. An HTML tag is dropped: it validates the other copy. The Markdown
-/// copy has no `Last-Modified`, so `If-Modified-Since` goes too.
-fn markdown_validators(headers: &mut HeaderMap) {
-    headers.remove(IF_MODIFIED_SINCE);
-    let Some(value) = headers.get(IF_NONE_MATCH).and_then(|v| v.to_str().ok()) else {
-        return;
-    };
-    let mut tags = Vec::new();
-    for tag in value.split(',').map(str::trim) {
-        if tag == "*" {
-            tags.push("*".to_owned());
-        } else if let Some(opaque) = tag
-            .trim_start_matches("W/")
-            .strip_prefix('"')
-            .and_then(|t| t.strip_suffix("-md\""))
-        {
-            tags.push(format!("\"{opaque}\""));
-            tags.push(format!("W/\"{opaque}\""));
-        }
-    }
-    match HeaderValue::from_str(&tags.join(", ")) {
-        Ok(v) if !tags.is_empty() => {
-            headers.insert(IF_NONE_MATCH, v);
-        }
-        _ => {
-            headers.remove(IF_NONE_MATCH);
         }
     }
 }
@@ -564,21 +582,26 @@ mod tests {
     }
 
     #[test]
-    fn markdown_validators_ask_about_the_markdown_copy() {
-        let mut h = HeaderMap::new();
-        h.insert(
-            IF_NONE_MATCH,
-            HeaderValue::from_static("W/\"v1-md\", \"v0\""),
-        );
-        h.insert(IF_MODIFIED_SINCE, HeaderValue::from_static("x"));
-        markdown_validators(&mut h);
-        assert_eq!(h.get(IF_NONE_MATCH).unwrap(), "\"v1\", W/\"v1\"");
-        assert!(h.get(IF_MODIFIED_SINCE).is_none());
+    fn validators_are_checked_against_the_representation_sent() {
+        let mut req = HeaderMap::new();
+        req.insert(IF_NONE_MATCH, HeaderValue::from_static("W/\"v1-md\""));
+        req.insert(IF_MODIFIED_SINCE, HeaderValue::from_static("x"));
+        let v = Validators::take(&mut req).expect("validators");
+        assert!(req.get(IF_NONE_MATCH).is_none() && req.get(IF_MODIFIED_SINCE).is_none());
 
-        let mut h = HeaderMap::new();
-        h.insert(IF_NONE_MATCH, HeaderValue::from_static("\"html-only\""));
-        markdown_validators(&mut h);
-        assert!(h.get(IF_NONE_MATCH).is_none(), "an HTML tag is dropped");
+        let md = |etag: &'static str| {
+            let mut res = Response::new(Body::from("body"));
+            res.headers_mut()
+                .insert(ETAG, HeaderValue::from_static(etag));
+            res
+        };
+        assert_eq!(
+            v.apply(md("W/\"v1-md\"")).status(),
+            StatusCode::NOT_MODIFIED
+        );
+        // The HTML tag is another representation: no 304.
+        assert_eq!(v.apply(md("\"v1\"")).status(), StatusCode::OK);
+        assert!(Validators::take(&mut HeaderMap::new()).is_none());
     }
 
     #[test]

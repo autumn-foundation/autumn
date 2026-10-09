@@ -173,9 +173,10 @@ pub fn valid_amount(amount: &str) -> bool {
 #[must_use]
 pub fn unmatchable_route(route: &PaidRoute) -> Option<String> {
     const METHODS: [&str; 7] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+    // Matching compares the method as written, so no trimming here.
     if !METHODS
         .iter()
-        .any(|m| m.eq_ignore_ascii_case(route.method.trim()))
+        .any(|m| m.eq_ignore_ascii_case(&route.method))
     {
         return Some(format!(
             "{:?} {}: method must be one of {}",
@@ -184,9 +185,9 @@ pub fn unmatchable_route(route: &PaidRoute) -> Option<String> {
             METHODS.join(", ")
         ));
     }
-    if !route.path.starts_with('/') {
+    if !route.path.starts_with('/') || route.path.chars().any(char::is_whitespace) {
         return Some(format!(
-            "{} {:?}: path must start with `/`",
+            "{} {:?}: path must start with `/` and have no spaces",
             route.method, route.path
         ));
     }
@@ -1114,6 +1115,8 @@ mod tests {
         for r in [
             PaidRoute::new("", "/x", "1"),
             PaidRoute::new("FETCH", "/x", "1"),
+            PaidRoute::new(" GET ", "/x", "1"),
+            PaidRoute::new("GET", "/x ", "1"),
             PaidRoute::new("GET", "api", "1"),
             PaidRoute::new("GET", "", "1"),
         ] {

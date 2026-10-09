@@ -196,6 +196,33 @@ async fn markdown_revalidates_against_the_markdown_etag() {
     assert_eq!(html_tag.text(), "cond\n");
 }
 
+#[get("/tagged.json")]
+async fn tagged_json() -> impl IntoResponse {
+    (
+        [("etag", "\"j1\"")],
+        Json(serde_json::json!({ "ok": true })),
+    )
+}
+
+#[tokio::test]
+async fn a_markdown_request_for_json_keeps_its_validators() {
+    let c = TestApp::new().routes(routes![tagged_json]).build();
+    for inm in ["\"j1\"", "*"] {
+        let res = c
+            .get("/tagged.json")
+            .header("accept", "text/markdown")
+            .header("if-none-match", inm)
+            .send()
+            .await;
+        assert_eq!(res.status, 304, "{inm}");
+        assert_eq!(
+            res.header("etag"),
+            Some("\"j1\""),
+            "no Markdown tag for JSON"
+        );
+    }
+}
+
 #[tokio::test]
 async fn oversized_pages_stay_html() {
     let mut config = AutumnConfig::default();
@@ -431,6 +458,21 @@ async fn robots_txt_is_served_by_default_and_an_app_route_wins() {
         .send()
         .await;
     assert_eq!(custom.text(), "User-agent: *\nDisallow: /private\n");
+}
+
+#[tokio::test]
+async fn the_sitemap_llms_txt_links_to_is_served() {
+    let c = client();
+    let llms = c.get("/llms.txt").send().await.text();
+    assert!(llms.contains("/sitemap.xml"), "{llms}");
+    let sitemap = c.get("/sitemap.xml").send().await;
+    sitemap.assert_ok();
+    assert_eq!(sitemap.header("content-type"), Some("application/xml"));
+    assert!(
+        sitemap.text().contains("<loc>http://localhost/</loc>"),
+        "{}",
+        sitemap.text()
+    );
 }
 
 #[tokio::test]

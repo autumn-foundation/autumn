@@ -74,6 +74,9 @@ pub struct SiteFacts {
     pub commerce: super::RegisteredCommerceDocs,
     /// The default `robots.txt`, when AEO serves it (no `[seo]` routes).
     pub robots_txt: Option<String>,
+    /// Serve a `/sitemap.xml` of the known pages when no route does, so the
+    /// links in `llms.txt` and the site guide always resolve.
+    pub sitemap: bool,
 }
 
 /// The mounted MCP server.
@@ -357,15 +360,55 @@ pub fn is_document_path(path: &str) -> bool {
         || path.ends_with("/server-card")
         || matches!(
             path,
-            LLMS_TXT_PATH | AUTH_MD_PATH | ROBOTS_TXT_PATH | super::webmcp::WEBMCP_JS_PATH
+            LLMS_TXT_PATH
+                | AUTH_MD_PATH
+                | ROBOTS_TXT_PATH
+                | SITEMAP_PATH
+                | super::webmcp::WEBMCP_JS_PATH
         )
 }
 
 /// Path of `robots.txt`.
 pub const ROBOTS_TXT_PATH: &str = "/robots.txt";
 
+/// Path of the sitemap.
+pub const SITEMAP_PATH: &str = "/sitemap.xml";
+
+/// A sitemap of `/` and the pages with a `seo(title)`. The router fallback
+/// serves it only when no `[seo]` or app route answers `/sitemap.xml`.
+fn sitemap(facts: &SiteFacts, origin: &Origin) -> Document {
+    use std::fmt::Write as _;
+
+    let mut body = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
+    );
+    let paths = std::iter::once("/").chain(
+        facts
+            .pages
+            .iter()
+            .map(|p| p.path.as_str())
+            .filter(|p| *p != "/"),
+    );
+    for path in paths {
+        let loc = origin
+            .url(path)
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        let _ = writeln!(body, "  <url><loc>{loc}</loc></url>");
+    }
+    body.push_str("</urlset>\n");
+    Document {
+        content_type: "application/xml",
+        headers: Vec::new(),
+        body,
+    }
+}
+
 fn render_inner(facts: &SiteFacts, origin: &Origin, path: &str, now: u64) -> Option<Document> {
     match path {
+        SITEMAP_PATH => facts.sitemap.then(|| sitemap(facts, origin)),
         ROBOTS_TXT_PATH => facts.robots_txt.as_ref().map(|body| Document {
             content_type: "text/plain; charset=utf-8",
             headers: Vec::new(),
@@ -1390,6 +1433,26 @@ mod tests {
         assert!(render(&facts, &origin(), "/mcp/server-card").is_some());
         let (_, catalog) = json_doc(&facts, API_CATALOG_PATH);
         assert!(!catalog.to_string().contains("//server-card"), "{catalog}");
+    }
+
+    #[test]
+    fn the_fallback_sitemap_lists_home_and_the_titled_pages() {
+        let mut facts = content_site();
+        assert!(render(&facts, &origin(), SITEMAP_PATH).is_none());
+        facts.sitemap = true;
+        let doc = render(&facts, &origin(), SITEMAP_PATH).unwrap();
+        assert_eq!(doc.content_type, "application/xml");
+        assert!(
+            doc.body.contains("<loc>https://shop.example.com/</loc>"),
+            "{}",
+            doc.body
+        );
+        assert!(
+            doc.body
+                .contains("<loc>https://shop.example.com/about</loc>"),
+            "{}",
+            doc.body
+        );
     }
 
     #[test]
