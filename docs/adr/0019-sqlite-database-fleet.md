@@ -184,6 +184,9 @@ which stops when the database closes and resumes on the next open.
   tenants stay open.
 - Replicas are not deleted with their database (Litestream has the same
   gap). Lifecycle hooks can, and roadmap item 4 will.
+- On Windows, deleting or restoring an existing database fails: SQLite opens
+  files without delete sharing, so the guard connection blocks the unlink.
+  Tracked in issue 3227.
 
 ## Roadmap
 

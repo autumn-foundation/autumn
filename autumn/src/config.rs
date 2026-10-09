@@ -10908,7 +10908,9 @@ impl DatabaseConfig {
             ));
         }
         let control = self.effective_primary_url();
-        if control.and_then(DatabaseBackend::detect) != Some(DatabaseBackend::Sqlite) {
+        if control.and_then(DatabaseBackend::detect) != Some(DatabaseBackend::Sqlite)
+            || control.is_some_and(is_in_memory_sqlite_target)
+        {
             return Err(ConfigError::Validation(
                 "database.fleet needs a file-backed sqlite: control database in database.url; \
                  framework state (sessions, jobs, flags) lives there while tenant data lives \
@@ -20045,7 +20047,16 @@ path = "/healthz"
     #[test]
     fn validate_rejects_a_fleet_without_a_sqlite_control_database() {
         use crate::fleet_layout::FleetMode;
-        for url in [None, Some("postgres://db/app")] {
+        for url in [
+            None,
+            Some("postgres://db/app"),
+            // In memory: framework state would vanish with the connection.
+            Some("sqlite::memory:"),
+            Some("sqlite:"),
+            Some("sqlite://"),
+            Some("file::memory:?cache=shared"),
+            Some("sqlite:file:app?mode=memory&cache=shared"),
+        ] {
             let config = DatabaseConfig {
                 url: url.map(str::to_owned),
                 fleet: Some(fleet(FleetMode::Tenant)),
@@ -20053,9 +20064,9 @@ path = "/healthz"
             };
             let err = config
                 .validate()
-                .expect_err("needs sqlite control")
+                .expect_err("needs a file-backed sqlite control database")
                 .to_string();
-            assert!(err.contains("sqlite: control database"), "{err}");
+            assert!(err.contains("sqlite: control database"), "{url:?}: {err}");
         }
     }
 

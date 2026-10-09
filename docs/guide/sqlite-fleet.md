@@ -197,6 +197,10 @@ replicating, the worst lag and which database has it.
 - A replicated database takes a fresh base snapshot each time it reopens.
   Size `max_open` so busy tenants stay open.
 - A deleted database's replica stays in object storage until you remove it.
+- On Windows, `delete` and `restore` of an existing database fail for now:
+  the file can't be removed while the guard connection that proves no other
+  process has it open is still open
+  ([#3227](https://github.com/autumn-foundation/autumn/issues/3227)).
 
 ## See also
 

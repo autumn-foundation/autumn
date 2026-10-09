@@ -226,9 +226,18 @@ fn io_error(op: &'static str) -> impl FnOnce(std::io::Error) -> FleetError {
 
 /// One open database in the fleet. Cheap to clone.
 ///
-/// Holding one does not keep the database open: once the fleet closes it, the
-/// pool refuses new checkouts, and the next [`DatabaseFleet::open`] opens it
-/// fresh. Hold it for a request, not across requests.
+/// Every live handle (and every clone) is a lease: while any exists, idle
+/// and `max_open` eviction skip the database, so a pool in use is never
+/// closed under its holder. Hold a handle for a request or a task, never in
+/// a long-lived cache: each retained handle pins one open database, and
+/// enough of them defeat `max_open` and `idle_close_secs`. Call
+/// [`DatabaseFleet::open`] again instead; it is cheap while the database is
+/// open.
+///
+/// An explicit [`DatabaseFleet::close`], [`DatabaseFleet::delete`] or
+/// [`DatabaseFleet::restore`] does not wait for leases: once it runs, the
+/// pool refuses new checkouts and the next [`DatabaseFleet::open`] opens the
+/// database fresh.
 #[derive(Clone)]
 pub struct FleetDatabase {
     key: FleetDbKey,
