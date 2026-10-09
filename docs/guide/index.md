@@ -80,6 +80,7 @@ Looking for the API reference instead? That is
 - [Threaded Comments on Anything](commentable.md) — attaching a comment thread to any record
 - [Horizontal Sharding](sharding.md) — splitting one logical database across several physical ones
 - [SQLite in Production](sqlite-in-production.md) — when SQLite is a reasonable production database, and how to run it
+- [SQLite Database Fleet](sqlite-fleet.md) — one SQLite database per tenant or per slot, replicated to object storage
 
 ## Files, media and storage
 

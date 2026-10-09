@@ -745,13 +745,57 @@ pub struct Shard {
     slots: Arc<[u16]>,
     topology: DatabaseTopology,
     runtime: Arc<ShardRuntime>,
+    /// The `shard=` value on metrics and route labels: the name of a
+    /// configured shard, `fleet` for a fleet database (whose name is
+    /// unbounded in a tenant fleet).
+    metric_label: Arc<str>,
+    /// The fleet database behind this shard, for a fleet-backed set.
+    #[cfg(feature = "sqlite")]
+    fleet_db: Option<crate::db::fleet::FleetDatabase>,
 }
 
+/// The metric label of every fleet database. See [`Shard::metric_label`].
+pub const FLEET_METRIC_LABEL: &str = "fleet";
+
 impl Shard {
-    /// Stable shard name from configuration.
+    /// Stable shard name: the configured name, or `tenant:<id>` /
+    /// `slot:<nnnnn>` for a fleet database (ADR 0019).
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The bounded label metrics and route keys carry for this shard: its
+    /// name for a configured shard, [`FLEET_METRIC_LABEL`] for a fleet
+    /// database. Spans and logs carry [`name`](Self::name).
+    #[must_use]
+    pub fn metric_label(&self) -> &str {
+        &self.metric_label
+    }
+
+    /// The fleet database behind this shard, when the set is fleet-backed.
+    #[cfg(feature = "sqlite")]
+    #[must_use]
+    pub const fn fleet_database(&self) -> Option<&crate::db::fleet::FleetDatabase> {
+        self.fleet_db.as_ref()
+    }
+
+    /// A shard over one open fleet database.
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn for_fleet_db(db: crate::db::fleet::FleetDatabase) -> Self {
+        static RUNTIME: std::sync::LazyLock<Arc<ShardRuntime>> = std::sync::LazyLock::new(|| {
+            Arc::new(ShardRuntime::new(ReplicaFallback::Primary, false))
+        });
+        let slot = db.key().routing_slot();
+        Self {
+            name: Arc::from(db.key().name()),
+            id: ShardId(usize::from(slot)),
+            slots: Arc::from([slot]),
+            topology: DatabaseTopology::primary_only(db.pool().clone()),
+            runtime: Arc::clone(&RUNTIME),
+            metric_label: Arc::from(FLEET_METRIC_LABEL),
+            fleet_db: Some(db),
+        }
     }
 
     /// Position of this shard in the configured set.
@@ -882,6 +926,16 @@ struct ShardSetInner {
     /// `slot_map[slot]` is the index into `shards` of the slot's owner.
     slot_map: Vec<usize>,
     router: Arc<dyn ShardRouter>,
+    /// The fleet behind a fleet-backed set (ADR 0019), with the control pool
+    /// that seeds tenant-free cross-shard repositories.
+    #[cfg(feature = "sqlite")]
+    fleet: Option<FleetBacking>,
+}
+
+#[cfg(feature = "sqlite")]
+struct FleetBacking {
+    fleet: crate::db::fleet::DatabaseFleet,
+    control_pool: Pool<RuntimeConnection>,
 }
 
 /// The configured set of shards plus the routing strategy.
@@ -895,7 +949,113 @@ pub struct ShardSet {
 }
 
 impl ShardSet {
-    /// Number of configured shards.
+    /// A set whose shards are the databases of a [`DatabaseFleet`]
+    /// (ADR 0019): every key resolves to its tenant's (or slot's) own
+    /// `SQLite` file, opened on first use.
+    ///
+    /// `control_pool` seeds tenant-free [`CrossShard`] repositories before
+    /// they fan out. A fleet-backed set has no configured shards:
+    /// [`len`](Self::len), [`iter`](Self::iter), [`get`](Self::get) and the
+    /// slot-map helpers see none, and [`route`](Self::route) refuses —
+    /// resolve keys with [`resolve`](Self::resolve).
+    ///
+    /// [`DatabaseFleet`]: crate::db::fleet::DatabaseFleet
+    #[cfg(feature = "sqlite")]
+    #[must_use]
+    pub fn from_fleet(
+        fleet: crate::db::fleet::DatabaseFleet,
+        control_pool: Pool<RuntimeConnection>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ShardSetInner {
+                shards: Vec::new(),
+                by_name: HashMap::new(),
+                slot_map: Vec::new(),
+                router: Arc::new(HashShardRouter),
+                fleet: Some(FleetBacking {
+                    fleet,
+                    control_pool,
+                }),
+            }),
+        }
+    }
+
+    /// The fleet behind a fleet-backed set.
+    #[cfg(feature = "sqlite")]
+    #[must_use]
+    pub fn fleet(&self) -> Option<&crate::db::fleet::DatabaseFleet> {
+        self.inner.fleet.as_ref().map(|backing| &backing.fleet)
+    }
+
+    /// Whether this set is backed by a fleet rather than configured shards.
+    #[must_use]
+    #[allow(
+        clippy::missing_const_for_fn,
+        reason = "reads through the Arc under the sqlite feature, which is not const"
+    )]
+    pub fn is_fleet(&self) -> bool {
+        #[cfg(feature = "sqlite")]
+        {
+            self.inner.fleet.is_some()
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            false
+        }
+    }
+
+    /// Resolve the shard that owns `key`, as an owned (cheap, `Arc`-backed)
+    /// [`Shard`].
+    ///
+    /// For configured shards this is [`route`](Self::route). For a
+    /// fleet-backed set it opens the key's database (creating it when the
+    /// fleet creates on demand). Every framework extractor resolves through
+    /// here, so both kinds of set serve [`ShardedDb`], [`Shards`] and
+    /// `#[repository(sharded)]`.
+    ///
+    /// # Errors
+    ///
+    /// The router's error, or the fleet's: `400` for a tenant id that cannot
+    /// name a file, `404` for an unprovisioned tenant, `503` for pending
+    /// migrations.
+    pub async fn resolve<'k>(&self, key: impl Into<ShardKey<'k>>) -> Result<Shard, AutumnError> {
+        let key = key.into();
+        #[cfg(feature = "sqlite")]
+        if let Some(backing) = &self.inner.fleet {
+            let db_key = backing.fleet.key_for_shard_key(key)?;
+            let db = backing.fleet.open(&db_key).await?;
+            return Ok(Shard::for_fleet_db(db));
+        }
+        self.route(key).await.cloned()
+    }
+
+    /// Resolve a shard by name: a configured shard's name, or a fleet
+    /// database's `tenant:<id>` / `slot:<n>` name (opened, never created).
+    ///
+    /// # Errors
+    ///
+    /// `400` for an unknown or malformed name, or the fleet's open error.
+    #[allow(
+        clippy::unused_async,
+        reason = "async for the fleet arm, which opens the database (sqlite feature)"
+    )]
+    pub async fn resolve_name(&self, name: &str) -> Result<Shard, AutumnError> {
+        #[cfg(feature = "sqlite")]
+        if let Some(backing) = &self.inner.fleet {
+            let key = backing.fleet.key_for_name(name)?;
+            if !backing.fleet.exists(&key) {
+                return Err(crate::db::fleet::FleetError::NotFound { name: key.name() }.into());
+            }
+            let db = backing.fleet.open(&key).await?;
+            return Ok(Shard::for_fleet_db(db));
+        }
+        self.by_name(name)
+            .cloned()
+            .ok_or_else(|| AutumnError::bad_request_msg(format!("unknown shard {name:?}")))
+    }
+
+    /// Number of configured shards (`0` for a fleet-backed set, whose
+    /// databases are opened on demand; see [`is_fleet`](Self::is_fleet)).
     #[must_use]
     pub fn len(&self) -> usize {
         self.inner.shards.len()
@@ -958,6 +1118,12 @@ impl ShardSet {
     /// produced an out-of-range [`ShardId`].
     pub async fn route<'k>(&self, key: impl Into<ShardKey<'k>>) -> Result<&Shard, AutumnError> {
         let key = key.into();
+        if self.is_fleet() {
+            return Err(AutumnError::internal_server_error_msg(
+                "ShardSet::route cannot borrow a fleet database, which is opened on demand; \
+                 call ShardSet::resolve instead",
+            ));
+        }
         let id = self.inner.router.route(key, self).await?;
         self.get(id).ok_or_else(|| {
             AutumnError::service_unavailable_msg(format!(
@@ -973,6 +1139,13 @@ impl ShardSet {
     /// deployments notice multiplied connection counts.
     #[must_use]
     pub fn total_max_connections(&self) -> usize {
+        #[cfg(feature = "sqlite")]
+        if let Some(backing) = &self.inner.fleet {
+            return backing
+                .fleet
+                .max_open()
+                .saturating_mul(backing.fleet.pool_size());
+        }
         self.inner
             .shards
             .iter()
@@ -1063,6 +1236,24 @@ impl ShardSet {
         F: Fn(&Shard) -> Fut + Send + Sync,
     {
         use futures::StreamExt as _;
+
+        // A fleet fans out over every database on disk, in key order, opening
+        // each (never creating one).
+        #[cfg(feature = "sqlite")]
+        if let Some(backing) = &self.inner.fleet {
+            let f = &f;
+            return backing
+                .fleet
+                .each(FAN_OUT_CONCURRENCY, |db| {
+                    let shard = Shard::for_fleet_db(db);
+                    f(&shard)
+                })
+                .await
+                .map_err(AutumnError::from)?
+                .into_iter()
+                .map(|(_, result)| result)
+                .collect();
+        }
 
         // Results are placed by shard index so declaration order is preserved
         // even though `FuturesUnordered` yields them in completion order.
@@ -1278,6 +1469,9 @@ pub fn build_shard_set(
                     shard_config.effective_replica_fallback(config),
                     replica_configured,
                 )),
+                metric_label: Arc::from(shard_config.name.as_str()),
+                #[cfg(feature = "sqlite")]
+                fleet_db: None,
             }
         })
         .collect();
@@ -1303,6 +1497,8 @@ pub fn build_shard_set(
             by_name,
             slot_map,
             router,
+            #[cfg(feature = "sqlite")]
+            fleet: None,
         }),
     })
 }
@@ -1489,6 +1685,16 @@ pub(crate) fn register_shard_health_indicators(
     registry: &crate::actuator::HealthIndicatorRegistry,
     ping_timeout: std::time::Duration,
 ) {
+    #[cfg(feature = "sqlite")]
+    if let Some(fleet) = set.fleet()
+        && let Err(error) = registry.register(
+            "db:fleet",
+            crate::actuator::IndicatorGroup::Readiness,
+            Arc::new(crate::db::fleet::FleetHealthIndicator::new(fleet.clone())),
+        )
+    {
+        tracing::warn!("{error}");
+    }
     for shard in set.iter() {
         let name = format!("db:shard:{}", shard.name());
         if let Err(error) = registry.register(
@@ -1575,6 +1781,19 @@ fn cross_shard_seed(
     set: &ShardSet,
     ctx: &crate::db::RequestDbContext,
 ) -> Result<ShardRepositorySeed, AutumnError> {
+    // A fleet has no first shard; the control pool serves the pre-fan-out
+    // connection, and the fan-out re-tags each query with `shard=fleet`.
+    #[cfg(feature = "sqlite")]
+    if let Some(backing) = &set.inner.fleet {
+        let mut seed = ShardRepositorySeed::from_ctx(
+            &backing.control_pool,
+            ctx,
+            FLEET_METRIC_LABEL,
+            crate::repository::ReadRoute::Primary,
+        );
+        seed.route.clone_from(&ctx.route_key);
+        return Ok(seed);
+    }
     let shard = set.iter().next().ok_or_else(no_shards_configured)?;
     let mut seed =
         ShardRepositorySeed::from_ctx(shard.primary_pool(), ctx, shard.name(), shard.read_route());
@@ -1673,8 +1892,8 @@ impl Shards {
         &self,
         key: impl Into<ShardKey<'k>>,
     ) -> Result<crate::db::Db, AutumnError> {
-        let shard = self.set.route(key).await?;
-        self.checkout_primary(shard).await
+        let shard = self.set.resolve(key).await?;
+        self.checkout_primary(&shard).await
     }
 
     /// Check out a **read** connection to the shard that owns `key`,
@@ -1690,14 +1909,14 @@ impl Shards {
         &self,
         key: impl Into<ShardKey<'k>>,
     ) -> Result<crate::db::Db, AutumnError> {
-        let shard = self.set.route(key).await?;
+        let shard = self.set.resolve(key).await?;
         let (pool, role) = shard.read_pool_with_role().ok_or_else(|| {
             AutumnError::service_unavailable_msg(format!(
                 "shard {:?} replica is not ready and replica_fallback = \"fail_readiness\"",
                 shard.name()
             ))
         })?;
-        self.checkout(shard, pool, role).await
+        self.checkout(&shard, pool, role).await
     }
 
     /// Check out a **replica-only** connection to the shard that owns `key`.
@@ -1720,7 +1939,7 @@ impl Shards {
         &self,
         key: impl Into<ShardKey<'k>>,
     ) -> Result<crate::db::Db, AutumnError> {
-        let shard = self.set.route(key).await?;
+        let shard = self.set.resolve(key).await?;
         let pool = shard.replica_read_pool().ok_or_else(|| {
             AutumnError::service_unavailable_msg(format!(
                 "shard {:?} has no healthy replica; read_replica_for requires a \
@@ -1728,7 +1947,7 @@ impl Shards {
                 shard.name()
             ))
         })?;
-        self.checkout(shard, pool, "replica").await
+        self.checkout(&shard, pool, "replica").await
     }
 
     /// Check out a connection to a shard's primary **by name** —
@@ -1739,11 +1958,16 @@ impl Shards {
     /// Returns a bad-request error for an unknown name, or a checkout
     /// failure.
     pub async fn db_on(&self, shard_name: &str) -> Result<crate::db::Db, AutumnError> {
-        let shard = self
-            .set
-            .by_name(shard_name)
-            .ok_or_else(|| AutumnError::bad_request_msg(format!("unknown shard {shard_name:?}")))?;
-        self.checkout_primary(shard).await
+        let shard = self.set.resolve_name(shard_name).await?;
+        self.checkout_primary(&shard).await
+    }
+
+    /// The fleet behind a fleet-backed set (ADR 0019): provision, delete,
+    /// back up and list tenant databases from a handler.
+    #[cfg(feature = "sqlite")]
+    #[must_use]
+    pub fn fleet(&self) -> Option<&crate::db::fleet::DatabaseFleet> {
+        self.set.fleet()
     }
 
     /// Run `f` against the primary of **every** shard, concurrently
@@ -1785,6 +2009,11 @@ impl Shards {
         // for Send.
         use futures::StreamExt as _;
 
+        #[cfg(feature = "sqlite")]
+        if self.set.is_fleet() {
+            return self.each_fleet_database(&f).await;
+        }
+
         let mut results: Vec<Option<(ShardId, Result<T, AutumnError>)>> =
             std::iter::repeat_with(|| None)
                 .take(self.set.len())
@@ -1805,6 +2034,40 @@ impl Shards {
             results[id.0] = Some((id, result));
         }
         results.into_iter().flatten().collect()
+    }
+
+    /// [`each_shard`](Self::each_shard) over a fleet: every database on
+    /// disk, in key order, each opened (never created). A fleet that cannot
+    /// be listed yields one error entry with `ShardId(usize::MAX)`.
+    #[cfg(feature = "sqlite")]
+    async fn each_fleet_database<T, Fut, F>(&self, f: &F) -> Vec<(ShardId, Result<T, AutumnError>)>
+    where
+        T: Send,
+        Fut: std::future::Future<Output = Result<T, AutumnError>> + Send,
+        F: Fn(&Shard, crate::db::Db) -> Fut + Send + Sync,
+    {
+        use futures::StreamExt as _;
+        let Some(fleet) = self.set.fleet() else {
+            return Vec::new();
+        };
+        let keys = match fleet.list().await {
+            Ok(keys) => keys,
+            Err(error) => return vec![(ShardId(usize::MAX), Err(error.into()))],
+        };
+        futures::stream::iter(keys)
+            .map(
+                |key| -> futures::future::BoxFuture<'_, (ShardId, Result<T, AutumnError>)> {
+                    Box::pin(async move {
+                        match self.set.resolve_name(&key.name()).await {
+                            Ok(shard) => self.run_on_shard(&shard, f).await,
+                            Err(error) => (ShardId(usize::from(key.routing_slot())), Err(error)),
+                        }
+                    })
+                },
+            )
+            .buffered(FAN_OUT_CONCURRENCY)
+            .collect()
+            .await
     }
 
     async fn run_on_shard<T, Fut, F>(
@@ -1837,7 +2100,7 @@ impl Shards {
         let ctx = self.ctx.clone();
         crate::db::Db::checkout(crate::db::DbCheckoutParams {
             pool,
-            pool_name: &format!("shard:{}:{role}", shard.name()),
+            pool_name: &format!("shard:{}:{role}", shard.metric_label()),
             shard: Some(shard.name()),
             statement_timeout: ctx.statement_timeout,
             idle_in_transaction_timeout: ctx.idle_in_transaction_timeout,
@@ -1845,7 +2108,7 @@ impl Shards {
             // separates in /actuator/metrics.
             route_key: ctx
                 .route_key
-                .map(|key| format!("{key} shard={}", shard.name())),
+                .map(|key| format!("{key} shard={}", shard.metric_label())),
             metrics: ctx.metrics,
             slow_query_threshold: ctx.slow_query_threshold,
             interceptors: ctx.interceptors,
@@ -2117,12 +2380,11 @@ pub async fn __autumn_resolve_repo_seed(
     )
     .await?;
     let key = resolve_shard_key(parts, state).await?;
-    let shard = shards.set.route(&key).await?;
-    let shard_name = Arc::clone(&shard.name);
+    let shard = shards.set.resolve(&key).await?;
     let seed = ShardRepositorySeed::from_ctx(
         shard.primary_pool(),
         &shards.ctx,
-        &shard_name,
+        shard.metric_label(),
         shard.read_route(),
     );
     let set = shards.set.clone();
@@ -2139,17 +2401,17 @@ impl axum::extract::FromRequestParts<crate::AppState> for ShardedDb {
         let shards = Shards::from_request_parts(parts, state).await?;
         let key = resolve_shard_key(parts, state).await?;
 
-        let shard = shards.set.route(&key).await?;
+        let shard = shards.set.resolve(&key).await?;
         let shard_name = Arc::clone(&shard.name);
         let shard_id = shard.id();
         let repo_seed = ShardRepositorySeed::from_ctx(
             shard.primary_pool(),
             &shards.ctx,
-            &shard_name,
+            shard.metric_label(),
             shard.read_route(),
         );
         let shard_set = shards.set.clone();
-        let db = shards.checkout_primary(shard).await?;
+        let db = shards.checkout_primary(&shard).await?;
         crate::read_your_writes::mark_write();
         Ok(Self {
             db,
@@ -2247,7 +2509,7 @@ impl axum::extract::FromRequestParts<crate::AppState> for ShardedReadDb {
         let shards = Shards::from_request_parts(parts, state).await?;
         let key = resolve_shard_key(parts, state).await?;
 
-        let shard = shards.set.route(&key).await?;
+        let shard = shards.set.resolve(&key).await?;
         let shard_name = Arc::clone(&shard.name);
         let shard_id = shard.id();
         let pool = shard.replica_read_pool().ok_or_else(|| {
@@ -2257,7 +2519,7 @@ impl axum::extract::FromRequestParts<crate::AppState> for ShardedReadDb {
                 shard.name()
             ))
         })?;
-        let db = shards.checkout(shard, pool, "replica").await?;
+        let db = shards.checkout(&shard, pool, "replica").await?;
         Ok(Self {
             db,
             shard_name,

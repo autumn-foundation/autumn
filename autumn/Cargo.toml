@@ -1192,6 +1192,16 @@ path = "tests/sqlite_tracked_sessions.rs"
 name = "sqlite_transactional_url_pool"
 path = "tests/sqlite_transactional_url_pool.rs"
 
+# SQLite fleet end to end (ADR 0019): `ShardedDb`, `Shards`, `CrossShard` and a
+# `#[repository(tenant_scoped, sharded)]` repository served by a per-tenant /
+# per-slot `DatabaseFleet`. The file is
+# `#![cfg(all(feature = "sqlite", feature = "test-support"))]`, so other builds
+# compile it to an empty binary. Run explicitly:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet`.
+[[test]]
+name = "sqlite_fleet"
+path = "tests/sqlite_fleet.rs"
+
 # Sim-testing W4 SQLite DB lane (issue #1797): proves the job/scheduler drain
 # runs end-to-end against a fresh, migrated, in-process in-memory SQLite substrate
 # (`sim::substrate::SqliteSubstrate`) over the representative local scheduler

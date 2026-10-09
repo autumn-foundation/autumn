@@ -3236,10 +3236,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __autumn_slow_threshold: self.__autumn_slow_threshold,
                     // Re-tag the route label with this shard so per-shard DB
                     // metrics and slow-query logs attribute fan-out work to the
-                    // shard executing it, not the originally-routed shard.
+                    // shard executing it, not the originally-routed shard. A
+                    // fleet database tags `shard=fleet`, never its own name,
+                    // so a tenant fleet cannot explode metric cardinality.
                     __autumn_route: ::autumn_web::sharding::reshard_route_label(
                         self.__autumn_route.as_deref(),
-                        __shard.name(),
+                        __shard.metric_label(),
                     ),
                     // Shard sub-repos are used for read fan-out only; mutations
                     // broadcast from the parent, not the per-shard instance.
