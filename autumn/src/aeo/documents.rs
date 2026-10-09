@@ -17,6 +17,14 @@ pub const LLMS_TXT_PATH: &str = "/llms.txt";
 pub const API_CATALOG_PATH: &str = "/.well-known/api-catalog";
 /// Domain-level path of the MCP server card.
 pub const SERVER_CARD_PATH: &str = "/.well-known/mcp/server-card.json";
+
+/// The endpoint-specific card path for an MCP mount at `mcp_path`. A
+/// trailing `/` is dropped, so `/` and `/mcp/` give `/server-card` and
+/// `/mcp/server-card`.
+#[must_use]
+pub fn server_card_path(mcp_path: &str) -> String {
+    format!("{}/server-card", mcp_path.trim_end_matches('/'))
+}
 /// Path of the agent skills index.
 pub const SKILLS_INDEX_PATH: &str = "/.well-known/agent-skills/index.json";
 /// Path of the ARD manifest under its current name.
@@ -419,7 +427,7 @@ fn render_inner(facts: &SiteFacts, origin: &Origin, path: &str, now: u64) -> Opt
                     });
             }
             let mcp = facts.mcp.as_ref()?;
-            let mut card = (path.strip_suffix("/server-card")? == mcp.path)
+            let mut card = (path == server_card_path(&mcp.path))
                 .then(|| server_card(facts, origin))
                 .flatten()?;
             // SEP-2127: the media type at the endpoint path. The
@@ -622,7 +630,7 @@ fn api_catalog(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
         let mut entry = json!({
             "anchor": origin.url(&mcp.path),
             "service-desc": [{
-                "href": origin.url(&format!("{}/server-card", mcp.path)),
+                "href": origin.url(&server_card_path(&mcp.path)),
                 "type": "application/mcp-server-card+json",
             }],
         });
@@ -924,7 +932,7 @@ fn ard_manifest(facts: &SiteFacts, origin: &Origin) -> Document {
             "identifier": urn("mcp", "server"),
             "displayName": format!("{display} MCP server"),
             "type": "application/mcp-server-card+json",
-            "url": origin.url(&format!("{}/server-card", mcp.path)),
+            "url": origin.url(&server_card_path(&mcp.path)),
         }));
     }
     for skill in all_skills(facts, origin) {
@@ -1371,6 +1379,17 @@ mod tests {
         assert_eq!(refunds.len(), 1, "{index}");
         let served = render(&facts, &origin(), refunds[0]["url"].as_str().unwrap()).unwrap();
         assert_eq!(refunds[0]["digest"], sha256_digest(served.body.as_bytes()));
+    }
+
+    #[test]
+    fn a_trailing_slash_mcp_mount_gets_a_clean_card_path() {
+        assert_eq!(server_card_path("/"), "/server-card");
+        assert_eq!(server_card_path("/mcp/"), "/mcp/server-card");
+        let mut facts = api_site();
+        facts.mcp.as_mut().unwrap().path = "/mcp/".to_owned();
+        assert!(render(&facts, &origin(), "/mcp/server-card").is_some());
+        let (_, catalog) = json_doc(&facts, API_CATALOG_PATH);
+        assert!(!catalog.to_string().contains("//server-card"), "{catalog}");
     }
 
     #[test]

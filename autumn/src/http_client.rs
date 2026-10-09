@@ -1602,6 +1602,7 @@ impl Client {
             entropy: self.entropy.clone(),
             throttle: self.throttle.clone(),
             criticality: None,
+            web_bot_auth: None,
         }
     }
 
@@ -1845,6 +1846,8 @@ pub struct RequestBuilder {
     throttle: Option<Arc<crate::admission::AdaptiveThrottle>>,
     /// The criticality to send. `None` sends the inbound request's.
     criticality: Option<crate::admission::Criticality>,
+    /// Web Bot Auth signer: each attempt sends a fresh signature.
+    web_bot_auth: Option<Arc<crate::aeo::web_bot_auth::WebBotAuthSigner>>,
 }
 
 impl RequestBuilder {
@@ -1887,13 +1890,16 @@ impl RequestBuilder {
     /// Signatures), so the receiving site can verify that it comes from this
     /// app. Adds `Signature-Agent`, `Signature-Input`, and `Signature`.
     ///
-    /// The URL must be absolute. See [`crate::aeo::web_bot_auth`].
+    /// The URL must be absolute. Each attempt (a retry, a same-origin
+    /// redirect) sends a new signature, so a held builder or a late retry
+    /// never sends an expired one. See [`crate::aeo::web_bot_auth`].
     #[must_use]
     pub fn sign_web_bot_auth(
         mut self,
         signer: &crate::aeo::web_bot_auth::WebBotAuthSigner,
     ) -> Self {
         if let Some(h) = signer.sign_url(&self.url) {
+            self.web_bot_auth = Some(Arc::new(signer.clone()));
             return self
                 .header("signature-agent", h.signature_agent)
                 .header("signature-input", h.signature_input)
@@ -2475,11 +2481,13 @@ impl RequestBuilder {
 
     /// The deadline and retry budget for one send to `host`.
     fn retry_gate(&self, host: Option<&str>) -> RetryGate {
-        RetryGate::start(
+        let mut gate = RetryGate::start(
             self.retry.budgets.clone(),
             host,
             self.retry.send_deadline_header,
-        )
+        );
+        gate.signer.clone_from(&self.web_bot_auth);
+        gate
     }
 
     /// `true` when a header needs the client to follow redirects itself:
@@ -2588,7 +2596,7 @@ impl RequestBuilder {
             req = req.timeout(timeout);
         }
         req = inject_trace_context(req);
-        req = with_caller_headers(req, gate, timeout, &self.extra_headers);
+        req = with_caller_headers(req, gate, timeout, &self.extra_headers, &self.url);
         if let Some(body) = &self.body {
             req = req.body(body.clone());
         }
@@ -3393,6 +3401,8 @@ struct RetryGate {
     /// first attempt. The value is relative, so a retry or a later hop sends
     /// what is left of it, not the whole value again.
     caller_deadline: std::sync::OnceLock<Option<Deadline>>,
+    /// Signs each attempt again (Web Bot Auth), see [`with_caller_headers`].
+    signer: Option<Arc<crate::aeo::web_bot_auth::WebBotAuthSigner>>,
 }
 
 impl Drop for RetryGate {
@@ -3434,6 +3444,7 @@ impl RetryGate {
             refill_pending: AtomicBool::new(true),
             pending_retry: std::sync::Mutex::new(None),
             caller_deadline: std::sync::OnceLock::new(),
+            signer: None,
         }
     }
 
@@ -3632,17 +3643,39 @@ fn with_caller_headers(
     gate: &RetryGate,
     timeout: Option<Duration>,
     caller: &HeaderMap,
+    url: &str,
 ) -> reqwest::RequestBuilder {
     let deadline_value = gate.header(timeout, caller);
     let sends_deadline = deadline_value.is_some();
     if let Some(value) = deadline_value {
         req = req.header(DEADLINE_HEADER, value);
     }
+    // A Web Bot Auth signature is made new for each attempt. A cross-origin
+    // hop already dropped the old one, and gets none.
+    let fresh = gate
+        .signer
+        .as_ref()
+        .filter(|_| caller.contains_key("signature"))
+        .and_then(|signer| signer.sign_url(url));
     for (name, value) in caller {
         if sends_deadline && name == DEADLINE_HEADER {
             continue;
         }
+        if fresh.is_some()
+            && matches!(
+                name.as_str(),
+                "signature" | "signature-input" | "signature-agent"
+            )
+        {
+            continue;
+        }
         req = req.header(name.clone(), value.clone());
+    }
+    if let Some(h) = fresh {
+        req = req
+            .header("signature-agent", h.signature_agent)
+            .header("signature-input", h.signature_input)
+            .header("signature", h.signature);
     }
     req
 }
@@ -4052,7 +4085,7 @@ async fn send_one(
             req = req.timeout(timeout);
         }
         req = inject_trace_context(req);
-        req = with_caller_headers(req, gate, attempt_timeout, extra_headers);
+        req = with_caller_headers(req, gate, attempt_timeout, extra_headers, url);
         if let Some(body) = body {
             req = req.body(body.clone());
         }
@@ -6827,6 +6860,50 @@ mod tests {
         for name in ["signature", "signature-input", "signature-agent"] {
             assert!(headers.get(name).is_none(), "{name} must be stripped");
         }
+    }
+
+    // A Web Bot Auth signature is made when the request is sent, not when
+    // the builder is configured, so a held builder never sends a stale one.
+    #[tokio::test]
+    async fn web_bot_auth_signs_at_send_time() {
+        use axum::{Router, routing::get};
+
+        let seen: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let seen2 = seen.clone();
+        let addr = spawn(Router::new().route(
+            "/",
+            get(move |headers: HeaderMap| {
+                let slot = seen2.clone();
+                async move {
+                    *slot.lock().unwrap() = Some(headers);
+                    "ok"
+                }
+            }),
+        ))
+        .await;
+        let key = crate::aeo::web_bot_auth::WebBotAuthKey::from_seed_b64(
+            "nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A",
+        )
+        .unwrap();
+        let signer = crate::aeo::web_bot_auth::WebBotAuthSigner::new(key, "https://bot.example");
+        let created = |input: &str| -> u64 {
+            input
+                .split(";created=")
+                .nth(1)
+                .and_then(|r| r.split(';').next())
+                .and_then(|v| v.parse().ok())
+                .unwrap()
+        };
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        let first = created(&signer.sign_url(&url).unwrap().signature_input);
+        let builder = Client::new().get(&url).sign_web_bot_auth(&signer);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        builder.send().await.unwrap();
+
+        let headers = seen.lock().unwrap().clone().expect("reached");
+        let sent = headers.get("signature-input").unwrap().to_str().unwrap();
+        assert!(created(sent) > first, "{sent}");
+        assert_eq!(headers.get_all("signature").iter().count(), 1);
     }
 
     // TEST 60: a SAME-origin redirect (relative `Location`, same host:port) must

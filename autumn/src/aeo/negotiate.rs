@@ -15,7 +15,7 @@ use std::task::{Context, Poll};
 use axum::body::{Body, Bytes};
 use axum::http::header::{
     CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
-    LAST_MODIFIED, LINK, VARY,
+    IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LINK, VARY,
 };
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::response::Response;
@@ -84,7 +84,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
+    fn call(&mut self, mut req: Request<Body>) -> Self::Future {
         let is_get = req.method() == Method::GET;
         let readable = is_get || req.method() == Method::HEAD;
         let flags = Flags {
@@ -93,6 +93,9 @@ where
             wants_markdown: self.config.markdown && readable && prefers_markdown(req.headers()),
             is_head: !is_get && readable,
         };
+        if flags.wants_markdown {
+            markdown_validators(req.headers_mut());
+        }
         // The future holds only the inner future. It does not clone the
         // service. It boxes only a page that it converts.
         NegotiateFuture {
@@ -139,6 +142,13 @@ where
         }
         let mut res = std::task::ready!(this.inner.poll(cx))?;
         let config = &**this.config;
+        if this.flags.wants_markdown && res.status() == StatusCode::NOT_MODIFIED {
+            // The handler matched the HTML tag of a Markdown ETag: the
+            // Markdown copy is unchanged too.
+            add_vary_accept(res.headers_mut());
+            markdown_etag(res.headers_mut());
+            return Poll::Ready(Ok(res));
+        }
         if res.extensions().get::<super::AeoDocument>().is_some() {
             res.headers_mut().remove(axum::http::header::SET_COOKIE);
         }
@@ -176,6 +186,53 @@ where
         let poll = convert.as_mut().poll(cx);
         *this.convert = Some(convert);
         poll.map(Ok)
+    }
+}
+
+/// Rewrite the HTML `ETag` to its Markdown form, `W/"<tag>-md"`.
+fn markdown_etag(headers: &mut HeaderMap) {
+    if let Some(etag) = headers.get(ETAG).and_then(|v| v.to_str().ok()) {
+        let opaque = etag.trim_start_matches("W/").trim_matches('"');
+        match HeaderValue::from_str(&format!("W/\"{opaque}-md\"")) {
+            Ok(v) => {
+                headers.insert(ETAG, v);
+            }
+            Err(_) => {
+                headers.remove(ETAG);
+            }
+        }
+    }
+}
+
+/// Make the validators of a Markdown request ask about the Markdown copy.
+/// A `-md` tag becomes the HTML tag it came from, so the handler can answer
+/// `304`. An HTML tag is dropped: it validates the other copy. The Markdown
+/// copy has no `Last-Modified`, so `If-Modified-Since` goes too.
+fn markdown_validators(headers: &mut HeaderMap) {
+    headers.remove(IF_MODIFIED_SINCE);
+    let Some(value) = headers.get(IF_NONE_MATCH).and_then(|v| v.to_str().ok()) else {
+        return;
+    };
+    let mut tags = Vec::new();
+    for tag in value.split(',').map(str::trim) {
+        if tag == "*" {
+            tags.push("*".to_owned());
+        } else if let Some(opaque) = tag
+            .trim_start_matches("W/")
+            .strip_prefix('"')
+            .and_then(|t| t.strip_suffix("-md\""))
+        {
+            tags.push(format!("\"{opaque}\""));
+            tags.push(format!("W/\"{opaque}\""));
+        }
+    }
+    match HeaderValue::from_str(&tags.join(", ")) {
+        Ok(v) if !tags.is_empty() => {
+            headers.insert(IF_NONE_MATCH, v);
+        }
+        _ => {
+            headers.remove(IF_NONE_MATCH);
+        }
     }
 }
 
@@ -331,17 +388,7 @@ fn markdown_headers(headers: &mut HeaderMap, config: &NegotiateConfig, tokens: O
         headers.remove(name);
     }
     headers.remove(axum::http::header::ACCEPT_RANGES);
-    if let Some(etag) = headers.get(ETAG).and_then(|v| v.to_str().ok()) {
-        let opaque = etag.trim_start_matches("W/").trim_matches('"');
-        match HeaderValue::from_str(&format!("W/\"{opaque}-md\"")) {
-            Ok(v) => {
-                headers.insert(ETAG, v);
-            }
-            Err(_) => {
-                headers.remove(ETAG);
-            }
-        }
-    }
+    markdown_etag(headers);
     // Some CDNs ignore `Vary` on HTML. With no cache policy from the app,
     // keep the Markdown copy out of shared caches.
     if !headers.contains_key(axum::http::header::CACHE_CONTROL) {
@@ -435,6 +482,24 @@ mod tests {
         assert!(!prefers_markdown(&accept(
             "text/html;q=0.9, text/markdown;q=0.5, */*;q=0.1"
         )));
+    }
+
+    #[test]
+    fn markdown_validators_ask_about_the_markdown_copy() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            IF_NONE_MATCH,
+            HeaderValue::from_static("W/\"v1-md\", \"v0\""),
+        );
+        h.insert(IF_MODIFIED_SINCE, HeaderValue::from_static("x"));
+        markdown_validators(&mut h);
+        assert_eq!(h.get(IF_NONE_MATCH).unwrap(), "\"v1\", W/\"v1\"");
+        assert!(h.get(IF_MODIFIED_SINCE).is_none());
+
+        let mut h = HeaderMap::new();
+        h.insert(IF_NONE_MATCH, HeaderValue::from_static("\"html-only\""));
+        markdown_validators(&mut h);
+        assert!(h.get(IF_NONE_MATCH).is_none(), "an HTML tag is dropped");
     }
 
     #[test]

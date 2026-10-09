@@ -36,6 +36,28 @@ async fn tagged() -> impl IntoResponse {
     )
 }
 
+/// Answers `304` for a matching `If-None-Match`, as a caching app does.
+#[get("/conditional")]
+async fn conditional(
+    headers: autumn_web::reexports::http::HeaderMap,
+) -> autumn_web::reexports::axum::response::Response {
+    let matches = headers
+        .get("if-none-match")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(',')
+                .any(|t| matches!(t.trim(), "\"v1\"" | "W/\"v1\""))
+        });
+    if matches {
+        return (
+            autumn_web::reexports::http::StatusCode::NOT_MODIFIED,
+            [("etag", "\"v1\"")],
+        )
+            .into_response();
+    }
+    ([("etag", "\"v1\"")], Html("<p>cond</p>")).into_response()
+}
+
 #[get("/big")]
 async fn big() -> Html<String> {
     Html(format!("<p>{}</p>", "x".repeat(4096)))
@@ -145,6 +167,33 @@ async fn markdown_rewrites_validators() {
     assert!(etag.starts_with("W/") && etag != "\"v1\"", "{etag}");
     assert!(res.header("last-modified").is_none());
     assert_eq!(res.text(), "tagged\n");
+}
+
+#[tokio::test]
+async fn markdown_revalidates_against_the_markdown_etag() {
+    let c = TestApp::new().routes(routes![conditional]).build();
+    let md = |inm: &str| {
+        c.get("/conditional")
+            .header("accept", "text/markdown")
+            .header("if-none-match", inm)
+    };
+    let first = c
+        .get("/conditional")
+        .header("accept", "text/markdown")
+        .send()
+        .await;
+    let etag = first.header("etag").unwrap().to_owned();
+    assert_eq!(etag, "W/\"v1-md\"");
+
+    let again = md(&etag).send().await;
+    assert_eq!(again.status, 304, "the Markdown ETag revalidates");
+    assert_eq!(again.header("etag"), Some(etag.as_str()));
+    assert!(vary_has_accept(again.header("vary")));
+
+    // An HTML validator never yields a 304 for the Markdown copy.
+    let html_tag = md("\"v1\"").send().await;
+    html_tag.assert_ok();
+    assert_eq!(html_tag.text(), "cond\n");
 }
 
 #[tokio::test]

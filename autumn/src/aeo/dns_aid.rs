@@ -63,7 +63,8 @@ pub fn records(input: &DnsAidInput) -> Vec<String> {
     if let Some(mcp) = &input.mcp_path {
         lines.push(format!(
             "_mcp._agents.{host}. {ttl} IN SVCB 1 {host}. alpn=\"mcp,{alpn}\" port={port} \
-             mandatory=alpn,port key65400=\"{base}{mcp}/server-card\""
+             mandatory=alpn,port key65400=\"{base}{card}\"",
+            card = super::documents::server_card_path(mcp)
         ));
     }
     lines.push(format!(
