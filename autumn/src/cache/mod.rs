@@ -752,6 +752,42 @@ impl CapsuleSeamCache {
     }
 }
 
+/// Set while this process replays a capsule. The capsule seam then never
+/// reaches a backend, also on a task with no tape (a state initializer, a
+/// detached task). It is never unset.
+#[cfg(feature = "reporting")]
+static REPLAY_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keep every cache backend offline from now on. `autumn replay` calls it
+/// before it builds the app (#2351).
+#[cfg(feature = "reporting")]
+pub(crate) fn block_backends_for_replay() {
+    REPLAY_BLOCKED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(feature = "reporting")]
+fn replay_blocked() -> bool {
+    #[cfg(test)]
+    if TEST_REPLAY_BLOCKED.with(std::cell::Cell::get) {
+        return true;
+    }
+    REPLAY_BLOCKED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+// The process-wide block cannot be set in a unit test: it would block every
+// other test. This thread's block stands in for it.
+#[cfg(all(test, feature = "reporting"))]
+thread_local! {
+    static TEST_REPLAY_BLOCKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the seam must not reach the backend: a tape is active, or this
+/// process replays a capsule.
+#[cfg(feature = "reporting")]
+fn offline() -> bool {
+    crate::capsule::effects::tape_active() || replay_blocked()
+}
+
 /// Why a capsule with a removal of unknown result is not replayable.
 #[cfg(feature = "reporting")]
 const UNCHECKED_REMOVAL_NOTE: &str = "a cache removal with no result reported a failure; \
@@ -782,14 +818,14 @@ impl Cache for CapsuleSeamCache {
     // or write is answered by its own seam before it gets here; anything
     // that still arrives is a miss, a dropped write, or no fill lock.
     fn get_value(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
-        if crate::capsule::effects::tape_active() {
+        if offline() {
             return None;
         }
         self.0.get_value(key)
     }
 
     fn insert_value(&self, key: &str, value: Arc<dyn Any + Send + Sync>) {
-        if crate::capsule::effects::tape_active() {
+        if offline() {
             return;
         }
         self.0.insert_value(key, value);
@@ -798,6 +834,9 @@ impl Cache for CapsuleSeamCache {
     fn invalidate(&self, key: &str) {
         if let Some(tape) = crate::capsule::effects::current_tape() {
             let _ = tape.cache_invalidate(key);
+            return;
+        }
+        if replay_blocked() {
             return;
         }
         Self::record(crate::capsule::CacheEffect::Invalidate {
@@ -812,6 +851,9 @@ impl Cache for CapsuleSeamCache {
             tape.cache_clear();
             return;
         }
+        if replay_blocked() {
+            return;
+        }
         Self::record(crate::capsule::CacheEffect::Clear);
         Self::unchecked_removal(|| self.0.clear());
     }
@@ -819,6 +861,9 @@ impl Cache for CapsuleSeamCache {
     fn invalidate_namespace(&self, namespace: &str) -> bool {
         if let Some(tape) = crate::capsule::effects::current_tape() {
             return tape.cache_invalidate_namespace(namespace).is_ok();
+        }
+        if replay_blocked() {
+            return true;
         }
         let done = self.0.invalidate_namespace(namespace);
         let result = if done {
@@ -837,14 +882,14 @@ impl Cache for CapsuleSeamCache {
     }
 
     fn insert_raw_bytes(&self, key: &str, bytes: Vec<u8>, ttl: Option<Duration>) {
-        if crate::capsule::effects::tape_active() {
+        if offline() {
             return;
         }
         self.0.insert_raw_bytes(key, bytes, ttl);
     }
 
     fn try_acquire_fill_lock(&self, key: &str, token: &str, ttl: Duration) -> FillLockStatus {
-        if crate::capsule::effects::tape_active() {
+        if offline() {
             return FillLockStatus::Unsupported;
         }
         let status = self.0.try_acquire_fill_lock(key, token, ttl);
@@ -859,7 +904,7 @@ impl Cache for CapsuleSeamCache {
     }
 
     fn release_fill_lock(&self, key: &str, token: &str) {
-        if crate::capsule::effects::tape_active() {
+        if offline() {
             return;
         }
         self.0.release_fill_lock(key, token);
@@ -873,6 +918,9 @@ impl Cache for CapsuleSeamCache {
         // here, on the calling task, and carried into the future.
         if let Some(tape) = crate::capsule::effects::current_tape() {
             return Box::pin(async move { tape.cache_invalidate(key) });
+        }
+        if replay_blocked() {
+            return Box::pin(async { Ok(()) });
         }
         // The scope is read now; the tape position is taken when the future
         // first runs, which is when replay consumes its entry. It is filled
@@ -901,6 +949,9 @@ impl Cache for CapsuleSeamCache {
     ) -> CacheFuture<'a, Result<(), InvalidationError>> {
         if let Some(tape) = crate::capsule::effects::current_tape() {
             return Box::pin(async move { tape.cache_invalidate_namespace(namespace) });
+        }
+        if replay_blocked() {
+            return Box::pin(async { Ok(()) });
         }
         let scope = crate::capsule::current_scope();
         Box::pin(async move {
@@ -1442,6 +1493,32 @@ mod tests {
             },
         ));
         assert!(!scope.had_state_cache());
+    }
+
+    /// Codex review on #3222: during `autumn replay`, a cache call with no
+    /// tape (a state initializer) does not reach the backend.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn the_replay_block_keeps_the_backend_offline_with_no_tape() {
+        let spy = Arc::new(SpyBackend::default());
+        let cache = with_capsule_seam(Arc::clone(&spy) as Arc<dyn Cache>);
+        TEST_REPLAY_BLOCKED.with(|blocked| blocked.set(true));
+        block_on(async {
+            assert!(cache.get_value("k").is_none());
+            cache.insert_value("k", Arc::new(1_u32));
+            cache.insert_raw_bytes("k", b"1".to_vec(), None);
+            cache.invalidate("k");
+            cache.clear();
+            assert!(cache.invalidate_namespace("ns"));
+            assert!(cache.invalidate_async("k").await.is_ok());
+            assert!(cache.invalidate_namespace_async("ns").await.is_ok());
+            assert_eq!(
+                cache.try_acquire_fill_lock("k", "t", Duration::from_secs(1)),
+                FillLockStatus::Unsupported
+            );
+        });
+        TEST_REPLAY_BLOCKED.with(|blocked| blocked.set(false));
+        assert!(spy.calls().is_empty(), "{:?}", spy.calls());
     }
 
     /// The seam wraps a backend once, so `Arc` identity stays stable.

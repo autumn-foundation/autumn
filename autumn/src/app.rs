@@ -8384,6 +8384,9 @@ impl AppBuilder {
         // Egress outside the HTTP client (`capsule::guard_egress`), in every
         // build.
         crate::capsule::boundary::block_egress_for_replay();
+        // A cache call with no tape (a state initializer) must not reach a
+        // live backend either.
+        crate::cache::block_backends_for_replay();
 
         let path = std::path::PathBuf::from(&capsule_path);
         let capsule = match crate::capsule::load_capsule(&path) {
@@ -17303,6 +17306,10 @@ mod tests {
         assert!(
             handler.contains("crate::capsule::boundary::block_egress_for_replay();"),
             "the replay handler must block egress outside the HTTP client in every build"
+        );
+        assert!(
+            handler.contains("crate::cache::block_backends_for_replay();"),
+            "the replay handler must keep every cache backend offline"
         );
         assert!(
             handler.contains("channels_backend: _replay_ignores_custom_channels_backend,"),

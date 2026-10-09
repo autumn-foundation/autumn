@@ -510,8 +510,9 @@ pub struct CaptureScope {
     closed: AtomicBool,
     /// Whether a global cache was installed when the run started.
     global_cache: bool,
-    /// What the first `AppState::cache()` call in the run returned.
-    state_cache: OnceLock<bool>,
+    /// Whether the app state held a cache: at the request start, or when the
+    /// run called `AppState::cache()`.
+    state_cache: AtomicBool,
 }
 
 impl CaptureScope {
@@ -535,21 +536,21 @@ impl CaptureScope {
             truncated: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             global_cache: crate::cache::global_cache().is_some(),
-            state_cache: OnceLock::new(),
+            state_cache: AtomicBool::new(false),
         }
     }
 
-    /// Note whether `AppState::cache()` returned a cache. The first call in
-    /// the run is kept.
+    /// Note whether the app state held a cache. Any `true` is kept.
     pub(crate) fn note_state_cache(&self, present: bool) {
-        let _ = self.state_cache.set(present);
+        if present {
+            self.state_cache.store(true, Ordering::Relaxed);
+        }
     }
 
-    /// Whether `AppState::cache()` returned a cache in the run. `false` when
-    /// the run did not call it.
+    /// Whether the app state held a cache in the run.
     #[must_use]
     pub(crate) fn had_state_cache(&self) -> bool {
-        self.state_cache.get().copied().unwrap_or(false)
+        self.state_cache.load(Ordering::Relaxed)
     }
 
     /// Whether a global cache was installed when the run started. Read at
@@ -1268,7 +1269,11 @@ pub fn is_valid_scope_id(id: &str) -> bool {
 pub struct CaptureLayer {
     settings: Arc<CaptureSettings>,
     filter: Arc<ParameterFilter>,
+    state_cache: Option<StateCacheProbe>,
 }
+
+/// Tells whether the app state holds a cache.
+type StateCacheProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 
 impl CaptureLayer {
     /// Build the layer from resolved settings and the shared redaction filter.
@@ -1277,7 +1282,17 @@ impl CaptureLayer {
         Self {
             settings: Arc::new(settings),
             filter,
+            state_cache: None,
         }
+    }
+
+    /// Read at each request start whether the app state holds a cache. Code
+    /// can resolve `state.cache()` when the app is built, before a request
+    /// scope exists, so the request alone cannot tell (#2351).
+    #[must_use]
+    pub(crate) fn with_state_cache_probe(mut self, probe: StateCacheProbe) -> Self {
+        self.state_cache = Some(probe);
+        self
     }
 }
 
@@ -1289,6 +1304,7 @@ impl<S> Layer<S> for CaptureLayer {
             inner,
             settings: Arc::clone(&self.settings),
             filter: Arc::clone(&self.filter),
+            state_cache: self.state_cache.clone(),
         }
     }
 }
@@ -1299,6 +1315,7 @@ pub struct CaptureService<S> {
     inner: S,
     settings: Arc<CaptureSettings>,
     filter: Arc<ParameterFilter>,
+    state_cache: Option<StateCacheProbe>,
 }
 
 impl<S> Service<Request<Body>> for CaptureService<S>
@@ -1321,6 +1338,7 @@ where
         let mut inner = std::mem::replace(&mut self.inner, cloned);
         let settings = Arc::clone(&self.settings);
         let filter = Arc::clone(&self.filter);
+        let state_cache = self.state_cache.clone();
 
         Box::pin(async move {
             let id = scope_id(&req);
@@ -1329,6 +1347,9 @@ where
                 .get::<MatchedPath>()
                 .map(|matched| matched.as_str().to_owned());
             let scope = Arc::new(CaptureScope::new(id, settings, filter));
+            if let Some(probe) = state_cache {
+                scope.note_state_cache(probe());
+            }
             // The raw peer socket, before any trusted-proxy resolution: a
             // replay restores it verbatim so middleware and handlers that
             // inspect the peer directly (address *and* port) see what the
@@ -1609,6 +1630,35 @@ mod tests {
             .clone()
             .expect("the capture layer must publish a handle in the request extensions");
         Arc::clone(handle.scope())
+    }
+
+    /// Codex review on #3222: the layer reads at the request start whether
+    /// the app state holds a cache. Code can resolve `state.cache()` when
+    /// the app is built, before any request scope exists.
+    #[tokio::test]
+    async fn the_capture_layer_records_a_state_cache_resolved_at_build() {
+        for present in [true, false] {
+            let seen: Arc<Mutex<Option<CaptureHandle>>> = Arc::new(Mutex::new(None));
+            let inner_seen = Arc::clone(&seen);
+            let inner = tower::service_fn(move |req: Request<Body>| {
+                let seen = Arc::clone(&inner_seen);
+                async move {
+                    if let Ok(mut slot) = seen.lock() {
+                        *slot = req.extensions().get::<CaptureHandle>().cloned();
+                    }
+                    Ok::<_, std::convert::Infallible>(Response::new(Body::empty()))
+                }
+            });
+            let mut service = test_layer(CaptureSettings::default())
+                .with_state_cache_probe(Arc::new(move || present))
+                .layer(inner);
+            let _ = service
+                .call(Request::new(Body::empty()))
+                .await
+                .expect("infallible");
+            let handle = seen.lock().expect("slot").clone().expect("handle");
+            assert_eq!(handle.scope().had_state_cache(), present);
+        }
     }
 
     /// An inner service that does its work in `call` itself, the way a real
