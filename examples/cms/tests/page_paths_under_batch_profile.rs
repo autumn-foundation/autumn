@@ -252,10 +252,7 @@ fn seed_edge_cases(conn: &mut PgConnection) -> Vec<i64> {
 
 /// The implementation as it stood before the Ledger change: one `post_by_id`
 /// per ancestor, per descendant. Kept verbatim as the equivalence oracle.
-async fn legacy_page_paths_under(
-    conn: &mut AsyncPgConnection,
-    post_id: i64,
-) -> Vec<Vec<String>> {
+async fn legacy_page_paths_under(conn: &mut AsyncPgConnection, post_id: i64) -> Vec<Vec<String>> {
     let mut ids = vec![post_id];
     ids.extend(
         content::descendant_ids(conn, post_id)
