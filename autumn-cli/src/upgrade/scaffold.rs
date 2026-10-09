@@ -106,8 +106,7 @@ struct ManifestFile {
 /// Most tries in [`Manifest::update`].
 const SWAP_ATTEMPTS: u32 = 8;
 
-/// Name of the file a swap holds the old contents in.
-const CLAIM_PREFIX: &str = ".autumn-upgrade-";
+/// A swap holds the old contents in `.autumn-upgrade-<file name>.<token>.old`.
 const CLAIM_SUFFIX: &str = ".old";
 
 const FLAVOR_API: &str = "api";
@@ -382,6 +381,7 @@ fn back_off(attempt: u32) {
 
 /// A claim that a swap holds beside `path`, if one exists.
 fn claim_in_flight(path: &Path) -> Option<PathBuf> {
+    let prefix = claim_prefix(path)?;
     std::fs::read_dir(path.parent()?)
         .ok()?
         .filter_map(Result::ok)
@@ -389,9 +389,20 @@ fn claim_in_flight(path: &Path) -> Option<PathBuf> {
         .find(|held| {
             held.file_name().is_some_and(|name| {
                 let name = name.to_string_lossy();
-                name.starts_with(CLAIM_PREFIX) && name.ends_with(CLAIM_SUFFIX)
+                // The token has no dot, so `a.b` never claims for `a`.
+                name.strip_prefix(&prefix)
+                    .and_then(|rest| rest.strip_suffix(CLAIM_SUFFIX))
+                    .is_some_and(|token| !token.contains('.'))
             })
         })
+}
+
+/// The start of the claim names for `path`.
+fn claim_prefix(path: &Path) -> Option<String> {
+    Some(format!(
+        ".autumn-upgrade-{}.",
+        path.file_name()?.to_string_lossy()
+    ))
 }
 
 /// Why a file cannot be written without a human looking at it.
@@ -1502,7 +1513,10 @@ fn swap(
         .parent()
         .ok_or_else(|| PublishError::Failed("no parent directory".to_owned()))?;
     let claim = tempfile::Builder::new()
-        .prefix(CLAIM_PREFIX)
+        .prefix(
+            &claim_prefix(absolute)
+                .ok_or_else(|| PublishError::Failed("no file name".to_owned()))?,
+        )
         .suffix(CLAIM_SUFFIX)
         .tempfile_in(directory)?
         .into_temp_path();
@@ -1529,13 +1543,15 @@ fn swap(
                     .to_owned(),
             ),
             Err(error) => {
-                let kept = error.path.keep().map_or_else(
-                    |_| String::new(),
-                    |path| format!(" (the earlier copy is at {})", path.display()),
-                );
-                PublishError::Moved(format!(
-                    "this file changed twice after the preview was computed{kept}"
-                ))
+                // The displaced copy is the only one. Report it, never retry it.
+                match error.path.keep() {
+                    Ok(path) => PublishError::Late(format!(
+                        "this file changed twice after the preview was computed; \
+                         the earlier copy is at {}",
+                        path.display()
+                    )),
+                    Err(error) => PublishError::Failed(error.to_string()),
+                }
             }
         });
     }
@@ -2959,7 +2975,7 @@ mod tests {
         // "no manifest" would publish a blank one and erase the history.
         let tmp = scaffolded(GenerateOptions::default());
         let manifest_path = tmp.path().join(MANIFEST_PATH);
-        let held = manifest_path.with_file_name(".autumn-upgrade-claim.old");
+        let held = manifest_path.with_file_name(".autumn-upgrade-scaffold.toml.claim.old");
         fs::rename(&manifest_path, &held).unwrap();
 
         let mut runs = 0;
@@ -2986,7 +3002,7 @@ mod tests {
             let _ = fs::remove_file(tmp.path().join(marker));
         }
         let manifest_path = tmp.path().join(MANIFEST_PATH);
-        let held = manifest_path.with_file_name(".autumn-upgrade-claim.old");
+        let held = manifest_path.with_file_name(".autumn-upgrade-scaffold.toml.claim.old");
         fs::rename(&manifest_path, &held).unwrap();
         let restore = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(30));
@@ -3006,7 +3022,7 @@ mod tests {
         // absent, and "no manifest" would report spurious conflicts.
         let tmp = scaffolded(GenerateOptions::default());
         let manifest_path = tmp.path().join(MANIFEST_PATH);
-        let held = manifest_path.with_file_name(".autumn-upgrade-claim.old");
+        let held = manifest_path.with_file_name(".autumn-upgrade-scaffold.toml.claim.old");
         fs::rename(&manifest_path, &held).unwrap();
         let restore = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(30));
@@ -3024,7 +3040,7 @@ mod tests {
         // wait, its recorded digest and an absent file read as "removed".
         let tmp = scaffolded(GenerateOptions::default());
         let path = tmp.path().join("Dockerfile");
-        let held = path.with_file_name(".autumn-upgrade-claim.old");
+        let held = path.with_file_name(".autumn-upgrade-Dockerfile.claim.old");
         fs::rename(&path, &held).unwrap();
         let restore = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(30));
@@ -3043,7 +3059,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("existing.toml");
         let claim = tempfile::Builder::new()
-            .prefix(CLAIM_PREFIX)
+            .prefix(".autumn-upgrade-existing.toml.")
             .suffix(CLAIM_SUFFIX)
             .tempfile_in(tmp.path())
             .unwrap()
@@ -3060,7 +3076,7 @@ mod tests {
         );
 
         let clean = tempfile::Builder::new()
-            .prefix(CLAIM_PREFIX)
+            .prefix(".autumn-upgrade-existing.toml.")
             .suffix(CLAIM_SUFFIX)
             .tempfile_in(tmp.path())
             .unwrap()
@@ -3100,7 +3116,7 @@ mod tests {
         let manifest_path = tmp.path().join(MANIFEST_PATH);
         fs::rename(
             &manifest_path,
-            manifest_path.with_file_name(".autumn-upgrade-claim.old"),
+            manifest_path.with_file_name(".autumn-upgrade-scaffold.toml.claim.old"),
         )
         .unwrap();
         assert!(is_project(tmp.path()));
@@ -3112,13 +3128,36 @@ mod tests {
         // offer to restore it; unreadable is a conflict, which never writes.
         let tmp = scaffolded(GenerateOptions::default());
         let path = tmp.path().join("Dockerfile");
-        fs::rename(&path, path.with_file_name(".autumn-upgrade-claim.old")).unwrap();
+        fs::rename(
+            &path,
+            path.with_file_name(".autumn-upgrade-Dockerfile.claim.old"),
+        )
+        .unwrap();
 
         let report = plan_in(tmp.path());
         assert_eq!(
             *status_of(&report.entries, "Dockerfile"),
             Status::Conflict(ConflictReason::Unreadable)
         );
+    }
+
+    #[test]
+    fn a_claim_on_one_file_does_not_block_its_siblings() {
+        // A stale claim for `Dockerfile` says nothing about `rustfmt.toml`,
+        // which is simply missing and is offered as an addition.
+        let tmp = scaffolded(GenerateOptions::default());
+        fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
+        let mut manifest = Manifest::load(tmp.path()).unwrap();
+        manifest.digests.remove("rustfmt.toml");
+        manifest.save(tmp.path()).unwrap();
+        fs::write(
+            tmp.path().join(".autumn-upgrade-Dockerfile.stale.old"),
+            "old\n",
+        )
+        .unwrap();
+
+        let report = plan_in(tmp.path());
+        assert_eq!(*status_of(&report.entries, "rustfmt.toml"), Status::Add);
     }
 
     #[test]
