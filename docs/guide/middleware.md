@@ -406,7 +406,9 @@ without a request id, since `RequestIdLayer` never ran for them).
 
 The ordering guarantee that matters most: **in a fully dynamic build, user
 layers run inside `RequestIdLayer` on ingress**, so every `.layer()` you
-register can read the generated `RequestId` from the request extensions.
+register can read the `RequestId` from the request extensions. The ID is
+new, or an inbound one from a trusted proxy (see
+[Overload signals](observability/overload-signals.md#request-ids)).
 Exception filters, metrics, and error-page rendering all sit *outside* your
 layers, which means errors you produce (and errors you let bubble up from
 handlers) are still caught by Autumn's error pipeline.
@@ -620,8 +622,8 @@ autumn_web::app()
 Write a small `Layer`/`Service` pair (see the pattern in
 `autumn/tests/custom_layer.rs`) that rewrites or inserts request/response
 headers, then register it with `.layer(MyLayer)`. Because the layer sits
-inside `RequestIdLayer`, you can stamp the request ID onto any outgoing
-header for downstream services.
+inside `RequestIdLayer`, you can read the request ID. Note that `http_client`
+already sends it as `x-request-id` on outbound calls.
 
 ---
 

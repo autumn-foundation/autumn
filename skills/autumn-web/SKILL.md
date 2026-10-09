@@ -3025,8 +3025,12 @@ compare cohorts:
 ```
 autumn_http_requests_total{version="canary"} 412
 autumn_http_responses_total{version="canary",status="5xx"} 3
-autumn_http_request_duration_seconds{version="canary",quantile="0.99"} 1.2
+autumn_http_request_duration_seconds_count{version="canary",method="GET",route="/items/{id}",status_class="2xx"} 409
 ```
+`autumn_http_request_duration_seconds` is a histogram (`method`, `route`,
+`status_class` labels). Use `histogram_quantile` over its `_bucket` series for
+p99. The old quantile lines are in the deprecated
+`autumn_http_request_duration_quantiles_seconds` summary.
 
 **`CanaryRoute` extractor** (in `prelude::*`) — lets a handler see whether the
 LB routed this specific request to the canary (`X-Canary: true`):

@@ -429,6 +429,54 @@ Three behaviour changes come with it:
 **Automation:** `manual` - it is a database privilege change, and no code
 rewrite applies.
 
+### Metrics: `autumn_http_request_duration_seconds` is now a histogram
+
+**Why:** You cannot add summaries from different replicas (issue #3064). A
+histogram gives fleet p99 and SLO error ratios.
+
+**Before (`{X.Y}`):** the family was a summary with quantile lines.
+
+```promql
+autumn_http_request_duration_seconds{version="canary",quantile="0.99"}
+```
+
+**After (`{(X+1).0}`):** the family is a histogram with `method`, `route`
+and `status_class` labels. Compute a quantile from the buckets:
+
+```promql
+histogram_quantile(0.99,
+  sum by (le, version) (rate(autumn_http_request_duration_seconds_bucket[5m])))
+```
+
+The old quantile lines stay, deprecated, under a new name:
+`autumn_http_request_duration_quantiles_seconds`. For a quick fix, rename
+the family in your queries, alerts and canary gates. A later release removes
+the summary.
+
+**Automation:** `manual` - the change is in PromQL queries and dashboards,
+not in Rust code.
+
+### Telemetry: `TelemetryConfig` and `OtlpTraceRuntime` have a new field
+
+**Why:** The OTLP sampler takes a ratio now (issue #3064).
+
+**Before (`{X.Y}`):** a struct literal listed every field.
+
+```rust
+let telemetry = TelemetryConfig { enabled: true, /* every field */ strict: false };
+```
+
+**After (`{(X+1).0}`):** add `sample_ratio`, or fill the rest from
+`Default`.
+
+```rust
+let telemetry = TelemetryConfig { enabled: true, ..TelemetryConfig::default() };
+```
+
+`OtlpTraceRuntime` has a new `sample_ratio: SampleRatio` field too.
+
+**Automation:** `manual` - a codemod cannot pick the ratio for you.
+
 ### WebSockets: `ws::WebSocket` and `ws::WebSocketUpgrade` are Autumn types
 
 **Why:** axum's socket sends no close frame when a message is too large, and
@@ -614,6 +662,7 @@ let ceiling: Option<usize> = limit.limit();
 
 **Automation:** `manual` — a new enum variant needs a new match arm, and no
 safe rewrite can choose its body.
+
 ### Config: `HealthConfig` gains four public fields
 
 **Why:** `/ready` now pings the primary database. The new fields set the
@@ -1032,6 +1081,8 @@ If nothing changed, delete this section.
   HTTP client's retry backoff.
 - New: `[jobs] max_backoff_ms` and `AUTUMN_JOBS__MAX_BACKOFF_MS` (default
   `3600000`, 1 h). The cap on job retry backoff for every backend.
+- New key `telemetry.sample_ratio` (`AUTUMN_TELEMETRY__SAMPLE_RATIO`),
+  default `1.0`. See [Overload signals](../guide/observability/overload-signals.md).
 - New: `[jobs] default_timeout_ms` and `AUTUMN_JOBS__DEFAULT_TIMEOUT_MS`
   (default `0`, no limit). The longest one run of a job without
   `#[job(timeout)]` may take (issue #3051).
@@ -1073,6 +1124,17 @@ Changes that still compile but behave differently at runtime. Examples:
 - Error responses adopted a new JSON shape.
 - A default middleware is now ordered differently.
 - A scheduled task now runs on a different worker.
+
+- A trusted proxy can now set the request id. When
+  `[security.trusted_proxies]` trusts the peer and the peer sends a UUID in
+  `X-Request-Id`, the app keeps it. Before, the app always made a new id.
+- `http_client` sends the current request's id as `x-request-id`. A header
+  that you set on the request builder wins.
+- A metric `method` label shows `_other` for a non-standard HTTP method. The
+  `/actuator/metrics` JSON route keys change too: `PROPFIND /x` is now
+  `_other /x`.
+- To stop `http_client` from sending the request id to a host, call
+  `.without_request_id()` on the request builder.
 
 Issue #3058:
 
