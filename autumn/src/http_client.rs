@@ -2384,16 +2384,8 @@ impl RequestBuilder {
             // A throttled attempt ends the call, retry or not.
             let ticket = self.begin_attempt(&gate, None)?;
             let last = attempt + 1 == max_attempts;
-            // One CLIENT span per attempt (issue #3064). The trace context is
-            // injected inside it, so the next service's parent is this attempt.
-            let span = client_attempt_span(&self.method, &self.url, attempt);
-            let req = self.plain_attempt(&gate, &span);
-            let (sent, followed) =
-                tracing::Instrument::instrument(send_tracking_redirects(req), span.clone()).await;
-            record_send_outcome(&span, &sent);
-            // Each host that served a redirect gets its refill, even when
-            // the send or the body fails later.
-            gate.record_destinations(&followed, &mut refilled);
+            let (span, sent, followed) =
+                self.send_plain_attempt(&gate, attempt, &mut refilled).await;
             match sent {
                 Ok(resp) => {
                     let status = resp.status();
@@ -2425,9 +2417,7 @@ impl RequestBuilder {
                         // Dropped unread — see `discard_response_body`.
                         Ok(Bytes::new())
                     } else {
-                        read_body_in_span(resp, &span)
-                            .await
-                            .map_err(|e| gate.body_error(e))
+                        read_body_in_span(resp, &span, &gate).await
                     };
                     // Count the attempt only now: a body that fails to arrive
                     // is a transport error, not an accept.
@@ -2574,6 +2564,31 @@ impl RequestBuilder {
         let ticket = self.throttle_attempt(host)?;
         gate.check()?;
         Ok(ticket)
+    }
+
+    /// Send one plain-path attempt in its own CLIENT span (issue #3064). The
+    /// trace context is injected inside the span, so the next service's
+    /// parent is this attempt. Returns the span, so the caller reads the body
+    /// in it, the send result and the redirect targets followed. Each host
+    /// that served a redirect gets its refill, even when the send or the body
+    /// fails later.
+    async fn send_plain_attempt(
+        &self,
+        gate: &RetryGate,
+        attempt: u32,
+        refilled: &mut std::collections::HashSet<String>,
+    ) -> (
+        tracing::Span,
+        Result<reqwest::Response, reqwest::Error>,
+        Vec<String>,
+    ) {
+        let span = client_attempt_span(&self.method, &self.url, attempt);
+        let req = self.plain_attempt(gate, &span);
+        let (sent, followed) =
+            tracing::Instrument::instrument(send_tracking_redirects(req), span.clone()).await;
+        record_send_outcome(&span, &sent);
+        gate.record_destinations(&followed, refilled);
+        (span, sent, followed)
     }
 
     /// The request of one plain-path attempt: the attempt timeout under a
@@ -4107,9 +4122,7 @@ async fn send_one(
                     // Dropped unread — see `RequestBuilder::discard_response_body`.
                     Ok(Bytes::new())
                 } else {
-                    read_body_in_span(resp, &span)
-                        .await
-                        .map_err(|e| gate.body_error(e))
+                    read_body_in_span(resp, &span, gate).await
                 };
                 // Count the attempt only now: a body that fails to arrive is
                 // a transport error, not an accept. A body the caller's
@@ -4484,18 +4497,20 @@ fn record_attempt_error(span: &tracing::Span, kind: &'static str) {
 }
 
 /// Read the response body inside the attempt `span`, so the span covers the
-/// body transfer. A read failure sets `error.type = "body"`.
+/// body transfer. A read failure sets `error.type = "body"`, and `gate`
+/// classifies it (see [`RetryGate::body_error`]).
 async fn read_body_in_span(
     response: reqwest::Response,
     span: &tracing::Span,
-) -> Result<Bytes, reqwest::Error> {
+    gate: &RetryGate,
+) -> Result<Bytes, ClientError> {
     use tracing::Instrument as _;
 
     let body = response.bytes().instrument(span.clone()).await;
     if body.is_err() {
         record_attempt_error(span, "body");
     }
-    body
+    body.map_err(|e| gate.body_error(e))
 }
 
 /// Send `request` inside `span`, then record the status code or the error
