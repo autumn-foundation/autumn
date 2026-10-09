@@ -745,10 +745,19 @@ struct CapsuleSeamCache(Arc<dyn Cache>);
 
 #[cfg(feature = "reporting")]
 impl CapsuleSeamCache {
-    /// Record a removal, with the result the backend gave.
-    fn record(effect: crate::capsule::CacheEffect) {
-        if let Some(scope) = crate::capsule::current_scope() {
-            scope.record_cache(effect);
+    /// Take a tape slot for a removal, in call order.
+    fn reserve() -> Option<(Arc<crate::capsule::CaptureScope>, usize)> {
+        crate::capsule::current_scope()
+            .and_then(|scope| scope.reserve_cache().map(|index| (scope, index)))
+    }
+
+    /// Fill a slot taken with [`reserve`](Self::reserve).
+    fn fill(
+        slot: Option<(Arc<crate::capsule::CaptureScope>, usize)>,
+        effect: crate::capsule::CacheEffect,
+    ) {
+        if let Some((scope, index)) = slot {
+            scope.fill_cache(index, effect);
         }
     }
 
@@ -855,11 +864,17 @@ impl Cache for CapsuleSeamCache {
         if replay_blocked() {
             return;
         }
-        Self::record(crate::capsule::CacheEffect::Invalidate {
-            key: key.to_owned(),
-            error: None,
-        });
+        // The slot is taken now and filled after the call, so a backend that
+        // panics leaves it unfilled and the capsule incomplete.
+        let slot = Self::reserve();
         Self::unchecked_removal(|| self.0.invalidate(key));
+        Self::fill(
+            slot,
+            crate::capsule::CacheEffect::Invalidate {
+                key: key.to_owned(),
+                error: None,
+            },
+        );
     }
 
     fn clear(&self) {
@@ -870,8 +885,9 @@ impl Cache for CapsuleSeamCache {
         if replay_blocked() {
             return;
         }
-        Self::record(crate::capsule::CacheEffect::Clear);
+        let slot = Self::reserve();
         Self::unchecked_removal(|| self.0.clear());
+        Self::fill(slot, crate::capsule::CacheEffect::Clear);
     }
 
     fn invalidate_namespace(&self, namespace: &str) -> bool {
@@ -881,6 +897,7 @@ impl Cache for CapsuleSeamCache {
         if replay_blocked() {
             return true;
         }
+        let slot = Self::reserve();
         let done = self.0.invalidate_namespace(namespace);
         let result = if done {
             Ok(())
@@ -890,10 +907,13 @@ impl Cache for CapsuleSeamCache {
                 "the backend cannot drop a namespace, or its sweep failed",
             ))
         };
-        Self::record(crate::capsule::CacheEffect::InvalidateNamespace {
-            namespace: namespace.to_owned(),
-            error: recorded_error(&result),
-        });
+        Self::fill(
+            slot,
+            crate::capsule::CacheEffect::InvalidateNamespace {
+                namespace: namespace.to_owned(),
+                error: recorded_error(&result),
+            },
+        );
         done
     }
 
@@ -1515,6 +1535,57 @@ mod tests {
         insert_cached(&spy, "k", 1_u32, None);
         TEST_REPLAY_BLOCKED.with(|blocked| blocked.set(false));
         assert!(spy.calls().is_empty(), "{:?}", spy.calls());
+    }
+
+    /// A backend whose sync removals panic.
+    #[cfg(feature = "reporting")]
+    struct PanickingBackend;
+
+    #[cfg(feature = "reporting")]
+    impl Cache for PanickingBackend {
+        fn get_value(&self, _key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+            None
+        }
+        fn insert_value(&self, _key: &str, _value: Arc<dyn Any + Send + Sync>) {}
+        fn invalidate(&self, _key: &str) {
+            panic!("backend failed");
+        }
+        fn clear(&self) {
+            panic!("backend failed");
+        }
+        fn invalidate_namespace(&self, _namespace: &str) -> bool {
+            panic!("backend failed");
+        }
+    }
+
+    /// Codex review on #3222: a sync removal whose backend panics leaves
+    /// its slot unfilled, so the capsule is incomplete and records no false
+    /// success.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_panicking_sync_removal_leaves_the_capsule_incomplete() {
+        for remove in [
+            (|cache: &dyn Cache| cache.invalidate("k")) as fn(&dyn Cache),
+            |cache: &dyn Cache| cache.clear(),
+            |cache: &dyn Cache| {
+                let _ = cache.invalidate_namespace("ns");
+            },
+        ] {
+            let cache = with_capsule_seam(Arc::new(PanickingBackend));
+            let scope = capture_scope();
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                block_on(crate::capsule::capture::with_capture_scope(
+                    Arc::clone(&scope),
+                    async { remove(cache.as_ref()) },
+                ));
+            }));
+            assert!(caught.is_err(), "the backend panics");
+            let _ = scope.effects_snapshot();
+            assert!(
+                scope.is_truncated(),
+                "an unfilled slot marks the capsule incomplete"
+            );
+        }
     }
 
     /// The seam wraps a backend once, so `Arc` identity stays stable.

@@ -784,16 +784,17 @@ impl ReplayEffects {
             // The recording wrote this key and never read it. A read here is a
             // new cache dependency, not a read-back (#2351 item 15). The run's
             // own write is still served, as production would serve it.
+            // The slot can hold the run's own unrecorded key, which no
+            // recorded identifier masks, so the key is not printed.
             self.diverge(EffectDivergence {
                 seam: EffectSeam::Cache,
                 kind: EffectDivergenceKind::Unrecorded,
                 index: 0,
                 expected: None,
-                actual: key.to_owned(),
-                detail: format!(
-                    "the replayed run read cache key {key:?}, which the recording wrote but \
-                     never read; the run's own write was served"
-                ),
+                actual: "a cache read (key withheld)".to_owned(),
+                detail: "the replayed run read a cache key that the recording wrote but never \
+                         read; the run's own write was served"
+                    .to_owned(),
             });
             return value.map_or(CachedValue::Miss, CachedValue::Hit);
         }
@@ -2493,6 +2494,21 @@ mod tests {
         assert_eq!(divergences.len(), 1, "{divergences:?}");
         assert!(!divergences[0].actual.contains("sk-live-42"));
         assert!(!divergences[0].detail.contains("sk-live-42"));
+    }
+
+    /// Codex review on #3222: a read-back of a key that only the replayed
+    /// run wrote prints no key.
+    #[test]
+    fn a_read_back_of_an_unrecorded_write_prints_no_key() {
+        let tape = ReplayEffects::new(CapsuleEffects::default());
+        tape.cache_insert("token:sk-live-42", b"1", None);
+        let _ = tape.cache_get("token:sk-live-42");
+        let divergences = tape.divergences();
+        assert!(!divergences.is_empty());
+        for divergence in &divergences {
+            assert!(!divergence.actual.contains("sk-live-42"), "{divergence:?}");
+            assert!(!divergence.detail.contains("sk-live-42"), "{divergence:?}");
+        }
     }
 
     /// Codex review on #3222: one recorded text can hold both placeholder
