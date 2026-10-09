@@ -1727,6 +1727,18 @@ jobs:
           )
           grep -qE 'test result: ok\. 9 passed' "${RUNNER_TEMP}/migration-lock-timeout.log" \
             || { echo "::error::the migration lock_timeout tests did not all run — the ci.yml filters no longer match"; exit 1; }
+          # Issue #3061: the database idempotency store's Postgres row-lock
+          # test is `--lib`: it drives the crate-private recovery-point copy.
+          # Named by full path, with a pass count, as above.
+          (
+            set -o pipefail
+            cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
+              --ignored --test-threads=1 \
+              idempotency::db_store::pg_tests:: \
+              | tee "${RUNNER_TEMP}/idempotency-db-store-pg.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/idempotency-db-store-pg.log" \
+            || { echo "::error::no idempotency db_store Postgres tests ran — the ci.yml filter no longer matches"; exit 1; }
           cargo test -p autumn-admin-plugin --test token_admin_db -- --ignored
           # Issue #2108: the same AdminModel cover as token_admin_db, for the
           # two models that read a `timestamptz` column. Both assert the audit

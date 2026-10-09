@@ -253,6 +253,13 @@ impl DbIdempotencyStore {
     /// Write `copied` (read from `from`) to the row `to_owner` holds on `to`,
     /// only while `from_owner` still holds `from` with that point. `false`
     /// when it no longer does.
+    ///
+    /// One transaction. It first rewrites the source row with its own values
+    /// while `from_owner` still holds it with the point. That write locks the
+    /// row until the copy commits: on Postgres, a request taking the key over
+    /// waits for the copy, and a takeover already in flight makes this write
+    /// wait and then find the key lost. A check that only reads the source,
+    /// even in the copy's own statement, sees its snapshot and does neither.
     async fn copy_held_point(
         &self,
         conn: &mut RuntimeConnection,
@@ -262,68 +269,63 @@ impl DbIdempotencyStore {
         to: &str,
         to_owner: &str,
     ) -> Result<bool, IdempotencyStoreError> {
-        let HeldPoint {
-            point,
-            body_hash,
-            ttl_ms,
-        } = copied;
-        #[allow(
-            clippy::arithmetic_side_effects,
-            reason = "a SQL expression, evaluated by the database"
-        )]
-        let crash_expiry = keys::locked_until_ms + ttl_ms;
-        // The point's own TTL from now, or past the lock if that is later;
-        // not the store default the lock set.
-        let fresh_expiry = now_ms().saturating_add(ttl_ms);
-        let expiry = diesel::dsl::case_when(crash_expiry.gt(fresh_expiry), crash_expiry)
-            .otherwise(fresh_expiry);
-        // The copy happens only while `from_owner` still holds the source
-        // row with the point just read: checked in the same statement, so a
-        // lock lost between the read and the write cannot copy a stale point.
-        let source = diesel::alias!(autumn_idempotency_keys as source);
-        let still_held = source
-            .filter(source.field(keys::storage_key).eq(from))
-            .filter(source.field(keys::locked_by).eq(from_owner))
-            .filter(source.field(keys::recovery_point).eq(point.clone()));
-        let target = keys::autumn_idempotency_keys
-            .filter(keys::storage_key.eq(to))
-            .filter(keys::locked_by.eq(to_owner))
-            .filter(keys::recovery_point.is_null())
-            .filter(diesel::dsl::exists(still_held));
-        let copied = diesel::update(target)
-            .set((
-                keys::recovery_point.eq(Some(point)),
-                keys::recovery_body_hash.eq(body_hash),
-                keys::ttl_ms.eq(ttl_ms),
-                keys::expires_at_ms.eq(expiry),
-            ))
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| db_error("copy idempotency recovery point", e))?;
-        if copied == 1 {
-            return Ok(true);
-        }
-        // Nothing copied: the source was lost, or the target already has a
-        // point (or lost its own lock, which its claim reports later).
-        self.holds(conn, from, from_owner).await
-    }
+        use scoped_futures::ScopedFutureExt as _;
 
-    /// `true` when `owner` holds `key`.
-    async fn holds(
-        &self,
-        conn: &mut RuntimeConnection,
-        key: &str,
-        owner: &str,
-    ) -> Result<bool, IdempotencyStoreError> {
-        keys::autumn_idempotency_keys
-            .filter(keys::storage_key.eq(key))
-            .filter(keys::locked_by.eq(owner))
-            .select(keys::storage_key)
-            .first::<String>(conn)
-            .await
-            .optional()
-            .map(|row| row.is_some())
-            .map_err(|e| db_error("read idempotency lock", e))
+        let (from, from_owner, to, to_owner) = (
+            from.to_owned(),
+            from_owner.to_owned(),
+            to.to_owned(),
+            to_owner.to_owned(),
+        );
+        crate::db::scoped_transaction(conn, move |conn| {
+            async move {
+                let HeldPoint {
+                    point,
+                    body_hash,
+                    ttl_ms,
+                } = copied;
+                let source = keys::autumn_idempotency_keys
+                    .filter(keys::storage_key.eq(&from))
+                    .filter(keys::locked_by.eq(&from_owner))
+                    .filter(keys::recovery_point.eq(&point));
+                let fenced = diesel::update(source)
+                    .set(keys::locked_until_ms.eq(keys::locked_until_ms))
+                    .execute(&mut *conn)
+                    .await?;
+                if fenced == 0 {
+                    return Ok(false);
+                }
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "a SQL expression, evaluated by the database"
+                )]
+                let crash_expiry = keys::locked_until_ms + ttl_ms;
+                // The point's own TTL from now, or past the lock if that is
+                // later; not the store default the lock set.
+                let fresh_expiry = now_ms().saturating_add(ttl_ms);
+                let expiry = diesel::dsl::case_when(crash_expiry.gt(fresh_expiry), crash_expiry)
+                    .otherwise(fresh_expiry);
+                // Nothing to update when the target already has a point, or
+                // lost its own lock (which its claim reports later).
+                let target = keys::autumn_idempotency_keys
+                    .filter(keys::storage_key.eq(&to))
+                    .filter(keys::locked_by.eq(&to_owner))
+                    .filter(keys::recovery_point.is_null());
+                diesel::update(target)
+                    .set((
+                        keys::recovery_point.eq(Some(point)),
+                        keys::recovery_body_hash.eq(body_hash),
+                        keys::ttl_ms.eq(ttl_ms),
+                        keys::expires_at_ms.eq(expiry),
+                    ))
+                    .execute(&mut *conn)
+                    .await?;
+                Ok::<_, diesel::result::Error>(true)
+            }
+            .scope_boxed()
+        })
+        .await
+        .map_err(|e| db_error("copy idempotency recovery point", e))
     }
 }
 
@@ -1089,7 +1091,7 @@ mod tests {
     /// writes nothing and reports the lost key, so the stale point read
     /// before is never used.
     #[tokio::test]
-    async fn copy_checks_the_source_owner_in_the_same_statement() {
+    async fn copy_refuses_a_source_taken_by_another_request() {
         let substrate = SqliteSubstrate::with_migrations(&[&crate::migrate::FRAMEWORK_MIGRATIONS])
             .expect("substrate");
         let store = DbIdempotencyStore::new(substrate.pool(), Duration::from_secs(60));
@@ -1147,5 +1149,94 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+}
+
+/// Postgres-only: the row-lock behaviour `SQLite`, which serialises writers,
+/// cannot show.
+#[cfg(all(test, not(feature = "sqlite")))]
+mod pg_tests {
+    use super::*;
+
+    /// Postgres: another request takes the old key in a transaction still
+    /// open when the copy runs. The copy waits for that transaction, then
+    /// sees the key lost. It does not copy from the old row version that a
+    /// snapshot read still sees, which would let both requests resume from
+    /// the same point.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn pg_copy_waits_for_a_source_takeover_in_flight() {
+        use diesel_async::SimpleAsyncConnection as _;
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+        use testcontainers::runners::AsyncRunner as _;
+        use testcontainers_modules::postgres::Postgres;
+
+        let container = Postgres::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+        let manager = AsyncDieselConnectionManager::<RuntimeConnection>::new(url);
+        let pool = Pool::builder(manager).max_size(4).build().unwrap();
+        pool.get()
+            .await
+            .unwrap()
+            .batch_execute(include_str!(
+                "../../migrations/20261005200000_create_idempotency_keys/up.sql"
+            ))
+            .await
+            .unwrap();
+        let store = Arc::new(DbIdempotencyStore::new(
+            pool.clone(),
+            Duration::from_secs(60),
+        ));
+        assert!(
+            store
+                .try_lock("old", "a1", Duration::from_secs(60))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .try_lock("new", "b", Duration::from_secs(60))
+                .await
+                .unwrap()
+        );
+        let mut taker = pool.get().await.unwrap();
+        diesel::update(keys::autumn_idempotency_keys.filter(keys::storage_key.eq("old")))
+            .set((
+                keys::recovery_point.eq(Some("charged")),
+                keys::ttl_ms.eq(60_000),
+            ))
+            .execute(&mut taker)
+            .await
+            .unwrap();
+
+        // a2 takes the old key; its transaction has not committed yet.
+        taker.batch_execute("BEGIN").await.unwrap();
+        diesel::update(keys::autumn_idempotency_keys.filter(keys::storage_key.eq("old")))
+            .set(keys::locked_by.eq(Some("a2")))
+            .execute(&mut taker)
+            .await
+            .unwrap();
+        let adopt = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move { store.adopt_recovery_point("old", "a1", "new", "b").await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !adopt.is_finished(),
+            "the copy waits for the open takeover of the old key"
+        );
+        taker.batch_execute("COMMIT").await.unwrap();
+
+        let adopted = adopt.await.unwrap().unwrap();
+        assert!(!adopted, "a1 lost the old key to a2");
+        let mut conn = pool.get().await.unwrap();
+        let point: Option<String> = keys::autumn_idempotency_keys
+            .filter(keys::storage_key.eq("new"))
+            .select(keys::recovery_point)
+            .first(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(point, None, "the point a2 now holds was not copied");
     }
 }
