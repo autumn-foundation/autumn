@@ -428,36 +428,52 @@ impl FleetMigrations {
         };
         crate::migrate::adopt_sqlite_collision_history(url, &self.history, &self.disambiguated)
             .map_err(fail)?;
-        let mut applied = 0;
-        for set in self.sets() {
-            let result = crate::migrate::run_pending_sqlite_quiet(
-                url,
-                crate::migrate::DisambiguatedMigrations::new(set, &self.disambiguated),
-            )
-            .map_err(fail)?;
-            for migration in &result.applied {
-                tracing::info!(database = %name, migration = %migration, "fleet migration applied");
-            }
-            applied += result.applied.len();
+        // Every set in one run, under one `BEGIN IMMEDIATE`: a failure in a
+        // later set rolls back the earlier ones too, so a database is never
+        // left part-way through an upgrade.
+        let result = crate::migrate::run_pending_sqlite_quiet(url, self.chained()).map_err(fail)?;
+        for migration in &result.applied {
+            tracing::info!(database = %name, migration = %migration, "fleet migration applied");
         }
-        Ok(applied)
+        Ok(result.applied.len())
+    }
+
+    /// The selected sets as one migration source.
+    fn chained(&self) -> ChainedMigrations<'_> {
+        ChainedMigrations(
+            self.sets()
+                .map(|set| crate::migrate::DisambiguatedMigrations::new(set, &self.disambiguated))
+                .collect(),
+        )
     }
 
     /// Count pending migrations without applying them. Blocking.
     fn pending(&self, url: &str, name: &str) -> Result<usize, FleetError> {
-        let mut pending = 0;
-        for set in self.sets() {
-            pending += crate::migrate::pending_migrations_sqlite(
-                url,
-                crate::migrate::DisambiguatedMigrations::new(set, &self.disambiguated),
-            )
+        crate::migrate::pending_migrations_sqlite(url, self.chained())
+            .map(|pending| pending.len())
             .map_err(|e| FleetError::Migration {
                 name: name.to_owned(),
                 detail: crate::db_url::redact_driver_error(&e.to_string(), url),
-            })?
-            .len();
+            })
+    }
+}
+
+/// Several migration sets read as one source, so diesel runs them in one
+/// pass (in version order) under one transaction.
+struct ChainedMigrations<'a>(Vec<crate::migrate::DisambiguatedMigrations<'a>>);
+
+impl diesel::migration::MigrationSource<diesel::sqlite::Sqlite> for ChainedMigrations<'_> {
+    fn migrations(
+        &self,
+    ) -> diesel::migration::Result<Vec<Box<dyn diesel::migration::Migration<diesel::sqlite::Sqlite>>>>
+    {
+        let mut all = Vec::new();
+        for source in &self.0 {
+            all.extend(
+                diesel::migration::MigrationSource::<diesel::sqlite::Sqlite>::migrations(source)?,
+            );
         }
-        Ok(pending)
+        Ok(all)
     }
 }
 
@@ -861,10 +877,33 @@ impl DatabaseFleet {
     /// [`open`](Self::open) error.
     pub async fn provision(&self, key: &FleetDbKey) -> Result<FleetDatabase, FleetError> {
         self.check_key(key)?;
-        if self.path_of(key).exists() {
+        let path = self.path_of(key);
+        if path.exists() {
             return Err(FleetError::AlreadyExists { name: key.name() });
         }
-        self.open_with(key, true).await
+        // Publish here, outside the single-flight open, so the publish result
+        // decides: of two concurrent provisions (in this process or another)
+        // only the one whose link created the file succeeds, and its caller
+        // alone runs whatever signup work follows.
+        let fleet = self.clone();
+        let name = key.name();
+        let created = crate::time::spawn_blocking(move || {
+            create_database_file(&path, &name, &fleet.inner.migrations)
+        })
+        .await
+        .map_err(|e| FleetError::Unavailable {
+            name: key.name(),
+            detail: format!("create task failed: {e}"),
+        })??;
+        if !created {
+            return Err(FleetError::AlreadyExists { name: key.name() });
+        }
+        let counters = &self.inner.counters;
+        counters.created.fetch_add(1, Ordering::Relaxed);
+        counters
+            .migrations_applied
+            .fetch_add(self.inner.migrations.count() as u64, Ordering::Relaxed);
+        self.open_with(key, false).await
     }
 
     /// Whether the database's file exists.
@@ -1317,6 +1356,16 @@ impl DatabaseFleet {
                 }
             }
             fleet.close_all().await;
+            // Every database is closed and shipped. Give parked replicators a
+            // last chance to catch up, then stop the loop thread so it does
+            // not outlive the app (an embedded or restarted server).
+            if let Some(replication) = fleet.replication().cloned() {
+                let _ = crate::time::spawn_blocking(move || {
+                    replication.tick_all();
+                    replication.stop();
+                })
+                .await;
+            }
         })
     }
 
@@ -2318,6 +2367,52 @@ mod tests {
             entries(fleet.root()).is_empty(),
             "no database and no staging file left: {:?}",
             entries(fleet.root())
+        );
+    }
+
+    #[tokio::test]
+    async fn of_concurrent_provisions_only_the_creator_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Tenant, |_| {});
+        let key = fleet.key_for("acme").unwrap();
+        let results = futures::future::join_all((0..8).map(|_| fleet.provision(&key))).await;
+        let created = results.iter().filter(|r| r.is_ok()).count();
+        let refused = results
+            .iter()
+            .filter(|r| matches!(r, Err(FleetError::AlreadyExists { .. })))
+            .count();
+        assert_eq!((created, refused), (1, 7), "{results:?}");
+        assert_eq!(fleet.stats().created_total, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failing_later_set_rolls_back_the_earlier_sets() {
+        let tmp = tempfile::tempdir().unwrap();
+        // An existing database with no migrations at all.
+        let bare = DatabaseFleet::builder(config(tmp.path(), FleetMode::Slot))
+            .build()
+            .unwrap();
+        bare.open(&FleetDbKey::Slot(8)).await.unwrap();
+        bare.close_all().await;
+
+        let fleet = DatabaseFleet::builder(config(tmp.path(), FleetMode::Slot))
+            .migrations(
+                "version-history",
+                crate::version_history::VERSION_HISTORY_MIGRATIONS,
+            )
+            .migrations("broken", BROKEN)
+            .build()
+            .unwrap();
+        let err = fleet.open(&FleetDbKey::Slot(8)).await.unwrap_err();
+        assert!(matches!(err, FleetError::Migration { .. }), "{err}");
+
+        let check = DatabaseFleet::builder(config(tmp.path(), FleetMode::Slot))
+            .build()
+            .unwrap();
+        let db = check.open(&FleetDbKey::Slot(8)).await.unwrap();
+        assert!(
+            !table_exists(&db, "_autumn_version_history").await,
+            "the earlier set's migrations were rolled back with the failing one"
         );
     }
 

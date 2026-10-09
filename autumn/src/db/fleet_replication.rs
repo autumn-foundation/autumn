@@ -454,6 +454,7 @@ mod tests {
     use crate::db::fleet::{DatabaseFleet, FleetError};
     use crate::fleet_layout::FleetMode;
     use crate::replication::FileDestination;
+    use tokio_util::sync::CancellationToken;
 
     fn settings() -> ReplicationSettings {
         ReplicationSettings {
@@ -881,6 +882,25 @@ mod tests {
         drop(other);
         fleet.restore(&key, None).await.unwrap();
         assert_eq!(count(&fleet.open(&key).await.unwrap()).await, 0);
+    }
+
+    #[tokio::test]
+    async fn shutting_the_fleet_down_stops_the_replication_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication) =
+            replicated_fleet(&tmp.path().join("a"), &tmp.path().join("replicas"), false);
+        fleet.open_for("acme").await.unwrap();
+        let thread = replication.spawn_loop().unwrap();
+        let shutdown = CancellationToken::new();
+        let maintenance = fleet.spawn_maintenance(shutdown.clone());
+        shutdown.cancel();
+        maintenance.await.unwrap();
+        assert_eq!(fleet.stats().open, 0);
+        // The loop sees the stop flag within one poll.
+        let joined = crate::time::spawn_blocking(move || thread.join())
+            .await
+            .unwrap();
+        assert!(joined.is_ok());
     }
 
     #[tokio::test]
