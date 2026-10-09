@@ -1507,8 +1507,7 @@ fn swap(
     }
 
     match temp.persist_noclobber(absolute) {
-        // The claimed file held the planned text, so dropping it loses nothing.
-        Ok(_) => Ok(()),
+        Ok(_) => finish_claim(claim, expected),
         Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
             Err(PublishError::Moved(
                 "something appeared at this path while it was being written; \
@@ -1525,6 +1524,23 @@ fn swap(
             Err(error.error.into())
         }
     }
+}
+
+/// Drop the old copy, unless it changed since the compare.
+///
+/// A writer that opened the old file before the swap can still write into it.
+/// Keep such a copy and say where it is, so the write is not lost in silence.
+fn finish_claim(claim: tempfile::TempPath, expected: &str) -> Result<(), PublishError> {
+    if read_text(&claim).is_some_and(|text| text == normalize(expected)) {
+        return Ok(());
+    }
+    Err(match claim.keep() {
+        Ok(path) => PublishError::Moved(format!(
+            "this file was written during the swap; the earlier copy is at {}",
+            path.display()
+        )),
+        Err(error) => PublishError::Failed(error.to_string()),
+    })
 }
 
 /// Re-read what an entry's path holds now, by the same rules the plan used —
@@ -2984,6 +3000,42 @@ mod tests {
         let report = plan_in(tmp.path());
         restore.join().unwrap();
         assert_eq!(*status_of(&report.entries, "Dockerfile"), Status::UpToDate);
+    }
+
+    #[test]
+    fn a_claim_written_through_an_open_handle_is_kept_not_deleted() {
+        // A writer that opened the old file before the swap keeps writing into
+        // it. Deleting that copy would lose the write without a trace.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("existing.toml");
+        let claim = tempfile::Builder::new()
+            .prefix(CLAIM_PREFIX)
+            .suffix(CLAIM_SUFFIX)
+            .tempfile_in(tmp.path())
+            .unwrap()
+            .into_temp_path();
+        fs::write(&claim, "planned\nand a late write\n").unwrap();
+        let held = claim.to_path_buf();
+
+        let error = finish_claim(claim, "planned\n").expect_err("must keep the copy");
+        assert!(matches!(error, PublishError::Moved(_)), "{error}");
+        assert!(error.to_string().contains(&*held.to_string_lossy()));
+        assert_eq!(
+            fs::read_to_string(&held).unwrap(),
+            "planned\nand a late write\n"
+        );
+
+        let clean = tempfile::Builder::new()
+            .prefix(CLAIM_PREFIX)
+            .suffix(CLAIM_SUFFIX)
+            .tempfile_in(tmp.path())
+            .unwrap()
+            .into_temp_path();
+        fs::write(&clean, "planned\n").unwrap();
+        let gone = clean.to_path_buf();
+        finish_claim(clean, "planned\n").expect("unchanged copy is dropped");
+        assert!(!gone.exists());
+        assert!(!path.exists());
     }
 
     #[test]
