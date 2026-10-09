@@ -252,6 +252,19 @@ impl Caller {
             Err(tokio::sync::oneshot::error::TryRecvError::Closed)
         )
     }
+
+    /// Check out a connection, unless the caller goes first. A dropped caller
+    /// does not wait in the pool queue, so it adds no hidden backlog.
+    async fn checkout(
+        &mut self,
+        pool: &Pool<RuntimeConnection>,
+    ) -> Result<diesel_async::pooled_connection::deadpool::Object<RuntimeConnection>, RoomError>
+    {
+        tokio::select! {
+            conn = pool.get() => conn.map_err(map_db_err),
+            _ = &mut self.0 => Err(RoomError::Store),
+        }
+    }
 }
 
 /// Check that `participant_id` holds a seat in the room, with `token`.
@@ -391,7 +404,7 @@ impl RoomStore for DbRoomStore {
         let (namespace, room_id) = (namespace.to_owned(), room_id.to_owned());
         Box::pin(detached(move |mut caller| async move {
             let (namespace, room_id) = (namespace.as_str(), room_id.as_str());
-            let mut conn = pool.get().await.map_err(map_db_err)?;
+            let mut conn = caller.checkout(&pool).await?;
             // One transaction that holds the room row: two joins for the last
             // seat run one after the other, so the count never goes stale.
             conn.transaction(async move |conn| {
