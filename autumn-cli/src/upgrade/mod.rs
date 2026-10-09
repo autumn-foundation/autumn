@@ -1432,8 +1432,9 @@ fn plan_scaffold(root: &Path, target: &str, report: &Report) -> Option<scaffold:
 
 /// What the codemods plan for each file, as the scaffold half sees it.
 ///
-/// After a partial apply, a file past the failure was never written. Its plan
-/// is its own text, so it is judged by what is on disk.
+/// A preview trusts the text the codemods read and the text they write. After
+/// an apply, a written file is trusted only as written. A file past a failed
+/// write is trusted only as read, so the disk decides.
 fn scaffold_plans(report: &Report) -> BTreeMap<String, scaffold::Planned> {
     let written = match report.outcome {
         Outcome::Partial { written } => written,
@@ -1444,13 +1445,13 @@ fn scaffold_plans(report: &Report) -> BTreeMap<String, scaffold::Planned> {
         .iter()
         .enumerate()
         .map(|(index, file)| {
-            let updated = if index < written {
-                &file.updated
-            } else {
-                &file.original
+            let (original, updated) = match report.outcome {
+                Outcome::Preview => (&file.original, &file.updated),
+                _ if index < written => (&file.updated, &file.updated),
+                _ => (&file.original, &file.original),
             };
             let plan = scaffold::Planned {
-                original: file.original.clone(),
+                original: original.clone(),
                 updated: updated.clone(),
             };
             (file.path.clone(), plan)
@@ -1883,6 +1884,17 @@ mod tests {
 
         report.outcome = Outcome::Preview;
         assert_eq!(scaffold_plans(&report)["build.rs"].updated, "B\n");
+        assert_eq!(scaffold_plans(&report)["build.rs"].original, "b\n");
+    }
+
+    #[test]
+    fn a_written_file_is_trusted_only_as_written() {
+        let mut report = empty(Outcome::Applied);
+        report.files = vec![rewrite("build.rs", "b\n", "B\n")];
+        let plan = &scaffold_plans(&report)["build.rs"];
+        // The old text on disk now means someone reverted the write.
+        assert_eq!(plan.original, "B\n");
+        assert_eq!(plan.updated, "B\n");
     }
 
     #[test]
