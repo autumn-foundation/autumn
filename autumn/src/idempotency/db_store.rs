@@ -218,7 +218,8 @@ impl DbIdempotencyStore {
     ///
     /// `false` when `from_owner` no longer holds `from`: its lock expired and
     /// another request took the key. The old key may still hold a point this
-    /// call cannot read, so the caller must not run the handler.
+    /// call cannot read, so the caller must not run the handler. `false` too
+    /// when a point was to be copied and `to_owner` no longer holds `to`.
     pub(super) async fn adopt_recovery_point(
         &self,
         from: &str,
@@ -252,7 +253,7 @@ impl DbIdempotencyStore {
 
     /// Write `copied` (read from `from`) to the row `to_owner` holds on `to`,
     /// only while `from_owner` still holds `from` with that point. `false`
-    /// when it no longer does.
+    /// when it no longer does, or when `to_owner` no longer holds `to`.
     ///
     /// One transaction. It first rewrites the source row with its own values
     /// while `from_owner` still holds it with the point. That write locks the
@@ -305,13 +306,10 @@ impl DbIdempotencyStore {
                 let fresh_expiry = now_ms().saturating_add(ttl_ms);
                 let expiry = diesel::dsl::case_when(crash_expiry.gt(fresh_expiry), crash_expiry)
                     .otherwise(fresh_expiry);
-                // Nothing to update when the target already has a point, or
-                // lost its own lock (which its claim reports later).
                 let target = keys::autumn_idempotency_keys
                     .filter(keys::storage_key.eq(&to))
-                    .filter(keys::locked_by.eq(&to_owner))
-                    .filter(keys::recovery_point.is_null());
-                diesel::update(target)
+                    .filter(keys::locked_by.eq(&to_owner));
+                let copied = diesel::update(target.filter(keys::recovery_point.is_null()))
                     .set((
                         keys::recovery_point.eq(Some(point)),
                         keys::recovery_body_hash.eq(body_hash),
@@ -320,7 +318,18 @@ impl DbIdempotencyStore {
                     ))
                     .execute(&mut *conn)
                     .await?;
-                Ok::<_, diesel::result::Error>(true)
+                if copied == 1 {
+                    return Ok(true);
+                }
+                // Nothing copied: the target has a point already, or lost its
+                // lock to another request. Only the first may go on.
+                let target_held = target
+                    .select(keys::storage_key)
+                    .first::<String>(&mut *conn)
+                    .await
+                    .optional()?
+                    .is_some();
+                Ok::<_, diesel::result::Error>(target_held)
             }
             .scope_boxed()
         })
@@ -1149,6 +1158,63 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    /// The new key's lock expired and another request took it before the
+    /// copy. The copy writes nothing and reports `false`, so this request
+    /// does not run the handler on a key it no longer holds.
+    #[tokio::test]
+    async fn copy_refuses_a_target_taken_by_another_request() {
+        let substrate = SqliteSubstrate::with_migrations(&[&crate::migrate::FRAMEWORK_MIGRATIONS])
+            .expect("substrate");
+        let store = DbIdempotencyStore::new(substrate.pool(), Duration::from_secs(60));
+        assert!(
+            store
+                .try_lock("old", "a1", Duration::from_secs(60))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .try_lock("new", "b", Duration::from_millis(5))
+                .await
+                .unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            store
+                .try_lock("new", "c", Duration::from_secs(60))
+                .await
+                .unwrap(),
+            "another request takes the new key once b's lock expired"
+        );
+        let mut conn = store.conn().await.unwrap();
+        diesel::update(keys::autumn_idempotency_keys.filter(keys::storage_key.eq("old")))
+            .set((
+                keys::recovery_point.eq(Some("charged")),
+                keys::ttl_ms.eq(60_000),
+            ))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let held = HeldPoint {
+            point: "charged".to_owned(),
+            body_hash: None,
+            ttl_ms: 60_000,
+        };
+
+        let copied = store
+            .copy_held_point(&mut conn, "old", "a1", held, "new", "b")
+            .await
+            .unwrap();
+        assert!(!copied, "b no longer holds the new key");
+        let point: Option<String> = keys::autumn_idempotency_keys
+            .filter(keys::storage_key.eq("new"))
+            .select(keys::recovery_point)
+            .first(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(point, None, "nothing was written to c's key");
     }
 }
 
