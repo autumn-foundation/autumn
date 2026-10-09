@@ -88,10 +88,15 @@ Uppercase is refused, not folded: on a case-insensitive file system `Acme` and
   connection is never chosen, and neither is one used in the last two seconds:
   a request resolves its database before it checks a connection out (a
   generated repository does so lazily), and closing the pool in between would
-  fail the request.
-- A newly created database whose identity check, migration or `on_open` hook
-  fails is closed and removed, so a failed first migration never strands a
-  file that cannot open (activerecord-tenanted drops it the same way).
+  fail the request. The sweeper re-checks `max_open` at least once per grace
+  window, so a burst of opens does not stay over the cap.
+- A new database is built in a private staging file beside its path —
+  identity row and every migration — and published with a hard link, which
+  refuses an existing target. A database is therefore absent or complete,
+  never half made; a failed creation removes only its own staging file; and
+  when two processes (say a `web` and a `worker` role on one volume) create
+  the same database, the second opens the first one's file instead of
+  deleting it.
 - Closing calls `Pool::close` (a stale handle can no longer check out), waits
   for in-flight connections, then runs lifecycle hooks. An opener for a
   draining key waits for the drain, then opens fresh. Deleting a key refuses
@@ -121,10 +126,14 @@ destination as the control database:
   replicator checkpoints. Fleet pools never inherit the process latch that
   disables auto-checkpointing for the control database, so a fleet that does
   not replicate keeps auto-checkpointing;
-- closing a database waits for its in-flight connections, then ships its last
-  frames before the replicator's connection goes. SQLite's last-connection
-  checkpoint therefore never folds an unshipped frame into the file;
-- `restore_from_replica` rebuilds one database on a fresh volume. With
+- closing a database waits for its in-flight connections, then ticks its
+  replicator until nothing committed is unshipped, before the replicator's
+  connection — the last one — goes. SQLite's last-connection checkpoint
+  therefore never folds an unshipped frame into the file. When the
+  destination is down, the replicator is parked rather than dropped: it keeps
+  the file open, the loop keeps shipping until it catches up, health reports
+  it under `closing`, and a reopen takes it back (one replicator per file);
+- `DatabaseFleet::restore` rebuilds one database on a fresh volume. With
   `restore_missing = true`, opening a database whose file is missing restores
   it first: a host that takes over a slot range serves it from the replicas.
 

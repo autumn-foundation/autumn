@@ -297,7 +297,8 @@ pub trait FleetLifecycle: Send + Sync + 'static {
         let _ = db;
     }
 
-    /// After the database's files have been removed.
+    /// When a delete has closed the database, before its files are removed.
+    /// Release anything that holds them open.
     fn on_delete(&self, key: &FleetDbKey) {
         let _ = key;
     }
@@ -378,6 +379,16 @@ impl FleetMigrations {
             history,
             apply_on_open,
         }
+    }
+
+    /// Migrations in the selected sets, which a new database receives.
+    fn count(&self) -> usize {
+        use diesel::migration::MigrationSource;
+        self.sets()
+            .map(|set| {
+                MigrationSource::<diesel::sqlite::Sqlite>::migrations(set).map_or(0, |m| m.len())
+            })
+            .sum()
     }
 
     fn sets(&self) -> impl Iterator<Item = &EmbeddedMigrations> {
@@ -842,7 +853,7 @@ impl DatabaseFleet {
                     if db.pool.is_closed() {
                         continue;
                     }
-                    self.enforce_capacity(key);
+                    self.enforce_capacity(Some(key));
                     return Ok(db);
                 }
                 Err(error) => {
@@ -901,14 +912,25 @@ impl DatabaseFleet {
         if !existed {
             existed = self.restore_missing(&key, &path).await?;
         }
-        if !existed {
+        // Whether this open published the file (another process may have won
+        // the race to create it; then we open theirs).
+        let created = if existed {
+            false
+        } else {
             if !create {
                 return Err(FleetError::NotFound { name });
             }
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(io_error("create database directory"))?;
-            }
-        }
+            let fleet = self.clone();
+            let (create_path, create_name) = (path.clone(), name.clone());
+            crate::time::spawn_blocking(move || {
+                create_database_file(&create_path, &create_name, &fleet.inner.migrations)
+            })
+            .await
+            .map_err(|e| FleetError::Unavailable {
+                name: name.clone(),
+                detail: format!("create task failed: {e}"),
+            })??
+        };
         let url = Self::url_of(&path);
         let pool = crate::db::build_sqlite_pool_with(
             &url,
@@ -926,24 +948,20 @@ impl DatabaseFleet {
             pool,
             closed: CancellationToken::new(),
         };
-        let applied = match self.prepare(&db, existed).await {
+        // The file is complete here — published fully migrated, restored, or
+        // already there — so a failure below closes the pool and never
+        // removes the file another opener (or process) may be serving.
+        let applied = match self.prepare(&db).await {
             Ok(applied) => applied,
             Err(error) => {
-                // Leave nothing half-made: close what was opened, and remove a
-                // database this open created (a failed first migration would
-                // otherwise strand a file that never opens).
                 db.closed.cancel();
                 let closer = db.pool.clone();
                 let _ = crate::time::spawn_blocking(move || closer.close()).await;
-                if !existed {
-                    let (path, root) = (path.clone(), self.inner.root.clone());
-                    let _ =
-                        crate::time::spawn_blocking(move || remove_database_files(&path, &root))
-                            .await;
-                }
                 return Err(error);
             }
         };
+        let applied = applied + usize::from(created) * self.inner.migrations.count();
+        let existed = !created;
         let counters = &self.inner.counters;
         counters.opens.fetch_add(1, Ordering::Relaxed);
         counters
@@ -958,10 +976,10 @@ impl DatabaseFleet {
 
     /// Identity check, migrations and `on_open` hooks for a freshly built
     /// pool. Returns the number of migrations applied.
-    async fn prepare(&self, db: &FleetDatabase, existed: bool) -> Result<usize, FleetError> {
+    async fn prepare(&self, db: &FleetDatabase) -> Result<usize, FleetError> {
         let name = db.key.name();
-        // The first pooled connection creates the file (diesel opens with
-        // SQLITE_OPEN_CREATE), sets WAL, and records which database it is.
+        // The first pooled connection sets WAL and checks (or, for a file
+        // that predates identity rows, records) which database it is.
         check_identity(&db.pool, &name).await?;
 
         let fleet = self.clone();
@@ -969,7 +987,7 @@ impl DatabaseFleet {
         let migrate_url = Self::url_of(&db.path);
         let applied = crate::time::spawn_blocking(move || {
             let migrations = &fleet.inner.migrations;
-            if !existed || migrations.apply_on_open {
+            if migrations.apply_on_open {
                 migrations.apply(&migrate_url, &migrate_name)
             } else {
                 match migrations.pending(&migrate_url, &migrate_name)? {
@@ -1049,7 +1067,7 @@ impl DatabaseFleet {
     /// Close least recently used idle databases until at most `max_open`
     /// are open. A database with a checked-out connection is never chosen,
     /// so the cap is soft while every open database is busy.
-    fn enforce_capacity(&self, keep: &FleetDbKey) {
+    fn enforce_capacity(&self, keep: Option<&FleetDbKey>) {
         let max_open = self.inner.max_open;
         let min_residency = self.inner.min_residency;
         let now = crate::time::ambient_instant();
@@ -1061,7 +1079,7 @@ impl DatabaseFleet {
             let mut idle: Vec<(u64, FleetDbKey)> = state
                 .open
                 .iter()
-                .filter(|(key, _)| *key != keep)
+                .filter(|(key, _)| Some(*key) != keep)
                 .filter(|(_, entry)| {
                     now.saturating_duration_since(entry.last_used()) >= min_residency
                 })
@@ -1225,20 +1243,33 @@ impl DatabaseFleet {
         }
     }
 
-    /// Start the idle sweeper. It stops when `shutdown` is cancelled, after
-    /// closing every database so replicators ship their last frames.
+    /// How often the sweeper runs: often enough to close idle databases on
+    /// time, and to retry the `max_open` cap once the residency grace that
+    /// blocked it has passed (a burst of opens inside one grace window would
+    /// otherwise stay over the cap until the next open).
+    fn sweep_interval(&self) -> Duration {
+        let idle = self
+            .inner
+            .idle_close
+            .map_or(MAX_SWEEP_INTERVAL, |idle| idle / 4);
+        idle.min(self.inner.min_residency.max(Duration::from_millis(100)))
+            .clamp(Duration::from_millis(100), MAX_SWEEP_INTERVAL)
+    }
+
+    /// Start the sweeper: it closes idle databases and enforces `max_open`.
+    /// It stops when `shutdown` is cancelled, after closing every database so
+    /// replicators ship their last frames.
     #[must_use = "await the handle at shutdown so every database closes (and ships its last frames)"]
     pub fn spawn_maintenance(&self, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
         let fleet = self.clone();
-        let interval = self.inner.idle_close.map_or(MAX_SWEEP_INTERVAL, |idle| {
-            (idle / 4).clamp(Duration::from_millis(100), MAX_SWEEP_INTERVAL)
-        });
+        let interval = self.sweep_interval();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     () = tokio::time::sleep(interval) => {
                         let _ = fleet.close_idle();
+                        fleet.enforce_capacity(None);
                     }
                 }
             }
@@ -1271,6 +1302,10 @@ impl DatabaseFleet {
             return Box::pin(self.delete(key)).await;
         };
         self.drain(&key, db).await;
+        // Hooks let go of the files first (a parked replicator holds one open).
+        for hook in self.hooks() {
+            hook.on_delete(&key);
+        }
         let path = self.path_of(&key);
         let root = self.inner.root.clone();
         let removed = crate::time::spawn_blocking(move || remove_database_files(&path, &root))
@@ -1282,9 +1317,6 @@ impl DatabaseFleet {
             .and_then(|r| r);
         if matches!(removed, Ok(true)) {
             self.inner.counters.deleted.fetch_add(1, Ordering::Relaxed);
-            for hook in self.hooks() {
-                hook.on_delete(&key);
-            }
         }
         self.finish_drain(&key, &drain);
         removed
@@ -1404,30 +1436,39 @@ impl DatabaseFleet {
             if let Some((key, db, drain)) = self.begin_exclusive(key, false)? {
                 self.drain(&key, db).await;
                 let path = self.path_of(&key);
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(io_error("create database directory"))?;
-                }
                 let restore_key = key.clone();
+                // Everything after the claim runs to `finish_drain`, whatever
+                // fails: an error that skipped it would strand every later
+                // opener of this key on a drain that never finishes.
                 let restored = crate::time::spawn_blocking(move || {
-                    replication.restore(&restore_key, target, &path)
-                })
-                .await;
-                self.finish_drain(&key, &drain);
-                return match restored {
-                    Ok(Ok(outcome)) => Ok(outcome),
-                    Ok(Err(crate::replication::RestoreError::NoReplica { .. })) => {
-                        Err(FleetError::NotFound { name: key.name() })
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| FleetError::Io {
+                            op: "create database directory",
+                            detail: e.to_string(),
+                        })?;
                     }
-                    Ok(Err(error)) => Err(FleetError::Restore {
-                        name: key.name(),
-                        detail: error.to_string(),
-                    }),
-                    Err(error) => Err(FleetError::Restore {
-                        name: key.name(),
-                        detail: error.to_string(),
-                    }),
-                };
+                    replication
+                        .restore(&restore_key, target, &path)
+                        .map_err(|error| match error {
+                            crate::replication::RestoreError::NoReplica { .. } => {
+                                FleetError::NotFound {
+                                    name: restore_key.name(),
+                                }
+                            }
+                            error => FleetError::Restore {
+                                name: restore_key.name(),
+                                detail: error.to_string(),
+                            },
+                        })
+                })
+                .await
+                .map_err(|error| FleetError::Restore {
+                    name: key.name(),
+                    detail: error.to_string(),
+                })
+                .and_then(|r| r);
+                self.finish_drain(&key, &drain);
+                return restored;
             }
             let pending = self.lock_state().draining.get(key).cloned();
             if let Some(pending) = pending {
@@ -1684,6 +1725,87 @@ async fn check_identity(pool: &Pool<RuntimeConnection>, name: &str) -> Result<()
             found: found.name,
         });
     }
+    Ok(())
+}
+
+/// Create a fleet database atomically. Blocking.
+///
+/// The database is built — identity row, every migration — in a private
+/// staging file beside `path` (`.<name>.creating-<pid>-<n>`, which no
+/// template matches), then published with a hard link, which refuses an
+/// existing target. So a database is either absent or complete, never half
+/// made; a failure removes only the staging file; and when another process
+/// publishes first, its file wins and this returns `Ok(false)`.
+fn create_database_file(
+    path: &Path,
+    name: &str,
+    migrations: &FleetMigrations,
+) -> Result<bool, FleetError> {
+    static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().ok_or_else(|| FleetError::Io {
+        op: "create database",
+        detail: "database path has no parent directory".to_owned(),
+    })?;
+    std::fs::create_dir_all(parent).map_err(io_error("create database directory"))?;
+    let file_name = path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let staging = parent.join(format!(
+        ".{file_name}.creating-{}-{}",
+        std::process::id(),
+        STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let discard = |staging: &Path| {
+        let _ = std::fs::remove_file(staging);
+        for sidecar in crate::fleet_layout::sidecar_paths(staging) {
+            let _ = std::fs::remove_file(sidecar);
+        }
+    };
+    discard(&staging);
+    let built = build_staged_database(&staging, name, migrations);
+    if let Err(error) = built {
+        discard(&staging);
+        return Err(error);
+    }
+    let published = std::fs::hard_link(&staging, path);
+    discard(&staging);
+    match published {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(io_error("publish database")(e)),
+    }
+}
+
+/// Identity row and migrations on a staging file, closed before it returns.
+fn build_staged_database(
+    staging: &Path,
+    name: &str,
+    migrations: &FleetMigrations,
+) -> Result<(), FleetError> {
+    use diesel::RunQueryDsl as _;
+    use diesel::connection::SimpleConnection as _;
+    let url = DatabaseFleet::url_of(staging);
+    let unavailable = |detail: String| FleetError::Unavailable {
+        name: name.to_owned(),
+        detail,
+    };
+    {
+        let mut conn = crate::db::establish_sqlite_migration_connection(&url)
+            .map_err(|e| unavailable(e.to_string()))?;
+        conn.batch_execute(&format!(
+            "CREATE TABLE IF NOT EXISTS {IDENTITY_TABLE} (\
+                 id INTEGER PRIMARY KEY CHECK (id = 1), \
+                 name TEXT NOT NULL)"
+        ))
+        .map_err(|e| unavailable(e.to_string()))?;
+        diesel::sql_query(format!(
+            "INSERT OR IGNORE INTO {IDENTITY_TABLE} (id, name) VALUES (1, ?)"
+        ))
+        .bind::<diesel::sql_types::Text, _>(name)
+        .execute(&mut conn)
+        .map_err(|e| unavailable(e.to_string()))?;
+    }
+    migrations.apply(&url, name)?;
     Ok(())
 }
 
@@ -1970,6 +2092,92 @@ mod tests {
         );
         // The handle resolved first still checks out: nothing closed it.
         assert!(resolved.pool().get().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_sweeper_closes_a_burst_once_its_residency_has_passed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = DatabaseFleet::builder(DatabaseFleetConfig {
+            max_open: 1,
+            ..config(tmp.path(), FleetMode::Slot)
+        })
+        .min_residency(Duration::from_millis(150))
+        .build()
+        .unwrap();
+        assert!(fleet.sweep_interval() <= Duration::from_millis(150));
+        for slot in 1..=3 {
+            fleet.open(&FleetDbKey::Slot(slot)).await.unwrap();
+        }
+        settle(&fleet).await;
+        assert_eq!(fleet.stats().open, 3, "a burst inside the grace stays open");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        fleet.enforce_capacity(None);
+        settle(&fleet).await;
+        assert_eq!(
+            fleet.stats().open,
+            1,
+            "the sweep enforces max_open afterwards"
+        );
+    }
+
+    const BROKEN: EmbeddedMigrations =
+        diesel_migrations::embed_migrations!("tests/fixtures/fleet_broken_migrations");
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = walk(dir);
+        names.sort();
+        names
+    }
+
+    fn walk(dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                out.extend(walk(&entry.path()));
+            } else {
+                out.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_failed_first_migration_publishes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = DatabaseFleet::builder(config(tmp.path(), FleetMode::Slot))
+            .migrations("broken", BROKEN)
+            .build()
+            .unwrap();
+        let err = fleet.open(&FleetDbKey::Slot(3)).await.unwrap_err();
+        assert!(matches!(err, FleetError::Migration { .. }), "{err}");
+        assert!(!fleet.exists(&FleetDbKey::Slot(3)));
+        assert!(
+            entries(fleet.root()).is_empty(),
+            "no database and no staging file left: {:?}",
+            entries(fleet.root())
+        );
+    }
+
+    #[test]
+    fn creating_a_database_another_process_published_keeps_theirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("000/slot-00001.db");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"their bytes").unwrap();
+        let migrations = FleetMigrations::new(Arc::new(Vec::new()), |_| true, true);
+        let created = create_database_file(&target, "slot:00001", &migrations).unwrap();
+        assert!(!created, "the other process won the race");
+        assert_eq!(std::fs::read(&target).unwrap(), b"their bytes");
+        assert_eq!(
+            entries(tmp.path()),
+            vec!["slot-00001.db".to_owned()],
+            "no staging left"
+        );
+
+        let fresh = tmp.path().join("000/slot-00002.db");
+        assert!(create_database_file(&fresh, "slot:00002", &migrations).unwrap());
+        assert!(fresh.is_file());
     }
 
     #[tokio::test]

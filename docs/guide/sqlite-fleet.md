@@ -153,8 +153,9 @@ migrations expand-then-contract.
 - Past `max_open`, the least recently used idle database closes. A database
   with a connection checked out, or used in the last two seconds, is never
   closed, so the cap is soft under load.
-- A new database whose first migration fails is removed again, so the next
-  request retries from scratch.
+- A new database is built and migrated in a private staging file, then
+  published in one step: it is absent or complete, never half made. When two
+  processes on one volume create the same database, both end up on one file.
 - Budget: `max_open × pool_size` connections and roughly
   `max_open × (2 × pool_size + 1)` file descriptors.
 - Metrics label every fleet database `shard=fleet`; the database name goes on
@@ -171,7 +172,9 @@ control database, under `<prefix>/<profile>/fleet/tenant/<id>` or
 
 - fleet databases run with `wal_autocheckpoint = 0`, and their replicator is
   the only checkpointer (a fleet without replication keeps SQLite's own);
-- closing a database ships its last frames before the file closes;
+- closing a database ships everything it committed before the file closes.
+  If the destination is down, the replicator stays open and keeps shipping
+  until it catches up (`closing` in the health details);
 - `fleet.restore(&key, at)` rebuilds one database, point in time included;
 - `restore_missing = true` restores a database whose file is missing before
   opening it. A host with an empty volume takes over a tenant or a slot range
