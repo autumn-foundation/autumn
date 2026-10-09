@@ -1513,6 +1513,7 @@ fn publish(absolute: &Path, contents: &str, mode: Publish) -> Result<(), Publish
 /// file took its place. While the path is absent, a new writer is not
 /// overwritten, because the staged file is linked in without replacing.
 /// [`claim_in_flight`] lets readers see this window.
+#[cfg(not(windows))]
 fn swap(
     temp: tempfile::NamedTempFile,
     absolute: &Path,
@@ -1608,10 +1609,40 @@ fn swap(
     }
 }
 
+/// Windows: re-read, compare, then replace.
+///
+/// The rename-aside claim is not used here. On `windows-latest` a claim file
+/// went missing right after its rename, and the cause is not known. The old
+/// copy cannot be put back, so the claim could lose a write. This keeps the
+/// narrow window the code had before: a writer that changes the file between
+/// the compare and the replace loses. [`Manifest::update`] still re-reads and
+/// retries.
+#[cfg(windows)]
+fn swap(
+    temp: tempfile::NamedTempFile,
+    absolute: &Path,
+    expected: &str,
+) -> Result<(), PublishError> {
+    let unchanged = std::fs::symlink_metadata(absolute)
+        .is_ok_and(|meta| meta.file_type().is_file())
+        && read_text(absolute).is_some_and(|text| text == normalize(expected));
+    if !unchanged {
+        return Err(PublishError::Moved(
+            "this file changed after the preview was computed; \
+             it was left exactly as it is"
+                .to_owned(),
+        ));
+    }
+    temp.persist(absolute)
+        .map(drop)
+        .map_err(|error| PublishError::Failed(error.error.to_string()))
+}
+
 /// Drop the old copy, unless it changed since the compare.
 ///
 /// A writer that opened the old file before the swap can still write into it.
 /// Keep such a copy and say where it is, so the write is not lost in silence.
+#[cfg_attr(windows, allow(dead_code))]
 fn finish_claim(claim: tempfile::TempPath, expected: &str) -> Result<(), PublishError> {
     match read_text(&claim) {
         Some(text) if text == normalize(expected) => return Ok(()),
@@ -3222,6 +3253,8 @@ mod tests {
         assert_eq!(kept.written_by.as_deref(), Some("99.0.0"));
     }
 
+    // Racy by design, and it needs the full swap, which Windows does not use.
+    #[cfg(not(windows))]
     #[test]
     fn two_accepts_at_once_keep_both_pins() {
         for _ in 0..20 {
