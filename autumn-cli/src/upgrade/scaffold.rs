@@ -1532,6 +1532,10 @@ fn swap(
         .suffix(CLAIM_SUFFIX)
         .tempfile_in(directory)?
         .into_temp_path();
+    // The file only reserved a unique name. Remove it, so a crash before the
+    // rename leaves no empty claim, and a claim exists only once it holds the
+    // destination.
+    let _ = std::fs::remove_file(&claim);
     match std::fs::rename(absolute, &claim) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
