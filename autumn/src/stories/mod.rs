@@ -1244,7 +1244,7 @@ mod tests {
                 !js_selector.matches(&dom).is_empty(),
                 "detail page must load the widget runtime script: {page}"
             );
-            // #2353: hx-* stories are inert without htmx on the detail page.
+            // #2353: without htmx, `hx-*` stories do nothing on the detail page.
             let htmx_selector = crate::test_html::SelectorList::parse(&format!(
                 "script[src=\"{}\"]",
                 crate::htmx::HTMX_JS_PATH
