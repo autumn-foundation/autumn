@@ -103,8 +103,12 @@ struct ManifestFile {
     files: BTreeMap<String, String>,
 }
 
-/// How many times [`Manifest::update`] retries after losing a swap.
-const SWAP_ATTEMPTS: usize = 8;
+/// Most tries in [`Manifest::update`].
+const SWAP_ATTEMPTS: u32 = 8;
+
+/// Name of the file a swap holds the old contents in.
+const CLAIM_PREFIX: &str = ".autumn-upgrade-";
+const CLAIM_SUFFIX: &str = ".old";
 
 const FLAVOR_API: &str = "api";
 const FLAVOR_FULLSTACK: &str = "fullstack";
@@ -285,26 +289,25 @@ impl Manifest {
     /// none of their protection: following the link would truncate a file
     /// outside the project, invisibly to that project's own `git diff`.
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
-        Self::update(root, |_| Some(self.clone())).map(drop)
+        Self::update(root, |_| self.clone()).map(drop)
     }
 
     /// Read, change and write the manifest as one compare-and-swap.
     ///
-    /// `change` gets the manifest as it is now (`None` if absent or unreadable)
-    /// and returns the manifest to write, or `None` to write nothing. If another
-    /// writer changes the file before the swap, `change` runs again on the new
-    /// state, so a pin that writer added is kept.
+    /// `change` gets the current manifest (`None` if absent or unparsable) and
+    /// returns the new one. If another writer changes the file first, `change`
+    /// runs again on the new state, so that writer's pins are kept.
     ///
     /// # Errors
     ///
-    /// Fails if the path is a symlink, cannot be read as text, cannot be
-    /// written, or keeps changing for [`SWAP_ATTEMPTS`] tries.
+    /// Fails on a symlink, unreadable text, a write error, an interrupted
+    /// upgrade, or [`SWAP_ATTEMPTS`] lost swaps.
     pub fn update(
         root: &Path,
-        mut change: impl FnMut(Option<Self>) -> Option<Self>,
+        mut change: impl FnMut(Option<Self>) -> Self,
     ) -> std::io::Result<Self> {
         let path = root.join(MANIFEST_PATH);
-        for _ in 0..SWAP_ATTEMPTS {
+        for attempt in 1..=SWAP_ATTEMPTS {
             let (current, mode) = match read_current(root, MANIFEST_PATH) {
                 OnDisk::Linked(_) => {
                     return Err(std::io::Error::other(format!(
@@ -317,12 +320,25 @@ impl Manifest {
                         "{MANIFEST_PATH} cannot be read as text; delete it to start again"
                     )));
                 }
-                OnDisk::Absent => (None, Publish::Create),
+                // A swap in flight also leaves the path absent. Building from
+                // nothing then would erase the history, so wait for it.
+                OnDisk::Absent => match claim_in_flight(&path) {
+                    Some(held) if attempt == SWAP_ATTEMPTS => {
+                        return Err(std::io::Error::other(format!(
+                            "an interrupted upgrade left {} in place of {MANIFEST_PATH}; \
+                             rename it back, or delete it to start again",
+                            held.display()
+                        )));
+                    }
+                    Some(_) => {
+                        back_off(attempt);
+                        continue;
+                    }
+                    None => (None, Publish::Create),
+                },
                 OnDisk::Text(text) => (Self::parse(&text), Publish::Swap(text)),
             };
-            let Some(next) = change(current) else {
-                return Err(std::io::Error::other("nothing to write"));
-            };
+            let next = change(current);
             let rendered = next.render();
             // An identical rewrite would only touch the mtime.
             if matches!(&mode, Publish::Swap(text) if normalize(text) == normalize(&rendered)) {
@@ -333,7 +349,7 @@ impl Manifest {
             }
             match publish(&path, &rendered, mode) {
                 Ok(()) => return Ok(next),
-                Err(PublishError::Moved(_)) => {}
+                Err(PublishError::Moved(_)) => back_off(attempt),
                 Err(PublishError::Failed(error)) => return Err(std::io::Error::other(error)),
             }
         }
@@ -341,6 +357,25 @@ impl Manifest {
             "{MANIFEST_PATH} kept changing; gave up after {SWAP_ATTEMPTS} tries"
         )))
     }
+}
+
+/// Wait a little longer after each lost swap, so writers stop colliding.
+fn back_off(attempt: u32) {
+    std::thread::sleep(std::time::Duration::from_millis(5) * attempt);
+}
+
+/// A claim that a swap holds beside `path`, if one exists.
+fn claim_in_flight(path: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(path.parent()?)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|held| {
+            held.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with(CLAIM_PREFIX) && name.ends_with(CLAIM_SUFFIX)
+            })
+        })
 }
 
 /// Why a file cannot be written without a human looking at it.
@@ -1154,14 +1189,14 @@ pub fn accept(root: &Path, paths: &[String]) -> Result<Manifest, String> {
         });
         manifest.options = options;
         manifest.pinned.extend(paths.iter().cloned());
-        Some(manifest)
+        manifest
     })
     .map_err(|error| format!("could not write {MANIFEST_PATH}: {error}"))
 }
 
 /// Write the additions and updates in `report`, then refresh the manifest.
 ///
-/// Each file is re-read immediately before it is written and compared against
+/// Each file is re-read before it is written and compared against
 /// what the plan was computed from. A file something else changed in between —
 /// a formatter, a code generator, an editor saving — is refused rather than
 /// overwritten with a decision made about different bytes. `report.outcome` is
@@ -1224,7 +1259,7 @@ fn record_baseline(report: &ScaffoldReport) -> Result<(), String> {
         return Ok(());
     }
     Manifest::update(&report.root, |previous| {
-        Some(report.next_manifest(previous.as_ref()))
+        report.next_manifest(previous.as_ref())
     })
     .map(drop)
     .map_err(|error| {
@@ -1238,10 +1273,8 @@ fn record_baseline(report: &ScaffoldReport) -> Result<(), String> {
 
 /// Write one entry, refusing to clobber anything that moved since the plan.
 ///
-/// The re-read is not belt-and-braces. The plan is a decision made about bytes
-/// read earlier, and between then and now a formatter, a code generator, an
-/// editor autosave, or a second `autumn upgrade` can have replaced them. Writing
-/// anyway would silently revert whatever landed in that window.
+/// The early re-read gives a clear error. [`Publish::Swap`] then checks the
+/// text again at the moment of the swap, so a later change is refused too.
 ///
 /// Written through a temporary file in the same directory and renamed into
 /// place, the way the app-code half of this command writes: a truncate-in-place
@@ -1292,8 +1325,8 @@ fn write_one(entry: &Entry) -> Result<(), String> {
 enum Publish {
     /// The path was empty when the plan was made and must still be empty.
     Create,
-    /// The path held exactly this text (line endings normalised) when the plan
-    /// was made, and must still hold it at the moment of the swap.
+    /// The path held this text (line endings ignored) at plan time. It must
+    /// hold it at swap time.
     Swap(String),
 }
 
@@ -1334,11 +1367,11 @@ impl std::fmt::Display for PublishError {
 /// concurrent `autumn upgrade --apply` — defeating the very race protection
 /// staging exists for. The cost is that a hard crash can leave one
 /// `.autumn-upgrade-*.tmp` behind; it is inert, and never blocks a later run.
+/// A crash inside a swap can leave `.autumn-upgrade-*.old`: the old file. Rename
+/// it back.
 ///
-/// [`Publish::Create`] publishes without replacing, because `rename` *does*
-/// replace its destination on Unix. The plan's re-read happens before the bytes
-/// are written and synced, so a file another process creates inside that window
-/// would be silently clobbered by the very step that advertises it will not.
+/// [`Publish::Create`] never replaces. `rename` replaces on Unix, so a file
+/// created while staging would be lost.
 ///
 /// [`Publish::Swap`] is a compare-and-swap: it replaces the destination only
 /// if it still holds the planned text, and refuses with [`PublishError::Moved`]
@@ -1367,10 +1400,7 @@ fn publish(absolute: &Path, contents: &str, mode: Publish) -> Result<(), Publish
                 .open(path)
         })?;
 
-    // A file that is really there keeps the mode it already has; anything else
-    // is genuinely new and keeps the umask-derived mode it was just created
-    // with. Keyed on what is on disk rather than on `mode`, which says whether
-    // replacing is *allowed*, not whether there is anything to replace.
+    // An existing file keeps its mode. A new file keeps the umask mode.
     if let Ok(metadata) = std::fs::metadata(absolute) {
         let _ = temp.as_file().set_permissions(metadata.permissions());
     }
@@ -1402,13 +1432,13 @@ fn publish(absolute: &Path, contents: &str, mode: Publish) -> Result<(), Publish
     Ok(())
 }
 
-/// Compare-and-swap: take the destination only if it still holds `expected`.
+/// Compare-and-swap: replace the destination only if it still holds `expected`.
 ///
-/// The destination is first claimed by renaming it aside, which is atomic and
-/// hands this process the exact file that was there. Only then is it compared.
-/// A mismatch puts it back without replacing anything newer. For a moment the
-/// path is absent, so a reader sees no file and a writer that creates one is
-/// not overwritten: the staged file is linked in without replacing.
+/// First rename the destination aside. This is atomic and gives this process
+/// the exact file. Then compare it. On a mismatch, put it back, unless a newer
+/// file took its place. While the path is absent, a new writer is not
+/// overwritten, because the staged file is linked in without replacing.
+/// [`claim_in_flight`] lets readers see this window.
 fn swap(
     temp: tempfile::NamedTempFile,
     absolute: &Path,
@@ -1418,8 +1448,8 @@ fn swap(
         .parent()
         .ok_or_else(|| PublishError::Failed("no parent directory".to_owned()))?;
     let claim = tempfile::Builder::new()
-        .prefix(".autumn-upgrade-")
-        .suffix(".old")
+        .prefix(CLAIM_PREFIX)
+        .suffix(CLAIM_SUFFIX)
         .tempfile_in(directory)?
         .into_temp_path();
     match std::fs::rename(absolute, &claim) {
@@ -1432,11 +1462,12 @@ fn swap(
         Err(error) => return Err(error.into()),
     }
 
-    let held = std::fs::symlink_metadata(&claim).is_ok_and(|meta| !meta.file_type().is_symlink())
+    // Only a plain file is read: a FIFO or device would block.
+    let held = std::fs::symlink_metadata(&claim).is_ok_and(|meta| meta.file_type().is_file())
         && read_text(&claim).is_some_and(|text| text == normalize(expected));
     if !held {
-        // Not the file that was planned: give it back, and keep it if something
-        // newer has taken its place.
+        // Wrong file. Put it back. If a newer file is there, keep the old copy
+        // beside it and say where.
         return Err(match claim.persist_noclobber(absolute) {
             Ok(()) => PublishError::Moved(
                 "this file changed after the preview was computed; \
@@ -1466,9 +1497,11 @@ fn swap(
             ))
         }
         Err(error) => {
-            // Put the planned file back; the path may be taken, and then theirs
-            // stands.
-            let _ = claim.persist_noclobber(absolute);
+            // Restore the old file. If the path is taken, the new file stays
+            // and the old copy is kept beside it.
+            if let Err(restore) = claim.persist_noclobber(absolute) {
+                let _ = restore.path.keep();
+            }
             Err(error.error.into())
         }
     }
@@ -2821,7 +2854,7 @@ mod tests {
                 fs::write(root.join(MANIFEST_PATH), theirs.render()).unwrap();
             }
             manifest.pinned.insert("build.rs".to_owned());
-            Some(manifest)
+            manifest
         })
         .expect("update");
         assert_eq!(runs, 2);
@@ -2842,12 +2875,32 @@ mod tests {
             theirs.pinned.insert(format!("racer-{runs}"));
             fs::write(root.join(MANIFEST_PATH), theirs.render()).unwrap();
             manifest.pinned.insert("mine".to_owned());
-            Some(manifest)
+            manifest
         })
         .expect_err("must stop");
         assert_eq!(runs, SWAP_ATTEMPTS);
         assert!(error.to_string().contains("changing"), "{error}");
         assert!(!Manifest::load(tmp.path()).unwrap().pinned.contains("mine"));
+    }
+
+    #[test]
+    fn an_update_never_builds_from_nothing_while_a_claim_is_in_flight() {
+        // A swap in progress leaves the manifest path absent. Reading that as
+        // "no manifest" would publish a blank one and erase the history.
+        let tmp = scaffolded(GenerateOptions::default());
+        let manifest_path = tmp.path().join(MANIFEST_PATH);
+        let held = manifest_path.with_file_name(".autumn-upgrade-claim.old");
+        fs::rename(&manifest_path, &held).unwrap();
+
+        let mut runs = 0;
+        let error = Manifest::update(tmp.path(), |current| {
+            runs += 1;
+            current.unwrap_or_else(|| panic!("built from nothing"))
+        })
+        .expect_err("must not build from nothing");
+        assert!(error.to_string().contains("interrupted"), "{error}");
+        assert_eq!(runs, 0);
+        assert!(held.exists(), "the held copy is never deleted");
     }
 
     #[test]
@@ -2869,6 +2922,9 @@ mod tests {
             let pinned = Manifest::load(tmp.path()).unwrap().pinned;
             assert!(pinned.contains("Dockerfile"), "{pinned:?}");
             assert!(pinned.contains("build.rs"), "{pinned:?}");
+            let kept = Manifest::load(tmp.path()).unwrap();
+            assert!(kept.version.is_some(), "the baseline survives");
+            assert!(!kept.digests.is_empty(), "the digests survive");
             assert!(no_scratch_beside(&root.join(MANIFEST_PATH)));
         }
     }
