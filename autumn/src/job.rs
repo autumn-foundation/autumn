@@ -3104,16 +3104,14 @@ async fn run_job_handler_inner(
     // itself only ever sees the caller's original args, and make a
     // `JobContext` ambient for the duration of execution so `ctx.set_progress`
     // works from anywhere inside the handler.
-    let ctx = match &tracked_key {
-        Some(key) => match crate::job_tracking::tracking_store_from_state(&state) {
-            Some(store) => {
-                let _ = store.mark_running(key).await;
-                crate::job_tracking::JobContext::tracked(key.clone(), store)
-            }
-            None => crate::job_tracking::JobContext::none(),
-        },
-        None => crate::job_tracking::JobContext::none(),
-    };
+    let tracked = tracked_key.as_ref().and_then(|key| {
+        crate::job_tracking::tracking_store_from_state(&state).map(|store| (store, key.clone()))
+    });
+    let ctx = tracked
+        .as_ref()
+        .map_or_else(crate::job_tracking::JobContext::none, |(store, key)| {
+            crate::job_tracking::JobContext::tracked(key.clone(), store.clone())
+        });
     let signals = crate::job_tracking::RunSignals::default();
     let ctx = ctx.with_run(signals.clone());
 
@@ -3163,6 +3161,13 @@ async fn run_job_handler_inner(
                 ctx.clone(),
                 crate::events::scope_event_app(event_app, execution),
             );
+            // Inside the bound, so a stalled store counts toward the job timeout.
+            let scoped = async move {
+                if let Some((store, key)) = tracked {
+                    let _ = store.mark_running(&key).await;
+                }
+                scoped.await
+            };
             match bound_run(scoped, &bounds, &signals).await {
                 BoundedRun::Finished(Ok(Ok(()))) => JobExecutionOutcome::Succeeded,
                 // `message`, not `Display`: this string is persisted in a
@@ -3184,22 +3189,32 @@ async fn run_job_handler_inner(
     };
 
     if tracked_key.is_some() {
-        match &outcome {
-            JobExecutionOutcome::Succeeded => ctx.settle_success().await,
-            // Panics always dead-letter regardless of remaining attempts
-            // (matching every backend's worker loop), so they are always
-            // terminal for tracking purposes too.
-            JobExecutionOutcome::Panicked(_) => {
-                ctx.settle_failure(crate::job_tracking::GENERIC_FAILURE_MESSAGE)
-                    .await;
+        let settle = async {
+            match &outcome {
+                JobExecutionOutcome::Succeeded => ctx.settle_success().await,
+                // Panics always dead-letter regardless of remaining attempts
+                // (matching every backend's worker loop), so they are always
+                // terminal for tracking purposes too.
+                JobExecutionOutcome::Panicked(_) => {
+                    ctx.settle_failure(crate::job_tracking::GENERIC_FAILURE_MESSAGE)
+                        .await;
+                }
+                JobExecutionOutcome::Failed(_) if final_attempt => {
+                    ctx.settle_failure(crate::job_tracking::GENERIC_FAILURE_MESSAGE)
+                        .await;
+                }
+                // A retry is pending, or another worker owns the job now. Leave
+                // the record running so progress persists across attempts.
+                JobExecutionOutcome::Failed(_) | JobExecutionOutcome::LeaseLost => {}
             }
-            JobExecutionOutcome::Failed(_) if final_attempt => {
-                ctx.settle_failure(crate::job_tracking::GENERIC_FAILURE_MESSAGE)
-                    .await;
-            }
-            // A retry is pending, or another worker owns the job now. Leave
-            // the record running so progress persists across attempts.
-            JobExecutionOutcome::Failed(_) | JobExecutionOutcome::LeaseLost => {}
+        };
+        // A stalled store must not hold the worker. The record expires by TTL.
+        if tokio::time::timeout(crate::job_tracking::TRACKING_SETTLE_CAP, settle)
+            .await
+            .is_err()
+        {
+            let cap_ms = crate::job_tracking::TRACKING_SETTLE_CAP.as_millis();
+            tracing::warn!(job = name, cap_ms, "tracking settle timed out");
         }
     }
 
@@ -26326,6 +26341,13 @@ mod lease_tests {
         Box::pin(hang_and_watch(&LEASE_SEEN))
     }
 
+    fn boom_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move { panic!("boom") })
+    }
+
     fn quick_handler(
         _state: AppState,
         _payload: Value,
@@ -26358,6 +26380,279 @@ mod lease_tests {
             1,
             "timeout, not lease loss"
         );
+    }
+
+    /// A tracking store whose chosen calls never return (issue #3151).
+    struct StalledTrackingStore {
+        stall_mark_running: bool,
+        stall_settle: bool,
+    }
+
+    impl crate::job_tracking::JobTrackingStore for StalledTrackingStore {
+        fn create<'a>(
+            &'a self,
+            _key: &'a str,
+            _owner: crate::job_tracking::TrackedJobOwner,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn mark_running<'a>(
+            &'a self,
+            _key: &'a str,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
+            let stall = self.stall_mark_running;
+            Box::pin(async move {
+                if stall {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            })
+        }
+
+        fn set_progress<'a>(
+            &'a self,
+            _key: &'a str,
+            _pct: u8,
+            _message: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn complete<'a>(
+            &'a self,
+            _key: &'a str,
+            _result: Value,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
+            let stall = self.stall_settle;
+            Box::pin(async move {
+                if stall {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            })
+        }
+
+        fn fail<'a>(
+            &'a self,
+            _key: &'a str,
+            _error: String,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
+            let stall = self.stall_settle;
+            Box::pin(async move {
+                if stall {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            })
+        }
+
+        fn get<'a>(
+            &'a self,
+            _key: &'a str,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = AutumnResult<Option<crate::job_tracking::TrackedJobRecord>>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn reset_for_retry<'a>(
+            &'a self,
+            _key: &'a str,
+            _owner: crate::job_tracking::TrackedJobOwner,
+            _expected_updated_at: chrono::DateTime<chrono::Utc>,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unstalled_store_answers_every_call() {
+        use crate::job_tracking::{JobTrackingStore as _, TrackedJobOwner};
+        let store = StalledTrackingStore {
+            stall_mark_running: false,
+            stall_settle: false,
+        };
+        store.create("k", TrackedJobOwner::Anonymous).await.unwrap();
+        store.mark_running("k").await.unwrap();
+        store.set_progress("k", 5, None).await.unwrap();
+        store.complete("k", Value::Null).await.unwrap();
+        store.fail("k", "e".to_owned()).await.unwrap();
+        assert!(store.get("k").await.unwrap().is_none());
+        store
+            .reset_for_retry("k", TrackedJobOwner::Anonymous, chrono::Utc::now())
+            .await
+            .unwrap();
+    }
+
+    /// Run a tracked job against `store`. The run must end within a long
+    /// virtual deadline, or the test fails.
+    async fn run_tracked(
+        store: StalledTrackingStore,
+        handler: JobHandler,
+        final_attempt: bool,
+        timeout: Option<Duration>,
+    ) -> JobExecutionOutcome {
+        let state = AppState::for_test().with_profile("dev");
+        state.insert_extension(crate::job_tracking::JobTrackingStoreEntry(Arc::new(store)));
+        let payload =
+            crate::job_tracking::wrap_tracked_payload("tracked-key", &serde_json::json!({}));
+        tokio::time::timeout(
+            Duration::from_secs(3600),
+            run_job_handler(
+                "tracked",
+                handler,
+                state,
+                payload,
+                final_attempt,
+                ExecutionBounds {
+                    timeout,
+                    lease_lost: None,
+                },
+                crate::cost::WorkRun::default(),
+            ),
+        )
+        .await
+        .expect("a stalled tracking store must not hold the worker")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_mark_running_counts_toward_the_timeout() {
+        let outcome = run_tracked(
+            StalledTrackingStore {
+                stall_mark_running: true,
+                stall_settle: false,
+            },
+            quick_handler,
+            false,
+            Some(Duration::from_millis(250)),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            JobExecutionOutcome::Failed("job timed out after 250ms".to_owned())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_success_settle_is_capped() {
+        let outcome = run_tracked(
+            StalledTrackingStore {
+                stall_mark_running: false,
+                stall_settle: true,
+            },
+            quick_handler,
+            true,
+            Some(Duration::from_millis(250)),
+        )
+        .await;
+        assert_eq!(outcome, JobExecutionOutcome::Succeeded);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_failure_settle_is_capped() {
+        let outcome = run_tracked(
+            StalledTrackingStore {
+                stall_mark_running: false,
+                stall_settle: true,
+            },
+            timeout_watch_handler,
+            true,
+            Some(Duration::from_millis(250)),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            JobExecutionOutcome::Failed("job timed out after 250ms".to_owned())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_settle_ends_at_the_cap_even_with_a_longer_timeout() {
+        let start = tokio::time::Instant::now();
+        let outcome = run_tracked(
+            StalledTrackingStore {
+                stall_mark_running: false,
+                stall_settle: true,
+            },
+            quick_handler,
+            true,
+            Some(Duration::from_secs(600)),
+        )
+        .await;
+        assert_eq!(outcome, JobExecutionOutcome::Succeeded);
+        assert_eq!(start.elapsed(), crate::job_tracking::TRACKING_SETTLE_CAP);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_settle_ends_at_the_cap_with_no_timeout() {
+        let start = tokio::time::Instant::now();
+        let outcome = run_tracked(
+            StalledTrackingStore {
+                stall_mark_running: false,
+                stall_settle: true,
+            },
+            boom_handler,
+            false,
+            None,
+        )
+        .await;
+        assert!(matches!(outcome, JobExecutionOutcome::Panicked(_)));
+        assert_eq!(start.elapsed(), crate::job_tracking::TRACKING_SETTLE_CAP);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_terminal_write_outside_the_handler_is_capped() {
+        let state = AppState::for_test().with_profile("dev");
+        state.insert_extension(crate::job_tracking::JobTrackingStoreEntry(Arc::new(
+            StalledTrackingStore {
+                stall_mark_running: false,
+                stall_settle: true,
+            },
+        )));
+        let payload =
+            crate::job_tracking::wrap_tracked_payload("tracked-key", &serde_json::json!({}));
+        let start = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(3600),
+            crate::job_tracking::settle_tracked_payload_as_failed(&state, &payload, "cancelled"),
+        )
+        .await
+        .expect("a stalled tracking store must not hold the caller");
+        assert_eq!(start.elapsed(), crate::job_tracking::TRACKING_SETTLE_CAP);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_lease_stops_a_stalled_mark_running() {
+        let lost = tokio_util::sync::CancellationToken::new();
+        let state = AppState::for_test().with_profile("dev");
+        state.insert_extension(crate::job_tracking::JobTrackingStoreEntry(Arc::new(
+            StalledTrackingStore {
+                stall_mark_running: true,
+                stall_settle: false,
+            },
+        )));
+        let payload =
+            crate::job_tracking::wrap_tracked_payload("tracked-key", &serde_json::json!({}));
+        let run = tokio::spawn(run_job_handler(
+            "tracked",
+            quick_handler,
+            state,
+            payload,
+            false,
+            ExecutionBounds {
+                timeout: None,
+                lease_lost: Some(lost.clone()),
+            },
+            crate::cost::WorkRun::default(),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        lost.cancel();
+        assert_eq!(run.await.expect("run task"), JobExecutionOutcome::LeaseLost);
     }
 
     #[tokio::test(start_paused = true)]

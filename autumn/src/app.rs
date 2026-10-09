@@ -3543,6 +3543,8 @@ impl AppBuilder {
     /// developer error.
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::cognitive_complexity)]
+    // Large frame is expected: the caller boxes this long-lived future.
+    #[allow(clippy::large_stack_frames)]
     pub async fn run(self) {
         // Remember the binary this process was started from, before a deploy
         // can replace the file underneath it: an in-place upgrade (#1674) execs
