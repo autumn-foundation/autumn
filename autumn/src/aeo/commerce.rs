@@ -209,23 +209,23 @@ pub fn unmatchable_route(route: &PaidRoute) -> Option<String> {
 
 /// `true` when two route templates name the same route: the same literal
 /// segments, and a capture (any name) or a catch-all at the same places.
-fn same_template(a: &str, b: &str) -> bool {
-    let kind = |s: &str| {
-        if s.starts_with("{*") && s.ends_with('}') {
+fn same_template(left: &str, right: &str) -> bool {
+    let kind = |segment: &str| {
+        if segment.starts_with("{*") && segment.ends_with('}') {
             "*"
-        } else if s.starts_with('{') && s.ends_with('}') {
+        } else if segment.starts_with('{') && segment.ends_with('}') {
             "{}"
         } else {
             ""
         }
     };
-    let (mut x, mut y) = (normalize(a).split('/'), normalize(b).split('/'));
+    let mut lhs = normalize(left).split('/');
+    let mut rhs = normalize(right).split('/');
     loop {
-        match (x.next(), y.next()) {
+        match (lhs.next(), rhs.next()) {
             (None, None) => return true,
-            (Some(p), Some(q)) => {
-                let (kp, kq) = (kind(p), kind(q));
-                if kp != kq || (kp.is_empty() && p != q) {
+            (Some(l), Some(r)) => {
+                if kind(l) != kind(r) || (kind(l).is_empty() && l != r) {
                     return false;
                 }
             }
