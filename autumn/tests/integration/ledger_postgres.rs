@@ -925,3 +925,134 @@ async fn soft_delete_appends_a_revision_and_the_chain_index_refuses_a_fork() {
     .await;
     assert!(forked.is_err(), "the chain unique index must refuse a fork");
 }
+
+// ── #2319: has_many(through) into a ledgered join table ─────────────
+
+diesel::table! {
+    test_ledger_link_posts (id) {
+        id -> Int8,
+        title -> Text,
+    }
+}
+
+diesel::table! {
+    ledger_link_tags (id) {
+        id -> Int8,
+        name -> Text,
+    }
+}
+
+#[autumn_web::model(table = "ledger_link_tags")]
+pub struct LedgerLinkTag {
+    #[id]
+    pub id: i64,
+    pub name: String,
+}
+
+#[autumn_web::repository(LedgerLinkTag, table = "ledger_link_tags")]
+pub trait LedgerLinkTagRepository {}
+
+#[autumn_web::model(table = "test_ledger_link_posts")]
+#[has_many(
+    LedgerLinkTag,
+    through = test_ledger_post_tags,
+    name = tags,
+    fk = post_id,
+    target_fk = tag_id,
+    helper = tag
+)]
+pub struct LedgerLinkPost {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(LedgerLinkPost, table = "test_ledger_link_posts")]
+pub trait LedgerLinkPostRepository {}
+
+/// The ledgered join table. Its own module: the `has_many(through)` macro
+/// declares a hidden table of the same name in the parent scope.
+mod link_rows {
+    diesel::table! {
+        test_ledger_post_tags (id) {
+            id -> Int8,
+            post_id -> Int8,
+            tag_id -> Int8,
+            deleted_at -> Nullable<Timestamp>,
+        }
+    }
+
+    #[autumn_web::model(table = "test_ledger_post_tags")]
+    pub struct LedgerPostTag {
+        #[id]
+        pub id: i64,
+        pub post_id: i64,
+        pub tag_id: i64,
+        #[default]
+        pub deleted_at: Option<chrono::NaiveDateTime>,
+    }
+
+    #[autumn_web::repository(
+        LedgerPostTag,
+        table = "test_ledger_post_tags",
+        soft_delete,
+        ledgered = true
+    )]
+    pub trait LedgerPostTagRepository {}
+}
+
+/// `add_*` / `remove_*` / `set_*` write the join table with raw SQL, which
+/// records no revision. On a ledgered join table they are refused.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_link_write_into_a_ledgered_join_table_is_refused() {
+    let (pool, _container) = setup_pool().await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute(
+            "CREATE TABLE test_ledger_link_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL);
+             CREATE TABLE ledger_link_tags (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL);
+             CREATE TABLE test_ledger_post_tags (
+                 id BIGSERIAL PRIMARY KEY,
+                 post_id BIGINT NOT NULL,
+                 tag_id BIGINT NOT NULL,
+                 deleted_at TIMESTAMP,
+                 UNIQUE (post_id, tag_id)
+             );",
+        )
+        .await
+        .expect("link tables");
+    }
+    let posts = PgLedgerLinkPostRepository::with_pool_untracked(pool.clone());
+    let tags = PgLedgerLinkTagRepository::with_pool_untracked(pool.clone());
+    let links = link_rows::PgLedgerPostTagRepository::with_pool_untracked(pool);
+    let post = posts
+        .save(&NewLedgerLinkPost {
+            title: "p".to_string(),
+        })
+        .await
+        .expect("post");
+    let tag = tags
+        .save(&NewLedgerLinkTag {
+            name: "t".to_string(),
+        })
+        .await
+        .expect("tag");
+
+    let refused = |err: &autumn_web::AutumnError| match err
+        .downcast_chain_ref::<autumn_web::ledger::LedgerError>()
+    {
+        Some(autumn_web::ledger::LedgerError::OutOfBandWrite { table, path }) => {
+            assert_eq!(table, "test_ledger_post_tags");
+            assert_eq!(*path, "has_many through");
+        }
+        other => panic!("expected OutOfBandWrite, got {other:?}"),
+    };
+    refused(&posts.add_tag(post.id, tag.id).await.expect_err("add"));
+    refused(&posts.remove_tag(post.id, tag.id).await.expect_err("remove"));
+    refused(&posts.set_tags(post.id, &[tag.id]).await.expect_err("set"));
+    {
+        use link_rows::LedgerPostTagRepository as _;
+        assert!(links.find_all().await.expect("list").is_empty());
+    }
+}

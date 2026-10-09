@@ -733,21 +733,143 @@ pub fn verify_chain_with_high_water(
     live: LedgerLiveState,
     high_water: LedgerHighWaterState<'_>,
 ) -> LedgerVerification {
-    let checked = revisions.len();
-    let broken = first_break(revisions)
-        .or_else(|| high_water_break(revisions, high_water))
-        .or_else(|| live_state_break(revisions, live))
-        .or_else(|| recorded_at_break(revisions));
-    let head_hash = if broken.is_none() {
-        revisions.last().map(|r| r.hash.clone())
-    } else {
+    let mut verifier = LedgerChainVerifier::new(record_id);
+    for revision in revisions {
+        verifier.push(revision);
+    }
+    verifier.finish(live, high_water)
+}
+
+/// The fields of a revision that verification keeps after it moves on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChainTip {
+    id: i64,
+    seq: i64,
+    hash: String,
+    recorded_at: DateTime<Utc>,
+}
+
+impl ChainTip {
+    fn of(revision: &LedgerRevision) -> Self {
+        Self {
+            id: revision.id,
+            seq: revision.seq,
+            hash: revision.hash.clone(),
+            recorded_at: revision.recorded_at,
+        }
+    }
+}
+
+/// Verify a chain one revision at a time (#2319).
+///
+/// Gives the same report as [`verify_chain_with_high_water`], but keeps only
+/// the newest revision's hash, so a long chain can be read in pages. Push the
+/// revisions in ascending `seq` order, then call [`finish`](Self::finish).
+#[derive(Debug, Clone)]
+pub struct LedgerChainVerifier {
+    record_id: i64,
+    checked: usize,
+    expected_seq: i64,
+    head: Option<ChainTip>,
+    chain_break: Option<LedgerBreakReport>,
+    time_break: Option<LedgerBreakReport>,
+}
+
+impl LedgerChainVerifier {
+    /// Start verifying `record_id`'s chain.
+    #[must_use]
+    pub const fn new(record_id: i64) -> Self {
+        Self {
+            record_id,
+            checked: 0,
+            expected_seq: 1,
+            head: None,
+            chain_break: None,
+            time_break: None,
+        }
+    }
+
+    /// Check the next revision of the chain.
+    pub fn push(&mut self, revision: &LedgerRevision) {
+        self.checked += 1;
+        if self.chain_break.is_none() {
+            self.chain_break = self.structural_break(revision);
+        }
+        if self.time_break.is_none() {
+            self.time_break = self
+                .head
+                .as_ref()
+                .and_then(|previous| recorded_at_break(previous, revision));
+        }
+        self.head = Some(ChainTip::of(revision));
+    }
+
+    /// Sequence number of the last revision pushed.
+    #[must_use]
+    pub fn head_seq(&self) -> Option<i64> {
+        self.head.as_ref().map(|head| head.seq)
+    }
+
+    /// Finish the walk and report the first broken link.
+    ///
+    /// See [`verify_chain_with_high_water`] for the order of the checks.
+    #[must_use]
+    pub fn finish(
+        self,
+        live: LedgerLiveState,
+        high_water: LedgerHighWaterState<'_>,
+    ) -> LedgerVerification {
+        let Self {
+            record_id,
+            checked,
+            head,
+            chain_break,
+            time_break,
+            ..
+        } = self;
+        let broken = chain_break
+            .or_else(|| high_water_break(head.as_ref(), high_water))
+            .or_else(|| live_state_break(head.as_ref(), live))
+            .or(time_break);
+        let head_hash = if broken.is_none() {
+            head.map(|tip| tip.hash)
+        } else {
+            None
+        };
+        LedgerVerification {
+            record_id,
+            revisions_checked: checked,
+            head_hash,
+            broken,
+        }
+    }
+
+    /// The first sequence or link break at `revision`, if any.
+    fn structural_break(&mut self, revision: &LedgerRevision) -> Option<LedgerBreakReport> {
+        if revision.seq != self.expected_seq {
+            return Some(sequence_break(
+                revision,
+                self.expected_seq,
+                self.head.is_none(),
+            ));
+        }
+        if let Some(report) = link_break(revision, self.head.as_ref()) {
+            return Some(report);
+        }
+        let Some(next_seq) = revision.seq.checked_add(1) else {
+            // Saturating here would make two consecutive `i64::MAX` rows look
+            // contiguous, hiding an inserted revision behind an overflow.
+            return Some(LedgerBreakReport {
+                seq: revision.seq,
+                revision_id: Some(revision.id),
+                kind: LedgerBreak::UnusableSeq,
+                detail: "sequence number is at i64::MAX and cannot be followed; \
+                         the chain cannot be continued or checked past this revision"
+                    .to_owned(),
+            });
+        };
+        self.expected_seq = next_seq;
         None
-    };
-    LedgerVerification {
-        record_id,
-        revisions_checked: checked,
-        head_hash,
-        broken,
     }
 }
 
@@ -763,7 +885,7 @@ pub fn verify_chain_with_high_water(
 /// which. That is what keeps the mark from being a second thing to forge
 /// silently.
 fn high_water_break(
-    revisions: &[LedgerRevision],
+    head: Option<&ChainTip>,
     high_water: LedgerHighWaterState<'_>,
 ) -> Option<LedgerBreakReport> {
     let high_water = match high_water {
@@ -772,7 +894,7 @@ fn high_water_break(
         LedgerHighWaterState::Absent => None,
         LedgerHighWaterState::Present(mark) => Some(mark),
     };
-    match (revisions.last(), high_water) {
+    match (head, high_water) {
         // No chain and no mark: a record that was never written, or one that
         // predates the day its model was ledgered. Not an accusation — see
         // `live_state_break` for why that false positive matters.
@@ -805,7 +927,7 @@ fn high_water_break(
 }
 
 /// Compare a non-empty chain's head revision with its mark.
-fn head_versus_mark(head: &LedgerRevision, mark: &LedgerHighWater) -> Option<LedgerBreakReport> {
+fn head_versus_mark(head: &ChainTip, mark: &LedgerHighWater) -> Option<LedgerBreakReport> {
     if mark.seq > head.seq {
         // Saturating is safe: `first_break` already refused a chain whose head
         // sits at `i64::MAX`, so `head.seq + 1` cannot wrap here.
@@ -853,10 +975,7 @@ fn head_versus_mark(head: &LedgerRevision, mark: &LedgerHighWater) -> Option<Led
 ///
 /// Runs only after the chain itself verifies, so a mismatch here always means
 /// the *end* of the history is missing rather than its middle being edited.
-fn live_state_break(
-    revisions: &[LedgerRevision],
-    live: LedgerLiveState,
-) -> Option<LedgerBreakReport> {
+fn live_state_break(head: Option<&ChainTip>, live: LedgerLiveState) -> Option<LedgerBreakReport> {
     // An empty chain is never a break, whatever the live row says.
     //
     // A record may simply never have been written, or may predate the day its model was
@@ -871,7 +990,7 @@ fn live_state_break(
     // outside the deletable rows and survives the erasure, so a chain with a mark and no
     // revisions is reported while one with neither stays silent. `revisions_checked == 0`
     // on the report is still what makes the empty case visible to a caller that cares.
-    let head = revisions.last()?;
+    let head = head?;
 
     match live {
         LedgerLiveState::NotChecked | LedgerLiveState::Matches => None,
@@ -899,7 +1018,7 @@ fn live_state_break(
     }
 }
 
-/// Report the first link along which transaction time moves backwards.
+/// Report a step where transaction time moves backwards between two neighbours.
 ///
 /// Reported **last**, after the structural, high-water and live-state checks,
 /// and that ordering is deliberate. A chain written by a pre-#2323 writer — from
@@ -912,52 +1031,18 @@ fn live_state_break(
 ///
 /// Valid time is deliberately not checked: a back-dated correction is the whole
 /// point of the second axis.
-fn recorded_at_break(revisions: &[LedgerRevision]) -> Option<LedgerBreakReport> {
-    revisions.windows(2).find_map(|pair| {
-        let [previous, revision] = pair else {
-            return None;
-        };
-        (revision.recorded_at < previous.recorded_at).then(|| LedgerBreakReport {
-            seq: revision.seq,
-            revision_id: Some(revision.id),
-            kind: LedgerBreak::RecordedAtRegression,
-            detail: format!(
-                "revision {} was recorded before revision {}, which precedes it in the \
-                 chain; transaction time cannot move backwards along a chain a post-#2323 \
-                 writer produced",
-                revision.seq, previous.seq
-            ),
-        })
+fn recorded_at_break(previous: &ChainTip, revision: &LedgerRevision) -> Option<LedgerBreakReport> {
+    (revision.recorded_at < previous.recorded_at).then(|| LedgerBreakReport {
+        seq: revision.seq,
+        revision_id: Some(revision.id),
+        kind: LedgerBreak::RecordedAtRegression,
+        detail: format!(
+            "revision {} was recorded before revision {}, which precedes it in the \
+             chain; transaction time cannot move backwards along a chain a post-#2323 \
+             writer produced",
+            revision.seq, previous.seq
+        ),
     })
-}
-
-fn first_break(revisions: &[LedgerRevision]) -> Option<LedgerBreakReport> {
-    let mut expected_seq: i64 = 1;
-    let mut prev: Option<&LedgerRevision> = None;
-
-    for revision in revisions {
-        if revision.seq != expected_seq {
-            return Some(sequence_break(revision, expected_seq, prev.is_none()));
-        }
-        if let Some(report) = link_break(revision, prev) {
-            return Some(report);
-        }
-        let Some(next_seq) = revision.seq.checked_add(1) else {
-            // Saturating here would make two consecutive `i64::MAX` rows look
-            // contiguous, hiding an inserted revision behind an overflow.
-            return Some(LedgerBreakReport {
-                seq: revision.seq,
-                revision_id: Some(revision.id),
-                kind: LedgerBreak::UnusableSeq,
-                detail: "sequence number is at i64::MAX and cannot be followed; \
-                         the chain cannot be continued or checked past this revision"
-                    .to_owned(),
-            });
-        };
-        expected_seq = next_seq;
-        prev = Some(revision);
-    }
-    None
 }
 
 /// Classify a sequence number that is not the one the chain expected.
@@ -999,10 +1084,7 @@ fn sequence_break(
 }
 
 /// Check one revision's own hash and its link to `prev`.
-fn link_break(
-    revision: &LedgerRevision,
-    prev: Option<&LedgerRevision>,
-) -> Option<LedgerBreakReport> {
+fn link_break(revision: &LedgerRevision, prev: Option<&ChainTip>) -> Option<LedgerBreakReport> {
     if revision.compute_hash() != revision.hash {
         return Some(LedgerBreakReport {
             seq: revision.seq,
@@ -1335,6 +1417,104 @@ pub fn diff_as_of(
     }
 }
 
+// ── Paginated chain reads (#2319) ────────────────────────────────────
+
+/// Position after a revision, for keyset pagination.
+///
+/// Holds `seq` and `id`: a forged revision can repeat a `seq`, and a cursor on
+/// `seq` alone would skip it at a page edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LedgerCursor {
+    /// Sequence number of the last revision read.
+    pub seq: i64,
+    /// Primary key of the last revision read.
+    pub id: i64,
+}
+
+impl LedgerCursor {
+    /// The cursor that follows `revision`.
+    #[must_use]
+    pub const fn after(revision: &LedgerRevision) -> Self {
+        Self {
+            seq: revision.seq,
+            id: revision.id,
+        }
+    }
+}
+
+/// One page request for `ledger_revisions_page`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerPageRequest {
+    /// Read the revisions after this cursor. `None` starts at the first one.
+    pub after: Option<LedgerCursor>,
+    /// Maximum revisions in the page. Clamped to `1..=MAX_LIMIT`.
+    pub limit: u32,
+}
+
+impl LedgerPageRequest {
+    /// Page size of [`Default::default`].
+    pub const DEFAULT_LIMIT: u32 = 100;
+    /// Largest page size a request can get.
+    pub const MAX_LIMIT: u32 = 1000;
+
+    /// The first page.
+    #[must_use]
+    pub const fn first(limit: u32) -> Self {
+        Self { after: None, limit }
+    }
+
+    /// The page after `cursor`.
+    #[must_use]
+    pub const fn after(cursor: LedgerCursor, limit: u32) -> Self {
+        Self {
+            after: Some(cursor),
+            limit,
+        }
+    }
+
+    /// The page size this request gets: at least 1, at most
+    /// [`MAX_LIMIT`](Self::MAX_LIMIT).
+    #[must_use]
+    pub fn limit(&self) -> u32 {
+        self.limit.clamp(1, Self::MAX_LIMIT)
+    }
+}
+
+impl Default for LedgerPageRequest {
+    fn default() -> Self {
+        Self::first(Self::DEFAULT_LIMIT)
+    }
+}
+
+/// One page of a record's chain, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerRevisionPage {
+    /// The revisions in this page, in `(seq, id)` order.
+    pub revisions: Vec<LedgerRevision>,
+    /// Cursor for the next page. `None` when this page is the last.
+    pub next: Option<LedgerCursor>,
+}
+
+impl LedgerRevisionPage {
+    /// Build a page from up to `limit + 1` rows. The extra row only tells
+    /// that a next page exists; it is not returned.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_rows(mut rows: Vec<LedgerRevision>, limit: u32) -> Self {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let next = if rows.len() > limit {
+            rows.truncate(limit);
+            rows.last().map(LedgerCursor::after)
+        } else {
+            None
+        };
+        Self {
+            revisions: rows,
+            next,
+        }
+    }
+}
+
 // ── Repository-seam guardrails ───────────────────────────────────────
 
 /// Marker proving a model tolerates hard deletion.
@@ -1400,21 +1580,38 @@ pub enum LedgerError {
     },
     /// A framework write path that records no revision reached a ledgered table.
     ///
-    /// Counter-cache upkeep and `dependent(.., delete_all | nullify)` cascades
-    /// run raw SQL. On a ledgered table, that SQL would change or erase rows and
-    /// record no revision. Autumn refuses the write (#2319).
+    /// Counter-cache upkeep, `dependent(.., delete_all | nullify)` cascades,
+    /// `#[votable]` and `#[commentable]` writes, `has_many(through)` link
+    /// writes and portability imports run raw SQL. On a ledgered table, that
+    /// SQL would change or erase rows and record no revision. Autumn refuses
+    /// the write (#2319).
     #[error(
         "{path} cannot write to ledgered table {table}. The write records no \
-         revision, so the ledger would disagree with the table. Remove the \
-         {path} setting (for a dependent, use `on_delete = destroy`), or stop \
-         ledgering {table}"
+         revision, so the ledger would disagree with the table. Write through the \
+         ledgered repository of {table} (for a dependent, use \
+         `on_delete = destroy`), or stop ledgering {table}"
     )]
     OutOfBandWrite {
         /// The ledgered table the write targeted.
         table: String,
-        /// The write path: `counter cache`, `dependent delete_all` or
-        /// `dependent nullify`.
+        /// The write path, for example `counter cache` or
+        /// `dependent delete_all`.
         path: &'static str,
+    },
+    /// A ledgered write moved a record to another tenant (#2319).
+    ///
+    /// A chain belongs to one `(tenant, record)`. A move would leave the old
+    /// chain without a live row and start a new chain in the other tenant.
+    #[error(
+        "cannot ledger {table}#{record_id}: the write changes its tenant. A revision \
+         chain belongs to one tenant, so the move would split it. Create a new record \
+         in the other tenant instead"
+    )]
+    TenantChange {
+        /// Table of the ledgered model.
+        table: String,
+        /// Primary key of the record being written.
+        record_id: i64,
     },
     /// A ledgered write carried a `NaN` or infinite float (#2326).
     ///
@@ -1465,6 +1662,61 @@ pub trait LedgeredRecord: crate::version_history::VersionedRecord {
     fn ledger_valid_from(&self) -> Option<DateTime<Utc>> {
         None
     }
+
+    /// Tenant that owns this record's chain.
+    ///
+    /// `None` for a model that is not `tenant_scoped`. A `tenant_scoped`
+    /// repository reads it through [`LedgerTenantColumn`], so the writer and the
+    /// reader key the chain on the same non-null column (#2319).
+    fn ledger_tenant_id(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// A tenant column that can own a ledger chain (#2319).
+///
+/// Only `String` implements it. A NULL tenant is not visible to a
+/// tenant-scoped read, and a cross-tenant ledger read is refused, so a chain
+/// written with a NULL tenant is unreachable. A ledgered `tenant_scoped`
+/// repository on an `Option<String>` column therefore does not compile.
+#[diagnostic::on_unimplemented(
+    message = "a ledgered `tenant_scoped` repository needs `tenant_id: String`, not `{Self}`",
+    label = "the tenant column of a ledgered model must not be nullable",
+    note = "a revision with a NULL tenant is not visible to a tenant-scoped read, and a \
+            cross-tenant ledger read is refused, so no read can reach its chain. Make the \
+            field `String` and the column `NOT NULL`, or remove `ledgered`"
+)]
+pub trait LedgerTenantColumn {
+    /// The tenant this column holds.
+    fn ledger_tenant_id(&self) -> &str;
+}
+
+impl LedgerTenantColumn for String {
+    fn ledger_tenant_id(&self) -> &str {
+        self.as_str()
+    }
+}
+
+/// Refuse a ledgered update that changes the record's tenant (#2319).
+///
+/// # Errors
+///
+/// [`LedgerError::TenantChange`], as a conflict, when `before` and `after`
+/// differ.
+#[doc(hidden)]
+pub fn refuse_tenant_change(
+    table: &str,
+    record_id: i64,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> crate::AutumnResult<()> {
+    if before == after {
+        return Ok(());
+    }
+    Err(crate::AutumnError::conflict(LedgerError::TenantChange {
+        table: table.to_string(),
+        record_id,
+    }))
 }
 
 /// Extract a valid-time instant from the column shapes a model may use.
@@ -2176,11 +2428,13 @@ pub fn is_ledgered_table(table: &str) -> bool {
 /// Refuse a raw write to `table` when it is ledgered.
 ///
 /// Call before framework SQL that changes rows outside the owning repository.
+/// Public for macro-generated code only.
 ///
 /// # Errors
 ///
 /// [`LedgerError::OutOfBandWrite`], as a conflict, when `table` is ledgered.
-pub(crate) fn refuse_out_of_band_write(table: &str, path: &'static str) -> crate::AutumnResult<()> {
+#[doc(hidden)]
+pub fn refuse_out_of_band_write(table: &str, path: &'static str) -> crate::AutumnResult<()> {
     if is_ledgered_table(table) {
         return Err(crate::AutumnError::conflict(LedgerError::OutOfBandWrite {
             table: table.to_string(),
@@ -3598,5 +3852,151 @@ mod tests {
         }
         .to_string();
         assert!(text.contains("t#9") && text.contains("score"), "{text}");
+    }
+
+    // ── streaming verification (#2319) ───────────────────────────────
+
+    /// Tampered chains that each trip a different rule.
+    fn tamper_cases() -> Vec<Vec<LedgerRevision>> {
+        let mut cases = vec![Vec::new(), chain(1), chain(5)];
+
+        let mut mutated = chain(5);
+        mutated[2].snapshot = json!({ "id": 7, "title": "tampered" });
+        cases.push(mutated);
+
+        let mut relinked = chain(5);
+        relinked[2].snapshot = json!({ "id": 7, "title": "tampered" });
+        relinked[2].hash = relinked[2].compute_hash();
+        cases.push(relinked);
+
+        let mut gap = chain(5);
+        gap.remove(2);
+        cases.push(gap);
+
+        let mut no_start = chain(5);
+        no_start.remove(0);
+        cases.push(no_start);
+
+        let mut duplicate = chain(5);
+        let forged = LedgerRevision {
+            id: 99,
+            ..duplicate[1].clone()
+        };
+        duplicate.insert(2, forged);
+        cases.push(duplicate);
+
+        let mut regression = chain(5);
+        regression[3].recorded_at = regression[2].recorded_at - chrono::Duration::seconds(1);
+        regression[3].hash = regression[3].compute_hash();
+        regression[4].prev_hash = Some(regression[3].hash.clone());
+        regression[4].hash = regression[4].compute_hash();
+        cases.push(regression);
+
+        let mut saturated = chain(2);
+        saturated[1].seq = i64::MAX;
+        cases.push(saturated);
+
+        cases
+    }
+
+    /// Feeding a chain in pages gives the same report as the slice verifier,
+    /// for every page size, live state and mark state.
+    #[test]
+    fn the_streaming_verifier_matches_the_slice_verifier() {
+        let full = chain(6);
+        let marks = [None, Some(mark_for(&full[..5])), Some(mark_for(&full))];
+        let lives = [
+            LedgerLiveState::NotChecked,
+            LedgerLiveState::Absent,
+            LedgerLiveState::Matches,
+            LedgerLiveState::Diverged,
+        ];
+        for revisions in tamper_cases() {
+            for live in lives {
+                for mark in &marks {
+                    let states = [
+                        LedgerHighWaterState::NotChecked,
+                        mark.as_ref()
+                            .map_or(LedgerHighWaterState::Absent, LedgerHighWaterState::Present),
+                    ];
+                    for high_water in states {
+                        let expected =
+                            verify_chain_with_high_water(7, &revisions, live, high_water);
+                        for page in 1..=revisions.len().max(1) {
+                            let mut verifier = LedgerChainVerifier::new(7);
+                            for chunk in revisions.chunks(page) {
+                                for revision in chunk {
+                                    verifier.push(revision);
+                                }
+                            }
+                            assert_eq!(
+                                verifier.finish(live, high_water),
+                                expected,
+                                "page size {page}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_streaming_verifier_keeps_only_the_head() {
+        let revisions = chain(4);
+        let mut verifier = LedgerChainVerifier::new(7);
+        assert!(verifier.head_seq().is_none());
+        for revision in &revisions {
+            verifier.push(revision);
+        }
+        assert_eq!(verifier.head_seq(), Some(4));
+    }
+
+    // ── page requests (#2319) ────────────────────────────────────────
+
+    #[test]
+    fn a_page_request_clamps_its_limit() {
+        assert_eq!(LedgerPageRequest::first(0).limit(), 1);
+        assert_eq!(LedgerPageRequest::first(10).limit(), 10);
+        assert_eq!(
+            LedgerPageRequest::first(u32::MAX).limit(),
+            LedgerPageRequest::MAX_LIMIT
+        );
+        assert_eq!(
+            LedgerPageRequest::default().limit(),
+            LedgerPageRequest::DEFAULT_LIMIT
+        );
+        let cursor = LedgerCursor { seq: 3, id: 30 };
+        assert_eq!(LedgerPageRequest::after(cursor, 5).after, Some(cursor));
+    }
+
+    #[test]
+    fn a_page_carries_a_cursor_only_when_more_rows_exist() {
+        let revisions = chain(3);
+        let full = LedgerRevisionPage::from_rows(revisions.clone(), 3);
+        assert!(full.next.is_none());
+        assert_eq!(full.revisions.len(), 3);
+
+        let more = LedgerRevisionPage::from_rows(revisions, 2);
+        assert_eq!(more.revisions.len(), 2);
+        assert_eq!(more.next, Some(LedgerCursor { seq: 2, id: 2 }));
+    }
+
+    // ── tenant column (#2319) ────────────────────────────────────────
+
+    #[test]
+    fn a_tenant_change_is_refused() {
+        refuse_tenant_change("t", 1, Some("a"), Some("a")).unwrap();
+        refuse_tenant_change("t", 1, None, None).unwrap();
+        let err = refuse_tenant_change("t", 9, Some("a"), Some("b")).expect_err("refused");
+        let text = err.to_string();
+        assert!(text.contains("t#9"), "{text}");
+        assert!(!text.contains("\"a\"") && !text.contains("\"b\""), "{text}");
+    }
+
+    #[test]
+    fn a_string_tenant_column_is_a_ledger_tenant() {
+        let tenant = String::from("acme");
+        assert_eq!(LedgerTenantColumn::ledger_tenant_id(&tenant), "acme");
     }
 }

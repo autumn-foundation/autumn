@@ -93,6 +93,12 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/repository_ledgered_purge_rejected.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/repository_ledgered_sensitive_columns.rs");
+    // #2319: a NULL-tenant chain is unreachable by every read mode.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_ledgered_nullable_tenant.rs");
+    // #2319: a derived `delete_by_*` records no revision.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_ledgered_derived_delete.rs");
 
     // Warden security review, 2026-09-13: `owner = <column>` only emits
     // opt-in `list_scoped`/`search_page_scoped` methods for a hand-written

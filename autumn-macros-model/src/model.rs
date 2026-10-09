@@ -3370,6 +3370,7 @@ fn emit_association_items(
                         assoc.name
                     );
                     let join_table_ident = format_ident!("{}", through.table);
+                    let join_table_name = through.table.as_str();
                     let target_fk_ident = format_ident!("{}", through.target_fk);
 
                     m2m_items.push(quote! {
@@ -3552,6 +3553,8 @@ fn emit_association_items(
                                 parent_id: i64,
                                 child_id: i64,
                             ) -> ::autumn_web::AutumnResult<()> {
+                                // #2319: the link write records no ledger revision.
+                                ::autumn_web::ledger::refuse_out_of_band_write(#join_table_name, "has_many through")?;
                                 use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
                                 use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
                                 let mut conn = self.__autumn_m2m_write_conn().await?;
@@ -3578,6 +3581,8 @@ fn emit_association_items(
                                 parent_id: i64,
                                 child_id: i64,
                             ) -> ::autumn_web::AutumnResult<()> {
+                                // #2319: the link write records no ledger revision.
+                                ::autumn_web::ledger::refuse_out_of_band_write(#join_table_name, "has_many through")?;
                                 use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
                                 use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
                                 let mut conn = self.__autumn_m2m_write_conn().await?;
@@ -3601,6 +3606,8 @@ fn emit_association_items(
                                 parent_id: i64,
                                 child_ids: &[i64],
                             ) -> ::autumn_web::AutumnResult<()> {
+                                // #2319: the link write records no ledger revision.
+                                ::autumn_web::ledger::refuse_out_of_band_write(#join_table_name, "has_many through")?;
                                 use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
                                 use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
                                 use ::autumn_web::reexports::diesel_async::AsyncConnection as _;
@@ -4400,6 +4407,10 @@ fn emit_votable_items(
                 use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                // #2319: the aggregate UPDATE and the edge writes record no
+                // ledger revision, so a ledgered target or edge table refuses.
+                ::autumn_web::ledger::refuse_out_of_band_write(#table_name_str, "votable aggregate")?;
+                ::autumn_web::ledger::refuse_out_of_band_write(#edge_table_name, "votable edge")?;
                 // Resolved before the connection is taken, so a tenant_scoped
                 // repository with no tenant context fails closed without
                 // occupying a pooled connection.
@@ -14291,6 +14302,55 @@ mod tests {
         assert!(
             generated.contains("M2mConnSource"),
             "expected the mutation trait to be blanket-implemented over M2mConnSource"
+        );
+    }
+
+    #[test]
+    fn model_macro_m2m_mutations_refuse_a_ledgered_join_table() {
+        // #2319: the link writes record no ledger revision.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[has_many(Tag, through = post_tags)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+        let guard = "refuse_out_of_band_write (\"post_tags\" , \"has_many through\")";
+        assert_eq!(
+            generated.matches(guard).count(),
+            3,
+            "add, remove and set must each refuse: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_macro_votable_refuses_a_ledgered_target_and_edge_table() {
+        // #2319: the aggregate UPDATE and the edge writes record no revision.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("refuse_out_of_band_write (\"posts\" , \"votable aggregate\")"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("refuse_out_of_band_write (\"votes\" , \"votable edge\")"),
+            "{generated}"
         );
     }
 

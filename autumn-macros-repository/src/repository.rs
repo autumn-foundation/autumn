@@ -1542,6 +1542,28 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     })
 }
 
+/// The error for a derived `delete_by_*` on a ledgered repository (#2319).
+///
+/// The derived delete is one bulk `UPDATE`. It records no revision, so the
+/// ledger would not match the table.
+fn ledgered_derived_delete_error(trait_def: &ItemTrait) -> Option<syn::Error> {
+    trait_def.items.iter().find_map(|item| {
+        let TraitItem::Fn(method) = item else {
+            return None;
+        };
+        let query = parse_query_name(&method.sig.ident.to_string())?;
+        (query.prefix == "delete").then(|| {
+            syn::Error::new_spanned(
+                &method.sig.ident,
+                "a ledgered repository cannot declare a derived `delete_by_*` method: it \
+                 deletes in one bulk write and records no revision, so the ledger would \
+                 not match the table. Find the records, then call `delete_by_id` or \
+                 `delete_many`, which record a revision for each one",
+            )
+        })
+    })
+}
+
 /// Parse a derived query method name like `find_by_title_and_published`.
 struct DerivedQuery {
     prefix: String,      // "find", "count", "delete", "exists"
@@ -2196,7 +2218,14 @@ fn vh_insert_ts(
     // Emitted here rather than at each call site so every write path version
     // history already covers is covered by the ledger too, by construction.
     let ledger_ts = if ledgered {
-        ledger_append_ts(&table_name_ts, op, record_expr, conn_ident, model_ident)
+        ledger_append_ts(
+            &table_name_ts,
+            op,
+            record_expr,
+            before_expr,
+            conn_ident,
+            model_ident,
+        )
     } else {
         quote! {}
     };
@@ -2282,6 +2311,7 @@ fn ledger_append_ts(
     table_name_ts: &str,
     op: &str,
     record_expr: &TokenStream,
+    before_expr: Option<&TokenStream>,
     conn_ident: &TokenStream,
     model_ident: &proc_macro2::Ident,
 ) -> TokenStream {
@@ -2352,6 +2382,20 @@ fn ledger_append_ts(
         }
     };
 
+    // #2319: a chain belongs to one tenant. An update that moves the record
+    // would split it, so refuse it.
+    let tenant_change_check = match (op, before_expr) {
+        ("update", Some(before)) => quote! {
+            ::autumn_web::ledger::refuse_tenant_change(
+                #table_name_ts,
+                __lg_record_id,
+                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(&(#before)),
+                __lg_tenant_id,
+            )?;
+        },
+        _ => quote! {},
+    };
+
     // #2326: refuse before the snapshot. The snapshot would turn NaN into `null`.
     // A delete or restore writes no float, so a legacy row that holds one can
     // still be deleted or restored.
@@ -2374,10 +2418,9 @@ fn ledger_append_ts(
                 (#record_expr).version_record_id()
             };
             #non_finite_check
-            let __lg_tenant_id: ::core::option::Option<&str> = {
-                use ::autumn_web::version_history::VersionedRecord as _;
-                (#record_expr).version_tenant_id()
-            };
+            let __lg_tenant_id: ::core::option::Option<&str> =
+                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(&(#record_expr));
+            #tenant_change_check
             #[allow(unused_mut, reason = "only the delete arm rewrites the snapshot")]
             let mut __lg_snapshot: ::autumn_web::reexports::serde_json::Value =
                 (#record_expr).__autumn_commit_hook_to_value()?;
@@ -2787,6 +2830,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(t) => t,
         Err(err) => return err.to_compile_error(),
     };
+
+    // #2319: a derived `delete_by_*` is one bulk write with no revision.
+    if config.ledgered {
+        if let Some(err) = ledgered_derived_delete_error(&trait_def) {
+            return err.to_compile_error();
+        }
+    }
 
     if config.broadcasts && config.hooks_type.is_none() {
         config.hooks_type = Some(format_ident!("Pg{}InternalHooks", trait_def.ident));
@@ -3844,6 +3894,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             );
         }
     };
+    // #2319: a repository that is not ledgered writes no revision. If another
+    // repository ledgers the same table, its writes refuse. This is the write
+    // connection, so reads are not affected.
+    let unledgered_write_guard = if config.ledgered {
+        quote! {}
+    } else {
+        quote! {
+            ::autumn_web::ledger::refuse_out_of_band_write(
+                #table_name,
+                "a repository that is not ledgered",
+            )?;
+        }
+    };
     // #2319: marks this table as ledgered. Raw-SQL framework paths read the
     // mark and refuse to write to it.
     let ledgered_table_registration = if config.ledgered {
@@ -4072,9 +4135,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
         });
+        // #2319: one typed source for the chain's tenant. Only `String`
+        // implements `LedgerTenantColumn`, so a nullable column does not compile.
+        let tenant_method = config.tenant_scoped.then(|| {
+            quote! {
+                fn ledger_tenant_id(&self) -> ::core::option::Option<&str> {
+                    ::core::option::Option::Some(
+                        ::autumn_web::ledger::LedgerTenantColumn::ledger_tenant_id(&self.tenant_id),
+                    )
+                }
+            }
+        });
         quote! {
             impl ::autumn_web::ledger::LedgeredRecord for #model_name {
                 #valid_from_method
+                #tenant_method
             }
         }
     } else {
@@ -4518,6 +4593,160 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         };
 
                     ::core::result::Result::Ok(revisions)
+                }
+
+                /// One page of the record's revision chain, oldest first (#2319).
+                ///
+                /// A keyset page on `(seq, id)`: each page costs one indexed
+                /// read, however long the chain is. Pass the returned `next`
+                /// cursor to read the next page.
+                ///
+                /// # Errors
+                ///
+                /// The same as [`ledger_revisions`](Self::ledger_revisions).
+                pub async fn ledger_revisions_page(
+                    &self,
+                    record_id: i64,
+                    page: ::autumn_web::ledger::LedgerPageRequest,
+                ) -> ::autumn_web::AutumnResult<::autumn_web::ledger::LedgerRevisionPage> {
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+
+                    #ledger_cross_shard_guard
+                    #ledger_cross_tenant_guard
+                    #ledger_tenant_setup
+
+                    let __ledger_limit = page.limit();
+                    let __ledger_after_seq: ::core::option::Option<i64> = page.after.map(|c| c.seq);
+                    let __ledger_after_id: i64 = page.after.map_or(0, |c| c.id);
+                    // One extra row tells whether a next page exists.
+                    let __ledger_fetch: i64 = i64::from(__ledger_limit) + 1;
+
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
+
+                    // #1996-style backend fork: the Postgres arm keeps the
+                    // `::text` / `$3::text` casts and `Timestamptz`; the SQLite
+                    // arm drops every cast and uses `TimestamptzSqlite` (there
+                    // is no `FromSql<Timestamptz, Sqlite>`). The row struct lives
+                    // inside each arm so only the selected arm is type-checked.
+                    let revisions: ::std::vec::Vec<::autumn_web::ledger::LedgerRevision> =
+                        ::autumn_web::backend_select! {
+                            pg => {{
+                                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                                struct __AutumnLedgerRow {
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    table_name: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    tenant_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    record_id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    seq: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    op: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    actor: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    request_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    snapshot: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
+                                    valid_from: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Timestamptz)]
+                                    recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    prev_hash: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    hash: ::std::string::String,
+                                }
+
+                                let raw_rows: ::std::vec::Vec<__AutumnLedgerRow> =
+                                    ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT id, table_name, tenant_id, record_id, seq, op, actor, \
+                                         request_id, snapshot, valid_from, \
+                                         recorded_at, prev_hash, hash \
+                                         FROM _autumn_ledger_revisions \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3::text IS NULL OR tenant_id = $3) \
+                                         AND ($4::bigint IS NULL OR seq > $4 \
+                                              OR (seq = $4 AND id > $5)) \
+                                         ORDER BY seq ASC, id ASC \
+                                         LIMIT $6"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__ledger_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::BigInt>, _>(__ledger_after_seq)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__ledger_after_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__ledger_fetch)
+                                    .get_results::<__AutumnLedgerRow>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+
+                                #ledger_map_rows
+                            }},
+                            sqlite => {{
+                                #[derive(::autumn_web::reexports::diesel::QueryableByName)]
+                                struct __AutumnLedgerRow {
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    table_name: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    tenant_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    record_id: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
+                                    seq: i64,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    op: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    actor: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    request_id: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    snapshot: ::std::string::String,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
+                                    valid_from: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::TimestamptzSqlite)]
+                                    recorded_at: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>)]
+                                    prev_hash: ::core::option::Option<::std::string::String>,
+                                    #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::Text)]
+                                    hash: ::std::string::String,
+                                }
+
+                                let raw_rows: ::std::vec::Vec<__AutumnLedgerRow> =
+                                    ::autumn_web::reexports::diesel::sql_query(
+                                        "SELECT id, table_name, tenant_id, record_id, seq, op, actor, \
+                                         request_id, snapshot, valid_from, \
+                                         recorded_at, prev_hash, hash \
+                                         FROM _autumn_ledger_revisions \
+                                         WHERE table_name = $1 AND record_id = $2 \
+                                         AND ($3 IS NULL OR tenant_id = $3) \
+                                         AND ($4 IS NULL OR seq > $4 \
+                                              OR (seq = $4 AND id > $5)) \
+                                         ORDER BY seq ASC, id ASC \
+                                         LIMIT $6"
+                                    )
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::Text>, _>(__ledger_tenant_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::Nullable<::autumn_web::reexports::diesel::sql_types::BigInt>, _>(__ledger_after_seq)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__ledger_after_id)
+                                    .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(__ledger_fetch)
+                                    .get_results::<__AutumnLedgerRow>(&mut conn)
+                                    .await
+                                    .map_err(::autumn_web::AutumnError::from)?;
+
+                                #ledger_map_rows
+                            }},
+                        };
+
+                    ::core::result::Result::Ok(
+                        ::autumn_web::ledger::LedgerRevisionPage::from_rows(revisions, __ledger_limit),
+                    )
                 }
 
                 /// The single revision in force at a bitemporal instant,
@@ -5060,7 +5289,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 /// # Errors
                 ///
                 /// Propagates read errors from
-                /// [`ledger_revisions`](Self::ledger_revisions).
+                /// [`ledger_revisions_page`](Self::ledger_revisions_page).
                 pub async fn ledger_verify(
                     &self,
                     record_id: i64,
@@ -5075,7 +5304,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // exists to produce trustworthy accusations. If the chain head
                     // moved under us, the live comparison is skipped rather than
                     // reported — a concurrent write is not tampering.
-                    let revisions = self.ledger_revisions(record_id).await?;
+                    // #2319: read the chain in pages. Memory holds one page
+                    // and the head, however long the chain is.
+                    let mut verifier = ::autumn_web::ledger::LedgerChainVerifier::new(record_id);
+                    let mut last: ::core::option::Option<::autumn_web::ledger::LedgerRevision> =
+                        ::core::option::Option::None;
+                    let mut request = ::autumn_web::ledger::LedgerPageRequest::first(
+                        ::autumn_web::ledger::LedgerPageRequest::MAX_LIMIT,
+                    );
+                    loop {
+                        let page = self.ledger_revisions_page(record_id, request).await?;
+                        for revision in &page.revisions {
+                            verifier.push(revision);
+                        }
+                        if let ::core::option::Option::Some(revision) = page.revisions.into_iter().last() {
+                            last = ::core::option::Option::Some(revision);
+                        }
+                        match page.next {
+                            ::core::option::Option::Some(cursor) => {
+                                request = ::autumn_web::ledger::LedgerPageRequest::after(
+                                    cursor,
+                                    ::autumn_web::ledger::LedgerPageRequest::MAX_LIMIT,
+                                );
+                            }
+                            ::core::option::Option::None => break,
+                        }
+                    }
                     let live = self.__autumn_ledger_live_view(record_id).await?;
                     // Head and mark in ONE statement: read separately they could
                     // come from differently-lagged replicas, and a fresh mark
@@ -5087,10 +5341,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         high_water,
                     } = self.__autumn_ledger_settled_state(record_id).await?;
                     let stable = settled_head.as_ref().map(|h| h.seq)
-                        == revisions.last().map(|r| r.seq);
+                        == last.as_ref().map(|r| r.seq);
 
                     let live_state = if stable {
-                        match (revisions.last(), live.as_ref()) {
+                        match (last.as_ref(), live.as_ref()) {
                             (_, ::core::option::Option::None) =>
                                 ::autumn_web::ledger::LedgerLiveState::Absent,
                             (::core::option::Option::None, ::core::option::Option::Some(_)) =>
@@ -5131,14 +5385,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::autumn_web::ledger::LedgerHighWaterState::NotChecked
                     };
 
-                    ::core::result::Result::Ok(
-                        ::autumn_web::ledger::verify_chain_with_high_water(
-                            record_id,
-                            &revisions,
-                            live_state,
-                            high_water_state,
-                        ),
-                    )
+                    ::core::result::Result::Ok(verifier.finish(live_state, high_water_state))
                 }
 
                 /// Whether the head revision describes the row the table holds.
@@ -6217,6 +6464,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::autumn_web::RuntimeConnection,
                 >,
             > {
+                #unledgered_write_guard
                 let result = self.__autumn_acquire_from(&self.pool).await;
                 // Mark write only after a successful primary checkout, mirroring
                 // the guard in `Db::from_request_parts`. A failed acquire (pool
@@ -28146,6 +28394,7 @@ mod tests {
 
         for method in [
             "ledger_revisions",
+            "ledger_revisions_page",
             "ledger_as_of",
             "ledger_as_of_at",
             "ledger_diff",
@@ -28185,6 +28434,7 @@ mod tests {
             "posts",
             op,
             &quote! { record },
+            Some(&quote! { before }),
             &quote! { conn },
             &format_ident!("Post"),
         )
@@ -28229,6 +28479,88 @@ mod tests {
             check < snapshot,
             "check must precede the snapshot: {generated}"
         );
+    }
+
+    #[test]
+    fn ledger_append_refuses_a_tenant_change_on_update_only() {
+        // #2319: a chain belongs to one tenant.
+        assert!(ledger_append_for("update").contains("refuse_tenant_change"));
+        for op in ["insert", "delete", "restore"] {
+            assert!(
+                !ledger_append_for(op).contains("refuse_tenant_change"),
+                "`{op}` cannot move a record"
+            );
+        }
+    }
+
+    #[test]
+    fn ledger_append_reads_the_tenant_from_the_ledgered_record() {
+        // #2319: the writer and the type assertion share one source.
+        let generated = ledger_append_for("insert");
+        assert!(
+            generated.contains("LedgeredRecord > :: ledger_tenant_id"),
+            "{generated}"
+        );
+        assert!(!generated.contains("version_tenant_id"), "{generated}");
+    }
+
+    #[test]
+    fn a_tenant_scoped_ledgered_record_reads_a_non_null_tenant() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, soft_delete, ledgered = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("LedgerTenantColumn :: ledger_tenant_id (& self . tenant_id)"),
+            "{generated}"
+        );
+
+        let untenanted = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(!untenanted.contains("LedgerTenantColumn"), "{untenanted}");
+    }
+
+    #[test]
+    fn a_ledgered_repository_rejects_a_derived_delete() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! {
+                pub trait PostRepository {
+                    fn delete_by_title(title: String) -> ();
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot declare a derived `delete_by_*` method"),
+            "{generated}"
+        );
+
+        // Derived reads stay allowed, and an unledgered derived delete too.
+        let reads = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! {
+                pub trait PostRepository {
+                    fn find_by_title(title: String) -> Vec<Post>;
+                }
+            },
+        )
+        .to_string();
+        assert!(!reads.contains("compile_error"), "{reads}");
+        let plain = repository_macro(
+            quote! { Post, soft_delete },
+            quote! {
+                pub trait PostRepository {
+                    fn delete_by_title(title: String) -> ();
+                }
+            },
+        )
+        .to_string();
+        assert!(!plain.contains("compile_error"), "{plain}");
     }
 
     #[test]

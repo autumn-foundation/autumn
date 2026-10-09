@@ -36,7 +36,7 @@ use autumn_web::config::DatabaseConfig;
 use autumn_web::current::with_actor;
 use autumn_web::db::{RuntimeConnection, create_pool};
 use autumn_web::hooks::Patch;
-use autumn_web::ledger::{LedgerAsOf, LedgerBreak};
+use autumn_web::ledger::{LedgerAsOf, LedgerBreak, LedgerPageRequest};
 use autumn_web::reexports::{chrono, diesel, diesel_async};
 use autumn_web::tenancy::with_tenant;
 use autumn_web::version_history::VersionOp;
@@ -112,11 +112,20 @@ mod schema {
             deleted_at -> Nullable<Timestamp>,
         }
     }
+
+    autumn_web::reexports::diesel::table! {
+        lg_movable_invoices (id) {
+            id -> Int8,
+            reference -> Text,
+            tenant_id -> Text,
+            deleted_at -> Nullable<Timestamp>,
+        }
+    }
 }
 
 use schema::{
-    lg_cascade_children, lg_cascade_parents, lg_effective_notes, lg_invoices, lg_secret_notes,
-    lg_tenant_invoices, lg_vault_notes,
+    lg_cascade_children, lg_cascade_parents, lg_effective_notes, lg_invoices, lg_movable_invoices,
+    lg_secret_notes, lg_tenant_invoices, lg_vault_notes,
 };
 
 #[autumn_web::model(table = "lg_invoices")]
@@ -161,6 +170,27 @@ pub struct LgTenantInvoice {
     ledgered = true
 )]
 pub trait LgTenantInvoiceRepository {}
+
+/// A tenant-scoped model whose `tenant_id` is a writable field, so an
+/// across-tenants update can try to move the row (#2319).
+#[autumn_web::model(table = "lg_movable_invoices")]
+pub struct LgMovableInvoice {
+    #[id]
+    pub id: i64,
+    pub reference: String,
+    pub tenant_id: String,
+    #[default]
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(
+    LgMovableInvoice,
+    table = "lg_movable_invoices",
+    tenant_scoped,
+    soft_delete,
+    ledgered = true
+)]
+pub trait LgMovableInvoiceRepository {}
 
 /// A model whose valid time comes from its own column, so the two axes diverge.
 #[autumn_web::model(table = "lg_effective_notes")]
@@ -344,6 +374,12 @@ async fn boot_pool_without_high_water(db_name: &str) -> SqlitePool {
                  deleted_at TIMESTAMP\
              )",
             "CREATE TABLE lg_tenant_invoices (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 reference TEXT NOT NULL, \
+                 tenant_id TEXT NOT NULL, \
+                 deleted_at TIMESTAMP\
+             )",
+            "CREATE TABLE lg_movable_invoices (\
                  id INTEGER PRIMARY KEY AUTOINCREMENT, \
                  reference TEXT NOT NULL, \
                  tenant_id TEXT NOT NULL, \
@@ -3052,4 +3088,215 @@ async fn write_three_revisions(repo: &PgLgInvoiceRepository) -> i64 {
         .expect("update");
     }
     created.id
+}
+
+// ── #2319: one tenant source, one read mode per chain ────────────────
+
+/// Moving a ledgered row to another tenant would split its chain: the old
+/// chain stays in tenant A with no live row, the new one starts in tenant B.
+/// The write is refused.
+#[tokio::test]
+async fn a_ledgered_row_cannot_move_between_tenants() {
+    let pool = boot_pool("lg_tenant_move").await;
+    let repo = PgLgMovableInvoiceRepository::with_pool_untracked(pool);
+
+    let id = with_tenant("tenant-a".to_string(), async {
+        repo.save(&NewLgMovableInvoice {
+            reference: "A-1".to_string(),
+            tenant_id: "tenant-a".to_string(),
+        })
+        .await
+        .expect("insert as tenant-a")
+        .id
+    })
+    .await;
+
+    let err = repo
+        .across_tenants()
+        .update(
+            id,
+            &UpdateLgMovableInvoice {
+                tenant_id: Patch::Set("tenant-b".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a ledgered row must not change tenant");
+    match err.downcast_chain_ref::<autumn_web::ledger::LedgerError>() {
+        Some(autumn_web::ledger::LedgerError::TenantChange { table, record_id }) => {
+            assert_eq!(table, "lg_movable_invoices");
+            assert_eq!(*record_id, id);
+        }
+        other => panic!("expected TenantChange, got {other:?}"),
+    }
+
+    // An across-tenants update that keeps the tenant still records a revision.
+    repo.across_tenants()
+        .update(
+            id,
+            &UpdateLgMovableInvoice {
+                reference: Patch::Set("A-2".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("same-tenant update");
+
+    with_tenant("tenant-a".to_string(), async {
+        let live = repo
+            .find_by_id(id)
+            .await
+            .expect("read")
+            .expect("still tenant-a's");
+        assert_eq!(live.tenant_id, "tenant-a");
+        let report = repo.ledger_verify(id).await.expect("verify");
+        assert!(report.is_intact(), "{report:?}");
+        assert_eq!(report.revisions_checked, 2);
+    })
+    .await;
+    with_tenant("tenant-b".to_string(), async {
+        assert!(repo.ledger_revisions(id).await.expect("read").is_empty());
+    })
+    .await;
+}
+
+/// No read mode interleaves two tenants' chains: every ledger read refuses
+/// `across_tenants()`.
+#[tokio::test]
+async fn every_ledger_read_refuses_across_tenants() {
+    let pool = boot_pool("lg_tenant_across").await;
+    let repo = PgLgTenantInvoiceRepository::with_pool_untracked(pool);
+    let id = with_tenant("tenant-a".to_string(), async {
+        repo.save(&NewLgTenantInvoice {
+            reference: "A-1".to_string(),
+        })
+        .await
+        .expect("insert")
+        .id
+    })
+    .await;
+
+    let across = repo.across_tenants();
+    assert!(across.ledger_revisions(id).await.is_err());
+    assert!(
+        across
+            .ledger_revisions_page(id, LedgerPageRequest::first(10))
+            .await
+            .is_err()
+    );
+    assert!(across.ledger_verify(id).await.is_err());
+    assert!(across.ledger_pin(id).await.is_err());
+    assert!(across.ledger_head(id).await.is_err());
+    assert!(across.ledger_high_water(id).await.is_err());
+    assert!(
+        across
+            .ledger_as_of_at(id, LedgerAsOf::default())
+            .await
+            .is_err()
+    );
+    let now = Utc::now();
+    assert!(across.ledger_diff(id, now, now).await.is_err());
+}
+
+// ── #2319: paginated chain reads ─────────────────────────────────────
+
+/// A keyset page walks the chain in `seq` order and joins up to the full read.
+#[tokio::test]
+async fn ledger_revisions_page_walks_the_chain_in_order() {
+    let pool = boot_pool("lg_page_walk").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool);
+    let id = write_three_revisions(&repo).await;
+    for amount in [4, 5] {
+        repo.update(
+            id,
+            &UpdateLgInvoice {
+                amount_cents: Patch::Set(amount),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update");
+    }
+
+    let mut seen = Vec::new();
+    let mut request = LedgerPageRequest::first(2);
+    let mut pages = 0;
+    loop {
+        let page = repo.ledger_revisions_page(id, request).await.expect("page");
+        pages += 1;
+        assert!(page.revisions.len() <= 2);
+        seen.extend(page.revisions);
+        match page.next {
+            Some(cursor) => request = LedgerPageRequest::after(cursor, 2),
+            None => break,
+        }
+    }
+    assert_eq!(pages, 3);
+    assert_eq!(
+        seen.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5]
+    );
+    assert_eq!(seen, repo.ledger_revisions(id).await.expect("full read"));
+}
+
+/// A limit of zero is clamped to one, so a caller loop always advances.
+#[tokio::test]
+async fn ledger_revisions_page_clamps_a_zero_limit() {
+    let pool = boot_pool("lg_page_zero").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool);
+    let id = write_three_revisions(&repo).await;
+
+    let page = repo
+        .ledger_revisions_page(id, LedgerPageRequest::first(0))
+        .await
+        .expect("page");
+    assert_eq!(page.revisions.len(), 1);
+    assert!(page.next.is_some());
+}
+
+/// A forged revision that repeats a `seq` is not skipped at a page edge, and
+/// `ledger_verify` still reports it.
+#[tokio::test]
+async fn a_duplicate_seq_on_a_page_edge_is_not_skipped() {
+    let pool = boot_pool("lg_page_dup").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        // A different tenant key slips past the chain's unique index.
+        diesel::sql_query(
+            "INSERT INTO _autumn_ledger_revisions \
+             (table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, \
+              valid_from, recorded_at, prev_hash, hash) \
+             SELECT table_name, 'forged', record_id, seq, op, actor, request_id, \
+                    snapshot, valid_from, recorded_at, prev_hash, hash \
+             FROM _autumn_ledger_revisions \
+             WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = 2",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("insert a duplicate seq");
+    }
+
+    let mut seqs = Vec::new();
+    let mut request = LedgerPageRequest::first(2);
+    loop {
+        let page = repo.ledger_revisions_page(id, request).await.expect("page");
+        seqs.extend(page.revisions.iter().map(|r| r.seq));
+        match page.next {
+            Some(cursor) => request = LedgerPageRequest::after(cursor, 2),
+            None => break,
+        }
+    }
+    assert_eq!(seqs, vec![1, 2, 2, 3]);
+
+    let broken = repo
+        .ledger_verify(id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("a duplicate seq must be reported");
+    assert_eq!(broken.kind, LedgerBreak::DuplicateSeq);
+    assert_eq!(broken.seq, 2);
 }

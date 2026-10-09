@@ -130,6 +130,18 @@ if let Some(broken) = &report.broken {
 // The raw chain, oldest first.
 let revisions = repo.ledger_revisions(id).await?;
 
+// The same chain, one keyset page at a time.
+use autumn_web::ledger::LedgerPageRequest;
+let mut request = LedgerPageRequest::first(100);
+loop {
+    let page = repo.ledger_revisions_page(id, request).await?;
+    // ... use page.revisions ...
+    match page.next {
+        Some(cursor) => request = LedgerPageRequest::after(cursor, 100),
+        None => break,
+    }
+}
+
 // The head hash, for pinning outside the database.
 let head = repo.ledger_head(id).await?;
 
@@ -289,12 +301,20 @@ repository. On a ledgered table, each one is **refused** with
 | A [counter-cache](counter-cache.md) column on a ledgered parent | Refused on any child write or recompute. |
 | `dependent(..., on_delete = delete_all)` into a ledgered child | Refused. No row is erased. |
 | `dependent(..., on_delete = nullify)` into a ledgered child | Refused. No foreign key is cleared. |
+| `#[votable]` `react()` on a ledgered target or edge table | Refused. The aggregate does not change. |
+| `add_comment` / `delete_comment` into a ledgered comments table | Refused. |
+| `add_*` / `remove_*` / `set_*` into a ledgered `has_many(through)` join table | Refused. |
+| A [data capsule](data-capsules.md) import into a ledgered table | Refused with `DataCapsuleError::InvalidInput`. |
+| A write from a second repository on the table that is not ledgered | Refused. Its reads still work. |
 
-The error names the table and the path. To fix it, remove the counter cache or
-the `dependent(...)` clause, or use `on_delete = destroy` (a ledgered child
+The error names the table and the path. To fix it, remove the setting, write
+through the ledgered repository, or use `on_delete = destroy` (a ledgered child
 records a revision). The check runs even if the parent has no children.
-Autumn cannot refuse a hand-written `UPDATE`; the live-row cross-check catches it. The check sees only
-repositories linked into the binary, and matches the bare table name.
+Autumn cannot refuse a hand-written `UPDATE`; the live-row cross-check catches it.
+The same is true for code that `autumn generate` writes into your crate, and for
+operator commands that copy rows (`autumn shard move-slot`, `autumn db scrub`).
+The check sees only repositories linked into the binary, and matches the bare
+table name.
 
 ### Threat model — read this
 
@@ -398,6 +418,8 @@ it is refused at the repository seam — at compile time, not at runtime:
 | The same cascade from a **hard**-deleting parent | Refused at runtime with a typed `LedgerError::HardDeleteCascade`. Neither outcome is available: erasing the child destroys the record its ledger reconstructs, and soft-deleting it leaves a live foreign key pointing at a parent row about to disappear, which the database rejects. The parent's macro cannot see that the child is ledgered — they are separate `#[repository]` invocations — so this is a runtime guard, not a compile error. Make the parent `soft_delete`, or remove the `dependent(...)` clause. |
 | A `NaN` or infinite float in a ledgered write | Refused with `LedgerError::NonFiniteValue`. The error names the column. The write rolls back. A snapshot cannot store these values, because JSON cannot hold them. The check covers `f32`, `f64`, and `Option` or `Vec` of them. Floats inside other types, such as a JSON column, are not checked. |
 | `#[version_history(sensitive = [...])]` | Rejected: a redacted column cannot be reconstructed, so byte-for-byte as-of fidelity would be unprovable. |
+| A derived `delete_by_*` method | Rejected: it deletes in one bulk `UPDATE` and records no revision. Find the records, then call `delete_by_id` or `delete_many`. |
+| `tenant_scoped` with `tenant_id: Option<String>` | Rejected: see [Multi-tenancy and sharding](#multi-tenancy-and-sharding). |
 | `no_versioned_record_impl` | Rejected: the ledger snapshots through the generated `VersionedRecord` impl, and a hand-written one is not guaranteed to serialize every column. |
 | `retention(...)` / `position(...)` | Already rejected for `versioned = true`: both mutate rows outside the history-writing paths. |
 
@@ -412,6 +434,19 @@ tenant A's revisions, and `ledger_as_of` fails closed to `None`.
 read would interleave their chains into one sequence — 1, 1, 2, 2 — which
 `verify` would correctly call `DuplicateSeq` on history nobody touched. Read the
 ledger inside a tenant scope instead.
+
+The tenant column must be `String`, not `Option<String>`. A revision with a
+NULL tenant is not visible to a tenant-scoped read, and a cross-tenant read is
+refused, so no read could reach its chain. A nullable column is a compile error.
+
+The writer and the reader use the same source: the row's `tenant_id`. The
+writer stamps each revision with it. The reader finds the chain and the live
+row by the active tenant, which is the same value. So each chain has exactly one
+read mode: the scope of the tenant that owns the row.
+
+A record cannot move to another tenant. An update that changes `tenant_id`
+fails with `LedgerError::TenantChange`. The move would leave the old chain with
+no live row, and start a new chain in the other tenant.
 
 Cross-shard ledger reads are rejected for the same class of reason: per-shard
 record ids are ambiguous, so a naive merge would be wrong. Query a specific shard
@@ -436,11 +471,14 @@ is cheap. The mark table takes an in-place
 `UPDATE` per ledgered write — the ledger's only non-append-only write — so it
 produces one dead tuple per revision in a table whose primary key is its only
 index; nothing unusual for autovacuum, but worth knowing at high write rates.
-`ledger_revisions`, `ledger_as_of`, `ledger_diff` and `ledger_verify` read a
-record's whole chain (there is no pagination in this slice), and `ledger_verify`
-additionally reads the live row, the high-water mark, and re-reads the head — the
-last of those is the stability gate that keeps a concurrent write from being
-mistaken for tampering.
+`ledger_as_of` and `ledger_diff` read one revision per instant.
+`ledger_revisions` reads a record's whole chain in one statement.
+`ledger_revisions_page` reads one keyset page on `(seq, id)`, so each page costs
+one indexed read. `ledger_verify` reads every revision, in pages of
+`LedgerPageRequest::MAX_LIMIT`, so its memory holds one page and the head. It
+also reads the live row, the high-water mark, and re-reads the head — the last
+of those is the stability gate that keeps a concurrent write from being mistaken
+for tampering.
 
 Snapshots store the full row, so a ledgered table's history grows with row width,
 not just with the size of each change — the price of O(1) as-of reconstruction
@@ -455,7 +493,6 @@ this slice.
 - No retention, compaction, or archival of old revisions.
 - No distributed or multi-node ledger consensus.
 - Postgres and SQLite only.
-- No pagination on `ledger_revisions` — a record's whole chain is read at once.
 - A hand-written `UPDATE` does not append a revision. Autumn cannot see it.
   `ledger_verify` reports it as a `LiveStateMismatch`. Framework write paths
   that bypass the repository are refused instead: see

@@ -62,6 +62,7 @@ pub trait LedgerValidTimeNoteRepository {}
 // The ledger query surface exists with the documented signatures.
 fn _assert_query_surface(repo: &PgLedgerNoteRepository) {
     let _ = repo.ledger_revisions(1);
+    let _ = repo.ledger_revisions_page(1, autumn_web::ledger::LedgerPageRequest::default());
     let _ = repo.ledger_as_of(1, autumn_web::reexports::chrono::Utc::now());
     let _ = repo.ledger_as_of_at(1, autumn_web::ledger::LedgerAsOf::default());
     let _ = repo.ledger_diff(
