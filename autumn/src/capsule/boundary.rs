@@ -29,6 +29,17 @@
 )]
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set while this process replays a capsule. Then [`guard_egress`] refuses
+/// every call, also on a task that has no tape. It is never unset.
+static EGRESS_BLOCKED: AtomicBool = AtomicBool::new(false);
+
+/// Refuse all egress from now on. `autumn replay` calls it before it
+/// builds the app.
+pub(crate) fn block_egress_for_replay() {
+    EGRESS_BLOCKED.store(true, Ordering::SeqCst);
+}
 
 /// Egress that a replay refused because the capsule cannot answer it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -69,6 +80,21 @@ pub fn guard_egress(
     method: &str,
     url: &str,
 ) -> Result<(), UnrecordedEgress> {
+    check_egress(
+        subsystem,
+        method,
+        url,
+        EGRESS_BLOCKED.load(Ordering::SeqCst),
+    )
+}
+
+/// [`guard_egress`], with the process-wide replay block given.
+fn check_egress(
+    subsystem: &'static str,
+    method: &str,
+    url: &str,
+    blocked: bool,
+) -> Result<(), UnrecordedEgress> {
     // The error and the divergence are printed, so the target keeps no query
     // string and no user info: either can hold a credential.
     let target = printable_target(url);
@@ -83,8 +109,7 @@ pub fn guard_egress(
     }
     // `autumn replay` blocks the whole process, including a task that carries
     // no tape.
-    #[cfg(feature = "http-client")]
-    if crate::http_client::outbound_blocked_for_replay() {
+    if blocked {
         return Err(refuse());
     }
     if let Some(scope) = crate::capsule::current_scope() {
@@ -225,6 +250,15 @@ mod tests {
             Arc::new(CaptureSettings::default()),
             Arc::new(crate::log::filter::ParameterFilter::default()),
         ))
+    }
+
+    /// Codex review on #3222: the process-wide replay block refuses a call
+    /// with no tape, also in a build without the HTTP client.
+    #[test]
+    fn the_replay_block_refuses_egress_with_no_tape() {
+        let blocked = check_egress("s3", "PUT", "https://bucket.example/key", true);
+        assert_eq!(blocked.map_err(|error| error.subsystem()), Err("s3"));
+        assert!(check_egress("s3", "PUT", "https://bucket.example/key", false).is_ok());
     }
 
     #[tokio::test]

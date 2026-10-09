@@ -3815,6 +3815,11 @@ pub(crate) fn install_replay_mailer(state: &AppState, config: &MailConfig) {
     if let Some(installed) = installed {
         mailer.defaults = Arc::clone(&installed.defaults);
         mailer.inline_css_default = installed.inline_css_default;
+        // `has_durable_delivery_queue()` is observable too. The replay queue
+        // refuses, so the live queue is never reached.
+        if installed.has_durable_delivery_queue() {
+            mailer.delivery_queue = Some(Arc::new(ReplayTransport { disabled }));
+        }
     } else {
         mailer.defaults = Arc::new(MailerDefaults {
             from: config.from.clone(),
@@ -3832,6 +3837,16 @@ pub(crate) fn install_replay_mailer(state: &AppState, config: &MailConfig) {
 #[cfg(feature = "reporting")]
 struct ReplayTransport {
     disabled: bool,
+}
+
+#[cfg(feature = "reporting")]
+impl MailDeliveryQueue for ReplayTransport {
+    fn enqueue<'a>(
+        &'a self,
+        mail: Mail,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+        self.send(mail)
+    }
 }
 
 #[cfg(feature = "reporting")]
@@ -6668,6 +6683,29 @@ mod tests {
         );
         assert!(replay.inline_css_default);
         assert!(replay.is_disabled());
+    }
+
+    /// Codex review on #3222: the replay mailer keeps
+    /// `has_durable_delivery_queue()`, and its queue refuses.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn replay_mailer_keeps_the_durable_queue_capability() {
+        let state = AppState::for_test();
+        let mut installed = Mailer::with_transport(DisabledTransport);
+        installed.delivery_queue = Some(Arc::new(ReplayTransport { disabled: false }));
+        state.insert_extension(installed);
+        install_replay_mailer(&state, &MailConfig::default());
+        let replay = state.extension::<Mailer>().expect("installed");
+        assert!(replay.has_durable_delivery_queue());
+        let queue = replay.delivery_queue.clone().expect("queue");
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Later")
+            .text("hello")
+            .build()
+            .unwrap();
+        assert!(queue.enqueue(mail).await.is_err());
     }
 
     /// Codex review on #3222: the production durability refusal is on the

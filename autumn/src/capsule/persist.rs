@@ -263,6 +263,7 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
     // and the SQL binds too. Recording raw and masking here (rather than at
     // each seam) keeps redaction's cost off requests that never fail.
     let mut effects = scope.effects_snapshot();
+    effects.global_cache = crate::cache::global_cache().is_some();
     // A job capsule's entry point is a payload like any other: it is the job's
     // *arguments*, and they carry tokens and PII exactly the way a request body
     // does. Redacted alongside the effect tape, through the same filter and

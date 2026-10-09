@@ -460,6 +460,11 @@ pub struct CapsuleEffects {
     /// in draw order.
     #[serde(default)]
     pub random: Vec<RandomEffect>,
+    /// Whether the app had a global cache. A cache call can take a
+    /// different path without one, so replay installs a global cache that
+    /// stores nothing when this is `true`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub global_cache: bool,
 }
 
 impl CapsuleEffects {

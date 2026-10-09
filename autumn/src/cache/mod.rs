@@ -102,22 +102,12 @@ pub fn global_cache() -> Option<Arc<dyn Cache>> {
 
 /// Set the global cache for `autumn replay` (#2351).
 ///
-/// Only a global cache records a removal, so a recorded removal shows that
-/// production had one. Replay then installs the capsule seam over a backend
-/// that stores nothing, and the tape answers the removal. With no recorded
-/// removal, replay has no global cache.
+/// When production had a global cache, replay installs the capsule seam over
+/// a backend that stores nothing. A cache call then takes the path it took in
+/// production, and the tape answers it. Otherwise replay has no global cache.
 #[cfg(feature = "reporting")]
-pub(crate) fn install_replay_cache(recorded: &[crate::capsule::CacheEffect]) {
-    use crate::capsule::CacheEffect;
-    let removal = recorded.iter().any(|effect| {
-        matches!(
-            effect,
-            CacheEffect::Invalidate { .. }
-                | CacheEffect::InvalidateNamespace { .. }
-                | CacheEffect::Clear
-        )
-    });
-    if removal {
+pub(crate) fn install_replay_cache(recorded: &crate::capsule::CapsuleEffects) {
+    if recorded.global_cache {
         set_global_cache(Arc::new(ReplayBackend));
     } else {
         clear_global_cache();
@@ -1241,25 +1231,24 @@ mod tests {
         );
     }
 
-    /// Codex review on #3222: a replay answers a recorded repository
-    /// invalidation from the tape, so it is consumed.
+    /// Codex review on #3222: when production had a global cache, a replay
+    /// answers a repository invalidation from the tape, so it is consumed.
     #[cfg(feature = "reporting")]
     #[test]
-    fn replay_installs_a_seam_cache_when_the_capsule_recorded_a_removal() {
+    fn replay_installs_a_seam_cache_when_production_had_a_global_cache() {
         let _guard = GLOBAL_CACHE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let recorded = vec![crate::capsule::CacheEffect::InvalidateNamespace {
-            namespace: "posts".to_owned(),
-            error: None,
-        }];
+        let recorded = crate::capsule::CapsuleEffects {
+            cache: vec![crate::capsule::CacheEffect::InvalidateNamespace {
+                namespace: "posts".to_owned(),
+                error: None,
+            }],
+            global_cache: true,
+            ..Default::default()
+        };
         install_replay_cache(&recorded);
-        let tape = Arc::new(crate::capsule::ReplayEffects::new(
-            crate::capsule::CapsuleEffects {
-                cache: recorded,
-                ..Default::default()
-            },
-        ));
+        let tape = Arc::new(crate::capsule::ReplayEffects::new(recorded));
         let complete = block_on(crate::capsule::with_effect_tape(
             Arc::clone(&tape),
             coherence::invalidate_namespace_async("posts"),
@@ -1268,7 +1257,7 @@ mod tests {
         assert!(complete);
         assert!(tape.finish().is_empty(), "{:?}", tape.finish());
 
-        install_replay_cache(&[]);
+        install_replay_cache(&crate::capsule::CapsuleEffects::default());
         assert!(global_cache().is_none());
     }
 

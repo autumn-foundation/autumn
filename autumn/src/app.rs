@@ -8381,6 +8381,9 @@ impl AppBuilder {
         // HTTP client in its state (AC4).
         #[cfg(feature = "http-client")]
         crate::http_client::block_outbound_for_replay();
+        // Egress outside the HTTP client (`capsule::guard_egress`), in every
+        // build.
+        crate::capsule::boundary::block_egress_for_replay();
 
         let path = std::path::PathBuf::from(&capsule_path);
         let capsule = match crate::capsule::load_capsule(&path) {
@@ -8481,7 +8484,7 @@ impl AppBuilder {
         if let Some(interceptor) = db_interceptor {
             state.insert_extension(interceptor);
         }
-        crate::cache::install_replay_cache(&capsule.effects.cache);
+        crate::cache::install_replay_cache(&capsule.effects);
 
         for register in policy_registrations {
             register(state.policy_registry());
@@ -17294,6 +17297,10 @@ mod tests {
         assert!(
             handler.contains("crate::http_client::block_outbound_for_replay();"),
             "the replay handler must block outbound HTTP before rebuilding the app"
+        );
+        assert!(
+            handler.contains("crate::capsule::boundary::block_egress_for_replay();"),
+            "the replay handler must block egress outside the HTTP client in every build"
         );
         assert!(
             handler.contains("channels_backend: _replay_ignores_custom_channels_backend,"),

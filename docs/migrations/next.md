@@ -931,7 +931,7 @@ let stats = autumn_web::shadow::ShadowStats {
 **Automation:** `manual` - the fix adds a struct update expression, and no
 codemod rewrites struct literals.
 
-### Capsules: new `CacheEffect` and `EffectSeam` variants, a new `JobEffect` field
+### Capsules: new `CacheEffect` and `EffectSeam` variants, new `JobEffect` and `CapsuleEffects` fields
 
 **Why:** issue #2351 adds cache removals and random-draw widths to the capsule
 seam. It also records the deadline of an `enqueue_at` call when the deadline
@@ -979,6 +979,9 @@ The new variants are `CacheEffect::Invalidate`, `CacheEffect::InvalidateNamespac
 `CacheEffect::Clear`, `EffectSeam::Random` and
 `MailErrorKind::NoDurableQueueInProduction`. An exhaustive `match` on
 `EffectSeam` or `MailErrorKind` needs a new arm.
+
+`CapsuleEffects` has a new field `global_cache`. A struct literal of
+`CapsuleEffects` needs `..CapsuleEffects::default()`.
 
 `CAPSULE_FORMAT_VERSION` is now 4. An older build refuses a version 4 capsule
 with a version mismatch. This build reads a version 3 capsule and replays it
