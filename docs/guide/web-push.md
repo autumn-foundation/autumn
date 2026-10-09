@@ -269,6 +269,24 @@ what makes the upsert atomic. Two consequences worth knowing:
   `PushError::TooManySubscriptions` (`422`). Without a ceiling, one account
   could make every send unbounded work.
 
+## Multi-tenancy
+
+With `[tenancy] enabled = true`, all tenants share one `push_subscriptions`
+table. The owner of a subscription is the pair (tenant, principal). The store
+gets the tenant from the resolved tenant of the request, never from the body.
+
+- Two tenants can use the same principal id. A send in one tenant reaches only
+  that tenant's devices.
+- An endpoint is unique across tenants. To move an endpoint to another tenant
+  or principal, send both stored keys.
+- The cap of 20 subscriptions counts per (tenant, principal).
+- A send from a job has no request. Wrap it in
+  `autumn_web::tenancy::with_tenant(tenant_id, async { ... })`.
+- A custom `PushSubscriptionStore` must scope by tenant too.
+
+This matches the in-app feed. Use the same principal id for both and they
+refer to the same user in the same tenant.
+
 ## Fail fast, never silently
 
 The failure this subsystem is built to prevent is an app that starts cleanly,

@@ -343,6 +343,16 @@ pub trait ProvideActuatorState {
         None
     }
 
+    /// Returns the read-replica pool, used to export its gauges on
+    /// `/actuator/prometheus` with `pool="replica"`. Defaults to `None`.
+    #[cfg(feature = "db")]
+    fn replica_pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
+    {
+        None
+    }
+
     /// Returns the scaffold-level accessibility posture reported by `/actuator/a11y`.
     ///
     /// Override this in your `AppState` implementation to declare which
@@ -3394,6 +3404,17 @@ pub(crate) const SERIES_DROPPED_FAMILY: &str = "autumn_metrics_series_dropped_to
 /// Redis dead letters removed to obey `jobs.redis.dead_letter_limit`.
 pub(crate) const DEAD_LETTER_TRIMMED_FAMILY: &str = "autumn_jobs_dead_letter_trimmed_total";
 
+/// Time a `Db` checkout waits for a pool connection (issue #3064).
+pub(crate) const DB_POOL_WAIT_FAMILY: &str = "autumn_db_pool_wait_seconds";
+
+/// HTTP request latency histogram (issue #3064).
+pub(crate) const HTTP_DURATION_FAMILY: &str = "autumn_http_request_duration_seconds";
+
+/// Deprecated latency summary. It keeps the p50/p95/p99 quantile lines that
+/// `autumn_http_request_duration_seconds` carried before it became a histogram.
+pub(crate) const HTTP_DURATION_QUANTILES_FAMILY: &str =
+    "autumn_http_request_duration_quantiles_seconds";
+
 /// Slow calls per circuit breaker (issue #3060).
 pub(crate) const BREAKER_SLOW_CALLS_FAMILY: &str = "autumn_circuit_breaker_slow_calls_total";
 
@@ -3406,19 +3427,22 @@ pub(crate) const BREAKER_SLOW_CALL_RATIO_FAMILY: &str = "autumn_circuit_breaker_
 /// `emitted_families` set with it so a plugin [`MetricsSource`] cannot shadow a
 /// built-in family, and [`crate::metrics`] refuses to register an app metric
 /// under any of these names.
-pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 31] = [
+pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 46] = [
     "autumn_http_requests_total",
     "autumn_http_requests_active",
     "autumn_http_responses_total",
-    // `autumn_http_request_duration_seconds` is a **summary**, and a summary
-    // owns the derived `_sum`/`_count` family names the same way a histogram
-    // owns `_bucket`/`_sum`/`_count` — even though this exporter emits only
-    // quantile lines for it. A second family under either derived name gives
-    // the document two `# HELP` lines for one family, which makes Prometheus'
-    // own parser reject the *whole* scrape, not just that family.
-    "autumn_http_request_duration_seconds",
+    // A histogram owns its derived `_bucket`/`_sum`/`_count` names, and a
+    // summary owns `_sum`/`_count`, even when this exporter writes only
+    // quantile lines. A second family under a derived name gives the document
+    // two `# HELP` lines for one family. Prometheus then rejects the *whole*
+    // scrape, not just that family.
+    HTTP_DURATION_FAMILY,
+    "autumn_http_request_duration_seconds_bucket",
     "autumn_http_request_duration_seconds_sum",
     "autumn_http_request_duration_seconds_count",
+    HTTP_DURATION_QUANTILES_FAMILY,
+    "autumn_http_request_duration_quantiles_seconds_sum",
+    "autumn_http_request_duration_quantiles_seconds_count",
     "autumn_shutdown_aborted_requests_total",
     "autumn_request_timeouts_total",
     "autumn_read_your_writes_pins_total",
@@ -3440,6 +3464,17 @@ pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 31] = [
     "autumn_cache_read_through_stale_if_error_serves_total",
     "autumn_cache_invalidation_failures_total",
     DEAD_LETTER_TRIMMED_FAMILY,
+    "autumn_jobs_queue_depth",
+    "autumn_jobs_oldest_age_seconds",
+    "autumn_jobs_dead_letter_total",
+    "autumn_db_pool_max_size",
+    "autumn_db_pool_size",
+    "autumn_db_pool_available",
+    "autumn_db_pool_waiting",
+    DB_POOL_WAIT_FAMILY,
+    "autumn_db_pool_wait_seconds_bucket",
+    "autumn_db_pool_wait_seconds_sum",
+    "autumn_db_pool_wait_seconds_count",
     BREAKER_SLOW_CALLS_FAMILY,
     BREAKER_SLOW_CALL_RATIO_FAMILY,
     crate::shadow::COMPARISONS_METRIC,
@@ -3666,6 +3701,7 @@ fn write_builtin_http_metrics(
     out: &mut String,
     version: &str,
     snapshot: &crate::middleware::metrics::MetricsSnapshot,
+    duration_series: &[crate::middleware::metrics::DurationSeries],
 ) {
     use std::fmt::Write;
 
@@ -3702,25 +3738,9 @@ fn write_builtin_http_metrics(
         );
     }
 
-    // request_duration_seconds — global latency percentiles exposed as Prometheus
-    // summary-style quantiles, labelled by deploy version so a canary controller
-    // can gate promotion on p99 latency per cohort.
-    out.push_str(
-        "# HELP autumn_http_request_duration_seconds HTTP request latency percentiles in seconds\n",
-    );
-    out.push_str("# TYPE autumn_http_request_duration_seconds summary\n");
-    for (quantile, millis) in [
-        ("0.5", snapshot.http.latency_ms.p50),
-        ("0.95", snapshot.http.latency_ms.p95),
-        ("0.99", snapshot.http.latency_ms.p99),
-    ] {
-        #[allow(clippy::cast_precision_loss)]
-        let seconds = millis as f64 / 1000.0;
-        let _ = writeln!(
-            out,
-            "autumn_http_request_duration_seconds{{version=\"{version}\",quantile=\"{quantile}\"}} {seconds}"
-        );
-    }
+    write_http_duration_histogram(out, version, duration_series);
+
+    write_http_duration_quantiles(out, version, snapshot);
 
     // autumn_shutdown_aborted_requests_total
     out.push_str(
@@ -3777,6 +3797,90 @@ fn write_builtin_http_metrics(
             }
         }
     }
+}
+
+/// Render the deprecated global p50/p95/p99 summary (issue #3064). You cannot
+/// add summaries from different replicas. Use the histogram instead.
+fn write_http_duration_quantiles(
+    out: &mut String,
+    version: &str,
+    snapshot: &crate::middleware::metrics::MetricsSnapshot,
+) {
+    use std::fmt::Write;
+
+    let name = HTTP_DURATION_QUANTILES_FAMILY;
+    let _ = writeln!(
+        out,
+        "# HELP {name} Deprecated: HTTP request latency quantiles in seconds. \
+         Use autumn_http_request_duration_seconds"
+    );
+    let _ = writeln!(out, "# TYPE {name} summary");
+    for (quantile, millis) in [
+        ("0.5", snapshot.http.latency_ms.p50),
+        ("0.95", snapshot.http.latency_ms.p95),
+        ("0.99", snapshot.http.latency_ms.p99),
+    ] {
+        #[allow(clippy::cast_precision_loss)]
+        let seconds = millis as f64 / 1000.0;
+        let _ = writeln!(
+            out,
+            "{name}{{version=\"{version}\",quantile=\"{quantile}\"}} {seconds}"
+        );
+    }
+}
+
+/// Render `autumn_http_request_duration_seconds` as a histogram (issue #3064).
+///
+/// Labels: `version`, `method`, `route`, `status_class`. Every label has a
+/// bounded value set. `route` is the matched route pattern, or `_unmatched`.
+/// `method` is a standard method, or `_other`.
+fn write_http_duration_histogram(
+    out: &mut String,
+    version: &str,
+    series: &[crate::middleware::metrics::DurationSeries],
+) {
+    use std::fmt::Write;
+
+    let name = HTTP_DURATION_FAMILY;
+    let _ = writeln!(out, "# HELP {name} HTTP request latency in seconds");
+    let _ = writeln!(out, "# TYPE {name} histogram");
+    for entry in series {
+        let labels = format!(
+            "version=\"{version}\",method=\"{}\",route=\"{}\",status_class=\"{}\"",
+            escape_prometheus_label_value(&entry.method),
+            escape_prometheus_label_value(&entry.route),
+            entry.status_class,
+        );
+        write_histogram_samples(out, name, &labels, &entry.histogram);
+    }
+}
+
+/// Write the `_bucket`, `_sum` and `_count` lines of one histogram series.
+/// `labels` is the rendered label list without braces.
+fn write_histogram_samples(
+    out: &mut String,
+    name: &str,
+    labels: &str,
+    histogram: &crate::middleware::metrics::HistogramSnapshot,
+) {
+    use std::fmt::Write;
+
+    let separator = if labels.is_empty() { "" } else { "," };
+    for (le, count) in crate::middleware::metrics::BUCKET_LABELS
+        .iter()
+        .zip(histogram.cumulative)
+    {
+        let _ = writeln!(
+            out,
+            "{name}_bucket{{{labels}{separator}le=\"{le}\"}} {count}"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "{name}_sum{{{labels}}} {}",
+        format_sample_value(histogram.sum_seconds)
+    );
+    let _ = writeln!(out, "{name}_count{{{labels}}} {}", histogram.count());
 }
 
 /// Render the built-in `autumn_cache_*` read-through stampede-protection
@@ -3850,10 +3954,11 @@ fn write_builtin_cache_metrics(
     }
 }
 
-/// Render the built-in job families into `out` (issue #3055).
+/// Render the built-in job families into `out` (issues #3055, #3064).
 ///
-/// The family is always present, so an alert on `increase()` sees a `0`
-/// sample before the first trim.
+/// Every family is always present, so an alert on `increase()` sees a `0`
+/// sample before the first event. The `queue` and `job` label values come from
+/// registered jobs and surveyed queues, so the label set is bounded.
 fn write_builtin_job_metrics(out: &mut String, version: &str, registry: &JobRegistry) {
     use std::fmt::Write;
 
@@ -3868,6 +3973,140 @@ fn write_builtin_job_metrics(out: &mut String, version: &str, registry: &JobRegi
         "{name}{{version=\"{version}\"}} {}",
         registry.dead_letter_trimmed_total()
     );
+
+    let mut queues: Vec<(String, QueueStatus)> = registry.queue_snapshot().into_iter().collect();
+    queues.sort_by(|a, b| a.0.cmp(&b.0));
+    let _ = writeln!(
+        out,
+        "# HELP autumn_jobs_queue_depth Jobs ready to run and waiting on each queue"
+    );
+    let _ = writeln!(out, "# TYPE autumn_jobs_queue_depth gauge");
+    for (queue, status) in &queues {
+        let queue = escape_prometheus_label_value(queue);
+        let _ = writeln!(
+            out,
+            "autumn_jobs_queue_depth{{version=\"{version}\",queue=\"{queue}\"}} {}",
+            status.depth
+        );
+    }
+    let _ = writeln!(
+        out,
+        "# HELP autumn_jobs_oldest_age_seconds Age of the oldest ready job on each queue"
+    );
+    let _ = writeln!(out, "# TYPE autumn_jobs_oldest_age_seconds gauge");
+    for (queue, status) in &queues {
+        let queue = escape_prometheus_label_value(queue);
+        #[allow(clippy::cast_precision_loss, reason = "Prometheus samples are f64")]
+        let seconds = status.oldest_waiting_age_ms as f64 / 1000.0;
+        let _ = writeln!(
+            out,
+            "autumn_jobs_oldest_age_seconds{{version=\"{version}\",queue=\"{queue}\"}} {}",
+            format_sample_value(seconds)
+        );
+    }
+
+    let mut jobs: Vec<(String, JobStatus)> = registry.snapshot().into_iter().collect();
+    jobs.sort_by(|a, b| a.0.cmp(&b.0));
+    let _ = writeln!(
+        out,
+        "# HELP autumn_jobs_dead_letter_total Job executions moved to the dead-letter queue"
+    );
+    let _ = writeln!(out, "# TYPE autumn_jobs_dead_letter_total counter");
+    for (job, status) in &jobs {
+        let job = escape_prometheus_label_value(job);
+        let _ = writeln!(
+            out,
+            "autumn_jobs_dead_letter_total{{version=\"{version}\",job=\"{job}\"}} {}",
+            status.dead_letters
+        );
+    }
+}
+
+/// A pool gauge: metric name, help text, and the `Status` field it reads.
+#[cfg(feature = "db")]
+type PoolGauge = (&'static str, &'static str, fn(&deadpool::Status) -> usize);
+
+/// Render the database pool families into `out` (issue #3064).
+///
+/// The wait histogram is always present. The gauges are present when the app
+/// has a pool. The `pool` label is `primary` or `replica`, or
+/// `shard:<name>:primary` and `shard:<name>:replica` for a sharded app.
+fn write_builtin_db_pool_metrics<S: ProvideActuatorState>(
+    out: &mut String,
+    version: &str,
+    state: &S,
+) {
+    use std::fmt::Write;
+
+    let name = DB_POOL_WAIT_FAMILY;
+    let _ = writeln!(
+        out,
+        "# HELP {name} Time a Db checkout took to get a pool connection, connect time included"
+    );
+    let _ = writeln!(out, "# TYPE {name} histogram");
+    write_histogram_samples(
+        out,
+        name,
+        &format!("version=\"{version}\""),
+        &state.metrics().db_pool_wait(),
+    );
+
+    #[cfg(feature = "db")]
+    {
+        let mut pools: Vec<(String, deadpool::Status)> = Vec::new();
+        if let Some(pool) = state.pool() {
+            pools.push(("primary".to_owned(), pool.status()));
+        }
+        if let Some(pool) = state.replica_pool() {
+            pools.push(("replica".to_owned(), pool.status()));
+        }
+        if let Some(shards) = state.shards() {
+            for shard in shards.iter() {
+                pools.push((
+                    format!("shard:{}:primary", shard.name()),
+                    shard.primary_pool().status(),
+                ));
+                if let Some(replica) = shard.replica_pool() {
+                    pools.push((format!("shard:{}:replica", shard.name()), replica.status()));
+                }
+            }
+        }
+        if pools.is_empty() {
+            return;
+        }
+        let gauges: [PoolGauge; 4] = [
+            (
+                "autumn_db_pool_max_size",
+                "Maximum connections in the pool",
+                |s| s.max_size,
+            ),
+            ("autumn_db_pool_size", "Open connections in the pool", |s| {
+                s.size
+            }),
+            (
+                "autumn_db_pool_available",
+                "Idle connections in the pool",
+                |s| s.available,
+            ),
+            (
+                "autumn_db_pool_waiting",
+                "Tasks waiting for a pool connection",
+                |s| s.waiting,
+            ),
+        ];
+        for (gauge, help, read) in gauges {
+            let _ = writeln!(out, "# HELP {gauge} {help}");
+            let _ = writeln!(out, "# TYPE {gauge} gauge");
+            for (label, status) in &pools {
+                let label = escape_prometheus_label_value(label);
+                let _ = writeln!(
+                    out,
+                    "{gauge}{{version=\"{version}\",pool=\"{label}\"}} {}",
+                    read(status)
+                );
+            }
+        }
+    }
 }
 
 /// Render the per-breaker slow-call families (issue #3060) into `out`.
@@ -4128,13 +4367,19 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
     let version = escape_prometheus_label_value(&state.deploy_version());
     let mut out = String::with_capacity(2048);
 
-    write_builtin_http_metrics(&mut out, &version, &snapshot);
+    write_builtin_http_metrics(
+        &mut out,
+        &version,
+        &snapshot,
+        &state.metrics().duration_series(),
+    );
     write_builtin_cache_metrics(
         &mut out,
         &version,
         &crate::cache::read_through_metrics().snapshot(),
     );
     write_builtin_job_metrics(&mut out, &version, state.job_registry());
+    write_builtin_db_pool_metrics(&mut out, &version, &state);
     write_builtin_circuit_breaker_metrics(
         &mut out,
         &version,
@@ -6397,6 +6642,9 @@ mod tests {
         pool: Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>,
         #[cfg(feature = "db")]
         shards: Option<crate::sharding::ShardSet>,
+        #[cfg(feature = "db")]
+        replica_pool:
+            Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>,
         #[cfg(feature = "ws")]
         channels: crate::channels::Channels,
         #[cfg(feature = "ws")]
@@ -6446,6 +6694,13 @@ mod tests {
         #[cfg(feature = "db")]
         fn shards(&self) -> Option<&crate::sharding::ShardSet> {
             self.shards.as_ref()
+        }
+        #[cfg(feature = "db")]
+        fn replica_pool(
+            &self,
+        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
+        {
+            self.replica_pool.as_ref()
         }
         #[cfg(feature = "ws")]
         fn channels(&self) -> &crate::channels::Channels {
@@ -6499,6 +6754,8 @@ mod tests {
             pool: None,
             #[cfg(feature = "db")]
             shards: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
@@ -7768,6 +8025,150 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         assert!(json.get("database").is_some());
     }
 
+    async fn scrape_prometheus(state: TestActuatorState) -> String {
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    /// The value of the one sample line that starts with `prefix`.
+    fn sample_value(text: &str, prefix: &str) -> f64 {
+        let line = text
+            .lines()
+            .find(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no sample `{prefix}` in:\n{text}"));
+        line.rsplit(' ').next().unwrap().parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn prometheus_exports_job_queue_gauges_and_dead_letters() {
+        let state = test_state();
+        let jobs = state.job_registry.clone();
+        jobs.register_on_queue("send_mail", "mail");
+        jobs.register_on_queue("resize", "media");
+        let now = jobs.now_ms();
+        jobs.record_enqueue_scheduled("send_mail", now - 5_000);
+        jobs.record_enqueue_scheduled("send_mail", now - 1_000);
+        jobs.record_enqueue("resize");
+        jobs.record_start("resize");
+        jobs.record_failure("resize", "boom".into(), true);
+
+        let text = scrape_prometheus(state).await;
+
+        assert!(
+            text.contains("# TYPE autumn_jobs_queue_depth gauge\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE autumn_jobs_oldest_age_seconds gauge\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE autumn_jobs_dead_letter_total counter\n"),
+            "{text}"
+        );
+        let depth = "autumn_jobs_queue_depth{version=\"stable\",queue=\"mail\"} ";
+        assert!((sample_value(&text, depth) - 2.0).abs() < f64::EPSILON);
+        let empty = "autumn_jobs_queue_depth{version=\"stable\",queue=\"media\"} ";
+        assert!(sample_value(&text, empty).abs() < f64::EPSILON);
+        let age = "autumn_jobs_oldest_age_seconds{version=\"stable\",queue=\"mail\"} ";
+        assert!(sample_value(&text, age) >= 4.9, "oldest job waited 5s");
+        let dead = "autumn_jobs_dead_letter_total{version=\"stable\",job=\"resize\"} ";
+        assert!((sample_value(&text, dead) - 1.0).abs() < f64::EPSILON);
+        let none = "autumn_jobs_dead_letter_total{version=\"stable\",job=\"send_mail\"} ";
+        assert!(sample_value(&text, none).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn prometheus_exports_db_pool_wait_histogram() {
+        let state = test_state();
+        state
+            .metrics
+            .record_db_pool_wait(std::time::Duration::from_micros(300));
+        state
+            .metrics
+            .record_db_pool_wait(std::time::Duration::from_millis(120));
+
+        let text = scrape_prometheus(state).await;
+
+        assert!(
+            text.contains("# TYPE autumn_db_pool_wait_seconds histogram\n"),
+            "{text}"
+        );
+        let first = "autumn_db_pool_wait_seconds_bucket{version=\"stable\",le=\"0.001\"} ";
+        assert!((sample_value(&text, first) - 1.0).abs() < f64::EPSILON);
+        let inf = "autumn_db_pool_wait_seconds_bucket{version=\"stable\",le=\"+Inf\"} ";
+        assert!((sample_value(&text, inf) - 2.0).abs() < f64::EPSILON);
+        let count = "autumn_db_pool_wait_seconds_count{version=\"stable\"} ";
+        assert!((sample_value(&text, count) - 2.0).abs() < f64::EPSILON);
+        let sum = "autumn_db_pool_wait_seconds_sum{version=\"stable\"} ";
+        assert!((sample_value(&text, sum) - 0.1203).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "db")]
+    async fn prometheus_exports_db_pool_gauges() {
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+        use diesel_async::pooled_connection::deadpool::Pool;
+
+        let mut state = test_state();
+        // deadpool is lazy, so no connection is opened.
+        let manager = AsyncDieselConnectionManager::<crate::db::RuntimeConnection>::new(
+            crate::test_urls::primary("actuator_prometheus_pool"),
+        );
+        state.pool = Some(Pool::builder(manager).max_size(7).build().unwrap());
+        let replica = AsyncDieselConnectionManager::<crate::db::RuntimeConnection>::new(
+            crate::test_urls::primary("actuator_prometheus_replica"),
+        );
+        state.replica_pool = Some(Pool::builder(replica).max_size(3).build().unwrap());
+
+        let text = scrape_prometheus(state).await;
+        let replica_max = "autumn_db_pool_max_size{version=\"stable\",pool=\"replica\"} ";
+        assert!((sample_value(&text, replica_max) - 3.0).abs() < f64::EPSILON);
+
+        for (name, value) in [
+            ("autumn_db_pool_max_size", 7.0),
+            ("autumn_db_pool_size", 0.0),
+            ("autumn_db_pool_available", 0.0),
+            ("autumn_db_pool_waiting", 0.0),
+        ] {
+            assert!(text.contains(&format!("# TYPE {name} gauge\n")), "{text}");
+            let prefix = format!("{name}{{version=\"stable\",pool=\"primary\"}} ");
+            assert!((sample_value(&text, &prefix) - value).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn builtin_family_names_cover_queue_and_pool_metrics() {
+        for name in [
+            "autumn_jobs_queue_depth",
+            "autumn_jobs_oldest_age_seconds",
+            "autumn_jobs_dead_letter_total",
+            "autumn_db_pool_max_size",
+            "autumn_db_pool_size",
+            "autumn_db_pool_available",
+            "autumn_db_pool_waiting",
+            "autumn_db_pool_wait_seconds",
+            "autumn_db_pool_wait_seconds_bucket",
+            "autumn_db_pool_wait_seconds_sum",
+            "autumn_db_pool_wait_seconds_count",
+        ] {
+            assert!(BUILTIN_METRIC_FAMILY_NAMES.contains(&name), "{name}");
+        }
+    }
+
     // ── Config properties endpoint tests ───────────────────────
 
     #[tokio::test]
@@ -8254,10 +8655,18 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         assert!(text.contains("autumn_http_responses_total{version=\"stable\",status=\"2xx\"} 1"));
         assert!(text.contains("autumn_http_responses_total{version=\"stable\",status=\"5xx\"} 1"));
 
-        // Latency percentiles are exposed in seconds, labelled by version.
-        assert!(text.contains("# TYPE autumn_http_request_duration_seconds summary"));
+        // Latency is a histogram in seconds, labelled by version, method,
+        // route and status class. The deprecated summary keeps the quantiles.
+        assert!(text.contains("# TYPE autumn_http_request_duration_seconds histogram"));
         assert!(text.contains(
-            "autumn_http_request_duration_seconds{version=\"stable\",quantile=\"0.99\"}"
+            "autumn_http_request_duration_seconds_count{version=\"stable\",method=\"GET\",route=\"/test\",status_class=\"2xx\"} 1"
+        ));
+        assert!(text.contains(
+            "autumn_http_request_duration_seconds_count{version=\"stable\",method=\"POST\",route=\"/test\",status_class=\"5xx\"} 1"
+        ));
+        assert!(text.contains("# TYPE autumn_http_request_duration_quantiles_seconds summary"));
+        assert!(text.contains(
+            "autumn_http_request_duration_quantiles_seconds{version=\"stable\",quantile=\"0.99\"}"
         ));
 
         assert!(text.contains(
@@ -8489,7 +8898,7 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         // and satisfy the quantile invariant p50 <= p95 <= p99.
         let quantile = |q: &str| -> f64 {
             let needle = format!(
-                "autumn_http_request_duration_seconds{{version=\"canary\",quantile=\"{q}\"}} "
+                "autumn_http_request_duration_quantiles_seconds{{version=\"canary\",quantile=\"{q}\"}} "
             );
             let line = text
                 .lines()
@@ -10218,9 +10627,9 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
 
     #[tokio::test]
     async fn prometheus_endpoint_skips_plugin_family_colliding_with_builtin_summary_derived_name() {
-        // `autumn_http_request_duration_seconds` is a summary, so it owns
-        // `_sum` and `_count` too. A plugin family under either name would put
-        // a second `# HELP` line for that family into the document, and
+        // A histogram owns `_bucket`, `_sum` and `_count`. A summary owns
+        // `_sum` and `_count`. A plugin family under any of these names puts a
+        // second `# HELP` line for that family into the document, and
         // Prometheus' own parser rejects the whole scrape when that happens.
         struct DerivedSummarySource(&'static str);
         impl MetricsSource for DerivedSummarySource {
@@ -10238,8 +10647,11 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         }
 
         for derived in [
+            "autumn_http_request_duration_seconds_bucket",
             "autumn_http_request_duration_seconds_sum",
             "autumn_http_request_duration_seconds_count",
+            "autumn_http_request_duration_quantiles_seconds_sum",
+            "autumn_http_request_duration_quantiles_seconds_count",
         ] {
             let state = test_state();
             state

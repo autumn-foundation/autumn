@@ -247,6 +247,7 @@ fn push_subscription_fields() -> Vec<Field> {
         state_machine: None,
     };
     vec![
+        field("tenant_id", false),
         field("principal_id", false),
         // UNIQUE is load-bearing, not decoration: it is what makes the store's
         // `ON CONFLICT (endpoint) DO UPDATE` upsert atomic rather than a racy
@@ -266,22 +267,31 @@ fn push_subscription_fields() -> Vec<Field> {
 /// notifications generator makes, for the same reason. The `SQLite` output
 /// already matches and is left exactly as the helper emits it.
 fn push_subscriptions_up_sql(backend: DatabaseBackend) -> String {
-    let indexes: BTreeSet<String> = std::iter::once("principal_id".to_owned()).collect();
     let sql = create_table_sql_with_metadata_and_id_for(
         backend,
         PUSH_SUBSCRIPTIONS_TABLE,
         &push_subscription_fields(),
-        &indexes,
+        &BTreeSet::new(),
         &BTreeMap::new(),
         IdType::BigSerial,
     );
-    match backend {
+    let sql = match backend {
         DatabaseBackend::Postgres => sql.replace(
             "created_at TIMESTAMP NOT NULL DEFAULT NOW()",
             "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
         ),
         DatabaseBackend::Sqlite => sql,
-    }
+    };
+    // `tenant_id` is `""` outside a tenant scope, so it is `NOT NULL DEFAULT ''`.
+    // The composite index serves the send path: it filters on both columns.
+    let sql = sql.replace(
+        "tenant_id TEXT NOT NULL",
+        "tenant_id TEXT NOT NULL DEFAULT ''",
+    );
+    format!(
+        "{sql}CREATE INDEX idx_push_subscriptions_tenant_principal ON push_subscriptions \
+         (tenant_id, principal_id);\n"
+    )
 }
 
 fn render_manifest() -> String {
@@ -2676,6 +2686,7 @@ async fn main() {
         let sql = push_subscriptions_up_sql(DatabaseBackend::Postgres);
 
         for column in [
+            "tenant_id TEXT NOT NULL DEFAULT ''",
             "principal_id TEXT NOT NULL",
             "endpoint TEXT NOT NULL",
             "p256dh TEXT NOT NULL",
@@ -2722,13 +2733,13 @@ async fn main() {
     }
 
     #[test]
-    fn push_migration_indexes_principal_id_for_the_send_path() {
-        // Every send does `WHERE principal_id = …`; without the index that is
-        // a sequential scan of every subscription in the system.
+    fn push_migration_indexes_tenant_and_principal_for_the_send_path() {
+        // Every send does `WHERE tenant_id = … AND principal_id = …`; without
+        // the index that is a sequential scan of every subscription.
         let sql = push_subscriptions_up_sql(DatabaseBackend::Postgres);
         assert!(
-            sql.contains("(principal_id)"),
-            "`principal_id` must be indexed:\n{sql}"
+            sql.contains("(tenant_id, principal_id)"),
+            "`(tenant_id, principal_id)` must be indexed:\n{sql}"
         );
     }
 

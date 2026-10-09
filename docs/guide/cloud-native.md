@@ -89,6 +89,7 @@ service_namespace = "apps"
 environment = "production"
 otlp_endpoint = "http://otel-collector:4317"
 protocol = "Grpc"
+sample_ratio = 1.0   # parent-based ratio for new traces
 ```
 
 If you are not ready for OTLP yet, force `log.format = "Json"` so your logs are
@@ -109,6 +110,10 @@ With the `telemetry-otlp` cargo feature enabled and `telemetry.enabled = true`:
   span tagged with `db.system=postgresql` whose scope covers the lifetime
   of the pooled connection — Diesel activity performed through it appears
   as a child of the request span in Jaeger / Tempo / Datadog.
+- **Sampling.** `telemetry.sample_ratio` sets a parent-based ratio sampler.
+  See [Overload signals](observability/overload-signals.md#sampler).
+- **Trace IDs in logs.** Request log events carry `trace_id` and `span_id`.
+- **Outbound CLIENT spans.** `http_client` opens one span per attempt.
 - **Job and mailer trace propagation.** `#[job]` and `#[mailer]` boundaries
   now carry the W3C `traceparent` / `tracestate` into their durable payloads.
   See below.

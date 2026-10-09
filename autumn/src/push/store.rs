@@ -409,6 +409,11 @@ pub const MAX_SUBSCRIPTIONS_PER_PRINCIPAL: usize = 20;
 ///   is only a capability to *send*, and without this rule anyone who obtained
 ///   one could re-register it under their own account with their own keys,
 ///   silently cutting the victim off and redirecting their notifications.
+/// - **Rows belong to a tenant.** The owner of a subscription is the pair
+///   (tenant, principal). The built-in stores read the tenant from the
+///   task-local [`CURRENT_TENANT`](crate::tenancy::CURRENT_TENANT), never from
+///   the request. A custom store must scope `save`, `list_for` and the scoped
+///   `remove` the same way. Outside a tenant scope the tenant is `""`.
 /// - **Removal is idempotent.** [`remove`](Self::remove) returns how many rows
 ///   it deleted; a missing endpoint is `Ok(0)`, not an error.
 ///
@@ -525,7 +530,8 @@ impl<S: PushSubscriptionStore> BoxedPushSubscriptionStore for S {
 /// and it grows without bound (no eviction), so it is not a production store.
 #[derive(Debug, Default)]
 pub struct MemoryPushSubscriptionStore {
-    rows: std::sync::Mutex<Vec<StoredSubscription>>,
+    /// `(tenant_id, subscription)`; see [`crate::tenancy::current_tenant_id`].
+    rows: std::sync::Mutex<Vec<(String, StoredSubscription)>>,
 }
 
 impl MemoryPushSubscriptionStore {
@@ -535,7 +541,9 @@ impl MemoryPushSubscriptionStore {
         Self::default()
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Vec<StoredSubscription>>, PushError> {
+    fn lock(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Vec<(String, StoredSubscription)>>, PushError> {
         self.rows
             .lock()
             .map_err(|_| PushError::Store("memory store mutex poisoned".to_owned()))
@@ -544,6 +552,7 @@ impl MemoryPushSubscriptionStore {
 
 impl PushSubscriptionStore for MemoryPushSubscriptionStore {
     async fn save(&self, subscription: StoredSubscription) -> Result<(), PushError> {
+        let tenant = crate::tenancy::current_tenant_id();
         let mut rows = self.lock()?;
 
         // Endpoint identity, not (principal, endpoint): re-subscribing on a
@@ -553,24 +562,28 @@ impl PushSubscriptionStore for MemoryPushSubscriptionStore {
         // endpoint URL and its (public) `p256dh` would be enough to take a
         // victim's device over, replacing `auth` in the process so the
         // victim's browser can no longer decrypt anything. See the trait docs.
-        if let Some(existing) = rows
+        // The owner is (tenant, principal): the same principal id in another
+        // tenant is a different owner.
+        if let Some((existing_tenant, existing)) = rows
             .iter()
-            .find(|row| row.endpoint == subscription.endpoint)
-            && existing.principal_id != subscription.principal_id
+            .find(|(_, row)| row.endpoint == subscription.endpoint)
+            && (*existing_tenant != tenant || existing.principal_id != subscription.principal_id)
             && (existing.p256dh != subscription.p256dh || existing.auth != subscription.auth)
         {
             return Err(PushError::EndpointClaimed);
         }
 
-        // A move from another principal adds a row to the destination, so the
-        // cap applies.
-        let is_new = !rows.iter().any(|row| {
-            row.endpoint == subscription.endpoint && row.principal_id == subscription.principal_id
+        // A move from another owner adds a row to the destination, so the cap
+        // applies. The owner is (tenant, principal).
+        let is_new = !rows.iter().any(|(t, row)| {
+            row.endpoint == subscription.endpoint
+                && *t == tenant
+                && row.principal_id == subscription.principal_id
         });
         if is_new
             && rows
                 .iter()
-                .filter(|row| row.principal_id == subscription.principal_id)
+                .filter(|(t, row)| *t == tenant && row.principal_id == subscription.principal_id)
                 .count()
                 >= MAX_SUBSCRIPTIONS_PER_PRINCIPAL
         {
@@ -579,29 +592,34 @@ impl PushSubscriptionStore for MemoryPushSubscriptionStore {
             });
         }
 
-        rows.retain(|row| row.endpoint != subscription.endpoint);
-        rows.push(subscription);
+        rows.retain(|(_, row)| row.endpoint != subscription.endpoint);
+        rows.push((tenant, subscription));
         drop(rows);
         Ok(())
     }
 
     async fn list_for(&self, principal_id: &str) -> Result<Vec<StoredSubscription>, PushError> {
+        let tenant = crate::tenancy::current_tenant_id();
         let rows = self.lock()?;
         Ok(rows
             .iter()
-            .filter(|row| row.principal_id == principal_id)
+            .filter(|(t, row)| *t == tenant && row.principal_id == principal_id)
             // The bound that actually caps per-notification work; see
             // `MAX_SUBSCRIPTIONS_PER_PRINCIPAL`.
             .take(MAX_SUBSCRIPTIONS_PER_PRINCIPAL)
-            .cloned()
+            .map(|(_, row)| row.clone())
             .collect())
     }
 
     async fn remove(&self, endpoint: &str, principal_id: Option<&str>) -> Result<u64, PushError> {
+        let tenant = crate::tenancy::current_tenant_id();
         let mut rows = self.lock()?;
         let before = rows.len();
-        rows.retain(|row| {
-            row.endpoint != endpoint || principal_id.is_some_and(|id| row.principal_id != id)
+        // A scoped remove only matches the caller's own (tenant, principal);
+        // an unscoped one is the framework pruning a dead endpoint.
+        rows.retain(|(t, row)| {
+            row.endpoint != endpoint
+                || principal_id.is_some_and(|id| *t != tenant || row.principal_id != id)
         });
         Ok((before - rows.len()) as u64)
     }
@@ -633,6 +651,7 @@ mod db_store {
         diesel::table! {
             push_subscriptions (id) {
                 id -> BigInt,
+                tenant_id -> Text,
                 principal_id -> Text,
                 endpoint -> Text,
                 p256dh -> Text,
@@ -646,6 +665,7 @@ mod db_store {
         diesel::table! {
             push_subscriptions (id) {
                 id -> BigInt,
+                tenant_id -> Text,
                 principal_id -> Text,
                 endpoint -> Text,
                 p256dh -> Text,
@@ -669,6 +689,7 @@ mod db_store {
     #[derive(Insertable)]
     #[diesel(table_name = push_subscriptions)]
     struct NewSubscriptionRow {
+        tenant_id: String,
         principal_id: String,
         endpoint: String,
         p256dh: String,
@@ -753,6 +774,12 @@ mod db_store {
         let message = e.to_string();
         // A missing table means the app has a database but never scaffolded
         // the push tables — turn the bare SQL error into an actionable one.
+        if message.contains("tenant_id") && message.contains("column") {
+            return PushError::Store(format!(
+                "query failed: {e}. The `{PUSH_SUBSCRIPTIONS_TABLE}` table has no `tenant_id` \
+                 column — see docs/migrations/next.md"
+            ));
+        }
         if message.contains("does not exist") || message.contains("no such table") {
             return PushError::Store(format!(
                 "query failed: {e}. The `{PUSH_SUBSCRIPTIONS_TABLE}` table is missing — \
@@ -773,6 +800,7 @@ mod db_store {
             use push_subscriptions::dsl;
 
             let mut conn = self.conn().await?;
+            let tenant_id = crate::tenancy::current_tenant_id();
             let principal_id = subscription.principal_id.clone();
             let endpoint = subscription.endpoint.clone();
             let p256dh = subscription.p256dh_base64url();
@@ -789,7 +817,10 @@ mod db_store {
             // `DO UPDATE … WHERE`, which would otherwise make this ambiguous.
             let counted = diesel::QueryDsl::filter(
                 diesel::QueryDsl::filter(
-                    dsl::push_subscriptions,
+                    diesel::QueryDsl::filter(
+                        dsl::push_subscriptions,
+                        dsl::tenant_id.eq(&tenant_id),
+                    ),
                     dsl::principal_id.eq(&principal_id),
                 ),
                 dsl::endpoint.ne(&endpoint),
@@ -809,6 +840,7 @@ mod db_store {
 
             let affected = diesel::insert_into(push_subscriptions::table)
                 .values(NewSubscriptionRow {
+                    tenant_id: tenant_id.clone(),
                     principal_id: principal_id.clone(),
                     endpoint: endpoint.clone(),
                     p256dh: p256dh.clone(),
@@ -820,6 +852,7 @@ mod db_store {
                 .on_conflict(dsl::endpoint)
                 .do_update()
                 .set((
+                    dsl::tenant_id.eq(&tenant_id),
                     dsl::principal_id.eq(&principal_id),
                     dsl::p256dh.eq(&p256dh),
                     dsl::auth.eq(&auth),
@@ -837,9 +870,12 @@ mod db_store {
                 // to decrypt. Anyone short of both fails and the statement
                 // touches zero rows.
                 .filter(
-                    dsl::principal_id.eq(principal_id.clone()).or(dsl::p256dh
-                        .eq(p256dh.clone())
-                        .and(dsl::auth.eq(auth.clone()))),
+                    dsl::tenant_id
+                        .eq(tenant_id.clone())
+                        .and(dsl::principal_id.eq(principal_id.clone()))
+                        .or(dsl::p256dh
+                            .eq(p256dh.clone())
+                            .and(dsl::auth.eq(auth.clone()))),
                 )
                 .execute(&mut conn)
                 .await
@@ -855,6 +891,7 @@ mod db_store {
             use push_subscriptions::dsl;
             let mut conn = self.conn().await?;
             let rows: Vec<SubscriptionRow> = dsl::push_subscriptions
+                .filter(dsl::tenant_id.eq(crate::tenancy::current_tenant_id()))
                 .filter(dsl::principal_id.eq(principal_id))
                 .order(dsl::id.asc())
                 // The bound that actually caps per-notification work — applied
@@ -880,6 +917,7 @@ mod db_store {
                     diesel::delete(
                         dsl::push_subscriptions
                             .filter(dsl::endpoint.eq(endpoint))
+                            .filter(dsl::tenant_id.eq(crate::tenancy::current_tenant_id()))
                             .filter(dsl::principal_id.eq(id)),
                     )
                     .execute(&mut conn)
@@ -956,8 +994,11 @@ mod tests {
     /// Deliberately not `async`: holding the guard inside an async fn would
     /// keep a `MutexGuard` alive across an await point.
     fn stuff_past_the_cap(store: &MemoryPushSubscriptionStore) {
-        let extra: Vec<StoredSubscription> = (0..(MAX_SUBSCRIPTIONS_PER_PRINCIPAL * 3))
-            .map(|i| stored(1_i64, &format!("https://push.example.com/raw{i}")))
+        let extra: Vec<(String, StoredSubscription)> = (0..(MAX_SUBSCRIPTIONS_PER_PRINCIPAL * 3))
+            .map(|i| {
+                let row = stored(1_i64, &format!("https://push.example.com/raw{i}"));
+                (String::new(), row)
+            })
             .collect();
         let mut rows = store.rows.lock().expect("memory store lock");
         rows.extend(extra);
@@ -1515,5 +1556,123 @@ mod tests {
             .save(stored(2_i64, "https://push.example.com/other-user"))
             .await
             .expect("one user at their cap must not block everyone else");
+    }
+    // ── Tenant isolation (issue #2337) ──────────────────────────────────────
+
+    use crate::tenancy::with_tenant;
+
+    fn in_tenant<F: std::future::Future>(
+        tenant: &str,
+        fut: F,
+    ) -> impl std::future::Future<Output = F::Output> {
+        with_tenant(tenant.to_owned(), fut)
+    }
+
+    #[tokio::test]
+    async fn the_same_principal_in_two_tenants_has_separate_subscriptions() {
+        let store = MemoryPushSubscriptionStore::new();
+        in_tenant(
+            "a",
+            store.save(stored(42_i64, "https://push.example.com/a")),
+        )
+        .await
+        .expect("save");
+        in_tenant(
+            "b",
+            store.save(stored(42_i64, "https://push.example.com/b")),
+        )
+        .await
+        .expect("save");
+
+        let a = in_tenant("a", store.list_for("42")).await.expect("list");
+        let b = in_tenant("b", store.list_for("42")).await.expect("list");
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].endpoint(), "https://push.example.com/a");
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].endpoint(), "https://push.example.com/b");
+        assert!(store.list_for("42").await.expect("list").is_empty());
+    }
+
+    #[tokio::test]
+    async fn another_tenant_cannot_take_an_endpoint_with_one_key() {
+        let store = MemoryPushSubscriptionStore::new();
+        let url = "https://push.example.com/shared";
+        in_tenant("a", store.save(stored(42_i64, url)))
+            .await
+            .expect("save");
+
+        let mut hostile = browser_subscription(url);
+        hostile.keys.p256dh = OTHER_P256DH.to_owned();
+        let hostile = hostile.decode(&42_i64.into()).expect("valid");
+        let err = in_tenant("b", store.save(hostile))
+            .await
+            .expect_err("same principal id, other tenant: still a cross-owner move");
+        assert!(matches!(err, PushError::EndpointClaimed), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn another_tenant_can_move_an_endpoint_with_both_keys() {
+        let store = MemoryPushSubscriptionStore::new();
+        let url = "https://push.example.com/shared";
+        in_tenant("a", store.save(stored(42_i64, url)))
+            .await
+            .expect("save");
+        in_tenant("b", store.save(stored(42_i64, url)))
+            .await
+            .expect("same device, same keys: the row moves");
+
+        assert!(
+            in_tenant("a", store.list_for("42"))
+                .await
+                .expect("list")
+                .is_empty()
+        );
+        assert_eq!(
+            in_tenant("b", store.list_for("42"))
+                .await
+                .expect("list")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_is_scoped_to_the_tenant() {
+        let store = MemoryPushSubscriptionStore::new();
+        let url = "https://push.example.com/a";
+        in_tenant("a", store.save(stored(42_i64, url)))
+            .await
+            .expect("save");
+
+        let removed = in_tenant("b", store.remove(url, Some("42")))
+            .await
+            .expect("remove");
+        assert_eq!(removed, 0);
+        assert_eq!(
+            in_tenant("a", store.list_for("42"))
+                .await
+                .expect("list")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cap_counts_per_tenant() {
+        let store = MemoryPushSubscriptionStore::new();
+        for i in 0..MAX_SUBSCRIPTIONS_PER_PRINCIPAL {
+            in_tenant(
+                "a",
+                store.save(stored(42_i64, &format!("https://push.example.com/a{i}"))),
+            )
+            .await
+            .expect("under the cap");
+        }
+        in_tenant(
+            "b",
+            store.save(stored(42_i64, "https://push.example.com/b")),
+        )
+        .await
+        .expect("tenant b has its own count");
     }
 }
