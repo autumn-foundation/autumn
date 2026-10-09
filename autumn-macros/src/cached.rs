@@ -635,7 +635,7 @@ fn generate_cache_body(
             if let Some(__autumn_cached) = ::autumn_web::cache::get_cached::<#value_type>(__autumn_cache, &__autumn_key) {
                 return <#ret_type as ::autumn_web::cache::CacheableResult>::from_ok(__autumn_cached);
             }
-            let __autumn_shared_epoch = ::autumn_web::cache::Cache::fill_epoch(__autumn_cache, __autumn_namespace);
+            let __autumn_shared_epoch = ::autumn_web::cache::sample_fill_epoch(__autumn_cache, __autumn_namespace);
             let __autumn_result = #compute;
             match <#ret_type as ::autumn_web::cache::CacheableResult>::into_result(__autumn_result) {
                 Ok(__autumn_val) => {
@@ -658,7 +658,7 @@ fn generate_cache_body(
             if let Some(__autumn_cached) = ::autumn_web::cache::get_cached::<#value_type>(__autumn_cache, &__autumn_key) {
                 return __autumn_cached;
             }
-            let __autumn_shared_epoch = ::autumn_web::cache::Cache::fill_epoch(__autumn_cache, __autumn_namespace);
+            let __autumn_shared_epoch = ::autumn_web::cache::sample_fill_epoch(__autumn_cache, __autumn_namespace);
             let __autumn_result = #compute;
             // The epoch check and the insert are one indivisible step: checking
             // first and inserting after leaves a window where an invalidation
@@ -1057,7 +1057,9 @@ mod tests {
             assert!(out.contains("insert_cached_fenced"), "{out}");
             assert!(!out.contains("insert_cached ::"), "unfenced insert: {out}");
             let miss = out.find("get_cached").expect("looks up");
-            let sample = out.find("fill_epoch").expect("samples the shared epoch");
+            let sample = out
+                .find("sample_fill_epoch")
+                .expect("samples the shared epoch");
             let compute = out.find("__autumn_result =").expect("computes");
             assert!(miss < sample && sample < compute, "wrong order: {out}");
         }

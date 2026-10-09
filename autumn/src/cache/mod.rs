@@ -505,11 +505,39 @@ where
     let Some(bytes) = serde_json::to_vec(&value).ok() else {
         return false;
     };
-    if record_or_replay_cache_insert(key, Some(&bytes), ttl) {
-        return true;
-    }
     // Raw bytes only: `insert_value` would write without the check.
-    cache.insert_raw_bytes_if_epoch(key, bytes, ttl, namespace, sampled)
+    let stored = cache.insert_raw_bytes_if_epoch(key, bytes.clone(), ttl, namespace, sampled);
+    if stored {
+        // Capture records the write after it happened. A replay never gets
+        // here: `sample_fill_epoch` returns `Unsupported` during a replay.
+        let _ = record_or_replay_cache_insert(key, Some(&bytes), ttl);
+    }
+    stored
+}
+
+/// Read the shared fill epoch for a fill that just missed.
+///
+/// A replay serves cache effects from the tape (#1634), so it never reads the
+/// backend. It gets [`FillEpoch::Unsupported`], and [`insert_cached_fenced`]
+/// then writes to the tape.
+#[must_use]
+pub fn sample_fill_epoch(cache: &dyn Cache, namespace: &str) -> FillEpoch {
+    if replaying() {
+        return FillEpoch::Unsupported;
+    }
+    cache.fill_epoch(namespace)
+}
+
+/// Whether an effect tape serves the current task.
+#[cfg(feature = "reporting")]
+fn replaying() -> bool {
+    crate::capsule::effects::tape_active()
+}
+
+/// No capsule support compiled in: there is no replay.
+#[cfg(not(feature = "reporting"))]
+const fn replaying() -> bool {
+    false
 }
 
 // ── Failure-capsule seam (#1634) ─────────────────────────────────────────────
@@ -852,6 +880,40 @@ mod shared_fence_tests {
             maud::html! { "new" }
         });
         assert_eq!(again.0, "new", "the stale markup must not be cached");
+    }
+
+    /// A replay serves cache effects from the tape. It must not read the live
+    /// epoch, and the fenced write must land on the tape (#1634).
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_replay_never_touches_the_live_epoch_and_still_writes_the_tape() {
+        use crate::capsule::{
+            CapsuleEffects,
+            effects::{CachedValue, ReplayEffects},
+        };
+        let live = Replica {
+            epoch_down: true,
+            ..Replica::default()
+        };
+        let tape = std::sync::Arc::new(ReplayEffects::new(CapsuleEffects::default()));
+        let seen = std::sync::Arc::clone(&tape);
+        crate::capsule::effects::with_effect_tape(tape, async {
+            let epoch = sample_fill_epoch(&live, "ns");
+            assert_eq!(
+                epoch,
+                FillEpoch::Unsupported,
+                "replay must skip the backend"
+            );
+            assert!(insert_cached_fenced(
+                &live, "ns:k", 7_u32, None, "ns", epoch
+            ));
+        })
+        .await;
+        assert!(
+            live.shared.lock().unwrap().data.is_empty(),
+            "a replay must not write the live backend"
+        );
+        assert!(matches!(seen.cache_get("ns:k"), CachedValue::Hit(_)));
     }
 
     #[cfg(feature = "cache-moka")]

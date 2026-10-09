@@ -270,7 +270,7 @@ pub fn cache_fragment_in(
     // The shared epoch is read after the miss and before the render. It fences
     // out an invalidation on another replica. The read is one round trip, on a
     // miss only.
-    let shared = cache.fill_epoch(namespace);
+    let shared = super::sample_fill_epoch(cache, namespace);
     let markup = render();
     // Check and insert as one step, the same way `#[cached]` does — see
     // `with_fill_fence`. A fenced-out fill still returns its markup to *this*
