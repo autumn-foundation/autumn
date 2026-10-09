@@ -834,3 +834,117 @@ fn schema_pull_file_uri_missing_path_errors_but_real_path_pulls() {
         "widgets pulled: {snap}"
     );
 }
+
+/// #1975: a `#[references]` action goes through the full loop. `schema diff`
+/// writes it, `schema pull` reads it back, and the next diff is empty.
+#[test]
+fn schema_pull_round_trips_fk_actions() {
+    let (_tmp, project) = fresh_project("pull_sqlite_fk_actions");
+    let db_path = project.join("app.db");
+    let url = format!("sqlite://{}", db_path.display());
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    write_models(
+        &project,
+        r#"
+#[autumn_web::model(managed)]
+pub struct Author {
+    #[id]
+    pub id: i64,
+}
+
+#[autumn_web::model(managed)]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[references(on_delete = "cascade")]
+    pub author_id: i64,
+    #[references(table = "authors", on_delete = "set_null", on_update = "restrict")]
+    pub editor_id: Option<i64>,
+}
+"#,
+    );
+    std::fs::write(project.join("empty_models.rs"), "").expect("empty models");
+    run_autumn_ok(
+        &project,
+        &[
+            "schema",
+            "snapshot",
+            "--from",
+            "empty_models.rs",
+            "--backend",
+            "sqlite",
+        ],
+        &envs,
+    );
+    run_autumn_ok(
+        &project,
+        &["schema", "diff", "--write-migration", "--name", "init"],
+        &envs,
+    );
+    let up = std::fs::read_dir(project.join("migrations"))
+        .expect("migrations dir")
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_init"))
+        .map(|e| std::fs::read_to_string(e.path().join("up.sql")).expect("up.sql"))
+        .expect("init migration");
+    assert!(
+        up.contains("REFERENCES authors(id) ON DELETE CASCADE"),
+        "up.sql: {up}"
+    );
+    assert!(
+        up.contains("REFERENCES authors(id) ON DELETE SET NULL ON UPDATE RESTRICT"),
+        "up.sql: {up}"
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+
+    run_autumn_ok(&project, &["schema", "pull"], &envs);
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    let posts = table_json(&snap, "posts");
+    let author = &column_json(&posts, "author_id")["references"];
+    assert_eq!(author["on_delete"], "Cascade", "{snap}");
+    assert!(author.get("on_update").is_none(), "{snap}");
+    let editor = &column_json(&posts, "editor_id")["references"];
+    assert_eq!(editor["on_delete"], "SetNull", "{snap}");
+    assert_eq!(editor["on_update"], "Restrict", "{snap}");
+
+    let (diff_out, _) = run_autumn_ok(&project, &["schema", "diff"], &envs);
+    assert!(
+        diff_out.contains("No schema changes"),
+        "the actions round-trip clean:\n{diff_out}"
+    );
+}
+
+/// #1975: SQLite marks the internal tables of a virtual table (for example
+/// rtree `_node`, `_parent`, `_rowid`) as `shadow`. The pull excludes them,
+/// and keeps an app table whose name only looks like one.
+#[test]
+fn schema_pull_excludes_rtree_shadow_tables() {
+    let (_tmp, project) = fresh_project("pull_sqlite_rtree");
+    let db_path = project.join("app.db");
+    let url = format!("sqlite://{}", db_path.display());
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    write_models(&project, "");
+    write_raw_migration(
+        &project,
+        "20260101000000_rtree",
+        "CREATE VIRTUAL TABLE boxes USING rtree(id, min_x, max_x);\n\
+         CREATE TABLE places_node (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL);\n",
+        "DROP TABLE places_node;\nDROP TABLE boxes;\n",
+    );
+    run_autumn_ok(&project, &["schema", "migrate"], &envs);
+    run_autumn_ok(&project, &["schema", "pull"], &envs);
+
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    assert!(
+        !snap.contains("\"name\": \"boxes"),
+        "no rtree virtual or shadow table in the snapshot: {snap}"
+    );
+    assert!(
+        snap.contains("\"name\": \"places_node\""),
+        "an app table that only looks like a shadow table is kept: {snap}"
+    );
+}

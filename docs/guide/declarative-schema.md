@@ -74,13 +74,45 @@ These field attributes change the table of a managed model:
 | `#[id]` | The primary key column. |
 | `#[indexed]` | An index `idx_<table>_<column>`. |
 | `#[unique]` | A `UNIQUE` column and an index `idx_<table>_<column>_unique`. |
-| `#[references]` | A foreign key. The field name gives the target table (`author_id` → `authors`). Use `#[references(table = "users")]` for another table. The column also gets an index. |
+| `#[references]` | A foreign key. The field name gives the target table (`author_id` → `authors`). Use `#[references(table = "users")]` for another table. The column also gets an index. See [Foreign-key actions](#foreign-key-actions). |
 | `#[renamed_from("old")]` | A rename. See [Renames](#renames-renamed_from). |
 | `#[diesel(column_name = "...")]` | The SQL name of the column. |
 
 `Option<T>` makes a column nullable. The `#[model]` macro accepts `managed`,
 `#[unique]`, `#[references]` and `#[renamed_from]`. It rejects an incorrect
 attribute at compile time.
+
+### Foreign-key actions
+
+Add `on_delete` or `on_update` to `#[references]` to set the referential
+action of the foreign key:
+
+```rust
+#[references(table = "users", on_delete = "cascade")]
+pub author_id: i64,
+#[references(on_delete = "set_null", on_update = "restrict")]
+pub editor_id: Option<i64>,
+```
+
+| Value | SQL |
+| --- | --- |
+| `cascade` | `CASCADE` |
+| `restrict` | `RESTRICT` |
+| `set_null` | `SET NULL` |
+| `set_default` | `SET DEFAULT` |
+| `no_action` | `NO ACTION` (the default) |
+
+- The diff writes the action after `REFERENCES` in `CREATE TABLE`,
+  `ADD COLUMN` and a SQLite table-recreate. `down.sql` keeps it.
+- `set_null` needs an `Option<_>` field. The macro rejects it on a required
+  field.
+- The macro rejects an unknown value. The parser skips that column with a
+  warning, so the diff does not change it.
+- `schema pull` reads the actions on both backends. `doctor` shows a
+  different action as drift.
+- The diff refuses to change the action of an existing foreign key, as it
+  refuses a new target. `--allow-destructive` does not override this. Write a
+  manual migration, then make the model and the snapshot agree.
 
 A table stays managed in the snapshot after you remove `managed` from its
 model. If you then delete the model, `schema diff --allow-destructive` drops
@@ -417,8 +449,10 @@ autumn schema pull --dry-run
 
 `pull` is read-only with respect to the database (catalog reads only). It
 introspects tables, columns (types, nullability, defaults), primary keys, foreign
-keys, unique constraints, and indexes into the **same** IR the model parser
-produces. Before overwriting, a **provider-lock** guard refuses to clobber a
+keys (with their `ON DELETE` / `ON UPDATE` actions), unique constraints, and
+indexes into the **same** IR the model parser produces. On SQLite, `pull` skips
+virtual tables and the shadow tables that SQLite keeps for them (for example
+FTS5 and rtree). Before overwriting, a **provider-lock** guard refuses to clobber a
 snapshot tagged for another backend.
 
 > **SQLite needs the `sqlite` build.** A CLI built with `--features sqlite`

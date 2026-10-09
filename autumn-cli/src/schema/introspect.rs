@@ -53,11 +53,9 @@
 //!   full one — a pre-existing parser gap that makes a round-trip diff non-empty
 //!   for long field names. Introspection records the DB's identifier faithfully;
 //!   reconciling the two names is a later slice.
-//! - **Composite index key order**: multi-column index columns are ordered by
-//!   `attnum`, not the true index key order. The model parser only ever emits
-//!   single-column indexes (exact here), so this affects only hand-authored
-//!   multi-column indexes; recording them faithfully but with attnum ordering is
-//!   preferred over dropping them.
+//! - **Composite index key order**: resolved. The columns of a multi-column
+//!   index follow the `pg_index.indkey` order (`unnest ... WITH ORDINALITY`), not
+//!   `attnum`.
 //! - **Operator classes / collations / ordering on *simple* indexes**: a plain
 //!   column index with a non-default operator class, collation, or `ASC`/`DESC`
 //!   ordering is still recorded by its columns (matching what the model parser
@@ -78,9 +76,10 @@
 //! - **Composite / multi-column foreign keys**: only the first
 //!   referencing/referenced column pair is recorded (the IR [`ForeignKey`] is
 //!   single-column). The model parser never emits a composite FK.
-//! - **Foreign-key / constraint names**: the IR [`ForeignKey`] carries only
-//!   `table`/`column`, so the Postgres constraint name is not represented (and so
-//!   never diffed).
+//! - **Foreign-key / constraint names**: the IR [`ForeignKey`] carries
+//!   `table`, `column` and the `ON DELETE` / `ON UPDATE` actions
+//!   (`confdeltype` / `confupdtype`), but not the constraint name. So the name is
+//!   never diffed.
 //! - **Enum `CHECK` constraints**: enum recovery from `CHECK` expressions is a
 //!   later slice; a `TEXT`-with-`CHECK` column pulls back as plain
 //!   [`Text`](ColumnType::Text).
@@ -161,8 +160,8 @@
 use std::collections::BTreeMap;
 
 use autumn_schema_core::{
-    Backend, CheckConstraint, Column, ColumnDefault, ColumnType, ForeignKey, Index, SerialKind,
-    Table,
+    Backend, CheckConstraint, Column, ColumnDefault, ColumnType, ForeignKey, ForeignKeyAction,
+    Index, SerialKind, Table, UnknownForeignKeyAction,
 };
 use diesel::{Connection as _, PgConnection, QueryableByName, RunQueryDsl as _, sql_query};
 
@@ -454,6 +453,30 @@ struct ForeignKeyRow {
     foreign_schema: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     foreign_column: String,
+    /// The `confdeltype` code (see [`pg_fk_action`]).
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    on_delete: String,
+    /// The `confupdtype` code (see [`pg_fk_action`]).
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    on_update: String,
+}
+
+/// Map a `pg_constraint.confdeltype` / `confupdtype` code to an action. `a`
+/// (`NO ACTION`) gives `None`.
+///
+/// # Errors
+///
+/// Returns [`UnknownForeignKeyAction`] for a code that Postgres does not
+/// document.
+fn pg_fk_action(code: &str) -> Result<Option<ForeignKeyAction>, UnknownForeignKeyAction> {
+    match code {
+        "a" => Ok(None),
+        "r" => Ok(Some(ForeignKeyAction::Restrict)),
+        "c" => Ok(Some(ForeignKeyAction::Cascade)),
+        "n" => Ok(Some(ForeignKeyAction::SetNull)),
+        "d" => Ok(Some(ForeignKeyAction::SetDefault)),
+        other => Err(UnknownForeignKeyAction(other.to_owned())),
+    }
 }
 
 #[derive(QueryableByName)]
@@ -737,7 +760,8 @@ fn fetch_foreign_keys(
     let query = format!(
         "SELECT t.relname AS table_name, att.attname AS column_name, \
          ft.relname AS foreign_table, fn.nspname AS foreign_schema, \
-         fatt.attname AS foreign_column \
+         fatt.attname AS foreign_column, \
+         con.confdeltype::text AS on_delete, con.confupdtype::text AS on_update \
          FROM pg_constraint con \
          JOIN pg_class t ON t.oid = con.conrelid \
          JOIN pg_namespace n ON n.oid = t.relnamespace \
@@ -751,6 +775,15 @@ fn fetch_foreign_keys(
     let rows: Vec<ForeignKeyRow> = sql_query(query)
         .load(conn)
         .map_err(|e| IntrospectError::Query(e.to_string()))?;
+    // Fail closed on an unknown action code, so `build_table` never reads one
+    // as `NO ACTION`.
+    for row in &rows {
+        for code in [&row.on_delete, &row.on_update] {
+            pg_fk_action(code).map_err(|e| {
+                IntrospectError::Query(format!("{}.{}: {e}", row.table_name, row.column_name))
+            })?;
+        }
+    }
     let mut by_table: BTreeMap<String, Vec<ForeignKeyRow>> = BTreeMap::new();
     for row in rows {
         by_table
@@ -962,7 +995,12 @@ fn build_table(
             } else {
                 format!("{}.{}", fk.foreign_schema, fk.foreign_table)
             };
-            column.references = Some(ForeignKey::new(foreign_table, fk.foreign_column.clone()));
+            // `fetch_foreign_keys` already refused an unknown code.
+            column.references = Some(
+                ForeignKey::new(foreign_table, fk.foreign_column.clone())
+                    .with_on_delete(pg_fk_action(&fk.on_delete).ok().flatten())
+                    .with_on_update(pg_fk_action(&fk.on_update).ok().flatten()),
+            );
         }
         table.columns.push(column);
     }
@@ -1622,7 +1660,8 @@ mod sqlite {
     use std::collections::BTreeMap;
 
     use autumn_schema_core::{
-        Backend, Column, ColumnDefault, ColumnType, ForeignKey, Index, SerialKind, Table,
+        Backend, Column, ColumnDefault, ColumnType, ForeignKey, ForeignKeyAction, Index,
+        SerialKind, Table,
     };
     use diesel::sql_types::{Integer, Nullable, Text};
     use diesel::{QueryableByName, RunQueryDsl as _, SqliteConnection, sql_query};
@@ -1722,6 +1761,12 @@ mod sqlite {
         /// composite / no single-column PK.
         #[diesel(sql_type = Nullable<Text>)]
         foreign_column: Option<String>,
+        /// The `ON DELETE` action as SQL, for example `CASCADE`.
+        #[diesel(sql_type = Text)]
+        on_delete: String,
+        /// The `ON UPDATE` action as SQL.
+        #[diesel(sql_type = Text)]
+        on_update: String,
     }
 
     fn query_err(e: &diesel::result::Error) -> IntrospectError {
@@ -1778,8 +1823,10 @@ mod sqlite {
     }
 
     /// List app tables (name + `CREATE TABLE` SQL), excluding `SQLite` internal
-    /// tables, the Diesel migrations table, framework-owned tables, and **FTS5
-    /// search-index tables** — the `CREATE VIRTUAL TABLE "<table>__fts" USING fts5(…)`
+    /// tables, the Diesel migrations table, framework-owned tables, every
+    /// **virtual table** and every **shadow table** (a `shadow` row of
+    /// `pragma_table_list`, for example rtree `_node`/`_parent`/`_rowid`). This
+    /// covers the `CREATE VIRTUAL TABLE "<table>__fts" USING fts5(…)`
     /// index a `--searchable` model generates (issue #1910) plus its internal shadow
     /// tables (`<vtab>_data`/`_idx`/`_content`/`_docsize`/`_config`). Those are stored
     /// in `sqlite_master` as `type = 'table'` with non-`sqlite_` names, but the model
@@ -1788,9 +1835,15 @@ mod sqlite {
     fn list_tables(
         conn: &mut SqliteConnection,
     ) -> Result<Vec<(String, Option<String>)>, IntrospectError> {
+        // `pragma_table_list` (SQLite 3.37+) marks the internal tables of a
+        // virtual table as `shadow` (rtree, FTS5 and other modules known to the
+        // connection). The FTS5 suffix check below stays as a fallback.
         let rows: Vec<TableRow> = sql_query(
-            "SELECT name AS name, sql AS sql FROM sqlite_master \
-             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            "SELECT m.name AS name, m.sql AS sql FROM sqlite_master m \
+             WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' \
+             AND NOT EXISTS (SELECT 1 FROM pragma_table_list tl \
+               WHERE tl.schema = 'main' AND tl.name = m.name AND tl.type = 'shadow') \
+             ORDER BY m.name",
         )
         .load(conn)
         .map_err(|e| query_err(&e))?;
@@ -1922,7 +1975,8 @@ mod sqlite {
     ) -> Result<BTreeMap<String, Vec<ForeignKeyRow>>, IntrospectError> {
         let rows: Vec<ForeignKeyRow> = sql_query(
             "SELECT m.name AS table_name, fkl.\"table\" AS foreign_table, \
-             fkl.\"from\" AS column_name, fkl.\"to\" AS foreign_column \
+             fkl.\"from\" AS column_name, fkl.\"to\" AS foreign_column, \
+             fkl.on_delete AS on_delete, fkl.on_update AS on_update \
              FROM sqlite_master m JOIN pragma_foreign_key_list(m.name) fkl \
              WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' AND fkl.seq = 0 \
              AND fkl.id NOT IN ( \
@@ -1930,6 +1984,15 @@ mod sqlite {
         )
         .load(conn)
         .map_err(|e| query_err(&e))?;
+        // Fail closed on an unknown action, so `build_table` never reads one as
+        // `NO ACTION`.
+        for row in &rows {
+            for action in [&row.on_delete, &row.on_update] {
+                ForeignKeyAction::from_sql(action).map_err(|e| {
+                    IntrospectError::Query(format!("{}.{}: {e}", row.table_name, row.column_name))
+                })?;
+            }
+        }
         Ok(group_by(rows, |r| r.table_name.clone()))
     }
 
@@ -2198,8 +2261,16 @@ mod sqlite {
                     single_col_pks.get(&fk.foreign_table).cloned()
                 });
                 if let Some(foreign_column) = foreign_column {
-                    column.references =
-                        Some(ForeignKey::new(fk.foreign_table.clone(), foreign_column));
+                    // `fetch_foreign_keys` already refused an unknown action.
+                    column.references = Some(
+                        ForeignKey::new(fk.foreign_table.clone(), foreign_column)
+                            .with_on_delete(
+                                ForeignKeyAction::from_sql(&fk.on_delete).ok().flatten(),
+                            )
+                            .with_on_update(
+                                ForeignKeyAction::from_sql(&fk.on_update).ok().flatten(),
+                            ),
+                    );
                 }
             }
             table.columns.push(column);
@@ -2562,12 +2633,16 @@ mod sqlite {
                     foreign_table: "parents".to_owned(),
                     column_name: "parent_code".to_owned(),
                     foreign_column: None,
+                    on_delete: "NO ACTION".to_owned(),
+                    on_update: "NO ACTION".to_owned(),
                 },
                 ForeignKeyRow {
                     table_name: "children".to_owned(),
                     foreign_table: "composite_parent".to_owned(),
                     column_name: "orphan_ref".to_owned(),
                     foreign_column: None,
+                    on_delete: "NO ACTION".to_owned(),
+                    on_update: "NO ACTION".to_owned(),
                 },
             ];
             // `parents` has a single-column PK `code`; `composite_parent` is absent
@@ -3698,6 +3773,8 @@ mod tests {
             foreign_table: "posts".to_owned(),
             foreign_schema: "public".to_owned(),
             foreign_column: "id".to_owned(),
+            on_delete: "a".to_owned(),
+            on_update: "a".to_owned(),
         }];
         let table = build_table("comments", &columns, &pk, &indexes, &fks, &[]);
         assert_eq!(table.name, "comments");
@@ -3964,6 +4041,8 @@ mod tests {
             foreign_table: "accounts".to_owned(),
             foreign_schema: "auth".to_owned(),
             foreign_column: "id".to_owned(),
+            on_delete: "a".to_owned(),
+            on_update: "a".to_owned(),
         }];
         let table = build_table("sessions", &columns, &[], &[], &fks, &[]);
         let account_id = table
@@ -3976,6 +4055,55 @@ mod tests {
             Some(ForeignKey::new("auth.accounts", "id")),
             "a cross-schema FK target is stored schema-qualified"
         );
+    }
+
+    #[test]
+    fn build_table_reads_fk_actions() {
+        // `confdeltype` / `confupdtype` codes: a = NO ACTION, r = RESTRICT,
+        // c = CASCADE, n = SET NULL, d = SET DEFAULT.
+        let columns = vec![ColumnRow {
+            table_name: "comments".to_owned(),
+            column_name: "post_id".to_owned(),
+            udt_name: "int8".to_owned(),
+            is_nullable: "YES".to_owned(),
+            column_default: None,
+            numeric_precision: None,
+            numeric_scale: None,
+            character_maximum_length: None,
+            domain_name: None,
+            domain_schema: None,
+            owns_sequence: false,
+            is_identity: "NO".to_owned(),
+            identity_generation: None,
+        }];
+        let fks = vec![ForeignKeyRow {
+            table_name: "comments".to_owned(),
+            column_name: "post_id".to_owned(),
+            foreign_table: "posts".to_owned(),
+            foreign_schema: "public".to_owned(),
+            foreign_column: "id".to_owned(),
+            on_delete: "c".to_owned(),
+            on_update: "n".to_owned(),
+        }];
+        let table = build_table("comments", &columns, &[], &[], &fks, &[]);
+        assert_eq!(
+            table.columns[0].references,
+            Some(
+                ForeignKey::new("posts", "id")
+                    .with_on_delete(Some(ForeignKeyAction::Cascade))
+                    .with_on_update(Some(ForeignKeyAction::SetNull))
+            )
+        );
+        for (code, want) in [
+            ("a", None),
+            ("r", Some(ForeignKeyAction::Restrict)),
+            ("c", Some(ForeignKeyAction::Cascade)),
+            ("n", Some(ForeignKeyAction::SetNull)),
+            ("d", Some(ForeignKeyAction::SetDefault)),
+        ] {
+            assert_eq!(pg_fk_action(code), Ok(want), "code {code}");
+        }
+        assert!(pg_fk_action("z").is_err());
     }
 
     #[test]
@@ -4002,6 +4130,8 @@ mod tests {
             foreign_table: "posts".to_owned(),
             foreign_schema: "public".to_owned(),
             foreign_column: "id".to_owned(),
+            on_delete: "a".to_owned(),
+            on_update: "a".to_owned(),
         }];
         let table = build_table("comments", &columns, &[], &[], &fks, &[]);
         let post_id = table.columns.iter().find(|c| c.name == "post_id").unwrap();

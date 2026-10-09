@@ -1,7 +1,8 @@
 // Compile-pass: declarative-schema markers on a model (#1975, slice 3.5).
 //
 // Acceptance-only: `#[model(managed)]`, `#[unique]`, and `#[references(...)]`
-// (both the explicit `table = "..."` form and the bare, inferred form) must be
+// (the explicit `table = "..."` form with `on_delete` / `on_update` actions,
+// and the bare, inferred form) must be
 // ACCEPTED and validated by the `#[model]` macro, stripped from the generated
 // query struct, and change NO codegen — the model still generates its normal
 // New*/Update* types over the Diesel table below. `#[renamed_from("...")]` on
@@ -28,7 +29,7 @@ pub struct Membership {
     #[unique]
     #[renamed_from("handle")]
     pub slug: String,
-    #[references(table = "accounts")]
+    #[references(table = "accounts", on_delete = "cascade", on_update = "restrict")]
     pub account_id: i64,
     // Bare `#[references]` — the target table is inferred from the field name
     // by the CLI toolchain; the macro simply accepts and strips it.

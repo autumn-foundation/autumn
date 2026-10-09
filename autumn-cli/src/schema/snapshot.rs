@@ -92,18 +92,14 @@ impl SchemaSnapshot {
         Self::new(schema.backend, schema.tables)
     }
 
-    /// Confirm this snapshot targets `expected` — the provider-lock guard a later
-    /// slice's diff engine calls before diffing a desired state against the
-    /// baseline (a snapshot generated for one dialect must not be diffed against
-    /// another). Never enforced by the writer.
+    /// Confirm this snapshot targets `expected` — the provider-lock guard that
+    /// `schema diff` and `schema migrate` call before they use the baseline (a
+    /// snapshot generated for one dialect must not be diffed against another).
+    /// Never enforced by the writer.
     ///
     /// # Errors
     ///
     /// Returns [`SnapshotError::BackendMismatch`] when the tags differ.
-    // The provider-lock guard is consumed by the slice-4 diff engine (which
-    // reads a baseline and diffs it against a desired state); the writer never
-    // calls it, so it is not yet reachable from the command path.
-    #[allow(dead_code)]
     pub fn ensure_backend_matches(&self, expected: Backend) -> Result<(), SnapshotError> {
         if self.backend == expected {
             Ok(())
@@ -261,9 +257,6 @@ pub fn write_snapshot(path: &Path, snapshot: &SchemaSnapshot) -> Result<(), Snap
 /// Returns [`SnapshotError::Io`] if the file cannot be read,
 /// [`SnapshotError::UnsupportedVersion`] if it declares an unknown version, or
 /// [`SnapshotError::Json`] if it is not a valid snapshot document.
-// The baseline reader is consumed by the slice-4 diff engine; the current
-// command only writes, so it is not yet reachable from the command path.
-#[allow(dead_code)]
 pub fn load_snapshot(path: &Path) -> Result<SchemaSnapshot, SnapshotError> {
     let text = std::fs::read_to_string(path).map_err(|source| SnapshotError::Io {
         path: path.display().to_string(),
