@@ -400,16 +400,28 @@ impl AeoSite {
             }
             None => None,
         };
-        let home_link = aeo
-            .link_headers
-            .then(|| documents::homepage_link_header(&facts))
-            .and_then(|v| HeaderValue::from_str(&v).ok());
+        // One `Link` value per home page: each names its own Markdown copy.
+        let home_links: Vec<(String, HeaderValue)> = if aeo.link_headers {
+            let homes = if facts.home_paths.is_empty() {
+                vec!["/".to_owned()]
+            } else {
+                facts.home_paths.clone()
+            };
+            homes
+                .into_iter()
+                .filter_map(|home| {
+                    let link = documents::homepage_link_header(&facts, &home);
+                    HeaderValue::from_str(&link).ok().map(|v| (home, v))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let content_signal = aeo
             .content_signals
             .enabled
             .then(|| HeaderValue::from_str(&robots::content_signal_value(aeo.content_signals)).ok())
             .flatten();
-        let home_paths = facts.home_paths.clone();
         // RFC 9728 §5.1: a `401` points at the protected resource metadata.
         let resource_metadata = (!aeo.oauth.authorization_servers.is_empty())
             .then_some(config.seo.base_url.as_deref())
@@ -429,8 +441,7 @@ impl AeoSite {
             negotiate: negotiate::NegotiateConfig {
                 markdown: aeo.markdown,
                 max_bytes: aeo.markdown_max_bytes,
-                home_link,
-                home_paths,
+                home_links,
                 content_signal,
                 resource_metadata_from_host: !aeo.oauth.authorization_servers.is_empty()
                     && resource_metadata.is_none(),
@@ -691,7 +702,11 @@ pub(crate) async fn write_static_documents(
         .collect();
     let mut written = Vec::new();
     while let Some(path) = queue.pop() {
-        let Ok(req) = Request::get(path.as_str()).body(Body::empty()) else {
+        // A build render: x402 charges the live request for these bytes.
+        let Ok(req) = Request::get(path.as_str())
+            .extension(crate::static_gen::RenderDeadlineExempt)
+            .body(Body::empty())
+        else {
             continue;
         };
         let Ok(res) = router.clone().oneshot(req).await;

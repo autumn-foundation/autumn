@@ -491,7 +491,7 @@ fn render_inner(facts: &SiteFacts, origin: &Origin, path: &str, now: u64) -> Opt
 /// The homepage `Link` header value. It always holds a relation that
 /// scanners count (`describedby`).
 #[must_use]
-pub fn homepage_link_header(facts: &SiteFacts) -> String {
+pub fn homepage_link_header(facts: &SiteFacts, home: &str) -> String {
     let mut links = Vec::new();
     if has_api(facts) {
         links.push(format!(
@@ -525,7 +525,11 @@ pub fn homepage_link_header(facts: &SiteFacts) -> String {
         "<{ARD_PATH}>; rel=\"ard\"; type=\"application/ai-catalog+json\""
     ));
     if facts.markdown {
-        links.push("</>; rel=\"alternate\"; type=\"text/markdown\"".to_owned());
+        // The Markdown copy of this page: `/`, or `/{locale}` on a localized
+        // site.
+        links.push(format!(
+            "<{home}>; rel=\"alternate\"; type=\"text/markdown\""
+        ));
     }
     links.join(", ")
 }
@@ -1819,7 +1823,7 @@ mod tests {
     fn link_header_keeps_a_counted_relation_without_llms_txt() {
         let mut facts = content_site();
         facts.llms_txt = false;
-        let link = homepage_link_header(&facts);
+        let link = homepage_link_header(&facts, "/");
         assert!(
             link.contains("</.well-known/ai-catalog.json>; rel=\"describedby\""),
             "{link}"
@@ -1893,7 +1897,7 @@ mod tests {
 
     #[test]
     fn homepage_link_header_lists_agent_relations() {
-        let link = homepage_link_header(&api_site());
+        let link = homepage_link_header(&api_site(), "/");
         for want in [
             "</.well-known/api-catalog>; rel=\"api-catalog\"",
             "</openapi.json>; rel=\"service-desc\"",
@@ -1904,9 +1908,14 @@ mod tests {
         ] {
             assert!(link.contains(want), "missing {want}: {link}");
         }
-        let content = homepage_link_header(&content_site());
+        let content = homepage_link_header(&content_site(), "/");
         assert!(content.contains("rel=\"describedby\""), "{content}");
         assert!(!content.contains("api-catalog"), "{content}");
+        let localized = homepage_link_header(&content_site(), "/fr");
+        assert!(
+            localized.contains("</fr>; rel=\"alternate\"; type=\"text/markdown\""),
+            "{localized}"
+        );
     }
 
     #[test]

@@ -29,11 +29,9 @@ pub struct NegotiateConfig {
     pub markdown: bool,
     /// Largest HTML body to convert.
     pub max_bytes: usize,
-    /// `Link` header for the home page.
-    pub home_link: Option<HeaderValue>,
-    /// The home page paths (`/{locale}` for each locale when the root is
-    /// locale-prefixed). Empty means `/`.
-    pub home_paths: Vec<String>,
+    /// The agent `Link` header of each home page: `/`, or `/{locale}` for
+    /// each locale when the root is locale-prefixed.
+    pub home_links: Vec<(String, HeaderValue)>,
     /// `Content-Signal` header for Markdown responses.
     pub content_signal: Option<HeaderValue>,
     /// `WWW-Authenticate` value for a `401` (RFC 9728 `resource_metadata`).
@@ -44,12 +42,9 @@ pub struct NegotiateConfig {
 }
 
 impl NegotiateConfig {
-    fn is_home(&self, path: &str) -> bool {
-        if self.home_paths.is_empty() {
-            path == "/"
-        } else {
-            self.home_paths.iter().any(|h| h == path)
-        }
+    /// The index of `path` in [`Self::home_links`], when it is a home page.
+    fn home(&self, path: &str) -> Option<usize> {
+        self.home_links.iter().position(|(home, _)| home == path)
     }
 }
 
@@ -104,7 +99,11 @@ where
         let is_get = req.method() == Method::GET;
         let readable = is_get || req.method() == Method::HEAD;
         let flags = Flags {
-            is_home: readable && self.config.is_home(req.uri().path()),
+            home: if readable {
+                self.config.home(req.uri().path())
+            } else {
+                None
+            },
             readable,
             wants_markdown: self.config.markdown && readable && prefers_markdown(req.headers()),
             is_head: !is_get && readable,
@@ -138,7 +137,8 @@ where
 #[derive(Debug, Clone, Copy)]
 #[allow(clippy::struct_excessive_bools)] // request facts, read once
 struct Flags {
-    is_home: bool,
+    /// The request's entry in `home_links`.
+    home: Option<usize>,
     readable: bool,
     wants_markdown: bool,
     is_head: bool,
@@ -225,9 +225,8 @@ where
                 add_resource_metadata(res.headers_mut(), &hint);
             }
         }
-        if this.flags.is_home
-            && res.status().is_success()
-            && let Some(link) = &config.home_link
+        if res.status().is_success()
+            && let Some((_, link)) = this.flags.home.and_then(|i| config.home_links.get(i))
         {
             res.headers_mut().append(LINK, link.clone());
         }
@@ -629,10 +628,17 @@ mod tests {
 
     #[test]
     fn localized_home_pages_are_home() {
-        let mut config = NegotiateConfig::default();
-        assert!(config.is_home("/") && !config.is_home("/en"));
-        config.home_paths = vec!["/en".to_owned(), "/fr".to_owned()];
-        assert!(config.is_home("/fr") && !config.is_home("/") && !config.is_home("/en/x"));
+        let link = |s: &'static str| HeaderValue::from_static(s);
+        let config = NegotiateConfig {
+            home_links: vec![
+                ("/en".to_owned(), link("<x>; rel=\"alternate\"")),
+                ("/fr".to_owned(), link("<y>; rel=\"alternate\"")),
+            ],
+            ..NegotiateConfig::default()
+        };
+        assert_eq!(config.home("/fr"), Some(1));
+        assert_eq!(config.home("/"), None);
+        assert_eq!(config.home("/en/x"), None);
     }
 
     #[test]
@@ -701,11 +707,10 @@ mod tests {
         let config = NegotiateConfig {
             markdown: true,
             max_bytes: 1024,
-            home_link: None,
+            home_links: Vec::new(),
             content_signal: None,
             resource_metadata: None,
             resource_metadata_from_host: false,
-            home_paths: Vec::new(),
         };
         markdown_headers(&mut h, &config, Some(1));
         for name in [
