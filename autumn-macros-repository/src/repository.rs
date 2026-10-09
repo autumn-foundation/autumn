@@ -6281,6 +6281,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 >,
             > {
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+                // Staging fault injection (#3071). Inert outside a fault scope.
+                ::autumn_web::fault_injection::__database_fault().await?;
                 let mut conn = pool.get().await.map_err(|e| {
                     ::autumn_web::reexports::tracing::error!(
                         "repository: failed to acquire database connection: {e}"

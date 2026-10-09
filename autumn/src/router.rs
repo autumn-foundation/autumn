@@ -4103,6 +4103,38 @@ fn finish_load_shed_layer(
 /// The clock and entropy source are taken from the app state rather than read
 /// ambiently, so a [`#[sim_test]`](crate::sim_test) controls both the sampling
 /// decision and the recorded timestamps.
+/// Paths that fault injection never faults: the probes and the actuator.
+fn fault_injection_exempt_paths(config: &AutumnConfig) -> Vec<String> {
+    let mut paths = probe_bypass_paths(config);
+    paths.extend(crate::actuator::actuator_endpoint_paths(
+        &config.actuator.prefix,
+        config.actuator.sensitive,
+        config.actuator.prometheus,
+    ));
+    paths
+}
+
+/// Install both fault injection layers again outside the static-first
+/// middleware (the SSG/ISG path), on the injector that `apply_middleware`
+/// built. A cached page is outside the request timeout, so the route layer
+/// caps injected latency at it.
+fn install_outer_fault_injection(
+    router: axum::Router<AppState>,
+    config: &AutumnConfig,
+    state: &AppState,
+) -> axum::Router<AppState> {
+    let Some(handle) = state.extension::<crate::fault_injection::FaultInjection>() else {
+        return router;
+    };
+    let deadline = config
+        .server
+        .timeouts
+        .request_timeout_ms
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis);
+    router.layer(handle.layers(deadline))
+}
+
 fn build_shadow_layer(
     config: &AutumnConfig,
     state: &AppState,
@@ -4645,6 +4677,10 @@ where
                 inner: self.inner.call(req),
             };
         };
+        // In a fault scope, take only the time left: a fault wait before this
+        // layer used part of the request timeout (#3071).
+        let duration =
+            crate::fault_injection::time_left().map_or(duration, |left| duration.min(left));
         // Adaptive admission tells a cancel at this deadline (overload) from a
         // client that goes away (#3068).
         if let Some(at) = tokio::time::Instant::now().checked_add(duration) {
@@ -5183,6 +5219,28 @@ fn apply_middleware(
     let (body_limit, upload_config) = build_upload_layers(config);
     let trusted_host_policy = TrustedHostPolicy::from_config_with_state(config, state);
     let (rate_limit_layer, rate_limit_principal_keying) = build_rate_limit_layers(config, state);
+    // Staging fault injection (#3071). The scope layer goes outside the
+    // exception filters and the session layer, so the Redis session store is
+    // in the request scope and the stop condition sees the final status. The route layer is the
+    // innermost member of `inner_stack`: it runs after rate limiting and load
+    // shedding, and the timeout, the access log and error reporting see an
+    // injected fault as a real one. Probe and actuator paths are exempt, as
+    // for `[shadow]`. `build` has no side effects.
+    // On the SSG/ISG path, `install_outer_fault_injection` adds the layers
+    // again outside the static-first middleware, on the same injector. The
+    // inner ones stay for the MCP dispatch clone; a request keeps the first
+    // scope, and route faults roll once.
+    let fault_injection = crate::fault_injection::build(
+        config,
+        state,
+        fault_injection_exempt_paths(config),
+        &route_timeouts,
+    );
+    let (fault_scope_layer, fault_route_layer, fault_handle) = match fault_injection {
+        Some((scope, route, handle)) => (Some(scope), Some(route), Some(handle)),
+        None => (None, None, None),
+    };
+
     let inner_stack = (
         // Insert UploadConfig into extensions so the Multipart extractor can
         // read per-file limits and the allowed MIME-type list.
@@ -5241,6 +5299,7 @@ fn apply_middleware(
         tower::util::option_layer(submit_token_layer),
         TrustedHostLayer::new(trusted_host_policy),
         tower::util::option_layer(build_ingress_cors_layer(config)),
+        tower::util::option_layer(fault_route_layer),
     );
 
     // User-registered Tower layers (`AppBuilder::layer`) wrap the group above.
@@ -5634,6 +5693,9 @@ fn apply_middleware(
                 .flatten(),
         ),
         crate::middleware::MetricsLayer::new(state.metrics.clone()),
+        // Outside the exception filters, so the stop condition counts the
+        // final status that a filter may set (#3071).
+        tower::util::option_layer(fault_scope_layer),
         ExceptionFilterLayer::new(all_filters),
         crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev },
         ryw_layer,
@@ -5672,6 +5734,10 @@ fn apply_middleware(
     // by `build_router_pre_state` after this function returns and after the MCP
     // dispatch clone is taken, so a `tools/call` replay never traverses the
     // page-cache gate (matching the SSG/ISG path and the documented intent).
+    if let Some(handle) = fault_handle {
+        crate::fault_injection::announce(&handle);
+        state.insert_extension(handle);
+    }
     Ok(router)
 }
 
@@ -6256,6 +6322,12 @@ pub fn try_build_router_with_static_inner(
     // so where exactly it merges relative to the shadow/compression/
     // static_gate/security-headers wraps below doesn't matter; only staying
     // outside `custom_layers` does.
+    // Fault injection (#3071), for the same reason as shadow mirroring below:
+    // a pre-rendered page never reaches the inner router, so the layers also
+    // go here. Before the MCP merge, so they do not wrap the `/mcp` envelope;
+    // its replays go through the inner layers, as on the dynamic path.
+    router = install_outer_fault_injection(router, config, &state);
+
     if let Some(mcp_router) = deferred_mcp_router {
         router = router.merge(mcp_router);
     }
@@ -13679,6 +13751,41 @@ mod trusted_host_tests {
         );
     }
 
+    /// In a fault scope, the timeout takes only the time left: a fault wait
+    /// before this layer (the Redis session load) uses part of it (#3071).
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout_takes_the_time_left_in_a_fault_scope() {
+        let mut config = AutumnConfig::default();
+        config.server.timeouts.request_timeout_ms = Some(1000);
+
+        let state = crate::state::AppState::for_test();
+        let router: axum::Router<AppState> = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                "ok"
+            }),
+        );
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+            false,
+        )
+        .with_state(state);
+
+        let request = Request::builder().uri("/slow").body(Body::empty()).unwrap();
+        let response = crate::fault_injection::with_request_budget(
+            std::time::Duration::from_millis(200),
+            router.oneshot(request),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn request_timeout_increments_metric() {
         let mut config = AutumnConfig::default();
@@ -14490,6 +14597,48 @@ mod trusted_host_tests {
             #[cfg(feature = "mcp")]
             mcp: None,
         }
+    }
+
+    /// #3071: on the SSG/ISG path the fault layers go outside the static
+    /// cache, so a route fault reaches a cached page, and only once.
+    #[tokio::test]
+    async fn route_fault_reaches_a_cached_static_page() {
+        let (_tmp, dist) = build_cached_dist("<h1>cached</h1>");
+        let mut config = AutumnConfig {
+            profile: Some("staging".to_owned()),
+            ..AutumnConfig::default()
+        };
+        config.fault_injection.enabled = true;
+        config.fault_injection.faults = vec![crate::fault_injection::FaultRule::new(
+            crate::fault_injection::FaultTarget::Route,
+            crate::fault_injection::FaultKind::Error,
+            1.0,
+        )];
+        let state = crate::state::AppState::for_test();
+        let app = super::try_build_router_with_static_inner(
+            Vec::new(),
+            &config,
+            state.clone(),
+            Some(dist.as_path()),
+            ctx_with_static_gate(redirect_gate_registration()),
+        )
+        .expect("router builds");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("x-authed", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let faults = state
+            .extension::<crate::fault_injection::FaultInjection>()
+            .expect("the handle is installed");
+        assert_eq!(faults.snapshot().injected, 1, "one fault, not two");
     }
 
     #[tokio::test]

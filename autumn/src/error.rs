@@ -224,6 +224,7 @@ where
                 Some(
                     crate::http_client::ClientError::CircuitBreakerOpen
                         | crate::http_client::ClientError::ThrottledLocally { .. }
+                        | crate::http_client::ClientError::FaultInjected(_)
                 )
             ) {
                 status = StatusCode::SERVICE_UNAVAILABLE;

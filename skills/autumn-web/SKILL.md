@@ -2849,6 +2849,38 @@ slow_call_rate_threshold = 0.5
 
 See `docs/guide/resilience.md`.
 
+## Resilience: staging fault injection (issue #3071)
+
+Add latency or errors in staging with `[fault_injection]`. Do not use it in
+production.
+
+```toml
+[fault_injection]
+enabled = true                 # or AUTUMN_FAULT_INJECTION__ENABLED=true
+
+[[fault_injection.faults]]
+routes = ["/api/*"]            # empty = all paths; probes and actuator exempt
+target = "route"               # route | database | redis | http
+kind = "error"                 # error | latency (needs latency_ms)
+rate = 0.05
+status = 503
+
+[fault_injection.stop]         # disarm on a fast error-budget burn
+objective = 99.0
+max_burn_rate = 14.4
+```
+
+- Refused in `prod` (and with no profile) unless
+  `allow_in_production = true`. Put that key only under
+  `[profile.prod.fault_injection]`.
+- The stop condition latches. Re-arm with
+  `state.extension::<autumn_web::fault_injection::FaultInjection>()` and
+  `.arm(actor)`. Each arm and disarm writes an audit event.
+- An `AutumnConfig` struct literal needs `..AutumnConfig::default()`.
+- For deterministic tests, use `FaultPlan`, not this section.
+
+See `docs/guide/fault-injection.md`.
+
 ## Sharding (0.6.0)
 
 Framework-native horizontal sharding: declare `[[database.shards]]` (each a

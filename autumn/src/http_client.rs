@@ -90,6 +90,10 @@ pub enum ClientError {
     /// The outbound circuit breaker is open.
     #[error("outbound circuit breaker is open")]
     CircuitBreakerOpen,
+    /// A staging fault (`[fault_injection]`, target `http`) failed the call
+    /// before it was sent.
+    #[error("{0}")]
+    FaultInjected(String),
     /// The client-side adaptive throttle rejected the attempt locally,
     /// because the host rejected too many recent attempts (issue #3068).
     /// See `[http.client.adaptive_throttle]`.
@@ -736,6 +740,7 @@ const fn http_error_kind(error: &ClientError) -> crate::capsule::schema::HttpErr
         ClientError::TooManyRedirects(_) => Kind::TooManyRedirects,
         ClientError::RedirectRejected(_) => Kind::RedirectRejected,
         ClientError::InvalidUrl(_) => Kind::InvalidUrl,
+        ClientError::FaultInjected(_) => Kind::FaultInjected,
         // Everything else — a `reqwest` transport error, and the replay-only
         // variants a recorded run cannot have produced — keeps its text alone.
         _ => Kind::Transport,
@@ -775,6 +780,7 @@ fn rebuild_client_error(
         Some(Kind::InvalidUrl) => {
             ClientError::InvalidUrl(strip_prefix_payload(&text, "invalid or unresolvable URL: "))
         }
+        Some(Kind::FaultInjected) => ClientError::FaultInjected(text),
         Some(Kind::TooManyRedirects) => text
             .trim_end_matches(')')
             .rsplit_once("(max ")
@@ -2205,6 +2211,10 @@ impl RequestBuilder {
 
     /// [`send`](Self::send), minus the replay gate and the capture tee.
     async fn send_recorded(mut self) -> Result<Response, ClientError> {
+        // Staging fault injection (#3071). Inert outside a fault scope.
+        crate::fault_injection::inject(crate::fault_injection::FaultTarget::Http)
+            .await
+            .map_err(|fault| ClientError::FaultInjected(fault.to_string()))?;
         // After the capture tee, so a capsule records the caller's headers
         // only and replays without a random key.
         self.ensure_idempotency_key();
@@ -4449,6 +4459,21 @@ mod tests {
         );
         match rebuild_client_error(Some(kind), err.to_string()) {
             ClientError::ThrottledLocally { host } => assert_eq!(host, "api.example.com:8443"),
+            other => panic!("rebuilt as {other:?}"),
+        }
+    }
+
+    /// Issue #3071: a capsule replays an injected fault as the same variant.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn fault_injected_round_trips_through_a_capsule() {
+        let err = ClientError::FaultInjected("fault injection: injected http error".to_owned());
+        let kind = http_error_kind(&err);
+        assert_eq!(kind, crate::capsule::schema::HttpErrorKind::FaultInjected);
+        match rebuild_client_error(Some(kind), err.to_string()) {
+            ClientError::FaultInjected(text) => {
+                assert_eq!(text, "fault injection: injected http error");
+            }
             other => panic!("rebuilt as {other:?}"),
         }
     }
