@@ -401,12 +401,48 @@ pub fn get<V: Clone + Send + Sync + 'static>(cache: &dyn Cache, key: &str) -> Op
     if replayed_untyped_get(key) {
         return None;
     }
-    let value = cache
-        .get_value(key)
-        .and_then(|arc| arc.downcast_ref::<V>().cloned());
+    let value = helper_read(cache, key).and_then(|arc| arc.downcast_ref::<V>().cloned());
     record_untyped_get(key, value.is_some());
     value
 }
+
+/// Read through a helper that records the read. The capsule seam takes any
+/// other `get_value` call as a direct read that it cannot record.
+fn helper_read(cache: &dyn Cache, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+    #[cfg(feature = "reporting")]
+    let _helper = HelperRead::enter();
+    cache.get_value(key)
+}
+
+// Set while a recording helper reads, so the seam can tell a direct read.
+#[cfg(feature = "reporting")]
+thread_local! {
+    static HELPER_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks a helper read for its lifetime, also when the backend panics.
+#[cfg(feature = "reporting")]
+struct HelperRead(bool);
+
+#[cfg(feature = "reporting")]
+impl HelperRead {
+    fn enter() -> Self {
+        Self(HELPER_READ.with(|flag| flag.replace(true)))
+    }
+}
+
+#[cfg(feature = "reporting")]
+impl Drop for HelperRead {
+    fn drop(&mut self) {
+        let outer = self.0;
+        HELPER_READ.with(|flag| flag.set(outer));
+    }
+}
+
+/// Why a capsule with a direct cache read is not replayable.
+#[cfg(feature = "reporting")]
+const DIRECT_READ_NOTE: &str = "the run read the cache with `Cache::get_value` directly; the \
+     value is not recorded, so replay cannot serve it";
 
 /// Typed insert: wrap the value in an `Arc` and store it.
 ///
@@ -442,7 +478,7 @@ where
         ReplayedRead::Miss => return None,
         ReplayedRead::Hit(value) => return Some(value),
     }
-    let arc = cache.get_value(key);
+    let arc = helper_read(cache, key);
     let value = arc.and_then(|arc| {
         // Fast path: in-memory backend stored the concrete type directly.
         if let Some(value) = arc.downcast_ref::<V>() {
@@ -843,8 +879,21 @@ impl Cache for CapsuleSeamCache {
     // or write is answered by its own seam before it gets here; anything
     // that still arrives is a miss, a dropped write, or no fill lock.
     fn get_value(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
-        if offline() {
+        let direct = !HELPER_READ.with(std::cell::Cell::get);
+        // A helper read with a tape never gets here, so with a tape this is a
+        // direct read: a divergence, as capture refuses such a capsule.
+        if let Some(tape) = crate::capsule::effects::current_tape() {
+            if direct {
+                tape.cache_untyped_get(key);
+            }
             return None;
+        }
+        if replay_blocked() {
+            return None;
+        }
+        if direct && let Some(scope) = crate::capsule::current_scope() {
+            scope.note(DIRECT_READ_NOTE);
+            scope.mark_truncated();
         }
         self.0.get_value(key)
     }
@@ -1586,6 +1635,39 @@ mod tests {
                 "an unfilled slot marks the capsule incomplete"
             );
         }
+    }
+
+    /// Codex review on #3222: a direct `get_value` call through the seam
+    /// marks the capsule incomplete during capture, and is a divergence
+    /// during a replay. A helper read stays recorded.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_direct_get_value_is_not_silently_substituted() {
+        let cache = with_capsule_seam(Arc::new(SpyBackend::default()));
+        let scope = capture_scope();
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async {
+                let _: Option<u32> = get_cached(cache.as_ref(), "k");
+            },
+        ));
+        assert!(!scope.is_truncated(), "a helper read is recorded");
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async {
+                let _ = cache.get_value("k");
+            },
+        ));
+        assert!(scope.is_truncated(), "a direct read cannot be recorded");
+
+        let tape = Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects::default(),
+        ));
+        let read = block_on(crate::capsule::with_effect_tape(Arc::clone(&tape), async {
+            cache.get_value("k")
+        }));
+        assert!(read.is_none());
+        assert_eq!(tape.divergences().len(), 1, "{:?}", tape.divergences());
     }
 
     /// The seam wraps a backend once, so `Arc` identity stays stable.

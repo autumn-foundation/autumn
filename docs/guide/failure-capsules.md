@@ -967,6 +967,14 @@ What capsules do not do, stated plainly:
   capture marks the capsule incomplete. A cache fill that meets a distributed
   fill lock (`Acquired` or `Held`) also marks it incomplete: replay has no
   lock, so it cannot take the same path.
+  A direct `Cache::get_value` call on the installed cache also marks it
+  incomplete: the value is not recorded. Use `cache::get_cached`.
+- **A raw cache backend skips the seam.** The framework wraps every cache it
+  installs (`with_cache_backend`, `set_global_cache`, `with_cache`,
+  `set_cache`). Code that keeps the backend it passed in, and calls it
+  directly, reaches that backend as it would reach any other client, also
+  during `autumn replay`. Use the cache that `state.cache()` or
+  `cache::global_cache()` returns.
 - **Only failures are captured.** There is no way to capsule a successful
   request, by design: the buffer for a request that succeeds is dropped at the
   response boundary.
