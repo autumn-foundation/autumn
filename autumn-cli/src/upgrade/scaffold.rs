@@ -103,6 +103,9 @@ struct ManifestFile {
     files: BTreeMap<String, String>,
 }
 
+/// How many times [`Manifest::update`] retries after losing a swap.
+const SWAP_ATTEMPTS: usize = 8;
+
 const FLAVOR_API: &str = "api";
 const FLAVOR_FULLSTACK: &str = "fullstack";
 
@@ -282,17 +285,61 @@ impl Manifest {
     /// none of their protection: following the link would truncate a file
     /// outside the project, invisibly to that project's own `git diff`.
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
-        if matches!(read_current(root, MANIFEST_PATH), OnDisk::Linked(_)) {
-            return Err(std::io::Error::other(format!(
-                "{MANIFEST_PATH} (or a directory on the way to it) is a symlink; \
-                 writing through it could write outside the project"
-            )));
-        }
+        Self::update(root, |_| Some(self.clone())).map(drop)
+    }
+
+    /// Read, change and write the manifest as one compare-and-swap.
+    ///
+    /// `change` gets the manifest as it is now (`None` if absent or unreadable)
+    /// and returns the manifest to write, or `None` to write nothing. If another
+    /// writer changes the file before the swap, `change` runs again on the new
+    /// state, so a pin that writer added is kept.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the path is a symlink, cannot be read as text, cannot be
+    /// written, or keeps changing for [`SWAP_ATTEMPTS`] tries.
+    pub fn update(
+        root: &Path,
+        mut change: impl FnMut(Option<Self>) -> Option<Self>,
+    ) -> std::io::Result<Self> {
         let path = root.join(MANIFEST_PATH);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        for _ in 0..SWAP_ATTEMPTS {
+            let (current, mode) = match read_current(root, MANIFEST_PATH) {
+                OnDisk::Linked(_) => {
+                    return Err(std::io::Error::other(format!(
+                        "{MANIFEST_PATH} (or a directory on the way to it) is a symlink; \
+                         writing through it could write outside the project"
+                    )));
+                }
+                OnDisk::Opaque(_) => {
+                    return Err(std::io::Error::other(format!(
+                        "{MANIFEST_PATH} cannot be read as text; delete it to start again"
+                    )));
+                }
+                OnDisk::Absent => (None, Publish::Create),
+                OnDisk::Text(text) => (Self::parse(&text), Publish::Swap(text)),
+            };
+            let Some(next) = change(current) else {
+                return Err(std::io::Error::other("nothing to write"));
+            };
+            let rendered = next.render();
+            // An identical rewrite would only touch the mtime.
+            if matches!(&mode, Publish::Swap(text) if normalize(text) == normalize(&rendered)) {
+                return Ok(next);
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            match publish(&path, &rendered, mode) {
+                Ok(()) => return Ok(next),
+                Err(PublishError::Moved(_)) => {}
+                Err(PublishError::Failed(error)) => return Err(std::io::Error::other(error)),
+            }
         }
-        publish(&path, &self.render(), Publish::Replace).map_err(std::io::Error::other)
+        Err(std::io::Error::other(format!(
+            "{MANIFEST_PATH} kept changing; gave up after {SWAP_ATTEMPTS} tries"
+        )))
     }
 }
 
@@ -1096,19 +1143,20 @@ pub fn accept(root: &Path, paths: &[String]) -> Result<Manifest, String> {
         ));
     }
 
-    let mut manifest = manifest.unwrap_or_else(|| Manifest {
-        version: None,
-        written_by: None,
-        options,
-        digests: BTreeMap::new(),
-        pinned: BTreeSet::new(),
-    });
-    manifest.options = options;
-    manifest.pinned.extend(paths.iter().cloned());
-    manifest
-        .save(root)
-        .map_err(|error| format!("could not write {MANIFEST_PATH}: {error}"))?;
-    Ok(manifest)
+    Manifest::update(root, |current| {
+        let options = resolve_options(root, current.as_ref());
+        let mut manifest = current.unwrap_or_else(|| Manifest {
+            version: None,
+            written_by: None,
+            options,
+            digests: BTreeMap::new(),
+            pinned: BTreeSet::new(),
+        });
+        manifest.options = options;
+        manifest.pinned.extend(paths.iter().cloned());
+        Some(manifest)
+    })
+    .map_err(|error| format!("could not write {MANIFEST_PATH}: {error}"))
 }
 
 /// Write the additions and updates in `report`, then refresh the manifest.
@@ -1175,16 +1223,11 @@ fn record_baseline(report: &ScaffoldReport) -> Result<(), String> {
     if report.entries.is_empty() {
         return Ok(());
     }
-    let previous = Manifest::load(&report.root);
-    let next = report.next_manifest(previous.as_ref());
-    // Rewriting an identical file would touch its mtime and show up in every
-    // `--apply` as a modified file with no diff.
-    let rendered = next.render();
-    let path = report.root.join(MANIFEST_PATH);
-    if std::fs::read_to_string(&path).is_ok_and(|current| current == rendered) {
-        return Ok(());
-    }
-    next.save(&report.root).map_err(|error| {
+    Manifest::update(&report.root, |previous| {
+        Some(report.next_manifest(previous.as_ref()))
+    })
+    .map(drop)
+    .map_err(|error| {
         format!(
             "the scaffold files were written, but the baseline could not be recorded: \
              {error}. Until it is, every file this run updated will be reported as a \
@@ -1233,15 +1276,11 @@ fn write_one(entry: &Entry) -> Result<(), String> {
         .ok_or_else(|| "no parent directory".to_owned())?;
     std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
 
-    publish(
-        &entry.absolute,
-        &entry.template,
-        if entry.current == OnDisk::Absent {
-            Publish::Create
-        } else {
-            Publish::Replace
-        },
-    )
+    let mode = match &entry.current {
+        OnDisk::Text(text) => Publish::Swap(text.clone()),
+        _ => Publish::Create,
+    };
+    publish(&entry.absolute, &entry.template, mode).map_err(|error| error.to_string())
 }
 
 /// Whether a publish may take a destination that already exists.
@@ -1249,12 +1288,35 @@ fn write_one(entry: &Entry) -> Result<(), String> {
 /// A statement about what the caller has *established*, not about what is on
 /// disk right now — the gap between those two is the race this exists to catch.
 /// Permissions are decided separately, from the destination itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Publish {
     /// The path was empty when the plan was made and must still be empty.
     Create,
-    /// The caller may take whatever is there.
-    Replace,
+    /// The path held exactly this text (line endings normalised) when the plan
+    /// was made, and must still hold it at the moment of the swap.
+    Swap(String),
+}
+
+/// Why a publish did not happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PublishError {
+    /// Another writer changed the path first. Nothing of theirs was touched.
+    Moved(String),
+    /// The disk refused.
+    Failed(String),
+}
+
+impl From<std::io::Error> for PublishError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Failed(error.to_string())
+    }
+}
+
+impl std::fmt::Display for PublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::Moved(text) | Self::Failed(text)) = self;
+        f.write_str(text)
+    }
 }
 
 /// Publish `contents` at `absolute`, atomically.
@@ -1278,17 +1340,15 @@ enum Publish {
 /// are written and synced, so a file another process creates inside that window
 /// would be silently clobbered by the very step that advertises it will not.
 ///
-/// [`Publish::Replace`] does replace, since that is the point there. Its window
-/// is narrowed by the re-read, not closed: a writer that replaces the file
-/// between the re-read and the publish loses. Closing that needs an exchange
-/// primitive no portable API offers, and it is the same window every
-/// rename-based updater lives with.
-fn publish(absolute: &Path, contents: &str, mode: Publish) -> Result<(), String> {
+/// [`Publish::Swap`] is a compare-and-swap: it replaces the destination only
+/// if it still holds the planned text, and refuses with [`PublishError::Moved`]
+/// otherwise. See [`swap`].
+fn publish(absolute: &Path, contents: &str, mode: Publish) -> Result<(), PublishError> {
     use std::io::Write as _;
 
     let directory = absolute
         .parent()
-        .ok_or_else(|| "no parent directory".to_owned())?;
+        .ok_or_else(|| PublishError::Failed("no parent directory".to_owned()))?;
     // Created through ordinary `0o666` open semantics so the process umask
     // applies, exactly as it does to the `fs::write` that `autumn new` uses.
     // `tempfile`'s own constructor deliberately creates `0600`, and deriving a
@@ -1305,44 +1365,113 @@ fn publish(absolute: &Path, contents: &str, mode: Publish) -> Result<(), String>
                 .write(true)
                 .create_new(true)
                 .open(path)
-        })
-        .map_err(|error| error.to_string())?;
+        })?;
 
     // A file that is really there keeps the mode it already has; anything else
     // is genuinely new and keeps the umask-derived mode it was just created
     // with. Keyed on what is on disk rather than on `mode`, which says whether
-    // replacing is *allowed*, not whether there is anything to replace — a
-    // `Publish::Replace` of an absent path is the manifest on every
-    // `autumn new`.
+    // replacing is *allowed*, not whether there is anything to replace.
     if let Ok(metadata) = std::fs::metadata(absolute) {
         let _ = temp.as_file().set_permissions(metadata.permissions());
     }
 
-    temp.write_all(contents.as_bytes())
-        .map_err(|error| error.to_string())?;
-    temp.flush().map_err(|error| error.to_string())?;
+    temp.write_all(contents.as_bytes())?;
+    temp.flush()?;
     // The publish is atomic, but only against a crash if the bytes reached the
     // disk first: otherwise it can land before the data and publish an empty
     // file.
-    temp.as_file()
-        .sync_all()
-        .map_err(|error| error.to_string())?;
+    temp.as_file().sync_all()?;
 
     match mode {
-        Publish::Create => temp.persist_noclobber(absolute).map_err(|error| {
-            if error.error.kind() == std::io::ErrorKind::AlreadyExists {
+        Publish::Create => temp
+            .persist_noclobber(absolute)
+            .map(drop)
+            .map_err(|error| {
+                if error.error.kind() == std::io::ErrorKind::AlreadyExists {
+                    PublishError::Moved(
+                        "something appeared at this path while it was being written; \
+                     it was left exactly as it is"
+                            .to_owned(),
+                    )
+                } else {
+                    error.error.into()
+                }
+            })?,
+        Publish::Swap(expected) => swap(temp, absolute, &expected)?,
+    }
+    Ok(())
+}
+
+/// Compare-and-swap: take the destination only if it still holds `expected`.
+///
+/// The destination is first claimed by renaming it aside, which is atomic and
+/// hands this process the exact file that was there. Only then is it compared.
+/// A mismatch puts it back without replacing anything newer. For a moment the
+/// path is absent, so a reader sees no file and a writer that creates one is
+/// not overwritten: the staged file is linked in without replacing.
+fn swap(
+    temp: tempfile::NamedTempFile,
+    absolute: &Path,
+    expected: &str,
+) -> Result<(), PublishError> {
+    let directory = absolute
+        .parent()
+        .ok_or_else(|| PublishError::Failed("no parent directory".to_owned()))?;
+    let claim = tempfile::Builder::new()
+        .prefix(".autumn-upgrade-")
+        .suffix(".old")
+        .tempfile_in(directory)?
+        .into_temp_path();
+    match std::fs::rename(absolute, &claim) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(PublishError::Moved(
+                "this file disappeared after the preview was computed".to_owned(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    let held = std::fs::symlink_metadata(&claim).is_ok_and(|meta| !meta.file_type().is_symlink())
+        && read_text(&claim).is_some_and(|text| text == normalize(expected));
+    if !held {
+        // Not the file that was planned: give it back, and keep it if something
+        // newer has taken its place.
+        return Err(match claim.persist_noclobber(absolute) {
+            Ok(()) => PublishError::Moved(
+                "this file changed after the preview was computed; \
+                 it was left exactly as it is"
+                    .to_owned(),
+            ),
+            Err(error) => {
+                let kept = error.path.keep().map_or_else(
+                    |_| String::new(),
+                    |path| format!(" (the earlier copy is at {})", path.display()),
+                );
+                PublishError::Moved(format!(
+                    "this file changed twice after the preview was computed{kept}"
+                ))
+            }
+        });
+    }
+
+    match temp.persist_noclobber(absolute) {
+        // The claimed file held the planned text, so dropping it loses nothing.
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(PublishError::Moved(
                 "something appeared at this path while it was being written; \
                  it was left exactly as it is"
-                    .to_owned()
-            } else {
-                error.error.to_string()
-            }
-        })?,
-        Publish::Replace => temp
-            .persist(absolute)
-            .map_err(|error| error.error.to_string())?,
-    };
-    Ok(())
+                    .to_owned(),
+            ))
+        }
+        Err(error) => {
+            // Put the planned file back; the path may be taken, and then theirs
+            // stands.
+            let _ = claim.persist_noclobber(absolute);
+            Err(error.error.into())
+        }
+    }
 }
 
 /// Re-read what an entry's path holds now, by the same rules the plan used —
@@ -2617,7 +2746,9 @@ mod tests {
         let path = tmp.path().join("arrived.toml");
         fs::write(&path, "someone else got here first\n").unwrap();
 
-        let error = publish(&path, "ours\n", Publish::Create).expect_err("must refuse");
+        let error = publish(&path, "ours\n", Publish::Create)
+            .expect_err("must refuse")
+            .to_string();
         assert!(error.contains("appeared"), "{error}");
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -2632,9 +2763,114 @@ mod tests {
         let path = tmp.path().join("existing.toml");
         fs::write(&path, "old\n").unwrap();
 
-        publish(&path, "new\n", Publish::Replace).expect("replace");
+        publish(&path, "new\n", Publish::Swap("old\n".to_owned())).expect("replace");
         assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
         assert!(no_scratch_beside(&path), "no scratch left behind");
+    }
+
+    #[test]
+    fn a_swap_refuses_a_destination_that_changed_after_the_plan() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("existing.toml");
+        fs::write(&path, "theirs, written after the plan\n").unwrap();
+
+        let error = publish(&path, "new\n", Publish::Swap("planned\n".to_owned()))
+            .expect_err("must refuse");
+        assert!(matches!(error, PublishError::Moved(_)), "{error}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "theirs, written after the plan\n"
+        );
+        assert!(no_scratch_beside(&path), "no scratch left behind");
+    }
+
+    #[test]
+    fn a_swap_refuses_a_destination_that_vanished() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("gone.toml");
+
+        let error = publish(&path, "new\n", Publish::Swap("planned\n".to_owned()))
+            .expect_err("must refuse");
+        assert!(matches!(error, PublishError::Moved(_)), "{error}");
+        assert!(!path.exists());
+        assert!(no_scratch_beside(&path), "no scratch left behind");
+    }
+
+    #[test]
+    fn a_swap_of_matching_text_ignores_line_endings() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("crlf.toml");
+        fs::write(&path, "a\r\nb\r\n").unwrap();
+
+        publish(&path, "new\n", Publish::Swap("a\nb\n".to_owned())).expect("swap");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+    }
+
+    #[test]
+    fn an_update_runs_again_when_a_writer_changed_the_manifest_first() {
+        let tmp = scaffolded(GenerateOptions::default());
+        let mut runs = 0;
+        let root = tmp.path().to_path_buf();
+        let saved = Manifest::update(tmp.path(), |current| {
+            runs += 1;
+            let mut manifest = current.expect("manifest");
+            if runs == 1 {
+                // A second command pins its own file between our read and swap.
+                let mut theirs = manifest.clone();
+                theirs.pinned.insert("Dockerfile".to_owned());
+                fs::write(root.join(MANIFEST_PATH), theirs.render()).unwrap();
+            }
+            manifest.pinned.insert("build.rs".to_owned());
+            Some(manifest)
+        })
+        .expect("update");
+        assert_eq!(runs, 2);
+        let pinned: Vec<&str> = saved.pinned.iter().map(String::as_str).collect();
+        assert_eq!(pinned, ["Dockerfile", "build.rs"]);
+        assert_eq!(Manifest::load(tmp.path()).unwrap(), saved);
+    }
+
+    #[test]
+    fn an_update_gives_up_when_the_manifest_never_settles() {
+        let tmp = scaffolded(GenerateOptions::default());
+        let root = tmp.path().to_path_buf();
+        let mut runs = 0;
+        let error = Manifest::update(tmp.path(), |current| {
+            runs += 1;
+            let mut manifest = current.expect("manifest");
+            let mut theirs = manifest.clone();
+            theirs.pinned.insert(format!("racer-{runs}"));
+            fs::write(root.join(MANIFEST_PATH), theirs.render()).unwrap();
+            manifest.pinned.insert("mine".to_owned());
+            Some(manifest)
+        })
+        .expect_err("must stop");
+        assert_eq!(runs, SWAP_ATTEMPTS);
+        assert!(error.to_string().contains("changing"), "{error}");
+        assert!(!Manifest::load(tmp.path()).unwrap().pinned.contains("mine"));
+    }
+
+    #[test]
+    fn two_accepts_at_once_keep_both_pins() {
+        for _ in 0..20 {
+            let tmp = scaffolded(GenerateOptions::default());
+            let root = tmp.path().to_path_buf();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let spawn = |path: &'static str| {
+                let (root, barrier) = (root.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    accept(&root, &[path.to_owned()])
+                })
+            };
+            let (left, right) = (spawn("Dockerfile"), spawn("build.rs"));
+            left.join().unwrap().expect("first accept");
+            right.join().unwrap().expect("second accept");
+            let pinned = Manifest::load(tmp.path()).unwrap().pinned;
+            assert!(pinned.contains("Dockerfile"), "{pinned:?}");
+            assert!(pinned.contains("build.rs"), "{pinned:?}");
+            assert!(no_scratch_beside(&root.join(MANIFEST_PATH)));
+        }
     }
 
     /// Whether the directory holding `path` is free of staging files.
