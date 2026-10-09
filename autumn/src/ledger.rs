@@ -1433,6 +1433,41 @@ pub enum LedgerError {
         /// The offending column.
         column: String,
     },
+    /// A stored snapshot is not the canonical text that was hashed (#2326).
+    ///
+    /// The text parses, but it is not byte-identical to its canonical form.
+    /// Someone re-encoded it, reordered its keys, or added a duplicate key.
+    #[error(
+        "ledger revision {seq} of {table}#{record_id} is not in canonical form: the stored \
+         snapshot text was re-encoded, reordered or holds a duplicate key"
+    )]
+    SnapshotNotCanonical {
+        /// Table of the ledgered model.
+        table: String,
+        /// Primary key of the record.
+        record_id: i64,
+        /// Sequence number of the revision.
+        seq: i64,
+    },
+    /// A stored snapshot does not decode into the model's current shape (#2326).
+    ///
+    /// The model schema probably changed after the revision was written. This is
+    /// not proof of tampering: `ledger_verify` tells the two apart.
+    #[error(
+        "ledger revision {seq} of {table}#{record_id} does not match the current model \
+         schema: {detail}. The model changed after this revision was written. Give a \
+         new field `#[serde(default)]`, or run `ledger_verify` to rule out an edit"
+    )]
+    SnapshotSchemaMismatch {
+        /// Table of the ledgered model.
+        table: String,
+        /// Primary key of the record.
+        record_id: i64,
+        /// Sequence number of the revision.
+        seq: i64,
+        /// The decode failure.
+        detail: String,
+    },
     /// A record's stored chain is broken, so its past state cannot be trusted.
     #[error("ledger chain for {table}#{record_id} is broken at revision {seq}: {detail}")]
     ChainBroken {
@@ -1591,6 +1626,41 @@ pub fn refuse_non_finite(
             },
         ))
     })
+}
+
+/// Parse a stored snapshot, refusing text that is not its canonical form (#2326).
+///
+/// The hash covers `canonical_json` of the parsed value. Without this check,
+/// `{ "a": 1 }` or `{"a":1,"a":2}` would verify as the canonical `{"a":2}`.
+///
+/// # Errors
+///
+/// [`LedgerError::ChainUnreadable`] for invalid JSON.
+/// [`LedgerError::SnapshotNotCanonical`] for any other encoding.
+#[doc(hidden)]
+pub fn parse_stored_snapshot(
+    table: &str,
+    record_id: i64,
+    seq: i64,
+    text: &str,
+) -> crate::AutumnResult<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|err| {
+        crate::AutumnError::internal_server_error(LedgerError::ChainUnreadable {
+            table: table.to_string(),
+            record_id,
+            detail: format!("revision {seq} has an unreadable snapshot: {err}"),
+        })
+    })?;
+    if canonical_json(&value) != text {
+        return Err(crate::AutumnError::internal_server_error(
+            LedgerError::SnapshotNotCanonical {
+                table: table.to_string(),
+                record_id,
+                seq,
+            },
+        ));
+    }
+    Ok(value)
 }
 
 /// Refuse to reconstruct a model from a snapshot whose `#[encrypted]` column
@@ -3598,5 +3668,32 @@ mod tests {
         }
         .to_string();
         assert!(text.contains("t#9") && text.contains("score"), "{text}");
+    }
+
+    // ── #2326: stored snapshot bytes ──────────────────────────────
+
+    #[test]
+    fn stored_snapshot_accepts_canonical_text() {
+        let text = r#"{"a":1,"b":[1,2]}"#;
+        let value = parse_stored_snapshot("t", 1, 1, text).unwrap();
+        assert_eq!(value, json!({"a": 1, "b": [1, 2]}));
+    }
+
+    #[test]
+    fn stored_snapshot_refuses_re_encoded_text() {
+        for text in [r#"{ "a": 1 }"#, r#"{"b":1,"a":2}"#, r#"{"a":1,"a":2}"#] {
+            let err = parse_stored_snapshot("t", 1, 3, text).expect_err(text);
+            let shown = err.to_string();
+            assert!(
+                shown.contains("canonical") && shown.contains('3'),
+                "{shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_snapshot_refuses_invalid_json() {
+        let err = parse_stored_snapshot("t", 1, 2, "{").expect_err("invalid");
+        assert!(err.to_string().contains("unreadable"), "{err}");
     }
 }

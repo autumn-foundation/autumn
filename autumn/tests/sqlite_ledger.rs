@@ -3053,3 +3053,113 @@ async fn write_three_revisions(repo: &PgLgInvoiceRepository) -> i64 {
     }
     created.id
 }
+
+// ── #2326: delete snapshot, byte fidelity, schema drift ──────────────
+
+/// A database trigger rewrites a column during the soft-delete `UPDATE`.
+#[tokio::test]
+async fn a_delete_snapshots_the_row_a_trigger_rewrote() {
+    let pool = boot_pool("lg_delete_trigger").await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute(
+            "CREATE TRIGGER lg_invoices_touch AFTER UPDATE OF deleted_at ON lg_invoices \
+             WHEN NEW.deleted_at IS NOT NULL \
+             BEGIN UPDATE lg_invoices SET reference = reference || '-touched' \
+             WHERE id = NEW.id; END",
+        )
+        .await
+        .expect("install trigger");
+    }
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool);
+    let created = repo
+        .save(&NewLgInvoice {
+            reference: "INV-T".to_string(),
+            amount_cents: 1,
+            amount_rate: 1.0,
+            metadata: "{}".to_string(),
+        })
+        .await
+        .expect("insert");
+    repo.delete_by_id(created.id).await.expect("soft delete");
+
+    let report = repo.ledger_verify(created.id).await.expect("verify");
+    assert!(
+        report.is_intact(),
+        "no false positive after delete: {report:?}"
+    );
+    let then = repo
+        .ledger_as_of(created.id, now() + Duration::seconds(1))
+        .await
+        .expect("as-of")
+        .expect("state");
+    assert_eq!(then.reference, "INV-T-touched");
+}
+
+#[tokio::test]
+async fn a_re_encoded_snapshot_is_refused() {
+    let pool = boot_pool("lg_reencoded").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    let head = repo
+        .ledger_revisions(id)
+        .await
+        .expect("revisions")
+        .pop()
+        .expect("head");
+    let spaced = autumn_web::ledger::canonical_json(&head.snapshot).replacen(':', ": ", 1);
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_revisions SET snapshot = ? \
+             WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = ?",
+        )
+        .bind::<diesel::sql_types::Text, _>(spaced)
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .bind::<diesel::sql_types::BigInt, _>(head.seq)
+        .execute(&mut *conn)
+        .await
+        .expect("re-encode");
+    }
+    let err = repo
+        .ledger_verify(id)
+        .await
+        .expect_err("same meaning, different bytes");
+    assert!(err.to_string().contains("canonical"), "{err}");
+}
+
+#[tokio::test]
+async fn a_snapshot_the_model_cannot_decode_reports_schema_drift() {
+    let pool = boot_pool("lg_schema_drift").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    let first = repo
+        .ledger_revisions(id)
+        .await
+        .expect("revisions")
+        .remove(0);
+    let mut old = first.snapshot.clone();
+    old.as_object_mut().expect("object").remove("amount_cents");
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_revisions SET snapshot = ? \
+             WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = ?",
+        )
+        .bind::<diesel::sql_types::Text, _>(autumn_web::ledger::canonical_json(&old))
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .bind::<diesel::sql_types::BigInt, _>(first.seq)
+        .execute(&mut *conn)
+        .await
+        .expect("simulate an older schema");
+    }
+    let err = repo
+        .ledger_as_of(id, first.recorded_at)
+        .await
+        .expect_err("cannot decode");
+    let text = err.to_string();
+    assert!(
+        text.contains("schema") && !text.contains("unreadable"),
+        "must not read as tamper evidence: {text}"
+    );
+}
