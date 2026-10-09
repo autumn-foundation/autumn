@@ -26842,7 +26842,14 @@ mod lease_tests {
             outcome,
             JobExecutionOutcome::Failed("job timed out after 250ms".to_owned())
         );
-        tokio::task::yield_now().await;
+        // The spawned watcher needs a turn to see the cancel. One yield is not
+        // always enough on a busy runner, so give it a bounded number.
+        for _ in 0..100 {
+            if TIMEOUT_SEEN.load(Ordering::SeqCst) != 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert_eq!(
             TIMEOUT_SEEN.load(Ordering::SeqCst),
             1,
@@ -27142,7 +27149,13 @@ mod lease_tests {
         lost.cancel();
         let outcome = run.await.expect("run task");
         assert_eq!(outcome, JobExecutionOutcome::LeaseLost);
-        tokio::task::yield_now().await;
+        // The spawned watcher needs a turn. Give it a bounded number.
+        for _ in 0..100 {
+            if LEASE_SEEN.load(Ordering::SeqCst) != 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert_eq!(
             LEASE_SEEN.load(Ordering::SeqCst),
             10,
