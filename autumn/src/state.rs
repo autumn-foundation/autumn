@@ -669,9 +669,17 @@ impl AppState {
     /// [`Self::with_cache`]).
     #[must_use]
     pub fn cache(&self) -> Option<Arc<dyn Cache>> {
-        self.extension::<GlobalCacheEntry>()
+        let cache = self
+            .extension::<GlobalCacheEntry>()
             .map(|e| e.0.clone())
-            .or_else(|| self.shared_cache.clone())
+            .or_else(|| self.shared_cache.clone());
+        // A failure capsule records this apart from the global cache, so a
+        // replay gives the state the same answer (#2351).
+        #[cfg(feature = "reporting")]
+        if let Some(scope) = crate::capsule::current_scope() {
+            scope.note_state_cache(cache.is_some());
+        }
+        cache
     }
 
     /// Register a global cache backend (builder / test helper, build-time).

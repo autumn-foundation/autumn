@@ -980,7 +980,7 @@ The new variants are `CacheEffect::Invalidate`, `CacheEffect::InvalidateNamespac
 `MailErrorKind::NoDurableQueueInProduction`. An exhaustive `match` on
 `EffectSeam` or `MailErrorKind` needs a new arm.
 
-`CapsuleEffects` has a new field `global_cache`. A struct literal of
+`CapsuleEffects` has new fields `global_cache` and `state_cache`. A struct literal of
 `CapsuleEffects` needs `..CapsuleEffects::default()`.
 
 `CAPSULE_FORMAT_VERSION` is now 4. An older build refuses a version 4 capsule

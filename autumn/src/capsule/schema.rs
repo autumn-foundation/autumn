@@ -465,6 +465,10 @@ pub struct CapsuleEffects {
     /// stores nothing when this is `true`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub global_cache: bool,
+    /// Whether `AppState::cache()` returned a cache in the run. It is held
+    /// apart from the global cache, so it is recorded apart.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub state_cache: bool,
 }
 
 impl CapsuleEffects {

@@ -510,6 +510,8 @@ pub struct CaptureScope {
     closed: AtomicBool,
     /// Whether a global cache was installed when the run started.
     global_cache: bool,
+    /// What the first `AppState::cache()` call in the run returned.
+    state_cache: OnceLock<bool>,
 }
 
 impl CaptureScope {
@@ -533,7 +535,21 @@ impl CaptureScope {
             truncated: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             global_cache: crate::cache::global_cache().is_some(),
+            state_cache: OnceLock::new(),
         }
+    }
+
+    /// Note whether `AppState::cache()` returned a cache. The first call in
+    /// the run is kept.
+    pub(crate) fn note_state_cache(&self, present: bool) {
+        let _ = self.state_cache.set(present);
+    }
+
+    /// Whether `AppState::cache()` returned a cache in the run. `false` when
+    /// the run did not call it.
+    #[must_use]
+    pub(crate) fn had_state_cache(&self) -> bool {
+        self.state_cache.get().copied().unwrap_or(false)
     }
 
     /// Whether a global cache was installed when the run started. Read at

@@ -106,8 +106,9 @@ pub fn global_cache() -> Option<Arc<dyn Cache>> {
 /// a backend that stores nothing. A cache call then takes the path it took in
 /// production, and the tape answers it. Otherwise replay has no global cache.
 ///
-/// Returns the installed cache. The caller also puts it in the app state, as
-/// `AppBuilder::with_cache_backend` does in production.
+/// Returns the cache for the app state: one when `AppState::cache()` returned
+/// one in production. It is the same `Arc` as the global cache when both were
+/// present, as `AppBuilder::with_cache_backend` makes them.
 #[cfg(feature = "reporting")]
 pub(crate) fn install_replay_cache(
     recorded: &crate::capsule::CapsuleEffects,
@@ -117,7 +118,9 @@ pub(crate) fn install_replay_cache(
     } else {
         clear_global_cache();
     }
-    global_cache()
+    recorded
+        .state_cache
+        .then(|| global_cache().unwrap_or_else(|| with_capsule_seam(Arc::new(ReplayBackend))))
 }
 
 /// The backend under the replay seam. It stores nothing.
@@ -1284,6 +1287,7 @@ mod tests {
                 error: None,
             }],
             global_cache: true,
+            state_cache: true,
             ..Default::default()
         };
         let installed = install_replay_cache(&recorded).expect("installed");
@@ -1299,6 +1303,21 @@ mod tests {
 
         assert!(install_replay_cache(&crate::capsule::CapsuleEffects::default()).is_none());
         assert!(global_cache().is_none());
+
+        // The two are recorded apart, so each is installed apart.
+        let only_state = crate::capsule::CapsuleEffects {
+            state_cache: true,
+            ..Default::default()
+        };
+        assert!(install_replay_cache(&only_state).is_some());
+        assert!(global_cache().is_none());
+        let only_global = crate::capsule::CapsuleEffects {
+            global_cache: true,
+            ..Default::default()
+        };
+        assert!(install_replay_cache(&only_global).is_none());
+        assert!(global_cache().is_some());
+        clear_global_cache();
     }
 
     /// A backend whose sync removals fail, and whose fill lock is held.
@@ -1396,6 +1415,33 @@ mod tests {
         clear_global_cache();
         assert!(scope.had_global_cache());
         assert!(!capture_scope().had_global_cache());
+    }
+
+    /// Codex review on #3222: a run records what `AppState::cache()` gave,
+    /// apart from the global cache.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_capture_scope_records_the_state_cache_apart() {
+        let with_cache = crate::state::AppState::for_test()
+            .with_cache(Arc::new(SpyBackend::default()) as Arc<dyn Cache>);
+        let scope = capture_scope();
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async {
+                assert!(with_cache.cache().is_some());
+            },
+        ));
+        assert!(scope.had_state_cache());
+
+        let without = crate::state::AppState::for_test();
+        let scope = capture_scope();
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async {
+                assert!(without.cache().is_none());
+            },
+        ));
+        assert!(!scope.had_state_cache());
     }
 
     /// The seam wraps a backend once, so `Arc` identity stays stable.

@@ -8484,8 +8484,8 @@ impl AppBuilder {
         if let Some(interceptor) = db_interceptor {
             state.insert_extension(interceptor);
         }
-        // In the state too, as `with_cache_backend` does, so `state.cache()`
-        // takes the production path.
+        // The capsule records the global cache and `state.cache()` apart, so
+        // each takes the production path.
         state.shared_cache = crate::cache::install_replay_cache(&capsule.effects);
 
         for register in policy_registrations {
