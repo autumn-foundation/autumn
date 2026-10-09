@@ -602,7 +602,17 @@ fn build_router_pre_state(
 
     // The OpenAPI and MCP mounts live on `ctx`, not on the config, so the
     // framework check inside the call above cannot see them.
-    reject_declared_routes_on_context_mounts(&ctx)?;
+    #[cfg(feature = "openapi")]
+    reject_declared_routes_on_context_mounts(&ctx.declared_routes, ctx.openapi.as_ref(), {
+        #[cfg(feature = "mcp")]
+        {
+            ctx.mcp.as_ref().map(|rt| rt.mount_path.as_str())
+        }
+        #[cfg(not(feature = "mcp"))]
+        {
+            None
+        }
+    })?;
 
     // Fail-fast if an OpenAPI mount path collides with a user or
     // framework GET route — axum panics on overlapping method routes,
@@ -2152,15 +2162,21 @@ pub fn reject_duplicate_user_routes(
 /// Refuse a declared plugin route on a path the context mounts: the `OpenAPI`
 /// JSON, Swagger UI and its assets (all GET), and the MCP endpoint (GET, POST
 /// and OPTIONS). Same refusal as [`reject_declared_framework_collisions`].
-fn reject_declared_routes_on_context_mounts(ctx: &RouterContext) -> Result<(), RouterBuildError> {
-    if ctx.declared_routes.is_empty() {
+///
+/// Takes the mounts as inputs, so the router build and the no-boot export
+/// preflight apply one rule.
+#[cfg(feature = "openapi")]
+pub fn reject_declared_routes_on_context_mounts(
+    declared_routes: &[crate::route_listing::RouteInfo],
+    openapi: Option<&crate::openapi::OpenApiConfig>,
+    mcp_mount_path: Option<&str>,
+) -> Result<(), RouterBuildError> {
+    if declared_routes.is_empty() {
         return Ok(());
     }
     // `(method, path)`: the verbs each mount really owns.
-    #[cfg_attr(not(any(feature = "openapi", feature = "mcp")), allow(unused_mut))]
     let mut mounts: Vec<(&'static str, String)> = Vec::new();
-    #[cfg(feature = "openapi")]
-    if let Some(openapi) = &ctx.openapi {
+    if let Some(openapi) = openapi {
         mounts.push(("GET", openapi.openapi_json_path.clone()));
         if let Some(ui_path) = &openapi.swagger_ui_path {
             mounts.push(("GET", ui_path.clone()));
@@ -2171,13 +2187,12 @@ fn reject_declared_routes_on_context_mounts(ctx: &RouterContext) -> Result<(), R
             );
         }
     }
-    #[cfg(feature = "mcp")]
-    if let Some(mcp) = &ctx.mcp {
-        mounts.push(("GET", mcp.mount_path.clone()));
-        mounts.push(("POST", mcp.mount_path.clone()));
-        mounts.push(("OPTIONS", mcp.mount_path.clone()));
+    if let Some(path) = mcp_mount_path {
+        for method in ["GET", "POST", "OPTIONS"] {
+            mounts.push((method, path.to_owned()));
+        }
     }
-    for declared in &ctx.declared_routes {
+    for declared in declared_routes {
         // A `WS` upgrade is a GET as far as axum's method router is concerned.
         let method = if declared.method.eq_ignore_ascii_case("WS") {
             "GET"
