@@ -186,7 +186,8 @@ Some consequences worth knowing:
 - The ledger reads a snapshot only if its stored text is its canonical form.
   Changed spacing, a different key order or a duplicate key return
   `LedgerError::SnapshotNotCanonical`. `ledger_verify` reports it as
-  `LedgerBreak::SnapshotNotCanonical`.
+  `LedgerBreak::SnapshotNotCanonical`. The ledger cannot read past such a
+  revision, so this break comes before any other break in the same chain.
 - If a snapshot does not decode into the current model, `ledger_as_of` and
   `ledger_diff` return `LedgerError::SnapshotSchemaMismatch`. This is not tamper
   evidence. To read old revisions after adding a required field, put

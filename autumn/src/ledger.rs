@@ -1713,7 +1713,8 @@ pub fn schema_mismatch(table: &str, record_id: i64, seq: i64, detail: &str) -> c
 /// Turn a chain read error into a verification report where it is a finding (#2326).
 ///
 /// A non-canonical snapshot is evidence of a change, not a read fault. Other
-/// errors pass through.
+/// errors pass through. The read stops at this revision, so no other break in the
+/// chain is reported with it.
 ///
 /// # Errors
 ///
