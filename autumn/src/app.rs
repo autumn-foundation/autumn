@@ -14660,8 +14660,10 @@ mod fleet_boot_tests {
     #[tokio::test]
     async fn the_boot_fleet_gets_the_shard_sets_and_never_the_control_set() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut config = AutumnConfig::default();
-        config.profile = Some("dev".into());
+        let mut config = AutumnConfig {
+            profile: Some("dev".into()),
+            ..AutumnConfig::default()
+        };
         config.database.url = Some(format!(
             "sqlite://{}",
             tmp.path().join("control.db").display()

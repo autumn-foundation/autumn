@@ -332,7 +332,8 @@ pub trait FleetLifecycle: Send + Sync + 'static {
         let _ = key;
     }
 
-    /// When a delete has closed the database, before its files are removed.
+    /// After a delete has removed the database's files. Not called when the
+    /// delete was refused or found nothing to delete.
     fn on_delete(&self, key: &FleetDbKey) {
         let _ = key;
     }
@@ -1407,7 +1408,6 @@ impl DatabaseFleet {
         // Hooks let go of the files first (a parked replicator holds one open).
         for hook in self.hooks() {
             hook.release(&key);
-            hook.on_delete(&key);
         }
         let path = self.path_of(&key);
         let root = self.inner.root.clone();
@@ -1430,6 +1430,11 @@ impl DatabaseFleet {
         .and_then(|r| r);
         if matches!(removed, Ok(true)) {
             self.inner.counters.deleted.fetch_add(1, Ordering::Relaxed);
+            // Only now: a refused delete (another process has the file open)
+            // or a missing file must not trigger, say, replica cleanup.
+            for hook in self.hooks() {
+                hook.on_delete(&key);
+            }
         }
         self.finish_drain(&key, &drain);
         removed
@@ -2550,6 +2555,8 @@ mod tests {
         use diesel::connection::SimpleConnection as _;
         let tmp = tempfile::tempdir().unwrap();
         let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let recorder = Arc::new(Recorder::default());
+        fleet.add_lifecycle(recorder.clone());
         let key = FleetDbKey::Slot(4);
         let path = fleet.open(&key).await.unwrap().path().to_path_buf();
         fleet.close(&key).await;
@@ -2566,11 +2573,21 @@ mod tests {
         assert!(matches!(err, FleetError::InUseElsewhere { .. }), "{err}");
         assert_eq!(err.http_status(), http::StatusCode::CONFLICT);
         assert!(path.is_file(), "nothing was unlinked");
+        assert_eq!(
+            recorder.deleted.load(Ordering::SeqCst),
+            0,
+            "on_delete (say, replica cleanup) must not run for a refused delete"
+        );
         fleet.open(&key).await.expect("the key is not stranded");
         fleet.close(&key).await;
         drop(other);
         assert!(fleet.delete(&key).await.unwrap());
         assert!(!path.exists());
+        assert_eq!(recorder.deleted.load(Ordering::SeqCst), 1);
+
+        // Nothing on disk: nothing deleted, so no hook either.
+        assert!(!fleet.delete(&key).await.unwrap());
+        assert_eq!(recorder.deleted.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
