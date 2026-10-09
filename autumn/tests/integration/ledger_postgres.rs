@@ -936,25 +936,25 @@ diesel::table! {
 }
 
 diesel::table! {
-    ledger_link_tags (id) {
+    test_ledger_link_tags (id) {
         id -> Int8,
         name -> Text,
     }
 }
 
-#[autumn_web::model(table = "ledger_link_tags")]
-pub struct LedgerLinkTag {
+#[autumn_web::model(table = "test_ledger_link_tags")]
+pub struct TestLedgerLinkTag {
     #[id]
     pub id: i64,
     pub name: String,
 }
 
-#[autumn_web::repository(LedgerLinkTag, table = "ledger_link_tags")]
-pub trait LedgerLinkTagRepository {}
+#[autumn_web::repository(TestLedgerLinkTag, table = "test_ledger_link_tags")]
+pub trait TestLedgerLinkTagRepository {}
 
 #[autumn_web::model(table = "test_ledger_link_posts")]
 #[has_many(
-    LedgerLinkTag,
+    TestLedgerLinkTag,
     through = test_ledger_post_tags,
     name = tags,
     fk = post_id,
@@ -1011,7 +1011,7 @@ async fn a_link_write_into_a_ledgered_join_table_is_refused() {
         let mut conn = pool.get().await.expect("conn");
         conn.batch_execute(
             "CREATE TABLE test_ledger_link_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL);
-             CREATE TABLE ledger_link_tags (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL);
+             CREATE TABLE test_ledger_link_tags (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL);
              CREATE TABLE test_ledger_post_tags (
                  id BIGSERIAL PRIMARY KEY,
                  post_id BIGINT NOT NULL,
@@ -1024,7 +1024,7 @@ async fn a_link_write_into_a_ledgered_join_table_is_refused() {
         .expect("link tables");
     }
     let posts = PgLedgerLinkPostRepository::with_pool_untracked(pool.clone());
-    let tags = PgLedgerLinkTagRepository::with_pool_untracked(pool.clone());
+    let tags = PgTestLedgerLinkTagRepository::with_pool_untracked(pool.clone());
     let links = link_rows::PgLedgerPostTagRepository::with_pool_untracked(pool);
     let post = posts
         .save(&NewLedgerLinkPost {
@@ -1033,7 +1033,7 @@ async fn a_link_write_into_a_ledgered_join_table_is_refused() {
         .await
         .expect("post");
     let tag = tags
-        .save(&NewLedgerLinkTag {
+        .save(&NewTestLedgerLinkTag {
             name: "t".to_string(),
         })
         .await
@@ -1055,4 +1055,63 @@ async fn a_link_write_into_a_ledgered_join_table_is_refused() {
         use link_rows::LedgerPostTagRepository as _;
         assert!(links.find_all().await.expect("list").is_empty());
     }
+}
+
+/// A keyset walk over several pages on Postgres (#2319). It joins up to the
+/// full read, and `ledger_verify` pages through the same chain.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ledger_revisions_page_walks_the_chain_on_postgres() {
+    use autumn_web::ledger::LedgerPageRequest;
+
+    let (pool, _container) = setup_pool().await;
+    let repo = build_repo(pool);
+    let created = repo
+        .save(&NewLedgerInvoice {
+            reference: "INV-P".to_string(),
+            amount_cents: 0,
+            amount_rate: 1e16,
+        })
+        .await
+        .expect("insert");
+    for amount in 1..=4 {
+        repo.update(
+            created.id,
+            &UpdateLedgerInvoice {
+                amount_cents: Patch::Set(amount),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update");
+    }
+
+    let mut seqs = Vec::new();
+    let mut request = LedgerPageRequest::first(2);
+    let mut pages = 0;
+    loop {
+        let page = repo
+            .ledger_revisions_page(created.id, request)
+            .await
+            .expect("page");
+        pages += 1;
+        seqs.extend(page.revisions.iter().map(|r| r.seq));
+        match page.next_request(2) {
+            Some(next) => request = next,
+            None => break,
+        }
+    }
+    assert_eq!(pages, 3);
+    assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
+    let full: Vec<i64> = repo
+        .ledger_revisions(created.id)
+        .await
+        .expect("full read")
+        .iter()
+        .map(|r| r.seq)
+        .collect();
+    assert_eq!(seqs, full);
+    let report = repo.ledger_verify(created.id).await.expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+    assert_eq!(report.revisions_checked, 5);
 }

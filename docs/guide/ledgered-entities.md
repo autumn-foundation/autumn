@@ -305,7 +305,8 @@ repository. On a ledgered table, each one is **refused** with
 | `add_comment` / `delete_comment` into a ledgered comments table | Refused. |
 | `add_*` / `remove_*` / `set_*` into a ledgered `has_many(through)` join table | Refused. |
 | A [data capsule](data-capsules.md) import into a ledgered table | Refused with `DataCapsuleError::InvalidInput`. |
-| A write from a second repository on the table that is not ledgered | Refused. Its reads still work. |
+| A write from an unledgered repository on the same table, or a `dependent(..., on_delete = destroy)` cascade through one | Refused. Its generated reads still work. `with_lock` and `find_or_create_by_*` use the write connection, so they are refused too. |
+| A model factory `create()` / `create_many()` | Panics with the same error. |
 
 The error names the table and the path. To fix it, remove the setting, write
 through the ledgered repository, or use `on_delete = destroy` (a ledgered child
@@ -440,7 +441,7 @@ NULL tenant is not visible to a tenant-scoped read, and a cross-tenant read is
 refused, so no read could reach its chain. A nullable column is a compile error.
 
 The writer and the reader use the same source: the row's `tenant_id`. The
-writer stamps each revision with it. The reader finds the chain and the live
+writer writes it into each revision. The reader finds the chain and the live
 row by the active tenant, which is the same value. So each chain has exactly one
 read mode: the scope of the tenant that owns the row.
 
@@ -474,8 +475,9 @@ index; nothing unusual for autovacuum, but worth knowing at high write rates.
 `ledger_as_of` and `ledger_diff` read one revision per instant.
 `ledger_revisions` reads a record's whole chain in one statement.
 `ledger_revisions_page` reads one keyset page on `(seq, id)`, so each page costs
-one indexed read. `ledger_verify` reads every revision, in pages of
-`LedgerPageRequest::MAX_LIMIT`, so its memory holds one page and the head. It
+one indexed read. Pages are separate reads, not one snapshot. `ledger_verify`
+reads every revision, in pages of `LedgerPageRequest::VERIFY_LIMIT`, so its
+memory holds one page and the head. It
 also reads the live row, the high-water mark, and re-reads the head — the last
 of those is the stability gate that keeps a concurrent write from being mistaken
 for tampering.

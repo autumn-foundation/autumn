@@ -927,7 +927,8 @@ pub trait PostRepository {
 | `add_comment` / `delete_comment` into a ledgered comments table | `OutOfBandWrite` |
 | `add_*` / `remove_*` / `set_*` into a ledgered `has_many(through)` join table | `OutOfBandWrite` |
 | A capsule import into a ledgered table | `DataCapsuleError::InvalidInput` |
-| A write from a repository that is not ledgered, on a ledgered table | `OutOfBandWrite` |
+| A write from an unledgered repository on a ledgered table, including `with_lock`, `find_or_create_by_*` and a `destroy` cascade through it | `OutOfBandWrite` |
+| A model factory `create()` into a ledgered table | Panic |
 | An update that changes a ledgered record's `tenant_id` | `TenantChange` (HTTP 409) |
 | A derived `delete_by_*` on a ledgered repository | Compile error |
 | `Option<String>` tenant column on a ledgered `tenant_scoped` repository | Compile error |

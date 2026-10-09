@@ -10132,6 +10132,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
+    let table_name_lit = table_ident.to_string();
     // create() inner body — shared by both the assoc and non-assoc paths.
     let create_inner_body = quote! {
         use ::autumn_web::reexports::diesel::prelude::*;
@@ -10143,6 +10144,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let new_record = #new_name {
             #(#new_construct_fields,)*
         };
+        // #2319: the factory insert records no ledger revision.
+        if let ::core::result::Result::Err(err) =
+            ::autumn_web::ledger::refuse_out_of_band_write(#table_name_lit, "factory")
+        {
+            panic!("factory: {err}");
+        }
         let mut conn = pool
             .get()
             .await
@@ -10174,7 +10181,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             /// Supply a pre-built instance with the `.{type_snake}(instance)` setter
             /// to skip the extra insert.
             ///
-            /// Panics if the insert fails or if a cyclic association chain is detected
+            /// Panics if the insert fails, if the table is ledgered (#2319), or if a cyclic association chain is detected
             /// (depth > 32).
             pub async fn create(
                 self,
@@ -10201,7 +10208,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             /// Insert a record built from this factory into the database and return
             /// the fully-populated model (with server-assigned primary key).
             ///
-            /// Panics if the insert fails.
+            /// Panics if the insert fails, or if the table is ledgered (#2319).
             pub async fn create(
                 self,
                 pool: &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<

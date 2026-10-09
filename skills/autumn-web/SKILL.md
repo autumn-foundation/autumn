@@ -1057,10 +1057,13 @@ What to know when writing app code against it:
 - **Raw-SQL framework paths are refused.** A counter cache on a ledgered
   parent, `dependent(.., on_delete = delete_all | nullify)` into a ledgered
   child, `#[votable]` / `#[commentable]` / `has_many(through)` writes into a
-  ledgered table, and writes from a second, unledgered repository on the table
-  fail with `LedgerError::OutOfBandWrite`. Use `on_delete = destroy`.
+  ledgered table, and writes from an unledgered repository on the same table
+  fail with `LedgerError::OutOfBandWrite`. A model factory panics. For a
+  dependent, use `on_delete = destroy`. For the other paths, write through the
+  ledgered repository.
 - **No derived `delete_by_*`** on a ledgered repository (compile error): it
-  records no revision. Find the records, then call `delete_by_id`.
+  records no revision. Find the records. Then call `delete_by_id` or
+  `delete_many`.
 - **Tenant column is `String`.** A ledgered `tenant_scoped` repository with
   `tenant_id: Option<String>` does not compile, and an update that changes
   `tenant_id` fails with `LedgerError::TenantChange`.

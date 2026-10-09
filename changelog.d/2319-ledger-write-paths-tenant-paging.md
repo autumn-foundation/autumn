@@ -3,8 +3,8 @@
 - **Breaking:** more framework writes to a ledgered table are refused with
   `LedgerError::OutOfBandWrite` (issue #2319): `#[votable]` reactions,
   `#[commentable]` comment writes, `has_many(through)` link writes, capsule
-  imports, and writes from a second repository on the table that is not
-  ledgered. A ledgered repository that declares a derived `delete_by_*`, or a
+  imports, and writes (or `destroy` cascades) from an unledgered repository on
+  the same table. A model factory panics. A ledgered repository that declares a derived `delete_by_*`, or a
   ledgered `tenant_scoped` repository with an `Option<String>` tenant column,
   does not compile. An update that moves a ledgered record to another tenant
   fails with `LedgerError::TenantChange`

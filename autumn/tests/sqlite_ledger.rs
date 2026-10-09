@@ -3177,25 +3177,35 @@ async fn every_ledger_read_refuses_across_tenants() {
     .await;
 
     let across = repo.across_tenants();
-    assert!(across.ledger_revisions(id).await.is_err());
-    assert!(
+    let refused = |result: Result<(), autumn_web::AutumnError>, read: &str| {
+        let err = result.expect_err(read);
+        assert!(
+            err.to_string()
+                .contains("cross-tenant ledger reads are not supported"),
+            "{read}: {err}"
+        );
+    };
+    refused(across.ledger_revisions(id).await.map(drop), "revisions");
+    refused(
         across
             .ledger_revisions_page(id, LedgerPageRequest::first(10))
             .await
-            .is_err()
+            .map(drop),
+        "page",
     );
-    assert!(across.ledger_verify(id).await.is_err());
-    assert!(across.ledger_pin(id).await.is_err());
-    assert!(across.ledger_head(id).await.is_err());
-    assert!(across.ledger_high_water(id).await.is_err());
-    assert!(
+    refused(across.ledger_verify(id).await.map(drop), "verify");
+    refused(across.ledger_pin(id).await.map(drop), "pin");
+    refused(across.ledger_head(id).await.map(drop), "head");
+    refused(across.ledger_high_water(id).await.map(drop), "high water");
+    refused(
         across
             .ledger_as_of_at(id, LedgerAsOf::default())
             .await
-            .is_err()
+            .map(drop),
+        "as of",
     );
     let now = Utc::now();
-    assert!(across.ledger_diff(id, now, now).await.is_err());
+    refused(across.ledger_diff(id, now, now).await.map(drop), "diff");
 }
 
 // ── #2319: paginated chain reads ─────────────────────────────────────

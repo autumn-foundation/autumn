@@ -877,6 +877,27 @@ mod tests {
         assert!(err.to_string().contains("capsule_ledgered_notes"), "{err}");
     }
 
+    /// `insert_all` refuses before it takes a connection. The pool points at
+    /// no server, so any other path fails with a `Store` error.
+    #[tokio::test]
+    async fn insert_all_refuses_a_ledgered_table_before_it_connects() {
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+
+        let manager =
+            AsyncDieselConnectionManager::<AsyncPgConnection>::new("postgres://127.0.0.1:1/none");
+        let store = PgCapsuleStore::new(Pool::builder(manager).build().expect("pool"));
+        let ledgered = manifest("capsule_ledgered_notes");
+        let mut row = Record::new();
+        row.insert("id".to_owned(), serde_json::json!(1));
+        let rows = vec![row];
+
+        let err = store
+            .insert_all(&[ImportBatch::new(&ledgered, &rows)])
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, DataCapsuleError::InvalidInput(_)), "{err:?}");
+    }
+
     #[test]
     fn keys_are_the_decimals_that_numeric_reads() {
         for s in [
