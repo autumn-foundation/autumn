@@ -113,6 +113,52 @@ Do the same for `add_comment`, `delete_comment` and
 **Automation:** `manual` — the new argument depends on the calling
 repository. A codemod cannot know that repository.
 
+### Notifications and push: tables get a `tenant_id` column
+
+**Why:** both tables keyed rows on the bare user id. With `[tenancy]` on, two
+tenants can use the same id. Then they shared one feed and one set of devices
+(#2337). Each row now has a tenant. The framework fills it from the tenant it
+resolved for the request. It never reads it from the request body.
+
+The built-in stores query the new column. An old table gives an error that names
+`tenant_id`. Add the column and the index. Existing rows get `''`, the "no
+tenant" value. An app without tenancy needs nothing else.
+
+**Before (`0.8`):** no `tenant_id` column.
+
+**After (next release):**
+
+```sql
+ALTER TABLE notifications ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';
+CREATE INDEX idx_notifications_tenant_recipient
+    ON notifications (tenant_id, recipient_id);
+
+ALTER TABLE push_subscriptions ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '';
+CREATE INDEX idx_push_subscriptions_tenant_principal
+    ON push_subscriptions (tenant_id, principal_id);
+```
+
+If tenancy is on, existing rows must get their real tenant. No tenant can see a row
+that keeps `''`. Set it in the same migration. Use your own rule. For example,
+join to your users table:
+
+```sql
+UPDATE notifications n SET tenant_id = u.tenant_id
+FROM users u WHERE u.id = n.recipient_id;
+```
+
+Two more changes apply when tenancy is on:
+
+- `Notifications::topic(id)` returns `notifications:{tenant}:{id}` inside a
+  tenant scope. Publishers and subscribers must run in the same scope.
+- A job or script that has no request must call the stores inside
+  `autumn_web::tenancy::with_tenant`. Without a tenant, the store uses `''`.
+
+A custom `NotificationStore` or `PushSubscriptionStore` must scope its queries
+by the same tenant.
+
+**Automation:** `manual` — the backfill rule depends on your data.
+
 Repeat the block below for each breaking change. Keep changes grouped by
 area (routing / config / database / …) so readers can skip to what they
 care about.
