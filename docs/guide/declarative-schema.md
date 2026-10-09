@@ -118,8 +118,9 @@ pub editor_id: Option<i64>,
   - If the database is correct, change the model to agree with it.
   - If the model is correct, write a manual migration
     (`autumn generate migration`) and apply it. Then run `autumn schema pull`.
-- On SQLite, the diff refuses a table-recreate of a table that another table
-  references with `ON DELETE CASCADE`, `SET NULL` or `SET DEFAULT`. The
+- On SQLite, the diff refuses a table-recreate of a table that a table
+  (also the same table) references with `ON DELETE CASCADE`, `SET NULL` or
+  `SET DEFAULT`. The
   migration runs in a transaction, where `PRAGMA foreign_keys=OFF` has no
   effect. Thus the `DROP TABLE` of the recreate would delete or change the
   child rows. Write that change as a manual migration.

@@ -25,7 +25,7 @@
   error shows the two keys. A bare `#[references]` is `NO ACTION`. If the
   database has `ON DELETE CASCADE`, declare `on_delete = "cascade"`.
 - **schema:** on SQLite, `schema diff` refuses a table-recreate of a table that
-  another table references with `ON DELETE CASCADE`, `SET NULL` or
+  a table (also the same table) references with `ON DELETE CASCADE`, `SET NULL` or
   `SET DEFAULT`. The migration transaction ignores `PRAGMA foreign_keys=OFF`,
   so the recreate would delete or change the child rows.
 

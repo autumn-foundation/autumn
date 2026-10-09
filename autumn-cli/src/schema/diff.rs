@@ -2748,9 +2748,10 @@ fn describe_foreign_key(fk: &ForeignKey) -> String {
     format!("{}({}){}", fk.table, fk.column, fk.action_clauses())
 }
 
-/// The first column of another table, in `ctx`, whose foreign key to `table`
-/// deletes or changes rows on delete (`CASCADE`, `SET NULL`, `SET DEFAULT`).
-/// A rebuild drops `table`, so it would fire that action.
+/// The first column in `ctx` whose foreign key to `table` deletes or changes
+/// rows on delete (`CASCADE`, `SET NULL`, `SET DEFAULT`). A rebuild drops
+/// `table`, so it would fire that action. This includes a self-reference: the
+/// staging table's rows reference the old table too.
 fn rebuild_fires_child_action(
     table: &str,
     ctx: &SchemaContext,
@@ -2758,7 +2759,6 @@ fn rebuild_fires_child_action(
     ctx.baseline
         .values()
         .chain(ctx.desired.values())
-        .filter(|t| t.name != table)
         .flat_map(|t| t.columns.iter().map(move |c| (t, c)))
         .find_map(|(t, c)| {
             let fk = c.references.as_ref().filter(|fk| fk.table == table)?;
@@ -9085,5 +9085,26 @@ PRAGMA foreign_keys=ON;
             plan.is_empty(),
             "the skipped column must not change: {plan:?}"
         );
+    }
+
+    /// A self-reference is a child too. The staging table's rows reference
+    /// the old table, so its `DROP TABLE` would fire the action on them.
+    #[test]
+    fn sqlite_rebuild_of_a_self_cascade_table_is_refused() {
+        let mut base = sqlite_users_table();
+        let mut parent = col("parent_id", ColumnType::Int64);
+        parent.nullable = true;
+        parent.references =
+            Some(ForeignKey::new("users", "id").with_on_delete(Some(ForeignKeyAction::Cascade)));
+        base.columns.push(parent);
+        base.columns.push(col("name", ColumnType::Text));
+        let mut want = base.clone();
+        want.columns[2].nullable = true;
+        let baseline = vec![base];
+        let desired = vec![want];
+        let plan = diff_schema(&baseline, &parsed(desired.clone(), vec![]), DEFAULT_OPTS);
+        let ctx = SchemaContext::from_tables(&desired, &baseline);
+        let err = emit_up_sql_with_context(&plan, &ctx).expect_err("a self cascade must refuse");
+        assert!(err.to_string().contains("users.parent_id"), "{err}");
     }
 }
