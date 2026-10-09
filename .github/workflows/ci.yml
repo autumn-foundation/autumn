@@ -2277,6 +2277,11 @@ jobs:
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test experiment_admin_bulk_delete_batch_profile -- --ignored
           cargo llvm-cov --no-report -p autumn-cache-redis -- --ignored
+          # The DB room store runs only in these Docker tests (#1974).
+          cargo llvm-cov --no-report -p autumn-media-plugin \
+            --test room_store_db -- --ignored
+          cargo llvm-cov --no-report -p autumn-media-plugin \
+            --test room_reaper_batch_profile -- --ignored
           cargo llvm-cov --no-report -p autumn-search -- --ignored
           cargo llvm-cov --no-report -p autumn-billing --test mirror_db -- --ignored
           cargo llvm-cov --no-report -p autumn-billing \
