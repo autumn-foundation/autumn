@@ -13,9 +13,11 @@
 //! Each shard is a full [`DatabaseTopology`] (primary + optional read
 //! replica), so the primary/replica story composes with sharding.
 //!
-//! Framework state (jobs, scheduler locks, sessions, feature flags) is
-//! **not** sharded; it lives on the control topology configured by
-//! `database.primary_url`/`database.url`.
+//! Most framework state (jobs, scheduler locks, sessions, feature flags)
+//! lives on the control topology configured by
+//! `database.primary_url`/`database.url`. The outbox, commit hooks, version
+//! history and derivation state are on each shard. With
+//! `jobs.postgres.shard_local = true`, jobs are on each shard too (ADR 0018).
 //!
 //! # Example
 //!

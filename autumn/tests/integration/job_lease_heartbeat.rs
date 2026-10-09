@@ -178,6 +178,7 @@ mod postgres_backend {
             workers,
             postgres: JobPostgresConfig {
                 visibility_timeout_ms,
+                ..JobPostgresConfig::default()
             },
             ..Default::default()
         }

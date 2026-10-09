@@ -99,6 +99,12 @@ struct MetricsInner {
     shed_critical: AtomicU64,
     shed_default: AtomicU64,
     shed_sheddable: AtomicU64,
+    /// Requests over `tenancy.max_concurrent_requests` (#3072).
+    /// Exposed as `autumn_tenant_bulkhead_rejections_total{kind="request"}`.
+    tenant_request_rejections: AtomicU64,
+    /// Checkouts over `tenancy.max_db_connections` (#3072).
+    /// Exposed as `autumn_tenant_bulkhead_rejections_total{kind="db"}`.
+    tenant_db_rejections: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -333,6 +339,8 @@ impl MetricsCollector {
                 shed_critical: AtomicU64::new(0),
                 shed_default: AtomicU64::new(0),
                 shed_sheddable: AtomicU64::new(0),
+                tenant_request_rejections: AtomicU64::new(0),
+                tenant_db_rejections: AtomicU64::new(0),
             }),
         }
     }
@@ -373,6 +381,20 @@ impl MetricsCollector {
             crate::admission::Criticality::Sheddable => &self.inner.shed_sheddable,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a request over its tenant's request cap (#3072).
+    pub(crate) fn record_tenant_request_rejection(&self) {
+        self.inner
+            .tenant_request_rejections
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a checkout over its tenant's connection cap (#3072).
+    pub(crate) fn record_tenant_db_rejection(&self) {
+        self.inner
+            .tenant_db_rejections
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Set the current admission limit (`autumn_admission_limit`).
@@ -656,6 +678,11 @@ impl MetricsCollector {
                     shed_critical: self.inner.shed_critical.load(Ordering::Relaxed),
                     shed_default: self.inner.shed_default.load(Ordering::Relaxed),
                     shed_sheddable: self.inner.shed_sheddable.load(Ordering::Relaxed),
+                    tenant_request_rejections: self
+                        .inner
+                        .tenant_request_rejections
+                        .load(Ordering::Relaxed),
+                    tenant_db_rejections: self.inner.tenant_db_rejections.load(Ordering::Relaxed),
                 },
             },
             idempotency: IdempotencyMetricsSnapshot {
@@ -753,6 +780,10 @@ pub struct AdmissionSnapshot {
     pub shed_default: u64,
     /// Shed `sheddable` requests.
     pub shed_sheddable: u64,
+    /// Requests over their tenant's request cap (#3072).
+    pub tenant_request_rejections: u64,
+    /// Checkouts over their tenant's connection cap (#3072).
+    pub tenant_db_rejections: u64,
 }
 
 /// Percentiles for latency measurements.
@@ -1290,6 +1321,22 @@ mod tests {
         collector.record_request_shed();
         let snap = collector.snapshot();
         assert_eq!(snap.http.requests_shed_total, 2);
+    }
+
+    #[test]
+    fn collector_records_tenant_bulkhead_rejections_by_kind() {
+        let collector = MetricsCollector::new();
+        collector.record_tenant_request_rejection();
+        collector.record_tenant_db_rejection();
+        collector.record_tenant_db_rejection();
+        let admission = collector.snapshot().http.admission;
+        assert_eq!(admission.tenant_request_rejections, 1);
+        assert_eq!(admission.tenant_db_rejections, 2);
+        assert_eq!(
+            collector.snapshot().http.requests_shed_total,
+            0,
+            "a tenant cap is not an admission shed"
+        );
     }
 
     #[test]

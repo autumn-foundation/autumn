@@ -421,6 +421,8 @@ mod shadow_mirror;
 #[cfg(feature = "db")]
 mod shard_across_tenants_no_shard_set;
 #[cfg(feature = "db")]
+mod shard_local_jobs;
+#[cfg(feature = "db")]
 mod shard_map_guard;
 #[cfg(feature = "db")]
 mod sharding_across_tenants;
@@ -469,6 +471,7 @@ mod sim_sla;
 #[cfg(feature = "sla")]
 mod sim_sla_replicas;
 mod sim_strict_wall_clock;
+mod sim_tenant_isolation;
 mod sim_test_smoke;
 mod sim_testapp_jobs;
 #[cfg(feature = "sla")]
@@ -493,8 +496,11 @@ mod system_test_api;
 #[cfg(feature = "db")]
 mod tenancy;
 mod tenancy_unit;
+mod tenant_bulkhead;
 mod tenant_cell_quota;
 mod tenant_cell_unit;
+#[cfg(feature = "db")]
+mod tenant_db_bulkhead;
 mod test_app_integration;
 mod test_db_integration;
 mod throttle_route;

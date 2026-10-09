@@ -213,6 +213,7 @@ Looking for the API reference instead? That is
 - [Running behind PgBouncer / RDS Proxy](connection-poolers.md) — which features work behind a connection pooler
 - [Embedded Clustering](clustering.md) — two-node clustering with no external dependency
 - [Per-Tenant Memory Cells](tenant-cells.md) — bounding per-tenant memory, with deterministic eviction
+- [Cell and Shuffle-Shard Isolation](cell-isolation.md) — per-tenant bulkheads, tenant job lanes, shard-local jobs, the cell router, and the multi-region stance
 - [Runtime Configuration](runtime-config.md) — `autumn.toml`, profiles, and environment overrides
 - [Health Indicators](health-indicators.md) — what `/health` and `/ready` report, and adding your own check
 - [App Metrics](metrics.md) — the metrics Autumn exports, and recording your own

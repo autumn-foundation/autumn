@@ -1595,6 +1595,8 @@ fn install_enqueue_client(
             resilience_config: state
                 .extension::<crate::config::AutumnConfig>()
                 .map(|c| Arc::new(c.resilience.clone())),
+            #[cfg(feature = "db")]
+            shard_local: false,
         },
     );
 }
