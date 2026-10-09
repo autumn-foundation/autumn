@@ -179,6 +179,7 @@ async fn postgres_recovered_claims_spread_out() {
         workers: 2,
         postgres: JobPostgresConfig {
             visibility_timeout_ms: 500,
+            ..JobPostgresConfig::default()
         },
         ..Default::default()
     };

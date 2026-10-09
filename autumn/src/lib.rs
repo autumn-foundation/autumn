@@ -108,6 +108,7 @@ pub mod batches;
 /// availability without depending on a headless-browser stack.
 pub mod browser_detect;
 pub mod build_info;
+pub mod bulkhead;
 pub mod cache;
 #[cfg(feature = "ws")]
 pub mod channels;
@@ -117,6 +118,8 @@ pub use channels::{
     ChannelPublishError, ChannelStats, Channels, ChannelsBackend, LocalChannelsBackend,
 };
 pub mod canary;
+#[cfg(feature = "db")]
+pub mod cell_router;
 // Per-deploy capacity contract (`capacity.lock`): the proven envelope a build
 // sustains, and the admission limit it licenses. Ungated on purpose —
 // `route_listing` and `router` consult it on every boot.

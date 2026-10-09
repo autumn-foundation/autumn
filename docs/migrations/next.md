@@ -600,6 +600,62 @@ let health = autumn_web::config::HealthConfig {
 **Automation:** `manual` - the fix adds a struct update expression, and no
 codemod rewrites struct literals.
 
+### Config: `TenancyConfig`, `JobConfig` and `JobPostgresConfig` have new fields
+
+**Why:** per-tenant bulkheads, tenant job lanes and shard-local jobs (issue
+#3072). `TenancyConfig` gains `max_concurrent_requests` and
+`max_db_connections`. `JobConfig` gains `tenants`. `JobPostgresConfig` gains
+`shard_local`.
+
+**Before (`{X.Y}`):** a struct literal listed every field.
+
+```rust
+let postgres = autumn_web::config::JobPostgresConfig {
+    visibility_timeout_ms: 30_000,
+};
+```
+
+**After (`{(X+1).0}`):** add `..Default::default()`. Every new field is off
+by default (`0` or `false`).
+
+```rust
+let postgres = autumn_web::config::JobPostgresConfig {
+    visibility_timeout_ms: 30_000,
+    ..autumn_web::config::JobPostgresConfig::default()
+};
+```
+
+**Automation:** `manual` - the fix adds a struct update expression, and no
+codemod rewrites struct literals.
+
+### Tenancy: `TenantPropagatingBody` has a `db_bulkhead` field
+
+**Why:** a database checkout while a streaming body is polled counts against
+`tenancy.max_db_connections` (issue #3072).
+
+**Before (`{X.Y}`):**
+
+```rust
+let body = TenantPropagatingBody {
+    inner,
+    tenant_id,
+    handle: None,
+};
+```
+
+**After (`{(X+1).0}`):** add `db_bulkhead: None`.
+
+```rust
+let body = TenantPropagatingBody {
+    inner,
+    tenant_id,
+    handle: None,
+    db_bulkhead: None,
+};
+```
+
+**Automation:** `manual` - no codemod rewrites struct literals.
+
 ### Probes: `/ready` pings the primary database
 
 **Why:** pool saturation made a busy replica unready, and an idle pool made a

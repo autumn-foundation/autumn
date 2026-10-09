@@ -2254,6 +2254,13 @@ jobs:
             --test feature_flags_pg_integration -- --ignored
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --test scoped_tokens_db -- --ignored
+          # Issue #3072: the shard-local job runtime and the tenant DB
+          # bulkhead run only in these Docker tests of the consolidated
+          # binary. A filter that matches nothing exits 0, so check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored shard_local_jobs:: tenant_db_bulkhead:: \
+            | tee "$RUNNER_TEMP/isolation-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/isolation-cov.log"
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_db -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \

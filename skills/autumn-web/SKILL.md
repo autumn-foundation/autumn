@@ -2895,6 +2895,27 @@ bounded `each_shard` fan-out); install custom routing with
 There are no cross-shard queries or transactions by design. See
 `docs/guide/sharding.md` and `examples/bookmarks-sharded`.
 
+## Cell and shuffle-shard isolation (issue #3072)
+
+Limit the effect of one noisy tenant. All settings are off by default. See
+`docs/guide/cell-isolation.md` and `docs/adr/0018-shard-local-framework-state.md`.
+
+- `[tenancy] max_concurrent_requests`: the in-flight requests of one tenant.
+  Over the cap: `503` + `Retry-After: 1`. Runs before the admission limit.
+- `[tenancy] max_db_connections`: the `Db`/shard checkouts of one tenant.
+  Over the cap: `503`. Set it to at least the connections one handler holds.
+- `[jobs.tenants]` (`local` backend only): `max_concurrent` (per-tenant job
+  slots), `lanes` and `lanes_per_tenant` (shuffle-sharded worker lanes; at
+  most `jobs.workers` lanes). Each queue serves tenants round-robin.
+  `autumn_web::bulkhead::shuffle_shard(key, lanes, size)` gives the lanes.
+- `[jobs.postgres] shard_local = true`: an `autumn_jobs` table, workers and
+  slots on each shard. `enqueue_in_tx` on a shard connection commits or rolls
+  back with the shard's data. Needs `jobs.backend = "postgres"` and shards.
+- `autumn_web::cell_router::CellRouter` (with `CellSpec::new`) maps a tenant
+  to a cell with the shard slot hash: `for_tenant`, `for_key`, `for_slot`,
+  `url_for`.
+- Metric: `autumn_tenant_bulkhead_rejections_total{kind="request"|"db"}`.
+
 ## Per-tenant memory cells (0.6.0, issue #1766)
 
 Row-level tenancy scopes a tenant's *rows*; per-tenant memory cells bound a
