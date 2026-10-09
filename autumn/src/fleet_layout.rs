@@ -10,7 +10,7 @@
 //!   and back again when the fleet enumerates its files.
 //!
 //! The runtime half (pools, lazy open, migrations, eviction, replication) is
-//! [`crate::db::fleet`], compiled only under the `sqlite` feature. Keeping the
+//! `crate::db::fleet`, compiled only under the `sqlite` feature. Keeping the
 //! layout here lets config validation and its tests run in every build.
 //!
 //! # Why the tenant id rules are strict

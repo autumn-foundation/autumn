@@ -180,7 +180,6 @@ pub mod db;
 #[cfg(feature = "db")]
 pub(crate) mod db_ping;
 pub(crate) mod db_url;
-/// On-disk layout of a SQLite database fleet (ADR 0019).
 pub mod fleet_layout;
 // Request deadlines (issue #3058). The module carries its own `//!` docs.
 pub mod deadline;

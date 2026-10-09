@@ -10331,7 +10331,7 @@ pub struct DatabaseFleetConfig {
     /// Create a database that does not exist yet on first use. Default:
     /// `true` for `mode = "slot"`, `false` for `mode = "tenant"` — tenant ids
     /// come from requests, so a tenant database is provisioned explicitly
-    /// ([`DatabaseFleet::provision`](crate::db::fleet::DatabaseFleet::provision))
+    /// (`DatabaseFleet::provision`, in `autumn_web::db::fleet`)
     /// unless the app opts in here.
     #[serde(default)]
     pub create_on_demand: Option<bool>,
