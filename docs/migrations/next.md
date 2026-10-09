@@ -976,8 +976,9 @@ let job = JobEffect {
 ```
 
 The new variants are `CacheEffect::Invalidate`, `CacheEffect::InvalidateNamespace`,
-`CacheEffect::Clear` and `EffectSeam::Random`. An exhaustive `match` on
-`EffectSeam` needs a new arm.
+`CacheEffect::Clear`, `EffectSeam::Random` and
+`MailErrorKind::NoDurableQueueInProduction`. An exhaustive `match` on
+`EffectSeam` or `MailErrorKind` needs a new arm.
 
 `CAPSULE_FORMAT_VERSION` is now 4. An older build refuses a version 4 capsule
 with a version mismatch. This build reads a version 3 capsule and replays it

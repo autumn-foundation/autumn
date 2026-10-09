@@ -876,6 +876,8 @@ pub enum MailErrorKind {
     AllRecipientsSuppressed,
     /// CSS inlining failed.
     CssInline,
+    /// `deliver_later` in production had no durable queue.
+    NoDurableQueueInProduction,
     /// Anything else; only the recorded text survives.
     Other,
 }

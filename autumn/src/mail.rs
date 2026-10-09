@@ -802,7 +802,8 @@ const fn mail_error_kind(error: &MailError) -> crate::capsule::schema::MailError
         MailError::Io(_) => Kind::Io,
         MailError::AllRecipientsSuppressed => Kind::AllRecipientsSuppressed,
         MailError::CssInline(_) => Kind::CssInline,
-        _ => Kind::Other,
+        MailError::NoDurableQueueInProduction => Kind::NoDurableQueueInProduction,
+        MailError::ReplayedFailure(_) => Kind::Other,
     }
 }
 
@@ -820,6 +821,7 @@ fn rebuild_mail_error(
     use crate::capsule::schema::MailErrorKind as Kind;
     match kind {
         Some(Kind::AllRecipientsSuppressed) => MailError::AllRecipientsSuppressed,
+        Some(Kind::NoDurableQueueInProduction) => MailError::NoDurableQueueInProduction,
         Some(Kind::InvalidMessage) => {
             MailError::InvalidMessage(strip_mail_prefix(&text, "invalid mail message: "))
         }
@@ -2243,7 +2245,7 @@ impl Mailer {
             return self.disabled_deliver_later(mail);
         }
         if self.block_deliver_later_without_durable_queue && self.delivery_queue.is_none() {
-            return Err(MailError::NoDurableQueueInProduction);
+            return self.refused_deliver_later(mail);
         }
         let mail = self.prepare_deferred(mail);
 
@@ -2322,7 +2324,7 @@ impl Mailer {
             return self.disabled_deliver_later(mail);
         }
         if self.block_deliver_later_without_durable_queue && self.delivery_queue.is_none() {
-            return Err(MailError::NoDurableQueueInProduction);
+            return self.refused_deliver_later(mail);
         }
         let mail = self.prepare_deferred(mail);
         self.spawn_mail_delivery(mail)
@@ -2359,6 +2361,19 @@ impl Mailer {
         }
         record_send(&mail, None);
         Ok(())
+    }
+
+    /// `deliver_later` in production with no durable queue: refused, and the
+    /// refusal is on the capsule seam. A replay mailer has no such guard, so
+    /// replay reproduces the refusal from the tape.
+    fn refused_deliver_later(&self, mail: Mail) -> Result<(), MailError> {
+        let mail = self.prepare_deferred(mail);
+        if let Some(answer) = replayed_send(&mail) {
+            return answer;
+        }
+        let error = MailError::NoDurableQueueInProduction;
+        record_send(&mail, Some(&error));
+        Err(error)
     }
 
     /// Spawn delivery of mail the seam already answered or recorded.
@@ -3771,9 +3786,13 @@ impl MailTransport for InterceptedMailTransport {
 /// A send that reaches the transport ran with no tape, and is refused.
 #[cfg(feature = "reporting")]
 pub(crate) fn install_replay_mailer(state: &AppState, config: &MailConfig) {
-    // Never disabled: the replay machine's mail config is not the recorded
-    // run's, and a disabled transport is still answered at the seam.
-    let mut mailer = Mailer::with_transport(ReplayTransport);
+    // `is_disabled()` is observable to a handler, so it follows the app's
+    // config. A disabled `deliver_later` is answered at the seam either way.
+    // The production durability guard is not copied: replay answers its
+    // recorded refusal from the tape.
+    let mut mailer = Mailer::with_transport(ReplayTransport {
+        disabled: config.transport == Transport::Disabled,
+    });
     // Defaults apply before the seam, so a recorded `reply_to` default is
     // matched.
     mailer.defaults = Arc::new(MailerDefaults {
@@ -3789,7 +3808,9 @@ pub(crate) fn install_replay_mailer(state: &AppState, config: &MailConfig) {
 /// A send on the replayed request is answered by the mail seam before it
 /// reaches a transport. A send that reaches this one ran with no tape.
 #[cfg(feature = "reporting")]
-struct ReplayTransport;
+struct ReplayTransport {
+    disabled: bool,
+}
 
 #[cfg(feature = "reporting")]
 impl MailTransport for ReplayTransport {
@@ -3806,6 +3827,10 @@ impl MailTransport for ReplayTransport {
                 mail.to.len()
             )))
         })
+    }
+
+    fn is_disabled(&self) -> bool {
+        self.disabled
     }
 }
 
@@ -6565,6 +6590,56 @@ mod tests {
             mailer.send(mail()).await.is_err(),
             "a send with no tape must not reach a transport"
         );
+    }
+
+    /// Codex review on #3222: the production durability refusal is on the
+    /// seam, so the replay mailer (which has no such guard) reproduces it.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_production_deliver_later_refusal_replays_as_the_same_error() {
+        let mut mailer = Mailer::with_transport(DisabledTransport);
+        mailer.transport = Arc::new(CapturingTransport {
+            sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        mailer.block_deliver_later_without_durable_queue = true;
+        let mail = || {
+            Mail::builder()
+                .from("from@example.com")
+                .to("user@example.com")
+                .subject("Later")
+                .text("hello")
+                .build()
+                .unwrap()
+        };
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "refused".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let captured = crate::capsule::capture::with_capture_scope(Arc::clone(&scope), async {
+            mailer.try_deliver_later(mail())
+        })
+        .await;
+        assert!(matches!(
+            captured,
+            Err(MailError::NoDurableQueueInProduction)
+        ));
+        let effects = scope.effects_snapshot();
+        assert_eq!(effects.mail.len(), 1);
+
+        let state = AppState::for_test();
+        install_replay_mailer(&state, &MailConfig::default());
+        let replay = state.extension::<Mailer>().expect("installed");
+        let tape = Arc::new(crate::capsule::ReplayEffects::new(effects));
+        let replayed = crate::capsule::with_effect_tape(Arc::clone(&tape), async {
+            replay.try_deliver_later(mail())
+        })
+        .await;
+        assert!(
+            matches!(replayed, Err(MailError::NoDurableQueueInProduction)),
+            "{replayed:?}"
+        );
+        assert!(tape.finish().is_empty(), "{:?}", tape.finish());
     }
 
     /// Review fix: `deliver_later` on a disabled transport is on the seam, so a

@@ -914,7 +914,10 @@ impl CaptureScope {
                     .attachments
                     .iter()
                     .fold(0, |total: usize, attachment| {
-                        total.saturating_add(attachment.filename.len())
+                        total
+                            .saturating_add(attachment.filename.len())
+                            .saturating_add(attachment.content_type.len())
+                            .saturating_add(attachment.sha256.len())
                     }),
             );
         let budget = self.settings.max_capsule_bytes;
@@ -1991,6 +1994,37 @@ mod tests {
                 subject: "Receipt".to_owned(),
                 body: CapsuleBody::Text("short".to_owned()),
                 alternate_body: CapsuleBody::Text("x".repeat(4096)),
+                ..Default::default()
+            },
+        );
+        assert!(scope.is_truncated());
+    }
+
+    /// Codex review on #3222: every attachment field is charged.
+    #[test]
+    fn attachment_metadata_is_charged_against_the_capsule_budget() {
+        let settings = CaptureSettings {
+            max_capsule_bytes: 256,
+            ..CaptureSettings::default()
+        };
+        let scope = CaptureScope::new(
+            "mail".to_owned(),
+            Arc::new(settings),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        );
+        let slot = scope.reserve_mail().expect("a slot is available");
+        scope.fill_mail(
+            slot,
+            MailEffect {
+                to: vec!["a@example.com".to_owned()],
+                subject: "Receipt".to_owned(),
+                body: CapsuleBody::Text("short".to_owned()),
+                attachments: vec![crate::capsule::schema::MailAttachmentEffect {
+                    filename: "a.pdf".to_owned(),
+                    content_type: "x".repeat(4096),
+                    len: 1,
+                    sha256: String::new(),
+                }],
                 ..Default::default()
             },
         );

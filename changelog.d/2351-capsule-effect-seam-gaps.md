@@ -53,5 +53,7 @@
 
 - **Breaking:** `capsule::CacheEffect` has new variants `Invalidate`,
   `InvalidateNamespace` and `Clear`; `capsule::EffectSeam` has a new variant
-  `Random`; `capsule::JobEffect` has a new public field `requested_due_at`
+  `Random`; `capsule::schema::MailErrorKind` has a new variant
+  `NoDurableQueueInProduction`; `capsule::JobEffect` has a new public field
+  `requested_due_at`
   ([migration guide](docs/migrations/next.md)).
