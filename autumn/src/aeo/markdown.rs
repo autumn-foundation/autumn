@@ -277,8 +277,10 @@ fn parse(html: &str) -> Doc {
             }
         }
 
-        let is_void = VOID.contains(&tag.name.as_str()) || tag.self_closing;
-        let raw = RAW_TEXT.contains(&tag.name.as_str()) && !tag.self_closing;
+        // Browsers ignore `/>` on a raw-text element: `<script/>` still runs
+        // to `</script>`, and everything up to it is script text.
+        let raw = RAW_TEXT.contains(&tag.name.as_str());
+        let is_void = VOID.contains(&tag.name.as_str()) || (tag.self_closing && !raw);
         if !is_void && (stack.len() > MAX_DEPTH || !dropped.is_empty()) {
             if raw {
                 // Skip the raw text: its content is never markup.
@@ -1239,6 +1241,12 @@ mod tests {
         let out = md(&html);
         assert!(!out.contains("secret"), "{out}");
         assert!(out.contains("ok"), "{out}");
+    }
+
+    #[test]
+    fn a_self_closing_raw_text_tag_still_runs_to_its_end_tag() {
+        let out = md("<script/>\"<main>injected</main>\"</script><main>real</main>");
+        assert_eq!(out, "real\n");
     }
 
     #[test]

@@ -763,7 +763,8 @@ fn server_card(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
             })
             .collect();
     } else {
-        card["authentication"] = json!({ "required": true, "schemes": ["bearer"] });
+        // The gate is any Tower layer (or a proxy): its scheme is unknown.
+        card["authentication"] = json!({ "required": true });
     }
     let mut doc = cors_json(&card);
     doc.headers
@@ -1644,6 +1645,7 @@ mod tests {
         let (_, card) = json_doc(&facts, SERVER_CARD_PATH);
         assert!(card.get("tools").is_none(), "{card}");
         assert_eq!(card["authentication"]["required"], true);
+        assert!(card["authentication"].get("schemes").is_none(), "{card}");
     }
 
     #[test]

@@ -474,7 +474,17 @@ impl AeoSite {
             .signature_agent
             .clone()
             .or_else(|| self.base_url.clone())?;
-        let signer = web_bot_auth::WebBotAuthSigner::new(key, agent);
+        // Verifiers fetch the key directory from this origin over HTTP.
+        if !url::Url::parse(agent.trim())
+            .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.has_host())
+        {
+            tracing::warn!(
+                signature_agent = %agent,
+                "aeo: Signature-Agent is not an http(s) URL; requests are not signed"
+            );
+            return None;
+        }
+        let signer = web_bot_auth::WebBotAuthSigner::new(key, agent.trim());
         Some(match wba.expires_secs {
             Some(secs) => signer.expires_secs(secs),
             None => signer,

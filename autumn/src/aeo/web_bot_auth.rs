@@ -384,6 +384,28 @@ mod tests {
     }
 
     #[test]
+    fn a_non_http_signature_agent_signs_nothing() {
+        let mut config = crate::config::AutumnConfig::default();
+        let mut site = super::super::AeoSite {
+            enabled: true,
+            ..Default::default()
+        };
+        site.facts.web_bot_auth = Some(WebBotAuthKey::from_seed_b64(RFC8037_D).unwrap());
+        for agent in ["ftp://keys.example.com", "keys.example.com", "/agents"] {
+            config.aeo.web_bot_auth.signature_agent = Some(agent.to_owned());
+            assert!(site.web_bot_auth_signer(&config).is_none(), "{agent}");
+        }
+        config.aeo.web_bot_auth.signature_agent = Some("https://keys.example.com/x".to_owned());
+        let signer = site
+            .web_bot_auth_signer(&config)
+            .expect("an https agent signs");
+        assert_eq!(
+            signer.sign("a.b", 1).signature_agent,
+            "\"https://keys.example.com\""
+        );
+    }
+
+    #[test]
     fn rfc8037_key_and_thumbprint() {
         let key = WebBotAuthKey::from_seed_b64(RFC8037_D).unwrap();
         let jwk = key.public_jwk();
