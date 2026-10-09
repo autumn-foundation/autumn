@@ -317,21 +317,17 @@ impl Manifest {
                     )));
                 }
                 OnDisk::Opaque(_) => {
-                    return Err(std::io::Error::other(format!(
-                        "{MANIFEST_PATH} cannot be read as text; delete it to start again"
+                    return Err(std::io::Error::other(claim_in_flight(&path).map_or_else(
+                        || {
+                            format!(
+                                "{MANIFEST_PATH} cannot be read as text; delete it to start again"
+                            )
+                        },
+                        |held| interrupted(&held),
                     )));
                 }
-                // `read_current` already waited out a swap. A claim still here
-                // is left by a crash. Building from nothing would erase the
-                // history.
                 OnDisk::Absent => match claim_in_flight(&path) {
-                    Some(held) => {
-                        return Err(std::io::Error::other(format!(
-                            "an interrupted upgrade left {} in place of {MANIFEST_PATH}; \
-                             rename it back, or delete it to start again",
-                            held.display()
-                        )));
-                    }
+                    Some(held) => return Err(std::io::Error::other(interrupted(&held))),
                     None => (None, Publish::Create),
                 },
                 OnDisk::Text(text) => (Self::parse(&text), Publish::Swap(text)),
@@ -339,8 +335,19 @@ impl Manifest {
             let next = change(current).map_err(std::io::Error::other)?;
             let rendered = next.render();
             // An identical rewrite would only touch the mtime.
-            if matches!(&mode, Publish::Swap(text) if normalize(text) == normalize(&rendered)) {
-                return Ok(next);
+            let unchanged = match &mode {
+                Publish::Swap(text) if normalize(text) == normalize(&rendered) => {
+                    Some(text.clone())
+                }
+                _ => None,
+            };
+            if let Some(text) = unchanged {
+                // Still current? A writer may have replaced it since the read.
+                if read_current(root, MANIFEST_PATH) == OnDisk::Text(text) {
+                    return Ok(next);
+                }
+                back_off(attempt);
+                continue;
             }
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -357,6 +364,15 @@ impl Manifest {
             "{MANIFEST_PATH} kept changing; gave up after {SWAP_ATTEMPTS} tries"
         )))
     }
+}
+
+/// What to tell the user when a swap left its claim behind.
+fn interrupted(held: &Path) -> String {
+    format!(
+        "an interrupted upgrade left {} in place of {MANIFEST_PATH}; \
+         rename it back, or delete it to start again",
+        held.display()
+    )
 }
 
 /// Wait a little longer after each lost swap, so writers stop colliding.
@@ -699,7 +715,13 @@ fn read_current(root: &Path, relative: &str) -> OnDisk {
         }
         back_off(attempt);
     }
-    read_current_once(root, relative)
+    let now = read_current_once(root, relative);
+    // A claim that outlasts the wait is a swap that stalled or crashed. The
+    // file exists, held aside: unreadable, never absent.
+    if now == OnDisk::Absent && claim_in_flight(&root.join(relative)).is_some() {
+        return OnDisk::Opaque(ConflictReason::Unreadable);
+    }
+    now
 }
 
 fn read_current_once(root: &Path, relative: &str) -> OnDisk {
@@ -828,7 +850,9 @@ pub fn classify(
 /// whatever the developer happens to be standing in.
 #[must_use]
 pub fn is_project(root: &Path) -> bool {
-    root.join("autumn.toml").is_file() || root.join(MANIFEST_PATH).is_file()
+    let manifest = root.join(MANIFEST_PATH);
+    // A manifest held aside by a swap still marks the project.
+    root.join("autumn.toml").is_file() || manifest.is_file() || claim_in_flight(&manifest).is_some()
 }
 
 /// The upgrade guide for the release being upgraded to.
@@ -3046,6 +3070,55 @@ mod tests {
         finish_claim(clean, "planned\n").expect("unchanged copy is dropped");
         assert!(!gone.exists());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_unchanged_update_still_checks_the_manifest_is_current() {
+        // `change` returns what it read, so the render matches. A writer that
+        // replaced the file after the read must still be seen.
+        let tmp = scaffolded(GenerateOptions::default());
+        let root = tmp.path().to_path_buf();
+        let mut runs = 0;
+        Manifest::update(tmp.path(), |current| {
+            runs += 1;
+            let manifest = current.expect("manifest");
+            if runs == 1 {
+                let mut theirs = manifest.clone();
+                theirs.pinned.insert("Dockerfile".to_owned());
+                fs::write(root.join(MANIFEST_PATH), theirs.render()).unwrap();
+            }
+            Ok(manifest)
+        })
+        .expect("update");
+        assert_eq!(runs, 2, "the stale snapshot must not be reported as done");
+    }
+
+    #[test]
+    fn a_project_known_only_by_a_held_manifest_is_still_a_project() {
+        let tmp = scaffolded(GenerateOptions::default());
+        fs::remove_file(tmp.path().join("autumn.toml")).unwrap();
+        let manifest_path = tmp.path().join(MANIFEST_PATH);
+        fs::rename(
+            &manifest_path,
+            manifest_path.with_file_name(".autumn-upgrade-claim.old"),
+        )
+        .unwrap();
+        assert!(is_project(tmp.path()));
+    }
+
+    #[test]
+    fn a_claim_that_never_ends_reads_as_unreadable_not_as_absent() {
+        // A crashed swap leaves the file held aside. Calling it removed would
+        // offer to restore it; unreadable is a conflict, which never writes.
+        let tmp = scaffolded(GenerateOptions::default());
+        let path = tmp.path().join("Dockerfile");
+        fs::rename(&path, path.with_file_name(".autumn-upgrade-claim.old")).unwrap();
+
+        let report = plan_in(tmp.path());
+        assert_eq!(
+            *status_of(&report.entries, "Dockerfile"),
+            Status::Conflict(ConflictReason::Unreadable)
+        );
     }
 
     #[test]
