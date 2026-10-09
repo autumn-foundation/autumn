@@ -827,7 +827,7 @@ fn redact_effect_headers(
 /// the *application's*, the operator never sees these headers in a log to
 /// notice them, and the spellings are conventional rather than app-specific.
 /// Masking a header that turns out to hold nothing secret costs a replay
-/// nothing: outbound matching is on method and URL.
+/// nothing: a masked header value matches any value.
 const OUTBOUND_SENSITIVE_HEADERS: &[&str] = &[
     "authorization",
     "proxy-authorization",

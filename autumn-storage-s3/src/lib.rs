@@ -229,6 +229,15 @@ async fn abort_multipart(client: &Client, bucket: &str, key: &str, upload_id: &s
         .await;
 }
 
+/// Check S3 egress against a failure capsule.
+///
+/// This client is not autumn-web's recorded outbound seam. A capsule replay
+/// refuses the call, and capture marks the capsule incomplete.
+fn guard_egress(method: &str, key: &str) -> Result<(), BlobStoreError> {
+    autumn_web::capsule::guard_egress("s3 blob store", method, key)
+        .map_err(|refused| BlobStoreError::backend(refused.to_string()))
+}
+
 impl BlobStore for S3BlobStore {
     fn provider_id(&self) -> &str {
         &self.options.provider_id
@@ -243,6 +252,7 @@ impl BlobStore for S3BlobStore {
         let byte_size = bytes.len() as u64;
         Box::pin(async move {
             validate_key(key)?;
+            guard_egress("PUT", key)?;
             let result = self
                 .client
                 .put_object()
@@ -271,6 +281,7 @@ impl BlobStore for S3BlobStore {
         let byte_size = bytes.len() as u64;
         Box::pin(async move {
             validate_key(key)?;
+            guard_egress("PUT", key)?;
             // `If-None-Match: *` makes S3 refuse the write (412) when the key
             // exists, so a blob of another writer is never replaced. A 409
             // means a parallel conditional write: the key is taken too.
@@ -313,6 +324,7 @@ impl BlobStore for S3BlobStore {
     ) -> BlobFuture<'a, Blob> {
         Box::pin(async move {
             validate_key(key)?;
+            guard_egress("PUT", key)?;
             let mut stream = data;
             let mut current_part: Vec<u8> = Vec::with_capacity(MULTIPART_PART_SIZE);
 
@@ -455,6 +467,7 @@ impl BlobStore for S3BlobStore {
     fn get<'a>(&'a self, key: &'a str) -> BlobFuture<'a, Bytes> {
         Box::pin(async move {
             validate_key(key)?;
+            guard_egress("GET", key)?;
             let result = self
                 .client
                 .get_object()
@@ -482,6 +495,7 @@ impl BlobStore for S3BlobStore {
     fn delete<'a>(&'a self, key: &'a str) -> BlobFuture<'a, ()> {
         Box::pin(async move {
             validate_key(key)?;
+            guard_egress("DELETE", key)?;
             self.client
                 .delete_object()
                 .bucket(&self.options.bucket)
@@ -496,6 +510,7 @@ impl BlobStore for S3BlobStore {
     fn head<'a>(&'a self, key: &'a str) -> BlobFuture<'a, Option<BlobMeta>> {
         Box::pin(async move {
             validate_key(key)?;
+            guard_egress("HEAD", key)?;
             let result = self
                 .client
                 .head_object()
@@ -978,6 +993,25 @@ mod tests {
                 .presigned_url("avatars//user.png", Duration::from_secs(60))
                 .await,
         );
+    }
+
+    /// autumn-web #2351 item 1: under a capsule replay the store refuses to
+    /// call S3, and logs a divergence.
+    #[tokio::test]
+    async fn a_capsule_replay_refuses_s3_egress() {
+        let store = test_store();
+        let tape = std::sync::Arc::new(autumn_web::capsule::ReplayEffects::new(
+            autumn_web::capsule::CapsuleEffects::default(),
+        ));
+        let result =
+            autumn_web::capsule::with_effect_tape(std::sync::Arc::clone(&tape), store.get("a.txt"))
+                .await;
+        let error = result.expect_err("a replay refuses S3 egress");
+        assert!(
+            error.to_string().contains("blocked during replay"),
+            "{error}"
+        );
+        assert_eq!(tape.divergences().len(), 1);
     }
 
     #[test]

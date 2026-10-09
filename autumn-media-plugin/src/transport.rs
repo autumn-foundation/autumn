@@ -247,6 +247,14 @@ fn ingest_status_from_path_json(json: &serde_json::Value) -> IngestStatus {
 
 /// Reusable `MediaMTX` v3 control-API client.
 ///
+/// Check a `MediaMTX` API call against a failure capsule.
+///
+/// This client is not autumn-web's recorded outbound seam. A capsule replay
+/// refuses the call, and capture marks the capsule incomplete.
+fn guard_egress(url: &str) -> Result<(), autumn_web::capsule::UnrecordedEgress> {
+    autumn_web::capsule::guard_egress("mediamtx", "GET", url)
+}
+
 /// Holds one `reqwest::Client` (a 3-second read timeout) and the API base
 /// origin (e.g. `http://127.0.0.1:9997`). Every reader returns an `Option`/enum
 /// sentinel rather than a `Result`, so callers can distinguish a transport
@@ -291,6 +299,7 @@ impl MediaMtxClient {
             "{}/v3/paths/list?itemsPerPage={PATHS_ITEMS_PER_PAGE}&page={page}",
             self.api_base
         );
+        guard_egress(&url).ok()?;
         let response = self.http.get(&url).send().await.ok()?;
         if !response.status().is_success() {
             return None;
@@ -344,6 +353,9 @@ impl MediaMtxClient {
     /// transport/parse failure → [`unavailable_stream_status`].
     pub async fn fetch_stream_status(&self, stream_key: &str) -> StreamStatus {
         let url = format!("{}/v3/paths/get/live%2F{stream_key}", self.api_base);
+        if guard_egress(&url).is_err() {
+            return unavailable_stream_status();
+        }
         let Ok(response) = self.http.get(&url).send().await else {
             return unavailable_stream_status();
         };
@@ -385,6 +397,7 @@ impl MediaMtxClient {
     /// Returns `None` when the path is not active or the API is unreachable.
     pub async fn fetch_stream_quality(&self, stream_key: &str) -> Option<StreamQualityStats> {
         let url = format!("{}/v3/paths/get/live%2F{stream_key}", self.api_base);
+        guard_egress(&url).ok()?;
         let response = self.http.get(&url).send().await.ok()?;
         if !response.status().is_success() {
             return None;

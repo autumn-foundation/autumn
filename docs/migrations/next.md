@@ -931,6 +931,59 @@ let stats = autumn_web::shadow::ShadowStats {
 **Automation:** `manual` - the fix adds a struct update expression, and no
 codemod rewrites struct literals.
 
+### Capsules: new `CacheEffect` and `EffectSeam` variants, a new `JobEffect` field
+
+**Why:** issue #2351 put cache removals and random-draw widths on the capsule
+seam, and keeps the deadline an `enqueue_at` call gave when it was already
+past. These types (feature `reporting`) are public and are not
+`#[non_exhaustive]`.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::capsule::{CacheEffect, JobEffect};
+
+fn key(effect: &CacheEffect) -> &str {
+    match effect {
+        CacheEffect::Get { key, .. } | CacheEffect::Insert { key, .. } => key,
+    }
+}
+
+let job = JobEffect {
+    name: "send_receipt".to_owned(),
+    payload: serde_json::json!({}),
+    delay_secs: None,
+    due_at: None,
+    error: None,
+};
+```
+
+**After (`{(X+1).0}`):** match the new variants, or call `CacheEffect::key`.
+Add `..JobEffect::default()` to a struct literal.
+
+```rust
+use autumn_web::capsule::{CacheEffect, JobEffect};
+
+fn key(effect: &CacheEffect) -> &str {
+    effect.key()
+}
+
+let job = JobEffect {
+    name: "send_receipt".to_owned(),
+    payload: serde_json::json!({}),
+    ..JobEffect::default()
+};
+```
+
+The new variants are `CacheEffect::Invalidate`, `CacheEffect::InvalidateNamespace`,
+`CacheEffect::Clear` and `EffectSeam::Random`. An exhaustive `match` on
+`EffectSeam` needs a new arm.
+
+A capsule that holds a new value is malformed to an older reader. The capsule
+format version does not change, so this build reads every older capsule.
+
+**Automation:** `manual` - a codemod cannot know what a new match arm must do.
+
 ---
 
 ## Plugin authors

@@ -718,7 +718,8 @@ fn caller_headers(builder: &RequestBuilder) -> Vec<(String, String)> {
         .map(|(name, value)| {
             (
                 name.as_str().to_owned(),
-                value.to_str().unwrap_or_default().to_owned(),
+                // Lossy, not empty: a changed opaque value must still differ.
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
             )
         })
         .collect()
@@ -878,9 +879,9 @@ impl OutboundRecorder {
     ///
     /// Records the headers the *caller* set. Headers the client adds later —
     /// the injected W3C trace context, and any default the underlying
-    /// `reqwest::Client` was built with — are not on the tape, because replay
-    /// matches on method and URL and does not need them; the recorded request
-    /// half is a debugging aid, not the match key.
+    /// `reqwest::Client` was built with — are not on the tape. They change from
+    /// run to run, and replay compares the method, the URL, the caller-set
+    /// headers and the body.
     fn arm(builder: &RequestBuilder) -> Self {
         let scope = crate::capsule::current_scope();
         let Some(scope) = scope else {
