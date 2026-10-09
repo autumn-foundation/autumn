@@ -514,7 +514,7 @@ pub(crate) fn localize_pages(
     }
     let mut out = Vec::with_capacity(pages.len() * locales.len());
     for page in pages {
-        if exclude_exact.iter().any(|p| *p == page.path)
+        if exclude_exact.contains(&page.path)
             || crate::seo::matches_locale_exclude_prefix(&page.path, exclude_prefixes)
         {
             out.push(page);
