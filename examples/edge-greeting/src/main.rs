@@ -12,20 +12,10 @@
 //! curl http://localhost:3000/greet/ada
 //! ```
 
-use autumn_web::prelude::*;
-
 #[autumn_web::main]
 async fn main() {
     autumn_web::app()
-        .routes(routes![
-            edge_greeting::handlers::greet,
-            edge_greeting::handlers::note,
-            edge_greeting::handlers::stats,
-            edge_greeting::handlers::count,
-            edge_greeting::handlers::whoami,
-            edge_greeting::handlers::boom,
-            edge_greeting::origin::feedback,
-        ])
+        .routes(edge_greeting::origin::routes())
         .with_edge_kv(edge_greeting::demo_kv())
         .run()
         .await;

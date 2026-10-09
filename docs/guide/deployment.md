@@ -2036,7 +2036,7 @@ The generated `fly.toml` includes four first-class integrations:
 | Feature | What it does |
 |---|---|
 | `/live` + `/ready` checks | Fly uses `/live` to decide machine restarts; `/ready` to gate traffic routing. Autumn flips `/ready` to 503 at drain start so Fly deregisters before the listener closes. |
-| `kill_timeout = 45` | Fly waits 45 s after SIGTERM before SIGKILL — `prestop_grace_secs (5) + shutdown_timeout_secs (30) + 10 s buffer` for the process to log and exit cleanly. Value is an integer (seconds); Fly does not accept a string like `"45s"`. |
+| `kill_timeout = 50` | Fly waits 50 s after SIGTERM before SIGKILL — `prestop_grace_secs (5) + shutdown_timeout_secs (35 in the prod profile) + 10 s buffer` for the process to log and exit cleanly. Value is an integer (seconds); Fly does not accept a string like `"45s"`. |
 | `[metrics]` → `/actuator/prometheus` | Fly scrapes Autumn's Prometheus text endpoint and surfaces it in the dashboard. No extra agent needed. Controlled by `actuator.prometheus` (default on) and independent of `actuator.sensitive` — see [Prometheus metrics for platform scraping](#prometheus-metrics-for-platform-scraping). |
 | `[deploy]` `release_command` (opt-in) | When uncommented, migrations run in a one-shot machine before new app machines start; a failed migration aborts the deploy before any traffic-serving machine is replaced. |
 

@@ -55,6 +55,7 @@
 //! | `AUTUMN_SERVER__UPGRADE__ENABLED` | `server.upgrade.enabled` | `bool` |
 //! | `AUTUMN_SERVER__UPGRADE__READY_TIMEOUT_SECS` | `server.upgrade.ready_timeout_secs` | `u64` |
 //! | `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS` | `server.timeouts.request_timeout_ms` | `u64` |
+//! | `AUTUMN_SERVER__TIMEOUTS__ACCEPT_DEADLINE_HEADER` | `server.timeouts.accept_deadline_header` | `bool` |
 //! | `AUTUMN_SERVER__HTTP__HEADER_READ_TIMEOUT_MS` | `server.http.header_read_timeout_ms` | `u64` |
 //! | `AUTUMN_SERVER__HTTP__KEEP_ALIVE_TIMEOUT_MS` | `server.http.keep_alive_timeout_ms` | `u64` |
 //! | `AUTUMN_SERVER__HTTP__MAX_HEADER_BYTES` | `server.http.max_header_bytes` | `usize` |
@@ -151,6 +152,10 @@
 //! | `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` | `jobs.redis.visibility_timeout_ms` | `u64` |
 //! | `AUTUMN_JOBS__REDIS__DEAD_LETTER_LIMIT` | `jobs.redis.dead_letter_limit` | `usize` (`0` = unbounded) |
 //! | `AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS` | `jobs.postgres.visibility_timeout_ms` | `u64` |
+//! | `AUTUMN_JOBS__POSTGRES__SHARD_LOCAL` | `jobs.postgres.shard_local` | `bool` |
+//! | `AUTUMN_JOBS__TENANTS__MAX_CONCURRENT` | `jobs.tenants.max_concurrent` | `usize` (`0` = no limit) |
+//! | `AUTUMN_JOBS__TENANTS__LANES` | `jobs.tenants.lanes` | `u16` (`0` = off) |
+//! | `AUTUMN_JOBS__TENANTS__LANES_PER_TENANT` | `jobs.tenants.lanes_per_tenant` | `u16` |
 //! | `AUTUMN_JOBS__TRACKING__TTL_SECS` | `jobs.tracking.ttl_secs` | `u64` |
 //! | `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` | `jobs.tracking.route_enabled` | `bool` |
 //! | `AUTUMN_OUTBOX__ENABLED` | `outbox.enabled` | `bool` |
@@ -234,6 +239,7 @@
 //! | `AUTUMN_SHADOW__MAX_BODY_BYTES` | `shadow.max_body_bytes` | `usize` |
 //! | `AUTUMN_SHADOW__MAX_RECORDS` | `shadow.max_records` | `usize` |
 //! | `AUTUMN_SHADOW__MAX_SAMPLE_BYTES` | `shadow.max_sample_bytes` | `usize` |
+//! | `AUTUMN_FAULT_INJECTION__ENABLED` | `fault_injection.enabled` | `bool` |
 
 use std::path::{Path, PathBuf};
 
@@ -599,7 +605,8 @@ environment = "production"
 
 [server]
 host = "0.0.0.0"
-shutdown_timeout_secs = 30
+# Request timeout + 5 s margin (issue #3058).
+shutdown_timeout_secs = 35
 # Prod: a misspelled key fails the boot (#3057).
 strict_config = true
 
@@ -1475,6 +1482,17 @@ pub struct AutumnConfig {
     /// this ordering breaks.
     #[serde(default)]
     pub metrics: MetricsConfig,
+
+    /// Staging fault injection (`[fault_injection]` section, issue #3071).
+    ///
+    /// Off by default. Refused in `prod` unless `allow_in_production = true`.
+    /// See [`crate::fault_injection`] and `docs/guide/fault-injection.md`.
+    ///
+    /// Keep this field above `database`, for the same reason as `shadow`:
+    /// strict validation then checks the keys. The regression guard is
+    /// `fault_injection_child_keys_are_strictly_validated`.
+    #[serde(default)]
+    pub fault_injection: crate::fault_injection::FaultInjectionConfig,
 
     /// Database connection settings (URL, pool size, timeouts).
     #[serde(default)]
@@ -2517,10 +2535,131 @@ pub struct HttpClientConfig {
     #[serde(default)]
     pub base_urls: std::collections::HashMap<String, String>,
 
+    /// Send the time left of the request deadline downstream in the
+    /// `x-autumn-deadline-ms` header. The client sends it only when a deadline
+    /// is set. Default: `true`.
+    #[serde(default = "default_http_send_deadline_header")]
+    pub send_deadline_header: bool,
+
+    /// Retry budget (`[http.client.retry_budget]`). See
+    /// [`RetryBudgetConfig`].
+    #[serde(default)]
+    pub retry_budget: RetryBudgetConfig,
+
     /// Client-side adaptive throttling per host (issue #3068). Off by
     /// default. See [`AdaptiveThrottleConfig`].
     #[serde(default)]
     pub adaptive_throttle: AdaptiveThrottleConfig,
+}
+
+/// Retry budget settings (`[http.client.retry_budget]`, issue #3058).
+///
+/// The outbound client keeps a token bucket for each upstream host. A retry
+/// takes tokens. Each first attempt adds `retry_ratio x transient_cost`
+/// tokens. A first attempt never waits for tokens. See the
+/// [timeouts and budgets guide](https://github.com/autumn-foundation/autumn/blob/trunk/docs/guide/timeouts-and-budgets.md).
+///
+/// ```toml
+/// [http.client.retry_budget]
+/// enabled = true
+/// capacity = 500
+/// transient_cost = 14
+/// throttling_cost = 5
+/// retry_ratio = 0.1
+/// ```
+#[cfg(feature = "http-client")]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RetryBudgetConfig {
+    /// Use the retry budget. Default: `true`.
+    #[serde(default = "default_retry_budget_enabled")]
+    pub enabled: bool,
+    /// Tokens in a full bucket. Default: 500.
+    #[serde(default = "default_retry_budget_capacity")]
+    pub capacity: u32,
+    /// Tokens for a retry after a `5xx`, a connect error or a timeout.
+    /// Default: 14.
+    #[serde(default = "default_retry_budget_transient_cost")]
+    pub transient_cost: u32,
+    /// Tokens for a retry after a `429`. Default: 5.
+    #[serde(default = "default_retry_budget_throttling_cost")]
+    pub throttling_cost: u32,
+    /// The share of requests that can retry a transient failure when the
+    /// bucket is empty. Default: 0.1 (10 %).
+    #[serde(default = "default_retry_budget_retry_ratio")]
+    pub retry_ratio: f64,
+}
+
+#[cfg(feature = "http-client")]
+const fn default_http_send_deadline_header() -> bool {
+    true
+}
+
+#[cfg(feature = "http-client")]
+const fn default_retry_budget_enabled() -> bool {
+    true
+}
+
+#[cfg(feature = "http-client")]
+const fn default_retry_budget_capacity() -> u32 {
+    500
+}
+
+#[cfg(feature = "http-client")]
+const fn default_retry_budget_transient_cost() -> u32 {
+    14
+}
+
+#[cfg(feature = "http-client")]
+const fn default_retry_budget_throttling_cost() -> u32 {
+    5
+}
+
+#[cfg(feature = "http-client")]
+const fn default_retry_budget_retry_ratio() -> f64 {
+    0.1
+}
+
+#[cfg(feature = "http-client")]
+impl RetryBudgetConfig {
+    /// Reject a ratio outside `0.0..=1.0` and a cost of zero, which would
+    /// allow unlimited retries. A disabled budget uses none of these values,
+    /// so it is not checked.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Validation`] that names the bad key.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if !(0.0..=1.0).contains(&self.retry_ratio) {
+            return Err(ConfigError::Validation(format!(
+                "http.client.retry_budget.retry_ratio must be in 0.0..=1.0, got {}",
+                self.retry_ratio
+            )));
+        }
+        if self.transient_cost == 0 || self.throttling_cost == 0 {
+            return Err(ConfigError::Validation(
+                "http.client.retry_budget costs must be 1 or more; set enabled = false \
+                 to turn the budget off"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "http-client")]
+impl Default for RetryBudgetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_retry_budget_enabled(),
+            capacity: default_retry_budget_capacity(),
+            transient_cost: default_retry_budget_transient_cost(),
+            throttling_cost: default_retry_budget_throttling_cost(),
+            retry_ratio: default_retry_budget_retry_ratio(),
+        }
+    }
 }
 
 /// `[http.client.adaptive_throttle]`: Google SRE client-side throttling.
@@ -2626,6 +2765,8 @@ impl Default for HttpClientConfig {
             max_retry_after_secs: default_http_max_retry_after_secs(),
             max_backoff_ms: default_http_max_backoff_ms(),
             base_urls: std::collections::HashMap::new(),
+            send_deadline_header: default_http_send_deadline_header(),
+            retry_budget: RetryBudgetConfig::default(),
             adaptive_throttle: AdaptiveThrottleConfig::default(),
         }
     }
@@ -4009,6 +4150,29 @@ pub struct JobConfig {
     /// built-in `GET /_autumn/jobs/{token}` status route).
     #[serde(default)]
     pub tracking: JobTrackingConfig,
+    /// Per-tenant worker slots and shuffle-shard lanes (issue #3072).
+    #[serde(default)]
+    pub tenants: JobTenantsConfig,
+}
+
+/// Tenant isolation for job workers (issue #3072).
+///
+/// Applies to the `local` backend. A job's tenant is the tenant of the
+/// request that enqueued it. Jobs without a tenant are not limited.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct JobTenantsConfig {
+    /// The most jobs of one tenant that run at the same time. `0` (the
+    /// default) sets no limit.
+    #[serde(default)]
+    pub max_concurrent: usize,
+    /// The number of shuffle-shard lanes. Worker `i` serves lane
+    /// `i % lanes`. `0` (the default) turns lanes off. The runtime uses at
+    /// most `jobs.workers` lanes.
+    #[serde(default)]
+    pub lanes: u16,
+    /// The number of lanes that serve each tenant. `0` means 1.
+    #[serde(default)]
+    pub lanes_per_tenant: u16,
 }
 
 impl Default for JobConfig {
@@ -4027,6 +4191,7 @@ impl Default for JobConfig {
             postgres: JobPostgresConfig::default(),
             sqlite: JobSqliteConfig::default(),
             tracking: JobTrackingConfig::default(),
+            tenants: JobTenantsConfig::default(),
         }
     }
 }
@@ -4385,12 +4550,19 @@ pub struct JobPostgresConfig {
     /// within this bound. Default: 30 seconds.
     #[serde(default = "default_jobs_pg_visibility_timeout_ms")]
     pub visibility_timeout_ms: u64,
+    /// Shard-local jobs (issue #3072). Make an `autumn_jobs` table on each
+    /// shard. Run workers for each shard. Then `enqueue_in_tx` on a shard
+    /// connection commits or rolls back with the shard's data. Default:
+    /// `false`.
+    #[serde(default)]
+    pub shard_local: bool,
 }
 
 impl Default for JobPostgresConfig {
     fn default() -> Self {
         Self {
             visibility_timeout_ms: default_jobs_pg_visibility_timeout_ms(),
+            shard_local: false,
         }
     }
 }
@@ -5497,6 +5669,8 @@ impl AutumnConfig {
         self.server.admission.validate()?;
         #[cfg(feature = "http-client")]
         self.http.client.adaptive_throttle.validate()?;
+        #[cfg(feature = "http-client")]
+        self.http.client.retry_budget.validate()?;
         self.scheduler.validate()?;
         self.outbox.validate()?;
         // #1605: reject an unparseable or zero retention window at boot rather
@@ -5520,6 +5694,17 @@ impl AutumnConfig {
                     .to_owned(),
             ));
         }
+        // Shard-local jobs (#3072) run on the Postgres backend, one job table
+        // for each shard.
+        if self.jobs.postgres.shard_local
+            && (self.jobs.backend != "postgres" || !self.database.has_shards())
+        {
+            return Err(ConfigError::Validation(
+                "jobs.postgres.shard_local = true needs jobs.backend = \"postgres\" and \
+                 [[database.shards]] (see docs/guide/cell-isolation.md)"
+                    .to_owned(),
+            ));
+        }
         let is_production = matches!(self.profile.as_deref(), Some("prod" | "production"));
         self.security
             .webhooks
@@ -5532,6 +5717,10 @@ impl AutumnConfig {
         // target, an unusable URL, an out-of-range sample rate) must fail boot
         // rather than start a replica that silently mirrors nothing.
         self.shadow.validate().map_err(ConfigError::Validation)?;
+        // Faults in prod need an explicit `allow_in_production = true`.
+        self.fault_injection
+            .validate(self.profile.as_deref())
+            .map_err(ConfigError::Validation)?;
         // Fail fast on an insecure or flapping [cluster] section: a node that
         // would boot without a shared secret must not boot at all.
         self.cluster.validate()?;
@@ -5782,6 +5971,7 @@ impl AutumnConfig {
     /// - `AUTUMN_SHADOW__MAX_BODY_BYTES` → `shadow.max_body_bytes` (`usize`)
     /// - `AUTUMN_SHADOW__MAX_RECORDS` → `shadow.max_records` (`usize`)
     /// - `AUTUMN_SHADOW__MAX_SAMPLE_BYTES` → `shadow.max_sample_bytes` (`usize`)
+    /// - `AUTUMN_FAULT_INJECTION__ENABLED` → `fault_injection.enabled` (`bool`)
     pub fn apply_env_overrides(&mut self) {
         self.apply_env_overrides_with_env(&OsEnv);
     }
@@ -5833,6 +6023,13 @@ impl AutumnConfig {
         self.apply_cluster_env_overrides_with_env(env);
         self.apply_push_env_overrides_with_env(env);
         self.apply_shadow_env_overrides_with_env(env);
+        // Only the switch. `allow_in_production` stays in the file, so an
+        // environment variable alone cannot turn on faults in prod.
+        parse_env_bool(
+            env,
+            "AUTUMN_FAULT_INJECTION__ENABLED",
+            &mut self.fault_injection.enabled,
+        );
     }
 
     /// Web Push (`[push]`) environment overrides.
@@ -5999,6 +6196,16 @@ impl AutumnConfig {
             env,
             "AUTUMN_TENANCY__IDLE_TTL_SECS",
             &mut self.tenancy.idle_ttl_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_TENANCY__MAX_CONCURRENT_REQUESTS",
+            &mut self.tenancy.max_concurrent_requests,
+        );
+        parse_env(
+            env,
+            "AUTUMN_TENANCY__MAX_DB_CONNECTIONS",
+            &mut self.tenancy.max_db_connections,
         );
     }
 
@@ -6317,8 +6524,8 @@ impl AutumnConfig {
         );
     }
 
-    fn apply_server_env_overrides_with_env(&mut self, env: &dyn Env) {
-        parse_env(env, "AUTUMN_SERVER__PORT", &mut self.server.port);
+    /// `[server.http]` connection limits (issue #3065).
+    fn apply_server_http_env_overrides_with_env(&mut self, env: &dyn Env) {
         let http = &mut self.server.http;
         parse_env_option(
             env,
@@ -6345,6 +6552,11 @@ impl AutumnConfig {
             "AUTUMN_SERVER__HTTP__MAX_CONNECTIONS",
             &mut http.max_connections,
         );
+    }
+
+    fn apply_server_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env(env, "AUTUMN_SERVER__PORT", &mut self.server.port);
+        self.apply_server_http_env_overrides_with_env(env);
         parse_env_string(env, "AUTUMN_SERVER__HOST", &mut self.server.host);
         parse_env(
             env,
@@ -6370,6 +6582,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS",
             &mut self.server.timeouts.request_timeout_ms,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_SERVER__TIMEOUTS__ACCEPT_DEADLINE_HEADER",
+            &mut self.server.timeouts.accept_deadline_header,
         );
         parse_env_option_string(
             env,
@@ -6892,6 +7109,26 @@ impl AutumnConfig {
             env,
             "AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS",
             &mut self.jobs.postgres.visibility_timeout_ms,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_JOBS__POSTGRES__SHARD_LOCAL",
+            &mut self.jobs.postgres.shard_local,
+        );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__TENANTS__MAX_CONCURRENT",
+            &mut self.jobs.tenants.max_concurrent,
+        );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__TENANTS__LANES",
+            &mut self.jobs.tenants.lanes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__TENANTS__LANES_PER_TENANT",
+            &mut self.jobs.tenants.lanes_per_tenant,
         );
         parse_env(
             env,
@@ -7812,6 +8049,13 @@ pub struct RequestTimeoutsConfig {
     /// `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS`.
     #[serde(default)]
     pub request_timeout_ms: Option<u64>,
+
+    /// Read the caller's `x-autumn-deadline-ms` header (issue #3058). The
+    /// header can only make the route deadline shorter. A route with no
+    /// deadline ignores it. Default: `false`. Configured via
+    /// `AUTUMN_SERVER__TIMEOUTS__ACCEPT_DEADLINE_HEADER`.
+    #[serde(default)]
+    pub accept_deadline_header: bool,
 }
 
 /// `[server.http]` — connection limits for the HTTP server (issue #3065).
@@ -11601,6 +11845,33 @@ fn default_startup_path() -> String {
     "/startup".to_owned()
 }
 
+/// Seconds of drain window above the request timeout (issue #3058).
+///
+/// A request that starts just before shutdown can run for the full request
+/// timeout. The drain window must be longer, or the watchdog stops it.
+pub const DRAIN_MARGIN_SECS: u64 = 5;
+
+impl ServerConfig {
+    /// A warning when `shutdown_timeout_secs` is shorter than the global
+    /// request timeout plus [`DRAIN_MARGIN_SECS`]. `None` when the drain
+    /// window is safe or no global request timeout is set. A per-route
+    /// `timeout_ms` is not checked.
+    #[must_use]
+    pub fn drain_window_warning(&self) -> Option<String> {
+        let timeout_ms = self.timeouts.request_timeout_ms.filter(|ms| *ms > 0)?;
+        let safe_secs = timeout_ms.div_ceil(1_000).saturating_add(DRAIN_MARGIN_SECS);
+        (self.shutdown_timeout_secs < safe_secs).then(|| {
+            format!(
+                "server.shutdown_timeout_secs ({}) is too short for \
+                 server.timeouts.request_timeout_ms ({timeout_ms}): a request that starts \
+                 just before shutdown can be stopped. Set shutdown_timeout_secs to {safe_secs} \
+                 or more.",
+                self.shutdown_timeout_secs
+            )
+        })
+    }
+}
+
 // ── Default trait impls ────────────────────────────────────────────
 
 impl Default for ServerConfig {
@@ -11986,6 +12257,19 @@ pub struct TenancyConfig {
     /// `0` = disabled.
     #[serde(default)]
     pub idle_ttl_secs: u64,
+
+    /// The most requests of one tenant in flight at the same time (issue
+    /// #3072). More get `503` with `Retry-After`. `0` (the default) sets no
+    /// limit. Compare `server.max_concurrent_requests`, the limit for all
+    /// tenants together.
+    #[serde(default)]
+    pub max_concurrent_requests: usize,
+
+    /// The most database connections that one tenant's requests hold at the
+    /// same time (issue #3072). More get `503`. `0` (the default) sets no
+    /// limit.
+    #[serde(default)]
+    pub max_db_connections: usize,
 }
 
 fn default_tenancy_source() -> String {
@@ -12021,6 +12305,8 @@ impl Default for TenancyConfig {
             quota_bytes: 0,
             max_cells: 0,
             idle_ttl_secs: 0,
+            max_concurrent_requests: 0,
+            max_db_connections: 0,
         }
     }
 }
@@ -14324,6 +14610,25 @@ slots = ["8194-16383"]
         config
             .validate()
             .expect("legacy url should satisfy the jobs requirement");
+    }
+
+    #[test]
+    fn shard_local_jobs_need_postgres_jobs_and_shards() {
+        let mut config = AutumnConfig::default();
+        config.jobs.postgres.shard_local = true;
+        let Err(ConfigError::Validation(message)) = config.validate() else {
+            panic!("shard_local without postgres jobs and shards should fail validation");
+        };
+        assert!(message.contains("shard_local"), "{message}");
+
+        config.jobs.backend = "postgres".to_owned();
+        assert!(config.validate().is_err(), "shard_local without shards");
+
+        config.database.shards = vec![shard("shard0", "postgres://s0.example/app")];
+        config.database.primary_url = Some("postgres://control.example/app".to_owned());
+        config
+            .validate()
+            .expect("postgres jobs with shards satisfy shard_local");
     }
 
     #[test]
@@ -16879,6 +17184,26 @@ path = "/healthz"
             config.tenancy.public_paths,
             vec!["/login", "/signup", "/assets"]
         );
+    }
+
+    #[test]
+    fn env_override_isolation_knobs() {
+        // Issue #3072: every isolation knob is settable from the environment.
+        let env = MockEnv::new()
+            .with("AUTUMN_TENANCY__MAX_CONCURRENT_REQUESTS", "32")
+            .with("AUTUMN_TENANCY__MAX_DB_CONNECTIONS", "4")
+            .with("AUTUMN_JOBS__TENANTS__MAX_CONCURRENT", "2")
+            .with("AUTUMN_JOBS__TENANTS__LANES", "8")
+            .with("AUTUMN_JOBS__TENANTS__LANES_PER_TENANT", "3")
+            .with("AUTUMN_JOBS__POSTGRES__SHARD_LOCAL", "true");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.tenancy.max_concurrent_requests, 32);
+        assert_eq!(config.tenancy.max_db_connections, 4);
+        assert_eq!(config.jobs.tenants.max_concurrent, 2);
+        assert_eq!(config.jobs.tenants.lanes, 8);
+        assert_eq!(config.jobs.tenants.lanes_per_tenant, 3);
+        assert!(config.jobs.postgres.shard_local);
     }
 
     #[test]
@@ -19590,7 +19915,7 @@ path = "/healthz"
         assert_eq!(config.log.level, "info");
         assert_eq!(config.log.format, LogFormat::Json);
         assert_eq!(config.server.host, "0.0.0.0");
-        assert_eq!(config.server.shutdown_timeout_secs, 30);
+        assert_eq!(config.server.shutdown_timeout_secs, 35);
         assert_eq!(config.telemetry.environment, "production");
         assert!(!config.health.detailed);
         // AC: HSTS auto-enabled in the production profile.
@@ -20795,6 +21120,110 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         "#;
         let config: ServerConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.timeouts.request_timeout_ms, Some(15_000));
+    }
+
+    #[test]
+    fn prod_drain_window_is_request_timeout_plus_margin() {
+        let defaults = profile_defaults_as_toml("prod");
+        let config: AutumnConfig = toml::from_str(&toml::to_string(&defaults).unwrap()).unwrap();
+        let timeout_secs = config.server.timeouts.request_timeout_ms.unwrap() / 1000;
+        assert_eq!(
+            config.server.shutdown_timeout_secs,
+            timeout_secs + DRAIN_MARGIN_SECS
+        );
+        assert!(config.server.drain_window_warning().is_none());
+    }
+
+    #[test]
+    fn drain_window_shorter_than_request_timeout_is_flagged() {
+        let mut server = ServerConfig::default();
+        server.timeouts.request_timeout_ms = Some(30_000);
+        server.shutdown_timeout_secs = 30;
+        let warning = server
+            .drain_window_warning()
+            .expect("30 s drain, 30 s timeout");
+        assert!(warning.contains("35"), "names the safe value: {warning}");
+
+        server.shutdown_timeout_secs = 35;
+        assert!(server.drain_window_warning().is_none());
+
+        server.timeouts.request_timeout_ms = Some(30_001);
+        assert!(server.drain_window_warning().is_some(), "rounds up to 36 s");
+        server.shutdown_timeout_secs = 36;
+        assert!(server.drain_window_warning().is_none());
+
+        server.timeouts.request_timeout_ms = None;
+        server.shutdown_timeout_secs = 1;
+        assert!(
+            server.drain_window_warning().is_none(),
+            "no timeout, no risk"
+        );
+    }
+
+    #[test]
+    fn accept_deadline_header_is_off_by_default_and_configurable() {
+        assert!(!RequestTimeoutsConfig::default().accept_deadline_header);
+        let config: ServerConfig =
+            toml::from_str("[timeouts]\naccept_deadline_header = true\n").unwrap();
+        assert!(config.timeouts.accept_deadline_header);
+
+        let env = MockEnv::new().with("AUTUMN_SERVER__TIMEOUTS__ACCEPT_DEADLINE_HEADER", "true");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.server.timeouts.accept_deadline_header);
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn http_client_deadline_header_and_retry_budget_defaults() {
+        let config = HttpClientConfig::default();
+        assert!(config.send_deadline_header);
+        let budget = &config.retry_budget;
+        assert!(budget.enabled);
+        assert_eq!(budget.capacity, 500);
+        assert_eq!(budget.transient_cost, 14);
+        assert_eq!(budget.throttling_cost, 5);
+        assert!((budget.retry_ratio - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn http_client_retry_budget_rejects_bad_values() {
+        let mut config = AutumnConfig::default();
+        assert!(config.validate().is_ok());
+        config.http.client.retry_budget.retry_ratio = 1.5;
+        assert!(config.validate().is_err());
+        config.http.client.retry_budget.retry_ratio = f64::NAN;
+        assert!(config.validate().is_err());
+        config.http.client.retry_budget.retry_ratio = 0.1;
+        config.http.client.retry_budget.transient_cost = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn a_disabled_retry_budget_is_not_validated() {
+        let mut config = AutumnConfig::default();
+        config.http.client.retry_budget.enabled = false;
+        config.http.client.retry_budget.transient_cost = 0;
+        config.http.client.retry_budget.throttling_cost = 0;
+        config.http.client.retry_budget.retry_ratio = 2.0;
+        assert!(config.validate().is_ok(), "{:?}", config.validate());
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn http_client_retry_budget_parses_from_toml() {
+        let config: HttpConfig = toml::from_str(
+            "[client]\nsend_deadline_header = false\n\
+             [client.retry_budget]\nenabled = false\ncapacity = 50\nretry_ratio = 0.2\n",
+        )
+        .unwrap();
+        assert!(!config.client.send_deadline_header);
+        assert!(!config.client.retry_budget.enabled);
+        assert_eq!(config.client.retry_budget.capacity, 50);
+        assert_eq!(config.client.retry_budget.transient_cost, 14);
+        assert!((config.client.retry_budget.retry_ratio - 0.2).abs() < f64::EPSILON);
     }
 
     #[test]

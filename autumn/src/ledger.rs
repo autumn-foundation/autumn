@@ -1416,6 +1416,23 @@ pub enum LedgerError {
         /// `dependent nullify`.
         path: &'static str,
     },
+    /// A ledgered write carried a `NaN` or infinite float (#2326).
+    ///
+    /// JSON cannot hold either value. A snapshot would store `null` and could not
+    /// be read back. The write is refused before the hash.
+    #[error(
+        "cannot ledger {table}#{record_id}: column `{column}` holds NaN or an infinite \
+         float, which a snapshot cannot store. Write a finite value, or stop ledgering \
+         {table}"
+    )]
+    NonFiniteValue {
+        /// Table of the ledgered model.
+        table: String,
+        /// Primary key of the record being written.
+        record_id: i64,
+        /// The offending column.
+        column: String,
+    },
     /// A record's stored chain is broken, so its past state cannot be trusted.
     #[error("ledger chain for {table}#{record_id} is broken at revision {seq}: {detail}")]
     ChainBroken {
@@ -1483,6 +1500,138 @@ impl LedgerValidTimeValue for Option<chrono::NaiveDateTime> {
     fn ledger_valid_from(&self) -> Option<DateTime<Utc>> {
         self.as_ref().map(chrono::NaiveDateTime::and_utc)
     }
+}
+
+// ── Snapshot fidelity (#2326) ────────────────────────────────────────
+
+/// Probe wrapper for the generated non-finite float check.
+///
+/// Call it as `(&NonFiniteProbe(&field)).autumn_has_non_finite()`. A float, or
+/// an `Option` or `Vec` of one, resolves to [`NonFiniteViaFloat`]; any other
+/// type falls back to `false`. Same autoref pattern as `MaybeValidate`.
+#[doc(hidden)]
+pub struct NonFiniteProbe<'a, T: ?Sized>(pub &'a T);
+
+/// A value that may hold a `NaN` or infinite float.
+#[doc(hidden)]
+pub trait FloatContent {
+    /// `true` when any float inside is not finite.
+    fn has_non_finite(&self) -> bool;
+}
+
+impl FloatContent for f64 {
+    fn has_non_finite(&self) -> bool {
+        !self.is_finite()
+    }
+}
+
+impl FloatContent for f32 {
+    fn has_non_finite(&self) -> bool {
+        !self.is_finite()
+    }
+}
+
+impl<T: FloatContent> FloatContent for Option<T> {
+    fn has_non_finite(&self) -> bool {
+        self.as_ref().is_some_and(FloatContent::has_non_finite)
+    }
+}
+
+impl<T: FloatContent> FloatContent for Vec<T> {
+    fn has_non_finite(&self) -> bool {
+        self.iter().any(FloatContent::has_non_finite)
+    }
+}
+
+/// Preferred branch: the field holds floats.
+#[doc(hidden)]
+pub trait NonFiniteViaFloat {
+    /// `true` when the field holds a non-finite float.
+    fn autumn_has_non_finite(&self) -> bool;
+}
+
+impl<T: FloatContent> NonFiniteViaFloat for NonFiniteProbe<'_, T> {
+    fn autumn_has_non_finite(&self) -> bool {
+        self.0.has_non_finite()
+    }
+}
+
+/// Fallback branch (one autoref further): every other type.
+#[doc(hidden)]
+pub trait NonFiniteFallback {
+    /// Always `false`.
+    fn autumn_has_non_finite(&self) -> bool;
+}
+
+impl<T: ?Sized> NonFiniteFallback for &NonFiniteProbe<'_, T> {
+    fn autumn_has_non_finite(&self) -> bool {
+        false
+    }
+}
+
+/// Refuse a ledgered write whose record holds a non-finite float (#2326).
+///
+/// `column` is what the model's generated check found, if anything.
+///
+/// # Errors
+///
+/// [`LedgerError::NonFiniteValue`] naming the column.
+#[doc(hidden)]
+pub fn refuse_non_finite(
+    table: &str,
+    record_id: i64,
+    column: Option<&'static str>,
+) -> crate::AutumnResult<()> {
+    column.map_or(Ok(()), |column| {
+        Err(crate::AutumnError::internal_server_error(
+            LedgerError::NonFiniteValue {
+                table: table.to_string(),
+                record_id,
+                column: column.to_string(),
+            },
+        ))
+    })
+}
+
+/// Refuse to reconstruct a model from a snapshot whose `#[encrypted]` column
+/// cannot be decrypted (#2326).
+///
+/// The model codec leaves an undecryptable envelope in place. This suits
+/// commit-hook replay. In as-of reconstruction, it would return ciphertext as
+/// plaintext.
+///
+/// # Errors
+///
+/// [`LedgerError::ChainUnreadable`] naming the columns and the revision.
+#[doc(hidden)]
+pub fn ensure_snapshot_recoverable(
+    table: &str,
+    record_id: i64,
+    seq: i64,
+    snapshot: &serde_json::Value,
+) -> crate::AutumnResult<()> {
+    if !crate::encryption::registered_encrypted_columns()
+        .iter()
+        .any(|d| d.table == table)
+    {
+        return Ok(());
+    }
+    let mut probe = snapshot.clone();
+    let lost = crate::encryption::decrypt_snapshot_columns(table, &mut probe);
+    if lost.is_empty() {
+        return Ok(());
+    }
+    Err(crate::AutumnError::internal_server_error(
+        LedgerError::ChainUnreadable {
+            table: table.to_string(),
+            record_id,
+            detail: format!(
+                "revision {seq}: encrypted column(s) `{}` cannot be decrypted. The key \
+                 is missing, the key ring is not set, or the envelope is damaged",
+                lost.join("`, `")
+            ),
+        },
+    ))
 }
 
 // ── Runtime append (#2309 follow-up) ─────────────────────────────────
@@ -3374,5 +3523,80 @@ mod tests {
             LedgerValidTimeValue::ledger_valid_from(&None::<chrono::NaiveDateTime>),
             None
         );
+    }
+    // ── #2326: snapshot fidelity ──────────────────────────────────
+
+    inventory::submit! {
+        crate::encryption::EncryptedColumnDescriptor {
+            model: "LedgerFidelityModel",
+            table: "ledger_fidelity_table",
+            column: "secret",
+            deterministic: false,
+            admin_visible: false,
+            versioned_ciphertext: false,
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::needless_borrow,
+        reason = "the extra borrow selects the fallback impl"
+    )]
+    fn non_finite_probe_flags_floats_the_snapshot_would_null() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!((&NonFiniteProbe(&bad)).autumn_has_non_finite());
+            assert!((&NonFiniteProbe(&Some(bad))).autumn_has_non_finite());
+            assert!((&NonFiniteProbe(&vec![1.0, bad])).autumn_has_non_finite());
+        }
+        assert!((&NonFiniteProbe(&f32::NAN)).autumn_has_non_finite());
+    }
+
+    #[test]
+    #[allow(
+        clippy::needless_borrow,
+        reason = "the extra borrow selects the fallback impl"
+    )]
+    fn non_finite_probe_accepts_finite_and_foreign_types() {
+        assert!(!(&NonFiniteProbe(&1.5_f64)).autumn_has_non_finite());
+        assert!(!(&NonFiniteProbe(&None::<f64>)).autumn_has_non_finite());
+        assert!(!(&NonFiniteProbe(&"NaN".to_string())).autumn_has_non_finite());
+        assert!(!(&NonFiniteProbe(&7_i64)).autumn_has_non_finite());
+    }
+
+    #[test]
+    fn unrecovered_envelope_is_chain_unreadable_and_names_column_and_revision() {
+        let snapshot = serde_json::json!({"id": 1, "secret": "not-a-real-envelope"});
+        let err = ensure_snapshot_recoverable("ledger_fidelity_table", 1, 4, &snapshot)
+            .expect_err("an unrecovered envelope must not reconstruct");
+        let text = err.to_string();
+        assert!(text.contains("secret"), "names the column: {text}");
+        assert!(text.contains("revision 4"), "names the revision: {text}");
+    }
+
+    #[test]
+    fn snapshot_without_encrypted_columns_is_recoverable() {
+        let snapshot = serde_json::json!({"id": 1, "secret": "plain"});
+        ensure_snapshot_recoverable("some_other_table", 1, 1, &snapshot).unwrap();
+        let null_secret = serde_json::json!({"id": 1, "secret": null});
+        ensure_snapshot_recoverable("ledger_fidelity_table", 1, 1, &null_secret).unwrap();
+    }
+
+    #[test]
+    fn refuse_non_finite_passes_none_and_refuses_a_column() {
+        refuse_non_finite("t", 1, None).unwrap();
+        let err = refuse_non_finite("t", 9, Some("score")).expect_err("must refuse");
+        let text = err.to_string();
+        assert!(text.contains("t#9") && text.contains("score"), "{text}");
+    }
+
+    #[test]
+    fn non_finite_error_names_table_record_and_column() {
+        let text = LedgerError::NonFiniteValue {
+            table: "t".into(),
+            record_id: 9,
+            column: "score".into(),
+        }
+        .to_string();
+        assert!(text.contains("t#9") && text.contains("score"), "{text}");
     }
 }

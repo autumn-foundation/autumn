@@ -483,6 +483,47 @@ fn shadow_child_keys_are_strictly_validated() {
     );
 }
 
+/// Regression guard for the `[fault_injection]` field ordering (issue #3071).
+///
+/// A typo such as `allow_in_prodution` must fail strict validation. If
+/// `fault_injection` moves below `database`, this test fails.
+#[test]
+fn fault_injection_child_keys_are_strictly_validated() {
+    let leaves = AutumnConfig::schema_leaf_paths();
+    for key in [
+        "fault_injection.enabled",
+        "fault_injection.allow_in_production",
+        "fault_injection.stop.objective",
+        "fault_injection.stop.max_burn_rate",
+        "fault_injection.stop.window_secs",
+        "fault_injection.stop.min_requests",
+    ] {
+        assert!(
+            leaves.contains(key),
+            "{key} must be a schema leaf, so strict validation checks [fault_injection]"
+        );
+    }
+
+    let schema = AutumnConfig::get_schema_keys();
+    let errors =
+        AutumnConfig::validate_toml("[fault_injection]\nallow_in_prodution = true\n", &schema);
+    assert!(
+        errors
+            .iter()
+            .any(|(path, _)| path == "fault_injection.allow_in_prodution"),
+        "a bad [fault_injection] key must fail strict validation, got: {errors:?}"
+    );
+
+    let ok = AutumnConfig::validate_toml(
+        "[fault_injection]\nenabled = true\n[fault_injection.stop]\nobjective = 99.9\n",
+        &schema,
+    );
+    assert!(
+        ok.is_empty(),
+        "a good [fault_injection] section must pass, got: {ok:?}"
+    );
+}
+
 /// #1890: config.rs-internal sections declared AFTER `database` used to vanish
 /// from the derived schema because the `statement_timeout` duration field
 /// aborted the `SchemaDeserializer` walk. The tolerant `deserialize_any` probe

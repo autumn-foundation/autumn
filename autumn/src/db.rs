@@ -1830,8 +1830,9 @@ pub(crate) fn sqlite_target_is_shared_cache(target: &str) -> bool {
 /// parameter is exactly `value`, read the way `SQLite` reads it: only a `file:`
 /// URI has query parameters (a plain path containing `?` is just a filename),
 /// the `#fragment` is ignored, names and values are percent-decoded before the
-/// case-sensitive comparison, and a repeated parameter takes its last value. `target` may be a raw configured URL
-/// (`sqlite:file:...`) or an already-normalized one.
+/// case-sensitive comparison, and a repeated parameter takes its last value.
+/// A `%00` ends the name or value it is in. `target` may be a raw configured
+/// URL (`sqlite:file:...`) or an already normalized one.
 #[cfg(feature = "sqlite")]
 fn sqlite_uri_has_query_pair(target: &str, key: &str, value: &str) -> bool {
     let target = normalize_sqlite_target(target);
@@ -1852,7 +1853,8 @@ fn sqlite_uri_has_query_pair(target: &str, key: &str, value: &str) -> bool {
 }
 
 /// Decode `%XX` escapes the way `SQLite`'s URI parser does; a `%` not followed
-/// by two hex digits is kept literally.
+/// by two hex digits is kept literally. A decoded NUL (`%00`) stops the
+/// decoding. `SQLite` drops the rest of that name or value (issue #3032).
 #[cfg(feature = "sqlite")]
 fn percent_decode(input: &str) -> Vec<u8> {
     let bytes = input.as_bytes();
@@ -1865,6 +1867,9 @@ fn percent_decode(input: &str) -> Vec<u8> {
                 bytes.get(i + 2).and_then(|b| (*b as char).to_digit(16)),
             )
         {
+            if hi == 0 && lo == 0 {
+                break;
+            }
             // Two hex digits always fit in a byte.
             out.push(u8::try_from(hi * 16 + lo).unwrap_or(b'%'));
             i += 3;
@@ -3131,6 +3136,9 @@ pub struct Db {
     is_test_tx: bool,
     /// Set with `SET LOCAL` at the start of each transaction (#3057).
     tx_timeouts: TxTimeouts,
+    /// The tenant's `tenancy.max_db_connections` permit (#3072). Last, so it
+    /// drops after the connection.
+    _tenant_permit: Option<crate::bulkhead::TenantPermit>,
 }
 
 impl Db {
@@ -3791,6 +3799,10 @@ impl Db {
     /// shard-routed checkouts: span creation, checkout interceptors,
     /// `SET statement_timeout`, and the metrics captured for the
     /// slow-query warning on `Drop`.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one checkout sequence; the deadline wait (#3058) is one more step"
+    )]
     pub(crate) async fn checkout(params: DbCheckoutParams<'_>) -> Result<Self, AutumnError> {
         // `SET statement_timeout` (and its i32-cap arithmetic below) is a
         // Postgres session GUC. Under the `sqlite` feature the runtime backend
@@ -3838,12 +3850,24 @@ impl Db {
         #[cfg(all(feature = "reporting", feature = "sqlite"))]
         crate::capsule::note_backend_capture_gap();
 
+        // The tenant's share of the pool (#3072). Take it before the pool
+        // checkout, so a tenant at its cap does not hold a connection.
+        let tenant_permit = crate::bulkhead::acquire_db_permit().inspect_err(|_| {
+            if let Some(metrics) = &params.metrics {
+                metrics.record_tenant_db_rejection();
+            }
+        })?;
+
         let pool = params.pool;
         let mut checkout_future: std::pin::Pin<
             Box<
                 dyn std::future::Future<Output = Result<PooledConnection, AutumnError>> + Send + '_,
             >,
         > = Box::pin(async move {
+            // Staging fault injection (#3071). Inert outside a fault scope.
+            crate::fault_injection::inject(crate::fault_injection::FaultTarget::Database)
+                .await
+                .map_err(|fault| AutumnError::service_unavailable_msg(fault.to_string()))?;
             pool.get().await.map_err(|e| {
                 tracing::error!("Failed to acquire database connection: {e}");
                 AutumnError::service_unavailable_msg(e.to_string())
@@ -3856,7 +3880,18 @@ impl Db {
             checkout_future = interceptor.intercept_checkout(ctx, checkout_future);
         }
 
-        let mut conn = checkout_future.instrument(span.clone()).await?;
+        // The request deadline (issue #3058) limits the wait for a connection.
+        // It does not change `statement_timeout`: that is a session setting,
+        // so it would stay on the pooled connection for the next user.
+        // `bounded` checks the deadline before each poll, so an idle
+        // connection is not handed out once the deadline has passed.
+        let mut conn = crate::deadline::bounded(checkout_future.instrument(span.clone()))
+            .await
+            .map_err(|crate::deadline::DeadlineExceeded| {
+                AutumnError::service_unavailable(crate::deadline::DeadlineStopped(
+                    "request deadline exceeded while waiting for a database connection",
+                ))
+            })??;
 
         // Postgres statement_timeout is a signed 32-bit integer (milliseconds).
         // Cap at i32::MAX to avoid a confusing 503 for very large configured values.
@@ -3950,6 +3985,7 @@ impl Db {
                 params.statement_timeout,
                 params.idle_in_transaction_timeout,
             ),
+            _tenant_permit: tenant_permit,
         })
     }
 
@@ -4388,6 +4424,41 @@ mod tests {
                  SET LOCAL idle_in_transaction_session_timeout = DEFAULT"
             )
         );
+    }
+
+    /// A `database` fault fails the checkout before the pool dials.
+    #[cfg(not(feature = "sqlite"))]
+    #[tokio::test]
+    async fn an_injected_database_fault_fails_the_checkout() {
+        use crate::fault_injection::{FaultKind, FaultRule, FaultTarget, with_faults};
+
+        let config = crate::config::DatabaseConfig {
+            primary_url: Some("postgres://127.0.0.1:1/faults".to_owned()),
+            connect_timeout_secs: 1,
+            ..Default::default()
+        };
+        let pool = super::create_pool(&config)
+            .expect("a lazy pool builds")
+            .expect("a URL is set");
+        let checkout = super::Db::checkout(super::DbCheckoutParams {
+            pool: &pool,
+            pool_name: "primary",
+            shard: None,
+            statement_timeout: None,
+            idle_in_transaction_timeout: None,
+            route_key: None,
+            metrics: None,
+            slow_query_threshold: std::time::Duration::from_millis(500),
+            interceptors: Vec::new(),
+            #[cfg(feature = "reporting")]
+            capture_gap: None,
+            clock: std::sync::Arc::clone(&super::DEFAULT_SYSTEM_CLOCK),
+        });
+        let rules = [FaultRule::new(FaultTarget::Database, FaultKind::Error, 1.0)];
+        let Err(error) = with_faults(&rules, checkout).await else {
+            panic!("the injected fault must fail the checkout");
+        };
+        assert!(error.to_string().contains("fault injection"), "{error}");
     }
 
     /// A scheduled task or a job has no request scope. The background scope
@@ -5711,6 +5782,52 @@ mod tests {
         assert!(sqlite_target_is_shared_cache(
             "file:app.db?cache=private&cache=shared"
         ));
+    }
+
+    // Issue #3032. A decoded NUL (`%00`) ends only the name or value being
+    // read. SQLite keeps parsing the next pair. Checked with Python's
+    // `sqlite3` (SQLite 3.45).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn percent_decode_stops_at_decoded_nul() {
+        assert_eq!(percent_decode("a%00b"), b"a");
+        assert_eq!(percent_decode("%00"), b"");
+        assert_eq!(percent_decode("a%0"), b"a%0");
+        assert_eq!(percent_decode("%53hared"), b"Shared");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_shared_cache_nul_ends_only_current_component() {
+        // NUL in a value: the text after it is dropped.
+        assert!(sqlite_target_is_shared_cache("file:a?cache=shared%00"));
+        assert!(sqlite_target_is_shared_cache("file:a?cache=shared%00x"));
+        assert!(!sqlite_target_is_shared_cache("file:a?cache=shar%00ed"));
+        // NUL in the last value: the last value still wins.
+        assert!(!sqlite_target_is_shared_cache(
+            "file::memory:?cache=shared&cache=private%00"
+        ));
+        assert!(sqlite_target_is_shared_cache(
+            "file:a?cache=private%00&cache=shared"
+        ));
+        assert!(!sqlite_target_is_shared_cache(
+            "file:a?cache=shared%00&cache=private"
+        ));
+        // NUL at the start of a name: the name is empty, so the pair is no
+        // `cache` pair.
+        assert!(sqlite_target_is_shared_cache(
+            "file:a?cache=shared&%00cache=private"
+        ));
+        // NUL inside a name: the name is cut there.
+        assert!(!sqlite_target_is_shared_cache("file:a?ca%00che=shared"));
+        assert!(sqlite_target_is_shared_cache("file:a?cache%00x=shared"));
+        assert!(!sqlite_target_is_shared_cache("file:a?cache=a%00b=shared"));
+        // Text after a NUL cannot start a new pair.
+        assert!(sqlite_target_is_shared_cache(
+            "file:a?cache=shared%00x=y&cache=shared"
+        ));
+        // NUL in the path does not stop the query.
+        assert!(sqlite_target_is_shared_cache("file:a%00?cache=shared"));
     }
 
     #[cfg(feature = "sqlite")]

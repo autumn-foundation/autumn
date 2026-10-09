@@ -9,6 +9,8 @@ autumn-web = { path = "../../autumn" }
 
 [dev-dependencies]
 example-e2e = { path = "../../example-e2e" }
+serde_json = "1"
+tempfile = "3"
 tokio = { workspace = true }
 
 [features]

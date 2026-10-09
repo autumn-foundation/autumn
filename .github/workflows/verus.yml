@@ -11,12 +11,14 @@ on:
   pull_request:
     paths:
       - "verification/**"
+      - "!verification/models/**"
       - "scripts/verify-verus.sh"
       - ".github/workflows/verus.yml"
   push:
     branches: [trunk, trunk-dev]
     paths:
       - "verification/**"
+      - "!verification/models/**"
       - "scripts/verify-verus.sh"
       - ".github/workflows/verus.yml"
   schedule:

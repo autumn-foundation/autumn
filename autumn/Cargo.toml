@@ -493,7 +493,9 @@ image = { workspace = true, optional = true }
 # owner-only permissions from creation, closing the bind→chmod race on
 # user-configured socket paths in shared directories. `time` gives the safe
 # thread CPU clock that `cost` reads for each request poll (issue #1720).
-nix = { version = "0.31.2", features = ["fs", "time"] }
+# `dir` (no extra crate): the data-capsule reader lists a directory through
+# an open handle, so a swapped link cannot redirect it (#1811).
+nix = { version = "0.31.2", features = ["fs", "dir", "time"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 # `getrusage` for the process CPU time that `tests/cost_reconcile.rs` checks
@@ -538,6 +540,8 @@ redis.workspace = true
 proptest = "1.4"
 time = { workspace = true }
 tokio-tungstenite = "0.30.0"
+# HTTP/2 client for the `tls_alpn` suite (#2321); already in the lockfile.
+h2 = "0.4"
 loom = "0.7.2"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
 rustversion = "1"

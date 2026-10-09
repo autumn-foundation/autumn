@@ -62,6 +62,12 @@ use serde::{Deserialize, Serialize};
 /// a v2 reader would skip `effects` entirely, replay a handler whose outbound
 /// call, cache read or minted identifier is nowhere in the document, and
 /// report a verdict on a run that never met the recording's effects.
+///
+/// A new enum value (for example [`HttpErrorKind::FaultInjected`]) does not
+/// bump the version: this build reads every v3 capsule, and a bump would make
+/// each committed corpus unreadable. An older reader rejects a capsule that
+/// holds the new value as malformed. A reader checks the version before the
+/// rest, so from this build on a later bump reports as a version mismatch.
 pub const CAPSULE_FORMAT_VERSION: u32 = 3;
 
 /// Errors surfaced when reading a capsule back from disk.
@@ -183,15 +189,22 @@ impl Capsule {
     /// schema and [`CapsuleError::VersionMismatch`] when the document was
     /// written by an incompatible build.
     pub fn from_json(json: &str) -> Result<Self, CapsuleError> {
-        let capsule: Self = serde_json::from_str(json).map_err(CapsuleError::Malformed)?;
-        if capsule.format_version == CAPSULE_FORMAT_VERSION {
-            Ok(capsule)
-        } else {
-            Err(CapsuleError::VersionMismatch {
-                found: capsule.format_version,
-                expected: CAPSULE_FORMAT_VERSION,
-            })
+        /// The version alone. Read first, so a document from another build
+        /// reports its version, also when it holds a value this build does
+        /// not know (#3071).
+        #[derive(Deserialize)]
+        struct VersionProbe {
+            format_version: u32,
         }
+
+        let probe: VersionProbe = serde_json::from_str(json).map_err(CapsuleError::Malformed)?;
+        if probe.format_version != CAPSULE_FORMAT_VERSION {
+            return Err(CapsuleError::VersionMismatch {
+                found: probe.format_version,
+                expected: CAPSULE_FORMAT_VERSION,
+            });
+        }
+        serde_json::from_str(json).map_err(CapsuleError::Malformed)
     }
 }
 
@@ -532,6 +545,8 @@ pub enum HttpErrorKind {
     RedirectRejected,
     /// A URL could not be parsed or resolved.
     InvalidUrl,
+    /// Staging fault injection failed the call (issue #3071).
+    FaultInjected,
 }
 
 impl Default for HttpEffect {
@@ -1128,6 +1143,22 @@ mod tests {
             message.contains("older") || message.contains("re-record"),
             "the refusal must be actionable: {message}"
         );
+    }
+
+    /// A reader checks the version before the rest, so a capsule from a
+    /// newer build reports a version mismatch, not a malformed document,
+    /// also when it holds a value this build does not know.
+    #[test]
+    fn a_newer_capsule_is_a_version_mismatch_even_with_unknown_values() {
+        let mut json = serde_json::to_value(sample()).expect("capsule serializes");
+        json["format_version"] = serde_json::json!(CAPSULE_FORMAT_VERSION + 1);
+        json["outcome"] = serde_json::json!("a_value_from_the_future");
+        match Capsule::from_json(&json.to_string()) {
+            Err(CapsuleError::VersionMismatch { found, .. }) => {
+                assert_eq!(found, CAPSULE_FORMAT_VERSION + 1);
+            }
+            other => panic!("expected a version mismatch, got {other:?}"),
+        }
     }
 
     #[test]

@@ -44,7 +44,8 @@ Concretely, on SIGTERM:
 2. `prestop_grace_secs` (default 5 s) — time for the load balancer to drain its
    connection pool to this replica.
 3. The TCP listener closes.
-4. In-flight requests complete (up to `shutdown_timeout_secs`, default 30 s).
+4. In-flight requests complete (up to `shutdown_timeout_secs`: default 30 s,
+   35 s in the `prod` profile).
 5. App hooks, telemetry flush, DB pool close, process exits.
 
 A new replica is only promoted to live after `/ready` returns 200 — which
@@ -57,7 +58,7 @@ have passed.
 # autumn.toml
 [server]
 prestop_grace_secs   = 5    # wait for LB to drain before closing listener
-shutdown_timeout_secs = 30  # max time for in-flight requests to complete
+shutdown_timeout_secs = 35  # request timeout (30 s) + 5 s; see timeouts-and-budgets.md
 ```
 
 For Fly.io, `kill_timeout` in `fly.toml` must be at least
@@ -66,7 +67,7 @@ For Fly.io, `kill_timeout` in `fly.toml` must be at least
 ```toml
 # fly.toml
 [deploy]
-  kill_timeout = 45   # 5 + 30 + 10 s buffer
+  kill_timeout = 50   # 5 + 35 + 10 s buffer
 ```
 
 ### Migration safety
@@ -558,14 +559,17 @@ container, another port, another machine) and point `target` at it.
   revalidates. These requests are skipped and counted as `skipped_conditional`.
   The trade is that on a cache-heavy route the revalidating share of traffic
   gets no coverage — the counter shows how much.
-- **A mirror's waiting is bounded.** One deadline, stamped at dispatch, covers
-  both the shadow request and the wait for the mirrored primary response, so a
-  client that stops reading — or a long-lived `text/event-stream` — cannot pin
-  an `max_in_flight` slot indefinitely. Those are counted as `incomplete`.
-  (Comparing the two responses once both are in hand is bounded CPU work on
-  bodies already capped by `max_body_bytes`, but it is not itself covered by
-  that deadline — see
-  [#2333](https://github.com/autumn-foundation/autumn/issues/2333).)
+- **A mirror cannot hold a slot past its deadline.** One deadline, set at
+  dispatch, covers the shadow request, the wait for the primary response, and
+  the comparison (decode, parse, digest, record). `max_in_flight` bounds
+  outstanding mirrors, end to end. A shadow request that is too slow is counted
+  as `timeout`. A primary response that does not finish is counted as
+  `incomplete`. A comparison that does not finish is counted as `abandoned`.
+  It is not a match or a divergence, and it records nothing.
+  The comparison runs on the blocking pool. An abandoned comparison stops after
+  the step it is running, and keeps its blocking thread until then. A second
+  cap, twice `max_in_flight`, limits these threads. Set `timeout_ms` and
+  `max_body_bytes` with this in mind.
 - **Credentials never reach a proxy.** The mirroring client disables proxy
   autodetection, so `HTTP_PROXY`/`HTTPS_PROXY` in the environment cannot divert
   a mirrored request (carrying the end user's cookie) to a third party.
@@ -688,8 +692,8 @@ $ curl -s localhost:3000/actuator/shadow | jq
 }
 ```
 
-`stats` also carries `skipped_refused`, `skipped_conditional`, and
-`primary_incomplete` (see the outcomes below).
+`stats` also carries `skipped_refused`, `skipped_conditional`,
+`primary_incomplete` and `comparisons_abandoned` (see the outcomes below).
 
 `/actuator/shadow` is a **sensitive** endpoint (`[actuator] sensitive = true`),
 like `/actuator/tasks` — the samples are excerpts of real production responses.
@@ -709,7 +713,8 @@ Two labelled metrics carry the same signal into your dashboards:
   response could not be decoded), `timeout`, `skipped` (a body over the capture
   budget), `dropped` (the in-flight ceiling was full), `refused` (the live build
   answered `429`/`503`), `incomplete` (the client never finished reading the
-  primary response), or `primary_error` (the **live** build's own response could
+  primary response), `abandoned` (the comparison did not finish by the deadline),
+  or `primary_error` (the **live** build's own response could
   not be decoded — counted apart, so a malformed response of your own never
   reads as a candidate connectivity problem).
 - `autumn_shadow_divergences_total{version, route, kind}` — the series to alert

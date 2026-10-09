@@ -111,6 +111,7 @@ the framework almost certainly already generates or ships it:
 | Ad-hoc `tokio::spawn` / background threads for deferred work | `#[job]` (+ retries, backends, uniqueness/concurrency caps), `#[scheduled]` for recurring, `#[task]` for operator CLI work |
 | A hand-written `#[scheduled]` fn + batched `DELETE`/`UPDATE` to expire old sessions, drafts, or one-time codes | `#[repository(Model, retention(after = "30d", basis = created_at))]` (0.7.0, issue #1342) — batched, soft-delete-aware, fleet-coordinated sweep with zero SQL; `autumn retention --dry-run` to validate first. See `docs/guide/retention-sweeps.md` |
 | A cron job (or nothing at all) trimming `autumn_jobs`, `autumn_job_tracking`, `autumn_experiment_assignments`, or a JSONL audit archive | `[retention]` in `autumn.toml` (0.8.0, issue #1605) — one window per framework-owned dataset, enforced by a fleet-coordinated in-process sweep; `autumn db retention --dry-run` reports the effective policy and eligible rows. See `docs/guide/data-retention.md` |
+| A hand-written GDPR export job that zips CSV/JSON a user cannot open, verify, or import again | `GdprRegistry::capsule(CapsuleModel::new(table, subject_column).belongs_to(..))` + `autumn data capsule export --subject <id> --out <dir>` (issue #1811) — one signed directory with records, a `manifest.json`, blobs, and an offline HTML viewer; `autumn data capsule import` verifies every file, then imports with no loss of data. Use `.exclude(column)` for secrets. See `docs/guide/data-capsules.md` |
 | Hand-written memoization or cache-aside code | `#[cached]` on functions; `cache::get_or_compute` / `get_or_compute_with` for stampede-safe read-through fills (0.6.0); `.stale_if_error(window)` serves the last value when a fill fails |
 | Calling `cache.invalidate(key)` by hand after a repository write | `#[repository(Model, invalidates(cached_fn))]`: each generated write drops the read after it commits (#3056). Async code uses `Cache::invalidate_async`, which returns the error |
 | Hand-written transaction retry loops for serialization failures | `Db::tx(...)`; `Db::tx_with(TxOptions::serializable(), ...)` auto-retries 40001 (0.6.0) |
@@ -2763,6 +2764,31 @@ declares. Every contract failure — missing file, malformed document, a contrac
 measured on a different host class — falls back to *unlimited*, never to a
 ceiling. See `docs/guide/capacity-contracts.md`.
 
+## Resilience: deadlines and retry budgets (#3058)
+
+The request timeout sets a deadline for the handler task. Read it with
+`autumn_web::deadline::Deadline::current()`. The outbound `Client` uses it:
+each attempt gets `min(timeout_secs, time left)`, and no retry or
+`Retry-After` wait starts that the time left cannot hold. When the deadline
+stops a call, the client returns `ClientError::DeadlineExceeded` (`504`).
+`tokio::spawn` drops the deadline; carry it with `Deadline::scope`. Stop other
+calls with `deadline::bounded(fut)`.
+
+```toml
+[http.client.retry_budget]   # per-host token bucket, on by default
+capacity = 500
+transient_cost = 14          # 5xx, connect error, timeout
+throttling_cost = 5          # 429
+retry_ratio = 0.1            # retry share when the bucket is empty
+
+[server.timeouts]
+accept_deadline_header = false   # true: x-autumn-deadline-ms can shorten the deadline
+```
+
+A timeout `503` has `Retry-After: 1..=3`. The `prod` drain window is 35 s
+(request timeout + 5 s). `autumn_web::extract::ShutdownToken` is cancelled at
+shutdown. See `docs/guide/timeouts-and-budgets.md`.
+
 ## Connection limits, WebSocket limits, replica lag (issue #3065)
 
 Bound slow, idle and excess connections. Every key is optional; the `prod`
@@ -2823,6 +2849,38 @@ slow_call_rate_threshold = 0.5
 
 See `docs/guide/resilience.md`.
 
+## Resilience: staging fault injection (issue #3071)
+
+Add latency or errors in staging with `[fault_injection]`. Do not use it in
+production.
+
+```toml
+[fault_injection]
+enabled = true                 # or AUTUMN_FAULT_INJECTION__ENABLED=true
+
+[[fault_injection.faults]]
+routes = ["/api/*"]            # empty = all paths; probes and actuator exempt
+target = "route"               # route | database | redis | http
+kind = "error"                 # error | latency (needs latency_ms)
+rate = 0.05
+status = 503
+
+[fault_injection.stop]         # disarm on a fast error-budget burn
+objective = 99.0
+max_burn_rate = 14.4
+```
+
+- Refused in `prod` (and with no profile) unless
+  `allow_in_production = true`. Put that key only under
+  `[profile.prod.fault_injection]`.
+- The stop condition latches. Re-arm with
+  `state.extension::<autumn_web::fault_injection::FaultInjection>()` and
+  `.arm(actor)`. Each arm and disarm writes an audit event.
+- An `AutumnConfig` struct literal needs `..AutumnConfig::default()`.
+- For deterministic tests, use `FaultPlan`, not this section.
+
+See `docs/guide/fault-injection.md`.
+
 ## Sharding (0.6.0)
 
 Framework-native horizontal sharding: declare `[[database.shards]]` (each a
@@ -2836,6 +2894,27 @@ bounded `each_shard` fan-out); install custom routing with
 `--control-only`; a boot-time shard-map guard fails fast on config drift.
 There are no cross-shard queries or transactions by design. See
 `docs/guide/sharding.md` and `examples/bookmarks-sharded`.
+
+## Cell and shuffle-shard isolation (issue #3072)
+
+Limit the effect of one noisy tenant. All settings are off by default. See
+`docs/guide/cell-isolation.md` and `docs/adr/0018-shard-local-framework-state.md`.
+
+- `[tenancy] max_concurrent_requests`: the in-flight requests of one tenant.
+  Over the cap: `503` + `Retry-After: 1`. Runs before the admission limit.
+- `[tenancy] max_db_connections`: the `Db`/shard checkouts of one tenant.
+  Over the cap: `503`. Set it to at least the connections one handler holds.
+- `[jobs.tenants]` (`local` backend only): `max_concurrent` (per-tenant job
+  slots), `lanes` and `lanes_per_tenant` (shuffle-sharded worker lanes; at
+  most `jobs.workers` lanes). Each queue serves tenants round-robin.
+  `autumn_web::bulkhead::shuffle_shard(key, lanes, size)` gives the lanes.
+- `[jobs.postgres] shard_local = true`: an `autumn_jobs` table, workers and
+  slots on each shard. `enqueue_in_tx` on a shard connection commits or rolls
+  back with the shard's data. Needs `jobs.backend = "postgres"` and shards.
+- `autumn_web::cell_router::CellRouter` (with `CellSpec::new`) maps a tenant
+  to a cell with the shard slot hash: `for_tenant`, `for_key`, `for_slot`,
+  `url_for`.
+- Metric: `autumn_tenant_bulkhead_rejections_total{kind="request"|"db"}`.
 
 ## Per-tenant memory cells (0.6.0, issue #1766)
 
@@ -3019,7 +3098,7 @@ enabled          = true
 target           = "http://127.0.0.1:9091"  # the candidate build (you run it)
 sample_rate      = 0.05    # of ELIGIBLE traffic. Default 1.0 — start low.
 routes           = ["/api/*"]  # empty (default) = every eligible route
-timeout_ms       = 2000    # bounds the shadow request AND the primary wait
+timeout_ms       = 2000    # one deadline per mirror: request, primary wait, comparison
 max_in_flight    = 8       # excess mirrors are dropped, never queued
 max_body_bytes   = 262144  # larger responses are not compared, either side
 max_records      = 50      # divergences kept for the actuator
@@ -3056,7 +3135,7 @@ Plus two built-in metric families on `/actuator/prometheus`:
 ```
 autumn_shadow_comparisons_total{version,route,outcome}  # match|diverged|error|
                                                         # timeout|skipped|dropped|
-                                                        # refused|incomplete
+                                                        # refused|incomplete|abandoned
 autumn_shadow_divergences_total{version,route,kind}     # the series to alert on
 ```
 

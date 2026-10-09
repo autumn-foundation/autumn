@@ -1742,6 +1742,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_handler_returning_a_deadline_stop_skips_partial_session_save() {
+        let state = test_state();
+        let store = MemoryStore::new();
+        store
+            .save("existing-id", HashMap::new())
+            .await
+            .expect("seed save");
+
+        // The handler changes the session, then returns the error of a call
+        // the request deadline stopped (issue #3058).
+        let app = Router::new()
+            .route(
+                "/",
+                get(|session: Session| async move {
+                    session.insert("user", "alice").await;
+                    Err::<&str, crate::AutumnError>(crate::deadline::DeadlineExceeded.into())
+                }),
+            )
+            .layer(SessionLayer::new(store.clone(), SessionConfig::default()))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/")
+                    .header(COOKIE, "autumn.sid=existing-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let saved = store
+            .load("existing-id")
+            .await
+            .expect("load")
+            .expect("session still present");
+        assert!(!saved.contains_key("user"), "no partial session save");
+        assert!(response.headers().get(SET_COOKIE).is_none());
+    }
+
     // ── Signed session cookies (RED phase) ─────────────────────────────────
 
     #[tokio::test]

@@ -261,7 +261,10 @@ impl<S> MaintenanceService<S> {
         // 4. Read-only mode: safe methods pass through.
         if config.readonly {
             let method = req.method();
-            if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+            // The HTTP/2 `WebSocket` upgrade passes, like the `GET` upgrade.
+            if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+                || crate::security::is_websocket_connect(req)
+            {
                 return None;
             }
         }

@@ -168,8 +168,11 @@ GATED_MODULES=(
   autumn/src/experiments.rs:default
   autumn/src/fake.rs:default
   autumn/src/feature_flags.rs:default
-  autumn/src/gdpr.rs:default
+  autumn/src/gdpr/mod.rs:default
+  autumn/src/gdpr/portability/mod.rs:default
   autumn/src/http_client.rs:default
+  # Request deadlines (#3058): tokio time only.
+  autumn/src/deadline.rs:default
   autumn/src/idempotency.rs:default
   autumn/src/inspector.rs:default
   autumn/src/job_tracking.rs:default

@@ -3543,6 +3543,8 @@ impl AppBuilder {
     /// developer error.
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::cognitive_complexity)]
+    // Large frame is expected: the caller boxes this long-lived future.
+    #[allow(clippy::large_stack_frames)]
     pub async fn run(self) {
         // Remember the binary this process was started from, before a deploy
         // can replace the file underneath it: an in-place upgrade (#1674) execs
@@ -3693,6 +3695,16 @@ impl AppBuilder {
         // registrations, and audit sinks — the inputs the scheduled sweep uses.
         if let Some(mode) = framework_retention_mode_from_env() {
             self.run_framework_retention_mode(mode).await;
+            return;
+        }
+
+        // ── Data-capsule mode ───────────────────────────────────────────
+        // With AUTUMN_DATA_CAPSULE=export|import|verify, export one subject
+        // to a signed capsule, import a capsule, or verify one, and exit.
+        // Triggered by `autumn data capsule` (issue #1811). It runs inside the
+        // app, so it uses the app's own registry, database, and secret.
+        if let Some(mode) = data_capsule_mode_from_env() {
+            self.run_data_capsule_mode(mode).await;
             return;
         }
 
@@ -5126,6 +5138,13 @@ impl AppBuilder {
         };
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
+        if let Some(warning) = config.server.drain_window_warning() {
+            tracing::warn!(
+                shutdown_timeout_secs = shutdown_timeout,
+                request_timeout_ms = config.server.timeouts.request_timeout_ms,
+                "{warning}"
+            );
+        }
         let prestop_grace = config.server.prestop_grace_secs;
 
         if let Err(error) = initialize_job_runtime(
@@ -5790,8 +5809,7 @@ impl AppBuilder {
 
         let shutdown_state = state.clone();
         let shutdown_signal_token = server_shutdown.clone();
-        #[cfg(feature = "ws")]
-        let websocket_shutdown = state.shutdown.clone();
+        let handler_shutdown = state.probes.shutdown_signal().clone();
         // Clone metrics so the drain-watchdog can record aborted requests.
         let shutdown_metrics = state.metrics.clone();
 
@@ -5869,9 +5887,9 @@ impl AppBuilder {
             }
             tracing::info!(phase = "listener_stopping", "shutdown: stopping listener");
 
-            // Phase 4: send WebSocket close frames.
-            #[cfg(feature = "ws")]
-            websocket_shutdown.cancel();
+            // Phase 4: send WebSocket close frames and cancel the
+            // `ShutdownToken` of running handlers.
+            handler_shutdown.cancel();
 
             // Phase 5: stop listener and signal jobs/scheduler to stop dequeuing.
             // Record drain-start before cancelling so main gets the right hook
@@ -7656,6 +7674,151 @@ impl AppBuilder {
         }
     }
 
+    /// Run `AUTUMN_DATA_CAPSULE=export|import|verify` and exit (issue #1811).
+    ///
+    /// All modes boot the app's state initializers, which install the
+    /// [`crate::gdpr::GdprRegistry`] and any `CapsuleService`. Export and
+    /// import also use the database and the blob store. Verify uses only the
+    /// signer: it runs no migration, and its built-in pools never connect. It
+    /// still builds the pools as the other modes do, with the app's own pool
+    /// provider, so an initializer can install its `CapsuleService`.
+    #[allow(clippy::too_many_lines)]
+    async fn run_data_capsule_mode(self, mode: DataCapsuleMode) {
+        let Self {
+            state_initializers,
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+            #[cfg(feature = "db")]
+            migrations,
+            #[cfg(feature = "db")]
+            pool_provider_factory,
+            #[cfg(feature = "db")]
+            shard_provider_factory,
+            #[cfg(feature = "db")]
+            shard_router,
+            #[cfg(feature = "db")]
+            directory_shard_router,
+            #[cfg(feature = "ws")]
+            channels_backend,
+            #[cfg(feature = "storage")]
+            blob_store,
+            ..
+        } = self;
+
+        let Some(path) = std::env::var_os(DATA_CAPSULE_PATH_ENV)
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from)
+        else {
+            eprintln!("autumn data capsule: {DATA_CAPSULE_PATH_ENV} is not set");
+            std::process::exit(1);
+        };
+        let subject = std::env::var(DATA_CAPSULE_SUBJECT_ENV).unwrap_or_default();
+        if mode == DataCapsuleMode::Export && subject.is_empty() {
+            eprintln!("autumn data capsule export: {DATA_CAPSULE_SUBJECT_ENV} is not set");
+            std::process::exit(1);
+        }
+
+        let (config, _telemetry_guard) = load_config_and_telemetry(
+            config_loader_factory,
+            telemetry_provider,
+            plugin_config_roots,
+        )
+        .await;
+        // A capsule holds personal data: use the same secret rules as a server.
+        fail_fast_on_invalid_signing_secret(&config);
+
+        // Verify runs no migration. It keeps the pools and the blob store, so
+        // an initializer that builds a service from them still works.
+        #[cfg(feature = "db")]
+        let verify = mode == DataCapsuleMode::Verify;
+
+        #[cfg(feature = "storage")]
+        let storage_bootstrap = blob_store.map_or_else(
+            || preflight_storage(&config),
+            |store| {
+                Some(StorageBootstrap {
+                    store,
+                    serving: None,
+                })
+            },
+        );
+
+        #[cfg(feature = "db")]
+        let (topology, shards) = if verify {
+            verify_database_parts(
+                &config,
+                pool_provider_factory,
+                shard_provider_factory,
+                shard_router,
+                directory_shard_router,
+            )
+            .await
+        } else {
+            match setup_database(
+                &config,
+                migrations,
+                pool_provider_factory,
+                shard_provider_factory,
+                shard_router,
+                directory_shard_router,
+                RepositoryCommitHookQueueMigrationMode::Runtime,
+            )
+            .await
+            {
+                Ok(database) => (database.topology, database.shards),
+                Err(error) => {
+                    eprintln!("{error}");
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
+            }
+        };
+
+        let state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            topology.as_ref(),
+            #[cfg(feature = "db")]
+            shards,
+            #[cfg(feature = "ws")]
+            channels_backend,
+        );
+        #[cfg(feature = "storage")]
+        if let Some(bootstrap) = storage_bootstrap {
+            let _ = bootstrap.install(&state);
+        }
+        run_state_initializers(state_initializers, &state);
+
+        let result = match mode {
+            // Verify needs only the signer. An installed `CapsuleService` can
+            // bring its own, so it runs after the state initializers too.
+            DataCapsuleMode::Verify => {
+                crate::gdpr::portability::CapsuleService::signer_for_state(&state)
+                    .and_then(|signer| crate::gdpr::portability::verify_dir(&path, &signer))
+                    .map(|report| serde_json::json!(report))
+            }
+            DataCapsuleMode::Export | DataCapsuleMode::Import => {
+                match crate::gdpr::portability::CapsuleService::from_state(&state) {
+                    Ok(service) if mode == DataCapsuleMode::Export => service
+                        .export_to(&subject, &path)
+                        .await
+                        .map(|report| serde_json::json!(report)),
+                    Ok(service) => service
+                        .import_from(&path)
+                        .await
+                        .map(|summary| serde_json::json!(summary)),
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        // `process::exit` skips `on_shutdown`: stop a managed postmaster first.
+        #[cfg(feature = "managed-pg")]
+        crate::managed_pg::emergency_stop_async().await;
+        emit_data_capsule_report(mode, &result);
+    }
+
     /// The `AUTUMN_RETENTION_DRY_RUN=1` one-shot on a build compiled WITHOUT
     /// database support: there is nothing to sweep, so report and exit 0
     /// (never starting the server).
@@ -8731,6 +8894,232 @@ pub(crate) fn framework_retention_mode_from_env() -> Option<FrameworkRetentionMo
     }
 }
 
+/// The `autumn data capsule` one-shot mode (issue #1811).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DataCapsuleMode {
+    /// Write a capsule for one subject.
+    Export,
+    /// Verify, then import a capsule.
+    Import,
+    /// Verify a capsule only.
+    Verify,
+}
+
+impl DataCapsuleMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Export => "export",
+            Self::Import => "import",
+            Self::Verify => "verify",
+        }
+    }
+}
+
+/// The env var `autumn data capsule` sets to select the one-shot mode.
+pub(crate) const DATA_CAPSULE_ENV: &str = "AUTUMN_DATA_CAPSULE";
+/// The subject id of `autumn data capsule export`.
+pub(crate) const DATA_CAPSULE_SUBJECT_ENV: &str = "AUTUMN_DATA_CAPSULE_SUBJECT";
+/// The capsule directory of `autumn data capsule`.
+pub(crate) const DATA_CAPSULE_PATH_ENV: &str = "AUTUMN_DATA_CAPSULE_PATH";
+/// Line prefix of the JSON report, matched by `autumn-cli/src/data_capsule.rs`.
+pub(crate) const DATA_CAPSULE_JSON_PREFIX: &str = "AUTUMN_DATA_CAPSULE_REPORT=";
+
+/// The `autumn data capsule` mode requested by `AUTUMN_DATA_CAPSULE`, if any.
+///
+/// An unknown value gives a warning and a normal boot, the same as
+/// `AUTUMN_DB_RETENTION`: a stray value must not stop a server.
+pub(crate) fn data_capsule_mode_from_env() -> Option<DataCapsuleMode> {
+    parse_data_capsule_mode(&std::env::var(DATA_CAPSULE_ENV).ok()?)
+}
+
+fn parse_data_capsule_mode(raw: &str) -> Option<DataCapsuleMode> {
+    match raw.trim() {
+        "" => None,
+        "export" => Some(DataCapsuleMode::Export),
+        "import" => Some(DataCapsuleMode::Import),
+        "verify" => Some(DataCapsuleMode::Verify),
+        other => {
+            eprintln!(
+                "Warning: {DATA_CAPSULE_ENV}={other:?} is not valid (expected \"export\", \
+                 \"import\" or \"verify\"), ignoring"
+            );
+            None
+        }
+    }
+}
+
+/// The JSON report line of `autumn data capsule`.
+fn data_capsule_report_line(
+    mode: DataCapsuleMode,
+    result: &Result<serde_json::Value, crate::gdpr::portability::DataCapsuleError>,
+) -> String {
+    let body = match result {
+        Ok(report) => serde_json::json!({"ok": true, "mode": mode.as_str(), "report": report}),
+        Err(error) => {
+            serde_json::json!({"ok": false, "mode": mode.as_str(), "error": error.to_string()})
+        }
+    };
+    format!("{DATA_CAPSULE_JSON_PREFIX}{body}")
+}
+
+/// Print the report line and exit: `0` on success, else `1`.
+fn emit_data_capsule_report(
+    mode: DataCapsuleMode,
+    result: &Result<serde_json::Value, crate::gdpr::portability::DataCapsuleError>,
+) -> ! {
+    println!("{}", data_capsule_report_line(mode, result));
+    if let Err(error) = result {
+        eprintln!("autumn data capsule {}: {error}", mode.as_str());
+    }
+    std::process::exit(i32::from(result.is_err()));
+}
+
+/// The database state that verify gives to the state initializers.
+///
+/// Verify runs no migration. It builds the pools as export and import do,
+/// with the app's `with_pool_provider` and `with_shard_provider` when it has
+/// them, so an initializer sees the same `pool()` and `shards()`, for example
+/// to build its own `CapsuleService`. The built-in pools are lazy: they
+/// connect, and a `SQLite` pool creates its file, only at the first checkout,
+/// which verify never makes. A provider that fails gives no state: verify then
+/// falls back to the signer of the configuration.
+#[cfg(feature = "db")]
+async fn verify_database_parts(
+    config: &AutumnConfig,
+    pool_provider: Option<PoolProviderFactory>,
+    shard_provider: Option<ShardProviderFactory>,
+    shard_router: Option<Arc<dyn crate::sharding::ShardRouter>>,
+    directory_shard_router: bool,
+) -> (
+    Option<crate::db::DatabaseTopology>,
+    Option<crate::sharding::ShardSet>,
+) {
+    let topology = match pool_provider {
+        Some(factory) => factory(config.database.clone()).await,
+        None => crate::db::create_topology(&config.database),
+    }
+    .ok()
+    .flatten();
+    let use_directory_router = shard_router.is_none()
+        && (directory_shard_router || config.database.directory_shard_router);
+    // No invalidation listener: verify opens no connection of its own.
+    let shards = resolve_shard_set(
+        config,
+        shard_router,
+        shard_provider,
+        use_directory_router,
+        false,
+        topology.as_ref(),
+    )
+    .await
+    .ok()
+    .flatten();
+    (topology, shards)
+}
+
+#[cfg(test)]
+mod data_capsule_mode_tests {
+    use super::*;
+
+    #[cfg(all(feature = "db", not(feature = "sqlite")))]
+    #[tokio::test]
+    async fn verify_gives_initializers_lazy_pools_and_shards() {
+        // A state initializer can build a routed store from `shards()`, so
+        // verify keeps the shape of the state. The pools must not connect:
+        // nothing listens on port 9.
+        let mut config = AutumnConfig::default();
+        config.database.url = Some("postgres://u:p@127.0.0.1:9/none".to_owned());
+        config.database.shards = vec![crate::config::ShardConfig {
+            name: "s1".to_owned(),
+            primary_url: crate::test_urls::primary("s1"),
+            slots: None,
+            replica_url: None,
+            primary_pool_size: None,
+            replica_pool_size: None,
+            replica_fallback: None,
+        }];
+        let (topology, shards) = verify_database_parts(&config, None, None, None, false).await;
+        assert!(topology.is_some(), "a lazy control pool");
+        assert_eq!(shards.map(|s| s.len()), Some(1), "the configured shard");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn verify_gives_sqlite_initializers_a_lazy_pool_without_a_file() {
+        // An initializer can build its `CapsuleService` from `pool()`. The
+        // pool must not open the database: SQLite would create the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.db");
+        let mut config = AutumnConfig::default();
+        config.database.url = Some(format!("sqlite://{}", path.display()));
+        let (topology, _) = verify_database_parts(&config, None, None, None, false).await;
+        assert!(topology.is_some(), "a lazy pool");
+        assert!(!path.exists(), "verify creates no database file");
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn verify_uses_the_pool_provider_of_the_app() {
+        // The app has no database URL: only its `with_pool_provider` knows
+        // the pool, as on export and import. Verify must ask it too.
+        let dir = tempfile::tempdir().unwrap();
+        let url = if cfg!(feature = "sqlite") {
+            format!("sqlite://{}", dir.path().join("app.db").display())
+        } else {
+            "postgres://u:p@127.0.0.1:9/none".to_owned()
+        };
+        let provider: PoolProviderFactory = Box::new(move |mut database| {
+            Box::pin(async move {
+                database.url = Some(url);
+                crate::db::create_topology(&database)
+            })
+        });
+        let config = AutumnConfig::default();
+        let (topology, _) = verify_database_parts(&config, Some(provider), None, None, false).await;
+        assert!(topology.is_some(), "the topology of the provider");
+    }
+
+    #[test]
+    fn mode_parses_the_three_values_and_ignores_others() {
+        assert_eq!(
+            parse_data_capsule_mode("export"),
+            Some(DataCapsuleMode::Export)
+        );
+        assert_eq!(
+            parse_data_capsule_mode(" import "),
+            Some(DataCapsuleMode::Import)
+        );
+        assert_eq!(
+            parse_data_capsule_mode("verify"),
+            Some(DataCapsuleMode::Verify)
+        );
+        assert_eq!(parse_data_capsule_mode(""), None);
+        assert_eq!(parse_data_capsule_mode("purge"), None);
+    }
+
+    #[test]
+    fn report_line_carries_the_prefix_and_the_outcome() {
+        let ok = data_capsule_report_line(
+            DataCapsuleMode::Export,
+            &Ok(serde_json::json!({"records": 3})),
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(ok.strip_prefix(DATA_CAPSULE_JSON_PREFIX).unwrap()).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["mode"], "export");
+        assert_eq!(json["report"]["records"], 3);
+
+        let err = data_capsule_report_line(
+            DataCapsuleMode::Verify,
+            &Err(crate::gdpr::portability::DataCapsuleError::MissingSigningSecret),
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(err.strip_prefix(DATA_CAPSULE_JSON_PREFIX).unwrap()).unwrap();
+        assert_eq!(json["ok"], false);
+        assert!(json["error"].as_str().unwrap().contains("signing secret"));
+    }
+}
+
 /// The env var `autumn db retention` sets to select the one-shot mode.
 pub(crate) const FRAMEWORK_RETENTION_ENV: &str = "AUTUMN_DB_RETENTION";
 
@@ -9469,6 +9858,24 @@ struct CronTick {
     window: std::time::Duration,
 }
 
+impl CronTick {
+    /// `true` when `now_unix_secs` is at or after the next occurrence. A zero
+    /// window (no next occurrence) is never past.
+    const fn is_past_window(self, now_unix_secs: u64) -> bool {
+        !self.window.is_zero()
+            && now_unix_secs >= self.unix_secs.saturating_add(self.window.as_secs())
+    }
+
+    /// `true`, with a debug log, when the state clock is past the window.
+    fn is_late(self, state: &AppState, name: &str, tick_key: &str) -> bool {
+        let late = self.is_past_window(crate::time::clock_unix_secs(state.clock()));
+        if late {
+            tracing::debug!(task = %name, tick = %tick_key, "Cron task tick is past its window");
+        }
+        late
+    }
+}
+
 /// Handle the execution of a single cron task.
 #[allow(clippy::cognitive_complexity)]
 #[allow(
@@ -9492,6 +9899,13 @@ async fn execute_cron_task(
     let tick_key = scheduled_key;
     let lease = loop {
         if wait_first && !gate.wait(&state, &name).await {
+            gate.release();
+            return;
+        }
+        // A cost wait can outlast the tick row (#3071). Another replica can
+        // have run this occurrence, and the prune can have deleted its row.
+        // Do not claim the occurrence after its window.
+        if gate.waited() && occurrence.is_late(&state, &name, &tick_key) {
             gate.release();
             return;
         }
@@ -9519,6 +9933,14 @@ async fn execute_cron_task(
         }
         break lease;
     };
+    // The claim can wait too (a pool checkout, a slow query). Check the window
+    // again: a claim after the window can have found a pruned row of a tick
+    // that ran (#3071). Keep the row, so no replica runs the tick again.
+    if occurrence.is_late(&state, &name, &tick_key) {
+        gate.release();
+        release_task_lease(lease, &name, &tick_key).await;
+        return;
+    }
     state
         .task_registry
         .record_leader(&name, lease.leader_id(), &tick_key);
@@ -14362,16 +14784,18 @@ fn build_state(
     #[cfg(feature = "db")] shards: Option<crate::sharding::ShardSet>,
     #[cfg(feature = "ws")] channels_backend: Option<Arc<dyn crate::channels::ChannelsBackend>>,
 ) -> AppState {
-    #[cfg(feature = "ws")]
-    let shutdown = tokio_util::sync::CancellationToken::new();
+    let probes = crate::probe::ProbeState::pending_startup();
     #[cfg(feature = "ws")]
     let channels = channels_backend.map_or_else(
         || {
-            crate::channels::Channels::from_config(&config.channels, shutdown.child_token())
-                .unwrap_or_else(|error| {
-                    tracing::error!(error = %error, "Failed to configure channels backend");
-                    std::process::exit(1);
-                })
+            crate::channels::Channels::from_config(
+                &config.channels,
+                probes.shutdown_signal().child_token(),
+            )
+            .unwrap_or_else(|error| {
+                tracing::error!(error = %error, "Failed to configure channels backend");
+                std::process::exit(1);
+            })
         },
         crate::channels::Channels::with_shared_backend,
     );
@@ -14397,7 +14821,7 @@ fn build_state(
         role: config.role,
         started_at: crate::time::monotonic_now(),
         health_detailed: config.health.detailed,
-        probes: crate::probe::ProbeState::pending_startup(),
+        probes,
         metrics: crate::middleware::MetricsCollector::new(),
         log_levels: crate::actuator::LogLevels::new(&config.log.level),
         task_registry: crate::actuator::TaskRegistry::new(),
@@ -14411,8 +14835,6 @@ fn build_state(
         presence,
         #[cfg(feature = "ws")]
         channels,
-        #[cfg(feature = "ws")]
-        shutdown,
         policy_registry: crate::authorization::PolicyRegistry::default(),
         forbidden_response: config.security.forbidden_response,
         auth_session_key: Arc::from(config.auth.session_key.as_str()),
@@ -20340,7 +20762,7 @@ mod tests {
         for (backend, acquired_while_high) in [("sqlite", 0), ("postgres", 0), ("in_process", 1)] {
             let name = format!("cost_lease_order_{backend}");
             crate::cost::mark_deferrable(crate::cost::WorkKind::Task, &name);
-            let state = AppState::for_test();
+            let state = cron_test_state();
             let signal = crate::cost::CostSignal::new(Some(1.0));
             signal.set(5.0);
             state.insert_extension(signal.clone());
@@ -20435,7 +20857,7 @@ mod tests {
         static SEEN_RETRY_TICK: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
         let name = "cost_sqlite_rising_signal".to_owned();
         crate::cost::mark_deferrable(crate::cost::WorkKind::Task, &name);
-        let state = AppState::for_test();
+        let state = cron_test_state();
         let signal = crate::cost::CostSignal::new(Some(1.0));
         state.insert_extension(signal.clone());
         let acquired = std::sync::Arc::new(AtomicUsize::new(0));
@@ -20517,7 +20939,7 @@ mod tests {
     /// every later tick would fold into a wait that never happens (#1720).
     #[tokio::test]
     async fn execute_cron_task_clears_the_cost_flag_when_the_lease_is_taken() {
-        let state = AppState::for_test();
+        let state = cron_test_state();
         let waiting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
 
@@ -20744,7 +21166,7 @@ mod tests {
     // Issue #3052: the handler reads its tick and fencing token.
     #[tokio::test]
     async fn scheduled_handler_sees_its_tick_and_fencing_token() {
-        let state = AppState::for_test();
+        let state = cron_test_state();
         state.task_registry.register_scheduled(
             "cron_fence_task",
             "cron 0 * * * * *",
@@ -20829,6 +21251,76 @@ mod tests {
             tick_keys.lock().unwrap().as_slice(),
             ["cron_review_task:1700000000"]
         );
+    }
+
+    /// A test state whose clock is one second into the cron occurrence at
+    /// `1_700_000_000`, so the window check lets the occurrence run.
+    fn cron_test_state() -> AppState {
+        AppState::for_test().with_clock(std::sync::Arc::new(crate::time::FixedClock::at(
+            chrono::DateTime::from_timestamp(1_700_000_001, 0).expect("a valid timestamp"),
+        )))
+    }
+
+    /// #3071: a cost wait, or a slow claim, can outlast the tick row.
+    /// Another replica can have run the occurrence, and the prune can have
+    /// deleted its row. An occurrence past its window does not run.
+    #[tokio::test]
+    async fn execute_cron_task_skips_an_occurrence_past_its_window() {
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+
+        async fn claims(scheduled_unix_secs: u64, waited: bool) -> Vec<String> {
+            let state = AppState::for_test();
+            state.task_registry.register_scheduled(
+                "late_cron_task",
+                "cron */10 * * * * *",
+                crate::task::TaskCoordination::Fleet,
+                "postgres",
+                "replica-a",
+            );
+            let tick_keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let coordinator = std::sync::Arc::new(GrantingSchedulerCoordinator {
+                backend: "postgres",
+                tick_keys: std::sync::Arc::clone(&tick_keys),
+                release_count: None,
+            });
+            let handler: crate::task::TaskHandler = |_| {
+                RUNS.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            };
+            super::execute_cron_task(
+                "late_cron_task".to_owned(),
+                state.clone(),
+                handler,
+                crate::task::TaskCoordination::Fleet,
+                coordinator,
+                std::time::Duration::from_secs(30),
+                super::CronTick {
+                    unix_secs: scheduled_unix_secs,
+                    window: std::time::Duration::from_secs(10),
+                },
+                super::CostGate {
+                    shutdown: tokio_util::sync::CancellationToken::new(),
+                    waiting: None,
+                    waited: std::sync::atomic::AtomicBool::new(waited),
+                },
+            )
+            .await;
+            tick_keys.lock().unwrap().clone()
+        }
+
+        let now = crate::time::clock_unix_secs(AppState::for_test().clock());
+        // After a cost wait: not claimed.
+        assert!(claims(1_700_000_000, true).await.is_empty());
+        // A slow claim: claimed, but not run.
+        assert_eq!(claims(1_700_000_000, false).await.len(), 1);
+        assert_eq!(
+            RUNS.load(Ordering::SeqCst),
+            0,
+            "a late occurrence does not run"
+        );
+        // In the window: claimed and run.
+        assert_eq!(claims(now, true).await, [format!("late_cron_task:{now}")]);
+        assert_eq!(RUNS.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -20939,7 +21431,7 @@ mod tests {
 
         super::execute_cron_task(
             "daily_task".to_owned(),
-            AppState::for_test(),
+            cron_test_state(),
             handler,
             crate::task::TaskCoordination::Fleet,
             std::sync::Arc::clone(&coordinator) as _,

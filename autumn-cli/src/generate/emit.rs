@@ -591,6 +591,19 @@ pub struct Plan {
     /// [`Plan::revert`] (`autumn destroy`, issue #1048) can remove exactly
     /// what this plan would have inserted into a shared file.
     pub reverts: Vec<Revert>,
+    /// `autumn-web` features this run no longer needs (issue #2328).
+    /// [`Plan::settle_released_features`] resolves this list.
+    released_features: Vec<ReleasedFeature>,
+}
+
+/// An `autumn-web` feature a regenerate run no longer needs.
+#[derive(Debug)]
+struct ReleasedFeature {
+    path: PathBuf,
+    feature: String,
+    /// For a feature with no source marker: a directory, and the file this
+    /// run rewrites in it. Other files in the directory keep the feature.
+    owner: Option<(PathBuf, PathBuf)>,
 }
 
 impl Plan {
@@ -604,6 +617,7 @@ impl Plan {
             actions: Vec::new(),
             warnings: Vec::new(),
             reverts: Vec::new(),
+            released_features: Vec::new(),
         }
     }
 
@@ -618,6 +632,99 @@ impl Plan {
     /// (issue #1048) — irrelevant to a normal `generate` run.
     pub fn push_revert(&mut self, revert: Revert) {
         self.reverts.push(revert);
+    }
+
+    /// Record that this run no longer needs `feature` in `path`
+    /// (`Cargo.toml`). This is the regenerate pair of
+    /// [`Revert::CargoAutumnWebFeature`].
+    ///
+    /// [`Plan::settle_released_features`] removes it if no other code uses it.
+    /// `owner` (directory, own file) applies only to a feature with no
+    /// source marker (see [`release_markers`]).
+    pub(super) fn release_feature(
+        &mut self,
+        path: PathBuf,
+        feature: &str,
+        owner: Option<(PathBuf, PathBuf)>,
+    ) {
+        self.released_features.push(ReleasedFeature {
+            path,
+            feature: feature.to_owned(),
+            owner,
+        });
+    }
+
+    /// Remove each released feature that no other code needs.
+    ///
+    /// Call once, after the last action is queued. Read the pending file
+    /// contents, not the files on disk. Then the code that this run
+    /// replaces cannot keep its own feature.
+    pub(super) fn settle_released_features(&mut self) {
+        use super::schema_edit::remove_autumn_web_feature;
+        let released = std::mem::take(&mut self.released_features);
+        if released.is_empty() {
+            return;
+        }
+        let pending = pending_contents(self);
+        for r in released {
+            let base = self
+                .actions
+                .iter()
+                .rev()
+                .find_map(|a| match a {
+                    Action::Modify { path, contents } if path == &r.path => Some(contents.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| fs::read_to_string(&r.path).unwrap_or_default());
+            // Marked code or a file next to this one: either keeps the feature.
+            // With neither a marker nor an owner, keep it.
+            let markers = release_markers(&r.feature);
+            let by_marker = markers
+                .as_deref()
+                .is_some_and(|m| markers_in_project(m, &self.project_root, &[], &pending));
+            let by_sibling = r.owner.as_ref().is_some_and(|(dir, own)| {
+                resource_dir_has_other_files(dir, std::slice::from_ref(own))
+            });
+            // Release only what this run takes away. Some file it overwrites
+            // used the feature before. A feature that no such file used was
+            // not this scaffold's, so keep it.
+            // An attachment column enables `multipart` and `storage` together,
+            // and an `--api` scaffold uses only `storage` in code.
+            let mut used_markers = markers.clone().unwrap_or_default();
+            if r.feature == "multipart" {
+                used_markers.extend(release_markers("storage").unwrap_or_default());
+            }
+            let was_used = Some(used_markers.as_slice())
+                .filter(|m| !m.is_empty())
+                .is_some_and(|m| {
+                    self.actions.iter().any(|a| {
+                        a.path() != r.path
+                            && fs::read_to_string(a.path()).is_ok_and(|old| {
+                                m.iter().any(|marker| old.contains(marker.as_str()))
+                            })
+                    })
+                });
+            // `htmx` is a default feature. Without default features, other
+            // code may need it in ways no marker shows, so keep it.
+            let defaults_off = r.feature == "htmx" && base_disables_defaults(&base);
+            // Config can run the blob service with no source marker: a
+            // `[storage]` block, or `AUTUMN_STORAGE__*` in `.env`.
+            let configured = r.feature == "storage" && storage_is_configured(&self.project_root);
+            let needed = !was_used
+                || by_marker
+                || by_sibling
+                || defaults_off
+                || configured
+                || (markers.is_none() && r.owner.is_none());
+            if needed {
+                continue;
+            }
+            let updated = remove_autumn_web_feature(&base, &r.feature);
+            if updated != base {
+                self.actions.retain(|a| a.path() != r.path);
+                self.modify(r.path, updated);
+            }
+        }
     }
 
     /// Push a [`Action::Create`] action.
@@ -1439,7 +1546,19 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
         // feature (issue #1048 PR review: destroying the only channel/live
         // scaffold of one transport must not strip a feature the other
         // transport, generated separately, still needs).
-        "ws" => &["#[ws]", "autumn_web::sse::stream("],
+        //
+        // The prelude re-exports the `ws` types unqualified (`Channels`,
+        // `Broadcast`, `ChannelMessage`, `ChannelStats`), so a route that
+        // uses `autumn_web::prelude::*` names none of the paths above.
+        "ws" => &[
+            "#[ws]",
+            "autumn_web::sse::stream",
+            "autumn_web::channels",
+            "Channels",
+            "Broadcast",
+            "ChannelMessage",
+            "ChannelStats",
+        ],
         // `TestDb::` (not bare `TestDb`) so a doc comment merely mentioning
         // the type (e.g. the template-shipped `tests/integration_test.rs`'s
         // "Add DB-backed tests with `TestDb`...") doesn't count as usage.
@@ -1490,7 +1609,15 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
         // counts as usage, leaving the feature enabled), which is the same
         // harmless direction `multipart` already accepts above; under-retention
         // is the one that does not compile.
-        "csv" => &["autumn_web::data::csv"],
+        //
+        // `Csv<T>` is the extractor and responder gated by the same feature. It
+        // lives in `autumn_web::extract` and is not in the prelude.
+        "csv" => &[
+            "autumn_web::data::csv",
+            "extract::Csv",
+            "autumn_web::Csv",
+            "Csv<",
+        ],
         _ => &[],
     }
 }
@@ -1522,9 +1649,106 @@ fn autumn_web_feature_still_needed_elsewhere(
         return false;
     }
     let markers: Vec<String> = markers.iter().map(|m| (*m).to_owned()).collect();
-    ["src", "tests", "benches"]
-        .iter()
-        .any(|dir| rs_tree_contains_marker(&project_root.join(dir), &markers, excluding, overrides))
+    markers_in_project(&markers, project_root, excluding, overrides)
+}
+
+/// Whether project config may turn on blob storage.
+///
+/// Reads every `autumn*.toml` and `.env*` file in the project root. That
+/// covers profile overlays and local overrides without listing each name. Any
+/// mention of storage keeps the feature. Variables set only in a deployment
+/// are not visible here.
+fn storage_is_configured(root: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(root) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_toml = entry
+            .path()
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"));
+        let is_config = (name.starts_with("autumn") && is_toml) || name.starts_with(".env");
+        is_config
+            && fs::read_to_string(entry.path())
+                .is_ok_and(|text| text.to_ascii_lowercase().contains("storage"))
+    })
+}
+
+/// Whether the manifest turns off default features for `autumn-web`.
+///
+/// Reads an inline entry (also over many lines), or the lines under a
+/// `[dependencies.autumn-web]` style table. Another dependency's setting does
+/// not count. An entry that inherits from the workspace (`workspace = true`)
+/// counts as off, because the workspace manifest is not read here.
+fn base_disables_defaults(manifest: &str) -> bool {
+    let is_off = |line: &str| {
+        let squeezed = line.replace(' ', "");
+        squeezed.contains("default-features=false") || squeezed.contains("workspace=true")
+    };
+    let names_web = |text: &str| text.contains("autumn-web") || text.contains("autumn_web");
+    let depth = |text: &str| {
+        i32::try_from(text.matches('{').count()).unwrap_or(0)
+            - i32::try_from(text.matches('}').count()).unwrap_or(0)
+    };
+    let mut in_web_table = false;
+    // Brace depth left open by an `autumn-web = {` entry.
+    let mut open_entry = 0;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if open_entry > 0 {
+            if is_off(trimmed) {
+                return true;
+            }
+            open_entry += depth(trimmed);
+        } else if trimmed.starts_with('[') {
+            in_web_table = names_web(trimmed);
+        } else if in_web_table || names_web(trimmed) {
+            if is_off(trimmed) {
+                return true;
+            }
+            if !in_web_table {
+                open_entry = depth(trimmed).max(0);
+            }
+        }
+    }
+    false
+}
+
+/// Whether any of `markers` appears in `src/`, `tests/`, `benches/` or `examples/`.
+fn markers_in_project(
+    markers: &[String],
+    project_root: &Path,
+    excluding: &[PathBuf],
+    overrides: &HashMap<PathBuf, String>,
+) -> bool {
+    // Targets whose `path` sits outside the four conventional trees count too.
+    let named = crate::plugin::install::explicit_target_sources(project_root);
+    let in_named = named.iter().any(|path| {
+        let content = overrides.get(path).cloned().or_else(|| {
+            (!excluding.contains(path))
+                .then(|| fs::read_to_string(path).ok())
+                .flatten()
+        });
+        content.is_some_and(|text| markers.iter().any(|m| text.contains(m.as_str())))
+    });
+    in_named
+        || ["src", "tests", "benches", "examples"].iter().any(|dir| {
+            rs_tree_contains_marker(&project_root.join(dir), markers, excluding, overrides)
+        })
+}
+
+/// Markers that show `feature` is in use, for a regenerate run.
+///
+/// `None` means the feature has no marker. `htmx` has markers here only. The
+/// stock `main.rs` names `autumn_web::htmx`, so a marker for it in
+/// [`autumn_web_feature_markers`] would keep the feature on every `destroy`.
+fn release_markers(feature: &str) -> Option<Vec<String>> {
+    let markers: &[&str] = match feature {
+        "htmx" => &["HTMX_JS_PATH", "HxRequest"],
+        other => autumn_web_feature_markers(other),
+    };
+    (!markers.is_empty()).then(|| markers.iter().map(|m| (*m).to_owned()).collect())
 }
 
 /// Whether a local Cargo `feature` (not an `autumn-web` feature — see
