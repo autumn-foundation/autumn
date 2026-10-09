@@ -2219,6 +2219,12 @@ jobs:
           # tests are executed there, just not measured for coverage here.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --test sqlite_boot_serve
+          # The sqlite URI helpers in `db.rs` (#3032) are covered by lib unit
+          # tests only. Without this leg their lines are instrumented and
+          # never run, so Codecov reads them as uncovered. A name filter keeps
+          # the leg narrow.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
+            --lib -- db::tests::sqlite_ db::tests::percent_decode
           # The #1907 durable job queue and lease scheduler are a large slice of
           # sqlite-only code; without this lane Codecov reports all of it
           # uncovered.
