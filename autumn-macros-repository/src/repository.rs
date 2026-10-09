@@ -5050,7 +5050,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // exists to produce trustworthy accusations. If the chain head
                     // moved under us, the live comparison is skipped rather than
                     // reported — a concurrent write is not tampering.
-                    let revisions = self.ledger_revisions(record_id).await?;
+                    let revisions = match self.ledger_revisions(record_id).await {
+                        ::core::result::Result::Ok(revisions) => revisions,
+                        ::core::result::Result::Err(err) =>
+                            return ::autumn_web::ledger::verification_from_read_error(record_id, err),
+                    };
                     let live = self.__autumn_ledger_live_view(record_id).await?;
                     // Head and mark in ONE statement: read separately they could
                     // come from differently-lagged replicas, and a fresh mark

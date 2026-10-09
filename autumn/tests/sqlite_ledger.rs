@@ -3121,15 +3121,10 @@ async fn a_re_encoded_snapshot_is_refused() {
         .await
         .expect("re-encode");
     }
-    let err = repo
-        .ledger_verify(id)
-        .await
-        .expect_err("same meaning, different bytes");
-    let text = err.to_string();
-    assert!(
-        text.contains("not in canonical form") && text.contains(&format!("revision {}", head.seq)),
-        "{text}"
-    );
+    let report = repo.ledger_verify(id).await.expect("verify reports it");
+    let broken = report.broken.expect("same meaning, different bytes");
+    assert_eq!(broken.kind, LedgerBreak::SnapshotNotCanonical);
+    assert_eq!(broken.seq, head.seq);
 }
 
 #[tokio::test]

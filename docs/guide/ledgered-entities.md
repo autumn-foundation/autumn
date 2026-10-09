@@ -185,7 +185,8 @@ Some consequences worth knowing:
   `ledger_verify` reports no mismatch after a delete.
 - The ledger reads a snapshot only if its stored text is its canonical form.
   Changed spacing, a different key order or a duplicate key return
-  `LedgerError::SnapshotNotCanonical`. This also stops `ledger_verify`.
+  `LedgerError::SnapshotNotCanonical`. `ledger_verify` reports it as
+  `LedgerBreak::SnapshotNotCanonical`.
 - If a snapshot does not decode into the current model, `ledger_as_of` and
   `ledger_diff` return `LedgerError::SnapshotSchemaMismatch`. This is not tamper
   evidence. To read old revisions after adding a required field, put

@@ -433,6 +433,12 @@ pub enum LedgerBreak {
     /// Either the head revision was replaced by a re-hashed forgery, or the mark
     /// itself was rewritten to match one.
     HighWaterMismatch,
+    /// A revision's stored text is not its canonical form (#2326).
+    ///
+    /// The text may still mean the same thing. The hash covers the canonical
+    /// form, so a re-encoded snapshot would pass a hash check. Someone changed
+    /// the stored bytes.
+    SnapshotNotCanonical,
 }
 
 impl LedgerBreak {
@@ -448,6 +454,7 @@ impl LedgerBreak {
             Self::UnusableSeq => "unusable_seq",
             Self::LiveStateMismatch => "live_state_mismatch",
             Self::RecordedAtRegression => "recorded_at_regression",
+            Self::SnapshotNotCanonical => "snapshot_not_canonical",
             Self::HighWaterMissing => "high_water_missing",
             Self::HighWaterBehind => "high_water_behind",
             Self::HighWaterMismatch => "high_water_mismatch",
@@ -1700,6 +1707,36 @@ pub fn schema_mismatch(table: &str, record_id: i64, seq: i64, detail: &str) -> c
         record_id,
         seq,
         detail: redact_quoted(detail),
+    })
+}
+
+/// Turn a chain read error into a verification report where it is a finding (#2326).
+///
+/// A non-canonical snapshot is evidence of a change, not a read fault. Other
+/// errors pass through.
+///
+/// # Errors
+///
+/// Returns `err` unchanged for any other error.
+#[doc(hidden)]
+pub fn verification_from_read_error(
+    record_id: i64,
+    err: crate::AutumnError,
+) -> crate::AutumnResult<LedgerVerification> {
+    let Some(LedgerError::SnapshotNotCanonical { seq, .. }) = err.downcast_ref::<LedgerError>()
+    else {
+        return Err(err);
+    };
+    Ok(LedgerVerification {
+        record_id,
+        revisions_checked: 0,
+        head_hash: None,
+        broken: Some(LedgerBreakReport {
+            seq: *seq,
+            revision_id: None,
+            kind: LedgerBreak::SnapshotNotCanonical,
+            detail: format!("revision {seq} is stored in a form other than its canonical text"),
+        }),
     })
 }
 
@@ -3751,5 +3788,32 @@ mod tests {
         let shown = redact_quoted(r#"invalid type: string "sk-secret", expected i64"#);
         assert!(!shown.contains("sk-secret"), "{shown}");
         assert!(shown.contains("expected i64"), "{shown}");
+    }
+
+    #[test]
+    fn a_non_canonical_read_error_becomes_a_break() {
+        let err = crate::AutumnError::internal_server_error(LedgerError::SnapshotNotCanonical {
+            table: "t".into(),
+            record_id: 4,
+            seq: 2,
+        });
+        let report = verification_from_read_error(4, err).unwrap();
+        let broken = report.broken.expect("a break");
+        assert_eq!(broken.kind, LedgerBreak::SnapshotNotCanonical);
+        assert_eq!(broken.seq, 2);
+        assert_eq!(
+            LedgerBreak::SnapshotNotCanonical.as_str(),
+            "snapshot_not_canonical"
+        );
+    }
+
+    #[test]
+    fn other_read_errors_pass_through() {
+        let err = crate::AutumnError::internal_server_error(LedgerError::ChainUnreadable {
+            table: "t".into(),
+            record_id: 4,
+            detail: "x".into(),
+        });
+        assert!(verification_from_read_error(4, err).is_err());
     }
 }
