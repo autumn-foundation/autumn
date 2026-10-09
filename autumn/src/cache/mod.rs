@@ -410,34 +410,40 @@ pub fn get<V: Clone + Send + Sync + 'static>(cache: &dyn Cache, key: &str) -> Op
 /// other `get_value` call as a direct read that it cannot record.
 fn helper_read(cache: &dyn Cache, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
     #[cfg(feature = "reporting")]
-    let _helper = HelperRead::enter();
+    let _helper = HelperCall::enter();
     cache.get_value(key)
 }
 
-// Set while a recording helper reads, so the seam can tell a direct read.
+// Set while a recording helper reads or writes, so the seam can tell a
+// direct call.
 #[cfg(feature = "reporting")]
 thread_local! {
-    static HELPER_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static HELPER_CALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Marks a helper read for its lifetime, also when the backend panics.
+/// Marks a helper call for its lifetime, also when the backend panics.
 #[cfg(feature = "reporting")]
-struct HelperRead(bool);
+struct HelperCall(bool);
 
 #[cfg(feature = "reporting")]
-impl HelperRead {
+impl HelperCall {
     fn enter() -> Self {
-        Self(HELPER_READ.with(|flag| flag.replace(true)))
+        Self(HELPER_CALL.with(|flag| flag.replace(true)))
     }
 }
 
 #[cfg(feature = "reporting")]
-impl Drop for HelperRead {
+impl Drop for HelperCall {
     fn drop(&mut self) {
         let outer = self.0;
-        HELPER_READ.with(|flag| flag.set(outer));
+        HELPER_CALL.with(|flag| flag.set(outer));
     }
 }
+
+/// Why a capsule with a direct cache write is not replayable.
+#[cfg(feature = "reporting")]
+const DIRECT_WRITE_NOTE: &str = "the run wrote the cache with `Cache::insert_value` or \
+     `insert_raw_bytes` directly; the write is not recorded, so replay cannot check it";
 
 /// Why a capsule with a direct cache read is not replayable.
 #[cfg(feature = "reporting")]
@@ -456,6 +462,8 @@ pub fn insert<V: Clone + Send + Sync + 'static>(cache: &dyn Cache, key: &str, va
     if record_or_replay_untyped_insert(key) {
         return;
     }
+    #[cfg(feature = "reporting")]
+    let _helper = HelperCall::enter();
     cache.insert_value(key, Arc::new(value));
 }
 
@@ -521,6 +529,8 @@ where
     if record_or_replay_cache_insert(key, bytes.as_deref(), ttl) {
         return;
     }
+    #[cfg(feature = "reporting")]
+    let _helper = HelperCall::enter();
     // In-memory path (MokaCache, CountingCache in tests, …)
     cache.insert_value(key, Arc::new(value));
     // Serialized path (RedisCache, any cross-replica backend)
@@ -781,6 +791,28 @@ struct CapsuleSeamCache(Arc<dyn Cache>);
 
 #[cfg(feature = "reporting")]
 impl CapsuleSeamCache {
+    /// Check a write that reaches the seam. A helper write with a tape never
+    /// gets here, so with a tape this is a direct write: a divergence, as
+    /// capture refuses such a capsule. Returns `true` when the backend must
+    /// not be written.
+    fn direct_write_blocked(key: &str) -> bool {
+        let direct = !HELPER_CALL.with(std::cell::Cell::get);
+        if let Some(tape) = crate::capsule::effects::current_tape() {
+            if direct {
+                tape.cache_untyped_insert(key);
+            }
+            return true;
+        }
+        if replay_blocked() {
+            return true;
+        }
+        if direct && let Some(scope) = crate::capsule::current_scope() {
+            scope.note(DIRECT_WRITE_NOTE);
+            scope.mark_truncated();
+        }
+        false
+    }
+
     /// Take a tape slot for a removal, in call order.
     fn reserve() -> Option<(Arc<crate::capsule::CaptureScope>, usize)> {
         crate::capsule::current_scope()
@@ -879,7 +911,7 @@ impl Cache for CapsuleSeamCache {
     // or write is answered by its own seam before it gets here; anything
     // that still arrives is a miss, a dropped write, or no fill lock.
     fn get_value(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
-        let direct = !HELPER_READ.with(std::cell::Cell::get);
+        let direct = !HELPER_CALL.with(std::cell::Cell::get);
         // A helper read with a tape never gets here, so with a tape this is a
         // direct read: a divergence, as capture refuses such a capsule.
         if let Some(tape) = crate::capsule::effects::current_tape() {
@@ -899,7 +931,7 @@ impl Cache for CapsuleSeamCache {
     }
 
     fn insert_value(&self, key: &str, value: Arc<dyn Any + Send + Sync>) {
-        if offline() {
+        if Self::direct_write_blocked(key) {
             return;
         }
         self.0.insert_value(key, value);
@@ -967,7 +999,7 @@ impl Cache for CapsuleSeamCache {
     }
 
     fn insert_raw_bytes(&self, key: &str, bytes: Vec<u8>, ttl: Option<Duration>) {
-        if offline() {
+        if Self::direct_write_blocked(key) {
             return;
         }
         self.0.insert_raw_bytes(key, bytes, ttl);
@@ -1668,6 +1700,40 @@ mod tests {
         }));
         assert!(read.is_none());
         assert_eq!(tape.divergences().len(), 1, "{:?}", tape.divergences());
+    }
+
+    /// Codex review on #3222: a direct `insert_value` or `insert_raw_bytes`
+    /// call through the seam marks the capsule incomplete during capture, and
+    /// is a divergence during a replay. A helper write stays recorded.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_direct_write_is_not_silently_dropped() {
+        let cache = with_capsule_seam(Arc::new(SpyBackend::default()));
+        let scope = capture_scope();
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async { insert_cached(cache.as_ref(), "k", 1_u32, None) },
+        ));
+        assert!(!scope.is_truncated(), "a helper write is recorded");
+        for write in [
+            (|cache: &dyn Cache| cache.insert_value("k", Arc::new(1_u32))) as fn(&dyn Cache),
+            |cache: &dyn Cache| cache.insert_raw_bytes("k", b"1".to_vec(), None),
+        ] {
+            let scope = capture_scope();
+            block_on(crate::capsule::capture::with_capture_scope(
+                Arc::clone(&scope),
+                async { write(cache.as_ref()) },
+            ));
+            assert!(scope.is_truncated(), "a direct write cannot be recorded");
+
+            let tape = Arc::new(crate::capsule::ReplayEffects::new(
+                crate::capsule::CapsuleEffects::default(),
+            ));
+            block_on(crate::capsule::with_effect_tape(Arc::clone(&tape), async {
+                write(cache.as_ref());
+            }));
+            assert_eq!(tape.divergences().len(), 1, "{:?}", tape.divergences());
+        }
     }
 
     /// The seam wraps a backend once, so `Arc` identity stays stable.
