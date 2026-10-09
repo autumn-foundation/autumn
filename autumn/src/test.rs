@@ -799,6 +799,8 @@ pub struct TestApp {
     /// to [`crate::time::TickingClock`] at runtime.
     clock_as_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     api_versions: Vec<crate::app::ApiVersion>,
+    agent_skills: Vec<crate::aeo::AgentSkill>,
+    commerce_docs: crate::aeo::RegisteredCommerceDocs,
     /// Plugin-contributed metrics sources registered via [`AppBuilder::metrics_source`].
     metrics_sources: Vec<(String, std::sync::Arc<dyn crate::actuator::MetricsSource>)>,
     /// Plugin-contributed health indicators registered via [`AppBuilder::health_indicator`].
@@ -883,6 +885,8 @@ impl TestApp {
             entropy: None,
             clock_as_any: None,
             api_versions: Vec::new(),
+            agent_skills: Vec::new(),
+            commerce_docs: crate::aeo::RegisteredCommerceDocs::default(),
             metrics_sources: Vec::new(),
             health_indicators: Vec::new(),
             #[cfg(feature = "inbound-mail")]
@@ -1753,6 +1757,27 @@ impl TestApp {
         self
     }
 
+    /// Publish an agent skill, as [`AppBuilder::agent_skill`](crate::app::AppBuilder::agent_skill).
+    #[must_use]
+    pub fn agent_skill(mut self, skill: crate::aeo::AgentSkill) -> Self {
+        self.agent_skills.push(skill);
+        self
+    }
+
+    /// Serve a UCP profile, as [`AppBuilder::ucp_profile`](crate::app::AppBuilder::ucp_profile).
+    #[must_use]
+    pub fn ucp_profile(mut self, profile: crate::aeo::commerce::UcpProfile) -> Self {
+        self.commerce_docs.ucp = Some(profile);
+        self
+    }
+
+    /// Serve an ACP document, as [`AppBuilder::acp_discovery`](crate::app::AppBuilder::acp_discovery).
+    #[must_use]
+    pub fn acp_discovery(mut self, document: crate::aeo::commerce::AcpDiscovery) -> Self {
+        self.commerce_docs.acp = Some(document);
+        self
+    }
+
     /// Register multiple API versions for testing.
     #[must_use]
     pub fn api_versions(
@@ -2191,6 +2216,8 @@ impl TestApp {
             register(state.policy_registry());
         }
         state.insert_extension(crate::app::RegisteredApiVersions(self.api_versions));
+        state.insert_extension(crate::aeo::RegisteredAgentSkills(self.agent_skills));
+        state.insert_extension(self.commerce_docs);
         crate::app::install_webhook_registry(&state, &self.config);
 
         // Install AutumnConfig so DbState::statement_timeout / slow_query_threshold
@@ -3334,6 +3361,20 @@ impl TestClient {
         RequestBuilder::new(
             self.router.clone(),
             Method::GET,
+            uri,
+            self.cookie_jar.clone(),
+            Some(self.state.clock.clone()),
+            self.n_plus_one_threshold(),
+            self.fault_error_counter(),
+        )
+    }
+
+    /// Start building a HEAD request.
+    #[must_use]
+    pub fn head(&self, uri: &str) -> RequestBuilder {
+        RequestBuilder::new(
+            self.router.clone(),
+            Method::HEAD,
             uri,
             self.cookie_jar.clone(),
             Some(self.state.clock.clone()),

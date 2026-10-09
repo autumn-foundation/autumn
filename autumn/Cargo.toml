@@ -443,6 +443,9 @@ rhai = { workspace = true, optional = true }
 rustyline = { workspace = true, optional = true }
 subtle = "2.6.1"
 base64 = "0.23"
+# Ed25519 signing for Web Bot Auth (`aeo::web_bot_auth`). Adds NO new crate:
+# `jsonwebtoken`'s `rust_crypto` backend already compiles ed25519-dalek 2.
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
 url = "2.5.8"
 percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }

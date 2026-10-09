@@ -1,0 +1,227 @@
+//! `WebMCP`: let in-browser AI agents call this site's MCP tools.
+//!
+//! Autumn serves a small script at [`WEBMCP_JS_PATH`]. On page load it calls
+//! `document.modelContext.registerTool()` once for each public MCP tool. A
+//! tool call goes to the MCP endpoint with the page's cookies and CSRF token,
+//! so the normal route pipeline (auth, CSRF, rate limits) applies.
+//!
+//! Add the script to the page `<head>` with [`head_tags`]. The scaffolded
+//! layout does this.
+
+use serde_json::{Value, json};
+
+use super::documents::SiteFacts;
+
+/// Path of the `WebMCP` script.
+pub const WEBMCP_JS_PATH: &str = "/_autumn/webmcp.js";
+
+/// The `WebMCP` script for `facts`. With no public MCP tools it does nothing.
+#[must_use]
+pub fn script(facts: &SiteFacts, csrf_header: &str) -> String {
+    let (endpoint, tools) = facts.mcp.as_ref().map_or_else(
+        || (String::new(), Vec::new()),
+        |mcp| {
+            let tools = mcp
+                .tools
+                .iter()
+                .filter(|_| mcp.public_tools)
+                .filter(|t| valid_tool_name(&t.name))
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description.clone().unwrap_or_else(|| t.name.clone()),
+                        "inputSchema": t.input_schema,
+                        "annotations": webmcp_annotations(&t.annotations),
+                    })
+                })
+                .collect();
+            (mcp.path.clone(), tools)
+        },
+    );
+    SCRIPT
+        .replace("__ENDPOINT__", &js_json(&json!(endpoint)))
+        .replace("__CSRF_HEADER__", &js_json(&json!(csrf_header)))
+        .replace("__TOOLS__", &js_json(&Value::Array(tools)))
+}
+
+/// JSON safe to put inside a `<script>`: `<`, `>`, and `&` are escaped, so
+/// no data can close the script element.
+fn js_json(value: &Value) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| "null".to_owned())
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+}
+
+const SCRIPT: &str = r#"// Autumn WebMCP: register this site's MCP tools with in-browser agents.
+(() => {
+  "use strict";
+  const mc = document.modelContext || navigator.modelContext;
+  if (!mc || typeof mc.registerTool !== "function") return;
+  const endpoint = __ENDPOINT__;
+  const csrfHeader = __CSRF_HEADER__;
+  const tools = __TOOLS__;
+  let nextId = 0;
+  const parse = (text) => {
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      const data = text.split("
+").filter((l) => l.startsWith("data:"));
+      return JSON.parse(data[data.length - 1].slice(5));
+    }
+  };
+  for (const t of tools) {
+    const execute = async (input) => {
+      const headers = {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "mcp-protocol-version": "2025-06-18",
+      };
+      const meta = document.querySelector('meta[name="csrf-token"]');
+      if (meta && meta.content) headers[csrfHeader] = meta.content;
+      const res = await fetch(endpoint, {
+        method: "POST",
+        credentials: "same-origin",
+        headers,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: ++nextId,
+          method: "tools/call",
+          params: { name: t.name, arguments: input || {} },
+        }),
+      });
+      const msg = parse(await res.text());
+      if (msg.error) throw new Error(msg.error.message || "MCP error");
+      return msg.result;
+    };
+    try {
+      const done = mc.registerTool({ ...t, execute });
+      if (done && typeof done.catch === "function") done.catch(() => {});
+    } catch (_) {}
+  }
+})();
+"#;
+
+/// `true` for a valid `WebMCP` tool name: 1–128 of `A-Z a-z 0-9 _ . -`.
+#[must_use]
+pub fn valid_tool_name(name: &str) -> bool {
+    (1..=128).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// Map MCP annotations to `WebMCP` annotations.
+#[must_use]
+pub fn webmcp_annotations(mcp: &Value) -> Value {
+    let flag = |key: &str| mcp.get(key).and_then(Value::as_bool).unwrap_or(false);
+    json!({
+        "readOnlyHint": flag("readOnlyHint"),
+        "consequentialHint": flag("destructiveHint"),
+    })
+}
+
+/// `<head>` tags for agents: the ARD link and the `WebMCP` script.
+///
+/// Pass the request's CSP nonce when the page uses a nonce-based policy.
+///
+/// ```rust,ignore
+/// html! { head { (autumn_web::aeo::webmcp::head_tags(None)) } }
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn head_tags(csp_nonce: Option<&str>) -> maud::Markup {
+    maud::html! {
+        link rel="ai-catalog" href=(super::AI_CATALOG_PATH) type="application/json";
+        script src=(WEBMCP_JS_PATH) defer nonce=[csp_nonce] {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aeo::documents::{McpFacts, ToolFacts};
+
+    fn facts(public: bool) -> SiteFacts {
+        SiteFacts {
+            mcp: Some(McpFacts {
+                path: "/mcp".to_owned(),
+                tools: vec![
+                    ToolFacts {
+                        name: "list_todos".to_owned(),
+                        description: Some("List </script> todos".to_owned()),
+                        input_schema: json!({"type": "object"}),
+                        annotations: json!({"readOnlyHint": true, "destructiveHint": false}),
+                    },
+                    ToolFacts {
+                        name: "bad name!".to_owned(),
+                        description: None,
+                        input_schema: json!({}),
+                        annotations: json!({}),
+                    },
+                ],
+                public_tools: public,
+            }),
+            ..SiteFacts::default()
+        }
+    }
+
+    #[test]
+    fn script_registers_each_valid_tool() {
+        let js = script(&facts(true), "x-csrf-token");
+        assert!(js.contains("registerTool"), "{js}");
+        assert!(
+            js.contains("document.modelContext || navigator.modelContext"),
+            "{js}"
+        );
+        assert!(js.contains("\"list_todos\""), "{js}");
+        assert!(!js.contains("bad name!"), "invalid names are skipped: {js}");
+        assert!(js.contains("\"/mcp\""), "{js}");
+        assert!(js.contains("\"x-csrf-token\""), "{js}");
+        assert!(
+            !js.contains("</script>"),
+            "no raw end tag in the script: {js}"
+        );
+    }
+
+    #[test]
+    fn script_is_a_no_op_without_public_tools() {
+        for f in [facts(false), SiteFacts::default()] {
+            let js = script(&f, "x-csrf-token");
+            assert!(js.contains("const tools = [];"), "{js}");
+        }
+    }
+
+    #[test]
+    fn tool_names() {
+        assert!(valid_tool_name("search_flights.v2-a"));
+        assert!(!valid_tool_name(""));
+        assert!(!valid_tool_name("Search flights"));
+        assert!(!valid_tool_name(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn annotations_map() {
+        assert_eq!(
+            webmcp_annotations(&json!({"readOnlyHint": true, "destructiveHint": true})),
+            json!({"readOnlyHint": true, "consequentialHint": true})
+        );
+        assert_eq!(
+            webmcp_annotations(&json!({})),
+            json!({"readOnlyHint": false, "consequentialHint": false})
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn head_tags_render_the_script_and_the_ard_link() {
+        let html = head_tags(Some("abc")).into_string();
+        assert!(
+            html.contains("<script src=\"/_autumn/webmcp.js\" defer nonce=\"abc\">"),
+            "{html}"
+        );
+        assert!(html.contains("rel=\"ai-catalog\""), "{html}");
+    }
+}

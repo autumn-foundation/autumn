@@ -1760,6 +1760,29 @@ impl RequestBuilder {
         self
     }
 
+    /// Sign this request with Web Bot Auth (RFC 9421 HTTP Message
+    /// Signatures), so the receiving site can verify that it comes from this
+    /// app. Adds `Signature-Agent`, `Signature-Input`, and `Signature`.
+    ///
+    /// The URL must be absolute. See [`crate::aeo::web_bot_auth`].
+    #[must_use]
+    pub fn sign_web_bot_auth(
+        mut self,
+        signer: &crate::aeo::web_bot_auth::WebBotAuthSigner,
+    ) -> Self {
+        if let Some(h) = signer.sign_url(&self.url) {
+            return self
+                .header("signature-agent", h.signature_agent)
+                .header("signature-input", h.signature_input)
+                .header("signature", h.signature);
+        }
+        self.pending_error = Some(ClientError::InvalidUrl(format!(
+            "Web Bot Auth needs an absolute URL, got {:?}",
+            self.url
+        )));
+        self
+    }
+
     /// Serialise `body` as JSON and set `Content-Type: application/json`.
     ///
     /// Serialisation errors are captured and returned when [`send`](Self::send)

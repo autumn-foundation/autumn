@@ -282,28 +282,12 @@ pub struct RegisteredSeoConfig(pub crate::config::SeoConfig);
 /// * `additional_rules` — Extra lines to append (e.g. `"Disallow: /admin"`).
 #[must_use]
 pub fn robots_txt(profile: &str, sitemap_url: Option<&str>, additional_rules: &[String]) -> String {
-    let mut txt = String::new();
-
-    let is_prod = matches!(profile, "prod" | "production");
-    if is_prod {
-        txt.push_str("User-agent: *\nAllow: /\n");
-    } else {
-        txt.push_str("User-agent: *\nDisallow: /\n");
-    }
-
-    for rule in additional_rules {
-        txt.push_str(rule);
-        txt.push('\n');
-    }
-
-    if let Some(url) = sitemap_url {
-        txt.push('\n');
-        txt.push_str("Sitemap: ");
-        txt.push_str(url);
-        txt.push('\n');
-    }
-
-    txt
+    crate::aeo::robots::robots_txt_with_policy(
+        profile,
+        sitemap_url,
+        additional_rules,
+        &crate::aeo::BotPolicy::default(),
+    )
 }
 
 // ── sitemap_xml() ─────────────────────────────────────────────────────────────
@@ -1135,6 +1119,7 @@ pub(crate) fn defaults_exclude_from_sitemap(defaults: SeoRouteDefaults) -> bool 
 /// instead of a single unprefixed entry, since only the prefixed URLs are
 /// actually reachable. Paths matching `locale.exclude_prefixes` are listed
 /// unprefixed, same as when `locale` is `None`.
+#[cfg(test)]
 pub(crate) async fn assemble_seo_bodies(
     profile: &str,
     base_url: Option<&str>,
@@ -1143,6 +1128,32 @@ pub(crate) async fn assemble_seo_bodies(
     sources: &[Arc<dyn SitemapSource>],
     static_paths: &[&str],
     locale: Option<SitemapLocaleConfig<'_>>,
+) -> (String, String) {
+    assemble_seo_bodies_with_policy(
+        profile,
+        base_url,
+        sitemap_url_override,
+        additional_rules,
+        sources,
+        static_paths,
+        locale,
+        &crate::aeo::BotPolicy::default(),
+    )
+    .await
+}
+
+/// [`assemble_seo_bodies`] with an AI [`BotPolicy`](crate::aeo::BotPolicy)
+/// for `robots.txt`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn assemble_seo_bodies_with_policy(
+    profile: &str,
+    base_url: Option<&str>,
+    sitemap_url_override: Option<&str>,
+    additional_rules: &[String],
+    sources: &[Arc<dyn SitemapSource>],
+    static_paths: &[&str],
+    locale: Option<SitemapLocaleConfig<'_>>,
+    policy: &crate::aeo::BotPolicy,
 ) -> (String, String) {
     let base_url = base_url.map(|u| u.trim_end_matches('/'));
 
@@ -1183,7 +1194,8 @@ pub(crate) async fn assemble_seo_bodies(
 
     let derived_sitemap_url = base_url.map(|b| format!("{b}/sitemap.xml"));
     let sitemap_url = sitemap_url_override.or(derived_sitemap_url.as_deref());
-    let robots_body = robots_txt(profile, sitemap_url, additional_rules);
+    let robots_body =
+        crate::aeo::robots::robots_txt_with_policy(profile, sitemap_url, additional_rules, policy);
     let sitemap_body = sitemap_xml(&sitemap_entries, base_url);
     (robots_body, sitemap_body)
 }

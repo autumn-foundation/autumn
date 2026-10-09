@@ -1704,6 +1704,12 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub seo: SeoConfig,
 
+    /// Agent readiness (AEO) settings (`[aeo]` in `autumn.toml`).
+    ///
+    /// On by default. See [`crate::aeo`] and `docs/guide/aeo.md`.
+    #[serde(default)]
+    pub aeo: crate::aeo::AeoConfig,
+
     /// Observability settings (`[observability]` section in `autumn.toml`).
     ///
     /// Controls opt-in framework-emitted telemetry that supplements the

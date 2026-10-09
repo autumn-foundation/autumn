@@ -226,6 +226,7 @@ pub mod range;
 // `SearchDocument` are not in scope — so adding one turns every intra-doc link
 // in `search.rs`'s header into a `broken_intra_doc_links` error. The module's
 // own header is the documentation.
+pub mod aeo;
 #[cfg(feature = "db")]
 pub mod search;
 pub mod seo;

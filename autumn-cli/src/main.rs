@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod a11y;
+mod aeo;
 mod agents;
 mod alert;
 mod assets;
@@ -556,6 +557,26 @@ pub struct OpenApiExportArgs {
 pub enum OpenApiSubcommands {
     /// Emit the app's `OpenAPI` 3.1 document without booting it.
     Export(OpenApiExportArgs),
+}
+
+/// Subcommands for `autumn aeo`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum AeoSubcommands {
+    /// Print the DNS-AID records to publish for this site.
+    ///
+    /// Reads `[seo] base_url` from `autumn.toml` when `--base-url` is not
+    /// given. Sign the zone with DNSSEC.
+    Dns {
+        /// Site base URL, e.g. `https://example.com`.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// MCP mount path, when the app serves MCP (e.g. `/mcp`).
+        #[arg(long)]
+        mcp_path: Option<String>,
+        /// Record TTL in seconds.
+        #[arg(long, default_value_t = 3600)]
+        ttl: u32,
+    },
 }
 
 /// Subcommands for `autumn agents`.
@@ -2298,6 +2319,19 @@ enum Commands {
     ///   autumn agents manifest --check agent-authority.json --release
     #[command(subcommand, verbatim_doc_comment)]
     Agents(AgentsSubcommands),
+
+    /// Agent readiness (AEO) tooling.
+    ///
+    /// `autumn aeo dns` prints the DNS for AI Discovery (DNS-AID) records
+    /// for the site. An app cannot publish DNS itself, so you add these lines
+    /// to your zone and sign it with DNSSEC.
+    ///
+    /// # Examples
+    ///
+    ///   autumn aeo dns
+    ///   autumn aeo dns --base-url https://example.com --mcp-path /mcp
+    #[command(subcommand, verbatim_doc_comment)]
+    Aeo(AeoSubcommands),
 
     /// Cache-coherence tooling — prove no write can leave a cached read stale.
     ///
@@ -5531,6 +5565,11 @@ fn run_command(command: Commands) {
                 assets::run_verify(&manifest_path, &static_dir);
             }
         },
+        Commands::Aeo(AeoSubcommands::Dns {
+            base_url,
+            mcp_path,
+            ttl,
+        }) => aeo::dns(base_url, mcp_path, ttl),
         Commands::Agents(AgentsSubcommands::Manifest(args)) => {
             let features = routes::CargoFeatures {
                 features: args.features,

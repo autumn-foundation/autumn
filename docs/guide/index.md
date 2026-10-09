@@ -167,6 +167,7 @@ Looking for the API reference instead? That is
 ## Content, SEO and localization
 
 - [SEO](seo.md) — canonical URLs, `robots` directives, and the auto-mounted `sitemap.xml` and `robots.txt`
+- [AEO](aeo.md) — agent readiness by default: Markdown for agents, `llms.txt`, AI crawler rules, MCP server card, agent skills, WebMCP, Web Bot Auth, x402
 - [Atom and RSS Feeds](feeds.md) — publishing a feed from your own models
 - [Internationalization (i18n)](i18n.md) — translating an app and serving it per locale
 - [Per-User Time Zones](time-zones.md) — rendering every timestamp in the reader's own zone

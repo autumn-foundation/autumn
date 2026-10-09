@@ -655,6 +655,26 @@ fn build_router_pre_state(
         None
     };
 
+    // Agent readiness (AEO): record what the app has before `route_list` is
+    // consumed. The documents are served from the router fallback and the
+    // response layer reads the same snapshot (see `crate::aeo`).
+    #[cfg(feature = "openapi")]
+    let aeo_openapi = ctx.openapi.as_ref();
+    #[cfg(not(feature = "openapi"))]
+    let aeo_openapi: Option<&()> = None;
+    #[cfg(feature = "mcp")]
+    let aeo_mcp = mcp_prepared.as_ref();
+    #[cfg(not(feature = "mcp"))]
+    let aeo_mcp: Option<&()> = None;
+    state.insert_extension(build_aeo_site(
+        config,
+        state,
+        &route_list,
+        &ctx.scoped_groups,
+        aeo_openapi,
+        aeo_mcp,
+    ));
+
     // Build the per-route timeout override table before `route_list` and the
     // scoped groups are consumed by the mounting steps below.
     let route_timeouts = build_route_timeout_table(&route_list, &ctx.scoped_groups, config);
@@ -1175,6 +1195,18 @@ async fn serve_openapi_spec(
     let refs: Vec<&crate::openapi::ApiDoc> = docs.iter().collect();
     let now = state.clock().now();
     let spec = crate::openapi::generate_spec_at(&config, &refs, now);
+    // MPP discovery: `x-payment-info` on priced operations.
+    let paid = state
+        .extension::<AutumnConfig>()
+        .filter(|c| c.aeo.enabled && c.aeo.paid_routes.iter().any(|r| r.mpp_method.is_some()));
+    let spec = match (paid, serde_json::to_value(&spec)) {
+        (Some(app), Ok(mut value)) => {
+            crate::aeo::commerce::apply_mpp(&mut value, &app.aeo.paid_routes);
+            value
+        }
+        (_, Ok(value)) => value,
+        (_, Err(e)) => serde_json::json!({ "error": format!("failed to serialize spec: {e}") }),
+    };
     let spec_json = serde_json::to_string_pretty(&spec)
         .unwrap_or_else(|e| format!("{{\"error\": \"failed to serialize spec: {e}\"}}"));
     (
@@ -1348,6 +1380,156 @@ fn validate_route_path(field: &'static str, value: &str) -> Result<(), RouterBui
 /// [`AppBuilder::nest`](crate::app::AppBuilder::nest) are not introspectable
 /// and so are not covered here — the same limitation the OpenAPI/MCP collision
 /// preflights carry.
+/// The x402 layer for the dynamic path. `None` when no route is priced, and
+/// in the SSG/ISG path (`deferred`), which installs it outside the
+/// static-first middleware.
+#[cfg(feature = "http-client")]
+fn aeo_x402_layer(
+    config: &AutumnConfig,
+    state: &AppState,
+    deferred: bool,
+) -> tower::util::Either<crate::aeo::commerce::X402Layer, tower::layer::util::Identity> {
+    tower::util::option_layer(
+        (!deferred)
+            .then(|| crate::aeo::commerce::X402Layer::from_config(config, state))
+            .flatten(),
+    )
+}
+
+#[cfg(not(feature = "http-client"))]
+const fn aeo_x402_layer(
+    _config: &AutumnConfig,
+    _state: &AppState,
+    _deferred: bool,
+) -> tower::layer::util::Identity {
+    tower::layer::util::Identity::new()
+}
+
+/// Build the AEO site snapshot from the route registry, the `OpenAPI` config,
+/// and the MCP tool catalog.
+#[cfg_attr(
+    not(all(feature = "openapi", feature = "mcp")),
+    allow(clippy::needless_pass_by_value, unused_variables)
+)]
+fn build_aeo_site<O: AeoOpenApiFacts, M: AeoMcpFacts>(
+    config: &AutumnConfig,
+    state: &AppState,
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+    openapi: Option<&O>,
+    mcp: Option<&M>,
+) -> crate::aeo::AeoSite {
+    use crate::aeo::documents::{PageFacts, SiteFacts};
+
+    let page = |path: String, seo: crate::seo::SeoRouteDefaults| {
+        let title = seo.title?;
+        let indexable = !seo
+            .robots
+            .is_some_and(crate::seo::robots_directive_is_noindex);
+        (indexable && !path.contains('{') && !path.contains('*')).then(|| PageFacts {
+            path,
+            title: title.to_owned(),
+            description: seo.description.map(str::to_owned),
+        })
+    };
+    let mut pages: Vec<PageFacts> = route_list
+        .iter()
+        .filter(|r| r.method == http::Method::GET)
+        .filter_map(|r| page(r.path.to_owned(), r.seo))
+        .collect();
+    for group in scoped_groups {
+        pages.extend(
+            group
+                .routes
+                .iter()
+                .filter(|r| r.method == http::Method::GET)
+                .filter_map(|r| page(join_nested_path(&group.prefix, r.path), r.seo)),
+        );
+    }
+    pages.sort_by(|a, b| a.path.cmp(&b.path));
+    pages.dedup_by(|a, b| a.path == b.path);
+
+    let mut facts = SiteFacts {
+        pages,
+        health_path: config.health.enabled.then(|| config.health.path.clone()),
+        skills: state
+            .extension::<crate::aeo::RegisteredAgentSkills>()
+            .map(|s| s.0.clone())
+            .unwrap_or_default(),
+        commerce: state
+            .extension::<crate::aeo::RegisteredCommerceDocs>()
+            .map(|c| (*c).clone())
+            .unwrap_or_default(),
+        ..SiteFacts::default()
+    };
+    if let Some(api) = openapi {
+        api.fill(&mut facts);
+    }
+    if let Some(mcp) = mcp {
+        mcp.fill(&mut facts);
+    }
+    crate::aeo::AeoSite::new(config, facts)
+}
+
+/// Copies what AEO needs from the `OpenAPI` config. A trait so
+/// [`build_aeo_site`] compiles without the `openapi` feature.
+trait AeoOpenApiFacts {
+    fn fill(&self, facts: &mut crate::aeo::documents::SiteFacts);
+}
+
+impl AeoOpenApiFacts for () {
+    fn fill(&self, _: &mut crate::aeo::documents::SiteFacts) {}
+}
+
+#[cfg(feature = "openapi")]
+impl AeoOpenApiFacts for crate::openapi::OpenApiConfig {
+    fn fill(&self, facts: &mut crate::aeo::documents::SiteFacts) {
+        facts.name = Some(self.title.clone()).filter(|t| !t.trim().is_empty());
+        facts.description.clone_from(&self.description);
+        facts.openapi = Some(crate::aeo::documents::OpenApiFacts {
+            json_path: self.openapi_json_path.clone(),
+            docs_path: self.swagger_ui_path.clone(),
+            version: self.version.clone(),
+        });
+    }
+}
+
+/// Copies what AEO needs from the prepared MCP endpoint.
+trait AeoMcpFacts {
+    fn fill(&self, facts: &mut crate::aeo::documents::SiteFacts);
+}
+
+impl AeoMcpFacts for () {
+    fn fill(&self, _: &mut crate::aeo::documents::SiteFacts) {}
+}
+
+#[cfg(feature = "mcp")]
+impl AeoMcpFacts for McpPrepared {
+    fn fill(&self, facts: &mut crate::aeo::documents::SiteFacts) {
+        let (path, tools, endpoint_layer) = self;
+        // A gated endpoint (`secure_mcp`) keeps its tool list private.
+        let public_tools = endpoint_layer.is_none();
+        let tools = if public_tools {
+            tools
+                .iter()
+                .map(|t| crate::aeo::documents::ToolFacts {
+                    name: t.name().to_owned(),
+                    description: t.description().map(str::to_owned),
+                    input_schema: t.input_schema().clone(),
+                    annotations: t.annotations().clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        facts.mcp = Some(crate::aeo::documents::McpFacts {
+            path: path.clone(),
+            tools,
+            public_tools,
+        });
+    }
+}
+
 fn collect_user_get_paths(
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
@@ -5074,7 +5256,14 @@ fn apply_middleware(
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
     // 404 fallback handler for unmatched routes must be registered BEFORE global middleware
     // so that unmatched routes are still protected by rate limiting, CSRF, CORS, etc.
-    router = router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
+    // The fallback also serves the AEO documents (`/llms.txt`, the
+    // `/.well-known/*` agent files): an application route at the same path
+    // always wins, and a generated path cannot collide with one.
+    let aeo_site = state.extension::<crate::aeo::AeoSite>();
+    let fallback_site = aeo_site.clone();
+    router = router.fallback(move |req: axum::extract::Request| {
+        crate::aeo::fallback(fallback_site.clone(), req)
+    });
 
     // Resolve signing keys once; shared across session and CSRF layers.
     let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
@@ -5586,6 +5775,18 @@ fn apply_middleware(
                 .then(|| build_shadow_layer(config, state))
                 .flatten(),
         ),
+        // AEO response layer: Markdown negotiation, `Vary: Accept`, and the
+        // homepage `Link` header. Inner to compression so it reads plain
+        // bytes; outer to the exception filter so it sees the final page.
+        // `None` in the SSG/ISG path, which installs it outside the
+        // static-first middleware instead (same reason as `defer_shadow`).
+        tower::util::option_layer(
+            (!defer_shadow)
+                .then(|| aeo_site.as_ref().and_then(|site| site.layer()))
+                .flatten(),
+        ),
+        // x402 payments for `[[aeo.paid_routes]]`, inner to the AEO layer.
+        aeo_x402_layer(config, state, defer_shadow),
         crate::middleware::MetricsLayer::new(state.metrics.clone()),
         ExceptionFilterLayer::new(all_filters),
         crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev },
@@ -6221,6 +6422,20 @@ pub fn try_build_router_with_static_inner(
     // every pre-rendered page the candidate generated differently went
     // uncompared. Outer to the user layers and inner to compression, matching its
     // position in the dynamic path.
+    // x402 and the AEO response layer, outside the static-first middleware
+    // so a pre-rendered page is charged and negotiated too. Inner to shadow
+    // and compression, matching their position in the dynamic path.
+    #[cfg(feature = "http-client")]
+    if let Some(x402) = crate::aeo::commerce::X402Layer::from_config(config, &state) {
+        router = router.layer(x402);
+    }
+    if let Some(aeo) = state
+        .extension::<crate::aeo::AeoSite>()
+        .and_then(|site| site.layer())
+    {
+        router = router.layer(aeo);
+    }
+
     if let Some(shadow) = build_shadow_layer(config, &state) {
         router = router.layer(shadow);
     }
@@ -15119,6 +15334,7 @@ mod trusted_host_tests {
         assert_unboxed::<crate::middleware::method_override::MethodOverrideRejectionService<Inner>>(
             "MethodOverrideRejectionService",
         );
+        assert_unboxed::<crate::aeo::negotiate::NegotiateService<Inner>>("NegotiateService");
         #[cfg(feature = "oauth2")]
         assert_unboxed::<super::HttpInterceptorService<Inner>>("HttpInterceptorService");
     }
