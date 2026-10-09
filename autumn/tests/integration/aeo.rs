@@ -787,6 +787,46 @@ mod commerce {
         verify.expect_called(2);
     }
 
+    #[get("/reports/{id}")]
+    async fn report(
+        autumn_web::reexports::axum::extract::Path(id): autumn_web::reexports::axum::extract::Path<
+            String,
+        >,
+    ) -> String {
+        id
+    }
+
+    #[get("/reports/admin")]
+    async fn admin_report() -> &'static str {
+        "admin"
+    }
+
+    #[tokio::test]
+    async fn the_route_axum_matched_sets_the_price() {
+        let mut config = paid_config();
+        config.aeo.paid_routes = ["/reports/{rid}:1", "/reports/admin:100"]
+            .iter()
+            .map(|spec| {
+                let (path, amount) = spec.split_once(':').unwrap();
+                PaidRoute::new("GET", path, amount)
+            })
+            .collect();
+        let c = TestApp::new()
+            .config(config)
+            .routes(routes![report, admin_report])
+            .build();
+        let amount = |res: autumn_web::test::TestResponse| {
+            decode_header(res.header("payment-required").unwrap()).unwrap()["accepts"][0]["amount"]
+                .clone()
+        };
+        assert_eq!(amount(c.get("/reports/admin").send().await), "100");
+        assert_eq!(
+            amount(c.get("/reports/7").send().await),
+            "1",
+            "capture names differ"
+        );
+    }
+
     #[tokio::test]
     async fn an_invalid_priced_route_fails_closed() {
         let mut config = paid_config();

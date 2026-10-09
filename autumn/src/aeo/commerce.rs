@@ -198,7 +198,70 @@ pub fn unmatchable_route(route: &PaidRoute) -> Option<String> {
             route.method, route.path
         ));
     }
+    if !valid_template(&route.path) {
+        return Some(format!(
+            "{} {:?}: a capture must be a whole `{{name}}` segment, and `{{*name}}` only last",
+            route.method, route.path
+        ));
+    }
     None
+}
+
+/// `true` when two route templates name the same route: the same literal
+/// segments, and a capture (any name) or a catch-all at the same places.
+fn same_template(a: &str, b: &str) -> bool {
+    let kind = |s: &str| {
+        if s.starts_with("{*") && s.ends_with('}') {
+            "*"
+        } else if s.starts_with('{') && s.ends_with('}') {
+            "{}"
+        } else {
+            ""
+        }
+    };
+    let (mut x, mut y) = (normalize(a).split('/'), normalize(b).split('/'));
+    loop {
+        match (x.next(), y.next()) {
+            (None, None) => return true,
+            (Some(p), Some(q)) => {
+                let (kp, kq) = (kind(p), kind(q));
+                if kp != kq || (kp.is_empty() && p != q) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// How many segments of `template` are literal, for picking the most
+/// specific of several matching routes.
+fn literal_segments(template: &str) -> usize {
+    template
+        .split('/')
+        .filter(|s| !s.is_empty() && !s.starts_with('{'))
+        .count()
+}
+
+/// `true` for a route template axum accepts and the matcher reads: a
+/// segment with a brace is a whole `{name}` capture, or a `{*name}`
+/// catch-all in the last place.
+fn valid_template(path: &str) -> bool {
+    let segments: Vec<&str> = path.split('/').collect();
+    segments.iter().enumerate().all(|(i, s)| {
+        if !s.contains(['{', '}']) {
+            return true;
+        }
+        let Some(inner) = s.strip_prefix('{').and_then(|s| s.strip_suffix('}')) else {
+            return false;
+        };
+        let (name, catch_all) = inner
+            .strip_prefix('*')
+            .map_or((inner, false), |n| (n, true));
+        !name.is_empty()
+            && !name.contains(['{', '}', '*'])
+            && (!catch_all || i == segments.len() - 1)
+    })
 }
 
 /// Problems in `[[aeo.paid_routes]]`, one message each. A priced x402 route
@@ -589,21 +652,31 @@ impl PricedRoutes {
             .extensions()
             .get::<axum::extract::MatchedPath>()
             .map(axum::extract::MatchedPath::as_str);
-        let path = req.uri().path();
         // A route outside the locale nests (a scoped group, an excluded
-        // path) can itself start with a locale segment, so the path is
-        // matched as it is and with the locale stripped. Both cannot name two
+        // path) can itself start with a locale segment, so a path is matched
+        // as it is and with the locale stripped. Both cannot name two
         // different routes: a localized `/x` is mounted at `/{locale}/x`.
-        let same = |r: &PaidRoute, t: &str| {
-            normalize(&r.path) == normalize(t)
-                || normalize(&r.path) == normalize(self.strip_locale(t))
-        };
-        self.routes.iter().find(|r| {
-            r.method_matches(method)
-                && (template.is_some_and(|t| same(r, t))
-                    || template_matches(&r.path, path)
-                    || template_matches(&r.path, self.strip_locale(path)))
-        })
+        let routes = self.routes.iter().filter(|r| r.method_matches(method));
+        if let Some(t) = template {
+            // axum picked the route: price exactly that one, so a wildcard
+            // listed first never prices a more specific static route.
+            return routes
+                .clone()
+                .find(|r| same_template(&r.path, t))
+                .or_else(|| {
+                    routes
+                        .clone()
+                        .find(|r| same_template(&r.path, self.strip_locale(t)))
+                });
+        }
+        // No matched route (a static file): the most specific match wins.
+        let path = req.uri().path();
+        routes
+            .filter(|r| {
+                template_matches(&r.path, path)
+                    || template_matches(&r.path, self.strip_locale(path))
+            })
+            .max_by_key(|r| literal_segments(&r.path))
     }
 
     fn strip_locale<'a>(&self, path: &'a str) -> &'a str {
@@ -1143,6 +1216,31 @@ mod tests {
     }
 
     #[test]
+    fn the_route_axum_matched_sets_the_price() {
+        let priced = PricedRoutes {
+            routes: vec![
+                PaidRoute::new("GET", "/reports/{id}", "1"),
+                PaidRoute::new("GET", "/reports/admin", "100"),
+            ],
+            locales: Vec::new(),
+        };
+        let req = |path: &str| {
+            axum::http::Request::get(path)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        // Structural template comparison: names do not matter, kinds do.
+        // (A matched route is covered by the integration test.)
+        assert!(same_template("/reports/{id}", "/reports/{rid}"));
+        assert!(!same_template("/reports/{id}", "/reports/admin"));
+        assert!(!same_template("/files/{*p}", "/files/{p}"));
+        // Without a matched route, the most specific match wins.
+        let amount = |path: &str| priced.route_for(&req(path)).map(|r| r.amount.clone());
+        assert_eq!(amount("/reports/admin").as_deref(), Some("100"));
+        assert_eq!(amount("/reports/7").as_deref(), Some("1"));
+    }
+
+    #[test]
     fn route_matching_normalizes_head_slash_and_wildcards() {
         let r = route();
         assert!(r.matches("HEAD", "/api/reports/7"));
@@ -1172,6 +1270,10 @@ mod tests {
             PaidRoute::new("GET", "/x ", "1"),
             PaidRoute::new("GET", "/api?plan=pro", "1"),
             PaidRoute::new("GET", "/api#top", "1"),
+            PaidRoute::new("GET", "/api/{id", "1"),
+            PaidRoute::new("GET", "/api/{}", "1"),
+            PaidRoute::new("GET", "/files/{*rest}/x", "1"),
+            PaidRoute::new("GET", "/img/{name}.png", "1"),
             PaidRoute::new("GET", "api", "1"),
             PaidRoute::new("GET", "", "1"),
         ] {

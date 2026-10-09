@@ -40,14 +40,19 @@ impl DnsAidInput {
     }
 }
 
-/// Zone file lines for the DNS-AID records. Empty when `base_url` has no
-/// DNS host name (an IP address has no zone).
+/// Zone file lines for the DNS-AID records. Empty when `base_url` is not an
+/// `http` or `https` URL with a DNS host name (an IP address has no zone).
 #[must_use]
 pub fn records(input: &DnsAidInput) -> Vec<String> {
     let base = input.base_url.trim().trim_end_matches('/');
     let Ok(url) = url::Url::parse(base) else {
         return Vec::new();
     };
+    // The records describe an HTTP service: another scheme's port and URL
+    // would be wrong.
+    if !matches!(url.scheme(), "http" | "https") {
+        return Vec::new();
+    }
     let Some(url::Host::Domain(host)) = url.host() else {
         return Vec::new();
     };
@@ -110,5 +115,6 @@ mod tests {
         );
         assert!(records(&DnsAidInput::new("not a url", None)).is_empty());
         assert!(records(&DnsAidInput::new("https://127.0.0.1", None)).is_empty());
+        assert!(records(&DnsAidInput::new("ftp://example.com", None)).is_empty());
     }
 }
