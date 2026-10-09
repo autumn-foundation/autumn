@@ -250,25 +250,29 @@ pub trait Cache: Send + Sync + 'static {
 
     /// Read the namespace's **shared** fill epoch.
     ///
-    /// A cross-replica backend keeps one epoch per namespace next to the data.
+    /// A cross-replica backend keeps one epoch for each namespace in the
+    /// shared store.
     /// [`invalidate_namespace`](Cache::invalidate_namespace) must raise it
     /// **before** it sweeps. A fill reads it after a miss and before it
-    /// computes, then inserts with
-    /// [`insert_raw_bytes_if_epoch`](Cache::insert_raw_bytes_if_epoch). Then a
-    /// fill on any replica cannot write back a value that an invalidation on
-    /// any replica has dropped.
+    /// computes. Then the fill inserts with
+    /// [`insert_raw_bytes_if_epoch`](Cache::insert_raw_bytes_if_epoch). Then no
+    /// fill can write back a value that an invalidation has dropped. This holds
+    /// on all replicas.
     ///
     /// The default is [`FillEpoch::Unsupported`]. The fence stays per process.
     fn fill_epoch(&self, _namespace: &str) -> FillEpoch {
         FillEpoch::Unsupported
     }
 
-    /// Store pre-serialized bytes **iff** the shared epoch still equals
+    /// Store pre-serialized bytes only if the shared epoch still equals
     /// `sampled`. The check and the store must be one atomic step.
     ///
     /// Returns `true` when stored. A backend that overrides
     /// [`fill_epoch`](Cache::fill_epoch) must override this too. The default
     /// stores without a check.
+    ///
+    /// When the epoch is [`FillEpoch::Sampled`], `insert_value` is not called.
+    /// Fill any local tier here.
     fn insert_raw_bytes_if_epoch(
         &self,
         key: &str,
@@ -359,7 +363,7 @@ pub enum FillEpoch {
     /// The epoch at the time of the read.
     Sampled(u64),
     /// The backend has a shared epoch but could not read it. A fill must not
-    /// insert: the cost is one extra miss.
+    /// insert. The result is one extra cache miss.
     Unavailable,
 }
 
@@ -472,7 +476,7 @@ where
     }
 }
 
-/// [`insert_cached`] fenced by the namespace's shared epoch.
+/// Like [`insert_cached`], but store only if the shared epoch did not change.
 ///
 /// `epoch` is the [`Cache::fill_epoch`] read after the miss and before the
 /// compute. Returns `true` when the value was stored. `false` means the fill

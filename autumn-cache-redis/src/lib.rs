@@ -77,6 +77,10 @@ end
 return 1
 ";
 
+/// [`FENCED_INSERT_SCRIPT`], hashed once.
+static FENCED_INSERT: std::sync::LazyLock<redis::Script> =
+    std::sync::LazyLock::new(|| redis::Script::new(FENCED_INSERT_SCRIPT));
+
 /// Errors that can occur when constructing or using a [`RedisCache`].
 #[derive(Debug, Error)]
 pub enum RedisCacheError {
@@ -279,10 +283,10 @@ impl RedisCache {
 
     /// Key of a namespace's shared fill epoch.
     ///
-    /// Outside `key_prefix:` for the same reason as [`Self::fill_lock_key`], and
-    /// for one more: [`Cache::clear`] sweeps `{key_prefix}:*`. If it removed an
-    /// epoch, the counter would restart at 0 and a stale fill that sampled 0
-    /// would pass.
+    /// Outside `key_prefix:`, like [`Self::fill_lock_key`]. This matters here:
+    /// [`Cache::clear`] sweeps `{key_prefix}:*`. If `clear` removed an epoch,
+    /// the counter would restart at 0, and a stale fill that sampled 0 would
+    /// pass.
     fn epoch_key(&self, namespace: &str) -> String {
         format!("__autumn_epoch__:{}:{}", self.key_prefix, namespace)
     }
@@ -298,11 +302,11 @@ impl RedisCache {
         .await
     }
 
-    /// Drop a namespace on every replica's behalf.
+    /// Drop a namespace for all replicas.
     ///
-    /// The epoch rises FIRST. A fill that sampled the old epoch is then fenced
+    /// The epoch rises first. Then a fill that sampled the old epoch is fenced
     /// out, and the sweep removes anything stored before the bump. The sweep
-    /// runs even if the bump failed, and the first error is returned.
+    /// runs even if the bump failed. The first error is returned.
     async fn invalidate_namespace_fenced(&self, namespace: &str) -> Result<(), InvalidationError> {
         let bumped = self.bump_epoch(namespace).await;
         let swept = self
@@ -548,7 +552,7 @@ impl Cache for RedisCache {
         let ttl_ms = ttl.map_or_else(String::new, |ttl| ttl_millis_for_redis(ttl).to_string());
         let mut conn = self.manager.clone();
         let result: Result<i64, _> = block_on(async move {
-            redis::Script::new(FENCED_INSERT_SCRIPT)
+            FENCED_INSERT
                 .key(&prefixed)
                 .key(&epoch_key)
                 .arg(sampled.to_string())
@@ -1124,6 +1128,7 @@ mod tests {
     // ── #2356: the fill fence is shared across replicas ─────────────────
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
     async fn redis_fill_on_another_replica_cannot_resurrect_an_invalidated_value() {
         let container = RedisImage::default().start().await.unwrap();
         let port = container.get_host_port_ipv4(6379).await.unwrap();
@@ -1154,6 +1159,23 @@ mod tests {
         assert!(!stored, "the shared epoch moved");
         assert!(!key_exists(&mut admin, "fence:reads:k").await);
 
+        // Without a TTL the entry has no expiry.
+        let epoch = replica_b.fill_epoch("reads");
+        assert!(insert_cached_fenced(
+            &replica_b,
+            "reads:forever",
+            1_i64,
+            None,
+            "reads",
+            epoch
+        ));
+        let left: i64 = redis::cmd("PTTL")
+            .arg("fence:reads:forever")
+            .query_async(&mut admin)
+            .await
+            .unwrap();
+        assert_eq!(left, -1, "no TTL means no expiry");
+
         // A fill that starts after the invalidation is stored, with its TTL.
         let epoch = replica_b.fill_epoch("reads");
         assert_eq!(epoch, FillEpoch::Sampled(1));
@@ -1179,6 +1201,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
     async fn redis_epoch_is_per_namespace_and_survives_clear() {
         let container = RedisImage::default().start().await.unwrap();
         let port = container.get_host_port_ipv4(6379).await.unwrap();
@@ -1196,6 +1219,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
     async fn redis_failed_epoch_bump_fails_the_invalidation() {
         let container = RedisImage::default().start().await.unwrap();
         let port = container.get_host_port_ipv4(6379).await.unwrap();
