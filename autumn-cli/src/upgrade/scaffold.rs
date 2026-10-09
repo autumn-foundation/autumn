@@ -1559,6 +1559,8 @@ fn swap(
     match temp.persist_noclobber(absolute) {
         Ok(_) => finish_claim(claim, expected),
         Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // The old copy may have had a late write too. Keep it if so.
+            finish_claim(claim, expected)?;
             Err(PublishError::Moved(
                 "something appeared at this path while it was being written; \
                  it was left exactly as it is"
