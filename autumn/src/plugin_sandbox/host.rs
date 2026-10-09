@@ -663,7 +663,7 @@ fn reported_imports<'a>(imports: impl Iterator<Item = wasmi::ImportType<'a>>) ->
 ///
 /// | | raw passes | expanded passes | charged |
 /// |---|---|---|---|
-/// | body | clone, encode-read, sizing read | encode-write, sizing write, copy into line, seed scan | `3 + 4 × 4/3 = 8 1/3`, charged as 9 |
+/// | body | clone, encode-read, sizing read | encode-write and escape-scan in both passes, seed scan | `3 + 5 × 4/3 = 9 2/3`, charged as 10 |
 /// | metadata | clone, escape-read, sizing read | escape-write, sizing write, seed scan | `3 + 3 × 6 = 21` |
 ///
 /// The sizing walks are `to_line`'s first pass, which counts the line so the
@@ -674,9 +674,9 @@ fn reported_imports<'a>(imports: impl Iterator<Item = wasmi::ImportType<'a>>) ->
 /// same ones [`ResourceLimits::request_footprint_bytes`](crate::plugin_sandbox::manifest::ResourceLimits::request_footprint_bytes)
 /// budgets memory at, so the two describe the same request.
 fn encoding_fuel(request: &SandboxRequest) -> u64 {
-    /// Raw-equivalent walks of the body: three over the raw bytes, four over the
-    /// base64 expansion of them, which is 4/3. `3 + 4 × 4/3` is 8 1/3, so 9.
-    const BODY_PASSES: u64 = 9;
+    /// Raw-equivalent walks of the body: three over the raw bytes, five over the
+    /// base64 expansion of them, which is 4/3. `3 + 5 × 4/3` is 9 2/3, so 10.
+    const BODY_PASSES: u64 = 10;
     /// Raw-equivalent walks of the metadata: three over the raw bytes, three
     /// over a JSON escaping that can reach six bytes per byte.
     const METADATA_PASSES: u64 = 21;
@@ -5450,13 +5450,13 @@ path = "/hello/greet"
     fn encoding_fuel_prices_the_sizing_pass_of_the_line() {
         // `to_line` serialises twice: once to count, once to write. The count
         // still encodes and escapes everything, so it is host work the guest's
-        // fuel must pay for. Two raw walks and 3 + 4/3 expanded ones make
-        // 8 1/3 of the body, with a little more for the metadata.
+        // fuel must pay for. Three raw walks and five expanded ones (encode and
+        // escape-scan in each pass, plus the seed scan) make 9 2/3 of the body.
         let mut request = get("/hello/greet");
         request.body = vec![b'x'; 60_000];
         let charged_bytes = encoding_fuel(&request).saturating_mul(BYTES_PER_FUEL);
         assert!(
-            charged_bytes >= 60_000 * 25 / 3,
+            charged_bytes >= 60_000 * 29 / 3,
             "the charge ({charged_bytes}) leaves the sizing pass free"
         );
     }
