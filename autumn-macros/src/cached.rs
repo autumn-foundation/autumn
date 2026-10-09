@@ -622,6 +622,7 @@ fn generate_cache_body(
                 .try_with(::std::clone::Clone::clone)
                 .ok()
                 .flatten();
+        let __autumn_namespace: &::core::primitive::str = #id_expr;
         let __autumn_key = ::autumn_web::cache::make_cache_key(
             #id_expr,
             &(__autumn_tenant_key_component, #key_args),
@@ -634,6 +635,7 @@ fn generate_cache_body(
             if let Some(__autumn_cached) = ::autumn_web::cache::get_cached::<#value_type>(__autumn_cache, &__autumn_key) {
                 return <#ret_type as ::autumn_web::cache::CacheableResult>::from_ok(__autumn_cached);
             }
+            let __autumn_shared_epoch = ::autumn_web::cache::Cache::fill_epoch(__autumn_cache, __autumn_namespace);
             let __autumn_result = #compute;
             match <#ret_type as ::autumn_web::cache::CacheableResult>::into_result(__autumn_result) {
                 Ok(__autumn_val) => {
@@ -643,7 +645,7 @@ fn generate_cache_body(
                     // pre-invalidation value lands after the clear.
                     ::autumn_web::cache::coherence::with_fill_fence(
                         __autumn_epoch_cell, __autumn_epoch_at_entry,
-                        || ::autumn_web::cache::insert_cached::<#value_type>(__autumn_cache, &__autumn_key, __autumn_val.clone(), __autumn_ttl),
+                        || ::autumn_web::cache::insert_cached_fenced::<#value_type>(__autumn_cache, &__autumn_key, __autumn_val.clone(), __autumn_ttl, __autumn_namespace, __autumn_shared_epoch),
                     );
                     <#ret_type as ::autumn_web::cache::CacheableResult>::from_ok(__autumn_val)
                 }
@@ -656,6 +658,7 @@ fn generate_cache_body(
             if let Some(__autumn_cached) = ::autumn_web::cache::get_cached::<#value_type>(__autumn_cache, &__autumn_key) {
                 return __autumn_cached;
             }
+            let __autumn_shared_epoch = ::autumn_web::cache::Cache::fill_epoch(__autumn_cache, __autumn_namespace);
             let __autumn_result = #compute;
             // The epoch check and the insert are one indivisible step: checking
             // first and inserting after leaves a window where an invalidation
@@ -663,7 +666,7 @@ fn generate_cache_body(
             // lands after the clear.
             ::autumn_web::cache::coherence::with_fill_fence(
                 __autumn_epoch_cell, __autumn_epoch_at_entry,
-                || ::autumn_web::cache::insert_cached::<#value_type>(__autumn_cache, &__autumn_key, __autumn_result.clone(), __autumn_ttl),
+                || ::autumn_web::cache::insert_cached_fenced::<#value_type>(__autumn_cache, &__autumn_key, __autumn_result.clone(), __autumn_ttl, __autumn_namespace, __autumn_shared_epoch),
             );
             __autumn_result
         }
@@ -1039,6 +1042,27 @@ mod tests {
         }
     }
 
+    /// The shared (cross-replica) epoch is read after the miss, before the
+    /// compute, and every insert goes through the epoch-checked form.
+    #[test]
+    fn the_insert_is_fenced_by_the_shared_epoch_too() {
+        for (attr, item) in [
+            (TokenStream::new(), quote! { async fn recent() -> u8 { 0 } }),
+            (
+                quote! { result },
+                quote! { async fn recent() -> Result<u8, Error> { Ok(0) } },
+            ),
+        ] {
+            let out = cached_macro(attr, item).to_string();
+            assert!(out.contains("insert_cached_fenced"), "{out}");
+            assert!(!out.contains("insert_cached ::"), "unfenced insert: {out}");
+            let miss = out.find("get_cached").expect("looks up");
+            let sample = out.find("fill_epoch").expect("samples the shared epoch");
+            let compute = out.find("__autumn_result =").expect("computes");
+            assert!(miss < sample && sample < compute, "wrong order: {out}");
+        }
+    }
+
     // ── #1716: cache-coherence dependency declaration ────────────────
 
     #[test]
@@ -1316,8 +1340,8 @@ mod tests {
         let id = "concat ! (module_path ! () , \"::\" , \"recent\")";
         assert_eq!(
             out.matches(id).count(),
-            5,
-            "key, namespace registration, descriptor, id constant, invalidator: {out}"
+            6,
+            "key, namespace registration, fence namespace, descriptor, id constant, invalidator: {out}"
         );
         assert!(
             out.contains(&format!("make_cache_key ({id}")),

@@ -757,9 +757,9 @@ fn invalidations_dimension(mutations: &[Mutation]) -> Dimension<ManifestInvalida
                          invalidator after its own transaction commits (#3056), and a durable \
                          commit-hook row retries it when `commit_hooks` is on. Not proven: that \
                          the backend sweep succeeds (a failure is logged and counted in \
-                         `autumn_cache_invalidation_failures_total`), and that no fill on \
-                         another replica writes an old value back — see \
-                         docs/guide/cache-coherence.md."
+                         `autumn_cache_invalidation_failures_total`), and, on a backend with no \
+                         shared fill epoch, that no fill on another replica writes an old value \
+                         back (`RedisCache` has one) — see docs/guide/cache-coherence.md."
             .to_string(),
         entries,
     }
@@ -1206,8 +1206,10 @@ pub fn with_fill_fence<R>(
 /// configured.
 ///
 /// Returns whether the invalidation was **complete**, which means exactly this:
-/// every entry the namespace held is gone, and no fill this process already had
-/// in flight can put a stale one back.
+/// every entry the namespace held is gone, and no fill already in flight can
+/// put a stale one back. The second part holds for fills in this process. It
+/// holds for fills on other replicas only if the backend has a shared fill
+/// epoch (see below).
 ///
 /// It is `false` when a registered process-level backend could not drop the
 /// namespace — a `RedisCache` whose `SCAN`/`DEL` errored, or a custom
@@ -1231,10 +1233,19 @@ pub fn with_fill_fence<R>(
 /// from "the function has not run yet". Register such a store to close that
 /// gap.
 ///
-/// The fill fence is **per process**. Another replica's in-flight fill, started
-/// before this invalidation and finishing after it, can still write a stale
-/// value into a shared backend; a `true` here does not speak for other
-/// replicas.
+/// # The fill fence
+///
+/// The local fence is **per process**. A backend extends it to the fleet with
+/// [`Cache::fill_epoch`](super::Cache::fill_epoch) and
+/// [`Cache::insert_raw_bytes_if_epoch`](super::Cache::insert_raw_bytes_if_epoch).
+/// `RedisCache` does: it raises a per-namespace epoch in Redis **before** it
+/// sweeps, and a fill stores its value only if that epoch did not move. With
+/// such a backend a `true` speaks for the fleet. If the epoch bump fails, this
+/// returns `false`.
+///
+/// With a backend that has no shared epoch, a fill on another replica that
+/// started before this call can still write a stale value after it. A `true`
+/// then speaks for this process only.
 ///
 /// # Panics
 ///

@@ -1,0 +1,10 @@
+### Changed
+
+- **cache:** the fill fence now works across replicas on `RedisCache`
+  (issue #2356). `invalidate_namespace` raises a per-namespace epoch in Redis
+  before it sweeps. A fill stores its value only if the epoch did not move, so
+  a fill on another replica cannot write back an invalidated value. A `true`
+  now speaks for the fleet. It is `false` if the epoch bump fails. Cost: one
+  `GET` on each miss. Custom backends opt in with `Cache::fill_epoch` and
+  `Cache::insert_raw_bytes_if_epoch`. Without them, the fence stays per
+  process.

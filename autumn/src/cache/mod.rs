@@ -248,6 +248,39 @@ pub trait Cache: Send + Sync + 'static {
     /// [`insert_value`]: Cache::insert_value
     fn insert_raw_bytes(&self, _key: &str, _bytes: Vec<u8>, _ttl: Option<std::time::Duration>) {}
 
+    /// Read the namespace's **shared** fill epoch.
+    ///
+    /// A cross-replica backend keeps one epoch per namespace next to the data.
+    /// [`invalidate_namespace`](Cache::invalidate_namespace) must raise it
+    /// **before** it sweeps. A fill reads it after a miss and before it
+    /// computes, then inserts with
+    /// [`insert_raw_bytes_if_epoch`](Cache::insert_raw_bytes_if_epoch). Then a
+    /// fill on any replica cannot write back a value that an invalidation on
+    /// any replica has dropped.
+    ///
+    /// The default is [`FillEpoch::Unsupported`]. The fence stays per process.
+    fn fill_epoch(&self, _namespace: &str) -> FillEpoch {
+        FillEpoch::Unsupported
+    }
+
+    /// Store pre-serialized bytes **iff** the shared epoch still equals
+    /// `sampled`. The check and the store must be one atomic step.
+    ///
+    /// Returns `true` when stored. A backend that overrides
+    /// [`fill_epoch`](Cache::fill_epoch) must override this too. The default
+    /// stores without a check.
+    fn insert_raw_bytes_if_epoch(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        ttl: Option<std::time::Duration>,
+        _namespace: &str,
+        _sampled: u64,
+    ) -> bool {
+        self.insert_raw_bytes(key, bytes, ttl);
+        true
+    }
+
     /// Try to acquire a cross-replica fill lock for `key`, used by
     /// [`get_or_compute_with`] to ensure at most one replica refills a hot
     /// key at a time.
@@ -316,6 +349,18 @@ pub trait Cache: Send + Sync + 'static {
             }
         })
     }
+}
+
+/// A namespace's shared fill epoch, as read by [`Cache::fill_epoch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillEpoch {
+    /// The backend has no shared epoch. Only the per-process fence applies.
+    Unsupported,
+    /// The epoch at the time of the read.
+    Sampled(u64),
+    /// The backend has a shared epoch but could not read it. A fill must not
+    /// insert: the cost is one extra miss.
+    Unavailable,
 }
 
 /// Outcome of [`Cache::try_acquire_fill_lock`].
@@ -425,6 +470,42 @@ where
     if let Some(bytes) = bytes {
         cache.insert_raw_bytes(key, bytes, ttl);
     }
+}
+
+/// [`insert_cached`] fenced by the namespace's shared epoch.
+///
+/// `epoch` is the [`Cache::fill_epoch`] read after the miss and before the
+/// compute. Returns `true` when the value was stored. `false` means the fill
+/// was fenced out, or the epoch was [`FillEpoch::Unavailable`].
+///
+/// With [`FillEpoch::Unsupported`] this is [`insert_cached`].
+pub fn insert_cached_fenced<V>(
+    cache: &dyn Cache,
+    key: &str,
+    value: V,
+    ttl: Option<std::time::Duration>,
+    namespace: &str,
+    epoch: FillEpoch,
+) -> bool
+where
+    V: Clone + serde::Serialize + Send + Sync + 'static,
+{
+    let sampled = match epoch {
+        FillEpoch::Unsupported => {
+            insert_cached(cache, key, value, ttl);
+            return true;
+        }
+        FillEpoch::Unavailable => return false,
+        FillEpoch::Sampled(sampled) => sampled,
+    };
+    let Some(bytes) = serde_json::to_vec(&value).ok() else {
+        return false;
+    };
+    if record_or_replay_cache_insert(key, Some(&bytes), ttl) {
+        return true;
+    }
+    // Raw bytes only: `insert_value` would write without the check.
+    cache.insert_raw_bytes_if_epoch(key, bytes, ttl, namespace, sampled)
 }
 
 // ── Failure-capsule seam (#1634) ─────────────────────────────────────────────
@@ -623,6 +704,168 @@ pub fn make_cache_key<K: Hash>(fn_name: &str, args: &K) -> String {
     let mut hasher = DefaultHasher::new();
     args.hash(&mut hasher);
     format!("{}:{:x}", fn_name, hasher.finish())
+}
+
+#[cfg(test)]
+mod shared_fence_tests {
+    //! A fake cross-replica backend: two handles share one store and one epoch.
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Shared {
+        data: HashMap<String, Vec<u8>>,
+        epochs: HashMap<String, u64>,
+    }
+
+    #[derive(Clone, Default)]
+    struct Replica {
+        shared: Arc<Mutex<Shared>>,
+        epoch_down: bool,
+    }
+
+    impl Cache for Replica {
+        fn get_value(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+            let bytes = self.shared.lock().unwrap().data.get(key).cloned()?;
+            Some(Arc::new(RawCacheBytes(bytes)))
+        }
+        fn insert_value(&self, _key: &str, _value: Arc<dyn Any + Send + Sync>) {
+            panic!("a shared-fence backend must not take the unfenced path");
+        }
+        fn invalidate(&self, key: &str) {
+            self.shared.lock().unwrap().data.remove(key);
+        }
+        fn clear(&self) {
+            self.shared.lock().unwrap().data.clear();
+        }
+        fn invalidate_namespace(&self, namespace: &str) -> bool {
+            let mut shared = self.shared.lock().unwrap();
+            *shared.epochs.entry(namespace.to_owned()).or_default() += 1;
+            let prefix = format!("{namespace}:");
+            shared.data.retain(|key, _| !key.starts_with(&prefix));
+            true
+        }
+        fn insert_raw_bytes(&self, key: &str, bytes: Vec<u8>, _ttl: Option<Duration>) {
+            self.shared
+                .lock()
+                .unwrap()
+                .data
+                .insert(key.to_owned(), bytes);
+        }
+        fn fill_epoch(&self, namespace: &str) -> FillEpoch {
+            if self.epoch_down {
+                return FillEpoch::Unavailable;
+            }
+            let shared = self.shared.lock().unwrap();
+            FillEpoch::Sampled(shared.epochs.get(namespace).copied().unwrap_or(0))
+        }
+        fn insert_raw_bytes_if_epoch(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+            _ttl: Option<Duration>,
+            namespace: &str,
+            sampled: u64,
+        ) -> bool {
+            let mut shared = self.shared.lock().unwrap();
+            if shared.epochs.get(namespace).copied().unwrap_or(0) != sampled {
+                return false;
+            }
+            shared.data.insert(key.to_owned(), bytes);
+            true
+        }
+    }
+
+    #[test]
+    fn a_fill_on_another_replica_cannot_resurrect_an_invalidated_value() {
+        let a = Replica::default();
+        let b = Replica {
+            shared: Arc::clone(&a.shared),
+            epoch_down: false,
+        };
+        // B misses and samples the shared epoch, then starts computing.
+        let epoch = b.fill_epoch("ns");
+        // A commits a write and invalidates the namespace.
+        assert!(a.invalidate_namespace("ns"));
+        // B finishes and tries to insert the pre-write value.
+        let inserted = insert_cached_fenced(&b, "ns:k", "old".to_string(), None, "ns", epoch);
+        assert!(
+            !inserted,
+            "the shared epoch moved, so the fill is fenced out"
+        );
+        assert!(get_cached::<String>(&a, "ns:k").is_none());
+    }
+
+    #[test]
+    fn a_fill_inserts_when_no_invalidation_landed() {
+        let a = Replica::default();
+        let epoch = a.fill_epoch("ns");
+        assert!(insert_cached_fenced(
+            &a,
+            "ns:k",
+            "new".to_string(),
+            None,
+            "ns",
+            epoch
+        ));
+        assert_eq!(get_cached::<String>(&a, "ns:k").as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn an_unreadable_epoch_skips_the_insert() {
+        let a = Replica {
+            epoch_down: true,
+            ..Replica::default()
+        };
+        let epoch = a.fill_epoch("ns");
+        assert_eq!(epoch, FillEpoch::Unavailable);
+        assert!(!insert_cached_fenced(
+            &a,
+            "ns:k",
+            "v".to_string(),
+            None,
+            "ns",
+            epoch
+        ));
+        assert!(get_cached::<String>(&a, "ns:k").is_none());
+    }
+
+    #[test]
+    fn a_fragment_render_on_another_replica_cannot_resurrect_an_invalidated_value() {
+        let a = Replica::default();
+        let b = Replica {
+            shared: Arc::clone(&a.shared),
+            epoch_down: false,
+        };
+        let html = fragment::cache_fragment_in(Some(&b), "ns", "id", "v1", None, || {
+            // A writes and invalidates while B is still rendering.
+            assert!(a.invalidate_namespace("ns"));
+            maud::html! { "old" }
+        });
+        assert_eq!(html.0, "old", "the fenced-out caller still gets its markup");
+        let again = fragment::cache_fragment_in(Some(&b), "ns", "id", "v1", None, || {
+            maud::html! { "new" }
+        });
+        assert_eq!(again.0, "new", "the stale markup must not be cached");
+    }
+
+    #[cfg(feature = "cache-moka")]
+    #[test]
+    fn a_backend_without_a_shared_epoch_inserts_as_before() {
+        let moka = MokaCache::new(10, None);
+        let epoch = moka.fill_epoch("ns");
+        assert_eq!(epoch, FillEpoch::Unsupported);
+        assert!(insert_cached_fenced(
+            &moka,
+            "ns:k",
+            "v".to_string(),
+            None,
+            "ns",
+            epoch
+        ));
+        assert_eq!(get_cached::<String>(&moka, "ns:k").as_deref(), Some("v"));
+    }
 }
 
 #[cfg(test)]
