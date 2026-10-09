@@ -2523,7 +2523,10 @@ mod tests {
         })
         .await;
         assert!(SAW_SCOPE.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(!scope.is_truncated(), "an awaited invalidation is not detached");
+        assert!(
+            !scope.is_truncated(),
+            "an awaited invalidation is not detached"
+        );
     }
 
     #[tokio::test]

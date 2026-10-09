@@ -1145,7 +1145,10 @@ mod tests {
         ));
         let available = autumn_web::capsule::with_effect_tape(
             std::sync::Arc::clone(&tape),
-            recording_available(&probe_client(), "http://127.0.0.1:9/get?path=live%2Fsk_test"),
+            recording_available(
+                &probe_client(),
+                "http://127.0.0.1:9/get?path=live%2Fsk_test",
+            ),
         )
         .await;
         assert!(!available);

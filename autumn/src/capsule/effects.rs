@@ -2259,10 +2259,7 @@ mod tests {
     fn a_credential_header_token_is_observed() {
         let tape = ReplayEffects::new(CapsuleEffects {
             http: vec![HttpEffect {
-                request_headers: vec![(
-                    "authorization".to_owned(),
-                    "[FILTERED]".to_owned(),
-                )],
+                request_headers: vec![("authorization".to_owned(), "[FILTERED]".to_owned())],
                 ..http("POST", "https://api.example/charge", 502)
             }],
             ..CapsuleEffects::default()
@@ -3006,12 +3003,12 @@ mod tests {
             ..CapsuleEffects::default()
         });
         tape.cache_insert("widgets", b"41", None);
-        assert!(tape.finish().is_empty(), "{:?}", tape.finish());
         assert_eq!(
             tape.cache_get("widgets"),
             CachedValue::Hit(b"41".to_vec()),
             "the run's own write is readable back, as it was in production"
         );
+        assert!(tape.finish().is_empty(), "{:?}", tape.finish());
     }
 
     #[test]
