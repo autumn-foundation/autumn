@@ -1422,6 +1422,9 @@ mod write_guard_tests {
 /// a writable `update` that `--apply` then refuses. A preview that does not
 /// predict its own apply is worse than no preview, and this is the one file
 /// that can be in both halves at once.
+///
+/// The plan also carries each file's planned text. The scaffold diff uses that
+/// text, so preview and apply show the same diff.
 fn plan_scaffold(root: &Path, target: &str, report: &Report) -> Option<scaffold::ScaffoldReport> {
     let migrated: BTreeMap<String, String> = report
         .files

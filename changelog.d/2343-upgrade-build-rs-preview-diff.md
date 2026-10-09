@@ -1,4 +1,4 @@
 ### Fixed
 
-- **upgrade:** `autumn upgrade` now diffs `build.rs` against the planned
-  codemod text. Preview and `--apply` show the same diff (issue #2343).
+- **upgrade:** `autumn upgrade` compares `build.rs` with the planned codemod
+  text. Preview and `--apply` show the same diff (issue #2343).
