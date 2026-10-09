@@ -1194,7 +1194,11 @@ mod tests {
 
     #[test]
     fn deep_nesting_does_not_overflow() {
-        let html = "<div>".repeat(100_000) + "deep" + &"</div>".repeat(100_000);
+        let html = format!(
+            "{}deep{}",
+            "<div>".repeat(100_000),
+            "</div>".repeat(100_000)
+        );
         assert_eq!(md(&html), "deep\n");
     }
 
