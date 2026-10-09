@@ -102,7 +102,26 @@ call with `ClientError::ThrottledLocally`, which maps to `503`, and does not
 count as a circuit-breaker failure. The random draw uses the app's entropy, so
 a sim seed replays it.
 
-### 4. Deadline-expired drops
+### 4. MCP `tools/call` admission
+
+The envelope holds a slot as `critical`, because the tool is not known yet.
+The replay must use its own class. Two rules (issue #3186):
+
+- **Class slots.** The layer keeps a count of classified requests: direct
+  requests and replays. An envelope is not in it. A replay claims a slot with a
+  CAS on this count against the threshold of its class. Thus N+1 concurrent
+  `sheddable` calls shed exactly one, and other unclassified envelopes do not
+  shed a replay. A replay keeps the slot of its envelope and does not take a
+  second one in the total count.
+- **No sample.** The layer gives the envelope an `EnvelopeAdmission` handle in
+  the request extensions. The replay gets the handle. When the replay is shed,
+  it marks the handle, and the envelope gives no limiter sample. MCP answers a
+  shed replay with HTTP 200, so the sample would be fast and false.
+
+Alternative rejected: read the body before admission and admit the envelope at
+the tool's class. It needs the body in memory before the first shed decision.
+
+### 5. Deadline-expired drops
 
 The issue asks to drop queued requests whose deadline passed. This limiter does
 not queue: it admits or sheds at once. Thus no request waits past a deadline in
@@ -127,9 +146,10 @@ the limiter. Deadline headers are the scope of issue #3058.
 - After a long latency increase, the Gradient2 limit can stay low for
   minutes. Use `vegas` when that is a problem.
 - The `/mcp` envelope admits a call as `critical` (up to the full limit),
-  before it knows the tool. The dispatch then checks the tool route's class,
-  so each tool is shed at its own share. MCP methods other than `tools/call`
-  (`initialize`, `tools/list`) are admitted up to the full limit.
+  before it knows the tool. The `tools/call` replay then claims a slot at the
+  tool route's class (see "MCP `tools/call` admission"). MCP methods other
+  than `tools/call` (`initialize`, `tools/list`) are admitted up to the full
+  limit.
 
 ## Evidence
 
