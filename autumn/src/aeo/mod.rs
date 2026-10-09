@@ -551,7 +551,10 @@ fn warn_on_config(config: &crate::config::AutumnConfig) {
         );
     }
     for problem in commerce::paid_route_problems(&aeo.paid_routes) {
-        tracing::warn!("aeo: [[aeo.paid_routes]] {problem}; Autumn skips this route");
+        tracing::warn!(
+            "aeo: [[aeo.paid_routes]] {problem}; an x402 route answers 503, and the route \
+             is not in the OpenAPI payment info"
+        );
     }
     if let Some(issuer) = aeo.oauth.authorization_server.issuer.as_deref() {
         // With no `base_url` the origin comes from each request; check only

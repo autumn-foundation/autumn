@@ -319,8 +319,9 @@ Price a route. A request without payment gets `402` and a
 `PAYMENT-SIGNATURE`. For `GET` and `HEAD`, the handler runs, then Autumn
 settles only a `2xx` answer (a redirect is not paid). For other methods,
 Autumn settles first, then runs the handler. A priced route never runs free: when
-`[aeo.x402]` is incomplete, or the build has no `http-client` feature, it
-answers `503`.
+`[aeo.x402]` is incomplete, the route's `amount` is invalid, or the build has
+no `http-client` feature, it answers `503`. A facilitator error answer is a
+`502`.
 
 ```toml
 [aeo.x402]

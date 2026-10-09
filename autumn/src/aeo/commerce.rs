@@ -517,7 +517,9 @@ impl PricedRoutes {
         let routes: Vec<PaidRoute> = aeo
             .paid_routes
             .iter()
-            .filter(|r| r.is_x402() && route_is_valid(r))
+            // An invalid x402 route stays matched, so it answers 503 and
+            // never runs free.
+            .filter(|r| r.is_x402())
             .cloned()
             .collect();
         if !aeo.enabled || routes.is_empty() {
@@ -772,7 +774,7 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let state = std::sync::Arc::clone(&self.state);
         futures::future::Either::Right(Box::pin(async move {
-            if !state.available {
+            if !state.available || !route_is_valid(&route) {
                 return Ok(plain(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
                     "payments are not available",
@@ -983,6 +985,15 @@ async fn facilitator(
             tracing::warn!(error = %err, op, "aeo: x402 facilitator call failed");
             axum::http::StatusCode::BAD_GATEWAY
         })?;
+    // An error answer is an unavailable facilitator, whatever its body says.
+    if !res.is_success() {
+        tracing::warn!(
+            status = res.status().as_u16(),
+            op,
+            "aeo: x402 facilitator answered an error"
+        );
+        return Err(axum::http::StatusCode::BAD_GATEWAY);
+    }
     res.json::<Value>().map_err(|err| {
         tracing::warn!(error = %err, op, "aeo: x402 facilitator sent no JSON");
         axum::http::StatusCode::BAD_GATEWAY

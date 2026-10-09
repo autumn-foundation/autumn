@@ -562,6 +562,46 @@ mod commerce {
     }
 
     #[tokio::test]
+    async fn an_invalid_priced_route_fails_closed() {
+        let mut config = paid_config();
+        config.aeo.paid_routes.retain(|r| r.path == "/api");
+        config.aeo.paid_routes[0].amount = "1.00".to_owned();
+        let res = TestApp::new()
+            .config(config)
+            .routes(routes![api])
+            .build()
+            .get("/api")
+            .send()
+            .await;
+        assert_eq!(res.status, 503, "an invalid price never serves free");
+    }
+
+    #[tokio::test]
+    async fn a_facilitator_error_is_a_502_whatever_its_body_says() {
+        let mut app = TestApp::new().config(paid_config()).routes(routes![api]);
+        let verify = app
+            .http_mock("x402")
+            .post("/verify")
+            .respond_with(500, json!({ "isValid": true }));
+        let c = app.build();
+        let required = decode_header(
+            c.get("/api")
+                .send()
+                .await
+                .header("payment-required")
+                .unwrap(),
+        )
+        .unwrap();
+        let res = c
+            .get("/api")
+            .header("payment-signature", &signature(&required["accepts"][0]))
+            .send()
+            .await;
+        assert_eq!(res.status, 502);
+        verify.expect_called(1);
+    }
+
+    #[tokio::test]
     async fn paid_request_is_verified_served_and_settled() {
         let mut app = TestApp::new().config(paid_config()).routes(routes![api]);
         let verify = app
