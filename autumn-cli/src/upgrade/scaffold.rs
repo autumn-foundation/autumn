@@ -348,7 +348,9 @@ impl Manifest {
             match publish(&path, &rendered, mode) {
                 Ok(()) => return Ok(next),
                 Err(PublishError::Moved(_)) => back_off(attempt),
-                Err(PublishError::Failed(error)) => return Err(std::io::Error::other(error)),
+                Err(PublishError::Late(error) | PublishError::Failed(error)) => {
+                    return Err(std::io::Error::other(error));
+                }
             }
         }
         Err(std::io::Error::other(format!(
@@ -1360,6 +1362,9 @@ enum Publish {
 enum PublishError {
     /// Another writer changed the path first. Nothing of theirs was touched.
     Moved(String),
+    /// The new file is in place, but a late write reached the old copy. The
+    /// copy was kept. Not retried: the write must be reported.
+    Late(String),
     /// The disk refused.
     Failed(String),
 }
@@ -1372,7 +1377,7 @@ impl From<std::io::Error> for PublishError {
 
 impl std::fmt::Display for PublishError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (Self::Moved(text) | Self::Failed(text)) = self;
+        let (Self::Moved(text) | Self::Late(text) | Self::Failed(text)) = self;
         f.write_str(text)
     }
 }
@@ -1540,7 +1545,7 @@ fn finish_claim(claim: tempfile::TempPath, expected: &str) -> Result<(), Publish
         return Ok(());
     }
     Err(match claim.keep() {
-        Ok(path) => PublishError::Moved(format!(
+        Ok(path) => PublishError::Late(format!(
             "this file was written during the swap; the earlier copy is at {}",
             path.display()
         )),
@@ -3023,7 +3028,7 @@ mod tests {
         let held = claim.to_path_buf();
 
         let error = finish_claim(claim, "planned\n").expect_err("must keep the copy");
-        assert!(matches!(error, PublishError::Moved(_)), "{error}");
+        assert!(matches!(error, PublishError::Late(_)), "{error}");
         assert!(error.to_string().contains(&*held.to_string_lossy()));
         assert_eq!(
             fs::read_to_string(&held).unwrap(),
