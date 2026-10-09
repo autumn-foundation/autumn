@@ -8,7 +8,7 @@
 use autumn_web::aeo::dns_aid::{DnsAidInput, records};
 
 /// Run `autumn aeo dns` and print the zone lines.
-pub fn dns(base_url: Option<String>, mcp_path: Option<String>, ttl: u32, profile: Option<&str>) {
+pub fn dns(base_url: Option<String>, mcp_path: Option<&str>, ttl: u32, profile: Option<&str>) {
     let base_url = base_url.or_else(|| {
         let profile = crate::migrate::effective_profile(profile);
         configured_base_url(
@@ -16,7 +16,7 @@ pub fn dns(base_url: Option<String>, mcp_path: Option<String>, ttl: u32, profile
                 .as_ref(),
         )
     });
-    match render(base_url.as_deref(), mcp_path.as_deref(), ttl) {
+    match render(base_url.as_deref(), mcp_path, ttl) {
         Ok(zone) => print!("{zone}"),
         Err(err) => {
             eprintln!("error: {err}");
@@ -36,8 +36,9 @@ fn configured_base_url(table: Option<&toml::Table>) -> Option<String> {
 
 /// The zone text for `base_url`, with a DNSSEC reminder.
 fn render(base_url: Option<&str>, mcp_path: Option<&str>, ttl: u32) -> Result<String, String> {
-    let base_url = base_url
-        .ok_or("no base URL: pass --base-url or set [seo] base_url in autumn.toml".to_owned())?;
+    let base_url = base_url.ok_or_else(|| {
+        "no base URL: pass --base-url or set [seo] base_url in autumn.toml".to_owned()
+    })?;
     let lines = records(&DnsAidInput::new(base_url, mcp_path).ttl(ttl));
     if lines.is_empty() {
         return Err(format!(

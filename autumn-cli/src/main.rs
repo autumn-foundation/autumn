@@ -2334,6 +2334,7 @@ enum Commands {
     ///
     ///   autumn aeo dns
     ///   autumn aeo dns --base-url https://example.com --mcp-path /mcp
+    #[allow(clippy::doc_markdown)]
     #[command(subcommand, verbatim_doc_comment)]
     Aeo(AeoSubcommands),
 
@@ -5574,7 +5575,7 @@ fn run_command(command: Commands) {
             mcp_path,
             ttl,
             profile,
-        }) => aeo::dns(base_url, mcp_path, ttl, profile.as_deref()),
+        }) => aeo::dns(base_url, mcp_path.as_deref(), ttl, profile.as_deref()),
         Commands::Agents(AgentsSubcommands::Manifest(args)) => {
             let features = routes::CargoFeatures {
                 features: args.features,
