@@ -661,20 +661,23 @@ fn reported_imports<'a>(imports: impl Iterator<Item = wasmi::ImportType<'a>>) ->
 ///
 /// | | raw passes | expanded passes | charged |
 /// |---|---|---|---|
-/// | body | clone, encode-read | encode-write, copy into line, seed scan | `2 + 3 × 4/3 = 6` |
-/// | metadata | clone, escape-read | escape-write, seed scan | `2 + 2 × 6 = 14` |
+/// | body | clone, encode-read, sizing read | encode-write, sizing write, copy into line, seed scan | `3 + 4 × 4/3 = 8 1/3`, charged as 9 |
+/// | metadata | clone, escape-read, sizing read | escape-write, sizing write, seed scan | `3 + 3 × 6 = 21` |
+///
+/// The sizing walks are `to_line`'s first pass, which counts the line so the
+/// second pass can write into an exact buffer.
 ///
 /// Both are upper bounds rather than measurements, because this runs *before*
 /// the line exists — that is the point of it. The expansion factors are the
 /// same ones [`ResourceLimits::request_footprint_bytes`](crate::plugin_sandbox::manifest::ResourceLimits::request_footprint_bytes)
 /// budgets memory at, so the two describe the same request.
 fn encoding_fuel(request: &SandboxRequest) -> u64 {
-    /// Raw-equivalent walks of the body: two over the raw bytes, three over the
-    /// base64 expansion of them, which is 4/3. `2 + 3 × 4/3` is exactly 6.
-    const BODY_PASSES: u64 = 6;
-    /// Raw-equivalent walks of the metadata: two over the raw bytes, two over a
-    /// JSON escaping that can reach six bytes per byte.
-    const METADATA_PASSES: u64 = 14;
+    /// Raw-equivalent walks of the body: three over the raw bytes, four over the
+    /// base64 expansion of them, which is 4/3. `3 + 4 × 4/3` is 8 1/3, so 9.
+    const BODY_PASSES: u64 = 9;
+    /// Raw-equivalent walks of the metadata: three over the raw bytes, three
+    /// over a JSON escaping that can reach six bytes per byte.
+    const METADATA_PASSES: u64 = 21;
 
     let charge = |bytes: usize, passes: u64| {
         u64::try_from(bytes)
@@ -5431,6 +5434,21 @@ path = "/hello/greet"
         assert_eq!(
             canonical,
             vec![("accept".to_owned(), "text/plain".to_owned())],
+        );
+    }
+
+    #[test]
+    fn encoding_fuel_prices_the_sizing_pass_of_the_line() {
+        // `to_line` serialises twice: once to count, once to write. The count
+        // still encodes and escapes everything, so it is host work the guest's
+        // fuel must pay for. Two raw walks and 3 + 4/3 expanded ones make
+        // 8 1/3 of the body, with a little more for the metadata.
+        let mut request = get("/hello/greet");
+        request.body = vec![b'x'; 60_000];
+        let charged_bytes = encoding_fuel(&request).saturating_mul(BYTES_PER_FUEL);
+        assert!(
+            charged_bytes >= 60_000 * 25 / 3,
+            "the charge ({charged_bytes}) leaves the sizing pass free"
         );
     }
 
