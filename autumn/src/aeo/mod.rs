@@ -120,6 +120,25 @@ pub struct AeoConfig {
     pub paid_routes: Vec<commerce::PaidRoute>,
 }
 
+impl AeoConfig {
+    /// Refuse an x402 route that can never match a request: its handler
+    /// would run free.
+    ///
+    /// # Errors
+    /// Names the first such route.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        for route in self.paid_routes.iter().filter(|r| r.is_x402()) {
+            if let Some(problem) = commerce::unmatchable_route(route) {
+                return Err(format!("[[aeo.paid_routes]] {problem}"));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Default for AeoConfig {
     fn default() -> Self {
         Self {
@@ -490,10 +509,14 @@ fn document_response(
         "\"{}\"",
         &documents::sha256_digest(doc.body.as_bytes())["sha256:".len()..][..32]
     );
+    // Weak comparison (RFC 9110 §13.1.2): a proxy may send `W/` back.
     let not_modified = request_headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.split(',').any(|t| t.trim() == etag || t.trim() == "*"));
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|t| t.trim().trim_start_matches("W/"))
+        .any(|t| t == etag || t == "*");
     let mut res = if *method == Method::OPTIONS {
         if !doc
             .headers

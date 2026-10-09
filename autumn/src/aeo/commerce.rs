@@ -165,12 +165,40 @@ pub fn valid_amount(amount: &str) -> bool {
         && (amount == "0" || !amount.starts_with('0'))
 }
 
-/// Problems in `[[aeo.paid_routes]]`, one message each. Autumn skips a
-/// route with a problem.
+/// The problem that keeps `route` from ever matching a request: a method
+/// that is not an HTTP method, or a path that does not start with `/`.
+/// Such an x402 route would serve its handler free, so the config is
+/// refused at startup.
+#[must_use]
+pub fn unmatchable_route(route: &PaidRoute) -> Option<String> {
+    const METHODS: [&str; 7] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+    if !METHODS
+        .iter()
+        .any(|m| m.eq_ignore_ascii_case(route.method.trim()))
+    {
+        return Some(format!(
+            "{:?} {}: method must be one of {}",
+            route.method,
+            route.path,
+            METHODS.join(", ")
+        ));
+    }
+    if !route.path.starts_with('/') {
+        return Some(format!(
+            "{} {:?}: path must start with `/`",
+            route.method, route.path
+        ));
+    }
+    None
+}
+
+/// Problems in `[[aeo.paid_routes]]`, one message each. A priced x402 route
+/// with a problem answers `503`.
 #[must_use]
 pub fn paid_route_problems(routes: &[PaidRoute]) -> Vec<String> {
     let mut problems = Vec::new();
     for r in routes {
+        problems.extend(unmatchable_route(r));
         if !valid_amount(&r.amount) {
             problems.push(format!(
                 "{} {}: amount {:?} is not digits",
@@ -1077,6 +1105,19 @@ mod tests {
         let mut r = PaidRoute::new("GET", "/x", "01");
         r.mpp_method = Some("Stripe".to_owned());
         assert_eq!(paid_route_problems(&[r]).len(), 2);
+    }
+
+    #[test]
+    fn a_route_that_can_never_match_is_a_problem() {
+        assert!(unmatchable_route(&PaidRoute::new("get", "/x", "1")).is_none());
+        for r in [
+            PaidRoute::new("", "/x", "1"),
+            PaidRoute::new("FETCH", "/x", "1"),
+            PaidRoute::new("GET", "api", "1"),
+            PaidRoute::new("GET", "", "1"),
+        ] {
+            assert!(unmatchable_route(&r).is_some(), "{r:?}");
+        }
     }
 
     #[cfg(feature = "http-client")]

@@ -5732,6 +5732,8 @@ impl AutumnConfig {
         // A zero recheck would spin; a negative threshold keeps deferrable work
         // waiting for ever, because the runtime-config signal is never below 0.
         self.cost.validate().map_err(ConfigError::Validation)?;
+        // An x402 route that can never match serves its handler free.
+        self.aeo.validate().map_err(ConfigError::Validation)?;
         // A `[replication]` block that is switched on but cannot ship (no
         // destination, both destinations, no credential indirection) must fail
         // here — so `autumn check` and `autumn doctor` see it too — rather than

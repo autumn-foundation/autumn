@@ -319,6 +319,36 @@ async fn skills_and_ard_are_served() {
 }
 
 #[tokio::test]
+async fn a_weakened_document_etag_still_revalidates() {
+    let c = client();
+    let etag = c
+        .get("/llms.txt")
+        .send()
+        .await
+        .header("etag")
+        .unwrap()
+        .to_owned();
+    let res = c
+        .get("/llms.txt")
+        .header("if-none-match", &format!("\"other\", W/{etag}"))
+        .send()
+        .await;
+    assert_eq!(res.status, 304);
+}
+
+#[test]
+fn an_x402_route_that_can_never_match_is_refused() {
+    let mut config = AutumnConfig::default();
+    config.aeo.paid_routes =
+        vec![toml::from_str("method = \"GET\"\npath = \"api\"\namount = \"1\"").unwrap()];
+    let err = config.validate().unwrap_err().to_string();
+    assert!(err.contains("must start with `/`"), "{err}");
+
+    config.aeo.enabled = false;
+    assert!(config.validate().is_ok(), "AEO off: nothing is priced");
+}
+
+#[tokio::test]
 async fn documents_answer_get_and_head_only() {
     let c = client();
     let get = c.get("/llms.txt").send().await;
