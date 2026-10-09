@@ -2911,6 +2911,125 @@ async fn a_declared_valid_time_column_separates_the_two_axes() {
     );
 }
 
+// ── #2326: snapshot fidelity ─────────────────────────────────────────
+
+#[tokio::test]
+async fn a_non_finite_float_cannot_be_written_to_a_ledgered_row() {
+    let pool = boot_pool("lg_non_finite").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool);
+
+    let err = repo
+        .save(&NewLgInvoice {
+            reference: "INV-INF".to_string(),
+            amount_cents: 1,
+            amount_rate: f64::INFINITY,
+            metadata: "{}".to_string(),
+        })
+        .await
+        .expect_err("a snapshot cannot hold infinity");
+    let text = err.to_string();
+    assert!(
+        text.contains("amount_rate") && text.contains("lg_invoices"),
+        "the error names the table and the column: {text}"
+    );
+
+    let all = repo.find_all().await.expect("list");
+    assert!(all.is_empty(), "the refused write left no row behind");
+}
+
+#[tokio::test]
+async fn a_non_finite_update_is_refused_and_leaves_the_chain_intact() {
+    let pool = boot_pool("lg_non_finite_update").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool);
+    let id = write_three_revisions(&repo).await;
+
+    repo.update(
+        id,
+        &UpdateLgInvoice {
+            amount_rate: Patch::Set(f64::NEG_INFINITY),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("infinity must be refused");
+
+    let report = repo.ledger_verify(id).await.expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+    assert_eq!(report.revisions_checked, 3, "no revision was appended");
+    let live = repo.find_by_id(id).await.expect("read").expect("row");
+    assert!(live.amount_rate.is_finite(), "the row kept its old value");
+}
+
+#[test]
+fn the_generated_check_names_the_first_non_finite_column() {
+    let mut invoice = LgInvoice {
+        id: 1,
+        reference: "R".to_string(),
+        amount_cents: 1,
+        amount_rate: 1.0,
+        metadata: "{}".to_string(),
+        deleted_at: None,
+    };
+    assert_eq!(invoice.__autumn_ledger_non_finite_column(), None);
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        invoice.amount_rate = bad;
+        assert_eq!(
+            invoice.__autumn_ledger_non_finite_column(),
+            Some("amount_rate")
+        );
+    }
+}
+
+#[tokio::test]
+async fn delete_and_restore_do_not_inherit_a_stale_valid_time() {
+    let pool = boot_pool("lg_valid_time_delete").await;
+    let repo = PgLgEffectiveNoteRepository::with_pool_untracked(pool);
+
+    let effective = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+        .expect("date")
+        .and_hms_opt(0, 0, 0)
+        .expect("time");
+    let created = repo
+        .save(&NewLgEffectiveNote {
+            body: "v1".to_string(),
+            effective_at: effective,
+        })
+        .await
+        .expect("insert");
+    repo.delete_by_id(created.id).await.expect("soft delete");
+    repo.restore(created.id).await.expect("restore");
+
+    let revisions = repo.ledger_revisions(created.id).await.expect("revisions");
+    assert_eq!(revisions.len(), 3);
+    for revision in &revisions[1..] {
+        assert_eq!(
+            revision.valid_from, revision.recorded_at,
+            "a delete or restore is valid from the instant it was made"
+        );
+    }
+
+    let february = chrono::NaiveDate::from_ymd_opt(2026, 2, 1)
+        .expect("date")
+        .and_hms_opt(0, 0, 0)
+        .expect("time")
+        .and_utc();
+    let then = repo
+        .ledger_as_of_at(created.id, LedgerAsOf::valid(february))
+        .await
+        .expect("as-of")
+        .expect("state");
+    assert!(
+        then.deleted_at.is_none(),
+        "February was before the deletion, so the row was not deleted yet"
+    );
+    assert!(
+        repo.ledger_verify(created.id)
+            .await
+            .expect("verify")
+            .is_intact()
+    );
+}
+
 async fn write_three_revisions(repo: &PgLgInvoiceRepository) -> i64 {
     let created = repo
         .save(&NewLgInvoice {
