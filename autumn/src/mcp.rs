@@ -1097,6 +1097,9 @@ struct ReplayContext<'a> {
     headers: &'a HeaderMap,
     identity: Option<&'a crate::security::ResolvedClientIdentity>,
     peer: Option<std::net::SocketAddr>,
+    /// The envelope's load-shed admission. A shed replay marks it, so the
+    /// envelope gives no limiter sample.
+    envelope_admission: Option<crate::middleware::EnvelopeAdmission>,
     /// The verified mTLS client identity of the connection the `/mcp` envelope
     /// arrived on (#1640), when there is one.
     #[cfg(feature = "tls")]
@@ -1185,6 +1188,7 @@ async fn serve_mcp(
     #[cfg(feature = "tls")] client_cert: Option<
         axum::extract::Extension<std::sync::Arc<crate::tls::client_auth::ClientIdentity>>,
     >,
+    envelope_admission: Option<axum::extract::Extension<crate::middleware::EnvelopeAdmission>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -1220,6 +1224,7 @@ async fn serve_mcp(
         headers: &headers,
         identity,
         peer: connect_info.map(|ext| (ext.0).0),
+        envelope_admission: envelope_admission.map(|ext| ext.0),
         #[cfg(feature = "tls")]
         client_cert,
     };
@@ -2085,6 +2090,9 @@ fn apply_replay_extensions(
     // effective ceiling for MCP traffic.
     if server.envelope_load_shed {
         extensions.insert(crate::middleware::LoadShedExempt);
+        if let Some(admission) = &ctx.envelope_admission {
+            extensions.insert(admission.clone());
+        }
     }
 }
 

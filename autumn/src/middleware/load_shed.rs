@@ -57,7 +57,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use axum::body::Body;
@@ -75,22 +75,35 @@ use crate::middleware::maintenance::{health_prefix_matches, prefix_with_trailing
 /// rather than piling onto the already-loaded process.
 const RETRY_AFTER_SECS: &str = "1";
 
-/// Request-extension marker that exempts a request from load-shed admission
-/// accounting.
+/// Request-extension marker for an MCP `tools/call` replay.
 ///
-/// Set on requests that have already been counted by an upstream
-/// `LoadShedLayer` so a shared-counter replay doesn't double-count them. The
-/// MCP endpoint uses this: `/mcp`'s outer envelope and its `tools/call`
-/// dispatch replay share the same `LoadShedLayer` instance (same `Arc`
-/// counter, see `crate::router::build_load_shed_layer`); without this marker
-/// a single `tools/call` would acquire one slot at the envelope and a second
-/// at the replay, silently halving the effective ceiling for MCP traffic (at
-/// `max_concurrent_requests = 1` a solo `tools/call` would even shed itself).
-/// The marker keeps the replay from consuming a second slot for the same
-/// logical request. It is only ever set internally — external requests
-/// cannot carry it, since extensions are not derived from headers.
+/// The `/mcp` envelope already holds a slot in the total count, as
+/// `critical`. The replay does not take a second one: at
+/// `max_concurrent_requests = 1`, a solo `tools/call` would shed itself.
+/// The replay claims a slot at its route's class instead. It is shed when
+/// that class is full. Only internal code sets this marker, because
+/// extensions do not come from headers.
 #[derive(Clone, Copy, Debug)]
 pub struct LoadShedExempt;
+
+/// Marks the `/mcp` envelope. The layer gives it an [`EnvelopeAdmission`].
+#[derive(Clone, Copy, Debug)]
+pub struct LoadShedEnvelope;
+
+/// The envelope's admission, as seen by its `tools/call` replay.
+#[derive(Clone, Debug, Default)]
+pub struct EnvelopeAdmission(Arc<AtomicBool>);
+
+impl EnvelopeAdmission {
+    /// The replay was shed: the envelope must give no limiter sample.
+    pub fn skip_sample(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn is_skipped(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
 
 /// Tower [`Layer`] that caps concurrent in-flight requests and sheds the
 /// excess with an immediate `503 Service Unavailable`.
@@ -101,6 +114,10 @@ pub struct LoadShedLayer {
     limit: LimitSource,
     shares: PartitionShares,
     in_flight: Arc<AtomicUsize>,
+    /// Requests that hold a slot of their own class: direct requests and
+    /// `tools/call` replays. An envelope that is not yet classified is not
+    /// counted, so a replay burst does not shed itself.
+    classified: Arc<AtomicUsize>,
     metrics: MetricsCollector,
     paths: Arc<ExemptPaths>,
     cors: Option<Arc<crate::config::CorsConfig>>,
@@ -166,6 +183,7 @@ impl LoadShedLayer {
             limit,
             shares: PartitionShares::default(),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            classified: Arc::new(AtomicUsize::new(0)),
             metrics,
             paths: Arc::new(ExemptPaths {
                 health_prefix: String::new(),
@@ -294,7 +312,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+    fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
         let limit = self.layer.current_limit();
         if limit == 0 || self.is_exempt(&req) {
             return LoadShedFuture::Forward {
@@ -303,19 +321,33 @@ where
             };
         }
         if req.extensions().get::<LoadShedExempt>().is_some() {
-            // An outer admission (the `/mcp` envelope) already counted this
-            // request, as `critical`, before it knew the route. Check the
-            // class of the route it reaches now. The in-flight count includes this request's own slot, so a
-            // fresh request would pass only if `in_flight <= threshold`.
-            if let Some(&criticality) = req.extensions().get::<Criticality>()
-                && self.layer.in_flight.load(Ordering::Acquire)
-                    > self.layer.shares.threshold(criticality, limit)
-            {
+            // An outer admission (the `/mcp` envelope) already holds this
+            // request's slot, as `critical`, because it did not know the
+            // route. Claim a slot at the route's own class now. The claim
+            // counts only classified requests, so other unclassified
+            // envelopes do not shed this one.
+            let Some(&criticality) = req.extensions().get::<Criticality>() else {
+                return LoadShedFuture::Forward {
+                    inner: self.inner.call(req),
+                    guard: None,
+                };
+            };
+            let threshold = self.layer.shares.threshold(criticality, limit);
+            if claim(&self.layer.classified, threshold).is_none() {
+                // The envelope answers 200, so it must give no sample.
+                if let Some(envelope) = req.extensions().get::<EnvelopeAdmission>() {
+                    envelope.skip_sample();
+                }
                 return self.shed(&req, criticality);
             }
             return LoadShedFuture::Forward {
                 inner: self.inner.call(req),
-                guard: None,
+                guard: Some(InFlightGuard {
+                    in_flight: None,
+                    classified: Some(Arc::clone(&self.layer.classified)),
+                    sampler: None,
+                    envelope: None,
+                }),
             };
         }
 
@@ -326,24 +358,22 @@ where
             .unwrap_or_default();
         let threshold = self.layer.shares.threshold(criticality, limit);
         let in_flight = &self.layer.in_flight;
-        let mut current = in_flight.load(Ordering::Acquire);
-        loop {
-            if current >= threshold {
-                return self.shed(&req, criticality);
-            }
-            // `current < threshold` is checked immediately above, so the bump is
-            // exact; `saturating_add` only guards the theoretical `usize::MAX`
-            // limit, where sticking at MAX beats aborting the request.
-            match in_flight.compare_exchange_weak(
-                current,
-                current.saturating_add(1),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
+        let Some(current) = claim(in_flight, threshold) else {
+            return self.shed(&req, criticality);
+        };
+        // An envelope is not classified until its replay claims a slot.
+        let envelope = req
+            .extensions()
+            .get::<LoadShedEnvelope>()
+            .is_some()
+            .then(EnvelopeAdmission::default);
+        if let Some(envelope) = &envelope {
+            req.extensions_mut().insert(envelope.clone());
         }
+        let classified = envelope.is_none().then(|| {
+            self.layer.classified.fetch_add(1, Ordering::AcqRel);
+            Arc::clone(&self.layer.classified)
+        });
 
         let deadline = req.extensions().get::<InboundDeadline>().copied();
         let sampler = match (&self.layer.limit, deadline) {
@@ -363,9 +393,34 @@ where
         LoadShedFuture::Forward {
             inner: self.inner.call(req),
             guard: Some(InFlightGuard {
-                counter: Arc::clone(in_flight),
+                in_flight: Some(Arc::clone(in_flight)),
+                classified,
                 sampler,
+                envelope,
             }),
+        }
+    }
+}
+
+/// Take one slot of `counter` while it is below `threshold`.
+///
+/// Returns the count before the claim. It uses a lock-free CAS loop.
+fn claim(counter: &AtomicUsize, threshold: usize) -> Option<usize> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        if current >= threshold {
+            return None;
+        }
+        // `current < threshold` is checked above, so the bump is exact;
+        // `saturating_add` only guards the theoretical `usize::MAX` limit.
+        match counter.compare_exchange_weak(
+            current,
+            current.saturating_add(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(current),
+            Err(observed) => current = observed,
         }
     }
 }
@@ -403,9 +458,15 @@ impl Sampler {
 /// [`crate::middleware::metrics::MetricsFuture`]'s `PinnedDrop` gives
 /// `requests_active`.
 struct InFlightGuard {
-    counter: Arc<AtomicUsize>,
+    /// The total count. `None` for a replay: the envelope holds that slot.
+    in_flight: Option<Arc<AtomicUsize>>,
+    /// The count of requests that hold a slot of their own class. `None`
+    /// for an envelope.
+    classified: Option<Arc<AtomicUsize>>,
     /// `Some` in adaptive mode until the sample is recorded.
     sampler: Option<Sampler>,
+    /// `Some` for an `/mcp` envelope.
+    envelope: Option<EnvelopeAdmission>,
 }
 
 impl InFlightGuard {
@@ -418,6 +479,13 @@ impl InFlightGuard {
         let Some(sampler) = self.sampler.take() else {
             return;
         };
+        if self
+            .envelope
+            .as_ref()
+            .is_some_and(EnvelopeAdmission::is_skipped)
+        {
+            return;
+        }
         match status {
             Some(s) if s.is_client_error() || s == axum::http::StatusCode::SERVICE_UNAVAILABLE => {}
             Some(s) => sampler.record(s == axum::http::StatusCode::GATEWAY_TIMEOUT),
@@ -432,13 +500,22 @@ impl Drop for InFlightGuard {
         // overload: record the elapsed time as a drop. Before it, the client
         // went away, which does not show capacity.
         if let Some(sampler) = self.sampler.take()
+            && !self
+                .envelope
+                .as_ref()
+                .is_some_and(EnvelopeAdmission::is_skipped)
             && sampler
                 .deadline
                 .is_some_and(|d| tokio::time::Instant::now() >= d)
         {
             sampler.record(true);
         }
-        self.counter.fetch_sub(1, Ordering::AcqRel);
+        if let Some(classified) = &self.classified {
+            classified.fetch_sub(1, Ordering::AcqRel);
+        }
+        if let Some(in_flight) = &self.in_flight {
+            in_flight.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -1091,22 +1168,32 @@ mod tests {
         for _ in 0..2 {
             let app = app.clone();
             held.push(tokio::spawn(async move {
-                app.oneshot(request("/block", Some(Criticality::Critical)))
-                    .await
-                    .unwrap()
-                    .status()
+                let mut req = request("/block", Some(Criticality::Critical));
+                req.extensions_mut().insert(LoadShedEnvelope);
+                app.oneshot(req).await.unwrap().status()
             }));
         }
         wait_for_entered(&entered, 2).await;
 
-        let replay = |c| {
-            let mut req = request("/work", Some(c));
+        let replay = |c, uri| {
+            let mut req = request(uri, Some(c));
             req.extensions_mut().insert(LoadShedExempt);
             req
         };
+        // The first sheddable replay takes the one sheddable slot.
+        let first = {
+            let app = app.clone();
+            tokio::spawn(async move {
+                app.oneshot(replay(Criticality::Sheddable, "/block"))
+                    .await
+                    .unwrap()
+                    .status()
+            })
+        };
+        wait_for_entered(&entered, 3).await;
         assert_eq!(
             app.clone()
-                .oneshot(replay(Criticality::Sheddable))
+                .oneshot(replay(Criticality::Sheddable, "/work"))
                 .await
                 .unwrap()
                 .status(),
@@ -1115,17 +1202,126 @@ mod tests {
         );
         assert_eq!(
             app.clone()
-                .oneshot(replay(Criticality::Critical))
+                .oneshot(replay(Criticality::Critical, "/work"))
                 .await
                 .unwrap()
                 .status(),
             axum::http::StatusCode::OK,
-            "a critical tool at the limit is not shed again"
+            "a critical tool below the limit is not shed"
         );
         gate.notify_waiters();
+        assert_eq!(first.await.unwrap(), axum::http::StatusCode::OK);
         for h in held {
             assert_eq!(h.await.unwrap(), axum::http::StatusCode::OK);
         }
+    }
+
+    /// Defect 1 (#3186): N+1 concurrent `sheddable` replays shed exactly 1.
+    /// Each envelope holds a slot as `critical`; replays must not count the
+    /// other replays' envelopes.
+    #[tokio::test]
+    async fn replay_burst_sheds_only_the_excess() {
+        use crate::admission::{Criticality, PartitionShares};
+        // Limit 10, sheddable share 0.5: threshold 5.
+        let layer = LoadShedLayer::new(10, MetricsCollector::new())
+            .with_partitions(PartitionShares::new(1.0, 0.5).unwrap());
+        let gate = Arc::new(Notify::new());
+        let entered = Arc::new(StdAtomicUsize::new(0));
+        let counters = (Arc::clone(&layer.in_flight), Arc::clone(&layer.classified));
+        let app = make_blocking_app(layer, gate.clone(), entered.clone());
+
+        let mut envelopes = Vec::new();
+        for _ in 0..6 {
+            let app = app.clone();
+            envelopes.push(tokio::spawn(async move {
+                let mut req = request("/block", Some(Criticality::Critical));
+                req.extensions_mut().insert(LoadShedEnvelope);
+                app.oneshot(req).await.unwrap().status()
+            }));
+        }
+        wait_for_entered(&entered, 6).await;
+
+        let mut replays = Vec::new();
+        for _ in 0..6 {
+            let app = app.clone();
+            replays.push(tokio::spawn(async move {
+                let mut req = request("/block", Some(Criticality::Sheddable));
+                req.extensions_mut().insert(LoadShedExempt);
+                app.oneshot(req).await.unwrap().status()
+            }));
+        }
+        wait_for_entered(&entered, 11).await;
+        gate.notify_waiters();
+        let mut statuses = Vec::new();
+        for h in replays {
+            statuses.push(h.await.unwrap());
+        }
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|s| **s == axum::http::StatusCode::SERVICE_UNAVAILABLE)
+                .count(),
+            1
+        );
+        for h in envelopes {
+            assert_eq!(h.await.unwrap(), axum::http::StatusCode::OK);
+        }
+        assert_eq!(counters.0.load(Ordering::Acquire), 0, "total count leaks");
+        assert_eq!(counters.1.load(Ordering::Acquire), 0, "class count leaks");
+    }
+
+    /// Defect 2 (#3186): a replay shed gives the envelope no limiter sample.
+    /// A control run shows that a normal fast envelope does grow the limit.
+    #[tokio::test]
+    async fn replay_shed_gives_no_limiter_sample() {
+        use crate::admission::{Criticality, PartitionShares};
+        use std::convert::Infallible;
+
+        async fn run_envelope(replay_class: Criticality) -> usize {
+            // Limit 1: one fast sample grows it. Sheddable share 0 sheds
+            // every sheddable replay.
+            let limiter = aimd_limiter(1);
+            let layer = LoadShedLayer::adaptive(Arc::clone(&limiter), MetricsCollector::new())
+                .with_partitions(PartitionShares::new(1.0, 0.0).unwrap());
+            let replay_svc =
+                layer
+                    .clone()
+                    .layer(tower::service_fn(|_req: Request<Body>| async move {
+                        Ok::<_, Infallible>(Response::new(Body::empty()))
+                    }));
+            let envelope_svc = layer.layer(tower::service_fn(move |req: Request<Body>| {
+                let mut replay_svc = replay_svc.clone();
+                async move {
+                    let handle = req
+                        .extensions()
+                        .get::<EnvelopeAdmission>()
+                        .cloned()
+                        .expect("the layer gives the envelope a handle");
+                    let mut replay = request("/work", Some(replay_class));
+                    replay.extensions_mut().insert(LoadShedExempt);
+                    replay.extensions_mut().insert(handle);
+                    let _ = replay_svc.call(replay).await.unwrap();
+                    // MCP turns a shed into an HTTP 200 tool error.
+                    Ok::<_, Infallible>(Response::new(Body::empty()))
+                }
+            }));
+            let mut req = request("/mcp", Some(Criticality::Critical));
+            req.extensions_mut().insert(LoadShedEnvelope);
+            let resp = envelope_svc.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+            limiter.limit()
+        }
+
+        assert_eq!(
+            run_envelope(Criticality::Critical).await,
+            2,
+            "control: a fast envelope grows the limit"
+        );
+        assert_eq!(
+            run_envelope(Criticality::Sheddable).await,
+            1,
+            "a shed replay is not a sample"
+        );
     }
 
     // ── Probe / actuator exemption ────────────────────────────────────────
