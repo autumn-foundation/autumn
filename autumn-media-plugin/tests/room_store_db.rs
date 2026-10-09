@@ -1018,6 +1018,8 @@ async fn a_dropped_join_does_not_leave_the_room_row_locked() {
     .await
     .expect("a later join must not wait on a dropped one");
     next.expect("join");
+    // The dropped join rolls back, so it holds no seat.
+    assert_eq!(seat_rows(&pool, "room-1").await, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1038,7 +1040,7 @@ async fn a_leave_with_a_wrong_token_takes_no_lock() {
 
     let mut holder = hold_room_row(&pool, "room-1").await;
     let wrong = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        CALL_LIMIT,
         store.leave_room("", "room-1", "p1", "not-the-token"),
     )
     .await

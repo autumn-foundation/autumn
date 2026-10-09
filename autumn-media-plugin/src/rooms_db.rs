@@ -223,14 +223,35 @@ async fn lock_room(
 
 /// Run `work` on its own task, so its transaction ends with `COMMIT` or
 /// `ROLLBACK` even if the caller drops the future (a client disconnect or a
-/// timeout). Without this, the pool gets the connection back with the
-/// transaction open, and the room row stays locked.
-async fn detached<T: Send + 'static>(
-    work: impl Future<Output = Result<T, RoomError>> + Send + 'static,
-) -> Result<T, RoomError> {
-    tokio::spawn(work)
-        .await
-        .unwrap_or_else(|err| Err(map_db_err(err)))
+/// timeout). Without this, the room row can stay locked until the pool drops
+/// that connection.
+///
+/// `work` gets a [`Caller`], so it can roll back when nobody waits for the
+/// result. A panic in `work` continues in the caller.
+async fn detached<T, Fut>(work: impl FnOnce(Caller) -> Fut) -> Result<T, RoomError>
+where
+    T: Send + 'static,
+    Fut: Future<Output = Result<T, RoomError>> + Send + 'static,
+{
+    let (_alive, watch) = tokio::sync::oneshot::channel::<()>();
+    match tokio::spawn(work(Caller(watch))).await {
+        Ok(result) => result,
+        Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+        Err(err) => Err(map_db_err(err)),
+    }
+}
+
+/// The caller of a [`detached`] call.
+struct Caller(tokio::sync::oneshot::Receiver<()>);
+
+impl Caller {
+    /// `true` when the caller dropped its future.
+    fn is_gone(&mut self) -> bool {
+        matches!(
+            self.0.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        )
+    }
 }
 
 /// Check that `participant_id` holds a seat in the room, with `token`.
@@ -368,7 +389,7 @@ impl RoomStore for DbRoomStore {
     ) -> RoomStoreFuture<'a, JoinRecord> {
         let pool = self.pool.clone();
         let (namespace, room_id) = (namespace.to_owned(), room_id.to_owned());
-        Box::pin(detached(async move {
+        Box::pin(detached(move |mut caller| async move {
             let (namespace, room_id) = (namespace.as_str(), room_id.as_str());
             let mut conn = pool.get().await.map_err(map_db_err)?;
             // One transaction that holds the room row: two joins for the last
@@ -401,6 +422,11 @@ impl RoomStore for DbRoomStore {
                     .await?;
                 if usize::try_from(seats).unwrap_or(usize::MAX) >= max {
                     return Err(RoomError::RoomFull { max }.into());
+                }
+                // A caller that is gone gets no seat: roll back, so it does
+                // not hold a place in the cap until the reaper removes it.
+                if caller.is_gone() {
+                    return Err(RoomError::Store.into());
                 }
 
                 let now = Utc::now();
@@ -454,7 +480,7 @@ impl RoomStore for DbRoomStore {
     ) -> RoomStoreFuture<'a, ()> {
         let pool = self.pool.clone();
         let owned = [namespace, room_id, participant_id, token].map(str::to_owned);
-        Box::pin(detached(async move {
+        Box::pin(detached(move |_caller| async move {
             let [namespace, room_id, participant_id, token] = owned.each_ref().map(String::as_str);
             let mut conn = pool.get().await.map_err(map_db_err)?;
             // Check the token before the lock, so a bad request takes no lock.
