@@ -10138,18 +10138,20 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         use ::autumn_web::reexports::diesel::prelude::*;
         use ::autumn_web::reexports::diesel_async::RunQueryDsl;
 
+        // #2319: the factory insert records no ledger revision. Refuse before
+        // any association row is created, so a refusal writes nothing.
+        if let ::core::result::Result::Err(err) =
+            ::autumn_web::ledger::refuse_out_of_band_write(#table_name_lit, "factory")
+        {
+            panic!("factory: {err}");
+        }
+
         #(#factory_value_bindings)*
         #(#create_assoc_bindings)*
 
         let new_record = #new_name {
             #(#new_construct_fields,)*
         };
-        // #2319: the factory insert records no ledger revision.
-        if let ::core::result::Result::Err(err) =
-            ::autumn_web::ledger::refuse_out_of_band_write(#table_name_lit, "factory")
-        {
-            panic!("factory: {err}");
-        }
         let mut conn = pool
             .get()
             .await
@@ -14333,6 +14335,32 @@ mod tests {
             3,
             "add, remove and set must each refuse: {generated}"
         );
+    }
+
+    #[test]
+    fn model_macro_factory_refuses_before_it_creates_associations() {
+        // #2319: a refused factory call must write nothing, so the guard runs
+        // before any `#[factory_assoc]` parent is created.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                    #[factory_assoc(User)]
+                    pub user_id: i64,
+                }
+            },
+        )
+        .to_string();
+        let guard = generated
+            .find("refuse_out_of_band_write (\"posts\" , \"factory\")")
+            .expect("the factory refuses a ledgered table");
+        let assoc = generated
+            .find("User :: factory () . create (pool)")
+            .expect("the factory creates the association");
+        assert!(guard < assoc, "{generated}");
     }
 
     #[test]
