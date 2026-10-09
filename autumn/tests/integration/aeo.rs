@@ -416,6 +416,7 @@ async fn private_page() -> impl IntoResponse {
 async fn without_a_base_url_the_401_hint_uses_the_request_host() {
     let mut config = AutumnConfig::default();
     config.aeo.oauth.authorization_servers = vec!["https://auth.example.com".to_owned()];
+    config.security.trusted_hosts.hosts = vec!["shop.example.com".to_owned()];
     let res = TestApp::new()
         .config(config)
         .routes(routes![private_page])
