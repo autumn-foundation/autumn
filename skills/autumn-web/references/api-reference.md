@@ -1060,6 +1060,12 @@ must have no TTL, or a TTL of at least `ttl + window`.
   `autumn_cache_invalidation_failures_total`. Alert on it.
 - `RedisCache` retries with `InvalidationRetry` (default 3 attempts);
   change it with `.with_invalidation_retry(InvalidationRetry::new(..))`.
+- `RedisCache` keeps a shared fill epoch per namespace (#2356).
+  `invalidate_namespace` raises it before the sweep, so a `true` is valid for
+  all replicas. It needs a Redis write (`INCR`), and `false` if that fails.
+  Fills made by `#[cached]` and `cache_fragment_in` use it. A custom backend
+  opts in with `Cache::shares_fill_epoch`, `Cache::fill_epoch` and
+  `Cache::insert_raw_bytes_if_epoch`.
 
 ## Downloads (0.6.0)
 
