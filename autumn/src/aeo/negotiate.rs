@@ -435,11 +435,7 @@ fn is_negotiable(res: &Response) -> bool {
         && headers
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|ct| {
-                ct.split(';')
-                    .next()
-                    .is_some_and(|m| m.trim().eq_ignore_ascii_case("text/html"))
-            })
+            .is_some_and(utf8_html)
         && !headers.contains_key(CONTENT_ENCODING)
         && !headers.contains_key(CONTENT_RANGE)
         && !headers
@@ -450,6 +446,26 @@ fn is_negotiable(res: &Response) -> bool {
                     .to_ascii_lowercase()
                     .starts_with("attachment")
             })
+}
+
+/// `text/html` whose bytes read as UTF-8: no charset, or `utf-8` or
+/// `us-ascii`. The converter reads UTF-8, and the Markdown says UTF-8.
+fn utf8_html(content_type: &str) -> bool {
+    let mut parts = content_type.split(';');
+    let html = parts
+        .next()
+        .is_some_and(|m| m.trim().eq_ignore_ascii_case("text/html"));
+    html && parts.all(|param| {
+        let Some((name, value)) = param.split_once('=') else {
+            return true;
+        };
+        !name.trim().eq_ignore_ascii_case("charset") || {
+            let charset = value.trim().trim_matches('"');
+            ["utf-8", "utf8", "us-ascii"]
+                .iter()
+                .any(|c| charset.eq_ignore_ascii_case(c))
+        }
+    })
 }
 
 fn add_vary_accept(headers: &mut HeaderMap) {
@@ -622,6 +638,17 @@ mod tests {
             "a stripped body says nothing"
         );
         assert!(known_to_fit(&Response::new(Body::from("<p>x</p>")), 10));
+    }
+
+    #[test]
+    fn only_utf8_html_is_converted() {
+        assert!(utf8_html("text/html"));
+        assert!(utf8_html("text/html; charset=utf-8"));
+        assert!(utf8_html("Text/HTML; Charset=\"UTF-8\""));
+        assert!(utf8_html("text/html; charset=us-ascii"));
+        assert!(!utf8_html("text/html; charset=iso-8859-1"));
+        assert!(!utf8_html("text/html;charset=windows-1252"));
+        assert!(!utf8_html("application/json"));
     }
 
     #[test]

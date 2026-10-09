@@ -262,12 +262,16 @@ pub struct Origin {
 
 impl Origin {
     /// Use `[seo] base_url` when set. Else build it from the `Host` header:
-    /// `http` for loopback hosts, `https` for the rest.
+    /// `http` for loopback hosts, `https` for the rest. A `base_url` with a
+    /// query or a fragment is not used: paths are appended to it, and they
+    /// would land inside that component.
     #[must_use]
     pub fn resolve(base_url: Option<&str>, host_header: Option<&str>) -> Self {
         if let Some(base) = base_url.map(|b| b.trim().trim_end_matches('/'))
             && let Ok(url) = url::Url::parse(base)
             && let Some(host) = url.host_str()
+            && url.query().is_none()
+            && url.fragment().is_none()
         {
             return Self {
                 base: base.to_owned(),
@@ -1324,6 +1328,15 @@ mod tests {
         let o = Origin::resolve(Some("https://Shop.Example.com:8443/"), Some("evil.test"));
         assert_eq!(o.base, "https://Shop.Example.com:8443");
         assert_eq!(o.host, "shop.example.com");
+    }
+
+    #[test]
+    fn a_base_url_with_a_query_or_fragment_is_not_used() {
+        for base in ["https://example.com?tenant=a", "https://example.com/#top"] {
+            let o = Origin::resolve(Some(base), Some("app.example.com"));
+            assert!(!o.configured, "{base}");
+            assert_eq!(o.url("/llms.txt"), "https://app.example.com/llms.txt");
+        }
     }
 
     #[test]

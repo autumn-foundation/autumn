@@ -428,17 +428,17 @@ impl AeoSite {
             .then(|| HeaderValue::from_str(&robots::content_signal_value(aeo.content_signals)).ok())
             .flatten();
         // RFC 9728 §5.1: a `401` points at the protected resource metadata.
-        let resource_metadata = (!aeo.oauth.authorization_servers.is_empty())
-            .then_some(config.seo.base_url.as_deref())
-            .flatten()
-            .and_then(|base| {
+        let configured = documents::Origin::resolve(config.seo.base_url.as_deref(), None);
+        let resource_metadata = (!aeo.oauth.authorization_servers.is_empty()
+            && configured.configured)
+            .then(|| {
                 HeaderValue::from_str(&format!(
-                    "Bearer resource_metadata=\"{}{}\"",
-                    base.trim_end_matches('/'),
-                    documents::OAUTH_RESOURCE_PATH
+                    "Bearer resource_metadata=\"{}\"",
+                    configured.url(documents::OAUTH_RESOURCE_PATH)
                 ))
                 .ok()
-            });
+            })
+            .flatten();
         Self {
             enabled: aeo.enabled,
             base_url: config.seo.base_url.clone(),
@@ -636,6 +636,15 @@ fn warn_on_config(config: &crate::config::AutumnConfig) {
         return;
     }
     let prod = matches!(config.profile.as_deref(), Some("prod" | "production"));
+    if let Some(base) = config.seo.base_url.as_deref()
+        && !documents::Origin::resolve(Some(base), None).configured
+    {
+        tracing::warn!(
+            base_url = base,
+            "aeo: [seo] base_url is not an absolute URL without a query or fragment; the \
+             agent documents use the request Host instead"
+        );
+    }
     if prod && config.seo.base_url.is_none() {
         tracing::warn!(
             "aeo: set [seo] base_url in production; without it the agent documents use \
@@ -766,7 +775,9 @@ pub fn robots_policy(config: &crate::config::AutumnConfig) -> BotPolicy {
         .enabled
         .then_some(config.seo.base_url.as_deref())
         .flatten()
-        .map(|base| format!("{}{AI_CATALOG_PATH}", base.trim_end_matches('/')));
+        .map(|base| documents::Origin::resolve(Some(base), None))
+        .filter(|origin| origin.configured)
+        .map(|origin| origin.url(AI_CATALOG_PATH));
     BotPolicy::from_config(&config.aeo).agentmap(agentmap)
 }
 

@@ -152,7 +152,8 @@ Autumn does not convert:
 
 - a page larger than `markdown_max_bytes` (it stays HTML),
 - a status other than `200`,
-- a compressed body, a range, or a download.
+- a compressed body, a range, or a download,
+- a page in a charset other than UTF-8 (or US-ASCII).
 
 Call the converter yourself with `autumn_web::aeo::markdown::html_to_markdown`.
 

@@ -869,6 +869,9 @@ impl Writer {
         let mut tr_ids = Vec::new();
         while let Some(n) = stack.pop() {
             for &c in doc.nodes[n].children.iter().rev() {
+                if is_hidden(doc, c) {
+                    continue;
+                }
                 match doc.name(c) {
                     Some("tr") => tr_ids.push(c),
                     Some("thead" | "tbody" | "tfoot") => stack.push(c),
@@ -882,7 +885,7 @@ impl Writer {
             let cells: Vec<String> = doc.nodes[tr]
                 .children
                 .iter()
-                .filter(|&&c| matches!(doc.name(c), Some("td" | "th")))
+                .filter(|&&c| matches!(doc.name(c), Some("td" | "th")) && !is_hidden(doc, c))
                 .map(|&c| {
                     Self::inline_of(doc, c, depth + 1)
                         .replace('|', "\\|")
@@ -1152,6 +1155,16 @@ mod tests {
             md("<table><thead><tr><th>A</th><th>B|C</th></tr></thead>\
                 <tbody><tr><td>1</td><td>2</td></tr></tbody></table>"),
             "| A | B\\|C |\n| --- | --- |\n| 1 | 2 |\n"
+        );
+    }
+
+    #[test]
+    fn hidden_table_parts_stay_hidden() {
+        assert_eq!(
+            md("<table><tr><th>A</th><th hidden>secret</th></tr>\
+                <tbody aria-hidden=\"true\"><tr><td>gone</td></tr></tbody>\
+                <tbody><tr hidden><td>gone</td></tr><tr><td>1</td></tr></tbody></table>"),
+            "| A |\n| --- |\n| 1 |\n"
         );
     }
 
