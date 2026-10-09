@@ -354,7 +354,11 @@ impl Manifest {
             match publish(&path, &rendered, mode) {
                 Ok(()) => return Ok(next),
                 Err(PublishError::Moved(_)) => back_off(attempt),
-                Err(PublishError::Late(error) | PublishError::Failed(error)) => {
+                Err(
+                    PublishError::Late(error)
+                    | PublishError::Retained(error)
+                    | PublishError::Failed(error),
+                ) => {
                     return Err(std::io::Error::other(error));
                 }
             }
@@ -1431,6 +1435,10 @@ enum PublishError {
     /// The new file is in place, but a late write reached the old copy. The
     /// copy was kept. Not retried: the write must be reported.
     Late(String),
+    /// The new file was not installed, and a displaced copy was kept. Not
+    /// retried: the copy must be reported. Only the full swap builds it.
+    #[cfg_attr(windows, allow(dead_code))]
+    Retained(String),
     /// The disk refused.
     Failed(String),
 }
@@ -1450,7 +1458,8 @@ impl From<std::io::Error> for PublishError {
 
 impl std::fmt::Display for PublishError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (Self::Moved(text) | Self::Late(text) | Self::Failed(text)) = self;
+        let (Self::Moved(text) | Self::Late(text) | Self::Retained(text) | Self::Failed(text)) =
+            self;
         f.write_str(text)
     }
 }
@@ -1593,7 +1602,7 @@ fn swap(
                 let restore = error.error.to_string();
                 let present = error.path.exists();
                 match error.path.keep() {
-                    Ok(path) => PublishError::Late(format!(
+                    Ok(path) => PublishError::Retained(format!(
                         "this file changed twice after the preview was computed; \
                          the earlier copy is at {}",
                         path.display()
@@ -1610,8 +1619,12 @@ fn swap(
     match staged.persist_noclobber(absolute) {
         Ok(()) => finish_claim(claim, expected),
         Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-            // The old copy may have had a late write too. Keep it if so.
-            finish_claim(claim, expected)?;
+            // The old copy may have had a late write too. Keep it if so. The
+            // staged file was not installed, so this is not a publish.
+            finish_claim(claim, expected).map_err(|error| match error {
+                PublishError::Late(message) => PublishError::Retained(message),
+                other => other,
+            })?;
             Err(PublishError::Moved(
                 "something appeared at this path while it was being written; \
                  it was left exactly as it is"
@@ -1625,7 +1638,7 @@ fn swap(
             Err(match claim.persist_noclobber(absolute) {
                 Ok(()) => PublishError::Failed(staging),
                 Err(restore) => match restore.path.keep() {
-                    Ok(path) => PublishError::Late(format!(
+                    Ok(path) => PublishError::Retained(format!(
                         "{staging}; the earlier copy is at {}",
                         path.display()
                     )),
@@ -3286,6 +3299,7 @@ mod tests {
     fn only_a_late_write_error_means_the_new_file_is_already_there() {
         assert!(PublishError::Late("x".to_owned()).published());
         assert!(!PublishError::Moved("x".to_owned()).published());
+        assert!(!PublishError::Retained("x".to_owned()).published());
         assert!(!PublishError::Failed("x".to_owned()).published());
     }
 
