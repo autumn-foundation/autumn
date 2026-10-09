@@ -244,15 +244,11 @@ impl WebBotAuthSigner {
     /// Sign a request to `url` now. `None` when `url` has no host.
     #[must_use]
     pub fn sign_url(&self, url: &str) -> Option<SignedHeaders> {
-        let url = url::Url::parse(url).ok()?;
-        let host = url.host_str()?;
-        let authority = url
-            .port()
-            .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}"));
+        let authority = request_authority(&url::Url::parse(url).ok()?)?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        Some(self.sign(&authority.to_ascii_lowercase(), now))
+        Some(self.sign(&authority, now))
     }
 
     /// Sign a request to `authority` (`host[:port]`) at Unix time `now`.
@@ -339,6 +335,20 @@ pub(crate) fn sign_directory(
     (
         format!("binding0={signature_params}"),
         format!("binding0=:{}:", key.sign_b64(base.as_bytes())),
+    )
+}
+
+/// The RFC 9421 `@authority` of `url`: the lowercase host, with brackets
+/// for IPv6, and the port only when it is not the default.
+fn request_authority(url: &url::Url) -> Option<String> {
+    let host = match url.host()? {
+        url::Host::Domain(d) => d.to_ascii_lowercase(),
+        url::Host::Ipv4(a) => a.to_string(),
+        url::Host::Ipv6(a) => format!("[{a}]"),
+    };
+    Some(
+        url.port()
+            .map_or_else(|| host.clone(), |port| format!("{host}:{port}")),
     )
 }
 
@@ -499,6 +509,25 @@ mod tests {
             signer.sign("a.b", 1).signature_agent,
             "\"https://bot.example.com\""
         );
+    }
+
+    #[test]
+    fn request_authority_keeps_ipv6_brackets() {
+        let at = |u: &str| request_authority(&url::Url::parse(u).unwrap());
+        assert_eq!(
+            at("https://[2001:db8::1]:8443/x").as_deref(),
+            Some("[2001:db8::1]:8443")
+        );
+        assert_eq!(at("https://[::1]/").as_deref(), Some("[::1]"));
+        assert_eq!(
+            at("https://Example.org:443/a").as_deref(),
+            Some("example.org")
+        );
+        assert_eq!(
+            at("http://example.org:8080").as_deref(),
+            Some("example.org:8080")
+        );
+        assert_eq!(at("mailto:a@b.example"), None);
     }
 
     #[test]

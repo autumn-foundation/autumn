@@ -2367,7 +2367,11 @@ impl RequestBuilder {
             .get(DEADLINE_HEADER)
             .and_then(crate::deadline::parse_header)
             .is_some();
-        if gate.deadline.is_some() || caller_header {
+        // An HTTP message signature is a credential that the pooled
+        // client's redirects would carry to the next host; the manual
+        // follow strips it on a cross-origin hop.
+        let signed = self.extra_headers.contains_key("signature");
+        if gate.deadline.is_some() || caller_header || signed {
             return self.follow_pooled(suppress_retries, &gate).await;
         }
         let mut last_retry = None;
@@ -4239,6 +4243,10 @@ fn strip_sensitive_headers_if_cross_origin(
         headers.remove("cookie2");
         headers.remove(reqwest::header::PROXY_AUTHORIZATION);
         headers.remove(reqwest::header::WWW_AUTHENTICATE);
+        // RFC 9421 signatures (Web Bot Auth) bind to the first authority.
+        headers.remove("signature");
+        headers.remove("signature-input");
+        headers.remove("signature-agent");
     }
     Ok(())
 }
@@ -6769,6 +6777,52 @@ mod tests {
             headers.get("proxy-authorization").is_none(),
             "proxy-authorization must be stripped on a cross-origin redirect"
         );
+    }
+
+    // A Web Bot Auth signature is a credential: on the default send path a
+    // cross-origin redirect must not carry it to the next host.
+    #[tokio::test]
+    async fn default_redirects_strip_message_signatures_cross_origin() {
+        use axum::{Router, routing::get};
+
+        let seen: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let seen2 = seen.clone();
+        let b_addr = spawn(Router::new().route(
+            "/dst",
+            get(move |headers: HeaderMap| {
+                let slot = seen2.clone();
+                async move {
+                    *slot.lock().unwrap() = Some(headers);
+                    "ok"
+                }
+            }),
+        ))
+        .await;
+        let b_port = b_addr.port();
+        let a_addr = spawn(Router::new().route(
+            "/",
+            get(move || async move { redirect_302(format!("http://127.0.0.1:{b_port}/dst")) }),
+        ))
+        .await;
+
+        let resp = Client::new()
+            .get(format!("http://127.0.0.1:{}/", a_addr.port()))
+            .header("signature-agent", "\"https://bot.example\"")
+            .header("signature-input", "sig1=(\"@authority\")")
+            .header("signature", "sig1=:AAAA:")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "the redirect is still followed"
+        );
+        let headers = seen.lock().unwrap().clone().expect("B reached");
+        for name in ["signature", "signature-input", "signature-agent"] {
+            assert!(headers.get(name).is_none(), "{name} must be stripped");
+        }
     }
 
     // TEST 60: a SAME-origin redirect (relative `Location`, same host:port) must

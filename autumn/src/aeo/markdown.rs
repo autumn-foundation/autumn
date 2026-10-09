@@ -197,9 +197,9 @@ fn parse(html: &str) -> Doc {
         }],
     };
     let mut stack: Vec<usize> = vec![ROOT];
-    // Names of the start tags past `MAX_DEPTH`. The parser does not keep
-    // them. Their end tags close only these, never a kept element.
-    let mut dropped: Vec<String> = Vec::new();
+    // The start tags past `MAX_DEPTH`. The parser does not keep them. Their
+    // end tags close only these, never a kept element.
+    let mut dropped = Dropped::default();
     let bytes = html.as_bytes();
     let mut i = 0;
 
@@ -247,9 +247,7 @@ fn parse(html: &str) -> Doc {
         i += tag.len;
         if tag.end {
             if !dropped.is_empty() {
-                if let Some(pos) = dropped.iter().rposition(|n| *n == tag.name) {
-                    dropped.truncate(pos);
-                }
+                dropped.close(&tag.name);
                 continue;
             }
             if let Some(pos) = stack
@@ -538,6 +536,44 @@ fn yaml_quote(s: &str) -> String {
 }
 
 // ── Writer ──────────────────────────────────────────────────────────────────
+
+/// Open start tags past `MAX_DEPTH`. An index by name finds the match of
+/// an end tag in constant time, and each tag leaves the stack once, so a
+/// page of unmatched end tags still parses in linear time.
+#[derive(Default)]
+struct Dropped {
+    names: Vec<String>,
+    at: std::collections::HashMap<String, Vec<usize>>,
+}
+
+impl Dropped {
+    fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    fn push(&mut self, name: String) {
+        self.at
+            .entry(name.clone())
+            .or_default()
+            .push(self.names.len());
+        self.names.push(name);
+    }
+
+    /// Close the last open `name` and every tag opened after it. An end
+    /// tag that matches nothing does nothing.
+    fn close(&mut self, name: &str) {
+        let Some(&pos) = self.at.get(name).and_then(|v| v.last()) else {
+            return;
+        };
+        while self.names.len() > pos {
+            if let Some(n) = self.names.pop()
+                && let Some(v) = self.at.get_mut(&n)
+            {
+                v.pop();
+            }
+        }
+    }
+}
 
 /// Elements dropped with their content.
 const DROP: &[&str] = &[
@@ -1189,6 +1225,20 @@ mod tests {
         let started = std::time::Instant::now();
         let _ = md(&"<a b".repeat(200_000));
         let _ = md(&"<a b=\"".repeat(200_000));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn unmatched_end_tags_past_the_depth_limit_parse_in_linear_time() {
+        // Many dropped start tags, then many end tags that match none.
+        let html = format!(
+            "{}{}{}",
+            "<div>".repeat(300),
+            "<span>".repeat(100_000),
+            "</b>".repeat(100_000)
+        );
+        let started = std::time::Instant::now();
+        let _ = md(&html);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 

@@ -335,11 +335,8 @@ pub fn render(facts: &SiteFacts, origin: &Origin, path: &str) -> Option<Document
 pub fn render_at(facts: &SiteFacts, origin: &Origin, path: &str, now: u64) -> Option<Document> {
     let mut doc = render_inner(facts, origin, path, now)?;
     if !origin.configured {
-        for (name, value) in &mut doc.headers {
-            if *name == "cache-control" {
-                "no-store".clone_into(value);
-            }
-        }
+        doc.headers.retain(|(name, _)| *name != "cache-control");
+        doc.headers.push(("cache-control", "no-store".to_owned()));
     }
     Some(doc)
 }
@@ -1682,13 +1679,17 @@ mod tests {
     fn host_derived_documents_are_never_publicly_cached() {
         let host_origin = Origin::resolve(None, Some("evil.example"));
         assert!(!host_origin.configured);
-        let doc = render(&api_site(), &host_origin, ARD_PATH).unwrap();
-        assert!(
-            doc.headers
-                .contains(&("cache-control", "no-store".to_owned())),
-            "{:?}",
-            doc.headers
-        );
+        // A document with no cache policy of its own gets `no-store` too.
+        for path in [ARD_PATH, LLMS_TXT_PATH] {
+            let doc = render(&api_site(), &host_origin, path).unwrap();
+            let policies: Vec<&String> = doc
+                .headers
+                .iter()
+                .filter(|(n, _)| *n == "cache-control")
+                .map(|(_, v)| v)
+                .collect();
+            assert_eq!(policies, ["no-store"], "{path}: {:?}", doc.headers);
+        }
         let doc = render(&api_site(), &origin(), ARD_PATH).unwrap();
         assert!(
             doc.headers
