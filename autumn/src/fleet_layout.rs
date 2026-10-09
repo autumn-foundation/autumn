@@ -380,7 +380,7 @@ impl FleetPathTemplate {
                     "segment {segment:?} is not allowed (no empty, `.` or `..` segments)"
                 )));
             }
-            segments.push(parse_segment(segment).map_err(&refuse)?);
+            segments.push(parse_segment(segment).map_err(refuse)?);
         }
         let all: Vec<&Part> = segments.iter().flatten().collect();
         let count = |want: &Part| all.iter().filter(|p| **p == want).count();
