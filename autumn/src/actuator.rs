@@ -1761,10 +1761,39 @@ impl JobRegistry {
 
     /// Record a terminal failure.
     pub fn record_failure(&self, name: &str, error: String, dead_lettered: bool) {
+        self.record_failure_inner(name, error, dead_lettered, true);
+    }
+
+    /// Count a start again that a newer attempt already balanced. The caller
+    /// then makes the `record_*` call that ends the run, which decrements once.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    pub(crate) fn restore_in_flight(&self, name: &str) {
         if let Ok(mut guard) = self.inner.write()
             && let Some(status) = guard.get_mut(name)
         {
-            status.in_flight = status.in_flight.saturating_sub(1);
+            status.in_flight = status.in_flight.saturating_add(1);
+        }
+    }
+
+    /// Record a terminal failure of a run this process did not start.
+    /// Count the failure. Leave `in_flight` alone.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    pub(crate) fn record_failure_not_started(
+        &self,
+        name: &str,
+        error: String,
+        dead_lettered: bool,
+    ) {
+        self.record_failure_inner(name, error, dead_lettered, false);
+    }
+
+    fn record_failure_inner(&self, name: &str, error: String, dead_lettered: bool, started: bool) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            if started {
+                status.in_flight = status.in_flight.saturating_sub(1);
+            }
             status.total_failures = status.total_failures.saturating_add(1);
             status.last_error = Some(error);
             if dead_lettered {
