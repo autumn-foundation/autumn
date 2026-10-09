@@ -165,10 +165,11 @@ pub fn valid_amount(amount: &str) -> bool {
         && (amount == "0" || !amount.starts_with('0'))
 }
 
-/// The problem that keeps `route` from ever matching a request: a method
-/// that is not an HTTP method, or a path that does not start with `/`.
-/// Such an x402 route would serve its handler free, so the config is
-/// refused at startup.
+/// Why `route` can never match a request, if it cannot.
+///
+/// That is a method that is not an HTTP method, or a path that does not
+/// start with `/`. Such an x402 route would serve its handler free, so the
+/// config is refused at startup.
 #[must_use]
 pub fn unmatchable_route(route: &PaidRoute) -> Option<String> {
     const METHODS: [&str; 7] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
