@@ -138,9 +138,9 @@ CREATE INDEX idx_push_subscriptions_tenant_principal
     ON push_subscriptions (tenant_id, principal_id);
 ```
 
-If tenancy is on, existing rows must get their real tenant. A row left at `''`
-is invisible to every tenant. Set it in the same migration. Use your own rule,
-for example a join to your users table:
+If tenancy is on, existing rows must get their real tenant. No tenant can see a row
+that keeps `''`. Set it in the same migration. Use your own rule. For example,
+join to your users table:
 
 ```sql
 UPDATE notifications n SET tenant_id = u.tenant_id

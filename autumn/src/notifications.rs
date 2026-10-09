@@ -71,10 +71,10 @@
 //!
 //! # Multi-tenancy
 //!
-//! Rows carry a `tenant_id` column, filled from the tenant the framework
-//! resolved for the request (`""` when tenancy is off). Two tenants that use
-//! the same `recipient_id` never see each other's feed, counts or channel
-//! topic. Outside a request (a job, a script) wrap the call in
+//! Rows carry a `tenant_id` column. The framework fills it from the tenant it
+//! resolved for the request. When tenancy is off, the tenant is `""`. Two
+//! tenants can use the same `recipient_id`. They never see each other's feed,
+//! counts or channel topic. Outside a request (a job, a script) wrap the call in
 //! [`with_tenant`](crate::tenancy::with_tenant).
 //!
 //! # List filters and ordering
@@ -810,7 +810,7 @@ mod db_store {
         // the notifications feed — turn the bare SQL error into an
         // actionable one ("relation … does not exist" on Postgres, "no such
         // table" on SQLite).
-        if message.contains("tenant_id") {
+        if message.contains("tenant_id") && message.contains("column") {
             return NotificationStoreError::new(format!(
                 "query failed: {e}. The `notifications` table has no `tenant_id` column — \
                  see docs/migrations/next.md"

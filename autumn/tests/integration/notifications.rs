@@ -297,20 +297,13 @@ mod tenant_isolation {
         assert_eq!(tenant("b", svc.unread_count(42)).await.unwrap(), 1);
     }
 
-    #[test]
-    fn topic_is_scoped_by_tenant_and_unchanged_without_one() {
+    #[tokio::test]
+    async fn topic_is_scoped_by_tenant_and_unchanged_without_one() {
         assert_eq!(Notifications::topic(7), "notifications:7");
-        let a = futures_lite_block(tenant("a", async { Notifications::topic(7) }));
-        let b = futures_lite_block(tenant("b", async { Notifications::topic(7) }));
-        assert_ne!(a, b);
-        assert_ne!(a, "notifications:7");
-    }
-
-    fn futures_lite_block<F: std::future::Future>(fut: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(fut)
+        let a = tenant("a", async { Notifications::topic(7) }).await;
+        let b = tenant("b", async { Notifications::topic(7) }).await;
+        assert_eq!(a, "notifications:a:7");
+        assert_eq!(b, "notifications:b:7");
     }
 }
 
@@ -703,6 +696,9 @@ mod pg {
         with_tenant("b".to_owned(), notifications.mark_read(a.id))
             .await
             .expect("mark");
+        with_tenant("b".to_owned(), notifications.mark_read_for(42, a.id))
+            .await
+            .expect("mark for");
         let unread = with_tenant("a".to_owned(), notifications.unread_count(42))
             .await
             .expect("count");

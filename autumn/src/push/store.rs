@@ -747,7 +747,7 @@ mod db_store {
         let message = e.to_string();
         // A missing table means the app has a database but never scaffolded
         // the push tables — turn the bare SQL error into an actionable one.
-        if message.contains("tenant_id") {
+        if message.contains("tenant_id") && message.contains("column") {
             return PushError::Store(format!(
                 "query failed: {e}. The `{PUSH_SUBSCRIPTIONS_TABLE}` table has no `tenant_id` \
                  column — see docs/migrations/next.md"
@@ -938,11 +938,14 @@ mod tests {
     /// Deliberately not `async`: holding the guard inside an async fn would
     /// keep a `MutexGuard` alive across an await point.
     fn stuff_past_the_cap(store: &MemoryPushSubscriptionStore) {
-        let extra: Vec<StoredSubscription> = (0..(MAX_SUBSCRIPTIONS_PER_PRINCIPAL * 3))
-            .map(|i| stored(1_i64, &format!("https://push.example.com/raw{i}")))
+        let extra: Vec<(String, StoredSubscription)> = (0..(MAX_SUBSCRIPTIONS_PER_PRINCIPAL * 3))
+            .map(|i| {
+                let row = stored(1_i64, &format!("https://push.example.com/raw{i}"));
+                (String::new(), row)
+            })
             .collect();
         let mut rows = store.rows.lock().expect("memory store lock");
-        rows.extend(extra.into_iter().map(|row| (String::new(), row)));
+        rows.extend(extra);
         drop(rows);
     }
 
@@ -1523,6 +1526,32 @@ mod tests {
             .await
             .expect_err("same principal id, other tenant: still a cross-owner move");
         assert!(matches!(err, PushError::EndpointClaimed), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn another_tenant_can_move_an_endpoint_with_both_keys() {
+        let store = MemoryPushSubscriptionStore::new();
+        let url = "https://push.example.com/shared";
+        in_tenant("a", store.save(stored(42_i64, url)))
+            .await
+            .expect("save");
+        in_tenant("b", store.save(stored(42_i64, url)))
+            .await
+            .expect("same device, same keys: the row moves");
+
+        assert!(
+            in_tenant("a", store.list_for("42"))
+                .await
+                .expect("list")
+                .is_empty()
+        );
+        assert_eq!(
+            in_tenant("b", store.list_for("42"))
+                .await
+                .expect("list")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

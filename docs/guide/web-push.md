@@ -275,8 +275,8 @@ gets the tenant from the resolved tenant of the request, never from the body.
 
 - Two tenants can use the same principal id. A send in one tenant reaches only
   that tenant's devices.
-- An endpoint is unique across tenants. Moving it to another tenant needs both
-  stored keys, the same as moving it to another principal.
+- An endpoint is unique across tenants. To move an endpoint to another tenant
+  or principal, send both stored keys.
 - The cap of 20 subscriptions counts per (tenant, principal).
 - A send from a job has no request. Wrap it in
   `autumn_web::tenancy::with_tenant(tenant_id, async { ... })`.

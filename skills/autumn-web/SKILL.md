@@ -1744,7 +1744,7 @@ async fn create_comment(notifications: Notifications) -> AutumnResult<&'static s
   `sse::stream_authorized` for channel-level enforcement.
 - **Tenancy:** rows carry `tenant_id` (the resolved tenant, `""` when none).
   Feeds, counts and `topic()` are per tenant. Jobs wrap calls in
-  `tenancy::with_tenant`. Push subscriptions are scoped the same way.
+  `tenancy::with_tenant`. Push subscriptions also store `tenant_id`.
 - Guide: `docs/guide/notifications.md`. Out of scope by design: bell widget,
   email/SMS channels, preferences/digests, cross-recipient fan-out.
 

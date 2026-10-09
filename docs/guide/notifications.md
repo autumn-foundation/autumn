@@ -116,8 +116,8 @@ resolved tenant of the request. It never reads it from the request body.
 
 - Two tenants can use the same `recipient_id`. Their feeds, unread counts and
   `mark_*` calls stay separate.
-- Without a tenant in scope, the tenant is `''`. A row written with a tenant
-  is not visible without it.
+- Without a tenant in scope, the tenant is `''`. A row with a tenant is hidden
+  when no tenant is in scope.
 - A job or script has no request. Wrap the call in
   `autumn_web::tenancy::with_tenant(tenant_id, async { ... })`.
 - A custom `NotificationStore` must scope by tenant too.

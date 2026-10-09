@@ -226,7 +226,7 @@ fn notification_fields() -> Vec<Field> {
 ///
 /// The column types must match the framework store's diesel `table!` in
 /// `autumn_web::notifications` (`BigInt`/`Text`/`Text`/
-/// `Nullable<Timestamptz>`/`Timestamptz`, plus the leading `tenant_id` `Text`; `TimestamptzSqlite` — RFC 3339
+/// `Nullable<Timestamptz>`/`Timestamptz`; `tenant_id` is a leading `Text`; `TimestamptzSqlite` — RFC 3339
 /// `TEXT` — on `SQLite`): that store, not any generated model, is what reads
 /// this table. The shared helper's stock `created_at` column is `TIMESTAMP`
 /// (the model generator's convention, paired with a `Timestamp` `schema.rs`
