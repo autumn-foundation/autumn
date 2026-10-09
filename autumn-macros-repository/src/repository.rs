@@ -2831,10 +2831,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // #2319: a derived `delete_by_*` is one bulk write with no revision.
-    if config.ledgered {
-        if let Some(err) = ledgered_derived_delete_error(&trait_def) {
-            return err.to_compile_error();
-        }
+    if config.ledgered
+        && let Some(err) = ledgered_derived_delete_error(&trait_def)
+    {
+        return err.to_compile_error();
     }
 
     if config.broadcasts && config.hooks_type.is_none() {
@@ -13819,12 +13819,10 @@ fn emit_dependent_cascade(
         quote! {}
     } else {
         quote! {
-            if matches!(__action, ::autumn_web::repository::DependentAction::Destroy) {
-                ::autumn_web::ledger::refuse_out_of_band_write(
-                    __table,
-                    "a repository that is not ledgered",
-                )?;
-            }
+            ::autumn_web::ledger::refuse_out_of_band_write(
+                __table,
+                "a repository that is not ledgered",
+            )?;
         }
     };
     let table_ident = format_ident!("{table_name}");
@@ -14622,7 +14620,6 @@ fn emit_dependent_cascade(
                 #dep_hooks_use
                 #dep_autumn_dependents_use
                 let __table: &str = #table_name;
-                #dependent_unledgered_guard
                 match __action {
                     // Restrict, Nullify, and DeleteAll are pure dynamic SQL over
                     // `__table` and `__fk_column`, both runtime `&str`s here, and
@@ -14669,6 +14666,7 @@ fn emit_dependent_cascade(
                         ::core::result::Result::Ok(::std::vec::Vec::new())
                     }
                     ::autumn_web::repository::DependentAction::Destroy => {
+                        #dependent_unledgered_guard
                         // Recursive cascade (#1739): each child row's mutation is
                         // applied inline, and BEFORE that mutation this repo's own
                         // `dependent(...)` cascade is invoked against the child id,

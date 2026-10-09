@@ -4024,6 +4024,7 @@ mod tests {
 
         let mut saturated = chain(2);
         saturated[1].seq = i64::MAX;
+        saturated[1].hash = saturated[1].compute_hash();
         cases.push(saturated);
 
         cases
@@ -4125,7 +4126,6 @@ mod tests {
             "missing_revision",
             "duplicate_seq",
             "recorded_at_regression",
-            "unusable_seq",
             "live_state_mismatch",
             "high_water_missing",
             "high_water_behind",
