@@ -1,4 +1,4 @@
-//! Request ID middleware -- assigns a unique UUID v4 to every request.
+//! Request ID middleware -- gives every request a [`RequestId`].
 //!
 //! Each request gets a [`RequestId`] that is:
 //!
@@ -6,6 +6,13 @@
 //!    `Extension<RequestId>`).
 //! 2. Added as an `X-Request-Id` response header for correlation in
 //!    logs and downstream services.
+//!
+//! The id is a new UUID v4, with one exception. When the peer is a trusted
+//! proxy (see `[security.trusted_proxies]`) and it sends one well-formed
+//! `X-Request-Id`, the layer keeps that id. Well-formed means a UUID in the
+//! hyphenated form (36 characters) or the simple form (32 hex digits). The
+//! layer keeps the text as sent. It ignores all other values, and it ignores
+//! a request with more than one `X-Request-Id` header.
 //!
 //! The [`RequestIdLayer`] is applied automatically by the framework.
 //! You do not need to register it manually.
@@ -61,6 +68,7 @@ use pin_project_lite::pin_project;
 use tower::{Layer, Service};
 
 use crate::entropy::{Entropy, OsEntropy};
+use crate::security::ProxyResolver;
 use uuid::Uuid;
 
 /// Header name for the request ID, added to every response.
@@ -86,19 +94,102 @@ static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 /// }
 /// ```
 #[derive(Clone, Debug)]
-pub struct RequestId(Uuid);
+pub struct RequestId {
+    uuid: Uuid,
+    /// How the trusted proxy wrote the id. `None` for a new id.
+    ///
+    /// The text is not stored: a request id is copied into every request's
+    /// extensions and ingress futures, so its size is paid per request.
+    inbound: Option<InboundForm>,
+}
+
+/// The text form of an inbound id: hyphenated or not, and which hex digits
+/// are uppercase (bit `i` is the `i`-th hex digit).
+#[derive(Clone, Copy, Debug)]
+struct InboundForm {
+    hyphenated: bool,
+    upper: u32,
+}
 
 impl RequestId {
     /// Returns the underlying [`Uuid`] value.
     #[must_use]
     pub const fn as_uuid(&self) -> Uuid {
-        self.0
+        self.uuid
+    }
+
+    /// Parse an inbound `X-Request-Id` value.
+    ///
+    /// Returns `None` unless `value` is a UUID in the hyphenated form
+    /// (36 characters) or the simple form (32 hex digits). The id keeps
+    /// `value` as its text, so logs match the logs of the sender.
+    #[must_use]
+    pub fn parse_inbound(value: &str) -> Option<Self> {
+        let hyphenated = match value.len() {
+            36 => true,
+            32 => false,
+            _ => return None,
+        };
+        let uuid = Uuid::try_parse(value).ok()?;
+        let upper = value
+            .bytes()
+            .filter(u8::is_ascii_hexdigit)
+            .enumerate()
+            .filter(|(_, byte)| byte.is_ascii_uppercase())
+            .fold(0_u32, |mask, (digit, _)| mask | (1 << digit));
+        Some(Self {
+            uuid,
+            inbound: Some(InboundForm { hyphenated, upper }),
+        })
+    }
+
+    /// Returns `true` when a trusted proxy supplied this id. An inbound id is
+    /// not unique: a proxy retry sends the same id again.
+    #[must_use]
+    pub const fn is_inbound(&self) -> bool {
+        self.inbound.is_some()
+    }
+
+    const fn minted(uuid: Uuid) -> Self {
+        Self {
+            uuid,
+            inbound: None,
+        }
+    }
+
+    /// Write the id text into `buf`: the inbound text as sent, or the
+    /// hyphenated lowercase form of a new id. No heap allocation.
+    fn encode<'a>(&self, buf: &'a mut [u8; uuid::fmt::Hyphenated::LENGTH]) -> &'a str {
+        let Some(form) = self.inbound else {
+            return self.uuid.as_hyphenated().encode_lower(buf);
+        };
+        let len = if form.hyphenated {
+            self.uuid.as_hyphenated().encode_lower(buf).len()
+        } else {
+            self.uuid.as_simple().encode_lower(buf).len()
+        };
+        let Some(text) = buf.get_mut(..len) else {
+            return "";
+        };
+        for (digit, byte) in text.iter_mut().filter(|b| **b != b'-').enumerate() {
+            if form.upper & (1 << digit) != 0 {
+                byte.make_ascii_uppercase();
+            }
+        }
+        // The text is ASCII hex digits and hyphens only.
+        std::str::from_utf8(text).unwrap_or_default()
+    }
+
+    fn header_value(&self) -> Option<HeaderValue> {
+        let mut buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
+        HeaderValue::from_str(self.encode(&mut buf)).ok()
     }
 }
 
 impl fmt::Display for RequestId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        let mut buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
+        f.write_str(self.encode(&mut buf))
     }
 }
 
@@ -120,12 +211,15 @@ pub struct RequestIdLayer {
     /// [`OsEntropy`]; the framework threads the app's seeded source here so
     /// request ids replay deterministically under a fixed simulation seed.
     entropy: Arc<dyn Entropy>,
+    /// Decides if the peer may set the id. `None` ignores every inbound id.
+    trust: Option<Arc<ProxyResolver>>,
 }
 
 impl Default for RequestIdLayer {
     fn default() -> Self {
         Self {
             entropy: Arc::new(OsEntropy),
+            trust: None,
         }
     }
 }
@@ -134,7 +228,18 @@ impl RequestIdLayer {
     /// Build a layer that mints request ids from the given entropy source.
     #[must_use]
     pub fn with_entropy(entropy: Arc<dyn Entropy>) -> Self {
-        Self { entropy }
+        Self {
+            entropy,
+            trust: None,
+        }
+    }
+
+    /// Keep a well-formed inbound `X-Request-Id` when `resolver` trusts the
+    /// peer. Without this call, the layer ignores every inbound id.
+    #[must_use]
+    pub fn with_inbound_trust(mut self, resolver: Arc<ProxyResolver>) -> Self {
+        self.trust = Some(resolver);
+        self
     }
 }
 
@@ -144,21 +249,45 @@ impl<S> Layer<S> for RequestIdLayer {
     fn layer(&self, inner: S) -> Self::Service {
         RequestIdService {
             inner,
-            entropy: self.entropy.clone(),
+            shared: Arc::new(RequestIdShared {
+                entropy: self.entropy.clone(),
+                trust: self.trust.clone(),
+            }),
         }
     }
 }
 
 /// Tower [`Service`] produced by [`RequestIdLayer`].
 ///
-/// Generates a [`RequestId`] for each request, inserts it into request
+/// Gives each request a [`RequestId`], inserts it into request
 /// extensions, and adds it as an `X-Request-Id` response header. You
 /// do not construct this type directly -- it is created by
 /// [`RequestIdLayer`].
 #[derive(Clone, Debug)]
 pub struct RequestIdService<S> {
     inner: S,
+    /// One pointer: the ingress stack clones this service per request.
+    shared: Arc<RequestIdShared>,
+}
+
+#[derive(Debug)]
+struct RequestIdShared {
     entropy: Arc<dyn Entropy>,
+    trust: Option<Arc<ProxyResolver>>,
+}
+
+impl<S> RequestIdService<S> {
+    /// The trusted inbound id, if the peer is trusted and the id is valid.
+    fn inbound_id<B>(&self, req: &Request<B>) -> Option<RequestId> {
+        let trust = self.shared.trust.as_ref()?;
+        let mut values = req.headers().get_all(&X_REQUEST_ID).iter();
+        let value = values.next()?.to_str().ok()?;
+        // A proxy that appends, not replaces, leaves the client's value too.
+        if values.next().is_some() || !trust.is_trusted_peer(req) {
+            return None;
+        }
+        RequestId::parse_inbound(value)
+    }
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for RequestIdService<S>
@@ -174,7 +303,9 @@ where
     }
 
     fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
-        let id = RequestId(self.entropy.uuid_v4());
+        let id = self
+            .inbound_id(&req)
+            .unwrap_or_else(|| RequestId::minted(self.shared.entropy.uuid_v4()));
         req.extensions_mut().insert(id.clone());
 
         RequestIdFuture {
@@ -203,13 +334,8 @@ where
         let this = self.project();
         match this.inner.poll(cx) {
             Poll::Ready(Ok(mut response)) => {
-                if let Some(id) = this.request_id.take() {
-                    // Format UUID directly into a stack buffer to avoid a String allocation.
-                    let mut buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
-                    let s = id.0.as_hyphenated().encode_lower(&mut buf);
-                    if let Ok(value) = HeaderValue::from_bytes(s.as_bytes()) {
-                        response.headers_mut().insert(X_REQUEST_ID.clone(), value);
-                    }
+                if let Some(value) = this.request_id.take().and_then(|id| id.header_value()) {
+                    response.headers_mut().insert(X_REQUEST_ID.clone(), value);
                 }
                 Poll::Ready(Ok(response))
             }
@@ -293,7 +419,195 @@ mod tests {
 
     #[test]
     fn request_id_display() {
-        let id = RequestId(Uuid::nil());
+        let id = RequestId::minted(Uuid::nil());
         assert_eq!(id.to_string(), "00000000-0000-0000-0000-000000000000");
+    }
+
+    /// `RequestId` rides in request extensions and in the ingress futures,
+    /// so its size is paid on every request (`tests/config_alloc_gate.rs`).
+    #[test]
+    fn request_id_stays_small() {
+        assert!(
+            std::mem::size_of::<RequestId>() <= 24,
+            "{} bytes",
+            std::mem::size_of::<RequestId>()
+        );
+    }
+
+    /// An inbound id keeps its text exactly, mixed case included.
+    #[test]
+    fn inbound_text_round_trips_in_every_case() {
+        for text in [
+            "0f8FAD5b-D9cb-469F-a165-70867728950E",
+            "0F8FAD5BD9CB469FA16570867728950E",
+            "0f8fad5bd9cb469fa16570867728950e",
+            "AbCdEf01-2345-6789-aBcD-eF0123456789",
+        ] {
+            let id = RequestId::parse_inbound(text).unwrap();
+            assert!(id.is_inbound());
+            assert_eq!(id.to_string(), text);
+            assert_eq!(id.header_value().unwrap(), text);
+        }
+        let minted = RequestId::minted(Uuid::nil());
+        assert!(!minted.is_inbound());
+        assert_eq!(
+            minted.header_value().unwrap(),
+            "00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    #[test]
+    fn parse_inbound_accepts_only_hyphenated_and_simple_uuids() {
+        let hyphenated = "0F8FAD5B-D9CB-469F-A165-70867728950E";
+        let id = RequestId::parse_inbound(hyphenated).unwrap();
+        assert_eq!(id.to_string(), hyphenated, "text is kept as sent");
+        assert_eq!(id.as_uuid(), Uuid::parse_str(hyphenated).unwrap());
+
+        let simple = "0f8fad5bd9cb469fa16570867728950e";
+        assert_eq!(
+            RequestId::parse_inbound(simple).unwrap().to_string(),
+            simple
+        );
+
+        for bad in [
+            "",
+            "not-a-uuid",
+            "0f8fad5b-d9cb-469f-a165-70867728950",
+            "{0f8fad5b-d9cb-469f-a165-70867728950e}",
+            "urn:uuid:0f8fad5b-d9cb-469f-a165-70867728950e",
+            "0f8fad5b-d9cb-469f-a165-70867728950g",
+        ] {
+            assert!(RequestId::parse_inbound(bad).is_none(), "{bad}");
+        }
+    }
+
+    fn trusting_layer(config: &crate::security::config::TrustedProxiesConfig) -> RequestIdLayer {
+        RequestIdLayer::default().with_inbound_trust(Arc::new(ProxyResolver::from_config(config)))
+    }
+
+    async fn response_id(layer: RequestIdLayer, peer: Option<&str>, inbound: &str) -> String {
+        response_id_with(layer, peer, &[("x-request-id", inbound)]).await
+    }
+
+    async fn response_id_with(
+        layer: RequestIdLayer,
+        peer: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> String {
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(layer);
+        let mut builder = Request::builder().uri("/");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let mut request = builder.body(Body::empty()).unwrap();
+        if let Some(peer) = peer {
+            let addr: std::net::SocketAddr = peer.parse().unwrap();
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(addr));
+        }
+        let response = app.oneshot(request).await.unwrap();
+        response.headers()["x-request-id"]
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn inbound_id_needs_a_trusted_peer() {
+        let inbound = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let ranges = crate::security::config::TrustedProxiesConfig {
+            ranges: vec!["10.0.0.0/8".to_owned()],
+            trusted_hops: None,
+            trust_forwarded_headers: true,
+        };
+
+        // No trust configured on the layer.
+        let id = response_id(RequestIdLayer::default(), None, inbound).await;
+        assert_ne!(id, inbound);
+
+        // Forwarded headers not trusted.
+        let off = crate::security::config::TrustedProxiesConfig {
+            ranges: Vec::new(),
+            trusted_hops: None,
+            trust_forwarded_headers: false,
+        };
+        let id = response_id(trusting_layer(&off), Some("10.1.2.3:4000"), inbound).await;
+        assert_ne!(id, inbound);
+
+        // Peer outside the trusted range.
+        let id = response_id(trusting_layer(&ranges), Some("203.0.113.9:4000"), inbound).await;
+        assert_ne!(id, inbound);
+
+        // Peer inside the trusted range.
+        let id = response_id(trusting_layer(&ranges), Some("10.1.2.3:4000"), inbound).await;
+        assert_eq!(id, inbound);
+
+        // No ranges and no hops: every peer is trusted (documented).
+        let open = crate::security::config::TrustedProxiesConfig {
+            ranges: Vec::new(),
+            trusted_hops: None,
+            trust_forwarded_headers: true,
+        };
+        let id = response_id(trusting_layer(&open), Some("203.0.113.9:4000"), inbound).await;
+        assert_eq!(id, inbound);
+
+        // Ranges that all fail to parse: no peer is trusted.
+        let broken = crate::security::config::TrustedProxiesConfig {
+            ranges: vec!["not-a-range".to_owned()],
+            trusted_hops: None,
+            trust_forwarded_headers: true,
+        };
+        let id = response_id(trusting_layer(&broken), Some("10.1.2.3:4000"), inbound).await;
+        assert_ne!(id, inbound);
+    }
+
+    #[tokio::test]
+    async fn hop_mode_needs_a_long_enough_forwarded_chain() {
+        let inbound = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let hops = crate::security::config::TrustedProxiesConfig {
+            ranges: Vec::new(),
+            trusted_hops: Some(1),
+            trust_forwarded_headers: true,
+        };
+        let peer = Some("203.0.113.9:4000");
+
+        // A direct client sends no X-Forwarded-For.
+        let id = response_id(trusting_layer(&hops), peer, inbound).await;
+        assert_ne!(id, inbound);
+
+        // The proxy appended the client: the chain has two entries.
+        let headers = [
+            ("x-request-id", inbound),
+            ("x-forwarded-for", "198.51.100.7, 10.0.0.2"),
+        ];
+        let id = response_id_with(trusting_layer(&hops), peer, &headers).await;
+        assert_eq!(id, inbound);
+    }
+
+    #[tokio::test]
+    async fn repeated_inbound_header_is_ignored() {
+        let open = crate::security::config::TrustedProxiesConfig {
+            ranges: Vec::new(),
+            trusted_hops: None,
+            trust_forwarded_headers: true,
+        };
+        let first = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let headers = [
+            ("x-request-id", first),
+            ("x-request-id", "1f8fad5b-d9cb-469f-a165-70867728950e"),
+        ];
+        let id = response_id_with(trusting_layer(&open), None, &headers).await;
+        assert_ne!(id, first);
+        assert!(Uuid::parse_str(&id).is_ok());
+    }
+
+    #[test]
+    fn inbound_flag_marks_only_proxy_ids() {
+        assert!(!RequestId::minted(Uuid::nil()).is_inbound());
+        let inbound = RequestId::parse_inbound("0f8fad5bd9cb469fa16570867728950e").unwrap();
+        assert!(inbound.is_inbound());
     }
 }

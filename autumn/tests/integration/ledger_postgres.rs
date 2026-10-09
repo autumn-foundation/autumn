@@ -303,7 +303,8 @@ async fn ledger_records_chains_and_reconstructs_on_postgres() {
         .expect("verify")
         .broken
         .expect("mutation detected");
-    assert_eq!(broken.kind, LedgerBreak::HashMismatch);
+    // `jsonb` re-renders the text, so the edit also leaves canonical form.
+    assert_eq!(broken.kind, LedgerBreak::SnapshotNotCanonical);
     assert_eq!(broken.seq, 2);
 }
 

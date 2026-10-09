@@ -433,6 +433,12 @@ pub enum LedgerBreak {
     /// Either the head revision was replaced by a re-hashed forgery, or the mark
     /// itself was rewritten to match one.
     HighWaterMismatch,
+    /// A revision's stored text is not its canonical form (#2326).
+    ///
+    /// The text may still mean the same thing. The hash covers the canonical
+    /// form, so a re-encoded snapshot would pass a hash check. Someone changed
+    /// the stored bytes.
+    SnapshotNotCanonical,
 }
 
 impl LedgerBreak {
@@ -448,6 +454,7 @@ impl LedgerBreak {
             Self::UnusableSeq => "unusable_seq",
             Self::LiveStateMismatch => "live_state_mismatch",
             Self::RecordedAtRegression => "recorded_at_regression",
+            Self::SnapshotNotCanonical => "snapshot_not_canonical",
             Self::HighWaterMissing => "high_water_missing",
             Self::HighWaterBehind => "high_water_behind",
             Self::HighWaterMismatch => "high_water_mismatch",
@@ -1635,15 +1642,9 @@ pub async fn read_revisions_page(
             "delete" => VersionOp::Delete,
             _ => VersionOp::Update,
         };
-        // A snapshot that does not parse is evidence of tampering. It is an
-        // error, not an empty record.
-        let snapshot: serde_json::Value = serde_json::from_str(&row.snapshot).map_err(|err| {
-            crate::AutumnError::internal_server_error(LedgerError::ChainUnreadable {
-                table: table_name.to_string(),
-                record_id,
-                detail: format!("revision {} has an unreadable snapshot: {err}", row.seq),
-            })
-        })?;
+        // A snapshot that does not parse, or is not its canonical text, is
+        // evidence of tampering (#2326). It is an error, not an empty record.
+        let snapshot = parse_stored_snapshot(table_name, record_id, row.seq, &row.snapshot)?;
         revisions.push(LedgerRevision {
             id: row.id,
             table_name: row.table_name,
@@ -1777,6 +1778,41 @@ pub enum LedgerError {
         record_id: i64,
         /// The offending column.
         column: String,
+    },
+    /// A stored snapshot is not the canonical text that was hashed (#2326).
+    ///
+    /// The text parses, but it is not byte-identical to its canonical form.
+    /// Someone re-encoded it, reordered its keys, or added a duplicate key.
+    #[error(
+        "ledger revision {seq} of {table}#{record_id} is not in canonical form: the stored \
+         snapshot text was re-encoded, reordered or holds a duplicate key"
+    )]
+    SnapshotNotCanonical {
+        /// Table of the ledgered model.
+        table: String,
+        /// Primary key of the record.
+        record_id: i64,
+        /// Sequence number of the revision.
+        seq: i64,
+    },
+    /// A stored snapshot does not decode into the model's current shape (#2326).
+    ///
+    /// The model schema probably changed after the revision was written. This is
+    /// not proof of an edit: `ledger_verify` shows the difference.
+    #[error(
+        "ledger revision {seq} of {table}#{record_id} does not match the current model \
+         schema: {detail}. The model changed after this revision was written. Add \
+         `#[serde(default)]` to a new field. Or run `ledger_verify` to check for an edit"
+    )]
+    SnapshotSchemaMismatch {
+        /// Table of the ledgered model.
+        table: String,
+        /// Primary key of the record.
+        record_id: i64,
+        /// Sequence number of the revision.
+        seq: i64,
+        /// The decode failure.
+        detail: String,
     },
     /// A record's stored chain is broken, so its past state cannot be trusted.
     #[error("ledger chain for {table}#{record_id} is broken at revision {seq}: {detail}")]
@@ -1990,6 +2026,112 @@ pub fn refuse_non_finite(
                 column: column.to_string(),
             },
         ))
+    })
+}
+
+/// Parse a stored snapshot, refusing text that is not its canonical form (#2326).
+///
+/// The hash covers `canonical_json` of the parsed value. Without this check,
+/// `{ "a": 1 }` or `{"a":1,"a":2}` would verify as the canonical `{"a":2}`.
+///
+/// # Errors
+///
+/// [`LedgerError::ChainUnreadable`] for invalid JSON.
+/// [`LedgerError::SnapshotNotCanonical`] for any other encoding.
+#[doc(hidden)]
+pub fn parse_stored_snapshot(
+    table: &str,
+    record_id: i64,
+    seq: i64,
+    text: &str,
+) -> crate::AutumnResult<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|err| {
+        crate::AutumnError::internal_server_error(LedgerError::ChainUnreadable {
+            table: table.to_string(),
+            record_id,
+            detail: format!("revision {seq} has an unreadable snapshot: {err}"),
+        })
+    })?;
+    if canonical_json(&value) != text {
+        return Err(crate::AutumnError::internal_server_error(
+            LedgerError::SnapshotNotCanonical {
+                table: table.to_string(),
+                record_id,
+                seq,
+            },
+        ));
+    }
+    Ok(value)
+}
+
+/// Replace each quoted value in a decode error with `"…"`.
+///
+/// A decode error can quote the value that failed. In a snapshot, that value
+/// can be a private column or ciphertext.
+#[doc(hidden)]
+#[must_use]
+pub fn redact_quoted(detail: &str) -> String {
+    let mut out = String::with_capacity(detail.len());
+    let mut in_quote = false;
+    let mut escaped = false;
+    for ch in detail.chars() {
+        if in_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_quote = false;
+                out.push_str("…\"");
+            }
+        } else {
+            out.push(ch);
+            in_quote = ch == '"';
+        }
+    }
+    out
+}
+
+/// The error for a snapshot that does not decode into the current model.
+#[doc(hidden)]
+#[must_use]
+pub fn schema_mismatch(table: &str, record_id: i64, seq: i64, detail: &str) -> crate::AutumnError {
+    crate::AutumnError::internal_server_error(LedgerError::SnapshotSchemaMismatch {
+        table: table.to_string(),
+        record_id,
+        seq,
+        detail: redact_quoted(detail),
+    })
+}
+
+/// Turn a chain read error into a verification report where it is a finding (#2326).
+///
+/// A non-canonical snapshot is evidence of a change, not a read fault. Other
+/// errors pass through. The read stops at this revision, so no other break in the
+/// chain is reported with it.
+///
+/// # Errors
+///
+/// Returns `err` unchanged for any other error.
+#[doc(hidden)]
+pub fn verification_from_read_error(
+    record_id: i64,
+    err: crate::AutumnError,
+) -> crate::AutumnResult<LedgerVerification> {
+    let Some(LedgerError::SnapshotNotCanonical { seq, .. }) = err.downcast_ref::<LedgerError>()
+    else {
+        return Err(err);
+    };
+    Ok(LedgerVerification {
+        record_id,
+        revisions_checked: 0,
+        head_hash: None,
+        broken: Some(LedgerBreakReport {
+            seq: *seq,
+            revision_id: None,
+            kind: LedgerBreak::SnapshotNotCanonical,
+            detail: format!("revision {seq} is stored in a form other than its canonical text"),
+        }),
     })
 }
 
@@ -4211,5 +4353,75 @@ mod tests {
     fn a_string_tenant_column_is_a_ledger_tenant() {
         let tenant = String::from("acme");
         assert_eq!(LedgerTenantColumn::ledger_tenant_id(&tenant), "acme");
+    }
+
+    // ── #2326: stored snapshot bytes ──────────────────────────────
+
+    #[test]
+    fn stored_snapshot_accepts_canonical_text() {
+        let text = r#"{"a":1,"b":[1,2]}"#;
+        let value = parse_stored_snapshot("t", 1, 1, text).unwrap();
+        assert_eq!(value, json!({"a": 1, "b": [1, 2]}));
+    }
+
+    #[test]
+    fn stored_snapshot_refuses_re_encoded_text() {
+        for text in [r#"{ "a": 1 }"#, r#"{"b":1,"a":2}"#, r#"{"a":1,"a":2}"#] {
+            let err = parse_stored_snapshot("t", 1, 3, text).expect_err(text);
+            let shown = err.to_string();
+            assert!(
+                shown.contains("canonical") && shown.contains('3'),
+                "{shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_snapshot_refuses_invalid_json() {
+        let err = parse_stored_snapshot("t", 1, 2, "{").expect_err("invalid");
+        assert!(err.to_string().contains("unreadable"), "{err}");
+    }
+
+    #[test]
+    fn stored_snapshot_accepts_floats_the_writer_produced() {
+        // These parse one ULP off without serde_json's `float_roundtrip`.
+        for x in [4.536_315_785_538_721e-181_f64, 4.138_526_855_143_091e260] {
+            let text = canonical_json(&json!({ "x": x }));
+            parse_stored_snapshot("t", 1, 1, &text).expect(&text);
+        }
+    }
+
+    #[test]
+    fn schema_detail_hides_quoted_values() {
+        let shown = redact_quoted(r#"invalid type: string "sk-secret", expected i64"#);
+        assert!(!shown.contains("sk-secret"), "{shown}");
+        assert!(shown.contains("expected i64"), "{shown}");
+    }
+
+    #[test]
+    fn a_non_canonical_read_error_becomes_a_break() {
+        let err = crate::AutumnError::internal_server_error(LedgerError::SnapshotNotCanonical {
+            table: "t".into(),
+            record_id: 4,
+            seq: 2,
+        });
+        let report = verification_from_read_error(4, err).unwrap();
+        let broken = report.broken.expect("a break");
+        assert_eq!(broken.kind, LedgerBreak::SnapshotNotCanonical);
+        assert_eq!(broken.seq, 2);
+        assert_eq!(
+            LedgerBreak::SnapshotNotCanonical.as_str(),
+            "snapshot_not_canonical"
+        );
+    }
+
+    #[test]
+    fn other_read_errors_pass_through() {
+        let err = crate::AutumnError::internal_server_error(LedgerError::ChainUnreadable {
+            table: "t".into(),
+            record_id: 4,
+            detail: "x".into(),
+        });
+        assert!(verification_from_read_error(4, err).is_err());
     }
 }
