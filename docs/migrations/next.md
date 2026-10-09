@@ -187,6 +187,39 @@ section.
 **Automation:** `manual` — add `timeout: None` to each hand-written `JobInfo`
 literal. `#[job]` and `JobInfo::new` set it.
 
+### Schema: `ForeignKey` has `on_delete` and `on_update` fields
+
+**Why:** `#[references]` can now set a referential action (issue #1975). The
+IR `autumn_schema_core::ForeignKey` carries it as
+`on_delete` / `on_update: Option<ForeignKeyAction>`. `None` is `NO ACTION`.
+
+**Before (`0.8`):**
+
+```rust
+let fk = ForeignKey {
+    table: "users".to_string(),
+    column: "id".to_string(),
+};
+```
+
+**After (`0.9`):**
+
+```rust
+let fk = ForeignKey::new("users", "id")
+    .with_on_delete(Some(ForeignKeyAction::Cascade)); // or no call for NO ACTION
+```
+
+A struct literal also works with `on_delete: None, on_update: None`.
+
+A snapshot (`.autumn/schema-snapshot.json`) with an action is written as
+`snapshot_version` 2. An older `autumn` CLI refuses that file. Upgrade the
+CLI on each machine and CI job that reads the snapshot. A snapshot without an
+action stays at version 1. A snapshot from `autumn schema pull` before this
+release has no actions: run `autumn schema pull` again to record them.
+
+**Automation:** `manual` — use `ForeignKey::new`, or add the two fields to
+each `ForeignKey` literal.
+
 ### Config: `AutumnConfig` gains a `cost` field
 
 **Why:** Per-request cost records and cost-aware deferral (issue #1720) need

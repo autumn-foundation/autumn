@@ -7,6 +7,17 @@
   drift. The macro rejects an unknown value. It also rejects `set_null` and
   `set_default` on a field that is not `Option<_>`.
 
+### Breaking Changes
+
+- **Breaking:** **schema:** `autumn_schema_core::ForeignKey` gains the public
+  fields `on_delete` and `on_update`. A struct literal needs the two fields,
+  or use `ForeignKey::new` ([migration guide](docs/migrations/next.md)).
+- **Breaking:** **schema:** a snapshot with a foreign-key action is written as
+  `snapshot_version` 2. An older CLI refuses it with "unsupported
+  snapshot_version", so it cannot drop the action in silence. Upgrade the CLI
+  ([migration guide](docs/migrations/next.md)). A snapshot without an action
+  stays at version 1.
+
 ### Changed
 
 - **schema:** `schema diff` refuses a changed `ON DELETE` / `ON UPDATE` action

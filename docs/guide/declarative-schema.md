@@ -125,6 +125,8 @@ pub editor_id: Option<i64>,
   child rows. Write that change as a manual migration.
 - A snapshot from `schema pull` before this release has no actions. Run
   `autumn schema pull` again to record them.
+- A snapshot with an action has `snapshot_version` 2. An older CLI refuses
+  it. A snapshot without an action stays at version 1.
 
 A table stays managed in the snapshot after you remove `managed` from its
 model. If you then delete the model, `schema diff --allow-destructive` drops
