@@ -430,9 +430,10 @@ impl ReplayFixtures {
                 .map(|draw| draw.bytes.clone())
                 .collect(),
         ));
-        let effects = Arc::new(crate::capsule::effects::ReplayEffects::new(
-            capsule.effects.clone(),
-        ));
+        let effects = Arc::new(
+            crate::capsule::effects::ReplayEffects::new(capsule.effects.clone())
+                .for_format_version(capsule.format_version),
+        );
         Self {
             clock,
             entropy,
@@ -560,17 +561,33 @@ fn judge(
     // never asked for.
     let mut effect_entries = fixtures.effects.finish();
     // A draw of another width is consumed in place, so the counts stay level
-    // and only this check sees it (#2351 item 11).
-    effect_entries.extend(fixtures.entropy.width_mismatches().into_iter().map(
-        |(index, recorded, requested)| {
-            crate::capsule::effects::random_width_divergence(index, recorded, requested)
-        },
-    ));
+    // and only this check sees it (#2351 item 11). A v3 capsule can hold an
+    // enqueue's job-id draw that replay never takes, so it is not checked.
+    let width_mismatches = if fixtures.effects.legacy_v3() {
+        Vec::new()
+    } else {
+        fixtures.entropy.width_mismatches()
+    };
+    effect_entries.extend(
+        width_mismatches
+            .into_iter()
+            .map(|(index, recorded, requested)| {
+                crate::capsule::effects::random_width_divergence(index, recorded, requested)
+            }),
+    );
     // A value that stood behind a placeholder in a matched effect is masked in
     // the recorded outcome. Mask it in the actual outcome too, before the
     // comparison and before anything prints it (#2351 item 16).
-    let actual =
-        crate::capsule::persist::scrub_outcome(actual, &fixtures.effects.observed_redactions());
+    let observed = fixtures.effects.observed_redactions();
+    let actual = crate::capsule::persist::scrub_outcome(actual, &observed);
+    // The divergence report is printed too. Mask the same values in it.
+    for entry in &mut effect_entries {
+        entry.actual = crate::capsule::redact::mask_echoes(&entry.actual, &observed);
+        entry.detail = crate::capsule::redact::mask_echoes(&entry.detail, &observed);
+        if let Some(expected) = entry.expected.as_mut() {
+            *expected = crate::capsule::redact::mask_echoes(expected, &observed);
+        }
+    }
     let verdict = if entries.is_empty() && effect_entries.is_empty() {
         if outcomes_match(&capsule.outcome, &actual) {
             Verdict::Reproduced

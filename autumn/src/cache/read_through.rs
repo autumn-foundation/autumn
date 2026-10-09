@@ -703,8 +703,8 @@ fn spawn_background_refresh<V, E, F, Fut>(
                 let _result = run_leader_fill(&cache, &key, &options, fill, tx).await;
                 drop(guard);
             };
-            // The refresh runs detached: the capsule says so, and a replay
-            // gives it the tape (#2351 item 3).
+            // The refresh runs detached: capture marks the capsule
+            // incomplete, and a replay gives the task the tape (#2351 item 3).
             #[cfg(feature = "reporting")]
             crate::capsule::spawn(refresh);
             #[cfg(not(feature = "reporting"))]

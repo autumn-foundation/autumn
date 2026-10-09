@@ -192,7 +192,7 @@ has one, which is how a capsule on disk is tied back to a log line.
 
 ```json
 {
-  "format_version": 3,
+  "format_version": 4,
   "id": "01JB2K7Q8N4W",
   "captured_at": "2026-08-12T10:14:13.882104Z",
   "autumn_version": "0.8.0",
@@ -281,7 +281,7 @@ effect because your handler reached it a different way:
 | --- | --- | --- |
 | Outbound HTTP | `http_client::RequestBuilder::send` | The recorded response is handed back — but only to a call that matches the recording's method, URL, caller-set headers *and* body; **no socket is opened**. A recorded *failure* comes back as the same `ClientError` variant, so a `matches!(err, ClientError::CircuitBreakerOpen)` guard takes the branch it took in production. Outbound webhook deliveries are covered here too, they send through the same client |
 | Job enqueue | every `job::enqueue*` entry point | The enqueue is *asserted* against the recording — including its schedule, compared on the terms the caller stated it (a relative delay by delay, an `enqueue_at` deadline by deadline) — and returns `Ok(())`; **nothing is written to a queue and no job runs** |
-| Cache | `cache::get_cached` / `insert_cached`, the untyped `cache::get` / `insert`, and `invalidate`, `invalidate_namespace` and `clear` on the installed backend | A recorded hit is served from the capsule and a recorded miss replays as a miss; a write or a removal lands in the tape, so a read-back in the same run finds what production found. A read of a key that the recording only wrote is a divergence. **The installed backend is never reached** |
+| Cache | `cache::get_cached` / `insert_cached`, the untyped `cache::get` / `insert`, and the removal methods (`invalidate`, `invalidate_namespace`, `clear` and their `_async` forms) on the installed backend | Replay serves a recorded hit from the capsule. A recorded miss replays as a miss. Replay applies each write and removal to the tape, so a later read in the same run gets the value production got. A read of a key that the recording only wrote is a divergence. **Replay does not reach the installed backend** |
 | Mail | `Mailer::send` | The send is asserted against everything a recipient would notice — recipients, subject, reply-to, both halves of a multipart body, `List-Unsubscribe`, caller-set headers, and each attachment by name, type, size and digest — and its sender, when the replayed run chose one; **nothing is delivered** |
 | Tenancy | `tenancy::extract_tenant_from_parts` | The recorded tenant is served without consulting live tenant configuration. A recorded failed lookup runs the resolver again on the restored request. A lookup the capsule did not record fails closed and is a divergence |
 | Randomness | `state.entropy()` | Every draw replays byte-for-byte, so the session id, CSRF token, request id or job id the failing request minted reappears. A draw of a different width is a divergence |
@@ -442,12 +442,13 @@ A `diverged` verdict is not a failure of the tool. It is the tool telling you
 that a status matching by luck, while the queries differ, is not a
 reproduction.
 
-A secret can reach the recorded outcome through an effect: a configured key
-sent in an outbound call, then quoted in the error. Persistence masks it in the
-recorded outcome. Replay masks the same value in the actual outcome before it
-compares them, so an unchanged failure reproduces and the verdict does not
-print the value. Only a value that stood behind a placeholder in an effect the
-run matched is masked.
+A secret can reach the recorded outcome through an effect: for example, a
+configured key sent in an outbound call and then quoted in the error.
+Persistence masks it in the recorded outcome. Before the comparison, replay
+masks the same value in the actual outcome and in the divergence report. Thus
+an unchanged failure reproduces, and the verdict does not show the value.
+Replay masks only a value that stood behind a placeholder in an effect the run
+matched.
 
 ### A worked divergence
 
@@ -874,12 +875,15 @@ What capsules do not do, stated plainly:
   `autumn_web::capsule::spawn` for work a request starts but does not await.
   During capture it marks the capsule incomplete, so "no effects" and "effects
   the capsule could not see" do not look the same. During a replay it gives the
-  task the tape, so the task's effects are served or refused. The framework
-  uses the same rule for its own detached work: after-commit callbacks and the
-  read-through background refresh. `Mailer::deliver_later` and the
-  `*_after_commit` job functions are recorded and replayed when they are
-  called, on the request task. A raw `tokio::spawn` stays invisible to both
-  sides: keep the effects a capsule needs on the awaited path.
+  task the tape, so replay serves or refuses the task's effects. The framework
+  uses the same rule for its own detached work: a callback given to
+  `db::register_after_commit`, a stale-while-revalidate background refresh,
+  and a repository invalidation that is not awaited. Replay refuses a capsule
+  with such work. `Mailer::deliver_later` and the `*_after_commit` job
+  functions are recorded and replayed when they are called, on the request
+  task, so they do not make a capsule incomplete. A raw `tokio::spawn`, or a
+  callback pushed onto `db::AFTER_COMMIT_REGISTRY` directly, stays invisible to
+  both sides: keep the effects a capsule needs on the awaited path.
 - **A mail sender is only compared when the replayed run chose one.** A
   message that names no `from` inherits `[mail] from` at send time, so the
   recorded address is deployment configuration rather than something the
@@ -927,27 +931,37 @@ What capsules do not do, stated plainly:
   never completes its slot. Rather than persist the placeholder as a recorded
   backend failure, the capsule notes it and marks itself incomplete.
 - **The cache seam covers the installed backend only.** A backend installed
-  through `AppBuilder`, `AppState::with_cache` or `AppState::set_cache` is
-  wrapped once. A call to `get_value` / `insert_value` on a backend you hold
-  yourself, and the per-function stores of `#[cached]` with no global backend,
-  are not on the seam.
-- **Outbound HTTP outside the framework client is refused, not recorded.**
-  CAPTCHA verification, the OAuth2 calls, SES inbound-mail checks, the S3 blob
-  store and the `MediaMTX` client each call `autumn_web::capsule::guard_egress`
-  before they send. During capture the call is made, and the capsule is marked
-  incomplete. During a replay — `autumn replay` or a generated regression
-  test — the call is refused and reported as an unrecorded effect. Code of your
-  own that builds its own client can call the same guard. A shadow mirror does
-  not start during a replay.
+  through `AppBuilder`, `cache::set_global_cache`, `AppState::with_cache` or
+  `AppState::set_cache` is wrapped once. A call on a backend you hold yourself,
+  a `GlobalCacheEntry` you insert directly, and the per-function stores of
+  `#[cached]` with no global backend are not on the seam. A decorator that
+  wraps the installed backend must forward `Cache::is_capsule_seam`, or the
+  backend is wrapped twice.
+- **A recorded error text that held a masked value still replays.** The
+  `redacted_keys` manifest names it (`http[0].error:<echo>`), but the capsule
+  is not refused: error text compares like the outcome does.
+- **A capsule from an older build replays with the older rules.** A format
+  version 3 capsule did not record cache removals, untyped cache reads, failed
+  tenant lookups or draw widths. Replay does not check those seams for it, so a
+  committed corpus keeps its verdicts.
+- **Capture does not record outbound HTTP outside the framework client.
+  Replay refuses it.** CAPTCHA verification, the `OAuth2` calls, the SES
+  inbound-mail checks, the `autumn-storage-s3` blob store, and the media
+  plugin's storage and `MediaMTX` client each call
+  `autumn_web::capsule::guard_egress` before they send. During capture, the
+  call is made and the capsule is marked incomplete. During a replay, the guard
+  refuses the call. When a replay tape serves the task, the verdict shows an
+  unrecorded effect. Code that builds its own client can call the same guard.
+  A shadow mirror does not start during a replay.
 - **A literal `[FILTERED]` in compared data refuses the capsule.** Replay reads
   the placeholder in a compared field (an outbound request, a job payload, a
   mail, a cache key or write) as a wildcard. When the recorded data held that
   text before redaction, a changed value there would match anything, so replay
   refuses the capsule by name.
-- **A tracked job's capsule is refused.** Replay runs a job untracked, with
-  inert event, transaction-timeout and job contexts. A handler that reads
-  `JobContext` would take a path production did not take, so capture marks the
-  capsule incomplete.
+- **A tracked job's capsule is refused.** Replay runs a job untracked. The job
+  gets the event, transaction-timeout and job contexts of a production run. A
+  handler that reads `JobContext` would take a path production did not take,
+  so capture marks the capsule incomplete.
 - **Only failures are captured.** There is no way to capsule a successful
   request, by design: the buffer for a request that succeeds is dropped at the
   response boundary.

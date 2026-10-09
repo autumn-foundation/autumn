@@ -3,7 +3,7 @@
 //! Two kinds of work can escape a capsule:
 //!
 //! * **Egress outside the outbound-HTTP seam.** A subsystem with its own
-//!   network client (CAPTCHA, OAuth2, an S3 store) does not go through
+//!   network client (CAPTCHA, `OAuth2`, an S3 store) does not go through
 //!   [`http_client`](crate::http_client). [`guard_egress`] refuses that call
 //!   during a replay, and marks the capsule incomplete during capture.
 //! * **Detached tasks.** The capture scope and the replay tape are task-locals,
@@ -69,14 +69,16 @@ pub fn guard_egress(
     method: &str,
     url: &str,
 ) -> Result<(), UnrecordedEgress> {
+    // The error and the divergence are printed, so the target keeps no query
+    // string and no user info: either can hold a credential.
+    let target = printable_target(url);
     let refuse = || UnrecordedEgress {
         subsystem,
         method: method.to_owned(),
-        // The query string can hold a credential, and the error is printed.
-        target: url.split_once('?').map_or(url, |(head, _)| head).to_owned(),
+        target: target.clone(),
     };
     if let Some(tape) = crate::capsule::effects::current_tape() {
-        tape.refuse_unrecorded_egress(subsystem, method, url);
+        tape.refuse_unrecorded_egress(subsystem, method, &target);
         return Err(refuse());
     }
     // `autumn replay` blocks the whole process, including a task that carries
@@ -94,6 +96,22 @@ pub fn guard_egress(
         scope.mark_truncated();
     }
     Ok(())
+}
+
+/// `url` with no query string, fragment or user info.
+fn printable_target(url: &str) -> String {
+    let head = url.split(['?', '#']).next().unwrap_or_default();
+    match head.split_once("://") {
+        Some((scheme, rest)) => {
+            let authority_end = rest.find('/').unwrap_or(rest.len());
+            let (authority, path) = rest.split_at_checked(authority_end).unwrap_or((rest, ""));
+            let host = authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host);
+            format!("{scheme}://{host}{path}")
+        }
+        None => head.to_owned(),
+    }
 }
 
 /// Spawn `future` on the Tokio runtime, and keep the capsule honest about it.
@@ -127,6 +145,25 @@ pub(crate) fn note_detached_work() {
     if let Some(scope) = crate::capsule::current_scope() {
         scope.note(DETACHED_WORK_NOTE);
         scope.mark_truncated();
+    }
+}
+
+/// Give `future` this task's capture scope and replay tape.
+///
+/// Only for work the calling task awaits at once: its effects then land in
+/// the capsule in order, as inline work would.
+pub(crate) fn carry_scopes<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    let scope = crate::capsule::current_scope();
+    let future = carry_tape(future);
+    async move {
+        match scope {
+            Some(scope) => {
+                crate::capsule::capture::CAPSULE_SCOPE
+                    .scope(scope, future)
+                    .await
+            }
+            None => future.await,
+        }
     }
 }
 
@@ -181,6 +218,15 @@ mod tests {
         assert_eq!(divergences.len(), 1, "{divergences:?}");
         assert_eq!(divergences[0].seam, EffectSeam::Http);
         assert_eq!(divergences[0].kind, EffectDivergenceKind::Unrecorded);
+    }
+
+    #[test]
+    fn a_printed_target_keeps_no_credential() {
+        assert_eq!(
+            printable_target("https://user:pw@api.example/v1/x?token=t#f"),
+            "https://api.example/v1/x"
+        );
+        assert_eq!(printable_target("mediamtx api"), "mediamtx api");
     }
 
     #[tokio::test]

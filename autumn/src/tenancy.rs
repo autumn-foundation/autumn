@@ -105,9 +105,10 @@ pub async fn extract_tenant_from_parts_with_domains(
     config: &crate::config::AutumnConfig,
     domains: Option<&crate::custom_domain::CustomDomainRegistry>,
 ) -> Result<String, crate::AutumnError> {
-    match replayed_tenant() {
-        ReplayedTenant::NoTape | ReplayedTenant::RecordedFailure => {}
-        ReplayedTenant::Resolved(tenant_id) => return Ok(tenant_id),
+    let replayed = replayed_tenant();
+    match &replayed {
+        ReplayedTenant::NoTape | ReplayedTenant::RecordedFailure | ReplayedTenant::Unchecked => {}
+        ReplayedTenant::Resolved(tenant_id) => return Ok(tenant_id.clone()),
         // The capsule has no tenant lookup. Live resolution would succeed on
         // input the recording never had, so fail closed (#2351 item 13).
         ReplayedTenant::Unrecorded => {
@@ -137,6 +138,16 @@ pub async fn extract_tenant_from_parts_with_domains(
     // request's headers are restored verbatim, so a run whose recorded failure
     // *was* a tenant-resolution error reproduces that error.
     let resolved = extract_tenant_from_parts_inner(parts, config).await;
+    // The recording failed here. A lookup that now succeeds would run the
+    // request under a tenant production never had, so fail closed.
+    if matches!(replayed, ReplayedTenant::RecordedFailure) && resolved.is_ok() {
+        note_tenant_resolved_after_recorded_failure();
+        return Err(crate::AutumnError::internal_server_error(
+            std::io::Error::other(
+                "the recorded tenant lookup failed, but the replayed run resolved a tenant",
+            ),
+        ));
+    }
     // A failure is recorded too, so replay can tell it from a lookup the
     // recording never made.
     record_tenant(resolved.as_ref().ok().map(String::as_str));
@@ -156,6 +167,8 @@ enum ReplayedTenant {
     RecordedFailure,
     /// The recording has no tenant lookup. The tape logged a divergence.
     Unrecorded,
+    /// A v3 capsule with no tenant lookup. Resolve, and do not check.
+    Unchecked,
 }
 
 /// The tenant a capsule replay serves, when one is serving this task.
@@ -169,8 +182,21 @@ fn replayed_tenant() -> ReplayedTenant {
         TenantVerdict::Resolved(id) => ReplayedTenant::Resolved(id),
         TenantVerdict::RecordedFailure => ReplayedTenant::RecordedFailure,
         TenantVerdict::Unrecorded => ReplayedTenant::Unrecorded,
+        TenantVerdict::Unchecked => ReplayedTenant::Unchecked,
     }
 }
+
+/// Log a tenant that resolved where the recording failed.
+#[cfg(feature = "reporting")]
+fn note_tenant_resolved_after_recorded_failure() {
+    if let Some(tape) = crate::capsule::effects::current_tape() {
+        tape.tenant_resolved_after_recorded_failure();
+    }
+}
+
+/// No capsule support compiled in: never a replay.
+#[cfg(not(feature = "reporting"))]
+const fn note_tenant_resolved_after_recorded_failure() {}
 
 /// No capsule support compiled in: never a replay.
 #[cfg(not(feature = "reporting"))]
@@ -1079,6 +1105,27 @@ mod tests {
         let mut parts = make_parts("tenant1.example.com");
         let tape = std::sync::Arc::new(crate::capsule::ReplayEffects::new(
             crate::capsule::CapsuleEffects::default(),
+        ));
+        let result = crate::capsule::with_effect_tape(
+            std::sync::Arc::clone(&tape),
+            extract_tenant_from_parts(&mut parts, &config),
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(tape.divergences().len(), 1);
+    }
+
+    /// Review fix: a lookup the recording saw fail must not succeed on replay.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_recorded_failure_that_now_resolves_fails_closed() {
+        let config = subdomain_config();
+        let mut parts = make_parts("tenant1.example.com");
+        let tape = std::sync::Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects {
+                tenant: Some(crate::capsule::TenantEffect { id: None }),
+                ..crate::capsule::CapsuleEffects::default()
+            },
         ));
         let result = crate::capsule::with_effect_tape(
             std::sync::Arc::clone(&tape),

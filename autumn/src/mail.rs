@@ -2240,7 +2240,7 @@ impl Mailer {
     /// Panics if the internal after-commit registry mutex is poisoned.
     pub fn try_deliver_later(&self, mail: Mail) -> Result<(), MailError> {
         if self.transport.is_disabled() {
-            return Ok(());
+            return self.disabled_deliver_later(mail);
         }
         if self.block_deliver_later_without_durable_queue && self.delivery_queue.is_none() {
             return Err(MailError::NoDurableQueueInProduction);
@@ -2319,7 +2319,7 @@ impl Mailer {
     /// available.
     pub fn try_deliver_later_eager(&self, mail: Mail) -> Result<(), MailError> {
         if self.transport.is_disabled() {
-            return Ok(());
+            return self.disabled_deliver_later(mail);
         }
         if self.block_deliver_later_without_durable_queue && self.delivery_queue.is_none() {
             return Err(MailError::NoDurableQueueInProduction);
@@ -2343,6 +2343,22 @@ impl Mailer {
         // from the capsule and then report an unrecorded-effect divergence.
         record_send(&mail, None);
         self.spawn_unrecorded_delivery(mail)
+    }
+
+    /// `deliver_later` on a disabled transport: nothing is sent, but the call
+    /// is on the capsule seam, as `send` is. So a capture with mail off and a
+    /// replay with mail on agree.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the replayed answer is the recorded `Result`"
+    )]
+    fn disabled_deliver_later(&self, mail: Mail) -> Result<(), MailError> {
+        let mail = self.prepare_deferred(mail);
+        if let Some(answer) = replayed_send(&mail) {
+            return answer;
+        }
+        record_send(&mail, None);
+        Ok(())
     }
 
     /// Spawn delivery of mail the seam already answered or recorded.
@@ -3749,6 +3765,50 @@ impl MailTransport for InterceptedMailTransport {
     }
 }
 
+/// Install the mailer a capsule replay uses (#2351 item 7).
+///
+/// A send on the replayed request is served from the tape by the mail seam.
+/// A send that reaches the transport ran with no tape, and is refused.
+#[cfg(feature = "reporting")]
+pub(crate) fn install_replay_mailer(state: &AppState, config: &MailConfig) {
+    // Never disabled: the replay machine's mail config is not the recorded
+    // run's, and a disabled transport is still answered at the seam.
+    let mut mailer = Mailer::with_transport(ReplayTransport);
+    // Defaults apply before the seam, so a recorded `reply_to` default is
+    // matched.
+    mailer.defaults = Arc::new(MailerDefaults {
+        from: config.from.clone(),
+        reply_to: config.reply_to.clone(),
+    });
+    mailer.inline_css_default = config.inline_css;
+    state.insert_extension(mailer);
+}
+
+/// The transport of the replay mailer: it refuses every send.
+///
+/// A send on the replayed request is answered by the mail seam before it
+/// reaches a transport. A send that reaches this one ran with no tape.
+#[cfg(feature = "reporting")]
+struct ReplayTransport;
+
+#[cfg(feature = "reporting")]
+impl MailTransport for ReplayTransport {
+    fn send<'a>(
+        &'a self,
+        mail: Mail,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+        // The subject is not printed: it can hold a code or other personal
+        // data, and this send matched no recorded effect.
+        Box::pin(async move {
+            Err(MailError::RuntimeUnavailable(format!(
+                "mail to {} recipient(s) was sent outside the capsule's replay scope; nothing was \
+                 delivered",
+                mail.to.len()
+            )))
+        })
+    }
+}
+
 /// Install the configured mailer into app state.
 ///
 /// Picks up a runtime-installed [`MailDeliveryQueueHandle`] from
@@ -3768,55 +3828,6 @@ impl MailTransport for InterceptedMailTransport {
 /// # Errors
 ///
 /// Returns an Autumn error when the configured transport cannot be created.
-/// Install the mailer a capsule replay uses (#2351 item 7).
-///
-/// A send on the replayed request is served from the tape by the mail seam.
-/// A send that reaches the transport ran with no tape, and is refused.
-#[cfg(feature = "reporting")]
-pub(crate) fn install_replay_mailer(state: &AppState, config: &MailConfig) {
-    let mut mailer = Mailer::with_transport(ReplayTransport {
-        // `try_deliver_later` stops before the seam on a disabled transport.
-        // Keep the recorded run's answer.
-        disabled: config.transport == Transport::Disabled,
-    });
-    // Defaults apply before the seam, so a recorded `reply_to` default is
-    // matched.
-    mailer.defaults = Arc::new(MailerDefaults {
-        from: config.from.clone(),
-        reply_to: config.reply_to.clone(),
-    });
-    mailer.inline_css_default = config.inline_css;
-    state.insert_extension(mailer);
-}
-
-/// The transport of the replay mailer: it refuses every send.
-///
-/// A send on the replayed request is answered by the mail seam before it
-/// reaches a transport. A send that reaches this one ran with no tape.
-#[cfg(feature = "reporting")]
-struct ReplayTransport {
-    disabled: bool,
-}
-
-#[cfg(feature = "reporting")]
-impl MailTransport for ReplayTransport {
-    fn send<'a>(
-        &'a self,
-        mail: Mail,
-    ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
-        Box::pin(async move {
-            Err(MailError::RuntimeUnavailable(format!(
-                "mail ({:?}) was sent outside the capsule's replay scope; nothing was delivered",
-                mail.subject
-            )))
-        })
-    }
-
-    fn is_disabled(&self) -> bool {
-        self.disabled
-    }
-}
-
 #[allow(clippy::too_many_lines)]
 pub(crate) fn install_mailer(
     state: &AppState,
@@ -6554,6 +6565,34 @@ mod tests {
             mailer.send(mail()).await.is_err(),
             "a send with no tape must not reach a transport"
         );
+    }
+
+    /// Review fix: `deliver_later` on a disabled transport is on the seam, so a
+    /// capture with mail off and a replay with mail on agree.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn deliver_later_on_a_disabled_transport_is_recorded() {
+        let mailer = Mailer::with_transport(DisabledTransport);
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "disabled".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        crate::capsule::capture::with_capture_scope(Arc::clone(&scope), async {
+            mailer
+                .try_deliver_later(
+                    Mail::builder()
+                        .from("from@example.com")
+                        .to("user@example.com")
+                        .subject("Later")
+                        .text("hello")
+                        .build()
+                        .unwrap(),
+                )
+                .expect("a disabled transport drops the mail");
+        })
+        .await;
+        assert_eq!(scope.effects_snapshot().mail.len(), 1);
     }
 
     /// #2351 item 3: `deliver_later` inside a transaction is recorded when it

@@ -111,7 +111,7 @@ pub use schema::{
     AppInfo, BindValue, CAPSULE_FORMAT_VERSION, CacheEffect, CacheInvalidationError, Capsule,
     CapsuleBody, CapsuleDb, CapsuleEffects, CapsuleError, CapsuleJob, CapsuleOutcome,
     CapsuleRequest, ConnectionTape, Exchange, ExchangeProtocol, HttpEffect, JobEffect, MailEffect,
-    RandomEffect, TenantEffect,
+    OLDEST_READABLE_FORMAT_VERSION, RandomEffect, TenantEffect,
 };
 
 /// Build the capture settings the layer and the persistence path share.

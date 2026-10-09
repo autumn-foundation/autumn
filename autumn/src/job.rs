@@ -3057,7 +3057,9 @@ async fn run_job_handler_unmetered(
     if let Some(context) = job_capture_context(&state) {
         let payload_for_capsule = payload.clone();
         let tracked = tracked_key.is_some();
-        let run = run_job_handler_inner(
+        // Boxed, so the capture branch does not add a second copy of the run
+        // to this future.
+        let run = Box::pin(run_job_handler_inner(
             name,
             handler,
             state,
@@ -3065,7 +3067,7 @@ async fn run_job_handler_unmetered(
             payload,
             final_attempt,
             bounds,
-        );
+        ));
         return crate::capsule::capture::capture_job(
             name,
             &payload_for_capsule,
@@ -3420,10 +3422,10 @@ pub(crate) async fn run_handler_with_interceptor(
         .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
         .map(|arc| (*arc).clone());
     let payload_for_handler = payload.clone();
-    // The contexts a production run gets, made inert: the replayed app for
+    // The contexts of a production run (#2351 item 14): the replayed app for
     // events, the background transaction timeouts, and an untracked job
-    // context whose run is never cancelled (#2351 item 14). A tracked job's
-    // capsule is refused at capture, so untracked is what production saw.
+    // context whose run is never cancelled. Replay refuses a tracked job's
+    // capsule, so untracked is what production saw.
     let event_app = state.clone();
     #[cfg(feature = "db")]
     let tx_timeout_state = state.clone();
@@ -3448,17 +3450,19 @@ pub(crate) async fn run_handler_with_interceptor(
 /// reaches a backend. So the seam is the registration: replay answers here,
 /// and capture records here.
 ///
-/// The tape position is taken before the registration runs, and filled with
-/// its result after, error included (#2351 item 9). A registration can fail
-/// (no job runtime, an unregistered name, a reserved payload marker), and a
-/// failure recorded as a success replays as `Ok(())` to a handler that saw an
-/// error. With no open transaction the registration enqueues at once, on this
-/// task; that inner enqueue is not recorded a second time.
+/// The tape position is taken before the registration runs. It is filled with
+/// the result after, error included (#2351 item 9). A registration can fail,
+/// for example with no job runtime. If capture recorded a success, replay
+/// would return `Ok(())` to a handler that got an error. With no open
+/// transaction, the registration enqueues at once on this task. Capture does
+/// not record that inner enqueue a second time.
 async fn after_commit_seam(
     name: &str,
     payload: &Value,
     schedule: EnqueueSchedule,
-    register: impl Future<Output = AutumnResult<()>>,
+    // Boxed: the registration holds a whole enqueue, and the seam must not
+    // copy it into each caller's future.
+    register: Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + '_>>,
 ) -> AutumnResult<()> {
     if let Some(answer) = replayed_enqueue(name, payload, schedule) {
         return answer;
@@ -3627,25 +3631,24 @@ struct EnqueueSlot {
     requested_due_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Keep the deadline the caller gave on the slot.
+/// Reserve an enqueue slot that keeps the deadline the caller gave.
 #[cfg(feature = "reporting")]
-fn with_requested_due(
-    slot: Option<EnqueueSlot>,
+fn reserve_enqueue_due(
+    payload: &Value,
     requested: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Option<EnqueueSlot> {
-    slot.map(|slot| EnqueueSlot {
-        requested_due_at: requested,
-        ..slot
-    })
+    let mut slot = reserve_enqueue(payload)?;
+    slot.requested_due_at = requested;
+    Some(slot)
 }
 
 /// No capsule support compiled in: there is no slot.
 #[cfg(not(feature = "reporting"))]
-const fn with_requested_due(
-    slot: Option<EnqueueSlot>,
+const fn reserve_enqueue_due(
+    _payload: &Value,
     _requested: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Option<EnqueueSlot> {
-    slot
+    None
 }
 
 /// Reserve an enqueue slot, when a capsule is being recorded.
@@ -3694,6 +3697,16 @@ fn fill_enqueue(
             error: error.map(crate::AutumnError::message),
         },
     );
+}
+
+/// The entropy source a job client mints job ids from.
+///
+/// A replay answers an enqueue before a job id is drawn, so the draw must not
+/// go on the capsule's random tape: it would shift every later draw by one
+/// (#2351 item 11).
+fn job_client_entropy(state: &AppState) -> Arc<dyn crate::entropy::Entropy> {
+    let entropy = state.entropy_arc();
+    entropy.unrecorded().unwrap_or(entropy)
 }
 
 /// Retrieves the global initialized job client.
@@ -4054,11 +4067,16 @@ pub async fn enqueue_after_commit<A: serde::Serialize>(name: &str, args: A) -> A
         )))
     })?;
     let registration = payload.clone();
-    after_commit_seam(name, &payload, EnqueueSchedule::Immediate, async move {
-        after_commit_client()?
-            .enqueue_after_commit(name, registration)
-            .await
-    })
+    after_commit_seam(
+        name,
+        &payload,
+        EnqueueSchedule::Immediate,
+        Box::pin(async move {
+            after_commit_client()?
+                .enqueue_after_commit(name, registration)
+                .await
+        }),
+    )
     .await
 }
 
@@ -4094,13 +4112,18 @@ pub async fn enqueue_in_after_commit<A: serde::Serialize>(
     })?;
     let registration = payload.clone();
     let schedule = EnqueueSchedule::After(delay_seconds(delay));
-    after_commit_seam(name, &payload, schedule, async move {
-        // `enqueue_after_commit_delay` computes `when` inside the callback so
-        // the delay is measured from commit time, not from this call site.
-        after_commit_client()?
-            .enqueue_after_commit_delay(name, registration, delay)
-            .await
-    })
+    after_commit_seam(
+        name,
+        &payload,
+        schedule,
+        Box::pin(async move {
+            // `enqueue_after_commit_delay` computes `when` inside the callback so
+            // the delay is measured from commit time, not from this call site.
+            after_commit_client()?
+                .enqueue_after_commit_delay(name, registration, delay)
+                .await
+        }),
+    )
     .await
 }
 
@@ -4121,11 +4144,16 @@ pub async fn enqueue_at_after_commit<A: serde::Serialize>(
         )))
     })?;
     let registration = payload.clone();
-    after_commit_seam(name, &payload, EnqueueSchedule::At(when), async move {
-        after_commit_client()?
-            .enqueue_after_commit_due(name, registration, Some(when))
-            .await
-    })
+    after_commit_seam(
+        name,
+        &payload,
+        EnqueueSchedule::At(when),
+        Box::pin(async move {
+            after_commit_client()?
+                .enqueue_after_commit_due(name, registration, Some(when))
+                .await
+        }),
+    )
     .await
 }
 
@@ -4389,7 +4417,7 @@ impl JobClient {
         // Reserve before the backend is asked and fill in after, so concurrent
         // enqueues keep initiation order and a backend *rejection* is recorded
         // as the failure the handler actually saw.
-        let slot = with_requested_due(reserve_enqueue(&payload), requested);
+        let slot = reserve_enqueue_due(&payload, requested);
         let result = self
             .enqueue_with_outcome_due_inner(name, payload, due_at, now, None)
             .await;
@@ -4898,7 +4926,7 @@ impl JobClient {
                 resolved.push((result_index, answer.map(|()| EnqueueOutcome::Queued)));
                 continue;
             }
-            let slot = with_requested_due(reserve_enqueue(&payload), requested);
+            let slot = reserve_enqueue_due(&payload, requested);
             let id = self.entropy.uuid_v4().to_string();
             let constraints = ResolvedJobConstraints::for_payload(settings, &payload);
 
@@ -5184,22 +5212,17 @@ impl JobClient {
         })?;
         // A free `*_after_commit` function owns the seam already; a held
         // client (the event bus's durable dispatch) is on the seam here.
+        let recorded = payload.clone();
+        let register = Box::pin(self.register_after_commit(name, payload, due));
         if enqueue_tee_suppressed() {
-            return self.register_after_commit(name, payload, due).await;
+            return register.await;
         }
         let schedule = match due {
             AfterCommitDue::At(None) => EnqueueSchedule::Immediate,
             AfterCommitDue::At(Some(at)) => EnqueueSchedule::At(at),
             AfterCommitDue::After(delay) => EnqueueSchedule::After(delay_seconds(delay)),
         };
-        let recorded = payload.clone();
-        after_commit_seam(
-            name,
-            &recorded,
-            schedule,
-            self.register_after_commit(name, payload, due),
-        )
-        .await
+        after_commit_seam(name, &recorded, schedule, register).await
     }
 
     /// Validate an after-commit enqueue and register it, or enqueue at once
@@ -5591,7 +5614,7 @@ impl JobClient {
         if self.pg_pool.is_some() {
             note_transactional_enqueue();
         }
-        let slot = with_requested_due(reserve_enqueue(&payload), requested);
+        let slot = reserve_enqueue_due(&payload, requested);
         let result = self
             .enqueue_on_conn_due_inner(name, payload, conn, due_at, relative_delay)
             .await;
@@ -6268,7 +6291,7 @@ pub(crate) fn start_local_runtime_inner(
         interceptor: state
             .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
             .map(|arc| (*arc).clone()),
-        entropy: state.entropy_arc(),
+        entropy: job_client_entropy(state),
         clock: state.clock_arc(),
         resilience_config: state
             .extension::<crate::config::AutumnConfig>()
@@ -10364,7 +10387,7 @@ fn start_redis_runtime(
             interceptor: state
                 .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
                 .map(|arc| (*arc).clone()),
-            entropy: state.entropy_arc(),
+            entropy: job_client_entropy(state),
             clock: state.clock_arc(),
             resilience_config: state
                 .extension::<crate::config::AutumnConfig>()
@@ -13226,7 +13249,7 @@ fn start_postgres_runtime(
             interceptor: state
                 .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
                 .map(|arc| (*arc).clone()),
-            entropy: state.entropy_arc(),
+            entropy: job_client_entropy(state),
             clock: state.clock_arc(),
             resilience_config: state
                 .extension::<crate::config::AutumnConfig>()

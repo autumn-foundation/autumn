@@ -26,6 +26,9 @@ use crate::time::{ClockSource, MonotonicInstant, SystemClock};
 
 /// Newtype wrapper used to store the global cache in the extension map so that
 /// `set_cache` (called from startup hooks) is visible to all `AppState` clones.
+///
+/// Use [`AppState::set_cache`]: a backend inserted here directly is not on the
+/// failure-capsule seam.
 pub struct GlobalCacheEntry(pub Arc<dyn Cache>);
 
 use crate::actuator;

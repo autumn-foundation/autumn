@@ -933,9 +933,9 @@ codemod rewrites struct literals.
 
 ### Capsules: new `CacheEffect` and `EffectSeam` variants, a new `JobEffect` field
 
-**Why:** issue #2351 put cache removals and random-draw widths on the capsule
-seam, and keeps the deadline an `enqueue_at` call gave when it was already
-past. These types (feature `reporting`) are public and are not
+**Why:** issue #2351 adds cache removals and random-draw widths to the capsule
+seam. It also records the deadline of an `enqueue_at` call when the deadline
+is already past. These types (feature `reporting`) are public and are not
 `#[non_exhaustive]`.
 
 **Before (`{X.Y}`):**
@@ -979,8 +979,10 @@ The new variants are `CacheEffect::Invalidate`, `CacheEffect::InvalidateNamespac
 `CacheEffect::Clear` and `EffectSeam::Random`. An exhaustive `match` on
 `EffectSeam` needs a new arm.
 
-A capsule that holds a new value is malformed to an older reader. The capsule
-format version does not change, so this build reads every older capsule.
+`CAPSULE_FORMAT_VERSION` is now 4. An older build refuses a version 4 capsule
+with a version mismatch. This build reads a version 3 capsule and replays it
+with the version 3 rules, so a committed corpus keeps its verdicts. Re-record
+a capsule to get the new checks.
 
 **Automation:** `manual` - a codemod cannot know what a new match arm must do.
 

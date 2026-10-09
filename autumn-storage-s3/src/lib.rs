@@ -233,8 +233,9 @@ async fn abort_multipart(client: &Client, bucket: &str, key: &str, upload_id: &s
 ///
 /// This client is not autumn-web's recorded outbound seam. A capsule replay
 /// refuses the call, and capture marks the capsule incomplete.
-fn guard_egress(method: &str, key: &str) -> Result<(), BlobStoreError> {
-    autumn_web::capsule::guard_egress("s3 blob store", method, key)
+fn guard_egress(method: &str) -> Result<(), BlobStoreError> {
+    // The target does not name the object: a key can hold personal data.
+    autumn_web::capsule::guard_egress("s3 blob store", method, "s3 object")
         .map_err(|refused| BlobStoreError::backend(refused.to_string()))
 }
 
@@ -252,7 +253,7 @@ impl BlobStore for S3BlobStore {
         let byte_size = bytes.len() as u64;
         Box::pin(async move {
             validate_key(key)?;
-            guard_egress("PUT", key)?;
+            guard_egress("PUT")?;
             let result = self
                 .client
                 .put_object()
@@ -281,7 +282,7 @@ impl BlobStore for S3BlobStore {
         let byte_size = bytes.len() as u64;
         Box::pin(async move {
             validate_key(key)?;
-            guard_egress("PUT", key)?;
+            guard_egress("PUT")?;
             // `If-None-Match: *` makes S3 refuse the write (412) when the key
             // exists, so a blob of another writer is never replaced. A 409
             // means a parallel conditional write: the key is taken too.
@@ -324,7 +325,7 @@ impl BlobStore for S3BlobStore {
     ) -> BlobFuture<'a, Blob> {
         Box::pin(async move {
             validate_key(key)?;
-            guard_egress("PUT", key)?;
+            guard_egress("PUT")?;
             let mut stream = data;
             let mut current_part: Vec<u8> = Vec::with_capacity(MULTIPART_PART_SIZE);
 
@@ -467,7 +468,7 @@ impl BlobStore for S3BlobStore {
     fn get<'a>(&'a self, key: &'a str) -> BlobFuture<'a, Bytes> {
         Box::pin(async move {
             validate_key(key)?;
-            guard_egress("GET", key)?;
+            guard_egress("GET")?;
             let result = self
                 .client
                 .get_object()
@@ -495,7 +496,7 @@ impl BlobStore for S3BlobStore {
     fn delete<'a>(&'a self, key: &'a str) -> BlobFuture<'a, ()> {
         Box::pin(async move {
             validate_key(key)?;
-            guard_egress("DELETE", key)?;
+            guard_egress("DELETE")?;
             self.client
                 .delete_object()
                 .bucket(&self.options.bucket)
@@ -510,7 +511,7 @@ impl BlobStore for S3BlobStore {
     fn head<'a>(&'a self, key: &'a str) -> BlobFuture<'a, Option<BlobMeta>> {
         Box::pin(async move {
             validate_key(key)?;
-            guard_egress("HEAD", key)?;
+            guard_egress("HEAD")?;
             let result = self
                 .client
                 .head_object()

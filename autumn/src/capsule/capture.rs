@@ -923,17 +923,29 @@ impl CaptureScope {
         });
     }
 
+    /// Reserve this run's next cache tape position, before an async removal
+    /// starts.
+    #[must_use]
+    pub fn reserve_cache(&self) -> Option<usize> {
+        let budget = self.settings.max_capsule_bytes;
+        self.with_effects(|buffer| {
+            buffer.reserve(|effects| &mut effects.cache, CacheEffect::pending(), budget)
+        })
+        .flatten()
+    }
+
+    /// Complete a reserved cache slot.
+    pub fn fill_cache(&self, index: usize, effect: CacheEffect) {
+        let weight = cache_weight(&effect);
+        let budget = self.settings.max_capsule_bytes;
+        let _ = self.with_effects(|buffer| {
+            buffer.fill(|effects| &mut effects.cache, index, effect, weight, budget);
+        });
+    }
+
     /// Record one cache read or write.
     pub fn record_cache(&self, effect: CacheEffect) {
-        let weight = effect.key().len().saturating_add(match &effect {
-            CacheEffect::Get { value, .. } => value.as_ref().map_or(0, String::len),
-            CacheEffect::Insert { value, .. } => value.len(),
-            CacheEffect::Invalidate { error, .. }
-            | CacheEffect::InvalidateNamespace { error, .. } => {
-                error.as_ref().map_or(0, |error| error.reason.len())
-            }
-            CacheEffect::Clear => 0,
-        });
+        let weight = cache_weight(&effect);
         let budget = self.settings.max_capsule_bytes;
         let _ = self.with_effects(|buffer| {
             buffer.push(|effects| &mut effects.cache, effect, weight, budget);
@@ -1050,6 +1062,18 @@ impl CaptureScope {
     pub fn is_truncated(&self) -> bool {
         self.truncated.load(Ordering::Relaxed)
     }
+}
+
+/// The approximate serialized size of a cache effect.
+fn cache_weight(effect: &CacheEffect) -> usize {
+    effect.key().len().saturating_add(match effect {
+        CacheEffect::Get { value, .. } => value.as_ref().map_or(0, String::len),
+        CacheEffect::Insert { value, .. } => value.len(),
+        CacheEffect::Invalidate { error, .. } | CacheEffect::InvalidateNamespace { error, .. } => {
+            error.as_ref().map_or(0, |error| error.reason.len())
+        }
+        CacheEffect::Clear => 0,
+    })
 }
 
 /// A cloneable handle to a request's [`CaptureScope`], carried in the request

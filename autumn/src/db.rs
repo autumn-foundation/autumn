@@ -129,6 +129,9 @@ tokio::task_local! {
     /// Task-local registry used by [`Db::tx`] to accumulate after-commit
     /// callbacks. Only set while the [`Db::tx`] future is being polled;
     /// absent outside a transaction block.
+    ///
+    /// Use [`register_after_commit`]: a callback pushed here directly does not
+    /// mark a failure capsule incomplete.
     pub static AFTER_COMMIT_REGISTRY: Arc<Mutex<Vec<CommitCallback>>>;
 }
 

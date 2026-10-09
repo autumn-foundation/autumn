@@ -605,11 +605,17 @@ pub fn redact_effects(
             }
             *value = masked;
         }
+        // Replay hands a recorded error back to the code too. Its key is not
+        // a refusal: error text compares like the outcome does.
         if let Some(error) = exchange.error.as_mut() {
-            *error = mask_echoes(error, values);
+            let masked = mask_echoes(error, values);
+            if masked != *error {
+                keys.insert(format!("http[{index}].error:<echo>"));
+            }
+            *error = masked;
         }
     }
-    for entry in &mut effects.cache {
+    for (index, entry) in effects.cache.iter_mut().enumerate() {
         match entry {
             crate::capsule::schema::CacheEffect::Get { key, .. }
             | crate::capsule::schema::CacheEffect::Insert { key, .. } => {
@@ -626,13 +632,17 @@ pub fn redact_effects(
             } => {
                 *key = mask_echoes(key, values);
                 if let Some(error) = error.as_mut() {
-                    error.reason = mask_echoes(&error.reason, values);
+                    let masked = mask_echoes(&error.reason, values);
+                    if masked != error.reason {
+                        keys.insert(format!("cache[{index}].error:<echo>"));
+                    }
+                    error.reason = masked;
                 }
             }
             crate::capsule::schema::CacheEffect::Clear => {}
         }
     }
-    for mail in &mut effects.mail {
+    for (index, mail) in effects.mail.iter_mut().enumerate() {
         mail.subject = mask_echoes(&mail.subject, values);
         mask_body_echoes(&mut mail.body, values);
         mask_body_echoes(&mut mail.alternate_body, values);
@@ -664,20 +674,28 @@ pub fn redact_effects(
             *from = mask_echoes(from, values);
         }
         if let Some(error) = mail.error.as_mut() {
-            *error = mask_echoes(error, values);
+            let masked = mask_echoes(error, values);
+            if masked != *error {
+                keys.insert(format!("mail[{index}].error:<echo>"));
+            }
+            *error = masked;
         }
     }
     // Job payloads and cache values are structured, so the filter pass masked
     // them *by key*; this catches the other half — a value the request already
     // had masked that reappears under a key the filter does not name.
-    for effect in &mut effects.jobs {
+    for (index, effect) in effects.jobs.iter_mut().enumerate() {
         effect.payload = mask_json_echoes(&effect.payload, values);
         // A rejection's text is free-form and written by whatever refused the
         // enqueue — a `JobInterceptor` can quote the payload field or the
         // credential it rejected — so it can carry a value masked everywhere
         // else in the capsule.
         if let Some(error) = effect.error.as_mut() {
-            *error = mask_echoes(error, values);
+            let masked = mask_echoes(error, values);
+            if masked != *error {
+                keys.insert(format!("job[{index}].error:<echo>"));
+            }
+            *error = masked;
         }
     }
     if let Some(job) = job.as_mut() {
@@ -1046,7 +1064,7 @@ fn redact_headers(
 /// value (`session="abc"` records `abc`, not `"abc"`). Both are spellings a
 /// sloppy handler could hold; both predate this function's byte port and are
 /// tracked separately rather than widened into it.
-fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedValues) {
+pub(crate) fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedValues) {
     let trimmed = trim_ows(value);
     // Only headers whose *syntax* this understands. A custom sensitive header
     // named by `filter_parameters` carries whatever its application likes, and

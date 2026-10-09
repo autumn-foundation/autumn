@@ -1359,7 +1359,13 @@ impl InvalidateAfterWrite {
             report_skipped_invalidation("the write ran outside a Tokio runtime");
             return false;
         };
-        handle.spawn((self.make)()).await.unwrap_or_else(|_| {
+        // Awaited at once, so the capsule scope and the replay tape go along:
+        // the removal is recorded and replayed like inline work (#2351).
+        #[cfg(feature = "reporting")]
+        let invalidation = crate::capsule::boundary::carry_scopes((self.make)());
+        #[cfg(not(feature = "reporting"))]
+        let invalidation = (self.make)();
+        handle.spawn(invalidation).await.unwrap_or_else(|_| {
             report_skipped_invalidation("the invalidation task panicked or was cancelled");
             false
         })
@@ -1384,7 +1390,16 @@ impl Drop for InvalidateAfterWrite {
         }
         self.pending = false;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn((self.make)());
+            // Not awaited: the capsule says so, and a replay gives the task
+            // the tape (#2351).
+            #[cfg(feature = "reporting")]
+            let invalidation = {
+                crate::capsule::boundary::note_detached_work();
+                crate::capsule::boundary::carry_tape((self.make)())
+            };
+            #[cfg(not(feature = "reporting"))]
+            let invalidation = (self.make)();
+            handle.spawn(invalidation);
         } else {
             report_skipped_invalidation("the write ended outside a Tokio runtime");
         }
@@ -2478,6 +2493,37 @@ mod tests {
 
     fn guard_runs() -> usize {
         GUARD_RUNS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    static SAW_SCOPE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(feature = "reporting")]
+    fn note_scope() -> crate::cache::CacheFuture<'static, bool> {
+        Box::pin(async {
+            SAW_SCOPE.store(
+                crate::capsule::current_scope().is_some(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            true
+        })
+    }
+
+    /// Review fix (#2351): a flushed invalidation runs on a spawned task, and
+    /// still records into the request's capsule.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_flushed_invalidation_keeps_the_capture_scope() {
+        let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+            "coherence".to_owned(),
+            std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+            std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        crate::capsule::capture::with_capture_scope(std::sync::Arc::clone(&scope), async {
+            assert!(InvalidateAfterWrite::new(note_scope).run().await);
+        })
+        .await;
+        assert!(SAW_SCOPE.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!scope.is_truncated(), "an awaited invalidation is not detached");
     }
 
     #[tokio::test]
