@@ -26780,6 +26780,8 @@ mod lease_tests {
 
     static TIMEOUT_SEEN: AtomicUsize = AtomicUsize::new(0);
     static LEASE_SEEN: AtomicUsize = AtomicUsize::new(0);
+    // Own counter: a test that shares one races the test that reads it.
+    static SETTLE_SEEN: AtomicUsize = AtomicUsize::new(0);
 
     /// Spawn work that records how the run was stopped in `seen`: 1 for a
     /// timeout, 10 for a lost lease. Then hang.
@@ -26800,6 +26802,13 @@ mod lease_tests {
         _payload: Value,
     ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
         Box::pin(hang_and_watch(&TIMEOUT_SEEN))
+    }
+
+    fn settle_watch_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(hang_and_watch(&SETTLE_SEEN))
     }
 
     fn lease_watch_handler(
@@ -27028,7 +27037,7 @@ mod lease_tests {
                 stall_mark_running: false,
                 stall_settle: true,
             },
-            timeout_watch_handler,
+            settle_watch_handler,
             true,
             Some(Duration::from_millis(250)),
         )
