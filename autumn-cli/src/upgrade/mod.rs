@@ -1423,7 +1423,11 @@ mod write_guard_tests {
 /// predict its own apply is worse than no preview, and this is the one file
 /// that can be in both halves at once.
 fn plan_scaffold(root: &Path, target: &str, report: &Report) -> Option<scaffold::ScaffoldReport> {
-    let migrated: BTreeSet<String> = report.files.iter().map(|file| file.path.clone()).collect();
+    let migrated: BTreeMap<String, String> = report
+        .files
+        .iter()
+        .map(|file| (file.path.clone(), file.updated.clone()))
+        .collect();
     scaffold::is_project(root).then(|| scaffold::plan_after(root, target, &migrated))
 }
 
