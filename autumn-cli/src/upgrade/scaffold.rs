@@ -1550,7 +1550,9 @@ fn swap(
                          the earlier copy is at {}",
                         path.display()
                     )),
-                    Err(error) => PublishError::Failed(error.to_string()),
+                    Err(error) => PublishError::Failed(format!(
+                        "could not keep the displaced copy after a failed restore: {error}"
+                    )),
                 }
             }
         });
@@ -1583,16 +1585,21 @@ fn swap(
 /// A writer that opened the old file before the swap can still write into it.
 /// Keep such a copy and say where it is, so the write is not lost in silence.
 fn finish_claim(claim: tempfile::TempPath, expected: &str) -> Result<(), PublishError> {
-    if read_text(&claim).is_some_and(|text| text == normalize(expected)) {
-        return Ok(());
+    match read_text(&claim) {
+        Some(text) if text == normalize(expected) => return Ok(()),
+        // Nothing is there, so nothing can be kept.
+        None if !claim.exists() => return Ok(()),
+        _ => {}
     }
-    Err(match claim.keep() {
-        Ok(path) => PublishError::Late(format!(
+    match claim.keep() {
+        Ok(path) => Err(PublishError::Late(format!(
             "this file was written during the swap; the earlier copy is at {}",
             path.display()
-        )),
-        Err(error) => PublishError::Failed(error.to_string()),
-    })
+        ))),
+        Err(error) => Err(PublishError::Failed(format!(
+            "could not keep the earlier copy after a late write: {error}"
+        ))),
+    }
 }
 
 /// Re-read what an entry's path holds now, by the same rules the plan used —
