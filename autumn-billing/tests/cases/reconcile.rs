@@ -887,3 +887,24 @@ async fn failed_apply_releases_claim_so_redelivery_applies() {
     assert_eq!(sub.status, SubscriptionStatus::Active);
     assert_eq!(sub.plan_id, Some(PlanId::new("pro")));
 }
+
+/// JSON from before `provider_subscription_id` existed still reads.
+#[test]
+fn invoice_json_without_the_provider_subscription_id_reads() {
+    let invoice = Invoice::new(
+        "i",
+        "c",
+        "in_1",
+        InvoiceStatus::Open,
+        Money::from_minor(1, Currency::USD),
+        Money::zero(Currency::USD),
+        at(0),
+        at(0),
+    );
+    let mut json = serde_json::to_value(&invoice).unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .remove("provider_subscription_id");
+    let read: Invoice = serde_json::from_value(json).unwrap();
+    assert_eq!(read.provider_subscription_id, None);
+}

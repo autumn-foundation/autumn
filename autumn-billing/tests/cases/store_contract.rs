@@ -982,6 +982,151 @@ pub async fn open_dunning_for_subscription_is_scoped_and_filtered(store: &dyn Bi
     );
 }
 
+/// An invoice keeps the provider subscription id. Linking a subscription
+/// adopts its unlinked invoices and open dunning rows, and nothing else.
+pub async fn link_subscription_adopts_pending_invoices_and_dunning(store: &dyn BillingStore) {
+    let customer = seed_customer(store, "adopt", None).await;
+    let sub = ProviderId::new("sub_adopt");
+    let orphan = store
+        .upsert_invoice(
+            invoice_upsert("adopt", &customer, "orphan", InvoiceStatus::Open, 100)
+                .with_provider_subscription(sub.clone()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(orphan.provider_subscription_id.as_ref(), Some(&sub));
+    assert_eq!(orphan.subscription_id, None);
+    let closed = store
+        .upsert_invoice(
+            invoice_upsert("adopt", &customer, "closed", InvoiceStatus::Open, 100)
+                .with_provider_subscription(sub.clone()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    for (invoice, state) in [
+        (&orphan, DunningState::Pending),
+        (&closed, DunningState::Recovered),
+    ] {
+        store
+            .upsert_dunning(DunningAttempt::new(
+                invoice.id.clone(),
+                customer.clone(),
+                1,
+                at(300),
+                state,
+                at(0),
+            ))
+            .await
+            .unwrap();
+    }
+    let other = store
+        .upsert_invoice(
+            invoice_upsert("adopt", &customer, "other", InvoiceStatus::Open, 100)
+                .with_provider_subscription("sub_adopt_other"),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    let linked = store
+        .upsert_invoice(
+            invoice_upsert("adopt", &customer, "linked", InvoiceStatus::Open, 100)
+                .with_provider_subscription(sub.clone())
+                .with_subscription("adopt-sub-first"),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+    store
+        .link_subscription(&sub, "adopt-sub", at(2000))
+        .await
+        .unwrap();
+
+    let by_id =
+        |id: String| async move { store.invoice_by_id(&id).await.unwrap().expect("invoice") };
+    assert_eq!(
+        by_id(orphan.id.clone()).await.subscription_id.as_deref(),
+        Some("adopt-sub")
+    );
+    assert_eq!(by_id(other.id).await.subscription_id, None);
+    assert_eq!(
+        by_id(linked.id).await.subscription_id.as_deref(),
+        Some("adopt-sub-first"),
+        "an existing link is kept"
+    );
+    let row = store.dunning_by_invoice(&orphan.id).await.unwrap().unwrap();
+    assert_eq!(row.subscription_id.as_deref(), Some("adopt-sub"));
+    assert_eq!(row.updated_at, at(2000));
+    let closed = store.dunning_by_invoice(&closed.id).await.unwrap().unwrap();
+    assert_eq!(closed.subscription_id, None, "a settled row is left alone");
+    // Idempotent.
+    store
+        .link_subscription(&sub, "adopt-sub", at(3000))
+        .await
+        .unwrap();
+}
+
+/// A settle built before a link was added keeps the stored link.
+pub async fn settle_dunning_keeps_a_concurrent_link(store: &dyn BillingStore) {
+    store
+        .upsert_dunning(
+            dunning("settle-link", "k", 1, 100, DunningState::Running)
+                .with_subscription("settle-link-sub"),
+        )
+        .await
+        .unwrap();
+    let stale = dunning("settle-link", "k", 1, 100, DunningState::Exhausted);
+    assert_eq!(stale.subscription_id, None);
+    assert!(
+        store
+            .settle_dunning("settle-link-inv-k", 1, &[DunningState::Running], stale)
+            .await
+            .unwrap()
+    );
+    let row = store
+        .dunning_by_invoice("settle-link-inv-k")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, DunningState::Exhausted);
+    assert_eq!(row.subscription_id.as_deref(), Some("settle-link-sub"));
+}
+
+/// An invoice linked before its dunning row was opened still gets the row
+/// linked.
+pub async fn link_subscription_adopts_dunning_opened_after_the_link(store: &dyn BillingStore) {
+    let customer = seed_customer(store, "late", None).await;
+    let sub = ProviderId::new("sub_late");
+    let late = store
+        .upsert_invoice(
+            invoice_upsert("late", &customer, "k", InvoiceStatus::Open, 100)
+                .with_provider_subscription(sub.clone())
+                .with_subscription("late-sub"),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    store
+        .upsert_dunning(DunningAttempt::new(
+            late.id.clone(),
+            customer.clone(),
+            1,
+            at(300),
+            DunningState::Pending,
+            at(0),
+        ))
+        .await
+        .unwrap();
+    store
+        .link_subscription(&sub, "late-sub", at(2000))
+        .await
+        .unwrap();
+    let row = store.dunning_by_invoice(&late.id).await.unwrap().unwrap();
+    assert_eq!(row.subscription_id.as_deref(), Some("late-sub"));
+}
+
 // ── Fix round 2 properties ──────────────────────────────────────────────
 
 /// One customer row per user: a second provider customer for a linked user
@@ -1413,7 +1558,10 @@ pub async fn run_contract(store: &dyn BillingStore) {
     subscription_unchanged_redelivery(store).await;
     subscription_missing_fields_keep_stored_values(store).await;
     invoice_unchanged_redelivery(store).await;
+    link_subscription_adopts_pending_invoices_and_dunning(store).await;
+    link_subscription_adopts_dunning_opened_after_the_link(store).await;
     settle_dunning_is_compare_and_set(store).await;
+    settle_dunning_keeps_a_concurrent_link(store).await;
     prune_events_deletes_applied_rows_before(store).await;
 }
 
@@ -1458,7 +1606,10 @@ mod memory {
         subscription_unchanged_redelivery,
         subscription_missing_fields_keep_stored_values,
         invoice_unchanged_redelivery,
+        link_subscription_adopts_pending_invoices_and_dunning,
+        link_subscription_adopts_dunning_opened_after_the_link,
         settle_dunning_is_compare_and_set,
+        settle_dunning_keeps_a_concurrent_link,
         prune_events_deletes_applied_rows_before,
     );
 
@@ -1641,4 +1792,15 @@ async fn relink_customer_default_is_unsupported_for_a_store_that_predates_it() {
         matches!(err, autumn_billing::BillingError::Unsupported(_)),
         "expected Unsupported, got {err:?}"
     );
+}
+
+/// The default `link_subscription` is a no-op, so an older store keeps
+/// compiling and keeps working.
+#[tokio::test]
+async fn link_subscription_default_is_a_no_op_for_a_store_that_predates_it() {
+    let store = LegacyStoreWithoutRelink;
+    store
+        .link_subscription(&ProviderId::new("sub"), "local", at(0))
+        .await
+        .expect("the default implementation succeeds");
 }
