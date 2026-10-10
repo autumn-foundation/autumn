@@ -397,6 +397,43 @@ mod tests {
         ts.to_string()
     }
 
+    // Characterizes the composition every attribute-macro entry point in
+    // `autumn-macros`/`autumn-macros-model`/`autumn-macros-repository`'s
+    // `lib.rs` performs by hand: extract the override, set it as the target
+    // for the macro's own call, then finalize that call's result against the
+    // same target. `with_override` (below) is this exact sequence as one
+    // function; this test pins the sequence's observable behavior
+    // independently of that function so a future change to the composition
+    // can't silently drift from what every entry point already does.
+    #[test]
+    fn override_protocol_composes_extract_then_target_then_finalize() {
+        let attr = quote! { crate = "renamed_web", "/x" };
+        let (crate_override, remaining_attr) = extract_crate_override(attr).unwrap();
+        assert_eq!(crate_override.as_deref(), Some("renamed_web"));
+        assert_eq!(ts_string(&remaining_attr), ts_string(&quote! { "/x" }));
+
+        let _guard = set_target(crate_override.as_deref());
+        // The macro's own body — generators and recognizers alike — must see
+        // the override while it runs, not just once `finalize` rewrites its
+        // returned tokens.
+        assert_eq!(current_target(), "renamed_web");
+
+        let generated = quote! { fn foo() -> ::autumn_web::Route { } };
+        let out = finalize(generated);
+        let s = ts_string(&out);
+        assert!(s.contains(":: renamed_web :: Route"), "got: {s}");
+        assert!(!s.contains("autumn_web"), "got: {s}");
+    }
+
+    #[test]
+    fn override_protocol_rejects_an_invalid_override_before_any_target_change() {
+        let attr = quote! { crate = "not an ident" };
+        let err = extract_crate_override(attr).unwrap_err();
+        assert!(ts_string(&err).contains("is not a valid Rust identifier"));
+        // No guard was ever set, so the ambient target is still the default.
+        assert_eq!(current_target(), DEFAULT_NAME);
+    }
+
     #[test]
     fn rewrite_bare_path_segment_to_override() {
         let input = quote! { fn foo() -> ::autumn_web::Route { } };
