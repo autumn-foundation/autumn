@@ -10946,11 +10946,24 @@ pub(crate) fn sqlite_url_file(url: &str) -> Option<PathBuf> {
         .or_else(|| url.strip_prefix("sqlite:"))
         .unwrap_or(url);
     // A URI path ends at `?` or `#`, and `SQLite` percent-decodes it
-    // (`%66leet` is `fleet`). `file:///abs` carries an empty authority.
+    // (`%66leet` is `fleet`). After `//` comes an authority: empty
+    // (`file:///abs`) or `localhost` names this host; `SQLite` refuses any
+    // other, so there is no local file to compare.
     let path = rest.strip_prefix("file:").map_or_else(
         || rest.split('?').next().unwrap_or_default().to_owned(),
         |uri| {
-            let uri = uri.strip_prefix("//").unwrap_or(uri);
+            let uri = uri.strip_prefix("//").map_or(uri, |authority_and_path| {
+                let (authority, path) = authority_and_path.split_at(
+                    authority_and_path
+                        .find('/')
+                        .unwrap_or(authority_and_path.len()),
+                );
+                if authority.is_empty() || authority.eq_ignore_ascii_case("localhost") {
+                    path
+                } else {
+                    ""
+                }
+            });
             percent_decode_uri_path(uri.split(['?', '#']).next().unwrap_or_default())
         },
     );
@@ -20204,6 +20217,9 @@ path = "/healthz"
             "file:/var/lib/app/%66leet/control.db",
             "sqlite:file:/var/lib/app/%66leet/control.db?mode=rwc",
             "sqlite:file:///var/lib/app/fleet/control.db#frag",
+            // `localhost` is the local host's authority: an absolute path.
+            "file://localhost/var/lib/app/fleet/control.db",
+            "sqlite:file://LOCALHOST/var/lib/app/fleet/control.db",
         ] {
             let mut config = fleet_db(fleet(FleetMode::Tenant));
             config.url = Some(url.to_owned());
