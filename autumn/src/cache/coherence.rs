@@ -757,8 +757,9 @@ fn invalidations_dimension(mutations: &[Mutation]) -> Dimension<ManifestInvalida
                          invalidator after its own transaction commits (#3056), and a durable \
                          commit-hook row retries it when `commit_hooks` is on. Not proven: that \
                          the backend sweep succeeds (a failure is logged and counted in \
-                         `autumn_cache_invalidation_failures_total`), and that no fill on \
-                         another replica writes an old value back — see \
+                         `autumn_cache_invalidation_failures_total`). Also not proven on a \
+                         backend with no shared fill epoch: that no fill on another replica \
+                         writes an old value back. `RedisCache` has a shared epoch. See \
                          docs/guide/cache-coherence.md."
             .to_string(),
         entries,
@@ -1206,8 +1207,10 @@ pub fn with_fill_fence<R>(
 /// configured.
 ///
 /// Returns whether the invalidation was **complete**, which means exactly this:
-/// every entry the namespace held is gone, and no fill this process already had
-/// in flight can put a stale one back.
+/// every entry the namespace held is gone, and no fill already in flight can
+/// put a stale one back. The second part holds for fills in this process. It
+/// holds for fills on other replicas only if the backend has a shared fill
+/// epoch (see below).
 ///
 /// It is `false` when a registered process-level backend could not drop the
 /// namespace — a `RedisCache` whose `SCAN`/`DEL` errored, or a custom
@@ -1231,18 +1234,34 @@ pub fn with_fill_fence<R>(
 /// from "the function has not run yet". Register such a store to close that
 /// gap.
 ///
-/// The fill fence is **per process**. Another replica's in-flight fill, started
-/// before this invalidation and finishing after it, can still write a stale
-/// value into a shared backend; a `true` here does not speak for other
-/// replicas.
+/// # The fill fence
+///
+/// The local fence is **per process**. A backend can extend it to all replicas
+/// with [`Cache::fill_epoch`](super::Cache::fill_epoch) and
+/// [`Cache::insert_raw_bytes_if_epoch`](super::Cache::insert_raw_bytes_if_epoch).
+/// `RedisCache` does. It raises a per-namespace epoch in Redis **before** it
+/// sweeps. A fill stores its value only if that epoch did not move. With such a
+/// backend, a `true` is valid for all replicas. If the epoch bump fails, this
+/// returns `false`.
+///
+/// The shared fence covers `#[cached]` and `cache_fragment_in` fills. It does
+/// not cover `get_or_compute`, `Cache::clear`, or a key-level `invalidate`.
+///
+/// With a backend that has no shared epoch, a fill on another replica that
+/// started before this call can still write a stale value after it. A `true`
+/// is then valid for this process only.
 ///
 /// # Panics
 ///
 /// Panics if the internal `RwLock` is poisoned.
 #[must_use = "a `false` means stale entries can still be served"]
 pub fn invalidate_namespace(namespace: &str) -> bool {
+    let mut complete = true;
     for store in fence_and_collect_stores(namespace) {
+        // A shared store raises its epoch here. `clear` alone would not.
+        let swept = store.invalidate_namespace(namespace);
         store.clear();
+        complete &= registered_store_complete(&*store, swept, namespace);
     }
 
     // The dedicated stores are only half the story: once a process-level backend
@@ -1250,7 +1269,7 @@ pub fn invalidate_namespace(namespace: &str) -> bool {
     // function store holds nothing. Ask the backend — `MokaCache` and
     // `RedisCache` both drop the namespace; a backend that cannot, or one whose
     // sweep failed, says so, and that `false` is what the caller reports.
-    super::global_cache().is_none_or(|global| {
+    let global_complete = super::global_cache().is_none_or(|global| {
         let complete = global.invalidate_namespace(namespace);
         if !complete {
             report_incomplete_invalidation(
@@ -1259,7 +1278,23 @@ pub fn invalidate_namespace(namespace: &str) -> bool {
             );
         }
         complete
-    })
+    });
+    complete && global_complete
+}
+
+/// Whether a registered store counts as invalidated.
+///
+/// A store with no shared epoch is cleared by `clear`, so its answer does not
+/// matter. A store with a shared epoch must have raised it.
+fn registered_store_complete(store: &dyn super::Cache, swept: bool, namespace: &str) -> bool {
+    if swept || !store.shares_fill_epoch() {
+        return true;
+    }
+    report_incomplete_invalidation(
+        namespace,
+        "a registered shared store could not raise its fill epoch",
+    );
+    false
 }
 
 /// Async form of [`invalidate_namespace`], with the same contract.
@@ -1293,14 +1328,18 @@ pub async fn invalidate_namespace_async(namespace: &str) -> bool {
             },
         }
     };
+    let mut complete = true;
     for store in stores {
+        // A shared store raises its epoch here. `clear` alone would not.
+        let swept = store.invalidate_namespace_async(namespace).await.is_ok();
         store.clear();
+        complete &= registered_store_complete(&*store, swept, namespace);
     }
     let Some(global) = super::global_cache() else {
-        return true;
+        return complete;
     };
     match global.invalidate_namespace_async(namespace).await {
-        Ok(()) => true,
+        Ok(()) => complete,
         Err(error) => {
             report_incomplete_invalidation(namespace, error.reason());
             false

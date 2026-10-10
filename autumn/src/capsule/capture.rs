@@ -1384,10 +1384,14 @@ where
 
 /// The capsule id for a request: its request id when
 /// [`RequestIdLayer`](crate::middleware::RequestIdLayer) (installed outer to
-/// this one) has already assigned one, else a fresh id.
+/// this one) has already minted one, else a fresh id.
+///
+/// An inbound id from a proxy is not unique: a proxy retry sends it again.
+/// Two scopes with one id collide in the registry, so it gets a fresh id.
 fn scope_id(req: &Request<Body>) -> String {
     req.extensions()
         .get::<crate::middleware::RequestId>()
+        .filter(|id| !id.is_inbound())
         .map(std::string::ToString::to_string)
         .filter(|id| is_valid_scope_id(id))
         .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string())

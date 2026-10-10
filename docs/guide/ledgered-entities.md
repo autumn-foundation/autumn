@@ -180,6 +180,19 @@ Some consequences worth knowing:
   `ledger_as_of` and `ledger_diff` return `LedgerError::ChainUnreadable`. The
   error names the column and the revision. The model never holds ciphertext in a
   plaintext field.
+- A delete revision snapshots the row as the database holds it after the
+  soft-delete `UPDATE`. The snapshot includes any column that a trigger changes.
+  `ledger_verify` reports no mismatch after a delete.
+- The ledger reads a snapshot only if its stored text is its canonical form.
+  Changed spacing, a different key order or a duplicate key return
+  `LedgerError::SnapshotNotCanonical`. `ledger_verify` reports it as
+  `LedgerBreak::SnapshotNotCanonical`. The ledger cannot read past such a
+  revision, so this break comes before any other break in the same chain.
+- If a snapshot does not decode into the current model, `ledger_as_of` and
+  `ledger_diff` return `LedgerError::SnapshotSchemaMismatch`. This is not tamper
+  evidence. To read old revisions after adding a required field, put
+  `#[serde(default)]` on it. Run `ledger_verify` to rule out an edit. The ledger does not
+  convert renamed fields or changed types yet.
 
 ## Bitemporality
 

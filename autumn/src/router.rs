@@ -968,10 +968,13 @@ fn build_router_pre_state(
             if let Some(load_shed) = mcp_load_shed_layer {
                 // The envelope does not know the tool yet, so it admits as
                 // `critical` (up to the full limit). The `tools/call` replay
-                // then checks the tool route's own class (#3068), so a
-                // `default` or `sheddable` tool is still shed at its share.
+                // then claims a slot at the tool route's own class (#3068,
+                // #3186), so a `default` or `sheddable` tool is still shed at
+                // its share. The marker gives the replay a handle to the
+                // envelope's admission.
                 mcp_router = mcp_router
                     .layer(load_shed)
+                    .layer(axum::Extension(crate::middleware::LoadShedEnvelope))
                     .layer(axum::Extension(crate::admission::Criticality::Critical));
             }
             // Stamp `ResolvedClientIdentity` on the *outer* `/mcp` request too. The
@@ -5506,8 +5509,12 @@ fn apply_middleware(
     // outside the user layers — so `ResolvedClientIdentity` is stamped before any
     // middleware reads ClientAddr, ClientHost, or ClientScheme.
     // Listed OUTERMOST FIRST — see the warning at the top of this function.
+    // One proxy resolver for both layers: the trust decision for
+    // `X-Request-Id` and for `X-Forwarded-*` has one source.
+    let trusted_proxies_layer = build_trusted_proxies_layer(config);
     let middle_stack = (
-        RequestIdLayer::with_entropy(state.entropy_arc()),
+        RequestIdLayer::with_entropy(state.entropy_arc())
+            .with_inbound_trust(trusted_proxies_layer.resolver()),
         crate::middleware::LogContextLayer::new(log_context_filter),
         tower::util::option_layer(server_timing_layer),
         tower::util::option_layer(cost_layer),
@@ -5517,7 +5524,7 @@ fn apply_middleware(
         tower::util::option_layer(timeout_layer),
         tower::util::option_layer(tenancy_layer),
         tower::util::option_layer(tx_timeouts_layer),
-        build_trusted_proxies_layer(config),
+        trusted_proxies_layer,
     );
 
     // Pre-clone signing keys for the RYWW middleware (session mode needs to

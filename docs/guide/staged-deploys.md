@@ -300,9 +300,19 @@ replica's `version` label, so a controller scraping both cohorts can diff them:
 autumn_http_requests_total{version="canary"} 412
 autumn_http_responses_total{version="canary",status="5xx"} 3
 autumn_http_responses_total{version="stable",status="5xx"} 0
-autumn_http_request_duration_seconds{version="canary",quantile="0.99"} 1.2
-autumn_http_request_duration_seconds{version="stable",quantile="0.99"} 0.21
+autumn_http_request_duration_seconds_bucket{version="canary",method="GET",route="/items/{id}",status_class="2xx",le="0.25"} 380
+autumn_http_request_duration_seconds_count{version="canary",method="GET",route="/items/{id}",status_class="2xx"} 409
 ```
+
+`autumn_http_request_duration_seconds` is a histogram. To compare p99
+latency per cohort:
+
+```promql
+histogram_quantile(0.99,
+  sum by (le, version) (rate(autumn_http_request_duration_seconds_bucket[5m])))
+```
+
+See [Overload signals](observability/overload-signals.md) for every label.
 
 A controller polls these between traffic-weight steps and decides whether to
 keep shifting weight up or to roll back.
@@ -420,7 +430,8 @@ spec:
 # Controller loop (pseudo-steps):
 # 1. Scrape canary vs stable:
 #      autumn_http_responses_total{version="canary",status="5xx"}
-#      autumn_http_request_duration_seconds{version="canary",quantile="0.99"}
+#      histogram_quantile(0.99, sum by (le) (rate(
+#        autumn_http_request_duration_seconds_bucket{version="canary"}[5m])))
 # 2. Healthy → scale myapp-canary up / myapp (stable) down, then relabel.
 # 3. Unhealthy → roll back cleanly without deleting the pod abruptly:
 kubectl exec deploy/myapp-canary -- autumn canary rollback --reason "error budget burn"

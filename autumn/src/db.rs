@@ -3804,6 +3804,22 @@ fn capsule_checkout_marker(capture_gap: Option<&str>) -> Option<String> {
     }
 }
 
+/// Await a pool checkout and record its wait time (issue #3064). The wait runs
+/// from the checkout request to a connection or an error. A checkout timeout
+/// is the most important signal, so the code records a failed checkout too.
+async fn timed_pool_wait<T>(
+    clock: &dyn crate::time::ClockSource,
+    metrics: Option<&crate::middleware::MetricsCollector>,
+    checkout: impl std::future::Future<Output = T>,
+) -> T {
+    let start = clock.monotonic();
+    let result = checkout.await;
+    if let Some(metrics) = metrics {
+        metrics.record_db_pool_wait(clock.monotonic().saturating_duration_since(start));
+    }
+    result
+}
+
 impl Db {
     /// Check a connection out of `params.pool` with full instrumentation.
     ///
@@ -3897,13 +3913,18 @@ impl Db {
         // so it would stay on the pooled connection for the next user.
         // `bounded` checks the deadline before each poll, so an idle
         // connection is not handed out once the deadline has passed.
-        let mut conn = crate::deadline::bounded(checkout_future.instrument(span.clone()))
-            .await
-            .map_err(|crate::deadline::DeadlineExceeded| {
-                AutumnError::service_unavailable(crate::deadline::DeadlineStopped(
-                    "request deadline exceeded while waiting for a database connection",
-                ))
-            })??;
+        // `timed_pool_wait` records the whole wait, a deadline stop included.
+        let mut conn = timed_pool_wait(
+            params.clock.as_ref(),
+            params.metrics.as_ref(),
+            crate::deadline::bounded(checkout_future.instrument(span.clone())),
+        )
+        .await
+        .map_err(|crate::deadline::DeadlineExceeded| {
+            AutumnError::service_unavailable(crate::deadline::DeadlineStopped(
+                "request deadline exceeded while waiting for a database connection",
+            ))
+        })??;
 
         // Postgres statement_timeout is a signed 32-bit integer (milliseconds).
         // Cap at i32::MAX to avoid a confusing 503 for very large configured values.
@@ -4622,6 +4643,37 @@ mod tests {
 
     use super::*;
     use crate::config::DatabaseConfig;
+
+    /// A failed checkout still records its pool wait (issue #3064): a
+    /// checkout timeout is the overload signal operators need most.
+    #[cfg(not(feature = "sqlite"))]
+    #[tokio::test]
+    async fn checkout_records_pool_wait_even_on_failure() {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            RuntimeConnection,
+        >::new("postgres://autumn:autumn@127.0.0.1:1/nothing");
+        let pool = Pool::builder(manager).max_size(1).build().unwrap();
+        let metrics = crate::middleware::MetricsCollector::new();
+
+        let result = Db::checkout(DbCheckoutParams {
+            pool: &pool,
+            pool_name: "primary",
+            shard: None,
+            statement_timeout: None,
+            idle_in_transaction_timeout: None,
+            route_key: None,
+            metrics: Some(metrics.clone()),
+            slow_query_threshold: std::time::Duration::from_millis(500),
+            interceptors: Vec::new(),
+            #[cfg(feature = "reporting")]
+            capture_gap: None,
+            clock: std::sync::Arc::clone(&DEFAULT_SYSTEM_CLOCK),
+        })
+        .await;
+
+        assert!(result.is_err(), "nothing listens on port 1");
+        assert_eq!(metrics.db_pool_wait().count(), 1);
+    }
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
