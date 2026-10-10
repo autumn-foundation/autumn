@@ -1170,14 +1170,7 @@ impl Writer {
             }
             "ul" | "ol" | "menu" => {
                 self.flush();
-                let list = Self::list(doc, id, depth, name == "ol");
-                if list.is_empty() {
-                    // No items: a browser still shows what is in it.
-                    self.children(doc, id, depth);
-                    self.flush();
-                } else {
-                    self.blocks.push(list);
-                }
+                self.blocks.extend(Self::list(doc, id, depth, name == "ol"));
             }
             "table" => {
                 self.flush();
@@ -1244,8 +1237,23 @@ impl Writer {
         sub.finish().trim_end().to_owned()
     }
 
-    fn list(doc: &Doc, id: usize, depth: usize, ordered: bool) -> String {
-        let mut lines = Vec::new();
+    /// A list as blocks: its items, and what a browser shows between them.
+    /// Text or an element that is no `<li>` stays in place, so it splits the
+    /// list there; numbering carries on past it.
+    fn list(doc: &Doc, id: usize, depth: usize, ordered: bool) -> Vec<String> {
+        let mut blocks = Vec::new();
+        let mut lines: Vec<String> = Vec::new();
+        let mut other = Self::default();
+        let end_other = |other: &mut Self, lines: &mut Vec<String>, blocks: &mut Vec<String>| {
+            let text = std::mem::take(other).finish();
+            let text = text.trim_end();
+            if !text.is_empty() {
+                if !lines.is_empty() {
+                    blocks.push(std::mem::take(lines).join("\n"));
+                }
+                blocks.push(text.to_owned());
+            }
+        };
         // `<ol reversed>` counts down, from the item count unless `start`
         // says otherwise. Markdown has no negative numbers.
         let reversed = doc.attr(id, "reversed").is_some();
@@ -1259,9 +1267,14 @@ impl Writer {
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(if reversed { items } else { 1 });
         for &item in &doc.nodes[id].children {
-            if doc.name(item) != Some("li") || is_hidden(doc, item) {
+            if doc.name(item) != Some("li") {
+                other.node(doc, item, depth + 1);
                 continue;
             }
+            if is_hidden(doc, item) {
+                continue;
+            }
+            end_other(&mut other, &mut lines, &mut blocks);
             // `<li value>` renumbers from that item on, as in a browser.
             if let Some(v) = doc.attr(item, "value").and_then(|v| v.trim().parse().ok()) {
                 n = v;
@@ -1289,52 +1302,69 @@ impl Writer {
                 lines.push(marker.trim_end().to_owned());
             }
         }
-        lines.join("\n")
+        end_other(&mut other, &mut lines, &mut blocks);
+        if !lines.is_empty() {
+            blocks.push(lines.join("\n"));
+        }
+        blocks
     }
 
     fn table(doc: &Doc, id: usize, depth: usize) -> String {
         let mut rows: Vec<Vec<String>> = Vec::new();
         let mut stack = vec![id];
-        let mut tr_ids = Vec::new();
+        // Each row, keyed by its first node for document order, with its
+        // cells. A cell outside any `<tr>` opens a row in a browser, which
+        // takes the cells after it up to the next `<tr>` or section.
+        let mut rows_at: Vec<(usize, Vec<usize>)> = Vec::new();
         // Text or an element that is no table part: a browser moves it out,
         // before the table, and shows it.
         let mut foster_ids = Vec::new();
+        let end_row = |implicit: &mut Vec<usize>, rows_at: &mut Vec<(usize, Vec<usize>)>| {
+            if let Some(&first) = implicit.first() {
+                rows_at.push((first, std::mem::take(implicit)));
+            }
+        };
         while let Some(n) = stack.pop() {
-            for &c in doc.nodes[n].children.iter().rev() {
+            let mut implicit = Vec::new();
+            for &c in &doc.nodes[n].children {
                 if is_hidden(doc, c) {
                     continue;
                 }
                 match doc.name(c) {
-                    Some("tr") => tr_ids.push(c),
-                    Some("thead" | "tbody" | "tfoot") => stack.push(c),
+                    Some("td" | "th") => implicit.push(c),
+                    Some("tr") => {
+                        end_row(&mut implicit, &mut rows_at);
+                        // In a row, anything but a cell is moved out too.
+                        let (cells, other): (Vec<usize>, Vec<usize>) = doc.nodes[c]
+                            .children
+                            .iter()
+                            .copied()
+                            .filter(|&k| !is_hidden(doc, k))
+                            .partition(|&k| matches!(doc.name(k), Some("td" | "th")));
+                        foster_ids.extend(other);
+                        rows_at.push((c, cells));
+                    }
+                    Some("thead" | "tbody" | "tfoot") => {
+                        end_row(&mut implicit, &mut rows_at);
+                        stack.push(c);
+                    }
                     Some("caption" | "colgroup" | "col") => {}
                     _ => foster_ids.push(c),
                 }
             }
+            end_row(&mut implicit, &mut rows_at);
         }
-        // `stack` pops in reverse; rebuild document order.
-        tr_ids.sort_unstable();
-        // In a row, anything but a cell is moved out too.
-        for &tr in &tr_ids {
-            foster_ids.extend(
-                doc.nodes[tr]
-                    .children
-                    .iter()
-                    .copied()
-                    .filter(|&c| !matches!(doc.name(c), Some("td" | "th")) && !is_hidden(doc, c)),
-            );
-        }
+        // Sections are read last-first; rebuild document order.
+        rows_at.sort_unstable_by_key(|r| r.0);
         foster_ids.sort_unstable();
         let mut foster = Self::default();
         for c in foster_ids {
             foster.node(doc, c, depth + 1);
         }
         let foster = foster.finish().trim_end().to_owned();
-        for tr in tr_ids {
-            let cells: Vec<String> = doc.nodes[tr]
-                .children
+        for (_, row) in rows_at {
+            let cells: Vec<String> = row
                 .iter()
-                .filter(|&&c| matches!(doc.name(c), Some("td" | "th")) && !is_hidden(doc, c))
                 .map(|&c| {
                     Self::inline_of(doc, c, depth + 1)
                         .replace('|', "\\|")
@@ -1445,26 +1475,20 @@ fn safe_url(raw: &str, link: bool) -> Option<String> {
     if url.is_empty() {
         return None;
     }
-    // Browsers drop tabs and newlines inside a scheme (`java\tscript:`).
-    let squeezed: String = url
-        .chars()
-        .filter(|c| !c.is_ascii_whitespace() && !c.is_control())
-        .take(16)
-        .collect();
     // A character reference the decoder left (`javascript&colon;`) still
     // spells a scheme once a Markdown renderer decodes it, so an `&` before
     // the first `/`, `?` or `#` is refused.
-    let head_has_reference = url
+    let head: String = url
         .chars()
         .filter(|c| !c.is_ascii_whitespace() && !c.is_control())
         .take_while(|c| !matches!(c, '/' | '?' | '#'))
-        .any(|c| c == '&');
-    if head_has_reference {
+        .collect();
+    if head.contains('&') {
         return None;
     }
-    let scheme_end = squeezed.find([':', '/', '?', '#']);
-    if let Some(end) = scheme_end.filter(|&e| squeezed[e..].starts_with(':')) {
-        let scheme = squeezed[..end].to_ascii_lowercase();
+    // Whatever comes before a `:` there is a scheme, however long.
+    if let Some((scheme, _)) = head.split_once(':') {
+        let scheme = scheme.to_ascii_lowercase();
         let allowed = matches!(scheme.as_str(), "http" | "https") || (link && scheme == "mailto");
         if !allowed {
             return None;
@@ -2069,6 +2093,38 @@ mod tests {
         assert_eq!(
             md("<head><title>A&#8;B</title></head><body>x</body>"),
             "---\ntitle: \"A\\u0008B\"\n---\n\nx\n"
+        );
+    }
+
+    #[test]
+    fn a_long_unknown_scheme_is_refused() {
+        assert_eq!(
+            md("<a href=\"abcdefghijklmnopq:payload\">Open</a>"),
+            "Open\n"
+        );
+        assert_eq!(md("<a href=\"/a/b:c\">Path</a>"), "[Path](/a/b:c)\n");
+    }
+
+    #[test]
+    fn text_between_list_items_stays_in_place() {
+        assert_eq!(md("<ul>Intro<li>One</li></ul>"), "Intro\n\n- One\n");
+        assert_eq!(
+            md("<ol>\n<li>a</li>\n<p>note</p>\n<li>b</li>\n</ol>"),
+            "1. a\n\nnote\n\n2. b\n"
+        );
+        // Whitespace between items does not split the list.
+        assert_eq!(md("<ul>\n<li>a</li>\n<li>b</li>\n</ul>"), "- a\n- b\n");
+    }
+
+    #[test]
+    fn cells_outside_a_row_form_one() {
+        assert_eq!(
+            md("<table><td>A</td><td>B</td></table>"),
+            "| A | B |\n| --- | --- |\n"
+        );
+        assert_eq!(
+            md("<table><tbody><td>A<td>B<tr><td>C</td></tr></tbody></table>"),
+            "| A | B |\n| --- | --- |\n| C |  |\n"
         );
     }
 
