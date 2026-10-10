@@ -279,6 +279,10 @@ const SCOPE: &[&str] = &[
     "template",
 ];
 
+fn is_heading(name: &str) -> bool {
+    matches!(name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
+}
+
 /// Elements whose content an end tag for an outer element cannot leave: a
 /// browser ignores a stray `</div>` inside a `<select>` or a `<template>`.
 const WALL: &[&str] = &["select", "template"];
@@ -432,6 +436,21 @@ fn parse(html: &str) -> Doc {
                 if SCOPE.contains(&open) {
                     break;
                 }
+            }
+        }
+
+        // A heading closes a heading left open right before it, as in a
+        // browser: `<h1>One<h2>Two` is two headings.
+        if is_heading(&tag.name) {
+            if let Some(top) = dropped.names.last() {
+                if is_heading(top) {
+                    dropped.truncate(dropped.names.len() - 1);
+                }
+            } else if stack.len() > 1
+                && let Some(&top) = stack.last()
+                && doc.name(top).is_some_and(is_heading)
+            {
+                stack.pop();
             }
         }
 
@@ -656,10 +675,9 @@ fn decode_entities(s: &str) -> String {
             .map(|n| n + 1);
         let decoded = semi
             .filter(|&n| rest.as_bytes()[n] == b';')
-            .and_then(|n| decode_reference(&rest[1..n]).map(|c| (c, n + 1)));
-        if let Some((c, used)) = decoded {
-            out.push(c);
-            rest = &rest[used..];
+            .filter(|&n| decode_reference(&rest[1..n], &mut out));
+        if let Some(n) = decoded {
+            rest = &rest[n + 1..];
         } else {
             out.push('&');
             rest = &rest[1..];
@@ -669,46 +687,29 @@ fn decode_entities(s: &str) -> String {
     out
 }
 
-fn decode_reference(name: &str) -> Option<char> {
+/// Decode the character reference `name` (between `&` and `;`) onto `out`.
+/// `false` when it is no reference: the caller keeps the source text.
+fn decode_reference(name: &str, out: &mut String) -> bool {
     if let Some(num) = name.strip_prefix('#') {
-        let code = if let Some(hex) = num.strip_prefix(['x', 'X']) {
-            u32::from_str_radix(hex, 16).ok()?
-        } else {
-            num.parse::<u32>().ok()?
+        let code = num.strip_prefix(['x', 'X']).map_or_else(
+            || num.parse::<u32>().ok(),
+            |hex| u32::from_str_radix(hex, 16).ok(),
+        );
+        let Some(code) = code else {
+            return false;
         };
-        return Some(
+        out.push(
             char::from_u32(code)
                 .filter(|&c| c != '\0')
                 .unwrap_or('\u{fffd}'),
         );
+        return true;
     }
-    Some(match name {
-        "amp" => '&',
-        "lt" => '<',
-        "gt" => '>',
-        "quot" => '"',
-        "apos" => '\'',
-        "nbsp" => '\u{a0}',
-        "copy" => '©',
-        "reg" => '®',
-        "trade" => '™',
-        "hellip" => '…',
-        "mdash" => '—',
-        "ndash" => '–',
-        "lsquo" => '\u{2018}',
-        "rsquo" => '\u{2019}',
-        "ldquo" => '\u{201c}',
-        "rdquo" => '\u{201d}',
-        "laquo" => '«',
-        "raquo" => '»',
-        "middot" => '·',
-        "bull" => '•',
-        "times" => '×',
-        "euro" => '€',
-        "pound" => '£',
-        "deg" => '°',
-        _ => return None,
-    })
+    let named = super::entities::NAMED;
+    named
+        .binary_search_by(|(key, _)| (*key).cmp(name))
+        .map(|i| out.push_str(named[i].1))
+        .is_ok()
 }
 
 fn collapse_ws(s: &str) -> String {
@@ -1804,6 +1805,22 @@ mod tests {
             md("<table><caption hidden>gone</caption><tr><td>1</td></tr></table>"),
             "| 1 |\n| --- |\n"
         );
+    }
+
+    #[test]
+    fn a_heading_closes_an_open_heading() {
+        assert_eq!(md("<main><h1>One<h2>Two</h2></main>"), "# One\n\n## Two\n");
+    }
+
+    #[test]
+    fn every_named_character_reference_decodes() {
+        assert_eq!(md("<p>Save &frac12; today</p>"), "Save \u{bd} today\n");
+        assert_eq!(
+            md("<p>&NotEqualTilde;&Aacute;&zwnj;x</p>"),
+            "\u{2242}\u{338}\u{c1}\u{200c}x\n"
+        );
+        // Not a reference: the source text stays, escaped.
+        assert_eq!(md("<p>&notareference;</p>"), "\\&notareference;\n");
     }
 
     #[test]

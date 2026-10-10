@@ -31,6 +31,7 @@
 pub mod commerce;
 pub mod dns_aid;
 pub(crate) mod documents;
+mod entities;
 pub mod markdown;
 pub(crate) mod negotiate;
 pub mod robots;
