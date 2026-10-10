@@ -1079,11 +1079,10 @@ impl CaptureScope {
         self.after_commit.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// A rollback dropped a counted callback.
+    /// A rollback dropped a counted callback. Each drop follows its own
+    /// registration, so the count does not go below zero.
     pub(crate) fn after_commit_dropped(&self) {
-        let _ = self
-            .after_commit
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        self.after_commit.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Whether a counted callback is still pending or ran.
