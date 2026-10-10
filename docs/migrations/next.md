@@ -1030,7 +1030,7 @@ codemod rewrites struct literals.
 
 **Why:** issue #2351 adds cache removals and random-draw widths to the capsule
 seam. It also records the deadline of an `enqueue_at` call when the deadline
-is already past. These types (feature `reporting`) are public and are not
+is already past, and the HTTP status of a failed enqueue. These types (feature `reporting`) are public and are not
 `#[non_exhaustive]`.
 
 **Before (`{X.Y}`):**

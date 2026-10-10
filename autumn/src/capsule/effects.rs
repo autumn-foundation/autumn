@@ -155,8 +155,8 @@ pub(crate) enum EnqueueVerdict {
     /// Matched a recorded enqueue that succeeded; nothing reaches a queue.
     Queued,
     /// Matched a recorded enqueue that the backend **rejected**; the caller
-    /// reproduces the error.
-    Failed(String),
+    /// reproduces the error, with its recorded status when there is one.
+    Failed(String, Option<u16>),
     /// Did not match the recording. A divergence has been logged.
     Diverged,
 }
@@ -738,8 +738,10 @@ impl ReplayEffects {
         }
         self.served.fetch_add(1, Ordering::SeqCst);
         recorded
-            .and_then(|recorded| recorded.error)
-            .map_or(EnqueueVerdict::Queued, EnqueueVerdict::Failed)
+            .and_then(|recorded| Some((recorded.error?, recorded.error_status)))
+            .map_or(EnqueueVerdict::Queued, |(error, status)| {
+                EnqueueVerdict::Failed(error, status)
+            })
     }
 
     /// What the capsule recorded for a cache key.
@@ -2032,6 +2034,7 @@ mod tests {
                 due_at: None,
                 requested_due_at: None,
                 error: None,
+                error_status: None,
             }],
             ..CapsuleEffects::default()
         });
@@ -2083,6 +2086,7 @@ mod tests {
                 due_at: None,
                 requested_due_at: None,
                 error: None,
+                error_status: None,
             }],
             ..CapsuleEffects::default()
         });
@@ -2183,6 +2187,7 @@ mod tests {
                 due_at: None,
                 requested_due_at: None,
                 error: None,
+                error_status: None,
             }],
             ..CapsuleEffects::default()
         });
@@ -2220,6 +2225,7 @@ mod tests {
                 due_at: None,
                 requested_due_at: None,
                 error: None,
+                error_status: None,
             }],
             ..CapsuleEffects::default()
         });
@@ -3049,6 +3055,7 @@ mod tests {
                 due_at: None,
                 requested_due_at: None,
                 error: Some("queue is down".to_owned()),
+                error_status: None,
             }],
             ..CapsuleEffects::default()
         });
@@ -3058,7 +3065,7 @@ mod tests {
                 &serde_json::json!({}),
                 crate::job::EnqueueSchedule::Immediate
             ),
-            EnqueueVerdict::Failed("queue is down".to_owned())
+            EnqueueVerdict::Failed("queue is down".to_owned(), None)
         );
         assert!(tape.divergences().is_empty());
     }

@@ -2067,6 +2067,7 @@ mod tests {
                     due_at: None,
                     requested_due_at: None,
                     error: None,
+                    error_status: None,
                 }],
                 cache: vec![CacheEffect::Insert {
                     key: "creds".to_owned(),
@@ -2212,6 +2213,7 @@ mod tests {
                     due_at: None,
                     requested_due_at: None,
                     error: None,
+                    error_status: None,
                 }],
                 mail: vec![MailEffect {
                     to: vec!["hunter2secret@example.com".to_owned()],

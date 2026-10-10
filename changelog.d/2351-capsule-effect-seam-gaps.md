@@ -62,7 +62,7 @@
 - **Breaking:** `capsule::CacheEffect` has new variants `Invalidate`,
   `InvalidateNamespace` and `Clear`; `capsule::EffectSeam` has new variants
   `Random` and `Detached`; `capsule::schema::MailErrorKind` has a new variant
-  `NoDurableQueueInProduction`; `capsule::JobEffect` has a new public field
-  `requested_due_at`; `capsule::CapsuleEffects` has a new public field
+  `NoDurableQueueInProduction`; `capsule::JobEffect` has new public fields
+  `requested_due_at` and `error_status`; `capsule::CapsuleEffects` has a new public field
   `builder_cache`
   ([migration guide](docs/migrations/next.md)).

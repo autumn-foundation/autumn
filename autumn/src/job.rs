@@ -3356,9 +3356,17 @@ fn replayed_enqueue(
             // puts this text into the capsule's outcome, and the replay verdict
             // compares outcome text exactly, so a prefix here would report an
             // unchanged queue-failure capsule as a mismatch.
-            EnqueueVerdict::Failed(error) => Err(AutumnError::internal_server_error(
-                std::io::Error::other(error),
-            )),
+            // The recorded status goes back too, so a handler that branches on
+            // it takes the same path. An older capsule has none: a 500.
+            EnqueueVerdict::Failed(error, status) => {
+                let error = AutumnError::internal_server_error(std::io::Error::other(error));
+                Err(
+                    match status.and_then(|status| http::StatusCode::from_u16(status).ok()) {
+                        Some(status) => error.with_status(status),
+                        None => error,
+                    },
+                )
+            }
             // `next_job` already logged the divergence; the enqueue fails
             // closed so the handler sees an error rather than a silent success
             // against a queue that was never touched.
@@ -3503,6 +3511,7 @@ fn fill_after_commit_enqueue(
             requested_due_at: None,
             // `message`, not `Display`: recorded on the capsule tape.
             error: error.map(AutumnError::message),
+            error_status: error.map(|error| error.status().as_u16()),
         },
     );
 }
@@ -3699,6 +3708,7 @@ fn fill_enqueue(
             requested_due_at: due_at.map_or(slot.requested_due_at, |_| None),
             // `message`, not `Display`: recorded on the capsule tape.
             error: error.map(crate::AutumnError::message),
+            error_status: error.map(|error| error.status().as_u16()),
         },
     );
 }
@@ -14526,6 +14536,47 @@ mod tests {
         let jobs = scope.effects_snapshot().jobs;
         assert_eq!(jobs.len(), 1, "{jobs:?}");
         assert_eq!(jobs[0].error.as_deref(), Some(error.message().as_str()));
+    }
+
+    /// Codex review on #3222: a rejected enqueue replays with the status it
+    /// had, not always as a 500. A reserved payload key is a 400.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_recorded_enqueue_error_replays_with_its_status() {
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let payload = serde_json::json!({"order": 7});
+        let recorded = crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            after_commit_seam(
+                "send_receipt",
+                &payload,
+                EnqueueSchedule::Immediate,
+                Box::pin(async { Err(AutumnError::bad_request_msg("reserved key")) }),
+            ),
+        )
+        .await
+        .expect_err("the registration failed");
+        assert_eq!(recorded.status(), http::StatusCode::BAD_REQUEST);
+
+        let tape = Arc::new(crate::capsule::ReplayEffects::new(scope.effects_snapshot()));
+        let replayed = crate::capsule::with_effect_tape(Arc::clone(&tape), async {
+            after_commit_seam(
+                "send_receipt",
+                &payload,
+                EnqueueSchedule::Immediate,
+                Box::pin(async { Ok(()) }),
+            )
+            .await
+        })
+        .await
+        .expect_err("the replay reproduces the failure");
+        assert_eq!(replayed.status(), http::StatusCode::BAD_REQUEST);
+        assert_eq!(replayed.message(), recorded.message());
+        assert!(tape.divergences().is_empty(), "{:?}", tape.divergences());
     }
 
     #[tokio::test]

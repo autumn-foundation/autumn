@@ -653,6 +653,11 @@ pub struct JobEffect {
     /// down the success path the failing run never took.
     #[serde(default)]
     pub error: Option<String>,
+    /// The HTTP status of [`error`](Self::error). Replay gives the error this
+    /// status, so a handler that branches on it takes the same path. `None`
+    /// (and a capsule from before this field) replays as a 500.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_status: Option<u16>,
 }
 
 impl Default for JobEffect {
@@ -665,6 +670,7 @@ impl Default for JobEffect {
             due_at: None,
             requested_due_at: None,
             error: None,
+            error_status: None,
         }
     }
 }
@@ -681,6 +687,7 @@ impl JobEffect {
             due_at: None,
             requested_due_at: None,
             error: Some(PENDING_EFFECT.to_owned()),
+            error_status: None,
         }
     }
 }
@@ -1136,6 +1143,7 @@ mod tests {
             due_at: None,
             requested_due_at: None,
             error: None,
+            error_status: None,
         });
         capsule.effects.cache.push(CacheEffect::Get {
             key: "user:7".to_owned(),
