@@ -2004,27 +2004,45 @@ mod tests {
 
     #[test]
     fn unmatched_end_tags_past_the_depth_limit_parse_in_linear_time() {
-        // Many dropped start tags, then many end tags that match none.
-        let html = format!(
-            "{}{}{}",
-            "<div>".repeat(300),
-            "<span>".repeat(100_000),
-            "</b>".repeat(100_000)
-        );
-        let started = std::time::Instant::now();
-        let _ = md(&html);
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
-
-        // Each `<p>` asks for an implied close across every dropped span.
-        let html = format!(
-            "{}{}{}",
-            "<div>".repeat(300),
-            "<span>".repeat(100_000),
-            "<p></p>".repeat(100_000)
-        );
-        let started = std::time::Instant::now();
-        let _ = md(&html);
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // The growth rate, not a wall-clock budget: a debug build on a busy
+        // runner is slow, but four times the input must take about four
+        // times as long (a quadratic parse takes sixteen). Best of three
+        // runs keeps a scheduler hiccup out of it.
+        let time = |html: &str| {
+            (0..3)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    let _ = md(html);
+                    started.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        let cases: [fn(usize) -> String; 2] = [
+            // Many dropped start tags, then many end tags that match none.
+            |n| {
+                format!(
+                    "{}{}{}",
+                    "<div>".repeat(300),
+                    "<span>".repeat(n),
+                    "</b>".repeat(n)
+                )
+            },
+            // Each `<p>` asks for an implied close across every dropped span.
+            |n| {
+                format!(
+                    "{}{}{}",
+                    "<div>".repeat(300),
+                    "<span>".repeat(n),
+                    "<p></p>".repeat(n)
+                )
+            },
+        ];
+        for case in cases {
+            let small = time(&case(5_000));
+            let large = time(&case(20_000));
+            assert!(large < small * 10, "{small:?} -> {large:?}");
+        }
     }
 
     #[test]
