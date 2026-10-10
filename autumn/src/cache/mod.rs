@@ -100,22 +100,20 @@ pub fn global_cache() -> Option<Arc<dyn Cache>> {
         .clone()
 }
 
-/// Set the global cache for `autumn replay` (#2351).
+/// Set the global cache for `autumn replay`, before the state initializers
+/// run (#2351).
 ///
-/// Replay builds no cache backend and runs no startup hook. When the app
-/// state had a cache in production (from the builder, a state initializer or
-/// a startup hook), replay installs the capsule seam over a backend that
-/// stores nothing, in the global cache and the app state. A cache call then
-/// takes the path it took in production, and the tape answers it. Otherwise
-/// the global cache is cleared, as the build clears it in production. A
-/// state initializer runs again during a replay and can replace it.
+/// Replay builds no cache backend. When the app builder has one
+/// (`with_cache_backend`), production installed it before the initializers,
+/// so replay installs the capsule seam over a backend that stores nothing, in
+/// the global cache and the app state. A cache call then takes the path it
+/// took in production, and the tape answers it. Otherwise the global cache is
+/// cleared, as the build clears it in production.
 ///
 /// Returns the cache for the app state.
 #[cfg(feature = "reporting")]
-pub(crate) fn install_replay_cache(
-    recorded: &crate::capsule::CapsuleEffects,
-) -> Option<Arc<dyn Cache>> {
-    if !recorded.state_cache {
+pub(crate) fn install_replay_cache(builder_cache: bool) -> Option<Arc<dyn Cache>> {
+    if !builder_cache {
         clear_global_cache();
         return None;
     }
@@ -123,6 +121,20 @@ pub(crate) fn install_replay_cache(
     let cache = with_capsule_seam(Arc::new(ReplayBackend));
     set_global_cache(Arc::clone(&cache));
     Some(cache)
+}
+
+/// After the state initializers: install the replay seam for a cache the
+/// capsule recorded and nothing has installed yet. It came from a startup
+/// hook (`RedisCachePlugin`), which replay does not run. Production's
+/// initializers ran before that hook, so they did not see it either.
+#[cfg(feature = "reporting")]
+pub(crate) fn install_late_replay_cache(
+    state: &crate::state::AppState,
+    recorded: &crate::capsule::CapsuleEffects,
+) {
+    if recorded.state_cache && state.cache().is_none() {
+        state.set_cache(Arc::new(ReplayBackend));
+    }
 }
 
 /// The backend under the replay seam. It stores nothing.
@@ -2050,7 +2062,7 @@ mod tests {
             state_cache: true,
             ..Default::default()
         };
-        let installed = install_replay_cache(&recorded).expect("installed");
+        let installed = install_replay_cache(true).expect("installed");
         assert!(installed.is_capsule_seam());
         assert!(Arc::ptr_eq(
             &installed,
@@ -2065,8 +2077,41 @@ mod tests {
         assert!(complete);
         assert!(tape.finish().is_empty(), "{:?}", tape.finish());
 
-        assert!(install_replay_cache(&crate::capsule::CapsuleEffects::default()).is_none());
+        assert!(install_replay_cache(false).is_none());
         assert!(global_cache().is_none());
+    }
+
+    /// Codex review on #3222: a cache only a startup hook installed is put
+    /// in place after the state initializers, as production's initializers
+    /// did not see it. A cache an initializer installed is kept.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_startup_hook_cache_is_installed_after_the_initializers() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let recorded = crate::capsule::CapsuleEffects {
+            state_cache: true,
+            ..Default::default()
+        };
+        let state = crate::state::AppState::for_test();
+        install_late_replay_cache(&state, &recorded);
+        let late = state.cache().expect("installed after the initializers");
+        assert!(late.is_capsule_seam());
+
+        let initializer = crate::state::AppState::for_test();
+        initializer.set_cache(Arc::new(SpyBackend::default()));
+        let kept = initializer.cache().expect("the initializer's cache");
+        install_late_replay_cache(&initializer, &recorded);
+        assert!(Arc::ptr_eq(
+            &kept,
+            &initializer.cache().expect("still there")
+        ));
+
+        let none = crate::state::AppState::for_test();
+        install_late_replay_cache(&none, &crate::capsule::CapsuleEffects::default());
+        clear_global_cache();
+        assert!(none.cache().is_none());
     }
 
     /// A backend whose sync removals fail, and whose fill lock is held.

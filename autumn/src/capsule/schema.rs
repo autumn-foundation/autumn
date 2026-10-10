@@ -465,8 +465,9 @@ pub struct CapsuleEffects {
     /// `RedisCachePlugin`). A cache call can take a different path without
     /// one. Replay builds no cache backend and runs no startup hook, so it
     /// installs a cache that stores nothing in the global cache and the app
-    /// state, before the state initializers run. A state initializer that
-    /// installs its own cache replaces it, with its backend kept offline.
+    /// state: before the state initializers for a builder's cache, after
+    /// them for a startup hook's, as production did. A state initializer
+    /// that installs its own cache runs again, with its backend offline.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub state_cache: bool,
 }

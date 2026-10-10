@@ -8434,6 +8434,8 @@ impl AppBuilder {
             // queue. The replay mailer gets a refusing queue in its place.
             #[cfg(feature = "mail")]
             mail_delivery_queue_factory,
+            // Read only for whether it is set: replay builds no cache backend.
+            cache_backend,
             ..
         } = self;
         #[cfg(feature = "mail")]
@@ -8552,7 +8554,7 @@ impl AppBuilder {
         }
         // In place of the builder's backend, which replay does not build: in
         // the global cache and the state, as `with_cache_backend` does.
-        state.shared_cache = crate::cache::install_replay_cache(&capsule.effects);
+        state.shared_cache = crate::cache::install_replay_cache(cache_backend.is_some());
 
         for register in policy_registrations {
             register(state.policy_registry());
@@ -8573,6 +8575,9 @@ impl AppBuilder {
         // gets it too (#2351 item 7).
         #[cfg(feature = "mail")]
         crate::mail::install_replay_mailer(&state, &config.mail, builder_mail_queue);
+        // After the initializers: a cache that only a startup hook installed,
+        // which replay does not run. Production's initializers did not see it.
+        crate::cache::install_late_replay_cache(&state, &capsule.effects);
         crate::cost::install(&state, &config);
         // Durable listeners need the job runtime this path never starts, so —
         // as in static builds — only sync listeners are registered, and a
@@ -17983,6 +17988,26 @@ mod tests {
         let last = handler.rfind(install).expect("installed");
         assert!(first < initializers, "installed before the initializers");
         assert!(last > initializers, "and again after them");
+    }
+
+    /// Codex review on #3222: replay installs a builder's cache before the
+    /// state initializers, and a startup hook's cache after them, as
+    /// production did.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn replay_installs_each_cache_where_production_did() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let handler = replay_mode_source(&source);
+        let initializers = handler
+            .find("run_state_initializers(state_initializers, &state);")
+            .expect("the replay handler runs the state initializers");
+        let builder = handler
+            .find("crate::cache::install_replay_cache(cache_backend.is_some())")
+            .expect("installs a builder's cache");
+        let late = handler
+            .find("crate::cache::install_late_replay_cache(&state, &capsule.effects)")
+            .expect("installs a startup hook's cache");
+        assert!(builder < initializers && late > initializers);
     }
 
     /// The knobs the helper forces, checked on a real configuration rather than
