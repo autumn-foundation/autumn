@@ -227,8 +227,9 @@ fn parse(html: &str) -> Doc {
         }],
     };
     let mut stack: Vec<usize> = vec![ROOT];
-    // The start tags past `MAX_DEPTH`. The parser does not keep them. Their
-    // end tags close only these, never a kept element.
+    // The start tags past `MAX_DEPTH`. The parser does not keep them. An end
+    // tag closes the last dropped tag it names; one naming only a kept
+    // element closes that element and every dropped tag inside it.
     let mut dropped = Dropped::default();
     let bytes = html.as_bytes();
     let mut i = 0;
@@ -278,7 +279,7 @@ fn parse(html: &str) -> Doc {
         };
         i += tag.len;
         if tag.end {
-            if !dropped.is_empty() {
+            if dropped.contains(&tag.name) {
                 dropped.close(&tag.name);
                 continue;
             }
@@ -287,15 +288,20 @@ fn parse(html: &str) -> Doc {
                 .rposition(|&id| doc.name(id) == Some(tag.name.as_str()))
                 && pos > 0
             {
+                dropped.clear();
                 stack.truncate(pos);
             }
             continue;
         }
 
         // An omitted `</head>`: a tag that cannot be in the head (`<body>`,
-        // `<main>`, ...) closes it, as in a browser.
+        // `<main>`, ...) closes it, as in a browser. Inside a `<template>`
+        // the head is not the insertion point, so the template keeps it.
         if !HEAD_CONTENT.contains(&tag.name.as_str())
-            && let Some(pos) = stack.iter().rposition(|&id| doc.name(id) == Some("head"))
+            && let Some(pos) = stack
+                .iter()
+                .rposition(|&id| matches!(doc.name(id), Some("head" | "template")))
+            && doc.name(stack[pos]) == Some("head")
         {
             stack.truncate(pos);
         }
@@ -635,6 +641,19 @@ impl Dropped {
     /// `true` inside a dropped tag that hides its content.
     const fn hides(&self) -> bool {
         self.hiding > 0
+    }
+
+    /// `true` when a dropped tag named `name` is open.
+    fn contains(&self, name: &str) -> bool {
+        self.at.get(name).is_some_and(|v| !v.is_empty())
+    }
+
+    /// Close every dropped tag: a kept ancestor's end tag closed them all.
+    fn clear(&mut self) {
+        self.names.clear();
+        self.hides.clear();
+        self.hiding = 0;
+        self.at.clear();
     }
 
     /// Close the last open `name` and every tag opened after it. An end
@@ -1344,6 +1363,27 @@ mod tests {
             md("<html><head><meta name=description content=d><p>Body text"),
             "---\ndescription: \"d\"\n---\n\nBody text\n"
         );
+    }
+
+    #[test]
+    fn a_template_in_the_head_keeps_its_content() {
+        assert_eq!(
+            md(
+                "<head><template><main>secret</main></template></head><body><main>visible</main></body>"
+            ),
+            "visible\n"
+        );
+    }
+
+    #[test]
+    fn a_kept_end_tag_closes_the_dropped_tags_inside_it() {
+        let deep = "<div>".repeat(250);
+        let spans = "<span>".repeat(100);
+        let out = md(&format!(
+            "{deep}<section hidden>{spans}secret</section><main>visible</main>"
+        ));
+        assert!(!out.contains("secret"), "{out}");
+        assert!(out.contains("visible"), "{out}");
     }
 
     #[test]
