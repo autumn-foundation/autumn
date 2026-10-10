@@ -1178,14 +1178,24 @@ impl Writer {
                 }
             }
         }
+        // `stack` pops in reverse; rebuild document order.
+        tr_ids.sort_unstable();
+        // In a row, anything but a cell is moved out too.
+        for &tr in &tr_ids {
+            foster_ids.extend(
+                doc.nodes[tr]
+                    .children
+                    .iter()
+                    .copied()
+                    .filter(|&c| !matches!(doc.name(c), Some("td" | "th")) && !is_hidden(doc, c)),
+            );
+        }
         foster_ids.sort_unstable();
         let mut foster = Self::default();
         for c in foster_ids {
             foster.node(doc, c, depth + 1);
         }
         let foster = foster.finish().trim_end().to_owned();
-        // `stack` pops in reverse; rebuild document order.
-        tr_ids.sort_unstable();
         for tr in tr_ids {
             let cells: Vec<String> = doc.nodes[tr]
                 .children
@@ -1774,6 +1784,10 @@ mod tests {
     #[test]
     fn content_inside_a_table_but_outside_its_cells_is_kept() {
         assert_eq!(md("<table>Visible</table>"), "Visible\n");
+        assert_eq!(
+            md("<table><tr>Visible<td>42</td></tr></table>"),
+            "Visible\n\n| 42 |\n| --- |\n"
+        );
         assert_eq!(
             md("<table>\n  <p>Note</p>\n  <tr><td>1</td></tr>\n</table>"),
             "Note\n\n| 1 |\n| --- |\n"

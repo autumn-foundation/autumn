@@ -3664,7 +3664,12 @@ impl tower_http::compression::predicate::Predicate for CompressionPredicate {
     where
         B: http_body::Body,
     {
+        // A digest covers the bytes the handler sent; encoding them after
+        // would break it, and any signature made over it (Web Bot Auth).
+        let headers = response.headers();
         self.default.should_compress(response)
+            && !headers.contains_key("content-digest")
+            && !headers.contains_key("repr-digest")
             && response
                 .headers()
                 .get(http::header::CONTENT_TYPE)

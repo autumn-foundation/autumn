@@ -35,6 +35,21 @@ async fn html_handler() -> impl IntoResponse {
     )
 }
 
+/// A body whose `Content-Digest` was computed before it left the handler.
+#[get("/digested")]
+async fn digested_handler() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (
+                header::HeaderName::from_static("content-digest"),
+                "sha-256=:AAAA:",
+            ),
+        ],
+        HTML_BODY,
+    )
+}
+
 #[get("/json")]
 async fn json_handler() -> impl IntoResponse {
     (
@@ -235,6 +250,26 @@ async fn no_double_compression_when_already_encoded() {
         ce, "gzip",
         "double-compression must not occur; got Content-Encoding: {ce:?}"
     );
+}
+
+/// A response that carries `Content-Digest` is not compressed: the digest
+/// (and any signature over it) covers the bytes the handler sent.
+#[tokio::test]
+async fn a_digested_response_is_not_compressed() {
+    let app = TestApp::new()
+        .routes(routes![digested_handler])
+        .config(compression_enabled_config())
+        .build();
+
+    let resp = app
+        .get("/digested")
+        .header("accept-encoding", "gzip, br")
+        .send()
+        .await;
+
+    resp.assert_ok();
+    assert_eq!(resp.header("content-encoding"), None);
+    assert_eq!(resp.body, HTML_BODY.as_bytes());
 }
 
 /// Without `Accept-Encoding` header, no compression is applied even when enabled.

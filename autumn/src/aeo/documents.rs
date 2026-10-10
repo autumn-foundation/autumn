@@ -997,7 +997,25 @@ fn front_matter_field(front: &str, key: &str) -> Option<String> {
     while more.last().is_some_and(|l| l.trim().is_empty()) {
         more.pop();
     }
-    let joined = fold_lines(std::iter::once(value).chain(more.iter().map(|l| l.trim())));
+    // In a double-quoted value, a `\` at the end of a line escapes the break:
+    // the lines join with no space.
+    let mut lines: Vec<String> = Vec::new();
+    let mut glue = false;
+    for line in std::iter::once(value).chain(more.iter().map(|l| l.trim())) {
+        match lines.last_mut() {
+            Some(last) if glue => last.push_str(line),
+            _ => lines.push(line.to_owned()),
+        }
+        glue = false;
+        if value.starts_with('"')
+            && let Some(last) = lines.last_mut()
+            && (last.len() - last.trim_end_matches('\\').len()) % 2 == 1
+        {
+            last.pop();
+            glue = true;
+        }
+    }
+    let joined = fold_lines(lines.iter().map(String::as_str));
     if joined.starts_with(['"', '\'']) {
         // Up to the closing quote: a comment may follow it.
         return Some(yaml_unquote(quoted_scalar(&joined)));
@@ -1643,6 +1661,11 @@ mod tests {
         );
         assert_eq!(parse("description: 'It''s here' # note"), "It's here");
         assert_eq!(parse(r#"description: "First\tSecond""#), "First\tSecond");
+        assert_eq!(
+            parse("description: \"Draft\\\n  refunds.\""),
+            "Draftrefunds."
+        );
+        assert_eq!(parse("description: \"Ends \\\\\n  here\""), "Ends \\ here");
         assert_eq!(
             parse(r#"description: "\u263A \x41\U0001F600 \\ \/""#),
             "\u{263A} A\u{1F600} \\ /"
