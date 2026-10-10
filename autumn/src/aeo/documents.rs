@@ -69,6 +69,9 @@ pub struct SiteFacts {
     pub oauth: OAuthConfig,
     /// The CSRF header the `WebMCP` script sends.
     pub csrf_header: String,
+    /// `true` when CSRF protection checks a `POST` to the MCP endpoint: a
+    /// `WebMCP` call then needs the page's token, read-only or not.
+    pub csrf_required: bool,
     /// The Web Bot Auth key, when configured.
     pub web_bot_auth: Option<super::web_bot_auth::WebBotAuthKey>,
     /// UCP and ACP documents.

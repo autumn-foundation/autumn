@@ -1389,20 +1389,24 @@ impl Writer {
     }
 
     /// The text of each row's cells, in the columns a browser gives them.
-    fn place_cells(doc: &Doc, rows_at: &[(usize, Vec<usize>)], depth: usize) -> Vec<Vec<String>> {
+    fn place_cells(doc: &Doc, rows_at: &[TableRow], depth: usize) -> Vec<Vec<String>> {
         // GFM has no spans: a place a `rowspan` or `colspan` covers is an
         // empty cell, so later cells keep the columns a browser gives them.
         // Placeholders are bounded by the table's own cells, so a hostile
         // span cannot blow up the output.
-        let own: usize = rows_at.iter().map(|(_, row)| row.len()).sum();
+        let own: usize = rows_at.iter().map(|row| row.cells.len()).sum();
         let mut budget = own.saturating_mul(8).saturating_add(64);
         // The row index each column stays covered until (exclusive).
         let mut covered_until: Vec<usize> = Vec::new();
         let mut rows = Vec::new();
-        for (r, (_, row)) in rows_at.iter().enumerate() {
+        for (r, row) in rows_at.iter().enumerate() {
+            // A span ends with its row group (`thead`, `tbody`, `tfoot`).
+            if r > 0 && rows_at[r - 1].group != row.group {
+                covered_until.clear();
+            }
             let mut cells = Vec::new();
             let mut col = 0;
-            for &c in row {
+            for &c in &row.cells {
                 while budget > 0 && covered_until.get(col).is_some_and(|&u| u > r) {
                     cells.push(String::new());
                     budget -= 1;
@@ -1417,7 +1421,7 @@ impl Writer {
                     doc.attr(c, name)
                         .and_then(|v| v.trim().parse::<usize>().ok())
                 };
-                // `rowspan="0"` runs to the end of the table.
+                // `rowspan="0"` runs to the end of its row group.
                 let rowspan = match span("rowspan") {
                     Some(0) => usize::MAX,
                     Some(n) => n.min(65_534),
@@ -1448,16 +1452,19 @@ impl Writer {
 
     fn table(doc: &Doc, id: usize, depth: usize) -> String {
         let mut stack = vec![id];
-        // Each row, keyed by its first node for document order, with its
-        // cells. A cell outside any `<tr>` opens a row in a browser, which
-        // takes the cells after it up to the next `<tr>` or section.
-        let mut rows_at: Vec<(usize, Vec<usize>)> = Vec::new();
+        // A cell outside any `<tr>` opens a row in a browser, which takes
+        // the cells after it up to the next `<tr>` or section.
+        let mut rows_at: Vec<TableRow> = Vec::new();
         // Text or an element that is no table part: a browser moves it out,
         // before the table, and shows it.
         let mut foster_ids = Vec::new();
-        let end_row = |implicit: &mut Vec<usize>, rows_at: &mut Vec<(usize, Vec<usize>)>| {
+        let end_row = |implicit: &mut Vec<usize>, group: usize, rows_at: &mut Vec<TableRow>| {
             if let Some(&first) = implicit.first() {
-                rows_at.push((first, std::mem::take(implicit)));
+                rows_at.push(TableRow {
+                    at: first,
+                    group,
+                    cells: std::mem::take(implicit),
+                });
             }
         };
         while let Some(n) = stack.pop() {
@@ -1469,7 +1476,7 @@ impl Writer {
                 match doc.name(c) {
                     Some("td" | "th") => implicit.push(c),
                     Some("tr") => {
-                        end_row(&mut implicit, &mut rows_at);
+                        end_row(&mut implicit, n, &mut rows_at);
                         // In a row, anything but a cell is moved out too.
                         let (cells, other): (Vec<usize>, Vec<usize>) = doc.nodes[c]
                             .children
@@ -1478,20 +1485,24 @@ impl Writer {
                             .filter(|&k| !is_hidden(doc, k))
                             .partition(|&k| matches!(doc.name(k), Some("td" | "th")));
                         foster_ids.extend(other);
-                        rows_at.push((c, cells));
+                        rows_at.push(TableRow {
+                            at: c,
+                            group: n,
+                            cells,
+                        });
                     }
                     Some("thead" | "tbody" | "tfoot") => {
-                        end_row(&mut implicit, &mut rows_at);
+                        end_row(&mut implicit, n, &mut rows_at);
                         stack.push(c);
                     }
                     Some("caption" | "colgroup" | "col") => {}
                     _ => foster_ids.push(c),
                 }
             }
-            end_row(&mut implicit, &mut rows_at);
+            end_row(&mut implicit, n, &mut rows_at);
         }
         // Sections are read last-first; rebuild document order.
-        rows_at.sort_unstable_by_key(|r| r.0);
+        rows_at.sort_unstable_by_key(|r| r.at);
         foster_ids.sort_unstable();
         let mut foster = Self::default();
         for c in foster_ids {
@@ -1581,6 +1592,14 @@ fn list_label(n: i64, style: Option<&str>) -> String {
     } else {
         label
     }
+}
+
+/// A table row: its first node (for document order), the section it sits
+/// in, and its cells.
+struct TableRow {
+    at: usize,
+    group: usize,
+    cells: Vec<usize>,
 }
 
 /// Join a list item's text and its nested list with one newline.
@@ -2425,6 +2444,13 @@ mod tests {
                 "<table><tr><th colspan=\"2\">H</th><th>I</th></tr><tr><td>a</td><td>b</td><td>c</td></tr></table>"
             ),
             "| H |  | I |\n| --- | --- | --- |\n| a | b | c |\n"
+        );
+        // A span stops at the end of its row group.
+        assert_eq!(
+            md(
+                "<table><tbody><tr><td rowspan=\"0\">X</td><td>Y</td></tr></tbody><tbody><tr><td>Z</td></tr></tbody></table>"
+            ),
+            "| X | Y |\n| --- | --- |\n| Z |\n"
         );
         // Placeholders are bounded by the table's own cells.
         let out = md(

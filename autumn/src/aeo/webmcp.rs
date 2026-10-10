@@ -47,6 +47,7 @@ pub(crate) fn script(facts: &SiteFacts, csrf_header: &str) -> String {
     SCRIPT
         .replace("__ENDPOINT__", &js_json(&json!(endpoint)))
         .replace("__CSRF_HEADER__", &js_json(&json!(csrf_header)))
+        .replace("__CSRF_REQUIRED__", &js_json(&json!(facts.csrf_required)))
         .replace("__TOOLS__", &js_json(&Value::Array(tools)))
 }
 
@@ -71,8 +72,12 @@ const SCRIPT: &str = r#"// Autumn WebMCP: register this site's MCP tools with in
     'meta[name="csrf-token"], meta[name="autumn-csrf-token"]'
   );
   const token = meta && meta.content;
-  // A write needs the CSRF token: without one, only read-only tools.
-  const tools = __TOOLS__.filter((t) => t.annotations.readOnlyHint || token);
+  // A write needs the CSRF token. Without one, only read-only tools, and
+  // none when CSRF protection checks every POST to the endpoint.
+  const csrfRequired = __CSRF_REQUIRED__;
+  const tools = __TOOLS__.filter(
+    (t) => token || (!csrfRequired && t.annotations.readOnlyHint)
+  );
   let nextId = 0;
   const parse = (text) => {
     try {
@@ -208,6 +213,19 @@ mod tests {
     }
 
     #[test]
+    fn without_a_token_csrf_keeps_every_tool_off_the_page() {
+        let mut f = facts(true);
+        assert!(script(&f, "x-csrf-token").contains("const csrfRequired = false;"));
+        f.csrf_required = true;
+        let js = script(&f, "x-csrf-token");
+        assert!(js.contains("const csrfRequired = true;"), "{js}");
+        assert!(
+            js.contains("token || (!csrfRequired && t.annotations.readOnlyHint)"),
+            "{js}"
+        );
+    }
+
+    #[test]
     fn script_registers_each_valid_tool() {
         let js = script(&facts(true), "x-csrf-token");
         assert!(js.contains("registerTool"), "{js}");
@@ -319,6 +337,9 @@ mod tests {
     #[test]
     fn write_tools_wait_for_a_csrf_token() {
         let js = script(&facts(true), "x-csrf-token");
-        assert!(js.contains("t.annotations.readOnlyHint || token"), "{js}");
+        assert!(
+            js.contains("token || (!csrfRequired && t.annotations.readOnlyHint)"),
+            "{js}"
+        );
     }
 }

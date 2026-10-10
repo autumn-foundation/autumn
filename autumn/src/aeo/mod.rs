@@ -384,6 +384,10 @@ impl AeoSite {
         facts
             .csrf_header
             .clone_from(&config.security.csrf.token_header);
+        facts.csrf_required = facts
+            .mcp
+            .as_ref()
+            .is_some_and(|mcp| csrf_checks_post(config, &mcp.path));
         if !aeo.publish_tools
             && let Some(mcp) = facts.mcp.as_mut()
         {
@@ -806,6 +810,32 @@ pub fn robots_policy(config: &crate::config::AutumnConfig) -> BotPolicy {
     BotPolicy::from_config(&config.aeo).agentmap(agentmap)
 }
 
+/// `true` when the CSRF layer checks a `POST` to `path`: protection is on,
+/// `POST` is not a safe method, and neither an exempt path nor a webhook
+/// endpoint (which the layer also exempts) covers it.
+fn csrf_checks_post(config: &crate::config::AutumnConfig, path: &str) -> bool {
+    let csrf = &config.security.csrf;
+    let exempt: Vec<String> = csrf
+        .exempt_paths
+        .iter()
+        .cloned()
+        .chain(
+            config
+                .security
+                .webhooks
+                .endpoints
+                .iter()
+                .map(|e| e.path.clone()),
+        )
+        .collect();
+    csrf.enabled
+        && !csrf
+            .safe_methods
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case("POST"))
+        && !crate::security::path::is_exempt_path(path, &exempt)
+}
+
 const fn default_markdown_max_bytes() -> usize {
     2 * 1024 * 1024
 }
@@ -869,6 +899,20 @@ mod tests {
         assert!(!dist.path().join("llms.txt").exists());
         // The page `head_tags` load it, so a static site serves it too.
         assert!(dist.path().join("_autumn/webmcp.js").exists());
+    }
+
+    #[test]
+    fn csrf_checks_a_post_to_mcp_unless_it_is_exempt() {
+        let mut config = crate::config::AutumnConfig::default();
+        config.security.csrf.enabled = false;
+        assert!(!csrf_checks_post(&config, "/mcp"));
+        config.security.csrf.enabled = true;
+        assert!(csrf_checks_post(&config, "/mcp"));
+        config.security.csrf.exempt_paths = vec!["/mcp".to_owned()];
+        assert!(!csrf_checks_post(&config, "/mcp"));
+        config.security.csrf.exempt_paths.clear();
+        config.security.csrf.safe_methods.push("post".to_owned());
+        assert!(!csrf_checks_post(&config, "/mcp"));
     }
 
     #[test]
