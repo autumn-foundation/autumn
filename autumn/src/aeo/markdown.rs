@@ -1047,6 +1047,17 @@ fn safe_url(raw: &str, link: bool) -> Option<String> {
         .filter(|c| !c.is_ascii_whitespace() && !c.is_control())
         .take(16)
         .collect();
+    // A character reference the decoder left (`javascript&colon;`) still
+    // spells a scheme once a Markdown renderer decodes it, so an `&` before
+    // the first `/`, `?` or `#` is refused.
+    let head_has_reference = url
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace() && !c.is_control())
+        .take_while(|c| !matches!(c, '/' | '?' | '#'))
+        .any(|c| c == '&');
+    if head_has_reference {
+        return None;
+    }
     let scheme_end = squeezed.find([':', '/', '?', '#']);
     if let Some(end) = scheme_end.filter(|&e| squeezed[e..].starts_with(':')) {
         let scheme = squeezed[..end].to_ascii_lowercase();
@@ -1178,6 +1189,21 @@ mod tests {
     #[test]
     fn text_with_markdown_syntax_is_escaped() {
         assert_eq!(md("<p>2 * 3 = [six]_</p>"), "2 \\* 3 = \\[six\\]\\_\n");
+    }
+
+    #[test]
+    fn an_encoded_scheme_separator_is_not_a_safe_link() {
+        assert_eq!(
+            md("<p><a href=\"javascript&colon;alert(1)\">x</a></p>"),
+            "x\n"
+        );
+        let out = md("<p>a <img src=\"data&colon;x\" alt=\"i\"> b</p>");
+        assert!(!out.contains("data"), "{out}");
+        // An `&` in the query is fine.
+        assert_eq!(
+            md("<p><a href=\"/s?a=1&amp;b=2\">s</a></p>"),
+            "[s](/s?a=1&b=2)\n"
+        );
     }
 
     #[test]

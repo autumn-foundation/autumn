@@ -196,6 +196,25 @@ async fn markdown_revalidates_against_the_markdown_etag() {
     assert_eq!(html_tag.text(), "cond\n");
 }
 
+#[tokio::test]
+async fn an_html_revalidation_keeps_vary_accept() {
+    let c = TestApp::new().routes(routes![conditional]).build();
+    let html = c.get("/conditional").send().await;
+    assert!(vary_has_accept(html.header("vary")));
+    let etag = html.header("etag").unwrap().to_owned();
+    let again = c
+        .get("/conditional")
+        .header("if-none-match", &etag)
+        .send()
+        .await;
+    assert_eq!(again.status, 304);
+    assert!(
+        vary_has_accept(again.header("vary")),
+        "{:?}",
+        again.header("vary")
+    );
+}
+
 #[get("/tagged.json")]
 async fn tagged_json() -> impl IntoResponse {
     (

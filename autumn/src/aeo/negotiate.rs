@@ -238,7 +238,14 @@ where
             None => res,
         };
         if !(config.markdown && this.flags.readable && is_negotiable(&res)) {
-            return Poll::Ready(Ok(checked(res)));
+            let mut res = checked(res);
+            // A `304` has no type to show whether its `200` was a page this
+            // layer negotiates, so it carries the `Vary: Accept` that `200`
+            // may carry: a cache then keeps the HTML and Markdown apart.
+            if config.markdown && this.flags.readable && res.status() == StatusCode::NOT_MODIFIED {
+                add_vary_accept(res.headers_mut());
+            }
+            return Poll::Ready(Ok(res));
         }
         add_vary_accept(res.headers_mut());
         if !this.flags.wants_markdown {
