@@ -991,8 +991,8 @@ fn front_matter_field(front: &str, key: &str) -> Option<String> {
         .take_while(|l| l.trim().is_empty() || l.starts_with([' ', '\t']))
         .copied()
         .collect();
-    if let Some((folded, chomp)) = block_scalar_header(value) {
-        return Some(block_scalar(&more, folded, chomp));
+    if let Some((folded, chomp, indent)) = block_scalar_header(value) {
+        return Some(block_scalar(&more, folded, chomp, indent));
     }
     while more.last().is_some_and(|l| l.trim().is_empty()) {
         more.pop();
@@ -1025,8 +1025,9 @@ fn quoted_scalar(s: &str) -> &str {
 }
 
 /// `|` or `>` with an optional chomping (`-`, `+`) and indentation digit:
-/// whether it folds, and its chomping (`' '` to clip).
-fn block_scalar_header(value: &str) -> Option<(bool, char)> {
+/// whether it folds, its chomping (`' '` to clip), and the indent it
+/// declares (a top-level key's content is indented by exactly that).
+fn block_scalar_header(value: &str) -> Option<(bool, char, Option<usize>)> {
     let value = value.split(" #").next().unwrap_or(value).trim_end();
     let mut chars = value.chars();
     let folded = match chars.next()? {
@@ -1035,23 +1036,26 @@ fn block_scalar_header(value: &str) -> Option<(bool, char)> {
         _ => return None,
     };
     let mut chomp = ' ';
+    let mut indent = None;
     for c in chars {
         match c {
             '-' | '+' if chomp == ' ' => chomp = c,
-            '1'..='9' => {}
+            '1'..='9' if indent.is_none() => indent = c.to_digit(10).map(|d| d as usize),
             _ => return None,
         }
     }
-    Some((folded, chomp))
+    Some((folded, chomp, indent))
 }
 
 /// A block scalar's lines, without their common indent, kept (`|`) or
 /// folded (`>`), then chomped.
-fn block_scalar(lines: &[&str], folded: bool, chomp: char) -> String {
-    let indent = lines
-        .iter()
-        .find(|l| !l.trim().is_empty())
-        .map_or(0, |l| l.len() - l.trim_start().len());
+fn block_scalar(lines: &[&str], folded: bool, chomp: char, declared: Option<usize>) -> String {
+    let indent = declared.unwrap_or_else(|| {
+        lines
+            .iter()
+            .find(|l| !l.trim().is_empty())
+            .map_or(0, |l| l.len() - l.trim_start().len())
+    });
     let mut body: Vec<&str> = lines
         .iter()
         .map(|l| l.get(indent..).unwrap_or("").trim_end_matches('\r'))
@@ -1585,6 +1589,11 @@ mod tests {
         );
         assert_eq!(parse("description: |\n  one\n  two"), "one\ntwo\n");
         assert_eq!(parse("description: |- # note\n  kept"), "kept");
+        // An indentation digit wins over the first line's indent.
+        assert_eq!(
+            parse("description: |2-\n    deep\n  shallow"),
+            "  deep\nshallow"
+        );
         assert_eq!(
             parse("description: A long\n  plain value # note"),
             "A long plain value"

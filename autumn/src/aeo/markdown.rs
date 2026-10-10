@@ -1084,6 +1084,10 @@ impl Writer {
             if doc.name(item) != Some("li") || is_hidden(doc, item) {
                 continue;
             }
+            // `<li value>` renumbers from that item on, as in a browser.
+            if let Some(v) = doc.attr(item, "value").and_then(|v| v.trim().parse().ok()) {
+                n = v;
+            }
             let marker = if ordered {
                 n += 1;
                 format!("{}. ", n - 1)
@@ -1113,6 +1117,9 @@ impl Writer {
         let mut rows: Vec<Vec<String>> = Vec::new();
         let mut stack = vec![id];
         let mut tr_ids = Vec::new();
+        // Text or an element that is no table part: a browser moves it out,
+        // before the table, and shows it.
+        let mut foster_ids = Vec::new();
         while let Some(n) = stack.pop() {
             for &c in doc.nodes[n].children.iter().rev() {
                 if is_hidden(doc, c) {
@@ -1121,10 +1128,17 @@ impl Writer {
                 match doc.name(c) {
                     Some("tr") => tr_ids.push(c),
                     Some("thead" | "tbody" | "tfoot") => stack.push(c),
-                    _ => {}
+                    Some("caption" | "colgroup" | "col") => {}
+                    _ => foster_ids.push(c),
                 }
             }
         }
+        foster_ids.sort_unstable();
+        let mut foster = Self::default();
+        for c in foster_ids {
+            foster.node(doc, c, depth + 1);
+        }
+        let foster = foster.finish().trim_end().to_owned();
         // `stack` pops in reverse; rebuild document order.
         tr_ids.sort_unstable();
         for tr in tr_ids {
@@ -1149,13 +1163,15 @@ impl Writer {
             .find(|&&c| doc.name(c) == Some("caption") && !is_hidden(doc, c))
             .map(|&c| escape_line_start(Self::inline_of(doc, c, depth + 1)))
             .filter(|c| !c.is_empty());
-        let Some(width) = rows.iter().map(Vec::len).max() else {
-            return caption.unwrap_or_default();
-        };
-        let mut out: Vec<String> = caption
+        let lead: Vec<String> = [Some(foster), caption]
             .into_iter()
-            .flat_map(|c| [c, String::new()])
+            .flatten()
+            .filter(|b| !b.is_empty())
             .collect();
+        let Some(width) = rows.iter().map(Vec::len).max() else {
+            return lead.join("\n\n");
+        };
+        let mut out: Vec<String> = lead.into_iter().flat_map(|b| [b, String::new()]).collect();
         for (k, row) in rows.iter().enumerate() {
             let mut cells = row.clone();
             cells.resize(width, String::new());
@@ -1668,6 +1684,23 @@ mod tests {
         );
         assert_eq!(md("<ol start=\"-2\"><li>a</li></ol>"), "1. a\n");
         assert_eq!(md("<ol><li>a</li></ol>"), "1. a\n");
+    }
+
+    #[test]
+    fn a_list_item_value_renumbers() {
+        assert_eq!(
+            md("<ol start=\"5\"><li>Five</li><li value=\"10\">Ten</li><li>Eleven</li></ol>"),
+            "5. Five\n10. Ten\n11. Eleven\n"
+        );
+    }
+
+    #[test]
+    fn content_inside_a_table_but_outside_its_cells_is_kept() {
+        assert_eq!(md("<table>Visible</table>"), "Visible\n");
+        assert_eq!(
+            md("<table>\n  <p>Note</p>\n  <tr><td>1</td></tr>\n</table>"),
+            "Note\n\n| 1 |\n| --- |\n"
+        );
     }
 
     #[test]
