@@ -212,7 +212,9 @@ let skill = AgentSkill::parse(include_str!("../skills/refunds/SKILL.md"))
 autumn_web::app().agent_skill(skill);
 ```
 
-A skill named `site-guide` replaces the generated one.
+The served file keeps the other front matter fields (`license`,
+`compatibility`, `metadata`, `allowed-tools`, ...) as written. A skill
+named `site-guide` replaces the generated one.
 
 ### MCP server card
 

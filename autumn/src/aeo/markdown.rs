@@ -1094,8 +1094,9 @@ impl Writer {
                 let (lead, text, trail) = Self::inline_parts(doc, id, depth);
                 self.line.push_str(lead);
                 match doc.attr(id, "href").and_then(|h| safe_url(h, true)) {
-                    // An empty link with no text shows nothing.
-                    Some(href) if !href.is_empty() || !text.is_empty() => {
+                    // A link with no text shows nothing, so it gets no
+                    // label made up from its URL.
+                    Some(href) if !text.is_empty() => {
                         // A `!` right before the label would make it an image,
                         // unless an odd run of `\` escapes it.
                         if let Some(before) = self.line.strip_suffix('!')
@@ -1104,14 +1105,9 @@ impl Writer {
                             self.line.pop();
                             self.line.push_str("\\!");
                         }
-                        let label = if text.is_empty() {
-                            escape_inline(&href)
-                        } else {
-                            text
-                        };
                         // A destination decodes character references too,
                         // so an `&copy;` the URL holds as text is escaped.
-                        let _ = write!(self.line, "[{label}]({})", escape_entity_like(&href));
+                        let _ = write!(self.line, "[{text}]({})", escape_entity_like(&href));
                     }
                     _ => self.line.push_str(&text),
                 }
@@ -2202,6 +2198,7 @@ mod tests {
         assert_eq!(md("<a href=\"\">Reload</a>"), "[Reload]()\n");
         assert_eq!(md("<a href=\" \">Reload</a>"), "[Reload]()\n");
         assert_eq!(md("<p>a<a href=\"\"></a>b</p>"), "ab\n");
+        assert_eq!(md("<a href=\"/tracking\"> </a><p>Body</p>"), "Body\n");
         assert_eq!(md("<img src=\"\" alt=\"x\">"), "");
     }
 

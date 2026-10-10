@@ -146,6 +146,10 @@ pub struct PageFacts {
 pub struct AgentSkill {
     name: String,
     description: String,
+    /// Front matter entries other than `name` and `description` (`license`,
+    /// `compatibility`, `metadata`, `allowed-tools`, ...), as written; each
+    /// line ends in `\n`.
+    extra: String,
     body: String,
 }
 
@@ -188,11 +192,14 @@ impl AgentSkill {
         Ok(Self {
             name,
             description,
+            extra: String::new(),
             body: body.into(),
         })
     }
 
-    /// Parse a complete `SKILL.md` file (front matter and body).
+    /// Parse a complete `SKILL.md` file (front matter and body). Front
+    /// matter fields other than `name` and `description` are served as
+    /// written.
     ///
     /// # Errors
     ///
@@ -213,7 +220,9 @@ impl AgentSkill {
             .strip_prefix("\r\n")
             .or_else(|| body.strip_prefix('\n'))
             .unwrap_or(body);
-        Self::new(name, description, body)
+        let mut skill = Self::new(name, description, body)?;
+        skill.extra = other_front_matter(front);
+        Ok(skill)
     }
 
     /// Skill name.
@@ -232,9 +241,10 @@ impl AgentSkill {
     #[must_use]
     pub fn to_skill_md(&self) -> String {
         format!(
-            "---\nname: {}\ndescription: {}\n---\n\n{}",
+            "---\nname: {}\ndescription: {}\n{}---\n\n{}",
             self.name,
             yaml_quote(&self.description),
+            self.extra,
             self.body
         )
     }
@@ -942,6 +952,7 @@ fn site_guide(facts: &SiteFacts, origin: &Origin) -> AgentSkill {
     AgentSkill {
         name: SITE_GUIDE_SKILL.to_owned(),
         description,
+        extra: String::new(),
         body,
     }
 }
@@ -975,6 +986,35 @@ pub(super) fn yaml_quote(s: &str) -> String {
         }
     }
     out.push('"');
+    out
+}
+
+/// The front matter without its top-level `name` and `description` entries,
+/// each line ending in `\n`. An entry starts at a line that begins with a
+/// key and takes the indented, `- ` and blank lines after it.
+fn other_front_matter(front: &str) -> String {
+    let mut out = String::new();
+    let mut keep = true;
+    for line in front.lines() {
+        let starts_entry = line
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace() && c != '-' && c != '#');
+        if starts_entry {
+            let key = line.split_once(':').map_or(line, |(k, _)| k).trim_end();
+            keep = !matches!(key, "name" | "description");
+        }
+        if keep {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    // Blank lines at the end would sit before the closing `---`.
+    let kept = out.trim_end_matches(['\n', ' ', '\t']).len();
+    out.truncate(kept);
+    if !out.is_empty() {
+        out.push('\n');
+    }
     out
 }
 
@@ -1609,6 +1649,23 @@ mod tests {
             "---\nname: refunds\ndescription: \"Draft refunds.\"\n---\n\n# Refunds\n\nSteps.\n"
         );
         assert_eq!(AgentSkill::parse(&md).unwrap(), skill);
+    }
+
+    #[test]
+    fn skill_parse_keeps_the_other_front_matter() {
+        let skill = AgentSkill::parse(
+            "---\nlicense: MIT\nname: a\ndescription: >-\n  Does\n  things.\n\
+             compatibility: Needs git\nmetadata:\n  author: me\nallowed-tools:\n\
+             - Bash\n- Read\n\n---\nBody\n",
+        )
+        .unwrap();
+        assert_eq!(
+            skill.to_skill_md(),
+            "---\nname: a\ndescription: \"Does things.\"\nlicense: MIT\n\
+             compatibility: Needs git\nmetadata:\n  author: me\nallowed-tools:\n\
+             - Bash\n- Read\n---\n\nBody\n"
+        );
+        assert_eq!(AgentSkill::parse(&skill.to_skill_md()).unwrap(), skill);
     }
 
     #[test]
