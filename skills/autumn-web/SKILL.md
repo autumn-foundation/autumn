@@ -2898,6 +2898,45 @@ bounded `each_shard` fan-out); install custom routing with
 There are no cross-shard queries or transactions by design. See
 `docs/guide/sharding.md` and `examples/bookmarks-sharded`.
 
+## SQLite database fleet: one database per tenant or slot (ADR 0019)
+
+On the `sqlite` backend, use `[database.fleet]` (not `[[database.shards]]`)
+to give each tenant, or each routing slot, its own SQLite file. Reach for it
+when tenants' writes queue behind SQLite's single writer, or when a tenant
+must be exported, restored or deleted as a file. The same `ShardedDb`,
+`Shards`, `CrossShard` and `#[repository(sharded)]` code routes to the
+tenant's file, opened and migrated on first use.
+
+```toml
+[database]
+url = "sqlite:///var/lib/app/control.db"   # sessions, jobs, flags stay here
+
+[database.fleet]
+mode = "tenant"              # or "slot" (bounded: 16384 files)
+root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
+```
+
+- Tenant ids must be `[a-z0-9_-]` (lowercase, max 128): anything else is
+  `400`, since the id names a file. A tenant fleet does not create unknown
+  tenants: call `shards.fleet().unwrap().provision(&fleet.key_for(id)?)` on
+  signup (`404` until then, `409` if it exists).
+- `DatabaseFleet` (`autumn_web::db::fleet`): `open_for`, `provision`,
+  `delete` (`410` meanwhile), `backup` (`VACUUM INTO`), `restore`, `list`,
+  `each`, `migrate_all`, `stats`. Health: `db:fleet`.
+- A slot fleet shares files between tenants: keep `tenant_scoped` on its
+  repositories. `CrossShard` / `each_shard` open every database on disk —
+  admin paths only.
+- With `[replication]` on, each open database ships its WAL under
+  `fleet/tenant/<id>` / `fleet/slot/<n>` (health `replication:fleet`);
+  `restore_missing = true` serves a missing database from its replica on a
+  fresh volume — only once the old host stopped writing. A replicated fleet
+  root is served by one process (one replicator per database).
+- The control database lives outside `root` (validation refuses it inside).
+- Outbox rows and derivation backfill stay on the control database.
+- Tests: `TestApp::new().with_db(control).with_fleet(fleet)`.
+
+See `docs/guide/sqlite-fleet.md`.
+
 ## Cell and shuffle-shard isolation (issue #3072)
 
 Limit the effect of one noisy tenant. All settings are off by default. See
