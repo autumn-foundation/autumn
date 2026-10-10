@@ -207,18 +207,18 @@ pub fn unmatchable_route(route: &PaidRoute) -> Option<String> {
     None
 }
 
-/// A route priced for both x402 and MPP, if any. x402 would answer every
-/// MPP client with its own challenge, so the config is refused at startup.
+/// A route priced for both x402 and MPP, if any.
+///
+/// x402 would answer every MPP client with its own challenge, so the config
+/// is refused at startup. An x402 `GET` entry also prices `HEAD`, so it
+/// clashes with an MPP `HEAD`.
 #[must_use]
 pub fn mixed_protocol_route(routes: &[PaidRoute]) -> Option<String> {
     routes.iter().filter(|r| r.is_x402()).find_map(|x402| {
         routes
             .iter()
             .filter(|r| !r.is_x402())
-            .find(|mpp| {
-                mpp.method.eq_ignore_ascii_case(&x402.method)
-                    && same_template(&mpp.path, &x402.path)
-            })
+            .find(|mpp| x402.method_matches(&mpp.method) && same_template(&mpp.path, &x402.path))
             .map(|mpp| {
                 format!(
                     "{} {:?} is priced for both x402 and MPP (`mpp_method` on {:?}); price it \
@@ -1291,6 +1291,12 @@ mod tests {
         };
         assert!(config.validate().is_err());
 
+        let mut head = route();
+        head.method = "HEAD".to_owned();
+        assert!(
+            mixed_protocol_route(&[x402.clone(), head]).is_some(),
+            "an x402 GET prices HEAD too"
+        );
         let mut other = route();
         other.method = "POST".to_owned();
         assert!(

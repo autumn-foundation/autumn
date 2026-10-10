@@ -112,13 +112,15 @@ impl Doc {
     }
 
     /// First element that `want` accepts, in document order, outside hidden
-    /// elements and `<template>`, `<svg>` and `<math>`: a title in those is
-    /// not the page's.
+    /// elements and the dropped ones other than `<head>` and `<title>`
+    /// (`<template>`, `<svg>`, `<iframe>`, ...): a title in those is not the
+    /// page's.
     fn find_metadata(&self, want: impl Fn(usize) -> bool) -> Option<usize> {
         let mut stack = vec![ROOT];
         while let Some(id) = stack.pop() {
             if let Some(n) = self.name(id) {
-                if id != ROOT && (is_hidden(self, id) || matches!(n, "template" | "svg" | "math")) {
+                let dropped = DROP.contains(&n) && !matches!(n, "head" | "title");
+                if id != ROOT && (is_hidden(self, id) || dropped) {
                     continue;
                 }
                 if want(id) {
@@ -1264,7 +1266,8 @@ mod tests {
     fn front_matter_skips_hidden_metadata() {
         let out = md("<template><title>secret</title>\
              <meta name=\"description\" content=\"hidden\"></template>\
-             <svg><title>icon</title></svg><title>real</title>\
+             <svg><title>icon</title></svg><iframe><title>framed</title></iframe>\
+             <object><title>embedded</title></object><title>real</title>\
              <meta name=\"description\" content=\"shown\"><p>x</p>");
         assert_eq!(
             out,
