@@ -1253,18 +1253,15 @@ impl Writer {
                 blocks.push(text.to_owned());
             }
         };
-        // `<ol reversed>` counts down, from the item count unless `start`
-        // says otherwise. Markdown has no negative numbers.
-        let reversed = doc.attr(id, "reversed").is_some();
-        let items = doc.nodes[id]
-            .children
-            .iter()
-            .filter(|&&c| doc.name(c) == Some("li") && !is_hidden(doc, c))
-            .count() as u64;
-        let mut n: u64 = doc
-            .attr(id, "start")
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(if reversed { items } else { 1 });
+        let numbers = if ordered {
+            Self::item_numbers(doc, id)
+        } else {
+            Vec::new()
+        };
+        // A Markdown list number is 0 to 999999999. Past that, or below
+        // zero, the items are bullets that spell out their numbers.
+        let as_bullets = numbers.iter().any(|n| !(0..=999_999_999).contains(n));
+        let mut numbers = numbers.into_iter();
         for &item in &doc.nodes[id].children {
             if doc.name(item) != Some("li") {
                 other.node(doc, item, depth + 1);
@@ -1274,23 +1271,17 @@ impl Writer {
                 continue;
             }
             end_other(&mut other, &mut lines, &mut blocks);
-            // `<li value>` renumbers from that item on, as in a browser.
-            if let Some(v) = doc.attr(item, "value").and_then(|v| v.trim().parse().ok()) {
-                n = v;
-            }
-            let marker = if ordered {
-                let number = n;
-                n = if reversed { n.saturating_sub(1) } else { n + 1 };
-                format!("{number}. ")
-            } else {
-                "- ".to_owned()
+            let (marker, label) = match numbers.next() {
+                Some(n) if as_bullets => ("- ".to_owned(), format!("{n}\\. ")),
+                Some(n) => (format!("{n}. "), String::new()),
+                None => ("- ".to_owned(), String::new()),
             };
             let pad = " ".repeat(marker.len());
             // A nested list sits under the item text with no blank line.
             let body = collapse_nested_list_gap(&Self::sub_block(doc, item, depth + 1));
             for (k, l) in body.lines().enumerate() {
                 if k == 0 {
-                    lines.push(format!("{marker}{l}"));
+                    lines.push(format!("{marker}{label}{l}"));
                 } else if l.is_empty() {
                     lines.push(String::new());
                 } else {
@@ -1298,7 +1289,7 @@ impl Writer {
                 }
             }
             if body.is_empty() {
-                lines.push(marker.trim_end().to_owned());
+                lines.push(format!("{marker}{label}").trim_end().to_owned());
             }
         }
         end_other(&mut other, &mut lines, &mut blocks);
@@ -1306,6 +1297,40 @@ impl Writer {
             blocks.push(lines.join("\n"));
         }
         blocks
+    }
+
+    /// The number a browser shows on each visible item of the `<ol>` `id`.
+    /// Counters are signed. `<ol reversed>` counts down, from the item count
+    /// unless `start` says otherwise; `<li value>` renumbers from that item
+    /// on.
+    fn item_numbers(doc: &Doc, id: usize) -> Vec<i64> {
+        let items: Vec<usize> = doc.nodes[id]
+            .children
+            .iter()
+            .copied()
+            .filter(|&c| doc.name(c) == Some("li") && !is_hidden(doc, c))
+            .collect();
+        let reversed = doc.attr(id, "reversed").is_some();
+        let count = i64::try_from(items.len()).unwrap_or(i64::MAX);
+        let mut n: i64 = doc
+            .attr(id, "start")
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(if reversed { count } else { 1 });
+        items
+            .iter()
+            .map(|&item| {
+                if let Some(v) = doc.attr(item, "value").and_then(|v| v.trim().parse().ok()) {
+                    n = v;
+                }
+                let number = n;
+                n = if reversed {
+                    n.saturating_sub(1)
+                } else {
+                    n.saturating_add(1)
+                };
+                number
+            })
+            .collect()
     }
 
     fn table(doc: &Doc, id: usize, depth: usize) -> String {
@@ -1910,7 +1935,8 @@ mod tests {
             md("<ol start=\"5\"><li>Step five</li><li>Step six</li></ol>"),
             "5. Step five\n6. Step six\n"
         );
-        assert_eq!(md("<ol start=\"-2\"><li>a</li></ol>"), "1. a\n");
+        // A browser shows -2, which no Markdown list number can.
+        assert_eq!(md("<ol start=\"-2\"><li>a</li></ol>"), "- -2\\. a\n");
         assert_eq!(md("<ol><li>a</li></ol>"), "1. a\n");
     }
 
@@ -2145,6 +2171,27 @@ mod tests {
         assert_eq!(
             md("<img src=\"/i?a=&amp;lt;\" alt=\"i\">"),
             "![i](/i?a=\\&lt;)\n"
+        );
+    }
+
+    #[test]
+    fn list_numbers_are_signed() {
+        assert_eq!(
+            md("<ol reversed start=\"1\"><li>A</li><li>B</li><li>C</li></ol>"),
+            "- 1\\. A\n- 0\\. B\n- -1\\. C\n"
+        );
+        assert_eq!(
+            md("<ol start=\"-2\"><li>A</li><li value=\"7\">B</li></ol>"),
+            "- -2\\. A\n- 7\\. B\n"
+        );
+        assert_eq!(
+            md("<ol reversed start=\"2\"><li>A</li><li>B</li></ol>"),
+            "2. A\n1. B\n"
+        );
+        // No overflow at the top of the range.
+        assert_eq!(
+            md("<ol start=\"9223372036854775807\"><li>A</li><li>B</li></ol>"),
+            "- 9223372036854775807\\. A\n- 9223372036854775807\\. B\n"
         );
     }
 

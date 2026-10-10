@@ -323,8 +323,11 @@ client.get("https://example.org/").sign_web_bot_auth(&signer).send().await?;
 ```
 
 With `[aeo] enabled = false`, Autumn loads no key and `from_state` returns
-`None`. The signature covers the first request only. Autumn does not sign a
-redirect again. `Signature-Agent` uses the quoted-string form that
+`None`. A signed request follows its redirects itself. Each request and
+retry gets a fresh signature, and so does a redirect to the same origin
+(scheme, host and port). A redirect to another origin drops the signature,
+`Signature-Input` and `Signature-Agent`, and that hop and every one after it
+go unsigned. `Signature-Agent` uses the quoted-string form that
 Cloudflare verifies, not the draft's dictionary form.
 
 ---

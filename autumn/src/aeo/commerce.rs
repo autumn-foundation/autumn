@@ -762,6 +762,9 @@ struct PricedRoutes {
     /// Supported locales when locale-prefixed routing is on: `/en/x` is the
     /// route `/x`.
     locales: Vec<String>,
+    /// Priced paths `locale_prefix_exclude` keeps out of the locale nests:
+    /// `/en/x` is never one of them, but may be another route of its own.
+    unprefixed: Vec<String>,
 }
 
 impl PricedRoutes {
@@ -781,9 +784,30 @@ impl PricedRoutes {
         } else {
             Vec::new()
         };
+        #[cfg(feature = "i18n")]
+        let unprefixed = routes
+            .iter()
+            .filter(|r| {
+                let path = normalize(&r.path);
+                config
+                    .i18n
+                    .locale_prefix_exclude_exact
+                    .iter()
+                    .any(|e| normalize(e) == path)
+                    || crate::router::matches_locale_exclude_prefix(
+                        path,
+                        &config.i18n.locale_prefix_exclude,
+                    )
+            })
+            .map(|r| r.path.clone())
+            .collect();
         #[cfg(not(feature = "i18n"))]
-        let locales = Vec::new();
-        Some(Self { routes, locales })
+        let (locales, unprefixed) = (Vec::new(), Vec::new());
+        Some(Self {
+            routes,
+            locales,
+            unprefixed,
+        })
     }
 
     /// The priced route for `req`, if any. Uses the route template axum
@@ -820,7 +844,7 @@ impl PricedRoutes {
                 .or_else(|| {
                     routes
                         .clone()
-                        .find(|r| same_template(&r.path, self.strip_locale(t)))
+                        .find(|r| self.localized(r) && same_template(&r.path, self.strip_locale(t)))
                 });
         }
         // No matched route: only a `GET` or `HEAD` can be a static file. An
@@ -837,9 +861,14 @@ impl PricedRoutes {
         routes
             .filter(|r| {
                 template_matches(&r.path, path)
-                    || template_matches(&r.path, self.strip_locale(path))
+                    || (self.localized(r) && template_matches(&r.path, self.strip_locale(path)))
             })
             .max_by_key(|r| literal_segments(&r.path))
+    }
+
+    /// `true` when `route` is mounted in the locale nests too.
+    fn localized(&self, route: &PaidRoute) -> bool {
+        !self.unprefixed.contains(&route.path)
     }
 
     fn strip_locale<'a>(&self, path: &'a str) -> &'a str {
@@ -1447,6 +1476,7 @@ mod tests {
                 PaidRoute::new("GET", "/api", "2"),
             ],
             locales: vec!["en".to_owned()],
+            unprefixed: Vec::new(),
         };
         let get = |path: &str| {
             axum::http::Request::get(path)
@@ -1461,6 +1491,24 @@ mod tests {
     }
 
     #[test]
+    fn an_excluded_route_is_not_priced_under_a_locale() {
+        let priced = PricedRoutes {
+            routes: vec![PaidRoute::new("GET", "/api", "1")],
+            locales: vec!["en".to_owned()],
+            unprefixed: vec!["/api".to_owned()],
+        };
+        let get = |path: &str| {
+            axum::http::Request::get(path)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let amount = |path: &str| priced.route_for(&get(path)).map(|r| r.amount.clone());
+        assert_eq!(amount("/api").as_deref(), Some("1"));
+        // `/en/api` is not the excluded `/api`: it can only be another route.
+        assert_eq!(amount("/en/api"), None);
+    }
+
+    #[test]
     fn the_route_axum_matched_sets_the_price() {
         let priced = PricedRoutes {
             routes: vec![
@@ -1468,6 +1516,7 @@ mod tests {
                 PaidRoute::new("GET", "/reports/admin", "100"),
             ],
             locales: Vec::new(),
+            unprefixed: Vec::new(),
         };
         let req = |path: &str| {
             axum::http::Request::get(path)
@@ -1521,6 +1570,7 @@ mod tests {
                 PaidRoute::new("GET", "/files/{name}", "2"),
             ],
             locales: Vec::new(),
+            unprefixed: Vec::new(),
         };
         let req = |method: &str, path: &str| {
             axum::http::Request::builder()
@@ -1548,6 +1598,7 @@ mod tests {
         let priced = PricedRoutes {
             routes: vec![PaidRoute::new("GET", "/downloads/{*path}", "1"), mpp],
             locales: Vec::new(),
+            unprefixed: Vec::new(),
         };
         let amount = |method: &str, path: &str| {
             let req = axum::http::Request::builder()
@@ -1571,6 +1622,7 @@ mod tests {
                 PaidRoute::new("HEAD", "/report", "5"),
             ],
             locales: Vec::new(),
+            unprefixed: Vec::new(),
         };
         let amount = |method: &str| {
             let req = axum::http::Request::builder()
@@ -1585,6 +1637,7 @@ mod tests {
         let get_only = PricedRoutes {
             routes: vec![PaidRoute::new("GET", "/report", "1")],
             locales: Vec::new(),
+            unprefixed: Vec::new(),
         };
         let head = axum::http::Request::head("/report")
             .body(axum::body::Body::empty())

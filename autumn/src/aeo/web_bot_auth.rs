@@ -19,8 +19,9 @@
 //! client.get("https://example.com/").sign_web_bot_auth(&signer).send().await?;
 //! ```
 //!
-//! The signature covers the first request only. A redirect to another host
-//! is not signed again.
+//! Each attempt, and each redirect to the same origin, gets a fresh
+//! signature. A redirect to another origin drops it, and the rest of the
+//! chain goes unsigned.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
