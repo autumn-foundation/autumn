@@ -256,13 +256,22 @@ fn same_template(left: &str, right: &str) -> bool {
     }
 }
 
-/// How many segments of `template` are literal, for picking the most
-/// specific of several matching routes.
-fn literal_segments(template: &str) -> usize {
-    template
+/// How specific `template` is, as axum's router ranks routes: at the first
+/// segment where two matching templates differ, a literal beats a `{name}`
+/// capture, which beats a `{*name}` catch-all.
+fn specificity(template: &str) -> Vec<u8> {
+    normalize(template)
         .split('/')
-        .filter(|s| !s.is_empty() && !s.starts_with('{'))
-        .count()
+        .map(|segment| {
+            if segment.starts_with("{*") {
+                0
+            } else if segment.starts_with('{') {
+                1
+            } else {
+                2
+            }
+        })
+        .collect()
 }
 
 /// `true` for a route template axum accepts and the matcher reads: a
@@ -863,7 +872,7 @@ impl PricedRoutes {
                 template_matches(&r.path, path)
                     || (self.localized(r) && template_matches(&r.path, self.strip_locale(path)))
             })
-            .max_by_key(|r| literal_segments(&r.path))
+            .max_by_key(|r| specificity(&r.path))
     }
 
     /// `true` when `route` is mounted in the locale nests too.
@@ -1612,6 +1621,36 @@ mod tests {
         assert_eq!(amount("GET", "/downloads/report.pdf"), None);
         assert_eq!(amount("HEAD", "/downloads/report.pdf"), None);
         assert_eq!(amount("GET", "/downloads/other.pdf").as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn a_static_file_takes_the_route_axum_would() {
+        let mut mpp = PaidRoute::new("GET", "/downloads/{file}", "5");
+        mpp.mpp_method = Some("tempo".to_owned());
+        // Listed either way round, the capture beats the catch-all.
+        for routes in [
+            vec![
+                mpp.clone(),
+                PaidRoute::new("GET", "/downloads/{*path}", "1"),
+            ],
+            vec![PaidRoute::new("GET", "/downloads/{*path}", "1"), mpp],
+        ] {
+            let priced = PricedRoutes {
+                routes,
+                locales: Vec::new(),
+                unprefixed: Vec::new(),
+            };
+            let amount = |path: &str| {
+                let req = axum::http::Request::get(path)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                priced.route_for(&req).map(|r| r.amount.clone())
+            };
+            assert_eq!(amount("/downloads/report.pdf"), None, "MPP's");
+            assert_eq!(amount("/downloads/a/b.pdf").as_deref(), Some("1"));
+        }
+        // An earlier literal outranks a later one.
+        assert!(specificity("/a/b/{*p}") > specificity("/a/{x}/c"));
     }
 
     #[test]
