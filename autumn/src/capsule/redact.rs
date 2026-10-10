@@ -377,6 +377,16 @@ pub fn literal_placeholder_locations(
     fn headers_hold(headers: &[(String, String)]) -> bool {
         headers.iter().any(|(_, value)| holds(value))
     }
+    // String values only: replay compares object keys exactly, so a key is
+    // never a wildcard.
+    fn json_holds(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(text) => holds(text),
+            serde_json::Value::Array(items) => items.iter().any(json_holds),
+            serde_json::Value::Object(fields) => fields.values().any(json_holds),
+            _ => false,
+        }
+    }
 
     let mut found = Vec::new();
     for (index, exchange) in effects.http.iter().enumerate() {
@@ -391,7 +401,7 @@ pub fn literal_placeholder_locations(
         }
     }
     for (index, job) in effects.jobs.iter().enumerate() {
-        if holds(&job.payload.to_string()) {
+        if json_holds(&job.payload) {
             found.push(format!("job[{index}].payload"));
         }
     }
@@ -2195,6 +2205,31 @@ mod tests {
                 "a read value is served, never a wildcard: {found:?}"
             );
             assert!(literal_placeholder_locations(&CapsuleEffects::default()).is_empty());
+        }
+
+        /// Codex review on #3222: a job payload is compared value by value,
+        /// and its object keys exactly. A key that holds the placeholder text
+        /// is not a wildcard.
+        #[test]
+        fn a_placeholder_in_a_job_payload_key_is_not_a_literal() {
+            let effects = CapsuleEffects {
+                jobs: vec![JobEffect {
+                    name: "n".to_owned(),
+                    payload: serde_json::json!({"[FILTERED]": {"list": ["plain"]}}),
+                    ..JobEffect::default()
+                }],
+                ..CapsuleEffects::default()
+            };
+            assert!(literal_placeholder_locations(&effects).is_empty());
+            let nested = CapsuleEffects {
+                jobs: vec![JobEffect {
+                    name: "n".to_owned(),
+                    payload: serde_json::json!({"a": [{"b": "x [FILTERED]"}]}),
+                    ..JobEffect::default()
+                }],
+                ..CapsuleEffects::default()
+            };
+            assert_eq!(literal_placeholder_locations(&nested), ["job[0].payload"]);
         }
 
         #[test]

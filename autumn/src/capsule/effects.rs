@@ -257,6 +257,8 @@ pub struct ReplayEffects {
     /// serving stable non-consuming values and still be able to report
     /// `Reproduced`. The verdict warns instead of pretending.
     scope_entered: std::sync::atomic::AtomicBool,
+    /// `register_after_commit` callbacks that a rollback has not dropped.
+    after_commit: AtomicUsize,
 }
 
 /// One recorded cache write: a value written, or entries removed.
@@ -508,6 +510,7 @@ impl ReplayEffects {
             recorded,
             served: AtomicUsize::new(0),
             scope_entered: std::sync::atomic::AtomicBool::new(false),
+            after_commit: AtomicUsize::new(0),
         }
     }
 
@@ -619,7 +622,11 @@ impl ReplayEffects {
         {
             let expected = describe_http(&next.method, &next.url);
             let changed = describe_request_mismatch(next, request);
+            let recorded_url = next.url.clone();
             drop(seam);
+            // The URL matched: learn what its masked values stood for before
+            // the report prints the live URL.
+            self.observe_text(&recorded_url, url);
             let actual = describe_http(method, url);
             self.diverge(EffectDivergence {
                 seam: EffectSeam::Http,
@@ -920,6 +927,23 @@ impl ReplayEffects {
     /// a capsule with detached work incomplete, so the recording had none.
     /// It is logged at the spawn, so the verdict sees it even when the task
     /// runs after the response.
+    /// Count a `register_after_commit` callback (#2351 item 3).
+    pub(crate) fn after_commit_registered(&self) {
+        self.after_commit.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A rollback dropped a counted callback.
+    pub(crate) fn after_commit_dropped(&self) {
+        let _ = self
+            .after_commit
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+    }
+
+    /// Whether a counted callback is still pending or ran.
+    pub(crate) fn after_commit_pending(&self) -> bool {
+        self.after_commit.load(Ordering::SeqCst) > 0
+    }
+
     pub(crate) fn detached_work_started(&self) {
         if self.legacy_v3 {
             return;
@@ -1150,7 +1174,14 @@ impl ReplayEffects {
         };
         if let Some(changed) = changed {
             let expected = describe_mail(&next.to, &next.subject);
+            let (recorded_to, recorded_subject) = (next.to.clone(), next.subject.clone());
             drop(seam);
+            // The envelope matched: learn what its masked values stood for
+            // before the report prints the live subject and domains.
+            for (recorded, actual) in recorded_to.iter().zip(to.iter()) {
+                self.observe_text(recorded, actual);
+            }
+            self.observe_text(&recorded_subject, subject);
             let actual = describe_mail(to, subject);
             self.diverge(EffectDivergence {
                 seam: EffectSeam::Mail,
@@ -2500,6 +2531,53 @@ mod tests {
         assert_eq!(divergences.len(), 1, "{divergences:?}");
         assert!(!divergences[0].actual.contains("sk-live-42"));
         assert!(!divergences[0].detail.contains("sk-live-42"));
+    }
+
+    /// Codex review on #3222: a request that changed only its message
+    /// learns the masked URL value first, so the scrub masks it in the report.
+    #[test]
+    fn a_request_mismatch_learns_the_masked_url_value() {
+        let mut recorded = http("POST", "https://api.example/users/[FILTERED]/charge", 200);
+        recorded.request_body = CapsuleBody::Text("amount=10".to_owned());
+        let tape = ReplayEffects::new(CapsuleEffects {
+            http: vec![recorded],
+            ..CapsuleEffects::default()
+        });
+        let body = CapsuleBody::Text("amount=99".to_owned());
+        let served = tape.next_http(&OutboundRequest {
+            method: "POST",
+            url: "https://api.example/users/sk-live-42/charge",
+            headers: &[],
+            body: &body,
+        });
+        assert!(served.is_none(), "the body changed");
+        assert_eq!(tape.divergences().len(), 1);
+        assert!(tape.observed_redactions().contains(b"sk-live-42"));
+    }
+
+    /// Codex review on #3222: a letter that changed only its contents
+    /// learns the masked envelope first, so the scrub masks it in the report.
+    #[test]
+    fn a_mail_content_mismatch_learns_the_masked_envelope() {
+        let tape = ReplayEffects::new(CapsuleEffects {
+            mail: vec![MailEffect {
+                to: vec!["[FILTERED]@shop.example".to_owned()],
+                subject: "Code [FILTERED]".to_owned(),
+                body: CapsuleBody::Text("hi".to_owned()),
+                error: None,
+                ..Default::default()
+            }],
+            ..CapsuleEffects::default()
+        });
+        let to = ["sk-live-42@shop.example".to_owned()];
+        let body = CapsuleBody::Text("bye".to_owned());
+        assert_eq!(
+            tape.next_mail(&sent(&to, "Code 991827", &body)),
+            MailVerdict::Diverged
+        );
+        let learned = tape.observed_redactions();
+        assert!(learned.contains(b"sk-live-42"));
+        assert!(learned.contains(b"991827"));
     }
 
     /// Codex review on #3222: a read-back of a key that only the replayed
