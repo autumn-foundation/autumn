@@ -135,6 +135,9 @@ impl AeoConfig {
                 return Err(format!("[[aeo.paid_routes]] {problem}"));
             }
         }
+        if let Some(problem) = commerce::mixed_protocol_route(&self.paid_routes) {
+            return Err(format!("[[aeo.paid_routes]] {problem}"));
+        }
         Ok(())
     }
 }

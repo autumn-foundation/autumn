@@ -336,7 +336,8 @@ Autumn settles first, then runs the handler. A priced route never runs free: whe
 no `http-client` feature, it answers `503`. A facilitator error answer is a
 `502`. An entry that can never match a request (a method that is not an HTTP
 method, or a `path` without a leading `/`, or with a space, a `?` query, or a
-`#` fragment) stops the app at startup.
+`#` fragment) stops the app at startup, and so does a route priced for both
+x402 and MPP.
 
 ```toml
 [aeo.x402]

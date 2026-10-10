@@ -207,6 +207,28 @@ pub fn unmatchable_route(route: &PaidRoute) -> Option<String> {
     None
 }
 
+/// A route priced for both x402 and MPP, if any. x402 would answer every
+/// MPP client with its own challenge, so the config is refused at startup.
+#[must_use]
+pub fn mixed_protocol_route(routes: &[PaidRoute]) -> Option<String> {
+    routes.iter().filter(|r| r.is_x402()).find_map(|x402| {
+        routes
+            .iter()
+            .filter(|r| !r.is_x402())
+            .find(|mpp| {
+                mpp.method.eq_ignore_ascii_case(&x402.method)
+                    && same_template(&mpp.path, &x402.path)
+            })
+            .map(|mpp| {
+                format!(
+                    "{} {:?} is priced for both x402 and MPP (`mpp_method` on {:?}); price it \
+                     with one",
+                    x402.method, x402.path, mpp.path
+                )
+            })
+    })
+}
+
 /// `true` when two route templates name the same route: the same literal
 /// segments, and a capture (any name) or a catch-all at the same places.
 fn same_template(left: &str, right: &str) -> bool {
@@ -1256,6 +1278,28 @@ mod tests {
     }
 
     #[test]
+    fn one_route_cannot_take_both_payment_protocols() {
+        let mut x402 = route();
+        x402.mpp_method = None;
+        let mut mpp = route();
+        mpp.path = "/api/reports/{rid}/".to_owned();
+        let problem = mixed_protocol_route(&[x402.clone(), mpp.clone()]).unwrap();
+        assert!(problem.contains("both x402 and MPP"), "{problem}");
+        let config = super::super::AeoConfig {
+            paid_routes: vec![x402.clone(), mpp],
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let mut other = route();
+        other.method = "POST".to_owned();
+        assert!(
+            mixed_protocol_route(&[x402, other]).is_none(),
+            "another method"
+        );
+    }
+
+    #[test]
     fn an_explicit_head_price_beats_the_get_fallback() {
         let priced = PricedRoutes {
             routes: vec![
@@ -1333,6 +1377,8 @@ mod tests {
     fn facilitator_must_be_https_or_loopback() {
         assert!(facilitator_url_is_safe("https://x402.org/facilitator"));
         assert!(facilitator_url_is_safe("http://localhost:8080"));
+        assert!(facilitator_url_is_safe("http://[::1]:8080"));
+        assert!(facilitator_url_is_safe("http://127.0.0.1:8080"));
         assert!(!facilitator_url_is_safe("http://facilitator.example"));
         assert!(!facilitator_url_is_safe("not a url"));
         assert!(!facilitator_url_is_safe("https://pay.example/api?key=x"));
