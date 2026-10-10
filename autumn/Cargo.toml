@@ -299,7 +299,7 @@ autumn-edge = { version = "0.8.0", path = "../autumn-edge", optional = true }
 # resolved in `Cargo.lock` via `autumn-edge`'s reference host, so this adds no
 # new crate to the workspace graph. MSRV 1.86 (below this workspace's 1.88
 # floor); licensed MIT OR Apache-2.0.
-wasmi = { version = "0.40", optional = true }
+wasmi = { version = "2.0", optional = true }
 # `default-features = false` drops the database-layer macros from the core
 # macro crate; the `db` feature above pulls them back in through the
 # `autumn-macros-model` / `autumn-macros-repository` crates. A no-database app

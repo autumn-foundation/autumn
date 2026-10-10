@@ -39,7 +39,7 @@ tower = { workspace = true, features = ["util"] }
 # links it and the dependency is native-only (never compiled for wasm). MSRV
 # verified: wasmi 0.40 declares `rust-version = "1.86"`, below this workspace's
 # 1.88 floor. Licensed MIT OR Apache-2.0, matching the workspace policy.
-wasmi = { version = "0.40", optional = true }
+wasmi = { version = "2.0", optional = true }
 # The edge node (feature `node`, native only). The HTTP server and the origin
 # client. Same reqwest line as `autumn-cli`. `http-body` (already in the graph
 # through axum) lets the node send a request body to the origin without a
