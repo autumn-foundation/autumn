@@ -966,6 +966,7 @@ fn yaml_quote(s: &str) -> String {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
             c if c.is_control() => {}
             c => out.push(c),
         }
@@ -1109,15 +1110,39 @@ fn yaml_unquote(value: &str) -> String {
     let mut out = String::with_capacity(inner.len());
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                Some(other) => out.push(other),
-                None => {}
-            }
-        } else {
+        if c != '\\' {
             out.push(c);
+            continue;
         }
+        // The YAML 1.2 double-quoted escapes.
+        let decoded = match chars.next() {
+            None => None,
+            Some('0') => Some('\0'),
+            Some('a') => Some('\u{7}'),
+            Some('b') => Some('\u{8}'),
+            Some('t' | '\t') => Some('\t'),
+            Some('n') => Some('\n'),
+            Some('v') => Some('\u{b}'),
+            Some('f') => Some('\u{c}'),
+            Some('r') => Some('\r'),
+            Some('e') => Some('\u{1b}'),
+            Some('N') => Some('\u{85}'),
+            Some('_') => Some('\u{a0}'),
+            Some('L') => Some('\u{2028}'),
+            Some('P') => Some('\u{2029}'),
+            Some(e @ ('x' | 'u' | 'U')) => {
+                let digits = match e {
+                    'x' => 2,
+                    'u' => 4,
+                    _ => 8,
+                };
+                let hex: String = chars.by_ref().take(digits).collect();
+                u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
+            }
+            // `\"`, `\\`, `\/`, `\ ` stand for themselves.
+            Some(other) => Some(other),
+        };
+        out.extend(decoded);
     }
     out
 }
@@ -1578,6 +1603,14 @@ mod tests {
             "Say \"hi\""
         );
         assert_eq!(parse("description: 'It''s here' # note"), "It's here");
+        assert_eq!(parse(r#"description: "First\tSecond""#), "First\tSecond");
+        assert_eq!(
+            parse(r#"description: "\u263A \x41\U0001F600 \\ \/""#),
+            "\u{263A} A\u{1F600} \\ /"
+        );
+        // A tab survives a round trip through the served `SKILL.md`.
+        let tabbed = AgentSkill::new("a", "One\tTwo", "Body").unwrap();
+        assert_eq!(AgentSkill::parse(&tabbed.to_skill_md()).unwrap(), tabbed);
     }
 
     #[test]

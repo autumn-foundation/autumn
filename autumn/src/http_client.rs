@@ -3793,11 +3793,32 @@ async fn serve_sim_host(
     {
         builder = builder.header(reqwest::header::CONTENT_LENGTH, body.len());
     }
+    // A Web Bot Auth signature is made new for each attempt, as on the real
+    // send path (`with_caller_headers`).
+    let fresh = request
+        .web_bot_auth
+        .as_ref()
+        .filter(|_| request.extra_headers.contains_key("signature"))
+        .and_then(|signer| signer.sign_url(url.as_str()));
     for (name, value) in &request.extra_headers {
         if sends_deadline && name == DEADLINE_HEADER {
             continue;
         }
+        if fresh.is_some()
+            && matches!(
+                name.as_str(),
+                "signature" | "signature-input" | "signature-agent"
+            )
+        {
+            continue;
+        }
         builder = builder.header(name, value);
+    }
+    if let Some(h) = fresh {
+        builder = builder
+            .header("signature-agent", h.signature_agent)
+            .header("signature-input", h.signature_input)
+            .header("signature", h.signature);
     }
     let body = request.body.clone().unwrap_or_default();
     let http_request = builder
@@ -5821,6 +5842,52 @@ mod tests {
                 assert_eq!(seen, host, "{url}");
             }
         });
+    }
+
+    /// A sim attempt signs Web Bot Auth again, as the real send path does, so
+    /// a held builder never sends a stale signature to a simulated host.
+    #[test]
+    fn sim_host_gets_a_fresh_web_bot_auth_signature() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let echo = axum::Router::new().fallback(|headers: HeaderMap| async move {
+            let count = headers.get_all("signature").iter().count();
+            let input = headers
+                .get("signature-input")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            format!("{count} {input}")
+        });
+        let key = crate::aeo::web_bot_auth::WebBotAuthKey::from_seed_b64(
+            "nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A",
+        )
+        .unwrap();
+        let signer = crate::aeo::web_bot_auth::WebBotAuthSigner::new(key, "https://bot.example");
+        let created = |input: &str| -> u64 {
+            input
+                .split(";created=")
+                .nth(1)
+                .and_then(|r| r.split(';').next())
+                .and_then(|v| v.parse().ok())
+                .unwrap()
+        };
+        let url = "https://payments/charge";
+        let first = created(&signer.sign_url(url).unwrap().signature_input);
+        let request = Client::new().get(url).sign_web_bot_auth(&signer);
+        std::thread::sleep(Duration::from_millis(1100));
+        let parsed = reqwest::Url::parse(url).unwrap();
+        let seen = runtime.block_on(async {
+            serve_sim_host(echo, &request, parsed, None)
+                .await
+                .unwrap()
+                .text()
+        });
+        let (count, input) = seen.split_once(' ').unwrap();
+        assert_eq!(count, "1", "{seen}");
+        assert!(created(input) > first, "{seen}");
     }
 
     /// A sim request with a body carries its `Content-Length`, as the real
