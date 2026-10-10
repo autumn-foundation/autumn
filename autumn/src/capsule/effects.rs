@@ -1361,8 +1361,10 @@ impl ReplayEffects {
         let (Some(recorded), Some(actual)) = (recorded, actual.identifier()) else {
             return true;
         };
+        // An unmasked recorded identifier: print only the same one. Another
+        // one can hold a secret that the scrub has not learned.
         if !recorded.contains(FILTERED) && !recorded.contains(FILTERED_URLENCODED) {
-            return true;
+            return recorded == actual;
         }
         if redacted_spans(recorded, actual).is_none() {
             return false;
@@ -2529,6 +2531,25 @@ mod tests {
         assert!(!divergences[0].detail.contains("sk-live-42"));
         // With no recorded write, the identifier is not printed.
         let tape = ReplayEffects::new(CapsuleEffects::default());
+        let _ = tape.cache_invalidate("token:sk-live-42");
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert!(!divergences[0].actual.contains("sk-live-42"));
+        assert!(!divergences[0].detail.contains("sk-live-42"));
+    }
+
+    /// Codex review on #3222: an invalidation of another key prints no key
+    /// when the recorded key has no placeholder. The live key can hold a
+    /// secret, and the scrub has not learned it.
+    #[test]
+    fn a_mismatched_invalidation_prints_no_live_key() {
+        let tape = ReplayEffects::new(CapsuleEffects {
+            cache: vec![CacheEffect::Invalidate {
+                key: "user:7".to_owned(),
+                error: None,
+            }],
+            ..CapsuleEffects::default()
+        });
         let _ = tape.cache_invalidate("token:sk-live-42");
         let divergences = tape.divergences();
         assert_eq!(divergences.len(), 1, "{divergences:?}");

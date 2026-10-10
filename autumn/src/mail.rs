@@ -3824,8 +3824,9 @@ pub(crate) fn install_replay_mailer(state: &AppState, config: &MailConfig, build
     // `has_durable_delivery_queue()` is observable too. Production gets a
     // queue from the builder (`with_mail_delivery_queue`) or from a handle in
     // the state. The replay queue refuses, so the live queue is never reached.
+    // Production attaches a queue only when the transport sends mail.
     let durable = installed.as_ref().map_or_else(
-        || builder_queue || state.extension::<MailDeliveryQueueHandle>().is_some(),
+        || !disabled && (builder_queue || state.extension::<MailDeliveryQueueHandle>().is_some()),
         |mailer| mailer.has_durable_delivery_queue(),
     );
     let mut mailer = Mailer::with_transport(ReplayTransport { disabled });
@@ -6728,8 +6729,13 @@ mod tests {
     #[cfg(feature = "reporting")]
     #[test]
     fn replay_mailer_keeps_a_builder_queue_capability() {
+        // Production attaches a queue only to a transport that sends mail.
+        let sending = MailConfig {
+            transport: Transport::Log,
+            ..MailConfig::default()
+        };
         let state = AppState::for_test();
-        install_replay_mailer(&state, &MailConfig::default(), true);
+        install_replay_mailer(&state, &sending, true);
         assert!(
             state
                 .extension::<Mailer>()
@@ -6737,7 +6743,7 @@ mod tests {
                 .has_durable_delivery_queue()
         );
         let state = AppState::for_test();
-        install_replay_mailer(&state, &MailConfig::default(), false);
+        install_replay_mailer(&state, &sending, false);
         assert!(
             !state
                 .extension::<Mailer>()
@@ -6777,7 +6783,7 @@ mod tests {
     fn a_second_replay_mailer_install_keeps_the_first() {
         let state = AppState::for_test();
         let config = MailConfig {
-            transport: Transport::Disabled,
+            transport: Transport::Log,
             from: Some("app@example.com".to_owned()),
             inline_css: true,
             ..MailConfig::default()
@@ -6785,10 +6791,26 @@ mod tests {
         install_replay_mailer(&state, &config, true);
         install_replay_mailer(&state, &MailConfig::default(), false);
         let replay = state.extension::<Mailer>().expect("installed");
-        assert!(replay.is_disabled());
+        assert!(!replay.is_disabled());
         assert!(replay.has_durable_delivery_queue());
         assert_eq!(replay.defaults.from.as_deref(), Some("app@example.com"));
         assert!(replay.inline_css_default);
+    }
+
+    /// Codex review on #3222: production attaches a delivery queue only when
+    /// the transport sends mail, so a disabled replay mailer has none either.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_disabled_replay_mailer_has_no_durable_queue() {
+        let state = AppState::for_test();
+        let config = MailConfig {
+            transport: Transport::Disabled,
+            ..MailConfig::default()
+        };
+        install_replay_mailer(&state, &config, true);
+        let replay = state.extension::<Mailer>().expect("installed");
+        assert!(replay.is_disabled());
+        assert!(!replay.has_durable_delivery_queue());
     }
 
     /// Codex review on #3222: the production durability refusal is on the

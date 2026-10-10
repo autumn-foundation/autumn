@@ -325,7 +325,6 @@ impl BlobStore for S3BlobStore {
     ) -> BlobFuture<'a, Blob> {
         Box::pin(async move {
             validate_key(key)?;
-            guard_egress("PUT")?;
             let mut stream = data;
             let mut current_part: Vec<u8> = Vec::with_capacity(MULTIPART_PART_SIZE);
 
@@ -346,6 +345,10 @@ impl BlobStore for S3BlobStore {
                     }
                 }
             }
+
+            // Not before the stream is read: a stream that fails first sends
+            // nothing. A short stream is guarded in `put`.
+            guard_egress("PUT")?;
 
             // The stream exceeded MULTIPART_PART_SIZE — use S3 multipart upload
             // so the payload is never fully buffered in memory.
@@ -1013,6 +1016,31 @@ mod tests {
             "{error}"
         );
         assert_eq!(tape.divergences().len(), 1);
+    }
+
+    /// autumn-web #2351, Codex review on #3222: a stream that fails before
+    /// the multipart threshold sends nothing, so a replay does not refuse it.
+    #[tokio::test]
+    async fn a_stream_error_before_any_upload_is_not_egress() {
+        let store = test_store();
+        let tape = std::sync::Arc::new(autumn_web::capsule::ReplayEffects::new(
+            autumn_web::capsule::CapsuleEffects::default(),
+        ));
+        let stream: autumn_web::storage::ByteStream<'_> =
+            Box::pin(futures::stream::iter(vec![Err(BlobStoreError::backend(
+                "the upload body failed",
+            ))]));
+        let result = autumn_web::capsule::with_effect_tape(
+            std::sync::Arc::clone(&tape),
+            store.put_stream("a.txt", "text/plain", stream),
+        )
+        .await;
+        let error = result.expect_err("the stream failed");
+        assert!(
+            error.to_string().contains("the upload body failed"),
+            "{error}"
+        );
+        assert!(tape.divergences().is_empty(), "{:?}", tape.divergences());
     }
 
     #[test]
