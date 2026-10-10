@@ -616,6 +616,13 @@ pub fn insert_cached_fenced<V>(
 where
     V: Clone + serde::Serialize + Send + Sync + 'static,
 {
+    // A replay has no fence: `insert_cached` sends the write to the tape, or
+    // drops it during `autumn replay` with no tape.
+    let epoch = if replaying() {
+        FillEpoch::Unsupported
+    } else {
+        epoch
+    };
     let sampled = match epoch {
         FillEpoch::Unsupported => {
             insert_cached(cache, key, value, ttl);
@@ -635,7 +642,7 @@ where
     };
     if stored {
         // Capture records the write after it happened. A replay never gets
-        // here: `sample_fill_epoch` returns `Unsupported` during a replay.
+        // here.
         let _ = record_or_replay_cache_insert(key, Some(&bytes), ttl);
     }
     stored
@@ -645,7 +652,8 @@ where
 ///
 /// A replay serves cache effects from the tape (#1634), so it never reads the
 /// backend. It gets [`FillEpoch::Unsupported`], and [`insert_cached_fenced`]
-/// then writes to the tape.
+/// then writes to the tape. During `autumn replay`, code with no tape also
+/// gets `Unsupported`, and the write is dropped.
 #[must_use]
 pub fn sample_fill_epoch(cache: &dyn Cache, namespace: &str) -> FillEpoch {
     if replaying() {
@@ -654,13 +662,14 @@ pub fn sample_fill_epoch(cache: &dyn Cache, namespace: &str) -> FillEpoch {
     cache.fill_epoch(namespace)
 }
 
-/// Whether an effect tape serves the current task.
+/// Whether an effect tape serves the current task, or this process replays a
+/// capsule.
 ///
 /// Not `tape_active`: that marks the replay scope as entered. Only the
 /// reporting layer may do that.
 #[cfg(feature = "reporting")]
 fn replaying() -> bool {
-    crate::capsule::effects::current_tape().is_some()
+    crate::capsule::effects::current_tape().is_some() || replay_blocked()
 }
 
 /// No capsule support compiled in: there is no replay.
@@ -1419,6 +1428,22 @@ mod shared_fence_tests {
             "the shared epoch moved, so the fill is fenced out"
         );
         assert!(get_cached::<String>(&a, "ns:k").is_none());
+    }
+
+    /// Codex review on #3222: during `autumn replay`, the fenced helpers do
+    /// not reach a raw backend that startup code holds, with no tape.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn the_replay_block_keeps_the_fenced_helpers_offline() {
+        let replica = Replica::default();
+        let live = replica.fill_epoch("ns");
+        super::TEST_REPLAY_BLOCKED.with(|blocked| blocked.set(true));
+        let sampled = sample_fill_epoch(&replica, "ns");
+        let stored = insert_cached_fenced(&replica, "ns:k", "v".to_string(), None, "ns", live);
+        super::TEST_REPLAY_BLOCKED.with(|blocked| blocked.set(false));
+        assert_eq!(sampled, FillEpoch::Unsupported, "no epoch read");
+        assert!(stored, "the replay took the write");
+        assert!(replica.shared.lock().unwrap().data.is_empty(), "no write");
     }
 
     #[test]
