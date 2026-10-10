@@ -1094,7 +1094,8 @@ impl Writer {
                 let (lead, text, trail) = Self::inline_parts(doc, id, depth);
                 self.line.push_str(lead);
                 match doc.attr(id, "href").and_then(|h| safe_url(h, true)) {
-                    Some(href) => {
+                    // An empty link with no text shows nothing.
+                    Some(href) if !href.is_empty() || !text.is_empty() => {
                         // A `!` right before the label would make it an image,
                         // unless an odd run of `\` escapes it.
                         if let Some(before) = self.line.strip_suffix('!')
@@ -1112,7 +1113,7 @@ impl Writer {
                         // so an `&copy;` the URL holds as text is escaped.
                         let _ = write!(self.line, "[{label}]({})", escape_entity_like(&href));
                     }
-                    None => self.line.push_str(&text),
+                    _ => self.line.push_str(&text),
                 }
                 self.line.push_str(trail);
             }
@@ -1474,7 +1475,7 @@ fn tidy_inline(s: &str) -> String {
 
 /// Escape Markdown syntax in text. `<` is escaped too, so decoded text
 /// never becomes raw HTML in a Markdown renderer.
-fn escape_inline(s: &str) -> String {
+pub(super) fn escape_inline(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if matches!(c, '\\' | '*' | '_' | '`' | '[' | ']' | '<' | '~') {
@@ -1496,8 +1497,9 @@ fn safe_url(raw: &str, link: bool) -> Option<String> {
         .chars()
         .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
         .collect();
+    // An empty `href` links to the page itself; an empty `src` shows nothing.
     if url.is_empty() {
-        return None;
+        return link.then(String::new);
     }
     // A character reference the decoder left (`javascript&colon;`) still
     // spells a scheme once a Markdown renderer decodes it, so an `&` before
@@ -2193,6 +2195,14 @@ mod tests {
             md("<ol start=\"9223372036854775807\"><li>A</li><li>B</li></ol>"),
             "- 9223372036854775807\\. A\n- 9223372036854775807\\. B\n"
         );
+    }
+
+    #[test]
+    fn an_empty_href_is_still_a_link() {
+        assert_eq!(md("<a href=\"\">Reload</a>"), "[Reload]()\n");
+        assert_eq!(md("<a href=\" \">Reload</a>"), "[Reload]()\n");
+        assert_eq!(md("<p>a<a href=\"\"></a>b</p>"), "ab\n");
+        assert_eq!(md("<img src=\"\" alt=\"x\">"), "");
     }
 
     #[test]

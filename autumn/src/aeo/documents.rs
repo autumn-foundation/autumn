@@ -595,13 +595,16 @@ fn llms_txt(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
     if !facts.llms_txt {
         return None;
     }
-    let mut out = format!("# {}\n", one_line(&display_name(facts, origin)));
+    // Titles and descriptions are text: Markdown in them must not make a
+    // link or emphasis of its own.
+    let text = |s: &str| super::markdown::escape_inline(&one_line(s));
+    let mut out = format!("# {}\n", text(&display_name(facts, origin)));
     if let Some(d) = facts
         .description
         .as_deref()
         .filter(|d| !d.trim().is_empty())
     {
-        let _ = writeln!(out, "\n> {}", one_line(d));
+        let _ = writeln!(out, "\n> {}", text(d));
     }
     if facts.markdown {
         out.push_str("\nSend `Accept: text/markdown` to get any page of this site as Markdown.\n");
@@ -609,14 +612,9 @@ fn llms_txt(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
     if !facts.pages.is_empty() {
         out.push_str("\n## Pages\n\n");
         for page in &facts.pages {
-            let _ = write!(
-                out,
-                "- [{}]({})",
-                one_line(&page.title),
-                origin.url(&page.path)
-            );
+            let _ = write!(out, "- [{}]({})", text(&page.title), origin.url(&page.path));
             if let Some(d) = page.description.as_deref().filter(|d| !d.trim().is_empty()) {
-                let _ = write!(out, ": {}", one_line(d));
+                let _ = write!(out, ": {}", text(d));
             }
             out.push('\n');
         }
@@ -1846,6 +1844,19 @@ mod tests {
         ] {
             assert!(doc.body.contains(want), "missing {want}:\n{}", doc.body);
         }
+    }
+
+    #[test]
+    fn llms_txt_titles_are_text() {
+        let mut facts = api_site();
+        facts.pages[0].title = "Docs](https://evil.example) [More".to_owned();
+        let doc = render(&facts, &origin(), LLMS_TXT_PATH).unwrap();
+        assert!(
+            doc.body
+                .contains(r"- [Docs\](https://evil.example) \[More](https://shop.example.com/"),
+            "{}",
+            doc.body
+        );
     }
 
     #[test]
