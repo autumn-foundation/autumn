@@ -3494,7 +3494,9 @@ fn rebuilt_enqueue_error(message: String, status: Option<u16>) -> AutumnError {
 #[cfg(feature = "reporting")]
 fn note_unrebuildable_enqueue_error(scope: &crate::capsule::CaptureScope, error: &AutumnError) {
     let rebuilt = rebuilt_enqueue_error(error.message(), Some(error.status().as_u16()));
-    if rebuilt.code() != error.code() {
+    // `details()` too: an empty field map has the plain error's code, but
+    // the rebuilt error has no details at all.
+    if rebuilt.code() != error.code() || error.details().is_some() {
         scope.note(
             "an enqueue failed with an error that replay cannot rebuild (field details or a \
              problem type); the capsule is not replayable",
@@ -14650,6 +14652,29 @@ mod tests {
                 &serde_json::json!({}),
                 EnqueueSchedule::Immediate,
                 Box::pin(async move { Err(AutumnError::validation(details)) }),
+            ),
+        )
+        .await;
+        assert!(scope.is_truncated());
+    }
+
+    /// Codex review on #3222: an empty field map has the plain error's
+    /// `code()`, but replay would give it no `details()`. Refused too.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn an_enqueue_error_with_an_empty_details_map_marks_the_capsule_incomplete() {
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let _ = crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            after_commit_seam(
+                "send_receipt",
+                &serde_json::json!({}),
+                EnqueueSchedule::Immediate,
+                Box::pin(async { Err(AutumnError::validation(std::collections::HashMap::new())) }),
             ),
         )
         .await;
