@@ -204,6 +204,11 @@ fn implied_close(tag: &str) -> &'static [&'static str] {
     }
 }
 
+/// Elements a document head can hold.
+const HEAD_CONTENT: &[&str] = &[
+    "base", "link", "meta", "noscript", "script", "style", "template", "title",
+];
+
 /// Elements that stop the search for an implied close (a `<li>` inside a
 /// nested `<ul>` must not close the outer `<li>`).
 const SCOPE: &[&str] = &["ul", "ol", "table", "dl", "select", "blockquote", "div"];
@@ -283,6 +288,14 @@ fn parse(html: &str) -> Doc {
                 stack.truncate(pos);
             }
             continue;
+        }
+
+        // An omitted `</head>`: a tag that cannot be in the head (`<body>`,
+        // `<main>`, ...) closes it, as in a browser.
+        if !HEAD_CONTENT.contains(&tag.name.as_str())
+            && let Some(pos) = stack.iter().rposition(|&id| doc.name(id) == Some("head"))
+        {
+            stack.truncate(pos);
         }
 
         // Implied end tags.
@@ -1282,6 +1295,18 @@ mod tests {
         assert_eq!(
             md("<template><main>tpl</main></template><main>real</main>"),
             "real\n"
+        );
+    }
+
+    #[test]
+    fn an_omitted_head_end_tag_does_not_swallow_the_body() {
+        assert_eq!(
+            md("<head><title>T</title><body><main>Visible</main>"),
+            "---\ntitle: \"T\"\n---\n\nVisible\n"
+        );
+        assert_eq!(
+            md("<html><head><meta name=description content=d><p>Body text"),
+            "---\ndescription: \"d\"\n---\n\nBody text\n"
         );
     }
 
