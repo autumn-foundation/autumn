@@ -978,7 +978,9 @@ What capsules do not do, stated plainly:
   stops, or a fill that cannot read the shared epoch, also marks it incomplete.
   A direct `Cache::get_value`, `insert_value`, `insert_raw_bytes` or
   `insert_raw_bytes_if_epoch` call on
-  the installed cache also marks it incomplete: the call is not recorded. Use
+  the installed cache also marks it incomplete: the call is not recorded.
+  During `autumn replay` such a call is a miss and an unrecorded divergence;
+  it does not stand in for a read a helper recorded. Use
   `cache::get_cached` and `cache::insert_cached`.
 - **A raw cache backend skips the seam.** The framework wraps every cache it
   installs (`with_cache_backend`, `set_global_cache`, `with_cache`,

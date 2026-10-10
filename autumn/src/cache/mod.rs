@@ -1130,10 +1130,11 @@ impl Cache for CapsuleSeamCache {
     fn get_value(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
         let direct = !HELPER_CALL.with(std::cell::Cell::get);
         // A helper read with a tape never gets here, so with a tape this is a
-        // direct read: a divergence, as capture refuses such a capsule.
+        // direct read: a divergence, as capture refuses such a capsule. It
+        // does not consume a read a helper recorded.
         if let Some(tape) = crate::capsule::effects::current_tape() {
             if direct {
-                tape.cache_untyped_get(key);
+                tape.cache_direct_get(key);
             }
             return None;
         }
@@ -2029,6 +2030,46 @@ mod tests {
             },
         ));
         assert!(scope.is_truncated());
+    }
+
+    /// Codex review on #3222: a direct `get_value` during a replay is an
+    /// unrecorded read. It does not consume a read a helper recorded:
+    /// capture refuses a capsule with a direct read.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_direct_read_on_replay_is_a_divergence_not_a_helper_read() {
+        let cache = with_capsule_seam(Arc::new(SpyBackend::default()) as Arc<dyn Cache>);
+        let recorded = crate::capsule::CapsuleEffects {
+            cache: vec![crate::capsule::CacheEffect::Get {
+                key: "user:7".to_owned(),
+                value: None,
+            }],
+            ..Default::default()
+        };
+        let tape = Arc::new(crate::capsule::ReplayEffects::new(recorded));
+        block_on(crate::capsule::with_effect_tape(Arc::clone(&tape), async {
+            assert!(cache.get_value("user:7").is_none());
+        }));
+        let finished = tape.finish();
+        assert!(
+            finished
+                .iter()
+                .any(|divergence| divergence.actual.contains("direct cache read")),
+            "{finished:?}"
+        );
+        assert!(
+            !finished
+                .iter()
+                .any(|divergence| divergence.actual.contains("user:7")),
+            "the key is withheld: {finished:?}"
+        );
+        assert!(
+            finished
+                .iter()
+                .any(|divergence| divergence.kind
+                    == crate::capsule::EffectDivergenceKind::Unconsumed),
+            "the helper's recorded read is still owed: {finished:?}"
+        );
     }
 
     /// Review fix: during a replay the wrapper reaches the backend for no

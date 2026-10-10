@@ -932,10 +932,30 @@ impl ReplayEffects {
         });
     }
 
-    /// Log work the replayed run started on a detached task. Capture marks
-    /// a capsule with detached work incomplete, so the recording had none.
-    /// It is logged at the spawn, so the verdict sees it even when the task
-    /// runs after the response.
+    /// Log a direct `Cache::get_value` made during replay, outside the
+    /// cache helpers.
+    ///
+    /// Capture marks a capsule with a direct read incomplete, so the
+    /// recording had none. The read does not consume a read a helper
+    /// recorded for the same key.
+    pub(crate) fn cache_direct_get(&self, key: &str) {
+        if self.legacy_v3 {
+            return;
+        }
+        // As for an untyped write: no recorded key teaches the verdict what
+        // to mask, so the key is not printed.
+        let _ = key;
+        self.diverge(EffectDivergence {
+            seam: EffectSeam::Cache,
+            kind: EffectDivergenceKind::Unrecorded,
+            index: 0,
+            expected: None,
+            actual: "a direct cache read (key withheld)".to_owned(),
+            detail: "the replayed run read the cache backend directly rather than through                      a cache helper; a capsule cannot record such a read, so it was a miss"
+                .to_owned(),
+        });
+    }
+
     /// Count a `register_after_commit` callback (#2351 item 3).
     pub(crate) fn after_commit_registered(&self) {
         self.after_commit.fetch_add(1, Ordering::SeqCst);
@@ -952,6 +972,10 @@ impl ReplayEffects {
         self.after_commit.load(Ordering::SeqCst) > 0
     }
 
+    /// Log work the replayed run started on a detached task. Capture marks
+    /// a capsule with detached work incomplete, so the recording had none.
+    /// It is logged at the spawn, so the verdict sees it even when the task
+    /// runs after the response.
     pub(crate) fn detached_work_started(&self) {
         if self.legacy_v3 {
             return;
@@ -2440,6 +2464,7 @@ mod tests {
         assert_eq!(tape.cache_invalidate_namespace("ns"), Ok(()));
         tape.cache_untyped_insert("k");
         tape.cache_untyped_get("k");
+        tape.cache_direct_get("k");
         assert_eq!(tape.tenant(), super::TenantVerdict::Unchecked);
         assert!(tape.finish().is_empty(), "{:?}", tape.finish());
     }
