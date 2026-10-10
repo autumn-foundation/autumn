@@ -30,7 +30,9 @@ pub const fn estimate_tokens(markdown: &str) -> usize {
 pub fn html_to_markdown(html: &str) -> String {
     let doc = parse(html);
     let mut out = String::new();
-    let title = doc.find("title").map(|t| doc.text_of(t));
+    let title = doc
+        .find_metadata(|id| doc.name(id) == Some("title"))
+        .map(|t| doc.text_of(t));
     let description = doc.meta_description();
     let title = title.map(|t| collapse_ws(&t)).filter(|t| !t.is_empty());
     let description = description
@@ -109,9 +111,23 @@ impl Doc {
         }
     }
 
-    /// First element named `name`, in document order.
-    fn find(&self, name: &str) -> Option<usize> {
-        (1..self.nodes.len()).find(|&id| self.name(id) == Some(name))
+    /// First element that `want` accepts, in document order, outside hidden
+    /// elements and `<template>`, `<svg>` and `<math>`: a title in those is
+    /// not the page's.
+    fn find_metadata(&self, want: impl Fn(usize) -> bool) -> Option<usize> {
+        let mut stack = vec![ROOT];
+        while let Some(id) = stack.pop() {
+            if let Some(n) = self.name(id) {
+                if id != ROOT && (is_hidden(self, id) || matches!(n, "template" | "svg" | "math")) {
+                    continue;
+                }
+                if want(id) {
+                    return Some(id);
+                }
+            }
+            stack.extend(self.nodes[id].children.iter().rev());
+        }
+        None
     }
 
     /// First element named `name` that is not hidden and not inside a
@@ -133,14 +149,13 @@ impl Doc {
     }
 
     fn meta_description(&self) -> Option<String> {
-        (1..self.nodes.len())
-            .find(|&id| {
-                self.name(id) == Some("meta")
-                    && self
-                        .attr(id, "name")
-                        .is_some_and(|n| n.eq_ignore_ascii_case("description"))
-            })
-            .and_then(|id| self.attr(id, "content").map(str::to_owned))
+        self.find_metadata(|id| {
+            self.name(id) == Some("meta")
+                && self
+                    .attr(id, "name")
+                    .is_some_and(|n| n.eq_ignore_ascii_case("description"))
+        })
+        .and_then(|id| self.attr(id, "content").map(str::to_owned))
     }
 
     /// All text below `id`, without markup.
@@ -1243,6 +1258,18 @@ mod tests {
         let out = md(&html);
         assert!(!out.contains("secret"), "{out}");
         assert!(out.contains("ok"), "{out}");
+    }
+
+    #[test]
+    fn front_matter_skips_hidden_metadata() {
+        let out = md("<template><title>secret</title>\
+             <meta name=\"description\" content=\"hidden\"></template>\
+             <svg><title>icon</title></svg><title>real</title>\
+             <meta name=\"description\" content=\"shown\"><p>x</p>");
+        assert_eq!(
+            out,
+            "---\ntitle: \"real\"\ndescription: \"shown\"\n---\n\nx\n"
+        );
     }
 
     #[test]

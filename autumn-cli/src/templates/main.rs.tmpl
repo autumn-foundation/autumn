@@ -42,7 +42,8 @@ pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: mau
                 // Agent readiness: the ARD link and the WebMCP script, which
                 // lets in-browser AI agents call the app's read-only MCP
                 // tools. Pass the CSRF token as the second argument to allow
-                // write tools too.
+                // write tools too. Remove this line if you set
+                // `[aeo] enabled = false`: both URLs then answer 404.
                 (autumn_web::aeo::webmcp::head_tags(None, None))
             }
             body {

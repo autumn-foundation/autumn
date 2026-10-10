@@ -274,6 +274,9 @@ visitor first. The script sends each call to
 the MCP endpoint with the page cookies and the CSRF token. Auth, CSRF, and
 rate limits apply to the call.
 
+The tags point at AEO documents, so remove them if you set
+`[aeo] enabled = false`: the script and the catalog then answer `404`.
+
 For a plain HTML form, add the declarative attributes:
 
 ```rust

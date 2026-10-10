@@ -169,9 +169,11 @@ impl Validators {
         })
     }
 
-    /// `res` as a `304` when these validators match it.
+    /// `res` as a `304` when these validators match it. A `206` carries the
+    /// whole representation's validators, and a condition is evaluated
+    /// before `Range` (RFC 9110 §13.2.2).
     fn apply(&self, res: Response) -> Response {
-        if res.status() == StatusCode::OK
+        if matches!(res.status(), StatusCode::OK | StatusCode::PARTIAL_CONTENT)
             && crate::etag::validators_match(
                 &self.if_none_match,
                 self.if_modified_since.as_ref(),
@@ -638,6 +640,22 @@ mod tests {
             "a stripped body says nothing"
         );
         assert!(known_to_fit(&Response::new(Body::from("<p>x</p>")), 10));
+    }
+
+    #[test]
+    fn a_matching_validator_turns_a_partial_response_into_304() {
+        let mut headers = HeaderMap::new();
+        headers.insert(IF_NONE_MATCH, HeaderValue::from_static("\"h1\""));
+        let validators = Validators::take(&mut headers).unwrap();
+        let partial = |etag: &'static str| {
+            let mut res = Response::new(Body::from("abc"));
+            *res.status_mut() = StatusCode::PARTIAL_CONTENT;
+            res.headers_mut()
+                .insert(axum::http::header::ETAG, HeaderValue::from_static(etag));
+            res
+        };
+        assert_eq!(validators.apply(partial("\"h1\"")).status(), 304);
+        assert_eq!(validators.apply(partial("\"h2\"")).status(), 206);
     }
 
     #[test]
