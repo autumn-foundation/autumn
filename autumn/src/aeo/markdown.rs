@@ -418,6 +418,7 @@ fn parse(html: &str) -> Doc {
                 i = body_end + end_tag_len(&html[body_end..]);
             } else {
                 let hides = DROP.contains(&tag.name.as_str())
+                    || (tag.name == "dialog" && !tag.attrs.iter().any(|(k, _)| k == "open"))
                     || tag.attrs.iter().any(|(k, v)| {
                         k == "hidden" || (k == "aria-hidden" && v.eq_ignore_ascii_case("true"))
                     });
@@ -825,7 +826,7 @@ impl Dropped {
 /// Elements dropped with their content.
 const DROP: &[&str] = &[
     "head", "script", "style", "noscript", "template", "svg", "math", "iframe", "object", "canvas",
-    "nav", "button", "input", "select", "textarea", "option", "dialog", "title",
+    "nav", "button", "input", "select", "textarea", "option", "title",
 ];
 
 const BLOCK: &[&str] = &[
@@ -1184,6 +1185,8 @@ fn is_hidden(doc: &Doc, id: usize) -> bool {
         || doc
             .attr(id, "aria-hidden")
             .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+        // A `<dialog>` shows only while `open`.
+        || (doc.name(id) == Some("dialog") && doc.attr(id, "open").is_none())
 }
 
 /// Collapse inline whitespace; keep the hard breaks that `<br>` wrote.
@@ -1618,6 +1621,16 @@ mod tests {
             "Hello  \n\\# not a heading  \n\\- not a list  \n1\\. not a list\n"
         );
         assert_eq!(md("<p>Hello<br> # indented</p>"), "Hello  \n\\# indented\n");
+    }
+
+    #[test]
+    fn only_an_open_dialog_is_content() {
+        let out = md("<main><p>Page</p><dialog open><p>Confirm?</p></dialog>\
+             <dialog><p>secret</p></dialog></main>");
+        assert!(out.contains("Confirm?") && !out.contains("secret"), "{out}");
+        let deep = "<div>".repeat(300) + "<dialog>secret</dialog><dialog open>shown</dialog>";
+        let out = md(&deep);
+        assert!(out.contains("shown") && !out.contains("secret"), "{out}");
     }
 
     #[test]

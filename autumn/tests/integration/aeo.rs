@@ -365,6 +365,36 @@ async fn llms_txt_lists_seo_pages() {
     );
 }
 
+/// `autumn build` renders pages and agent documents with no `Host`, under
+/// the `prod` profile, whose trusted-host check refuses a request with none.
+/// A build render is internal, so it passes; a live request still does not.
+#[tokio::test]
+async fn an_internal_render_needs_no_host_under_prod() {
+    use autumn_web::reexports::axum::body::Body;
+    use autumn_web::reexports::http::Request;
+    use tower::ServiceExt as _;
+
+    let mut config = AutumnConfig::default();
+    config.seo.base_url = Some("https://example.com".to_owned());
+    let router = TestApp::new()
+        .config(config)
+        .profile("prod")
+        .routes(routes![home])
+        .build()
+        .into_router();
+    for path in ["/", "/llms.txt"] {
+        let render = Request::get(path)
+            .extension(autumn_web::static_gen::RenderDeadlineExempt)
+            .body(Body::empty())
+            .unwrap();
+        let res = router.clone().oneshot(render).await.unwrap();
+        assert_eq!(res.status(), 200, "{path}: a build render is internal");
+        let live = Request::get(path).body(Body::empty()).unwrap();
+        let res = router.clone().oneshot(live).await.unwrap();
+        assert_eq!(res.status(), 400, "{path}: a live request needs a Host");
+    }
+}
+
 #[tokio::test]
 async fn an_app_route_wins_over_a_generated_document() {
     let res = TestApp::new()

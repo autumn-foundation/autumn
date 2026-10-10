@@ -6049,6 +6049,17 @@ fn trusted_host_rejection<B>(
     if host.is_none() && !host_source_present && policy.allow_missing_host {
         return None;
     }
+    // A build render (`autumn build`, an ISR refresh) is made in process and
+    // carries no `Host`. Only server code can attach the marker, so a client
+    // request can never take this branch.
+    if !host_source_present
+        && req
+            .extensions()
+            .get::<crate::static_gen::RenderDeadlineExempt>()
+            .is_some()
+    {
+        return None;
+    }
     if host.as_deref().is_some_and(|host| policy.allows_host(host)) {
         return None;
     }
