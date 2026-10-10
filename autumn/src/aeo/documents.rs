@@ -206,14 +206,9 @@ impl AgentSkill {
             .split_once("\n---\n")
             .or_else(|| rest.split_once("\r\n---\r\n"))
             .ok_or(AgentSkillError::MissingFrontMatter)?;
-        let field = |key: &str| {
-            front.lines().find_map(|line| {
-                let value = line.strip_prefix(key)?.strip_prefix(':')?.trim();
-                Some(yaml_unquote(value))
-            })
-        };
-        let name = field("name").ok_or(AgentSkillError::MissingFrontMatter)?;
-        let description = field("description").ok_or(AgentSkillError::MissingFrontMatter)?;
+        let name = front_matter_field(front, "name").ok_or(AgentSkillError::MissingFrontMatter)?;
+        let description =
+            front_matter_field(front, "description").ok_or(AgentSkillError::MissingFrontMatter)?;
         let body = body
             .strip_prefix("\r\n")
             .or_else(|| body.strip_prefix('\n'))
@@ -979,6 +974,109 @@ fn yaml_quote(s: &str) -> String {
     out
 }
 
+/// The value of the top-level `key` in YAML front matter. It reads what a
+/// `SKILL.md` writes: a plain or quoted scalar, with indented continuation
+/// lines folded in; a block scalar (`|` or `>`, with `-` or `+` chomping);
+/// and a ` #` comment after a plain value.
+fn front_matter_field(front: &str, key: &str) -> Option<String> {
+    let lines: Vec<&str> = front.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.strip_prefix(key).is_some_and(|r| r.starts_with(':')))?;
+    let value = lines[at][key.len() + 1..].trim();
+    // A value goes on over indented and blank lines, up to the next key.
+    let mut more: Vec<&str> = lines[at + 1..]
+        .iter()
+        .take_while(|l| l.trim().is_empty() || l.starts_with([' ', '\t']))
+        .copied()
+        .collect();
+    if let Some((folded, chomp)) = block_scalar_header(value) {
+        return Some(block_scalar(&more, folded, chomp));
+    }
+    while more.last().is_some_and(|l| l.trim().is_empty()) {
+        more.pop();
+    }
+    let joined = fold_lines(std::iter::once(value).chain(more.iter().map(|l| l.trim())));
+    if joined.starts_with(['"', '\'']) {
+        return Some(yaml_unquote(&joined));
+    }
+    // A plain value ends at a comment.
+    let plain = joined.find(" #").map_or(joined.as_str(), |n| &joined[..n]);
+    Some(plain.trim_end().to_owned())
+}
+
+/// `|` or `>` with an optional chomping (`-`, `+`) and indentation digit:
+/// whether it folds, and its chomping (`' '` to clip).
+fn block_scalar_header(value: &str) -> Option<(bool, char)> {
+    let value = value.split(" #").next().unwrap_or(value).trim_end();
+    let mut chars = value.chars();
+    let folded = match chars.next()? {
+        '>' => true,
+        '|' => false,
+        _ => return None,
+    };
+    let mut chomp = ' ';
+    for c in chars {
+        match c {
+            '-' | '+' if chomp == ' ' => chomp = c,
+            '1'..='9' => {}
+            _ => return None,
+        }
+    }
+    Some((folded, chomp))
+}
+
+/// A block scalar's lines, without their common indent, kept (`|`) or
+/// folded (`>`), then chomped.
+fn block_scalar(lines: &[&str], folded: bool, chomp: char) -> String {
+    let indent = lines
+        .iter()
+        .find(|l| !l.trim().is_empty())
+        .map_or(0, |l| l.len() - l.trim_start().len());
+    let mut body: Vec<&str> = lines
+        .iter()
+        .map(|l| l.get(indent..).unwrap_or("").trim_end_matches('\r'))
+        .collect();
+    let mut trailing = 0;
+    while body.last().is_some_and(|l| l.trim().is_empty()) {
+        body.pop();
+        trailing += 1;
+    }
+    let mut text = if folded {
+        fold_lines(body.iter().copied())
+    } else {
+        body.join("\n")
+    };
+    if !text.is_empty() {
+        match chomp {
+            '-' => {}
+            '+' => text.push_str(&"\n".repeat(trailing + 1)),
+            _ => text.push('\n'),
+        }
+    }
+    text
+}
+
+/// YAML line folding: a break between two lines is a space, and each blank
+/// line is a newline.
+fn fold_lines<'a>(lines: impl Iterator<Item = &'a str>) -> String {
+    let mut out = String::new();
+    let mut after_text = false;
+    for line in lines {
+        if line.is_empty() {
+            out.push('\n');
+            after_text = false;
+        } else {
+            if after_text {
+                out.push(' ');
+            }
+            out.push_str(line);
+            after_text = true;
+        }
+    }
+    out
+}
+
 fn yaml_unquote(value: &str) -> String {
     let quoted = value.len() >= 2
         && ((value.starts_with('"') && value.ends_with('"'))
@@ -1428,6 +1526,31 @@ mod tests {
         assert_eq!(skill.name(), "a-b");
         assert_eq!(skill.description(), "Does a thing: well");
         assert!(AgentSkill::parse("no front matter").is_err());
+    }
+
+    #[test]
+    fn skill_parse_reads_block_and_multi_line_scalars() {
+        let parse = |front: &str| {
+            AgentSkill::parse(&format!("---\nname: a\n{front}\nlicense: MIT\n---\nBody\n"))
+                .unwrap()
+                .description()
+                .to_owned()
+        };
+        assert_eq!(
+            parse("description: >-\n  Folded\n  text.\n\n  Next."),
+            "Folded text.\nNext."
+        );
+        assert_eq!(parse("description: |\n  one\n  two"), "one\ntwo\n");
+        assert_eq!(parse("description: |- # note\n  kept"), "kept");
+        assert_eq!(
+            parse("description: A long\n  plain value # note"),
+            "A long plain value"
+        );
+        assert_eq!(
+            parse("description: \"A long\n  quoted one\""),
+            "A long quoted one"
+        );
+        assert_eq!(parse("description: Plain\n\n"), "Plain");
     }
 
     #[test]

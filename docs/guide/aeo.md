@@ -128,6 +128,8 @@ Autumn converts the page to Markdown:
 
 - It converts `<main>`, else `<body>`.
 - It drops scripts, styles, navigation, form controls, and hidden elements.
+  A closed `<dialog>` counts as hidden. A closed `<details>` keeps its
+  content, because a reader can open it.
 - It puts `<title>` and the description meta tag in YAML front matter.
 
 The response carries these headers:
