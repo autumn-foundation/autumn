@@ -998,11 +998,29 @@ fn front_matter_field(front: &str, key: &str) -> Option<String> {
     }
     let joined = fold_lines(std::iter::once(value).chain(more.iter().map(|l| l.trim())));
     if joined.starts_with(['"', '\'']) {
-        return Some(yaml_unquote(&joined));
+        // Up to the closing quote: a comment may follow it.
+        return Some(yaml_unquote(quoted_scalar(&joined)));
     }
     // A plain value ends at a comment.
     let plain = joined.find(" #").map_or(joined.as_str(), |n| &joined[..n]);
     Some(plain.trim_end().to_owned())
+}
+
+/// The quoted scalar at the start of `s`, quotes included. In `"..."` a
+/// `\"` is not the end; in `'...'` a `''` is not.
+fn quoted_scalar(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let quote = bytes[0];
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if quote == b'"' => i += 2,
+            b'\'' if quote == b'\'' && bytes.get(i + 1) == Some(&b'\'') => i += 2,
+            b if b == quote => return &s[..=i],
+            _ => i += 1,
+        }
+    }
+    s
 }
 
 /// `|` or `>` with an optional chomping (`-`, `+`) and indentation digit:
@@ -1551,6 +1569,15 @@ mod tests {
             "A long quoted one"
         );
         assert_eq!(parse("description: Plain\n\n"), "Plain");
+        assert_eq!(
+            parse("description: \"Draft refunds.\" # note"),
+            "Draft refunds."
+        );
+        assert_eq!(
+            parse("description: \"Say \\\"hi\\\"\" # note"),
+            "Say \"hi\""
+        );
+        assert_eq!(parse("description: 'It''s here' # note"), "It's here");
     }
 
     #[test]

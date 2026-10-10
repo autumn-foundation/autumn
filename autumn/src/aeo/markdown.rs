@@ -826,7 +826,7 @@ impl Dropped {
 /// Elements dropped with their content.
 const DROP: &[&str] = &[
     "head", "script", "style", "noscript", "template", "svg", "math", "iframe", "object", "canvas",
-    "nav", "button", "input", "select", "textarea", "option", "title",
+    "nav", "button", "input", "select", "textarea", "option", "title", "noembed", "noframes",
 ];
 
 const BLOCK: &[&str] = &[
@@ -1631,6 +1631,12 @@ mod tests {
         let deep = "<div>".repeat(300) + "<dialog>secret</dialog><dialog open>shown</dialog>";
         let out = md(&deep);
         assert!(out.contains("shown") && !out.contains("secret"), "{out}");
+    }
+
+    #[test]
+    fn fallback_content_is_not_published() {
+        let out = md("<p>shown</p><noembed>secret</noembed><noframes>secret</noframes>");
+        assert_eq!(out, "shown\n");
     }
 
     #[test]
