@@ -5295,8 +5295,7 @@ impl AppBuilder {
         #[cfg(feature = "sqlite")]
         let fleet_shutdown = tokio_util::sync::CancellationToken::new();
         #[cfg(feature = "sqlite")]
-        let mut fleet_maintenance =
-            start_fleet_runtime(&state, role.runs_workers(), fleet_shutdown.clone());
+        let mut fleet_maintenance = start_fleet_runtime(&state, fleet_shutdown.clone());
 
         // The replication loop runs on a dedicated OS thread, not a
         // `spawn_blocking` task: it lives for the whole process and does blocking
@@ -8228,7 +8227,7 @@ impl AppBuilder {
             );
         }
         #[cfg(feature = "sqlite")]
-        let fleet_maintenance = start_fleet_runtime(&state, true, task_shutdown.child_token());
+        let fleet_maintenance = start_fleet_runtime(&state, task_shutdown.child_token());
 
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
             eprintln!("startup hook failed: {error}");
@@ -13050,22 +13049,26 @@ fn apply_pending_sqlite_or_exit(
 }
 
 /// Start the per-process work of a `[database.fleet]` (ADR 0019): a commit-hook
-/// worker for each database while it is open (when this role runs workers),
-/// and the idle sweeper, which closes every database when `shutdown` fires.
-/// `None` when the app has no fleet.
+/// worker for each database while it is open, and the idle sweeper, which
+/// closes every database when `shutdown` fires. `None` when the app has no
+/// fleet.
+///
+/// The hook worker runs in every role, `web` included. A fleet database's
+/// queue can only be drained by a process that has the database open, and a
+/// `worker` process does not discover fleet databases, so gating this on the
+/// role would leave a `web` process's after-commit hooks pending forever.
+/// Rows are claimed one at a time under `BEGIN IMMEDIATE` with a lease, so two
+/// processes draining one database is safe.
 #[cfg(feature = "sqlite")]
 fn start_fleet_runtime(
     state: &AppState,
-    runs_workers: bool,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let fleet = state.shards()?.fleet()?.clone();
-    if runs_workers {
-        fleet.add_lifecycle(Arc::new(FleetCommitHookWorkers {
-            #[cfg(feature = "ws")]
-            channels: state.channels().clone(),
-        }));
-    }
+    fleet.add_lifecycle(Arc::new(FleetCommitHookWorkers {
+        #[cfg(feature = "ws")]
+        channels: state.channels().clone(),
+    }));
     Some(fleet.spawn_maintenance(shutdown))
 }
 
@@ -14652,6 +14655,47 @@ mod fleet_boot_tests {
         .await
         .unwrap()
         .n == 1
+    }
+
+    /// A symlinked fleet root that resolves to the control database's
+    /// directory passes the lexical config check, so boot compares the
+    /// canonical paths: tenant `control` must never open the control database.
+    #[cfg(unix)]
+    #[test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "fleet path templates use {placeholders}"
+    )]
+    fn boot_refuses_a_fleet_root_that_aliases_the_control_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let link = tmp.path().join("fleet-link");
+        std::os::unix::fs::symlink(&data, &link).unwrap();
+        let mut config = AutumnConfig {
+            profile: Some("dev".into()),
+            ..AutumnConfig::default()
+        };
+        config.database.url = Some(format!("sqlite://{}", data.join("control.db").display()));
+        config.database.fleet = Some(crate::config::DatabaseFleetConfig {
+            mode: crate::fleet_layout::FleetMode::Tenant,
+            root: link.display().to_string(),
+            path: Some("{tenant}.db".to_owned()),
+            max_open: 4,
+            pool_size: 1,
+            create_on_demand: None,
+            idle_close_secs: 0,
+            restore_missing: false,
+        });
+        config
+            .database
+            .validate()
+            .expect("lexically, the paths differ");
+        let Err(err) = crate::db::fleet::build_for_app(&config, Arc::new(Vec::new()), |_| true)
+        else {
+            panic!("a fleet root aliasing the control database must be refused");
+        };
+        assert!(err.contains("control database"), "{err}");
     }
 
     /// The boot path builds the fleet from the same folded list it migrates

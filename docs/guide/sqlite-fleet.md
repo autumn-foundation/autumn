@@ -201,8 +201,9 @@ replicating, the worst lag and which database has it.
 - The outbox relay, derivation backfill, shard-local jobs and the job
   dashboard work on the control database, not on fleet databases. Enqueue
   through the control database.
-- Each open database runs its own commit-hook worker. Hooks queued in a
-  database drain when it is open, and resume on its next open.
+- Each open database runs its own commit-hook worker, in every process role
+  (`web` included: a `worker` process does not open fleet databases). Hooks
+  queued in a database drain while it is open, and resume on its next open.
 - A replicated database takes a fresh base snapshot each time it reopens.
   Size `max_open` so busy tenants stay open.
 - A deleted database's replica stays in object storage until you remove it.

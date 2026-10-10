@@ -157,7 +157,10 @@ roadmap item 2).
 The outbox relay, derivation backfill, the job dashboard and shard-local jobs
 enumerate configured shards at boot and do not visit fleet databases. The
 commit-hook queue does: each open database runs its own commit-hook worker,
-which stops when the database closes and resumes on the next open.
+which stops when the database closes and resumes on the next open. It runs in
+every process role, `web` included, because only a process that has the
+database open can drain its queue; rows are claimed under `BEGIN IMMEDIATE`
+with a lease, so two processes draining one database is safe.
 
 ## Consequences
 

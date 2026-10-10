@@ -2127,14 +2127,42 @@ pub(crate) fn build_for_app(
         config.database.auto_migrate,
         config.database.auto_migrate_in_production,
     );
-    DatabaseFleet::from_parts(
+    let fleet = DatabaseFleet::from_parts(
         fleet_config,
         config.database.connect_timeout_secs,
         FleetMigrations::new(all, keep, apply_on_open),
         DEFAULT_MIN_RESIDENCY,
     )
-    .map(Some)
-    .map_err(|e| format!("Failed to set up database.fleet: {e}"))
+    .map_err(|e| format!("Failed to set up database.fleet: {e}"))?;
+    // Config validation compares paths lexically; a symlinked root can still
+    // reach the control database. `root()` is canonical, so compare the
+    // control file's canonical path too.
+    if let Some(control) = config
+        .database
+        .effective_primary_url()
+        .and_then(crate::config::sqlite_url_file)
+        .and_then(|path| canonical_target(&path))
+        && control.starts_with(fleet.root())
+    {
+        return Err(format!(
+            "Failed to set up database.fleet: the control database {} resolves inside \
+             database.fleet.root {}; a tenant or slot path could open it. Put the control \
+             database outside the fleet root",
+            control.display(),
+            fleet.root().display()
+        ));
+    }
+    Ok(Some(fleet))
+}
+
+/// `path` with every symlink resolved: the file itself when it exists, else
+/// its canonical parent plus the file name. `None` when the parent is missing
+/// too (then nothing under the root can alias it yet).
+fn canonical_target(path: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(path).ok().or_else(|| {
+        let parent = std::fs::canonicalize(path.parent()?).ok()?;
+        Some(parent.join(path.file_name()?))
+    })
 }
 
 #[cfg(test)]

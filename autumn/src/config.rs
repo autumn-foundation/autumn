@@ -10937,7 +10937,7 @@ impl DatabaseConfig {
 /// The file a file-backed `sqlite:` URL names, made absolute without touching
 /// the file system. `None` for an in-memory target. Mirrors how the pool
 /// normalizes a target (`sqlite://`, `sqlite:` or `file:`, query dropped).
-fn sqlite_url_file(url: &str) -> Option<PathBuf> {
+pub(crate) fn sqlite_url_file(url: &str) -> Option<PathBuf> {
     if is_in_memory_sqlite_target(url) {
         return None;
     }
