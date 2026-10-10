@@ -8506,10 +8506,14 @@ impl AppBuilder {
             install_i18n_bundle_layer(custom_layers, &state, i18n_bundle, &config.i18n);
 
         install_webhook_registry(&state, &config);
+        // Before the initializers, as production installs its mailer, so an
+        // initializer that reads the `Mailer` sees the same configuration.
+        #[cfg(feature = "mail")]
+        crate::mail::install_replay_mailer(&state, &config.mail, builder_mail_queue);
         run_state_initializers(state_initializers, &state);
-        // After the initializers, so it replaces a live `Mailer` one of them
-        // installed; before the router state is cloned, so a job replay gets
-        // it too (#2351 item 7).
+        // Again after the initializers, so it replaces a live `Mailer` one of
+        // them installed; before the router state is cloned, so a job replay
+        // gets it too (#2351 item 7).
         #[cfg(feature = "mail")]
         crate::mail::install_replay_mailer(&state, &config.mail, builder_mail_queue);
         crate::cost::install(&state, &config);
@@ -17359,12 +17363,22 @@ mod tests {
     fn replay_installs_a_tape_backed_mailer() {
         let source = include_str!("app.rs").replace("\r\n", "\n");
         let handler = replay_mode_source(&source);
+        let install =
+            "crate::mail::install_replay_mailer(&state, &config.mail, builder_mail_queue);";
         assert!(
-            handler.contains(
-                "crate::mail::install_replay_mailer(&state, &config.mail, builder_mail_queue);"
-            ),
+            handler.contains(install),
             "the replay handler must install the tape-backed mailer"
         );
+        // Codex review on #3222: production installs the mailer before the
+        // state initializers, so an initializer can read it. Replay does too,
+        // and again after them, to replace a live one an initializer installed.
+        let initializers = handler
+            .find("run_state_initializers(state_initializers, &state);")
+            .expect("the replay handler runs the state initializers");
+        let first = handler.find(install).expect("installed");
+        let last = handler.rfind(install).expect("installed");
+        assert!(first < initializers, "installed before the initializers");
+        assert!(last > initializers, "and again after them");
     }
 
     /// The knobs the helper forces, checked on a real configuration rather than

@@ -6769,6 +6769,28 @@ mod tests {
         assert!(queue.enqueue(mail).await.is_err());
     }
 
+    /// Codex review on #3222: replay installs its mailer before the state
+    /// initializers and again after them. The second install keeps what the
+    /// first one took from the config.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_second_replay_mailer_install_keeps_the_first() {
+        let state = AppState::for_test();
+        let config = MailConfig {
+            transport: Transport::Disabled,
+            from: Some("app@example.com".to_owned()),
+            inline_css: true,
+            ..MailConfig::default()
+        };
+        install_replay_mailer(&state, &config, true);
+        install_replay_mailer(&state, &MailConfig::default(), false);
+        let replay = state.extension::<Mailer>().expect("installed");
+        assert!(replay.is_disabled());
+        assert!(replay.has_durable_delivery_queue());
+        assert_eq!(replay.defaults.from.as_deref(), Some("app@example.com"));
+        assert!(replay.inline_css_default);
+    }
+
     /// Codex review on #3222: the production durability refusal is on the
     /// seam, so the replay mailer (which has no such guard) reproduces it.
     #[cfg(feature = "reporting")]
