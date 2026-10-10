@@ -329,7 +329,7 @@ http-body-util = "0.1"
 # compression-br features (used to precompute static CSS encodings once
 # instead of recompressing on every request — see `static_css_response`).
 flate2 = "1"
-brotli = "8"
+brotli = "9"
 bcrypt.workspace = true
 deadpool = { version = "0.13", default-features = false, features = ["managed", "rt_tokio_1"], optional = true }
 diesel = { workspace = true, optional = true }
