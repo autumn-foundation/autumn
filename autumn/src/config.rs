@@ -10949,8 +10949,10 @@ pub(crate) fn sqlite_url_file(url: &str) -> Option<PathBuf> {
     // (`%66leet` is `fleet`). After `//` comes an authority: empty
     // (`file:///abs`) or `localhost` names this host; `SQLite` refuses any
     // other, so there is no local file to compare.
+    // Any other spelling reaches `sqlite3_open` as a literal path: `?` and `#`
+    // are filename characters there, not a query.
     let path = rest.strip_prefix("file:").map_or_else(
-        || rest.split('?').next().unwrap_or_default().to_owned(),
+        || rest.to_owned(),
         |uri| {
             let uri = uri.strip_prefix("//").map_or(uri, |authority_and_path| {
                 let (authority, path) = authority_and_path.split_at(
@@ -20229,6 +20231,18 @@ path = "/healthz"
                 .to_string();
             assert!(err.contains("inside database.fleet.root"), "{url}: {err}");
         }
+        // Outside a `file:` URI, `?` is just a filename character: SQLite opens
+        // `/srv/fleet?data/control.db`, inside a root named `/srv/fleet?data`.
+        let mut literal = fleet_db(DatabaseFleetConfig {
+            root: "/srv/fleet?data".to_owned(),
+            ..fleet(FleetMode::Tenant)
+        });
+        literal.url = Some("sqlite:///srv/fleet?data/control.db".to_owned());
+        let err = literal
+            .validate()
+            .expect_err("a literal `?` path inside the root")
+            .to_string();
+        assert!(err.contains("inside database.fleet.root"), "{err}");
         // Beside the root (the documented layout) is fine, and so is a sibling
         // whose name merely starts with the root's.
         fleet_db(fleet(FleetMode::Tenant)).validate().unwrap();

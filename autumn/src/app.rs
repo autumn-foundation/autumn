@@ -13169,15 +13169,30 @@ fn fleet_control_target_identified(
     custom_pool_provider: bool,
     migration_url: Option<&str>,
 ) -> Result<(), String> {
-    if custom_pool_provider && migration_url.is_none() {
-        return Err(
+    if !custom_pool_provider {
+        return Ok(());
+    }
+    match migration_url {
+        None => Err(
             "database.fleet with a custom DatabasePoolProvider: the provider's topology must \
              name its control database with DatabaseTopology::with_migration_url(...), so the \
              fleet can refuse a control file inside database.fleet.root"
                 .to_owned(),
-        );
+        ),
+        Some(url)
+            if crate::config::DatabaseBackend::detect(url)
+                != Some(crate::config::DatabaseBackend::Sqlite)
+                || crate::config::sqlite_url_file(url).is_none() =>
+        {
+            Err(format!(
+                "database.fleet with a custom DatabasePoolProvider: the provider names its control \
+                 database as {}, which is not a file-backed sqlite: database; a fleet keeps \
+                 framework state (sessions, jobs, flags) there, so it must survive a restart",
+                crate::db_url::redact_target(url)
+            ))
+        }
+        Some(_) => Ok(()),
     }
-    Ok(())
 }
 
 /// Migrate every database of a `[database.fleet]` (ADR 0019) for the
@@ -14782,6 +14797,15 @@ mod fleet_boot_tests {
         assert!(err.contains("with_migration_url"), "{err}");
         fleet_control_target_identified(true, Some("sqlite:///srv/control.db"))
             .expect("named: checked against the root");
+        // Named, but not a file: framework state would vanish on restart.
+        for target in [
+            "sqlite::memory:",
+            "file::memory:?cache=shared",
+            "postgres://db/app",
+        ] {
+            let err = fleet_control_target_identified(true, Some(target)).unwrap_err();
+            assert!(err.contains("file-backed"), "{target}: {err}");
+        }
         fleet_control_target_identified(false, None)
             .expect("the built-in provider opens the configured url, already checked");
     }
