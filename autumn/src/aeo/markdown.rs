@@ -160,14 +160,20 @@ impl Doc {
         .and_then(|id| self.attr(id, "content").map(str::to_owned))
     }
 
-    /// All text below `id`, without markup.
+    /// The text below `id`, without markup, and without the descendants the
+    /// writer skips: hidden ones and dropped ones (`<script>`, ...).
     fn text_of(&self, id: usize) -> String {
         let mut out = String::new();
         let mut stack = vec![id];
         while let Some(n) = stack.pop() {
             match &self.nodes[n].kind {
                 Kind::Text(t) => out.push_str(t),
-                Kind::Element { .. } => stack.extend(self.nodes[n].children.iter().rev()),
+                Kind::Element { name, .. } => {
+                    if n != id && (is_hidden(self, n) || DROP.contains(&name.as_str())) {
+                        continue;
+                    }
+                    stack.extend(self.nodes[n].children.iter().rev());
+                }
             }
         }
         out
@@ -1276,6 +1282,18 @@ mod tests {
         assert_eq!(
             md("<template><main>tpl</main></template><main>real</main>"),
             "real\n"
+        );
+    }
+
+    #[test]
+    fn code_blocks_skip_hidden_descendants() {
+        assert_eq!(
+            md("<pre><code><span hidden>secret</span>visible<script>x()</script></code></pre>"),
+            "```\nvisible\n```\n"
+        );
+        assert_eq!(
+            md("<p><code>a<span aria-hidden=\"true\">b</span>c</code></p>"),
+            "`ac`\n"
         );
     }
 

@@ -270,8 +270,8 @@ impl Origin {
     /// paths are appended to the base, and the documents are public.
     #[must_use]
     pub fn resolve(base_url: Option<&str>, host_header: Option<&str>) -> Self {
-        if let Some(base) = base_url.map(|b| b.trim().trim_end_matches('/'))
-            && let Ok(url) = url::Url::parse(base)
+        if let Some(raw) = base_url.map(|b| b.trim().trim_end_matches('/'))
+            && let Ok(url) = url::Url::parse(raw)
             && let Some(host) = url.host_str()
             && matches!(url.scheme(), "http" | "https")
             && url.username().is_empty()
@@ -279,8 +279,11 @@ impl Origin {
             && url.query().is_none()
             && url.fragment().is_none()
         {
+            // The scheme as parsed (lowercase), the rest as written: the
+            // signing authority strips the default port by scheme.
+            let base = format!("{}{}", url.scheme(), &raw[url.scheme().len()..]);
             return Self {
-                base: base.to_owned(),
+                base,
                 host: host.to_ascii_lowercase(),
                 configured: true,
             };
@@ -1799,6 +1802,11 @@ mod tests {
         assert!(!o.is_request_authority(Some("www.example.com")));
         assert!(!o.is_request_authority(Some("example.com:8443")));
         assert!(!o.is_request_authority(None));
+
+        // A scheme in capitals still names the default port.
+        let o = Origin::resolve(Some("HTTPS://example.com:443"), None);
+        assert_eq!(o.signing_authority(), "example.com");
+        assert!(o.is_request_authority(Some("example.com")));
     }
 
     #[test]
