@@ -1031,7 +1031,9 @@ thread_local! {
 /// process replays a capsule.
 #[cfg(feature = "reporting")]
 fn offline() -> bool {
-    crate::capsule::effects::tape_active() || replay_blocked()
+    // Not `tape_active`: that marks the replay scope as entered. Only the
+    // reporting layer may do that.
+    crate::capsule::effects::current_tape().is_some() || replay_blocked()
 }
 
 /// Why a capsule with a removal of unknown result is not replayable.
@@ -1982,7 +1984,7 @@ mod tests {
         let tape = Arc::new(crate::capsule::ReplayEffects::new(
             crate::capsule::CapsuleEffects::default(),
         ));
-        block_on(crate::capsule::with_effect_tape(tape, async {
+        block_on(crate::capsule::with_effect_tape(Arc::clone(&tape), async {
             assert!(cache.get_value("k").is_none());
             cache.insert_value("k", Arc::new(1_u32));
             cache.insert_raw_bytes("k", b"1".to_vec(), None);
@@ -1991,8 +1993,12 @@ mod tests {
                 FillLockStatus::Unsupported
             );
             cache.release_fill_lock("k", "t");
+            assert_eq!(cache.fill_epoch("ns"), FillEpoch::Unsupported);
         }));
         assert!(spy.calls().is_empty(), "{:?}", spy.calls());
+        // Codex review on #3222: only the reporting layer enters the replay
+        // scope. A cache call must not, or the missing-layer warning is lost.
+        assert!(!tape.scope_entered());
     }
 
     /// An async removal takes its tape position when it first runs, the

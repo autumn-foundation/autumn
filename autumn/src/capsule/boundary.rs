@@ -449,7 +449,7 @@ mod tests {
         }
         let shadow = include_str!("../shadow/layer.rs");
         assert!(
-            shadow.contains("crate::capsule::effects::tape_active()"),
+            shadow.contains("crate::capsule::effects::current_tape().is_some()"),
             "a shadow mirror must not start during a replay"
         );
     }

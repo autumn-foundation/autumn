@@ -328,7 +328,9 @@ impl MirrorContext {
         // A mirror is not a handler effect, and its client is not the recorded
         // outbound seam: a replay starts none (#2351 item 1).
         #[cfg(feature = "reporting")]
-        if crate::capsule::effects::tape_active() {
+        // `current_tape`, not `tape_active`: only the reporting layer marks
+        // the replay scope as entered.
+        if crate::capsule::effects::current_tape().is_some() {
             return None;
         }
         #[cfg(feature = "http-client")]
