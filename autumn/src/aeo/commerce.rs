@@ -1138,7 +1138,15 @@ where
                         Err(failed) => return Ok(*failed),
                     }
                 }
-                None => return Ok(res),
+                None => {
+                    // Never settled, so not spent: the client may retry it.
+                    state
+                        .used
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .release(&key);
+                    return Ok(res);
+                }
             };
             let headers = res.headers_mut();
             if let Some(h) = receipt {

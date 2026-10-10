@@ -880,7 +880,15 @@ impl Writer {
         let text = tidy_inline(&self.line);
         self.line.clear();
         if !text.is_empty() {
-            self.blocks.push(escape_line_start(text));
+            // A `<br>` starts a new Markdown line, which can start a block
+            // too, so each line is escaped, not only the first. Its leading
+            // spaces go: a browser collapses them, and an indented `#` is
+            // still a heading.
+            let lines: Vec<String> = text
+                .split('\n')
+                .map(|line| escape_line_start(line.trim_start_matches(' ').to_owned()))
+                .collect();
+            self.blocks.push(lines.join("\n"));
         }
     }
 
@@ -1277,8 +1285,8 @@ fn escape_entity_like(s: &str) -> String {
     out
 }
 
-/// Escape a marker at the start of a paragraph that Markdown would read as
-/// a heading, quote, list, or rule.
+/// Escape a marker at the start of a paragraph line that Markdown would
+/// read as a heading, quote, list, or rule.
 fn escape_line_start(text: String) -> String {
     let first = text.chars().next();
     if matches!(first, Some('#' | '>' | '-' | '+' | '=')) {
@@ -1601,6 +1609,15 @@ mod tests {
         let deep = "<div>".repeat(300) + "<script>x</script x='<b>secret</b>'>ok";
         let out = md(&deep);
         assert!(!out.contains("secret") && out.contains("ok"), "{out}");
+    }
+
+    #[test]
+    fn a_marker_after_a_line_break_is_escaped() {
+        assert_eq!(
+            md("<p>Hello<br># not a heading<br>- not a list<br>1. not a list</p>"),
+            "Hello  \n\\# not a heading  \n\\- not a list  \n1\\. not a list\n"
+        );
+        assert_eq!(md("<p>Hello<br> # indented</p>"), "Hello  \n\\# indented\n");
     }
 
     #[test]

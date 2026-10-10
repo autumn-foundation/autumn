@@ -1002,20 +1002,22 @@ mod commerce {
             let required =
                 decode_header(c.get(path).send().await.header("payment-required").unwrap())
                     .unwrap();
-            // One payment per request: a header works only once.
             let payment = encode_header(&json!({
                 "x402Version": 2,
                 "accepted": required["accepts"][0],
                 "payload": { "signature": format!("0xsig{path}") },
             }));
-            let res = c
-                .get(path)
-                .header("payment-signature", &payment)
-                .send()
-                .await;
-            assert_eq!(res.status, status, "{path}");
+            // Never settled, so never spent: the same proof can be retried.
+            for _ in 0..2 {
+                let res = c
+                    .get(path)
+                    .header("payment-signature", &payment)
+                    .send()
+                    .await;
+                assert_eq!(res.status, status, "{path}: never `payment already used`");
+            }
         }
-        verify.expect_called(2);
+        verify.expect_called(4);
         settle.expect_called(0);
     }
 

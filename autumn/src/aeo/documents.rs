@@ -1103,8 +1103,13 @@ fn local_issuer<'a>(facts: &'a SiteFacts, origin: &Origin) -> Option<&'a str> {
         .as_deref()
         .filter(|i| !i.trim().is_empty())?;
     let url = url::Url::parse(issuer).ok()?;
-    // RFC 8414 §2: an `https` URL with no query or fragment.
-    let valid = url.scheme() == "https" && url.query().is_none() && url.fragment().is_none();
+    // RFC 8414 §2: an `https` URL with no query or fragment. Credentials in
+    // it would be published in the metadata, so they are refused too.
+    let valid = url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none();
     let rooted = valid && matches!(url.path(), "" | "/");
     let same_origin = url::Url::parse(&origin.base).is_ok_and(|base| base.origin() == url.origin());
     (rooted && same_origin).then_some(issuer)
@@ -1778,10 +1783,12 @@ mod tests {
         );
         assert!(meta.get("jwks_uri").is_none());
 
-        // RFC 8414 §2: https, no query, no fragment.
+        // RFC 8414 §2: https, no query, no fragment. No credentials either.
         for bad in [
             "https://shop.example.com?tenant=a",
             "https://shop.example.com#x",
+            "https://token@shop.example.com",
+            "https://user:pass@shop.example.com",
         ] {
             facts.oauth.authorization_server.issuer = Some(bad.to_owned());
             assert!(
