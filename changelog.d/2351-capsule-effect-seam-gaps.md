@@ -27,7 +27,8 @@
 - **capsule:** capture marks a capsule incomplete, so replay refuses it, when
   the run starts detached work (`db::register_after_commit`, a
   stale-while-revalidate refresh), runs a tracked job, makes egress outside
-  the HTTP seam, or reads or writes an untyped cache value.
+  the HTTP seam, reads or writes an untyped cache value, or has a cache fill
+  that a distributed fill lock or the shared fill fence stops.
 
 ### Fixed
 

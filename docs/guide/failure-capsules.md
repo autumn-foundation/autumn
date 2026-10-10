@@ -966,8 +966,10 @@ What capsules do not do, stated plainly:
   returns no result. When the backend counts a failed removal during the call,
   capture marks the capsule incomplete. A cache fill that meets a distributed
   fill lock (`Acquired` or `Held`) also marks it incomplete: replay has no
-  lock, so it cannot take the same path.
-  A direct `Cache::get_value`, `insert_value` or `insert_raw_bytes` call on
+  lock, so it cannot take the same path. A fill that the shared fill fence
+  stops, or a fill that cannot read the shared epoch, also marks it incomplete.
+  A direct `Cache::get_value`, `insert_value`, `insert_raw_bytes` or
+  `insert_raw_bytes_if_epoch` call on
   the installed cache also marks it incomplete: the call is not recorded. Use
   `cache::get_cached` and `cache::insert_cached`.
 - **A raw cache backend skips the seam.** The framework wraps every cache it

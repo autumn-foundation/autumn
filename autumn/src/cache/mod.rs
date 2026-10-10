@@ -628,7 +628,11 @@ where
         return false;
     };
     // Raw bytes only: `insert_value` would write without the check.
-    let stored = cache.insert_raw_bytes_if_epoch(key, bytes.clone(), ttl, namespace, sampled);
+    let stored = {
+        #[cfg(feature = "reporting")]
+        let _helper = HelperCall::enter();
+        cache.insert_raw_bytes_if_epoch(key, bytes.clone(), ttl, namespace, sampled)
+    };
     if stored {
         // Capture records the write after it happened. A replay never gets
         // here: `sample_fill_epoch` returns `Unsupported` during a replay.
@@ -939,6 +943,14 @@ impl CapsuleSeamCache {
         false
     }
 
+    /// Mark the capsule incomplete: the fill fence stopped a fill.
+    fn fence_stopped_fill() {
+        if let Some(scope) = crate::capsule::current_scope() {
+            scope.note(FILL_FENCE_NOTE);
+            scope.mark_truncated();
+        }
+    }
+
     /// Take a tape slot for a removal, in call order.
     fn reserve() -> Option<(Arc<crate::capsule::CaptureScope>, usize)> {
         crate::capsule::current_scope()
@@ -1016,6 +1028,11 @@ const UNCHECKED_REMOVAL_NOTE: &str = "a cache removal with no result reported a 
 #[cfg(feature = "reporting")]
 const FILL_LOCK_NOTE: &str = "a cache fill met a distributed fill lock; the lock outcome \
      is not recorded, so replay cannot take the same path";
+
+/// Why a capsule whose fill the shared fence stopped is not replayable.
+#[cfg(feature = "reporting")]
+const FILL_FENCE_NOTE: &str = "the shared fill fence stopped a cache fill; replay \
+     has no fence, so it cannot take the same path";
 
 /// A recorded [`InvalidationError`].
 #[cfg(feature = "reporting")]
@@ -1129,6 +1146,43 @@ impl Cache for CapsuleSeamCache {
             return;
         }
         self.0.insert_raw_bytes(key, bytes, ttl);
+    }
+
+    fn shares_fill_epoch(&self) -> bool {
+        self.0.shares_fill_epoch()
+    }
+
+    // A replay takes the unfenced path. A capture that does not store its
+    // fill cannot replay that path, so it is incomplete.
+    fn fill_epoch(&self, namespace: &str) -> FillEpoch {
+        if offline() {
+            return FillEpoch::Unsupported;
+        }
+        let epoch = self.0.fill_epoch(namespace);
+        if epoch == FillEpoch::Unavailable {
+            Self::fence_stopped_fill();
+        }
+        epoch
+    }
+
+    fn insert_raw_bytes_if_epoch(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        ttl: Option<Duration>,
+        namespace: &str,
+        sampled: u64,
+    ) -> bool {
+        if Self::direct_write_blocked(key) {
+            return false;
+        }
+        let stored = self
+            .0
+            .insert_raw_bytes_if_epoch(key, bytes, ttl, namespace, sampled);
+        if !stored {
+            Self::fence_stopped_fill();
+        }
+        stored
     }
 
     fn try_acquire_fill_lock(&self, key: &str, token: &str, ttl: Duration) -> FillLockStatus {
@@ -1504,6 +1558,90 @@ mod shared_fence_tests {
             "a replay must not write the live backend"
         );
         assert!(matches!(seen.cache_get("ns:k"), CachedValue::Hit(_)));
+    }
+
+    #[cfg(feature = "reporting")]
+    fn capture_scope() -> Arc<crate::capsule::CaptureScope> {
+        Arc::new(crate::capsule::CaptureScope::new(
+            "fence-test".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ))
+    }
+
+    /// The capsule seam wraps every installed backend. It must keep the
+    /// shared fence of the backend.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn the_capsule_seam_keeps_the_shared_fence() {
+        let a = Replica::default();
+        let b = with_capsule_seam(Arc::new(Replica {
+            shared: Arc::clone(&a.shared),
+            ..Replica::default()
+        }));
+        assert!(b.shares_fill_epoch());
+        let epoch = sample_fill_epoch(b.as_ref(), "ns");
+        assert_eq!(epoch, FillEpoch::Sampled(0));
+        assert!(a.invalidate_namespace("ns"));
+        assert!(!insert_cached_fenced(
+            b.as_ref(),
+            "ns:k",
+            "old".to_string(),
+            None,
+            "ns",
+            epoch
+        ));
+        assert!(a.shared.lock().unwrap().data.is_empty());
+    }
+
+    /// A fenced fill under capture is recorded. A fill the fence stops, or
+    /// an epoch that cannot be read, is not recorded and replay takes the
+    /// unfenced path, so the capsule is incomplete.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_fill_the_fence_stops_marks_the_capsule_incomplete() {
+        use futures::executor::block_on;
+        let fill = |replica: Replica, invalidate: bool| {
+            let shared = Arc::clone(&replica.shared);
+            let cache = with_capsule_seam(Arc::new(replica));
+            let scope = capture_scope();
+            block_on(crate::capsule::capture::with_capture_scope(
+                Arc::clone(&scope),
+                async {
+                    let epoch = sample_fill_epoch(cache.as_ref(), "ns");
+                    if invalidate {
+                        shared.lock().unwrap().epochs.insert("ns".to_owned(), 9);
+                    }
+                    let _ = insert_cached_fenced(cache.as_ref(), "ns:k", 1_u32, None, "ns", epoch);
+                },
+            ));
+            scope
+        };
+        let stored = fill(Replica::default(), false);
+        assert!(!stored.is_truncated(), "a stored fill is replayable");
+        assert_eq!(stored.effects_snapshot().cache.len(), 1);
+        assert!(fill(Replica::default(), true).is_truncated());
+        let down = Replica {
+            epoch_down: true,
+            ..Replica::default()
+        };
+        assert!(fill(down, false).is_truncated());
+    }
+
+    /// A direct fenced write is like a direct `insert_raw_bytes`.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_direct_fenced_write_marks_the_capsule_incomplete() {
+        use futures::executor::block_on;
+        let cache = with_capsule_seam(Arc::new(Replica::default()));
+        let scope = capture_scope();
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async {
+                let _ = cache.insert_raw_bytes_if_epoch("ns:k", b"1".to_vec(), None, "ns", 0);
+            },
+        ));
+        assert!(scope.is_truncated());
     }
 
     #[cfg(feature = "cache-moka")]
