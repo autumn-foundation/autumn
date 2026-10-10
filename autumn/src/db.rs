@@ -792,16 +792,20 @@ pub(crate) fn spawn_committed_after_commit_callbacks(
     if callbacks.is_empty() {
         return None;
     }
-    // The callbacks run on a detached task, where capture cannot see their
-    // effects (#2351 item 3). Noted at the commit, not at the registration:
-    // a rolled-back transaction drops its callbacks, and nothing escapes.
-    #[cfg(feature = "reporting")]
-    crate::capsule::boundary::note_detached_work();
+    // Each callback makes its future here, on the committing task. A
+    // `register_after_commit` callback then marks the capsule incomplete
+    // (#2351 item 3). A framework callback recorded its effect at
+    // registration and marks nothing. A rolled-back transaction drops its
+    // callbacks, so it marks nothing.
+    let prepared: Vec<_> = callbacks
+        .into_iter()
+        .map(|cb| std::panic::catch_unwind(AssertUnwindSafe(cb)))
+        .collect();
 
     let timeouts = TxTimeouts::current().unwrap_or_default();
     let callbacks_run = async move {
-        for cb in callbacks {
-            let result = match std::panic::catch_unwind(AssertUnwindSafe(cb)) {
+        for callback in prepared {
+            let result = match callback {
                 Ok(callback) => AssertUnwindSafe(callback).catch_unwind().await,
                 Err(panic) => Err(panic),
             };
@@ -891,7 +895,13 @@ where
     AFTER_COMMIT_REGISTRY
         .try_with(|registry| {
             let f = f_opt.take().expect("closure only entered once");
-            let boxed: CommitCallback = Box::new(move || Box::pin(f()));
+            // Called at the commit. The work runs on a detached task, where
+            // capture cannot see its effects.
+            let boxed: CommitCallback = Box::new(move || {
+                #[cfg(feature = "reporting")]
+                crate::capsule::boundary::note_detached_work();
+                Box::pin(async move { f().await })
+            });
             registry.lock().expect("registry lock").push(boxed);
         })
         .ok();
@@ -4589,6 +4599,36 @@ mod tests {
             .await;
         drain.expect("a callback was spawned").await.expect("runs");
         assert!(scope.is_truncated(), "the commit spawns detached work");
+    }
+
+    /// Codex review on #3222: `Mailer::deliver_later` and the
+    /// `*_after_commit` job calls record their effect at registration and
+    /// push their callback directly. A commit with only such callbacks keeps
+    /// the capsule complete.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_recorded_framework_callback_keeps_the_capsule_complete() {
+        let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+            std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_in_callback = std::sync::Arc::clone(&ran);
+        let callback: super::CommitCallback = Box::new(move || {
+            Box::pin(async move {
+                ran_in_callback.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        let drain =
+            crate::capsule::capture::with_capture_scope(std::sync::Arc::clone(&scope), async {
+                super::spawn_committed_after_commit_callbacks(vec![callback])
+            })
+            .await;
+        drain.expect("a callback was spawned").await.expect("runs");
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!scope.is_truncated());
     }
 
     /// #2351 item 3: during a replay, the callbacks get the replay tape, so
