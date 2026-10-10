@@ -792,20 +792,19 @@ pub(crate) fn spawn_committed_after_commit_callbacks(
     if callbacks.is_empty() {
         return None;
     }
-    // Each callback makes its future here, on the committing task. A
-    // `register_after_commit` callback then marks the capsule incomplete
-    // (#2351 item 3). A framework callback recorded its effect at
-    // registration and marks nothing. A rolled-back transaction drops its
-    // callbacks, so it marks nothing.
-    let prepared: Vec<_> = callbacks
-        .into_iter()
-        .map(|cb| std::panic::catch_unwind(AssertUnwindSafe(cb)))
-        .collect();
+    // The callbacks run on a detached task, where capture cannot see their
+    // effects (#2351 item 3). A `register_after_commit` callback is counted
+    // from its registration, and marks the capsule incomplete here. A
+    // framework callback recorded its effect at registration and marks
+    // nothing. A rolled-back transaction drops its callbacks, so it marks
+    // nothing.
+    #[cfg(feature = "reporting")]
+    crate::capsule::boundary::note_committed_after_commit();
 
     let timeouts = TxTimeouts::current().unwrap_or_default();
     let callbacks_run = async move {
-        for callback in prepared {
-            let result = match callback {
+        for cb in callbacks {
+            let result = match std::panic::catch_unwind(AssertUnwindSafe(cb)) {
                 Ok(callback) => AssertUnwindSafe(callback).catch_unwind().await,
                 Err(panic) => Err(panic),
             };
@@ -895,12 +894,13 @@ where
     AFTER_COMMIT_REGISTRY
         .try_with(|registry| {
             let f = f_opt.take().expect("closure only entered once");
-            // Called at the commit. The work runs on a detached task, where
-            // capture cannot see its effects.
+            // Counted until it runs, or until a rollback drops it.
+            #[cfg(feature = "reporting")]
+            let pending = crate::capsule::boundary::PendingAfterCommit::register();
             let boxed: CommitCallback = Box::new(move || {
                 #[cfg(feature = "reporting")]
-                crate::capsule::boundary::note_detached_work();
-                Box::pin(async move { f().await })
+                pending.started();
+                Box::pin(f())
             });
             registry.lock().expect("registry lock").push(boxed);
         })
@@ -4599,6 +4599,62 @@ mod tests {
             .await;
         drain.expect("a callback was spawned").await.expect("runs");
         assert!(scope.is_truncated(), "the commit spawns detached work");
+    }
+
+    /// Codex review on #3222: a callback is built only after the one before
+    /// it completes, inside the drain task.
+    #[tokio::test]
+    async fn after_commit_callbacks_are_built_in_order_after_the_last_one_ran() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback = |name: &'static str| -> super::CommitCallback {
+            let log = std::sync::Arc::clone(&log);
+            Box::new(move || {
+                log.lock().expect("log").push(format!("build {name}"));
+                Box::pin(async move {
+                    tokio::task::yield_now().await;
+                    log.lock().expect("log").push(format!("run {name}"));
+                    Ok(())
+                })
+            })
+        };
+        let drain =
+            super::spawn_committed_after_commit_callbacks(vec![callback("one"), callback("two")]);
+        drain.expect("a drain task").await.expect("runs");
+        assert_eq!(
+            *log.lock().expect("log"),
+            ["build one", "run one", "build two", "run two"]
+        );
+    }
+
+    /// Codex review on #3222: a rolled-back `register_after_commit` callback
+    /// does not mark a later commit's capsule incomplete.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_rolled_back_registration_does_not_mark_a_later_commit() {
+        let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+            std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let registry: std::sync::Arc<std::sync::Mutex<Vec<super::CommitCallback>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::capsule::capture::with_capture_scope(
+            std::sync::Arc::clone(&scope),
+            super::AFTER_COMMIT_REGISTRY.scope(std::sync::Arc::clone(&registry), async {
+                super::register_after_commit(|| async { Ok(()) }).await;
+            }),
+        )
+        .await;
+        // The rollback drops the callback.
+        drop(std::mem::take(&mut *registry.lock().expect("registry")));
+        let framework: super::CommitCallback = Box::new(|| Box::pin(async { Ok(()) }));
+        let drain =
+            crate::capsule::capture::with_capture_scope(std::sync::Arc::clone(&scope), async {
+                super::spawn_committed_after_commit_callbacks(vec![framework])
+            })
+            .await;
+        drain.expect("a drain task").await.expect("runs");
+        assert!(!scope.is_truncated());
     }
 
     /// Codex review on #3222: `Mailer::deliver_later` and the

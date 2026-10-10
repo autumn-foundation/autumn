@@ -219,6 +219,65 @@ pub(crate) fn carry_detached<F: Future>(future: F) -> impl Future<Output = F::Ou
     }
 }
 
+/// A `register_after_commit` callback, counted from its registration
+/// (#2351 item 3).
+///
+/// The commit notes detached work while a counted callback is pending. A
+/// rollback drops the callback, and the count goes back down. A callback
+/// that runs stays counted: its work is detached.
+pub(crate) struct PendingAfterCommit {
+    scope: Option<std::sync::Arc<crate::capsule::CaptureScope>>,
+    tape: Option<std::sync::Arc<crate::capsule::effects::ReplayEffects>>,
+}
+
+impl PendingAfterCommit {
+    /// Count a callback for this task's capture scope and replay tape.
+    pub(crate) fn register() -> Self {
+        let scope = crate::capsule::current_scope();
+        let tape = crate::capsule::effects::current_tape();
+        if let Some(scope) = &scope {
+            scope.after_commit_registered();
+        }
+        if let Some(tape) = &tape {
+            tape.after_commit_registered();
+        }
+        Self { scope, tape }
+    }
+
+    /// The callback runs. It stays counted.
+    pub(crate) fn started(mut self) {
+        self.scope = None;
+        self.tape = None;
+    }
+}
+
+impl Drop for PendingAfterCommit {
+    fn drop(&mut self) {
+        if let Some(scope) = self.scope.take() {
+            scope.after_commit_dropped();
+        }
+        if let Some(tape) = self.tape.take() {
+            tape.after_commit_dropped();
+        }
+    }
+}
+
+/// Note detached work at a commit when a counted `register_after_commit`
+/// callback is pending.
+pub(crate) fn note_committed_after_commit() {
+    if let Some(scope) = crate::capsule::current_scope()
+        && scope.after_commit_pending()
+    {
+        scope.note(DETACHED_WORK_NOTE);
+        scope.mark_truncated();
+    }
+    if let Some(tape) = crate::capsule::effects::current_tape()
+        && tape.after_commit_pending()
+    {
+        tape.detached_work_started();
+    }
+}
+
 /// Notes detached work when it drops armed, as [`note_detached_work`] does.
 ///
 /// Hold one while the caller waits for a spawned task. If the caller is

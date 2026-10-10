@@ -510,6 +510,8 @@ pub struct CaptureScope {
     closed: AtomicBool,
     /// Whether the app builder installed a cache.
     builder_cache: AtomicBool,
+    /// `register_after_commit` callbacks that a rollback has not dropped.
+    after_commit: std::sync::atomic::AtomicUsize,
 }
 
 impl CaptureScope {
@@ -533,6 +535,7 @@ impl CaptureScope {
             truncated: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             builder_cache: AtomicBool::new(false),
+            after_commit: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1069,6 +1072,23 @@ impl CaptureScope {
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    /// Count a `register_after_commit` callback (#2351 item 3).
+    pub(crate) fn after_commit_registered(&self) {
+        self.after_commit.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A rollback dropped a counted callback.
+    pub(crate) fn after_commit_dropped(&self) {
+        let _ = self
+            .after_commit
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+    }
+
+    /// Whether a counted callback is still pending or ran.
+    pub(crate) fn after_commit_pending(&self) -> bool {
+        self.after_commit.load(Ordering::SeqCst) > 0
     }
 
     /// Mark the capsule as incomplete; replay must refuse it.
