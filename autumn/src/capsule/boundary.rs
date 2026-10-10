@@ -219,29 +219,40 @@ pub(crate) fn carry_detached<F: Future>(future: F) -> impl Future<Output = F::Ou
     }
 }
 
-/// Marks the in-flight capsule incomplete when it drops armed.
+/// Notes detached work when it drops armed, as [`note_detached_work`] does.
 ///
 /// Hold one while the caller waits for a spawned task. If the caller is
 /// dropped first, the task continues without it.
-pub(crate) struct DetachGuard(Option<std::sync::Arc<crate::capsule::CaptureScope>>);
+pub(crate) struct DetachGuard {
+    scope: Option<std::sync::Arc<crate::capsule::CaptureScope>>,
+    tape: Option<std::sync::Arc<crate::capsule::effects::ReplayEffects>>,
+}
 
 impl DetachGuard {
-    /// Arm the guard for this task's capture scope.
+    /// Arm the guard for this task's capture scope and replay tape.
     pub(crate) fn arm() -> Self {
-        Self(crate::capsule::current_scope())
+        Self {
+            scope: crate::capsule::current_scope(),
+            tape: crate::capsule::effects::current_tape(),
+        }
     }
 
     /// The wait ended: the task is not detached.
     pub(crate) fn disarm(mut self) {
-        self.0 = None;
+        self.scope = None;
+        self.tape = None;
     }
 }
 
 impl Drop for DetachGuard {
     fn drop(&mut self) {
-        if let Some(scope) = self.0.take() {
+        if let Some(scope) = self.scope.take() {
             scope.note(DETACHED_WORK_NOTE);
             scope.mark_truncated();
+        }
+        // Logged now: the task can end after the verdict.
+        if let Some(tape) = self.tape.take() {
+            tape.detached_work_started();
         }
     }
 }

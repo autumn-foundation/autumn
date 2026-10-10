@@ -2599,6 +2599,29 @@ mod tests {
         assert!(scope.is_truncated(), "the invalidation runs detached");
     }
 
+    /// Codex review on #3222: a replay that drops the flush while it waits
+    /// logs the detached task now, before the verdict.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_replay_flush_dropped_while_waiting_is_a_divergence() {
+        let tape = std::sync::Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects::default(),
+        ));
+        crate::capsule::with_effect_tape(std::sync::Arc::clone(&tape), async {
+            let mut guard = InvalidateAfterWrite::new(never_ends);
+            let waited =
+                tokio::time::timeout(std::time::Duration::from_millis(10), guard.flush()).await;
+            assert!(waited.is_err(), "the invalidation never ends");
+        })
+        .await;
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert_eq!(
+            divergences[0].seam,
+            crate::capsule::effects::EffectSeam::Detached
+        );
+    }
+
     #[tokio::test]
     async fn the_after_write_guard_invalidates_once_per_commit() {
         // One test owns GUARD_RUNS, so the counts are exact.
