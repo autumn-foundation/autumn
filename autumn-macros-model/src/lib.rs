@@ -288,13 +288,10 @@ use proc_macro::TokenStream;
 /// connection pool.
 #[proc_macro_attribute]
 pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(model::model_macro(attr, item.into())).into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        model::model_macro(attr, item)
+    })
+    .into()
 }
 
 /// Define a service for cross-model orchestration and non-DB side effects.
@@ -336,11 +333,8 @@ pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(service::service_macro(attr, item.into())).into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        service::service_macro(attr, item)
+    })
+    .into()
 }
