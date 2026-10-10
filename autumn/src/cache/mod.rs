@@ -156,30 +156,87 @@ pub(crate) const fn replayed_namespace_removal(_namespace: &str) -> Option<bool>
     None
 }
 
-/// Record a coherence namespace removal that reached only registered
-/// stores, with no installed cache to record it (#2351).
+/// A coherence namespace removal's place on the capsule seam (#2351).
+///
+/// Coherence clears the registered stores, which are not on the seam, and
+/// asks the installed cache. It returns `false` when either part fails. The
+/// capsule records that combined answer once, as a replay returns it, so the
+/// installed cache's own record of its part is suppressed: call it through
+/// [`call_installed`](Self::call_installed).
 #[cfg(feature = "reporting")]
-pub(crate) fn record_local_namespace_removal(namespace: &str, complete: bool) {
-    let Some(scope) = crate::capsule::current_scope() else {
-        return;
-    };
-    if let Some(index) = scope.reserve_cache() {
-        scope.fill_cache(
-            index,
-            crate::capsule::CacheEffect::InvalidateNamespace {
-                namespace: namespace.to_owned(),
-                error: (!complete).then(|| crate::capsule::CacheInvalidationError {
-                    attempts: 1,
-                    reason: "a registered store could not drop the namespace".to_owned(),
-                }),
-            },
-        );
+pub(crate) struct NamespaceRemoval(Option<(Arc<crate::capsule::CaptureScope>, usize)>);
+
+#[cfg(feature = "reporting")]
+impl NamespaceRemoval {
+    /// Take the removal's slot before any store is reached.
+    pub(crate) fn reserve() -> Self {
+        Self(
+            crate::capsule::current_scope()
+                .and_then(|scope| scope.reserve_cache().map(|index| (scope, index))),
+        )
+    }
+
+    /// Call the installed cache without it recording the removal. A future
+    /// it returns has already read the flag.
+    pub(crate) fn call_installed<R>(call: impl FnOnce() -> R) -> R {
+        let outer = COHERENCE_REMOVAL.with(|flag| flag.replace(true));
+        let restore = RestoreFlag(outer);
+        let result = call();
+        drop(restore);
+        result
+    }
+
+    /// Record the combined answer: `failure` names the part that failed.
+    pub(crate) fn record(self, namespace: &str, failure: Option<&str>) {
+        if let Some((scope, index)) = self.0 {
+            scope.fill_cache(
+                index,
+                crate::capsule::CacheEffect::InvalidateNamespace {
+                    namespace: namespace.to_owned(),
+                    error: failure.map(|reason| crate::capsule::CacheInvalidationError {
+                        attempts: 1,
+                        reason: reason.to_owned(),
+                    }),
+                },
+            );
+        }
+    }
+}
+
+// Set while coherence calls the installed cache for a removal it records.
+#[cfg(feature = "reporting")]
+thread_local! {
+    static COHERENCE_REMOVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Restores [`COHERENCE_REMOVAL`], also when the backend panics.
+#[cfg(feature = "reporting")]
+struct RestoreFlag(bool);
+
+#[cfg(feature = "reporting")]
+impl Drop for RestoreFlag {
+    fn drop(&mut self) {
+        let outer = self.0;
+        COHERENCE_REMOVAL.with(|flag| flag.set(outer));
     }
 }
 
 /// No capsule support compiled in: nothing to record.
 #[cfg(not(feature = "reporting"))]
-pub(crate) const fn record_local_namespace_removal(_namespace: &str, _complete: bool) {}
+pub(crate) struct NamespaceRemoval;
+
+#[cfg(not(feature = "reporting"))]
+impl NamespaceRemoval {
+    pub(crate) const fn reserve() -> Self {
+        Self
+    }
+
+    pub(crate) fn call_installed<R>(call: impl FnOnce() -> R) -> R {
+        call()
+    }
+
+    pub(crate) const fn record(self, _namespace: &str, _failure: Option<&str>) {}
+}
 
 /// The backend under the replay seam. It stores nothing.
 #[cfg(feature = "reporting")]
@@ -1196,6 +1253,10 @@ impl Cache for CapsuleSeamCache {
         if replay_blocked() {
             return true;
         }
+        // Coherence records the removal with its registered stores' part.
+        if COHERENCE_REMOVAL.with(std::cell::Cell::get) {
+            return self.0.invalidate_namespace(namespace);
+        }
         let slot = Self::reserve();
         let done = self.0.invalidate_namespace(namespace);
         let result = if done {
@@ -1324,6 +1385,10 @@ impl Cache for CapsuleSeamCache {
         }
         if replay_blocked() {
             return Box::pin(async { Ok(()) });
+        }
+        // Coherence records the removal with its registered stores' part.
+        if COHERENCE_REMOVAL.with(std::cell::Cell::get) {
+            return self.0.invalidate_namespace_async(namespace);
         }
         let scope = crate::capsule::current_scope();
         Box::pin(async move {

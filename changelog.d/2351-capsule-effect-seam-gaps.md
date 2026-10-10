@@ -34,7 +34,9 @@
 
 - **capsule:** cache removals (`invalidate`, `invalidate_namespace`, `clear`)
   and the untyped `cache::get` / `cache::insert` are on the capsule seam. A
-  replay does not reach the installed cache backend.
+  replay does not reach the installed cache backend. A coherence
+  `invalidate_namespace` records its combined answer, so a registered store
+  that failed replays as the `false` production returned.
 - **capsule:** a replay now diverges when it reads a cache key that the
   recording only wrote, makes a tenant lookup the recording did not make, or
   draws random bytes of a different width.
