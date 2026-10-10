@@ -137,6 +137,50 @@ pub(crate) fn install_late_replay_cache(
     }
 }
 
+/// A replay's answer to a coherence namespace removal (#2351).
+///
+/// The tape answers it, as it does for the installed cache, and no store is
+/// reached: a registered store is not on the seam. During `autumn replay`
+/// with no tape, nothing is reached either. `None` outside a replay.
+#[cfg(feature = "reporting")]
+pub(crate) fn replayed_namespace_removal(namespace: &str) -> Option<bool> {
+    if let Some(tape) = crate::capsule::effects::current_tape() {
+        return Some(tape.cache_invalidate_namespace(namespace).is_ok());
+    }
+    replay_blocked().then_some(true)
+}
+
+/// No capsule support compiled in: never a replay.
+#[cfg(not(feature = "reporting"))]
+pub(crate) const fn replayed_namespace_removal(_namespace: &str) -> Option<bool> {
+    None
+}
+
+/// Record a coherence namespace removal that reached only registered
+/// stores, with no installed cache to record it (#2351).
+#[cfg(feature = "reporting")]
+pub(crate) fn record_local_namespace_removal(namespace: &str, complete: bool) {
+    let Some(scope) = crate::capsule::current_scope() else {
+        return;
+    };
+    if let Some(index) = scope.reserve_cache() {
+        scope.fill_cache(
+            index,
+            crate::capsule::CacheEffect::InvalidateNamespace {
+                namespace: namespace.to_owned(),
+                error: (!complete).then(|| crate::capsule::CacheInvalidationError {
+                    attempts: 1,
+                    reason: "a registered store could not drop the namespace".to_owned(),
+                }),
+            },
+        );
+    }
+}
+
+/// No capsule support compiled in: nothing to record.
+#[cfg(not(feature = "reporting"))]
+pub(crate) const fn record_local_namespace_removal(_namespace: &str, _complete: bool) {}
+
 /// The backend under the replay seam. It stores nothing.
 #[cfg(feature = "reporting")]
 struct ReplayBackend;
