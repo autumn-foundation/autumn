@@ -898,6 +898,9 @@ impl DatabaseFleet {
         let fleet = self.clone();
         let name = key.name();
         let created = crate::time::spawn_blocking(move || {
+            // Before any file work: staging and publish would otherwise follow
+            // a bucket symlink and leave a database outside the root.
+            check_contained(fleet.root(), &path)?;
             create_database_file(&path, &name, &fleet.inner.migrations)
         })
         .await
@@ -2823,6 +2826,9 @@ mod tests {
         if bucket != path.parent().unwrap() {
             std::os::unix::fs::symlink(&elsewhere, bucket).unwrap();
             let err = fleet.open(&acme).await.unwrap_err();
+            assert!(err.to_string().contains("outside"), "{err}");
+            // Provisioning does its own file work first: it must check too.
+            let err = fleet.provision(&acme).await.unwrap_err();
             assert!(err.to_string().contains("outside"), "{err}");
             assert!(
                 std::fs::read_dir(&elsewhere).unwrap().next().is_none(),
