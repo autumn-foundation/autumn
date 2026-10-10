@@ -10945,12 +10945,46 @@ pub(crate) fn sqlite_url_file(url: &str) -> Option<PathBuf> {
         .strip_prefix("sqlite://")
         .or_else(|| url.strip_prefix("sqlite:"))
         .unwrap_or(url);
-    let rest = rest.strip_prefix("file:").map_or(rest, |uri| {
-        // `file:///abs` carries an empty authority.
-        uri.strip_prefix("//").unwrap_or(uri)
-    });
-    let path = rest.split('?').next().unwrap_or_default();
-    (!path.is_empty()).then(|| lexical_absolute(Path::new(path)))
+    // A URI path ends at `?` or `#`, and `SQLite` percent-decodes it
+    // (`%66leet` is `fleet`). `file:///abs` carries an empty authority.
+    let path = rest.strip_prefix("file:").map_or_else(
+        || rest.split('?').next().unwrap_or_default().to_owned(),
+        |uri| {
+            let uri = uri.strip_prefix("//").unwrap_or(uri);
+            percent_decode_uri_path(uri.split(['?', '#']).next().unwrap_or_default())
+        },
+    );
+    (!path.is_empty()).then(|| lexical_absolute(Path::new(&path)))
+}
+
+/// `SQLite`'s percent-decoding of a URI path: `%XX` becomes that byte, a `%`
+/// not followed by two hex digits stays literal, and a decoded NUL ends the
+/// path. Mirrors `crate::db::percent_decode`, which is `sqlite`-gated while
+/// config validation is not.
+fn percent_decode_uri_path(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let decoded = (bytes[i] == b'%')
+            .then(|| bytes.get(i + 1..i + 3))
+            .flatten()
+            .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match decoded {
+            Some(0) => break,
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `path` made absolute against the working directory, with `.` and `..`
@@ -20123,6 +20157,24 @@ path = "/healthz"
     }
 
     #[test]
+    fn percent_decoding_matches_sqlite_uri_paths() {
+        assert_eq!(percent_decode_uri_path("/a/%66leet/b"), "/a/fleet/b");
+        assert_eq!(percent_decode_uri_path("/a%2Fb"), "/a/b");
+        assert_eq!(percent_decode_uri_path("/50%"), "/50%", "trailing % stays");
+        assert_eq!(percent_decode_uri_path("/x%zz"), "/x%zz", "non-hex stays");
+        assert_eq!(
+            percent_decode_uri_path("/x%+1"),
+            "/x%+1",
+            "a sign is not hex"
+        );
+        assert_eq!(
+            percent_decode_uri_path("/db%00tail"),
+            "/db",
+            "NUL ends the path"
+        );
+    }
+
+    #[test]
     fn validate_rejects_a_control_database_inside_the_fleet_root() {
         use crate::fleet_layout::FleetMode;
         // A tenant named `control` under `{tenant}.db` would open the control
@@ -20143,6 +20195,21 @@ path = "/healthz"
             let err = config
                 .validate()
                 .expect_err("control database inside the fleet root")
+                .to_string();
+            assert!(err.contains("inside database.fleet.root"), "{url}: {err}");
+        }
+        // SQLite percent-decodes a `file:` URI path (and ends it at `?` or
+        // `#`), so `%66leet` is `fleet`: the encoded spelling must not slip by.
+        for url in [
+            "file:/var/lib/app/%66leet/control.db",
+            "sqlite:file:/var/lib/app/%66leet/control.db?mode=rwc",
+            "sqlite:file:///var/lib/app/fleet/control.db#frag",
+        ] {
+            let mut config = fleet_db(fleet(FleetMode::Tenant));
+            config.url = Some(url.to_owned());
+            let err = config
+                .validate()
+                .expect_err("decoded control path is inside the fleet root")
                 .to_string();
             assert!(err.contains("inside database.fleet.root"), "{url}: {err}");
         }

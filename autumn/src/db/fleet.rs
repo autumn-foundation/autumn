@@ -1710,14 +1710,19 @@ impl DatabaseFleet {
             async move {
                 let url = Self::url_of(&fleet.path_of(&key));
                 let name = key.name();
-                let outcome =
-                    crate::time::spawn_blocking(move || fleet.inner.migrations.apply(&url, &name))
-                        .await
-                        .map_err(|e| FleetError::Migration {
-                            name: key.name(),
-                            detail: e.to_string(),
-                        })
-                        .and_then(|r| r);
+                // Same identity rule as `open`: a file copied or renamed onto
+                // this key's path is another database's data, so it is
+                // reported, never migrated.
+                let outcome = crate::time::spawn_blocking(move || {
+                    check_identity_blocking(&url, &name)?;
+                    fleet.inner.migrations.apply(&url, &name)
+                })
+                .await
+                .map_err(|e| FleetError::Migration {
+                    name: key.name(),
+                    detail: e.to_string(),
+                })
+                .and_then(|r| r);
                 (key, outcome)
             }
         }))
@@ -1823,6 +1828,49 @@ async fn check_identity(pool: &Pool<RuntimeConnection>, name: &str) -> Result<()
         diesel::sql_query(format!("SELECT name FROM {IDENTITY_TABLE} WHERE id = 1"))
             .get_result(&mut *conn)
             .await
+            .map_err(|e| unavailable(e.to_string()))?;
+    if found.name != name {
+        return Err(FleetError::Misplaced {
+            name: name.to_owned(),
+            found: found.name,
+        });
+    }
+    Ok(())
+}
+
+/// [`check_identity`] on a blocking connection, for paths that migrate a file
+/// without opening a pool ([`DatabaseFleet::migrate_all`]).
+fn check_identity_blocking(url: &str, name: &str) -> Result<(), FleetError> {
+    use diesel::RunQueryDsl as _;
+    use diesel::connection::SimpleConnection as _;
+
+    #[derive(diesel::QueryableByName)]
+    struct Identity {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        name: String,
+    }
+
+    let unavailable = |detail: String| FleetError::Unavailable {
+        name: name.to_owned(),
+        detail,
+    };
+    let mut conn = crate::db::establish_sqlite_migration_connection(url)
+        .map_err(|e| unavailable(e.to_string()))?;
+    conn.batch_execute(&format!(
+        "CREATE TABLE IF NOT EXISTS {IDENTITY_TABLE} (\
+             id INTEGER PRIMARY KEY CHECK (id = 1), \
+             name TEXT NOT NULL)"
+    ))
+    .map_err(|e| unavailable(e.to_string()))?;
+    diesel::sql_query(format!(
+        "INSERT OR IGNORE INTO {IDENTITY_TABLE} (id, name) VALUES (1, ?)"
+    ))
+    .bind::<diesel::sql_types::Text, _>(name)
+    .execute(&mut conn)
+    .map_err(|e| unavailable(e.to_string()))?;
+    let found: Identity =
+        diesel::sql_query(format!("SELECT name FROM {IDENTITY_TABLE} WHERE id = 1"))
+            .get_result(&mut conn)
             .map_err(|e| unavailable(e.to_string()))?;
     if found.name != name {
         return Err(FleetError::Misplaced {
@@ -2662,6 +2710,18 @@ mod tests {
             "{err}"
         );
         assert_eq!(err.http_status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+
+        // `AUTUMN_MIGRATE=1` must not migrate it either: the copy is acme's
+        // data, and its migrations are not globex's to run.
+        let report = fleet.migrate_all(2).await.unwrap();
+        assert_eq!(report.databases, 2);
+        assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
+        let (failed_key, failure) = &report.failed[0];
+        assert_eq!(failed_key, &globex);
+        assert!(
+            matches!(failure, FleetError::Misplaced { found, .. } if found == "tenant:acme"),
+            "{failure}"
+        );
     }
 
     #[tokio::test]
