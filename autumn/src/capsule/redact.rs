@@ -360,12 +360,44 @@ pub const LITERAL_PLACEHOLDER_SUFFIX: &str = ":<literal placeholder>";
 pub fn literal_placeholder_locations(
     effects: &crate::capsule::schema::CapsuleEffects,
 ) -> Vec<String> {
+    compared_fields_where(effects, &|text: &str| {
+        text.contains(FILTERED_PLACEHOLDER) || text.contains("%5BFILTERED%5D")
+    })
+}
+
+/// The compared effect fields where two placeholders touch.
+///
+/// Replay cannot tell where one masked value ends and the next begins, so it
+/// learns only their joined value. An outcome that echoes one of them could
+/// not be scrubbed, so the capsule is refused. Run it on the persisted
+/// effects.
+#[must_use]
+pub fn adjacent_placeholder_locations(
+    effects: &crate::capsule::schema::CapsuleEffects,
+) -> Vec<String> {
+    compared_fields_where(effects, &crate::capsule::effects::has_adjacent_placeholders)
+}
+
+/// The compared effect fields whose text `holds` accepts.
+fn compared_fields_where(
+    effects: &crate::capsule::schema::CapsuleEffects,
+    holds: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
     use crate::capsule::schema::CacheEffect;
 
-    fn holds(text: &str) -> bool {
-        text.contains(FILTERED_PLACEHOLDER) || text.contains("%5BFILTERED%5D")
+    // String values only: replay compares object keys exactly, so a key is
+    // never a wildcard.
+    fn json_holds(value: &serde_json::Value, holds: &dyn Fn(&str) -> bool) -> bool {
+        match value {
+            serde_json::Value::String(text) => holds(text),
+            serde_json::Value::Array(items) => items.iter().any(|item| json_holds(item, holds)),
+            serde_json::Value::Object(fields) => {
+                fields.values().any(|field| json_holds(field, holds))
+            }
+            _ => false,
+        }
     }
-    fn body_holds(body: &CapsuleBody) -> bool {
+    let body_holds = |body: &CapsuleBody| -> bool {
         match body {
             CapsuleBody::Text(text) => holds(text),
             CapsuleBody::Base64(encoded) => STANDARD
@@ -373,20 +405,8 @@ pub fn literal_placeholder_locations(
                 .is_ok_and(|bytes| holds(&String::from_utf8_lossy(&bytes))),
             CapsuleBody::Absent | CapsuleBody::Skipped { .. } => false,
         }
-    }
-    fn headers_hold(headers: &[(String, String)]) -> bool {
-        headers.iter().any(|(_, value)| holds(value))
-    }
-    // String values only: replay compares object keys exactly, so a key is
-    // never a wildcard.
-    fn json_holds(value: &serde_json::Value) -> bool {
-        match value {
-            serde_json::Value::String(text) => holds(text),
-            serde_json::Value::Array(items) => items.iter().any(json_holds),
-            serde_json::Value::Object(fields) => fields.values().any(json_holds),
-            _ => false,
-        }
-    }
+    };
+    let headers_hold = |headers: &[(String, String)]| headers.iter().any(|(_, value)| holds(value));
 
     let mut found = Vec::new();
     for (index, exchange) in effects.http.iter().enumerate() {
@@ -401,7 +421,7 @@ pub fn literal_placeholder_locations(
         }
     }
     for (index, job) in effects.jobs.iter().enumerate() {
-        if json_holds(&job.payload) {
+        if json_holds(&job.payload, holds) {
             found.push(format!("job[{index}].payload"));
         }
     }

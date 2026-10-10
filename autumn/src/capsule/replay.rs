@@ -1192,6 +1192,17 @@ pub fn refusal_reason(capsule: &Capsule) -> Option<String> {
             literal.join(", ")
         ));
     }
+    // Two placeholders side by side: replay learns only their joined value,
+    // so an outcome that echoes one of them could not be masked.
+    let adjacent = crate::capsule::redact::adjacent_placeholder_locations(&capsule.effects);
+    if !adjacent.is_empty() {
+        return Some(format!(
+            "recorded effect data holds two masked values side by side ({}). Replay cannot tell \
+             where one ends and the next begins, so it could not mask either one in the \
+             replayed outcome. Debug it from the recorded outcome instead.",
+            adjacent.join(", ")
+        ));
+    }
     let masked_input: Vec<&str> = capsule
         .request
         .redacted_keys
@@ -1876,6 +1887,32 @@ mod tests {
         let reason = refusal_reason(&capsule).expect("a literal placeholder is refused");
         assert!(reason.contains("[FILTERED]"), "{reason}");
         assert!(reason.contains("http[0].request_body"), "{reason}");
+    }
+
+    /// Codex review on #3222: two masked values side by side cannot be told
+    /// apart, so replay could not mask either one in the outcome. Refused.
+    #[test]
+    fn a_capsule_with_adjacent_placeholders_is_refused() {
+        let mut capsule = fixture(status(500));
+        capsule
+            .effects
+            .http
+            .push(crate::capsule::schema::HttpEffect {
+                method: "GET".to_owned(),
+                url: "https://api.example/v1/[FILTERED][FILTERED]/charge".to_owned(),
+                ..crate::capsule::schema::HttpEffect::default()
+            });
+        let reason = refusal_reason(&capsule).expect("adjacent placeholders are refused");
+        assert!(reason.contains("http[0].url"), "{reason}");
+        // One placeholder, or two with text between them, is not refused.
+        capsule.effects.http[0].url = "https://api.example/v1/[FILTERED]/x/[FILTERED]".to_owned();
+        assert!(refusal_reason(&capsule).is_none());
+        assert!(crate::capsule::effects::has_adjacent_placeholders(
+            "a%5BFILTERED%5D[FILTERED]b"
+        ));
+        assert!(!crate::capsule::effects::has_adjacent_placeholders(
+            "[FILTERED]"
+        ));
     }
 
     /// #2351 item 11: a draw of a different width than the recording is a

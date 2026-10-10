@@ -1717,6 +1717,18 @@ fn redacted_spans<'a>(recorded: &str, actual: &'a str) -> Option<Vec<(&'a str, b
     Some(spans)
 }
 
+/// Whether two placeholders touch in a recorded text, so that nothing marks
+/// where one masked value ends and the next begins.
+pub(crate) fn has_adjacent_placeholders(recorded: &str) -> bool {
+    let (segments, _) = split_placeholders(recorded);
+    let between = segments.len().saturating_sub(2);
+    segments
+        .iter()
+        .skip(1)
+        .take(between)
+        .any(|segment| segment.is_empty())
+}
+
 /// Split a recorded text at its placeholders, in either spelling. Returns
 /// the literal segments (one more than the placeholders), and for each
 /// placeholder whether it was the URL-encoded one.

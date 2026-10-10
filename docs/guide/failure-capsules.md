@@ -958,6 +958,10 @@ What capsules do not do, stated plainly:
   mail, a cache key or write) as a wildcard. When the recorded data held that
   text before redaction, a changed value there would match anything, so replay
   refuses the capsule by name.
+- **Two masked values side by side refuse the capsule.** When redaction
+  leaves two placeholders with nothing between them in compared data, replay
+  cannot tell where one value ends and the next begins. It could not mask
+  either one in the replayed outcome, so replay refuses the capsule.
 - **A tracked job's capsule is refused.** Replay runs a job untracked. The job
   gets the event, transaction-timeout and job contexts of a production run. A
   handler that reads `JobContext` would take a path production did not take,
