@@ -1142,36 +1142,7 @@ impl ReplayEffects {
         // config. Reading that absence as "the code changed its sender" is the
         // same false signal as reporting a subsystem replay never booted. A
         // sender the run did choose, and chose differently, is a real change.
-        let sender_match = sent.from.is_none_or(|actual| {
-            next.from
-                .as_deref()
-                .is_some_and(|recorded| matches_redacted(recorded, actual))
-        });
-        // Everything a recipient would notice, not only what addresses the
-        // envelope: an invoice removed, an HTML template rewritten under an
-        // untouched text fallback, an unsubscribe header dropped. Each is a
-        // materially different email, and serving the recorded success for one
-        // would leave the final audit nothing to catch.
-        let changed = if !sender_match {
-            Some("its sender")
-        } else if !body_matches_redacted(&next.body, sent.body) {
-            Some("its body")
-        } else if !body_matches_redacted(&next.alternate_body, sent.alternate_body) {
-            Some("the other half of its multipart body")
-        } else if !optional_matches_redacted(next.reply_to.as_deref(), sent.reply_to) {
-            Some("its reply-to")
-        } else if !optional_matches_redacted(
-            next.list_unsubscribe.as_deref(),
-            sent.list_unsubscribe,
-        ) {
-            Some("its list-unsubscribe header")
-        } else if !headers_match_redacted(&next.extra_headers, sent.extra_headers) {
-            Some("its headers")
-        } else if !attachments_match_redacted(&next.attachments, sent.attachments) {
-            Some("its attachments")
-        } else {
-            None
-        };
+        let changed = mail_change(next, sent);
         if let Some(changed) = changed {
             let expected = describe_mail(&next.to, &next.subject);
             let (recorded_to, recorded_subject) = (next.to.clone(), next.subject.clone());
@@ -1602,6 +1573,39 @@ const fn json_kind(value: &serde_json::Value) -> &'static str {
         serde_json::Value::String(_) => "string",
         serde_json::Value::Array(_) => "array",
         serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// What a replayed letter changed from the recorded one with the same
+/// envelope, if anything.
+#[cfg(any(test, feature = "mail"))]
+fn mail_change(next: &MailEffect, sent: &SentMail<'_>) -> Option<&'static str> {
+    let sender_match = sent.from.is_none_or(|actual| {
+        next.from
+            .as_deref()
+            .is_some_and(|recorded| matches_redacted(recorded, actual))
+    });
+    // Everything a recipient would notice, not only what addresses the
+    // envelope: an invoice removed, an HTML template rewritten under an
+    // untouched text fallback, an unsubscribe header dropped. Each is a
+    // materially different email, and serving the recorded success for one
+    // would leave the final audit nothing to catch.
+    if !sender_match {
+        Some("its sender")
+    } else if !body_matches_redacted(&next.body, sent.body) {
+        Some("its body")
+    } else if !body_matches_redacted(&next.alternate_body, sent.alternate_body) {
+        Some("the other half of its multipart body")
+    } else if !optional_matches_redacted(next.reply_to.as_deref(), sent.reply_to) {
+        Some("its reply-to")
+    } else if !optional_matches_redacted(next.list_unsubscribe.as_deref(), sent.list_unsubscribe) {
+        Some("its list-unsubscribe header")
+    } else if !headers_match_redacted(&next.extra_headers, sent.extra_headers) {
+        Some("its headers")
+    } else if !attachments_match_redacted(&next.attachments, sent.attachments) {
+        Some("its attachments")
+    } else {
+        None
     }
 }
 
