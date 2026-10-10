@@ -710,12 +710,18 @@ pub(crate) fn outbound_blocked_for_replay() -> bool {
 /// replay compares against it. Headers the client adds later — the injected
 /// W3C trace context, and any default the underlying `reqwest::Client` was
 /// built with — are deliberately outside it, so a client-side default can
-/// never be read as the handler changing its request.
+/// never be read as the handler changing its request. So is a Web Bot Auth
+/// `Signature` and `Signature-Input`: the client makes them new for each
+/// send, so they differ on every replay.
 #[cfg(feature = "reporting")]
 fn caller_headers(builder: &RequestBuilder) -> Vec<(String, String)> {
     builder
         .extra_headers
         .iter()
+        .filter(|(name, _)| {
+            builder.web_bot_auth.is_none()
+                || !matches!(name.as_str(), "signature" | "signature-input")
+        })
         .map(|(name, value)| {
             (
                 name.as_str().to_owned(),
@@ -7599,6 +7605,40 @@ mod tests {
         let sent = headers.get("signature-input").unwrap().to_str().unwrap();
         assert!(created(sent) > first, "{sent}");
         assert_eq!(headers.get_all("signature").iter().count(), 1);
+    }
+
+    // A failure capsule matches a replayed call on the headers the handler
+    // chose. A Web Bot Auth signature is made new for each send, so it is
+    // left out, or no replay of a signed call would ever match.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn capsule_matching_skips_the_web_bot_auth_signature() {
+        let key = crate::aeo::web_bot_auth::WebBotAuthKey::from_seed_b64(
+            "nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A",
+        )
+        .unwrap();
+        let signer = crate::aeo::web_bot_auth::WebBotAuthSigner::new(key, "https://bot.example");
+        let builder = Client::new()
+            .get("https://api.example/x")
+            .header("x-kept", "1")
+            .sign_web_bot_auth(&signer);
+        let names: Vec<String> = caller_headers(&builder)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(names.contains(&"x-kept".to_owned()), "{names:?}");
+        assert!(names.contains(&"signature-agent".to_owned()), "{names:?}");
+        assert!(!names.contains(&"signature".to_owned()), "{names:?}");
+        assert!(!names.contains(&"signature-input".to_owned()), "{names:?}");
+
+        // A handler's own `Signature` header, with no signer, still counts.
+        let plain = Client::new()
+            .get("https://api.example/x")
+            .header("signature", "mine");
+        assert_eq!(
+            caller_headers(&plain),
+            vec![("signature".to_owned(), "mine".to_owned())]
+        );
     }
 
     // TEST 60: a SAME-origin redirect (relative `Location`, same host:port) must

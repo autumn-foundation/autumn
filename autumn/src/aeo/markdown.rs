@@ -187,7 +187,16 @@ const VOID: &[&str] = &[
 
 /// Elements whose content is raw text up to the matching end tag.
 const RAW_TEXT: &[&str] = &[
-    "script", "style", "textarea", "title", "xmp", "noscript", "iframe", "noembed", "noframes",
+    "script",
+    "style",
+    "textarea",
+    "title",
+    "xmp",
+    "noscript",
+    "iframe",
+    "noembed",
+    "noframes",
+    "plaintext",
 ];
 
 /// Start tags that close an open element of the listed names first.
@@ -565,11 +574,14 @@ fn memchr(needle: u8, hay: &[u8]) -> Option<usize> {
     hay.iter().position(|&c| c == needle)
 }
 
-/// Find `needle` (ASCII) in `hay`, ignoring ASCII case.
 /// Offset of the end tag that closes the raw-text element `name`. As in the
 /// HTML tokenizer, `</name` counts only when the tag name ends there, so
-/// `</scripture>` inside a script is still script text.
+/// `</scripture>` inside a script is still script text. Nothing closes
+/// `<plaintext>`: its text runs to the end of the document.
 fn raw_text_end(hay: &str, name: &str) -> Option<usize> {
+    if name == "plaintext" {
+        return None;
+    }
     let close = format!("</{name}");
     let mut from = 0;
     while let Some(n) = find_ascii_ci(&hay[from..], &close) {
@@ -582,6 +594,7 @@ fn raw_text_end(hay: &str, name: &str) -> Option<usize> {
     None
 }
 
+/// Find `needle` (ASCII) in `hay`, ignoring ASCII case.
 fn find_ascii_ci(hay: &str, needle: &str) -> Option<usize> {
     let h = hay.as_bytes();
     let n = needle.as_bytes();
@@ -1563,6 +1576,14 @@ mod tests {
         assert!(out.contains("- one") && out.contains("- two"), "{out}");
         let out = md("<p hidden>secret<li>shown");
         assert!(!out.contains("secret") && out.contains("shown"), "{out}");
+    }
+
+    #[test]
+    fn plaintext_runs_to_the_end_of_the_document() {
+        let out = md("<p>before</p><nav><plaintext></nav><main>secret</main>");
+        assert!(out.contains("before") && !out.contains("secret"), "{out}");
+        let deep = "<div>".repeat(300) + "<nav><plaintext></nav><p>secret</p>";
+        assert!(!md(&deep).contains("secret"));
     }
 
     #[test]
