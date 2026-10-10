@@ -12541,6 +12541,8 @@ async fn setup_database(
     let shard_map_migration_required =
         shard_map_migration_is_required(config.database.has_shards(), hook_queue_migration_mode);
     let check_replica_migrations = !migrations.is_empty();
+    #[cfg(feature = "sqlite")]
+    let custom_pool_provider = pool_provider.is_some();
     let topology = match pool_provider {
         Some(factory) => factory(config.database.clone()).await,
         None => crate::db::create_topology(&config.database),
@@ -12670,36 +12672,41 @@ async fn setup_database(
     // fleet directory.
     #[cfg(feature = "sqlite")]
     let shards = match (runtime_boot, topology.as_ref()) {
-        (true, Some(topology)) => crate::db::fleet::build_for_app(
-            config,
-            topology.migration_url(),
-            Arc::clone(&migrations),
-            |set| !migration_set_is_control_framework(set),
-        )?
-        .map_or(shards, |fleet| {
-            tracing::info!(
-                mode = %fleet.mode(),
-                root = %fleet.root().display(),
-                max_open = fleet.max_open(),
-                "SQLite database fleet ready"
-            );
-            if config
-                .database
-                .fleet
-                .as_ref()
-                .is_some_and(|f| f.restore_missing)
-                && !config.replication.as_ref().is_some_and(|r| r.enabled)
-            {
-                tracing::warn!(
-                    "database.fleet.restore_missing is set but [replication] is off; there is \
-                     no replica to restore a missing database from"
-                );
+        (true, Some(topology)) => {
+            if config.database.fleet.is_some() {
+                fleet_control_target_identified(custom_pool_provider, topology.migration_url())?;
             }
-            Some(crate::sharding::ShardSet::from_fleet(
-                fleet,
-                topology.primary().clone(),
-            ))
-        }),
+            crate::db::fleet::build_for_app(
+                config,
+                topology.migration_url(),
+                Arc::clone(&migrations),
+                |set| !migration_set_is_control_framework(set),
+            )?
+            .map_or(shards, |fleet| {
+                tracing::info!(
+                    mode = %fleet.mode(),
+                    root = %fleet.root().display(),
+                    max_open = fleet.max_open(),
+                    "SQLite database fleet ready"
+                );
+                if config
+                    .database
+                    .fleet
+                    .as_ref()
+                    .is_some_and(|f| f.restore_missing)
+                    && !config.replication.as_ref().is_some_and(|r| r.enabled)
+                {
+                    tracing::warn!(
+                        "database.fleet.restore_missing is set but [replication] is off; there is \
+                         no replica to restore a missing database from"
+                    );
+                }
+                Some(crate::sharding::ShardSet::from_fleet(
+                    fleet,
+                    topology.primary().clone(),
+                ))
+            })
+        }
         _ => shards,
     };
 
@@ -13149,6 +13156,28 @@ impl crate::db::fleet::FleetLifecycle for FleetCommitHookWorkers {
     fn on_close(&self, db: &crate::db::fleet::FleetDatabase) {
         crate::repository_commit_hooks::forget_sqlite_repository_commit_hook_kick(db.pool());
     }
+}
+
+/// A fleet must know which file the control pool opens, to refuse one inside
+/// its root. The built-in provider opens the configured URL, which
+/// [`crate::db::fleet::build_for_app`] checks. A custom provider may open
+/// anything, so it must name its target with
+/// [`crate::db::DatabaseTopology::with_migration_url`]; without that, boot
+/// refuses rather than guess.
+#[cfg(feature = "sqlite")]
+fn fleet_control_target_identified(
+    custom_pool_provider: bool,
+    migration_url: Option<&str>,
+) -> Result<(), String> {
+    if custom_pool_provider && migration_url.is_none() {
+        return Err(
+            "database.fleet with a custom DatabasePoolProvider: the provider's topology must \
+             name its control database with DatabaseTopology::with_migration_url(...), so the \
+             fleet can refuse a control file inside database.fleet.root"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 /// Migrate every database of a `[database.fleet]` (ADR 0019) for the
@@ -14742,6 +14771,19 @@ mod fleet_boot_tests {
         assert!(err.contains("control database"), "{err}");
         crate::db::fleet::build_for_app(&config, None, Arc::new(Vec::new()), |_| true)
             .expect("the configured control database is outside the root");
+    }
+
+    /// A custom pool provider must say which file its control pool opens
+    /// (`DatabaseTopology::with_migration_url`), or the fleet cannot rule out
+    /// that it lies inside the root: boot refuses rather than guess.
+    #[test]
+    fn a_fleet_requires_a_custom_provider_to_name_its_control_database() {
+        let err = fleet_control_target_identified(true, None).unwrap_err();
+        assert!(err.contains("with_migration_url"), "{err}");
+        fleet_control_target_identified(true, Some("sqlite:///srv/control.db"))
+            .expect("named: checked against the root");
+        fleet_control_target_identified(false, None)
+            .expect("the built-in provider opens the configured url, already checked");
     }
 
     /// The boot path builds the fleet from the same folded list it migrates

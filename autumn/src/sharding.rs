@@ -165,6 +165,9 @@ fn key_hash64(key: ShardKey<'_>) -> u64 {
 /// tenant id instead: two tenant databases never share an id, and the same
 /// tenant always gets the same one. A fleet database's id indexes nothing
 /// ([`ShardSet::get`] is for configured shards); it only tells databases apart.
+/// It is a hash, so distinctness is probabilistic: negligible risk with a
+/// 64-bit `usize`, real past tens of thousands of tenants with a 32-bit one.
+/// [`Shard::name`] is the identity to key results by.
 #[cfg(any(feature = "sqlite", test))]
 #[must_use]
 pub(crate) fn fleet_shard_id(key: &crate::fleet_layout::FleetDbKey) -> ShardId {

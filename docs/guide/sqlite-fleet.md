@@ -40,7 +40,10 @@ idle_close_secs = 300           # close a database idle this long
 ```
 
 The control database must live outside `root`: otherwise a tenant or slot
-path could resolve to it, so config validation refuses that layout.
+path could resolve to it, so config validation (and boot, after resolving
+symlinks) refuses that layout. An app with a custom `DatabasePoolProvider`
+must name its control database with `DatabaseTopology::with_migration_url`,
+or a fleet refuses to boot: it cannot otherwise tell where that pool points.
 
 Every key has an `AUTUMN_DATABASE__FLEET__*` override. With no TOML section,
 setting both `AUTUMN_DATABASE__FLEET__MODE` and `AUTUMN_DATABASE__FLEET__ROOT`
