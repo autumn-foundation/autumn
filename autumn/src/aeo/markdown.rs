@@ -329,8 +329,8 @@ fn parse(html: &str) -> Doc {
             continue;
         }
         let rest = &html[i..];
-        if rest.starts_with("<!--") {
-            i = rest.find("-->").map_or(bytes.len(), |n| i + n + 3);
+        if let Some(body) = rest.strip_prefix("<!--") {
+            i = comment_end(body).map_or(bytes.len(), |n| i + 4 + n);
             continue;
         }
         if rest.starts_with("<!") || rest.starts_with("<?") {
@@ -637,6 +637,31 @@ fn read_tag(s: &str) -> TagRead {
 
 fn memchr(needle: u8, hay: &[u8]) -> Option<usize> {
     hay.iter().position(|&c| c == needle)
+}
+
+/// Bytes from the comment body `body` (after `<!--`) through the comment's
+/// end, as a browser reads it: `<!-->` and `<!--->` are empty comments, and
+/// `--!>` ends one as `-->` does. `None` runs the comment to the end.
+fn comment_end(body: &str) -> Option<usize> {
+    if body.starts_with('>') {
+        return Some(1);
+    }
+    if body.starts_with("->") {
+        return Some(2);
+    }
+    let mut from = 0;
+    while let Some(n) = body[from..].find("--") {
+        let at = from + n;
+        let after = &body[at + 2..];
+        if after.starts_with('>') {
+            return Some(at + 3);
+        }
+        if after.starts_with("!>") {
+            return Some(at + 4);
+        }
+        from = at + 1;
+    }
+    None
 }
 
 /// Length of the end tag at the start of `s`. A quoted attribute value can
@@ -1052,6 +1077,11 @@ impl Writer {
                 self.line.push_str(lead);
                 match doc.attr(id, "href").and_then(|h| safe_url(h, true)) {
                     Some(href) => {
+                        // A `!` right before the label would make it an image.
+                        if self.line.ends_with('!') && !self.line.ends_with("\\!") {
+                            self.line.pop();
+                            self.line.push_str("\\!");
+                        }
                         let label = if text.is_empty() {
                             escape_inline(&href)
                         } else {
@@ -1967,6 +1997,29 @@ mod tests {
             md("<table><tr><td><a href=\"/a\">a</a><td><a href=\"/b\">b</a></table>")
                 .contains("[a](/a) | [b](/b)")
         );
+    }
+
+    #[test]
+    fn comments_close_as_in_a_browser() {
+        assert_eq!(md("<main><p>One</p><!--><p>Two</p></main>"), "One\n\nTwo\n");
+        assert_eq!(
+            md("<main><p>One</p><!---><p>Two</p></main>"),
+            "One\n\nTwo\n"
+        );
+        assert_eq!(
+            md("<main><p>One</p><!-- x --!><p>Two</p></main>"),
+            "One\n\nTwo\n"
+        );
+        assert_eq!(
+            md("<main><p>One</p><!-- x - -> y --><p>Two</p></main>"),
+            "One\n\nTwo\n"
+        );
+    }
+
+    #[test]
+    fn a_bang_before_a_link_stays_text() {
+        assert_eq!(md("<p>!<a href=\"/x\">x</a></p>"), "\\![x](/x)\n");
+        assert_eq!(md("<p>Wow! <a href=\"/x\">x</a></p>"), "Wow! [x](/x)\n");
     }
 
     #[test]
