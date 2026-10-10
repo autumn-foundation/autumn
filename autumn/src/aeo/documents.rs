@@ -1066,7 +1066,7 @@ fn block_scalar(lines: &[&str], folded: bool, chomp: char, declared: Option<usiz
         trailing += 1;
     }
     let mut text = if folded {
-        fold_lines(body.iter().copied())
+        fold_block(&body)
     } else {
         body.join("\n")
     };
@@ -1078,6 +1078,32 @@ fn block_scalar(lines: &[&str], folded: bool, chomp: char, declared: Option<usiz
         }
     }
     text
+}
+
+/// A folded (`>`) block's lines, joined. A break between two plain lines
+/// is a space and each blank line a newline; a more-indented line keeps the
+/// breaks around it.
+fn fold_block(lines: &[&str]) -> String {
+    let mut out = String::new();
+    let mut prev_more: Option<bool> = None;
+    let mut blanks = 0;
+    for line in lines {
+        if line.is_empty() {
+            blanks += 1;
+            continue;
+        }
+        let more = line.starts_with([' ', '\t']);
+        match prev_more {
+            Some(prev) if prev || more => out.push_str(&"\n".repeat(blanks + 1)),
+            Some(_) if blanks == 0 => out.push(' '),
+            // The first line, or a plain line after plain lines and blanks.
+            _ => out.push_str(&"\n".repeat(blanks)),
+        }
+        out.push_str(line);
+        prev_more = Some(more);
+        blanks = 0;
+    }
+    out
 }
 
 /// YAML line folding: a break between two lines is a space, and each blank
@@ -1589,6 +1615,10 @@ mod tests {
         );
         assert_eq!(parse("description: |\n  one\n  two"), "one\ntwo\n");
         assert_eq!(parse("description: |- # note\n  kept"), "kept");
+        assert_eq!(
+            parse("description: >-\n  first\n    indented\n  last"),
+            "first\n  indented\nlast"
+        );
         // An indentation digit wins over the first line's indent.
         assert_eq!(
             parse("description: |2-\n    deep\n  shallow"),

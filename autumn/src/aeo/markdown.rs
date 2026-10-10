@@ -364,6 +364,36 @@ fn parse(html: &str) -> Doc {
             continue;
         }
 
+        // In a `<select>`, an `<input>`, `<keygen>`, `<textarea>` or another
+        // `<select>` closes it, as in a browser; a nested `<select>` is then
+        // dropped.
+        if matches!(
+            tag.name.as_str(),
+            "input" | "keygen" | "textarea" | "select"
+        ) {
+            let in_dropped = dropped
+                .wall()
+                .filter(|&w| dropped.last("select") == Some(w));
+            let closed = if let Some(wall) = in_dropped {
+                dropped.truncate(wall);
+                true
+            } else if dropped.wall().is_none()
+                && let Some(pos) = stack
+                    .iter()
+                    .rposition(|&id| matches!(doc.name(id), Some("select" | "template")))
+                && doc.name(stack[pos]) == Some("select")
+            {
+                stack.truncate(pos);
+                dropped.clear();
+                true
+            } else {
+                false
+            };
+            if closed && tag.name == "select" {
+                continue;
+            }
+        }
+
         // An omitted `</head>`: a tag that cannot be in the head (`<body>`,
         // `<main>`, ...) closes it, as in a browser. Inside a `<template>`
         // the head is not the insertion point, so the template keeps it.
@@ -1587,6 +1617,14 @@ mod tests {
         ));
         assert!(!out.contains("secret"), "{out}");
         assert!(out.contains("visible"), "{out}");
+    }
+
+    #[test]
+    fn an_input_like_tag_closes_a_select() {
+        assert_eq!(md("<select><input><main>Visible</main>"), "Visible\n");
+        assert_eq!(md("<select><option>a<select><p>Shown</p>"), "Shown\n");
+        let deep = "<div>".repeat(300) + "<select><textarea>t</textarea>Visible";
+        assert!(md(&deep).contains("Visible"));
     }
 
     #[test]
