@@ -106,6 +106,12 @@ pub type RuntimeBackend = diesel::pg::Pg;
 #[cfg(feature = "sqlite")]
 pub type RuntimeBackend = diesel::sqlite::Sqlite;
 
+/// One `SQLite` database per tenant or per routing slot (ADR 0019).
+#[cfg(feature = "sqlite")]
+pub mod fleet;
+/// Continuous replication of a fleet's databases (ADR 0019 §5).
+#[cfg(feature = "sqlite")]
+pub mod fleet_replication;
 pub mod pooler;
 /// `TEXT`-backed newtypes for foreign model-field types on `SQLite` (#1924).
 #[cfg(feature = "sqlite")]
@@ -1921,6 +1927,46 @@ fn build_sqlite_pool(
     pool_size: usize,
     connect_timeout_secs: u64,
 ) -> Result<Pool<RuntimeConnection>, PoolError> {
+    build_sqlite_pool_with(
+        url,
+        pool_size,
+        connect_timeout_secs,
+        SqliteCheckpointOwner::ProcessLatch,
+    )
+}
+
+/// Who checkpoints the WAL of a `SQLite` pool's database.
+#[cfg(feature = "sqlite")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqliteCheckpointOwner {
+    /// Follow [`sqlite_replication_active`], read as each connection is
+    /// created: the control database, which the process replicator owns.
+    ProcessLatch,
+    /// A fleet database (ADR 0019): `true` when a fleet replicator owns its
+    /// checkpoints, `false` when `SQLite` auto-checkpoints. Never the process
+    /// latch — a fleet database the control replicator does not ship must
+    /// not lose auto-checkpointing, or its `-wal` grows without bound.
+    Fleet(bool),
+}
+
+#[cfg(feature = "sqlite")]
+impl SqliteCheckpointOwner {
+    fn replicating(self) -> bool {
+        match self {
+            Self::ProcessLatch => sqlite_replication_active(),
+            Self::Fleet(replicating) => replicating,
+        }
+    }
+}
+
+/// [`build_sqlite_pool`] with an explicit [`SqliteCheckpointOwner`].
+#[cfg(feature = "sqlite")]
+pub(crate) fn build_sqlite_pool_with(
+    url: &str,
+    pool_size: usize,
+    connect_timeout_secs: u64,
+    checkpoint_owner: SqliteCheckpointOwner,
+) -> Result<Pool<RuntimeConnection>, PoolError> {
     // Under the `sqlite` feature the runtime targets SQLite, so the URL must
     // actually NAME a SQLite target. Everything past this point treats the
     // string as a filename: `normalize_sqlite_target` strips the `sqlite:` /
@@ -2035,14 +2081,14 @@ fn build_sqlite_pool(
     // per-connection pragmas (`busy_timeout`, `foreign_keys`), so a read-only pool builds
     // and serves reads. In-memory targets are not read-only and keep the full batch.
     let mut config = diesel_async::pooled_connection::ManagerConfig::<RuntimeConnection>::default();
-    config.custom_setup = Box::new(|url: &str| {
+    config.custom_setup = Box::new(move |url: &str| {
         use diesel_async::{AsyncConnection as _, SimpleAsyncConnection as _};
         let url = url.to_owned();
         async move {
             let mut conn = RuntimeConnection::establish(&url).await?;
             let pragmas = sqlite_connection_pragmas(
                 sqlite_target_is_read_only(&url),
-                sqlite_replication_active(),
+                checkpoint_owner.replicating(),
             );
             apply_sqlite_pragmas(&mut conn, pragmas)
                 .await
