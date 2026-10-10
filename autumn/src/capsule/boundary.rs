@@ -145,13 +145,13 @@ fn check_egress(
 fn printable_target(url: &str) -> String {
     let head = url.split(['?', '#']).next().unwrap_or_default();
     match head.split_once("://") {
+        // The origin only: a path can hold a signed token or an object key.
         Some((scheme, rest)) => {
-            let authority_end = rest.find('/').unwrap_or(rest.len());
-            let (authority, path) = rest.split_at_checked(authority_end).unwrap_or((rest, ""));
+            let authority = rest.split('/').next().unwrap_or_default();
             let host = authority
                 .rsplit_once('@')
                 .map_or(authority, |(_, host)| host);
-            format!("{scheme}://{host}{path}")
+            format!("{scheme}://{host}")
         }
         None => head.to_owned(),
     }
@@ -399,9 +399,12 @@ mod tests {
 
     #[test]
     fn a_printed_target_keeps_no_credential() {
+        // Codex review on #3222: no path either. A path can hold a signed
+        // token or an object key, and the scrub never learns an unrecorded
+        // call's values.
         assert_eq!(
-            printable_target("https://user:pw@api.example/v1/x?token=t#f"),
-            "https://api.example/v1/x"
+            printable_target("https://user:pw@api.example/v1/reset/s3cr3t?token=t#f"),
+            "https://api.example"
         );
         assert_eq!(printable_target("mediamtx api"), "mediamtx api");
     }

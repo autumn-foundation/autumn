@@ -710,7 +710,12 @@ impl ReplayEffects {
                     || next.due_at.is_some()
                     || next.requested_due_at.is_some()
             }
-            crate::job::EnqueueSchedule::After(delay) => next.delay_secs != Some(delay),
+            // Capture rounds a sub-second remainder up. A v3 capture cut it
+            // off, so one second less also matches there.
+            crate::job::EnqueueSchedule::After(delay) => {
+                next.delay_secs != Some(delay)
+                    && !(self.legacy_v3 && next.delay_secs == Some(delay.saturating_sub(1)))
+            }
             // Capture runs a past deadline at once and records `due_at: None`.
             // It keeps the deadline the caller gave in `requested_due_at`, so
             // replay compares that one (#2351 item 18).

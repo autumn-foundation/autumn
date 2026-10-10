@@ -3565,7 +3565,24 @@ pub(crate) enum EnqueueSchedule {
 }
 
 fn delay_seconds(delay: std::time::Duration) -> i64 {
-    i64::try_from(delay.as_secs()).unwrap_or(i64::MAX)
+    // Rounded up, as capture records it: a positive sub-second delay is not
+    // immediate.
+    let secs = delay
+        .as_secs()
+        .saturating_add(u64::from(delay.subsec_nanos() > 0));
+    i64::try_from(secs).unwrap_or(i64::MAX)
+}
+
+/// The delay capture records for `due_at - now`: whole seconds, rounded up,
+/// as replay computes it in `delay_seconds`.
+#[cfg(any(test, feature = "reporting"))]
+const fn recorded_delay(delay: chrono::TimeDelta) -> i64 {
+    let secs = delay.num_seconds();
+    if delay.subsec_nanos() > 0 {
+        secs.saturating_add(1)
+    } else {
+        secs
+    }
 }
 
 /// No capsule support compiled in: never a replay.
@@ -3702,7 +3719,7 @@ fn fill_enqueue(
             // `signed_duration_since` rather than `-`: this module's panic gate
             // denies `arithmetic_side_effects`, and the subtraction operator on
             // `DateTime` is not total.
-            delay_secs: due_at.map(|due| due.signed_duration_since(now).num_seconds()),
+            delay_secs: due_at.map(|due| recorded_delay(due.signed_duration_since(now))),
             due_at,
             // Kept only when the deadline had passed and the job ran at once.
             requested_due_at: due_at.map_or(slot.requested_due_at, |_| None),
@@ -14536,6 +14553,18 @@ mod tests {
         let jobs = scope.effects_snapshot().jobs;
         assert_eq!(jobs.len(), 1, "{jobs:?}");
         assert_eq!(jobs[0].error.as_deref(), Some(error.message().as_str()));
+    }
+
+    /// Codex review on #3222: a positive sub-second delay is not immediate.
+    /// Capture and replay both round it up to whole seconds.
+    #[test]
+    fn a_sub_second_delay_rounds_up_on_both_sides() {
+        assert_eq!(delay_seconds(Duration::from_millis(500)), 1);
+        assert_eq!(delay_seconds(Duration::from_secs(2)), 2);
+        assert_eq!(delay_seconds(Duration::ZERO), 0);
+        assert_eq!(recorded_delay(chrono::TimeDelta::milliseconds(500)), 1);
+        assert_eq!(recorded_delay(chrono::TimeDelta::seconds(2)), 2);
+        assert_eq!(recorded_delay(chrono::TimeDelta::zero()), 0);
     }
 
     /// Codex review on #3222: a rejected enqueue replays with the status it
