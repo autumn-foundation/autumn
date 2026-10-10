@@ -190,15 +190,14 @@ const CONTENT_SIGNAL_COMMENT: &str = "\
 
 ";
 
-/// The `User-agent` names in `rules`.
+/// The `User-agent` names in `rules`, without a trailing `# comment`.
 fn named_user_agents(rules: &[String]) -> Vec<&str> {
     rules
         .iter()
         .filter_map(|r| {
             let (key, value) = r.split_once(':')?;
-            key.trim()
-                .eq_ignore_ascii_case("user-agent")
-                .then(|| value.trim())
+            let name = value.split('#').next().unwrap_or(value).trim();
+            (key.trim().eq_ignore_ascii_case("user-agent") && !name.is_empty()).then_some(name)
         })
         .collect()
 }
@@ -320,6 +319,22 @@ mod tests {
             &BotPolicy::from_config(&AeoConfig::default()),
         );
         assert_eq!(txt.matches("User-agent: GPTBot").count(), 1, "{txt}");
+        assert!(txt.contains("User-agent: ClaudeBot"), "{txt}");
+    }
+
+    #[test]
+    fn an_operator_group_with_a_comment_still_owns_its_bot() {
+        let rules = [
+            "User-agent: GPTBot # block".to_owned(),
+            "Disallow: /".to_owned(),
+        ];
+        let txt = robots_txt_with_policy(
+            "prod",
+            None,
+            &rules,
+            &BotPolicy::from_config(&AeoConfig::default()),
+        );
+        assert!(!txt.contains("User-agent: GPTBot\n"), "{txt}");
         assert!(txt.contains("User-agent: ClaudeBot"), "{txt}");
     }
 

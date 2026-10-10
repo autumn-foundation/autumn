@@ -717,9 +717,10 @@ const STATIC_DOCUMENT_PATHS: &[&str] = &[
 
 /// Write the agent documents of `router` into the static build `dist`.
 ///
-/// The documents hold absolute URLs, so this writes nothing without
-/// `[seo] base_url` (`base_url` is `None`). A file that is already in
-/// `dist` stays. Returns the paths it wrote.
+/// The documents hold absolute URLs, so without `[seo] base_url`
+/// (`base_url` is `None`) only the `WebMCP` script is written: it holds none,
+/// and a page's `head_tags` load it. A file that is already in `dist`
+/// stays. Returns the paths it wrote.
 ///
 /// # Errors
 ///
@@ -733,13 +734,15 @@ pub(crate) async fn write_static_documents(
 
     // The build has no request `Host`: without a usable base URL every
     // absolute link would point at localhost.
-    if !documents::Origin::resolve(base_url, None).configured {
-        return Ok(Vec::new());
-    }
-    let mut queue: Vec<String> = STATIC_DOCUMENT_PATHS
-        .iter()
-        .map(|p| (*p).to_owned())
-        .collect();
+    let mut queue: Vec<String> = if documents::Origin::resolve(base_url, None).configured {
+        STATIC_DOCUMENT_PATHS
+            .iter()
+            .map(|p| (*p).to_owned())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    queue.push(webmcp::WEBMCP_JS_PATH.to_owned());
     let mut written = Vec::new();
     while let Some(path) = queue.pop() {
         // A build render: x402 charges the live request for these bytes.
@@ -847,7 +850,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_static_build_without_a_usable_base_url_writes_nothing() {
+    async fn a_static_build_without_a_usable_base_url_writes_only_the_script() {
         let config = crate::config::AutumnConfig::default();
         let dist = tempfile::tempdir().unwrap();
         for base in [
@@ -858,9 +861,14 @@ mod tests {
             let written = write_static_documents(site_router(&config), base, dist.path())
                 .await
                 .unwrap();
-            assert!(written.is_empty(), "{base:?}: {written:?}");
+            assert!(
+                written.iter().all(|p| p == webmcp::WEBMCP_JS_PATH),
+                "{base:?}: {written:?}"
+            );
         }
         assert!(!dist.path().join("llms.txt").exists());
+        // The page `head_tags` load it, so a static site serves it too.
+        assert!(dist.path().join("_autumn/webmcp.js").exists());
     }
 
     #[test]
@@ -899,6 +907,7 @@ mod tests {
         let written = write_static_documents(site_router(&config), None, dist.path())
             .await
             .unwrap();
-        assert!(written.is_empty(), "{written:?}");
+        // Only the script, which holds no absolute URL.
+        assert_eq!(written, [webmcp::WEBMCP_JS_PATH], "{written:?}");
     }
 }

@@ -190,7 +190,9 @@ shared cache keeps a forged host. Autumn logs a warning in production when
 
 `autumn build` writes `llms.txt`, the skills, the ARD manifest, `auth.md`,
 the OAuth metadata, and the commerce documents into `dist/` when
-`[seo] base_url` is set. A file that a static route wrote stays. A static
+`[seo] base_url` is set. It always writes `/_autumn/webmcp.js`, which the
+page `head_tags` load; with no MCP server it registers no tools. A file that a
+static route wrote stays. A static
 build has no MCP server, so it has no server card. With `.openapi(...)` it
 lists the API, and writes the API catalog next to `openapi.json`. The
 documents link `/openapi.json`, where the build writes it, and no Swagger UI.

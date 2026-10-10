@@ -6737,12 +6737,14 @@ impl AppBuilder {
             )
             .await
             {
-                Ok(paths) if paths.is_empty() && config.seo.base_url.is_none() => {
-                    eprintln!("  \u{2139} AEO: set [seo] base_url to write the agent documents");
-                }
                 Ok(paths) => {
                     for path in paths {
                         eprintln!("  \u{2713} AEO: {path} written");
+                    }
+                    if config.seo.base_url.is_none() {
+                        eprintln!(
+                            "  \u{2139} AEO: set [seo] base_url to write the agent documents"
+                        );
                     }
                 }
                 Err(e) => eprintln!("  \u{26A0} Failed to write the agent documents: {e}"),
