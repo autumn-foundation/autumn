@@ -59,10 +59,10 @@ fn zone_safe(s: &str) -> bool {
 
 /// Zone file lines for the DNS-AID records.
 ///
-/// Empty when `base_url` is not an
-/// `http` or `https` URL with a DNS host name (an IP address has no zone),
-/// has a query or a fragment, or holds a character a zone file string
-/// cannot carry; or when `mcp_path` fails [`valid_mcp_path`].
+/// Empty when `base_url` is not an `http` or `https` URL with a DNS host
+/// name (an IP address has no zone), has a user name, password, query or
+/// fragment, or holds a character a zone file string cannot carry; or when
+/// `mcp_path` fails [`valid_mcp_path`].
 #[must_use]
 pub fn records(input: &DnsAidInput) -> Vec<String> {
     let base = input.base_url.trim().trim_end_matches('/');
@@ -81,6 +81,8 @@ pub fn records(input: &DnsAidInput) -> Vec<String> {
     // would be wrong. Paths are appended to the base, so a query or a
     // fragment would swallow them.
     if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
     {
@@ -151,6 +153,7 @@ mod tests {
         assert!(records(&DnsAidInput::new("ftp://example.com", None)).is_empty());
         assert!(records(&DnsAidInput::new("https://example.com?tenant=a", None)).is_empty());
         assert!(records(&DnsAidInput::new("https://example.com#top", None)).is_empty());
+        assert!(records(&DnsAidInput::new("https://token@example.com", None)).is_empty());
         assert!(records(&DnsAidInput::new("https://exa\nmple.com", None)).is_empty());
         assert!(records(&DnsAidInput::new("https://example.com/a\"b", None)).is_empty());
     }

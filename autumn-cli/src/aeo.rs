@@ -48,7 +48,8 @@ fn render(base_url: Option<&str>, mcp_path: Option<&str>, ttl: u32) -> Result<St
     let lines = records(&DnsAidInput::new(base_url, mcp_path).ttl(ttl));
     if lines.is_empty() {
         return Err(format!(
-            "{base_url:?} is not an http(s) URL with a DNS host name and no query or fragment"
+            "{base_url:?} is not an http(s) URL with a DNS host name and no credentials, \
+             query or fragment"
         ));
     }
     let mut zone = String::from(

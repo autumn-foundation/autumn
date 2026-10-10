@@ -657,7 +657,7 @@ fn warn_on_config(config: &crate::config::AutumnConfig) {
     {
         tracing::warn!(
             base_url = base,
-            "aeo: [seo] base_url is not an http(s) URL without a query or fragment; the \
+            "aeo: [seo] base_url is not an http(s) URL without credentials, a query or a fragment; the \
              agent documents use the request Host instead, and a static build writes none"
         );
     }

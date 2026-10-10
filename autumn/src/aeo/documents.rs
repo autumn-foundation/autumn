@@ -265,14 +265,17 @@ pub struct Origin {
 impl Origin {
     /// Use `[seo] base_url` when set. Else build it from the `Host` header:
     /// `http` for loopback hosts, `https` for the rest. A `base_url` that is
-    /// not `http` or `https`, or has a query or a fragment, is not used: the
-    /// documents describe an HTTP site, and paths are appended to the base.
+    /// not `http` or `https`, has a query or a fragment, or carries a user
+    /// name or password is not used: the documents describe an HTTP site,
+    /// paths are appended to the base, and the documents are public.
     #[must_use]
     pub fn resolve(base_url: Option<&str>, host_header: Option<&str>) -> Self {
         if let Some(base) = base_url.map(|b| b.trim().trim_end_matches('/'))
             && let Ok(url) = url::Url::parse(base)
             && let Some(host) = url.host_str()
             && matches!(url.scheme(), "http" | "https")
+            && url.username().is_empty()
+            && url.password().is_none()
             && url.query().is_none()
             && url.fragment().is_none()
         {
@@ -1359,6 +1362,8 @@ mod tests {
             "https://example.com?tenant=a",
             "https://example.com/#top",
             "ftp://example.com",
+            "https://deploy-token@example.com",
+            "https://user:pass@example.com",
         ] {
             let o = Origin::resolve(Some(base), Some("app.example.com"));
             assert!(!o.configured, "{base}");
