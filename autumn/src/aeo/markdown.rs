@@ -213,7 +213,20 @@ const HEAD_CONTENT: &[&str] = &[
 
 /// Elements that stop the search for an implied close (a `<li>` inside a
 /// nested `<ul>` must not close the outer `<li>`).
-const SCOPE: &[&str] = &["ul", "ol", "table", "dl", "select", "blockquote", "div"];
+const SCOPE: &[&str] = &[
+    "ul",
+    "ol",
+    "table",
+    "dl",
+    "select",
+    "blockquote",
+    "div",
+    "template",
+];
+
+/// Elements whose content an end tag for an outer element cannot leave: a
+/// browser ignores a stray `</div>` inside a `<select>` or a `<template>`.
+const WALL: &[&str] = &["select", "template"];
 
 #[allow(clippy::too_many_lines)] // one tokenizer loop; splitting it hides the state
 fn parse(html: &str) -> Doc {
@@ -279,18 +292,20 @@ fn parse(html: &str) -> Doc {
         };
         i += tag.len;
         if tag.end {
-            if dropped.contains(&tag.name) {
-                dropped.close(&tag.name);
+            // `</select>` and `</template>` close their own wall; any other
+            // end tag stops at the innermost one.
+            let walled = !WALL.contains(&tag.name.as_str());
+            if !dropped.is_empty() {
+                let wall = dropped.wall().filter(|_| walled);
+                match (dropped.last(&tag.name), wall) {
+                    (Some(pos), Some(wall)) if pos < wall => {}
+                    (Some(pos), _) => dropped.truncate(pos),
+                    (None, Some(_)) => {}
+                    (None, None) => close_kept(&doc, &mut stack, &mut dropped, &tag.name, walled),
+                }
                 continue;
             }
-            if let Some(pos) = stack
-                .iter()
-                .rposition(|&id| doc.name(id) == Some(tag.name.as_str()))
-                && pos > 0
-            {
-                dropped.clear();
-                stack.truncate(pos);
-            }
+            close_kept(&doc, &mut stack, &mut dropped, &tag.name, walled);
             continue;
         }
 
@@ -298,23 +313,28 @@ fn parse(html: &str) -> Doc {
         // `<main>`, ...) closes it, as in a browser. Inside a `<template>`
         // the head is not the insertion point, so the template keeps it.
         if !HEAD_CONTENT.contains(&tag.name.as_str())
+            && dropped.wall().is_none()
             && let Some(pos) = stack
                 .iter()
                 .rposition(|&id| matches!(doc.name(id), Some("head" | "template")))
             && doc.name(stack[pos]) == Some("head")
         {
             stack.truncate(pos);
+            dropped.clear();
         }
 
-        // Implied end tags.
+        // Implied end tags. The search runs from the innermost open tag
+        // out, through the dropped tags first, so closing a kept element
+        // also closes every dropped tag inside it.
         let closes = implied_close(&tag.name);
-        if !closes.is_empty() {
+        if !closes.is_empty() && !dropped.implied_close(closes) {
             for pos in (1..stack.len()).rev() {
                 let Some(open) = doc.name(stack[pos]) else {
                     break;
                 };
                 if closes.contains(&open) {
                     stack.truncate(pos);
+                    dropped.clear();
                     break;
                 }
                 if SCOPE.contains(&open) {
@@ -609,6 +629,27 @@ fn yaml_quote(s: &str) -> String {
 
 // ── Writer ──────────────────────────────────────────────────────────────────
 
+/// An end tag no dropped tag answers: close the last kept element it
+/// names, and every dropped tag inside it. Unless the tag is `walled`
+/// (`</select>`, `</template>`), it cannot close past the innermost open
+/// `<select>` or `<template>`, as in a browser.
+fn close_kept(doc: &Doc, stack: &mut Vec<usize>, dropped: &mut Dropped, name: &str, walled: bool) {
+    let floor = if walled {
+        stack
+            .iter()
+            .rposition(|&id| doc.name(id).is_some_and(|n| WALL.contains(&n)))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    if let Some(pos) = stack.iter().rposition(|&id| doc.name(id) == Some(name))
+        && pos > floor
+    {
+        dropped.clear();
+        stack.truncate(pos);
+    }
+}
+
 /// Open start tags past `MAX_DEPTH`. An index by name finds the match of
 /// an end tag in constant time, and each tag leaves the stack once, so a
 /// page of unmatched end tags still parses in linear time.
@@ -621,6 +662,10 @@ struct Dropped {
     /// How many open tags hide their content.
     hiding: usize,
     at: std::collections::HashMap<String, Vec<usize>>,
+    /// Where the open `WALL` tags sit, innermost last.
+    walls: Vec<usize>,
+    /// Where the open `SCOPE` tags sit, innermost last.
+    scopes: Vec<usize>,
 }
 
 impl Dropped {
@@ -629,10 +674,14 @@ impl Dropped {
     }
 
     fn push(&mut self, name: String, hides: bool) {
-        self.at
-            .entry(name.clone())
-            .or_default()
-            .push(self.names.len());
+        let pos = self.names.len();
+        if WALL.contains(&name.as_str()) {
+            self.walls.push(pos);
+        }
+        if SCOPE.contains(&name.as_str()) {
+            self.scopes.push(pos);
+        }
+        self.at.entry(name.clone()).or_default().push(pos);
         self.names.push(name);
         self.hides.push(hides);
         self.hiding += usize::from(hides);
@@ -643,9 +692,30 @@ impl Dropped {
         self.hiding > 0
     }
 
-    /// `true` when a dropped tag named `name` is open.
-    fn contains(&self, name: &str) -> bool {
-        self.at.get(name).is_some_and(|v| !v.is_empty())
+    /// Where the last open dropped `name` sits, if one is open.
+    fn last(&self, name: &str) -> Option<usize> {
+        self.at.get(name).and_then(|v| v.last()).copied()
+    }
+
+    /// Where the last open dropped `select` or `template` sits: end tags
+    /// for elements opened before it cannot reach past it.
+    fn wall(&self) -> Option<usize> {
+        self.walls.last().copied()
+    }
+
+    /// Apply a start tag's implied close (`closes`) to the dropped tags.
+    /// `true` when the search ended here, on a closed tag or a `SCOPE`;
+    /// `false` when it runs on into the kept elements.
+    fn implied_close(&mut self, closes: &[&str]) -> bool {
+        let found = closes.iter().filter_map(|name| self.last(name)).max();
+        let scope = self.scopes.last().copied();
+        match (found, scope) {
+            (Some(pos), scope) if scope.is_none_or(|scope| pos >= scope) => {
+                self.truncate(pos);
+                true
+            }
+            (_, scope) => scope.is_some(),
+        }
     }
 
     /// Close every dropped tag: a kept ancestor's end tag closed them all.
@@ -654,15 +724,20 @@ impl Dropped {
         self.hides.clear();
         self.hiding = 0;
         self.at.clear();
+        self.walls.clear();
+        self.scopes.clear();
     }
 
-    /// Close the last open `name` and every tag opened after it. An end
-    /// tag that matches nothing does nothing.
-    fn close(&mut self, name: &str) {
-        let Some(&pos) = self.at.get(name).and_then(|v| v.last()) else {
-            return;
-        };
+    /// Close the dropped tag at `pos` and every tag opened after it.
+    fn truncate(&mut self, pos: usize) {
         while self.names.len() > pos {
+            let top = self.names.len() - 1;
+            if self.walls.last() == Some(&top) {
+                self.walls.pop();
+            }
+            if self.scopes.last() == Some(&top) {
+                self.scopes.pop();
+            }
             if self.hides.pop() == Some(true) {
                 self.hiding -= 1;
             }
@@ -1387,6 +1462,29 @@ mod tests {
     }
 
     #[test]
+    fn a_stray_end_tag_cannot_leave_a_select() {
+        assert_eq!(
+            md("<div><select></div><main>hidden</main></select><main>real</main></div>"),
+            "real\n"
+        );
+        assert_eq!(
+            md("<div><template></div><main>hidden</main></template><main>real</main></div>"),
+            "real\n"
+        );
+    }
+
+    #[test]
+    fn an_implied_close_ends_the_dropped_tags_inside_it() {
+        let deep = "<div>".repeat(250);
+        let spans = "<span>".repeat(100);
+        let out = md(&format!(
+            "{deep}<p>first{spans}<span hidden>secret<p>visible</p>after"
+        ));
+        assert!(!out.contains("secret"), "{out}");
+        assert!(out.contains("visible") && out.contains("after"), "{out}");
+    }
+
+    #[test]
     fn code_blocks_skip_hidden_descendants() {
         assert_eq!(
             md("<pre><code><span hidden>secret</span>visible<script>x()</script></code></pre>"),
@@ -1485,6 +1583,17 @@ mod tests {
             "<div>".repeat(300),
             "<span>".repeat(100_000),
             "</b>".repeat(100_000)
+        );
+        let started = std::time::Instant::now();
+        let _ = md(&html);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        // Each `<p>` asks for an implied close across every dropped span.
+        let html = format!(
+            "{}{}{}",
+            "<div>".repeat(300),
+            "<span>".repeat(100_000),
+            "<p></p>".repeat(100_000)
         );
         let started = std::time::Instant::now();
         let _ = md(&html);

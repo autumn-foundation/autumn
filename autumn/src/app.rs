@@ -6689,10 +6689,13 @@ impl AppBuilder {
                 error_page_renderer: None,
                 session_store,
                 // The agent documents list the API that `dist/openapi.json`
-                // (written below) describes. The static renderer writes only
-                // the static routes, so the runtime spec route is not output.
+                // (written below) describes. The build writes that file at the
+                // site root whatever path the runtime serves it on, and writes
+                // no Swagger UI, so the documents link only what `dist` holds.
                 #[cfg(feature = "openapi")]
-                openapi: openapi.clone(),
+                openapi: openapi
+                    .clone()
+                    .map(|api| api.openapi_json_path("/openapi.json").swagger_ui_path(None)),
                 #[cfg(feature = "mcp")]
                 mcp: None,
             },
