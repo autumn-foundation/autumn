@@ -865,13 +865,16 @@ impl PricedRoutes {
         ) {
             return None;
         }
-        // A static file: the most specific match wins.
+        // A static file: the most specific match wins. Of two the same
+        // shape, the first listed, as `find` picks for a matched route:
+        // `max_by_key` keeps the last of equals, so it reads them reversed.
         let path = req.uri().path();
         routes
             .filter(|r| {
                 template_matches(&r.path, path)
                     || (self.localized(r) && template_matches(&r.path, self.strip_locale(path)))
             })
+            .rev()
             .max_by_key(|r| specificity(&r.path))
     }
 
@@ -1649,6 +1652,20 @@ mod tests {
             assert_eq!(amount("/downloads/report.pdf"), None, "MPP's");
             assert_eq!(amount("/downloads/a/b.pdf").as_deref(), Some("1"));
         }
+        // Two of the same shape: the first listed wins, as for a matched
+        // route.
+        let priced = PricedRoutes {
+            routes: vec![
+                PaidRoute::new("GET", "/downloads/{file}", "1"),
+                PaidRoute::new("GET", "/downloads/{name}", "2"),
+            ],
+            locales: Vec::new(),
+            unprefixed: Vec::new(),
+        };
+        let req = axum::http::Request::get("/downloads/a.pdf")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(priced.route_for(&req).map(|r| r.amount.as_str()), Some("1"));
         // An earlier literal outranks a later one.
         assert!(specificity("/a/b/{*p}") > specificity("/a/{x}/c"));
     }

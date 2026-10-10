@@ -283,6 +283,28 @@ async fn head_of_a_dynamic_page_mirrors_the_markdown_get() {
     assert!(head.text().is_empty());
 }
 
+#[get("/docs/page")]
+async fn based_page() -> impl IntoResponse {
+    Html(
+        "<html><head><base href=\"../assets/\"></head>\
+         <body><a href=\"guide?v=2\">Guide</a></body></html>",
+    )
+}
+
+#[tokio::test]
+async fn a_relative_base_resolves_against_the_requested_page() {
+    let res = TestApp::new()
+        .routes(routes![based_page])
+        .build()
+        .get("/docs/page")
+        .header("accept", "text/markdown")
+        .send()
+        .await;
+    res.assert_ok();
+    // A browser follows `/assets/guide`, not `/docs/guide`.
+    assert_eq!(res.text(), "[Guide](/assets/guide?v=2)\n");
+}
+
 #[tokio::test]
 async fn oversized_pages_stay_html_for_head_too() {
     let mut config = AutumnConfig::default();

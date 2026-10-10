@@ -28,6 +28,14 @@ pub const fn estimate_tokens(markdown: &str) -> usize {
 /// Convert an HTML document to Markdown.
 #[must_use]
 pub fn html_to_markdown(html: &str) -> String {
+    html_to_markdown_at(html, None)
+}
+
+/// Convert the HTML page served at `path` (the request path and query) to
+/// Markdown. A relative `<base href>` resolves against `path`, as a browser
+/// resolves it against the page URL.
+#[must_use]
+pub fn html_to_markdown_at(html: &str, path: Option<&str>) -> String {
     // As the HTML parser does first: CRLF and a lone CR are LF.
     let normalized;
     let html = if html.contains('\r') {
@@ -37,7 +45,10 @@ pub fn html_to_markdown(html: &str) -> String {
         html
     };
     let mut doc = parse(html);
-    doc.base = doc.document_base();
+    if let Some((base, scheme_relative)) = doc.document_base(path) {
+        doc.base = Some(base);
+        doc.base_scheme_relative = scheme_relative;
+    }
     let mut out = String::new();
     let title = doc
         .find_metadata(|id| doc.name(id) == Some("title"))
@@ -99,16 +110,25 @@ struct Node {
 /// never recurses.
 struct Doc {
     nodes: Vec<Node>,
-    /// The document's `<base href>`, when it is an absolute `http` or
-    /// `https` URL.
+    /// The document's `<base href>`, as an `http` or `https` URL. One the
+    /// page's origin resolves sits on [`PAGE_ORIGIN`].
     base: Option<url::Url>,
+    /// `true` when the base was scheme-relative (`//cdn.example/`): the
+    /// page's scheme is not known, so links keep that form.
+    base_scheme_relative: bool,
 }
 
+/// Stand-in origin for the page: the real one is not known here. A URL
+/// resolved onto it is written root-relative. `.invalid` is reserved, so no
+/// real link names it.
+const PAGE_ORIGIN: &str = "http://autumn.invalid";
+
 impl Doc {
-    /// The first `<base>` with an `href`, as a browser picks it. A relative
-    /// one resolves against the page URL, which is not known here, so it is
-    /// not used; nor is a scheme other than `http` or `https`.
-    fn document_base(&self) -> Option<url::Url> {
+    /// The first `<base>` with an `href`, as a browser picks it, and
+    /// whether it was scheme-relative. A path-relative one resolves against
+    /// the page `path`, and is not used without it. A scheme other than
+    /// `http` or `https` is not used.
+    fn document_base(&self, path: Option<&str>) -> Option<(url::Url, bool)> {
         let mut stack = vec![ROOT];
         while let Some(id) = stack.pop() {
             match self.name(id) {
@@ -116,9 +136,23 @@ impl Doc {
                 Some("template") => continue,
                 Some("base") => {
                     if let Some(href) = self.attr(id, "href") {
-                        return url::Url::parse(href.trim())
-                            .ok()
-                            .filter(|u| matches!(u.scheme(), "http" | "https"));
+                        let href = href.trim_matches(|c: char| c <= ' ');
+                        let url = match url::Url::parse(href) {
+                            Ok(url) => url,
+                            Err(url::ParseError::RelativeUrlWithoutBase) => {
+                                // `/x` and `//host/x` need only the origin.
+                                let page = path.or_else(|| href.starts_with('/').then_some("/"))?;
+                                url::Url::parse(PAGE_ORIGIN)
+                                    .ok()?
+                                    .join(page)
+                                    .ok()?
+                                    .join(href)
+                                    .ok()?
+                            }
+                            Err(_) => return None,
+                        };
+                        return matches!(url.scheme(), "http" | "https")
+                            .then(|| (url, href.starts_with("//")));
                     }
                 }
                 _ => {}
@@ -139,12 +173,24 @@ impl Doc {
             .chars()
             .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
             .collect();
-        match url::Url::parse(&cleaned) {
-            Err(url::ParseError::RelativeUrlWithoutBase) => base
-                .join(&cleaned)
-                .map_or_else(|_| raw.into(), |u| String::from(u).into()),
-            _ => raw.into(),
+        let Err(url::ParseError::RelativeUrlWithoutBase) = url::Url::parse(&cleaned) else {
+            return raw.into();
+        };
+        let Ok(url) = base.join(&cleaned) else {
+            return raw.into();
+        };
+        if url.scheme() == "http" && url.host_str() == PAGE_ORIGIN.strip_prefix("http://") {
+            return url[url::Position::BeforePath..].to_owned().into();
         }
+        let url = String::from(url);
+        // A scheme-relative base keeps its form: the page's scheme is not
+        // known, and the stand-in resolves it as `http`.
+        if self.base_scheme_relative
+            && let Some(rest) = url.strip_prefix("http:")
+        {
+            return rest.to_owned().into();
+        }
+        url.into()
     }
 
     fn name(&self, id: usize) -> Option<&str> {
@@ -343,6 +389,7 @@ const WALL: &[&str] = &["select", "template"];
 fn parse(html: &str) -> Doc {
     let mut doc = Doc {
         base: None,
+        base_scheme_relative: false,
         nodes: vec![Node {
             kind: Kind::Element {
                 name: "#root".to_owned(),
@@ -2400,10 +2447,26 @@ mod tests {
             "[X](https://other.example/x)\n"
         );
         assert_eq!(page("<a href=\"javascript:alert(1)\">J</a>"), "J\n");
-        // A relative base, or one in a template, is not used.
+        // A root-relative base needs only the origin; a path-relative one
+        // needs the page path; one in a template is not used.
         assert_eq!(
             md("<base href=\"/sub/\"><a href=\"guide\">Guide</a>"),
+            "[Guide](/sub/guide)\n"
+        );
+        assert_eq!(
+            md("<base href=\"../assets/\"><a href=\"guide\">Guide</a>"),
             "[Guide](guide)\n"
+        );
+        assert_eq!(
+            html_to_markdown_at(
+                "<base href=\"../assets/\"><a href=\"guide?q=1#top\">Guide</a>",
+                Some("/docs/page")
+            ),
+            "[Guide](/assets/guide?q=1#top)\n"
+        );
+        assert_eq!(
+            md("<base href=\"//cdn.example/x/\"><a href=\"guide\">Guide</a>"),
+            "[Guide](//cdn.example/x/guide)\n"
         );
         assert_eq!(
             md("<template><base href=\"https://x.example/\"></template><a href=\"g\">G</a>"),

@@ -121,6 +121,11 @@ where
         } else {
             None
         };
+        let page = flags.wants_markdown.then(|| {
+            req.uri()
+                .path_and_query()
+                .map_or_else(|| req.uri().path().to_owned(), ToString::to_string)
+        });
         // The future holds only the inner future. It does not clone the
         // service. It boxes only a page that it converts.
         NegotiateFuture {
@@ -129,6 +134,7 @@ where
             flags,
             validators,
             host,
+            page,
             convert: None,
         }
     }
@@ -196,6 +202,8 @@ pin_project_lite::pin_project! {
         flags: Flags,
         validators: Option<Box<Validators>>,
         host: Option<HeaderValue>,
+        // The request path and query, for a relative `<base href>`.
+        page: Option<String>,
         convert: Option<ConvertFuture>,
     }
 }
@@ -233,6 +241,7 @@ where
             res.headers_mut().append(LINK, link.clone());
         }
         let validators = this.validators.take();
+        let page = this.page.take();
         let checked = |res: Response| match &validators {
             Some(v) => v.apply(res),
             None => res,
@@ -269,7 +278,7 @@ where
         }
         let config = Arc::clone(this.config);
         let mut convert: ConvertFuture = Box::pin(async move {
-            let res = to_markdown(res, &config).await;
+            let res = to_markdown(res, &config, page.as_deref()).await;
             match validators {
                 Some(v) => v.apply(res),
                 None => res,
@@ -525,7 +534,7 @@ fn known_to_fit(res: &Response, max: usize) -> bool {
         .is_some_and(|len| len <= max as u64)
 }
 
-async fn to_markdown(res: Response, config: &NegotiateConfig) -> Response {
+async fn to_markdown(res: Response, config: &NegotiateConfig, page: Option<&str>) -> Response {
     if too_large(&res, config.max_bytes) {
         return res;
     }
@@ -537,8 +546,9 @@ async fn to_markdown(res: Response, config: &NegotiateConfig) -> Response {
     let markdown = if bytes.len() > BLOCKING_THRESHOLD {
         // A large page converts off the async worker threads.
         let html = bytes.clone();
+        let page = page.map(ToOwned::to_owned);
         match crate::time::spawn_blocking(move || {
-            super::markdown::html_to_markdown(&String::from_utf8_lossy(&html))
+            super::markdown::html_to_markdown_at(&String::from_utf8_lossy(&html), page.as_deref())
         })
         .await
         {
@@ -546,7 +556,7 @@ async fn to_markdown(res: Response, config: &NegotiateConfig) -> Response {
             Err(_) => return Response::from_parts(parts, Body::from(bytes)),
         }
     } else {
-        super::markdown::html_to_markdown(&String::from_utf8_lossy(&bytes))
+        super::markdown::html_to_markdown_at(&String::from_utf8_lossy(&bytes), page)
     };
     markdown_headers(
         &mut parts.headers,
