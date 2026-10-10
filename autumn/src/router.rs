@@ -5404,7 +5404,7 @@ fn apply_middleware(
         }
         let probe_state = state.clone();
         crate::capsule::CaptureLayer::new(capture_settings, capture_filter)
-            .with_builder_cache_probe(Arc::new(move || probe_state.has_builder_cache()))
+            .with_state_cache_probe(Arc::new(move || probe_state.has_cache()))
     }));
     #[cfg(not(feature = "reporting"))]
     let capture_layer = tower::layer::util::Identity::new();

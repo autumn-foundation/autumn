@@ -508,8 +508,8 @@ pub struct CaptureScope {
     notes: Mutex<Vec<String>>,
     truncated: AtomicBool,
     closed: AtomicBool,
-    /// Whether the app builder installed a cache.
-    builder_cache: AtomicBool,
+    /// Whether the app state had a cache when the run started.
+    state_cache: AtomicBool,
     /// `register_after_commit` callbacks that a rollback has not dropped.
     after_commit: std::sync::atomic::AtomicUsize,
 }
@@ -534,22 +534,22 @@ impl CaptureScope {
             notes: Mutex::new(Vec::new()),
             truncated: AtomicBool::new(false),
             closed: AtomicBool::new(false),
-            builder_cache: AtomicBool::new(false),
+            state_cache: AtomicBool::new(false),
             after_commit: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    /// Note whether the app builder installed a cache. Any `true` is kept.
-    pub(crate) fn note_builder_cache(&self, present: bool) {
+    /// Note whether the app state has a cache. Any `true` is kept.
+    pub(crate) fn note_state_cache(&self, present: bool) {
         if present {
-            self.builder_cache.store(true, Ordering::Relaxed);
+            self.state_cache.store(true, Ordering::Relaxed);
         }
     }
 
-    /// Whether the app builder installed a cache.
+    /// Whether the app state had a cache when the run started.
     #[must_use]
-    pub(crate) fn had_builder_cache(&self) -> bool {
-        self.builder_cache.load(Ordering::Relaxed)
+    pub(crate) fn had_state_cache(&self) -> bool {
+        self.state_cache.load(Ordering::Relaxed)
     }
 
     /// The capsule id (the request id, when one was available).
@@ -1277,11 +1277,11 @@ pub fn is_valid_scope_id(id: &str) -> bool {
 pub struct CaptureLayer {
     settings: Arc<CaptureSettings>,
     filter: Arc<ParameterFilter>,
-    builder_cache: Option<BuilderCacheProbe>,
+    state_cache: Option<StateCacheProbe>,
 }
 
-/// Tells whether the app builder installed a cache.
-type BuilderCacheProbe = Arc<dyn Fn() -> bool + Send + Sync>;
+/// Tells whether the app state has a cache.
+type StateCacheProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 
 impl CaptureLayer {
     /// Build the layer from resolved settings and the shared redaction filter.
@@ -1290,7 +1290,7 @@ impl CaptureLayer {
         Self {
             settings: Arc::new(settings),
             filter,
-            builder_cache: None,
+            state_cache: None,
         }
     }
 
@@ -1298,8 +1298,8 @@ impl CaptureLayer {
     /// Code can resolve the cache when the app is built, before a request
     /// scope exists, so the request alone cannot tell (#2351).
     #[must_use]
-    pub(crate) fn with_builder_cache_probe(mut self, probe: BuilderCacheProbe) -> Self {
-        self.builder_cache = Some(probe);
+    pub(crate) fn with_state_cache_probe(mut self, probe: StateCacheProbe) -> Self {
+        self.state_cache = Some(probe);
         self
     }
 }
@@ -1312,7 +1312,7 @@ impl<S> Layer<S> for CaptureLayer {
             inner,
             settings: Arc::clone(&self.settings),
             filter: Arc::clone(&self.filter),
-            builder_cache: self.builder_cache.clone(),
+            state_cache: self.state_cache.clone(),
         }
     }
 }
@@ -1323,7 +1323,7 @@ pub struct CaptureService<S> {
     inner: S,
     settings: Arc<CaptureSettings>,
     filter: Arc<ParameterFilter>,
-    builder_cache: Option<BuilderCacheProbe>,
+    state_cache: Option<StateCacheProbe>,
 }
 
 impl<S> Service<Request<Body>> for CaptureService<S>
@@ -1346,7 +1346,7 @@ where
         let mut inner = std::mem::replace(&mut self.inner, cloned);
         let settings = Arc::clone(&self.settings);
         let filter = Arc::clone(&self.filter);
-        let builder_cache = self.builder_cache.clone();
+        let state_cache = self.state_cache.clone();
 
         Box::pin(async move {
             let id = scope_id(&req);
@@ -1355,8 +1355,8 @@ where
                 .get::<MatchedPath>()
                 .map(|matched| matched.as_str().to_owned());
             let scope = Arc::new(CaptureScope::new(id, settings, filter));
-            if let Some(probe) = builder_cache {
-                scope.note_builder_cache(probe());
+            if let Some(probe) = state_cache {
+                scope.note_state_cache(probe());
             }
             // The raw peer socket, before any trusted-proxy resolution: a
             // replay restores it verbatim so middleware and handlers that
@@ -1645,10 +1645,10 @@ mod tests {
     }
 
     /// Codex review on #3222: the layer reads at the request start whether
-    /// the app builder installed a cache. Code can resolve the cache when
+    /// the app state has a cache. Code can resolve the cache when
     /// the app is built, before any request scope exists.
     #[tokio::test]
-    async fn the_capture_layer_records_a_builder_cache() {
+    async fn the_capture_layer_records_a_state_cache() {
         for present in [true, false] {
             let seen: Arc<Mutex<Option<CaptureHandle>>> = Arc::new(Mutex::new(None));
             let inner_seen = Arc::clone(&seen);
@@ -1662,14 +1662,14 @@ mod tests {
                 }
             });
             let mut service = test_layer(CaptureSettings::default())
-                .with_builder_cache_probe(Arc::new(move || present))
+                .with_state_cache_probe(Arc::new(move || present))
                 .layer(inner);
             let _ = service
                 .call(Request::new(Body::empty()))
                 .await
                 .expect("infallible");
             let handle = seen.lock().expect("slot").clone().expect("handle");
-            assert_eq!(handle.scope().had_builder_cache(), present);
+            assert_eq!(handle.scope().had_state_cache(), present);
         }
     }
 

@@ -102,19 +102,20 @@ pub fn global_cache() -> Option<Arc<dyn Cache>> {
 
 /// Set the global cache for `autumn replay` (#2351).
 ///
-/// Replay does not build the builder's cache backend. When the app builder
-/// installed one in production, replay installs the capsule seam over a
-/// backend that stores nothing, in the same places: the global cache and the
-/// app state. A cache call then takes the path it took in production, and
-/// the tape answers it. Otherwise the global cache is cleared, as the build
-/// clears it in production. Other cache setup runs again during a replay.
+/// Replay builds no cache backend and runs no startup hook. When the app
+/// state had a cache in production (from the builder, a state initializer or
+/// a startup hook), replay installs the capsule seam over a backend that
+/// stores nothing, in the global cache and the app state. A cache call then
+/// takes the path it took in production, and the tape answers it. Otherwise
+/// the global cache is cleared, as the build clears it in production. A
+/// state initializer runs again during a replay and can replace it.
 ///
 /// Returns the cache for the app state.
 #[cfg(feature = "reporting")]
 pub(crate) fn install_replay_cache(
     recorded: &crate::capsule::CapsuleEffects,
 ) -> Option<Arc<dyn Cache>> {
-    if !recorded.builder_cache {
+    if !recorded.state_cache {
         clear_global_cache();
         return None;
     }
@@ -2046,7 +2047,7 @@ mod tests {
                 namespace: "posts".to_owned(),
                 error: None,
             }],
-            builder_cache: true,
+            state_cache: true,
             ..Default::default()
         };
         let installed = install_replay_cache(&recorded).expect("installed");
@@ -2150,23 +2151,23 @@ mod tests {
         );
     }
 
-    /// Codex review on #3222: only a cache the builder installed is
-    /// recorded. A cache an initializer installs with `set_cache` is
-    /// installed again by the initializer during a replay.
+    /// Codex review on #3222: a cache installed by any route is recorded,
+    /// a startup hook (`RedisCachePlugin`) included. Replay runs no startup
+    /// hook, so it must install a cache in its place.
     #[cfg(feature = "reporting")]
     #[test]
-    fn only_a_builder_state_cache_is_recorded() {
+    fn a_cache_from_any_install_route_is_recorded() {
         let _guard = GLOBAL_CACHE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let builder = crate::state::AppState::for_test()
             .with_cache(Arc::new(SpyBackend::default()) as Arc<dyn Cache>);
-        assert!(builder.has_builder_cache());
-        let initializer = crate::state::AppState::for_test();
-        initializer.set_cache(Arc::new(SpyBackend::default()));
+        assert!(builder.has_cache());
+        let startup = crate::state::AppState::for_test();
+        assert!(!startup.has_cache());
+        startup.set_cache(Arc::new(SpyBackend::default()));
         clear_global_cache();
-        assert!(initializer.cache().is_some());
-        assert!(!initializer.has_builder_cache());
+        assert!(startup.has_cache());
     }
 
     /// Codex review on #3222: during `autumn replay`, a cache call with no

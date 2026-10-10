@@ -64,5 +64,5 @@
   `Random` and `Detached`; `capsule::schema::MailErrorKind` has a new variant
   `NoDurableQueueInProduction`; `capsule::JobEffect` has new public fields
   `requested_due_at` and `error_status`; `capsule::CapsuleEffects` has a new public field
-  `builder_cache`
+  `state_cache`
   ([migration guide](docs/migrations/next.md)).
