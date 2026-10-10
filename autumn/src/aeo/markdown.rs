@@ -199,11 +199,57 @@ fn implied_close(tag: &str) -> &'static [&'static str] {
         "td" | "th" => &["td", "th"],
         "option" => &["option"],
         "thead" | "tbody" | "tfoot" => &["thead", "tbody", "tfoot", "tr", "td", "th"],
-        "p" | "div" | "ul" | "ol" | "table" | "pre" | "blockquote" | "h1" | "h2" | "h3" | "h4"
-        | "h5" | "h6" | "hr" | "section" | "article" | "header" | "footer" | "nav" | "main"
-        | "form" | "dl" | "figure" | "aside" => &["p"],
         _ => &[],
     }
+}
+
+/// The start tags that close an open `<p>`, as in the HTML parser. A `<li>`,
+/// `<dt>` or `<dd>` closes its own kind first, then any `<p>` left open.
+fn closes_paragraph(tag: &str) -> bool {
+    matches!(
+        tag,
+        "address"
+            | "article"
+            | "aside"
+            | "blockquote"
+            | "center"
+            | "details"
+            | "dialog"
+            | "dir"
+            | "div"
+            | "dl"
+            | "fieldset"
+            | "figcaption"
+            | "figure"
+            | "footer"
+            | "form"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "header"
+            | "hgroup"
+            | "hr"
+            | "listing"
+            | "main"
+            | "menu"
+            | "nav"
+            | "ol"
+            | "p"
+            | "plaintext"
+            | "pre"
+            | "search"
+            | "section"
+            | "summary"
+            | "table"
+            | "ul"
+            | "xmp"
+            | "li"
+            | "dd"
+            | "dt"
+    )
 }
 
 /// Elements a document head can hold.
@@ -326,8 +372,15 @@ fn parse(html: &str) -> Doc {
         // Implied end tags. The search runs from the innermost open tag
         // out, through the dropped tags first, so closing a kept element
         // also closes every dropped tag inside it.
-        let closes = implied_close(&tag.name);
-        if !closes.is_empty() && !dropped.implied_close(closes) {
+        let paragraph: &[&str] = if closes_paragraph(&tag.name) {
+            &["p"]
+        } else {
+            &[]
+        };
+        for closes in [implied_close(&tag.name), paragraph] {
+            if closes.is_empty() || dropped.implied_close(closes) {
+                continue;
+            }
             for pos in (1..stack.len()).rev() {
                 let Some(open) = doc.name(stack[pos]) else {
                     break;
@@ -1482,6 +1535,34 @@ mod tests {
         ));
         assert!(!out.contains("secret"), "{out}");
         assert!(out.contains("visible") && out.contains("after"), "{out}");
+    }
+
+    #[test]
+    fn every_html_block_closes_an_open_paragraph() {
+        assert_eq!(
+            md("<p hidden>secret<address>Visible</address><p>After"),
+            "Visible\n\nAfter\n"
+        );
+        for block in [
+            "details",
+            "fieldset",
+            "figcaption",
+            "hgroup",
+            "menu",
+            "search",
+            "summary",
+        ] {
+            let out = md(&format!("<p hidden>secret<{block}>Visible</{block}>"));
+            assert!(
+                !out.contains("secret") && out.contains("Visible"),
+                "{block}: {out}"
+            );
+        }
+        // A list item closes the paragraph inside the item before it.
+        let out = md("<ul><li><p>one<li>two</ul>");
+        assert!(out.contains("- one") && out.contains("- two"), "{out}");
+        let out = md("<p hidden>secret<li>shown");
+        assert!(!out.contains("secret") && out.contains("shown"), "{out}");
     }
 
     #[test]
