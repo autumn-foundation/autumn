@@ -8565,6 +8565,12 @@ impl AppBuilder {
             install_i18n_bundle_layer(custom_layers, &state, i18n_bundle, &config.i18n);
 
         install_webhook_registry(&state, &config);
+        // Production's `outbox::install` gives `deliver_later` a queue when
+        // `outbox.enabled` and the app has a database. Replay runs no relay,
+        // so the replay mailer stands in for that queue too.
+        #[cfg(all(feature = "mail", feature = "db"))]
+        let builder_mail_queue =
+            builder_mail_queue || crate::outbox::installs_mail_queue(&state, &config.outbox);
         // Before the initializers, as production installs its mailer, so an
         // initializer that reads the `Mailer` sees the same configuration.
         #[cfg(feature = "mail")]
@@ -17988,6 +17994,15 @@ mod tests {
         let last = handler.rfind(install).expect("installed");
         assert!(first < initializers, "installed before the initializers");
         assert!(last > initializers, "and again after them");
+        // Codex review on #3222: with `outbox.enabled`, production's mailer
+        // has the outbox's queue. Replay counts it before the first install.
+        #[cfg(feature = "db")]
+        {
+            let outbox = handler
+                .find("crate::outbox::installs_mail_queue(&state, &config.outbox)")
+                .expect("the replay handler counts the outbox's mail queue");
+            assert!(outbox < first, "counted before the mailer is installed");
+        }
     }
 
     /// Codex review on #3222: replay installs a builder's cache before the

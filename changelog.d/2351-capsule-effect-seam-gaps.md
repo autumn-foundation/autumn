@@ -11,7 +11,9 @@
   backends stay offline, a mail send with no tape is refused, and a task that
   startup code spawns gets a tape that refuses every call.
 - **capsule:** `autumn replay` installs a mailer. A mail-sending route reaches
-  the mail seam and replays from the capsule. Nothing is delivered.
+  the mail seam and replays from the capsule. Nothing is delivered. Its
+  `has_durable_delivery_queue()` answers as production's did, also when the
+  queue came from `[outbox] enabled = true`.
 - **capsule:** a capsule records whether the app builder installed a cache
   (`with_cache_backend`). `autumn replay` then installs a cache that stores
   nothing in the same places, so a cache call takes the production path and
