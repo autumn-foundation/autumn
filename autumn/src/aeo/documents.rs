@@ -958,7 +958,7 @@ fn valid_skill_name(name: &str) -> bool {
         && !name.contains("--")
 }
 
-fn yaml_quote(s: &str) -> String {
+pub(super) fn yaml_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {

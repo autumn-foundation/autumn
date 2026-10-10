@@ -101,8 +101,19 @@ const SCRIPT: &str = r#"// Autumn WebMCP: register this site's MCP tools with in
           params: { name: t.name, arguments: input || {} },
         }),
       });
-      const msg = parse(await res.text());
-      if (msg.error) throw new Error(msg.error.message || "MCP error");
+      let msg = null;
+      try {
+        msg = parse(await res.text());
+      } catch (_) {}
+      if (msg && typeof msg === "object" && msg.error) {
+        throw new Error(msg.error.message || "MCP error");
+      }
+      // A layer in front of /mcp (auth, CSRF, a rate limit) answers with
+      // its own status and body: that is a failure, not a result.
+      if (!res.ok || !msg || typeof msg !== "object" || !("result" in msg)) {
+        const why = (msg && (msg.detail || msg.title)) || "HTTP " + res.status;
+        throw new Error("MCP request failed: " + why);
+      }
       return msg.result;
     };
     try {
@@ -245,6 +256,15 @@ mod tests {
         for line in script(&facts(true), "x-csrf-token").lines() {
             assert_eq!(line.matches('"').count() % 2, 0, "{line}");
         }
+    }
+
+    #[test]
+    fn a_rejected_call_is_an_error_not_a_result() {
+        // A Problem Details body from a layer in front of /mcp parses as
+        // JSON, so the status and the JSON-RPC shape are both checked.
+        let js = script(&facts(true), "x-csrf-token");
+        assert!(js.contains("!res.ok"), "{js}");
+        assert!(js.contains(r#"!("result" in msg)"#), "{js}");
     }
 
     #[test]

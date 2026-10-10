@@ -50,12 +50,12 @@ pub fn html_to_markdown(html: &str) -> String {
         out.push_str("---\n");
         if let Some(t) = &title {
             out.push_str("title: ");
-            out.push_str(&yaml_quote(t));
+            out.push_str(&super::documents::yaml_quote(t));
             out.push('\n');
         }
         if let Some(d) = &description {
             out.push_str("description: ");
-            out.push_str(&yaml_quote(d));
+            out.push_str(&super::documents::yaml_quote(d));
             out.push('\n');
         }
         out.push_str("---\n\n");
@@ -837,21 +837,6 @@ fn collapse_ws(s: &str) -> String {
     s.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn yaml_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if c.is_control() => {}
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 // ── Writer ──────────────────────────────────────────────────────────────────
 
 /// An end tag no dropped tag answers: close the last kept element it
@@ -1113,8 +1098,11 @@ impl Writer {
                 self.line.push_str(lead);
                 match doc.attr(id, "href").and_then(|h| safe_url(h, true)) {
                     Some(href) => {
-                        // A `!` right before the label would make it an image.
-                        if self.line.ends_with('!') && !self.line.ends_with("\\!") {
+                        // A `!` right before the label would make it an image,
+                        // unless an odd run of `\` escapes it.
+                        if let Some(before) = self.line.strip_suffix('!')
+                            && before.bytes().rev().take_while(|&b| b == b'\\').count() % 2 == 0
+                        {
                             self.line.pop();
                             self.line.push_str("\\!");
                         }
@@ -2068,6 +2056,20 @@ mod tests {
     fn crlf_reads_as_lf() {
         assert_eq!(md("<pre>\r\nx\r\ny\r\n</pre>"), "```\nx\ny\n```\n");
         assert_eq!(md("<p>a\rb</p>"), "a b\n");
+    }
+
+    #[test]
+    fn a_bang_after_an_escaped_backslash_is_escaped() {
+        // The text `\` writes as `\\`, which leaves the `!` bare.
+        assert_eq!(md("<p>\\!<a href=\"/x\">x</a></p>"), "\\\\\\![x](/x)\n");
+    }
+
+    #[test]
+    fn front_matter_keeps_control_characters() {
+        assert_eq!(
+            md("<head><title>A&#8;B</title></head><body>x</body>"),
+            "---\ntitle: \"A\\u0008B\"\n---\n\nx\n"
+        );
     }
 
     #[test]
