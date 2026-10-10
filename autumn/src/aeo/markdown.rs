@@ -60,10 +60,9 @@ pub fn html_to_markdown(html: &str) -> String {
         }
         out.push_str("---\n\n");
     }
-    let root = doc
-        .find_visible("main")
-        .or_else(|| doc.find_visible("body"))
-        .unwrap_or(ROOT);
+    // Without a `<main>`, the whole document: a browser moves content
+    // before `<body>` or after `</body>` into the body.
+    let root = doc.find_visible("main").unwrap_or(ROOT);
     let mut w = Writer::default();
     w.children(&doc, root, 0);
     let body = w.finish();
@@ -985,8 +984,6 @@ const BLOCK: &[&str] = &[
     "dl",
     "dt",
     "dd",
-    "html",
-    "body",
     "#root",
     "center",
     "hgroup",
@@ -1111,7 +1108,9 @@ impl Writer {
                         } else {
                             text
                         };
-                        let _ = write!(self.line, "[{label}]({href})");
+                        // A destination decodes character references too,
+                        // so an `&copy;` the URL holds as text is escaped.
+                        let _ = write!(self.line, "[{label}]({})", escape_entity_like(&href));
                     }
                     None => self.line.push_str(&text),
                 }
@@ -1120,7 +1119,7 @@ impl Writer {
             "img" => {
                 if let Some(src) = doc.attr(id, "src").and_then(|s| safe_url(s, false)) {
                     let alt = escape_inline(&collapse_ws(doc.attr(id, "alt").unwrap_or("")));
-                    let _ = write!(self.line, "![{alt}]({src})");
+                    let _ = write!(self.line, "![{alt}]({})", escape_entity_like(&src));
                 }
             }
             "pre" => {
@@ -2125,6 +2124,27 @@ mod tests {
         assert_eq!(
             md("<table><tbody><td>A<td>B<tr><td>C</td></tr></tbody></table>"),
             "| A | B |\n| --- | --- |\n| C |  |\n"
+        );
+    }
+
+    #[test]
+    fn content_outside_the_body_joins_it() {
+        assert_eq!(md("<body>One</body>Two"), "OneTwo\n");
+        assert_eq!(
+            md("<html><head><title>T</title></head>Before<body><p>In</p></body></html>After"),
+            "---\ntitle: \"T\"\n---\n\nBefore\n\nIn\n\nAfter\n"
+        );
+    }
+
+    #[test]
+    fn a_reference_in_a_url_stays_literal() {
+        assert_eq!(
+            md("<a href=\"/go?x=&amp;copy;&amp;y=1\">Go</a>"),
+            "[Go](/go?x=\\&copy;&y=1)\n"
+        );
+        assert_eq!(
+            md("<img src=\"/i?a=&amp;lt;\" alt=\"i\">"),
+            "![i](/i?a=\\&lt;)\n"
         );
     }
 

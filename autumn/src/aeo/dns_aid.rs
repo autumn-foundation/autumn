@@ -91,7 +91,12 @@ pub fn records(input: &DnsAidInput) -> Vec<String> {
     let Some(url::Host::Domain(host)) = url.host() else {
         return Vec::new();
     };
-    let host = host.to_ascii_lowercase();
+    // A fully qualified `example.com.` keeps its root dot in the URL; the
+    // records add their own.
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    if host.is_empty() {
+        return Vec::new();
+    }
     let alpn = if url.scheme() == "https" {
         "h2"
     } else {
@@ -120,6 +125,16 @@ pub fn records(input: &DnsAidInput) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fully_qualified_host_has_one_root_dot() {
+        let lines = records(&DnsAidInput::new("https://example.com.", None));
+        assert!(
+            lines[0].starts_with("_index._agents.example.com. 3600 IN SVCB 1 example.com. "),
+            "{lines:?}"
+        );
+        assert!(lines.iter().all(|l| !l.contains("..")), "{lines:?}");
+    }
 
     #[test]
     fn mcp_site_records() {
