@@ -962,6 +962,10 @@ What capsules do not do, stated plainly:
   gets the event, transaction-timeout and job contexts of a production run. A
   handler that reads `JobContext` would take a path production did not take,
   so capture marks the capsule incomplete.
+- **An enqueue error with field details refuses the capsule.** Replay gives
+  a failed enqueue its recorded message and status. An error with field
+  details or its own problem type has a different `code()`, which replay
+  cannot rebuild, so capture marks the capsule incomplete.
 - **Some cache calls refuse the capsule.** A sync `invalidate` or `clear`
   returns no result. When the backend counts a failed removal during the call,
   capture marks the capsule incomplete. A cache fill that meets a distributed

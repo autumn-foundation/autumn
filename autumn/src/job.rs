@@ -3358,15 +3358,7 @@ fn replayed_enqueue(
             // unchanged queue-failure capsule as a mismatch.
             // The recorded status goes back too, so a handler that branches on
             // it takes the same path. An older capsule has none: a 500.
-            EnqueueVerdict::Failed(error, status) => {
-                let error = AutumnError::internal_server_error(std::io::Error::other(error));
-                Err(
-                    match status.and_then(|status| http::StatusCode::from_u16(status).ok()) {
-                        Some(status) => error.with_status(status),
-                        None => error,
-                    },
-                )
-            }
+            EnqueueVerdict::Failed(error, status) => Err(rebuilt_enqueue_error(error, status)),
             // `next_job` already logged the divergence; the enqueue fails
             // closed so the handler sees an error rather than a silent success
             // against a queue that was never touched.
@@ -3485,6 +3477,32 @@ async fn after_commit_seam(
     result
 }
 
+/// The error a replay gives for a recorded enqueue failure: its message,
+/// with its status when the capsule has one.
+#[cfg(feature = "reporting")]
+fn rebuilt_enqueue_error(message: String, status: Option<u16>) -> AutumnError {
+    let error = AutumnError::internal_server_error(std::io::Error::other(message));
+    match status.and_then(|status| http::StatusCode::from_u16(status).ok()) {
+        Some(status) => error.with_status(status),
+        None => error,
+    }
+}
+
+/// Mark the capsule incomplete when replay cannot rebuild a failed
+/// enqueue's error: field details or a problem type the tape does not keep
+/// change its public `code()`.
+#[cfg(feature = "reporting")]
+fn note_unrebuildable_enqueue_error(scope: &crate::capsule::CaptureScope, error: &AutumnError) {
+    let rebuilt = rebuilt_enqueue_error(error.message(), Some(error.status().as_u16()));
+    if rebuilt.code() != error.code() {
+        scope.note(
+            "an enqueue failed with an error that replay cannot rebuild (field details or a \
+             problem type); the capsule is not replayable",
+        );
+        scope.mark_truncated();
+    }
+}
+
 /// Complete an after-commit slot with the registration's result.
 #[cfg(feature = "reporting")]
 fn fill_after_commit_enqueue(
@@ -3496,6 +3514,9 @@ fn fill_after_commit_enqueue(
     let Some(slot) = slot else {
         return;
     };
+    if let Some(error) = error {
+        note_unrebuildable_enqueue_error(&slot.scope, error);
+    }
     let (delay_secs, due_at) = match schedule {
         EnqueueSchedule::Immediate => (None, None),
         EnqueueSchedule::After(delay) => (Some(delay), None),
@@ -3711,6 +3732,9 @@ fn fill_enqueue(
     let Some(slot) = slot else {
         return;
     };
+    if let Some(error) = error {
+        note_unrebuildable_enqueue_error(&slot.scope, error);
+    }
     slot.scope.fill_job_enqueue(
         slot.index,
         crate::capsule::JobEffect {
@@ -14605,7 +14629,34 @@ mod tests {
         .expect_err("the replay reproduces the failure");
         assert_eq!(replayed.status(), http::StatusCode::BAD_REQUEST);
         assert_eq!(replayed.message(), recorded.message());
+        assert_eq!(replayed.code(), recorded.code());
         assert!(tape.divergences().is_empty(), "{:?}", tape.divergences());
+        assert!(!scope.is_truncated(), "a plain error replays as recorded");
+    }
+
+    /// Codex review on #3222: an enqueue error that carries field details
+    /// cannot be rebuilt on replay, so the capsule is marked incomplete.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn an_enqueue_error_with_field_details_marks_the_capsule_incomplete() {
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let details =
+            std::collections::HashMap::from([("email".to_owned(), vec!["is taken".to_owned()])]);
+        let _ = crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            after_commit_seam(
+                "send_receipt",
+                &serde_json::json!({}),
+                EnqueueSchedule::Immediate,
+                Box::pin(async move { Err(AutumnError::validation(details)) }),
+            ),
+        )
+        .await;
+        assert!(scope.is_truncated());
     }
 
     #[tokio::test]
