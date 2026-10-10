@@ -617,11 +617,17 @@ where
     V: Clone + serde::Serialize + Send + Sync + 'static,
 {
     // A replay has no fence: `insert_cached` sends the write to the tape, or
-    // drops it during `autumn replay` with no tape.
-    let epoch = if replaying() {
-        FillEpoch::Unsupported
-    } else {
-        epoch
+    // drops it during `autumn replay` with no tape. Only a sampled epoch
+    // reaches the backend, so only it is bypassed, and only after the value
+    // is encoded, as the fenced path does.
+    let epoch = match epoch {
+        FillEpoch::Sampled(_) if replaying() => {
+            if serde_json::to_vec(&value).is_err() {
+                return false;
+            }
+            FillEpoch::Unsupported
+        }
+        other => other,
     };
     let sampled = match epoch {
         FillEpoch::Unsupported => {
@@ -1444,6 +1450,41 @@ mod shared_fence_tests {
         assert_eq!(sampled, FillEpoch::Unsupported, "no epoch read");
         assert!(stored, "the replay took the write");
         assert!(replica.shared.lock().unwrap().data.is_empty(), "no write");
+    }
+
+    /// Codex review on #3222: a replay keeps the fenced fill's result. A
+    /// value that cannot be serialized, and an unreadable epoch, are not
+    /// stored, as in production.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_replay_keeps_the_fenced_fill_result() {
+        struct Unencodable;
+        impl serde::Serialize for Unencodable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("cannot encode"))
+            }
+        }
+        impl Clone for Unencodable {
+            fn clone(&self) -> Self {
+                Self
+            }
+        }
+        let replica = Replica::default();
+        super::TEST_REPLAY_BLOCKED.with(|blocked| blocked.set(true));
+        let unencodable = insert_cached_fenced(
+            &replica,
+            "ns:k",
+            Unencodable,
+            None,
+            "ns",
+            FillEpoch::Sampled(0),
+        );
+        let unavailable =
+            insert_cached_fenced(&replica, "ns:k", 1_u32, None, "ns", FillEpoch::Unavailable);
+        super::TEST_REPLAY_BLOCKED.with(|blocked| blocked.set(false));
+        assert!(!unencodable, "the fenced path does not store it");
+        assert!(!unavailable, "an unreadable epoch stores nothing");
+        assert!(replica.shared.lock().unwrap().data.is_empty());
     }
 
     #[test]
