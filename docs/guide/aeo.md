@@ -189,7 +189,8 @@ shared cache keeps a forged host. Autumn logs a warning in production when
 `autumn build` writes `llms.txt`, the skills, the ARD manifest, `auth.md`,
 the OAuth metadata, and the commerce documents into `dist/` when
 `[seo] base_url` is set. A file that a static route wrote stays. A static
-build has no MCP server or API, so it has no server card or API catalog.
+build has no MCP server, so it has no server card. With `.openapi(...)` it
+lists the API, and writes the API catalog next to `openapi.json`.
 The build does not write the Web Bot Auth directory, because its signature
 expires. Markdown negotiation and x402 need the server.
 

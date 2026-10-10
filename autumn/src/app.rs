@@ -6688,8 +6688,11 @@ impl AppBuilder {
                 #[cfg(feature = "maud")]
                 error_page_renderer: None,
                 session_store,
+                // The agent documents list the API that `dist/openapi.json`
+                // (written below) describes. The static renderer writes only
+                // the static routes, so the runtime spec route is not output.
                 #[cfg(feature = "openapi")]
-                openapi: None,
+                openapi: openapi.clone(),
                 #[cfg(feature = "mcp")]
                 mcp: None,
             },

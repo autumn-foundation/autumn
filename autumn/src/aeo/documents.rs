@@ -652,7 +652,7 @@ fn llms_txt(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
             origin.url(SKILLS_INDEX_PATH)
         );
     }
-    if auth_md_applies(facts) {
+    if auth_md_applies(facts, origin) {
         let _ = writeln!(
             out,
             "- [auth.md]({}): how agents get credentials.",
@@ -932,7 +932,7 @@ fn site_guide(facts: &SiteFacts, origin: &Origin) -> AgentSkill {
             origin.url(&api.json_path)
         );
     }
-    if auth_md_applies(facts) {
+    if auth_md_applies(facts, origin) {
         let _ = writeln!(
             body,
             "\n## Authenticate\n\n- Read {} before you call the API.",
@@ -1084,7 +1084,7 @@ fn protected_resource(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
     if !oauth.scopes_supported.is_empty() {
         prm["scopes_supported"] = json!(oauth.scopes_supported);
     }
-    if auth_md_applies(facts) {
+    if auth_md_applies(facts, origin) {
         prm["resource_documentation"] = json!(origin.url(AUTH_MD_PATH));
     }
     Some(cors_json(&prm))
@@ -1185,15 +1185,15 @@ fn authorization_server(facts: &SiteFacts, origin: &Origin) -> Option<Document> 
 
 /// `/auth.md` needs a concrete way to get a credential: a registration
 /// page, or OAuth metadata.
-const fn auth_md_applies(facts: &SiteFacts) -> bool {
+fn auth_md_applies(facts: &SiteFacts, origin: &Origin) -> bool {
     facts.auth_md.enabled
         && (facts.auth_md.registration_url.is_some()
             || !facts.oauth.authorization_servers.is_empty()
-            || facts.oauth.authorization_server.issuer.is_some())
+            || local_issuer(facts, origin).is_some())
 }
 
 fn auth_md(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
-    if !auth_md_applies(facts) {
+    if !auth_md_applies(facts, origin) {
         return None;
     }
     let name = one_line(&display_name(facts, origin));
@@ -1222,7 +1222,7 @@ fn auth_md(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
             origin.url(OAUTH_RESOURCE_PATH)
         );
     }
-    if oauth.authorization_server.issuer.is_some() {
+    if local_issuer(facts, origin).is_some() {
         let _ = writeln!(
             md,
             "- OAuth authorization server metadata: {}",
@@ -1813,6 +1813,20 @@ mod tests {
             doc.body
         );
         assert!(doc.body.contains("/about</loc>"), "{}", doc.body);
+    }
+
+    #[test]
+    fn auth_md_needs_an_issuer_this_site_can_publish() {
+        let mut facts = api_site();
+        facts.oauth.authorization_server.issuer = Some("https://auth.elsewhere.example".to_owned());
+        assert!(render(&facts, &origin(), AUTH_MD_PATH).is_none());
+        facts.oauth.authorization_server.issuer = Some("https://shop.example.com".to_owned());
+        let doc = render(&facts, &origin(), AUTH_MD_PATH).unwrap();
+        assert!(
+            doc.body.contains("OAuth authorization server metadata"),
+            "{}",
+            doc.body
+        );
     }
 
     #[test]
