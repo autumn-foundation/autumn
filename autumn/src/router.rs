@@ -6533,16 +6533,22 @@ pub fn try_build_router_with_static_inner(
                         // layer is applied outside this middleware and
                         // negotiates gzip/brotli by content type: it encodes
                         // compressible SSG pages and leaves binary assets alone.
+                        // A `HEAD` carries the length the `GET` would send, so
+                        // a layer outside (Markdown negotiation) can tell
+                        // whether that body fits.
+                        let len = contents.len();
                         let body = if is_head {
                             axum::body::Body::empty()
                         } else {
                             axum::body::Body::from(contents)
                         };
-                        return http::Response::builder()
+                        let mut response = http::Response::builder()
                             .status(http::StatusCode::OK)
-                            .header(http::header::CONTENT_TYPE, hit.content_type)
-                            .body(body)
-                            .expect("infallible response builder");
+                            .header(http::header::CONTENT_TYPE, hit.content_type);
+                        if is_head {
+                            response = response.header(http::header::CONTENT_LENGTH, len);
+                        }
+                        return response.body(body).expect("infallible response builder");
                     }
                 }
                 next.run(req).await
@@ -12040,6 +12046,47 @@ enabled = true
             .await
             .unwrap();
         assert_eq!(&body[..], b"<h1>secret</h1>");
+    }
+
+    /// A `HEAD` of a pre-rendered page carries the length its `GET` sends, so
+    /// Markdown negotiation gives `HEAD` the same headers as `GET`.
+    #[tokio::test]
+    async fn ssg_head_mirrors_the_markdown_get() {
+        let html = b"<html><body><main><h1>About</h1></main></body></html>";
+        let tmp = create_ssg_dist(&[("/about", "about.html", html)]);
+        let dist = tmp.path().join("dist");
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &AutumnConfig::default(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let send = |method: http::Method| {
+            router.clone().oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/about")
+                    .header(http::header::ACCEPT, "text/markdown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+        let head = send(http::Method::HEAD).await.unwrap();
+        let get = send(http::Method::GET).await.unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(
+            head.headers().get(http::header::CONTENT_TYPE),
+            get.headers().get(http::header::CONTENT_TYPE),
+        );
+        assert!(
+            head.headers()[http::header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/markdown"),
+            "{:?}",
+            head.headers()
+        );
     }
 
     /// A manifest-backed HTML page is gzip-compressed when the client accepts
