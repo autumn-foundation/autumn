@@ -36,7 +36,8 @@ pub fn html_to_markdown(html: &str) -> String {
     } else {
         html
     };
-    let doc = parse(html);
+    let mut doc = parse(html);
+    doc.base = doc.document_base();
     let mut out = String::new();
     let title = doc
         .find_metadata(|id| doc.name(id) == Some("title"))
@@ -98,9 +99,54 @@ struct Node {
 /// never recurses.
 struct Doc {
     nodes: Vec<Node>,
+    /// The document's `<base href>`, when it is an absolute `http` or
+    /// `https` URL.
+    base: Option<url::Url>,
 }
 
 impl Doc {
+    /// The first `<base>` with an `href`, as a browser picks it. A relative
+    /// one resolves against the page URL, which is not known here, so it is
+    /// not used; nor is a scheme other than `http` or `https`.
+    fn document_base(&self) -> Option<url::Url> {
+        let mut stack = vec![ROOT];
+        while let Some(id) = stack.pop() {
+            match self.name(id) {
+                // Template content is not part of the document.
+                Some("template") => continue,
+                Some("base") => {
+                    if let Some(href) = self.attr(id, "href") {
+                        return url::Url::parse(href.trim())
+                            .ok()
+                            .filter(|u| matches!(u.scheme(), "http" | "https"));
+                    }
+                }
+                _ => {}
+            }
+            stack.extend(self.nodes[id].children.iter().rev());
+        }
+        None
+    }
+
+    /// `raw` resolved against the document base, as a browser follows it.
+    /// An absolute URL, or any URL without a base, is unchanged.
+    fn resolve<'a>(&self, raw: &'a str) -> std::borrow::Cow<'a, str> {
+        let Some(base) = &self.base else {
+            return raw.into();
+        };
+        let cleaned: String = raw
+            .trim_matches(|c: char| c <= ' ')
+            .chars()
+            .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+            .collect();
+        match url::Url::parse(&cleaned) {
+            Err(url::ParseError::RelativeUrlWithoutBase) => base
+                .join(&cleaned)
+                .map_or_else(|_| raw.into(), |u| String::from(u).into()),
+            _ => raw.into(),
+        }
+    }
+
     fn name(&self, id: usize) -> Option<&str> {
         match &self.nodes[id].kind {
             Kind::Element { name, .. } => Some(name),
@@ -296,6 +342,7 @@ const WALL: &[&str] = &["select", "template"];
 #[allow(clippy::too_many_lines)] // one tokenizer loop; splitting it hides the state
 fn parse(html: &str) -> Doc {
     let mut doc = Doc {
+        base: None,
         nodes: vec![Node {
             kind: Kind::Element {
                 name: "#root".to_owned(),
@@ -1093,7 +1140,10 @@ impl Writer {
             "a" => {
                 let (lead, text, trail) = Self::inline_parts(doc, id, depth);
                 self.line.push_str(lead);
-                match doc.attr(id, "href").and_then(|h| safe_url(h, true)) {
+                match doc
+                    .attr(id, "href")
+                    .and_then(|h| safe_url(&doc.resolve(h), true))
+                {
                     // A link with no text shows nothing, so it gets no
                     // label made up from its URL.
                     Some(href) if !text.is_empty() => {
@@ -1114,7 +1164,10 @@ impl Writer {
                 self.line.push_str(trail);
             }
             "img" => {
-                if let Some(src) = doc.attr(id, "src").and_then(|s| safe_url(s, false)) {
+                if let Some(src) = doc
+                    .attr(id, "src")
+                    .and_then(|s| safe_url(&doc.resolve(s), false))
+                {
                     let alt = escape_inline(&collapse_ws(doc.attr(id, "alt").unwrap_or("")));
                     let _ = write!(self.line, "![{alt}]({})", escape_entity_like(&src));
                 }
@@ -1255,9 +1308,14 @@ impl Writer {
         } else {
             Vec::new()
         };
-        // A Markdown list number is 0 to 999999999. Past that, or below
-        // zero, the items are bullets that spell out their numbers.
-        let as_bullets = numbers.iter().any(|n| !(0..=999_999_999).contains(n));
+        // `<ol type>` picks letters or Roman numerals; the attribute is case
+        // sensitive.
+        let style = doc
+            .attr(id, "type")
+            .filter(|t| matches!(*t, "a" | "A" | "i" | "I"));
+        // A Markdown list number is 0 to 999999999, in decimal. For any
+        // other label, the items are bullets that spell out their labels.
+        let as_bullets = style.is_some() || numbers.iter().any(|n| !(0..=999_999_999).contains(n));
         let mut numbers = numbers.into_iter();
         for &item in &doc.nodes[id].children {
             if doc.name(item) != Some("li") {
@@ -1269,7 +1327,7 @@ impl Writer {
             }
             end_other(&mut other, &mut lines, &mut blocks);
             let (marker, label) = match numbers.next() {
-                Some(n) if as_bullets => ("- ".to_owned(), format!("{n}\\. ")),
+                Some(n) if as_bullets => ("- ".to_owned(), format!("{}\\. ", list_label(n, style))),
                 Some(n) => (format!("{n}. "), String::new()),
                 None => ("- ".to_owned(), String::new()),
             };
@@ -1330,8 +1388,65 @@ impl Writer {
             .collect()
     }
 
+    /// The text of each row's cells, in the columns a browser gives them.
+    fn place_cells(doc: &Doc, rows_at: &[(usize, Vec<usize>)], depth: usize) -> Vec<Vec<String>> {
+        // GFM has no spans: a place a `rowspan` or `colspan` covers is an
+        // empty cell, so later cells keep the columns a browser gives them.
+        // Placeholders are bounded by the table's own cells, so a hostile
+        // span cannot blow up the output.
+        let own: usize = rows_at.iter().map(|(_, row)| row.len()).sum();
+        let mut budget = own.saturating_mul(8).saturating_add(64);
+        // The row index each column stays covered until (exclusive).
+        let mut covered_until: Vec<usize> = Vec::new();
+        let mut rows = Vec::new();
+        for (r, (_, row)) in rows_at.iter().enumerate() {
+            let mut cells = Vec::new();
+            let mut col = 0;
+            for &c in row {
+                while budget > 0 && covered_until.get(col).is_some_and(|&u| u > r) {
+                    cells.push(String::new());
+                    budget -= 1;
+                    col += 1;
+                }
+                cells.push(
+                    Self::inline_of(doc, c, depth + 1)
+                        .replace('|', "\\|")
+                        .replace('\n', " "),
+                );
+                let span = |name: &str| {
+                    doc.attr(c, name)
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                };
+                // `rowspan="0"` runs to the end of the table.
+                let rowspan = match span("rowspan") {
+                    Some(0) => usize::MAX,
+                    Some(n) => n.min(65_534),
+                    None => 1,
+                };
+                let colspan = span("colspan").unwrap_or(1).clamp(1, 1000);
+                for k in 0..colspan {
+                    if k > 0 {
+                        if budget == 0 {
+                            break;
+                        }
+                        cells.push(String::new());
+                        budget -= 1;
+                    }
+                    if covered_until.len() <= col {
+                        covered_until.resize(col + 1, 0);
+                    }
+                    covered_until[col] = r.saturating_add(rowspan);
+                    col += 1;
+                }
+            }
+            if !cells.is_empty() {
+                rows.push(cells);
+            }
+        }
+        rows
+    }
+
     fn table(doc: &Doc, id: usize, depth: usize) -> String {
-        let mut rows: Vec<Vec<String>> = Vec::new();
         let mut stack = vec![id];
         // Each row, keyed by its first node for document order, with its
         // cells. A cell outside any `<tr>` opens a row in a browser, which
@@ -1383,19 +1498,7 @@ impl Writer {
             foster.node(doc, c, depth + 1);
         }
         let foster = foster.finish().trim_end().to_owned();
-        for (_, row) in rows_at {
-            let cells: Vec<String> = row
-                .iter()
-                .map(|&c| {
-                    Self::inline_of(doc, c, depth + 1)
-                        .replace('|', "\\|")
-                        .replace('\n', " ")
-                })
-                .collect();
-            if !cells.is_empty() {
-                rows.push(cells);
-            }
-        }
+        let rows = Self::place_cells(doc, &rows_at, depth);
         // A visible `<caption>` goes above the table, as its own paragraph.
         let caption = doc.nodes[id]
             .children
@@ -1413,14 +1516,70 @@ impl Writer {
         };
         let mut out: Vec<String> = lead.into_iter().flat_map(|b| [b, String::new()]).collect();
         for (k, row) in rows.iter().enumerate() {
-            let mut cells = row.clone();
-            cells.resize(width, String::new());
-            out.push(format!("| {} |", cells.join(" | ")));
+            // Only the header row sets the column count; GFM fills a short
+            // row with empty cells, so the others are not padded.
             if k == 0 {
+                let mut cells = row.clone();
+                cells.resize(width, String::new());
+                out.push(format!("| {} |", cells.join(" | ")));
                 out.push(format!("|{}", " --- |".repeat(width)));
+            } else {
+                out.push(format!("| {} |", row.join(" | ")));
             }
         }
         out.join("\n")
+    }
+}
+
+/// The label a browser shows for item number `n` of an `<ol type>`:
+/// letters (`a`, `A`) from 1 up, Roman numerals (`i`, `I`) from 1 to 3999,
+/// and decimal otherwise.
+fn list_label(n: i64, style: Option<&str>) -> String {
+    let upper = style.is_some_and(|s| s == "A" || s == "I");
+    let label = match style {
+        Some("a" | "A") if n >= 1 => {
+            // Bijective base 26: z, aa, ab, ...
+            let mut n = n;
+            let mut letters = Vec::new();
+            while n > 0 {
+                n -= 1;
+                letters.push(b'a' + u8::try_from(n % 26).unwrap_or(0));
+                n /= 26;
+            }
+            letters.iter().rev().map(|&b| char::from(b)).collect()
+        }
+        Some("i" | "I") if (1..=3999).contains(&n) => {
+            const ROMAN: [(i64, &str); 13] = [
+                (1000, "m"),
+                (900, "cm"),
+                (500, "d"),
+                (400, "cd"),
+                (100, "c"),
+                (90, "xc"),
+                (50, "l"),
+                (40, "xl"),
+                (10, "x"),
+                (9, "ix"),
+                (5, "v"),
+                (4, "iv"),
+                (1, "i"),
+            ];
+            let mut n = n;
+            let mut out = String::new();
+            for (value, digits) in ROMAN {
+                while n >= value {
+                    out.push_str(digits);
+                    n -= value;
+                }
+            }
+            out
+        }
+        _ => return n.to_string(),
+    };
+    if upper {
+        label.to_ascii_uppercase()
+    } else {
+        label
     }
 }
 
@@ -2147,7 +2306,7 @@ mod tests {
         );
         assert_eq!(
             md("<table><tbody><td>A<td>B<tr><td>C</td></tr></tbody></table>"),
-            "| A | B |\n| --- | --- |\n| C |  |\n"
+            "| A | B |\n| --- | --- |\n| C |\n"
         );
     }
 
@@ -2200,6 +2359,79 @@ mod tests {
         assert_eq!(md("<p>a<a href=\"\"></a>b</p>"), "ab\n");
         assert_eq!(md("<a href=\"/tracking\"> </a><p>Body</p>"), "Body\n");
         assert_eq!(md("<img src=\"\" alt=\"x\">"), "");
+    }
+
+    #[test]
+    fn links_resolve_against_the_base() {
+        let page = |body: &str| {
+            md(&format!(
+                "<head><base href=\"https://cdn.example/assets/\"></head><body>{body}</body>"
+            ))
+        };
+        assert_eq!(
+            page("<a href=\"guide\">Guide</a>"),
+            "[Guide](https://cdn.example/assets/guide)\n"
+        );
+        assert_eq!(
+            page("<a href=\"/top\">Top</a> <img src=\"i.png\" alt=\"i\">"),
+            "[Top](https://cdn.example/top) ![i](https://cdn.example/assets/i.png)\n"
+        );
+        assert_eq!(
+            page("<a href=\"https://other.example/x\">X</a>"),
+            "[X](https://other.example/x)\n"
+        );
+        assert_eq!(page("<a href=\"javascript:alert(1)\">J</a>"), "J\n");
+        // A relative base, or one in a template, is not used.
+        assert_eq!(
+            md("<base href=\"/sub/\"><a href=\"guide\">Guide</a>"),
+            "[Guide](guide)\n"
+        );
+        assert_eq!(
+            md("<template><base href=\"https://x.example/\"></template><a href=\"g\">G</a>"),
+            "[G](g)\n"
+        );
+    }
+
+    #[test]
+    fn ordered_list_types_keep_their_labels() {
+        assert_eq!(
+            md("<ol type=\"A\"><li>First</li><li>Second</li></ol>"),
+            "- A\\. First\n- B\\. Second\n"
+        );
+        assert_eq!(
+            md("<ol type=\"a\" start=\"26\"><li>z</li><li>aa</li></ol>"),
+            "- z\\. z\n- aa\\. aa\n"
+        );
+        assert_eq!(
+            md("<ol type=\"I\" start=\"3\"><li>c</li><li>d</li></ol>"),
+            "- III\\. c\n- IV\\. d\n"
+        );
+        assert_eq!(
+            md("<ol type=\"i\" start=\"0\"><li>z</li></ol>"),
+            "- 0\\. z\n"
+        );
+        assert_eq!(md("<ol type=\"1\"><li>a</li></ol>"), "1. a\n");
+        assert_eq!(list_label(1994, Some("i")), "mcmxciv");
+    }
+
+    #[test]
+    fn spanned_cells_keep_their_columns() {
+        assert_eq!(
+            md("<table><tr><td rowspan=\"2\">X</td><td>Y</td></tr><tr><td>Z</td></tr></table>"),
+            "| X | Y |\n| --- | --- |\n|  | Z |\n"
+        );
+        assert_eq!(
+            md(
+                "<table><tr><th colspan=\"2\">H</th><th>I</th></tr><tr><td>a</td><td>b</td><td>c</td></tr></table>"
+            ),
+            "| H |  | I |\n| --- | --- | --- |\n| a | b | c |\n"
+        );
+        // Placeholders are bounded by the table's own cells.
+        let out = md(
+            "<table><tr><td colspan=\"1000\" rowspan=\"0\">A</td></tr><tr><td>B</td></tr></table>",
+        );
+        // Two cells: 8 placeholders each and 64 spare, not 1000 columns.
+        assert!(out.matches(" |").count() < 2 * (2 * 8 + 64 + 2), "{out}");
     }
 
     #[test]
