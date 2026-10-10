@@ -256,6 +256,33 @@ async fn oversized_pages_stay_html() {
     assert_eq!(res.text().len(), 4096 + "<p></p>".len());
 }
 
+/// HEAD of a dynamic page gets GET's headers, its `Content-Length` too.
+#[tokio::test]
+async fn head_of_a_dynamic_page_mirrors_the_markdown_get() {
+    let c = client();
+    let get = c
+        .get("/about")
+        .header("accept", "text/markdown")
+        .send()
+        .await;
+    let head = c
+        .head("/about")
+        .header("accept", "text/markdown")
+        .send()
+        .await;
+    head.assert_ok();
+    assert_eq!(head.header("content-type"), get.header("content-type"));
+    assert_eq!(
+        head.header("content-length").map(str::to_owned),
+        Some(get.text().len().to_string())
+    );
+    assert_eq!(
+        head.header("x-markdown-tokens"),
+        get.header("x-markdown-tokens")
+    );
+    assert!(head.text().is_empty());
+}
+
 #[tokio::test]
 async fn oversized_pages_stay_html_for_head_too() {
     let mut config = AutumnConfig::default();

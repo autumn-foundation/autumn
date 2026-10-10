@@ -275,7 +275,6 @@ const SCOPE: &[&str] = &[
     "dl",
     "select",
     "blockquote",
-    "div",
     "template",
 ];
 
@@ -1392,6 +1391,8 @@ fn safe_url(raw: &str, link: bool) -> Option<String> {
             ')' => out.push_str("%29"),
             '<' => out.push_str("%3C"),
             '>' => out.push_str("%3E"),
+            // A `\` would escape the closing `)` of the Markdown link.
+            '\\' => out.push_str("%5C"),
             c if c.is_control() => {
                 let mut buf = [0u8; 4];
                 for b in c.encode_utf8(&mut buf).bytes() {
@@ -1894,6 +1895,19 @@ mod tests {
         assert_eq!(
             md("<p><a href=\"/s?a=1&copy=2\">s</a></p>"),
             "[s](/s?a=1&copy=2)\n"
+        );
+    }
+
+    #[test]
+    fn a_list_item_closes_through_a_div() {
+        assert_eq!(md("<ul><li>one<div><li>two</ul>"), "- one\n- two\n");
+    }
+
+    #[test]
+    fn a_backslash_in_a_link_is_encoded() {
+        assert_eq!(
+            md("<p><a href=\"/docs\\\">Docs</a></p>"),
+            "[Docs](/docs%5C)\n"
         );
     }
 

@@ -251,10 +251,17 @@ where
         if !this.flags.wants_markdown {
             return Poll::Ready(Ok(res));
         }
-        if this.flags.is_head {
-            // HEAD carries the headers a GET would get; there is no body.
-            // Only a known length shows that GET's body fits: a stream of
-            // unknown length may outgrow the limit, and GET then sends HTML.
+        // HEAD carries the headers a GET would get. A handler's HEAD body is
+        // still here (the router drops it after this layer), so it converts
+        // as GET does and the router sets the Markdown's `Content-Length`.
+        // With the body already gone, only a known length shows that GET's
+        // body fits: a stream of unknown length may outgrow the limit, and
+        // GET then sends HTML.
+        let body_here = {
+            use http_body::Body as _;
+            res.body().size_hint().exact().is_some_and(|n| n > 0)
+        };
+        if this.flags.is_head && !body_here {
             if known_to_fit(&res, config.max_bytes) {
                 markdown_headers(res.headers_mut(), config, None);
             }
