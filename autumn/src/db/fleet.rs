@@ -1938,9 +1938,10 @@ pub(crate) fn discard_staging(staging: &Path) {
 
 /// Refuse a database path that leads out of the fleet's (canonical) root: the
 /// file itself a symlink, or a directory on the way to it resolving
-/// elsewhere. A stale or planted link would otherwise let a key open, claim
-/// and migrate a file that is not a fleet database (the control database,
-/// say). Blocking; a path that does not exist yet passes.
+/// elsewhere (the nearest one that exists, so a directory not created yet is
+/// judged by where it would be created). A stale or planted link would
+/// otherwise let a key open, claim and migrate a file that is not a fleet
+/// database (the control database, say). Blocking.
 fn check_contained(root: &Path, path: &Path) -> Result<(), FleetError> {
     let refuse = |detail: String| FleetError::Io {
         op: "check database path",
@@ -1952,15 +1953,19 @@ fn check_contained(root: &Path, path: &Path) -> Result<(), FleetError> {
             path.display()
         )));
     }
-    if let Some(parent) = path
-        .parent()
-        .and_then(|dir| std::fs::canonicalize(dir).ok())
-        && !parent.starts_with(root)
+    // The nearest directory that exists decides: a missing one below it would
+    // be created through whatever it resolves to.
+    let existing = path
+        .ancestors()
+        .skip(1)
+        .find_map(|dir| std::fs::canonicalize(dir).ok());
+    if let Some(resolved) = existing
+        && !resolved.starts_with(root)
     {
         return Err(refuse(format!(
             "{} resolves to {}, outside the fleet root {}",
             path.display(),
-            parent.display(),
+            resolved.display(),
             root.display()
         )));
     }
@@ -2846,6 +2851,43 @@ mod tests {
             conn.batch_execute(&format!("SELECT 1 FROM {IDENTITY_TABLE}"))
                 .is_err(),
             "the control database was never claimed"
+        );
+    }
+
+    /// A missing directory under a symlinked one: the nearest directory that
+    /// exists decides, before `create_dir_all` follows the link.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "fleet path templates use {placeholders}"
+    )]
+    async fn a_missing_directory_under_a_symlink_out_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fleet");
+        std::fs::create_dir(&root).unwrap();
+        let fleet = fleet(&root, FleetMode::Tenant, |c| {
+            c.path = Some("{bucket}/new/{tenant}.db".to_owned());
+            c.create_on_demand = Some(true);
+        });
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let acme = fleet.key_for("acme").unwrap();
+        let bucket = fleet
+            .path_of(&acme)
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::os::unix::fs::symlink(&elsewhere, &bucket).unwrap();
+        let err = fleet.provision(&acme).await.unwrap_err();
+        assert!(err.to_string().contains("outside"), "{err}");
+        let err = fleet.open(&acme).await.unwrap_err();
+        assert!(err.to_string().contains("outside"), "{err}");
+        assert!(
+            std::fs::read_dir(&elsewhere).unwrap().next().is_none(),
+            "nothing was created outside the root"
         );
     }
 
