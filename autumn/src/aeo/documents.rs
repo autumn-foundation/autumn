@@ -890,13 +890,15 @@ fn skills_index(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
 
 fn site_guide(facts: &SiteFacts, origin: &Origin) -> AgentSkill {
     let name = one_line(&display_name(facts, origin));
-    let mut body = format!("# Use {name}\n\n");
+    // Metadata is text: Markdown in it must not make a link or an image.
+    let text = |s: &str| super::markdown::escape_inline(&one_line(s));
+    let mut body = format!("# Use {}\n\n", text(&name));
     if let Some(d) = facts
         .description
         .as_deref()
         .filter(|d| !d.trim().is_empty())
     {
-        let _ = write!(body, "{}\n\n", one_line(d));
+        let _ = write!(body, "{}\n\n", text(d));
     }
     body.push_str("## Read\n\n");
     if facts.markdown {
@@ -923,7 +925,7 @@ fn site_guide(facts: &SiteFacts, origin: &Origin) -> AgentSkill {
         for tool in mcp.tools.iter().filter(|_| mcp.public_tools) {
             match &tool.description {
                 Some(d) => {
-                    let _ = writeln!(body, "  - `{}`: {}", tool.name, one_line(d));
+                    let _ = writeln!(body, "  - `{}`: {}", tool.name, text(d));
                 }
                 None => {
                     let _ = writeln!(body, "  - `{}`", tool.name);
@@ -1436,7 +1438,8 @@ fn auth_md(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
     if !auth_md_applies(facts, origin) {
         return None;
     }
-    let name = one_line(&display_name(facts, origin));
+    // The name is text: Markdown in it must not make a link or an image.
+    let name = super::markdown::escape_inline(&one_line(&display_name(facts, origin)));
     let oauth = &facts.oauth;
     let mut md = format!(
         "# {name} auth.md\n\nThis page tells AI agents how to get and use a credential for {name}.\n"
@@ -1901,6 +1904,18 @@ mod tests {
         ] {
             assert!(doc.body.contains(want), "missing {want}:\n{}", doc.body);
         }
+    }
+
+    #[test]
+    fn the_site_guide_escapes_metadata() {
+        let mut facts = api_site();
+        facts.name = Some("![logo](https://tracker.example/x)".to_owned());
+        let skill = site_guide(&facts, &origin());
+        let md = skill.to_skill_md();
+        assert!(
+            md.contains(r"# Use !\[logo\](https://tracker.example/x)"),
+            "{md}"
+        );
     }
 
     #[test]
