@@ -14746,6 +14746,130 @@ mod fleet_boot_tests {
                 .is_none()
         );
     }
+
+    /// A control database plus a slot fleet under `dir`, the way `run()` sees
+    /// them: the config, the built fleet, and an `AppState` carrying it.
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "fleet path templates use {placeholders}"
+    )]
+    fn booted(dir: &std::path::Path) -> (AutumnConfig, crate::db::fleet::DatabaseFleet, AppState) {
+        let mut config = AutumnConfig {
+            profile: Some("dev".into()),
+            ..AutumnConfig::default()
+        };
+        config.database.url = Some(format!("sqlite://{}", dir.join("control.db").display()));
+        config.database.fleet = Some(crate::config::DatabaseFleetConfig {
+            mode: crate::fleet_layout::FleetMode::Slot,
+            root: dir.join("fleet").display().to_string(),
+            path: None,
+            max_open: 4,
+            pool_size: 1,
+            create_on_demand: None,
+            idle_close_secs: 0,
+            restore_missing: false,
+        });
+        let all = Arc::new(vec![("framework", crate::migrate::FRAMEWORK_MIGRATIONS)]);
+        let fleet = crate::db::fleet::build_for_app(&config, all, |set| {
+            !migration_set_is_control_framework(set)
+        })
+        .unwrap()
+        .expect("a fleet is configured");
+        let control = crate::db::create_pool(&config.database)
+            .unwrap()
+            .expect("a control url is configured");
+        let state = AppState::for_test().with_shards(crate::sharding::ShardSet::from_fleet(
+            fleet.clone(),
+            control,
+        ));
+        (config, fleet, state)
+    }
+
+    /// `run()`'s fleet runtime: every open database gets a commit-hook worker,
+    /// and cancelling the token closes every database before the task ends.
+    #[tokio::test]
+    async fn the_fleet_runtime_closes_every_database_on_shutdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_config, fleet, state) = booted(tmp.path());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let maintenance =
+            start_fleet_runtime(&state, shutdown.clone()).expect("the app has a fleet");
+        let db = fleet.open_for("acme").await.unwrap();
+        // The worker runs against the database's own pool.
+        assert!(!db.closed().is_cancelled());
+        drop(db);
+        assert_eq!(fleet.stats().open, 1);
+        shutdown.cancel();
+        maintenance.await.unwrap();
+        assert_eq!(fleet.stats().open, 0, "shutdown closed every database");
+
+        assert!(
+            start_fleet_runtime(&AppState::for_test(), shutdown).is_none(),
+            "no fleet, no runtime"
+        );
+    }
+
+    /// `[replication]` on a fleet app: the fleet replicates next to the control
+    /// database, reports `replication:fleet`, and refuses a second install.
+    #[tokio::test]
+    async fn fleet_replication_installs_beside_the_control_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, fleet, state) = booted(tmp.path());
+        let replicas = tmp.path().join("replicas");
+        std::fs::create_dir(&replicas).unwrap();
+        let replication_config = crate::config::ReplicationConfig {
+            enabled: true,
+            path: Some(replicas.display().to_string()),
+            ..crate::config::ReplicationConfig::default()
+        };
+        let control_url = config.database.url.clone().unwrap();
+        let runtime = crate::time::spawn_blocking(move || {
+            crate::replication::build(
+                &replication_config,
+                &control_url,
+                "dev",
+                None,
+                Arc::new(crate::time::SystemClock),
+            )
+        })
+        .await
+        .unwrap()
+        .expect("a file destination builds");
+        let lag = std::time::Duration::from_secs(30);
+
+        start_fleet_replication(&state, &config, &runtime, lag).unwrap();
+        assert!(fleet.replicating());
+        assert!(
+            state
+                .health_indicator_registry()
+                .contains(crate::db::fleet_replication::FLEET_REPLICATION_INDICATOR)
+        );
+        let again = start_fleet_replication(&state, &config, &runtime, lag).unwrap_err();
+        assert!(again.contains("already replicates"), "{again}");
+        if let Some(replication) = fleet.replication() {
+            replication.stop();
+        }
+
+        start_fleet_replication(&AppState::for_test(), &config, &runtime, lag)
+            .expect("no fleet, nothing to replicate");
+    }
+
+    /// `AUTUMN_MIGRATE=1` on a fleet app migrates every database on disk and
+    /// reports the count; an app without a fleet migrates nothing.
+    #[tokio::test]
+    async fn migrate_mode_migrates_every_fleet_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut config, fleet, _state) = booted(tmp.path());
+        for tenant in ["acme", "globex"] {
+            fleet.open_for(tenant).await.unwrap();
+        }
+        fleet.close_all().await;
+        let all = Arc::new(vec![("framework", crate::migrate::FRAMEWORK_MIGRATIONS)]);
+        // Created databases are migrated already: nothing is pending.
+        assert_eq!(migrate_fleet_or_exit(&config, Arc::clone(&all)).await, 0);
+        config.database.fleet = None;
+        assert_eq!(migrate_fleet_or_exit(&config, all).await, 0);
+    }
 }
 
 #[cfg(test)]
