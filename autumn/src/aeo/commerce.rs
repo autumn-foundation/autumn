@@ -621,7 +621,69 @@ struct X402State {
     client: crate::http_client::Client,
     base_url: Option<String>,
     /// SHA-256 of each payment header already used.
-    used: std::sync::Mutex<lru::LruCache<[u8; 32], ()>>,
+    used: std::sync::Mutex<UsedPayments>,
+}
+
+/// Payment headers already used, each kept until its payment expires.
+///
+/// A live record is never evicted: with every slot taken by an unexpired
+/// payment, a new one is refused (`503`) rather than reopening a replay.
+#[cfg(feature = "http-client")]
+#[derive(Debug)]
+struct UsedPayments {
+    /// Header hash to the Unix second its payment expires.
+    until: std::collections::HashMap<[u8; 32], u64>,
+    capacity: usize,
+}
+
+#[cfg(feature = "http-client")]
+#[derive(Debug, PartialEq, Eq)]
+enum ClaimError {
+    /// This header was already used.
+    Used,
+    /// Every slot holds an unexpired payment.
+    Full,
+}
+
+#[cfg(feature = "http-client")]
+impl UsedPayments {
+    fn new(capacity: usize) -> Self {
+        Self {
+            until: std::collections::HashMap::new(),
+            capacity,
+        }
+    }
+
+    /// Claim `key` until `expires` (Unix seconds).
+    fn claim(&mut self, key: [u8; 32], expires: u64, now: u64) -> Result<(), ClaimError> {
+        if self.until.contains_key(&key) {
+            return Err(ClaimError::Used);
+        }
+        if self.until.len() >= self.capacity {
+            self.until.retain(|_, until| *until > now);
+            if self.until.len() >= self.capacity {
+                return Err(ClaimError::Full);
+            }
+        }
+        self.until.insert(key, expires);
+        Ok(())
+    }
+
+    /// Give back a claim for a payment that was not used.
+    fn release(&mut self, key: &[u8; 32]) {
+        self.until.remove(key);
+    }
+}
+
+/// When a payment stops being valid: its EIP-3009 `validBefore`, else the
+/// offered `maxTimeoutSeconds` from now.
+#[cfg(feature = "http-client")]
+fn payment_expiry(payload: &Value, max_timeout_secs: u64, now: u64) -> u64 {
+    let valid_before = &payload["payload"]["authorization"]["validBefore"];
+    valid_before
+        .as_u64()
+        .or_else(|| valid_before.as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| now.saturating_add(max_timeout_secs))
 }
 
 /// Marks a request that one x402 layer already handled, so the second copy
@@ -770,9 +832,7 @@ impl X402Layer {
                 available: complete && safe,
                 client: crate::http_client::Client::from_state(state).named("x402"),
                 base_url: config.seo.base_url.clone(),
-                used: std::sync::Mutex::new(lru::LruCache::new(
-                    std::num::NonZeroUsize::new(10_000).unwrap_or(std::num::NonZeroUsize::MIN),
-                )),
+                used: std::sync::Mutex::new(UsedPayments::new(10_000)),
             }),
         })
     }
@@ -993,19 +1053,37 @@ where
                 "paymentPayload": payload,
                 "paymentRequirements": offered,
             });
-            // One payment header works once. Claim it before any call.
+            // One payment header works once. Claim it before any call, until
+            // the payment itself expires.
             let key: [u8; 32] = sha2::Sha256::digest(header.as_bytes()).into();
-            {
-                let mut used = state
-                    .used
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if used.put(key, ()).is_some() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let expires =
+                payment_expiry(&payload, state.config.max_timeout_secs.unwrap_or(300), now);
+            let claim = state
+                .used
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .claim(key, expires, now);
+            match claim {
+                Ok(()) => {}
+                Err(ClaimError::Used) => {
                     return Ok(payment_required(
                         &state,
                         &route,
                         &resource,
                         "payment already used",
+                    ));
+                }
+                Err(ClaimError::Full) => {
+                    tracing::error!(
+                        "aeo: x402 used-payment record is full of unexpired payments; \
+                         refusing new payments until some expire"
+                    );
+                    return Ok(plain(
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "payment capacity reached",
                     ));
                 }
             }
@@ -1017,11 +1095,18 @@ where
                         .used
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .pop(&key);
+                        .release(&key);
                     return Ok(plain(status, "payment facilitator unavailable"));
                 }
             };
             if verify.get("isValid").and_then(Value::as_bool) != Some(true) {
+                // A rejected payment holds no slot: junk headers cannot fill
+                // the record and push out real ones.
+                state
+                    .used
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .release(&key);
                 let reason = verify
                     .get("invalidReason")
                     .and_then(Value::as_str)
@@ -1413,6 +1498,34 @@ mod tests {
         ] {
             assert!(unmatchable_route(&r).is_some(), "{r:?}");
         }
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn a_live_payment_record_is_never_evicted() {
+        let mut used = UsedPayments::new(2);
+        assert_eq!(used.claim([1; 32], 100, 10), Ok(()));
+        assert_eq!(used.claim([1; 32], 100, 10), Err(ClaimError::Used));
+        assert_eq!(used.claim([2; 32], 50, 10), Ok(()));
+        // Full of live payments: refuse, never evict.
+        assert_eq!(used.claim([3; 32], 100, 10), Err(ClaimError::Full));
+        assert_eq!(used.claim([1; 32], 100, 10), Err(ClaimError::Used));
+        // Once one expires, its slot is reused.
+        assert_eq!(used.claim([3; 32], 100, 60), Ok(()));
+        assert_eq!(used.claim([1; 32], 100, 60), Err(ClaimError::Used));
+        // A released claim can be made again.
+        used.release(&[3; 32]);
+        assert_eq!(used.claim([3; 32], 100, 60), Ok(()));
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn payment_expiry_reads_valid_before() {
+        let payload = json!({"payload": {"authorization": {"validBefore": "1700"}}});
+        assert_eq!(payment_expiry(&payload, 300, 1000), 1700);
+        let payload = json!({"payload": {"authorization": {"validBefore": 1800}}});
+        assert_eq!(payment_expiry(&payload, 300, 1000), 1800);
+        assert_eq!(payment_expiry(&json!({}), 300, 1000), 1300);
     }
 
     #[cfg(feature = "http-client")]

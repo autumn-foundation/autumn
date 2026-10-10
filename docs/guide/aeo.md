@@ -357,7 +357,9 @@ description = "One report"
 If settlement fails, Autumn sends `402` and discards the handler body. If
 the facilitator does not answer, Autumn sends `502`. A paid answer carries
 `Cache-Control: private, no-store`. One payment header works once per
-process; a second use gets `402`. With several replicas, a client can use a
+process; a second use gets `402`. Autumn remembers a used header until its
+payment expires, for up to 10,000 unexpired payments at once; past that, a new
+payment gets `503` until some expire. With several replicas, a client can use a
 header once on each replica before settlement fails. Make priced handlers
 idempotent (see [idempotency](idempotency.md)).
 

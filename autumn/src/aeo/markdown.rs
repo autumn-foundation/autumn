@@ -186,7 +186,9 @@ const VOID: &[&str] = &[
 ];
 
 /// Elements whose content is raw text up to the matching end tag.
-const RAW_TEXT: &[&str] = &["script", "style", "textarea", "title", "xmp", "noscript"];
+const RAW_TEXT: &[&str] = &[
+    "script", "style", "textarea", "title", "xmp", "noscript", "iframe", "noembed", "noframes",
+];
 
 /// Start tags that close an open element of the listed names first.
 fn implied_close(tag: &str) -> &'static [&'static str] {
@@ -1320,6 +1322,14 @@ mod tests {
         assert_eq!(md("<main hidden>secret</main><main>real</main>"), "real\n");
         assert_eq!(
             md("<template><main>tpl</main></template><main>real</main>"),
+            "real\n"
+        );
+    }
+
+    #[test]
+    fn iframe_fallback_is_raw_text() {
+        assert_eq!(
+            md("<div><iframe></div><main>hidden</main></iframe><main>real</main></div>"),
             "real\n"
         );
     }
