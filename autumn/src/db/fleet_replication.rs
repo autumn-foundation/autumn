@@ -326,7 +326,7 @@ impl FleetLifecycle for FleetReplication {
         // existing target: when two processes restore the same database at
         // once, the first to publish wins and the other opens its file,
         // rather than replacing it under a process already serving it.
-        let staging = super::fleet::staging_path(path, "restoring");
+        let staging = super::fleet::staging_path(path, "restoring").map_err(|e| e.to_string())?;
         let result = match self.restore_to(key, None, &staging) {
             Ok(outcome) => match std::fs::hard_link(&staging, path) {
                 Ok(()) => {

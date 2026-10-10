@@ -1000,6 +1000,7 @@ impl DatabaseFleet {
     async fn open_now(&self, key: FleetDbKey, create: bool) -> Result<FleetDatabase, FleetError> {
         let path = self.path_of(&key);
         let name = key.name();
+        check_contained(self.root(), &path)?;
         let mut existed = path.is_file();
         if !existed {
             existed = self.restore_missing(&key, &path).await?;
@@ -1417,6 +1418,7 @@ impl DatabaseFleet {
             // unlinking it under that process would split the tenant's data
             // between the old inode and a new file. The guard refuses then,
             // and blocks new openers while the files go.
+            check_contained(&root, &path)?;
             let guard = exclusive_guard(&path, &name)?;
             let removed = remove_database_files(&path, &root);
             drop(guard);
@@ -1558,11 +1560,13 @@ impl DatabaseFleet {
                     hook.release(&key);
                 }
                 let path = self.path_of(&key);
+                let root = self.inner.root.clone();
                 let restore_key = key.clone();
                 // Everything after the claim runs to `finish_drain`, whatever
                 // fails: an error that skipped it would strand every later
                 // opener of this key on a drain that never finishes.
                 let restored = crate::time::spawn_blocking(move || {
+                    check_contained(&root, &path)?;
                     restore_in_place(&replication, &restore_key, target, &path)
                 })
                 .await
@@ -1713,7 +1717,9 @@ impl DatabaseFleet {
                 // Same identity rule as `open`: a file copied or renamed onto
                 // this key's path is another database's data, so it is
                 // reported, never migrated.
+                let path = fleet.path_of(&key);
                 let outcome = crate::time::spawn_blocking(move || {
+                    check_contained(fleet.root(), &path)?;
                     check_identity_blocking(&url, &name)?;
                     fleet.inner.migrations.apply(&url, &name)
                 })
@@ -1881,27 +1887,81 @@ fn check_identity_blocking(url: &str, name: &str) -> Result<(), FleetError> {
     Ok(())
 }
 
-/// A private path beside `path` that no template matches (it starts with a
-/// dot and does not end in the template's extension), unique per process and
-/// attempt: `.<file>.<tag>-<pid>-<n>`.
-pub(crate) fn staging_path(path: &Path, tag: &str) -> PathBuf {
-    static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
-    let file_name = path
-        .file_name()
-        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-    path.with_file_name(format!(
-        ".{file_name}.{tag}-{}-{}",
-        std::process::id(),
-        STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
-    ))
+/// The next candidate staging name in this process; see [`staging_path`].
+static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A private path beside `path` for building a database before publishing it:
+/// `<dir>/<file>`, where `<dir>` is `.<file>.<tag>-<pid>-<n>`, a directory no
+/// template matches (it starts with a dot). The directory is created
+/// exclusively, so the name is this caller's alone even across processes that
+/// share the volume but not a PID namespace (two containers can both be PID
+/// 1): a name someone else holds is skipped. Release it with
+/// [`discard_staging`].
+pub(crate) fn staging_path(path: &Path, tag: &str) -> Result<PathBuf, FleetError> {
+    let file_name = path.file_name().ok_or_else(|| FleetError::Io {
+        op: "reserve staging name",
+        detail: format!("{} has no file name", path.display()),
+    })?;
+    let file_label = file_name.to_string_lossy();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(io_error("create database directory"))?;
+    }
+    loop {
+        let dir = path.with_file_name(format!(
+            ".{file_label}.{tag}-{}-{}",
+            std::process::id(),
+            STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir.join(file_name)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(io_error("reserve staging name")(e)),
+        }
+    }
 }
 
-/// Remove a staging file and any sidecars `SQLite` left beside it.
+/// Remove a staging file, any sidecars `SQLite` left beside it, and the
+/// directory [`staging_path`] reserved for it.
 pub(crate) fn discard_staging(staging: &Path) {
     let _ = std::fs::remove_file(staging);
     for sidecar in crate::fleet_layout::sidecar_paths(staging) {
         let _ = std::fs::remove_file(sidecar);
     }
+    if let Some(dir) = staging.parent() {
+        // Only an empty directory goes: nothing of anyone else's is touched.
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+/// Refuse a database path that leads out of the fleet's (canonical) root: the
+/// file itself a symlink, or a directory on the way to it resolving
+/// elsewhere. A stale or planted link would otherwise let a key open, claim
+/// and migrate a file that is not a fleet database (the control database,
+/// say). Blocking; a path that does not exist yet passes.
+fn check_contained(root: &Path, path: &Path) -> Result<(), FleetError> {
+    let refuse = |detail: String| FleetError::Io {
+        op: "check database path",
+        detail,
+    };
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(refuse(format!(
+            "{} is a symlink; a fleet database must be a regular file inside the root",
+            path.display()
+        )));
+    }
+    if let Some(parent) = path
+        .parent()
+        .and_then(|dir| std::fs::canonicalize(dir).ok())
+        && !parent.starts_with(root)
+    {
+        return Err(refuse(format!(
+            "{} resolves to {}, outside the fleet root {}",
+            path.display(),
+            parent.display(),
+            root.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Prove no other process has `path` open, and keep it that way while the
@@ -1967,7 +2027,7 @@ fn restore_in_place(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(io_error("create database directory"))?;
     }
-    let staging = staging_path(path, "restoring");
+    let staging = staging_path(path, "restoring")?;
     let restored = replication
         .restore_to(key, target, &staging)
         .map_err(|error| match error {
@@ -2026,9 +2086,8 @@ fn create_database_file(
         detail: "database path has no parent directory".to_owned(),
     })?;
     std::fs::create_dir_all(parent).map_err(io_error("create database directory"))?;
-    let staging = staging_path(path, "creating");
+    let staging = staging_path(path, "creating")?;
     let discard = discard_staging;
-    discard(&staging);
     let built = build_staged_database(&staging, name, migrations);
     if let Err(error) = built {
         discard(&staging);
@@ -2124,12 +2183,15 @@ impl crate::actuator::HealthIndicator for FleetHealthIndicator {
             let writable = crate::time::spawn_blocking(move || {
                 // Unique per check, created new and removed by this check only:
                 // concurrent probes (or processes) never race on one name.
-                let probe = staging_path(&root.join("fleet"), "probe");
-                std::fs::OpenOptions::new()
+                let probe = staging_path(&root.join("fleet"), "probe")
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                let written = std::fs::OpenOptions::new()
                     .write(true)
                     .create_new(true)
                     .open(&probe)
-                    .and_then(|_| std::fs::remove_file(&probe))
+                    .map(drop);
+                discard_staging(&probe);
+                written
             })
             .await;
             let stats = self.fleet.stats();
@@ -2722,6 +2784,96 @@ mod tests {
             matches!(failure, FleetError::Misplaced { found, .. } if found == "tenant:acme"),
             "{failure}"
         );
+    }
+
+    /// A database path, or a bucket directory on the way to it, that is a
+    /// symlink must not lead the fleet out of its root: tenant `control`
+    /// linked to the control database would otherwise be claimed and
+    /// migrated as a tenant.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinks_out_of_the_root_are_refused() {
+        use diesel::connection::SimpleConnection as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fleet");
+        std::fs::create_dir(&root).unwrap();
+        let fleet = fleet(&root, FleetMode::Tenant, |c| {
+            c.create_on_demand = Some(true);
+        });
+        let outside = tmp.path().join("control.db");
+        crate::db::establish_sqlite_migration_connection(&DatabaseFleet::url_of(&outside))
+            .unwrap()
+            .batch_execute("CREATE TABLE control_only (id INTEGER)")
+            .unwrap();
+
+        // The database file itself is a symlink.
+        let control = fleet.key_for("control").unwrap();
+        let path = fleet.path_of(&control);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        let err = fleet.open(&control).await.unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+
+        // A bucket directory is a symlink that leaves the root.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let acme = fleet.key_for("acme").unwrap();
+        let acme_path = fleet.path_of(&acme);
+        let bucket = acme_path.parent().unwrap();
+        if bucket != path.parent().unwrap() {
+            std::os::unix::fs::symlink(&elsewhere, bucket).unwrap();
+            let err = fleet.open(&acme).await.unwrap_err();
+            assert!(err.to_string().contains("outside"), "{err}");
+            assert!(
+                std::fs::read_dir(&elsewhere).unwrap().next().is_none(),
+                "nothing was created outside the root"
+            );
+        }
+
+        // `AUTUMN_MIGRATE=1` never migrates it: enumeration skips a symlink,
+        // and the containment check refuses one that slips through.
+        fleet.migrate_all(2).await.unwrap();
+        let mut conn =
+            crate::db::establish_sqlite_migration_connection(&DatabaseFleet::url_of(&outside))
+                .unwrap();
+        assert!(
+            conn.batch_execute(&format!("SELECT 1 FROM {IDENTITY_TABLE}"))
+                .is_err(),
+            "the control database was never claimed"
+        );
+    }
+
+    #[test]
+    fn a_staging_name_another_process_took_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("acme.db");
+        // Another container with the same PID and counter got there first.
+        let next = STAGING_SEQ.load(Ordering::Relaxed);
+        let taken: Vec<PathBuf> = (next..next + 8)
+            .map(|n| {
+                tmp.path()
+                    .join(format!(".acme.db.creating-{}-{n}", std::process::id()))
+            })
+            .collect();
+        for dir in &taken {
+            std::fs::create_dir(dir).unwrap();
+            std::fs::write(dir.join("acme.db"), b"theirs").unwrap();
+        }
+        let staging = staging_path(&path, "creating").unwrap();
+        assert!(
+            !taken.iter().any(|dir| staging.starts_with(dir)),
+            "{} reused a taken name",
+            staging.display()
+        );
+        assert!(staging.parent().unwrap().is_dir(), "the name is reserved");
+        discard_staging(&staging);
+        assert!(
+            !staging.parent().unwrap().exists(),
+            "discard frees the name"
+        );
+        for dir in &taken {
+            assert_eq!(std::fs::read(dir.join("acme.db")).unwrap(), b"theirs");
+        }
     }
 
     #[tokio::test]
