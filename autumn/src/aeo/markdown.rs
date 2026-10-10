@@ -415,9 +415,7 @@ fn parse(html: &str) -> Doc {
             if raw {
                 // Skip the raw text: its content is never markup.
                 let body_end = raw_text_end(&html[i..], &tag.name).map_or(bytes.len(), |n| i + n);
-                i = html[body_end..]
-                    .find('>')
-                    .map_or(bytes.len(), |n| body_end + n + 1);
+                i = body_end + end_tag_len(&html[body_end..]);
             } else {
                 let hides = DROP.contains(&tag.name.as_str())
                     || tag.attrs.iter().any(|(k, v)| {
@@ -456,9 +454,7 @@ fn parse(html: &str) -> Doc {
                 });
                 doc.nodes[id].children.push(tid);
             }
-            i = html[body_end..]
-                .find('>')
-                .map_or(bytes.len(), |n| body_end + n + 1);
+            i = body_end + end_tag_len(&html[body_end..]);
         } else if !is_void {
             stack.push(id);
         }
@@ -572,6 +568,16 @@ fn read_tag(s: &str) -> TagRead {
 
 fn memchr(needle: u8, hay: &[u8]) -> Option<usize> {
     hay.iter().position(|&c| c == needle)
+}
+
+/// Length of the end tag at the start of `s`. A quoted attribute value can
+/// hold a `>` (`</script x=">">`), so the tag is read, not searched for.
+fn end_tag_len(s: &str) -> usize {
+    match read_tag(s) {
+        TagRead::Tag(tag) => tag.len,
+        TagRead::Eof => s.len(),
+        TagRead::Text => s.find('>').map_or(s.len(), |n| n + 1),
+    }
 }
 
 /// Offset of the end tag that closes the raw-text element `name`. As in the
@@ -1584,6 +1590,17 @@ mod tests {
         assert!(out.contains("before") && !out.contains("secret"), "{out}");
         let deep = "<div>".repeat(300) + "<nav><plaintext></nav><p>secret</p>";
         assert!(!md(&deep).contains("secret"));
+    }
+
+    #[test]
+    fn a_raw_text_end_tag_ends_at_its_own_close() {
+        assert_eq!(
+            md("<body><script>x</script x=\"<b>secret</b>\">visible</body>"),
+            "visible\n"
+        );
+        let deep = "<div>".repeat(300) + "<script>x</script x='<b>secret</b>'>ok";
+        let out = md(&deep);
+        assert!(!out.contains("secret") && out.contains("ok"), "{out}");
     }
 
     #[test]
