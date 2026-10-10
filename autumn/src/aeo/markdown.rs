@@ -1075,14 +1075,18 @@ impl Writer {
 
     fn list(doc: &Doc, id: usize, depth: usize, ordered: bool) -> String {
         let mut lines = Vec::new();
-        let mut n = 0usize;
+        // `<ol start>` sets the first number. Markdown has no negative ones.
+        let mut n: u64 = doc
+            .attr(id, "start")
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1);
         for &item in &doc.nodes[id].children {
             if doc.name(item) != Some("li") || is_hidden(doc, item) {
                 continue;
             }
-            n += 1;
             let marker = if ordered {
-                format!("{n}. ")
+                n += 1;
+                format!("{}. ", n - 1)
             } else {
                 "- ".to_owned()
             };
@@ -1138,10 +1142,20 @@ impl Writer {
                 rows.push(cells);
             }
         }
+        // A visible `<caption>` goes above the table, as its own paragraph.
+        let caption = doc.nodes[id]
+            .children
+            .iter()
+            .find(|&&c| doc.name(c) == Some("caption") && !is_hidden(doc, c))
+            .map(|&c| escape_line_start(Self::inline_of(doc, c, depth + 1)))
+            .filter(|c| !c.is_empty());
         let Some(width) = rows.iter().map(Vec::len).max() else {
-            return String::new();
+            return caption.unwrap_or_default();
         };
-        let mut out = Vec::new();
+        let mut out: Vec<String> = caption
+            .into_iter()
+            .flat_map(|c| [c, String::new()])
+            .collect();
         for (k, row) in rows.iter().enumerate() {
             let mut cells = row.clone();
             cells.resize(width, String::new());
@@ -1644,6 +1658,28 @@ mod tests {
         assert_eq!(md("<p>~~not deleted~~</p>"), "\\~\\~not deleted\\~\\~\n");
         assert_eq!(md("<p>a</p><p>~~~</p><p>b</p>"), "a\n\n\\~\\~\\~\n\nb\n");
         assert_eq!(md("<p><del>gone</del></p>"), "~~gone~~\n");
+    }
+
+    #[test]
+    fn an_ordered_list_keeps_its_start_number() {
+        assert_eq!(
+            md("<ol start=\"5\"><li>Step five</li><li>Step six</li></ol>"),
+            "5. Step five\n6. Step six\n"
+        );
+        assert_eq!(md("<ol start=\"-2\"><li>a</li></ol>"), "1. a\n");
+        assert_eq!(md("<ol><li>a</li></ol>"), "1. a\n");
+    }
+
+    #[test]
+    fn a_table_keeps_its_caption() {
+        assert_eq!(
+            md("<table><caption>Quarterly totals</caption><tr><td>42</td></tr></table>"),
+            "Quarterly totals\n\n| 42 |\n| --- |\n"
+        );
+        assert_eq!(
+            md("<table><caption hidden>gone</caption><tr><td>1</td></tr></table>"),
+            "| 1 |\n| --- |\n"
+        );
     }
 
     #[test]
