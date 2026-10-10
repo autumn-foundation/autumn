@@ -755,7 +755,7 @@ fn payment_expiry(payload: &Value, max_timeout_secs: u64, now: u64) -> u64 {
 #[derive(Debug, Clone, Copy)]
 struct X402Handled;
 
-/// The valid x402 routes, and the locale prefixes to strip.
+/// The priced routes, and the locale prefixes to strip.
 #[derive(Debug, Clone)]
 struct PricedRoutes {
     routes: Vec<PaidRoute>,
@@ -768,15 +768,11 @@ impl PricedRoutes {
     /// The priced routes, or `None` when AEO is off or no route is priced.
     fn from_config(config: &crate::config::AutumnConfig) -> Option<Self> {
         let aeo = &config.aeo;
-        let routes: Vec<PaidRoute> = aeo
-            .paid_routes
-            .iter()
-            // An invalid x402 route stays matched, so it answers 503 and
-            // never runs free.
-            .filter(|r| r.is_x402())
-            .cloned()
-            .collect();
-        if !aeo.enabled || routes.is_empty() {
+        // An invalid x402 route stays matched, so it answers 503 and never
+        // runs free. MPP routes are kept so a static file picks the same
+        // route its handler would, and x402 steps aside when that is MPP's.
+        let routes = aeo.paid_routes.clone();
+        if !aeo.enabled || !routes.iter().any(PaidRoute::is_x402) {
             return None;
         }
         #[cfg(feature = "i18n")]
@@ -792,11 +788,13 @@ impl PricedRoutes {
 
     /// The priced route for `req`, if any. Uses the route template axum
     /// matched when it is known. An entry for the request's own method wins
-    /// over a `GET` entry that also prices `HEAD`.
+    /// over a `GET` entry that also prices `HEAD`. `None` when the route is
+    /// MPP's: the app runs that payment.
     fn route_for(&self, req: &axum::http::Request<axum::body::Body>) -> Option<&PaidRoute> {
         let method = req.method().as_str();
         self.lookup(req, |r| r.method.eq_ignore_ascii_case(method))
             .or_else(|| self.lookup(req, |r| r.method_matches(method)))
+            .filter(|r| r.is_x402())
     }
 
     fn lookup(
@@ -1541,6 +1539,28 @@ mod tests {
                 .map(|r| r.amount.as_str()),
             Some("2")
         );
+    }
+
+    #[test]
+    fn a_static_file_priced_for_mpp_is_not_charged_by_x402() {
+        let mut mpp = PaidRoute::new("GET", "/downloads/report.pdf", "5");
+        mpp.mpp_method = Some("tempo".to_owned());
+        let priced = PricedRoutes {
+            routes: vec![PaidRoute::new("GET", "/downloads/{*path}", "1"), mpp],
+            locales: Vec::new(),
+        };
+        let amount = |method: &str, path: &str| {
+            let req = axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            priced.route_for(&req).map(|r| r.amount.clone())
+        };
+        // The MPP route is the more specific one, as it is for the handler.
+        assert_eq!(amount("GET", "/downloads/report.pdf"), None);
+        assert_eq!(amount("HEAD", "/downloads/report.pdf"), None);
+        assert_eq!(amount("GET", "/downloads/other.pdf").as_deref(), Some("1"));
     }
 
     #[test]

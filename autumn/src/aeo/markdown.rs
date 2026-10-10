@@ -345,7 +345,7 @@ fn parse(html: &str) -> Doc {
             i = rest.find('>').map_or(bytes.len(), |n| i + n + 1);
             continue;
         }
-        let tag = match read_tag(rest) {
+        let mut tag = match read_tag(rest) {
             TagRead::Tag(tag) => tag,
             TagRead::Text => {
                 // A lone `<` is text.
@@ -357,6 +357,11 @@ fn parse(html: &str) -> Doc {
             TagRead::Eof => break,
         };
         i += tag.len;
+        // A browser reads `</br>` as `<br>`.
+        if tag.end && tag.name == "br" {
+            tag.end = false;
+            tag.attrs.clear();
+        }
         if tag.end {
             // `</select>` and `</template>` close their own wall; any other
             // end tag stops at the innermost one.
@@ -1442,7 +1447,13 @@ fn escape_inline(s: &str) -> String {
 /// Markdown link. Relative URLs and `http`/`https` pass; `mailto` passes for
 /// links. Every other scheme (`javascript:`, `data:`, ...) gives `None`.
 fn safe_url(raw: &str, link: bool) -> Option<String> {
-    let url = raw.trim();
+    // The URL parser trims C0 controls and spaces, then drops every tab and
+    // newline, so `https://exa&#10;mple.com` is `https://example.com`.
+    let url: String = raw
+        .trim_matches(|c: char| c <= ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
     if url.is_empty() {
         return None;
     }
@@ -2057,6 +2068,19 @@ mod tests {
     fn crlf_reads_as_lf() {
         assert_eq!(md("<pre>\r\nx\r\ny\r\n</pre>"), "```\nx\ny\n```\n");
         assert_eq!(md("<p>a\rb</p>"), "a b\n");
+    }
+
+    #[test]
+    fn an_end_br_is_a_line_break() {
+        assert_eq!(md("<p>One</br>Two</p>"), "One  \nTwo\n");
+    }
+
+    #[test]
+    fn a_url_loses_its_tabs_and_newlines() {
+        assert_eq!(
+            md("<a href=\" https://exa&#10;mple.com/x&#9;y \">Link</a>"),
+            "[Link](https://example.com/xy)\n"
+        );
     }
 
     #[test]
