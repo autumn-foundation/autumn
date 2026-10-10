@@ -967,7 +967,12 @@ fn yaml_quote(s: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => {}
+            '\r' => out.push_str("\\r"),
+            // Any other control character as a YAML escape, so the value
+            // reads back as written.
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{:04X}", u32::from(c));
+            }
             c => out.push(c),
         }
     }
@@ -1670,9 +1675,16 @@ mod tests {
             parse(r#"description: "\u263A \x41\U0001F600 \\ \/""#),
             "\u{263A} A\u{1F600} \\ /"
         );
-        // A tab survives a round trip through the served `SKILL.md`.
-        let tabbed = AgentSkill::new("a", "One\tTwo", "Body").unwrap();
-        assert_eq!(AgentSkill::parse(&tabbed.to_skill_md()).unwrap(), tabbed);
+        // A tab, a carriage return or another control character survives a
+        // round trip through the served `SKILL.md`.
+        for text in ["One\tTwo", "First\rSecond", "A\u{8}B\u{1b}C"] {
+            let skill = AgentSkill::new("a", text, "Body").unwrap();
+            assert_eq!(
+                AgentSkill::parse(&skill.to_skill_md()).unwrap(),
+                skill,
+                "{text:?}"
+            );
+        }
     }
 
     #[test]

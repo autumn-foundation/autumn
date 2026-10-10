@@ -438,6 +438,26 @@ fn parse(html: &str) -> Doc {
             }
         }
 
+        // A `<button>` or an `<a>` closes one that is still open, as in a
+        // browser: they never nest. The search stops at a table cell or a
+        // template, which a browser's scope does too.
+        if matches!(tag.name.as_str(), "button" | "a") {
+            if let Some(pos) = dropped.last(&tag.name) {
+                dropped.truncate(pos);
+            } else if let Some(pos) = stack
+                .iter()
+                .rposition(|&id| {
+                    doc.name(id).is_some_and(|n| {
+                        n == tag.name || matches!(n, "td" | "th" | "caption" | "table" | "template")
+                    })
+                })
+                .filter(|&pos| pos > 0 && doc.name(stack[pos]) == Some(tag.name.as_str()))
+            {
+                stack.truncate(pos);
+                dropped.clear();
+            }
+        }
+
         // A heading closes a heading left open right before it, as in a
         // browser: `<h1>One<h2>Two` is two headings.
         if is_heading(&tag.name) {
@@ -1930,6 +1950,23 @@ mod tests {
     fn preformatted_text_keeps_its_trailing_spaces() {
         assert_eq!(md("<pre>x </pre>"), "```\nx \n```\n");
         assert_eq!(md("<pre>\nx\n</pre>"), "```\nx\n```\n");
+    }
+
+    #[test]
+    fn a_button_or_link_closes_an_open_one() {
+        assert_eq!(
+            md("<button>one<button>two</button><main>Visible</main>"),
+            "Visible\n"
+        );
+        assert_eq!(
+            md("<p><a href=\"/one\">one<a href=\"/two\">two</a>end</p>"),
+            "[one](/one)[two](/two)end\n"
+        );
+        // A link in a table cell is not closed by one in the next cell.
+        assert!(
+            md("<table><tr><td><a href=\"/a\">a</a><td><a href=\"/b\">b</a></table>")
+                .contains("[a](/a) | [b](/b)")
+        );
     }
 
     #[test]
