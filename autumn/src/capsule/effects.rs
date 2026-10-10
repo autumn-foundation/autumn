@@ -718,7 +718,12 @@ impl ReplayEffects {
                 } else {
                     crate::job::delay_seconds(delay)
                 };
-                next.delay_secs != Some(recorded)
+                // Capture runs a zero delay at once and records no delay.
+                let ran_at_once = delay.is_zero()
+                    && next.delay_secs.is_none()
+                    && next.due_at.is_none()
+                    && next.requested_due_at.is_none();
+                next.delay_secs != Some(recorded) && !ran_at_once
             }
             // Capture runs a past deadline at once and records `due_at: None`.
             // It keeps the deadline the caller gave in `requested_due_at`, so
@@ -2351,6 +2356,35 @@ mod tests {
         // Codex review on #3222: a whole-second change is still a change in v3.
         assert_eq!(verdict(&v3(5), 6_000), EnqueueVerdict::Diverged);
         assert_eq!(verdict(&v3(5), 5_000), EnqueueVerdict::Queued);
+    }
+
+    /// Codex review on #3222: capture runs an `enqueue_in` with a zero delay
+    /// at once and records no delay, so a zero delay matches that entry.
+    #[test]
+    fn a_zero_relative_delay_matches_the_immediate_entry_it_recorded() {
+        let immediate = CapsuleEffects {
+            jobs: vec![JobEffect {
+                name: "send_receipt".to_owned(),
+                payload: serde_json::json!({}),
+                ..JobEffect::default()
+            }],
+            ..CapsuleEffects::default()
+        };
+        let after = |millis: u64| {
+            crate::job::EnqueueSchedule::After(std::time::Duration::from_millis(millis))
+        };
+        let tape = ReplayEffects::new(immediate.clone());
+        assert_eq!(
+            tape.next_job("send_receipt", &serde_json::json!({}), after(0)),
+            EnqueueVerdict::Queued
+        );
+        assert!(tape.finish().is_empty(), "{:?}", tape.finish());
+        // A positive delay is still not the immediate entry.
+        let tape = ReplayEffects::new(immediate);
+        assert_eq!(
+            tape.next_job("send_receipt", &serde_json::json!({}), after(1_000)),
+            EnqueueVerdict::Diverged
+        );
     }
 
     #[test]
