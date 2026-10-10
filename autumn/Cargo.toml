@@ -484,7 +484,7 @@ lettre = { version = "0.11.21", default-features = false, features = ["builder",
 # optional network (`http`/reqwest) and local-file stylesheet fetchers — Autumn
 # only inlines embedded `<style>` blocks, never remote CSS — keeping the added
 # graph to the html5ever/selectors parsing stack. Gated behind the `mail` feature.
-css-inline = { version = "0.21", default-features = false, optional = true }
+css-inline = { version = "0.22", default-features = false, optional = true }
 chromiumoxide = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 
