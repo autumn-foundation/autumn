@@ -701,7 +701,16 @@ impl PricedRoutes {
                         .find(|r| same_template(&r.path, self.strip_locale(t)))
                 });
         }
-        // No matched route (a static file): the most specific match wins.
+        // No matched route: only a `GET` or `HEAD` can be a static file. An
+        // unsafe request that matched nothing is a 404, and must not be paid
+        // for (x402 settles an unsafe request before the handler runs).
+        if !matches!(
+            *req.method(),
+            axum::http::Method::GET | axum::http::Method::HEAD
+        ) {
+            return None;
+        }
+        // A static file: the most specific match wins.
         let path = req.uri().path();
         routes
             .filter(|r| {
@@ -1302,6 +1311,34 @@ mod tests {
         assert!(
             mixed_protocol_route(&[x402, other]).is_none(),
             "another method"
+        );
+    }
+
+    #[test]
+    fn an_unmatched_unsafe_request_is_never_priced() {
+        let priced = PricedRoutes {
+            routes: vec![
+                PaidRoute::new("POST", "/api", "1"),
+                PaidRoute::new("GET", "/files/{name}", "2"),
+            ],
+            locales: Vec::new(),
+        };
+        let req = |method: &str, path: &str| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        // No `MatchedPath`: the router found no route, so a POST is a 404.
+        assert!(priced.route_for(&req("POST", "/api")).is_none());
+        assert!(priced.route_for(&req("POST", "/api/")).is_none());
+        // A GET without a matched route is a static file, and is priced.
+        assert_eq!(
+            priced
+                .route_for(&req("GET", "/files/a.pdf"))
+                .map(|r| r.amount.as_str()),
+            Some("2")
         );
     }
 

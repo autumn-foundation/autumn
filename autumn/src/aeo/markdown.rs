@@ -235,7 +235,9 @@ fn parse(html: &str) -> Doc {
         if bytes[i] != b'<' {
             let end = memchr(b'<', &bytes[i..]).map_or(bytes.len(), |n| i + n);
             let text = decode_entities(&html[i..end]);
-            if !text.is_empty() {
+            // Past the depth limit, text joins the last kept element, unless
+            // a dropped tag around it hides its content.
+            if !text.is_empty() && !dropped.hides() {
                 push(&mut doc, &stack, Kind::Text(text));
             }
             i = end;
@@ -308,8 +310,16 @@ fn parse(html: &str) -> Doc {
                     .find('>')
                     .map_or(bytes.len(), |n| body_end + n + 1);
             } else {
-                dropped.push(tag.name);
+                let hides = DROP.contains(&tag.name.as_str())
+                    || tag.attrs.iter().any(|(k, v)| {
+                        k == "hidden" || (k == "aria-hidden" && v.eq_ignore_ascii_case("true"))
+                    });
+                dropped.push(tag.name, hides);
             }
+            continue;
+        }
+        if dropped.hides() {
+            // A void element (an `<img>`) inside a hidden dropped tag.
             continue;
         }
         let name = tag.name.clone();
@@ -578,6 +588,11 @@ fn yaml_quote(s: &str) -> String {
 #[derive(Default)]
 struct Dropped {
     names: Vec<String>,
+    /// Per open tag: whether it hides its content (hidden, or a `DROP`
+    /// element), as the writer would at a shallower depth.
+    hides: Vec<bool>,
+    /// How many open tags hide their content.
+    hiding: usize,
     at: std::collections::HashMap<String, Vec<usize>>,
 }
 
@@ -586,12 +601,19 @@ impl Dropped {
         self.names.is_empty()
     }
 
-    fn push(&mut self, name: String) {
+    fn push(&mut self, name: String, hides: bool) {
         self.at
             .entry(name.clone())
             .or_default()
             .push(self.names.len());
         self.names.push(name);
+        self.hides.push(hides);
+        self.hiding += usize::from(hides);
+    }
+
+    /// `true` inside a dropped tag that hides its content.
+    const fn hides(&self) -> bool {
+        self.hiding > 0
     }
 
     /// Close the last open `name` and every tag opened after it. An end
@@ -601,6 +623,9 @@ impl Dropped {
             return;
         };
         while self.names.len() > pos {
+            if self.hides.pop() == Some(true) {
+                self.hiding -= 1;
+            }
             if let Some(n) = self.names.pop()
                 && let Some(v) = self.at.get_mut(&n)
             {
@@ -1252,6 +1277,25 @@ mod tests {
             md("<template><main>tpl</main></template><main>real</main>"),
             "real\n"
         );
+    }
+
+    #[test]
+    fn hidden_content_past_the_depth_limit_stays_hidden() {
+        let deep = "<div>".repeat(300);
+        for hidden in [
+            "<div hidden>secret<img src=x alt=pic></div>",
+            "<div aria-hidden=\"true\">secret</div>",
+            "<nav>secret</nav>",
+        ] {
+            let out = md(&format!("{deep}{hidden}<p>ok</p>"));
+            assert!(
+                !out.contains("secret") && !out.contains("pic"),
+                "{hidden}: {out}"
+            );
+            assert!(out.contains("ok"), "{hidden}: {out}");
+        }
+        // Plain content past the limit is still kept.
+        assert!(md(&format!("{deep}<span>kept</span>")).contains("kept"));
     }
 
     #[test]
