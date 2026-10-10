@@ -1052,7 +1052,10 @@ impl Writer {
             "pre" => {
                 self.flush();
                 let code = doc.text_of(id);
-                let code = code.strip_prefix('\n').unwrap_or(&code).trim_end();
+                // As in a browser, only a newline right after `<pre>` and one
+                // right before `</pre>` are not content; spaces are.
+                let code = code.strip_prefix('\n').unwrap_or(&code);
+                let code = code.strip_suffix('\n').unwrap_or(code);
                 let lang = doc.nodes[id]
                     .children
                     .iter()
@@ -1091,10 +1094,14 @@ impl Writer {
                     self.blocks.push(quoted.join("\n"));
                 }
             }
-            "ul" | "ol" => {
+            "ul" | "ol" | "menu" => {
                 self.flush();
                 let list = Self::list(doc, id, depth, name == "ol");
-                if !list.is_empty() {
+                if list.is_empty() {
+                    // No items: a browser still shows what is in it.
+                    self.children(doc, id, depth);
+                    self.flush();
+                } else {
                     self.blocks.push(list);
                 }
             }
@@ -1909,6 +1916,20 @@ mod tests {
             md("<p><a href=\"/docs\\\">Docs</a></p>"),
             "[Docs](/docs%5C)\n"
         );
+    }
+
+    #[test]
+    fn a_menu_is_a_bullet_list() {
+        assert_eq!(
+            md("<menu><li>One</li><li>Two</li></menu>"),
+            "- One\n- Two\n"
+        );
+    }
+
+    #[test]
+    fn preformatted_text_keeps_its_trailing_spaces() {
+        assert_eq!(md("<pre>x </pre>"), "```\nx \n```\n");
+        assert_eq!(md("<pre>\nx\n</pre>"), "```\nx\n```\n");
     }
 
     #[test]
