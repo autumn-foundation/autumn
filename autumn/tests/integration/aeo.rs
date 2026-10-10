@@ -1097,6 +1097,21 @@ mod commerce {
         assert_eq!(replay.status, 402);
         let again = decode_header(replay.header("payment-required").unwrap()).unwrap();
         assert_eq!(again["error"], "payment already used");
+        // The same proof written another way is the same payment.
+        let rewritten = encode_header(&json!({
+            "x402Version": 2,
+            "accepted": required["accepts"][0],
+            "payload": { "signature": "0xSIG" },
+        }));
+        assert_ne!(rewritten, sig);
+        let replay = c
+            .get("/api")
+            .header("payment-signature", &rewritten)
+            .send()
+            .await;
+        assert_eq!(replay.status, 402);
+        let again = decode_header(replay.header("payment-required").unwrap()).unwrap();
+        assert_eq!(again["error"], "payment already used");
     }
 
     #[tokio::test]

@@ -1204,7 +1204,7 @@ fn tidy_inline(s: &str) -> String {
 fn escape_inline(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if matches!(c, '\\' | '*' | '_' | '`' | '[' | ']' | '<') {
+        if matches!(c, '\\' | '*' | '_' | '`' | '[' | ']' | '<' | '~') {
             out.push('\\');
         }
         out.push(c);
@@ -1637,6 +1637,13 @@ mod tests {
     fn fallback_content_is_not_published() {
         let out = md("<p>shown</p><noembed>secret</noembed><noframes>secret</noframes>");
         assert_eq!(out, "shown\n");
+    }
+
+    #[test]
+    fn literal_tildes_are_escaped() {
+        assert_eq!(md("<p>~~not deleted~~</p>"), "\\~\\~not deleted\\~\\~\n");
+        assert_eq!(md("<p>a</p><p>~~~</p><p>b</p>"), "a\n\n\\~\\~\\~\n\nb\n");
+        assert_eq!(md("<p><del>gone</del></p>"), "~~gone~~\n");
     }
 
     #[test]

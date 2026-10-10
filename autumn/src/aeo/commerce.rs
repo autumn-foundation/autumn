@@ -675,6 +675,68 @@ impl UsedPayments {
     }
 }
 
+/// The identity of a payment proof, for the replay record. The same proof
+/// written another way (key order, whitespace, base64 form, hex case, a
+/// padded nonce) gets the same key. An EIP-3009 authorization is its
+/// network, asset, payer and nonce, which the chain itself spends once;
+/// another proof is its signature, or else its signed payload with sorted
+/// keys.
+#[cfg(feature = "http-client")]
+fn payment_key(payload: &Value) -> [u8; 32] {
+    // Hex as a value: case, a `0x` prefix and leading zeros do not count.
+    fn hex_value(v: &Value) -> String {
+        let s = match v {
+            Value::String(s) => s.to_ascii_lowercase(),
+            other => other.to_string(),
+        };
+        let s = s.strip_prefix("0x").unwrap_or(&s);
+        s.trim_start_matches('0').to_owned()
+    }
+    let proof = &payload["payload"];
+    let auth = &proof["authorization"];
+    let mut hasher = sha2::Sha256::new();
+    if auth["from"].is_string() && !auth["nonce"].is_null() {
+        hasher.update(b"eip3009");
+        for part in [
+            &payload["accepted"]["network"],
+            &payload["accepted"]["asset"],
+            &auth["from"],
+            &auth["nonce"],
+        ] {
+            hasher.update(b"\0");
+            hasher.update(hex_value(part).as_bytes());
+        }
+    } else if let Some(signature) = proof["signature"].as_str() {
+        hasher.update(b"signature\0");
+        hasher.update(signature.to_ascii_lowercase().as_bytes());
+    } else {
+        hasher.update(b"payload\0");
+        hasher.update(canonical_json(proof).as_bytes());
+    }
+    hasher.finalize().into()
+}
+
+/// JSON with object keys sorted, whatever order they arrived in.
+#[cfg(feature = "http-client")]
+fn canonical_json(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let fields: Vec<String> = keys
+                .into_iter()
+                .map(|k| format!("{}:{}", Value::from(k.as_str()), canonical_json(&map[k])))
+                .collect();
+            format!("{{{}}}", fields.join(","))
+        }
+        Value::Array(items) => {
+            let items: Vec<String> = items.iter().map(canonical_json).collect();
+            format!("[{}]", items.join(","))
+        }
+        other => other.to_string(),
+    }
+}
+
 /// When a payment stops being valid: its EIP-3009 `validBefore`, else the
 /// offered `maxTimeoutSeconds` from now.
 #[cfg(feature = "http-client")]
@@ -1053,9 +1115,9 @@ where
                 "paymentPayload": payload,
                 "paymentRequirements": offered,
             });
-            // One payment header works once. Claim it before any call, until
-            // the payment itself expires.
-            let key: [u8; 32] = sha2::Sha256::digest(header.as_bytes()).into();
+            // One payment works once, however its header is written. Claim it
+            // before any call, until the payment itself expires.
+            let key = payment_key(&payload);
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
@@ -1524,6 +1586,45 @@ mod tests {
         // A released claim can be made again.
         used.release(&[3; 32]);
         assert_eq!(used.claim([3; 32], 100, 60), Ok(()));
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn a_payment_has_one_key_however_it_is_written() {
+        let parse = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+        let a = parse(
+            r#"{"accepted":{"network":"eip155:8453","asset":"0xUSDC"},
+               "payload":{"signature":"0xAB","authorization":{"from":"0xAbC","nonce":"0x01"}}}"#,
+        );
+        let b = parse(
+            r#"{ "payload" : { "authorization" : { "nonce" : "0x0000001", "from" : "0xabc" },
+                 "signature" : "0xab" }, "accepted" : { "asset" : "0xusdc", "network" : "eip155:8453" } }"#,
+        );
+        assert_eq!(payment_key(&a), payment_key(&b));
+        let other_nonce = parse(
+            r#"{"accepted":{"network":"eip155:8453","asset":"0xUSDC"},
+               "payload":{"signature":"0xAB","authorization":{"from":"0xAbC","nonce":"0x02"}}}"#,
+        );
+        assert_ne!(payment_key(&a), payment_key(&other_nonce));
+        let other_chain = parse(
+            r#"{"accepted":{"network":"eip155:1","asset":"0xUSDC"},
+               "payload":{"signature":"0xAB","authorization":{"from":"0xAbC","nonce":"0x01"}}}"#,
+        );
+        assert_ne!(payment_key(&a), payment_key(&other_chain));
+
+        // No authorization: the signature, then the payload with sorted keys.
+        assert_eq!(
+            payment_key(&parse(r#"{"payload":{"signature":"0xSIG"}}"#)),
+            payment_key(&parse(r#"{"payload":{"signature":"0xsig"}}"#))
+        );
+        assert_eq!(
+            payment_key(&parse(
+                r#"{"payload":{"transaction":"t","extra":[1,{"b":2,"a":1}]}}"#
+            )),
+            payment_key(&parse(
+                r#"{"payload":{"extra":[1,{"a":1,"b":2}],"transaction":"t"}}"#
+            ))
+        );
     }
 
     #[cfg(feature = "http-client")]
