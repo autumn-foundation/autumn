@@ -1,4 +1,4 @@
-//! On-disk layout of a SQLite database fleet: one database file per tenant,
+//! On-disk layout of a `SQLite` database fleet: one database file per tenant,
 //! or one per routing slot (ADR 0019).
 //!
 //! This module is the pure, backend-independent half of the fleet. It owns:

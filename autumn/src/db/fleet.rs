@@ -1715,16 +1715,9 @@ impl DatabaseFleet {
         let outcomes = futures::stream::iter(keys.into_iter().map(|key| {
             let fleet = self.clone();
             async move {
-                let url = Self::url_of(&fleet.path_of(&key));
-                let name = key.name();
-                // Same identity rule as `open`: a file copied or renamed onto
-                // this key's path is another database's data, so it is
-                // reported, never migrated.
-                let path = fleet.path_of(&key);
+                let blocking_key = key.clone();
                 let outcome = crate::time::spawn_blocking(move || {
-                    check_contained(fleet.root(), &path)?;
-                    check_identity_blocking(&url, &name)?;
-                    fleet.inner.migrations.apply(&url, &name)
+                    migrate_existing_blocking(&fleet, &blocking_key)
                 })
                 .await
                 .map_err(|e| FleetError::Migration {
@@ -1845,6 +1838,47 @@ async fn check_identity(pool: &Pool<RuntimeConnection>, name: &str) -> Result<()
         });
     }
     Ok(())
+}
+
+/// Migrate one database `migrate_all` found on disk. Blocking.
+///
+/// Same rules as `open`: the path must stay inside the root, and a file
+/// copied or renamed onto this key's path (another database's data) is
+/// reported, never migrated. A file deleted since it was listed (a live
+/// process sharing the root deleted the tenant) is skipped: it is opened
+/// without create, so migrating it cannot bring back an empty database.
+fn migrate_existing_blocking(fleet: &DatabaseFleet, key: &FleetDbKey) -> Result<usize, FleetError> {
+    let path = fleet.path_of(key);
+    let name = key.name();
+    check_contained(fleet.root(), &path)?;
+    let url = existing_only_url(&path);
+    match check_identity_blocking(&url, &name) {
+        Ok(()) => fleet.inner.migrations.apply(&url, &name),
+        Err(_) if !path.exists() => Ok(0),
+        Err(error) => Err(error),
+    }
+}
+
+/// A connection string that opens `path` only if the file exists. On Unix a
+/// `file:` URI with `mode=rw`, which `SQLite` refuses to create through
+/// (`%`, `?` and `#` are escaped, as the URI grammar needs). Elsewhere the
+/// plain path, whose canonical Windows spelling (`\\?\C:\…`) has no URI
+/// form; [`migrate_existing_blocking`]'s existence check then narrows the
+/// window instead.
+fn existing_only_url(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        let text = path.to_string_lossy();
+        let escaped = text
+            .replace('%', "%25")
+            .replace('?', "%3F")
+            .replace('#', "%23");
+        format!("file:{escaped}?mode=rw")
+    }
+    #[cfg(not(unix))]
+    {
+        DatabaseFleet::url_of(path)
+    }
 }
 
 /// [`check_identity`] on a blocking connection, for paths that migrate a file
@@ -2234,6 +2268,7 @@ impl crate::actuator::HealthIndicator for FleetHealthIndicator {
 /// registered migrations (the control-plane framework set excluded).
 pub(crate) fn build_for_app(
     config: &crate::config::AutumnConfig,
+    resolved_control_url: Option<&str>,
     all: Arc<Vec<(&'static str, EmbeddedMigrations)>>,
     keep: impl Fn(&EmbeddedMigrations) -> bool,
 ) -> Result<Option<DatabaseFleet>, String> {
@@ -2254,13 +2289,18 @@ pub(crate) fn build_for_app(
     .map_err(|e| format!("Failed to set up database.fleet: {e}"))?;
     // Config validation compares paths lexically; a symlinked root can still
     // reach the control database. `root()` is canonical, so compare the
-    // control file's canonical path too.
-    if let Some(control) = config
+    // control file's canonical path too: the configured one, and the one a
+    // custom pool provider resolved at runtime (it may differ).
+    let control_targets = config
         .database
         .effective_primary_url()
-        .and_then(crate::config::sqlite_url_file)
-        .and_then(|path| canonical_target(&path))
-        && control.starts_with(fleet.root())
+        .into_iter()
+        .chain(resolved_control_url)
+        .filter_map(crate::config::sqlite_url_file)
+        .filter_map(|path| canonical_target(&path));
+    if let Some(control) = control_targets
+        .into_iter()
+        .find(|control| control.starts_with(fleet.root()))
     {
         return Err(format!(
             "Failed to set up database.fleet: the control database {} resolves inside \
@@ -2889,6 +2929,24 @@ mod tests {
             std::fs::read_dir(&elsewhere).unwrap().next().is_none(),
             "nothing was created outside the root"
         );
+    }
+
+    /// `AUTUMN_MIGRATE=1` lists the fleet, then migrates each file. A file
+    /// deleted in between (by a live process sharing the root) must stay
+    /// deleted: migrating it must not recreate an empty tenant database.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn migrating_a_database_deleted_after_listing_does_not_recreate_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Tenant, |_| {});
+        let acme = fleet.key_for("acme").unwrap();
+        fleet.provision(&acme).await.unwrap();
+        fleet.close(&acme).await;
+        let path = fleet.path_of(&acme);
+        std::fs::remove_file(&path).unwrap();
+        let applied = migrate_existing_blocking(&fleet, &acme).expect("a vanished file is skipped");
+        assert_eq!(applied, 0);
+        assert!(!path.exists(), "the deleted database stayed deleted");
     }
 
     #[test]

@@ -160,6 +160,27 @@ fn key_hash64(key: ShardKey<'_>) -> u64 {
     }
 }
 
+/// The [`ShardId`] of a fleet database. A slot database is its slot. In a
+/// tenant fleet many tenants share a slot, so the id is a 64-bit hash of the
+/// tenant id instead: two tenant databases never share an id, and the same
+/// tenant always gets the same one. A fleet database's id indexes nothing
+/// ([`ShardSet::get`] is for configured shards); it only tells databases apart.
+#[cfg(any(feature = "sqlite", test))]
+#[must_use]
+pub(crate) fn fleet_shard_id(key: &crate::fleet_layout::FleetDbKey) -> ShardId {
+    match key {
+        crate::fleet_layout::FleetDbKey::Slot(slot) => ShardId(usize::from(*slot)),
+        crate::fleet_layout::FleetDbKey::Tenant { id, .. } =>
+        {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "an id, not an index: a 32-bit target keeps 32 well-mixed bits"
+            )]
+            ShardId(fnv1a_64(id.as_str().as_bytes()) as usize)
+        }
+    }
+}
+
 /// Map a routing key onto a logical slot in <code>0..[SLOT_COUNT]</code>.
 ///
 /// This function is deterministic across processes and versions; see the
@@ -817,7 +838,7 @@ impl Shard {
         let slot = db.key().routing_slot();
         Self {
             name: Arc::from(db.key().name()),
-            id: ShardId(usize::from(slot)),
+            id: fleet_shard_id(db.key()),
             slots: Arc::from([slot]),
             topology: DatabaseTopology::primary_only(db.pool().clone()),
             runtime: Arc::clone(&RUNTIME),
@@ -2088,7 +2109,7 @@ impl Shards {
                     Box::pin(async move {
                         match self.set.resolve_name(&key.name()).await {
                             Ok(shard) => self.run_on_shard(&shard, f).await,
-                            Err(error) => (ShardId(usize::from(key.routing_slot())), Err(error)),
+                            Err(error) => (fleet_shard_id(&key), Err(error)),
                         }
                     })
                 },
@@ -2593,6 +2614,35 @@ async fn resolve_shard_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tenant databases that share a routing slot are still distinct
+    /// databases: their `ShardId`s must differ, or callers aggregating by id
+    /// would merge two tenants' results. A slot database keeps its slot.
+    #[test]
+    fn fleet_shard_ids_are_unique_per_database() {
+        use crate::fleet_layout::{FleetDbKey, TenantDbId};
+        let tenant = |id: &str| FleetDbKey::Tenant {
+            id: TenantDbId::parse(id).unwrap(),
+            slot: slot_for_key(ShardKey::Str(id)).0,
+        };
+        // Find two tenant ids that land on the same slot.
+        let mut seen = std::collections::HashMap::new();
+        let (a, b) = (0..100_000)
+            .map(|n| format!("t{n}"))
+            .find_map(|id| {
+                let slot = slot_for_key(ShardKey::Str(&id)).0;
+                seen.insert(slot, id.clone()).map(|earlier| (earlier, id))
+            })
+            .expect("16384 slots collide well within 100k ids");
+        assert_eq!(tenant(&a).routing_slot(), tenant(&b).routing_slot());
+        assert_ne!(fleet_shard_id(&tenant(&a)), fleet_shard_id(&tenant(&b)));
+        assert_eq!(
+            fleet_shard_id(&tenant(&a)),
+            fleet_shard_id(&tenant(&a)),
+            "stable"
+        );
+        assert_eq!(fleet_shard_id(&FleetDbKey::Slot(42)), ShardId(42));
+    }
     use crate::config::{ShardConfig, SlotSpec};
 
     #[test]
