@@ -1188,7 +1188,12 @@ where
             } else {
                 match settle(&state, &route, &resource, &body).await {
                     Ok(receipt) => Some(receipt),
-                    Err(failed) => return Ok(*failed),
+                    Err((failed, rejected)) => {
+                        if rejected {
+                            release_payment(&state, &key);
+                        }
+                        return Ok(*failed);
+                    }
                 }
             };
             let mut res = inner.call(req).await?;
@@ -1197,7 +1202,12 @@ where
                 None if res.status().is_success() => {
                     match settle(&state, &route, &resource, &body).await {
                         Ok(receipt) => receipt,
-                        Err(failed) => return Ok(*failed),
+                        Err((failed, rejected)) => {
+                            if rejected {
+                                release_payment(&state, &key);
+                            }
+                            return Ok(*failed);
+                        }
                     }
                 }
                 None => {
@@ -1223,18 +1233,34 @@ where
     }
 }
 
+/// Free a claimed payment: it was never spent, so the client may retry it.
+#[cfg(feature = "http-client")]
+fn release_payment(state: &X402State, key: &[u8; 32]) {
+    state
+        .used
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .release(key);
+}
+
 /// Settle a verified payment. `Ok` carries the `PAYMENT-RESPONSE` value;
-/// `Err` is the response to send instead (boxed: the error path is rare).
+/// `Err` is the response to send instead (boxed: the error path is rare),
+/// and whether the facilitator rejected the payment outright. A rejected
+/// payment was not spent; one the facilitator did not answer for may have
+/// been.
 #[cfg(feature = "http-client")]
 async fn settle(
     state: &X402State,
     route: &PaidRoute,
     resource: &str,
     body: &Value,
-) -> Result<Option<axum::http::HeaderValue>, Box<axum::response::Response>> {
-    let settled = facilitator(state, "settle", body)
-        .await
-        .map_err(|status| Box::new(plain(status, "payment facilitator unavailable")))?;
+) -> Result<Option<axum::http::HeaderValue>, (Box<axum::response::Response>, bool)> {
+    let settled = facilitator(state, "settle", body).await.map_err(|status| {
+        (
+            Box::new(plain(status, "payment facilitator unavailable")),
+            false,
+        )
+    })?;
     let header = axum::http::HeaderValue::from_str(&encode_header(&settled)).ok();
     if settled.get("success").and_then(Value::as_bool) == Some(true) {
         return Ok(header);
@@ -1243,7 +1269,7 @@ async fn settle(
     if let Some(h) = header {
         failed.headers_mut().insert("payment-response", h);
     }
-    Err(Box::new(failed))
+    Err((Box::new(failed), true))
 }
 
 /// `true` for an `https` facilitator, or `http` on a loopback host, with no

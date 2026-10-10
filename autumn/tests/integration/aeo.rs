@@ -1136,12 +1136,19 @@ mod commerce {
                 .unwrap(),
         )
         .unwrap();
-        let res = c
-            .post("/api/render")
-            .header("payment-signature", &signature(&required["accepts"][0]))
-            .send()
-            .await;
-        assert_eq!(res.status, 402);
+        let payment = signature(&required["accepts"][0]);
+        // A rejected settlement spent nothing: the same proof can be retried,
+        // and is rejected on its own merits, never as already used.
+        for _ in 0..2 {
+            let res = c
+                .post("/api/render")
+                .header("payment-signature", &payment)
+                .send()
+                .await;
+            assert_eq!(res.status, 402);
+            let again = decode_header(res.header("payment-required").unwrap()).unwrap();
+            assert_eq!(again["error"], "settlement failed");
+        }
         assert!(
             !RENDERED.load(std::sync::atomic::Ordering::SeqCst),
             "the handler must not run when settlement fails"

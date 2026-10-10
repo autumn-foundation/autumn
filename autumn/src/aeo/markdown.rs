@@ -320,7 +320,7 @@ fn parse(html: &str) -> Doc {
     while i < bytes.len() {
         if bytes[i] != b'<' {
             let end = memchr(b'<', &bytes[i..]).map_or(bytes.len(), |n| i + n);
-            let text = decode_entities(&html[i..end]);
+            let text = decode_entities(&html[i..end], false);
             // Past the depth limit, text joins the last kept element, unless
             // a dropped tag around it hides its content.
             if !text.is_empty() && !dropped.hides() {
@@ -493,7 +493,7 @@ fn parse(html: &str) -> Doc {
             let content = &html[i..body_end];
             if !content.is_empty() {
                 let text = if name == "title" || name == "textarea" {
-                    decode_entities(content)
+                    decode_entities(content, false)
                 } else {
                     content.to_owned()
                 };
@@ -589,7 +589,7 @@ fn read_tag(s: &str) -> TagRead {
                     let Some(close) = memchr(q, &b[i + 1..]) else {
                         return TagRead::Eof;
                     };
-                    value = decode_entities(&s[i + 1..i + 1 + close]);
+                    value = decode_entities(&s[i + 1..i + 1 + close], true);
                     i += close + 2;
                 }
                 Some(_) => {
@@ -598,7 +598,7 @@ fn read_tag(s: &str) -> TagRead {
                     {
                         i += 1;
                     }
-                    value = decode_entities(&s[start..i]);
+                    value = decode_entities(&s[start..i], true);
                 }
                 None => return TagRead::Eof,
             }
@@ -661,7 +661,7 @@ fn find_ascii_ci(hay: &str, needle: &str) -> Option<usize> {
 }
 
 /// Decode HTML character references. Unknown names stay as written.
-fn decode_entities(s: &str) -> String {
+fn decode_entities(s: &str, in_attribute: bool) -> String {
     if !s.contains('&') {
         return s.to_owned();
     }
@@ -669,47 +669,88 @@ fn decode_entities(s: &str) -> String {
     let mut rest = s;
     while let Some(amp) = rest.find('&') {
         out.push_str(&rest[..amp]);
-        rest = &rest[amp..];
-        let semi = rest[1..]
-            .find(|c: char| c == ';' || c == '&' || c.is_whitespace() || c == '<')
-            .map(|n| n + 1);
-        let decoded = semi
-            .filter(|&n| rest.as_bytes()[n] == b';')
-            .filter(|&n| decode_reference(&rest[1..n], &mut out));
-        if let Some(n) = decoded {
-            rest = &rest[n + 1..];
-        } else {
+        rest = &rest[amp + 1..];
+        let used = decode_reference(rest, in_attribute, &mut out);
+        if used == 0 {
             out.push('&');
-            rest = &rest[1..];
         }
+        rest = &rest[used..];
     }
     out.push_str(rest);
     out
 }
 
-/// Decode the character reference `name` (between `&` and `;`) onto `out`.
-/// `false` when it is no reference: the caller keeps the source text.
-fn decode_reference(name: &str, out: &mut String) -> bool {
-    if let Some(num) = name.strip_prefix('#') {
-        let code = num.strip_prefix(['x', 'X']).map_or_else(
-            || num.parse::<u32>().ok(),
-            |hex| u32::from_str_radix(hex, 16).ok(),
-        );
-        let Some(code) = code else {
-            return false;
-        };
-        out.push(
-            char::from_u32(code)
-                .filter(|&c| c != '\0')
-                .unwrap_or('\u{fffd}'),
-        );
-        return true;
+/// Decode the character reference at the start of `s` (just after the `&`)
+/// onto `out`, as the HTML tokenizer does, and return how many bytes of `s`
+/// it used; `0` when there is none, and the `&` stays text.
+fn decode_reference(s: &str, in_attribute: bool, out: &mut String) -> usize {
+    let b = s.as_bytes();
+    if b.first() == Some(&b'#') {
+        let hex = matches!(b.get(1), Some(b'x' | b'X'));
+        let start = if hex { 2 } else { 1 };
+        let digits = b[start..]
+            .iter()
+            .take_while(|c| {
+                if hex {
+                    c.is_ascii_hexdigit()
+                } else {
+                    c.is_ascii_digit()
+                }
+            })
+            .count();
+        if digits == 0 {
+            return 0;
+        }
+        let radix = if hex { 16 } else { 10 };
+        let code = u32::from_str_radix(&s[start..start + digits], radix).unwrap_or(u32::MAX);
+        out.push(numeric_reference(code));
+        let end = start + digits;
+        return end + usize::from(b.get(end) == Some(&b';'));
+    }
+    let name = b.iter().take_while(|c| c.is_ascii_alphanumeric()).count();
+    if name == 0 {
+        return 0;
     }
     let named = super::entities::NAMED;
-    named
-        .binary_search_by(|(key, _)| (*key).cmp(name))
-        .map(|i| out.push_str(named[i].1))
-        .is_ok()
+    if b.get(name) == Some(&b';')
+        && let Ok(i) = named.binary_search_by(|(key, _)| (*key).cmp(&s[..name]))
+    {
+        out.push_str(named[i].1);
+        return name + 1;
+    }
+    // The longest legacy name, read without its `;`. In an attribute, one
+    // that runs on into a letter, a digit or `=` is left alone, so a query
+    // string (`?a=1&copy=2`) keeps its text.
+    let legacy = super::entities::LEGACY;
+    for len in (1..=name.min(super::entities::LEGACY_MAX)).rev() {
+        if let Ok(i) = legacy.binary_search_by(|(key, _)| (*key).cmp(&s[..len])) {
+            let next = b.get(len);
+            if in_attribute && next.is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'=') {
+                return 0;
+            }
+            out.push_str(legacy[i].1);
+            return len;
+        }
+    }
+    0
+}
+
+/// The character a numeric reference stands for. As in a browser, the C1
+/// range reads as Windows-1252, and NUL, a surrogate or a value past
+/// U+10FFFF is U+FFFD.
+fn numeric_reference(code: u32) -> char {
+    const WINDOWS_1252: [u32; 32] = [
+        0x20AC, 0x81, 0x201A, 0x192, 0x201E, 0x2026, 0x2020, 0x2021, 0x2C6, 0x2030, 0x160, 0x2039,
+        0x152, 0x8D, 0x17D, 0x8F, 0x90, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+        0x2DC, 0x2122, 0x161, 0x203A, 0x153, 0x9D, 0x17E, 0x178,
+    ];
+    let code = match code {
+        0x80..=0x9F => WINDOWS_1252[(code - 0x80) as usize],
+        other => other,
+    };
+    char::from_u32(code)
+        .filter(|&c| c != '\0')
+        .unwrap_or('\u{fffd}')
 }
 
 fn collapse_ws(s: &str) -> String {
@@ -964,15 +1005,27 @@ impl Writer {
             "em" | "i" => self.wrap(doc, id, depth, "*"),
             "del" | "s" | "strike" => self.wrap(doc, id, depth, "~~"),
             "code" | "kbd" | "samp" => {
-                let text = collapse_ws(&doc.text_of(id));
+                let raw = doc.text_of(id);
+                let text = collapse_ws(&raw);
                 if !text.is_empty() {
+                    // Edge spaces go outside the span, as with other markers.
+                    let lead = if raw.starts_with(char::is_whitespace) {
+                        " "
+                    } else {
+                        ""
+                    };
+                    let trail = if raw.ends_with(char::is_whitespace) {
+                        " "
+                    } else {
+                        ""
+                    };
                     let fence = "`".repeat(longest_backtick_run(&text) + 1);
                     let pad = if text.starts_with('`') || text.ends_with('`') {
                         " "
                     } else {
                         ""
                     };
-                    let _ = write!(self.line, "{fence}{pad}{text}{pad}{fence}");
+                    let _ = write!(self.line, "{lead}{fence}{pad}{text}{pad}{fence}{trail}");
                 }
             }
             "a" => {
@@ -1820,7 +1873,28 @@ mod tests {
             "\u{2242}\u{338}\u{c1}\u{200c}x\n"
         );
         // Not a reference: the source text stays, escaped.
-        assert_eq!(md("<p>&notareference;</p>"), "\\&notareference;\n");
+        assert_eq!(md("<p>&zzz;</p>"), "\\&zzz;\n");
+    }
+
+    #[test]
+    fn inline_code_keeps_the_spaces_around_it() {
+        assert_eq!(md("<p>A<code> B </code>C</p>"), "A `B` C\n");
+    }
+
+    #[test]
+    fn references_decode_as_in_a_browser() {
+        // A legacy name needs no `;` in text.
+        assert_eq!(md("<p>&copy 2026 &notit;</p>"), "\u{a9} 2026 \u{ac}it;\n");
+        // C1 numbers read as Windows-1252; a `;` is optional.
+        assert_eq!(
+            md("<p>&#128; &#x93;q&#x94; &#169 x</p>"),
+            "\u{20ac} \u{201c}q\u{201d} \u{a9} x\n"
+        );
+        // In an attribute, a legacy name running into `=` stays text.
+        assert_eq!(
+            md("<p><a href=\"/s?a=1&copy=2\">s</a></p>"),
+            "[s](/s?a=1&copy=2)\n"
+        );
     }
 
     #[test]
