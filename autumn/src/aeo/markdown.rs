@@ -980,6 +980,13 @@ impl Writer {
                             .split_ascii_whitespace()
                             .find_map(|c| c.strip_prefix("language-"))
                     })
+                    // A language name is a word: a backtick in it would
+                    // break the fence.
+                    .filter(|lang| {
+                        lang.chars().all(|c| {
+                            c.is_alphanumeric() || matches!(c, '-' | '_' | '+' | '.' | '#')
+                        })
+                    })
                     .unwrap_or("");
                 let fence = "`".repeat((longest_backtick_run(code) + 1).max(3));
                 self.blocks.push(format!("{fence}{lang}\n{code}\n{fence}"));
@@ -1075,11 +1082,18 @@ impl Writer {
 
     fn list(doc: &Doc, id: usize, depth: usize, ordered: bool) -> String {
         let mut lines = Vec::new();
-        // `<ol start>` sets the first number. Markdown has no negative ones.
+        // `<ol reversed>` counts down, from the item count unless `start`
+        // says otherwise. Markdown has no negative numbers.
+        let reversed = doc.attr(id, "reversed").is_some();
+        let items = doc.nodes[id]
+            .children
+            .iter()
+            .filter(|&&c| doc.name(c) == Some("li") && !is_hidden(doc, c))
+            .count() as u64;
         let mut n: u64 = doc
             .attr(id, "start")
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(1);
+            .unwrap_or(if reversed { items } else { 1 });
         for &item in &doc.nodes[id].children {
             if doc.name(item) != Some("li") || is_hidden(doc, item) {
                 continue;
@@ -1089,8 +1103,9 @@ impl Writer {
                 n = v;
             }
             let marker = if ordered {
-                n += 1;
-                format!("{}. ", n - 1)
+                let number = n;
+                n = if reversed { n.saturating_sub(1) } else { n + 1 };
+                format!("{number}. ")
             } else {
                 "- ".to_owned()
             };
@@ -1684,6 +1699,30 @@ mod tests {
         );
         assert_eq!(md("<ol start=\"-2\"><li>a</li></ol>"), "1. a\n");
         assert_eq!(md("<ol><li>a</li></ol>"), "1. a\n");
+    }
+
+    #[test]
+    fn a_reversed_list_counts_down() {
+        assert_eq!(
+            md("<ol reversed><li>Third</li><li>Second</li><li>First</li></ol>"),
+            "3. Third\n2. Second\n1. First\n"
+        );
+        assert_eq!(
+            md("<ol reversed start=\"10\"><li>a</li><li>b</li></ol>"),
+            "10. a\n9. b\n"
+        );
+    }
+
+    #[test]
+    fn a_code_language_with_a_backtick_is_dropped() {
+        assert_eq!(
+            md("<pre><code class=\"language-```\">x</code></pre><p>after</p>"),
+            "```\nx\n```\n\nafter\n"
+        );
+        assert_eq!(
+            md("<pre><code class=\"language-c++\">x</code></pre>"),
+            "```c++\nx\n```\n"
+        );
     }
 
     #[test]
