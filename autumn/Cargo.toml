@@ -469,7 +469,7 @@ zeroize = "1"
 # direct edge plus the `ecdh` feature, which is a feature flag on the
 # already-compiled `elliptic-curve`, not a new dependency.
 p256 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa", "std"] }
-getrandom = "0.2"
+getrandom = "0.4"
 hex = "0.4"
 include_dir = { version = "0.7", optional = true }
 csv = { workspace = true, optional = true }
