@@ -711,10 +711,14 @@ impl ReplayEffects {
                     || next.requested_due_at.is_some()
             }
             // Capture rounds a sub-second remainder up. A v3 capture cut it
-            // off, so one second less also matches there.
+            // off, so a v3 capsule is compared the way it was recorded.
             crate::job::EnqueueSchedule::After(delay) => {
-                next.delay_secs != Some(delay)
-                    && !(self.legacy_v3 && next.delay_secs == Some(delay.saturating_sub(1)))
+                let recorded = if self.legacy_v3 {
+                    i64::try_from(delay.as_secs()).unwrap_or(i64::MAX)
+                } else {
+                    crate::job::delay_seconds(delay)
+                };
+                next.delay_secs != Some(recorded)
             }
             // Capture runs a past deadline at once and records `due_at: None`.
             // It keeps the deadline the caller gave in `requested_due_at`, so
@@ -2286,7 +2290,7 @@ mod tests {
             tape.next_job(
                 "send_receipt",
                 &serde_json::json!({}),
-                crate::job::EnqueueSchedule::After(3600)
+                crate::job::EnqueueSchedule::After(std::time::Duration::from_secs(3600))
             ),
             EnqueueVerdict::Diverged
         );
@@ -2295,6 +2299,36 @@ mod tests {
 
     /// #2351 item 17: a plain `enqueue` must not consume a recorded delayed
     /// or future-deadline entry.
+    #[test]
+    fn a_relative_delay_is_compared_the_way_its_format_recorded_it() {
+        let recorded = |delay_secs: i64| CapsuleEffects {
+            jobs: vec![JobEffect {
+                name: "send_receipt".to_owned(),
+                payload: serde_json::json!({}),
+                delay_secs: Some(delay_secs),
+                ..JobEffect::default()
+            }],
+            ..CapsuleEffects::default()
+        };
+        let after = |millis: u64| {
+            crate::job::EnqueueSchedule::After(std::time::Duration::from_millis(millis))
+        };
+        let verdict = |tape: &ReplayEffects, millis: u64| {
+            tape.next_job("send_receipt", &serde_json::json!({}), after(millis))
+        };
+        // v4 rounds up: 500 ms was recorded as 1 s.
+        assert_eq!(
+            verdict(&ReplayEffects::new(recorded(1)), 500),
+            EnqueueVerdict::Queued
+        );
+        // v3 cut it off: 500 ms was recorded as 0 s.
+        let v3 = |secs| ReplayEffects::new(recorded(secs)).for_format_version(3);
+        assert_eq!(verdict(&v3(0), 500), EnqueueVerdict::Queued);
+        // Codex review on #3222: a whole-second change is still a change in v3.
+        assert_eq!(verdict(&v3(5), 6_000), EnqueueVerdict::Diverged);
+        assert_eq!(verdict(&v3(5), 5_000), EnqueueVerdict::Queued);
+    }
+
     #[test]
     fn an_immediate_enqueue_does_not_satisfy_a_recorded_delayed_one() {
         let delayed = JobEffect {

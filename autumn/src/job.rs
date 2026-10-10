@@ -3519,7 +3519,7 @@ fn fill_after_commit_enqueue(
     }
     let (delay_secs, due_at) = match schedule {
         EnqueueSchedule::Immediate => (None, None),
-        EnqueueSchedule::After(delay) => (Some(delay), None),
+        EnqueueSchedule::After(delay) => (Some(delay_seconds(delay)), None),
         EnqueueSchedule::At(deadline) => (None, Some(deadline)),
     };
     slot.scope.fill_job_enqueue(
@@ -3579,13 +3579,14 @@ fn enqueue_tee_suppressed() -> bool {
 pub(crate) enum EnqueueSchedule {
     /// Run as soon as a worker takes it.
     Immediate,
-    /// Run after a relative delay, in whole seconds.
-    After(i64),
+    /// Run after a relative delay. Kept exact: capture records whole seconds
+    /// rounded up, and a v3 capsule recorded them cut off.
+    After(std::time::Duration),
     /// Run at an absolute instant.
     At(chrono::DateTime<chrono::Utc>),
 }
 
-fn delay_seconds(delay: std::time::Duration) -> i64 {
+pub(crate) fn delay_seconds(delay: std::time::Duration) -> i64 {
     // Rounded up, as capture records it: a positive sub-second delay is not
     // immediate.
     let secs = delay
@@ -3951,9 +3952,7 @@ pub async fn enqueue_in(
     // app B, whose runtime filters due-at against its own clock, so the job would be
     // years off B's timeline and never become due. Same failure mode as the real-time
     // bug this migration fixed, reached from the other direction.
-    if let Some(answer) =
-        replayed_enqueue(name, &payload, EnqueueSchedule::After(delay_seconds(delay)))
-    {
+    if let Some(answer) = replayed_enqueue(name, &payload, EnqueueSchedule::After(delay)) {
         return answer;
     }
     let client = require_job_client()?;
@@ -4055,9 +4054,7 @@ pub async fn enqueue_in_on_conn<A: serde::Serialize>(
             "job args serialization failed: {e}"
         )))
     })?;
-    if let Some(answer) =
-        replayed_enqueue(name, &payload, EnqueueSchedule::After(delay_seconds(delay)))
-    {
+    if let Some(answer) = replayed_enqueue(name, &payload, EnqueueSchedule::After(delay)) {
         return answer;
     }
     let client = require_job_client()?;
@@ -4166,7 +4163,7 @@ pub async fn enqueue_in_after_commit<A: serde::Serialize>(
         )))
     })?;
     let registration = payload.clone();
-    let schedule = EnqueueSchedule::After(delay_seconds(delay));
+    let schedule = EnqueueSchedule::After(delay);
     after_commit_seam(
         name,
         &payload,
@@ -5281,7 +5278,7 @@ impl JobClient {
         let schedule = match due {
             AfterCommitDue::At(None) => EnqueueSchedule::Immediate,
             AfterCommitDue::At(Some(at)) => EnqueueSchedule::At(at),
-            AfterCommitDue::After(delay) => EnqueueSchedule::After(delay_seconds(delay)),
+            AfterCommitDue::After(delay) => EnqueueSchedule::After(delay),
         };
         after_commit_seam(name, &recorded, schedule, register).await
     }

@@ -402,7 +402,9 @@ fn compared_fields_where(
             CapsuleBody::Text(text) => holds(text),
             CapsuleBody::Base64(encoded) => STANDARD
                 .decode(encoded.as_bytes())
-                .is_ok_and(|bytes| holds(&String::from_utf8_lossy(&bytes))),
+                // Only text: replay compares a binary body exactly, so a
+                // placeholder there is no wildcard.
+                .is_ok_and(|bytes| std::str::from_utf8(&bytes).is_ok_and(holds)),
             CapsuleBody::Absent | CapsuleBody::Skipped { .. } => false,
         }
     };
@@ -448,7 +450,7 @@ fn compared_fields_where(
         let value_holds = match entry {
             CacheEffect::Insert { value, .. } => STANDARD
                 .decode(value.as_bytes())
-                .is_ok_and(|bytes| holds(&String::from_utf8_lossy(&bytes))),
+                .is_ok_and(|bytes| std::str::from_utf8(&bytes).is_ok_and(holds)),
             _ => false,
         };
         if key_holds || value_holds {
@@ -2225,6 +2227,23 @@ mod tests {
                 "a read value is served, never a wildcard: {found:?}"
             );
             assert!(literal_placeholder_locations(&CapsuleEffects::default()).is_empty());
+        }
+
+        /// Codex review on #3222: replay compares a binary body exactly, so
+        /// placeholder bytes in one are not a wildcard and are not reported.
+        #[test]
+        fn placeholder_bytes_in_a_binary_body_are_not_reported() {
+            let mut bytes = vec![0xff, 0xfe];
+            bytes.extend_from_slice(b"[FILTERED][FILTERED]");
+            let effects = CapsuleEffects {
+                http: vec![HttpEffect {
+                    request_body: CapsuleBody::Base64(STANDARD.encode(&bytes)),
+                    ..exchange("https://api.example/upload")
+                }],
+                ..CapsuleEffects::default()
+            };
+            assert!(literal_placeholder_locations(&effects).is_empty());
+            assert!(adjacent_placeholder_locations(&effects).is_empty());
         }
 
         /// Codex review on #3222: a job payload is compared value by value,
