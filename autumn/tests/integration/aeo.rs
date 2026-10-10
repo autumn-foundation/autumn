@@ -1078,6 +1078,55 @@ mod commerce {
         settle.expect_called(0);
     }
 
+    #[get("/api/slow")]
+    async fn slow() -> Json<serde_json::Value> {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        Json(json!({ "late": true }))
+    }
+
+    /// A request cut short by the request timeout spent nothing: its proof
+    /// is free again, never `payment already used`.
+    #[tokio::test]
+    async fn a_timed_out_paid_request_frees_its_payment() {
+        let mut config = paid_config();
+        config.server.timeouts.request_timeout_ms = Some(50);
+        config.aeo.paid_routes.push(
+            toml::from_str::<PaidRoute>(
+                "method = \"GET\"\npath = \"/api/slow\"\namount = \"10000\"\ndescription = \"Slow\"",
+            )
+            .unwrap(),
+        );
+        let mut app = TestApp::new().config(config).routes(routes![slow]);
+        let verify = app
+            .http_mock("x402")
+            .post("/verify")
+            .respond_with(200, json!({ "isValid": true }));
+        let settle = app
+            .http_mock("x402")
+            .post("/settle")
+            .respond_with(200, json!({ "success": true }));
+        let c = app.build();
+        let required = decode_header(
+            c.get("/api/slow")
+                .send()
+                .await
+                .header("payment-required")
+                .unwrap(),
+        )
+        .unwrap();
+        let payment = signature(&required["accepts"][0]);
+        for _ in 0..2 {
+            let res = c
+                .get("/api/slow")
+                .header("payment-signature", &payment)
+                .send()
+                .await;
+            assert_eq!(res.status, 503, "the request timeout cut it short");
+        }
+        verify.expect_called(2);
+        settle.expect_called(0);
+    }
+
     #[post("/api/render")]
     async fn render_job() -> Json<serde_json::Value> {
         RENDERED.store(true, std::sync::atomic::Ordering::SeqCst);

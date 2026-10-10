@@ -1128,8 +1128,8 @@ where
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .claim(key, expires, now);
-            match claim {
-                Ok(()) => {}
+            let mut claim = match claim {
+                Ok(()) => PaymentClaim::new(std::sync::Arc::clone(&state), key),
                 Err(ClaimError::Used) => {
                     return Ok(payment_required(
                         &state,
@@ -1148,27 +1148,16 @@ where
                         "payment capacity reached",
                     ));
                 }
-            }
+            };
+            // From here, every return before settlement drops `claim`, which
+            // frees the payment: not verified, rejected (so junk headers
+            // cannot fill the record), never settled, or the request was
+            // cancelled (a timeout, a client gone) while it ran.
             let verify = match facilitator(&state, "verify", &body).await {
                 Ok(v) => v,
-                Err(status) => {
-                    // Not verified, so not used: the client may retry it.
-                    state
-                        .used
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .release(&key);
-                    return Ok(plain(status, "payment facilitator unavailable"));
-                }
+                Err(status) => return Ok(plain(status, "payment facilitator unavailable")),
             };
             if verify.get("isValid").and_then(Value::as_bool) != Some(true) {
-                // A rejected payment holds no slot: junk headers cannot fill
-                // the record and push out real ones.
-                state
-                    .used
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .release(&key);
                 let reason = verify
                     .get("invalidReason")
                     .and_then(Value::as_str)
@@ -1186,6 +1175,8 @@ where
             let early = if safe {
                 None
             } else {
+                // A settlement cut short may have gone through: keep it.
+                claim.disarm();
                 match settle(&state, &route, &resource, &body).await {
                     Ok(receipt) => Some(receipt),
                     Err((failed, rejected)) => {
@@ -1200,6 +1191,7 @@ where
             let receipt = match early {
                 Some(receipt) => receipt,
                 None if res.status().is_success() => {
+                    claim.disarm();
                     match settle(&state, &route, &resource, &body).await {
                         Ok(receipt) => receipt,
                         Err((failed, rejected)) => {
@@ -1210,15 +1202,8 @@ where
                         }
                     }
                 }
-                None => {
-                    // Never settled, so not spent: the client may retry it.
-                    state
-                        .used
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .release(&key);
-                    return Ok(res);
-                }
+                // Never settled, so not spent: `claim` frees it.
+                None => return Ok(res),
             };
             let headers = res.headers_mut();
             if let Some(h) = receipt {
@@ -1230,6 +1215,41 @@ where
             );
             Ok(res)
         }))
+    }
+}
+
+/// A claimed payment, freed when dropped unless [`Self::disarm`] ran first:
+/// a request cancelled before settlement spent nothing, so the client may
+/// retry the same proof.
+#[cfg(feature = "http-client")]
+struct PaymentClaim {
+    state: std::sync::Arc<X402State>,
+    key: [u8; 32],
+    armed: bool,
+}
+
+#[cfg(feature = "http-client")]
+impl PaymentClaim {
+    const fn new(state: std::sync::Arc<X402State>, key: [u8; 32]) -> Self {
+        Self {
+            state,
+            key,
+            armed: true,
+        }
+    }
+
+    /// Keep the claim: settlement starts, and may go through.
+    const fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(feature = "http-client")]
+impl Drop for PaymentClaim {
+    fn drop(&mut self) {
+        if self.armed {
+            release_payment(&self.state, &self.key);
+        }
     }
 }
 

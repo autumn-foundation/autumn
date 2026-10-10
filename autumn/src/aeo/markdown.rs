@@ -28,6 +28,14 @@ pub const fn estimate_tokens(markdown: &str) -> usize {
 /// Convert an HTML document to Markdown.
 #[must_use]
 pub fn html_to_markdown(html: &str) -> String {
+    // As the HTML parser does first: CRLF and a lone CR are LF.
+    let normalized;
+    let html = if html.contains('\r') {
+        normalized = html.replace("\r\n", "\n").replace('\r', "\n");
+        normalized.as_str()
+    } else {
+        html
+    };
     let doc = parse(html);
     let mut out = String::new();
     let title = doc
@@ -456,6 +464,29 @@ fn parse(html: &str) -> Doc {
                 stack.truncate(pos);
                 dropped.clear();
             }
+        }
+
+        // A table part closes what the table holds that is not a table part
+        // (a `<p>` a browser moved out of the table), as the browser's
+        // "clear the stack back to a table context" does: the row stays in
+        // the table, not in the paragraph.
+        if matches!(
+            tag.name.as_str(),
+            "tr" | "tbody" | "thead" | "tfoot" | "caption" | "colgroup"
+        ) && let Some(pos) = stack.iter().rposition(|&id| {
+            doc.name(id).is_some_and(|n| {
+                matches!(
+                    n,
+                    "table" | "tbody" | "thead" | "tfoot" | "tr" | "td" | "th" | "template"
+                )
+            })
+        }) && matches!(
+            doc.name(stack[pos]),
+            Some("table" | "tbody" | "thead" | "tfoot")
+        ) && pos + 1 < stack.len()
+        {
+            stack.truncate(pos + 1);
+            dropped.clear();
         }
 
         // A heading closes a heading left open right before it, as in a
@@ -2020,6 +2051,20 @@ mod tests {
     fn a_bang_before_a_link_stays_text() {
         assert_eq!(md("<p>!<a href=\"/x\">x</a></p>"), "\\![x](/x)\n");
         assert_eq!(md("<p>Wow! <a href=\"/x\">x</a></p>"), "Wow! [x](/x)\n");
+    }
+
+    #[test]
+    fn crlf_reads_as_lf() {
+        assert_eq!(md("<pre>\r\nx\r\ny\r\n</pre>"), "```\nx\ny\n```\n");
+        assert_eq!(md("<p>a\rb</p>"), "a b\n");
+    }
+
+    #[test]
+    fn a_row_after_moved_out_content_stays_in_the_table() {
+        assert_eq!(
+            md("<table><p>Note<tr><td>1</td></tr></table>"),
+            "Note\n\n| 1 |\n| --- |\n"
+        );
     }
 
     #[test]
