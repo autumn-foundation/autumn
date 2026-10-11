@@ -1697,8 +1697,10 @@ fn finish_claim(claim: tempfile::TempPath, expected: &str) -> Result<(), Publish
             "this file was written during the swap; the earlier copy is at {}",
             path.display()
         ))),
-        Err(error) => Err(PublishError::Failed(format!(
-            "could not keep the earlier copy after a late write: {error}"
+        // The new file is already in place, so this is still a publish.
+        Err(error) => Err(PublishError::Late(format!(
+            "this file was written during the swap, and the earlier copy could not \
+             be kept: {error}"
         ))),
     }
 }
