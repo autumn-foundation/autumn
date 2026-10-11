@@ -1211,10 +1211,13 @@ impl Writer {
                 self.line.push_str(trail);
             }
             "img" => {
-                if let Some(src) = doc
+                // With no `src`, a browser loads a `srcset` candidate; the
+                // Markdown takes the first.
+                let src = doc
                     .attr(id, "src")
-                    .and_then(|s| safe_url(&doc.resolve(s), false))
-                {
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| doc.attr(id, "srcset").and_then(first_srcset_url));
+                if let Some(src) = src.and_then(|s| safe_url(&doc.resolve(s), false)) {
                     let alt = escape_inline(&collapse_ws(doc.attr(id, "alt").unwrap_or("")));
                     let _ = write!(self.line, "![{alt}]({})", escape_entity_like(&src));
                 }
@@ -1784,6 +1787,16 @@ fn encode_destination(url: &str) -> String {
         }
     }
     out
+}
+
+/// The URL of the first candidate in a `srcset`: past leading whitespace
+/// and commas, up to the next whitespace, without trailing commas.
+fn first_srcset_url(srcset: &str) -> Option<&str> {
+    let start = srcset.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ',');
+    let end = start
+        .find(|c: char| c.is_ascii_whitespace())
+        .unwrap_or(start.len());
+    Some(start[..end].trim_end_matches(',')).filter(|u| !u.is_empty())
 }
 
 /// Escape `&` where it starts text a renderer would read as an entity
@@ -2566,6 +2579,23 @@ mod tests {
             md("<a href=\"mailto:a\\b@example.com\">M</a>"),
             "[M](mailto:a%5Cb@example.com)\n"
         );
+    }
+
+    #[test]
+    fn an_image_with_only_srcset_keeps_its_first_candidate() {
+        assert_eq!(
+            md("<img srcset=\"/hero.jpg\" alt=\"Hero\">"),
+            "![Hero](/hero.jpg)\n"
+        );
+        assert_eq!(
+            md("<img src=\"\" srcset=\" /a.jpg 1x, /b.jpg 2x\" alt=\"A\">"),
+            "![A](/a.jpg)\n"
+        );
+        assert_eq!(
+            md("<img src=\"/s.jpg\" srcset=\"/a.jpg 1x\" alt=\"S\">"),
+            "![S](/s.jpg)\n"
+        );
+        assert_eq!(md("<img srcset=\" , \" alt=\"x\">"), "");
     }
 
     #[test]

@@ -263,9 +263,7 @@ impl AgentSkill {
 /// [`TrustedProxiesLayer`](crate::security::TrustedProxiesLayer) resolves
 /// them from `X-Forwarded-Host` and `X-Forwarded-Proto`; else the `Host`
 /// header (or the URI authority) and no scheme.
-pub fn request_authority<B>(
-    req: &axum::http::Request<B>,
-) -> (Option<String>, Option<String>) {
+pub fn request_authority<B>(req: &axum::http::Request<B>) -> (Option<String>, Option<String>) {
     if let Some(identity) = req
         .extensions()
         .get::<crate::security::ResolvedClientIdentity>()
@@ -338,9 +336,10 @@ impl Origin {
             && url.query().is_none()
             && url.fragment().is_none()
         {
-            // The scheme as parsed (lowercase), the rest as written: the
-            // signing authority strips the default port by scheme.
-            let base = format!("{}{}", url.scheme(), &raw[url.scheme().len()..]);
+            // The URL as parsed: scheme and host lowercase, an IDN host in
+            // its ASCII (punycode) form a request's `Host` carries, and no
+            // default port, so the signed authority matches the request's.
+            let base = url.as_str().trim_end_matches('/').to_owned();
             return Self {
                 base,
                 host: host.to_ascii_lowercase(),
@@ -1652,7 +1651,8 @@ mod tests {
     #[test]
     fn origin_prefers_base_url() {
         let o = Origin::resolve(Some("https://Shop.Example.com:8443/"), Some("evil.test"));
-        assert_eq!(o.base, "https://Shop.Example.com:8443");
+        // The base as parsed: the host lowercase, the port kept.
+        assert_eq!(o.base, "https://shop.example.com:8443");
         assert_eq!(o.host, "shop.example.com");
     }
 
@@ -2237,6 +2237,12 @@ mod tests {
         let o = Origin::resolve(Some("HTTPS://example.com:443"), None);
         assert_eq!(o.signing_authority(), "example.com");
         assert!(o.is_request_authority(Some("example.com")));
+
+        // An IDN host is signed in the punycode form a request carries.
+        let o = Origin::resolve(Some("https://bücher.example/shop/"), None);
+        assert_eq!(o.base, "https://xn--bcher-kva.example/shop");
+        assert_eq!(o.signing_authority(), "xn--bcher-kva.example");
+        assert!(o.is_request_authority(Some("xn--bcher-kva.example")));
     }
 
     #[test]
