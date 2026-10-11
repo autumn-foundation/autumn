@@ -116,11 +116,12 @@ where
         } else {
             None
         };
-        let host = if self.config.resource_metadata_from_host {
-            req.headers().get(axum::http::header::HOST).cloned()
-        } else {
-            None
-        };
+        // The host and scheme the client used, for a `401` hint built from
+        // them: a trusted proxy's forwarded ones, else `Host`.
+        let host = self
+            .config
+            .resource_metadata_from_host
+            .then(|| super::documents::request_authority(&req));
         let page = flags.wants_markdown.then(|| {
             req.uri()
                 .path_and_query()
@@ -201,7 +202,7 @@ pin_project_lite::pin_project! {
         config: Arc<NegotiateConfig>,
         flags: Flags,
         validators: Option<Box<Validators>>,
-        host: Option<HeaderValue>,
+        host: Option<(Option<String>, Option<String>)>,
         // The request path and query, for a relative `<base href>`.
         page: Option<String>,
         convert: Option<ConvertFuture>,
@@ -228,7 +229,13 @@ where
             let hint = config.resource_metadata.clone().or_else(|| {
                 config
                     .resource_metadata_from_host
-                    .then(|| host_resource_metadata(this.host.as_ref()))
+                    .then(|| {
+                        let (host, scheme) = this
+                            .host
+                            .as_ref()
+                            .map_or((None, None), |(h, s)| (h.as_deref(), s.as_deref()));
+                        host_resource_metadata(host, scheme)
+                    })
                     .flatten()
             });
             if let Some(hint) = hint {
@@ -292,8 +299,8 @@ where
 
 /// The `401` hint for a site with no `[seo] base_url`: the metadata URL at
 /// the request's own origin.
-fn host_resource_metadata(host: Option<&HeaderValue>) -> Option<HeaderValue> {
-    let origin = super::documents::Origin::resolve(None, host.and_then(|h| h.to_str().ok()));
+fn host_resource_metadata(host: Option<&str>, scheme: Option<&str>) -> Option<HeaderValue> {
+    let origin = super::documents::Origin::resolve_with_scheme(None, host, scheme);
     HeaderValue::from_str(&format!(
         "Bearer resource_metadata=\"{}\"",
         origin.url(super::documents::OAUTH_RESOURCE_PATH)

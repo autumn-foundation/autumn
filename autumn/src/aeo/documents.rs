@@ -259,6 +259,32 @@ impl AgentSkill {
     }
 }
 
+/// The host and scheme `req` reached the site by. Behind a trusted proxy,
+/// [`TrustedProxiesLayer`](crate::security::TrustedProxiesLayer) resolves
+/// them from `X-Forwarded-Host` and `X-Forwarded-Proto`; else the `Host`
+/// header (or the URI authority) and no scheme.
+pub fn request_authority<B>(
+    req: &axum::http::Request<B>,
+) -> (Option<String>, Option<String>) {
+    if let Some(identity) = req
+        .extensions()
+        .get::<crate::security::ResolvedClientIdentity>()
+        && let Some(host) = identity.host.as_deref()
+    {
+        return (Some(host.to_owned()), identity.scheme.clone());
+    }
+    let host = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            req.uri()
+                .authority()
+                .map(axum::http::uri::Authority::as_str)
+        });
+    (host.map(str::to_owned), None)
+}
+
 /// Where a request came in: the absolute origin and its host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Origin {
@@ -278,6 +304,31 @@ impl Origin {
     /// paths are appended to the base, and the documents are public.
     #[must_use]
     pub fn resolve(base_url: Option<&str>, host_header: Option<&str>) -> Self {
+        Self::resolve_with_scheme(base_url, host_header, None)
+    }
+
+    /// [`Origin::resolve`] for `req`: its external host and scheme as a
+    /// trusted proxy reported them, else its `Host`. Also returns the host
+    /// used, for [`Origin::is_request_authority`].
+    pub(crate) fn for_request<B>(
+        base_url: Option<&str>,
+        req: &axum::http::Request<B>,
+    ) -> (Self, Option<String>) {
+        let (host, scheme) = request_authority(req);
+        (
+            Self::resolve_with_scheme(base_url, host.as_deref(), scheme.as_deref()),
+            host,
+        )
+    }
+
+    /// [`Origin::resolve`] with the request's scheme when it is known (from
+    /// a trusted proxy's `X-Forwarded-Proto`). An unknown scheme is `http`
+    /// for loopback hosts and `https` for the rest.
+    pub(crate) fn resolve_with_scheme(
+        base_url: Option<&str>,
+        host_header: Option<&str>,
+        scheme: Option<&str>,
+    ) -> Self {
         if let Some(raw) = base_url.map(|b| b.trim().trim_end_matches('/'))
             && let Ok(url) = url::Url::parse(raw)
             && let Some(host) = url.host_str()
@@ -305,7 +356,12 @@ impl Origin {
             || host.ends_with(".localhost")
             || host == "[::1]"
             || host.starts_with("127.");
-        let scheme = if loopback { "http" } else { "https" };
+        let scheme = match scheme {
+            Some(s) if s.eq_ignore_ascii_case("http") => "http",
+            Some(s) if s.eq_ignore_ascii_case("https") => "https",
+            _ if loopback => "http",
+            _ => "https",
+        };
         Self {
             base: format!("{scheme}://{authority}"),
             host,
@@ -1640,6 +1696,19 @@ mod tests {
             );
         }
         assert_eq!(Origin::resolve(None, None).host, "localhost");
+        // A scheme a trusted proxy reported wins over the loopback guess.
+        assert_eq!(
+            Origin::resolve_with_scheme(None, Some("app.example"), Some("http")).base,
+            "http://app.example"
+        );
+        assert_eq!(
+            Origin::resolve_with_scheme(None, Some("localhost:3000"), Some("HTTPS")).base,
+            "https://localhost:3000"
+        );
+        assert_eq!(
+            Origin::resolve_with_scheme(None, Some("app.example"), Some("ftp")).base,
+            "https://app.example"
+        );
     }
 
     // ── Agent skills ────────────────────────────────────────────────────

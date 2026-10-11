@@ -520,12 +520,8 @@ pub(crate) async fn fallback(site: Option<Arc<AeoSite>>, req: Request<Body>) -> 
         && (readable || method == Method::OPTIONS)
         && documents::is_document_path(uri.path())
     {
-        let host = req
-            .headers()
-            .get(axum::http::header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .or_else(|| uri.authority().map(axum::http::uri::Authority::as_str));
-        let origin = documents::Origin::resolve(site.base_url.as_deref(), host);
+        let (origin, host) = documents::Origin::for_request(site.base_url.as_deref(), &req);
+        let host = host.as_deref();
         if let Some(mut doc) = documents::render(&site.facts, &origin, uri.path()) {
             // The directory signature covers `@authority`: through another
             // trusted host a verifier would rebuild a different one.

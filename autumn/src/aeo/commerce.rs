@@ -1417,11 +1417,7 @@ fn facilitator_url_is_safe(raw: &str) -> bool {
 
 #[cfg(feature = "http-client")]
 fn resource_url(state: &X402State, req: &axum::http::Request<axum::body::Body>) -> String {
-    let host = req
-        .headers()
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok());
-    let origin = super::documents::Origin::resolve(state.base_url.as_deref(), host);
+    let (origin, _) = super::documents::Origin::for_request(state.base_url.as_deref(), req);
     let path = req
         .uri()
         .path_and_query()

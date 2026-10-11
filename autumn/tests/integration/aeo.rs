@@ -283,6 +283,25 @@ async fn head_of_a_dynamic_page_mirrors_the_markdown_get() {
     assert!(head.text().is_empty());
 }
 
+#[tokio::test]
+async fn documents_use_the_host_a_trusted_proxy_reports() {
+    let mut config = AutumnConfig::default();
+    config.security.trusted_proxies.trust_forwarded_headers = true;
+    // The trusted-host check reads the raw `Host`, the proxy's internal one.
+    config.security.trusted_hosts.hosts = vec!["internal.svc.cluster.local".to_owned()];
+    let res = client_with(config)
+        .get("/llms.txt")
+        .header("host", "internal.svc.cluster.local")
+        .header("x-forwarded-host", "app.example")
+        .header("x-forwarded-proto", "https")
+        .send()
+        .await;
+    res.assert_ok();
+    let body = res.text();
+    assert!(body.contains("https://app.example/sitemap.xml"), "{body}");
+    assert!(!body.contains("internal.svc"), "{body}");
+}
+
 #[get("/docs/page")]
 async fn based_page() -> impl IntoResponse {
     Html(
