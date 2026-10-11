@@ -2572,16 +2572,18 @@ mod tests {
             max_open: 1,
             ..config(tmp.path(), FleetMode::Slot)
         })
-        .min_residency(Duration::from_millis(150))
+        .min_residency(Duration::from_secs(1))
         .build()
         .unwrap();
-        assert!(fleet.sweep_interval() <= Duration::from_millis(150));
+        assert!(fleet.sweep_interval() <= Duration::from_secs(1));
+        // Opening three databases must fit inside the grace, also on a slow
+        // Windows runner.
         for slot in 1..=3 {
             fleet.open(&FleetDbKey::Slot(slot)).await.unwrap();
         }
         settle(&fleet).await;
         assert_eq!(fleet.stats().open, 3, "a burst inside the grace stays open");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
         // A sweep closes only an idle database. On a busy runner a pool can
         // still hold a connection after the sleep, so sweep as the sweeper
         // does, until the burst is closed or the deadline passes.
