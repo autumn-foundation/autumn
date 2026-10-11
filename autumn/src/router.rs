@@ -6624,6 +6624,12 @@ pub fn try_build_router_with_static_inner(
             async move {
                 let is_get = req.method() == http::Method::GET;
                 let is_head = req.method() == http::Method::HEAD;
+                // A Markdown `HEAD` keeps the page bytes, already read here,
+                // so the negotiation layer converts them as for `GET` and
+                // sets the Markdown's length and token count. The server
+                // sends no `HEAD` body either way.
+                let head_for_markdown =
+                    is_head && crate::aeo::negotiate::prefers_markdown(req.headers());
                 if is_get || is_head {
                     let path = req.uri().path();
                     // Normalize trailing slash: /about/ → /about (but keep / as /)
@@ -6648,7 +6654,8 @@ pub fn try_build_router_with_static_inner(
                         // a layer outside (Markdown negotiation) can tell
                         // whether that body fits.
                         let len = contents.len();
-                        let body = if is_head {
+                        let empty_head = is_head && !head_for_markdown;
+                        let body = if empty_head {
                             axum::body::Body::empty()
                         } else {
                             axum::body::Body::from(contents)
@@ -6656,7 +6663,7 @@ pub fn try_build_router_with_static_inner(
                         let mut response = http::Response::builder()
                             .status(http::StatusCode::OK)
                             .header(http::header::CONTENT_TYPE, hit.content_type);
-                        if is_head {
+                        if empty_head {
                             response = response.header(http::header::CONTENT_LENGTH, len);
                         }
                         return response.body(body).expect("infallible response builder");
@@ -13665,6 +13672,49 @@ enabled = true
             .await
             .unwrap();
         assert!(body.is_empty(), "HEAD response body should be empty");
+    }
+
+    #[tokio::test]
+    async fn a_markdown_head_of_a_static_page_mirrors_the_get() {
+        let tmp = create_static_dist(None);
+        let dist = tmp.path().join("dist");
+        let config = AutumnConfig::default();
+        let router = try_build_router_with_static(Vec::new(), &config, test_state(), Some(&dist))
+            .expect("router builds");
+        let send = |method: &str| {
+            router.clone().oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/about")
+                    .header("accept", "text/markdown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+        let get = send("GET").await.unwrap();
+        let head = send("HEAD").await.unwrap();
+        let header = |res: &axum::response::Response, name: &str| {
+            res.headers()
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_owned())
+        };
+        assert!(
+            header(&get, "content-type")
+                .unwrap()
+                .starts_with("text/markdown")
+        );
+        assert_eq!(header(&head, "content-type"), header(&get, "content-type"));
+        assert_eq!(
+            header(&head, "x-markdown-tokens"),
+            header(&get, "x-markdown-tokens")
+        );
+        assert!(header(&head, "x-markdown-tokens").is_some());
+        let head_length = header(&head, "content-length");
+        let get_body = axum::body::to_bytes(get.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        // The `HEAD` names the length of the Markdown the `GET` sends.
+        assert_eq!(head_length, Some(get_body.len().to_string()));
     }
 
     #[tokio::test]
