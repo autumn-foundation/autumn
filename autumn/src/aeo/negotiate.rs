@@ -392,22 +392,10 @@ fn with_bearer_param(challenges: &str, param: &str) -> Option<String> {
     {
         return None;
     }
-    // Split on commas outside quoted strings.
-    let mut items = Vec::new();
-    let (mut start, mut quoted, mut escaped) = (0, false, false);
-    for (i, c) in challenges.char_indices() {
-        match c {
-            _ if escaped => escaped = false,
-            '\\' if quoted => escaped = true,
-            '"' => quoted = !quoted,
-            ',' if !quoted => {
-                items.push(challenges[start..i].trim());
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    items.push(challenges[start..].trim());
+    let items: Vec<&str> = split_unquoted(challenges, ',')
+        .into_iter()
+        .map(str::trim)
+        .collect();
     // An item opens a challenge when its first token is not followed by `=`.
     let opens = |item: &str| {
         let token_end = item
@@ -493,12 +481,14 @@ fn ranges(accept: &[HeaderValue]) -> impl Iterator<Item = (&str, Vec<(&str, &str
     accept
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
+        .flat_map(|v| split_unquoted(v, ','))
         .map(|range| {
-            let mut parts = range.split(';');
-            let media = parts.next().unwrap_or("").trim();
-            let q = accept_weight(range.split(';').skip(1));
+            let parts = split_unquoted(range, ';');
+            let media = parts.first().copied().unwrap_or("").trim();
+            let q = accept_weight(parts.iter().skip(1).copied());
             let params = parts
+                .into_iter()
+                .skip(1)
                 .map(str::trim)
                 .filter(|p| !p.is_empty())
                 .take_while(|p| {
@@ -514,11 +504,32 @@ fn ranges(accept: &[HeaderValue]) -> impl Iterator<Item = (&str, Vec<(&str, &str
         })
 }
 
+/// `s` split on `sep` outside quoted strings (RFC 9110 §5.6.4), so a
+/// quoted parameter value may hold a `,` or `;`.
+fn split_unquoted(s: &str, sep: char) -> Vec<&str> {
+    let mut items = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (i, c) in s.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            c if c == sep && !quoted => {
+                items.push(&s[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    items.push(&s[start..]);
+    items
+}
+
 /// The parameters of a representation's type. HTML with no `charset` is
 /// UTF-8.
 fn type_params(content_type: &str) -> Vec<(&str, &str)> {
-    let mut params: Vec<(&str, &str)> = content_type
-        .split(';')
+    let mut params: Vec<(&str, &str)> = split_unquoted(content_type, ';')
+        .into_iter()
         .skip(1)
         .filter_map(|p| p.split_once('='))
         .map(|(k, v)| (k.trim(), v.trim().trim_matches('"')))
@@ -636,7 +647,7 @@ fn is_negotiable(res: &Response) -> bool {
 /// `text/html` whose bytes read as UTF-8: no charset, or `utf-8` or
 /// `us-ascii`. The converter reads UTF-8, and the Markdown says UTF-8.
 fn utf8_html(content_type: &str) -> bool {
-    let mut parts = content_type.split(';');
+    let mut parts = split_unquoted(content_type, ';').into_iter();
     let html = parts
         .next()
         .is_some_and(|m| m.trim().eq_ignore_ascii_case("text/html"));
@@ -990,6 +1001,10 @@ mod tests {
             profiled,
             "text/html; charset=utf-8; profile=https://example.test/p"
         ));
+        // A quoted value may hold the separators.
+        let quoted = "text/html;profile=\"a,b;c\";q=1, text/markdown;q=0.5";
+        assert!(!wins(quoted, "text/html; profile=\"a,b;c\""));
+        assert!(wins(quoted, "text/html; profile=\"a\""));
         // Another profile, or none, is not covered: Markdown wins.
         assert!(wins(
             profiled,
