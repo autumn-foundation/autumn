@@ -100,6 +100,7 @@ not a rewrite.
 | --- | --- |
 | One host, one process, zero-ops priority | **SQLite** |
 | One host, write volume comfortably below a single serialized writer | **SQLite** |
+| One host, many tenants, writes that queue behind each other | **SQLite [fleet](./sqlite-fleet.md)** (one writer per tenant) |
 | Multiple replicas / multiple hosts sharing data | **Postgres** |
 | Read replicas, sharding, or heavy write concurrency | **Postgres** |
 | You need Postgres-specific FTS features (language-stemming dictionaries), `LISTEN/NOTIFY`, or **cross-host** leader election | **Postgres** |
@@ -896,8 +897,10 @@ bugs; they are the scale-out tier's reason to exist, and every one of them
 
 - **Read replicas** (`replica_url` / replica routing) — a single file has no
   networked replica to route reads to.
-- **Native sharding** (the shard directory / multi-shard repositories) — see
-  [Sharding](./sharding.md).
+- **Configured shards** (`[[database.shards]]`, the shard directory) — see
+  [Sharding](./sharding.md). The SQLite tier shards differently: a
+  [database fleet](./sqlite-fleet.md) gives each tenant (or slot) its own file
+  behind the same `ShardedDb` / `#[repository(sharded)]` code.
 - **Replication to a second live node** (a standby process serving from the same
   data). Continuous replication to offsite *storage* is supported — see
   [durability](#durability-continuous-replication-and-point-in-time-restore) —

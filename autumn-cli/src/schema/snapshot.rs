@@ -7,9 +7,9 @@
 //! adds the other half of a diff: a durable, versioned, dialect-tagged file that
 //! records the schema's *last-known agreed shape*. At adoption time the declared
 //! models and the live database agree, so writing a snapshot of the models
-//! establishes the initial baseline; a later slice's diff engine compares the
-//! freshly-parsed desired state against this committed file to compute the
-//! pending migration.
+//! establishes the initial baseline. The diff engine ([`crate::schema::diff`])
+//! compares the parsed desired state against this committed file to compute
+//! the pending migration.
 //!
 //! # Why a bespoke envelope (not just `Vec<Table>`)
 //!
@@ -21,8 +21,8 @@
 //!   silently mis-parsed by an older CLI.
 //! - **A top-level `backend`** dialect tag (Decision 5 provider-lock): the same
 //!   logical schema renders different DDL per backend, so a snapshot is locked to
-//!   the provider it was generated against. [`SchemaSnapshot::ensure_backend_matches`]
-//!   is the guard a later slice's diff engine calls before diffing.
+//!   the provider it was generated against. `schema diff` and `schema migrate`
+//!   call [`SchemaSnapshot::ensure_backend_matches`] before they use it.
 //!
 //! # Canonical serialization
 //!
@@ -38,10 +38,25 @@ use std::path::Path;
 use autumn_schema_core::{Backend, Schema, Table};
 use serde::{Deserialize, Serialize};
 
-/// The current on-disk snapshot format version. Bumped only by a
-/// backwards-incompatible change to the envelope; [`load_snapshot`] rejects any
-/// other value so an older CLI never silently mis-reads a newer file.
-pub const SNAPSHOT_VERSION: u32 = 1;
+/// The newest on-disk snapshot format version. [`load_snapshot`] reads
+/// versions 1 to this value and rejects all others, so an older CLI never
+/// silently mis-reads a newer file.
+///
+/// - Version 1: the base format.
+/// - Version 2: a foreign key has an `ON DELETE` / `ON UPDATE` action. An older
+///   CLI ignores unknown keys, so it would drop the action. A snapshot without
+///   an action stays at version 1 and keeps the same bytes.
+pub const SNAPSHOT_VERSION: u32 = 2;
+
+/// The lowest format version that can hold `tables` (see [`SNAPSHOT_VERSION`]).
+fn required_version(tables: &[Table]) -> u32 {
+    let has_action = tables.iter().flat_map(|t| &t.columns).any(|c| {
+        c.references
+            .as_ref()
+            .is_some_and(|fk| fk.on_delete.is_some() || fk.on_update.is_some())
+    });
+    if has_action { 2 } else { 1 }
+}
 
 /// The conventional, checked-in location of the schema snapshot, relative to the
 /// project root. Lives under the `.autumn/` state directory (the same
@@ -68,14 +83,15 @@ pub struct SchemaSnapshot {
 }
 
 impl SchemaSnapshot {
-    /// Build a snapshot at the current [`SNAPSHOT_VERSION`] from `backend` and
-    /// `tables`. The tables are stored as given; canonical ordering is applied at
-    /// serialization time by [`to_canonical_json`], not here, so a caller's live
-    /// in-memory ordering (e.g. declaration order) is preserved for any other use.
+    /// Build a snapshot from `backend` and `tables`, at the lowest format
+    /// version that can hold them. The tables are stored as given; canonical
+    /// ordering is applied at serialization time by [`to_canonical_json`], not
+    /// here, so a caller's live in-memory ordering (e.g. declaration order) is
+    /// preserved for any other use.
     #[must_use]
-    pub const fn new(backend: Backend, tables: Vec<Table>) -> Self {
+    pub fn new(backend: Backend, tables: Vec<Table>) -> Self {
         Self {
-            snapshot_version: SNAPSHOT_VERSION,
+            snapshot_version: required_version(&tables),
             backend,
             tables,
         }
@@ -92,18 +108,14 @@ impl SchemaSnapshot {
         Self::new(schema.backend, schema.tables)
     }
 
-    /// Confirm this snapshot targets `expected` — the provider-lock guard a later
-    /// slice's diff engine calls before diffing a desired state against the
-    /// baseline (a snapshot generated for one dialect must not be diffed against
-    /// another). Never enforced by the writer.
+    /// Confirm this snapshot targets `expected` — the provider-lock guard that
+    /// `schema diff` and `schema migrate` call before they use the baseline (a
+    /// snapshot generated for one dialect must not be diffed against another).
+    /// Never enforced by the writer.
     ///
     /// # Errors
     ///
     /// Returns [`SnapshotError::BackendMismatch`] when the tags differ.
-    // The provider-lock guard is consumed by the slice-4 diff engine (which
-    // reads a baseline and diffs it against a desired state); the writer never
-    // calls it, so it is not yet reachable from the command path.
-    #[allow(dead_code)]
     pub fn ensure_backend_matches(&self, expected: Backend) -> Result<(), SnapshotError> {
         if self.backend == expected {
             Ok(())
@@ -144,7 +156,7 @@ pub enum SnapshotError {
     },
     /// The file declares a `snapshot_version` this CLI does not understand.
     #[error(
-        "unsupported snapshot_version {found} (this build understands version {SNAPSHOT_VERSION}); \
+        "unsupported snapshot_version {found} (this build understands versions 1 to {SNAPSHOT_VERSION}); \
          upgrade the Autumn CLI to read this snapshot"
     )]
     UnsupportedVersion {
@@ -172,8 +184,10 @@ pub enum SnapshotError {
 /// input twice is guaranteed to produce identical bytes.
 #[must_use]
 pub fn to_canonical_json(snapshot: &SchemaSnapshot) -> String {
+    // The version follows the content, so a reloaded version-2 file without
+    // actions is written back as version 1.
     let canonical = SchemaSnapshot {
-        snapshot_version: snapshot.snapshot_version,
+        snapshot_version: required_version(&snapshot.tables),
         backend: snapshot.backend,
         tables: canonical_tables(&snapshot.tables),
     };
@@ -261,9 +275,6 @@ pub fn write_snapshot(path: &Path, snapshot: &SchemaSnapshot) -> Result<(), Snap
 /// Returns [`SnapshotError::Io`] if the file cannot be read,
 /// [`SnapshotError::UnsupportedVersion`] if it declares an unknown version, or
 /// [`SnapshotError::Json`] if it is not a valid snapshot document.
-// The baseline reader is consumed by the slice-4 diff engine; the current
-// command only writes, so it is not yet reachable from the command path.
-#[allow(dead_code)]
 pub fn load_snapshot(path: &Path) -> Result<SchemaSnapshot, SnapshotError> {
     let text = std::fs::read_to_string(path).map_err(|source| SnapshotError::Io {
         path: path.display().to_string(),
@@ -275,8 +286,6 @@ pub fn load_snapshot(path: &Path) -> Result<SchemaSnapshot, SnapshotError> {
 /// Parse a snapshot from an in-memory string, applying the same version guard as
 /// [`load_snapshot`]. Split out so it is testable without touching the
 /// filesystem; `label` names the source in any error.
-// Reachable only through `load_snapshot` (slice-4 diff engine) and the tests.
-#[allow(dead_code)]
 fn parse_snapshot_str(text: &str, label: &str) -> Result<SchemaSnapshot, SnapshotError> {
     // Read the version from a loose `Value` first so an unknown *future* format
     // (whose table shape this build may not understand) still fails with the
@@ -289,7 +298,7 @@ fn parse_snapshot_str(text: &str, label: &str) -> Result<SchemaSnapshot, Snapsho
     if let Some(version) = value
         .get("snapshot_version")
         .and_then(serde_json::Value::as_u64)
-        && version != u64::from(SNAPSHOT_VERSION)
+        && !(1..=u64::from(SNAPSHOT_VERSION)).contains(&version)
     {
         return Err(SnapshotError::UnsupportedVersion {
             found: u32::try_from(version).unwrap_or(u32::MAX),
@@ -369,8 +378,9 @@ mod tests {
         let back = parse_snapshot_str(&json, "<test>").expect("parse back");
         // Equality is order-insensitive at the table/index level only if both
         // sides are canonical; canonicalize the original for the comparison.
+        // The fixture has no foreign-key action, so the format is version 1.
         let expected = SchemaSnapshot {
-            snapshot_version: SNAPSHOT_VERSION,
+            snapshot_version: 1,
             backend: Backend::Postgres,
             tables: canonical_tables(&snapshot.tables),
         };
@@ -386,7 +396,7 @@ mod tests {
         write_snapshot(&path, &snapshot).expect("write");
         let loaded = load_snapshot(&path).expect("load");
         assert_eq!(loaded.backend, Backend::Sqlite);
-        assert_eq!(loaded.snapshot_version, SNAPSHOT_VERSION);
+        assert_eq!(loaded.snapshot_version, 1);
         // Loaded tables are the canonical form.
         assert_eq!(loaded.tables, canonical_tables(&snapshot.tables));
     }
@@ -606,8 +616,42 @@ mod tests {
         assert!(json.contains("\"default\": \"Now\""));
         // Re-loading the produced JSON yields a valid, version-1 snapshot.
         let loaded = parse_snapshot_str(&json, "<test>").expect("reload");
-        assert_eq!(loaded.snapshot_version, SNAPSHOT_VERSION);
+        assert_eq!(loaded.snapshot_version, 1);
         assert_eq!(loaded.tables.len(), 1);
         assert_eq!(loaded.tables[0].name, "posts");
+    }
+
+    /// A foreign-key action needs format 2. An older CLI rejects that file
+    /// with `UnsupportedVersion`, and so cannot drop the action in silence.
+    #[test]
+    fn a_foreign_key_action_writes_version_2() {
+        let src = r#"
+            #[model]
+            pub struct Comment {
+                #[id]
+                pub id: i64,
+                #[references(table = "posts", on_delete = "cascade")]
+                pub post_id: i64,
+            }
+        "#;
+        let parsed = parse_model_source(src, Backend::Postgres).expect("parse");
+        let json = to_canonical_json(&SchemaSnapshot::new(Backend::Postgres, parsed.tables));
+        assert!(json.contains("\"snapshot_version\": 2"), "{json}");
+        let loaded = parse_snapshot_str(&json, "<test>").expect("this build reads version 2");
+        assert_eq!(loaded.snapshot_version, 2);
+        // Version 1 still loads. A version above the newest is refused.
+        let v1 = r#"{ "snapshot_version": 1, "backend": "Postgres", "tables": [] }"#;
+        assert_eq!(
+            parse_snapshot_str(v1, "<v1>").expect("v1").snapshot_version,
+            1
+        );
+        let next = format!(
+            r#"{{ "snapshot_version": {}, "backend": "Postgres", "tables": [] }}"#,
+            SNAPSHOT_VERSION + 1
+        );
+        assert!(matches!(
+            parse_snapshot_str(&next, "<next>"),
+            Err(SnapshotError::UnsupportedVersion { .. })
+        ));
     }
 }

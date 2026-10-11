@@ -73,7 +73,7 @@ use crate::time::ClockSource;
 /// How much slack past the configured RPO the health indicator allows before
 /// reporting `Down`. Three RPOs absorbs one slow upload and one retried tick
 /// without paging an operator over ordinary jitter.
-const LAG_ALERT_MULTIPLIER: u32 = 3;
+pub(crate) const LAG_ALERT_MULTIPLIER: u32 = 3;
 
 /// How long a just-started replicator may have shipped nothing before that
 /// counts against it (a first base snapshot of a large database takes a while).

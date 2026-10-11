@@ -47,7 +47,9 @@ environment override: `AUTUMN_PUSH__PUBLIC_KEY`, `AUTUMN_PUSH__SUBJECT`,
 `subject` must be a `mailto:` or `https:` URI — RFC 8292 requires it, and it is
 how a push service operator reaches you about your traffic. A bare email
 address is the common mistake and is refused at boot, because otherwise the app
-starts fine and every delivery is rejected remotely.
+starts fine and every delivery is rejected remotely. A `mailto:` subject with
+a space or a second `@` is refused too. Autumn trims the value before it uses
+it.
 
 ### 3. Generate the PWA
 
@@ -119,7 +121,7 @@ is the framework's.
 | Method | Behavior |
 |---|---|
 | `send(principal, &message)` | Deliver to every device that principal has subscribed |
-| `send_many(principals, &message)` | Fan out across principals, aggregating one report |
+| `send_many(principals, &message)` | Fan out across principals (up to four at once), aggregating one report |
 | `subscribe(principal, &browser_subscription)` | Validate and record a browser subscription |
 | `unsubscribe(principal, endpoint)` | Remove one of that principal's subscriptions |
 | `vapid_public_key()` | The `applicationServerKey` the browser subscribes with |
@@ -316,6 +318,9 @@ RFC 8030 gives push services `404 Not Found` and `410 Gone` to say a
 subscription no longer exists. Autumn removes those rows and reports them in
 `report.pruned`, so a dead endpoint is never re-sent to.
 
+A stored row with unreadable key data is skipped and logged. The other
+devices of that user still receive the push.
+
 Every *other* failure — a `5xx` outage, a `429` rate limit, a transport error —
 is counted in `report.failed` and the subscription is **left in place**.
 Pruning on a transient failure would silently unsubscribe every user during an
@@ -415,7 +420,8 @@ shaped differently, mark it:
 <form action="/session/end" method="post" data-autumn-push-unsubscribe>
 ```
 
-A failed unsubscribe never blocks the sign-out itself.
+A failed unsubscribe never blocks the sign-out itself. The opt-out button
+revokes the browser subscription even when the server call fails.
 
 ## Payload limits
 

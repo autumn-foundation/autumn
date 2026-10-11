@@ -600,6 +600,20 @@ fn build_router_pre_state(
         config,
     )?;
 
+    // The OpenAPI and MCP mounts live on `ctx`, not on the config, so the
+    // framework check inside the call above cannot see them.
+    #[cfg(feature = "openapi")]
+    reject_declared_routes_on_context_mounts(&ctx.declared_routes, ctx.openapi.as_ref(), {
+        #[cfg(feature = "mcp")]
+        {
+            ctx.mcp.as_ref().map(|rt| rt.mount_path.as_str())
+        }
+        #[cfg(not(feature = "mcp"))]
+        {
+            None
+        }
+    })?;
+
     // Fail-fast if an OpenAPI mount path collides with a user or
     // framework GET route — axum panics on overlapping method routes,
     // so surface this as a recoverable error before we start merging.
@@ -2145,6 +2159,61 @@ pub fn reject_duplicate_user_routes(
         );
     }
 
+    Ok(())
+}
+
+/// Refuse a declared plugin route on a path the context mounts: the `OpenAPI`
+/// JSON, Swagger UI and its assets (all GET), and the MCP endpoint (GET, POST
+/// and OPTIONS). Same refusal as [`reject_declared_framework_collisions`].
+///
+/// Takes the mounts as inputs, so the router build and the no-boot export
+/// preflight apply one rule.
+#[cfg(feature = "openapi")]
+pub fn reject_declared_routes_on_context_mounts(
+    declared_routes: &[crate::route_listing::RouteInfo],
+    openapi: Option<&crate::openapi::OpenApiConfig>,
+    mcp_mount_path: Option<&str>,
+) -> Result<(), RouterBuildError> {
+    if declared_routes.is_empty() {
+        return Ok(());
+    }
+    // `(method, path)`: the verbs each mount really owns.
+    let mut mounts: Vec<(&'static str, String)> = Vec::new();
+    if let Some(openapi) = openapi {
+        mounts.push(("GET", openapi.openapi_json_path.clone()));
+        if let Some(ui_path) = &openapi.swagger_ui_path {
+            mounts.push(("GET", ui_path.clone()));
+            mounts.extend(
+                crate::openapi::swagger_ui_asset_paths(ui_path)
+                    .into_iter()
+                    .map(|path| ("GET", path)),
+            );
+        }
+    }
+    if let Some(path) = mcp_mount_path {
+        for method in ["GET", "POST", "OPTIONS"] {
+            mounts.push((method, path.to_owned()));
+        }
+    }
+    for declared in declared_routes {
+        // A `WS` upgrade is a GET as far as axum's method router is concerned.
+        let method = if declared.method.eq_ignore_ascii_case("WS") {
+            "GET"
+        } else {
+            declared.method.as_str()
+        };
+        if let Some((_, path)) = mounts
+            .iter()
+            .find(|(owned, path)| framework_route_clashes(path, owned, &declared.path, method))
+        {
+            return Err(RouterBuildError::DuplicateUserRoute {
+                method: declared.method.clone(),
+                path: declared.path.clone(),
+                existing: format!("autumn framework route {path}"),
+                incoming: declared.handler.clone(),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -8480,6 +8549,30 @@ mod tests {
         );
     }
 
+    /// #2353: an `hx-*` story page loads htmx, and loads it before the
+    /// widget runtime.
+    #[cfg(all(feature = "maud", feature = "htmx"))]
+    #[tokio::test]
+    async fn story_detail_route_loads_htmx_for_hx_stories() {
+        let router = build_router(
+            Vec::new(),
+            &story_gallery_config(),
+            stories_state_with_builtin(),
+        );
+
+        let response = get_with_host(router, "/_stories/active-search").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("hx-get"), "story must use htmx: {body}");
+        let htmx_at = body
+            .find(crate::htmx::HTMX_JS_PATH)
+            .unwrap_or_else(|| panic!("page must load htmx.min.js: {body}"));
+        let widgets_at = body
+            .find(crate::htmx::AUTUMN_WIDGETS_JS_PATH)
+            .unwrap_or_else(|| panic!("page must load autumn-widgets.js: {body}"));
+        assert!(htmx_at < widgets_at, "htmx must load first: {body}");
+    }
+
     /// T3 (AC4): a mounted gallery 404s unknown slugs while the index stays up.
     #[cfg(feature = "maud")]
     #[tokio::test]
@@ -10827,6 +10920,101 @@ enabled = true
             }
             other => panic!("expected the framework-path refusal, got {other:?}"),
         }
+    }
+
+    /// The `OpenAPI` and MCP mounts live on the router context, not the config, so
+    /// the framework-path check cannot see them. A manifest naming one still
+    /// panics at `Router::nest`.
+    #[cfg(feature = "openapi")]
+    #[tokio::test]
+    async fn try_build_router_rejects_a_declared_route_on_the_openapi_paths() {
+        let config = AutumnConfig::default();
+        let openapi = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
+            .openapi_json_path("/spec.json")
+            .swagger_ui_path(Some("/docs".to_owned()));
+        let asset = crate::openapi::swagger_ui_asset_paths("/docs")
+            .into_iter()
+            .next()
+            .expect("the UI serves at least one asset");
+        for path in ["/spec.json", "/docs", asset.as_str()] {
+            let mut ctx = duplicate_test_ctx();
+            ctx.openapi = Some(openapi.clone());
+            ctx.declared_routes = vec![declared_route("GET", path, "evil-plugin")];
+            let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+                .expect_err("a declared route on an OpenAPI path must be refused");
+            match err {
+                RouterBuildError::DuplicateUserRoute {
+                    path: ref found,
+                    ref existing,
+                    ref incoming,
+                    ..
+                } => {
+                    assert_eq!(found, path);
+                    assert!(existing.starts_with("autumn framework route"), "{existing}");
+                    assert_eq!(incoming, "sandbox:evil-plugin");
+                }
+                other => panic!("expected a typed refusal for {path}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Only a GET clashes with the `OpenAPI` GETs. A POST at the same path is a
+    /// different method and axum merges it, so refusing it would reject a
+    /// mount that works.
+    #[cfg(feature = "openapi")]
+    #[tokio::test]
+    async fn try_build_router_accepts_a_declared_post_on_an_openapi_path() {
+        let config = AutumnConfig::default();
+        let mut ctx = duplicate_test_ctx();
+        ctx.openapi = Some(
+            crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("/spec.json"),
+        );
+        ctx.declared_routes = vec![declared_route("POST", "/spec.json", "honest-plugin")];
+        let _built = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect("a declared POST does not clash with the OpenAPI GET");
+    }
+
+    /// The MCP endpoint mounts GET, POST and OPTIONS at `mount_path`.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn try_build_router_rejects_a_declared_route_on_the_mcp_mount_path() {
+        let config = AutumnConfig::default();
+        // OPTIONS too: the endpoint mounts its own CORS preflight there.
+        for method in ["GET", "POST", "OPTIONS"] {
+            let mut ctx = duplicate_test_ctx();
+            ctx.mcp = Some(crate::mcp::McpRuntime {
+                mount_path: "/agent-tools".to_owned(),
+                expose_all: false,
+                endpoint_layer: None,
+            });
+            ctx.declared_routes = vec![declared_route(method, "/agent-tools", "evil-plugin")];
+            let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+                .expect_err("a declared route on the MCP path must be refused");
+            assert!(
+                matches!(
+                    err,
+                    RouterBuildError::DuplicateUserRoute { ref existing, .. }
+                        if existing.starts_with("autumn framework route")
+                ),
+                "expected a typed refusal for {method}, got {err:?}"
+            );
+        }
+    }
+
+    /// A DELETE is neither of the MCP verbs, so it mounts beside it.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn try_build_router_accepts_a_declared_delete_on_the_mcp_mount_path() {
+        let config = AutumnConfig::default();
+        let mut ctx = duplicate_test_ctx();
+        ctx.mcp = Some(crate::mcp::McpRuntime {
+            mount_path: "/agent-tools".to_owned(),
+            expose_all: false,
+            endpoint_layer: None,
+        });
+        ctx.declared_routes = vec![declared_route("DELETE", "/agent-tools", "honest-plugin")];
+        let _built = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect("a declared DELETE does not clash with the MCP verbs");
     }
 
     /// A shape clash is method-independent, so the check must be too.

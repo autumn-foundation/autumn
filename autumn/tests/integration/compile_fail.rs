@@ -255,6 +255,8 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_references_namevalue.rs");
     #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_references_set_null_required.rs");
+    #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_renamed_from_bad_name.rs");
 
     // #1911: `#[state_machine(lifecycle = T)]` where `T` is not a `#[lifecycle]`

@@ -69,7 +69,9 @@ use wasmi::{Caller, Config, Engine, Linker, Module, Store};
 
 use super::artifact::SandboxArtifact;
 use super::manifest::{ResourceLimits, SandboxManifest};
-use super::wire::{GuestFrame, HostFrame, SandboxRequest, SandboxResponse, from_line, to_line};
+use super::wire::{
+    GuestFrame, HostFrame, SandboxRequest, SandboxResponse, from_line, to_exact_line, to_line,
+};
 
 /// The WASI module name every import in the shim lives under.
 const WASI: &str = "wasi_snapshot_preview1";
@@ -661,20 +663,23 @@ fn reported_imports<'a>(imports: impl Iterator<Item = wasmi::ImportType<'a>>) ->
 ///
 /// | | raw passes | expanded passes | charged |
 /// |---|---|---|---|
-/// | body | clone, encode-read | encode-write, copy into line, seed scan | `2 + 3 × 4/3 = 6` |
-/// | metadata | clone, escape-read | escape-write, seed scan | `2 + 2 × 6 = 14` |
+/// | body | clone, encode-read, sizing read | encode-write and escape-scan in both passes, seed scan | `3 + 5 × 4/3 = 9 2/3`, charged as 10 |
+/// | metadata | clone, escape-read, sizing read | escape-write, sizing write, seed scan | `3 + 3 × 6 = 21` |
+///
+/// The sizing walks are `to_line`'s first pass, which counts the line so the
+/// second pass can write into an exact buffer.
 ///
 /// Both are upper bounds rather than measurements, because this runs *before*
 /// the line exists — that is the point of it. The expansion factors are the
 /// same ones [`ResourceLimits::request_footprint_bytes`](crate::plugin_sandbox::manifest::ResourceLimits::request_footprint_bytes)
 /// budgets memory at, so the two describe the same request.
 fn encoding_fuel(request: &SandboxRequest) -> u64 {
-    /// Raw-equivalent walks of the body: two over the raw bytes, three over the
-    /// base64 expansion of them, which is 4/3. `2 + 3 × 4/3` is exactly 6.
-    const BODY_PASSES: u64 = 6;
-    /// Raw-equivalent walks of the metadata: two over the raw bytes, two over a
-    /// JSON escaping that can reach six bytes per byte.
-    const METADATA_PASSES: u64 = 14;
+    /// Raw-equivalent walks of the body: three over the raw bytes, five over the
+    /// base64 expansion of them, which is 4/3. `3 + 5 × 4/3` is 9 2/3, so 10.
+    const BODY_PASSES: u64 = 10;
+    /// Raw-equivalent walks of the metadata: three over the raw bytes, three
+    /// over a JSON escaping that can reach six bytes per byte.
+    const METADATA_PASSES: u64 = 21;
 
     let charge = |bytes: usize, passes: u64| {
         u64::try_from(bytes)
@@ -1678,7 +1683,14 @@ impl SandboxHost {
         // reuses the allocation, and the `String` is gone afterwards. For a
         // plugin with a large body ceiling that is a whole base64-expanded copy
         // of the request that no longer exists at the same time as the others.
-        let line = match to_line(&frame()) {
+        let frame = frame();
+        // Only the request frame is large, and only its encoding is priced for
+        // the second pass above. Render frames keep the single pass.
+        let line = match if matches!(frame, HostFrame::Request { .. }) {
+            to_exact_line(&frame)
+        } else {
+            to_line(&frame)
+        } {
             Ok(line) => line,
             Err(err) => {
                 // The host could not encode its own frame. Reported as a
@@ -4062,7 +4074,16 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
         .func_wrap(
             WASI,
             "fd_seek",
-            |_: Caller<'_, HostState>, _fd: i32, _offset: i64, _whence: i32, _out: i32| {
+            |mut caller: Caller<'_, HostState>, fd: i32, _offset: i64, _whence: i32, _out: i32| {
+                // Unknown descriptor: refuse and record, like `fd_read`.
+                if !(0..=2).contains(&fd) {
+                    caller.data_mut().deny(
+                        DeniedCapability::Filesystem,
+                        "fd_seek",
+                        "a sandboxed plugin has no descriptors beyond the request dialogue",
+                    );
+                    return errno::BADF;
+                }
                 // stdio is a pipe. Saying so is more useful than saying no.
                 errno::SPIPE
             },
@@ -4780,7 +4801,7 @@ path = "/hello/greet"
         let outcome = try_host_with(guests::ANSWER_THEN_SPIN, limits)
             .expect("loads")
             .run(&get("/hello/greet"));
-        assert_eq!(outcome.result.expect("answers").status, 200);
+        assert_eq!(outcome.result.as_ref().expect("answers").status, 200);
         assert!(
             outcome.fuel_used < 1_000_000,
             "the answer cost {} fuel; the guest was allowed to keep spinning",
@@ -5012,6 +5033,51 @@ path = "/hello/greet"
             denied(&outcome, DeniedCapability::Filesystem),
             vec!["fd_read".to_owned()]
         );
+    }
+
+    /// A guest that seeks `fd`, traps unless the answer is `errno`, then
+    /// writes a fixed 200 response.
+    fn seek_guest(fd: i32, errno: i32) -> String {
+        format!(
+            r#"(module
+  (import "wasi_snapshot_preview1" "fd_seek" (func $seek (param i32 i64 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1 1)
+  (data (i32.const 128) "{{\"op\":\"response\",\"status\":200,\"headers\":[[\"content-type\",\"text/plain\"]],\"body_b64\":\"b2s=\"}}\0a")
+  (func (export "_start")
+    (if (i32.ne (call $seek (i32.const {fd}) (i64.const 0) (i32.const 0) (i32.const 0)) (i32.const {errno}))
+      (then unreachable))
+    (i32.store (i32.const 0) (i32.const 128))
+    (i32.store (i32.const 4) (i32.const 91))
+    (drop (call $write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))))"#
+        )
+    }
+
+    #[test]
+    fn seeking_an_unknown_descriptor_is_denied_and_recorded() {
+        let outcome = host(&seek_guest(99, 8)).run(&get("/hello/greet"));
+        assert_eq!(outcome.result.as_ref().expect("answers").status, 200);
+        assert_eq!(
+            denied(&outcome, DeniedCapability::Filesystem),
+            vec!["fd_seek".to_owned()]
+        );
+    }
+
+    #[test]
+    fn seeking_a_negative_descriptor_is_denied_too() {
+        let outcome = host(&seek_guest(-1, 8)).run(&get("/hello/greet"));
+        assert_eq!(outcome.result.as_ref().expect("answers").status, 200);
+        assert_eq!(
+            denied(&outcome, DeniedCapability::Filesystem),
+            vec!["fd_seek".to_owned()]
+        );
+    }
+
+    #[test]
+    fn seeking_stdio_is_a_pipe_and_not_a_denial() {
+        let outcome = host(&seek_guest(1, 70)).run(&get("/hello/greet"));
+        assert_eq!(outcome.result.as_ref().expect("answers").status, 200);
+        assert!(outcome.denials.is_empty(), "{:?}", outcome.denials);
     }
 
     #[test]
@@ -5377,6 +5443,21 @@ path = "/hello/greet"
         assert_eq!(
             canonical,
             vec![("accept".to_owned(), "text/plain".to_owned())],
+        );
+    }
+
+    #[test]
+    fn encoding_fuel_prices_the_sizing_pass_of_the_line() {
+        // `to_line` serialises twice: once to count, once to write. The count
+        // still encodes and escapes everything, so it is host work the guest's
+        // fuel must pay for. Three raw walks and five expanded ones (encode and
+        // escape-scan in each pass, plus the seed scan) make 9 2/3 of the body.
+        let mut request = get("/hello/greet");
+        request.body = vec![b'x'; 60_000];
+        let charged_bytes = encoding_fuel(&request).saturating_mul(BYTES_PER_FUEL);
+        assert!(
+            charged_bytes >= 60_000 * 29 / 3,
+            "the charge ({charged_bytes}) leaves the sizing pass free"
         );
     }
 
