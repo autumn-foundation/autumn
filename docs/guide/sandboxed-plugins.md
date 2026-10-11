@@ -339,6 +339,7 @@ would the GET and the host discards the body for you.
 | `max_request_body_bytes` | the body forwarded in | 413, guest never started |
 | `max_response_bytes` | the frame accepted back | 502 for an oversized frame; 504 for one that never ends |
 | `max_concurrency` | instances alive at once | 503 with `Retry-After`; requests are shed, not queued |
+| shared guest pool | guests running at once in the whole process, all plugins together (default 128; set with `plugin_sandbox::set_guest_slots` at boot, at most a quarter of `max_blocking_threads`) | 503 with `Retry-After`; this can shed a request that `max_concurrency` would admit |
 | `request_body_timeout_ms` | how long a request may take to send its body | 408, and the permit goes back |
 
 The number worth reviewing is `max_concurrency × the per-request footprint`,
