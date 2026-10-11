@@ -76,8 +76,7 @@ async fn capsule_export_import_profile() {
         .expect("seed");
     // Target: same schema, no rows.
     let mut dst = PgConnection::establish(&format!("{base}/ledger_dst")).expect("dst");
-    dst.batch_execute(&ddl)
-        .expect("schema");
+    dst.batch_execute(&ddl).expect("schema");
     dst.batch_execute(
         &(0..TABLES)
             .map(|t| format!("TRUNCATE t{t};"))
@@ -95,10 +94,7 @@ async fn capsule_export_import_profile() {
     eprintln!("LEDGER-MARK export-start");
     let capsule = export_subject(&models, &source, "1").await.expect("export");
     eprintln!("LEDGER-MARK export-end");
-    let rows: usize = models
-        .iter()
-        .map(|m| capsule.records(&m.table).len())
-        .sum();
+    let rows: usize = models.iter().map(|m| capsule.records(&m.table).len()).sum();
     eprintln!("LEDGER-ROWS {rows}");
     eprintln!("LEDGER-MARK import-start");
     import_capsule(&capsule, &models, &target)
