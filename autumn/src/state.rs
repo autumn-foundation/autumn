@@ -333,14 +333,18 @@ impl AppState {
     /// Panics if the internal extension map mutex is poisoned.
     #[must_use]
     pub fn session_rotation_hooks(&self) -> crate::session::SessionRotationHooks {
-        let mut extensions = self
-            .extensions
-            .write()
-            .expect("app state extension lock poisoned");
-        let entry = extensions
-            .entry(TypeId::of::<crate::session::SessionRotationHooks>())
-            .or_insert_with(|| Arc::new(crate::session::SessionRotationHooks::default()));
-        Arc::clone(entry)
+        let entry = {
+            let mut extensions = self
+                .extensions
+                .write()
+                .expect("app state extension lock poisoned");
+            Arc::clone(
+                extensions
+                    .entry(TypeId::of::<crate::session::SessionRotationHooks>())
+                    .or_insert_with(|| Arc::new(crate::session::SessionRotationHooks::default())),
+            )
+        };
+        entry
             .downcast::<crate::session::SessionRotationHooks>()
             .map(|hooks| (*hooks).clone())
             .expect("rotation hooks extension has the wrong type")

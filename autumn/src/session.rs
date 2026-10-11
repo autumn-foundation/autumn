@@ -346,10 +346,6 @@ impl std::fmt::Debug for SessionRotationHooks {
 
 impl SessionRotationHooks {
     /// Add a hook. Hooks run in registration order.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the registry lock is poisoned.
     pub fn register<F, Fut>(&self, hook: F)
     where
         F: Fn(SessionRotation) -> Fut + Send + Sync + 'static,
@@ -357,20 +353,16 @@ impl SessionRotationHooks {
     {
         self.hooks
             .write()
-            .expect("session rotation hooks lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(Arc::new(move |rotation| Box::pin(hook(rotation))));
     }
 
     /// Number of registered hooks.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the registry lock is poisoned.
     #[must_use]
     pub fn len(&self) -> usize {
         self.hooks
             .read()
-            .expect("session rotation hooks lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
     }
 
@@ -384,7 +376,7 @@ impl SessionRotationHooks {
         let hooks: Vec<_> = self
             .hooks
             .read()
-            .expect("session rotation hooks lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         for hook in hooks {
             if let Err(error) = hook(rotation.clone()).await {
@@ -2048,10 +2040,9 @@ mod tests {
 
     // ── Rotation hooks (issue #2347) ──
 
-    fn rotation_log() -> (
-        SessionRotationHooks,
-        Arc<std::sync::Mutex<Vec<(String, String)>>>,
-    ) {
+    type RotationLog = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    fn rotation_log() -> (SessionRotationHooks, RotationLog) {
         let hooks = SessionRotationHooks::default();
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::clone(&log);
