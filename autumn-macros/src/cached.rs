@@ -804,7 +804,12 @@ pub fn cached_impl_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             continue;
         };
         for attr in &mut method.attrs {
-            if attr.path().segments.last().is_some_and(|seg| seg.ident == "cached") {
+            if attr
+                .path()
+                .segments
+                .last()
+                .is_some_and(|seg| seg.ident == "cached")
+            {
                 scope_cached_attr(attr, &scope);
             }
         }
