@@ -1246,6 +1246,30 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   `POST {prefix}/impersonate` (gated) and `POST {prefix}/impersonate/stop`
   (ungated on purpose). Session-based auth only.
 
+## Idempotency keys (#3061)
+
+`Idempotency-Key` replay for mutating requests. See `docs/guide/idempotency.md`.
+
+- Enable with `AppBuilder::idempotent()` / `TestApp::idempotent()`, or
+  `[idempotency] enabled = true`.
+- Config `[idempotency]`: `backend` (`memory` | `redis` | `database`),
+  `ttl_secs` (response retention, default `86400`), `in_flight_ttl_secs`
+  (lock expiry after a crash or failed save, default `60`).
+- `backend = "database"` → `DbIdempotencyStore` (table
+  `autumn_idempotency_keys`, from `FRAMEWORK_MIGRATIONS`). For exactly-once
+  payments, take the `IdempotencyTx` extractor and call
+  `idem.commit(conn, response).await?` inside `db.tx(...)`; return the
+  response it gives back. A crash after the commit replays it; it is never
+  re-run. Use a primary `Db` connection, not a shard.
+- Multi-step handlers: `idem.set_recovery_point(conn, "step")` in a tx;
+  `idem.recovery_point(&mut db)` on retry. Another body with the same key
+  gets `422`.
+- `IdempotencyTx` methods are no-ops without a key or with another backend.
+- Custom store: implement the async `IdempotencyStore` trait (`get`, `set`
+  returning whether it stored, `try_lock(key, owner, ttl)`,
+  `unlock(key, owner)`, and optionally `renew_lock(key, owner, ttl)`; each
+  returns an `IdempotencyFuture`). Do not block the runtime thread.
+
 ## Submit tokens (0.6.0, #1360)
 
 One-time, at-most-once form submission with no JS — defends against

@@ -3706,10 +3706,12 @@ fn apply_submit_token_middleware<S>(
 where
     S: Clone + Send + Sync + 'static,
 {
-    Ok(match build_submit_token_layer(config, is_production)? {
-        Some(layer) => router.layer(layer),
-        None => router,
-    })
+    Ok(
+        match build_submit_token_layer(config, &AppState::for_test(), is_production)? {
+            Some(layer) => router.layer(layer),
+            None => router,
+        },
+    )
 }
 
 /// Build the one-time submit-token layer, or `None` when it is disabled.
@@ -3720,6 +3722,7 @@ where
 /// `Err`, before any layer is applied.
 fn build_submit_token_layer(
     config: &AutumnConfig,
+    state: &AppState,
     is_production: bool,
 ) -> Result<Option<crate::security::SubmitTokenLayer>, RouterBuildError> {
     let cfg = &config.security.submit_token;
@@ -3765,26 +3768,7 @@ fn build_submit_token_layer(
     // `resolved_backend` is the single source of truth so this cannot drift from
     // `build_idempotency_layers`.
     let backend = cfg.resolved_backend(config.idempotency.backend);
-    let store: std::sync::Arc<dyn IdempotencyStore> = match backend {
-        crate::config::IdempotencyBackend::Memory => {
-            std::sync::Arc::new(MemoryIdempotencyStore::new(ttl))
-        }
-        #[cfg(feature = "redis")]
-        crate::config::IdempotencyBackend::Redis => {
-            match crate::idempotency::RedisIdempotencyStore::from_config(&config.idempotency) {
-                Ok(s) => std::sync::Arc::new(s),
-                Err(e) => return Err(RouterBuildError::InvalidIdempotencyBackend(e)),
-            }
-        }
-        #[cfg(not(feature = "redis"))]
-        crate::config::IdempotencyBackend::Redis => {
-            return Err(RouterBuildError::InvalidIdempotencyBackend(
-                "submit_token backend 'redis' requires the autumn-web 'redis' feature \
-                 flag; rebuild with --features redis or switch to backend = \"memory\""
-                    .to_owned(),
-            ));
-        }
-    };
+    let store = build_idempotency_store(backend, config, state, ttl, "submit_token")?;
 
     let mut layer = crate::security::SubmitTokenLayer::new(store, cfg)
         .with_max_scan_bytes(config.security.upload.max_request_size_bytes);
@@ -4972,6 +4956,79 @@ fn deadline_exceeded_response(
     response
 }
 
+/// Build the store for `backend`. `label` names the config section in errors.
+fn build_idempotency_store(
+    backend: crate::config::IdempotencyBackend,
+    config: &AutumnConfig,
+    state: &AppState,
+    ttl: Duration,
+    label: &str,
+) -> Result<std::sync::Arc<dyn IdempotencyStore>, RouterBuildError> {
+    #[cfg(not(feature = "db"))]
+    let _ = state;
+    match backend {
+        crate::config::IdempotencyBackend::Memory => {
+            Ok(std::sync::Arc::new(MemoryIdempotencyStore::new(ttl)))
+        }
+        #[cfg(feature = "redis")]
+        crate::config::IdempotencyBackend::Redis => {
+            crate::idempotency::RedisIdempotencyStore::from_config(&config.idempotency)
+                .map(|store| std::sync::Arc::new(store) as std::sync::Arc<dyn IdempotencyStore>)
+                .map_err(RouterBuildError::InvalidIdempotencyBackend)
+        }
+        #[cfg(not(feature = "redis"))]
+        crate::config::IdempotencyBackend::Redis => {
+            let _ = config;
+            Err(RouterBuildError::InvalidIdempotencyBackend(format!(
+                "{label} backend 'redis' requires the autumn-web 'redis' feature \
+                 flag; rebuild with --features redis or switch to backend = \"memory\""
+            )))
+        }
+        #[cfg(feature = "db")]
+        crate::config::IdempotencyBackend::Database => state.pool().map_or_else(
+            || {
+                Err(RouterBuildError::InvalidIdempotencyBackend(format!(
+                    "{label} backend 'database' requires a configured database; \
+                     set [database] url or switch to backend = \"memory\""
+                )))
+            },
+            |pool| {
+                Ok(std::sync::Arc::new(
+                    crate::idempotency::DbIdempotencyStore::new(pool.clone(), ttl)
+                        .with_legal_holds(state),
+                ) as std::sync::Arc<dyn IdempotencyStore>)
+            },
+        ),
+        #[cfg(not(feature = "db"))]
+        crate::config::IdempotencyBackend::Database => {
+            Err(RouterBuildError::InvalidIdempotencyBackend(format!(
+                "{label} backend 'database' requires the autumn-web 'db' feature"
+            )))
+        }
+    }
+}
+
+/// Tell the operator when a request can outlive its in-flight lock. Then a
+/// retry can run the handler while the first request still runs. Only a
+/// handler that uses `IdempotencyTx::commit` on the database store is fenced.
+fn warn_on_short_in_flight_ttl(config: &AutumnConfig) {
+    let in_flight_secs = config.idempotency.in_flight_ttl_secs;
+    match config.server.timeouts.request_timeout_ms {
+        None => tracing::info!(
+            in_flight_ttl_secs = in_flight_secs,
+            "no request timeout is set; an idempotent request that runs longer than \
+             idempotency.in_flight_ttl_secs can run twice"
+        ),
+        Some(timeout_ms) if in_flight_secs.saturating_mul(1000) < timeout_ms => tracing::warn!(
+            in_flight_ttl_secs = in_flight_secs,
+            request_timeout_ms = timeout_ms,
+            "idempotency.in_flight_ttl_secs is shorter than the request timeout; \
+             a retry can run while the first request still runs"
+        ),
+        Some(_) => {}
+    }
+}
+
 /// The lowest and highest `Retry-After` seconds on a timeout `503`.
 const TIMEOUT_RETRY_AFTER_SECS: std::ops::RangeInclusive<u64> = 1..=3;
 
@@ -4997,26 +5054,14 @@ fn build_idempotency_layers(
 
     let ttl = Duration::from_secs(config.idempotency.ttl_secs);
     let in_flight_ttl = Duration::from_secs(config.idempotency.in_flight_ttl_secs);
-    let store: std::sync::Arc<dyn IdempotencyStore> = match config.idempotency.backend {
-        crate::config::IdempotencyBackend::Memory => {
-            std::sync::Arc::new(MemoryIdempotencyStore::new(ttl))
-        }
-        #[cfg(feature = "redis")]
-        crate::config::IdempotencyBackend::Redis => {
-            match crate::idempotency::RedisIdempotencyStore::from_config(&config.idempotency) {
-                Ok(s) => std::sync::Arc::new(s),
-                Err(e) => return Err(RouterBuildError::InvalidIdempotencyBackend(e)),
-            }
-        }
-        #[cfg(not(feature = "redis"))]
-        crate::config::IdempotencyBackend::Redis => {
-            return Err(RouterBuildError::InvalidIdempotencyBackend(
-                "idempotency backend 'redis' requires the autumn-web 'redis' feature \
-                 flag; rebuild with --features redis or switch to backend = \"memory\""
-                    .to_owned(),
-            ));
-        }
-    };
+    let store = build_idempotency_store(
+        config.idempotency.backend,
+        config,
+        state,
+        ttl,
+        "idempotency",
+    )?;
+    warn_on_short_in_flight_ttl(config);
 
     tracing::debug!(
         backend = ?config.idempotency.backend,
@@ -5287,7 +5332,7 @@ fn apply_middleware(
     // other is `build_session_layer` below). The infallible builders have side
     // effects — `tracing::info!` lines, and a lazy Redis connection manager for a
     // Redis-backed rate limiter — that must not run on the way to a fail-fast `Err`.
-    let submit_token_layer = build_submit_token_layer(config, is_production)?;
+    let submit_token_layer = build_submit_token_layer(config, state, is_production)?;
     let (body_limit, upload_config) = build_upload_layers(config);
     let trusted_host_policy = TrustedHostPolicy::from_config_with_state(config, state);
     let (rate_limit_layer, rate_limit_principal_keying) = build_rate_limit_layers(config, state);

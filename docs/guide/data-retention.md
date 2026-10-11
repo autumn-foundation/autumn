@@ -67,7 +67,7 @@ before setting those three.
 | `job_history` | Finished job rows (`completed`/`failed`/`discarded`) | `autumn_jobs` | **forever** | sweep |
 | `commit_hooks` | Finished `#[after_commit]` hook rows (`completed`/`failed`/`after_hook_failed`) | `autumn_repository_commit_hooks` | **forever** | sweep |
 | `job_tracking` | Tracked-job progress/result records | `autumn_job_tracking`, or Redis — follows `jobs.backend` | jobs.tracking.ttl_secs (24h by default) | sweep on `postgres`, backend TTL otherwise |
-| `idempotency` | Stored `Idempotency-Key` responses | memory / Redis | idempotency.ttl_secs (24h by default) | backend TTL |
+| `idempotency` | Stored `Idempotency-Key` responses | memory / Redis / `autumn_idempotency_keys` | idempotency.ttl_secs (24h by default) | backend TTL; the database store deletes expired rows as it writes |
 | `experiment_assignments` | Sticky actor → variant assignments | `autumn_experiment_assignments` | **forever** | sweep |
 | `webhook_replay` | Inbound webhook replay markers | memory / Redis | the endpoint's replay_window_secs (24h by default) | backend TTL |
 | `sessions` | Server-side session records | memory / Redis | session.max_age_secs (the session cookie's lifetime) | backend TTL |
@@ -314,13 +314,20 @@ and its reason appear in the report:
 ```
 
 Only sweep-enforced datasets have a backing table a hold can name; the
-TTL-native ones cannot be held this way.
+TTL-native ones cannot be held this way, except the database idempotency
+store (below).
 
 A hold on `autumn_job_tracking` also suppresses the job runner's own
 independent `expires_at` cleanup, which predates this policy and is not part
 of it. Without that, a hold would be honoured by `autumn db retention` and
 quietly violated five minutes later by the maintenance loop — worse than
 having no hold at all.
+
+The database idempotency store (`[idempotency] backend = "database"`) keeps
+its records in `autumn_idempotency_keys` and expires them itself. A hold on
+that table works the same way: the store stops deleting and overwriting
+expired rows. A request that reuses a held, expired `Idempotency-Key` gets
+`409` rather than replacing the held response.
 
 ## The CLI
 

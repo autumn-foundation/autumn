@@ -170,7 +170,11 @@ mod htmx_serving;
 mod http_latency_histogram;
 #[cfg(feature = "i18n")]
 mod i18n_integration;
+#[cfg(feature = "db")]
+mod idempotency_db_store;
 mod idempotency_middleware;
+#[cfg(feature = "redis")]
+mod idempotency_redis_current_thread;
 mod idempotency_tenant_scope;
 mod idempotency_token_principal;
 mod impersonation;
@@ -452,6 +456,7 @@ mod sim_deterministic_ids;
 mod sim_drain_stall;
 mod sim_fault_plan;
 mod sim_fault_plan_pg;
+mod sim_idempotency_in_flight_ttl;
 mod sim_interleave;
 mod sim_job_clock;
 mod sim_liveness_watchdog;
