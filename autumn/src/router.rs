@@ -1421,15 +1421,12 @@ fn aeo_x402_layer(
 }
 
 /// The `GET /` routes the route table and scoped groups declare.
+/// Each is `Some(noindex)` when that home exists.
 struct HomeRoutes {
     /// A `routes![...]` home, mounted inside the locale nests.
-    routed: bool,
+    routed: Option<bool>,
     /// A scoped-group home, mounted outside them.
-    scoped: bool,
-    /// The `routes![...]` home is `noindex`.
-    routed_noindex: bool,
-    /// The scoped-group home is `noindex`.
-    scoped_noindex: bool,
+    scoped: Option<bool>,
 }
 
 impl HomeRoutes {
@@ -1446,18 +1443,18 @@ impl HomeRoutes {
                 })
             })
             .collect();
-        let noindex = |routes: &[&Route]| {
-            routes.iter().any(|r| {
-                r.seo
-                    .robots
-                    .is_some_and(crate::seo::robots_directive_is_noindex)
+        let home = |routes: &[&Route]| {
+            (!routes.is_empty()).then(|| {
+                routes.iter().any(|r| {
+                    r.seo
+                        .robots
+                        .is_some_and(crate::seo::robots_directive_is_noindex)
+                })
             })
         };
         Self {
-            routed: !routed.is_empty(),
-            scoped: !scoped.is_empty(),
-            routed_noindex: noindex(&routed),
-            scoped_noindex: noindex(&scoped),
+            routed: home(&routed),
+            scoped: home(&scoped),
         }
     }
 }
@@ -1543,25 +1540,25 @@ fn build_aeo_site<O: AeoOpenApiFacts, M: AeoMcpFacts>(
     // An API-only app has no home page: list none rather than a `404`. A
     // merged router is opaque and may serve `/`, so with one the home page
     // is assumed to exist.
-    let has_home = merged_routers || home.routed || home.scoped;
+    let has_home = merged_routers || home.routed.is_some() || home.scoped.is_some();
     // Only a `routes![...]` home is localized. A home from a scoped group or a
     // merged router mounts outside the locale nests and answers at `/`, next
     // to any localized ones.
     // Each home's own `noindex` leaves only that page out of the sitemap.
     let mut noindex_homes = Vec::new();
-    let home_paths = if home.routed {
-        if home.routed_noindex {
+    let home_paths = if let Some(routed_noindex) = home.routed {
+        if routed_noindex {
             noindex_homes.clone_from(&home_paths);
         }
         let mut paths = home_paths;
-        if home.scoped && !paths.iter().any(|p| p == "/") {
+        if home.scoped.is_some() && !paths.iter().any(|p| p == "/") {
             paths.push("/".to_owned());
         }
         paths
     } else {
         vec!["/".to_owned()]
     };
-    if home.scoped_noindex {
+    if home.scoped == Some(true) {
         noindex_homes.push("/".to_owned());
     }
     let mut facts = SiteFacts {
