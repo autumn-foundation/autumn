@@ -895,10 +895,11 @@ fn lock_for_decision(dir: &std::path::Path) -> Option<nix::fcntl::Flock<std::fs:
     for _ in 0..LOCK_ATTEMPTS {
         match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
             Ok(lock) => return Some(lock),
-            Err((back, _)) => {
+            Err((back, nix::errno::Errno::EWOULDBLOCK | nix::errno::Errno::EINTR)) => {
                 file = back;
                 std::thread::sleep(LOCK_RETRY);
             }
+            Err(_) => return None,
         }
     }
     None

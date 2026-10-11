@@ -152,6 +152,14 @@ fn an_adopted_block_is_unfrozen_only_after_the_handover_can_no_longer_be_abandon
         verify < publish,
         "the handover must be verified before the predecessor is released"
     );
+    let refusal = ready_path[publish..]
+        .split_once("Err(error) =>")
+        .expect("a readiness failure is handled")
+        .1;
+    assert!(
+        !refusal.contains("unfreeze_adopted_live_state"),
+        "a failed publish must leave the adopted state frozen"
+    );
     assert!(
         publish < unfreeze,
         "readiness must be published *successfully* before the state becomes writable: a \
