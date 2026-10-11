@@ -126,8 +126,8 @@ pub struct Session {
 struct SessionInner {
     id: String,
     old_id: Option<String>,
-    /// The id just before the latest rotation. Equals `old_id` after one.
-    previous_id: Option<String>,
+    /// Every id the session held before the current one, oldest first.
+    prior_ids: Vec<String>,
     data: HashMap<String, String>,
     cookie_backed: bool,
     dirty: bool,
@@ -164,7 +164,7 @@ impl Session {
             inner: Arc::new(RwLock::new(SessionInner {
                 id,
                 old_id: None,
-                previous_id: None,
+                prior_ids: Vec::new(),
                 data,
                 cookie_backed,
                 dirty: false,
@@ -256,25 +256,14 @@ impl Session {
         if inner.old_id.is_none() {
             inner.old_id = Some(inner.id.clone());
         }
-        inner.previous_id = Some(std::mem::replace(&mut inner.id, new_id));
+        let previous = std::mem::replace(&mut inner.id, new_id);
+        inner.prior_ids.push(previous);
         inner.dirty = true;
     }
 
-    /// The ids this request held before the current one: the id it started
-    /// with, and the id just before the latest rotation. Empty when the id was
-    /// not rotated.
-    pub(crate) async fn earlier_ids(&self) -> Vec<String> {
-        let (first, previous) = {
-            let inner = self.inner.read().await;
-            (inner.old_id.clone(), inner.previous_id.clone())
-        };
-        let mut ids: Vec<String> = first.into_iter().collect();
-        if let Some(previous) = previous
-            && !ids.contains(&previous)
-        {
-            ids.push(previous);
-        }
-        ids
+    /// The id just before the latest rotation, if the id was rotated.
+    pub(crate) async fn previous_id(&self) -> Option<String> {
+        self.inner.read().await.prior_ids.last().cloned()
     }
 
     /// Destroy the session entirely. A new session ID will be issued
@@ -328,6 +317,10 @@ pub struct SessionRotation {
     pub old_id: String,
     /// The id now stored and sent to the client.
     pub new_id: String,
+    /// Every id the session held during the request before `new_id`, oldest
+    /// first. It starts with `old_id`. Several rotations in one request leave
+    /// state under any of them, for example after a flow that moved it by hand.
+    pub earlier_ids: Vec<String>,
 }
 
 /// Error type a rotation hook returns.
@@ -1106,6 +1099,7 @@ where
                     .map(|old_id| SessionRotation {
                         old_id,
                         new_id: sid.clone(),
+                        earlier_ids: inner_guard.prior_ids.clone(),
                     });
                 // The tenant `[tenancy] source = "session"` will resolve for a
                 // retry presenting this finalized session — read live from the
@@ -2148,6 +2142,31 @@ mod tests {
 
         let seen = log.lock().unwrap().clone();
         assert_eq!(seen, vec![(old_id, new_id)], "two rotations, one net hop");
+    }
+
+    #[tokio::test]
+    async fn rotation_event_lists_every_earlier_id() {
+        let hooks = SessionRotationHooks::default();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        hooks.register(move |rotation| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock().unwrap().push(rotation);
+                Ok(())
+            }
+        });
+        let (app, cookie) = rotation_app(hooks, MemoryStore::new()).await;
+        let old_id = cookie.trim_start_matches("autumn.sid=").to_owned();
+
+        hit(&app, "/rotate", &cookie).await;
+
+        let events = seen.lock().unwrap().clone();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.earlier_ids.len(), 2, "the start id and one hop");
+        assert_eq!(event.earlier_ids[0], old_id);
+        assert_ne!(event.earlier_ids[1], event.new_id);
     }
 
     #[tokio::test]

@@ -1142,6 +1142,19 @@ async fn rotate_and_rebind_twice(State(state): State<AppState>, session: Session
     format!("{first},{second}")
 }
 
+/// The impersonated user logs in as themselves (rotates, keeps the reserved
+/// keys), then an idle-rotation component rotates and rebinds.
+#[autumn_web::post("/login-as-the-target-then-idle-rebind")]
+async fn login_as_the_target_then_idle_rebind(
+    State(state): State<AppState>,
+    session: Session,
+) -> String {
+    session.rotate_id().await;
+    session.insert("user_id", "user-9").await;
+    session.rotate_id().await;
+    impersonation::rebind(&state, &session).await.to_string()
+}
+
 /// A login of the target on the same browser, then a rebind attempt.
 #[autumn_web::post("/login-as-the-target-and-rebind")]
 async fn login_as_the_target_and_rebind(State(state): State<AppState>, session: Session) -> String {
@@ -1161,6 +1174,7 @@ fn rotation_app(rotations: &Rotations) -> TestClientAlias {
             rotate_keep_identity,
             rotate_and_rebind,
             rotate_and_rebind_twice,
+            login_as_the_target_then_idle_rebind,
             login_as_the_target_and_rebind
         ])
         .state_initializer(move |state| {
@@ -1280,6 +1294,37 @@ async fn rebind_survives_two_rotations_in_one_request() {
     assert_eq!(
         who(&client).await,
         "user=user-9;impersonator=admin-1;actor=admin-1"
+    );
+}
+
+#[tokio::test]
+async fn a_later_rebind_cannot_revive_a_record_a_login_retired() {
+    let rotations = Rotations::default();
+    let client = rotation_app(&rotations);
+    client.post("/login-admin").send().await.assert_ok();
+    client
+        .post("/impersonate")
+        .form("user_id=user-9")
+        .send()
+        .await
+        .assert_ok();
+
+    // The customer logs in as themselves; an idle rotation then asks to rebind.
+    let rebound = client
+        .post("/login-as-the-target-then-idle-rebind")
+        .send()
+        .await
+        .text();
+    assert_eq!(rebound, "false", "the login already retired the record");
+
+    client
+        .post("/stop-impersonating")
+        .send()
+        .await
+        .assert_status(400);
+    assert_eq!(
+        who(&client).await,
+        "user=user-9;impersonator=-;actor=user-9"
     );
 }
 

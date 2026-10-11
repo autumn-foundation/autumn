@@ -3415,9 +3415,10 @@ async fn rebind_tracked_session_on_rotation(
     let mut db = pool.get().await.map_err(|e| {{
         AutumnError::internal_server_error_msg(format!("Failed to rebind tracked session: {{e}}"))
     }})?;
-    diesel::update(
-        {sess_table}::table.filter({sess_table}::token_digest.eq(sha256_hex(&rotation.old_id))),
-    )
+    // The row sits under any earlier id of this request: a flow may have moved
+    // it by hand after a first rotation.
+    let earlier: Vec<String> = rotation.earlier_ids.iter().map(|id| sha256_hex(id)).collect();
+    diesel::update({sess_table}::table.filter({sess_table}::token_digest.eq_any(earlier)))
     .set({sess_table}::token_digest.eq(sha256_hex(&rotation.new_id)))
     .execute(&mut *db)
     .await
@@ -11883,6 +11884,10 @@ mod tests {
         assert!(
             routes.contains("async fn rebind_tracked_session_on_rotation"),
             "rotation hook body must be generated"
+        );
+        assert!(
+            routes.contains("rotation.earlier_ids"),
+            "the hook must find a row an earlier hop already moved"
         );
     }
 
