@@ -1236,6 +1236,57 @@ mod commerce {
         Json(json!({ "ordered": true }))
     }
 
+    #[cfg(feature = "mcp")]
+    #[post("/api/checkout")]
+    #[api_doc(mcp, summary = "Check out")]
+    async fn checkout() -> Json<Vec<String>> {
+        Json(vec!["checked_out".to_owned()])
+    }
+
+    /// A priced tool called through `POST /mcp` with CSRF on: the envelope
+    /// carries no route of its own, and the replay to the tool's route is
+    /// what CSRF and x402 see.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn csrf_lets_a_paid_mcp_tool_call_reach_x402() {
+        let mut config = paid_config();
+        config.security.csrf.enabled = true;
+        config.aeo.paid_routes = vec![PaidRoute::new("POST", "/api/checkout", "500")];
+        let mut app = TestApp::new()
+            .config(config)
+            .routes(routes![checkout])
+            .openapi(autumn_web::openapi::OpenApiConfig::new("Shop", "1.0.0"))
+            .mount_mcp("/mcp");
+        let _verify = app
+            .http_mock("x402")
+            .post("/verify")
+            .respond_with(200, json!({ "isValid": true }));
+        let _settle = app
+            .http_mock("x402")
+            .post("/settle")
+            .respond_with(200, json!({ "success": true, "transaction": "0xtx" }));
+        let c = app.build();
+        let call = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "checkout", "arguments": {} },
+        });
+        let challenge = c.post("/mcp").json(&call).send().await;
+        assert_ne!(challenge.status, 403, "{}", challenge.text());
+        let required = challenge
+            .header("payment-required")
+            .unwrap_or_else(|| panic!("no challenge: {}", challenge.text()))
+            .to_owned();
+        let required = decode_header(&required).unwrap();
+        let paid = c
+            .post("/mcp")
+            .header("payment-signature", &signature(&required["accepts"][0]))
+            .json(&call)
+            .send()
+            .await;
+        paid.assert_ok();
+        assert!(paid.text().contains("checked_out"), "{}", paid.text());
+    }
+
     #[tokio::test]
     async fn csrf_lets_a_payment_client_reach_x402() {
         let mut config = paid_config();

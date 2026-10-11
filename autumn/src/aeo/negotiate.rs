@@ -422,7 +422,7 @@ pub fn prefers_markdown(headers: &HeaderMap) -> bool {
             let media = parts.next().unwrap_or("").trim();
             let q = accept_weight(parts);
             if media.eq_ignore_ascii_case("text/markdown") {
-                if markdown_params_fit(range.split(';').skip(1)) {
+                if params_fit(range.split(';').skip(1), true) {
                     markdown = markdown.max(q);
                 }
                 continue;
@@ -436,6 +436,11 @@ pub fn prefers_markdown(headers: &HeaderMap) -> bool {
             } else {
                 continue;
             };
+            // A range whose parameters the UTF-8 HTML does not fit (another
+            // `charset`) does not cover it.
+            if !params_fit(range.split(';').skip(1), false) {
+                continue;
+            }
             if specificity > html.0 || (specificity == html.0 && q > html.1) {
                 html = (specificity, q);
             }
@@ -445,11 +450,11 @@ pub fn prefers_markdown(headers: &HeaderMap) -> bool {
     markdown > 0.0 && markdown >= html.1
 }
 
-/// `true` when the parameters of a `text/markdown` range (those before
-/// `q`) fit what this layer sends: UTF-8 GitHub Flavored Markdown. A range
-/// that asks for another `charset` or `variant` (RFC 7763), or names a
-/// parameter this layer does not know, does not match.
-fn markdown_params_fit<'a>(params: impl Iterator<Item = &'a str>) -> bool {
+/// `true` when a media range's parameters (those before `q`) fit what is
+/// sent: UTF-8, and for Markdown (`variant_ok`) GitHub Flavored Markdown. A
+/// range that asks for another `charset` or `variant` (RFC 7763), or names
+/// a parameter this layer does not know, does not match.
+fn params_fit<'a>(params: impl Iterator<Item = &'a str>, variant_ok: bool) -> bool {
     for param in params.filter(|p| !p.trim().is_empty()) {
         let Some((key, value)) = param.split_once('=') else {
             return false;
@@ -460,7 +465,9 @@ fn markdown_params_fit<'a>(params: impl Iterator<Item = &'a str>) -> bool {
         }
         let value = value.trim().trim_matches('"');
         let fits = (key.eq_ignore_ascii_case("charset") && value.eq_ignore_ascii_case("utf-8"))
-            || (key.eq_ignore_ascii_case("variant") && value.eq_ignore_ascii_case("GFM"));
+            || (variant_ok
+                && key.eq_ignore_ascii_case("variant")
+                && value.eq_ignore_ascii_case("GFM"));
         if !fits {
             return false;
         }
@@ -768,6 +775,17 @@ mod tests {
             "text/markdown; charset=\"UTF-8\"; variant=gfm; q=0.9, text/html;q=0.5"
         )));
         assert!(prefers_markdown(&accept("text/markdown;")));
+        // An HTML range for another charset does not cover the UTF-8 HTML.
+        assert!(prefers_markdown(&accept(
+            "text/html; charset=iso-8859-1, text/markdown;q=0.5"
+        )));
+        assert!(!prefers_markdown(&accept(
+            "text/html; charset=utf-8, text/markdown;q=0.5"
+        )));
+        // The more specific range is skipped, so `*/*` decides.
+        assert!(!prefers_markdown(&accept(
+            "text/html;charset=latin1, */*, text/markdown;q=0.5"
+        )));
         assert!(prefers_markdown(&accept(
             "text/markdown;Q=0.9, text/html;q=0.5"
         )));
