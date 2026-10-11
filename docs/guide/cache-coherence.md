@@ -105,6 +105,20 @@ A cached read is identified by `module_path!() :: <fn name>` — the exact strin
 `make_cache_key` already prefixes every one of its keys with. The manifest's
 identity and the runtime key space are the same string, by construction.
 
+Two impls in one module can hold a same-named `#[cached]` function. Put
+`#[cached_impl]` on each `impl` block. It adds the type to the identity:
+`module::Products::get`. You can also write `#[cached(scope = "Products")]`.
+Without a scope, both functions share one key space, and `autumn cache audit`
+reports the shared identity.
+
+```rust
+#[autumn_web::cached_impl]
+impl Products {
+    #[cached]
+    async fn get(id: i64) -> String { /* .. */ }
+}
+```
+
 ### Invalidation edges are checked by the compiler
 
 `#[cached]` emits an identity constant beside the function it wraps.

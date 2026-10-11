@@ -60,6 +60,10 @@ struct CachedAttrs {
     /// gate. The reason is mandatory and must be non-blank so an escape hatch
     /// always carries its justification into the manifest.
     acknowledge_stale: Option<String>,
+    /// Enclosing type of an associated function. It joins the read identity,
+    /// so same-named functions in different impls do not share cache keys
+    /// (#2358).
+    scope: Option<String>,
 }
 
 /// Try to parse `max` as either a string literal or an integer literal.
@@ -89,6 +93,7 @@ fn parse_cached_args(attr: TokenStream) -> syn::Result<CachedAttrs> {
         key: Vec::new(),
         reads: Vec::new(),
         acknowledge_stale: None,
+        scope: None,
     };
 
     if attr.is_empty() {
@@ -151,10 +156,20 @@ fn parse_cached_args(attr: TokenStream) -> syn::Result<CachedAttrs> {
             }
             result.acknowledge_stale = Some(reason);
             Ok(())
+        } else if meta.path.is_ident("scope") {
+            let value: LitStr = meta.value()?.parse()?;
+            if value.value().trim().is_empty() {
+                return Err(syn::Error::new_spanned(
+                    &value,
+                    "`scope` requires a non-empty type name",
+                ));
+            }
+            result.scope = Some(value.value());
+            Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected ttl, max, result, key, reads, or \
-                 acknowledge_stale",
+                "unsupported attribute: expected ttl, max, result, key, reads, \
+                 acknowledge_stale, or scope",
             ))
         }
     })
@@ -333,8 +348,15 @@ fn read_id_const_ident(fn_name: &syn::Ident) -> syn::Ident {
 /// the constant by path. In an `impl` block the constant is an ASSOCIATED
 /// const, which a bare path cannot reach; and `module_path!()` names the
 /// enclosing module either way, so every splice is the same string.
-fn read_id_expr(fn_name_str: &str) -> TokenStream {
-    quote! { concat!(module_path!(), "::", #fn_name_str) }
+///
+/// `scope` is the enclosing type of an associated function. The identity must
+/// stay a `const` string and `type_name` is not `const`, so the type comes from
+/// the macro, not from rustc.
+fn read_id_expr(fn_name_str: &str, scope: Option<&str>) -> TokenStream {
+    scope.map_or_else(
+        || quote! { concat!(module_path!(), "::", #fn_name_str) },
+        |scope| quote! { concat!(module_path!(), "::", #scope, "::", #fn_name_str) },
+    )
 }
 
 /// Name of the generated per-read invalidator.
@@ -369,7 +391,7 @@ fn generate_coherence_items(
 ) -> CoherenceItems {
     let vis = &input_fn.vis;
     let id_const = read_id_const_ident(fn_name);
-    let id_expr = read_id_expr(fn_name_str);
+    let id_expr = read_id_expr(fn_name_str, attrs.scope.as_deref());
     let invalidator = invalidator_ident(fn_name);
 
     // Declared beats derived: an explicit `reads(...)` is the strongest claim
@@ -569,7 +591,7 @@ fn generate_cache_body(
         quote! { (|| #fn_block)() }
     };
 
-    let id_expr = read_id_expr(&fn_name.to_string());
+    let id_expr = read_id_expr(&fn_name.to_string(), attrs.scope.as_deref());
     let cache_init = quote! {
         // `Arc` rather than a bare `MokaCache` (#1716): the store stays a
         // per-function static, but a clone is handed to the coherence registry
@@ -753,6 +775,65 @@ pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+/// `#[cached_impl]`: add `scope = "<Self type>"` to each `#[cached]` method.
+///
+/// An attribute on a method cannot see its `impl`. This one can, so it passes
+/// the type down (#2358).
+pub fn cached_impl_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        return syn::Error::new_spanned(attr, "`#[cached_impl]` takes no arguments")
+            .to_compile_error();
+    }
+    let mut imp: syn::ItemImpl = match syn::parse2(item) {
+        Ok(imp) => imp,
+        Err(err) => return err.to_compile_error(),
+    };
+    let scope = match &*imp.self_ty {
+        syn::Type::Path(path) => path.path.segments.last().map(|seg| seg.ident.to_string()),
+        _ => None,
+    };
+    let Some(scope) = scope else {
+        return syn::Error::new_spanned(
+            &imp.self_ty,
+            "`#[cached_impl]` needs a named type; use `#[cached(scope = \"..\")]` instead",
+        )
+        .to_compile_error();
+    };
+    for item in &mut imp.items {
+        let syn::ImplItem::Fn(method) = item else {
+            continue;
+        };
+        for attr in &mut method.attrs {
+            if attr.path().segments.last().is_some_and(|seg| seg.ident == "cached") {
+                scope_cached_attr(attr, &scope);
+            }
+        }
+    }
+    quote! { #imp }
+}
+
+/// Append `scope = "<scope>"` to a `#[cached]` attribute that has none.
+fn scope_cached_attr(attr: &mut syn::Attribute, scope: &str) {
+    let path = attr.path().clone();
+    match &attr.meta {
+        syn::Meta::Path(_) => {
+            *attr = syn::parse_quote! { #[#path(scope = #scope)] };
+        }
+        syn::Meta::List(list) => {
+            let tokens = &list.tokens;
+            let has_scope = parse_cached_args(tokens.clone()).is_ok_and(|a| a.scope.is_some());
+            if !has_scope {
+                *attr = if tokens.is_empty() {
+                    syn::parse_quote! { #[#path(scope = #scope)] }
+                } else {
+                    syn::parse_quote! { #[#path(#tokens, scope = #scope)] }
+                };
+            }
+        }
+        syn::Meta::NameValue(_) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,6 +976,134 @@ mod tests {
             output_str.contains("10_000"),
             "default max should be 10_000"
         );
+    }
+
+    #[test]
+    fn scope_enters_the_read_identity() {
+        let out = cached_macro(
+            quote! { scope = "Products" },
+            quote! { async fn get(id: i64) -> String { String::new() } },
+        )
+        .to_string();
+        assert!(!out.contains("compile_error"), "{out}");
+        assert!(
+            out.contains("concat ! (module_path ! () , \"::\" , \"Products\" , \"::\" , \"get\")"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("concat ! (module_path ! () , \"::\" , \"get\")"),
+            "the unscoped identity must not remain: {out}"
+        );
+    }
+
+    #[test]
+    fn without_scope_the_identity_is_unchanged() {
+        let out = cached_macro(
+            TokenStream::new(),
+            quote! { async fn get(id: i64) -> String { String::new() } },
+        )
+        .to_string();
+        assert!(
+            out.contains("concat ! (module_path ! () , \"::\" , \"get\")"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_blank_scope_is_a_compile_error() {
+        let out = cached_macro(
+            quote! { scope = " " },
+            quote! { async fn get(id: i64) -> String { String::new() } },
+        )
+        .to_string();
+        assert!(out.contains("compile_error"), "{out}");
+    }
+
+    fn scoped(attr: TokenStream, item: TokenStream) -> String {
+        cached_impl_macro(attr, item).to_string()
+    }
+
+    #[test]
+    fn cached_impl_scopes_each_cached_method_by_the_self_type() {
+        let out = scoped(
+            TokenStream::new(),
+            quote! {
+                impl Products {
+                    #[cached]
+                    async fn get(id: i64) -> String { String::new() }
+                    #[cached(ttl = "5m")]
+                    async fn list() -> Vec<String> { Vec::new() }
+                    async fn plain() {}
+                }
+            },
+        );
+        assert!(out.contains("# [cached (scope = \"Products\")]"), "{out}");
+        assert!(
+            out.contains("# [cached (ttl = \"5m\" , scope = \"Products\")]"),
+            "{out}"
+        );
+        assert_eq!(out.matches("scope").count(), 2, "{out}");
+    }
+
+    #[test]
+    fn cached_impl_handles_a_qualified_attribute_path() {
+        let out = scoped(
+            TokenStream::new(),
+            quote! {
+                impl Reviews {
+                    #[autumn_web::cached]
+                    async fn get(id: i64) -> String { String::new() }
+                }
+            },
+        );
+        assert!(
+            out.contains("# [autumn_web :: cached (scope = \"Reviews\")]"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn cached_impl_keeps_an_explicit_scope() {
+        let out = scoped(
+            TokenStream::new(),
+            quote! {
+                impl Products {
+                    #[cached(scope = "Mine")]
+                    async fn get(id: i64) -> String { String::new() }
+                }
+            },
+        );
+        assert_eq!(out.matches("scope").count(), 1, "{out}");
+        assert!(out.contains("\"Mine\""), "{out}");
+    }
+
+    #[test]
+    fn cached_impl_names_a_generic_type_by_its_last_segment() {
+        let out = scoped(
+            TokenStream::new(),
+            quote! {
+                impl<T> crate::repo::Store<T> {
+                    #[cached]
+                    async fn get(id: i64) -> String { String::new() }
+                }
+            },
+        );
+        assert!(out.contains("scope = \"Store\""), "{out}");
+    }
+
+    #[test]
+    fn cached_impl_rejects_a_non_impl_item() {
+        let out = scoped(TokenStream::new(), quote! { fn f() {} });
+        assert!(out.contains("compile_error"), "{out}");
+    }
+
+    #[test]
+    fn cached_impl_rejects_a_type_without_a_name() {
+        let out = scoped(
+            TokenStream::new(),
+            quote! { impl Tr for (i64, i64) { #[cached] fn f() {} } },
+        );
+        assert!(out.contains("compile_error"), "{out}");
     }
 
     #[test]
