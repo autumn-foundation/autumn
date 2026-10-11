@@ -215,9 +215,9 @@ replicating, the worst lag and which database has it.
   Size `max_open` so busy tenants stay open.
 - A deleted database's replica stays in object storage until you remove it.
 - On Windows, `delete` and `restore` close the guard connection before they
-  remove the files. A process that opens the database in that short gap
-  makes `delete` answer `409` (nothing is lost). It makes `restore` answer
-  `409` when it publishes first.
+  remove files. If another process opens the database in that gap, `delete`
+  answers `409`. `restore` also answers `409` if that process creates the
+  file before `restore` publishes.
 
 ## See also
 

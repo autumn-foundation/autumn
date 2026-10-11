@@ -1419,8 +1419,9 @@ impl DatabaseFleet {
         let removed = crate::time::spawn_blocking(move || {
             // Another process sharing the root may still serve the file;
             // unlinking it under that process would split the tenant's data
-            // between the old inode and a new file. The guard refuses then,
-            // and blocks new openers while the files go.
+            // between the old inode and a new file. The guard refuses then.
+            // On Unix it also blocks new openers while the files go. On
+            // Windows it closes first.
             check_contained(&root, &path)?;
             with_exclusive_access(&path, &name, HOLD_GUARD_WHILE_REMOVING, || {
                 remove_database_files(&path, &root, &name)
@@ -2014,7 +2015,8 @@ fn check_contained(root: &Path, path: &Path) -> Result<(), FleetError> {
 /// [`FleetError::InUseElsewhere`]. On success the database is in rollback
 /// mode with no `-wal`, and the exclusive lock keeps new openers out until
 /// the guard is dropped; closing it then cannot touch a `-wal` some later
-/// opener creates at the same path.
+/// opener creates at the same path. On Windows, callers drop it before they
+/// remove files.
 fn exclusive_guard(
     path: &Path,
     name: &str,
@@ -2052,17 +2054,17 @@ fn exclusive_guard(
     Ok(Some(conn))
 }
 
-/// Whether the guard stays open while files are removed. Unix can unlink an
-/// open file. Windows cannot: `SQLite` opens files without
-/// `FILE_SHARE_DELETE`, so our own guard would block the removal.
+/// Whether the guard stays open while files are removed. Unix removes open
+/// files. Windows does not: `SQLite` opens files without `FILE_SHARE_DELETE`,
+/// so our guard would block the removal.
 const HOLD_GUARD_WHILE_REMOVING: bool = !cfg!(windows);
 
 /// Run `work` once no other process has `path` open. Blocking.
 ///
 /// With `hold`, the guard stays open during `work`. Without it, the guard
-/// closes first, so `work` must tolerate a late opener: Windows refuses to
-/// delete a file that is open elsewhere (see [`removal_error`]), and the
-/// no-replace publish in [`publish_restored`] refuses a file that appeared.
+/// closes first. Then another process can open the file before `work` runs,
+/// and `work` must handle that. Windows refuses to delete an open file (see
+/// [`removal_error`]). [`publish_restored`] refuses a file that appeared.
 fn with_exclusive_access<T>(
     path: &Path,
     name: &str,
@@ -2080,8 +2082,8 @@ fn with_exclusive_access<T>(
     }
 }
 
-/// Map a failed file removal. A sharing violation (Windows error 32) means
-/// another process has the file open: that is [`FleetError::InUseElsewhere`].
+/// Map a failed file removal. Windows error 32 (sharing violation) means
+/// another process has the file open. Return [`FleetError::InUseElsewhere`].
 fn removal_error<'a>(
     op: &'static str,
     name: &'a str,
@@ -2098,8 +2100,8 @@ fn removal_error<'a>(
     }
 }
 
-/// Link the staged copy to `path`. Never replaces a file: one that appeared
-/// since the removal is a conflict.
+/// Link the staged copy to `path`. Never replace a file. If a file appeared
+/// after the removal, return [`FleetError::AlreadyExists`].
 fn publish_restored(staging: &Path, path: &Path, name: &str) -> Result<(), FleetError> {
     std::fs::hard_link(staging, path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
@@ -2115,9 +2117,10 @@ fn publish_restored(staging: &Path, path: &Path, name: &str) -> Result<(), Fleet
 /// Replace the database at `path` with its replica. Blocking.
 ///
 /// The replica is rebuilt in a private staging file first, so a failed
-/// restore leaves the current file untouched. Then, under the exclusive
-/// guard (no other process may serve the old file), the old files are
-/// removed and the staging file is linked into place.
+/// restore leaves the current file untouched. Then the old files go and the
+/// staging file is linked into place. On Unix, the exclusive guard stays open
+/// for this. On Windows, it closes first. A file that appears in that gap
+/// gives `AlreadyExists`.
 fn restore_in_place(
     replication: &super::fleet_replication::FleetReplication,
     key: &FleetDbKey,
@@ -2235,7 +2238,8 @@ fn build_staged_database(
 
 /// Remove a database file, its sidecars, and the directories the template
 /// created for it when they are now empty (never `root` itself). `Ok(false)`
-/// when there was no file. The main file goes first.
+/// when there was no file. Remove the main file first: on Windows, a sharing
+/// violation then stops the delete before any sidecar is lost.
 fn remove_database_files(path: &Path, root: &Path, name: &str) -> Result<bool, FleetError> {
     let existed = path.is_file();
     for file in std::iter::once(path.to_path_buf()).chain(crate::fleet_layout::sidecar_paths(path))
