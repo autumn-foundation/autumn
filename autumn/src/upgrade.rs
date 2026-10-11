@@ -2019,6 +2019,114 @@ mod tests {
             .status();
     }
 
+    /// An executable shell script that stands in for the new build.
+    #[cfg(unix)]
+    fn fake_successor(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("successor.sh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("writes the script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        path
+    }
+
+    /// Run `upgrade_in_place` against `binary` with a live-state block.
+    #[cfg(unix)]
+    fn run_upgrade(
+        dir: &std::path::Path,
+        binary: &std::path::Path,
+        timeout: std::time::Duration,
+        handle: &LiveStateHandle<StatsV1>,
+    ) -> Result<Handover, UpgradeError> {
+        let registry = Arc::new(LiveStateRegistry::new(handle));
+        temp_env::with_vars([(BINARY_ENV, Some(binary)), (DIR_ENV, Some(dir))], || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(async {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                        .await
+                        .expect("binds");
+                    let socket = HandoffSocket::from_listener(&listener).expect("dup");
+                    upgrade_in_place(UpgradePlan {
+                        socket: &socket,
+                        registry: Some(registry),
+                        ready_timeout: timeout,
+                        clock: Arc::new(crate::time::SystemClock),
+                        entropy: Arc::new(crate::entropy::SeededEntropy::new(2350)),
+                    })
+                    .await
+                })
+        })
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_successor_that_publishes_is_a_handover_and_keeps_the_state_frozen() {
+        let dir = scratch_dir(line!());
+        let binary = fake_successor(&dir, "touch \"$AUTUMN_UPGRADE_READY_FILE\"\nexec sleep 30");
+        let handle = LiveStateHandle::new(StatsV1::default());
+
+        let handover = run_upgrade(&dir, &binary, std::time::Duration::from_secs(20), &handle)
+            .expect("the successor published");
+
+        assert!(handle.is_frozen(), "the successor owns the state now");
+        assert!(process_is_alive(handover.successor_pid));
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(handover.successor_pid.to_string())
+            .status();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_successor_that_never_publishes_is_killed_and_the_state_is_handed_back() {
+        let dir = scratch_dir(line!());
+        let pid_file = dir.join("pid");
+        let binary = fake_successor(
+            &dir,
+            &format!("echo $$ > {}\nexec sleep 30", pid_file.display()),
+        );
+        let handle = LiveStateHandle::new(StatsV1::default());
+
+        let error = run_upgrade(
+            &dir,
+            &binary,
+            std::time::Duration::from_millis(300),
+            &handle,
+        )
+        .expect_err("nothing was published");
+
+        assert!(matches!(error, UpgradeError::ReadyTimeout(_)), "{error}");
+        assert!(!handle.is_frozen(), "this process keeps the state");
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the script ran")
+            .trim()
+            .parse()
+            .expect("a pid");
+        assert!(
+            !process_is_alive(pid),
+            "the unpublished successor is killed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_successor_that_exits_is_reported_and_the_state_is_handed_back() {
+        let dir = scratch_dir(line!());
+        let binary = fake_successor(&dir, "exit 3");
+        let handle = LiveStateHandle::new(StatsV1::default());
+
+        let error = run_upgrade(&dir, &binary, std::time::Duration::from_secs(20), &handle)
+            .expect_err("the successor exited");
+
+        assert!(matches!(error, UpgradeError::SuccessorExited(_)), "{error}");
+        assert!(!handle.is_frozen());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn an_ordinary_cold_start_has_no_handover_to_complete() {
         temp_env::with_vars_unset([LISTEN_FD_ENV, STATE_FILE_ENV], || {
