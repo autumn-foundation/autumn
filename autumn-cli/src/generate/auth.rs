@@ -3886,10 +3886,20 @@ pub async fn require_tracked_session(
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
 
+    // While an operator impersonates, `{snake_name}_id` is the target but the row
+    // still belongs to the operator who signed in. Match the row by its owner.
+    let row_owner_id: i64 = ::autumn_web::auth::impersonation::audit_actor_id(
+        session,
+        &{snake_name}_id.to_string(),
+    )
+    .await
+    .parse()
+    .unwrap_or({snake_name}_id);
+
     let token_digest = session_token_digest(session).await;
     let tracked: Option<{pascal_name}Session> = {sess_table}::table
         .filter({sess_table}::token_digest.eq(&token_digest))
-        .filter({sess_table}::user_id.eq({snake_name}_id))
+        .filter({sess_table}::user_id.eq(row_owner_id))
         .select({pascal_name}Session::as_select())
         .first(&mut **db)
         .await
@@ -11836,6 +11846,23 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Issue #2347: while impersonating, `{snake}_id` is the target but the
+    /// tracked row belongs to the operator. The lookup must use the operator's
+    /// id, or the next request would miss the row and 401.
+    #[test]
+    fn require_tracked_session_matches_the_row_owner_while_impersonating() {
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
+        let start = routes
+            .find("pub async fn require_tracked_session")
+            .expect("require_tracked_session is generated");
+        let len = routes[start..].find("\n}\n").expect("fn body ends");
+        let body = &routes[start..start + len];
+        assert!(
+            body.contains("impersonation::audit_actor_id"),
+            "row owner must resolve through the impersonation record:\n{body}"
+        );
+    }
 
     /// Issue #2347: any `rotate_id()` while logged in moves the digest the
     /// tracked row is keyed by. The startup hook must register a rotation hook
