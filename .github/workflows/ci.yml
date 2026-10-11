@@ -2301,11 +2301,13 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --test flags -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test config -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test experiments -- --ignored
-          # Issue #1975: the declarative-schema engine (`autumn-cli/src/schema/`)
-          # is tested by unit tests in the `autumn` bin target. No other lane
-          # instruments that target, so without this line its patch coverage
-          # reads as 0%. A filter that matches nothing exits 0, so check the count.
-          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- schema:: \
+          # The `autumn` bin target's unit tests are instrumented by no other
+          # lane, so without this line a change under autumn-cli/src reads as 0%
+          # patch coverage however well its unit tests cover it. Two modules so
+          # far: the declarative-schema engine (issue #1975) and `autumn upgrade`
+          # (issue #2342). Add a filter here for the next one. A filter that
+          # matches nothing exits 0, so check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- schema:: upgrade:: \
             | tee "$RUNNER_TEMP/cli-schema-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-schema-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
