@@ -6782,7 +6782,15 @@ impl AppBuilder {
         {
             let seo_cfg = &config.seo;
             let raw_profile = config.profile.as_deref().unwrap_or("dev");
-            let profile = crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all);
+            // Here for AEO alone, the file is AEO's: it classes profiles as
+            // the server's AEO `robots.txt` does, so a custom production
+            // profile does not ship `Disallow: /`.
+            let aeo_only = seo_sources.is_empty() && !crate::seo::has_seo_config(seo_cfg);
+            let profile = if aeo_only {
+                crate::aeo::robots_profile(&config)
+            } else {
+                crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all)
+            };
             // A static route that declared `seo(robots = "noindex")` must not
             // be advertised in sitemap.xml — otherwise the app tells crawlers
             // "here is this URL" and "do not index it" at the same time (#1182).

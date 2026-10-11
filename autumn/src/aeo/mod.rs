@@ -646,11 +646,17 @@ fn document_response(
 /// and `test` profiles close the site: a custom profile name (`staging`,
 /// `live`) must not hide a public site from search engines by accident.
 fn default_robots_txt(config: &crate::config::AutumnConfig) -> String {
-    let profile = match config.profile.as_deref() {
+    robots::robots_txt_with_policy(robots_profile(config), None, &[], &robots_policy(config))
+}
+
+/// The profile AEO's own `robots.txt` uses: every profile but `dev` and
+/// `test` (a custom `live` or `staging` one too) is a public site.
+#[must_use]
+pub(crate) fn robots_profile(config: &crate::config::AutumnConfig) -> &'static str {
+    match config.profile.as_deref() {
         Some("dev" | "test") | None => "dev",
         Some(_) => "prod",
-    };
-    robots::robots_txt_with_policy(profile, None, &[], &robots_policy(config))
+    }
 }
 
 /// Log the `[aeo]` settings that cannot work as written.
@@ -899,6 +905,21 @@ mod tests {
         assert!(!dist.path().join("llms.txt").exists());
         // The page `head_tags` load it, so a static site serves it too.
         assert!(dist.path().join("_autumn/webmcp.js").exists());
+    }
+
+    #[test]
+    fn every_profile_but_dev_and_test_is_public() {
+        let mut config = crate::config::AutumnConfig::default();
+        for (profile, want) in [
+            (None, "dev"),
+            (Some("dev"), "dev"),
+            (Some("test"), "dev"),
+            (Some("prod"), "prod"),
+            (Some("live"), "prod"),
+        ] {
+            config.profile = profile.map(str::to_owned);
+            assert_eq!(robots_profile(&config), want, "{profile:?}");
+        }
     }
 
     #[test]

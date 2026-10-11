@@ -1734,11 +1734,22 @@ fn safe_url(raw: &str, link: bool) -> Option<String> {
         return None;
     }
     // Whatever comes before a `:` there is a scheme, however long.
-    if let Some((scheme, _)) = head.split_once(':') {
-        let scheme = scheme.to_ascii_lowercase();
-        let allowed = matches!(scheme.as_str(), "http" | "https") || (link && scheme == "mailto");
-        if !allowed {
-            return None;
+    let scheme = head.split_once(':').map(|(s, _)| s.to_ascii_lowercase());
+    let special = match scheme.as_deref() {
+        None | Some("http" | "https") => true,
+        Some("mailto") if link => false,
+        Some(_) => return None,
+    };
+    if special {
+        // An http(s) URL, or a relative one on an http(s) page: the URL
+        // parser reads `\` as `/` before the query.
+        let end = url.find(['?', '#']).unwrap_or(url.len());
+        let (path, rest) = url.split_at(end);
+        if path.contains('\\') {
+            return Some(encode_destination(&format!(
+                "{}{rest}",
+                path.replace('\\', "/")
+            )));
         }
     }
     Some(encode_destination(&url))
@@ -2276,9 +2287,15 @@ mod tests {
 
     #[test]
     fn a_backslash_in_a_link_is_encoded() {
+        // In the path it is a `/`, as a browser reads it; after the query
+        // starts it stays, encoded so it cannot escape the closing `)`.
         assert_eq!(
             md("<p><a href=\"/docs\\\">Docs</a></p>"),
-            "[Docs](/docs%5C)\n"
+            "[Docs](/docs/)\n"
+        );
+        assert_eq!(
+            md("<p><a href=\"/docs?q=\\\">Docs</a></p>"),
+            "[Docs](/docs?q=%5C)\n"
         );
     }
 
@@ -2533,6 +2550,22 @@ mod tests {
         );
         // Two cells: 8 placeholders each and 64 spare, not 1000 columns.
         assert!(out.matches(" |").count() < 2 * (2 * 8 + 64 + 2), "{out}");
+    }
+
+    #[test]
+    fn a_backslash_in_an_http_url_is_a_slash() {
+        assert_eq!(
+            md("<a href=\"https://example.com\\docs\">Docs</a>"),
+            "[Docs](https://example.com/docs)\n"
+        );
+        assert_eq!(
+            md("<a href=\"/docs\\guide?q=a\\b\">G</a>"),
+            "[G](/docs/guide?q=a%5Cb)\n"
+        );
+        assert_eq!(
+            md("<a href=\"mailto:a\\b@example.com\">M</a>"),
+            "[M](mailto:a%5Cb@example.com)\n"
+        );
     }
 
     #[test]
