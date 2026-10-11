@@ -215,7 +215,13 @@ dropping state — reviewing what each field is mapped *to* is still yours.
    upgrade can still be abandoned (a failing startup hook), and a write the
    successor acknowledged would die with it while the predecessor resumed from
    the snapshot. Only one of the two processes is ever writable, so a retry
-   always lands somewhere that keeps it.
+   always lands somewhere that keeps it. A lock file in the handoff directory protects two steps: the
+   successor's publish-and-unfreeze, and the predecessor's decision to kill.
+   The predecessor cannot kill a successor that has become writable. If the
+   successor dies after it publishes but before the predecessor settles the
+   handoff (about one poll interval), the predecessor resumes from its
+   snapshot. The service stays up, but a write that the successor acknowledged
+   can be lost. After the handoff settles, nothing watches the successor.
 4. **Drain.** The predecessor stops accepting, finishes its in-flight requests,
    runs its `on_shutdown` hooks, and exits. Connections queued on the shared
    socket are picked up by the successor — the socket is never closed, so
