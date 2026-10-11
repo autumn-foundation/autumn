@@ -10,4 +10,5 @@
 ### Fixed
 
 - **auth:** an operator who impersonates a user now spends their own throttle
-  budget, not the customer's.
+  budget, not the customer's. Per-user throttle buckets for impersonated
+  traffic move from the customer to the operator.

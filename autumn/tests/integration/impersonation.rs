@@ -1252,7 +1252,7 @@ async fn rebind_keeps_the_record_across_a_same_identity_rotation() {
 }
 
 #[tokio::test]
-async fn rebind_refuses_a_login_of_the_impersonated_user() {
+async fn rebind_does_not_revive_a_retired_record() {
     let rotations = Rotations::default();
     let client = rotation_app(&rotations);
     client.post("/login-admin").send().await.assert_ok();
@@ -1263,8 +1263,8 @@ async fn rebind_refuses_a_login_of_the_impersonated_user() {
         .await
         .assert_ok();
 
-    // The record is bound to the generation `begin` minted. A rotation that
-    // follows a *different* generation must not be adopted by `rebind`.
+    // The first rotation retires the record. A later `rebind` must not
+    // revive it: the record is bound to a generation that is gone.
     client
         .post("/rotate-keep-identity")
         .send()

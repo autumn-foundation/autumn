@@ -244,6 +244,9 @@ impl Session {
     ///
     /// This is critical to call during privilege elevation (e.g., login)
     /// to prevent Session Fixation attacks.
+    ///
+    /// State keyed by the old id can follow the new id with a
+    /// [`SessionRotationHooks`] hook.
     pub async fn rotate_id(&self) {
         let new_id = self.entropy.uuid_v4().to_string();
         let mut inner = self.inner.write().await;
@@ -357,22 +360,21 @@ impl SessionRotationHooks {
             .push(Arc::new(move |rotation| Box::pin(hook(rotation))));
     }
 
-    /// Number of registered hooks.
-    #[must_use]
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.hooks
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
     }
 
-    /// Whether no hook is registered.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     async fn run(&self, rotation: &SessionRotation) {
+        if self.is_empty() {
+            return;
+        }
         let hooks: Vec<_> = self
             .hooks
             .read()
@@ -1081,10 +1083,15 @@ where
                 let sid = inner_guard.id.clone();
                 let primary_replay_after_guard_denial =
                     inner_guard.cookie_backed && inner_guard.old_id.is_some();
-                let rotation = inner_guard.old_id.clone().map(|old_id| SessionRotation {
-                    old_id,
-                    new_id: sid.clone(),
-                });
+                // A session with no stored row has nothing keyed to its old id.
+                let rotation = inner_guard
+                    .old_id
+                    .clone()
+                    .filter(|_| inner_guard.cookie_backed)
+                    .map(|old_id| SessionRotation {
+                        old_id,
+                        new_id: sid.clone(),
+                    });
                 // The tenant `[tenancy] source = "session"` will resolve for a
                 // retry presenting this finalized session — read live from the
                 // data just written rather than reusing the tenant captured
@@ -2137,6 +2144,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rotation_hook_is_silent_for_a_session_with_no_cookie() {
+        let (hooks, log) = rotation_log();
+        let (app, _) = rotation_app(hooks, MemoryStore::new()).await;
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/rotate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn rotation_hook_is_silent_when_the_session_is_destroyed() {
         let (hooks, log) = rotation_log();
         let (app, cookie) = rotation_app(hooks, MemoryStore::new()).await;
@@ -2170,11 +2194,22 @@ mod tests {
     async fn a_failing_rotation_hook_does_not_fail_the_response() {
         let hooks = SessionRotationHooks::default();
         hooks.register(|_| async { Err("db down".into()) });
-        let (_, log) = rotation_log();
-        let _ = log;
+        let ran_after = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&ran_after);
+        hooks.register(move |_| {
+            let flag = Arc::clone(&flag);
+            async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        });
         let (app, cookie) = rotation_app(hooks, MemoryStore::new()).await;
         let response = hit(&app, "/rotate", &cookie).await;
         assert_eq!(response.status(), http::StatusCode::OK);
         assert!(response.headers().get(SET_COOKIE).is_some());
+        assert!(
+            ran_after.load(std::sync::atomic::Ordering::SeqCst),
+            "a later hook still runs after an earlier one fails"
+        );
     }
 }

@@ -11847,7 +11847,8 @@ mod tests {
         let hook_at = routes
             .find("pub async fn remember_me_startup")
             .expect("startup hook is generated");
-        let body = &routes[hook_at..(hook_at + 1500).min(routes.len())];
+        let body_len = routes[hook_at..].find("\n}\n").expect("hook body ends");
+        let body = &routes[hook_at..hook_at + body_len];
         assert!(
             body.contains(".session_rotation_hooks()") && body.contains(".register("),
             "startup hook must register a rotation hook:\n{body}"
