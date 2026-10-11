@@ -973,6 +973,8 @@ mod commerce {
         assert_eq!(required["x402Version"], 2);
         assert_eq!(required["accepts"][0]["amount"], "10000");
         assert_eq!(required["resource"]["url"], "http://localhost/api");
+        // The route's type is not known, so none is claimed.
+        assert!(required["resource"].get("mimeType").is_none(), "{required}");
     }
 
     #[tokio::test]

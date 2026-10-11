@@ -392,7 +392,13 @@ mod tests {
             ..Default::default()
         };
         site.facts.web_bot_auth = Some(WebBotAuthKey::from_seed_b64(RFC8037_D).unwrap());
-        for agent in ["ftp://keys.example.com", "keys.example.com", "/agents"] {
+        // Verifiers reject an `http` agent, so nothing is signed for one.
+        for agent in [
+            "ftp://keys.example.com",
+            "keys.example.com",
+            "/agents",
+            "http://keys.example.com",
+        ] {
             config.aeo.web_bot_auth.signature_agent = Some(agent.to_owned());
             assert!(site.web_bot_auth_signer(&config).is_none(), "{agent}");
         }

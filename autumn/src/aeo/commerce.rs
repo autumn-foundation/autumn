@@ -364,10 +364,11 @@ impl X402Config {
         json!({
             "x402Version": 2,
             "error": error,
+            // No `mimeType`: it is optional, and a priced route may answer
+            // HTML, JSON or a file.
             "resource": {
                 "url": resource_url,
                 "description": route.description.as_deref().unwrap_or_default(),
-                "mimeType": "application/json",
             },
             "accepts": [self.requirements(route)],
         })
