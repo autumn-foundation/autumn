@@ -95,7 +95,10 @@ pub use manifest::{
     MAX_REQUEST_BODY_BYTES, MAX_REQUEST_BODY_TIMEOUT_MS, MAX_RESPONSE_BYTES, ManifestError,
     ResourceLimits, SandboxCapability, SandboxManifest, WIRE_VERSION,
 };
-pub use plugin::{SANDBOX_ATTRIBUTION_HEADER, SandboxPluginError, SandboxedPlugin};
+pub use plugin::{
+    DEFAULT_GUEST_SLOTS, SANDBOX_ATTRIBUTION_HEADER, SandboxPluginError, SandboxedPlugin,
+    set_guest_slots,
+};
 pub use slots::{RenderSlots, SlotError};
 pub use wire::{
     ALLOWED_REQUEST_HEADERS, ALLOWED_RESPONSE_CONTENT_TYPES, ALLOWED_RESPONSE_HEADERS, OwnedRoutes,

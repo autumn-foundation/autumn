@@ -36,6 +36,7 @@
 //! | traps, exits, answers badly | 502 on its own prefix | nothing |
 //! | spins or floods output | 504 on its own prefix | nothing |
 //! | is already at its concurrency ceiling | 503 with `Retry-After` | nothing |
+//! | finds the shared guest pool full | 503 with `Retry-After` | nothing |
 //! | is sent a body over its ceiling | 413, guest never started | nothing |
 //!
 //! The last column is the point. Every failure mode is scoped to the plugin's
@@ -62,7 +63,7 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::body::Body;
 use axum::response::{IntoResponse as _, Response};
@@ -125,6 +126,50 @@ impl From<SandboxLoadError> for SandboxPluginError {
     }
 }
 
+/// Default number of guests that may run at once in the whole process.
+///
+/// A guest runs on Tokio's shared blocking pool. That pool has 512 threads by
+/// default. A quarter of it leaves the rest for host work, such as password
+/// hashing. Change the limit with [`set_guest_slots`].
+pub const DEFAULT_GUEST_SLOTS: usize = 128;
+
+static GUEST_SLOTS: OnceLock<(usize, Arc<Semaphore>)> = OnceLock::new();
+
+/// Set the process-wide guest limit. Call once, before any plugin is built.
+///
+/// Set it to at most a quarter of the runtime's `max_blocking_threads`. It
+/// caps all sandboxed plugins together, on top of each `max_concurrency`; a
+/// request over it gets 503.
+///
+/// The pool is first come, first served. A plugin with a high `max_concurrency`
+/// can take all of it, so keep each `max_concurrency` well under the limit.
+///
+/// # Errors
+///
+/// Returns the limit already in force if one was set. Returns 0 if `slots` is
+/// zero or too large.
+pub fn set_guest_slots(slots: usize) -> Result<(), usize> {
+    fix_slots(&GUEST_SLOTS, slots)
+}
+
+fn fix_slots(cell: &OnceLock<(usize, Arc<Semaphore>)>, slots: usize) -> Result<(), usize> {
+    if slots == 0 || slots > Semaphore::MAX_PERMITS {
+        return Err(0);
+    }
+    cell.set((slots, Arc::new(Semaphore::new(slots))))
+        .map_err(|_| cell.get().map_or(DEFAULT_GUEST_SLOTS, |(held, _)| *held))
+}
+
+fn guest_slots() -> Arc<Semaphore> {
+    let (_, pool) = GUEST_SLOTS.get_or_init(|| {
+        (
+            DEFAULT_GUEST_SLOTS,
+            Arc::new(Semaphore::new(DEFAULT_GUEST_SLOTS)),
+        )
+    });
+    Arc::clone(pool)
+}
+
 /// A sandboxed plugin, ready to mount.
 ///
 /// `Clone` shares the compiled host, the concurrency permits, the capability
@@ -138,6 +183,8 @@ pub struct SandboxedPlugin {
     /// One permit per concurrently-executing request, so `max_concurrency ×
     /// memory_bytes` bounds what this plugin can cost the host at any instant.
     permits: Arc<Semaphore>,
+    /// The process-wide pool of guest slots, shared by every sandboxed plugin.
+    guest_slots: Arc<Semaphore>,
     /// The identity an operator reviewed, logged at mount so the grant in the
     /// log can be compared with the one on the review screen. `None` when the
     /// plugin was built from a bare host rather than an artifact — there is no
@@ -180,10 +227,18 @@ impl SandboxedPlugin {
         Self {
             host: Arc::new(host),
             permits,
+            guest_slots: guest_slots(),
             artifact_sha256: None,
             services,
             activity: Arc::new(PluginActivityLog::new()),
         }
+    }
+
+    /// Use a private guest pool. For tests.
+    #[cfg(test)]
+    fn with_guest_slots(mut self, slots: Arc<Semaphore>) -> Self {
+        self.guest_slots = slots;
+        self
     }
 
     /// Wire the backends this plugin's granted capabilities need (issue #1632).
@@ -288,6 +343,14 @@ impl SandboxedPlugin {
             );
             return None;
         };
+        let Ok(slot_permit) = Arc::clone(&self.guest_slots).try_acquire_owned() else {
+            tracing::warn!(
+                plugin,
+                slot,
+                "the sandbox guest pool is full; omitting its render fragment"
+            );
+            return None;
+        };
         let services = CapabilityServices {
             // Read here rather than in the closure; see the note in `serve`.
             tenant: crate::tenancy::CURRENT_TENANT
@@ -320,6 +383,7 @@ impl SandboxedPlugin {
             ingest_log.ingest(&ingest_plugin, outcome.activity.clone());
             ingest_log.ingest_dropped(&ingest_plugin, outcome.dropped_events);
             drop(permit);
+            drop(slot_permit);
             outcome
         })
         .await;
@@ -406,6 +470,7 @@ impl SandboxedPlugin {
             };
             let host = Arc::clone(&self.host);
             let permits = Arc::clone(&self.permits);
+            let guest_slots = Arc::clone(&self.guest_slots);
             let services = self.services.clone();
             let activity = Arc::clone(&self.activity);
             let pattern = route.path.clone();
@@ -417,6 +482,7 @@ impl SandboxedPlugin {
                         let mounted = Mounted {
                             host: Arc::clone(&host),
                             permits: Arc::clone(&permits),
+                            guest_slots: Arc::clone(&guest_slots),
                             services: services.clone(),
                             activity: Arc::clone(&activity),
                         };
@@ -514,6 +580,7 @@ fn method_filter(method: &str, implies_head: bool) -> Option<MethodFilter> {
 struct Mounted {
     host: Arc<SandboxHost>,
     permits: Arc<Semaphore>,
+    guest_slots: Arc<Semaphore>,
     services: CapabilityServices,
     activity: Arc<PluginActivityLog>,
 }
@@ -527,6 +594,7 @@ async fn serve(
     let Mounted {
         host,
         permits,
+        guest_slots,
         services,
         activity,
     } = mounted;
@@ -553,6 +621,21 @@ async fn serve(
     let request = match read_request(&plugin, limits, pattern, &params, request).await {
         Ok(request) => request,
         Err(response) => return *response,
+    };
+
+    // Taken after the body is read, so a slow client holds no slot. Held,
+    // like the plugin's permit, inside the blocking task. See
+    // `DEFAULT_GUEST_SLOTS`.
+    let Ok(slot) = guest_slots.try_acquire_owned() else {
+        tracing::warn!(
+            plugin,
+            "the sandbox guest pool is full; shedding the request"
+        );
+        let mut response = sandbox_error(&plugin, StatusCode::SERVICE_UNAVAILABLE);
+        response
+            .headers_mut()
+            .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+        return response;
     };
 
     // `wasmi` is a synchronous interpreter: running it on the async runtime
@@ -601,6 +684,7 @@ async fn serve(
         let outcome = host.run_with(&request, services);
         ingest_log.ingest(&ingest_plugin, outcome.activity.clone());
         ingest_log.ingest_dropped(&ingest_plugin, outcome.dropped_activity);
+        drop(slot);
         (outcome, permit)
     })
     .await;
@@ -1106,6 +1190,15 @@ sha256 = "{digest}"
         send_with_body(app, method, path, Body::empty()).await
     }
 
+    async fn send_raw(app: axum::Router, method: &str, path: &str) -> Response {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .body(Body::empty())
+            .expect("request");
+        app.oneshot(request).await.expect("infallible")
+    }
+
     async fn send_with_body(
         app: axum::Router,
         method: &str,
@@ -1294,6 +1387,73 @@ sha256 = "{digest}"
         drop(held);
         let (status, _) = send(app(&plugin), "GET", "/hello/greet").await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_process_wide_guest_slots_shed_a_request_the_plugin_would_admit() {
+        // The plugin's own ceiling is wide open; only the shared pool is full.
+        let plugin = plugin_from(
+            guests::HELLO,
+            GREET_ROUTE,
+            ResourceLimits {
+                max_concurrency: 8,
+                ..ResourceLimits::default()
+            },
+        )
+        .with_guest_slots(Arc::new(Semaphore::new(1)));
+        let held = Arc::clone(&plugin.guest_slots)
+            .try_acquire_owned()
+            .expect("the only slot is free");
+        let response = send_raw(app(&plugin), "GET", "/hello/greet").await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().contains_key(http::header::RETRY_AFTER));
+        // The refused request gave its plugin permit back.
+        assert_eq!(plugin.permits.available_permits(), 8);
+        assert!(plugin.render_slot("any", &[]).await.is_none());
+        drop(held);
+        let (status, _) = send(app(&plugin), "GET", "/hello/greet").await;
+        assert_eq!(status, StatusCode::OK);
+        // The slot came back after the request: a second one still serves.
+        assert_eq!(plugin.guest_slots.available_permits(), 1);
+    }
+
+    #[test]
+    fn the_public_setter_refuses_bad_limits_and_leaves_the_pool_alone() {
+        // Refused before the process-wide cell is touched.
+        assert_eq!(set_guest_slots(0), Err(0));
+        assert_eq!(set_guest_slots(usize::MAX), Err(0));
+    }
+
+    #[tokio::test]
+    async fn one_guest_pool_caps_two_plugins_together() {
+        let pool = Arc::new(Semaphore::new(1));
+        let one = hello_plugin().with_guest_slots(Arc::clone(&pool));
+        let two = hello_plugin().with_guest_slots(Arc::clone(&pool));
+        let held = Arc::clone(&pool).try_acquire_owned().expect("free");
+        for plugin in [&one, &two] {
+            let (status, _) = send(app(plugin), "GET", "/hello/greet").await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        }
+        drop(held);
+        let (status, _) = send(app(&two), "GET", "/hello/greet").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[test]
+    fn the_default_guest_slots_are_a_fraction_of_tokios_blocking_pool() {
+        // Tokio's default pool is 512 threads; host work must keep most of it.
+        const { assert!(DEFAULT_GUEST_SLOTS <= 512 / 4) };
+        const { assert!(DEFAULT_GUEST_SLOTS >= 1) };
+    }
+
+    #[test]
+    fn the_guest_slot_limit_is_fixed_by_the_first_caller() {
+        let cell = std::sync::OnceLock::new();
+        assert_eq!(fix_slots(&cell, 3), Ok(()));
+        assert_eq!(fix_slots(&cell, 9), Err(3), "a later caller is refused");
+        assert_eq!(cell.get().map(|(n, _)| *n), Some(3));
+        assert_eq!(fix_slots(&std::sync::OnceLock::new(), 0), Err(0));
+        assert_eq!(fix_slots(&std::sync::OnceLock::new(), usize::MAX), Err(0));
     }
 
     #[tokio::test(start_paused = true)]
