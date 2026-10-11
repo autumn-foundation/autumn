@@ -37,7 +37,7 @@ impl IdempotencyStore for SetFailsStore {
         _record: IdempotencyRecord,
         _body_hash: Vec<u8>,
         _ttl: Duration,
-    ) -> IdempotencyFuture<'a, ()> {
+    ) -> IdempotencyFuture<'a, bool> {
         Box::pin(async { Err(IdempotencyStoreError::backend("redis: connection reset")) })
     }
 

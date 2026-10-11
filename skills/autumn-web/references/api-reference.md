@@ -1265,9 +1265,10 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   `idem.recovery_point(&mut db)` on retry. Another body with the same key
   gets `422`.
 - `IdempotencyTx` methods are no-ops without a key or with another backend.
-- Custom store: implement the async `IdempotencyStore` trait (`get`, `set`,
-  `try_lock(key, owner, ttl)`, `unlock(key, owner)`, each returns an
-  `IdempotencyFuture`). Do not block the runtime thread.
+- Custom store: implement the async `IdempotencyStore` trait (`get`, `set`
+  returning whether it stored, `try_lock(key, owner, ttl)`,
+  `unlock(key, owner)`, and optionally `renew_lock(key, owner, ttl)`; each
+  returns an `IdempotencyFuture`). Do not block the runtime thread.
 
 ## Submit tokens (0.6.0, #1360)
 

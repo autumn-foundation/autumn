@@ -446,7 +446,7 @@ impl IdempotencyStore for DbIdempotencyStore {
         record: IdempotencyRecord,
         body_hash: Vec<u8>,
         ttl: Duration,
-    ) -> IdempotencyFuture<'a, ()> {
+    ) -> IdempotencyFuture<'a, bool> {
         Box::pin(async move {
             let bytes = StoredEntry::encode(record, body_hash)?;
             // The clock after checkout: a slow pool must not eat the TTL.
@@ -497,12 +497,13 @@ impl IdempotencyStore for DbIdempotencyStore {
                 .is_null()
                 .or(keys::expires_at_ms.le(self.reclaim_before(now)))
                 .or(keys::record_owner.eq(owner));
-            diesel::query_dsl::methods::FilterDsl::filter(upsert, lock_free.and(record_free))
-                .execute(&mut conn)
-                .await
-                .map_err(|e| db_error("store idempotency record", e))?;
+            let written =
+                diesel::query_dsl::methods::FilterDsl::filter(upsert, lock_free.and(record_free))
+                    .execute(&mut conn)
+                    .await
+                    .map_err(|e| db_error("store idempotency record", e))?;
             self.sweep(&mut conn).await;
-            Ok(())
+            Ok(written == 1)
         })
     }
 
@@ -623,6 +624,27 @@ impl IdempotencyStore for DbIdempotencyStore {
             }
             let until = now_after.saturating_add(lock_ms);
             renew_lock(&mut conn, key, owner, until, default_ttl)
+                .await
+                .map_err(|e| db_error("renew idempotency lock", e))
+        })
+    }
+
+    fn renew_lock<'a>(
+        &'a self,
+        key: &'a str,
+        owner: &'a str,
+        lock_ttl: Duration,
+    ) -> IdempotencyFuture<'a, bool> {
+        Box::pin(async move {
+            let mut conn = self.conn().await?;
+            // The clock after checkout, as in `try_lock`.
+            let lock_ttl = if lock_ttl.is_zero() {
+                Duration::from_secs(1)
+            } else {
+                lock_ttl
+            };
+            let until = now_ms().saturating_add(ms(lock_ttl));
+            renew_lock(&mut conn, key, owner, until, ms(self.default_ttl))
                 .await
                 .map_err(|e| db_error("renew idempotency lock", e))
         })
@@ -1339,6 +1361,75 @@ mod tests {
         let store = DbIdempotencyStore::new(substrate.pool(), Duration::MAX);
         huge_ttl_round_trip(&store).await;
     }
+
+    /// `renew_lock` runs the holder's lock a full TTL from now, and nobody
+    /// else's. `set` reports a write that another owner's lock fenced out.
+    #[tokio::test]
+    async fn renew_lock_and_set_report_the_owner_fence() {
+        let substrate = SqliteSubstrate::with_migrations(&[&crate::migrate::FRAMEWORK_MIGRATIONS])
+            .expect("substrate");
+        let store = DbIdempotencyStore::new(substrate.pool(), Duration::from_secs(60));
+        renew_and_fence_round_trip(&store).await;
+    }
+}
+
+/// `renew_lock` runs the holder's lock a full TTL from now, and nobody else's;
+/// `set` reports a write another owner's lock fenced out. Shared by the
+/// `SQLite` and Postgres tests.
+#[cfg(test)]
+async fn renew_and_fence_round_trip(store: &DbIdempotencyStore) {
+    let record = || IdempotencyRecord {
+        status: 201,
+        headers: Vec::new(),
+        body: b"done".to_vec(),
+        metadata: Vec::new(),
+    };
+    assert!(
+        store
+            .try_lock("k", "a", Duration::from_secs(1))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .renew_lock("k", "b", Duration::from_secs(30))
+            .await
+            .unwrap(),
+        "only the holder renews"
+    );
+    let before = now_ms();
+    assert!(
+        store
+            .renew_lock("k", "a", Duration::from_secs(30))
+            .await
+            .unwrap()
+    );
+    let mut conn = store.conn().await.unwrap();
+    let until: i64 = keys::autumn_idempotency_keys
+        .filter(keys::storage_key.eq("k"))
+        .select(keys::locked_until_ms)
+        .first(&mut conn)
+        .await
+        .unwrap();
+    drop(conn);
+    assert!(
+        until >= before.saturating_add(30_000),
+        "the lock runs 30 s from the renewal"
+    );
+
+    assert!(
+        !store
+            .set("k", "b", record(), Vec::new(), Duration::from_secs(60))
+            .await
+            .unwrap(),
+        "another owner's live lock fences the write out"
+    );
+    assert!(
+        store
+            .set("k", "a", record(), Vec::new(), Duration::from_secs(60))
+            .await
+            .unwrap()
+    );
 }
 
 /// Lock, store and release `key` with a TTL past the millisecond range, then
@@ -1352,10 +1443,13 @@ async fn huge_ttl_round_trip(store: &DbIdempotencyStore) {
         metadata: Vec::new(),
     };
     assert!(store.try_lock("k", "a", Duration::MAX).await.unwrap());
-    store
-        .set("k", "a", record, Vec::new(), Duration::MAX)
-        .await
-        .unwrap();
+    assert!(
+        store
+            .set("k", "a", record, Vec::new(), Duration::MAX)
+            .await
+            .unwrap(),
+        "the holder's write is stored"
+    );
     store.unlock("k", "a").await.unwrap();
     let entry = store.get("k").await.unwrap();
     assert!(entry.is_some(), "the record replays");
@@ -1551,5 +1645,30 @@ mod pg_tests {
             .unwrap();
         let store = DbIdempotencyStore::new(pool, Duration::MAX);
         huge_ttl_round_trip(&store).await;
+    }
+    /// Postgres: `renew_lock` and the `set` fence, as in the `SQLite` test.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn pg_renew_lock_and_set_report_the_owner_fence() {
+        use diesel_async::SimpleAsyncConnection as _;
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+        use testcontainers::runners::AsyncRunner as _;
+        use testcontainers_modules::postgres::Postgres;
+
+        let container = Postgres::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+        let manager = AsyncDieselConnectionManager::<RuntimeConnection>::new(url);
+        let pool = Pool::builder(manager).max_size(4).build().unwrap();
+        pool.get()
+            .await
+            .unwrap()
+            .batch_execute(include_str!(
+                "../../migrations/20261005200000_create_idempotency_keys/up.sql"
+            ))
+            .await
+            .unwrap();
+        let store = DbIdempotencyStore::new(pool, Duration::from_secs(60));
+        renew_and_fence_round_trip(&store).await;
     }
 }

@@ -2,10 +2,12 @@
 
 - **Breaking:** `IdempotencyStore` is async ([migration guide](docs/migrations/next.md)).
   Each method returns an `IdempotencyFuture` and a `Result` (issue #3061). The
-  trait has four methods: `get`, `set(key, owner, …)`,
+  trait has four required methods: `get`, `set(key, owner, …)`,
   `try_lock(key, owner, ttl)` and `unlock(key, owner)`. `set` writes nothing
   while another owner holds a live lock on the key or has stored an unexpired
-  response for it. `try_get`, `try_set`, `try_lock_owned` and `unlock_owned`
+  response for it, and returns whether it stored. An optional
+  `renew_lock(key, owner, ttl)` renews the lock when the work before the
+  handler was slow; without it, such a request gets `409`. `try_get`, `try_set`, `try_lock_owned` and `unlock_owned`
   are removed. The Redis store does not call `block_in_place`, so it works on
   a current-thread runtime and does not hold a Tokio worker while it waits for
   Redis.

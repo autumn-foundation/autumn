@@ -608,6 +608,7 @@ where
             // Acquire the in-flight lock. A concurrent duplicate that loses the
             // race gets a 409 so it can never re-run the handler.
             let owner = Uuid::new_v4().to_string();
+            let lock_taken_at = crate::time::ambient_instant();
             let acquired = settings
                 .store
                 .try_lock(&key, &owner, settings.in_flight_ttl)
@@ -652,9 +653,47 @@ where
                 }
             }
 
+            if let Some(response) =
+                lapsed_lock_response(&settings, &key, &owner, lock_taken_at).await
+            {
+                return Ok(response);
+            }
+
             let response = inner.call(req).await?;
             Ok(cache_consumed_token_response(response, &settings, &key, &owner).await)
         })
+    }
+}
+
+/// The `409` for a submit whose lock lapsed before the handler ran, or `None`
+/// when the lock still covers the handler: renewed when the work since it was
+/// taken was slow (see `keep_lock_for_handler`). A renewal error fails closed.
+async fn lapsed_lock_response(
+    settings: &SubmitTokenSettings,
+    key: &str,
+    owner: &str,
+    taken_at: std::time::Instant,
+) -> Option<Response<Body>> {
+    use crate::idempotency::LockForHandler;
+    match crate::idempotency::keep_lock_for_handler(
+        settings.store.as_ref(),
+        key,
+        owner,
+        settings.in_flight_ttl,
+        taken_at,
+    )
+    .await
+    {
+        Ok(LockForHandler::Held | LockForHandler::Renewed) => None,
+        Ok(LockForHandler::Lost) => {
+            tracing::warn!("Submit-token lock lapsed before the handler ran; returning 409");
+            release_lock(&settings.store, key, owner).await;
+            Some(in_flight_conflict_response())
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "Submit-token lock renewal failed; failing closed");
+            Some(in_flight_conflict_response())
+        }
     }
 }
 
@@ -1472,7 +1511,7 @@ mod tests {
             _record: IdempotencyRecord,
             _body_hash: Vec<u8>,
             _ttl: Duration,
-        ) -> IdempotencyFuture<'a, ()> {
+        ) -> IdempotencyFuture<'a, bool> {
             Box::pin(async {
                 Err(IdempotencyStoreError::backend(
                     "simulated consumed-token persistence failure",
@@ -1729,7 +1768,7 @@ mod tests {
             record: IdempotencyRecord,
             body_hash: Vec<u8>,
             ttl: Duration,
-        ) -> IdempotencyFuture<'a, ()> {
+        ) -> IdempotencyFuture<'a, bool> {
             self.inner.set(key, owner, record, body_hash, ttl)
         }
 
@@ -1792,6 +1831,82 @@ mod tests {
             1,
             "the handler must not re-run when the consumed-token lookup fails"
         );
+    }
+
+    /// A store whose lookup after the lock is slow, and which cannot renew a
+    /// lock (the trait's default `renew_lock`).
+    struct SlowLookupNoRenewStore {
+        inner: MemoryIdempotencyStore,
+        lookups: AtomicUsize,
+    }
+
+    impl IdempotencyStore for SlowLookupNoRenewStore {
+        fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
+            let lookup = self.lookups.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if lookup == 1 {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                self.inner.get(key).await
+            })
+        }
+
+        fn set<'a>(
+            &'a self,
+            key: &'a str,
+            owner: &'a str,
+            record: IdempotencyRecord,
+            body_hash: Vec<u8>,
+            ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
+            self.inner.set(key, owner, record, body_hash, ttl)
+        }
+
+        fn try_lock<'a>(
+            &'a self,
+            key: &'a str,
+            owner: &'a str,
+            lock_ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
+            self.inner.try_lock(key, owner, lock_ttl)
+        }
+
+        fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
+            self.inner.unlock(key, owner)
+        }
+    }
+
+    /// A submit whose lookup after the lock used more than a tenth of the
+    /// in-flight TTL needs a renewed lock; a store that cannot renew answers
+    /// `409` instead of running the handler on a lock that may have lapsed.
+    #[tokio::test]
+    async fn slow_post_lock_lookup_without_renewal_does_not_run_the_handler() {
+        let store: Arc<dyn IdempotencyStore> = Arc::new(SlowLookupNoRenewStore {
+            inner: MemoryIdempotencyStore::new(Duration::from_secs(600)),
+            lookups: AtomicUsize::new(0),
+        });
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let config = SubmitTokenConfig {
+            in_flight_ttl_secs: 1,
+            ..default_config()
+        };
+        let app = Router::new()
+            .route(
+                "/submit",
+                post(move || {
+                    let count = count_inner.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        "created"
+                    }
+                }),
+            )
+            .layer(SubmitTokenLayer::new(store, &config));
+
+        let response = app.oneshot(urlencoded_post("tok-slow")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(count.load(Ordering::SeqCst), 0, "the handler must not run");
     }
 
     /// Finding J (preserve body read errors): when the request body stream
@@ -1877,7 +1992,7 @@ mod tests {
             record: IdempotencyRecord,
             body_hash: Vec<u8>,
             ttl: Duration,
-        ) -> IdempotencyFuture<'a, ()> {
+        ) -> IdempotencyFuture<'a, bool> {
             *self.set_ttl.lock().unwrap() = Some(ttl);
             self.inner.set(key, owner, record, body_hash, ttl)
         }
@@ -2086,7 +2201,7 @@ mod tests {
             record: IdempotencyRecord,
             body_hash: Vec<u8>,
             ttl: Duration,
-        ) -> IdempotencyFuture<'a, ()> {
+        ) -> IdempotencyFuture<'a, bool> {
             self.inner.set(key, owner, record, body_hash, ttl)
         }
 

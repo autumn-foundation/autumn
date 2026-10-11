@@ -11,7 +11,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use autumn_web::config::IdempotencyConfig;
-use autumn_web::idempotency::{IdempotencyLayer, IdempotencyStore as _, RedisIdempotencyStore};
+use autumn_web::idempotency::{
+    IdempotencyLayer, IdempotencyRecord, IdempotencyStore as _, RedisIdempotencyStore,
+};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use testcontainers::runners::AsyncRunner;
@@ -75,4 +77,27 @@ async fn redis_store_replays_on_a_current_thread_runtime() {
     assert!(!store.try_lock(&raw, "b", ttl).await.expect("lock"));
     store.unlock(&raw, "a").await.expect("unlock");
     assert!(store.try_lock(&raw, "b", ttl).await.expect("lock"));
+
+    // Only the holder renews, and its lock fences out another owner's write.
+    assert!(!store.renew_lock(&raw, "a", ttl).await.expect("renew"));
+    assert!(store.renew_lock(&raw, "b", ttl).await.expect("renew"));
+    let record = || IdempotencyRecord {
+        status: 201,
+        headers: Vec::new(),
+        body: b"done".to_vec(),
+        metadata: Vec::new(),
+    };
+    assert!(
+        !store
+            .set(&raw, "a", record(), Vec::new(), ttl)
+            .await
+            .expect("set"),
+        "b's lock fences out a's write"
+    );
+    assert!(
+        store
+            .set(&raw, "b", record(), Vec::new(), ttl)
+            .await
+            .expect("set")
+    );
 }

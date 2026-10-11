@@ -493,13 +493,16 @@ impl IdempotencyStore for MyStore {
         record: IdempotencyRecord,
         body_hash: Vec<u8>,
         ttl: Duration,
-    ) -> IdempotencyFuture<'a, ()> {
+    ) -> IdempotencyFuture<'a, bool> {
         Box::pin(async move { /* ... */ })
     }
     fn try_lock<'a>(&'a self, key: &'a str, owner: &'a str, ttl: Duration) -> IdempotencyFuture<'a, bool> {
         Box::pin(async move { /* ... */ })
     }
     fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
+        Box::pin(async move { /* ... */ })
+    }
+    fn renew_lock<'a>(&'a self, key: &'a str, owner: &'a str, ttl: Duration) -> IdempotencyFuture<'a, bool> {
         Box::pin(async move { /* ... */ })
     }
 }
@@ -514,6 +517,15 @@ impl IdempotencyStore for MyStore {
   holds a live lock on the key, or has stored a response for it that has not
   expired: a request that outlived its lock must not replace the newer
   request's response. Store the owner with the response to check this.
+- `set` returns `true` when it stored the response and `false` when another
+  owner fenced it out. A session rewrite that is fenced out fails closed
+  with `503`.
+- `renew_lock` is new and optional. It runs `owner`'s lock for `ttl` from now,
+  only while `owner` holds it. The middleware and submit tokens call it when
+  the work between taking the lock and running the handler used more than a
+  tenth of the in-flight TTL. Without it, the default returns `false`, and
+  such a request gets `409` instead of running the handler on a lock that
+  may have lapsed.
 - A direct call to a store method needs `.await`.
 
 **Automation:** `manual` - each method needs a new body and a new return

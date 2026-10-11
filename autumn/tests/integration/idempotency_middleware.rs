@@ -1312,7 +1312,7 @@ impl IdempotencyStore for SecondSetFailsStore {
         record: autumn_web::idempotency::IdempotencyRecord,
         body_hash: Vec<u8>,
         ttl: Duration,
-    ) -> autumn_web::idempotency::IdempotencyFuture<'a, ()> {
+    ) -> autumn_web::idempotency::IdempotencyFuture<'a, bool> {
         if self.sets.fetch_add(1, Ordering::SeqCst) == 1 {
             return Box::pin(async {
                 Err(IdempotencyStoreError::backend("forced alias write failure"))
@@ -2529,8 +2529,8 @@ impl autumn_web::idempotency::IdempotencyStore for FailingLookupStore {
         _record: autumn_web::idempotency::IdempotencyRecord,
         _body_hash: Vec<u8>,
         _ttl: Duration,
-    ) -> autumn_web::idempotency::IdempotencyFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
+    ) -> autumn_web::idempotency::IdempotencyFuture<'a, bool> {
+        Box::pin(async { Ok(true) })
     }
 
     fn try_lock<'a>(
@@ -2602,7 +2602,7 @@ impl autumn_web::idempotency::IdempotencyStore for FailingPersistenceStore {
         _record: autumn_web::idempotency::IdempotencyRecord,
         _body_hash: Vec<u8>,
         _ttl: Duration,
-    ) -> autumn_web::idempotency::IdempotencyFuture<'a, ()> {
+    ) -> autumn_web::idempotency::IdempotencyFuture<'a, bool> {
         Box::pin(async { Err(IdempotencyStoreError::backend("forced persistence failure")) })
     }
 
@@ -2686,8 +2686,8 @@ fn test_default_store_ttl_trait_impl() {
             _: IdempotencyRecord,
             _: Vec<u8>,
             _: Duration,
-        ) -> autumn_web::idempotency::IdempotencyFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
+        ) -> autumn_web::idempotency::IdempotencyFuture<'a, bool> {
+            Box::pin(async { Ok(true) })
         }
         fn try_lock<'a>(
             &'a self,

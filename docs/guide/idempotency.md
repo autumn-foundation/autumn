@@ -432,7 +432,7 @@ impl IdempotencyStore for MyStore {
     }
 
     /// Write nothing while another owner holds a live lock on `key`, or has
-    /// stored an unexpired response for it.
+    /// stored an unexpired response for it. `true` = stored.
     fn set<'a>(
         &'a self,
         key: &'a str,
@@ -440,7 +440,7 @@ impl IdempotencyStore for MyStore {
         record: IdempotencyRecord,
         body_hash: Vec<u8>,
         ttl: Duration,
-    ) -> IdempotencyFuture<'a, ()> {
+    ) -> IdempotencyFuture<'a, bool> {
         Box::pin(async move { /* ... */ })
     }
 
@@ -453,12 +453,25 @@ impl IdempotencyStore for MyStore {
     fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
         Box::pin(async move { /* ... */ })
     }
+
+    /// Optional. Run `owner`'s lock for `ttl` from now, only while `owner`
+    /// holds it. `true` = renewed.
+    fn renew_lock<'a>(&'a self, key: &'a str, owner: &'a str, ttl: Duration) -> IdempotencyFuture<'a, bool> {
+        Box::pin(async move { /* ... */ })
+    }
 }
 ```
 
 Return backend errors. Do not block the runtime thread. The middleware fails
-closed: a `get` or `set` error gives `503`, and a `try_lock` error gives
-`409`.
+closed: a `get` or `set` error gives `503`, and a `try_lock` or `renew_lock`
+error gives `409`.
+
+When the work between taking the lock and running the handler (the second
+lookup, the stale-cookie copy) uses more than a tenth of the in-flight TTL,
+the middleware renews the lock with `renew_lock`, so the handler starts with
+a full lock. A store that does not implement it returns `false` by default,
+and the request gets `409` rather than running on a lock that may have
+lapsed.
 
 Wire it into the layer and apply it to your router:
 
