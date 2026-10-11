@@ -1741,6 +1741,18 @@ fn safe_url(raw: &str, link: bool) -> Option<String> {
             return None;
         }
     }
+    Some(encode_destination(&url))
+}
+
+/// `url` as a Markdown link destination: percent-encoded and with
+/// entity-shaped `&` escaped, so it reads back as written. It checks no
+/// scheme; use it for URLs Autumn builds itself.
+pub(super) fn link_destination(url: &str) -> String {
+    escape_entity_like(&encode_destination(url))
+}
+
+/// Percent-encode what would end or break a Markdown link destination.
+fn encode_destination(url: &str) -> String {
     let mut out = String::with_capacity(url.len());
     for c in url.chars() {
         match c {
@@ -1760,7 +1772,7 @@ fn safe_url(raw: &str, link: bool) -> Option<String> {
             c => out.push(c),
         }
     }
-    Some(out)
+    out
 }
 
 /// Escape `&` where it starts text a renderer would read as an entity

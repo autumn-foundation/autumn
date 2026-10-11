@@ -415,7 +415,9 @@ pub fn prefers_markdown(headers: &HeaderMap) -> bool {
             let media = parts.next().unwrap_or("").trim();
             let q = accept_weight(parts);
             if media.eq_ignore_ascii_case("text/markdown") {
-                markdown = markdown.max(q);
+                if markdown_params_fit(range.split(';').skip(1)) {
+                    markdown = markdown.max(q);
+                }
                 continue;
             }
             let specificity = if media.eq_ignore_ascii_case("text/html") {
@@ -434,6 +436,29 @@ pub fn prefers_markdown(headers: &HeaderMap) -> bool {
     }
     // Markdown must be named: `*/*` alone still gets HTML.
     markdown > 0.0 && markdown >= html.1
+}
+
+/// `true` when the parameters of a `text/markdown` range (those before
+/// `q`) fit what this layer sends: UTF-8 GitHub Flavored Markdown. A range
+/// that asks for another `charset` or `variant` (RFC 7763), or names a
+/// parameter this layer does not know, does not match.
+fn markdown_params_fit<'a>(params: impl Iterator<Item = &'a str>) -> bool {
+    for param in params.filter(|p| !p.trim().is_empty()) {
+        let Some((key, value)) = param.split_once('=') else {
+            return false;
+        };
+        let key = key.trim();
+        if key.eq_ignore_ascii_case("q") {
+            return true;
+        }
+        let value = value.trim().trim_matches('"');
+        let fits = (key.eq_ignore_ascii_case("charset") && value.eq_ignore_ascii_case("utf-8"))
+            || (key.eq_ignore_ascii_case("variant") && value.eq_ignore_ascii_case("GFM"));
+        if !fits {
+            return false;
+        }
+    }
+    true
 }
 
 /// The `q` weight of one media range (RFC 9110 §12.4.2). A missing `q` is
@@ -724,6 +749,18 @@ mod tests {
         assert!(!prefers_markdown(&accept("text/markdown;q=0.5, */*")));
         assert!(!prefers_markdown(&accept("text/markdown;q=0.5, text/*")));
         assert!(prefers_markdown(&accept("text/markdown, */*;q=0.8")));
+        // Media parameters restrict the match: this layer sends UTF-8 GFM.
+        assert!(!prefers_markdown(&accept(
+            "text/markdown; charset=iso-8859-1, text/html;q=0.5"
+        )));
+        assert!(!prefers_markdown(&accept(
+            "text/markdown;variant=CommonMark"
+        )));
+        assert!(!prefers_markdown(&accept("text/markdown;level=1")));
+        assert!(prefers_markdown(&accept(
+            "text/markdown; charset=\"UTF-8\"; variant=gfm; q=0.9, text/html;q=0.5"
+        )));
+        assert!(prefers_markdown(&accept("text/markdown;")));
         assert!(prefers_markdown(&accept(
             "text/markdown;Q=0.9, text/html;q=0.5"
         )));

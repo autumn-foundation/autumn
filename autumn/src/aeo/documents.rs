@@ -611,6 +611,8 @@ fn llms_txt(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
     // Titles and descriptions are text: Markdown in them must not make a
     // link or emphasis of its own.
     let text = |s: &str| super::markdown::escape_inline(&one_line(s));
+    // A route path may hold `)` or a space, which would end the link.
+    let dest = |path: &str| super::markdown::link_destination(&origin.url(path));
     let mut out = format!("# {}\n", text(&display_name(facts, origin)));
     if let Some(d) = facts
         .description
@@ -625,7 +627,7 @@ fn llms_txt(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
     if !facts.pages.is_empty() {
         out.push_str("\n## Pages\n\n");
         for page in &facts.pages {
-            let _ = write!(out, "- [{}]({})", text(&page.title), origin.url(&page.path));
+            let _ = write!(out, "- [{}]({})", text(&page.title), dest(&page.path));
             if let Some(d) = page.description.as_deref().filter(|d| !d.trim().is_empty()) {
                 let _ = write!(out, ": {}", text(d));
             }
@@ -637,47 +639,43 @@ fn llms_txt(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
         let _ = writeln!(
             out,
             "- [MCP server]({}): Streamable HTTP endpoint.",
-            origin.url(&mcp.path)
+            dest(&mcp.path)
         );
     }
     if has_api(facts) {
         let _ = writeln!(
             out,
             "- [API catalog]({}): RFC 9727 list of APIs.",
-            origin.url(API_CATALOG_PATH)
+            dest(API_CATALOG_PATH)
         );
     }
     if let Some(api) = &facts.openapi {
         let _ = writeln!(
             out,
             "- [OpenAPI]({}): API description.",
-            origin.url(&api.json_path)
+            dest(&api.json_path)
         );
     }
     if !all_skills(facts, origin).is_empty() {
         let _ = writeln!(
             out,
             "- [Agent skills]({}): skills for this site.",
-            origin.url(SKILLS_INDEX_PATH)
+            dest(SKILLS_INDEX_PATH)
         );
     }
     if auth_md_applies(facts, origin) {
         let _ = writeln!(
             out,
             "- [auth.md]({}): how agents get credentials.",
-            origin.url(AUTH_MD_PATH)
+            dest(AUTH_MD_PATH)
         );
     }
     let _ = writeln!(
         out,
         "- [Resource manifest]({}): ARD list of agent resources.",
-        origin.url(super::AI_CATALOG_PATH)
+        dest(super::AI_CATALOG_PATH)
     );
-    let _ = writeln!(
-        out,
-        "- [Sitemap]({}): all pages.",
-        origin.url("/sitemap.xml")
-    );
+    let _ = writeln!(out, "- [Sitemap]({}): all pages.", dest("/sitemap.xml"));
     Some(Document {
         content_type: "text/plain; charset=utf-8",
         headers: Vec::new(),
@@ -1929,6 +1927,19 @@ mod tests {
         assert!(
             doc.body
                 .contains(r"- [Docs\](https://evil.example) \[More](https://shop.example.com/"),
+            "{}",
+            doc.body
+        );
+    }
+
+    #[test]
+    fn llms_txt_links_reach_every_route() {
+        let mut facts = api_site();
+        facts.pages[0].path = "/docs)v2 x".to_owned();
+        let doc = render(&facts, &origin(), LLMS_TXT_PATH).unwrap();
+        assert!(
+            doc.body
+                .contains("](https://shop.example.com/docs%29v2%20x)"),
             "{}",
             doc.body
         );
