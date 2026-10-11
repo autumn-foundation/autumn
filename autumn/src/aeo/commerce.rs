@@ -901,6 +901,75 @@ impl PricedRoutes {
     }
 }
 
+/// Lets a payment client's request to an x402-priced route past CSRF.
+///
+/// It sits outside the CSRF layer and marks a request to a priced x402
+/// route that either carries no `Cookie` (no ambient credential to forge;
+/// x402 answers it `402`) or carries a `PAYMENT-SIGNATURE` header (a custom
+/// header a cross-site page cannot send without passing CORS). Without the
+/// mark, CSRF answers every priced `POST` from a payment client `403` before
+/// x402 can challenge or verify it. A browser request with cookies and no
+/// payment header still needs its CSRF token.
+#[derive(Clone)]
+pub(crate) struct X402CsrfLayer {
+    priced: std::sync::Arc<PricedRoutes>,
+}
+
+impl X402CsrfLayer {
+    /// The layer, or `None` when no x402 route is priced.
+    #[must_use]
+    pub(crate) fn from_config(config: &crate::config::AutumnConfig) -> Option<Self> {
+        Some(Self {
+            priced: std::sync::Arc::new(PricedRoutes::from_config(config)?),
+        })
+    }
+}
+
+impl<S> tower::Layer<S> for X402CsrfLayer {
+    type Service = X402CsrfService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        X402CsrfService {
+            inner,
+            priced: std::sync::Arc::clone(&self.priced),
+        }
+    }
+}
+
+/// Service of [`X402CsrfLayer`].
+#[derive(Clone)]
+pub(crate) struct X402CsrfService<S> {
+    inner: S,
+    priced: std::sync::Arc<PricedRoutes>,
+}
+
+impl<S> tower::Service<axum::http::Request<axum::body::Body>> for X402CsrfService<S>
+where
+    S: tower::Service<axum::http::Request<axum::body::Body>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: axum::http::Request<axum::body::Body>) -> Self::Future {
+        let headers = req.headers();
+        let not_forgeable = !headers.contains_key(axum::http::header::COOKIE)
+            || headers.contains_key("payment-signature");
+        if not_forgeable && self.priced.route_for(&req).is_some() {
+            req.extensions_mut()
+                .insert(crate::security::csrf::CsrfNotApplicable);
+        }
+        self.inner.call(req)
+    }
+}
+
 #[cfg(feature = "http-client")]
 impl X402Layer {
     /// The layer for `[aeo.x402]` and `[[aeo.paid_routes]]`, or `None` when

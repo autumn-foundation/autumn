@@ -1212,6 +1212,45 @@ mod commerce {
         assert_eq!(again["error"], "payment already used");
     }
 
+    #[post("/api/order")]
+    async fn order() -> Json<serde_json::Value> {
+        Json(json!({ "ordered": true }))
+    }
+
+    #[tokio::test]
+    async fn csrf_lets_a_payment_client_reach_x402() {
+        let mut config = paid_config();
+        config.security.csrf.enabled = true;
+        config.aeo.paid_routes = vec![PaidRoute::new("POST", "/api/order", "500")];
+        let mut app = TestApp::new().config(config).routes(routes![order]);
+        let _verify = app
+            .http_mock("x402")
+            .post("/verify")
+            .respond_with(200, json!({ "isValid": true }));
+        let _settle = app
+            .http_mock("x402")
+            .post("/settle")
+            .respond_with(200, json!({ "success": true, "transaction": "0xtx" }));
+        let c = app.build();
+        // A payment client sends no cookie: it gets the challenge, not 403.
+        let challenge = c.post("/api/order").send().await;
+        assert_eq!(challenge.status, 402);
+        let required = decode_header(challenge.header("payment-required").unwrap()).unwrap();
+        let paid = c
+            .post("/api/order")
+            .header("payment-signature", &signature(&required["accepts"][0]))
+            .send()
+            .await;
+        paid.assert_ok();
+        // A browser request carries cookies, and still needs its CSRF token.
+        let browser = c
+            .post("/api/order")
+            .header("cookie", "session=abc")
+            .send()
+            .await;
+        assert_eq!(browser.status, 403);
+    }
+
     #[tokio::test]
     async fn an_unsafe_method_settles_before_its_handler_runs() {
         let mut config = paid_config();

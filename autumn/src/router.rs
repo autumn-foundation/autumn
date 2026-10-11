@@ -5527,7 +5527,21 @@ fn apply_middleware(
         // that declares no `required_paths`.
         tower::util::option_layer(build_client_cert_requirement_layer(config)),
         tower::util::option_layer(build_bot_protection_layer(config)),
-        tower::util::option_layer(build_csrf_layer(config, signing_keys_opt.clone())),
+        (
+            // Outer to CSRF: a request to an x402-priced route with no
+            // cookie, or with a `PAYMENT-SIGNATURE` header, cannot be forged
+            // cross-site and is gated by x402 itself, so a payment client's
+            // `POST` reaches x402 instead of a CSRF `403`.
+            tower::util::option_layer(
+                config
+                    .security
+                    .csrf
+                    .enabled
+                    .then(|| crate::aeo::commerce::X402CsrfLayer::from_config(config))
+                    .flatten(),
+            ),
+            tower::util::option_layer(build_csrf_layer(config, signing_keys_opt.clone())),
+        ),
         // Inner to the CSRF layer so CSRF is validated first on the request
         // path; a replayed `_submit_token` is still short-circuited even when
         // the request carries a valid `_csrf` (issue #1360, AC #4).

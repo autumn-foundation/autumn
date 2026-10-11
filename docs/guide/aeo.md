@@ -353,6 +353,13 @@ method, or a `path` without a leading `/`, or with a space, a `?` query, or a
 `#` fragment) stops the app at startup, and so does a route priced for both
 x402 and MPP.
 
+CSRF protection (on in the production profile) does not stand in a payment
+client's way. A request to a priced x402 route skips the CSRF check when it
+carries no `Cookie` (it has no session to forge, and gets the `402`) or
+carries a `PAYMENT-SIGNATURE` header (which a cross-site page cannot send
+without passing CORS). x402 runs no handler without that header. A browser
+request with cookies and no payment header still needs its CSRF token.
+
 ```toml
 [aeo.x402]
 facilitator_url = "https://x402.org/facilitator"
