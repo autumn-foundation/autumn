@@ -126,6 +126,8 @@ pub struct Session {
 struct SessionInner {
     id: String,
     old_id: Option<String>,
+    /// The id just before the latest rotation. Equals `old_id` after one.
+    previous_id: Option<String>,
     data: HashMap<String, String>,
     cookie_backed: bool,
     dirty: bool,
@@ -162,6 +164,7 @@ impl Session {
             inner: Arc::new(RwLock::new(SessionInner {
                 id,
                 old_id: None,
+                previous_id: None,
                 data,
                 cookie_backed,
                 dirty: false,
@@ -253,13 +256,22 @@ impl Session {
         if inner.old_id.is_none() {
             inner.old_id = Some(inner.id.clone());
         }
-        inner.id = new_id;
+        inner.previous_id = Some(std::mem::replace(&mut inner.id, new_id));
         inner.dirty = true;
     }
 
-    /// The id this request started with, when the id was rotated since.
-    pub(crate) async fn rotated_from(&self) -> Option<String> {
-        self.inner.read().await.old_id.clone()
+    /// The ids this request held before the current one: the id it started
+    /// with, and the id just before the latest rotation. Empty when the id was
+    /// not rotated.
+    pub(crate) async fn earlier_ids(&self) -> Vec<String> {
+        let inner = self.inner.read().await;
+        let mut ids: Vec<String> = inner.old_id.iter().cloned().collect();
+        if let Some(previous) = &inner.previous_id
+            && !ids.contains(previous)
+        {
+            ids.push(previous.clone());
+        }
+        ids
     }
 
     /// Destroy the session entirely. A new session ID will be issued

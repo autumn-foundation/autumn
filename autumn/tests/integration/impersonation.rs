@@ -1132,6 +1132,16 @@ async fn rotate_and_rebind(State(state): State<AppState>, session: Session) -> S
     impersonation::rebind(&state, &session).await.to_string()
 }
 
+/// Two trusted rotations in one request, each followed by its own rebind.
+#[autumn_web::post("/rotate-and-rebind-twice")]
+async fn rotate_and_rebind_twice(State(state): State<AppState>, session: Session) -> String {
+    session.rotate_id().await;
+    let first = impersonation::rebind(&state, &session).await;
+    session.rotate_id().await;
+    let second = impersonation::rebind(&state, &session).await;
+    format!("{first},{second}")
+}
+
 /// A login of the target on the same browser, then a rebind attempt.
 #[autumn_web::post("/login-as-the-target-and-rebind")]
 async fn login_as_the_target_and_rebind(State(state): State<AppState>, session: Session) -> String {
@@ -1150,6 +1160,7 @@ fn rotation_app(rotations: &Rotations) -> TestClientAlias {
             whoami,
             rotate_keep_identity,
             rotate_and_rebind,
+            rotate_and_rebind_twice,
             login_as_the_target_and_rebind
         ])
         .state_initializer(move |state| {
@@ -1248,6 +1259,27 @@ async fn rebind_keeps_the_record_across_a_same_identity_rotation() {
     assert_eq!(
         who(&client).await,
         "user=admin-1;impersonator=-;actor=admin-1"
+    );
+}
+
+#[tokio::test]
+async fn rebind_survives_two_rotations_in_one_request() {
+    let rotations = Rotations::default();
+    let client = rotation_app(&rotations);
+    client.post("/login-admin").send().await.assert_ok();
+    client
+        .post("/impersonate")
+        .form("user_id=user-9")
+        .send()
+        .await
+        .assert_ok();
+
+    let result = client.post("/rotate-and-rebind-twice").send().await.text();
+    assert_eq!(result, "true,true", "each rebind follows the latest id");
+
+    assert_eq!(
+        who(&client).await,
+        "user=user-9;impersonator=admin-1;actor=admin-1"
     );
 }
 

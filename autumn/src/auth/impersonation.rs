@@ -493,9 +493,9 @@ pub async fn clear(session: &Session) {
 /// rotation policy, not a login — call this right after `rotate_id()` to move
 /// the binding to the new id. Returns `true` when the record was kept.
 ///
-/// It refuses (returns `false`) unless the record was bound to the id this
-/// request started with and the session still resolves as the impersonated
-/// user. A record already retired by an earlier rotation is never revived.
+/// It refuses (returns `false`) unless the record was bound to an id this
+/// request held before (the one it started with, or the one before the latest
+/// rotation) and the session still resolves as the impersonated user. A record already retired by an earlier rotation is never revived.
 ///
 /// Do **not** call it from a login flow. A login by the impersonated user
 /// matches the same checks, and the rebind would hand them the record. Login
@@ -510,13 +510,11 @@ pub async fn clear(session: &Session) {
 /// }
 /// ```
 pub async fn rebind(state: &AppState, session: &Session) -> bool {
-    let Some(previous_id) = session.rotated_from().await else {
-        return false;
-    };
+    let earlier_ids = session.earlier_ids().await;
     let bound = session.get(IMPERSONATION_SESSION_ID_KEY).await;
     let impersonated = session.get(IMPERSONATED_SESSION_KEY).await;
     let effective = session.get(state.auth_session_key()).await;
-    let still_live = bound.as_deref() == Some(previous_id.as_str())
+    let still_live = bound.is_some_and(|bound| earlier_ids.contains(&bound))
         && session.contains_key(IMPERSONATOR_SESSION_KEY).await
         && impersonated.is_some()
         && impersonated == effective;
