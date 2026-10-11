@@ -509,8 +509,8 @@ fn accept_refuses_a_path_the_scaffold_does_not_own() {
 #[test]
 fn a_workspace_member_is_not_seeded_with_files_the_workspace_root_owns() {
     // A crate-local `clippy.toml` SHADOWS the workspace's rather than adding to
-    // it, silently dropping its lints and MSRV pin; `.github/` only runs from
-    // the repository root. Seeding those into a member is a regression that
+    // it, silently dropping its lints and MSRV pin; workflows only run from
+    // the git root. Seeding those into a member is a regression that
     // looks like an upgrade.
     let (tmp, root) = new_project("member", &[]);
     fs::write(
