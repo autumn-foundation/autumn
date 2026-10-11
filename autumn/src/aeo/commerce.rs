@@ -1392,6 +1392,7 @@ where
                 axum::http::header::CACHE_CONTROL,
                 axum::http::HeaderValue::from_static("private, no-store"),
             );
+            expose_payment_headers(headers);
             Ok(res)
         }))
     }
@@ -1518,7 +1519,28 @@ fn payment_required(
         axum::http::header::CACHE_CONTROL,
         axum::http::HeaderValue::from_static("no-store"),
     );
+    expose_payment_headers(headers);
     res
+}
+
+/// Let a cross-origin browser client read the x402 challenge and receipt:
+/// CORS hides any response header it does not expose. Added to what the
+/// response already exposes. Without an allowed origin a browser reads none
+/// of the response, so this grants nothing on its own.
+pub(crate) fn expose_payment_headers(headers: &mut axum::http::HeaderMap) {
+    const EXPOSE: &str = "PAYMENT-REQUIRED, PAYMENT-RESPONSE";
+    let name = axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS;
+    let covered = headers.get_all(&name).iter().any(|v| {
+        v.to_str().is_ok_and(|v| {
+            v.split(',').any(|h| {
+                let h = h.trim();
+                h == "*" || h.eq_ignore_ascii_case("payment-response")
+            })
+        })
+    });
+    if !covered {
+        headers.append(name, axum::http::HeaderValue::from_static(EXPOSE));
+    }
 }
 
 #[cfg(feature = "http-client")]

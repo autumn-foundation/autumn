@@ -962,6 +962,11 @@ mod commerce {
             .await;
         assert_eq!(res.status, 402);
         assert_eq!(res.header("cache-control"), Some("no-store"));
+        // A cross-origin browser client can read the challenge.
+        assert_eq!(
+            res.header("access-control-expose-headers"),
+            Some("PAYMENT-REQUIRED, PAYMENT-RESPONSE")
+        );
         let required = decode_header(res.header("payment-required").unwrap()).unwrap();
         assert_eq!(required["x402Version"], 2);
         assert_eq!(required["accepts"][0]["amount"], "10000");
@@ -1132,6 +1137,10 @@ mod commerce {
             .await;
         res.assert_ok();
         assert!(res.text().contains("42"));
+        assert_eq!(
+            res.header("access-control-expose-headers"),
+            Some("PAYMENT-REQUIRED, PAYMENT-RESPONSE")
+        );
         let receipt = decode_header(res.header("payment-response").unwrap()).unwrap();
         assert_eq!(receipt["transaction"], "0xtx");
         verify.expect_called(1);

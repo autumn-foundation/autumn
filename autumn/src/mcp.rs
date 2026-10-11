@@ -77,11 +77,16 @@ const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// MCP Streamable-HTTP transport headers a browser client attaches to its
-/// JSON-RPC requests. They are always added to the `OPTIONS` preflight's
-/// `Access-Control-Allow-Headers` (on top of the app's configured list) so a
-/// default CORS config doesn't block the follow-up `POST`. See
+/// JSON-RPC requests, and the x402 `payment-signature` of a paid tool call
+/// (forwarded to the priced route). They are always added to the `OPTIONS`
+/// preflight's `Access-Control-Allow-Headers` (on top of the app's configured
+/// list) so a default CORS config doesn't block the follow-up `POST`. See
 /// <https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#protocol-version-header>.
-const MCP_REQUEST_HEADERS: &[&str] = &["mcp-protocol-version", "mcp-session-id"];
+const MCP_REQUEST_HEADERS: &[&str] = &[
+    "mcp-protocol-version",
+    "mcp-session-id",
+    "payment-signature",
+];
 
 /// Upper bound on a tool's buffered response body (10 MiB). MCP tool results
 /// are structured JSON; this guards the in-process dispatch path against a
@@ -2167,6 +2172,7 @@ fn apply_replayed(headers: &mut HeaderMap, replayed: Vec<(HeaderName, HeaderValu
             header::CACHE_CONTROL,
             HeaderValue::from_static("private, no-store"),
         );
+        crate::aeo::commerce::expose_payment_headers(headers);
     }
 }
 
@@ -4461,6 +4467,11 @@ mod tests {
         assert!(failure.is_some());
         assert_eq!(resp.headers()["payment-response"], "receipt");
         assert_eq!(resp.headers()[header::CACHE_CONTROL], "private, no-store");
+        // A cross-origin browser client can read the receipt.
+        assert_eq!(
+            resp.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS],
+            "PAYMENT-REQUIRED, PAYMENT-RESPONSE"
+        );
     }
 
     /// Codex review (P2): a paid tool result keeps x402's `no-store`, on the
@@ -4647,6 +4658,11 @@ mod tests {
         assert!(
             allow_headers.contains("mcp-protocol-version"),
             "allow-headers missing MCP-Protocol-Version: {allow_headers}"
+        );
+        // A paid tool call's retry carries the x402 payment.
+        assert!(
+            allow_headers.contains("payment-signature"),
+            "allow-headers missing Payment-Signature: {allow_headers}"
         );
 
         // Non-allowlisted origin → no CORS grant (browser will block the POST).

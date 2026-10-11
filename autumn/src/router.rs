@@ -1540,9 +1540,14 @@ fn build_aeo_site<O: AeoOpenApiFacts, M: AeoMcpFacts>(
     // is assumed to exist.
     let has_home = merged_routers || home.routed || home.scoped;
     // Only a `routes![...]` home is localized. A home from a scoped group or a
-    // merged router mounts outside the locale nests and answers at `/`.
+    // merged router mounts outside the locale nests and answers at `/`, next
+    // to any localized ones.
     let home_paths = if home.routed {
-        home_paths
+        let mut paths = home_paths;
+        if home.scoped && !paths.iter().any(|p| p == "/") {
+            paths.push("/".to_owned());
+        }
+        paths
     } else {
         vec!["/".to_owned()]
     };
@@ -10069,6 +10074,28 @@ mod tests {
             assert_eq!(
                 routed.facts.home_paths,
                 vec!["/en".to_owned(), "/fr".to_owned()]
+            );
+
+            // Codex review (P2): a scoped `/` home is reachable at `/` next to
+            // the localized ones, and is listed with them.
+            let scoped = crate::app::ScopedGroup {
+                prefix: "/".to_owned(),
+                routes: vec![simple_route("/", "scoped_home", false)],
+                source: crate::route_listing::RouteSource::User,
+                apply_layer: Box::new(|r| r),
+            };
+            let both = super::build_aeo_site::<(), ()>(
+                &config,
+                &test_state(),
+                &[simple_route("/", "home", false)],
+                &[scoped],
+                false,
+                None,
+                None,
+            );
+            assert_eq!(
+                both.facts.home_paths,
+                vec!["/en".to_owned(), "/fr".to_owned(), "/".to_owned()]
             );
         }
 
