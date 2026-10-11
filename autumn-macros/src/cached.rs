@@ -818,7 +818,7 @@ pub fn cached_impl_macro(
         )
         .to_compile_error();
     };
-    let target = autumn_macros_support::crate_path::current_target();
+    let target = autumn_macros_support::crate_path::current_target_path_segment();
     for item in &mut imp.items {
         let syn::ImplItem::Fn(method) = item else {
             continue;
@@ -842,7 +842,8 @@ fn is_type_path(text: &str) -> bool {
 
 /// Whether a path names this crate's `cached` macro.
 ///
-/// `target` is the resolved crate name, which may be renamed (`web::cached`).
+/// `target` is the resolved crate name as it is spelled in a path. It may be
+/// renamed (`web::cached`) or raw (`r#type::cached`).
 /// Another crate's `cached` macro (`memo::cached`) stays untouched.
 fn is_cached_path(path: &syn::Path, target: &str) -> bool {
     let names: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
@@ -1149,6 +1150,16 @@ mod tests {
             out.contains("# [autumn_web :: prelude :: cached (scope = \"P\")]"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn cached_impl_scopes_a_keyword_renamed_crate_path() {
+        let _target = autumn_macros_support::crate_path::set_target(Some("type"));
+        let out = scoped(
+            TokenStream::new(),
+            quote! { impl P { #[r#type::cached] fn f() {} } },
+        );
+        assert!(out.contains("scope = \"P\""), "{out}");
     }
 
     #[test]
