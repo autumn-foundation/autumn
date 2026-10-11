@@ -206,8 +206,8 @@ Some consequences worth knowing:
   `#[serde(default)]` on it. Run `ledger_verify` to rule out an edit. The ledger does not
   convert renamed fields or changed types yet.
 - A field added as `Option<T>` needs no attribute. An old snapshot without it
-  reads as `None`. `ledger_diff` across that change shows no change for the
-  field until a revision sets it.
+  reads as `None`. `ledger_diff` shows no change for that field until a
+  revision sets it. This does not hold with `skip_serializing_if`.
 
 ## Bitemporality
 

@@ -3893,10 +3893,10 @@ async fn a_revision_written_before_an_optional_field_existed_reconstructs() {
     assert_eq!(then.deleted_at, None);
 }
 
-/// A diff across a schema change is defined: the added field shows as a
-/// change from empty, not as an error (#2326).
+/// A diff across a schema change is defined. An absent `Option` field equals
+/// `null`. It is not a change and not an error (#2326).
 #[tokio::test]
-async fn a_diff_across_a_schema_boundary_names_the_added_field() {
+async fn a_diff_across_a_schema_boundary_ignores_an_absent_option() {
     let pool = boot_pool("lg_schema_diff").await;
     let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
     let id = write_three_revisions(&repo).await;
