@@ -202,20 +202,29 @@ impl HtmlCharset {
         let ascii = content_type.split(';').skip(1).any(|param| {
             param.split_once('=').is_some_and(|(name, value)| {
                 name.trim().eq_ignore_ascii_case("charset")
-                    && value
-                        .trim()
-                        .trim_matches('"')
-                        .eq_ignore_ascii_case("us-ascii")
+                    && Self::label(value) == Some(Self::Ascii)
             })
         });
         if ascii { Self::Ascii } else { Self::Utf8 }
     }
 
-    /// The `charset` value a range must name to cover this HTML.
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Utf8 => "utf-8",
-            Self::Ascii => "us-ascii",
+    /// The charset a `charset` value names, by its common labels (the
+    /// WHATWG Encoding Standard's for UTF-8; IANA's for US-ASCII). `None`
+    /// for any other charset.
+    fn label(value: &str) -> Option<Self> {
+        let value = value.trim().trim_matches('"');
+        if ["utf-8", "utf8", "unicode-1-1-utf-8"]
+            .iter()
+            .any(|l| value.eq_ignore_ascii_case(l))
+        {
+            Some(Self::Utf8)
+        } else if ["us-ascii", "ascii", "iso646-us", "ansi_x3.4-1968"]
+            .iter()
+            .any(|l| value.eq_ignore_ascii_case(l))
+        {
+            Some(Self::Ascii)
+        } else {
+            None
         }
     }
 }
@@ -524,9 +533,9 @@ fn prefers_markdown_over(headers: &HeaderMap, html_charset: HtmlCharset) -> bool
             // A range whose parameters the representation does not fit
             // (another `charset` or `variant`) does not cover it.
             let charset = if markdown_range {
-                "utf-8"
+                HtmlCharset::Utf8
             } else {
-                html_charset.name()
+                html_charset
             };
             let Some(params) = fitting_params(range.split(';').skip(1), markdown_range, charset)
             else {
@@ -550,7 +559,7 @@ fn prefers_markdown_over(headers: &HeaderMap, html_charset: HtmlCharset) -> bool
 fn fitting_params<'a>(
     params: impl Iterator<Item = &'a str>,
     variant_ok: bool,
-    charset: &str,
+    charset: HtmlCharset,
 ) -> Option<usize> {
     let mut count = 0;
     for param in params.filter(|p| !p.trim().is_empty()) {
@@ -560,7 +569,8 @@ fn fitting_params<'a>(
             return Some(count);
         }
         let value = value.trim().trim_matches('"');
-        let fits = (key.eq_ignore_ascii_case("charset") && value.eq_ignore_ascii_case(charset))
+        let fits = (key.eq_ignore_ascii_case("charset")
+            && HtmlCharset::label(value) == Some(charset))
             || (variant_ok
                 && key.eq_ignore_ascii_case("variant")
                 && value.eq_ignore_ascii_case("GFM"));
@@ -620,12 +630,7 @@ fn utf8_html(content_type: &str) -> bool {
         let Some((name, value)) = param.split_once('=') else {
             return true;
         };
-        !name.trim().eq_ignore_ascii_case("charset") || {
-            let charset = value.trim().trim_matches('"');
-            ["utf-8", "utf8", "us-ascii"]
-                .iter()
-                .any(|c| charset.eq_ignore_ascii_case(c))
-        }
+        !name.trim().eq_ignore_ascii_case("charset") || HtmlCharset::label(value).is_some()
     })
 }
 
@@ -936,6 +941,22 @@ mod tests {
 
         let plain = Choice::of(&accept("text/html, text/markdown;q=0.5"));
         assert!(!plain.possible());
+    }
+
+    /// Codex review (P2): equivalent labels name the same charset.
+    #[test]
+    fn charset_labels_are_matched_by_what_they_name() {
+        assert!(utf8(&accept("text/markdown;charset=utf8, text/html;q=0")));
+        assert!(utf8(&accept(
+            "text/markdown;charset=\"UTF8\", text/html;q=0.5"
+        )));
+        let choice = Choice::of(&accept("text/html;charset=utf-8, text/markdown;q=0.5"));
+        assert!(!choice.for_response("text/html; charset=utf8"));
+        let choice = Choice::of(&accept("text/html;charset=ascii, text/markdown;q=0.5"));
+        assert!(!choice.for_response("text/html; charset=us-ascii"));
+        assert!(choice.for_response("text/html"));
+        assert!(utf8_html("text/html; charset=ASCII"));
+        assert!(!utf8_html("text/html; charset=latin1"));
     }
 
     #[test]

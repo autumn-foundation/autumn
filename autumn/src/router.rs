@@ -12626,6 +12626,13 @@ enabled = true
             "{:?}",
             head.headers()
         );
+        // Codex review (P2): the Markdown sets the length; no body is sent.
+        let get_len = get.headers()[http::header::CONTENT_LENGTH].clone();
+        assert_eq!(head.headers()[http::header::CONTENT_LENGTH], get_len);
+        let body = axum::body::to_bytes(head.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty(), "{body:?}");
     }
 
     /// A manifest-backed HTML page is gzip-compressed when the client accepts
