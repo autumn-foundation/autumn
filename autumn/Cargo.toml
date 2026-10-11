@@ -1452,3 +1452,11 @@ workspace = true
 [[test]]
 name = "tls_client_auth_metrics"
 path = "tests/tls_client_auth_metrics.rs"
+
+# Ledger profiling harness for the data-capsule export/import statement counts
+# (`docs/perf/capsule-statements/`). `#[ignore]`d and env-gated
+# (`LEDGER_PG_URL`); its own binary so the Docker `--ignored` sweep of the
+# consolidated binary never runs it.
+[[test]]
+name = "ledger_capsule_profile"
+path = "tests/ledger_capsule_profile.rs"
