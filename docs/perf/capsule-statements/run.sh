@@ -15,7 +15,13 @@ snap() { # phase
 }
 # The test blocks at every mark until it is acknowledged, so a reset or
 # snapshot always completes before the next phase issues a statement.
-wait_mark() { until grep -q "LEDGER-MARK $1" "$log"; do sleep 0.1; done; }
+wait_mark() {
+  until grep -q "LEDGER-MARK $1" "$log"; do
+    # The test process died (compile or setup error): report it, do not spin.
+    kill -0 "$pid" 2>/dev/null || { wait "$pid"; echo "profiler exited before mark $1; see $log" >&2; exit 1; }
+    sleep 0.1
+  done
+}
 ack() { touch "$gate/$1.ack"; }
 wait_mark export-start; P -c "SELECT pg_stat_statements_reset()" >/dev/null; ack export-start
 wait_mark export-end; snap export; P -c "SELECT pg_stat_statements_reset()" >/dev/null; ack export-end
