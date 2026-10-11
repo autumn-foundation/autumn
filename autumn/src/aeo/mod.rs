@@ -414,6 +414,14 @@ impl AeoSite {
             None => None,
         };
         // One `Link` value per home page: each names its own Markdown copy.
+        // Its targets sit below the path of `[seo] base_url`, if any.
+        let base_path = documents::Origin::resolve(config.seo.base_url.as_deref(), None)
+            .configured
+            .then(|| config.seo.base_url.as_deref())
+            .flatten()
+            .and_then(|base| url::Url::parse(base.trim()).ok())
+            .map(|url| url.path().trim_end_matches('/').to_owned())
+            .unwrap_or_default();
         let home_links: Vec<(String, HeaderValue)> = if aeo.link_headers && !facts.no_home {
             let homes = if facts.home_paths.is_empty() {
                 vec!["/".to_owned()]
@@ -423,7 +431,7 @@ impl AeoSite {
             homes
                 .into_iter()
                 .filter_map(|home| {
-                    let link = documents::homepage_link_header(&facts, &home);
+                    let link = documents::homepage_link_header(&facts, &home, &base_path);
                     HeaderValue::from_str(&link).ok().map(|v| (home, v))
                 })
                 .collect()

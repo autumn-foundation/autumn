@@ -977,6 +977,29 @@ mod commerce {
         assert!(required["resource"].get("mimeType").is_none(), "{required}");
     }
 
+    /// Codex review (P2): a cross-origin browser's paid retry carries
+    /// `PAYMENT-SIGNATURE`; the preflight allows it.
+    #[tokio::test]
+    async fn a_browser_may_send_the_payment_header_cross_origin() {
+        let mut config = paid_config();
+        config.cors.allowed_origins = vec!["https://app.example".to_owned()];
+        let res = TestApp::new()
+            .config(config)
+            .routes(routes![api])
+            .build()
+            .options("/api")
+            .header("origin", "https://app.example")
+            .header("access-control-request-method", "GET")
+            .header("access-control-request-headers", "payment-signature")
+            .send()
+            .await;
+        let allowed = res
+            .header("access-control-allow-headers")
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert!(allowed.contains("payment-signature"), "{allowed:?}");
+    }
+
     #[tokio::test]
     async fn an_incomplete_x402_config_fails_closed() {
         let mut config = paid_config();

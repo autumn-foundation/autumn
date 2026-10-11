@@ -588,45 +588,56 @@ fn render_inner(facts: &SiteFacts, origin: &Origin, path: &str, now: u64) -> Opt
 
 /// The homepage `Link` header value. It always holds a relation that
 /// scanners count (`describedby`).
+///
+/// `base_path` is the path of `[seo] base_url` (`/shop` for
+/// `https://example.com/shop`, else empty): an app served below a prefix
+/// links its resources there, as the documents do.
 #[must_use]
-pub fn homepage_link_header(facts: &SiteFacts, home: &str) -> String {
+pub fn homepage_link_header(facts: &SiteFacts, home: &str, base_path: &str) -> String {
+    let at = |path: &str| format!("{base_path}{path}");
     let mut links = Vec::new();
     if has_api(facts) {
         links.push(format!(
-            "<{API_CATALOG_PATH}>; rel=\"api-catalog\"; type=\"application/linkset+json\""
+            "<{}>; rel=\"api-catalog\"; type=\"application/linkset+json\"",
+            at(API_CATALOG_PATH)
         ));
     }
     if let Some(api) = &facts.openapi {
         links.push(format!(
             "<{}>; rel=\"service-desc\"; type=\"application/vnd.oai.openapi+json\"",
-            api.json_path
+            at(&api.json_path)
         ));
         if let Some(docs) = &api.docs_path {
-            links.push(format!("<{docs}>; rel=\"service-doc\"; type=\"text/html\""));
+            links.push(format!(
+                "<{}>; rel=\"service-doc\"; type=\"text/html\"",
+                at(docs)
+            ));
         }
     }
-    if facts.llms_txt {
-        links.push(format!(
-            "<{LLMS_TXT_PATH}>; rel=\"describedby\"; type=\"text/plain\""
-        ));
+    let describedby = if facts.llms_txt {
+        (LLMS_TXT_PATH, "text/plain")
     } else {
-        links.push(format!(
-            "<{}>; rel=\"describedby\"; type=\"application/ai-catalog+json\"",
-            super::AI_CATALOG_PATH
-        ));
-    }
+        (super::AI_CATALOG_PATH, "application/ai-catalog+json")
+    };
     links.push(format!(
-        "<{}>; rel=\"ai-catalog\"; type=\"application/ai-catalog+json\"",
-        super::AI_CATALOG_PATH
+        "<{}>; rel=\"describedby\"; type=\"{}\"",
+        at(describedby.0),
+        describedby.1
     ));
     links.push(format!(
-        "<{ARD_PATH}>; rel=\"ard\"; type=\"application/ai-catalog+json\""
+        "<{}>; rel=\"ai-catalog\"; type=\"application/ai-catalog+json\"",
+        at(super::AI_CATALOG_PATH)
+    ));
+    links.push(format!(
+        "<{}>; rel=\"ard\"; type=\"application/ai-catalog+json\"",
+        at(ARD_PATH)
     ));
     if facts.markdown {
         // The Markdown copy of this page: `/`, or `/{locale}` on a localized
         // site.
         links.push(format!(
-            "<{home}>; rel=\"alternate\"; type=\"text/markdown\""
+            "<{}>; rel=\"alternate\"; type=\"text/markdown\"",
+            at(home)
         ));
     }
     links.join(", ")
@@ -2550,7 +2561,7 @@ mod tests {
     fn link_header_keeps_a_counted_relation_without_llms_txt() {
         let mut facts = content_site();
         facts.llms_txt = false;
-        let link = homepage_link_header(&facts, "/");
+        let link = homepage_link_header(&facts, "/", "");
         assert!(
             link.contains("</.well-known/ai-catalog.json>; rel=\"describedby\""),
             "{link}"
@@ -2624,7 +2635,7 @@ mod tests {
 
     #[test]
     fn homepage_link_header_lists_agent_relations() {
-        let link = homepage_link_header(&api_site(), "/");
+        let link = homepage_link_header(&api_site(), "/", "");
         for want in [
             "</.well-known/api-catalog>; rel=\"api-catalog\"",
             "</openapi.json>; rel=\"service-desc\"",
@@ -2635,14 +2646,25 @@ mod tests {
         ] {
             assert!(link.contains(want), "missing {want}: {link}");
         }
-        let content = homepage_link_header(&content_site(), "/");
+        let content = homepage_link_header(&content_site(), "/", "");
         assert!(content.contains("rel=\"describedby\""), "{content}");
         assert!(!content.contains("api-catalog"), "{content}");
-        let localized = homepage_link_header(&content_site(), "/fr");
+        let localized = homepage_link_header(&content_site(), "/fr", "");
         assert!(
             localized.contains("</fr>; rel=\"alternate\"; type=\"text/markdown\""),
             "{localized}"
         );
+
+        // Codex review (P2): an app below a `base_url` prefix links there.
+        let shop = homepage_link_header(&api_site(), "/", "/shop");
+        for want in [
+            "</shop/.well-known/api-catalog>; rel=\"api-catalog\"",
+            "</shop/openapi.json>; rel=\"service-desc\"",
+            "</shop/llms.txt>; rel=\"describedby\"",
+            "</shop/>; rel=\"alternate\"; type=\"text/markdown\"",
+        ] {
+            assert!(shop.contains(want), "missing {want}: {shop}");
+        }
     }
 
     #[test]

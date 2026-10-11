@@ -3880,7 +3880,26 @@ fn build_ingress_cors_layer(config: &AutumnConfig) -> Option<tower_http::cors::C
     if config.cors.allowed_origins.is_empty() {
         return None;
     }
-    let cors = build_cors_layer(&config.cors);
+    // A browser's paid x402 retry carries `PAYMENT-SIGNATURE`, which its
+    // preflight must allow, or the payment never reaches the priced route.
+    let pays = config.aeo.enabled
+        && config
+            .aeo
+            .paid_routes
+            .iter()
+            .any(crate::aeo::commerce::PaidRoute::is_x402)
+        && !config
+            .cors
+            .allowed_headers
+            .iter()
+            .any(|h| h == "*" || h.eq_ignore_ascii_case("payment-signature"));
+    let cors = if pays {
+        let mut cors = config.cors.clone();
+        cors.allowed_headers.push("payment-signature".to_owned());
+        build_cors_layer(&cors)
+    } else {
+        build_cors_layer(&config.cors)
+    };
     tracing::info!(
         origins = ?config.cors.allowed_origins,
         credentials = config.cors.allow_credentials,
