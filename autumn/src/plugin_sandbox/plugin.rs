@@ -128,28 +128,32 @@ impl From<SandboxLoadError> for SandboxPluginError {
 
 /// Default number of guests that may run at once in the whole process.
 ///
-/// A guest runs on Tokio's shared blocking pool, which has 512 threads unless
-/// the embedder changes it. A quarter of that leaves the rest for host work,
-/// such as password hashing and storage. Change it with [`set_guest_slots`].
+/// A guest runs on Tokio's shared blocking pool. That pool has 512 threads by
+/// default. A quarter of it leaves the rest for host work, such as password
+/// hashing. Change the limit with [`set_guest_slots`].
 pub const DEFAULT_GUEST_SLOTS: usize = 128;
 
 static GUEST_SLOTS: OnceLock<(usize, Arc<Semaphore>)> = OnceLock::new();
 
-/// Set the process-wide guest limit. Call once, before the first plugin runs.
+/// Set the process-wide guest limit. Call once, before any plugin is built.
 ///
 /// Set it to at most a quarter of the runtime's `max_blocking_threads`. It
 /// caps all sandboxed plugins together, on top of each `max_concurrency`; a
 /// request over it gets 503.
 ///
+/// The pool is first come, first served. A plugin with a high `max_concurrency`
+/// can take all of it, so keep each `max_concurrency` well under the limit.
+///
 /// # Errors
 ///
-/// Returns the limit already in force if one was set, or if `slots` is zero.
+/// Returns the limit already in force if one was set. Returns 0 if `slots` is
+/// zero or too large.
 pub fn set_guest_slots(slots: usize) -> Result<(), usize> {
     fix_slots(&GUEST_SLOTS, slots)
 }
 
 fn fix_slots(cell: &OnceLock<(usize, Arc<Semaphore>)>, slots: usize) -> Result<(), usize> {
-    if slots == 0 {
+    if slots == 0 || slots > Semaphore::MAX_PERMITS {
         return Err(0);
     }
     cell.set((slots, Arc::new(Semaphore::new(slots))))
@@ -1413,10 +1417,25 @@ sha256 = "{digest}"
         assert_eq!(plugin.guest_slots.available_permits(), 1);
     }
 
+    #[tokio::test]
+    async fn one_guest_pool_caps_two_plugins_together() {
+        let pool = Arc::new(Semaphore::new(1));
+        let one = hello_plugin().with_guest_slots(Arc::clone(&pool));
+        let two = hello_plugin().with_guest_slots(Arc::clone(&pool));
+        let held = Arc::clone(&pool).try_acquire_owned().expect("free");
+        for plugin in [&one, &two] {
+            let (status, _) = send(app(plugin), "GET", "/hello/greet").await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        }
+        drop(held);
+        let (status, _) = send(app(&two), "GET", "/hello/greet").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
     #[test]
     fn the_default_guest_slots_are_a_fraction_of_tokios_blocking_pool() {
         // Tokio's default pool is 512 threads; host work must keep most of it.
-        const { assert!(DEFAULT_GUEST_SLOTS <= 512 / 2) };
+        const { assert!(DEFAULT_GUEST_SLOTS <= 512 / 4) };
         const { assert!(DEFAULT_GUEST_SLOTS >= 1) };
     }
 
@@ -1427,6 +1446,7 @@ sha256 = "{digest}"
         assert_eq!(fix_slots(&cell, 9), Err(3), "a later caller is refused");
         assert_eq!(cell.get().map(|(n, _)| *n), Some(3));
         assert_eq!(fix_slots(&std::sync::OnceLock::new(), 0), Err(0));
+        assert_eq!(fix_slots(&std::sync::OnceLock::new(), usize::MAX), Err(0));
     }
 
     #[tokio::test(start_paused = true)]
