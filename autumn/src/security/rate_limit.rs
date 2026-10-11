@@ -1639,18 +1639,20 @@ pub async fn __check_throttle(
     // `populate_rate_limit_principal` exactly: read the same auth session key from
     // the same verified `Session`. An explicit extension (set by `RequireAuth` /
     // `RequireApiToken`) still wins and is never overwritten.
-    let derived_principal =
-        if principal.is_none() && key_strategy == KeyStrategy::AuthenticatedPrincipal {
-            match session {
-                Some(session) => session
-                    .get(state.auth_session_key())
+    let derived_principal = if principal.is_none()
+        && key_strategy == KeyStrategy::AuthenticatedPrincipal
+    {
+        match session {
+            Some(session) => {
+                crate::auth::impersonation::throttle_principal_id(session, state.auth_session_key())
                     .await
-                    .map(RateLimitPrincipal),
-                None => None,
+                    .map(RateLimitPrincipal)
             }
-        } else {
-            None
-        };
+            None => None,
+        }
+    } else {
+        None
+    };
     let principal = principal.or(derived_principal.as_ref());
 
     // Qualify the registry key with (1) the constructing app's process-unique
