@@ -46,6 +46,35 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    test_ledger_tenant_notes (id) {
+        id -> Int8,
+        body -> Text,
+        tenant_id -> Text,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+/// A tenant-scoped ledgered model, for the trigger-moved-tenant cases (#2319).
+#[autumn_web::model(table = "test_ledger_tenant_notes")]
+pub struct LedgerTenantNote {
+    #[id]
+    pub id: i64,
+    pub body: String,
+    pub tenant_id: String,
+    #[default]
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(
+    LedgerTenantNote,
+    table = "test_ledger_tenant_notes",
+    tenant_scoped,
+    soft_delete,
+    ledgered = true
+)]
+pub trait LedgerTenantNoteRepository {}
+
 #[autumn_web::model(table = "test_ledger_invoices")]
 pub struct LedgerInvoice {
     #[id]
@@ -111,6 +140,12 @@ async fn setup_pool() -> (
              reference TEXT NOT NULL,
              amount_cents BIGINT NOT NULL,
              amount_rate DOUBLE PRECISION NOT NULL,
+             deleted_at TIMESTAMP
+         )",
+        "CREATE TABLE IF NOT EXISTS test_ledger_tenant_notes (
+             id BIGSERIAL PRIMARY KEY,
+             body TEXT NOT NULL,
+             tenant_id TEXT NOT NULL,
              deleted_at TIMESTAMP
          )",
         VERSION_HISTORY_UP,
@@ -1115,4 +1150,59 @@ async fn ledger_revisions_page_walks_the_chain_on_postgres() {
     let report = repo.ledger_verify(created.id).await.expect("verify");
     assert!(report.is_intact(), "{report:?}");
     assert_eq!(report.revisions_checked, 5);
+}
+
+/// A BEFORE trigger that rewrites `tenant_id` during a restore puts the new
+/// tenant into the `RETURNING` row and the reload alike, so only a comparison
+/// with the pre-restore row sees it. The restore is refused and rolled back
+/// (#2319). SQLite cannot run this case: its BEFORE triggers cannot set `NEW`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_before_trigger_cannot_move_a_ledgered_row_during_restore() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgLedgerTenantNoteRepository::with_pool_untracked(pool.clone());
+
+    autumn_web::tenancy::with_tenant("tenant-a".to_string(), async {
+        let id = repo
+            .save(&NewLedgerTenantNote {
+                body: "note".to_string(),
+                tenant_id: "tenant-a".to_string(),
+            })
+            .await
+            .expect("insert")
+            .id;
+        repo.delete_by_id(id).await.expect("delete");
+        {
+            let mut conn = pool.get().await.expect("conn");
+            conn.batch_execute(
+                "CREATE FUNCTION test_ledger_move_tenant() RETURNS trigger AS $$ \
+                 BEGIN NEW.tenant_id := 'tenant-b'; RETURN NEW; END $$ LANGUAGE plpgsql; \
+                 CREATE TRIGGER test_ledger_move_on_restore \
+                 BEFORE UPDATE OF deleted_at ON test_ledger_tenant_notes FOR EACH ROW \
+                 WHEN (NEW.deleted_at IS NULL) EXECUTE FUNCTION test_ledger_move_tenant()",
+            )
+            .await
+            .expect("install trigger");
+        }
+
+        let err = repo
+            .restore(id)
+            .await
+            .expect_err("the restore moves the row");
+        match err.downcast_chain_ref::<autumn_web::ledger::LedgerError>() {
+            Some(autumn_web::ledger::LedgerError::TenantChange { table, record_id }) => {
+                assert_eq!(table, "test_ledger_tenant_notes");
+                assert_eq!(*record_id, id);
+            }
+            other => panic!("expected TenantChange, got {other:?}"),
+        }
+        assert!(
+            repo.find_by_id(id).await.expect("read").is_none(),
+            "the restore rolled back"
+        );
+        let report = repo.ledger_verify(id).await.expect("verify");
+        assert!(report.is_intact(), "{report:?}");
+        assert_eq!(report.revisions_checked, 2);
+    })
+    .await;
 }

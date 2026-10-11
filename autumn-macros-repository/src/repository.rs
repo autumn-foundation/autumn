@@ -2389,10 +2389,12 @@ fn ledger_append_ts(
     };
 
     // #2319: a chain belongs to one tenant. An update that moves the record
-    // would split it, so refuse it. A trigger can also rewrite `tenant_id` on
-    // any write; the reload checks the row it left behind.
+    // would split it, so refuse it. A restore gets the same check: a BEFORE
+    // trigger can rewrite `tenant_id` into the `RETURNING` row itself, where
+    // the reload below cannot see a difference. An AFTER trigger can rewrite
+    // it on any write; the reload checks the row it left behind.
     let tenant_change_check = match (op, before_expr) {
-        ("update", Some(before)) => quote! {
+        ("update" | "restore", Some(before)) => quote! {
             ::autumn_web::ledger::refuse_tenant_change(
                 #table_name_ts,
                 __lg_record_id,
@@ -28419,13 +28421,17 @@ mod tests {
                 "{op}: one snapshot, of the reloaded row"
             );
         }
-        // An update also compares the record it was given with the one before.
-        assert_eq!(
-            ledger_append_for("update")
-                .matches("refuse_tenant_change")
-                .count(),
-            2
-        );
+        // An update or restore also compares the written row with the one
+        // before, which catches a BEFORE trigger the reload cannot.
+        for op in ["update", "restore"] {
+            assert_eq!(
+                ledger_append_for(op)
+                    .matches("refuse_tenant_change")
+                    .count(),
+                2,
+                "{op}"
+            );
+        }
     }
 
     #[test]
