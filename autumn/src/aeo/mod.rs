@@ -750,6 +750,9 @@ pub(crate) async fn write_static_documents(
     };
     queue.push(webmcp::WEBMCP_JS_PATH.to_owned());
     let mut written = Vec::new();
+    // The skills index waits for its skills: a `SKILL.md` already in `dist`
+    // is kept, and the index must name the digest of the bytes served.
+    let mut index = None;
     while let Some(path) = queue.pop() {
         // A build render: x402 charges the live request for these bytes.
         let Ok(req) = Request::get(path.as_str())
@@ -769,6 +772,8 @@ pub(crate) async fn write_static_documents(
         };
         if path == documents::SKILLS_INDEX_PATH {
             queue.extend(skill_paths(&body));
+            index = Some(body);
+            continue;
         }
         let file = dist.join(path.trim_start_matches('/'));
         if tokio::fs::try_exists(&file).await.unwrap_or(false) {
@@ -780,8 +785,52 @@ pub(crate) async fn write_static_documents(
         tokio::fs::write(&file, &body).await?;
         written.push(path);
     }
+    if let Some(body) = index {
+        let file = dist.join(documents::SKILLS_INDEX_PATH.trim_start_matches('/'));
+        if !tokio::fs::try_exists(&file).await.unwrap_or(false) {
+            let body = index_with_disk_digests(&body, dist).await;
+            if let Some(parent) = file.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(&file, &body).await?;
+            written.push(documents::SKILLS_INDEX_PATH.to_owned());
+        }
+    }
     written.sort();
     Ok(written)
+}
+
+/// The skills index with each local skill's digest taken from the file in
+/// `dist`: the one written, or one the build kept. Unchanged when every
+/// digest already matches.
+async fn index_with_disk_digests(index: &[u8], dist: &std::path::Path) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(index) else {
+        return index.to_vec();
+    };
+    let mut changed = false;
+    if let Some(skills) = value.get_mut("skills").and_then(|s| s.as_array_mut()) {
+        for skill in skills {
+            let Some(url) = skill.get("url").and_then(|u| u.as_str()) else {
+                continue;
+            };
+            if !skill_paths_filter(url) {
+                continue;
+            }
+            let Ok(bytes) = tokio::fs::read(dist.join(url.trim_start_matches('/'))).await else {
+                continue;
+            };
+            let digest = serde_json::Value::String(documents::sha256_digest(&bytes));
+            if skill.get("digest") != Some(&digest) {
+                skill["digest"] = digest;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        serde_json::to_vec_pretty(&value).unwrap_or_else(|_| index.to_vec())
+    } else {
+        index.to_vec()
+    }
 }
 
 /// The local `SKILL.md` paths that a skills index names.
@@ -792,9 +841,15 @@ fn skill_paths(index: &[u8]) -> Vec<String> {
         .unwrap_or_default()
         .iter()
         .filter_map(|s| s.get("url")?.as_str())
-        .filter(|u| u.starts_with('/') && !u.starts_with("//") && !u.contains(".."))
+        .filter(|u| skill_paths_filter(u))
         .map(str::to_owned)
         .collect()
+}
+
+/// `true` for a skill URL that names a file in `dist`: a local path that
+/// cannot climb out of it.
+fn skill_paths_filter(url: &str) -> bool {
+    url.starts_with('/') && !url.starts_with("//") && !url.contains("..")
 }
 
 /// The `robots.txt` [`BotPolicy`] for `config`, with `Agentmap:` when
@@ -879,6 +934,42 @@ mod tests {
         let skill = index["skills"][0]["url"].as_str().unwrap();
         assert!(read(skill.trim_start_matches('/')).starts_with("---\n"));
         assert!(!dist.path().join(".well-known/api-catalog").exists());
+    }
+
+    #[tokio::test]
+    async fn a_kept_skill_file_sets_its_index_digest() {
+        let mut config = crate::config::AutumnConfig::default();
+        config.seo.base_url = Some("https://example.com".to_owned());
+        let dist = tempfile::tempdir().unwrap();
+        let kept = dist
+            .path()
+            .join(".well-known/agent-skills/site-guide/SKILL.md");
+        std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        std::fs::write(&kept, "---\nname: site-guide\ndescription: mine\n---\n").unwrap();
+
+        write_static_documents(
+            site_router(&config),
+            config.seo.base_url.as_deref(),
+            dist.path(),
+        )
+        .await
+        .unwrap();
+
+        let index: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dist.path().join(".well-known/agent-skills/index.json")).unwrap(),
+        )
+        .unwrap();
+        let entry = index["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "site-guide")
+            .unwrap();
+        assert_eq!(
+            entry["digest"],
+            documents::sha256_digest(&std::fs::read(&kept).unwrap()),
+            "the index names the bytes served"
+        );
     }
 
     #[tokio::test]
