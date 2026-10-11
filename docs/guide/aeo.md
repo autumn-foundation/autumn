@@ -280,11 +280,11 @@ html! {
 
 Pass the CSP nonce when your policy uses nonces, and the request's CSRF
 token (from the `Option<CsrfToken>` extractor). The token is written as
-`<meta name="csrf-token">`, which the htmx CSRF helper reads too. Without a
-token the script registers only the read-only tools. When CSRF protection is
-on and the MCP endpoint is not exempt, as in the production profile, every
-call is a checked `POST`, so without a token it registers no tools. On page
-load, the script
+`<meta name="csrf-token">`, which the htmx CSRF helper reads too. When CSRF
+protection is on and the MCP endpoint is not exempt, as in the production
+profile, every call is a checked `POST`, so without a token the script
+registers no tools at all. Only when CSRF does not check the endpoint does a
+page without a token still get the read-only tools. On page load, the script
 calls `document.modelContext.registerTool()` for each public tool that is
 marked safe: `readOnlyHint: true` (a `GET` tool), or `destructiveHint:
 false`. A write tool gets `consequentialHint: true`, so the browser can ask the

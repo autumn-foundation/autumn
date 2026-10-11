@@ -6,10 +6,12 @@
 //! so the normal route pipeline (auth, CSRF, rate limits) applies.
 //!
 //! Add the script to the page `<head>` with [`head_tags`]. The scaffolded
-//! layout does this. A tool that is not read-only needs the page's CSRF
-//! token: pass it to [`head_tags`], which writes the
-//! `<meta name="csrf-token">` tag. Without a token the script registers only
-//! the read-only tools.
+//! layout does this. Pass the page's CSRF token to [`head_tags`], which
+//! writes the `<meta name="csrf-token">` tag. When CSRF protection checks the
+//! MCP endpoint (the production default), every tool call is a checked
+//! `POST`, so without a token the script registers no tools, read-only ones
+//! included. Only when CSRF does not check the endpoint does a page without a
+//! token still get the read-only tools.
 
 use serde_json::{Value, json};
 
@@ -165,7 +167,8 @@ fn hint(mcp: &Value, key: &str) -> Option<bool> {
 /// Pass the request's CSP nonce when the page uses a nonce-based policy.
 /// Pass the request's CSRF token (from the
 /// [`CsrfToken`](crate::security::CsrfToken) extractor) to let in-browser
-/// agents call tools that are not read-only; it is written as
+/// agents call tools: when CSRF checks the MCP endpoint, as it does by
+/// default in production, no tool is registered without it. It is written as
 /// `<meta name="csrf-token">`, which the htmx CSRF helper reads too.
 ///
 /// ```rust,ignore
