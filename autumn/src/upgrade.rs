@@ -888,21 +888,34 @@ fn lock_for_publish(
     }
 }
 
+/// Create the handoff lock file, owner-only, and keep it open.
+#[cfg(unix)]
+fn create_lock_file(path: &std::path::Path) -> Result<std::fs::File, std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
 /// Take the handoff lock for the predecessor's decision, or `None`.
 ///
 /// `Drop` must not hang a drain, so the wait is bounded. A holder that outlasts
-/// it is stuck: kill the successor so the kernel drops its lock, then try
-/// again. Without a lock file (or after a second timeout) the decision runs
-/// unlocked.
+/// it is stuck. If it has not published readiness it cannot be writable yet:
+/// kill it so the kernel drops its lock, then try again. If it has published,
+/// it may be writable, so return `None` and let the caller leave it alone.
 #[cfg(unix)]
 fn lock_for_decision(
-    dir: &std::path::Path,
+    lock: Option<std::fs::File>,
+    ready: &std::path::Path,
     child: &mut Option<std::process::Child>,
 ) -> Option<nix::fcntl::Flock<std::fs::File>> {
     use nix::errno::Errno;
     use nix::fcntl::{Flock, FlockArg};
 
-    let mut file = std::fs::File::open(dir.join(LOCK_FILE)).ok()?;
+    let mut file = lock?;
     for round in 0..2 {
         for _ in 0..LOCK_ATTEMPTS {
             match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
@@ -915,6 +928,9 @@ fn lock_for_decision(
             }
         }
         if round == 0 {
+            if ready.exists() {
+                return None;
+            }
             let child = child.as_mut()?;
             let _ = child.kill();
             let _ = child.wait();
@@ -971,8 +987,9 @@ pub(crate) async fn upgrade_in_place(plan: UpgradePlan<'_>) -> Result<Handover, 
         child: None,
         registry: plan.registry.clone(),
         completed: false,
+        lock: None,
     };
-    write_owner_only(&handoff.dir.join(LOCK_FILE), b"")?;
+    handoff.lock = Some(create_lock_file(&handoff.dir.join(LOCK_FILE))?);
     let successor_pid =
         spawn_and_await_successor(&plan, &binary, &mut handoff, next_generation).await?;
     handoff.completed = true;
@@ -1003,6 +1020,9 @@ struct Handoff {
     /// Set once the successor is serving and the handover is this process's to
     /// walk away from.
     completed: bool,
+    /// The handoff lock file, opened at creation so `Drop` cannot fail to open
+    /// it (`EMFILE`, say) and fall back to deciding without the lock.
+    lock: Option<std::fs::File>,
 }
 
 #[cfg(unix)]
@@ -1021,8 +1041,8 @@ impl Drop for Handoff {
         // The lock makes that decision atomic with the successor's
         // "publish + unfreeze": a successor mid-publish finishes first, so
         // this process never kills one that has become writable.
-        let _lock = lock_for_decision(&self.dir, &mut self.child);
         let ready_path = self.dir.join("ready");
+        let _lock = lock_for_decision(self.lock.take(), &ready_path, &mut self.child);
         let taken_over = self.completed
             || self
                 .child
@@ -1697,11 +1717,13 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("a stand-in successor process");
+        let lock = std::fs::File::open(dir.join(LOCK_FILE)).ok();
         Handoff {
             dir,
             child: Some(child),
             registry: Some(registry),
             completed: false,
+            lock,
         }
     }
 
@@ -1915,6 +1937,31 @@ mod tests {
 
         assert!(!process_is_alive(pid), "the stuck successor is killed");
         assert!(!handle.is_frozen(), "this process resumes");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_publisher_stalled_after_readiness_is_not_killed() {
+        // Readiness is renamed before the unfreeze, so a stalled holder with
+        // readiness published may already be writable.
+        let dir = scratch_dir(line!());
+        std::fs::write(dir.join(LOCK_FILE), "").expect("lock file");
+        std::fs::write(dir.join("ready"), "1").expect("published");
+        let handle = LiveStateHandle::new(StatsV1::default());
+        let registry = Arc::new(LiveStateRegistry::new(&handle));
+        registry.freeze_and_snapshot(1).expect("snapshots");
+        let handoff = handoff_for_test(dir.clone(), registry);
+        let pid = handoff.child.as_ref().expect("child").id();
+
+        let _stuck = hold_handoff_lock(&dir);
+        drop(handoff);
+
+        assert!(process_is_alive(pid), "a published successor must live");
+        assert!(handle.is_frozen(), "the successor owns the state");
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status();
     }
 
     #[test]
