@@ -2277,26 +2277,23 @@ fn version_op_variant(op: &str) -> TokenStream {
     }
 }
 
-/// Reload a ledgered row after a soft delete or restore (#2326, #2319).
+/// Reload a ledgered row after its write and snapshot it (#2326, #2319).
 ///
-/// `ledgered` implies `soft_delete`, so a delete here is always soft: the row
-/// survives with `deleted_at` set. The record handed to [`ledger_append_ts`]
-/// is the pre-delete load, but a ledger revision snapshots the state after its write.
-/// A trigger or a default may change any column in the same UPDATE (#2326), so
-/// reload the whole row. A restore needs the same: its record is the UPDATE's
-/// `RETURNING` row, which does not show what an AFTER trigger changed. The
-/// bulk paths share this builder. Reading the row back is one indexed lookup,
-/// on ledgered deletes and restores only.
+/// A revision snapshots the state after its write, but no record a write path
+/// holds shows it reliably. A delete holds its pre-delete load; an insert,
+/// update or restore holds the statement's `RETURNING` row, which does not
+/// show what an AFTER trigger changed. A trigger or a default may change any
+/// column (#2326), `tenant_id` included, so reload the whole row. The bulk
+/// paths share this builder. The reload is one indexed lookup per ledgered
+/// write, in the transaction that already reads the chain head.
+///
+/// Expands to an expression of type `serde_json::Value`.
 fn ledger_reload_after_write_ts(
     table_name_ts: &str,
-    op: &str,
     conn_ident: &TokenStream,
     model_ident: &proc_macro2::Ident,
 ) -> TokenStream {
     let table_ident = format_ident!("{table_name_ts}");
-    if !matches!(op, "delete" | "restore") {
-        return quote! {};
-    }
     quote! {
         {
             use ::autumn_web::reexports::diesel::prelude::*;
@@ -2310,7 +2307,7 @@ fn ledger_reload_after_write_ts(
                 .await
                 .optional()
                 .map_err(::autumn_web::AutumnError::from)?;
-            // A missing row would leave the stale pre-delete snapshot. Refuse.
+            // A missing row would leave a stale snapshot. Refuse.
             let ::core::option::Option::Some(__lg_row) = __lg_after else {
                 return ::core::result::Result::Err(
                     ::autumn_web::AutumnError::internal_server_error(
@@ -2329,7 +2326,7 @@ fn ledger_reload_after_write_ts(
                 __lg_tenant_id,
                 <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(&__lg_row),
             )?;
-            __lg_snapshot = __lg_row.__autumn_commit_hook_to_value()?;
+            __lg_row.__autumn_commit_hook_to_value()?
         }
     }
 }
@@ -2373,8 +2370,7 @@ fn ledger_append_ts(
 ) -> TokenStream {
     let op_variant = version_op_variant(op);
 
-    let soft_delete_stamp =
-        ledger_reload_after_write_ts(table_name_ts, op, conn_ident, model_ident);
+    let snapshot_after_write = ledger_reload_after_write_ts(table_name_ts, conn_ident, model_ident);
 
     // #2326: a delete or restore is valid from the moment it is made. The record
     // still holds the old valid time. Reading it would back-date the revision.
@@ -2397,8 +2393,8 @@ fn ledger_append_ts(
     };
 
     // #2319: a chain belongs to one tenant. An update that moves the record
-    // would split it, so refuse it. A delete or restore sets only `deleted_at`,
-    // but a trigger can rewrite `tenant_id`; those check the reloaded row above.
+    // would split it, so refuse it. A trigger can also rewrite `tenant_id` on
+    // any write; the reload checks the row it left behind.
     let tenant_change_check = match (op, before_expr) {
         ("update", Some(before)) => quote! {
             ::autumn_web::ledger::refuse_tenant_change(
@@ -2436,10 +2432,8 @@ fn ledger_append_ts(
             let __lg_tenant_id: ::core::option::Option<&str> =
                 <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(&(#record_expr));
             #tenant_change_check
-            #[allow(unused_mut, reason = "only the delete arm rewrites the snapshot")]
-            let mut __lg_snapshot: ::autumn_web::reexports::serde_json::Value =
-                (#record_expr).__autumn_commit_hook_to_value()?;
-            #soft_delete_stamp
+            let __lg_snapshot: ::autumn_web::reexports::serde_json::Value =
+                #snapshot_after_write;
             #valid_from_stmt
             ::autumn_web::ledger::append_revision(
                 &mut *#conn_ident,
@@ -28393,27 +28387,33 @@ mod tests {
 
     #[test]
     fn ledger_append_refuses_a_tenant_change_on_every_mutation() {
-        // #2319: a chain belongs to one tenant. A trigger can rewrite
-        // `tenant_id` during a delete or restore, so those are checked too.
-        for op in ["update", "delete", "restore"] {
-            assert!(
-                ledger_append_for(op).contains("refuse_tenant_change"),
-                "`{op}` must refuse a tenant change"
-            );
-        }
-        // An insert starts the chain, so there is nothing to compare.
-        assert!(!ledger_append_for("insert").contains("refuse_tenant_change"));
-        // A delete or restore compares against the reloaded row, after any
-        // trigger ran, and snapshots that row.
-        for op in ["delete", "restore"] {
+        // #2319: a chain belongs to one tenant. An AFTER trigger can rewrite
+        // `tenant_id` on any write, and no `RETURNING` row shows it, so every
+        // write reloads the row, checks its tenant, and snapshots that row.
+        for op in ["insert", "update", "delete", "restore"] {
             let generated = ledger_append_for(op);
             let reload = generated.find("__lg_after").expect("reloads the row");
-            let check = generated.find("refuse_tenant_change").expect("checks");
+            let check = generated[reload..]
+                .find("refuse_tenant_change")
+                .map(|at| reload + at)
+                .expect("checks the reloaded row");
             let snapshot = generated
                 .find("__lg_row . __autumn_commit_hook_to_value")
                 .expect("snapshots the reloaded row");
             assert!(reload < check && check < snapshot, "{op}: {generated}");
+            assert_eq!(
+                generated.matches("__autumn_commit_hook_to_value").count(),
+                1,
+                "{op}: one snapshot, of the reloaded row"
+            );
         }
+        // An update also compares the record it was given with the one before.
+        assert_eq!(
+            ledger_append_for("update")
+                .matches("refuse_tenant_change")
+                .count(),
+            2
+        );
     }
 
     #[test]

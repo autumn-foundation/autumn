@@ -3170,10 +3170,10 @@ fn assert_tenant_change(err: &autumn_web::AutumnError, id: i64) {
     }
 }
 
-async fn install_tenant_rewrite_trigger(pool: &SqlitePool, name: &str, when: &str) {
+async fn install_tenant_rewrite_trigger(pool: &SqlitePool, name: &str, event: &str, when: &str) {
     let mut conn = pool.get().await.expect("conn");
     conn.batch_execute(&format!(
-        "CREATE TRIGGER {name} AFTER UPDATE OF deleted_at ON lg_movable_invoices \
+        "CREATE TRIGGER {name} AFTER {event} ON lg_movable_invoices \
          WHEN {when} \
          BEGIN UPDATE lg_movable_invoices SET tenant_id = 'tenant-b' WHERE id = NEW.id; END"
     ))
@@ -3186,7 +3186,13 @@ async fn install_tenant_rewrite_trigger(pool: &SqlitePool, name: &str, when: &st
 #[tokio::test]
 async fn a_trigger_cannot_move_a_ledgered_row_during_delete() {
     let pool = boot_pool("lg_tenant_delete_trigger").await;
-    install_tenant_rewrite_trigger(&pool, "lg_move_on_delete", "NEW.deleted_at IS NOT NULL").await;
+    install_tenant_rewrite_trigger(
+        &pool,
+        "lg_move_on_delete",
+        "UPDATE OF deleted_at",
+        "NEW.deleted_at IS NOT NULL",
+    )
+    .await;
     let repo = PgLgMovableInvoiceRepository::with_pool_untracked(pool);
 
     with_tenant("tenant-a".to_string(), async {
@@ -3217,6 +3223,91 @@ async fn a_trigger_cannot_move_a_ledgered_row_during_delete() {
     .await;
 }
 
+/// The same for an update: its `RETURNING` row does not show the trigger's
+/// change, so the reloaded row is checked. Refused and rolled back.
+#[tokio::test]
+async fn a_trigger_cannot_move_a_ledgered_row_during_update() {
+    let pool = boot_pool("lg_tenant_update_trigger").await;
+    install_tenant_rewrite_trigger(
+        &pool,
+        "lg_move_on_update",
+        "UPDATE OF reference",
+        "NEW.reference = 'A-2'",
+    )
+    .await;
+    let repo = PgLgMovableInvoiceRepository::with_pool_untracked(pool);
+
+    with_tenant("tenant-a".to_string(), async {
+        let id = repo
+            .save(&NewLgMovableInvoice {
+                reference: "A-1".to_string(),
+                tenant_id: "tenant-a".to_string(),
+            })
+            .await
+            .expect("insert")
+            .id;
+        let err = repo
+            .update(
+                id,
+                &UpdateLgMovableInvoice {
+                    reference: Patch::Set("A-2".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the update moves the row");
+        assert_tenant_change(&err, id);
+
+        let live = repo
+            .find_by_id(id)
+            .await
+            .expect("read")
+            .expect("the update rolled back");
+        assert_eq!(
+            (live.reference.as_str(), live.tenant_id.as_str()),
+            ("A-1", "tenant-a")
+        );
+        let report = repo.ledger_verify(id).await.expect("verify");
+        assert!(report.is_intact(), "{report:?}");
+        assert_eq!(report.revisions_checked, 1);
+    })
+    .await;
+}
+
+/// The same for an insert: a chain must not start in one tenant for a row
+/// that lands in another. Refused and rolled back.
+#[tokio::test]
+async fn a_trigger_cannot_move_a_ledgered_row_during_insert() {
+    let pool = boot_pool("lg_tenant_insert_trigger").await;
+    install_tenant_rewrite_trigger(&pool, "lg_move_on_insert", "INSERT", "1").await;
+    let repo = PgLgMovableInvoiceRepository::with_pool_untracked(pool);
+
+    let err = with_tenant("tenant-a".to_string(), async {
+        repo.save(&NewLgMovableInvoice {
+            reference: "A-1".to_string(),
+            tenant_id: "tenant-a".to_string(),
+        })
+        .await
+        .expect_err("the insert moves the row")
+    })
+    .await;
+    assert!(
+        matches!(
+            err.downcast_chain_ref::<autumn_web::ledger::LedgerError>(),
+            Some(autumn_web::ledger::LedgerError::TenantChange { .. })
+        ),
+        "{err}"
+    );
+    assert!(
+        repo.across_tenants()
+            .find_all()
+            .await
+            .expect("list")
+            .is_empty(),
+        "the insert rolled back"
+    );
+}
+
 /// The same for a restore: the undelete is refused and rolled back.
 #[tokio::test]
 async fn a_trigger_cannot_move_a_ledgered_row_during_restore() {
@@ -3233,7 +3324,13 @@ async fn a_trigger_cannot_move_a_ledgered_row_during_restore() {
             .expect("insert")
             .id;
         repo.delete_by_id(id).await.expect("delete");
-        install_tenant_rewrite_trigger(&pool, "lg_move_on_restore", "NEW.deleted_at IS NULL").await;
+        install_tenant_rewrite_trigger(
+            &pool,
+            "lg_move_on_restore",
+            "UPDATE OF deleted_at",
+            "NEW.deleted_at IS NULL",
+        )
+        .await;
         let err = repo
             .restore(id)
             .await
