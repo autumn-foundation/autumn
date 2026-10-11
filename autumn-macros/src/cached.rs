@@ -158,13 +158,17 @@ fn parse_cached_args(attr: TokenStream) -> syn::Result<CachedAttrs> {
             Ok(())
         } else if meta.path.is_ident("scope") {
             let value: LitStr = meta.value()?.parse()?;
-            if value.value().trim().is_empty() {
+            if result.scope.is_some() {
+                return Err(meta.error("`scope` is set twice"));
+            }
+            let name = value.value();
+            if syn::parse_str::<Ident>(name.trim()).is_err() {
                 return Err(syn::Error::new_spanned(
                     &value,
-                    "`scope` requires a non-empty type name",
+                    "`scope` must be a type name, such as \"Products\"",
                 ));
             }
-            result.scope = Some(value.value());
+            result.scope = Some(name.trim().to_owned());
             Ok(())
         } else {
             Err(meta.error(
@@ -779,7 +783,11 @@ pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// An attribute on a method cannot see its `impl`. This one can, so it passes
 /// the type down (#2358).
-pub fn cached_impl_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn cached_impl_macro(
+    attr: TokenStream,
+    item: TokenStream,
+    crate_override: Option<&str>,
+) -> TokenStream {
     if !attr.is_empty() {
         return syn::Error::new_spanned(attr, "`#[cached_impl]` takes no arguments")
             .to_compile_error();
@@ -804,39 +812,63 @@ pub fn cached_impl_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             continue;
         };
         for attr in &mut method.attrs {
-            if attr
-                .path()
-                .segments
-                .last()
-                .is_some_and(|seg| seg.ident == "cached")
-            {
-                scope_cached_attr(attr, &scope);
+            if is_cached_path(attr.path()) {
+                scope_cached_attr(attr, &scope, crate_override);
             }
         }
     }
     quote! { #imp }
 }
 
-/// Append `scope = "<scope>"` to a `#[cached]` attribute that has none.
-fn scope_cached_attr(attr: &mut syn::Attribute, scope: &str) {
+/// Whether a path names this crate's `cached` macro.
+///
+/// A third-party `cached` crate has the same last segment. It must stay
+/// untouched.
+fn is_cached_path(path: &syn::Path) -> bool {
+    let names: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+    matches!(
+        names
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice(),
+        ["cached"] | ["autumn_web" | "crate", "cached"]
+    )
+}
+
+/// Append `scope = "<scope>"` (and the `crate = ".."` override, if any) to a
+/// `#[cached]` attribute that has no scope.
+fn scope_cached_attr(attr: &mut syn::Attribute, scope: &str, crate_override: Option<&str>) {
     let path = attr.path().clone();
-    match &attr.meta {
-        syn::Meta::Path(_) => {
-            *attr = syn::parse_quote! { #[#path(scope = #scope)] };
-        }
-        syn::Meta::List(list) => {
-            let tokens = &list.tokens;
-            let has_scope = parse_cached_args(tokens.clone()).is_ok_and(|a| a.scope.is_some());
-            if !has_scope {
-                *attr = if tokens.is_empty() {
-                    syn::parse_quote! { #[#path(scope = #scope)] }
-                } else {
-                    syn::parse_quote! { #[#path(#tokens, scope = #scope)] }
-                };
-            }
-        }
-        syn::Meta::NameValue(_) => {}
+    let tokens = match &attr.meta {
+        syn::Meta::Path(_) => TokenStream::new(),
+        syn::Meta::List(list) => list.tokens.clone(),
+        syn::Meta::NameValue(_) => return,
+    };
+    if parse_cached_args(
+        autumn_macros_support::crate_path::extract_crate_override(tokens.clone())
+            .map_or_else(|_| tokens.clone(), |(_, rest)| rest),
+    )
+    .is_ok_and(|a| a.scope.is_some())
+    {
+        return;
     }
+    // A trailing comma is legal in `#[cached(ttl = "5m",)]`. Drop it, so the
+    // comma added below does not double it.
+    let mut kept: Vec<proc_macro2::TokenTree> = tokens.into_iter().collect();
+    if matches!(kept.last(), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == ',') {
+        kept.pop();
+    }
+    let tokens: TokenStream = kept.into_iter().collect();
+    let mut extra = quote! { scope = #scope };
+    if let Some(name) = crate_override {
+        extra = quote! { #extra, crate = #name };
+    }
+    *attr = if tokens.is_empty() {
+        syn::parse_quote! { #[#path(#extra)] }
+    } else {
+        syn::parse_quote! { #[#path(#tokens, #extra)] }
+    };
 }
 
 #[cfg(test)]
@@ -1015,17 +1047,89 @@ mod tests {
     }
 
     #[test]
-    fn a_blank_scope_is_a_compile_error() {
+    fn a_scope_that_is_not_a_type_name_is_a_compile_error() {
+        for bad in [" ", "a::b", "x:", "Foo::get", "1x"] {
+            let out = cached_macro(
+                quote! { scope = #bad },
+                quote! { async fn get(id: i64) -> String { String::new() } },
+            )
+            .to_string();
+            assert!(out.contains("compile_error"), "{bad}: {out}");
+        }
+    }
+
+    #[test]
+    fn a_repeated_scope_is_a_compile_error() {
         let out = cached_macro(
-            quote! { scope = " " },
+            quote! { scope = "A", scope = "B" },
             quote! { async fn get(id: i64) -> String { String::new() } },
         )
         .to_string();
         assert!(out.contains("compile_error"), "{out}");
     }
 
+    #[test]
+    fn scope_combines_with_key_and_reads() {
+        let out = cached_macro(
+            quote! { scope = "Products", key(id), reads(Product) },
+            quote! { async fn get(id: i64, repo: &Repo) -> String { String::new() } },
+        )
+        .to_string();
+        assert!(!out.contains("compile_error"), "{out}");
+        assert!(out.contains("\"Products\""), "{out}");
+    }
+
+    #[test]
+    fn cached_impl_forwards_the_crate_override() {
+        let out = cached_impl_macro(
+            TokenStream::new(),
+            quote! { impl Products { #[cached] async fn get(id: i64) -> String { String::new() } } },
+            Some("web"),
+        )
+        .to_string();
+        assert!(
+            out.contains("# [cached (scope = \"Products\" , crate = \"web\")]"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn cached_impl_skips_a_third_party_cached_attribute() {
+        let out = scoped(
+            TokenStream::new(),
+            quote! {
+                impl Products {
+                    #[cached::proc_macro::cached]
+                    fn get(id: i64) -> String { String::new() }
+                }
+            },
+        );
+        assert!(!out.contains("scope"), "{out}");
+    }
+
     fn scoped(attr: TokenStream, item: TokenStream) -> String {
-        cached_impl_macro(attr, item).to_string()
+        cached_impl_macro(attr, item, None).to_string()
+    }
+
+    #[test]
+    fn cached_impl_accepts_a_trailing_comma() {
+        let out = scoped(
+            TokenStream::new(),
+            quote! { impl P { #[cached(ttl = "5m",)] async fn f() {} } },
+        );
+        assert!(
+            out.contains("# [cached (ttl = \"5m\" , scope = \"P\")]"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn cached_impl_keeps_an_explicit_scope_beside_a_crate_override() {
+        let out = scoped(
+            TokenStream::new(),
+            quote! { impl P { #[cached(scope = "Mine", crate = "web")] async fn f() {} } },
+        );
+        assert_eq!(out.matches("scope").count(), 1, "{out}");
     }
 
     #[test]

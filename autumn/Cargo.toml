@@ -1416,6 +1416,11 @@ path = "tests/cache_global_integration.rs"
 name = "cached_global_backend"
 path = "tests/cached_global_backend.rs"
 
+# Isolated: installs the process-global cache backend (#2358).
+[[test]]
+name = "cached_impl_global_scope"
+path = "tests/cached_impl_global_scope.rs"
+
 # Isolated: reads/writes the process-global cache backend via
 # `cache_fragment_global`, which `TestApp::build` clears unconditionally and
 # which a concurrently running consolidated-binary test could otherwise

@@ -1530,7 +1530,12 @@ pub fn cached_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             Err(err) => return err.into(),
         };
     let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(cached::cached_impl_macro(attr, item.into())).into()
+    autumn_macros_support::crate_path::finalize(cached::cached_impl_macro(
+        attr,
+        item.into(),
+        crate_override.as_deref(),
+    ))
+    .into()
 }
 
 /// Enrich a route handler's auto-generated `OpenAPI` documentation.
