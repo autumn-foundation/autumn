@@ -26,7 +26,8 @@ pub fn cached_impl_macro(
         Err(err) => return err.to_compile_error(),
     };
     // The whole path, without generics: `impl a::Store` and `impl b::Store`
-    // in one module must not share a scope. A leading `crate` adds nothing.
+    // in one module must not share a scope. `crate`, `self` and `super` stay,
+    // so `a::Store` and `crate::a::Store` stay apart.
     let scope = match &*imp.self_ty {
         syn::Type::Path(path) if path.qself.is_none() => {
             let names: Vec<String> = path
@@ -34,7 +35,6 @@ pub fn cached_impl_macro(
                 .segments
                 .iter()
                 .map(|seg| seg.ident.to_string())
-                .skip_while(|name| name == "crate")
                 .collect();
             (!names.is_empty()).then(|| names.join("::"))
         }
@@ -302,7 +302,21 @@ mod tests {
                 }
             },
         );
-        assert!(out.contains("scope = \"repo::Store\""), "{out}");
+        assert!(out.contains("scope = \"crate::repo::Store\""), "{out}");
+    }
+
+    #[test]
+    fn cached_impl_keeps_a_root_qualified_path_apart() {
+        let rel = scoped(
+            TokenStream::new(),
+            quote! { impl a::Store { #[cached] fn get() {} } },
+        );
+        let root = scoped(
+            TokenStream::new(),
+            quote! { impl crate::a::Store { #[cached] fn get() {} } },
+        );
+        assert!(rel.contains("scope = \"a::Store\""), "{rel}");
+        assert!(root.contains("scope = \"crate::a::Store\""), "{root}");
     }
 
     #[test]

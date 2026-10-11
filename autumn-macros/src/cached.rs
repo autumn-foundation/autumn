@@ -781,10 +781,12 @@ pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Whether `text` is a plain type path: `Store` or `a::Store`.
 ///
-/// No leading `::`, no generics, no spaces.
+/// No leading `::`, no generics, no spaces. `crate`, `self` and `super` count,
+/// because `impl crate::a::Store` is a legal self type.
 fn is_type_path(text: &str) -> bool {
-    text.split("::")
-        .all(|segment| syn::parse_str::<Ident>(segment).is_ok())
+    text.split("::").all(|segment| {
+        matches!(segment, "crate" | "self" | "super") || syn::parse_str::<Ident>(segment).is_ok()
+    })
 }
 
 #[cfg(test)]
@@ -993,6 +995,14 @@ mod tests {
         .to_string();
         assert!(!out.contains("compile_error"), "{out}");
         assert!(out.contains("\"Products\""), "{out}");
+    }
+
+    #[test]
+    fn a_scope_may_use_path_keywords() {
+        for scope in ["crate::a::Store", "self::Store", "super::Store"] {
+            let out = cached_macro(quote! { scope = #scope }, quote! { fn get() {} }).to_string();
+            assert!(!out.contains("compile_error"), "{scope}: {out}");
+        }
     }
 
     #[test]
