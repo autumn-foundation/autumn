@@ -142,7 +142,7 @@ fn an_adopted_block_is_unfrozen_only_after_the_handover_can_no_longer_be_abandon
         .find("verify_handover_complete()")
         .expect("the handover is verified before the predecessor is released");
     let publish = ready_path
-        .find("publish_upgrade_readiness()")
+        .find("publish_upgrade_readiness(")
         .expect("the predecessor is released by publishing readiness");
     let unfreeze = ready_path
         .find("unfreeze_adopted_live_state(&state)")
