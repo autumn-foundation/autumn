@@ -988,10 +988,19 @@ pub(crate) async fn upgrade_in_place(plan: UpgradePlan<'_>) -> Result<Handover, 
         registry: plan.registry.clone(),
         completed: false,
         lock: None,
+        settled: None,
     };
     handoff.lock = Some(create_lock_file(&handoff.dir.join(LOCK_FILE))?);
     let successor_pid =
-        spawn_and_await_successor(&plan, &binary, &mut handoff, next_generation).await?;
+        match spawn_and_await_successor(&plan, &binary, &mut handoff, next_generation).await {
+            Ok(pid) => pid,
+            // The successor can publish after the wait gave up. If it took
+            // over, report a handover: the caller must drain, not carry on.
+            Err(error) => match handoff.child.as_ref().map(std::process::Child::id) {
+                Some(pid) if handoff.settle() => pid,
+                _ => return Err(error),
+            },
+        };
     handoff.completed = true;
 
     Ok(Handover {
@@ -1023,11 +1032,18 @@ struct Handoff {
     /// The handoff lock file, opened at creation so `Drop` cannot fail to open
     /// it (`EMFILE`, say) and fall back to deciding without the lock.
     lock: Option<std::fs::File>,
+    /// The outcome of [`settle`](Self::settle), once made.
+    settled: Option<bool>,
 }
 
 #[cfg(unix)]
-impl Drop for Handoff {
-    fn drop(&mut self) {
+impl Handoff {
+    /// Decide, once, whether the successor took over. If it did not, kill it
+    /// and hand the state back.
+    fn settle(&mut self) -> bool {
+        if let Some(taken_over) = self.settled {
+            return taken_over;
+        }
         // `completed` is this process's *observation* that the successor took
         // over, and it lags the fact by up to one poll interval. A successor
         // that has already published readiness and is still running owns the
@@ -1060,6 +1076,15 @@ impl Drop for Handoff {
                 registry.unfreeze();
             }
         }
+        self.settled = Some(taken_over);
+        taken_over
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Handoff {
+    fn drop(&mut self) {
+        self.settle();
         // The handoff directory carries application state; it never outlives
         // the handoff, completed or abandoned.
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -1724,6 +1749,7 @@ mod tests {
             registry: Some(registry),
             completed: false,
             lock,
+            settled: None,
         }
     }
 
@@ -1958,6 +1984,30 @@ mod tests {
 
         assert!(process_is_alive(pid), "a published successor must live");
         assert!(handle.is_frozen(), "the successor owns the state");
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_late_publication_is_reported_as_a_takeover() {
+        // The deadline passed, then the successor published. The caller must
+        // learn that it took over, not get the timeout error.
+        let dir = scratch_dir(line!());
+        std::fs::write(dir.join(LOCK_FILE), "").expect("lock file");
+        std::fs::write(dir.join("ready"), "1").expect("published");
+        let handle = LiveStateHandle::new(StatsV1::default());
+        let registry = Arc::new(LiveStateRegistry::new(&handle));
+        registry.freeze_and_snapshot(1).expect("snapshots");
+        let mut handoff = handoff_for_test(dir, registry);
+        let pid = handoff.child.as_ref().expect("child").id();
+
+        assert!(handoff.settle(), "a published, running successor took over");
+        assert!(handle.is_frozen());
+        drop(handoff);
+        assert!(process_is_alive(pid));
         let _ = std::process::Command::new("kill")
             .arg("-9")
             .arg(pid.to_string())
