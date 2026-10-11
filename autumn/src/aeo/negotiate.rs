@@ -792,6 +792,9 @@ mod tests {
         assert!(!prefers_markdown(&accept(
             "text/html;charset=utf-8;q=1, text/html;q=0, text/markdown;q=0.5"
         )));
+        assert!(prefers_markdown(&accept(
+            "text/html;charset=utf-8;q=0, text/html;q=1, text/markdown;q=0.5"
+        )));
         // An HTML range for another charset does not cover the UTF-8 HTML.
         assert!(prefers_markdown(&accept(
             "text/html; charset=iso-8859-1, text/markdown;q=0.5"
