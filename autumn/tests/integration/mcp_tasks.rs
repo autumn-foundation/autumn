@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use autumn_web::Route;
 use autumn_web::audit::{AuditError, AuditEvent, AuditLogger, AuditSink};
+use autumn_web::config::AutumnConfig;
 use autumn_web::mcp::McpTaskConfig;
 use autumn_web::prelude::*;
 use autumn_web::test::{TestApp, TestClient};
@@ -47,6 +49,8 @@ async fn panicky_report() -> AutumnResult<Json<Report>> {
     panic!("report generator crashed");
 }
 
+/// Set when the slow handler starts.
+static SLOW_STARTED: AtomicBool = AtomicBool::new(false);
 /// Set when the slow handler's future is dropped.
 static SLOW_DROPPED: AtomicBool = AtomicBool::new(false);
 
@@ -62,6 +66,7 @@ impl Drop for DropFlag {
 #[api_doc(mcp, task, summary = "Very slow report")]
 async fn slow_report() -> AutumnResult<Json<Report>> {
     let _flag = DropFlag(&SLOW_DROPPED);
+    SLOW_STARTED.store(true, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_secs(60)).await;
     Ok(Json(Report { rows: 9 }))
 }
@@ -151,6 +156,17 @@ async fn wait_terminal(client: &TestClient, task_id: &str) -> Value {
     panic!("task {task_id} did not reach a terminal status");
 }
 
+/// Poll `check` for up to 2 s.
+async fn wait_until(check: impl Fn() -> bool) -> bool {
+    for _ in 0..200 {
+        if check() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
 fn task_id(created: &Value) -> String {
     created["result"]["taskId"]
         .as_str()
@@ -227,9 +243,15 @@ async fn task_tool_returns_create_task_result() {
     );
     assert!(is_iso8601(&result["createdAt"]), "{result}");
     assert!(is_iso8601(&result["lastUpdatedAt"]), "{result}");
-    assert!(result["ttlMs"].as_u64().is_some_and(|ttl| ttl > 0), "{result}");
+    assert!(
+        result["ttlMs"].as_u64().is_some_and(|ttl| ttl > 0),
+        "{result}"
+    );
     assert!(result["pollIntervalMs"].as_u64().is_some(), "{result}");
-    assert!(result.get("content").is_none(), "a task handle has no content");
+    assert!(
+        result.get("content").is_none(),
+        "a task handle has no content"
+    );
 }
 
 #[tokio::test]
@@ -243,7 +265,10 @@ async fn completed_task_inlines_the_tool_result() {
     assert_eq!(result["status"], "completed");
     assert_eq!(result["result"]["isError"], false);
     let text = result["result"]["content"][0]["text"].as_str().unwrap();
-    assert_eq!(serde_json::from_str::<Value>(text).unwrap(), json!({"rows": 3}));
+    assert_eq!(
+        serde_json::from_str::<Value>(text).unwrap(),
+        json!({"rows": 3})
+    );
 }
 
 #[tokio::test]
@@ -264,14 +289,15 @@ async fn tool_error_completes_with_is_error() {
     assert!(done["result"].get("error").is_none());
 }
 
+/// The pipeline turns a handler panic into HTTP 500, as for a blocking call.
+/// That is a tool error, so the task completes with `isError`.
 #[tokio::test]
-async fn panicking_handler_fails_the_task() {
+async fn panicking_handler_completes_with_is_error() {
     let client = app(routes![panicky_report]);
     let id = task_id(&call(&client, "panicky_report", true).await);
     let done = wait_terminal(&client, &id).await;
-    assert_eq!(done["result"]["status"], "failed", "{done}");
-    assert_eq!(done["result"]["error"]["code"], -32603, "{done}");
-    assert!(done["result"]["statusMessage"].is_string(), "{done}");
+    assert_eq!(done["result"]["status"], "completed", "{done}");
+    assert_eq!(done["result"]["result"]["isError"], true, "{done}");
 }
 
 #[tokio::test]
@@ -404,6 +430,10 @@ async fn another_caller_cannot_read_the_task() {
 async fn cancel_stops_a_running_task() {
     let client = app(routes![slow_report]);
     let id = task_id(&call(&client, "slow_report", true).await);
+    assert!(
+        wait_until(|| SLOW_STARTED.load(Ordering::SeqCst)).await,
+        "the handler did not start"
+    );
     assert_eq!(get_task(&client, &id).await["result"]["status"], "working");
 
     let ack = task_rpc(&client, None, "tasks/cancel", &id).await;
@@ -411,13 +441,10 @@ async fn cancel_stops_a_running_task() {
 
     let done = wait_terminal(&client, &id).await;
     assert_eq!(done["result"]["status"], "cancelled", "{done}");
-    for _ in 0..200 {
-        if SLOW_DROPPED.load(Ordering::SeqCst) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("the cancelled handler kept running");
+    assert!(
+        wait_until(|| SLOW_DROPPED.load(Ordering::SeqCst)).await,
+        "the cancelled handler kept running"
+    );
 }
 
 #[tokio::test]
@@ -427,7 +454,10 @@ async fn cancel_does_not_change_a_completed_task() {
     wait_terminal(&client, &id).await;
     let ack = task_rpc(&client, None, "tasks/cancel", &id).await;
     assert_eq!(ack["result"], json!({"resultType": "complete"}), "{ack}");
-    assert_eq!(get_task(&client, &id).await["result"]["status"], "completed");
+    assert_eq!(
+        get_task(&client, &id).await["result"]["status"],
+        "completed"
+    );
 }
 
 #[tokio::test]

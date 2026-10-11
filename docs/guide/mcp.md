@@ -236,12 +236,12 @@ follow for MCP specifically:
   `agent.tool.<name>.refused` (status Failure, with a `refused_reason` and no
   `http_status`) records the refusal. Note the attempt is written *before* the
   request is dispatched, and so before route-level authorization — once a sink
-  is installed, gate the endpoint with `secure_mcp(...)` (§6) and rate-limit
+  is installed, gate the endpoint with `secure_mcp(...)` (§7) and rate-limit
   it.
 - **`autumn agents manifest --check`** lists every MCP-exposed tool: governed
   ones with their envelope, and every mutating tool that has *no* envelope —
   the one gap the compiler cannot catch, because a tool with no grant has no
-  assertion to fail. Generated `#[repository(api, mcp)]` CRUD tools (§9) have
+  assertion to fail. Generated `#[repository(api, mcp)]` CRUD tools (§10) have
   no annotation site in this slice, so they surface there.
 
 See [The Agent Authority Envelope](agent-authority.md) for the grant grammar,
@@ -309,7 +309,7 @@ wearing an MCP hat**. You write zero JSON-RPC or SSE framing.
 
 Add the `stream` flag to `#[api_doc(mcp, stream)]` and return an `Sse` stream
 of `Event`s. Because an `Sse` handler has no JSON response schema, `stream` also
-exempts the tool from the JSON-out eligibility gate (see §8):
+exempts the tool from the JSON-out eligibility gate (see §9):
 
 ```rust
 use std::convert::Infallible;
@@ -401,7 +401,142 @@ proxies don't drop a slow stream.
 
 ---
 
-## 6. Authentication: reuse your bearer tokens
+## 6. Long-running tools as tasks
+
+A blocking `tools/call` keeps the `POST /mcp` open until the handler returns,
+and the global request deadline cuts it. A **task tool** can return a task
+handle instead. The client polls for the result. This is the MCP
+[Tasks extension](https://modelcontextprotocol.io/extensions/tasks/overview)
+(`io.modelcontextprotocol/tasks`).
+
+### Opt in with `task`
+
+```rust
+#[post("/api/reports", timeout = "off")]
+#[api_doc(mcp, task, summary = "Build the monthly report")]
+async fn build_report(Json(req): Json<ReportRequest>) -> AutumnResult<Json<Report>> {
+    // Slow work.
+}
+```
+
+`Route::mcp_task()` does the same for a route that a plugin builds. A task
+tool must return JSON, like other tools. `stream` and `task` can be used
+together: a task buffers the stream into its final result.
+
+When one or more tools are task tools, `initialize` advertises the extension:
+
+```json
+{ "capabilities": { "tools": { "listChanged": false },
+                    "extensions": { "io.modelcontextprotocol/tasks": {} } } }
+```
+
+### The flow
+
+The server decides per request. A call becomes a task only when the tool is a
+task tool **and** the request declares the extension:
+
+```jsonc
+// client → server
+{ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+  "params": { "name": "build_report", "arguments": { "body": { "month": "2026-09" } },
+    "_meta": { "io.modelcontextprotocol/clientCapabilities":
+               { "extensions": { "io.modelcontextprotocol/tasks": {} } } } } }
+
+// server → client, at once
+{ "jsonrpc": "2.0", "id": 1, "result": {
+    "resultType": "task", "taskId": "9f0c…e1", "status": "working",
+    "createdAt": "2026-10-11T10:30:00.000Z", "lastUpdatedAt": "2026-10-11T10:30:00.000Z",
+    "ttlMs": 3600000, "pollIntervalMs": 1000 } }
+```
+
+The client then calls `tasks/get` with the `taskId` (and the same `_meta`).
+When the status is `completed`, `result` holds the `CallToolResult` that a
+blocking call gives. Other methods:
+
+| Method | Result |
+| --- | --- |
+| `tasks/get` | The task. `result` when `completed`, `error` when `failed`. |
+| `tasks/cancel` | `{ "resultType": "complete" }`. A running task stops and becomes `cancelled`. A terminal task does not change. |
+| `tasks/update` | `{ "resultType": "complete" }`. Autumn never asks for input, so it ignores `inputResponses`. |
+
+Status rules:
+
+- A handler error (4xx/5xx) is `completed` with `isError: true`, as the spec
+  requires.
+- A handler panic is `failed` with error `-32603`.
+- Bad arguments or an unknown tool give the normal JSON-RPC error. No task is
+  made.
+
+Errors on `tasks/*`:
+
+| Code | When |
+| --- | --- |
+| `-32021` | The request does not declare the extension. |
+| `-32602` | Unknown task, expired task, or a task of another caller. |
+| `-32601` | The app has no task tool. |
+| `-32600` | `tasks/*` is in a JSON-RPC batch. |
+
+### Blocking fallbacks
+
+A task tool runs as a normal blocking call when:
+
+- the client does not declare the extension, or
+- the task store is full (`max_tasks`). The server logs a warning.
+
+### Timeouts and limits
+
+A task runs outside the `POST /mcp` request, so the global request deadline
+does not stop it. The route's own timeout applies. Set `timeout = "off"` or
+`timeout_ms = …` on the route for long work.
+
+```rust
+use std::time::Duration;
+use autumn_web::mcp::McpTaskConfig;
+
+autumn_web::app()
+    .routes(routes![build_report])
+    .mount_mcp("/mcp")
+    .mcp_tasks(
+        McpTaskConfig::default()
+            .ttl(Duration::from_secs(600))        // default: 1 hour
+            .poll_interval(Duration::from_secs(2)) // default: 1 second
+            .max_tasks(256),                       // default: 1024
+    )
+    .run()
+    .await;
+```
+
+When the TTL ends, the server deletes the task. If the task is still running,
+its work stops.
+
+### Security
+
+- **Task IDs** are 256 bits from the app's entropy source.
+- **Owner binding.** Each task keeps a SHA-256 digest of the caller's
+  credentials: the resolved actor, `Authorization`, the session cookie and the
+  tenant header. `tasks/*` with other credentials gets `-32602`, the same
+  error as an unknown ID. A caller with no credentials is anonymous; then only
+  the task ID protects the task.
+- **Audit.** A task call writes the same `attempt` and outcome records as a
+  blocking call (see "Proving what an agent can do"). A cancelled or expired
+  task writes an outcome with `result = task_aborted`; a panic writes
+  `task_panicked`.
+- **Load shedding.** A task takes its own slot while it runs.
+
+### Limits of this version
+
+- The store is **in memory and per process**. Tasks do not survive a restart.
+  With more than one replica, route `tasks/*` on the `Mcp-Name` header (the
+  client sets it to the task ID) so that polls reach the same replica.
+- A task has no HTTP response, so `Set-Cookie` and `Server-Timing` from the
+  handler are dropped.
+- `notifications/tasks` is not sent. Clients poll.
+- The `2025-11-25` core tasks (`task` request parameter, `tasks/result`,
+  `tasks/list`) are not served.
+
+---
+
+## 7. Authentication: reuse your bearer tokens
 
 `tools/call` runs through the **real handler pipeline** — the same in-process
 path Autumn's [test client](testing.md) uses. That means `#[secured]`,
@@ -510,7 +645,7 @@ agent client both need no configuration.
 
 ---
 
-## 7. The whole-API hatch
+## 8. The whole-API hatch
 
 For internal tools or trusted agents you can expose every eligible **read**
 endpoint at once, without tagging each one, via `expose_all_as_mcp()`:
@@ -534,7 +669,7 @@ conservative:
 
 ---
 
-## 8. Eligibility: JSON in, JSON out
+## 9. Eligibility: JSON in, JSON out
 
 Only JSON endpoints are eligible. Autumn detects this structurally: a route is
 eligible when its handler has a JSON **response schema** (it returns
@@ -563,7 +698,7 @@ handler tagged `status = 204`) cannot leak its response body to agents.
 
 ---
 
-## 9. Repository CRUD tools
+## 10. Repository CRUD tools
 
 The `#[repository(Model, api = "/path")]` macro generates five CRUD routes.
 Add the `mcp` key to expose them as tools — no hand-written handlers or
@@ -598,7 +733,7 @@ agents fully-typed inputs.
 
 ---
 
-## 10. Plugins and route-level opt-in
+## 11. Plugins and route-level opt-in
 
 Typed routes registered by a [plugin](../plugins.md) — via
 `AppBuilder::routes()` or `scoped()` inside `Plugin::build` — flow into the
@@ -675,7 +810,7 @@ feature and calls `mount_mcp`.
 
 ---
 
-## 11. End-to-end example
+## 12. End-to-end example
 
 `examples/todo-app` ships an `/mcp` endpoint. Its bearer-token JSON API is
 mounted in a `scoped("/api", RequireApiToken, …)` group and tagged
@@ -703,7 +838,7 @@ header to watch progress frames arrive as the scan runs.
 
 ---
 
-## 12. How a tool call is dispatched (and why it can't loop)
+## 13. How a tool call is dispatched (and why it can't loop)
 
 When a `tools/call` arrives, the MCP handler reconstructs an ordinary HTTP
 request — filling the path template, building the query string, and attaching
@@ -735,11 +870,11 @@ that from convention to a structural guarantee.)
 
 ---
 
-## 13. Scope and roadmap
+## 14. Scope and roadmap
 
 This slice is **tools-only**. Tool results are buffered by default, with
-**opt-in progressive streaming over SSE** (§5). The following remain **out of
-scope** and are tracked as follow-ups:
+**opt-in progressive streaming over SSE** (§5) and **opt-in tasks** (§6). The
+following remain **out of scope** and are tracked as follow-ups:
 
 - **Daemon lifetime** for long-running, session-surviving work —
   [#1119](https://github.com/autumn-foundation/autumn/issues/1119).
@@ -747,10 +882,10 @@ scope** and are tracked as follow-ups:
   start/status/signal MCP tools on top of this layer
   ([autumn-harvest#597](https://github.com/madmax983/autumn-harvest)); the
   management API itself can already be exposed via the plugin route toggles
-  (§10).
+  (§11).
 - **Tool declarations for raw `nest()`/`merge()` routers** — opaque routers
   carry no `ApiDoc`, so plugins must register typed routes to be
-  MCP-exposable (§10).
+  MCP-exposable (§11).
 - **MCP resources, prompts, and sampling** — this slice is tools-only.
 - **stdio transport** — agents target deployed apps, so HTTP only for v1.
 - **Non-JSON endpoints** (file upload/download, HTML).

@@ -215,6 +215,10 @@ pub struct ApiDoc {
     /// schema, this flag also exempts the tool from the JSON-out eligibility
     /// gate that otherwise excludes schema-less routes.
     pub mcp_stream: bool,
+    /// True when the endpoint opts in to the MCP Tasks extension via
+    /// `#[api_doc(mcp, task)]`. A client that declares the extension gets a
+    /// task handle and polls `tasks/get` for the result.
+    pub mcp_task: bool,
     /// Build-time authority envelope proved for this handler by
     /// `#[agent_operable(grant = ...)]` (issue #1691), or `None` for a handler
     /// that declares none.

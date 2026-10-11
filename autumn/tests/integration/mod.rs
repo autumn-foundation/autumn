@@ -236,9 +236,9 @@ mod mcp_step_up_guard;
 #[cfg(feature = "mcp")]
 mod mcp_streaming;
 #[cfg(feature = "mcp")]
-mod mcp_tasks;
-#[cfg(feature = "mcp")]
 mod mcp_structured_query;
+#[cfg(feature = "mcp")]
+mod mcp_tasks;
 #[cfg(feature = "mcp")]
 mod mcp_throttle_guard;
 mod middleware_introspection;
