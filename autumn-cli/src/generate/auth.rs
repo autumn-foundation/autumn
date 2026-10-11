@@ -11849,7 +11849,7 @@ mod tests {
             .expect("startup hook is generated");
         let body = &routes[hook_at..(hook_at + 1500).min(routes.len())];
         assert!(
-            body.contains("session_rotation_hooks().register"),
+            body.contains(".session_rotation_hooks()") && body.contains(".register("),
             "startup hook must register a rotation hook:\n{body}"
         );
         assert!(
