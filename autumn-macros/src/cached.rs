@@ -818,12 +818,13 @@ pub fn cached_impl_macro(
         )
         .to_compile_error();
     };
+    let target = autumn_macros_support::crate_path::current_target();
     for item in &mut imp.items {
         let syn::ImplItem::Fn(method) = item else {
             continue;
         };
         for attr in &mut method.attrs {
-            if is_cached_path(attr.path()) {
+            if is_cached_path(attr.path(), &target) {
                 scope_cached_attr(attr, &scope, crate_override);
             }
         }
@@ -841,17 +842,24 @@ fn is_type_path(text: &str) -> bool {
 
 /// Whether a path names this crate's `cached` macro.
 ///
-/// The crate may be renamed (`web::cached`), so any `..::cached` counts. The
-/// third-party `cached` crate (`cached::proc_macro::cached`) does not.
-fn is_cached_path(path: &syn::Path) -> bool {
-    path.segments
-        .last()
-        .is_some_and(|seg| seg.ident == "cached")
-        && (path.segments.len() == 1 || path.segments[0].ident != "cached")
+/// `target` is the resolved crate name, which may be renamed (`web::cached`).
+/// Another crate's `cached` macro (`memo::cached`) stays untouched.
+fn is_cached_path(path: &syn::Path, target: &str) -> bool {
+    let names: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+    match names
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["cached"] => true,
+        [krate, "cached"] => *krate == target || matches!(*krate, "autumn_web" | "crate"),
+        _ => false,
+    }
 }
 
-/// Append `scope = "<scope>"` (and the `crate = ".."` override, if any) to a
-/// `#[cached]` attribute that has no scope.
+/// Add `scope = "<scope>"` and the outer `crate = ".."` override to a
+/// `#[cached]` attribute. Each is added only if the attribute lacks it.
 fn scope_cached_attr(attr: &mut syn::Attribute, scope: &str, crate_override: Option<&str>) {
     let path = attr.path().clone();
     let tokens = match &attr.meta {
@@ -859,12 +867,16 @@ fn scope_cached_attr(attr: &mut syn::Attribute, scope: &str, crate_override: Opt
         syn::Meta::List(list) => list.tokens.clone(),
         syn::Meta::NameValue(_) => return,
     };
-    if parse_cached_args(
+    let (inner_crate, rest) =
         autumn_macros_support::crate_path::extract_crate_override(tokens.clone())
-            .map_or_else(|_| tokens.clone(), |(_, rest)| rest),
-    )
-    .is_ok_and(|a| a.scope.is_some())
-    {
+            .unwrap_or_else(|_| (None, tokens.clone()));
+    let has_scope = parse_cached_args(rest).is_ok_and(|a| a.scope.is_some());
+    let forward_crate = if inner_crate.is_some() {
+        None
+    } else {
+        crate_override
+    };
+    if has_scope && forward_crate.is_none() {
         return;
     }
     // A trailing comma is legal in `#[cached(ttl = "5m",)]`. Drop it, so the
@@ -874,14 +886,17 @@ fn scope_cached_attr(attr: &mut syn::Attribute, scope: &str, crate_override: Opt
         kept.pop();
     }
     let tokens: TokenStream = kept.into_iter().collect();
-    let mut extra = quote! { scope = #scope };
-    if let Some(name) = crate_override {
-        extra = quote! { #extra, crate = #name };
+    let mut extra: Vec<TokenStream> = Vec::new();
+    if !has_scope {
+        extra.push(quote! { scope = #scope });
+    }
+    if let Some(name) = forward_crate {
+        extra.push(quote! { crate = #name });
     }
     *attr = if tokens.is_empty() {
-        syn::parse_quote! { #[#path(#extra)] }
+        syn::parse_quote! { #[#path(#(#extra),*)] }
     } else {
-        syn::parse_quote! { #[#path(#tokens, #extra)] }
+        syn::parse_quote! { #[#path(#tokens, #(#extra),*)] }
     };
 }
 
@@ -1108,7 +1123,32 @@ mod tests {
     }
 
     #[test]
+    fn cached_impl_forwards_the_crate_override_beside_an_explicit_scope() {
+        let out = cached_impl_macro(
+            TokenStream::new(),
+            quote! { impl P { #[cached(scope = "Mine")] async fn f() {} } },
+            Some("web"),
+        )
+        .to_string();
+        assert!(
+            out.contains("# [cached (scope = \"Mine\" , crate = \"web\")]"),
+            "{out}"
+        );
+        assert_eq!(out.matches("scope").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn cached_impl_skips_another_crates_cached_path() {
+        let out = scoped(
+            TokenStream::new(),
+            quote! { impl P { #[memo::cached] fn f() {} } },
+        );
+        assert!(!out.contains("scope"), "{out}");
+    }
+
+    #[test]
     fn cached_impl_scopes_a_renamed_crate_path() {
+        let _target = autumn_macros_support::crate_path::set_target(Some("web"));
         let out = scoped(
             TokenStream::new(),
             quote! { impl P { #[web::cached] async fn f() {} } },
