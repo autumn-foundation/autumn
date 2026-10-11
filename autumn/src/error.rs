@@ -265,6 +265,14 @@ where
         // a refused negative balance are state conflicts, so they take 409.
         // An overflow is a value the server built and could not hold, so it
         // stays a 500. Mapped by downcast for the reason on the Constela arm.
+        // A SQLite fleet (ADR 0019): an unusable tenant id is the client's
+        // fault (400), an unknown tenant database is 404, a pending migration
+        // is 503. Mapped by downcast for the reason on the Constela arm.
+        #[cfg(feature = "sqlite")]
+        if let Some(fleet_err) = any_err.downcast_ref::<crate::db::fleet::FleetError>() {
+            status = fleet_err.http_status();
+        }
+
         if let Some(money_err) = any_err.downcast_ref::<crate::money::MoneyError>() {
             status = money_err.http_status();
         }

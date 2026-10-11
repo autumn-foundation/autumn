@@ -211,6 +211,7 @@ mod tests {
             environment: "test".to_owned(),
             otlp_endpoint: None,
             protocol: TelemetryProtocol::Grpc,
+            sample_ratio: 1.0,
         };
 
         // This should return an error because it's enabled but no endpoint is provided (assuming OTLP feature).

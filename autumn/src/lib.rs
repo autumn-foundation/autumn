@@ -180,6 +180,7 @@ pub mod db;
 #[cfg(feature = "db")]
 pub(crate) mod db_ping;
 pub(crate) mod db_url;
+pub mod fleet_layout;
 // Request deadlines (issue #3058). The module carries its own `//!` docs.
 pub mod deadline;
 pub mod dotenv;

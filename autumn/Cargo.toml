@@ -389,7 +389,7 @@ moka = { workspace = true, optional = true }
 multer = { workspace = true }
 pin-project-lite = "0.2"
 serde.workspace = true
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 # Version-requirement matching for the plugin API stability contract
 # (issue #1601). `semver` has no transitive dependencies.
 semver.workspace = true
@@ -1191,6 +1191,16 @@ path = "tests/sqlite_tracked_sessions.rs"
 [[test]]
 name = "sqlite_transactional_url_pool"
 path = "tests/sqlite_transactional_url_pool.rs"
+
+# SQLite fleet end to end (ADR 0019): `ShardedDb`, `Shards`, `CrossShard` and a
+# `#[repository(tenant_scoped, sharded)]` repository served by a per-tenant /
+# per-slot `DatabaseFleet`. The file is
+# `#![cfg(all(feature = "sqlite", feature = "test-support"))]`, so other builds
+# compile it to an empty binary. Run explicitly:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet`.
+[[test]]
+name = "sqlite_fleet"
+path = "tests/sqlite_fleet.rs"
 
 # Sim-testing W4 SQLite DB lane (issue #1797): proves the job/scheduler drain
 # runs end-to-end against a fresh, migrated, in-process in-memory SQLite substrate

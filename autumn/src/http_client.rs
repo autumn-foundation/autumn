@@ -2,8 +2,9 @@
 //!
 //! Exposes [`Client`](crate::http_client::Client) as `autumn_web::http::Client` — a thin `reqwest`-backed
 //! outbound HTTP client that propagates the active span's `traceparent` /
-//! `tracestate` headers, retries transient failures, and is mockable in tests
-//! via [`TestApp::http_mock`](crate::test::TestApp::http_mock).
+//! `tracestate` headers and the current request's `x-request-id`, opens one
+//! CLIENT span per attempt, retries transient failures, and is mockable in
+//! tests via [`TestApp::http_mock`](crate::test::TestApp::http_mock).
 //!
 //! # Quick start
 //!
@@ -1598,6 +1599,7 @@ impl Client {
             discard_response_body: false,
             breaker_scoped: false,
             sim_net: self.sim_net.clone(),
+            forward_request_id: true,
             retry: self.retry.clone(),
             entropy: self.entropy.clone(),
             throttle: self.throttle.clone(),
@@ -1806,6 +1808,10 @@ enum RedirectMode {
 const SSRF_SAFE_MAX_REDIRECTS: usize = 5;
 
 /// Fluent outbound request builder produced by [`Client`] methods.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent per-request switches; each has its own builder method"
+)]
 pub struct RequestBuilder {
     client: reqwest::Client,
     method: Method,
@@ -1837,6 +1843,9 @@ pub struct RequestBuilder {
     breaker_scoped: bool,
     /// The simulated network, when the client came from a sim app state.
     sim_net: Option<Arc<crate::sim::SimNet>>,
+    /// When `true` (the default), `send` adds the current request's id as
+    /// `x-request-id`. See [`RequestBuilder::without_request_id`].
+    forward_request_id: bool,
     /// Retry budgets and deadline header settings (issue #3058).
     retry: RetrySettings,
     /// Source of retry jitter and of the automatic `Idempotency-Key`.
@@ -1848,6 +1857,16 @@ pub struct RequestBuilder {
 }
 
 impl RequestBuilder {
+    /// Do not send the current request's id as `x-request-id`.
+    ///
+    /// By default, a request sent during an inbound request carries that
+    /// request's id (issue #3064). Use this for a host that must not see it.
+    #[must_use]
+    pub const fn without_request_id(mut self) -> Self {
+        self.forward_request_id = false;
+        self
+    }
+
     /// Send this criticality in the `X-Autumn-Criticality` header (issue
     /// #3068). Without this call, the client sends the criticality of the
     /// inbound request that it serves, if any.
@@ -2215,6 +2234,11 @@ impl RequestBuilder {
         crate::fault_injection::inject(crate::fault_injection::FaultTarget::Http)
             .await
             .map_err(|fault| ClientError::FaultInjected(fault.to_string()))?;
+        // After the capture tee armed, so a capsule records only the caller's
+        // own headers and replay compares like with like.
+        if self.forward_request_id {
+            add_current_request_id(&mut self.extra_headers);
+        }
         // After the capture tee, so a capsule records the caller's headers
         // only and replays without a random key.
         self.ensure_idempotency_key();
@@ -2360,11 +2384,8 @@ impl RequestBuilder {
             // A throttled attempt ends the call, retry or not.
             let ticket = self.begin_attempt(&gate, None)?;
             let last = attempt + 1 == max_attempts;
-            let req = self.plain_attempt(&gate);
-            let (sent, followed) = send_tracking_redirects(req).await;
-            // Each host that served a redirect gets its refill, even when
-            // the send or the body fails later.
-            gate.record_destinations(&followed, &mut refilled);
+            let (span, sent, followed) =
+                self.send_plain_attempt(&gate, attempt, &mut refilled).await;
             match sent {
                 Ok(resp) => {
                     let status = resp.status();
@@ -2396,7 +2417,7 @@ impl RequestBuilder {
                         // Dropped unread — see `discard_response_body`.
                         Ok(Bytes::new())
                     } else {
-                        resp.bytes().await.map_err(|e| gate.body_error(e))
+                        read_body_in_span(resp, &span, &gate).await
                     };
                     // Count the attempt only now: a body that fails to arrive
                     // is a transport error, not an accept.
@@ -2545,10 +2566,35 @@ impl RequestBuilder {
         Ok(ticket)
     }
 
+    /// Send one plain-path attempt in its own CLIENT span (issue #3064). The
+    /// trace context is injected inside the span, so the next service's
+    /// parent is this attempt. Returns the span, so the caller reads the body
+    /// in it, the send result and the redirect targets followed. Each host
+    /// that served a redirect gets its refill, even when the send or the body
+    /// fails later.
+    async fn send_plain_attempt(
+        &self,
+        gate: &RetryGate,
+        attempt: u32,
+        refilled: &mut std::collections::HashSet<String>,
+    ) -> (
+        tracing::Span,
+        Result<reqwest::Response, reqwest::Error>,
+        Vec<String>,
+    ) {
+        let span = client_attempt_span(&self.method, &self.url, attempt);
+        let req = self.plain_attempt(gate, &span);
+        let (sent, followed) =
+            tracing::Instrument::instrument(send_tracking_redirects(req), span.clone()).await;
+        record_send_outcome(&span, &sent);
+        gate.record_destinations(&followed, refilled);
+        (span, sent, followed)
+    }
+
     /// The request of one plain-path attempt: the attempt timeout under a
     /// deadline, the trace context, then the caller's headers, which may
     /// override or extend the trace headers.
-    fn plain_attempt(&self, gate: &RetryGate) -> reqwest::RequestBuilder {
+    fn plain_attempt(&self, gate: &RetryGate, span: &tracing::Span) -> reqwest::RequestBuilder {
         let timeout = gate.attempt_timeout(self.retry_policy.request_timeout);
         let mut req = self.client.request(self.method.clone(), &self.url);
         if gate.deadline.is_some()
@@ -2556,7 +2602,7 @@ impl RequestBuilder {
         {
             req = req.timeout(timeout);
         }
-        req = inject_trace_context(req);
+        req = span.in_scope(|| inject_trace_context(req, &self.extra_headers));
         req = with_caller_headers(req, gate, timeout, &self.extra_headers);
         if let Some(body) = &self.body {
             req = req.body(body.clone());
@@ -2627,6 +2673,8 @@ impl RequestBuilder {
     /// jittered backoff, `Retry-After` on 429 and 503, and per-attempt
     /// timeout of the real retry loop.
     async fn send_sim(self, net: &crate::sim::SimNet) -> Result<Response, ClientError> {
+        use tracing::Instrument as _;
+
         let url = self.sim_url()?;
         let host = url
             .host_str()
@@ -2642,9 +2690,14 @@ impl RequestBuilder {
             }
             let ticket = self.begin_attempt(&gate, Some(&host))?;
             let last = attempt + 1 == max_attempts;
+            // One CLIENT span per attempt, as on the real send paths. The host
+            // router sees this span in its `traceparent`.
+            let span = client_attempt_span(&self.method, url.as_str(), attempt);
             let timeout = gate.attempt_timeout(self.retry_policy.request_timeout);
             let deadline_header = gate.header(timeout, &self.extra_headers);
-            let exchange = self.sim_attempt(net, &host, &url, timeout, deadline_header);
+            let exchange = self
+                .sim_attempt(net, &host, &url, timeout, deadline_header)
+                .instrument(span.clone());
             // Under a deadline, check it before each poll of the attempt, as
             // the real paths' request timeout does: `tokio::time::timeout`
             // polls the attempt first, so an answer ready at the deadline
@@ -2673,6 +2726,12 @@ impl RequestBuilder {
                 }
                 None => exchange.await,
             };
+            match &outcome {
+                Ok(response) => record_attempt_status(&span, response.status.as_u16()),
+                Err(SimAttemptError::Transient(_)) => record_attempt_error(&span, "network"),
+                Err(SimAttemptError::Fatal(_)) => record_attempt_error(&span, "request"),
+            }
+            drop(span);
             // A transient failure at the caller's deadline says nothing about
             // the host: its ticket is dropped, which counts as an accept.
             let deadline_stop =
@@ -3646,12 +3705,9 @@ async fn serve_sim_host(
         let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
         builder = builder.header(reqwest::header::HOST, authority);
     }
-    // Trace context first, as on the real send path. A caller header of the
-    // same name wins.
-    for (name, value) in trace_context_headers() {
-        if !request.extra_headers.contains_key(name.as_str()) {
-            builder = builder.header(name, value);
-        }
+    // Trace context first, as on the real send path. A caller header wins.
+    for (name, value) in trace_headers_to_send(trace_context_headers(), &request.extra_headers) {
+        builder = builder.header(name, value);
     }
     let sends_deadline = deadline_header.is_some();
     if let Some(value) = deadline_header {
@@ -4020,13 +4076,14 @@ async fn send_one(
         if let Some(timeout) = attempt_timeout {
             req = req.timeout(timeout);
         }
-        req = inject_trace_context(req);
+        let span = client_attempt_span(method, url, attempt);
+        req = span.in_scope(|| inject_trace_context(req, extra_headers));
         req = with_caller_headers(req, gate, attempt_timeout, extra_headers);
         if let Some(body) = body {
             req = req.body(body.clone());
         }
 
-        match req.send().await {
+        match send_in_span(req, &span).await {
             Ok(resp) => {
                 let status = resp.status();
                 let headers = resp.headers().clone();
@@ -4065,7 +4122,7 @@ async fn send_one(
                     // Dropped unread — see `RequestBuilder::discard_response_body`.
                     Ok(Bytes::new())
                 } else {
-                    resp.bytes().await.map_err(|e| gate.body_error(e))
+                    read_body_in_span(resp, &span, gate).await
                 };
                 // Count the attempt only now: a body that fails to arrive is
                 // a transport error, not an accept. A body the caller's
@@ -4393,16 +4450,151 @@ fn log_request(
     );
 }
 
-/// Inject the active span's W3C `traceparent` / `tracestate` headers into the
-/// request builder.  No-ops when the `telemetry-otlp` feature is disabled or
-/// when there is no active span with a valid context.
-#[allow(clippy::missing_const_for_fn)]
-fn inject_trace_context(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+/// Open the CLIENT span for one outbound attempt (issue #3064).
+///
+/// Field names follow the OpenTelemetry HTTP client conventions. The span
+/// holds the URL path only, not the query: a query can hold secrets.
+fn client_attempt_span(method: &Method, url: &str, attempt: u32) -> tracing::Span {
+    let span = tracing::info_span!(
+        "http.client.request",
+        otel.name = %method,
+        otel.kind = "client",
+        http.request.method = %method,
+        server.address = tracing::field::Empty,
+        url.path = tracing::field::Empty,
+        http.request.resend_count = tracing::field::Empty,
+        http.response.status_code = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+    );
+    // The conventions leave `resend_count` unset on the first attempt.
+    if attempt > 0 {
+        span.record("http.request.resend_count", attempt);
+    }
+    // Parse the URL only when a subscriber listens.
+    if !span.is_disabled()
+        && let Ok(parsed) = reqwest::Url::parse(url)
+    {
+        span.record("server.address", parsed.host_str().unwrap_or_default());
+        span.record("url.path", parsed.path());
+    }
+    span
+}
+
+/// Record the response status on an attempt span. A 4xx or 5xx status sets
+/// the span status to `ERROR`, as the HTTP client conventions require.
+fn record_attempt_status(span: &tracing::Span, status: u16) {
+    span.record("http.response.status_code", status);
+    if status >= 400 {
+        span.record("otel.status_code", "ERROR");
+    }
+}
+
+/// Record a failed attempt: the error class and the `ERROR` span status.
+fn record_attempt_error(span: &tracing::Span, kind: &'static str) {
+    span.record("error.type", kind);
+    span.record("otel.status_code", "ERROR");
+}
+
+/// Read the response body inside the attempt `span`, so the span covers the
+/// body transfer. A read failure sets `error.type = "body"`, and `gate`
+/// classifies it (see [`RetryGate::body_error`]).
+async fn read_body_in_span(
+    response: reqwest::Response,
+    span: &tracing::Span,
+    gate: &RetryGate,
+) -> Result<Bytes, ClientError> {
+    use tracing::Instrument as _;
+
+    let body = response.bytes().instrument(span.clone()).await;
+    if body.is_err() {
+        record_attempt_error(span, "body");
+    }
+    body.map_err(|e| gate.body_error(e))
+}
+
+/// Send `request` inside `span`, then record the status code or the error
+/// class on the span.
+///
+/// The caller keeps `span` open through the body read, and ends it before a
+/// `Retry-After` sleep: the sleep is not part of the attempt.
+async fn send_in_span(
+    request: reqwest::RequestBuilder,
+    span: &tracing::Span,
+) -> Result<reqwest::Response, reqwest::Error> {
+    use tracing::Instrument as _;
+
+    let sent = request.send().instrument(span.clone()).await;
+    record_send_outcome(span, &sent);
+    sent
+}
+
+/// Record the status code or the error class of one send on its attempt
+/// `span`.
+fn record_send_outcome(span: &tracing::Span, sent: &Result<reqwest::Response, reqwest::Error>) {
+    match sent {
+        Ok(response) => record_attempt_status(span, response.status().as_u16()),
+        Err(error) => {
+            let kind = if error.is_timeout() {
+                "timeout"
+            } else if error.is_connect() {
+                "connect"
+            } else {
+                "request"
+            };
+            record_attempt_error(span, kind);
+        }
+    }
+}
+
+/// Inject the W3C trace-context headers of the active span, except the ones
+/// that [`trace_headers_to_send`] drops for `caller_headers`.
+fn inject_trace_context(
+    builder: reqwest::RequestBuilder,
+    caller_headers: &HeaderMap,
+) -> reqwest::RequestBuilder {
     let mut builder = builder;
-    for (name, value) in trace_context_headers() {
+    for (name, value) in trace_headers_to_send(trace_context_headers(), caller_headers) {
         builder = builder.header(name, value);
     }
     builder
+}
+
+/// The injected trace headers to send. Skip a name that `caller_headers`
+/// holds: `RequestBuilder::header` appends, so if not, the request sends both
+/// values.
+///
+/// `traceparent` and `tracestate` are one W3C context. When the caller sets
+/// either one, skip both, so the request never mixes two contexts.
+fn trace_headers_to_send(
+    injected: Vec<(String, HeaderValue)>,
+    caller_headers: &HeaderMap,
+) -> Vec<(String, HeaderValue)> {
+    const W3C_PAIR: [&str; 2] = ["traceparent", "tracestate"];
+    let caller_has_context = W3C_PAIR
+        .iter()
+        .any(|name| caller_headers.contains_key(*name));
+    injected
+        .into_iter()
+        .filter(|(name, _)| {
+            let paired = caller_has_context && W3C_PAIR.contains(&name.as_str());
+            !paired && !caller_headers.contains_key(name.as_str())
+        })
+        .collect()
+}
+
+/// Add the current request's id as `x-request-id` (issue #3064). Do nothing
+/// when the caller set the header, or when there is no current request.
+fn add_current_request_id(headers: &mut HeaderMap) {
+    static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
+    if headers.contains_key(&X_REQUEST_ID) {
+        return;
+    }
+    if let Some(value) =
+        crate::log::context::current_request_id().and_then(|id| HeaderValue::from_str(&id).ok())
+    {
+        headers.insert(X_REQUEST_ID.clone(), value);
+    }
 }
 
 /// The W3C trace-context headers for the active span. Empty when the
@@ -5646,13 +5838,114 @@ mod tests {
         });
     }
 
-    // TEST 34: inject_trace_context passthrough (without telemetry-otlp feature).
+    // TEST 34: the request id is added only inside a request.
     #[test]
-    fn inject_trace_context_passthrough_without_telemetry() {
-        let inner = reqwest::Client::new();
-        let builder = inner.get("https://example.com");
-        // Without telemetry-otlp the function is a no-op; verify it doesn't panic.
-        let _b = inject_trace_context(builder);
+    fn no_request_id_outside_a_request() {
+        let mut headers = HeaderMap::new();
+        add_current_request_id(&mut headers);
+        assert!(headers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn current_request_id_is_added() {
+        let ctx = crate::log::context::LogContext::new(Some("rid-1".to_owned()));
+        let mut headers = HeaderMap::new();
+        crate::log::context::scope(ctx, async { add_current_request_id(&mut headers) }).await;
+        assert_eq!(headers.get("x-request-id").unwrap(), "rid-1");
+    }
+
+    #[tokio::test]
+    async fn caller_request_id_is_kept() {
+        let ctx = crate::log::context::LogContext::new(Some("rid-1".to_owned()));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("mine"));
+        crate::log::context::scope(ctx, async { add_current_request_id(&mut headers) }).await;
+        assert_eq!(headers.get_all("x-request-id").iter().count(), 1);
+        assert_eq!(headers.get("x-request-id").unwrap(), "mine");
+    }
+
+    /// `traceparent` and `tracestate` are one W3C context. A caller value for
+    /// either one drops both injected headers, so the request never mixes two
+    /// contexts.
+    #[test]
+    fn caller_trace_header_drops_the_whole_injected_pair() {
+        let injected = || {
+            vec![
+                ("traceparent".to_owned(), HeaderValue::from_static("ours-p")),
+                ("tracestate".to_owned(), HeaderValue::from_static("ours-s")),
+                ("baggage".to_owned(), HeaderValue::from_static("ours-b")),
+            ]
+        };
+        let names = |caller: &[&'static str]| {
+            let mut headers = HeaderMap::new();
+            for name in caller {
+                headers.insert(*name, HeaderValue::from_static("mine"));
+            }
+            let mut sent: Vec<String> = trace_headers_to_send(injected(), &headers)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            sent.sort();
+            sent
+        };
+        assert_eq!(names(&[]), ["baggage", "traceparent", "tracestate"]);
+        assert_eq!(names(&["traceparent"]), ["baggage"]);
+        assert_eq!(names(&["tracestate"]), ["baggage"]);
+        assert_eq!(names(&["baggage"]), ["traceparent", "tracestate"]);
+    }
+
+    #[test]
+    fn caller_trace_header_suppresses_the_injected_one() {
+        let mut caller = HeaderMap::new();
+        caller.insert("traceparent", HeaderValue::from_static("mine"));
+        let request =
+            inject_trace_context(reqwest::Client::new().get("https://example.com"), &caller)
+                .build()
+                .unwrap();
+        assert!(request.headers().get("traceparent").is_none());
+    }
+
+    // A request built with `without_request_id` sends no id.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn without_request_id_sends_no_id() {
+        use axum::{Router, http::HeaderMap as AxumHeaders, routing::get};
+
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        let app = Router::new().route(
+            "/echo",
+            get(|headers: AxumHeaders| async move {
+                headers
+                    .get("x-request-id")
+                    .map_or_else(|| "none".to_owned(), |v| v.to_str().unwrap().to_owned())
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let ctx = crate::log::context::LogContext::new(Some("rid-1".to_owned()));
+        let url = format!("http://{addr}/echo");
+        let (forwarded, opted_out) = crate::log::context::scope(ctx, async {
+            let forwarded = Client::new().get(&url).send().await.unwrap().text();
+            let opted_out = Client::new()
+                .get(&url)
+                .without_request_id()
+                .send()
+                .await
+                .unwrap()
+                .text();
+            (forwarded, opted_out)
+        })
+        .await;
+        assert_eq!(forwarded, "rid-1");
+        assert_eq!(opted_out, "none");
+
+        crate::circuit_breaker::global_registry().clear();
     }
 
     // TEST 35: Real GET request exercises inject_trace_context, log_request, and
@@ -5683,6 +5976,407 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 200);
         assert!(resp.url().is_some());
         assert_eq!(resp.text(), "pong");
+
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    /// Records each `http.client.request` span and the fields set on it.
+    #[derive(Clone, Default)]
+    struct ClientSpanCapture {
+        spans: std::sync::Arc<
+            std::sync::Mutex<
+                std::collections::HashMap<u64, std::collections::BTreeMap<String, String>>,
+            >,
+        >,
+    }
+
+    struct SpanFieldVisitor<'a>(&'a mut std::collections::BTreeMap<String, String>);
+
+    impl tracing::field::Visit for SpanFieldVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(
+                field.name().to_owned(),
+                format!("{value:?}").trim_matches('"').to_owned(),
+            );
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for ClientSpanCapture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() != "http.client.request" {
+                return;
+            }
+            let mut fields = std::collections::BTreeMap::new();
+            attrs.record(&mut SpanFieldVisitor(&mut fields));
+            self.spans.lock().unwrap().insert(id.into_u64(), fields);
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if let Some(fields) = self.spans.lock().unwrap().get_mut(&id.into_u64()) {
+                values.record(&mut SpanFieldVisitor(fields));
+            }
+        }
+    }
+
+    /// Records how long each `http.client.request` span stays open.
+    #[derive(Clone, Default)]
+    struct ClientSpanDurations {
+        opened: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, Instant>>>,
+        closed: std::sync::Arc<std::sync::Mutex<Vec<Duration>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for ClientSpanDurations
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() == "http.client.request" {
+                self.opened
+                    .lock()
+                    .unwrap()
+                    .insert(id.into_u64(), Instant::now());
+            }
+        }
+
+        fn on_close(&self, id: tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            let start = self.opened.lock().unwrap().remove(&id.into_u64());
+            if let Some(start) = start {
+                self.closed.lock().unwrap().push(start.elapsed());
+            }
+        }
+    }
+
+    /// Install both span capture layers on this thread, warm up the callsite,
+    /// and return them.
+    fn capture_client_spans() -> (
+        ClientSpanCapture,
+        ClientSpanDurations,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let fields = ClientSpanCapture::default();
+        let durations = ClientSpanDurations::default();
+        let guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(fields.clone())
+                .with(durations.clone()),
+        );
+        drop(client_attempt_span(&Method::GET, "http://warm.up/", 0));
+        tracing::callsite::rebuild_interest_cache();
+        fields.spans.lock().unwrap().clear();
+        durations.closed.lock().unwrap().clear();
+        (fields, durations, guard)
+    }
+
+    // The attempt span stays open while the body streams, and records a body
+    // read failure.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn attempt_span_covers_the_response_body() {
+        use axum::{Router, body::Body, routing::get};
+        use futures::StreamExt as _;
+
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        let app = Router::new()
+            .route(
+                "/slow",
+                get(|| async {
+                    let stream = futures::stream::once(async {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Ok::<_, std::io::Error>(Bytes::from_static(b"late"))
+                    });
+                    Body::from_stream(stream)
+                }),
+            )
+            .route(
+                "/broken",
+                get(|| async {
+                    // Headers and one chunk go out, then the body fails.
+                    let stream = futures::stream::iter([
+                        Ok(Bytes::from_static(b"partial")),
+                        Err(std::io::Error::other("cut")),
+                    ])
+                    .then(|item| async move {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        item
+                    });
+                    Body::from_stream(stream)
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        for custom_path in [false, true] {
+            let (fields, durations, _guard) = capture_client_spans();
+            let mut slow = Client::new().get(format!("http://{addr}/slow"));
+            let mut broken = Client::new().get(format!("http://{addr}/broken"));
+            if custom_path {
+                slow = slow.no_redirect();
+                broken = broken.no_redirect();
+            }
+            assert_eq!(slow.send().await.unwrap().text(), "late");
+            let closed = durations.closed.lock().unwrap().clone();
+            assert_eq!(closed.len(), 1, "custom={custom_path}: {closed:?}");
+            assert!(
+                closed[0] >= Duration::from_millis(250),
+                "custom={custom_path}: the span ended before the body: {closed:?}"
+            );
+
+            fields.spans.lock().unwrap().clear();
+            assert!(broken.send().await.is_err());
+            let spans: Vec<_> = fields.spans.lock().unwrap().values().cloned().collect();
+            assert_eq!(spans.len(), 1, "custom={custom_path}: {spans:?}");
+            assert_eq!(
+                spans[0].get("error.type").map(String::as_str),
+                Some("body"),
+                "custom={custom_path}: {spans:?}"
+            );
+            assert_eq!(
+                spans[0].get("otel.status_code").map(String::as_str),
+                Some("ERROR"),
+                "custom={custom_path}: {spans:?}"
+            );
+
+            // A 4xx response is an error span too.
+            fields.spans.lock().unwrap().clear();
+            let mut missing = Client::new().get(format!("http://{addr}/missing"));
+            if custom_path {
+                missing = missing.no_redirect();
+            }
+            assert_eq!(missing.send().await.unwrap().status().as_u16(), 404);
+            let spans: Vec<_> = fields.spans.lock().unwrap().values().cloned().collect();
+            assert_eq!(spans.len(), 1, "custom={custom_path}: {spans:?}");
+            assert_eq!(
+                spans[0].get("otel.status_code").map(String::as_str),
+                Some("ERROR"),
+                "custom={custom_path}: {spans:?}"
+            );
+        }
+
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    // A sim attempt opens a CLIENT span too, one per attempt.
+    #[tokio::test]
+    async fn sim_attempts_open_client_spans() {
+        use axum::{Router, http::StatusCode, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (fields, _durations, _guard) = capture_client_spans();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let payments = Router::new().route(
+            "/charge",
+            get(move || {
+                let calls = std::sync::Arc::clone(&calls);
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let mut client = Client::new();
+        client.sim_net = Some(Arc::new(
+            crate::sim::SimNet::new().host("payments", payments),
+        ));
+
+        let response = client.get("http://payments/charge").send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+
+        let mut attempts: Vec<_> = fields.spans.lock().unwrap().values().cloned().collect();
+        attempts.sort_by_key(|f| f.get("http.request.resend_count").cloned());
+        assert_eq!(attempts.len(), 2, "{attempts:?}");
+        assert_eq!(
+            attempts[0].get("server.address").map(String::as_str),
+            Some("payments")
+        );
+        assert_eq!(
+            attempts[0]
+                .get("http.response.status_code")
+                .map(String::as_str),
+            Some("503")
+        );
+        assert_eq!(
+            attempts[1]
+                .get("http.response.status_code")
+                .map(String::as_str),
+            Some("200")
+        );
+        // A 5xx attempt is an error span; a 2xx attempt has no status.
+        assert_eq!(
+            attempts[0].get("otel.status_code").map(String::as_str),
+            Some("ERROR"),
+            "{attempts:?}"
+        );
+        assert_eq!(attempts[1].get("otel.status_code"), None, "{attempts:?}");
+    }
+
+    // A 429 attempt span ends before the `Retry-After` sleep, so its duration
+    // is the HTTP exchange only, on the plain and the custom send paths.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn attempt_span_ends_before_the_retry_after_sleep() {
+        use axum::{Router, http::StatusCode, response::IntoResponse as _, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        for custom_path in [false, true] {
+            let durations = ClientSpanDurations::default();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(durations.clone()),
+            );
+            drop(client_attempt_span(&Method::GET, "http://warm.up/", 0));
+            tracing::callsite::rebuild_interest_cache();
+            durations.closed.lock().unwrap().clear();
+
+            // The first call answers 429 with `Retry-After: 1`, the next 200.
+            let calls = std::sync::Arc::new(AtomicUsize::new(0));
+            let app = Router::new().route(
+                "/limited",
+                get(move || {
+                    let calls = std::sync::Arc::clone(&calls);
+                    async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "1")]).into_response()
+                        } else {
+                            StatusCode::OK.into_response()
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let mut request = Client::new().get(format!("http://{addr}/limited"));
+            if custom_path {
+                request = request.no_redirect();
+            }
+            assert_eq!(request.send().await.unwrap().status().as_u16(), 200);
+
+            let closed = durations.closed.lock().unwrap().clone();
+            assert_eq!(closed.len(), 2, "custom={custom_path}: {closed:?}");
+            assert!(
+                closed[0] < Duration::from_millis(500),
+                "custom={custom_path}: the 429 attempt span held the 1s sleep: {closed:?}"
+            );
+        }
+
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    // One CLIENT span per outbound attempt (issue #3064), on the plain and
+    // the custom send paths.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn each_attempt_opens_one_client_span() {
+        use axum::{Router, http::StatusCode, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        for custom_path in [false, true] {
+            let capture = ClientSpanCapture::default();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(capture.clone()),
+            );
+            // Another test can register this callsite on a thread with no
+            // subscriber, and cache it as "never". Register it here first,
+            // rebuild the cache, then discard the warm-up span.
+            drop(client_attempt_span(&Method::GET, "http://warm.up/", 0));
+            tracing::callsite::rebuild_interest_cache();
+            capture.spans.lock().unwrap().clear();
+
+            // The first call answers 503, the next 200: two attempts.
+            let calls = std::sync::Arc::new(AtomicUsize::new(0));
+            let app = Router::new().route(
+                "/flaky",
+                get(move || {
+                    let calls = std::sync::Arc::clone(&calls);
+                    async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let mut request = Client::new().get(format!("http://{addr}/flaky"));
+            if custom_path {
+                request = request.no_redirect();
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+
+            let mut attempts: Vec<_> = capture.spans.lock().unwrap().values().cloned().collect();
+            attempts.sort_by_key(|f| f.get("http.request.resend_count").cloned());
+            assert_eq!(attempts.len(), 2, "custom={custom_path}: {attempts:?}");
+            for (n, fields) in attempts.iter().enumerate() {
+                assert_eq!(fields.get("otel.kind").map(String::as_str), Some("client"));
+                assert_eq!(
+                    fields.get("http.request.method").map(String::as_str),
+                    Some("GET")
+                );
+                assert_eq!(
+                    fields.get("server.address").map(String::as_str),
+                    Some("127.0.0.1")
+                );
+                let resend = fields.get("http.request.resend_count");
+                assert_eq!(resend, (n > 0).then(|| n.to_string()).as_ref());
+            }
+            assert_eq!(
+                attempts[0]
+                    .get("http.response.status_code")
+                    .map(String::as_str),
+                Some("503")
+            );
+            assert_eq!(
+                attempts[1]
+                    .get("http.response.status_code")
+                    .map(String::as_str),
+                Some("200")
+            );
+        }
 
         crate::circuit_breaker::global_registry().clear();
     }
@@ -7942,8 +8636,12 @@ mod tests {
                 ..RetryPolicy::default()
             };
             let gate = RetryGate::with_deadline(None, None, None, true);
+            // Warm the connection. A cold first connect on a slow runner
+            // must not use up the hop deadline.
+            let client = reqwest::Client::new();
+            let _ = client.get(&url).send().await;
             let result = send_one(
-                &reqwest::Client::new(),
+                &client,
                 &Method::GET,
                 &url,
                 &HeaderMap::new(),
@@ -7951,7 +8649,7 @@ mod tests {
                 &policy,
                 &crate::entropy::SeededEntropy::new(1),
                 false,
-                Some(crate::time::ambient_instant() + Duration::from_millis(300)),
+                Some(crate::time::ambient_instant() + Duration::from_secs(1)),
                 false,
                 &gate,
                 false,

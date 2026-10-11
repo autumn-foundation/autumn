@@ -2223,13 +2223,23 @@ jobs:
           # tests only. Without this leg their lines are instrumented and
           # never run, so Codecov reads them as uncovered. A name filter keeps
           # the leg narrow.
+          # The SQLite database fleet (ADR 0019) is sqlite-only too: its runtime
+          # and per-database replication (`db::fleet`, `db::fleet_replication`)
+          # and the boot wiring are measured by the same leg, so no second
+          # lib-test build.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
-            --lib -- db::tests::sqlite_ db::tests::percent_decode
+            --lib -- db::tests::sqlite_ db::tests::percent_decode db::fleet \
+            app::fleet_boot_tests
           # The #1907 durable job queue and lease scheduler are a large slice of
           # sqlite-only code; without this lane Codecov reports all of it
           # uncovered.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_jobs_scheduler_e2e
+          # The fleet's HTTP suite: `ShardedDb`, sharded repositories and fan-out
+          # resolving to fleet databases (the fleet arms of `sharding.rs`).
+          # Shares the build above (same package and features).
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_fleet
           # Issue #2108: the admin plugin's `backend_select!` sqlite arms and
           # the cross-backend model suite. Without this lane Codecov reads them
           # as a new uncovered surface. No Docker, ~0.01s of runtime.
@@ -2455,6 +2465,7 @@ jobs:
             --test sqlite_scoped_repository \
             --test sqlite_read_only_tx \
             --test sqlite_transactional_url_pool \
+            --test sqlite_fleet \
             --test sqlite_version_history \
             --test sqlite_ledger \
             --test sqlite_ledger_out_of_band \

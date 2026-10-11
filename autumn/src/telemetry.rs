@@ -19,7 +19,11 @@ use opentelemetry_otlp::WithTonicConfig as _;
 #[cfg(feature = "telemetry-otlp")]
 use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
 #[cfg(feature = "telemetry-otlp")]
-use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator, trace::SdkTracerProvider};
+use opentelemetry_sdk::{
+    Resource,
+    propagation::TraceContextPropagator,
+    trace::{Sampler, SdkTracerProvider},
+};
 
 /// Type-erased handle for pushing a new [`EnvFilter`] directive to the live
 /// `tracing` subscriber at runtime.
@@ -123,6 +127,42 @@ pub struct OtlpTraceRuntime {
     pub protocol: TelemetryProtocol,
     /// Resource attributes describing this service.
     pub resource: TelemetryResource,
+    /// Ratio for the parent-based root sampler.
+    pub sample_ratio: SampleRatio,
+}
+
+/// A trace sample ratio in `[0.0, 1.0]`.
+///
+/// [`SampleRatio::new`] clamps the value and reads `NaN` as `1.0`, so the
+/// value is never `NaN`. That makes the `Eq` implementation sound.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SampleRatio(f64);
+
+impl Eq for SampleRatio {}
+
+impl SampleRatio {
+    /// Clamp `ratio` into `[0.0, 1.0]`. `NaN` becomes `1.0`.
+    #[must_use]
+    pub const fn new(ratio: f64) -> Self {
+        if ratio.is_nan() {
+            Self(1.0)
+        } else {
+            Self(ratio.clamp(0.0, 1.0))
+        }
+    }
+
+    /// The ratio as a number.
+    #[must_use]
+    pub const fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl Default for SampleRatio {
+    /// Sample every trace.
+    fn default() -> Self {
+        Self(1.0)
+    }
 }
 
 /// Service metadata attached to emitted traces.
@@ -302,6 +342,7 @@ impl TelemetryRuntime {
                     service_version: telemetry.service_version.clone(),
                     environment: telemetry.environment.clone(),
                 },
+                sample_ratio: SampleRatio::new(telemetry.sample_ratio),
             }),
             warning: None,
         })
@@ -601,8 +642,17 @@ fn build_tracer_provider(otlp: &OtlpTraceRuntime) -> Result<SdkTracerProvider, T
 
     Ok(SdkTracerProvider::builder()
         .with_resource(resource)
+        .with_sampler(sampler(otlp.sample_ratio))
         .with_batch_exporter(exporter)
         .build())
+}
+
+/// Parent-based ratio sampler (issue #3064). A child follows the decision of
+/// its parent, so a trace is never cut in half. The ratio decides only for
+/// root spans.
+#[cfg(feature = "telemetry-otlp")]
+fn sampler(ratio: SampleRatio) -> Sampler {
+    Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(ratio.get())))
 }
 
 #[cfg(feature = "telemetry-otlp")]
@@ -840,6 +890,69 @@ mod tests {
         }
     }
 
+    fn otlp_config(sample_ratio: f64) -> TelemetryConfig {
+        TelemetryConfig {
+            enabled: true,
+            otlp_endpoint: Some("http://127.0.0.1:4317".into()),
+            sample_ratio,
+            ..TelemetryConfig::default()
+        }
+    }
+
+    fn planned_ratio(sample_ratio: f64) -> f64 {
+        let runtime =
+            TelemetryRuntime::from_config(&LogConfig::default(), &otlp_config(sample_ratio), None)
+                .unwrap();
+        let TraceExport::Otlp(otlp) = runtime.trace_export else {
+            panic!("expected OTLP export");
+        };
+        otlp.sample_ratio.get()
+    }
+
+    #[test]
+    fn sample_ratio_defaults_to_one_and_is_clamped() {
+        assert!((TelemetryConfig::default().sample_ratio - 1.0).abs() < f64::EPSILON);
+        assert!((planned_ratio(0.25) - 0.25).abs() < f64::EPSILON);
+        assert!((planned_ratio(7.0) - 1.0).abs() < f64::EPSILON);
+        assert!(planned_ratio(-1.0).abs() < f64::EPSILON);
+        assert!((planned_ratio(f64::NAN) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[cfg(feature = "telemetry-otlp")]
+    #[test]
+    fn sampler_is_parent_based_ratio() {
+        use opentelemetry::trace::{
+            Span as _, TraceContextExt as _, Tracer as _, TracerProvider as _,
+        };
+
+        // No exporter: the test never waits on a network export.
+        let provider = |ratio: f64| {
+            SdkTracerProvider::builder()
+                .with_sampler(sampler(SampleRatio::new(ratio)))
+                .build()
+        };
+
+        // Ratio 0: a root span is not sampled.
+        let never = provider(0.0);
+        assert!(!never.tracer("t").start("root").span_context().is_sampled());
+
+        // Ratio 0, sampled parent: the child follows the parent.
+        let parent = opentelemetry::trace::SpanContext::new(
+            opentelemetry::trace::TraceId::from_hex("0af7651916cd43dd8448eb211c80319c").unwrap(),
+            opentelemetry::trace::SpanId::from_hex("b7ad6b7169203331").unwrap(),
+            opentelemetry::trace::TraceFlags::SAMPLED,
+            true,
+            opentelemetry::trace::TraceState::default(),
+        );
+        let cx = opentelemetry::Context::new().with_remote_span_context(parent);
+        let child = never.tracer("t").start_with_context("child", &cx);
+        assert!(child.span_context().is_sampled());
+
+        // Ratio 1: a root span is sampled.
+        let always = provider(1.0);
+        assert!(always.tracer("t").start("root").span_context().is_sampled());
+    }
+
     #[cfg(feature = "telemetry-otlp")]
     #[tokio::test]
     async fn build_tracer_provider_installs_w3c_propagator_and_returns_provider() {
@@ -858,6 +971,7 @@ mod tests {
                 service_version: "0.0.0".into(),
                 environment: "test".into(),
             },
+            sample_ratio: SampleRatio::default(),
         };
         let provider = build_tracer_provider(&otlp)
             .expect("tonic exporter + provider build should succeed lazily");
@@ -890,6 +1004,7 @@ mod tests {
                 service_version: "0.0.0".into(),
                 environment: "test".into(),
             },
+            sample_ratio: SampleRatio::default(),
         };
         let provider =
             build_tracer_provider(&otlp).expect("http-protobuf exporter should build lazily");

@@ -206,6 +206,7 @@ Every one of these is a hard error, not a warning:
 | a zero or oversized limit | a zero ceiling means "cannot run", not "no limit" |
 | `memory_bytes × max_concurrency` over 1 GiB | that product, not its factors, is what the plugin can cost the host |
 | a route path the router would refuse — `:id`, `*rest`, `{id`, `{*rest}/more` | `axum::Router::route` *panics* on one, so a manifest that passed would take the app down at boot |
+| a route on a path the app already serves, or on the configured OpenAPI, Swagger UI or MCP path | `Router::nest` would panic. The build returns a `RouterBuildError` that names the path. |
 | a module importing an allowlisted WASI name with the wrong signature, or exporting a `_start` that is not `() -> ()` | it would load and then fail on every request, as a gateway error nobody can explain from outside |
 | a module with more than 4096 data + element segments, or more than 16 MiB of them | every request re-instantiates the module, and that copying happens before the first guest instruction — so it is bounded at load rather than discovered per request |
 | a module that exports no linear memory named `memory`, or whose *initial* memory is already over the manifest's ceiling | every host function reads and writes through that export, so without it the plugin loads and then fails every request |

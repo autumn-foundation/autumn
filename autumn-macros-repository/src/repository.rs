@@ -2288,17 +2288,11 @@ fn ledger_append_ts(
     let op_variant = version_op_variant(op);
 
     // `ledgered` implies `soft_delete`, so a delete here is always soft: the row
-    // survives with `deleted_at` set. Version history's delete entry records the
-    // row's pre-delete values, and the record handed to this builder is that same
-    // pre-delete load — but every ledger revision snapshots the state after its
-    // write, or as-of reconstruction after a delete would return a row whose
-    // `deleted_at` is null while a live `with_deleted()` query shows it set.
-    //
-    // The `deleted_at` the UPDATE wrote is read back from the table rather than
-    // recomputed: the several soft-delete paths bind it from differently-scoped
-    // locals, and the bulk paths from a per-chunk one, so reading the stored value
-    // is the only spelling that compiles everywhere and the only one guaranteed
-    // byte-identical to the row. One extra indexed lookup, on ledgered deletes only.
+    // survives with `deleted_at` set. The record handed to this builder is the
+    // pre-delete load, but a ledger revision snapshots the state after its write.
+    // A trigger or a default may change any column in the same UPDATE (#2326), so
+    // reload the whole row. The bulk paths share this builder. Reading the row
+    // back is one indexed lookup, on ledgered deletes only.
     let table_ident = format_ident!("{table_name_ts}");
     let soft_delete_stamp = if op == "delete" {
         quote! {
@@ -2307,25 +2301,26 @@ fn ledger_append_ts(
                 // Named, not glob-aliased: the sync prelude also brings a
                 // `first`, and only an explicit import shadows it.
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let __lg_deleted_at: ::core::option::Option<
-                    ::autumn_web::reexports::chrono::NaiveDateTime,
-                > = #table_ident::table
+                let __lg_after: ::core::option::Option<#model_ident> = #table_ident::table
                     .find(__lg_record_id)
-                    .select(#table_ident::deleted_at)
-                    .first::<::core::option::Option<
-                        ::autumn_web::reexports::chrono::NaiveDateTime,
-                    >>(&mut *#conn_ident)
+                    .select(#model_ident::as_select())
+                    .first::<#model_ident>(&mut *#conn_ident)
                     .await
                     .optional()
-                    .map_err(::autumn_web::AutumnError::from)?
-                    .flatten();
-                if let ::core::option::Option::Some(__lg_obj) = __lg_snapshot.as_object_mut() {
-                    __lg_obj.insert(
-                        "deleted_at".to_string(),
-                        ::autumn_web::reexports::serde_json::to_value(__lg_deleted_at)
-                            .unwrap_or(::autumn_web::reexports::serde_json::Value::Null),
+                    .map_err(::autumn_web::AutumnError::from)?;
+                // A missing row would leave the stale pre-delete snapshot. Refuse.
+                let ::core::option::Option::Some(__lg_row) = __lg_after else {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::internal_server_error(
+                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
+                                table: #table_name_ts.to_string(),
+                                record_id: __lg_record_id,
+                                detail: "the deleted row cannot be read back".to_string(),
+                            },
+                        ),
                     );
-                }
+                };
+                __lg_snapshot = __lg_row.__autumn_commit_hook_to_value()?;
             }
         }
     } else {
@@ -3080,27 +3075,41 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             #[doc(hidden)]
             __autumn_shards: ::core::option::Option<::autumn_web::sharding::ShardSet>,
+            // Pins a fleet database open while this repository lives, so a
+            // lazily acquired connection never finds its pool closed
+            // (ADR 0019). `None` for configured shards.
+            #[doc(hidden)]
+            __autumn_shard_lease: ::core::option::Option<::autumn_web::sharding::ShardLease>,
         }
     } else {
         quote! {}
     };
 
     let shards_clone_field = if config.sharded {
-        quote! { __autumn_shards: self.__autumn_shards.clone(), }
+        quote! {
+            __autumn_shards: self.__autumn_shards.clone(),
+            __autumn_shard_lease: self.__autumn_shard_lease.clone(),
+        }
     } else {
         quote! {}
     };
 
     // The non-sharded extractor and shard-unaware constructors always use None.
     let shards_none_field = if config.sharded {
-        quote! { __autumn_shards: ::core::option::Option::None, }
+        quote! {
+            __autumn_shards: ::core::option::Option::None,
+            __autumn_shard_lease: ::core::option::Option::None,
+        }
     } else {
         quote! {}
     };
 
     // The self-routing sharded extractor populates this from the resolved ShardSet.
     let shards_some_field = if config.sharded {
-        quote! { __autumn_shards: ::core::option::Option::Some(__shard_set), }
+        quote! {
+            __autumn_shards: ::core::option::Option::Some(__shard_set),
+            __autumn_shard_lease: ::core::clone::Clone::clone(&__seed.lease),
+        }
     } else {
         quote! {}
     };
@@ -3112,6 +3121,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             __autumn_shards: ::core::option::Option::Some(
                 ::core::clone::Clone::clone(db.__autumn_shard_set()),
+            ),
+            __autumn_shard_lease: ::core::clone::Clone::clone(
+                &db.__autumn_repository_seed().lease,
             ),
         }
     } else {
@@ -3228,6 +3240,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #idempotency_field
                     across_tenants: true,
                     __autumn_shards: ::core::option::Option::None,
+                    // The fan-out future acquires lazily after `__shard` is
+                    // gone: hold its lease so the fleet keeps it open.
+                    __autumn_shard_lease: __shard.lease(),
                     // Honor the shard's read routing (replica / fail-closed),
                     // but preserve an explicit parent primary-read override
                     // (`primary_reads` or `on_primary()`) so cross-shard
@@ -3241,10 +3256,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __autumn_slow_threshold: self.__autumn_slow_threshold,
                     // Re-tag the route label with this shard so per-shard DB
                     // metrics and slow-query logs attribute fan-out work to the
-                    // shard executing it, not the originally-routed shard.
+                    // shard executing it, not the originally-routed shard. A
+                    // fleet database tags `shard=fleet`, never its own name,
+                    // so a tenant fleet cannot explode metric cardinality.
                     __autumn_route: ::autumn_web::sharding::reshard_route_label(
                         self.__autumn_route.as_deref(),
-                        __shard.name(),
+                        __shard.metric_label(),
                     ),
                     // Shard sub-repos are used for read fan-out only; mutations
                     // broadcast from the parent, not the per-shard instance.
@@ -4234,14 +4251,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // returning `{}` here would let `ledger_as_of` reconstruct an
                 // empty record and call it history.
                 let snapshot: ::autumn_web::reexports::serde_json::Value =
-                    ::autumn_web::reexports::serde_json::from_str(&row.snapshot)
-                        .map_err(|err| ::autumn_web::AutumnError::internal_server_error(
-                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
-                                table: #table_name.to_string(),
-                                record_id,
-                                detail: format!("revision {} has an unreadable snapshot: {err}", row.seq),
-                            },
-                        ))?;
+                    ::autumn_web::ledger::parse_stored_snapshot(
+                        #table_name, record_id, row.seq, &row.snapshot,
+                    )?;
                 __out.push(::autumn_web::ledger::LedgerRevision {
                     id: row.id,
                     table_name: row.table_name,
@@ -4275,14 +4287,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => ::autumn_web::version_history::VersionOp::Update,
                 };
                 let snapshot: ::autumn_web::reexports::serde_json::Value =
-                    ::autumn_web::reexports::serde_json::from_str(&row.snapshot)
-                        .map_err(|err| ::autumn_web::AutumnError::internal_server_error(
-                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
-                                table: #table_name.to_string(),
-                                record_id,
-                                detail: format!("revision {} has an unreadable snapshot: {err}", row.seq),
-                            },
-                        ))?;
+                    ::autumn_web::ledger::parse_stored_snapshot(
+                        #table_name, record_id, row.seq, &row.snapshot,
+                    )?;
                 ::core::option::Option::Some(::autumn_web::ledger::LedgerRevision {
                     id: row.id,
                     table_name: row.table_name,
@@ -4319,14 +4326,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => ::autumn_web::version_history::VersionOp::Update,
                 };
                 let snapshot: ::autumn_web::reexports::serde_json::Value =
-                    ::autumn_web::reexports::serde_json::from_str(&row.snapshot)
-                        .map_err(|err| ::autumn_web::AutumnError::internal_server_error(
-                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
-                                table: #table_name.to_string(),
-                                record_id,
-                                detail: format!("revision {} has an unreadable snapshot: {err}", row.seq),
-                            },
-                        ))?;
+                    ::autumn_web::ledger::parse_stored_snapshot(
+                        #table_name, record_id, row.seq, &row.snapshot,
+                    )?;
                 let revision = ::autumn_web::ledger::LedgerRevision {
                     id: row.id,
                     table_name: row.table_name,
@@ -5019,16 +5021,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         &revision.snapshot,
                     )?;
                     #model_name::__autumn_commit_hook_from_value(revision.snapshot.clone())
-                        .map_err(|err| ::autumn_web::AutumnError::internal_server_error(
-                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
-                                table: #table_name.to_string(),
-                                record_id,
-                                detail: format!(
-                                    "revision {} does not reconstruct into {}: {err}",
-                                    revision.seq,
-                                    stringify!(#model_name),
-                                ),
-                            },
+                        .map_err(|err| ::autumn_web::ledger::schema_mismatch(
+                            #table_name,
+                            record_id,
+                            revision.seq,
+                            &format!("cannot decode into {}: {err}", stringify!(#model_name)),
                         ))
                 }
 
@@ -5075,7 +5072,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // exists to produce trustworthy accusations. If the chain head
                     // moved under us, the live comparison is skipped rather than
                     // reported — a concurrent write is not tampering.
-                    let revisions = self.ledger_revisions(record_id).await?;
+                    let revisions = match self.ledger_revisions(record_id).await {
+                        ::core::result::Result::Ok(revisions) => revisions,
+                        ::core::result::Result::Err(err) =>
+                            return ::autumn_web::ledger::verification_from_read_error(record_id, err),
+                    };
                     let live = self.__autumn_ledger_live_view(record_id).await?;
                     // Head and mark in ONE statement: read separately they could
                     // come from differently-lagged replicas, and a fresh mark
@@ -5845,6 +5846,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #idempotency_init
                         across_tenants: true,
                         __autumn_shards: ::core::option::Option::Some(__set),
+                        __autumn_shard_lease: ::core::option::Option::None,
                         __autumn_read_route: #cross_read_route,
                         __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
                         __autumn_slow_threshold: __seed.slow_query_threshold,
@@ -28289,8 +28291,8 @@ mod tests {
         // history's delete entry records the pre-delete load, which would make
         // as-of after a delete report `deleted_at: null`.
         assert!(
-            generated.contains("\"deleted_at\" . to_string ()"),
-            "a ledgered delete revision must snapshot the stored deleted_at: {generated}"
+            generated.contains("__lg_row . __autumn_commit_hook_to_value"),
+            "a ledgered delete revision must snapshot the reloaded row: {generated}"
         );
     }
 

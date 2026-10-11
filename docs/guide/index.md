@@ -80,6 +80,7 @@ Looking for the API reference instead? That is
 - [Threaded Comments on Anything](commentable.md) — attaching a comment thread to any record
 - [Horizontal Sharding](sharding.md) — splitting one logical database across several physical ones
 - [SQLite in Production](sqlite-in-production.md) — when SQLite is a reasonable production database, and how to run it
+- [SQLite Database Fleet](sqlite-fleet.md) — one SQLite database per tenant or per slot, replicated to object storage
 
 ## Files, media and storage
 
@@ -179,6 +180,7 @@ Looking for the API reference instead? That is
 - [Compile-Time Query Budgets](query-budgets.md) — `#[query_budget(N)]`: catching N+1 regressions at build time
 - [Capacity Contracts](capacity-contracts.md) — declaring what a route is allowed to consume
 - [Server-Timing](observability/server-timing.md) — per-phase request timings the browser shows in devtools
+- [Overload Signals](observability/overload-signals.md) — latency histograms, queue and pool metrics, request IDs and trace IDs
 - [Dev-Loop Latency Budget](dev-loop-latency.md) — the p50/p95 budgets for `autumn dev`, and how they are measured
 
 ## Testing

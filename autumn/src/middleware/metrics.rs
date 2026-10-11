@@ -37,7 +37,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::MatchedPath;
 use axum::http::{Request, Response};
@@ -88,6 +88,9 @@ struct MetricsInner {
     /// because `server.max_concurrent_requests` was at its ceiling.
     /// Exposed as `autumn_requests_shed_total`.
     requests_shed_total: AtomicU64,
+    /// Time spent waiting for a database pool connection.
+    /// Exposed as `autumn_db_pool_wait_seconds`.
+    db_pool_wait: AtomicHistogram,
     /// The current admission limit, or 0 without a limiter.
     /// Exposed as `autumn_admission_limit`.
     admission_limit: AtomicU64,
@@ -117,6 +120,8 @@ struct StatusBuckets {
 struct RouteMetrics {
     count: u64,
     latencies_ms: VecDeque<u64>,
+    /// One latency histogram per status class (see [`STATUS_CLASSES`]).
+    durations: [Histogram; STATUS_CLASSES.len()],
 }
 
 impl Default for RouteMetrics {
@@ -124,8 +129,166 @@ impl Default for RouteMetrics {
         Self {
             count: 0,
             latencies_ms: VecDeque::with_capacity(MAX_LATENCY_SAMPLES),
+            durations: Default::default(),
         }
     }
+}
+
+impl RouteMetrics {
+    fn observe(&mut self, latency_ms: u64, status_class: usize, elapsed: Duration) {
+        self.count = self.count.saturating_add(1);
+        if self.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
+            self.latencies_ms.pop_front();
+        }
+        self.latencies_ms.push_back(latency_ms);
+        if let Some(histogram) = self.durations.get_mut(status_class) {
+            histogram.observe(elapsed);
+        }
+    }
+}
+
+// ── Latency histograms ──────────────────────────────────────────
+
+/// Upper bounds of the latency histogram buckets, in microseconds.
+/// The last (`+Inf`) bucket is implicit.
+const BUCKET_BOUNDS_MICROS: [u64; 12] = [
+    1_000, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000,
+    5_000_000, 10_000_000,
+];
+
+/// Prometheus `le` label values for [`BUCKET_BOUNDS_MICROS`], then `+Inf`.
+pub const BUCKET_LABELS: [&str; 13] = [
+    "0.001", "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "+Inf",
+];
+
+/// `status_class` label values. Index 5 holds codes outside 100..=599.
+pub const STATUS_CLASSES: [&str; 6] = ["1xx", "2xx", "3xx", "4xx", "5xx", "other"];
+
+/// `method` label values. All other methods use [`OTHER_METHOD`].
+const KNOWN_METHODS: [&str; 9] = [
+    "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "CONNECT", "TRACE",
+];
+
+/// `method` label for an extension method. This keeps the label set bounded.
+pub const OTHER_METHOD: &str = "_other";
+
+/// Map a method to a bounded label value.
+fn method_label(method: &str) -> &'static str {
+    KNOWN_METHODS
+        .iter()
+        .find(|known| **known == method)
+        .copied()
+        .unwrap_or(OTHER_METHOD)
+}
+
+/// Map a status code to an index in [`STATUS_CLASSES`].
+const fn status_class_index(status: u16) -> usize {
+    match status / 100 {
+        1 => 0,
+        2 => 1,
+        3 => 2,
+        4 => 3,
+        5 => 4,
+        _ => 5,
+    }
+}
+
+/// Index of the first bucket that holds `micros`.
+fn bucket_index(micros: u64) -> usize {
+    BUCKET_BOUNDS_MICROS
+        .iter()
+        .position(|bound| micros <= *bound)
+        .unwrap_or(BUCKET_BOUNDS_MICROS.len())
+}
+
+fn duration_micros(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Non-cumulative bucket counts. The caller holds a lock.
+#[derive(Debug, Clone, Copy, Default)]
+struct Histogram {
+    counts: [u64; BUCKET_LABELS.len()],
+    sum_micros: u64,
+}
+
+impl Histogram {
+    fn observe(&mut self, elapsed: Duration) {
+        let micros = duration_micros(elapsed);
+        if let Some(count) = self.counts.get_mut(bucket_index(micros)) {
+            *count = count.saturating_add(1);
+        }
+        self.sum_micros = self.sum_micros.saturating_add(micros);
+    }
+
+    fn snapshot(&self) -> HistogramSnapshot {
+        HistogramSnapshot::from_counts(self.counts, self.sum_micros)
+    }
+}
+
+/// Lock-free histogram for a path that runs on each request and has no lock.
+#[derive(Debug, Default)]
+struct AtomicHistogram {
+    counts: [AtomicU64; BUCKET_LABELS.len()],
+    sum_micros: AtomicU64,
+}
+
+impl AtomicHistogram {
+    fn observe(&self, elapsed: Duration) {
+        let micros = duration_micros(elapsed);
+        if let Some(count) = self.counts.get(bucket_index(micros)) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        self.sum_micros.fetch_add(micros, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> HistogramSnapshot {
+        let counts = std::array::from_fn(|i| {
+            self.counts
+                .get(i)
+                .map_or(0, |count| count.load(Ordering::Relaxed))
+        });
+        HistogramSnapshot::from_counts(counts, self.sum_micros.load(Ordering::Relaxed))
+    }
+}
+
+/// A point-in-time histogram, ready for Prometheus.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HistogramSnapshot {
+    /// Cumulative count per bucket, in [`BUCKET_LABELS`] order.
+    pub cumulative: [u64; BUCKET_LABELS.len()],
+    /// Sum of all observations, in seconds.
+    pub sum_seconds: f64,
+}
+
+impl HistogramSnapshot {
+    fn from_counts(counts: [u64; BUCKET_LABELS.len()], sum_micros: u64) -> Self {
+        let mut running = 0u64;
+        let cumulative = counts.map(|count| {
+            running = running.saturating_add(count);
+            running
+        });
+        #[allow(clippy::cast_precision_loss, reason = "Prometheus samples are f64")]
+        let sum_seconds = sum_micros as f64 / 1_000_000.0;
+        Self {
+            cumulative,
+            sum_seconds,
+        }
+    }
+
+    /// Total number of observations (the `+Inf` bucket).
+    pub fn count(&self) -> u64 {
+        self.cumulative.last().copied().unwrap_or_default()
+    }
+}
+
+/// One histogram series of `autumn_http_request_duration_seconds`.
+#[derive(Debug, Clone)]
+pub struct DurationSeries {
+    pub method: String,
+    pub route: String,
+    pub status_class: &'static str,
+    pub histogram: HistogramSnapshot,
 }
 
 /// Maximum number of latency samples to keep per route.
@@ -171,6 +334,7 @@ impl MetricsCollector {
                 request_timeouts_total: AtomicU64::new(0),
                 read_your_writes_pins_total: AtomicU64::new(0),
                 requests_shed_total: AtomicU64::new(0),
+                db_pool_wait: AtomicHistogram::default(),
                 admission_limit: AtomicU64::new(0),
                 shed_critical: AtomicU64::new(0),
                 shed_default: AtomicU64::new(0),
@@ -267,11 +431,68 @@ impl MetricsCollector {
     }
 
     /// Record a completed request.
+    ///
+    /// `method` is mapped to a bounded label: an extension method is
+    /// recorded as `_other`.
     pub fn record(&self, method: &str, route: &str, status: u16, latency_ms: u64) {
+        self.record_duration(method, route, status, Duration::from_millis(latency_ms));
+    }
+
+    /// Record a completed request with its exact duration.
+    pub(crate) fn record_duration(
+        &self,
+        method: &str,
+        route: &str,
+        status: u16,
+        elapsed: Duration,
+    ) {
+        let latency_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         self.inner.requests_total.fetch_add(1, Ordering::Relaxed);
         self.record_status(status);
         self.record_global_latency(latency_ms);
-        self.record_route(method, route, latency_ms);
+        self.record_route(method_label(method), route, status, elapsed);
+    }
+
+    /// Record the time one database checkout waited for a pool connection.
+    /// Exposed as the `autumn_db_pool_wait_seconds` histogram.
+    pub fn record_db_pool_wait(&self, elapsed: Duration) {
+        self.inner.db_pool_wait.observe(elapsed);
+    }
+
+    /// Histogram of database pool wait time.
+    pub(crate) fn db_pool_wait(&self) -> HistogramSnapshot {
+        self.inner.db_pool_wait.snapshot()
+    }
+
+    /// One histogram series per (route, method, status class) seen so far,
+    /// sorted by route, then method, then status class.
+    pub(crate) fn duration_series(&self) -> Vec<DurationSeries> {
+        let mut series = Vec::new();
+        for shard_lock in &self.inner.shards {
+            let Ok(shard) = shard_lock.read() else {
+                continue;
+            };
+            for (key, metrics) in &shard.by_route {
+                let Some((method, route)) = key.split_once(' ') else {
+                    continue;
+                };
+                for (status_class, histogram) in STATUS_CLASSES.iter().zip(&metrics.durations) {
+                    let histogram = histogram.snapshot();
+                    if histogram.count() > 0 {
+                        series.push(DurationSeries {
+                            method: method.to_owned(),
+                            route: route.to_owned(),
+                            status_class,
+                            histogram,
+                        });
+                    }
+                }
+            }
+        }
+        series.sort_by(|a, b| {
+            (&a.route, &a.method, a.status_class).cmp(&(&b.route, &b.method, b.status_class))
+        });
+        series
     }
 
     fn record_status(&self, status: u16) {
@@ -309,8 +530,10 @@ impl MetricsCollector {
         }
     }
 
-    fn record_route(&self, method: &str, route: &str, latency_ms: u64) {
+    fn record_route(&self, method: &str, route: &str, status: u16, elapsed: Duration) {
         let shard_idx = shard_index(route);
+        let latency_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        let status_class = status_class_index(status);
 
         // ⚡ Bolt Optimization:
         // Format the key into a stack-allocated buffer to avoid a heap allocation
@@ -339,11 +562,7 @@ impl MetricsCollector {
             && let Ok(mut shard) = lock.write()
         {
             if let Some(entry) = shard.by_route.get_mut(key_str) {
-                entry.count = entry.count.saturating_add(1);
-                if entry.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
-                    entry.latencies_ms.pop_front();
-                }
-                entry.latencies_ms.push_back(latency_ms);
+                entry.observe(latency_ms, status_class, elapsed);
             } else {
                 is_new = true;
             }
@@ -358,12 +577,11 @@ impl MetricsCollector {
             if let Some(lock) = self.inner.shards.get(shard_idx)
                 && let Ok(mut shard) = lock.write()
             {
-                let entry = shard.by_route.entry(key).or_default();
-                entry.count = entry.count.saturating_add(1);
-                if entry.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
-                    entry.latencies_ms.pop_front();
-                }
-                entry.latencies_ms.push_back(latency_ms);
+                shard
+                    .by_route
+                    .entry(key)
+                    .or_default()
+                    .observe(latency_ms, status_class, elapsed);
             }
         }
     }
@@ -766,19 +984,15 @@ where
         match this.inner.poll(cx) {
             Poll::Ready(Ok(response)) => {
                 if let Some(collector) = this.collector.take() {
-                    let latency_ms = u64::try_from(
-                        crate::time::ambient_instant()
-                            .saturating_duration_since(*this.start)
-                            .as_millis(),
-                    )
-                    .unwrap_or(u64::MAX);
+                    let elapsed =
+                        crate::time::ambient_instant().saturating_duration_since(*this.start);
                     let method_str = this.method.as_str();
                     let route_str = this.route.as_ref().map_or(
                         super::access_log::UNMATCHED_ROUTE,
                         axum::extract::MatchedPath::as_str,
                     );
                     let status = response.status().as_u16();
-                    collector.record(method_str, route_str, status, latency_ms);
+                    collector.record_duration(method_str, route_str, status, elapsed);
                     collector.decrement_active();
                 }
                 Poll::Ready(Ok(response))
@@ -797,6 +1011,88 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn method_label_is_bounded() {
+        assert_eq!(method_label("GET"), "GET");
+        assert_eq!(method_label("PATCH"), "PATCH");
+        assert_eq!(method_label("PROPFIND"), OTHER_METHOD);
+        assert_eq!(method_label("get"), OTHER_METHOD);
+    }
+
+    #[test]
+    fn status_class_covers_every_code() {
+        assert_eq!(STATUS_CLASSES[status_class_index(101)], "1xx");
+        assert_eq!(STATUS_CLASSES[status_class_index(204)], "2xx");
+        assert_eq!(STATUS_CLASSES[status_class_index(308)], "3xx");
+        assert_eq!(STATUS_CLASSES[status_class_index(404)], "4xx");
+        assert_eq!(STATUS_CLASSES[status_class_index(503)], "5xx");
+        assert_eq!(STATUS_CLASSES[status_class_index(999)], "other");
+    }
+
+    #[test]
+    fn bucket_bounds_are_inclusive() {
+        assert_eq!(bucket_index(0), 0);
+        assert_eq!(bucket_index(1_000), 0);
+        assert_eq!(bucket_index(1_001), 1);
+        assert_eq!(bucket_index(10_000_000), 11);
+        assert_eq!(bucket_index(10_000_001), 12, "+Inf bucket");
+        assert_eq!(BUCKET_LABELS.len(), BUCKET_BOUNDS_MICROS.len() + 1);
+    }
+
+    #[test]
+    fn histogram_snapshot_is_cumulative() {
+        let mut histogram = Histogram::default();
+        histogram.observe(Duration::from_micros(500));
+        histogram.observe(Duration::from_millis(30));
+        histogram.observe(Duration::from_secs(60));
+        let snap = histogram.snapshot();
+        assert_eq!(snap.cumulative[0], 1);
+        assert_eq!(snap.cumulative[4], 2, "le=0.05 holds 30ms");
+        assert_eq!(snap.cumulative[11], 2, "le=10 excludes 60s");
+        assert_eq!(snap.count(), 3);
+        assert!((snap.sum_seconds - 60.0305).abs() < 1e-9);
+    }
+
+    #[test]
+    fn duration_series_split_by_method_route_and_status_class() {
+        let collector = MetricsCollector::new();
+        collector.record("GET", "/a", 200, 3);
+        collector.record("GET", "/a", 500, 3);
+        collector.record("FOO", "/a", 405, 3);
+        collector.record("GET", "/b", 200, 3);
+        let series = collector.duration_series();
+        let keys: Vec<(&str, &str, &str, u64)> = series
+            .iter()
+            .map(|s| {
+                (
+                    s.route.as_str(),
+                    s.method.as_str(),
+                    s.status_class,
+                    s.histogram.count(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("/a", "GET", "2xx", 1),
+                ("/a", "GET", "5xx", 1),
+                ("/a", "_other", "4xx", 1),
+                ("/b", "GET", "2xx", 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn db_pool_wait_is_a_histogram() {
+        let collector = MetricsCollector::new();
+        collector.record_db_pool_wait(Duration::from_micros(200));
+        collector.record_db_pool_wait(Duration::from_millis(400));
+        let snap = collector.db_pool_wait();
+        assert_eq!(snap.cumulative[0], 1);
+        assert_eq!(snap.count(), 2);
+    }
 
     #[test]
     fn collector_records_request() {
@@ -836,10 +1132,10 @@ mod tests {
         // `u64::MAX`; the bump must stick there rather than overflow-panic the
         // request path in a debug build.
         let collector = MetricsCollector::new();
-        collector.record_route("GET", "/saturating", 5);
+        collector.record_route("GET", "/saturating", 200, Duration::from_millis(5));
         pin_counter_at_ceiling(&collector, "/saturating", "GET /saturating");
 
-        collector.record_route("GET", "/saturating", 5);
+        collector.record_route("GET", "/saturating", 200, Duration::from_millis(5));
 
         let snap = collector.snapshot();
         assert_eq!(snap.http.by_route["GET /saturating"].count, u64::MAX);

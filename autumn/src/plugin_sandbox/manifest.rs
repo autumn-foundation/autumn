@@ -354,22 +354,11 @@ impl ResourceLimits {
     #[must_use]
     pub const fn request_footprint_bytes(&self) -> u128 {
         (self.memory_bytes as u128)
-            // Five, not four, and the fifth is a temporary the term used to miss.
-            // At the moment `to_line` runs, four copies of the body are live at
-            // once: the caller's, the clone `HostFrame::request` takes, the
-            // `String` `BASE64.encode` allocates, and the encoded text
-            // `serialize_str` copies into the serializer's output. The last two
-            // are 4/3 each, because base64 expands, so the peak is
-            // 1 + 1 + 4/3 + 4/3 = 14/3 of the body, over the four this budgeted,
-            // by enough to matter at a concurrency near the product's ceiling.
-            //
-            // Counted rather than removed: serialising the base64 straight into
-            // the output would delete the temporary outright, which is the better
-            // fix and a larger one — it changes how the frame is written, and
-            // proving the allocation is gone needs more than reading the code. The
-            // bound is corrected here to what the code does; making the code do
-            // less is worth doing on its own.
-            .saturating_add((self.max_request_body_bytes as u128).saturating_mul(5))
+            // Four. At `to_line` the body is live twice (caller, frame clone) and
+            // the base64 text is written straight into the line (4/3). That is
+            // 10/3 of the body. There is no encode temporary, and `to_line`
+            // sizes the line exactly, so it holds no spare capacity.
+            .saturating_add((self.max_request_body_bytes as u128).saturating_mul(4))
             .saturating_add((self.max_response_bytes as u128).saturating_mul(5))
             // The instance's tables, bounded by `MAX_TABLE_ELEMENTS` at a
             // generous 16 bytes a reference. Small, but per-instance storage
@@ -2205,16 +2194,12 @@ max_concurrency = 8
     }
 
     #[test]
-    fn the_body_term_covers_the_base64_temporary_as_well_as_the_line() {
-        // The term counted the caller's body, the frame's clone, and the
-        // encoded text in the line — and missed that the encoding is built in a
-        // `String` of its own first. `BASE64.encode(bytes)` allocates, and
-        // `serialize_str` then copies that into the serializer's output, so
-        // both are live at once and both are 4/3 of the body.
+    fn the_body_term_covers_the_body_twice_and_the_encoded_line() {
+        // Live at the peak: the caller's body, the frame's clone, and the
+        // base64 text in the line. The encoder writes into the line, so there is
+        // no fourth copy.
         //
-        // Measured rather than asserted from arithmetic: the expansion has to
-        // track what the encoder actually writes, so if that ever changes this
-        // fails rather than quietly understating the product again.
+        // Measured, not derived: if the encoding stops being ~4/3 this fails.
         use crate::plugin_sandbox::wire::{HostFrame, SandboxRequest, to_line};
 
         let granted = [SandboxCapability::HttpRequest];
@@ -2244,9 +2229,8 @@ max_concurrency = 8
             "the encoding is no longer ~4/3; the term below is derived from it: {expansion}%",
         );
 
-        // Live at the peak: the caller's body, the frame's clone, the encoded
-        // temporary, and the encoded text in the output — 1 + 1 + 4/3 + 4/3.
-        let peak_percent = 200 + 2 * expansion;
+        // 1 + 1 + 4/3 of the body.
+        let peak_percent = 200 + expansion;
         let limits = ResourceLimits {
             memory_bytes: 0,
             max_request_body_bytes: 1_000_000,
@@ -2317,11 +2301,9 @@ max_concurrency = 8
 
     #[test]
     fn the_footprint_counts_every_buffer_a_request_holds_at_once() {
-        // The request body is buffered, cloned into the frame, base64-encoded
-        // into a temporary, and copied from that into the NDJSON line that
-        // becomes the guest's stdin — four live copies of an expanding thing,
-        // not one — and the instance's tables are per-instance host storage
-        // too.
+        // The request body is buffered, cloned into the frame, and base64-encoded
+        // into the NDJSON line that becomes the guest's stdin — all live at
+        // once — and the instance's tables are per-instance host storage too.
         let limits = ResourceLimits {
             memory_bytes: 1_000_000,
             max_request_body_bytes: 100_000,
@@ -2335,7 +2317,7 @@ max_concurrency = 8
         let fixed = crate::plugin_sandbox::host::FIXED_HOST_BUFFER_BYTES as u128;
         assert_eq!(
             limits.request_footprint_bytes(),
-            1_000_000 + 5 * 100_000 + 5 * 10_000 + tables + metadata + globals + functions + fixed
+            1_000_000 + 4 * 100_000 + 5 * 10_000 + tables + metadata + globals + functions + fixed
         );
     }
 

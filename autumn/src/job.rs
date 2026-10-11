@@ -26780,9 +26780,9 @@ mod lease_tests {
 
     static TIMEOUT_SEEN: AtomicUsize = AtomicUsize::new(0);
     static LEASE_SEEN: AtomicUsize = AtomicUsize::new(0);
-    /// Its own counter: a test that shares `TIMEOUT_SEEN` makes the count
-    /// depend on which tests run at the same time.
-    static STALLED_SEEN: AtomicUsize = AtomicUsize::new(0);
+    /// Owned by `a_stalled_failure_settle_is_capped`: sharing `TIMEOUT_SEEN`
+    /// made the count read 2 when both timeout tests ran in parallel.
+    static STALLED_SETTLE_SEEN: AtomicUsize = AtomicUsize::new(0);
 
     /// Spawn work that records how the run was stopped in `seen`: 1 for a
     /// timeout, 10 for a lost lease. Then hang.
@@ -26798,18 +26798,18 @@ mod lease_tests {
         Ok(())
     }
 
-    fn stalled_watch_handler(
-        _state: AppState,
-        _payload: Value,
-    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
-        Box::pin(hang_and_watch(&STALLED_SEEN))
-    }
-
     fn timeout_watch_handler(
         _state: AppState,
         _payload: Value,
     ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
         Box::pin(hang_and_watch(&TIMEOUT_SEEN))
+    }
+
+    fn stalled_settle_watch_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(hang_and_watch(&STALLED_SETTLE_SEEN))
     }
 
     fn lease_watch_handler(
@@ -26852,14 +26852,7 @@ mod lease_tests {
             outcome,
             JobExecutionOutcome::Failed("job timed out after 250ms".to_owned())
         );
-        // The spawned watcher needs a turn to see the cancel. One yield is not
-        // always enough on a busy runner, so give it a bounded number.
-        for _ in 0..100 {
-            if TIMEOUT_SEEN.load(Ordering::SeqCst) != 0 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        tokio::task::yield_now().await;
         assert_eq!(
             TIMEOUT_SEEN.load(Ordering::SeqCst),
             1,
@@ -27045,7 +27038,7 @@ mod lease_tests {
                 stall_mark_running: false,
                 stall_settle: true,
             },
-            stalled_watch_handler,
+            stalled_settle_watch_handler,
             true,
             Some(Duration::from_millis(250)),
         )
@@ -27159,13 +27152,7 @@ mod lease_tests {
         lost.cancel();
         let outcome = run.await.expect("run task");
         assert_eq!(outcome, JobExecutionOutcome::LeaseLost);
-        // The spawned watcher needs a turn. Give it a bounded number.
-        for _ in 0..100 {
-            if LEASE_SEEN.load(Ordering::SeqCst) != 0 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        tokio::task::yield_now().await;
         assert_eq!(
             LEASE_SEEN.load(Ordering::SeqCst),
             10,
