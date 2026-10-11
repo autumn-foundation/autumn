@@ -84,8 +84,9 @@ pub struct SiteFacts {
     /// The home page paths: `/`, or `/{locale}` for each locale when the
     /// root is locale-prefixed. Empty means `/`.
     pub home_paths: Vec<String>,
-    /// The home page says `noindex`: the sitemap leaves it out.
-    pub home_noindex: bool,
+    /// The home paths whose route says `noindex`: the sitemap leaves them
+    /// out.
+    pub noindex_homes: Vec<String>,
     /// No `GET /` route serves a home page (an API-only app): the sitemap
     /// names none, so it never sends a crawler to a `404`.
     pub no_home: bool,
@@ -481,13 +482,14 @@ fn sitemap(facts: &SiteFacts, origin: &Origin) -> Document {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
     );
-    let mut paths: Vec<&str> = if facts.home_noindex || facts.no_home {
+    let mut paths: Vec<&str> = if facts.no_home {
         Vec::new()
     } else if facts.home_paths.is_empty() {
         vec!["/"]
     } else {
         facts.home_paths.iter().map(String::as_str).collect()
     };
+    paths.retain(|p| !facts.noindex_homes.iter().any(|n| n == p));
     for page in &facts.pages {
         if !paths.contains(&page.path.as_str()) {
             paths.push(&page.path);
@@ -2345,11 +2347,33 @@ mod tests {
         );
     }
 
+    /// Codex review (P2): `noindex` is per home page.
+    #[test]
+    fn only_the_noindex_home_leaves_the_sitemap() {
+        let mut facts = content_site();
+        facts.sitemap = true;
+        facts.home_paths = vec!["/en".to_owned(), "/fr".to_owned(), "/".to_owned()];
+        facts.noindex_homes = vec!["/".to_owned()];
+        let body = render(&facts, &origin(), SITEMAP_PATH).unwrap().body;
+        assert!(
+            body.contains("<loc>https://shop.example.com/en</loc>"),
+            "{body}"
+        );
+        assert!(
+            body.contains("<loc>https://shop.example.com/fr</loc>"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("<loc>https://shop.example.com/</loc>"),
+            "{body}"
+        );
+    }
+
     #[test]
     fn a_noindex_home_is_not_in_the_fallback_sitemap() {
         let mut facts = content_site();
         facts.sitemap = true;
-        facts.home_noindex = true;
+        facts.noindex_homes = vec!["/".to_owned()];
         let doc = render(&facts, &origin(), SITEMAP_PATH).unwrap();
         assert!(
             !doc.body.contains("<loc>https://shop.example.com/</loc>"),

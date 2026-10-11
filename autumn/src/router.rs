@@ -1426,8 +1426,10 @@ struct HomeRoutes {
     routed: bool,
     /// A scoped-group home, mounted outside them.
     scoped: bool,
-    /// One of them is `noindex`.
-    noindex: bool,
+    /// The `routes![...]` home is `noindex`.
+    routed_noindex: bool,
+    /// The scoped-group home is `noindex`.
+    scoped_noindex: bool,
 }
 
 impl HomeRoutes {
@@ -1444,15 +1446,18 @@ impl HomeRoutes {
                 })
             })
             .collect();
-        let noindex = routed.iter().chain(&scoped).any(|r| {
-            r.seo
-                .robots
-                .is_some_and(crate::seo::robots_directive_is_noindex)
-        });
+        let noindex = |routes: &[&Route]| {
+            routes.iter().any(|r| {
+                r.seo
+                    .robots
+                    .is_some_and(crate::seo::robots_directive_is_noindex)
+            })
+        };
         Self {
             routed: !routed.is_empty(),
             scoped: !scoped.is_empty(),
-            noindex,
+            routed_noindex: noindex(&routed),
+            scoped_noindex: noindex(&scoped),
         }
     }
 }
@@ -1542,7 +1547,12 @@ fn build_aeo_site<O: AeoOpenApiFacts, M: AeoMcpFacts>(
     // Only a `routes![...]` home is localized. A home from a scoped group or a
     // merged router mounts outside the locale nests and answers at `/`, next
     // to any localized ones.
+    // Each home's own `noindex` leaves only that page out of the sitemap.
+    let mut noindex_homes = Vec::new();
     let home_paths = if home.routed {
+        if home.routed_noindex {
+            noindex_homes.clone_from(&home_paths);
+        }
         let mut paths = home_paths;
         if home.scoped && !paths.iter().any(|p| p == "/") {
             paths.push("/".to_owned());
@@ -1551,11 +1561,13 @@ fn build_aeo_site<O: AeoOpenApiFacts, M: AeoMcpFacts>(
     } else {
         vec!["/".to_owned()]
     };
-    let home_noindex = home.noindex;
+    if home.scoped_noindex {
+        noindex_homes.push("/".to_owned());
+    }
     let mut facts = SiteFacts {
         pages,
         home_paths,
-        home_noindex,
+        noindex_homes,
         no_home: !has_home,
         health_path: config.health.enabled.then(|| config.health.path.clone()),
         skills: state
@@ -10097,6 +10109,31 @@ mod tests {
                 both.facts.home_paths,
                 vec!["/en".to_owned(), "/fr".to_owned(), "/".to_owned()]
             );
+            assert!(both.facts.noindex_homes.is_empty());
+
+            // Codex review (P2): a `noindex` scoped `/` leaves only `/` out;
+            // the indexable localized homes stay listed.
+            let mut scoped_home = simple_route("/", "scoped_home", false);
+            scoped_home.seo = crate::seo::SeoRouteDefaults {
+                robots: Some("noindex"),
+                ..crate::seo::SeoRouteDefaults::EMPTY
+            };
+            let scoped = crate::app::ScopedGroup {
+                prefix: "/".to_owned(),
+                routes: vec![scoped_home],
+                source: crate::route_listing::RouteSource::User,
+                apply_layer: Box::new(|r| r),
+            };
+            let mixed = super::build_aeo_site::<(), ()>(
+                &config,
+                &test_state(),
+                &[simple_route("/", "home", false)],
+                &[scoped],
+                false,
+                None,
+                None,
+            );
+            assert_eq!(mixed.facts.noindex_homes, vec!["/".to_owned()]);
         }
 
         /// Routes registered via `AppBuilder::scoped()` are mounted by a
@@ -12526,7 +12563,7 @@ enabled = true
             None,
         );
         assert!(!site.facts.no_home);
-        assert!(site.facts.home_noindex);
+        assert_eq!(site.facts.noindex_homes, vec!["/".to_owned()]);
     }
 
     /// With a static build, the x402 copy outside the static-first
