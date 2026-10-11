@@ -1726,14 +1726,22 @@ fn safe_url(raw: &str, link: bool) -> Option<String> {
         return link.then(String::new);
     }
     // A character reference the decoder left (`javascript&colon;`) still
-    // spells a scheme once a Markdown renderer decodes it, so an `&` before
-    // the first `/`, `?` or `#` is refused.
+    // spells a scheme once a Markdown renderer decodes it, so a reference
+    // (`&name;`, `&#…;`) before the first `/`, `?` or `#` is refused. A
+    // plain `&`, as in `R&D/guide`, decodes to nothing and stays.
     let head: String = url
         .chars()
         .filter(|c| !c.is_ascii_whitespace() && !c.is_control())
         .take_while(|c| !matches!(c, '/' | '?' | '#'))
         .collect();
-    if head.contains('&') {
+    // The `#` of a numeric reference (`&#58;`) is no fragment here, so the
+    // reference check reads on to the first `/` or `?`.
+    let reference_head: String = url
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace() && !c.is_control())
+        .take_while(|c| !matches!(c, '/' | '?'))
+        .collect();
+    if has_reference(&reference_head) {
         return None;
     }
     // Whatever comes before a `:` there is a scheme, however long.
@@ -1787,6 +1795,19 @@ fn encode_destination(url: &str) -> String {
         }
     }
     out
+}
+
+/// `true` when `s` holds a character reference a Markdown renderer would
+/// decode: `&`, then letters, digits or `#`, then `;`.
+fn has_reference(s: &str) -> bool {
+    s.match_indices('&').any(|(i, _)| {
+        let rest = &s[i + 1..];
+        let len = rest
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'#')
+            .count();
+        len > 0 && rest.as_bytes().get(len) == Some(&b';')
+    })
 }
 
 /// The URL of the first candidate in a `srcset`: past leading whitespace
@@ -2596,6 +2617,17 @@ mod tests {
             "![S](/s.jpg)\n"
         );
         assert_eq!(md("<img srcset=\" , \" alt=\"x\">"), "");
+    }
+
+    #[test]
+    fn a_plain_ampersand_in_a_relative_path_stays_a_link() {
+        assert_eq!(
+            md("<a href=\"R&amp;D/guide\">Guide</a>"),
+            "[Guide](R&D/guide)\n"
+        );
+        // A reference that would spell a scheme once decoded is refused.
+        assert_eq!(md("<a href=\"javascript&amp;colon;alert(1)\">J</a>"), "J\n");
+        assert_eq!(md("<a href=\"javascript&amp;#58;alert(1)\">J</a>"), "J\n");
     }
 
     #[test]

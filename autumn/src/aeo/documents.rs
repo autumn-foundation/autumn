@@ -1355,7 +1355,9 @@ fn ard_manifest(facts: &SiteFacts, origin: &Origin) -> Document {
         "specVersion": "1.0",
         "host": {
             "displayName": display,
-            "identifier": format!("did:web:{}", origin.host),
+            // did:web names the origin's authority, with the colon of a
+            // non-default port percent-encoded.
+            "identifier": format!("did:web:{}", origin.signing_authority().replace(':', "%3A")),
         },
         "entries": entries,
     }))
@@ -2124,6 +2126,10 @@ mod tests {
             assert_eq!(ard["specVersion"], "1.0");
             assert_eq!(ard["host"]["displayName"], "Shop");
             assert_eq!(ard["host"]["identifier"], "did:web:shop.example.com");
+            let port = Origin::resolve(Some("https://shop.example.com:8443"), None);
+            let doc = render(&api_site(), &port, ARD_PATH).unwrap();
+            let ard: Value = serde_json::from_str(&doc.body).unwrap();
+            assert_eq!(ard["host"]["identifier"], "did:web:shop.example.com%3A8443");
             let entries = ard["entries"].as_array().unwrap();
             let types: Vec<&str> = entries
                 .iter()
