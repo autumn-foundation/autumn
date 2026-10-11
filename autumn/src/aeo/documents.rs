@@ -833,6 +833,13 @@ fn server_card(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
         "transport": { "type": "streamable-http", "endpoint": endpoint },
         "capabilities": { "tools": { "listChanged": false } },
     });
+    // `websiteUrl` is optional: an app with no home page names none rather
+    // than a `404`.
+    if facts.no_home
+        && let Some(card) = card.as_object_mut()
+    {
+        card.remove("websiteUrl");
+    }
     if mcp.public_tools {
         card["tools"] = mcp
             .tools
@@ -2246,6 +2253,16 @@ mod tests {
         assert_eq!(o.base, "https://xn--bcher-kva.example/shop");
         assert_eq!(o.signing_authority(), "xn--bcher-kva.example");
         assert!(o.is_request_authority(Some("xn--bcher-kva.example")));
+    }
+
+    #[test]
+    fn a_server_card_names_no_website_without_a_home() {
+        let mut facts = api_site();
+        let (_, card) = json_doc(&facts, "/.well-known/mcp/server-card.json");
+        assert_eq!(card["websiteUrl"], "https://shop.example.com/");
+        facts.no_home = true;
+        let (_, card) = json_doc(&facts, "/.well-known/mcp/server-card.json");
+        assert!(card.get("websiteUrl").is_none(), "{card}");
     }
 
     #[test]

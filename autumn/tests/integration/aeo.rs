@@ -284,6 +284,29 @@ async fn head_of_a_dynamic_page_mirrors_the_markdown_get() {
 }
 
 #[tokio::test]
+async fn a_home_page_from_a_merged_router_stays_in_the_sitemap() {
+    let mut config = AutumnConfig::default();
+    config.seo.base_url = Some("https://shop.example.com".to_owned());
+    let merged = autumn_web::reexports::axum::Router::new().route(
+        "/",
+        autumn_web::reexports::axum::routing::get(|| async { Html("<p>home</p>") }),
+    );
+    let body = TestApp::new()
+        .config(config)
+        .routes(routes![data])
+        .merge(merged)
+        .build()
+        .get("/sitemap.xml")
+        .send()
+        .await
+        .text();
+    assert!(
+        body.contains("<loc>https://shop.example.com/</loc>"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn documents_use_the_host_a_trusted_proxy_reports() {
     let mut config = AutumnConfig::default();
     config.security.trusted_proxies.trust_forwarded_headers = true;

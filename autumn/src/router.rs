@@ -696,6 +696,7 @@ fn build_router_pre_state(
         state,
         &route_list,
         &ctx.scoped_groups,
+        !ctx.merge_routers.is_empty(),
         aeo_openapi,
         aeo_mcp,
     ));
@@ -1416,6 +1417,7 @@ fn build_aeo_site<O: AeoOpenApiFacts, M: AeoMcpFacts>(
     state: &AppState,
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
+    merged_routers: bool,
     openapi: Option<&O>,
     mcp: Option<&M>,
 ) -> crate::aeo::AeoSite {
@@ -1481,10 +1483,13 @@ fn build_aeo_site<O: AeoOpenApiFacts, M: AeoMcpFacts>(
     pages.sort_by(|a, b| a.path.cmp(&b.path));
     pages.dedup_by(|a, b| a.path == b.path);
 
-    // An API-only app has no home page: list none rather than a `404`.
-    let has_home = route_list
-        .iter()
-        .any(|r| r.method == http::Method::GET && r.path == "/")
+    // An API-only app has no home page: list none rather than a `404`. A
+    // merged router is opaque and may serve `/`, so with one the home page
+    // is assumed to exist.
+    let has_home = merged_routers
+        || route_list
+            .iter()
+            .any(|r| r.method == http::Method::GET && r.path == "/")
         || scoped_groups.iter().any(|g| {
             g.routes.iter().any(|r| {
                 r.method == http::Method::GET && join_nested_path(&g.prefix, r.path) == "/"
