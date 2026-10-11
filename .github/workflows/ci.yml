@@ -1740,7 +1740,8 @@ jobs:
           # block.
           cargo test -p autumn-media-plugin --test room_reaper_batch_profile -- --ignored
           # The DB-backed RoomStore lifecycle suite (create/join/roster/leave
-          # persistence, member-gating, heartbeat renewal, the reap sweep).
+          # persistence, member-gating, heartbeat renewal, the reap sweep,
+          # and the seat-cap and room-delete races, #2864 / #2407).
           # autumn-media-plugin has no crate-wide `--ignored` sweep, so each of
           # its Docker test targets is named here (#1974).
           cargo test -p autumn-media-plugin --test room_store_db -- --ignored
@@ -2286,6 +2287,11 @@ jobs:
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test experiment_admin_bulk_delete_batch_profile -- --ignored
           cargo llvm-cov --no-report -p autumn-cache-redis -- --ignored
+          # The DB room store runs only in these Docker tests (#1974).
+          cargo llvm-cov --no-report -p autumn-media-plugin \
+            --test room_store_db -- --ignored
+          cargo llvm-cov --no-report -p autumn-media-plugin \
+            --test room_reaper_batch_profile -- --ignored
           cargo llvm-cov --no-report -p autumn-search -- --ignored
           cargo llvm-cov --no-report -p autumn-billing --test mirror_db -- --ignored
           cargo llvm-cov --no-report -p autumn-billing \

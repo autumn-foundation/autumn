@@ -4171,7 +4171,10 @@ under the idle TTL (default 15 min); a client that does neither is reaped from
 signaling, though its live WebRTC path survives and it can re-join. After
 `joined_at + [media] room_session_max_seconds` (default 12 h), heartbeat and
 roster return `404`; the client leaves, then joins again. `[media] room_rate_limit_per_minute`
-(default `0` = off) limits each client IP per room route.
+(default `0` = off) limits each client IP per room route. A join `display_name`
+longer than 64 characters gets `400`. On `room_store_backend = "db"`, join, leave
+and the reaper lock the room row, so two processes cannot pass the seat cap; a
+join that races the last leave or the reaper can get `404`.
 
 `autumn deploy status [--json] [--strict]` is read-only and safe mid-incident:
 one row per host (mode, release from the `current` symlink, live slot, `/ready`

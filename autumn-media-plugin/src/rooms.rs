@@ -84,9 +84,8 @@
 //! # Single-process limitation
 //!
 //! [`InMemoryRoomStore`] keeps all room state in process memory, so it is
-//! **single-process only** — a multi-process / multi-replica deployment needs a
-//! shared backing store. [`RoomStore`] is the swap seam for that: a networked
-//! (and necessarily async) store would revisit these synchronous signatures.
+//! **single-process only**. For more than one process, use
+//! [`DbRoomStore`](crate::rooms_db::DbRoomStore) (`room_store_backend = "db"`).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -277,6 +276,13 @@ pub enum RoomError {
     /// or query internals into a response.
     #[error("room store is temporarily unavailable")]
     Store,
+
+    /// The join `display_name` has more than `max` characters.
+    #[error("display_name is longer than {max} characters")]
+    DisplayNameTooLong {
+        /// The limit, in characters.
+        max: usize,
+    },
 }
 
 impl RoomError {
@@ -302,9 +308,9 @@ impl RoomError {
                 AutumnError::service_unavailable_msg(self.to_string())
             }
             Self::Unauthorized => AutumnError::unauthorized_msg(self.to_string()),
-            Self::InvalidSegment { .. } | Self::InvalidMaxParticipants { .. } => {
-                AutumnError::bad_request_msg(self.to_string())
-            }
+            Self::InvalidSegment { .. }
+            | Self::InvalidMaxParticipants { .. }
+            | Self::DisplayNameTooLong { .. } => AutumnError::bad_request_msg(self.to_string()),
         }
     }
 }
@@ -494,6 +500,9 @@ pub trait RoomStore: Send + Sync {
     /// Join the room `(namespace, room_id)`, minting a participant + token that
     /// stays valid for `token_ttl`.
     ///
+    /// A store does not check the `display_name` length.
+    /// [`RoomService::join`] does (see [`MAX_DISPLAY_NAME_CHARS`]).
+    ///
     /// # Errors
     ///
     /// [`RoomError::RoomNotFound`] (including a namespace mismatch) or
@@ -627,6 +636,14 @@ pub fn renewed_expiry(
 /// in-memory registries), **not** a substitute for a rate limit — see the
 /// module-level *Security & host responsibilities* note.
 pub const MAX_ROOMS: usize = 10_000;
+
+/// The longest join `display_name`, in `char`s (not bytes).
+///
+/// A store keeps the name until the seat leaves or the reaper removes it. Each
+/// snapshot copies the name. [`RoomService::join`] refuses a longer name with
+/// [`RoomError::DisplayNameTooLong`] (`400`). A direct
+/// [`RoomStore::join_room`] call does not check the limit.
+pub const MAX_DISPLAY_NAME_CHARS: usize = 64;
 
 /// A single-process, in-memory [`RoomStore`].
 ///
@@ -1159,6 +1176,9 @@ impl RoomService {
     ///
     /// # Errors
     ///
+    /// Returns [`RoomError::DisplayNameTooLong`] if `display_name` has more
+    /// than [`MAX_DISPLAY_NAME_CHARS`] characters. Then it does not call the
+    /// store.
     /// Propagates any [`RoomError`] from the store, or
     /// [`RoomError::InvalidSegment`] if a path cannot be composed.
     pub async fn join(
@@ -1166,6 +1186,14 @@ impl RoomService {
         room_id: &str,
         display_name: Option<String>,
     ) -> Result<JoinResponse, RoomError> {
+        if display_name
+            .as_deref()
+            .is_some_and(|name| name.chars().count() > MAX_DISPLAY_NAME_CHARS)
+        {
+            return Err(RoomError::DisplayNameTooLong {
+                max: MAX_DISPLAY_NAME_CHARS,
+            });
+        }
         let record = self
             .store
             .join_room(
@@ -1297,7 +1325,8 @@ impl RoomService {
 /// Body of a room-join request.
 #[derive(Debug, serde::Deserialize)]
 pub struct JoinRequest {
-    /// Optional display name for the joining participant.
+    /// Optional display name for the joining participant, at most
+    /// [`MAX_DISPLAY_NAME_CHARS`] characters.
     #[serde(default)]
     pub display_name: Option<String>,
 }
@@ -1594,10 +1623,11 @@ fn room_route(method: &str, path: String, handler: &str) -> RouteInfo {
 #[cfg(test)]
 mod tests {
     use super::{
-        HeartbeatRequest, InMemoryRoomStore, LeaveRequest, MAX_REAPER_TTL_SECONDS, ReapStats, Room,
-        RoomError, RoomParticipant, RoomRateGate, RoomService, RoomStore, SessionToken,
-        bearer_token, clamp_reaper_ttl, renewed_expiry, room_participant_path, room_route_infos,
-        room_router, room_service, rooms_heartbeat, rooms_roster, validate_room_segment,
+        HeartbeatRequest, InMemoryRoomStore, LeaveRequest, MAX_DISPLAY_NAME_CHARS,
+        MAX_REAPER_TTL_SECONDS, ReapStats, Room, RoomError, RoomParticipant, RoomRateGate,
+        RoomService, RoomStore, SessionToken, bearer_token, clamp_reaper_ttl, renewed_expiry,
+        room_participant_path, room_route_infos, room_router, room_service, rooms_heartbeat,
+        rooms_roster, validate_room_segment,
     };
     use crate::config::MediaMtxConfig;
     use crate::transport::MediaUrls;
@@ -2957,6 +2987,103 @@ mod tests {
         let joined = service.join(&room.id, None).await.expect("join");
         assert!(joined.token_expires_at <= Utc::now() + Duration::hours(1));
         assert!(joined.token_expires_at >= before + Duration::hours(1));
+    }
+
+    // ── Join display_name limit (#3104) ──────────────────────────────────────
+
+    fn service_over(store: Arc<InMemoryRoomStore>) -> RoomService {
+        RoomService::new(store, urls(), "", Duration::seconds(300), 6)
+    }
+
+    fn seats_in(store: &InMemoryRoomStore, room_id: &str) -> usize {
+        store.rooms.read().unwrap()[&(String::new(), room_id.to_owned())]
+            .participants
+            .len()
+    }
+
+    #[tokio::test]
+    async fn join_refuses_a_display_name_past_the_limit_and_stores_nothing() {
+        let store = Arc::new(InMemoryRoomStore::new(6));
+        let service = service_over(store.clone());
+        let room = service.create().await.expect("create");
+
+        for name in ["a", "é"].map(|c| c.repeat(MAX_DISPLAY_NAME_CHARS + 1)) {
+            let result = service.join(&room.id, Some(name)).await;
+            assert!(matches!(
+                result,
+                Err(RoomError::DisplayNameTooLong {
+                    max: MAX_DISPLAY_NAME_CHARS
+                })
+            ));
+        }
+        assert_eq!(seats_in(&store, &room.id), 0, "no seat is stored");
+    }
+
+    #[tokio::test]
+    async fn join_accepts_a_display_name_at_the_limit_counted_in_chars() {
+        let store = Arc::new(InMemoryRoomStore::new(6));
+        let service = service_over(store.clone());
+        let room = service.create().await.expect("create");
+
+        // Two bytes per char: a byte count would refuse this name.
+        let name = "é".repeat(MAX_DISPLAY_NAME_CHARS);
+        let joined = service.join(&room.id, Some(name.clone())).await;
+
+        assert!(joined.is_ok(), "a name at the limit joins: {joined:?}");
+        let roster = store.rooms.read().unwrap()[&(String::new(), room.id.clone())]
+            .participants
+            .values()
+            .map(|seat| seat.display_name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(roster, vec![Some(name)]);
+    }
+
+    #[test]
+    fn display_name_too_long_is_a_bad_request() {
+        let error = RoomError::DisplayNameTooLong { max: 64 }.into_autumn();
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn join_route_answers_400_for_a_display_name_past_the_limit() {
+        let sessions = MemoryStore::new();
+        sessions
+            .save(
+                "member-session",
+                HashMap::from([("user_id".to_owned(), "member-1".to_owned())]),
+            )
+            .await
+            .expect("save authenticated session");
+        let store = Arc::new(InMemoryRoomStore::new(6));
+        let service = service_over(store.clone());
+        let room_id = service.create().await.expect("create room").id;
+        let state = AppState::for_test();
+        state.insert_extension(service);
+        let app = room_router()
+            .layer(SessionLayer::new(sessions, SessionConfig::default()))
+            .with_state(state);
+
+        let body = serde_json::json!({ "display_name": "a".repeat(MAX_DISPLAY_NAME_CHARS + 1) });
+        let response = app
+            .oneshot(
+                Request::post(format!("/rooms/{room_id}/join"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, "autumn.sid=member-session")
+                    .body(Body::from(body.to_string()))
+                    .expect("join request"),
+            )
+            .await
+            .expect("join response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = autumn_web::reexports::axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(
+            String::from_utf8_lossy(&body).contains("display_name"),
+            "the 400 names the field, not a JSON parse error"
+        );
+        assert_eq!(seats_in(&store, &room_id), 0, "no seat is stored");
     }
 
     #[tokio::test]

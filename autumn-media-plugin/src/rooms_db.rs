@@ -20,23 +20,42 @@
 //! itself (that would trip the feature-unification hazard in `autumn/src/db.rs`);
 //! the active backend is chosen by the end application.
 //!
+//! # Seat cap and room deletes
+//!
+//! Join, leave and the reaper's room delete each run in one transaction that
+//! first locks the room row. Thus two processes that join the last seat run one
+//! after the other, and the room never has more seats than its cap (#2864,
+//! #3104). A room delete cannot remove a seat that a join returned (#2407). The
+//! lock is a no-op `UPDATE`, so it works the same on Postgres (row lock) and
+//! `SQLite` (database write lock). The schema does not change.
+//!
+//! Join and leave run on their own task. Thus a dropped caller future (a client
+//! disconnect) cannot leave a transaction open with the room locked. Leave
+//! checks the token before it takes the lock, so a bad request takes no lock.
+//!
+//! With a Postgres default isolation level above READ COMMITTED, a join that
+//! waits for the lock fails with `503` (serialization error), not a passed cap.
+//!
 //! # Reaper concurrency — last-write-wins (idempotent)
 //!
 //! [`reap_stale`](DbRoomStore::reap_stale) is a **last-write-wins** sweep, not a
-//! lease: it deletes every participant whose `last_seen_at` is older than the
-//! injected `now - idle_ttl` cutoff, then deletes every room that is now empty
-//! and whose `created_at` is older than the same cutoff. Both are unconditional
-//! deletes keyed only on the injected clock, so **concurrent reapers across
-//! processes converge with no corruption** — a second reaper's delete simply
-//! affects zero rows. There is no shared lease row to time out and no leader
-//! election to get wrong. Deletes are keyed on the exact `(namespace, room_id)`
+//! lease. Phase 1 deletes each participant whose `last_seen_at` is older than
+//! the injected `now - idle_ttl` cutoff. Phase 2, in one transaction, claims
+//! each empty room whose `created_at` is older than the same cutoff, deletes the
+//! claimed rooms that are still empty, and restores each claimed room that a
+//! join filled. A second reaper finds no rows to delete, so **concurrent
+//! reapers across processes converge with no corruption**. There is no shared
+//! lease row to time out and no leader election to get wrong. Two reapers with
+//! different query plans can lock rows in a different order. Then Postgres can
+//! stop one with a deadlock error. That reaper logs a warning and deletes no
+//! rooms on that tick. Deletes are keyed on the exact `(namespace, room_id)`
 //! pair, so reaping **never crosses namespaces** (tenant isolation), exactly
 //! like the in-memory sweep.
 
 use chrono::{DateTime, Duration, SubsecRound, Utc};
 use diesel::prelude::*;
-use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::deadpool::Pool;
+use diesel_async::{AsyncConnection as _, RunQueryDsl};
 use uuid::Uuid;
 
 use autumn_web::RuntimeConnection;
@@ -146,6 +165,151 @@ fn map_db_err<E: std::fmt::Display>(err: E) -> RoomError {
     RoomError::Store
 }
 
+/// The error of a transaction body. Both kinds roll the transaction back.
+enum TxError {
+    /// A room outcome for the caller (`RoomFull`, `RoomNotFound`, ...).
+    Room(RoomError),
+    /// A database failure, mapped by [`map_db_err`].
+    Db(diesel::result::Error),
+}
+
+impl From<diesel::result::Error> for TxError {
+    fn from(err: diesel::result::Error) -> Self {
+        Self::Db(err)
+    }
+}
+
+impl From<RoomError> for TxError {
+    fn from(err: RoomError) -> Self {
+        Self::Room(err)
+    }
+}
+
+impl TxError {
+    fn into_room(self) -> RoomError {
+        match self {
+            Self::Room(err) => err,
+            Self::Db(err) => map_db_err(err),
+        }
+    }
+}
+
+/// Lock the row of one room until the transaction ends. Returns `false` if
+/// the room does not exist.
+///
+/// Call it first in the transaction. It is a no-op `UPDATE`, so it is a write
+/// on both backends: Postgres locks the row, and `SQLite` takes the database
+/// write lock (and waits on `busy_timeout`). A later statement takes a new
+/// snapshot, so it sees each seat that another writer committed while it held
+/// the lock. Join and leave change the seats of a room only while they hold
+/// this lock, and the reaper claims a room the same way before it deletes it.
+async fn lock_room(
+    conn: &mut RuntimeConnection,
+    namespace: &str,
+    room_id: &str,
+) -> QueryResult<bool> {
+    let locked = diesel::update(
+        media_rooms::table.filter(
+            media_rooms::namespace
+                .eq(namespace)
+                .and(media_rooms::room_id.eq(room_id)),
+        ),
+    )
+    .set(media_rooms::max_participants.eq(media_rooms::max_participants))
+    .execute(conn)
+    .await?;
+    Ok(locked > 0)
+}
+
+/// Run `work` on its own task, so its transaction ends with `COMMIT` or
+/// `ROLLBACK` even if the caller drops the future (a client disconnect or a
+/// timeout). Without this, the room row can stay locked until the pool drops
+/// that connection.
+///
+/// `work` gets a [`Caller`], so it can roll back when nobody waits for the
+/// result. A panic in `work` continues in the caller.
+async fn detached<T, Fut>(work: impl FnOnce(Caller) -> Fut) -> Result<T, RoomError>
+where
+    T: Send + 'static,
+    Fut: Future<Output = Result<T, RoomError>> + Send + 'static,
+{
+    let (_alive, watch) = tokio::sync::oneshot::channel::<()>();
+    match tokio::spawn(work(Caller(watch))).await {
+        Ok(result) => result,
+        Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+        Err(err) => Err(map_db_err(err)),
+    }
+}
+
+/// The caller of a [`detached`] call.
+struct Caller(tokio::sync::oneshot::Receiver<()>);
+
+impl Caller {
+    /// `true` when the caller dropped its future.
+    fn is_gone(&mut self) -> bool {
+        matches!(
+            self.0.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        )
+    }
+
+    /// Check out a connection, unless the caller goes first. A dropped caller
+    /// does not wait in the pool queue, so it adds no hidden backlog.
+    async fn checkout(
+        &mut self,
+        pool: &Pool<RuntimeConnection>,
+    ) -> Result<diesel_async::pooled_connection::deadpool::Object<RuntimeConnection>, RoomError>
+    {
+        tokio::select! {
+            conn = pool.get() => conn.map_err(map_db_err),
+            _ = &mut self.0 => Err(RoomError::Store),
+        }
+    }
+}
+
+/// Check that `participant_id` holds a seat in the room, with `token`.
+///
+/// The errors are the same as the in-memory store: `RoomNotFound`, then
+/// `ParticipantNotFound`, then `Unauthorized`. The compare is value-only and
+/// constant-time. Expiry is advisory: a value-correct token always leaves.
+async fn check_seat(
+    conn: &mut RuntimeConnection,
+    namespace: &str,
+    room_id: &str,
+    participant_id: &str,
+    token: &str,
+) -> Result<(), TxError> {
+    let room_exists: Option<String> = media_rooms::table
+        .filter(
+            media_rooms::namespace
+                .eq(namespace)
+                .and(media_rooms::room_id.eq(room_id)),
+        )
+        .select(media_rooms::room_id)
+        .first(conn)
+        .await
+        .optional()?;
+    if room_exists.is_none() {
+        return Err(RoomError::RoomNotFound.into());
+    }
+    let stored: String = media_room_participants::table
+        .filter(
+            media_room_participants::namespace
+                .eq(namespace)
+                .and(media_room_participants::room_id.eq(room_id))
+                .and(media_room_participants::participant_id.eq(participant_id)),
+        )
+        .select(media_room_participants::token)
+        .first(conn)
+        .await
+        .optional()?
+        .ok_or(RoomError::ParticipantNotFound)?;
+    if !autumn_web::auth::constant_time_eq(token.as_bytes(), stored.as_bytes()) {
+        return Err(RoomError::Unauthorized.into());
+    }
+    Ok(())
+}
+
 /// Build a token-free [`RoomSnapshot`] from a room row and its participant rows,
 /// with the same deterministic roster ordering (`joined_at`, then `id`) as the
 /// in-memory store.
@@ -236,79 +400,88 @@ impl RoomStore for DbRoomStore {
         display_name: Option<String>,
         token_ttl: Duration,
     ) -> RoomStoreFuture<'a, JoinRecord> {
-        Box::pin(async move {
-            let mut conn = self.pool.get().await.map_err(map_db_err)?;
+        let pool = self.pool.clone();
+        let (namespace, room_id) = (namespace.to_owned(), room_id.to_owned());
+        Box::pin(detached(move |mut caller| async move {
+            let (namespace, room_id) = (namespace.as_str(), room_id.as_str());
+            let mut conn = caller.checkout(&pool).await?;
+            // One transaction that holds the room row: two joins for the last
+            // seat run one after the other, so the count never goes stale.
+            conn.transaction(async move |conn| {
+                // Fail-closed on a namespace mismatch: the filter keys on both
+                // columns.
+                if !lock_room(conn, namespace, room_id).await? {
+                    return Err(RoomError::RoomNotFound.into());
+                }
+                let room: RoomRow = media_rooms::table
+                    .filter(
+                        media_rooms::namespace
+                            .eq(namespace)
+                            .and(media_rooms::room_id.eq(room_id)),
+                    )
+                    .select(RoomRow::as_select())
+                    .first(conn)
+                    .await?;
+                let max = usize::try_from(room.max_participants).unwrap_or(0);
 
-            // The room must exist (fail-closed on a namespace mismatch — the
-            // filter keys on both columns).
-            let room: RoomRow = media_rooms::table
-                .filter(
-                    media_rooms::namespace
-                        .eq(namespace)
-                        .and(media_rooms::room_id.eq(room_id)),
-                )
-                .select(RoomRow::as_select())
-                .first(&mut conn)
-                .await
-                .optional()
-                .map_err(map_db_err)?
-                .ok_or(RoomError::RoomNotFound)?;
-            let max = usize::try_from(room.max_participants).unwrap_or(0);
+                let seats: i64 = media_room_participants::table
+                    .filter(
+                        media_room_participants::namespace
+                            .eq(namespace)
+                            .and(media_room_participants::room_id.eq(room_id)),
+                    )
+                    .count()
+                    .get_result(conn)
+                    .await?;
+                if usize::try_from(seats).unwrap_or(usize::MAX) >= max {
+                    return Err(RoomError::RoomFull { max }.into());
+                }
+                // A caller that is gone gets no seat: roll back, so it does
+                // not hold a place in the cap until the reaper removes it.
+                if caller.is_gone() {
+                    return Err(RoomError::Store.into());
+                }
 
-            // Capacity check (non-transactional backstop, as above).
-            let seats: i64 = media_room_participants::table
-                .filter(
-                    media_room_participants::namespace
-                        .eq(namespace)
-                        .and(media_room_participants::room_id.eq(room_id)),
-                )
-                .count()
-                .get_result(&mut conn)
-                .await
-                .map_err(map_db_err)?;
-            if usize::try_from(seats).unwrap_or(usize::MAX) >= max {
-                return Err(RoomError::RoomFull { max });
-            }
+                let now = Utc::now();
+                let participant_id = Uuid::new_v4().to_string();
+                let token = SessionToken::generate();
+                let token_expires_at = now + token_ttl;
+                let new = ParticipantRow {
+                    namespace: namespace.to_owned(),
+                    room_id: room_id.to_owned(),
+                    participant_id: participant_id.clone(),
+                    display_name,
+                    token: token.expose().to_owned(),
+                    joined_at: now.naive_utc(),
+                    token_expires_at: token_expires_at.naive_utc(),
+                    last_seen_at: now.naive_utc(),
+                };
+                diesel::insert_into(media_room_participants::table)
+                    .values(&new)
+                    .execute(conn)
+                    .await?;
 
-            let now = Utc::now();
-            let participant_id = Uuid::new_v4().to_string();
-            let token = SessionToken::generate();
-            let token_expires_at = now + token_ttl;
-            let new = ParticipantRow {
-                namespace: namespace.to_owned(),
-                room_id: room_id.to_owned(),
-                participant_id: participant_id.clone(),
-                display_name,
-                token: token.expose().to_owned(),
-                joined_at: now.naive_utc(),
-                token_expires_at: token_expires_at.naive_utc(),
-                last_seen_at: now.naive_utc(),
-            };
-            diesel::insert_into(media_room_participants::table)
-                .values(&new)
-                .execute(&mut conn)
-                .await
-                .map_err(map_db_err)?;
+                // Snapshot the room after the join (includes the new seat).
+                let rows: Vec<ParticipantRow> = media_room_participants::table
+                    .filter(
+                        media_room_participants::namespace
+                            .eq(namespace)
+                            .and(media_room_participants::room_id.eq(room_id)),
+                    )
+                    .select(ParticipantRow::as_select())
+                    .load(conn)
+                    .await?;
 
-            // Snapshot the room *after* the join (includes the new participant).
-            let rows: Vec<ParticipantRow> = media_room_participants::table
-                .filter(
-                    media_room_participants::namespace
-                        .eq(namespace)
-                        .and(media_room_participants::room_id.eq(room_id)),
-                )
-                .select(ParticipantRow::as_select())
-                .load(&mut conn)
-                .await
-                .map_err(map_db_err)?;
-
-            Ok(JoinRecord {
-                participant_id,
-                token,
-                token_expires_at,
-                room: snapshot_from(&room, &rows),
+                Ok(JoinRecord {
+                    participant_id,
+                    token,
+                    token_expires_at,
+                    room: snapshot_from(&room, &rows),
+                })
             })
-        })
+            .await
+            .map_err(TxError::into_room)
+        }))
     }
 
     fn leave_room<'a>(
@@ -318,83 +491,63 @@ impl RoomStore for DbRoomStore {
         participant_id: &'a str,
         token: &'a str,
     ) -> RoomStoreFuture<'a, ()> {
-        Box::pin(async move {
-            let mut conn = self.pool.get().await.map_err(map_db_err)?;
-
-            // Distinguish "no such room" from "no such participant" the same way
-            // the in-memory store does.
-            let room_exists: Option<String> = media_rooms::table
-                .filter(
-                    media_rooms::namespace
-                        .eq(namespace)
-                        .and(media_rooms::room_id.eq(room_id)),
-                )
-                .select(media_rooms::room_id)
-                .first(&mut conn)
+        let pool = self.pool.clone();
+        let owned = [namespace, room_id, participant_id, token].map(str::to_owned);
+        Box::pin(detached(move |mut caller| async move {
+            let [namespace, room_id, participant_id, token] = owned.each_ref().map(String::as_str);
+            // A caller that goes while it waits for the pool gets no connection.
+            // After the checkout, the leave runs to the end: the user asked for it.
+            let mut conn = caller.checkout(&pool).await?;
+            // Check the token before the lock, so a bad request takes no lock.
+            check_seat(&mut conn, namespace, room_id, participant_id, token)
                 .await
-                .optional()
-                .map_err(map_db_err)?;
-            if room_exists.is_none() {
-                return Err(RoomError::RoomNotFound);
-            }
+                .map_err(TxError::into_room)?;
+            // One transaction that holds the room row, so a join cannot add a
+            // seat between the last leave's count and its room delete.
+            conn.transaction(async move |conn| {
+                if !lock_room(conn, namespace, room_id).await? {
+                    return Err(RoomError::RoomNotFound.into());
+                }
+                // Check again under the lock: the seat can go between the two.
+                check_seat(conn, namespace, room_id, participant_id, token).await?;
 
-            let stored: String = media_room_participants::table
-                .filter(
-                    media_room_participants::namespace
-                        .eq(namespace)
-                        .and(media_room_participants::room_id.eq(room_id))
-                        .and(media_room_participants::participant_id.eq(participant_id)),
-                )
-                .select(media_room_participants::token)
-                .first(&mut conn)
-                .await
-                .optional()
-                .map_err(map_db_err)?
-                .ok_or(RoomError::ParticipantNotFound)?;
-
-            // Value-only, constant-time verify (expiry is advisory, never
-            // checked — a value-correct token always leaves).
-            if !autumn_web::auth::constant_time_eq(token.as_bytes(), stored.as_bytes()) {
-                return Err(RoomError::Unauthorized);
-            }
-
-            diesel::delete(
-                media_room_participants::table.filter(
-                    media_room_participants::namespace
-                        .eq(namespace)
-                        .and(media_room_participants::room_id.eq(room_id))
-                        .and(media_room_participants::participant_id.eq(participant_id)),
-                ),
-            )
-            .execute(&mut conn)
-            .await
-            .map_err(map_db_err)?;
-
-            // Drop an emptied room so idle rooms never accumulate.
-            let remaining: i64 = media_room_participants::table
-                .filter(
-                    media_room_participants::namespace
-                        .eq(namespace)
-                        .and(media_room_participants::room_id.eq(room_id)),
-                )
-                .count()
-                .get_result(&mut conn)
-                .await
-                .map_err(map_db_err)?;
-            if remaining == 0 {
                 diesel::delete(
-                    media_rooms::table.filter(
-                        media_rooms::namespace
+                    media_room_participants::table.filter(
+                        media_room_participants::namespace
                             .eq(namespace)
-                            .and(media_rooms::room_id.eq(room_id)),
+                            .and(media_room_participants::room_id.eq(room_id))
+                            .and(media_room_participants::participant_id.eq(participant_id)),
                     ),
                 )
-                .execute(&mut conn)
-                .await
-                .map_err(map_db_err)?;
-            }
-            Ok(())
-        })
+                .execute(conn)
+                .await?;
+
+                // Drop an emptied room so idle rooms never accumulate.
+                let remaining: i64 = media_room_participants::table
+                    .filter(
+                        media_room_participants::namespace
+                            .eq(namespace)
+                            .and(media_room_participants::room_id.eq(room_id)),
+                    )
+                    .count()
+                    .get_result(conn)
+                    .await?;
+                if remaining == 0 {
+                    diesel::delete(
+                        media_rooms::table.filter(
+                            media_rooms::namespace
+                                .eq(namespace)
+                                .and(media_rooms::room_id.eq(room_id)),
+                        ),
+                    )
+                    .execute(conn)
+                    .await?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(TxError::into_room)
+        }))
     }
 
     fn roster<'a>(
@@ -570,24 +723,69 @@ impl RoomStore for DbRoomStore {
             // create→first-join window is never reaped out from under a joiner.
             // The emptiness test is a correlated `NOT EXISTS` matching the
             // participants' full composite key, so reaping never crosses
-            // namespaces — and the whole sweep is ONE statement rather than a
-            // candidate scan plus a `COUNT(*)` and a `DELETE` per candidate.
-            match diesel::delete(
-                media_rooms::table.filter(
-                    media_rooms::created_at
-                        .lt(cutoff)
-                        .and(diesel::dsl::not(diesel::dsl::exists(
-                            media_room_participants::table.filter(
-                                media_room_participants::namespace
-                                    .eq(media_rooms::namespace)
-                                    .and(media_room_participants::room_id.eq(media_rooms::room_id)),
-                            ),
-                        ))),
-                ),
-            )
-            .execute(&mut conn)
-            .await
-            {
+            // namespaces.
+            //
+            // A join can add a seat while the delete waits for the room row.
+            // On Postgres, the waiting delete then checks the new row again but
+            // keeps its old `NOT EXISTS` result, and the cascade deletes the
+            // seat that the join returned (#2407). So phase 2 is one
+            // transaction of three statements, each a batch, not one per room:
+            //
+            // 1. Claim each candidate: negate its `max_participants` (always
+            //    `>= 1` otherwise). This locks the row, as `lock_room` does.
+            //    Other transactions never see the negative value: it is not
+            //    committed, and step 3 restores it.
+            // 2. Delete each claimed room that is still empty. A new statement
+            //    takes a new snapshot, so it sees each seat that a join
+            //    committed before the claim got its lock. A join that starts
+            //    after the claim waits for this transaction to end.
+            // 3. Restore the claimed rooms that a join filled.
+            let empty = || {
+                diesel::dsl::not(diesel::dsl::exists(
+                    media_room_participants::table.filter(
+                        media_room_participants::namespace
+                            .eq(media_rooms::namespace)
+                            .and(media_room_participants::room_id.eq(media_rooms::room_id)),
+                    ),
+                ))
+            };
+            let swept = conn
+                .transaction(async |conn| {
+                    diesel::update(
+                        media_rooms::table.filter(
+                            media_rooms::created_at
+                                .lt(cutoff)
+                                .and(media_rooms::max_participants.gt(0))
+                                .and(empty()),
+                        ),
+                    )
+                    .set(media_rooms::max_participants.eq(media_rooms::max_participants * -1))
+                    .execute(conn)
+                    .await?;
+                    let reaped = diesel::delete(
+                        media_rooms::table.filter(
+                            media_rooms::created_at
+                                .lt(cutoff)
+                                .and(media_rooms::max_participants.lt(0))
+                                .and(empty()),
+                        ),
+                    )
+                    .execute(conn)
+                    .await?;
+                    diesel::update(
+                        media_rooms::table.filter(
+                            media_rooms::created_at
+                                .lt(cutoff)
+                                .and(media_rooms::max_participants.lt(0)),
+                        ),
+                    )
+                    .set(media_rooms::max_participants.eq(media_rooms::max_participants * -1))
+                    .execute(conn)
+                    .await?;
+                    Ok::<_, diesel::result::Error>(reaped)
+                })
+                .await;
+            match swept {
                 Ok(reaped) => stats.rooms_reaped = reaped,
                 Err(err) => {
                     tracing::warn!(error = %err, "media rooms: reaper room sweep failed");
