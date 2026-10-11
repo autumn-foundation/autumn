@@ -111,8 +111,8 @@ Two impls in one module can hold a same-named `#[cached]` function. Put
 Without a scope, both functions share one key space, and `autumn cache audit`
 reports the shared identity. The scope is opt-in.
 
-The scope is the last segment of the type. Two impls can still share it:
-`impl Store<A>` and `impl Store<B>`, or two traits on one type with a
+The scope is the type path without generics: `a::Store`. Two impls can still
+share it: `impl Store<A>` and `impl Store<B>`, or two traits on one type with a
 same-named function. Give those a different `scope = "..."` by hand.
 
 ```rust

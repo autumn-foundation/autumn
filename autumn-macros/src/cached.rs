@@ -162,10 +162,10 @@ fn parse_cached_args(attr: TokenStream) -> syn::Result<CachedAttrs> {
                 return Err(meta.error("`scope` is set twice"));
             }
             let name = value.value();
-            if syn::parse_str::<Ident>(name.trim()).is_err() {
+            if !is_type_path(name.trim()) {
                 return Err(syn::Error::new_spanned(
                     &value,
-                    "`scope` must be a type name, such as \"Products\"",
+                    "`scope` must be a type name, such as \"Products\" or \"a::Store\"",
                 ));
             }
             result.scope = Some(name.trim().to_owned());
@@ -796,8 +796,19 @@ pub fn cached_impl_macro(
         Ok(imp) => imp,
         Err(err) => return err.to_compile_error(),
     };
+    // The whole path, without generics: `impl a::Store` and `impl b::Store`
+    // in one module must not share a scope. A leading `crate` adds nothing.
     let scope = match &*imp.self_ty {
-        syn::Type::Path(path) => path.path.segments.last().map(|seg| seg.ident.to_string()),
+        syn::Type::Path(path) if path.qself.is_none() => {
+            let names: Vec<String> = path
+                .path
+                .segments
+                .iter()
+                .map(|seg| seg.ident.to_string())
+                .skip_while(|name| name == "crate")
+                .collect();
+            (!names.is_empty()).then(|| names.join("::"))
+        }
         _ => None,
     };
     let Some(scope) = scope else {
@@ -818,6 +829,14 @@ pub fn cached_impl_macro(
         }
     }
     quote! { #imp }
+}
+
+/// Whether `text` is a plain type path: `Store` or `a::Store`.
+///
+/// No leading `::`, no generics, no spaces.
+fn is_type_path(text: &str) -> bool {
+    text.split("::")
+        .all(|segment| syn::parse_str::<Ident>(segment).is_ok())
 }
 
 /// Whether a path names this crate's `cached` macro.
@@ -1048,7 +1067,7 @@ mod tests {
 
     #[test]
     fn a_scope_that_is_not_a_type_name_is_a_compile_error() {
-        for bad in [" ", "a::b", "x:", "Foo::get", "1x"] {
+        for bad in [" ", "x:", "::a", "Foo<T>", "a b", "1x", "a::"] {
             let out = cached_macro(
                 quote! { scope = #bad },
                 quote! { async fn get(id: i64) -> String { String::new() } },
@@ -1197,7 +1216,28 @@ mod tests {
                 }
             },
         );
-        assert!(out.contains("scope = \"Store\""), "{out}");
+        assert!(out.contains("scope = \"repo::Store\""), "{out}");
+    }
+
+    #[test]
+    fn cached_impl_keeps_the_qualified_path_apart() {
+        let a = scoped(
+            TokenStream::new(),
+            quote! { impl a::Store { #[cached] fn get() {} } },
+        );
+        let b = scoped(
+            TokenStream::new(),
+            quote! { impl b::Store { #[cached] fn get() {} } },
+        );
+        assert!(a.contains("scope = \"a::Store\""), "{a}");
+        assert!(b.contains("scope = \"b::Store\""), "{b}");
+    }
+
+    #[test]
+    fn a_qualified_scope_enters_the_identity() {
+        let out = cached_macro(quote! { scope = "a::Store" }, quote! { fn get() {} }).to_string();
+        assert!(!out.contains("compile_error"), "{out}");
+        assert!(out.contains("\"a::Store\""), "{out}");
     }
 
     #[test]
