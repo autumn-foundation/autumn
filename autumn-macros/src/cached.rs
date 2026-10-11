@@ -853,7 +853,9 @@ fn is_cached_path(path: &syn::Path, target: &str) -> bool {
         .as_slice()
     {
         ["cached"] => true,
-        [krate, "cached"] => *krate == target || matches!(*krate, "autumn_web" | "crate"),
+        [krate, "cached"] | [krate, "prelude", "cached"] => {
+            *krate == target || matches!(*krate, "autumn_web" | "crate")
+        }
         _ => false,
     }
 }
@@ -1135,6 +1137,18 @@ mod tests {
             "{out}"
         );
         assert_eq!(out.matches("scope").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn cached_impl_scopes_the_prelude_path() {
+        let out = scoped(
+            TokenStream::new(),
+            quote! { impl P { #[autumn_web::prelude::cached] fn f() {} } },
+        );
+        assert!(
+            out.contains("# [autumn_web :: prelude :: cached (scope = \"P\")]"),
+            "{out}"
+        );
     }
 
     #[test]
