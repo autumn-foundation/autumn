@@ -928,15 +928,13 @@ fn static_miss(
     let Some(pages) = static_paths else {
         return false;
     };
-    match pages.get(normalize(req.uri().path())) {
-        None => true,
-        Some(template) => {
-            if let Some(t) = template {
-                req.extensions_mut().insert(StaticRoute(t.clone()));
-            }
-            false
-        }
+    let Some(template) = pages.get(normalize(req.uri().path())) else {
+        return true;
+    };
+    if let Some(t) = template {
+        req.extensions_mut().insert(StaticRoute(t.clone()));
     }
+    false
 }
 
 #[cfg(feature = "http-client")]
