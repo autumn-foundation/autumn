@@ -414,7 +414,7 @@ impl AeoSite {
             None => None,
         };
         // One `Link` value per home page: each names its own Markdown copy.
-        let home_links: Vec<(String, HeaderValue)> = if aeo.link_headers {
+        let home_links: Vec<(String, HeaderValue)> = if aeo.link_headers && !facts.no_home {
             let homes = if facts.home_paths.is_empty() {
                 vec!["/".to_owned()]
             } else {

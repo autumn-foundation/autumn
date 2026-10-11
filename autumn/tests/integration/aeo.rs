@@ -105,7 +105,7 @@ async fn accept_markdown_returns_markdown() {
     res.assert_ok();
     assert_eq!(
         res.header("content-type"),
-        Some("text/markdown; charset=utf-8")
+        Some("text/markdown; charset=utf-8; variant=GFM")
     );
     assert!(
         vary_has_accept(res.header("vary")),
@@ -161,7 +161,7 @@ async fn markdown_rewrites_validators() {
         .await;
     assert_eq!(
         res.header("content-type"),
-        Some("text/markdown; charset=utf-8")
+        Some("text/markdown; charset=utf-8; variant=GFM")
     );
     let etag = res.header("etag").expect("etag kept as a markdown variant");
     assert!(etag.starts_with("W/") && etag != "\"v1\"", "{etag}");
@@ -387,7 +387,7 @@ async fn non_html_and_error_responses_are_untouched() {
     assert_eq!(missing.status, 404);
     assert_ne!(
         missing.header("content-type"),
-        Some("text/markdown; charset=utf-8")
+        Some("text/markdown; charset=utf-8; variant=GFM")
     );
 }
 
@@ -665,7 +665,7 @@ async fn head_with_markdown_accept_mirrors_get_headers() {
     res.assert_ok();
     assert_eq!(
         res.header("content-type"),
-        Some("text/markdown; charset=utf-8")
+        Some("text/markdown; charset=utf-8; variant=GFM")
     );
     assert!(vary_has_accept(res.header("vary")));
 }

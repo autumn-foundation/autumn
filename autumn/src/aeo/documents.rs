@@ -86,6 +86,9 @@ pub struct SiteFacts {
     pub home_paths: Vec<String>,
     /// The home page says `noindex`: the sitemap leaves it out.
     pub home_noindex: bool,
+    /// No `GET /` route serves a home page (an API-only app): the sitemap
+    /// names none, so it never sends a crawler to a `404`.
+    pub no_home: bool,
 }
 
 /// The mounted MCP server.
@@ -478,7 +481,7 @@ fn sitemap(facts: &SiteFacts, origin: &Origin) -> Document {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
     );
-    let mut paths: Vec<&str> = if facts.home_noindex {
+    let mut paths: Vec<&str> = if facts.home_noindex || facts.no_home {
         Vec::new()
     } else if facts.home_paths.is_empty() {
         vec!["/"]
@@ -2249,6 +2252,19 @@ mod tests {
         assert_eq!(o.base, "https://xn--bcher-kva.example/shop");
         assert_eq!(o.signing_authority(), "xn--bcher-kva.example");
         assert!(o.is_request_authority(Some("xn--bcher-kva.example")));
+    }
+
+    #[test]
+    fn a_site_without_a_home_route_lists_no_home() {
+        let mut facts = content_site();
+        facts.sitemap = true;
+        facts.no_home = true;
+        let doc = render(&facts, &origin(), SITEMAP_PATH).unwrap();
+        assert!(
+            !doc.body.contains("<loc>https://shop.example.com/</loc>"),
+            "{}",
+            doc.body
+        );
     }
 
     #[test]

@@ -1481,6 +1481,15 @@ fn build_aeo_site<O: AeoOpenApiFacts, M: AeoMcpFacts>(
     pages.sort_by(|a, b| a.path.cmp(&b.path));
     pages.dedup_by(|a, b| a.path == b.path);
 
+    // An API-only app has no home page: list none rather than a `404`.
+    let has_home = route_list
+        .iter()
+        .any(|r| r.method == http::Method::GET && r.path == "/")
+        || scoped_groups.iter().any(|g| {
+            g.routes.iter().any(|r| {
+                r.method == http::Method::GET && join_nested_path(&g.prefix, r.path) == "/"
+            })
+        });
     let home_noindex = route_list.iter().any(|r| {
         r.method == http::Method::GET
             && r.path == "/"
@@ -1492,6 +1501,7 @@ fn build_aeo_site<O: AeoOpenApiFacts, M: AeoMcpFacts>(
         pages,
         home_paths,
         home_noindex,
+        no_home: !has_home,
         health_path: config.health.enabled.then(|| config.health.path.clone()),
         skills: state
             .extension::<crate::aeo::RegisteredAgentSkills>()

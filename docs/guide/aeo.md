@@ -136,7 +136,7 @@ The response carries these headers:
 
 | Header | Value |
 |---|---|
-| `Content-Type` | `text/markdown; charset=utf-8` |
+| `Content-Type` | `text/markdown; charset=utf-8; variant=GFM` |
 | `Vary` | `Accept` |
 | `x-markdown-tokens` | Token estimate |
 | `Content-Signal` | The `robots.txt` signals |

@@ -411,23 +411,26 @@ fn markdown_etag(headers: &mut HeaderMap) {
 /// range that covers HTML (`text/html`, then `text/*`, then `*/*`).
 #[must_use]
 pub fn prefers_markdown(headers: &HeaderMap) -> bool {
-    let mut markdown = 0.0_f32;
-    // (specificity, q) of the most specific range that covers HTML. RFC 9110
-    // §12.5.1: `text/html` overrides `text/*`, which overrides `*/*`.
-    let mut html = (0_u8, 0.0_f32);
+    // (specificity, q) of the most specific matching range, for Markdown
+    // and for HTML. RFC 9110 §12.5.1: the most specific range that matches
+    // gives the quality. A range names a type (`text/html` over `text/*`
+    // over `*/*`), then parameters: `text/markdown;variant=GFM` overrides
+    // `text/markdown`.
+    let mut markdown = ((0_u8, 0_usize), 0.0_f32);
+    let mut html = ((0_u8, 0_usize), 0.0_f32);
+    let take = |best: &mut ((u8, usize), f32), specificity: (u8, usize), q: f32| {
+        if specificity > best.0 || (specificity == best.0 && q > best.1) {
+            *best = (specificity, q);
+        }
+    };
     for value in headers.get_all(axum::http::header::ACCEPT) {
         let Ok(value) = value.to_str() else { continue };
         for range in value.split(',') {
             let mut parts = range.split(';');
             let media = parts.next().unwrap_or("").trim();
             let q = accept_weight(parts);
-            if media.eq_ignore_ascii_case("text/markdown") {
-                if params_fit(range.split(';').skip(1), true) {
-                    markdown = markdown.max(q);
-                }
-                continue;
-            }
-            let specificity = if media.eq_ignore_ascii_case("text/html") {
+            let markdown_range = media.eq_ignore_ascii_case("text/markdown");
+            let level = if markdown_range || media.eq_ignore_ascii_case("text/html") {
                 3
             } else if media.eq_ignore_ascii_case("text/*") {
                 2
@@ -436,32 +439,33 @@ pub fn prefers_markdown(headers: &HeaderMap) -> bool {
             } else {
                 continue;
             };
-            // A range whose parameters the UTF-8 HTML does not fit (another
-            // `charset`) does not cover it.
-            if !params_fit(range.split(';').skip(1), false) {
+            // A range whose parameters the representation does not fit
+            // (another `charset` or `variant`) does not cover it.
+            let Some(params) = fitting_params(range.split(';').skip(1), markdown_range) else {
                 continue;
-            }
-            if specificity > html.0 || (specificity == html.0 && q > html.1) {
-                html = (specificity, q);
+            };
+            if markdown_range {
+                take(&mut markdown, (level, params), q);
+            } else {
+                take(&mut html, (level, params), q);
             }
         }
     }
     // Markdown must be named: `*/*` alone still gets HTML.
-    markdown > 0.0 && markdown >= html.1
+    markdown.1 > 0.0 && markdown.1 >= html.1
 }
 
-/// `true` when a media range's parameters (those before `q`) fit what is
-/// sent: UTF-8, and for Markdown (`variant_ok`) GitHub Flavored Markdown. A
-/// range that asks for another `charset` or `variant` (RFC 7763), or names
-/// a parameter this layer does not know, does not match.
-fn params_fit<'a>(params: impl Iterator<Item = &'a str>, variant_ok: bool) -> bool {
+/// How many parameters a media range names (those before `q`), when they
+/// all fit what is sent: UTF-8, and for Markdown (`variant_ok`) GitHub
+/// Flavored Markdown. `None` for a range that asks for another `charset` or
+/// `variant` (RFC 7763), or names a parameter this layer does not know.
+fn fitting_params<'a>(params: impl Iterator<Item = &'a str>, variant_ok: bool) -> Option<usize> {
+    let mut count = 0;
     for param in params.filter(|p| !p.trim().is_empty()) {
-        let Some((key, value)) = param.split_once('=') else {
-            return false;
-        };
+        let (key, value) = param.split_once('=')?;
         let key = key.trim();
         if key.eq_ignore_ascii_case("q") {
-            return true;
+            return Some(count);
         }
         let value = value.trim().trim_matches('"');
         let fits = (key.eq_ignore_ascii_case("charset") && value.eq_ignore_ascii_case("utf-8"))
@@ -469,10 +473,11 @@ fn params_fit<'a>(params: impl Iterator<Item = &'a str>, variant_ok: bool) -> bo
                 && key.eq_ignore_ascii_case("variant")
                 && value.eq_ignore_ascii_case("GFM"));
         if !fits {
-            return false;
+            return None;
         }
+        count += 1;
     }
-    true
+    Some(count)
 }
 
 /// The `q` weight of one media range (RFC 9110 §12.4.2). A missing `q` is
@@ -613,7 +618,9 @@ const BLOCKING_THRESHOLD: usize = 256 * 1024;
 fn markdown_headers(headers: &mut HeaderMap, config: &NegotiateConfig, tokens: Option<usize>) {
     headers.insert(
         CONTENT_TYPE,
-        HeaderValue::from_static("text/markdown; charset=utf-8"),
+        // RFC 7763: the variant is GitHub Flavored Markdown (its tables and
+        // strikethrough), which a client can name in `Accept`.
+        HeaderValue::from_static("text/markdown; charset=utf-8; variant=GFM"),
     );
     headers.remove(CONTENT_LENGTH);
     headers.remove(LAST_MODIFIED);
@@ -775,6 +782,16 @@ mod tests {
             "text/markdown; charset=\"UTF-8\"; variant=gfm; q=0.9, text/html;q=0.5"
         )));
         assert!(prefers_markdown(&accept("text/markdown;")));
+        // The most specific matching range gives the quality.
+        assert!(!prefers_markdown(&accept(
+            "text/markdown;variant=GFM;q=0, text/markdown;q=1, text/html;q=0.5"
+        )));
+        assert!(prefers_markdown(&accept(
+            "text/markdown;q=0, text/markdown;variant=GFM;q=1, text/html;q=0.5"
+        )));
+        assert!(!prefers_markdown(&accept(
+            "text/html;charset=utf-8;q=1, text/html;q=0, text/markdown;q=0.5"
+        )));
         // An HTML range for another charset does not cover the UTF-8 HTML.
         assert!(prefers_markdown(&accept(
             "text/html; charset=iso-8859-1, text/markdown;q=0.5"
