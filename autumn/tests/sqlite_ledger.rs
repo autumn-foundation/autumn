@@ -2996,6 +2996,101 @@ async fn a_non_finite_update_is_refused_and_leaves_the_chain_intact() {
     assert!(live.amount_rate.is_finite(), "the row kept its old value");
 }
 
+/// A trigger can write the float after the statement's `RETURNING` row was
+/// taken. The check reads the reloaded row (#2319).
+#[tokio::test]
+async fn a_trigger_written_infinity_is_refused_and_leaves_the_chain_intact() {
+    let pool = boot_pool("lg_non_finite_trigger").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute(
+            "CREATE TRIGGER lg_invoices_inf AFTER UPDATE OF reference ON lg_invoices \
+             WHEN NEW.reference = 'INV-INF' \
+             BEGIN UPDATE lg_invoices SET amount_rate = 9e999 WHERE id = NEW.id; END",
+        )
+        .await
+        .expect("install trigger");
+    }
+
+    let err = repo
+        .update(
+            id,
+            &UpdateLgInvoice {
+                reference: Patch::Set("INV-INF".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("the trigger wrote infinity");
+    assert!(err.to_string().contains("amount_rate"), "{err}");
+
+    let report = repo.ledger_verify(id).await.expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+    assert_eq!(report.revisions_checked, 3, "no revision was appended");
+    let live = repo.find_by_id(id).await.expect("read").expect("row");
+    assert!(live.amount_rate.is_finite(), "the update rolled back");
+}
+
+/// A trigger that rewrites the valid-time column: the revision's `valid_from`
+/// and its snapshot both come from the reloaded row (#2319).
+#[tokio::test]
+async fn a_trigger_written_valid_time_is_the_revisions_valid_time() {
+    let pool = boot_pool("lg_valid_time_trigger").await;
+    let repo = PgLgEffectiveNoteRepository::with_pool_untracked(pool.clone());
+    let created = repo
+        .save(&NewLgEffectiveNote {
+            body: "v1".to_string(),
+            effective_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+                .expect("date")
+                .and_hms_opt(0, 0, 0)
+                .expect("time"),
+        })
+        .await
+        .expect("insert");
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute(
+            "CREATE TRIGGER lg_effective_touch AFTER UPDATE OF body ON lg_effective_notes \
+             WHEN NEW.body = 'v2' \
+             BEGIN UPDATE lg_effective_notes SET effective_at = '2024-03-01 00:00:00' \
+             WHERE id = NEW.id; END",
+        )
+        .await
+        .expect("install trigger");
+    }
+    repo.update(
+        created.id,
+        &UpdateLgEffectiveNote {
+            body: Patch::Set("v2".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("update");
+
+    let rewritten = chrono::NaiveDate::from_ymd_opt(2024, 3, 1)
+        .expect("date")
+        .and_hms_opt(0, 0, 0)
+        .expect("time");
+    let live = repo
+        .find_by_id(created.id)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(live.effective_at, rewritten, "the trigger ran");
+    let head = repo
+        .ledger_revisions(created.id)
+        .await
+        .expect("revisions")
+        .pop()
+        .expect("head");
+    assert_eq!(head.valid_from, rewritten.and_utc());
+    let report = repo.ledger_verify(created.id).await.expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+}
+
 #[test]
 fn the_generated_check_names_the_first_non_finite_column() {
     let mut invoice = LgInvoice {

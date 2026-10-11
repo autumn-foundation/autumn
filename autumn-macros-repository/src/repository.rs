@@ -2287,7 +2287,10 @@ fn version_op_variant(op: &str) -> TokenStream {
 /// paths share this builder. The reload is one indexed lookup per ledgered
 /// write, in the transaction that already reads the chain head.
 ///
-/// Expands to an expression of type `serde_json::Value`.
+/// Everything the revision takes from the row is read from this reload: the
+/// snapshot, the tenant check, the non-finite check and the valid time.
+///
+/// Expands to an expression of the model's type.
 fn ledger_reload_after_write_ts(
     table_name_ts: &str,
     conn_ident: &TokenStream,
@@ -2319,14 +2322,7 @@ fn ledger_reload_after_write_ts(
                     ),
                 );
             };
-            // #2319: a trigger that rewrote `tenant_id` would split the chain.
-            ::autumn_web::ledger::refuse_tenant_change(
-                #table_name_ts,
-                __lg_record_id,
-                __lg_tenant_id,
-                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(&__lg_row),
-            )?;
-            __lg_row.__autumn_commit_hook_to_value()?
+            __lg_row
         }
     }
 }
@@ -2370,7 +2366,7 @@ fn ledger_append_ts(
 ) -> TokenStream {
     let op_variant = version_op_variant(op);
 
-    let snapshot_after_write = ledger_reload_after_write_ts(table_name_ts, conn_ident, model_ident);
+    let reload_after_write = ledger_reload_after_write_ts(table_name_ts, conn_ident, model_ident);
 
     // #2326: a delete or restore is valid from the moment it is made. The record
     // still holds the old valid time. Reading it would back-date the revision.
@@ -2387,7 +2383,7 @@ fn ledger_append_ts(
                 ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
             > = {
                 use ::autumn_web::ledger::LedgeredRecord as _;
-                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_valid_from(&(#record_expr))
+                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_valid_from(&__lg_row)
             };
         }
     };
@@ -2415,7 +2411,7 @@ fn ledger_append_ts(
             ::autumn_web::ledger::refuse_non_finite(
                 #table_name_ts,
                 __lg_record_id,
-                (#record_expr).__autumn_ledger_non_finite_column(),
+                __lg_row.__autumn_ledger_non_finite_column(),
             )?;
         }
     } else {
@@ -2428,12 +2424,21 @@ fn ledger_append_ts(
                 use ::autumn_web::version_history::VersionedRecord as _;
                 (#record_expr).version_record_id()
             };
+            // The row as the write left it, after any trigger ran.
+            let __lg_row: #model_ident = #reload_after_write;
             #non_finite_check
             let __lg_tenant_id: ::core::option::Option<&str> =
                 <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(&(#record_expr));
             #tenant_change_check
+            // #2319: a trigger that rewrote `tenant_id` would split the chain.
+            ::autumn_web::ledger::refuse_tenant_change(
+                #table_name_ts,
+                __lg_record_id,
+                __lg_tenant_id,
+                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(&__lg_row),
+            )?;
             let __lg_snapshot: ::autumn_web::reexports::serde_json::Value =
-                #snapshot_after_write;
+                __lg_row.__autumn_commit_hook_to_value()?;
             #valid_from_stmt
             ::autumn_web::ledger::append_revision(
                 &mut *#conn_ident,
@@ -28357,8 +28362,8 @@ mod tests {
         }
         for op in ["insert", "update"] {
             assert!(
-                ledger_append_for(op).contains("ledger_valid_from"),
-                "`{op}` must keep reading the record's valid time"
+                ledger_append_for(op).contains("ledger_valid_from (& __lg_row)"),
+                "`{op}` must read the valid time of the reloaded row"
             );
         }
     }
@@ -28370,6 +28375,13 @@ mod tests {
             assert!(
                 !ledger_append_for(op).contains("__autumn_ledger_non_finite_column"),
                 "`{op}` writes no float, so it must not be refused for a legacy value"
+            );
+        }
+        for op in ["insert", "update"] {
+            // A trigger may write the float, so check the reloaded row.
+            assert!(
+                ledger_append_for(op).contains("__lg_row . __autumn_ledger_non_finite_column"),
+                "`{op}` must check the reloaded row"
             );
         }
         let generated = ledger_append_for("update");
