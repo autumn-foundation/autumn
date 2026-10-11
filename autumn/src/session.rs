@@ -264,12 +264,15 @@ impl Session {
     /// with, and the id just before the latest rotation. Empty when the id was
     /// not rotated.
     pub(crate) async fn earlier_ids(&self) -> Vec<String> {
-        let inner = self.inner.read().await;
-        let mut ids: Vec<String> = inner.old_id.iter().cloned().collect();
-        if let Some(previous) = &inner.previous_id
-            && !ids.contains(previous)
+        let (first, previous) = {
+            let inner = self.inner.read().await;
+            (inner.old_id.clone(), inner.previous_id.clone())
+        };
+        let mut ids: Vec<String> = first.into_iter().collect();
+        if let Some(previous) = previous
+            && !ids.contains(&previous)
         {
-            ids.push(previous.clone());
+            ids.push(previous);
         }
         ids
     }
