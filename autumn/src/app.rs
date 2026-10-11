@@ -3306,14 +3306,15 @@ impl AppBuilder {
         // "db" is a reserved built-in component name. Allowing a custom indicator
         // under this name would produce an inconsistent response: the custom result
         // would still gate the aggregate status while the built-in primary ping owns
-        // the components.db / checks.database display. The "db:shard:" prefix is
-        // reserved for the framework's per-shard indicators for the same reason.
+        // the components.db / checks.database display. The "db:shard:" prefix and
+        // "db:fleet" are reserved for the framework's per-shard and fleet
+        // indicators for the same reason.
         #[cfg(feature = "db")]
-        if name == "db" || name.starts_with("db:shard:") {
+        if name == "db" || name == "db:fleet" || name.starts_with("db:shard:") {
             tracing::warn!(
                 indicator_name = %name,
-                "\"db\" and \"db:shard:*\" are reserved built-in health indicator names; \
-                 registration skipped. Use a different name for your custom indicator."
+                "\"db\", \"db:fleet\" and \"db:shard:*\" are reserved built-in health indicator \
+                 names; registration skipped. Use a different name for your custom indicator."
             );
             return self;
         }
@@ -4369,6 +4370,10 @@ impl AppBuilder {
             // replicator stamps, and the health indicator's startup grace, are
             // read from it, so a test that freezes time moves them all (#1797).
             let clock = state.clock_arc();
+            #[cfg(feature = "sqlite")]
+            let fleet_lag_alert_after = replication_config
+                .rpo()
+                .saturating_mul(crate::replication::LAG_ALERT_MULTIPLIER);
 
             let built = crate::time::spawn_blocking(move || {
                 crate::replication::build(
@@ -4402,6 +4407,15 @@ impl AppBuilder {
                             as std::sync::Arc<dyn crate::actuator::HealthIndicator>,
                     ) {
                         tracing::warn!("{e}");
+                    }
+                    // A SQLite fleet (ADR 0019 §5) ships each of its databases
+                    // next to the control database, through the same destination.
+                    #[cfg(feature = "sqlite")]
+                    if let Err(e) =
+                        start_fleet_replication(&state, &config, &runtime, fleet_lag_alert_after)
+                    {
+                        tracing::error!("SQLite fleet replication could not start: {e}");
+                        std::process::exit(1);
                     }
                     replication_worker = Some(runtime.replicator);
                 }
@@ -4460,6 +4474,8 @@ impl AppBuilder {
         #[cfg(feature = "db")]
         apply_replica_migration_readiness(&state, replica_readiness);
         if let Some(cache) = cache_backend {
+            // Wrapped once, so the global and the state hold the same `Arc`.
+            let cache = crate::cache::with_capsule_seam(cache);
             crate::cache::set_global_cache(cache.clone());
             state.shared_cache = Some(cache);
         } else {
@@ -5274,6 +5290,14 @@ impl AppBuilder {
                 server_shutdown.child_token(),
             );
         }
+        // SQLite fleet (ADR 0019): a commit-hook worker per open database and
+        // the idle sweeper. Like replication below, its token is cancelled only
+        // after the request drain, so the final close of every database (and
+        // its last replication ship) comes after the last commit.
+        #[cfg(feature = "sqlite")]
+        let fleet_shutdown = tokio_util::sync::CancellationToken::new();
+        #[cfg(feature = "sqlite")]
+        let mut fleet_maintenance = start_fleet_runtime(&state, fleet_shutdown.clone());
 
         // The replication loop runs on a dedicated OS thread, not a
         // `spawn_blocking` task: it lives for the whole process and does blocking
@@ -6103,6 +6127,25 @@ impl AppBuilder {
         // budget as the departure and the hooks below: a destination that has gone
         // away must not hold the process open past what a supervisor allows.
         // Overrunning it is loud rather than silent — the operator's RPO is at stake.
+        // Phase 6a (fleet): close every open fleet database. Each close waits
+        // for its in-flight connections, then runs the lifecycle hooks — a
+        // fleet replicator ships the database's last frames there. Same budget
+        // and same reasoning as the control replication flush below.
+        #[cfg(feature = "sqlite")]
+        if let Some(maintenance) = fleet_maintenance.take() {
+            fleet_shutdown.cancel();
+            let wait = shutdown_budget.saturating_sub(elapsed_since_drain_start());
+            if tokio::time::timeout(wait, maintenance).await.is_ok() {
+                tracing::info!("shutdown: SQLite fleet databases closed");
+            } else {
+                tracing::warn!(
+                    timeout_secs = wait.as_secs(),
+                    "shutdown: SQLite fleet databases did not all close within the shutdown \
+                     budget; a replicated fleet's last frames may not be offsite"
+                );
+            }
+        }
+
         #[cfg(feature = "db")]
         if let Some(waiter) = replication_done.take() {
             // Only now: every request that will ever commit has committed, so
@@ -6492,6 +6535,8 @@ impl AppBuilder {
         #[cfg(feature = "db")]
         apply_replica_migration_readiness(&state, replica_readiness);
         if let Some(cache) = cache_backend {
+            // Wrapped once, so the global and the state hold the same `Arc`.
+            let cache = crate::cache::with_capsule_seam(cache);
             crate::cache::set_global_cache(cache.clone());
             state.shared_cache = Some(cache);
         } else {
@@ -7225,13 +7270,15 @@ impl AppBuilder {
 
         // Fold in the framework migration sets a normal boot would apply, using the
         // SAME helper as `setup_database`, so the applied set is identical.
-        let migrations = migrations_with_repository_framework_migrations(
+        let migrations = Arc::new(migrations_with_repository_framework_migrations(
             migrations,
             crate::repository_commit_hooks::has_repository_commit_hook_descriptors(),
             crate::version_history::has_versioned_repository_descriptors(),
             crate::derivation::has_derivation_descriptors(),
             RepositoryCommitHookQueueMigrationMode::Runtime,
-        );
+        ));
+        #[cfg(feature = "sqlite")]
+        let fleet_migrations = Arc::clone(&migrations);
 
         // Writable targets only: the control primary, then each shard primary.
         let control_url = config.database.effective_primary_url().map(str::to_owned);
@@ -7321,7 +7368,7 @@ impl AppBuilder {
                         std::process::exit(1);
                     }
                     #[cfg(feature = "sqlite")]
-                    for (_, mig) in &migrations {
+                    for (_, mig) in migrations.iter() {
                         total += apply_pending_sqlite_or_exit(
                             url,
                             crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
@@ -7329,7 +7376,7 @@ impl AppBuilder {
                         );
                     }
                 } else {
-                    for (_, mig) in &migrations {
+                    for (_, mig) in migrations.iter() {
                         total += apply_pending_or_exit(
                             url,
                             crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
@@ -7363,6 +7410,12 @@ impl AppBuilder {
             eprintln!("autumn migrate: migration task panicked: {error}");
             std::process::exit(1);
         });
+
+        // A SQLite fleet (ADR 0019): every tenant / slot database on disk gets
+        // the same non-control sets, so a boot that does not auto-apply finds
+        // them current instead of refusing them.
+        #[cfg(feature = "sqlite")]
+        let applied_total = applied_total + migrate_fleet_or_exit(&config, fleet_migrations).await;
 
         eprintln!(
             "autumn migrate: applied {applied_total} pending migration(s); database is up to date"
@@ -8049,6 +8102,8 @@ impl AppBuilder {
         #[cfg(feature = "db")]
         apply_replica_migration_readiness(&state, replica_readiness);
         if let Some(cache) = cache_backend {
+            // Wrapped once, so the global and the state hold the same `Arc`.
+            let cache = crate::cache::with_capsule_seam(cache);
             crate::cache::set_global_cache(cache.clone());
             state.shared_cache = Some(cache);
         } else {
@@ -8177,6 +8232,8 @@ impl AppBuilder {
                 task_shutdown.child_token(),
             );
         }
+        #[cfg(feature = "sqlite")]
+        let fleet_maintenance = start_fleet_runtime(&state, task_shutdown.child_token());
 
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
             eprintln!("startup hook failed: {error}");
@@ -8207,6 +8264,12 @@ impl AppBuilder {
         let result = (task_handler)(state.clone(), args).instrument(span).await;
 
         task_shutdown.cancel();
+        // Close the fleet databases the task opened (and ship their last
+        // frames when the fleet replicates) before the process exits.
+        #[cfg(feature = "sqlite")]
+        if let Some(maintenance) = fleet_maintenance {
+            let _ = maintenance.await;
+        }
         run_shutdown_hooks(&shutdown_hooks).await;
         // If the generated `pg.stop()` hook errored/timed out it keeps the
         // handle for a retry, but a one-off task then exits — so retry the stop
@@ -8298,11 +8361,13 @@ impl AppBuilder {
     ///   request to a live service.
     /// * No job runtime, no scheduler, no startup/shutdown hooks, and only
     ///   *sync* event listeners (a durable listener needs the job runtime).
-    /// * No storage preflight, no mailer, no fail-fast configuration gates: a
-    ///   machine replaying a production capsule generally has none of that
-    ///   configured, and none of it is on the recorded path. A handler that
-    ///   extracts one of those subsystems is reported as a mismatch rather than
-    ///   killing the replay.
+    /// * A replay mailer, whose sends are served from the capsule and never
+    ///   delivered (`mail::install_replay_mailer`).
+    /// * No storage preflight, no fail-fast configuration gates: a machine
+    ///   replaying a production capsule generally has none of that configured,
+    ///   and none of it is on the recorded path. A handler that extracts one of
+    ///   those subsystems is reported as a mismatch rather than killing the
+    ///   replay.
     /// * No port is bound.
     #[cfg(feature = "reporting")]
     #[allow(clippy::too_many_lines)]
@@ -8365,14 +8430,28 @@ impl AppBuilder {
             #[cfg(all(feature = "embed-assets", feature = "i18n"))]
             embedded_locales,
             plugin_config_roots,
+            // Read only for whether it is set: calling it could reach a live
+            // queue. The replay mailer gets a refusing queue in its place.
+            #[cfg(feature = "mail")]
+            mail_delivery_queue_factory,
+            // Read only for whether it is set: replay builds no cache backend.
+            cache_backend,
             ..
         } = self;
+        #[cfg(feature = "mail")]
+        let builder_mail_queue = mail_delivery_queue_factory.is_some();
 
         // Nothing outside the capsule may be reached from here on: the router
         // this rebuilds is the real one, with the application's real outbound
         // HTTP client in its state (AC4).
         #[cfg(feature = "http-client")]
         crate::http_client::block_outbound_for_replay();
+        // Egress outside the HTTP client (`capsule::guard_egress`), in every
+        // build.
+        crate::capsule::boundary::block_egress_for_replay();
+        // A cache call with no tape (a state initializer) must not reach a
+        // live backend either.
+        crate::cache::block_backends_for_replay();
 
         let path = std::path::PathBuf::from(&capsule_path);
         let capsule = match crate::capsule::load_capsule(&path) {
@@ -8473,7 +8552,9 @@ impl AppBuilder {
         if let Some(interceptor) = db_interceptor {
             state.insert_extension(interceptor);
         }
-        crate::cache::clear_global_cache();
+        // In place of the builder's backend, which replay does not build: in
+        // the global cache and the state, as `with_cache_backend` does.
+        state.shared_cache = crate::cache::install_replay_cache(cache_backend.is_some());
 
         for register in policy_registrations {
             register(state.policy_registry());
@@ -8484,7 +8565,25 @@ impl AppBuilder {
             install_i18n_bundle_layer(custom_layers, &state, i18n_bundle, &config.i18n);
 
         install_webhook_registry(&state, &config);
+        // Production's `outbox::install` gives `deliver_later` a queue when
+        // `outbox.enabled` and the app has a database. Replay runs no relay,
+        // so the replay mailer stands in for that queue too.
+        #[cfg(all(feature = "mail", feature = "db"))]
+        let builder_mail_queue =
+            builder_mail_queue || crate::outbox::installs_mail_queue(&state, &config.outbox);
+        // Before the initializers, as production installs its mailer, so an
+        // initializer that reads the `Mailer` sees the same configuration.
+        #[cfg(feature = "mail")]
+        crate::mail::install_replay_mailer(&state, &config.mail, builder_mail_queue);
         run_state_initializers(state_initializers, &state);
+        // Again after the initializers, so it replaces a live `Mailer` one of
+        // them installed; before the router state is cloned, so a job replay
+        // gets it too (#2351 item 7).
+        #[cfg(feature = "mail")]
+        crate::mail::install_replay_mailer(&state, &config.mail, builder_mail_queue);
+        // After the initializers: a cache that only a startup hook installed,
+        // which replay does not run. Production's initializers did not see it.
+        crate::cache::install_late_replay_cache(&state, &capsule.effects);
         crate::cost::install(&state, &config);
         // Durable listeners need the job runtime this path never starts, so —
         // as in static builds — only sync listeners are registered, and a
@@ -9279,6 +9378,8 @@ fn force_offline_replay_config(config: &mut AutumnConfig) {
     // the debugging session. A per-route `#[timeout(...)]` override still applies —
     // it is part of the route table, not the configuration.
     config.server.timeouts.request_timeout_ms = None;
+    // A shadow mirror has its own client and is not a handler effect.
+    config.shadow.enabled = false;
 }
 
 /// The database topology a replay runs against: an in-process pool answering
@@ -12442,13 +12543,16 @@ async fn setup_database(
     if config.replication.as_ref().is_some_and(|r| r.enabled) {
         crate::db::set_sqlite_replication_active();
     }
-    let migrations = migrations_with_repository_framework_migrations(
+    // Shared, not copied: `EmbeddedMigrations` cannot be cloned, and a SQLite
+    // fleet (ADR 0019) migrates each tenant database from the same list long
+    // after boot.
+    let migrations = Arc::new(migrations_with_repository_framework_migrations(
         migrations,
         crate::repository_commit_hooks::has_repository_commit_hook_descriptors(),
         crate::version_history::has_versioned_repository_descriptors(),
         crate::derivation::has_derivation_descriptors(),
         hook_queue_migration_mode,
-    );
+    ));
     // Directory routing is only actually active when the app did NOT supply an
     // explicit shard router: an explicit `with_shard_router(...)` takes
     // precedence over `directory_shard_router` in `resolve_shard_set`, so in
@@ -12458,6 +12562,14 @@ async fn setup_database(
     // (or warn about a pending directory migration) for a table it won't use.
     let use_directory_router = shard_router.is_none()
         && (directory_shard_router || config.database.directory_shard_router);
+    // A fleet routes by its mode and path template, never by a router.
+    #[cfg(feature = "sqlite")]
+    if config.database.fleet.is_some() && shard_router.is_some() {
+        tracing::warn!(
+            "with_shard_router is ignored: database.fleet routes each key to its own \
+             database by fleet mode (ADR 0019)"
+        );
+    }
     // The tenant→shard directory table is a CONTROL-plane table: create it at
     // startup only when directory routing is active (and shards exist), and
     // only on the control target — not via the shared list above, which is also
@@ -12473,6 +12585,8 @@ async fn setup_database(
     let shard_map_migration_required =
         shard_map_migration_is_required(config.database.has_shards(), hook_queue_migration_mode);
     let check_replica_migrations = !migrations.is_empty();
+    #[cfg(feature = "sqlite")]
+    let custom_pool_provider = pool_provider.is_some();
     let topology = match pool_provider {
         Some(factory) => factory(config.database.clone()).await,
         None => crate::db::create_topology(&config.database),
@@ -12590,11 +12704,55 @@ async fn setup_database(
         topology.is_some(),
         shards.is_some(),
         provider_migration_url,
-        migrations,
+        Arc::clone(&migrations),
         directory_migration_required,
         shard_map_migration_required,
     )
     .await;
+
+    // A SQLite fleet (ADR 0019) becomes the shard set: tenant data routes to
+    // per-tenant / per-slot files, each migrated with the non-control sets when
+    // it opens. Built at runtime only — a static build must not create the
+    // fleet directory.
+    #[cfg(feature = "sqlite")]
+    let shards = match (runtime_boot, topology.as_ref()) {
+        (true, Some(topology)) => {
+            if config.database.fleet.is_some() {
+                fleet_control_target_identified(custom_pool_provider, topology.migration_url())?;
+            }
+            crate::db::fleet::build_for_app(
+                config,
+                topology.migration_url(),
+                Arc::clone(&migrations),
+                |set| !migration_set_is_control_framework(set),
+            )?
+            .map_or(shards, |fleet| {
+                tracing::info!(
+                    mode = %fleet.mode(),
+                    root = %fleet.root().display(),
+                    max_open = fleet.max_open(),
+                    "SQLite database fleet ready"
+                );
+                if config
+                    .database
+                    .fleet
+                    .as_ref()
+                    .is_some_and(|f| f.restore_missing)
+                    && !config.replication.as_ref().is_some_and(|r| r.enabled)
+                {
+                    tracing::warn!(
+                        "database.fleet.restore_missing is set but [replication] is off; there is \
+                         no replica to restore a missing database from"
+                    );
+                }
+                Some(crate::sharding::ShardSet::from_fleet(
+                    fleet,
+                    topology.primary().clone(),
+                ))
+            })
+        }
+        _ => shards,
+    };
 
     // Derivations (#1769): the state table exists by now, so reconcile each
     // declared `#[derivation]` against it and repair whatever changed. A
@@ -12942,6 +13100,192 @@ fn apply_pending_sqlite_or_exit(
     }
 }
 
+/// Start the per-process work of a `[database.fleet]` (ADR 0019): a commit-hook
+/// worker for each database while it is open, and the idle sweeper, which
+/// closes every database when `shutdown` fires. `None` when the app has no
+/// fleet.
+///
+/// The hook worker runs in every role, `web` included. A fleet database's
+/// queue can only be drained by a process that has the database open, and a
+/// `worker` process does not discover fleet databases, so gating this on the
+/// role would leave a `web` process's after-commit hooks pending forever.
+/// Rows are claimed one at a time under `BEGIN IMMEDIATE` with a lease, so two
+/// processes draining one database is safe.
+#[cfg(feature = "sqlite")]
+fn start_fleet_runtime(
+    state: &AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let fleet = state.shards()?.fleet()?.clone();
+    fleet.add_lifecycle(Arc::new(FleetCommitHookWorkers {
+        #[cfg(feature = "ws")]
+        channels: state.channels().clone(),
+    }));
+    Some(fleet.spawn_maintenance(shutdown))
+}
+
+/// Replicate every database of the app's fleet next to the control database
+/// (ADR 0019 §5): installs the lifecycle hooks, registers the
+/// `replication:fleet` indicator and starts the loop thread. A no-op without a
+/// fleet.
+#[cfg(feature = "sqlite")]
+fn start_fleet_replication(
+    state: &AppState,
+    config: &AutumnConfig,
+    runtime: &crate::replication::ReplicationRuntime,
+    lag_alert_after: std::time::Duration,
+) -> Result<(), String> {
+    let Some(fleet) = state.shards().and_then(crate::sharding::ShardSet::fleet) else {
+        return Ok(());
+    };
+    let restore_missing = config
+        .database
+        .fleet
+        .as_ref()
+        .is_some_and(|f| f.restore_missing);
+    let replication = Arc::new(crate::db::fleet_replication::FleetReplication::new(
+        Arc::clone(runtime.replicator.destination()),
+        runtime.settings.clone(),
+        lag_alert_after,
+        restore_missing,
+        state.clock_arc(),
+    ));
+    fleet
+        .install_replication(Arc::clone(&replication))
+        .map_err(|_| "the fleet already replicates".to_owned())?;
+    if let Err(e) = state.health_indicator_registry.register(
+        crate::db::fleet_replication::FLEET_REPLICATION_INDICATOR,
+        crate::actuator::IndicatorGroup::HealthOnly,
+        replication.indicator(),
+    ) {
+        tracing::warn!("{e}");
+    }
+    replication
+        .spawn_loop()
+        .map_err(|e| format!("could not start the fleet replication thread: {e}"))?;
+    tracing::info!(
+        prefix = %format!("{}/fleet/", runtime.settings.root),
+        restore_missing,
+        "SQLite fleet replication is enabled"
+    );
+    Ok(())
+}
+
+/// Runs the durable commit-hook worker of each open fleet database, and stops
+/// it when the database closes. Hooks enqueued on a database that is closed
+/// are drained the next time it opens.
+#[cfg(feature = "sqlite")]
+struct FleetCommitHookWorkers {
+    #[cfg(feature = "ws")]
+    channels: crate::channels::Channels,
+}
+
+#[cfg(feature = "sqlite")]
+impl crate::db::fleet::FleetLifecycle for FleetCommitHookWorkers {
+    fn on_open(&self, db: &crate::db::fleet::FleetDatabase) -> Result<(), String> {
+        #[cfg(feature = "ws")]
+        crate::repository_commit_hooks::start_repository_commit_hook_worker(
+            db.pool().clone(),
+            Some(self.channels.clone()),
+            db.closed().clone(),
+        );
+        #[cfg(not(feature = "ws"))]
+        crate::repository_commit_hooks::start_repository_commit_hook_worker(
+            db.pool().clone(),
+            db.closed().clone(),
+        );
+        Ok(())
+    }
+
+    fn on_close(&self, db: &crate::db::fleet::FleetDatabase) {
+        crate::repository_commit_hooks::forget_sqlite_repository_commit_hook_kick(db.pool());
+    }
+}
+
+/// A fleet must know which file the control pool opens, to refuse one inside
+/// its root. The built-in provider opens the configured URL, which
+/// [`crate::db::fleet::build_for_app`] checks. A custom provider may open
+/// anything, so it must name its target with
+/// [`crate::db::DatabaseTopology::with_migration_url`]; without that, boot
+/// refuses rather than guess.
+#[cfg(feature = "sqlite")]
+fn fleet_control_target_identified(
+    custom_pool_provider: bool,
+    migration_url: Option<&str>,
+) -> Result<(), String> {
+    if !custom_pool_provider {
+        return Ok(());
+    }
+    match migration_url {
+        None => Err(
+            "database.fleet with a custom DatabasePoolProvider: the provider's topology must \
+             name its control database with DatabaseTopology::with_migration_url(...), so the \
+             fleet can refuse a control file inside database.fleet.root"
+                .to_owned(),
+        ),
+        Some(url)
+            if crate::config::DatabaseBackend::detect(url)
+                != Some(crate::config::DatabaseBackend::Sqlite)
+                || crate::config::sqlite_url_file(url).is_none() =>
+        {
+            Err(format!(
+                "database.fleet with a custom DatabasePoolProvider: the provider names its control \
+                 database as {}, which is not a file-backed sqlite: database; a fleet keeps \
+                 framework state (sessions, jobs, flags) there, so it must survive a restart",
+                crate::db_url::redact_target(url)
+            ))
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+/// Migrate every database of a `[database.fleet]` (ADR 0019) for the
+/// `AUTUMN_MIGRATE=1` one-shot, returning the number of migrations applied, or
+/// exiting non-zero when any database fails (each failure is printed, redacted).
+#[cfg(feature = "sqlite")]
+async fn migrate_fleet_or_exit(
+    config: &AutumnConfig,
+    migrations: Arc<Vec<(&'static str, crate::migrate::EmbeddedMigrations)>>,
+) -> usize {
+    let fleet = match crate::db::fleet::build_for_app(config, None, migrations, |set| {
+        !migration_set_is_control_framework(set)
+    }) {
+        Ok(Some(fleet)) => fleet,
+        Ok(None) => return 0,
+        Err(error) => {
+            eprintln!("autumn migrate: {error}");
+            std::process::exit(1);
+        }
+    };
+    match fleet
+        .migrate_all(crate::db::fleet::DEFAULT_FLEET_CONCURRENCY)
+        .await
+    {
+        Ok(report) if report.failed.is_empty() => {
+            eprintln!(
+                "autumn migrate: fleet: {} database(s), {} migration(s) applied",
+                report.databases, report.applied
+            );
+            report.applied
+        }
+        Ok(report) => {
+            for (key, error) in &report.failed {
+                eprintln!("autumn migrate: fleet database {key}: {error}");
+            }
+            eprintln!(
+                "autumn migrate: fleet: {} of {} database(s) failed; the others are migrated",
+                report.failed.len(),
+                report.databases
+            );
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("autumn migrate: fleet: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Guard the startup-migration path against a **sharded** `SQLite` deployment.
 ///
 /// PR3 (#1614) wired a working `SQLite` startup-migration path: registered
@@ -13217,7 +13561,7 @@ async fn run_startup_migrations(
     control_configured: bool,
     shards_configured: bool,
     provider_migration_url: Option<String>,
-    migrations: Vec<(&'static str, crate::migrate::EmbeddedMigrations)>,
+    migrations: Arc<Vec<(&'static str, crate::migrate::EmbeddedMigrations)>>,
     directory_migration_required: bool,
     shard_map_migration_required: bool,
 ) {
@@ -13288,7 +13632,7 @@ async fn run_startup_migrations(
                 );
                 std::process::exit(1);
             }
-            for (_, mig) in &migrations {
+            for (_, mig) in migrations.iter() {
                 crate::migrate::auto_migrate_sqlite(
                     url,
                     profile.as_deref(),
@@ -13302,7 +13646,7 @@ async fn run_startup_migrations(
         }
 
         if let Some(url) = control_url {
-            for (_, mig) in &migrations {
+            for (_, mig) in migrations.iter() {
                 crate::migrate::auto_migrate(
                     &url,
                     profile.as_deref(),
@@ -13885,12 +14229,6 @@ fn export_preflight(ctx: &ExportPreflight<'_>) -> Result<(), String> {
         nest_routers,
         declared_routes,
         config,
-        // Read only by the `mcp` block below; binding it unconditionally keeps
-        // one destructuring rather than two cfg'd copies of the same pattern.
-        #[cfg_attr(
-            not(feature = "mcp"),
-            expect(unused_variables, reason = "only the `mcp` block reads it")
-        )]
         mcp_mount_path,
     } = ctx;
 
@@ -13957,6 +14295,15 @@ fn export_preflight(ctx: &ExportPreflight<'_>) -> Result<(), String> {
             merge_routers,
             nest_routers,
             config,
+        )
+    })
+    .and_then(|()| {
+        // The plugin-route half of the router's own mount check. `run()` hands
+        // the router the SAME gated OpenAPI value and the MCP path.
+        crate::router::reject_declared_routes_on_context_mounts(
+            declared_routes,
+            mounted_openapi,
+            mcp_mount_path,
         )
     });
 
@@ -14377,6 +14724,310 @@ mod agent_authority_route_summary_tests {
         let hatched = agent_authority_route_summary(&route_with("/items", false), None, true);
         assert!(hatched.mcp_tool);
         assert_eq!(hatched.exposed_by, Some(McpExposedBy::Hatch));
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod fleet_boot_tests {
+    use super::*;
+
+    async fn table_exists(db: &crate::db::fleet::FleetDatabase, table: &str) -> bool {
+        use diesel_async::RunQueryDsl as _;
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+        let mut conn = db.pool().get().await.unwrap();
+        diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind::<diesel::sql_types::Text, _>(table)
+        .get_result::<Count>(&mut *conn)
+        .await
+        .unwrap()
+        .n == 1
+    }
+
+    /// A symlinked fleet root that resolves to the control database's
+    /// directory passes the lexical config check, so boot compares the
+    /// canonical paths: tenant `control` must never open the control database.
+    #[cfg(unix)]
+    #[test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "fleet path templates use {placeholders}"
+    )]
+    fn boot_refuses_a_fleet_root_that_aliases_the_control_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let link = tmp.path().join("fleet-link");
+        std::os::unix::fs::symlink(&data, &link).unwrap();
+        let mut config = AutumnConfig {
+            profile: Some("dev".into()),
+            ..AutumnConfig::default()
+        };
+        config.database.url = Some(format!("sqlite://{}", data.join("control.db").display()));
+        config.database.fleet = Some(crate::config::DatabaseFleetConfig {
+            mode: crate::fleet_layout::FleetMode::Tenant,
+            root: link.display().to_string(),
+            path: Some("{tenant}.db".to_owned()),
+            max_open: 4,
+            pool_size: 1,
+            create_on_demand: None,
+            idle_close_secs: 0,
+            restore_missing: false,
+        });
+        config
+            .database
+            .validate()
+            .expect("lexically, the paths differ");
+        let Err(err) =
+            crate::db::fleet::build_for_app(&config, None, Arc::new(Vec::new()), |_| true)
+        else {
+            panic!("a fleet root aliasing the control database must be refused");
+        };
+        assert!(err.contains("control database"), "{err}");
+    }
+
+    /// A custom pool provider can resolve the control database at runtime
+    /// (the topology's `migration_url`). That target is checked too: config
+    /// pointing outside the root does not let a resolved control file inside
+    /// it through.
+    #[test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "fleet path templates use {placeholders}"
+    )]
+    fn boot_refuses_a_provider_resolved_control_database_inside_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fleet");
+        std::fs::create_dir(&root).unwrap();
+        let mut config = AutumnConfig {
+            profile: Some("dev".into()),
+            ..AutumnConfig::default()
+        };
+        config.database.url = Some(format!(
+            "sqlite://{}",
+            tmp.path().join("control.db").display()
+        ));
+        config.database.fleet = Some(crate::config::DatabaseFleetConfig {
+            mode: crate::fleet_layout::FleetMode::Tenant,
+            root: root.display().to_string(),
+            path: Some("{tenant}.db".to_owned()),
+            max_open: 4,
+            pool_size: 1,
+            create_on_demand: None,
+            idle_close_secs: 0,
+            restore_missing: false,
+        });
+        let resolved = format!("sqlite://{}", root.join("control.db").display());
+        let Err(err) =
+            crate::db::fleet::build_for_app(&config, Some(&resolved), Arc::new(Vec::new()), |_| {
+                true
+            })
+        else {
+            panic!("a resolved control database inside the root must be refused");
+        };
+        assert!(err.contains("control database"), "{err}");
+        crate::db::fleet::build_for_app(&config, None, Arc::new(Vec::new()), |_| true)
+            .expect("the configured control database is outside the root");
+    }
+
+    /// A custom pool provider must say which file its control pool opens
+    /// (`DatabaseTopology::with_migration_url`), or the fleet cannot rule out
+    /// that it lies inside the root: boot refuses rather than guess.
+    #[test]
+    fn a_fleet_requires_a_custom_provider_to_name_its_control_database() {
+        let err = fleet_control_target_identified(true, None).unwrap_err();
+        assert!(err.contains("with_migration_url"), "{err}");
+        fleet_control_target_identified(true, Some("sqlite:///srv/control.db"))
+            .expect("named: checked against the root");
+        // Named, but not a file: framework state would vanish on restart.
+        for target in [
+            "sqlite::memory:",
+            "file::memory:?cache=shared",
+            "postgres://db/app",
+        ] {
+            let err = fleet_control_target_identified(true, Some(target)).unwrap_err();
+            assert!(err.contains("file-backed"), "{target}: {err}");
+        }
+        fleet_control_target_identified(false, None)
+            .expect("the built-in provider opens the configured url, already checked");
+    }
+
+    /// The boot path builds the fleet from the same folded list it migrates
+    /// the control database with, minus the control-plane set: tenant files
+    /// get the shard framework tables, never `api_tokens` or the job queue.
+    #[tokio::test]
+    async fn the_boot_fleet_gets_the_shard_sets_and_never_the_control_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = AutumnConfig {
+            profile: Some("dev".into()),
+            ..AutumnConfig::default()
+        };
+        config.database.url = Some(format!(
+            "sqlite://{}",
+            tmp.path().join("control.db").display()
+        ));
+        config.database.fleet = Some(crate::config::DatabaseFleetConfig {
+            mode: crate::fleet_layout::FleetMode::Slot,
+            root: tmp.path().join("fleet").display().to_string(),
+            path: None,
+            max_open: 4,
+            pool_size: 1,
+            create_on_demand: None,
+            idle_close_secs: 0,
+            restore_missing: false,
+        });
+        let all = Arc::new(vec![
+            ("framework", crate::migrate::FRAMEWORK_MIGRATIONS),
+            (
+                "version-history",
+                crate::version_history::VERSION_HISTORY_MIGRATIONS,
+            ),
+        ]);
+        let fleet = crate::db::fleet::build_for_app(&config, None, all, |set| {
+            !migration_set_is_control_framework(set)
+        })
+        .unwrap()
+        .expect("a fleet is configured");
+        let db = fleet.open_for("acme").await.unwrap();
+        assert!(table_exists(&db, "_autumn_version_history").await);
+        assert!(!table_exists(&db, "api_tokens").await);
+        assert!(!table_exists(&db, "autumn_jobs").await);
+
+        config.database.fleet = None;
+        assert!(
+            crate::db::fleet::build_for_app(&config, None, Arc::new(Vec::new()), |_| true)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A control database plus a slot fleet under `dir`, the way `run()` sees
+    /// them: the config, the built fleet, and an `AppState` carrying it.
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "fleet path templates use {placeholders}"
+    )]
+    fn booted(dir: &std::path::Path) -> (AutumnConfig, crate::db::fleet::DatabaseFleet, AppState) {
+        let mut config = AutumnConfig {
+            profile: Some("dev".into()),
+            ..AutumnConfig::default()
+        };
+        config.database.url = Some(format!("sqlite://{}", dir.join("control.db").display()));
+        config.database.fleet = Some(crate::config::DatabaseFleetConfig {
+            mode: crate::fleet_layout::FleetMode::Slot,
+            root: dir.join("fleet").display().to_string(),
+            path: None,
+            max_open: 4,
+            pool_size: 1,
+            create_on_demand: None,
+            idle_close_secs: 0,
+            restore_missing: false,
+        });
+        let all = Arc::new(vec![("framework", crate::migrate::FRAMEWORK_MIGRATIONS)]);
+        let fleet = crate::db::fleet::build_for_app(&config, None, all, |set| {
+            !migration_set_is_control_framework(set)
+        })
+        .unwrap()
+        .expect("a fleet is configured");
+        let control = crate::db::create_pool(&config.database)
+            .unwrap()
+            .expect("a control url is configured");
+        let state = AppState::for_test().with_shards(crate::sharding::ShardSet::from_fleet(
+            fleet.clone(),
+            control,
+        ));
+        (config, fleet, state)
+    }
+
+    /// `run()`'s fleet runtime: every open database gets a commit-hook worker,
+    /// and cancelling the token closes every database before the task ends.
+    #[tokio::test]
+    async fn the_fleet_runtime_closes_every_database_on_shutdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_config, fleet, state) = booted(tmp.path());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let maintenance =
+            start_fleet_runtime(&state, shutdown.clone()).expect("the app has a fleet");
+        let db = fleet.open_for("acme").await.unwrap();
+        // The worker runs against the database's own pool.
+        assert!(!db.closed().is_cancelled());
+        drop(db);
+        assert_eq!(fleet.stats().open, 1);
+        shutdown.cancel();
+        maintenance.await.unwrap();
+        assert_eq!(fleet.stats().open, 0, "shutdown closed every database");
+
+        assert!(
+            start_fleet_runtime(&AppState::for_test(), shutdown).is_none(),
+            "no fleet, no runtime"
+        );
+    }
+
+    /// `[replication]` on a fleet app: the fleet replicates next to the control
+    /// database, reports `replication:fleet`, and refuses a second install.
+    #[tokio::test]
+    async fn fleet_replication_installs_beside_the_control_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, fleet, state) = booted(tmp.path());
+        let replicas = tmp.path().join("replicas");
+        std::fs::create_dir(&replicas).unwrap();
+        let replication_config = crate::config::ReplicationConfig {
+            enabled: true,
+            path: Some(replicas.display().to_string()),
+            ..crate::config::ReplicationConfig::default()
+        };
+        let control_url = config.database.url.clone().unwrap();
+        let runtime = crate::time::spawn_blocking(move || {
+            crate::replication::build(
+                &replication_config,
+                &control_url,
+                "dev",
+                None,
+                Arc::new(crate::time::SystemClock),
+            )
+        })
+        .await
+        .unwrap()
+        .expect("a file destination builds");
+        let lag = std::time::Duration::from_secs(30);
+
+        start_fleet_replication(&state, &config, &runtime, lag).unwrap();
+        assert!(fleet.replicating());
+        assert!(
+            state
+                .health_indicator_registry()
+                .contains(crate::db::fleet_replication::FLEET_REPLICATION_INDICATOR)
+        );
+        let again = start_fleet_replication(&state, &config, &runtime, lag).unwrap_err();
+        assert!(again.contains("already replicates"), "{again}");
+        if let Some(replication) = fleet.replication() {
+            replication.stop();
+        }
+
+        start_fleet_replication(&AppState::for_test(), &config, &runtime, lag)
+            .expect("no fleet, nothing to replicate");
+    }
+
+    /// `AUTUMN_MIGRATE=1` on a fleet app migrates every database on disk and
+    /// reports the count; an app without a fleet migrates nothing.
+    #[tokio::test]
+    async fn migrate_mode_migrates_every_fleet_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut config, fleet, _state) = booted(tmp.path());
+        for tenant in ["acme", "globex"] {
+            fleet.open_for(tenant).await.unwrap();
+        }
+        fleet.close_all().await;
+        let all = Arc::new(vec![("framework", crate::migrate::FRAMEWORK_MIGRATIONS)]);
+        // Created databases are migrated already: nothing is pending.
+        assert_eq!(migrate_fleet_or_exit(&config, Arc::clone(&all)).await, 0);
+        config.database.fleet = None;
+        assert_eq!(migrate_fleet_or_exit(&config, all).await, 0);
     }
 }
 
@@ -17281,6 +17932,14 @@ mod tests {
             "the replay handler must block outbound HTTP before rebuilding the app"
         );
         assert!(
+            handler.contains("crate::capsule::boundary::block_egress_for_replay();"),
+            "the replay handler must block egress outside the HTTP client in every build"
+        );
+        assert!(
+            handler.contains("crate::cache::block_backends_for_replay();"),
+            "the replay handler must keep every cache backend offline"
+        );
+        assert!(
             handler.contains("channels_backend: _replay_ignores_custom_channels_backend,"),
             "the replay handler must drop a custom channels backend, which outranks the \
              forced in-process one"
@@ -17307,6 +17966,66 @@ mod tests {
             forcer.contains("config.server.timeouts.request_timeout_ms = None;"),
             "replay must clear the wall-clock request deadline"
         );
+        // #2351 item 1: a shadow mirror has its own client and is not a
+        // handler effect.
+        assert!(
+            forcer.contains("config.shadow.enabled = false;"),
+            "replay must not mirror traffic to a shadow target"
+        );
+    }
+
+    /// #2351 item 7: a replayed mail-sending route reaches the mail seam. The
+    /// replay installs a mailer whose sends are served from the tape.
+    #[cfg(all(feature = "reporting", feature = "mail"))]
+    #[test]
+    fn replay_installs_a_tape_backed_mailer() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let handler = replay_mode_source(&source);
+        let install =
+            "crate::mail::install_replay_mailer(&state, &config.mail, builder_mail_queue);";
+        assert!(
+            handler.contains(install),
+            "the replay handler must install the tape-backed mailer"
+        );
+        // Codex review on #3222: production installs the mailer before the
+        // state initializers, so an initializer can read it. Replay does too,
+        // and again after them, to replace a live one an initializer installed.
+        let initializers = handler
+            .find("run_state_initializers(state_initializers, &state);")
+            .expect("the replay handler runs the state initializers");
+        let first = handler.find(install).expect("installed");
+        let last = handler.rfind(install).expect("installed");
+        assert!(first < initializers, "installed before the initializers");
+        assert!(last > initializers, "and again after them");
+        // Codex review on #3222: with `outbox.enabled`, production's mailer
+        // has the outbox's queue. Replay counts it before the first install.
+        #[cfg(feature = "db")]
+        {
+            let outbox = handler
+                .find("crate::outbox::installs_mail_queue(&state, &config.outbox)")
+                .expect("the replay handler counts the outbox's mail queue");
+            assert!(outbox < first, "counted before the mailer is installed");
+        }
+    }
+
+    /// Codex review on #3222: replay installs a builder's cache before the
+    /// state initializers, and a startup hook's cache after them, as
+    /// production did.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn replay_installs_each_cache_where_production_did() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let handler = replay_mode_source(&source);
+        let initializers = handler
+            .find("run_state_initializers(state_initializers, &state);")
+            .expect("the replay handler runs the state initializers");
+        let builder = handler
+            .find("crate::cache::install_replay_cache(cache_backend.is_some())")
+            .expect("installs a builder's cache");
+        let late = handler
+            .find("crate::cache::install_late_replay_cache(&state, &capsule.effects)")
+            .expect("installs a startup hook's cache");
+        assert!(builder < initializers && late > initializers);
     }
 
     /// The knobs the helper forces, checked on a real configuration rather than
@@ -21891,6 +22610,37 @@ mod tests {
                 .is_none(),
             "no gallery registered must mean no StoryRegistry extension"
         );
+    }
+
+    /// `autumn openapi export --check` must refuse what startup refuses. A
+    /// plugin route on the configured `OpenAPI` or MCP path fails the router
+    /// build, so the no-boot preflight must fail it too.
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn export_preflight_refuses_a_declared_route_on_a_context_mount() {
+        let config = crate::config::AutumnConfig::default();
+        let openapi =
+            crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("/spec.json");
+        let declared = vec![crate::route_listing::RouteInfo {
+            method: "GET".to_owned(),
+            path: "/spec.json".to_owned(),
+            handler: "sandbox:evil-plugin".to_owned(),
+            source: crate::route_listing::RouteSource::Plugin("evil-plugin".to_owned()),
+            ..crate::route_listing::RouteInfo::default()
+        }];
+        let error = export_preflight(&ExportPreflight {
+            routes: &[test_get_route("/hello", "hello")],
+            scoped_groups: &[],
+            api_versions: &[],
+            openapi_config: &openapi,
+            merge_routers: &[],
+            nest_routers: &[],
+            declared_routes: &declared,
+            config: &config,
+            mcp_mount_path: None,
+        })
+        .expect_err("the router build refuses this, so the export check must too");
+        assert!(error.contains("/spec.json"), "{error}");
     }
 }
 

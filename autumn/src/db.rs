@@ -106,6 +106,12 @@ pub type RuntimeBackend = diesel::pg::Pg;
 #[cfg(feature = "sqlite")]
 pub type RuntimeBackend = diesel::sqlite::Sqlite;
 
+/// One `SQLite` database per tenant or per routing slot (ADR 0019).
+#[cfg(feature = "sqlite")]
+pub mod fleet;
+/// Continuous replication of a fleet's databases (ADR 0019 §5).
+#[cfg(feature = "sqlite")]
+pub mod fleet_replication;
 pub mod pooler;
 /// `TEXT`-backed newtypes for foreign model-field types on `SQLite` (#1924).
 #[cfg(feature = "sqlite")]
@@ -129,6 +135,9 @@ tokio::task_local! {
     /// Task-local registry used by [`Db::tx`] to accumulate after-commit
     /// callbacks. Only set while the [`Db::tx`] future is being polled;
     /// absent outside a transaction block.
+    ///
+    /// Use [`register_after_commit`]: a callback pushed here directly does not
+    /// mark a failure capsule incomplete.
     pub static AFTER_COMMIT_REGISTRY: Arc<Mutex<Vec<CommitCallback>>>;
 }
 
@@ -789,38 +798,51 @@ pub(crate) fn spawn_committed_after_commit_callbacks(
     if callbacks.is_empty() {
         return None;
     }
+    // The callbacks run on a detached task, where capture cannot see their
+    // effects (#2351 item 3). A `register_after_commit` callback is counted
+    // from its registration, and marks the capsule incomplete here. A
+    // framework callback recorded its effect at registration and marks
+    // nothing. A rolled-back transaction drops its callbacks, so it marks
+    // nothing.
+    #[cfg(feature = "reporting")]
+    crate::capsule::boundary::note_committed_after_commit();
 
     let timeouts = TxTimeouts::current().unwrap_or_default();
-    Some(tokio::task::spawn(TX_TIMEOUTS.scope(
-        timeouts,
-        async move {
-            for cb in callbacks {
-                let result = match std::panic::catch_unwind(AssertUnwindSafe(cb)) {
-                    Ok(callback) => AssertUnwindSafe(callback).catch_unwind().await,
-                    Err(panic) => Err(panic),
-                };
+    let callbacks_run = async move {
+        for cb in callbacks {
+            let result = match std::panic::catch_unwind(AssertUnwindSafe(cb)) {
+                Ok(callback) => AssertUnwindSafe(callback).catch_unwind().await,
+                Err(panic) => Err(panic),
+            };
 
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        let failures_total = record_after_commit_failure();
-                        tracing::error!(
-                            autumn.after_commit.failures_total = failures_total,
-                            "after_commit callback failed (tx already committed): {e}"
-                        );
-                    }
-                    Err(panic) => {
-                        let failures_total = record_after_commit_failure();
-                        let panic = after_commit_panic_message(&*panic);
-                        tracing::error!(
-                            autumn.after_commit.failures_total = failures_total,
-                            "after_commit callback panicked (tx already committed): {panic}"
-                        );
-                    }
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    let failures_total = record_after_commit_failure();
+                    tracing::error!(
+                        autumn.after_commit.failures_total = failures_total,
+                        "after_commit callback failed (tx already committed): {e}"
+                    );
+                }
+                Err(panic) => {
+                    let failures_total = record_after_commit_failure();
+                    let panic = after_commit_panic_message(&*panic);
+                    tracing::error!(
+                        autumn.after_commit.failures_total = failures_total,
+                        "after_commit callback panicked (tx already committed): {panic}"
+                    );
                 }
             }
-        },
-    )))
+        }
+    };
+    // During a capsule replay the callbacks get the replay tape, so their
+    // effects are served or refused and never reach live services (#2351
+    // item 3).
+    #[cfg(feature = "reporting")]
+    let callbacks_run = crate::capsule::boundary::carry_detached(callbacks_run);
+    Some(tokio::task::spawn(
+        TX_TIMEOUTS.scope(timeouts, callbacks_run),
+    ))
 }
 
 fn after_commit_panic_message(payload: &(dyn Any + Send)) -> String {
@@ -878,11 +900,17 @@ where
     AFTER_COMMIT_REGISTRY
         .try_with(|registry| {
             let f = f_opt.take().expect("closure only entered once");
-            let boxed: CommitCallback = Box::new(move || Box::pin(f()));
+            // Counted until it runs, or until a rollback drops it.
+            #[cfg(feature = "reporting")]
+            let pending = crate::capsule::boundary::PendingAfterCommit::register();
+            let boxed: CommitCallback = Box::new(move || {
+                #[cfg(feature = "reporting")]
+                pending.started();
+                Box::pin(f())
+            });
             registry.lock().expect("registry lock").push(boxed);
         })
         .ok();
-
     // If still Some, the task-local wasn't set — we're outside a tx; run eagerly.
     if let Some(f) = f_opt {
         tracing::debug!("register_after_commit: no active transaction; running callback eagerly");
@@ -1899,6 +1927,46 @@ fn build_sqlite_pool(
     pool_size: usize,
     connect_timeout_secs: u64,
 ) -> Result<Pool<RuntimeConnection>, PoolError> {
+    build_sqlite_pool_with(
+        url,
+        pool_size,
+        connect_timeout_secs,
+        SqliteCheckpointOwner::ProcessLatch,
+    )
+}
+
+/// Who checkpoints the WAL of a `SQLite` pool's database.
+#[cfg(feature = "sqlite")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqliteCheckpointOwner {
+    /// Follow [`sqlite_replication_active`], read as each connection is
+    /// created: the control database, which the process replicator owns.
+    ProcessLatch,
+    /// A fleet database (ADR 0019): `true` when a fleet replicator owns its
+    /// checkpoints, `false` when `SQLite` auto-checkpoints. Never the process
+    /// latch — a fleet database the control replicator does not ship must
+    /// not lose auto-checkpointing, or its `-wal` grows without bound.
+    Fleet(bool),
+}
+
+#[cfg(feature = "sqlite")]
+impl SqliteCheckpointOwner {
+    fn replicating(self) -> bool {
+        match self {
+            Self::ProcessLatch => sqlite_replication_active(),
+            Self::Fleet(replicating) => replicating,
+        }
+    }
+}
+
+/// [`build_sqlite_pool`] with an explicit [`SqliteCheckpointOwner`].
+#[cfg(feature = "sqlite")]
+pub(crate) fn build_sqlite_pool_with(
+    url: &str,
+    pool_size: usize,
+    connect_timeout_secs: u64,
+    checkpoint_owner: SqliteCheckpointOwner,
+) -> Result<Pool<RuntimeConnection>, PoolError> {
     // Under the `sqlite` feature the runtime targets SQLite, so the URL must
     // actually NAME a SQLite target. Everything past this point treats the
     // string as a filename: `normalize_sqlite_target` strips the `sqlite:` /
@@ -2013,14 +2081,14 @@ fn build_sqlite_pool(
     // per-connection pragmas (`busy_timeout`, `foreign_keys`), so a read-only pool builds
     // and serves reads. In-memory targets are not read-only and keep the full batch.
     let mut config = diesel_async::pooled_connection::ManagerConfig::<RuntimeConnection>::default();
-    config.custom_setup = Box::new(|url: &str| {
+    config.custom_setup = Box::new(move |url: &str| {
         use diesel_async::{AsyncConnection as _, SimpleAsyncConnection as _};
         let url = url.to_owned();
         async move {
             let mut conn = RuntimeConnection::establish(&url).await?;
             let pragmas = sqlite_connection_pragmas(
                 sqlite_target_is_read_only(&url),
-                sqlite_replication_active(),
+                checkpoint_owner.replicating(),
             );
             apply_sqlite_pragmas(&mut conn, pragmas)
                 .await
@@ -4545,6 +4613,150 @@ mod tests {
             *seen.lock().expect("lock"),
             Some(super::TxTimeouts::new(Some(Duration::from_secs(30)), None))
         );
+    }
+
+    /// #2351 item 3: a callback the application registers runs on a detached
+    /// task. Capture cannot see its effects, so the capsule says so.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_registered_after_commit_callback_marks_the_capsule_incomplete() {
+        let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+            std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let registry: std::sync::Arc<std::sync::Mutex<Vec<super::CommitCallback>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::capsule::capture::with_capture_scope(
+            std::sync::Arc::clone(&scope),
+            super::AFTER_COMMIT_REGISTRY.scope(std::sync::Arc::clone(&registry), async {
+                super::register_after_commit(|| async { Ok(()) }).await;
+            }),
+        )
+        .await;
+        // Codex review on #3222: a registration alone is not detached work.
+        // A rolled-back transaction drops its callbacks.
+        assert!(!scope.is_truncated());
+        let callbacks = std::mem::take(&mut *registry.lock().expect("registry"));
+        let drain =
+            crate::capsule::capture::with_capture_scope(std::sync::Arc::clone(&scope), async {
+                super::spawn_committed_after_commit_callbacks(callbacks)
+            })
+            .await;
+        drain.expect("a callback was spawned").await.expect("runs");
+        assert!(scope.is_truncated(), "the commit spawns detached work");
+    }
+
+    /// Codex review on #3222: a callback is built only after the one before
+    /// it completes, inside the drain task.
+    #[tokio::test]
+    async fn after_commit_callbacks_are_built_in_order_after_the_last_one_ran() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback = |name: &'static str| -> super::CommitCallback {
+            let log = std::sync::Arc::clone(&log);
+            Box::new(move || {
+                log.lock().expect("log").push(format!("build {name}"));
+                Box::pin(async move {
+                    tokio::task::yield_now().await;
+                    log.lock().expect("log").push(format!("run {name}"));
+                    Ok(())
+                })
+            })
+        };
+        let drain =
+            super::spawn_committed_after_commit_callbacks(vec![callback("one"), callback("two")]);
+        drain.expect("a drain task").await.expect("runs");
+        assert_eq!(
+            *log.lock().expect("log"),
+            ["build one", "run one", "build two", "run two"]
+        );
+    }
+
+    /// Codex review on #3222: a rolled-back `register_after_commit` callback
+    /// does not mark a later commit's capsule incomplete.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_rolled_back_registration_does_not_mark_a_later_commit() {
+        let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+            std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let registry: std::sync::Arc<std::sync::Mutex<Vec<super::CommitCallback>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::capsule::capture::with_capture_scope(
+            std::sync::Arc::clone(&scope),
+            super::AFTER_COMMIT_REGISTRY.scope(std::sync::Arc::clone(&registry), async {
+                super::register_after_commit(|| async { Ok(()) }).await;
+            }),
+        )
+        .await;
+        // The rollback drops the callback.
+        drop(std::mem::take(&mut *registry.lock().expect("registry")));
+        let framework: super::CommitCallback = Box::new(|| Box::pin(async { Ok(()) }));
+        let drain =
+            crate::capsule::capture::with_capture_scope(std::sync::Arc::clone(&scope), async {
+                super::spawn_committed_after_commit_callbacks(vec![framework])
+            })
+            .await;
+        drain.expect("a drain task").await.expect("runs");
+        assert!(!scope.is_truncated());
+    }
+
+    /// Codex review on #3222: `Mailer::deliver_later` and the
+    /// `*_after_commit` job calls record their effect at registration and
+    /// push their callback directly. A commit with only such callbacks keeps
+    /// the capsule complete.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_recorded_framework_callback_keeps_the_capsule_complete() {
+        let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+            std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_in_callback = std::sync::Arc::clone(&ran);
+        let callback: super::CommitCallback = Box::new(move || {
+            Box::pin(async move {
+                ran_in_callback.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        let drain =
+            crate::capsule::capture::with_capture_scope(std::sync::Arc::clone(&scope), async {
+                super::spawn_committed_after_commit_callbacks(vec![callback])
+            })
+            .await;
+        drain.expect("a callback was spawned").await.expect("runs");
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!scope.is_truncated());
+    }
+
+    /// #2351 item 3: during a replay, the callbacks get the replay tape, so
+    /// their effects are served or refused and never reach live services.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn after_commit_callbacks_keep_the_replay_tape() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let seen_in_callback = std::sync::Arc::clone(&seen);
+        let callback: super::CommitCallback = Box::new(move || {
+            Box::pin(async move {
+                *seen_in_callback.lock().expect("lock") =
+                    crate::capsule::effects::current_tape().is_some();
+                Ok(())
+            })
+        });
+        let tape = std::sync::Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects::default(),
+        ));
+        let drain = crate::capsule::with_effect_tape(tape, async move {
+            super::spawn_committed_after_commit_callbacks(vec![callback])
+        })
+        .await
+        .expect("a callback was registered");
+        drain.await.expect("callback task");
+        assert!(*seen.lock().expect("lock"));
     }
 
     #[test]

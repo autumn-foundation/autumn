@@ -2092,8 +2092,10 @@ mod tests {
         assert!(!held_in_window(&state, 0), "pending is not a window");
 
         signal.set(2.0);
-        assert!(deferring_jobs(&state));
+        // Read before the window: the clock is real, and a read after it can
+        // fall in the next millisecond.
         let now = clock_ms(&state);
+        assert!(deferring_jobs(&state));
         assert!(held_in_window(&state, now), "ready before the window");
         assert!(
             !held_in_window(&state, now + 60_000),

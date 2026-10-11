@@ -132,7 +132,7 @@ a retry. Under a request deadline the client follows redirects itself, so each
 redirect hop is an attempt on its own host. All `Client` extractors in an app
 use one set of counts.
 
-The custom send path (`pin_to`, `get_ssrf_safe`, `no_redirect`,
+The custom send path (`pin_to`, `pin_to_addrs`, `get_ssrf_safe`, `no_redirect`,
 `follow_redirects`) uses the throttle only with `breaker_scoped()`, once per
 call, because its hosts often come from users. A throttle tracks at most 4096
 hosts; it does not reject calls to a host it does not track.

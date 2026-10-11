@@ -654,7 +654,17 @@ pub struct Mail {
 fn replayed_send(mail: &Mail) -> Option<Result<(), MailError>> {
     use crate::capsule::effects::MailVerdict;
 
-    let tape = crate::capsule::effects::current_tape()?;
+    let Some(tape) = crate::capsule::effects::current_tape() else {
+        // Startup code (a state initializer) runs with no tape. In a
+        // replaying process it must not reach a live transport.
+        return crate::capsule::boundary::replaying().then(|| {
+            Err(MailError::RuntimeUnavailable(format!(
+                "mail to {} recipient(s) was sent during a capsule replay outside the replayed \
+                 request; nothing was delivered",
+                mail.to.len()
+            )))
+        });
+    };
     // Derived by `capsule_body`, the same rule the recorder applies, so the
     // comparison is like with like.
     let body = capsule_body(mail);
@@ -725,6 +735,17 @@ const fn fill_mail_slot(_slot: Option<()>, _mail: &Mail, _error: Option<&MailErr
 #[cfg(not(feature = "reporting"))]
 const fn replayed_send(_mail: &Mail) -> Option<Result<(), MailError>> {
     None
+}
+
+/// Whether a version 3 capsule is replaying on this task.
+#[cfg(feature = "reporting")]
+fn replaying_legacy_v3() -> bool {
+    crate::capsule::effects::current_tape().is_some_and(|tape| tape.legacy_v3())
+}
+
+#[cfg(not(feature = "reporting"))]
+const fn replaying_legacy_v3() -> bool {
+    false
 }
 
 /// The capsule record for one message.
@@ -802,7 +823,8 @@ const fn mail_error_kind(error: &MailError) -> crate::capsule::schema::MailError
         MailError::Io(_) => Kind::Io,
         MailError::AllRecipientsSuppressed => Kind::AllRecipientsSuppressed,
         MailError::CssInline(_) => Kind::CssInline,
-        _ => Kind::Other,
+        MailError::NoDurableQueueInProduction => Kind::NoDurableQueueInProduction,
+        MailError::ReplayedFailure(_) => Kind::Other,
     }
 }
 
@@ -820,6 +842,7 @@ fn rebuild_mail_error(
     use crate::capsule::schema::MailErrorKind as Kind;
     match kind {
         Some(Kind::AllRecipientsSuppressed) => MailError::AllRecipientsSuppressed,
+        Some(Kind::NoDurableQueueInProduction) => MailError::NoDurableQueueInProduction,
         Some(Kind::InvalidMessage) => {
             MailError::InvalidMessage(strip_mail_prefix(&text, "invalid mail message: "))
         }
@@ -2240,17 +2263,24 @@ impl Mailer {
     /// Panics if the internal after-commit registry mutex is poisoned.
     pub fn try_deliver_later(&self, mail: Mail) -> Result<(), MailError> {
         if self.transport.is_disabled() {
-            return Ok(());
+            return self.disabled_deliver_later(mail);
         }
         if self.block_deliver_later_without_durable_queue && self.delivery_queue.is_none() {
-            return Err(MailError::NoDurableQueueInProduction);
+            return self.refused_deliver_later(mail);
         }
         let mail = self.prepare_deferred(mail);
 
         // When inside a db.tx, push the spawn as an after-commit callback so
         // the mail only fires if the transaction commits successfully.
         #[cfg(feature = "db")]
-        {
+        if crate::db::AFTER_COMMIT_REGISTRY.try_with(|_| ()).is_ok() {
+            // Failure-capsule seam (#2351 item 3). The callback runs on a
+            // detached task with no capture scope and no replay tape, so the
+            // seam is the registration, on this task.
+            if let Some(answer) = replayed_send(&mail) {
+                return answer;
+            }
+            record_send(&mail, None);
             let mailer = self.clone();
             let deferred = mail.clone();
             let mut f_opt: Option<(Self, Mail)> = Some((mailer, deferred));
@@ -2275,7 +2305,8 @@ impl Mailer {
                                         crate::AutumnError::internal_server_error_msg(e.to_string())
                                     })
                                 } else {
-                                    m.spawn_mail_delivery(m_mail).map_err(|e| {
+                                    // Recorded at registration already.
+                                    m.spawn_unrecorded_delivery(m_mail).map_err(|e| {
                                         crate::AutumnError::internal_server_error_msg(e.to_string())
                                     })
                                 }
@@ -2311,10 +2342,10 @@ impl Mailer {
     /// available.
     pub fn try_deliver_later_eager(&self, mail: Mail) -> Result<(), MailError> {
         if self.transport.is_disabled() {
-            return Ok(());
+            return self.disabled_deliver_later(mail);
         }
         if self.block_deliver_later_without_durable_queue && self.delivery_queue.is_none() {
-            return Err(MailError::NoDurableQueueInProduction);
+            return self.refused_deliver_later(mail);
         }
         let mail = self.prepare_deferred(mail);
         self.spawn_mail_delivery(mail)
@@ -2334,6 +2365,44 @@ impl Mailer {
         // capture scope either, so a `deliver_later` would otherwise be missing
         // from the capsule and then report an unrecorded-effect divergence.
         record_send(&mail, None);
+        self.spawn_unrecorded_delivery(mail)
+    }
+
+    /// `deliver_later` on a disabled transport: nothing is sent, but the call
+    /// is on the capsule seam, as `send` is. So a capture with mail off and a
+    /// replay with mail on agree.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the replayed answer is the recorded `Result`"
+    )]
+    fn disabled_deliver_later(&self, mail: Mail) -> Result<(), MailError> {
+        // A version 3 capsule did not record this call.
+        if replaying_legacy_v3() {
+            return Ok(());
+        }
+        let mail = self.prepare_deferred(mail);
+        if let Some(answer) = replayed_send(&mail) {
+            return answer;
+        }
+        record_send(&mail, None);
+        Ok(())
+    }
+
+    /// `deliver_later` in production with no durable queue: refused, and the
+    /// refusal is on the capsule seam. A replay mailer has no such guard, so
+    /// replay reproduces the refusal from the tape.
+    fn refused_deliver_later(&self, mail: Mail) -> Result<(), MailError> {
+        let mail = self.prepare_deferred(mail);
+        if let Some(answer) = replayed_send(&mail) {
+            return answer;
+        }
+        let error = MailError::NoDurableQueueInProduction;
+        record_send(&mail, Some(&error));
+        Err(error)
+    }
+
+    /// Spawn delivery of mail the seam already answered or recorded.
+    fn spawn_unrecorded_delivery(&self, mail: Mail) -> Result<(), MailError> {
         // Honor the disabled-transport contract: if the operator turned mail off
         // for this profile, deliver_later must drop the message just like
         // immediate `send` does — even when a queue is attached.
@@ -3733,6 +3802,88 @@ impl MailTransport for InterceptedMailTransport {
 
     fn is_disabled(&self) -> bool {
         self.inner.is_disabled()
+    }
+}
+
+/// Install the mailer a capsule replay uses (#2351 item 7).
+///
+/// A send on the replayed request is served from the tape by the mail seam.
+/// A send that reaches the transport ran with no tape, and is refused.
+#[cfg(feature = "reporting")]
+pub(crate) fn install_replay_mailer(state: &AppState, config: &MailConfig, builder_queue: bool) {
+    // A state initializer can install its own mailer. Its defaults, CSS
+    // inlining and `is_disabled()` apply before the seam, so the replay
+    // mailer keeps them. Only the transport changes. With no installed
+    // mailer, the app's config gives these values. The production durability
+    // guard is not copied: replay answers its recorded refusal from the tape.
+    let installed = state.extension::<Mailer>();
+    let disabled = installed.as_ref().map_or_else(
+        || config.transport == Transport::Disabled,
+        |mailer| mailer.is_disabled(),
+    );
+    // `has_durable_delivery_queue()` is observable too. Production gets a
+    // queue from the builder (`with_mail_delivery_queue`) or from a handle in
+    // the state. The replay queue refuses, so the live queue is never reached.
+    // Production attaches a queue only when the transport sends mail.
+    let durable = installed.as_ref().map_or_else(
+        || !disabled && (builder_queue || state.extension::<MailDeliveryQueueHandle>().is_some()),
+        |mailer| mailer.has_durable_delivery_queue(),
+    );
+    let mut mailer = Mailer::with_transport(ReplayTransport { disabled });
+    if durable {
+        mailer.delivery_queue = Some(Arc::new(ReplayTransport { disabled }));
+    }
+    if let Some(installed) = installed {
+        mailer.defaults = Arc::clone(&installed.defaults);
+        mailer.inline_css_default = installed.inline_css_default;
+    } else {
+        mailer.defaults = Arc::new(MailerDefaults {
+            from: config.from.clone(),
+            reply_to: config.reply_to.clone(),
+        });
+        mailer.inline_css_default = config.inline_css;
+    }
+    state.insert_extension(mailer);
+}
+
+/// The transport of the replay mailer: it refuses every send.
+///
+/// A send on the replayed request is answered by the mail seam before it
+/// reaches a transport. A send that reaches this one ran with no tape.
+#[cfg(feature = "reporting")]
+struct ReplayTransport {
+    disabled: bool,
+}
+
+#[cfg(feature = "reporting")]
+impl MailDeliveryQueue for ReplayTransport {
+    fn enqueue<'a>(
+        &'a self,
+        mail: Mail,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+        self.send(mail)
+    }
+}
+
+#[cfg(feature = "reporting")]
+impl MailTransport for ReplayTransport {
+    fn send<'a>(
+        &'a self,
+        mail: Mail,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+        // The subject is not printed: it can hold a code or other personal
+        // data, and this send matched no recorded effect.
+        Box::pin(async move {
+            Err(MailError::RuntimeUnavailable(format!(
+                "mail to {} recipient(s) was sent outside the capsule's replay scope; nothing was \
+                 delivered",
+                mail.to.len()
+            )))
+        })
+    }
+
+    fn is_disabled(&self) -> bool {
+        self.disabled
     }
 }
 
@@ -6453,6 +6604,326 @@ mod tests {
             2,
             "only the two non-suppressed recipients are delivered"
         );
+    }
+
+    /// #2351 item 7: the replay mailer answers from the tape, and refuses a
+    /// send that no tape serves.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn replay_mailer_answers_from_the_tape_and_refuses_off_tape_sends() {
+        let state = AppState::for_test();
+        install_replay_mailer(&state, &MailConfig::default(), false);
+        let mailer = state.extension::<Mailer>().expect("installed");
+        let mail = || {
+            Mail::builder()
+                .from("from@example.com")
+                .to("user@example.com")
+                .subject("Reset")
+                .text("hello")
+                .build()
+                .unwrap()
+        };
+        let tape = Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects {
+                mail: vec![crate::capsule::MailEffect {
+                    to: vec!["user@example.com".to_owned()],
+                    from: Some("from@example.com".to_owned()),
+                    subject: "Reset".to_owned(),
+                    body: crate::capsule::CapsuleBody::Text("hello".to_owned()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ));
+        crate::capsule::with_effect_tape(Arc::clone(&tape), mailer.send(mail()))
+            .await
+            .expect("served from the tape");
+        assert!(tape.finish().is_empty(), "{:?}", tape.finish());
+        assert!(
+            mailer.send(mail()).await.is_err(),
+            "a send with no tape must not reach a transport"
+        );
+    }
+
+    /// Codex review on #3222: a version 3 capsule did not record a disabled
+    /// `deliver_later`, so its replay does not expect an entry.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_v3_capsule_replays_a_disabled_deliver_later_as_before() {
+        let state = AppState::for_test();
+        let config = MailConfig {
+            transport: Transport::Disabled,
+            ..MailConfig::default()
+        };
+        install_replay_mailer(&state, &config, false);
+        let mailer = state.extension::<Mailer>().expect("installed");
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Later")
+            .text("hello")
+            .build()
+            .unwrap();
+        let tape = Arc::new(
+            crate::capsule::ReplayEffects::new(crate::capsule::CapsuleEffects::default())
+                .for_format_version(3),
+        );
+        let replayed = crate::capsule::with_effect_tape(Arc::clone(&tape), async {
+            mailer.try_deliver_later(mail)
+        })
+        .await;
+        assert!(replayed.is_ok(), "{replayed:?}");
+        assert!(tape.finish().is_empty(), "{:?}", tape.finish());
+    }
+
+    /// Codex review on #3222: the replay mailer keeps the defaults of a
+    /// mailer that a state initializer installed.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn replay_mailer_keeps_the_installed_mailer_defaults() {
+        let state = AppState::for_test();
+        let installed = Mailer::builder()
+            .transport(Transport::Disabled)
+            .from("app@example.com")
+            .reply_to("support@example.com")
+            .inline_css(true)
+            .build()
+            .unwrap();
+        state.insert_extension(installed);
+        install_replay_mailer(&state, &MailConfig::default(), false);
+        let replay = state.extension::<Mailer>().expect("installed");
+        assert_eq!(replay.defaults.from.as_deref(), Some("app@example.com"));
+        assert_eq!(
+            replay.defaults.reply_to.as_deref(),
+            Some("support@example.com")
+        );
+        assert!(replay.inline_css_default);
+        assert!(replay.is_disabled());
+    }
+
+    /// Codex review on #3222: in a replaying process, a send with no tape
+    /// (startup code) does not reach the transport.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_send_with_no_tape_in_a_replaying_process_is_refused() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mailer = Mailer::with_transport(CapturingTransport {
+            sent: Arc::clone(&sent),
+        });
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Startup")
+            .text("hello")
+            .build()
+            .unwrap();
+        crate::capsule::boundary::TEST_REPLAYING.with(|replaying| replaying.set(true));
+        let result = mailer.send(mail).await;
+        crate::capsule::boundary::TEST_REPLAYING.with(|replaying| replaying.set(false));
+        assert!(result.is_err(), "{result:?}");
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    /// Codex review on #3222: a queue the builder gave the production
+    /// mailer is kept as a refusing replay queue.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn replay_mailer_keeps_a_builder_queue_capability() {
+        // Production attaches a queue only to a transport that sends mail.
+        let sending = MailConfig {
+            transport: Transport::Log,
+            ..MailConfig::default()
+        };
+        let state = AppState::for_test();
+        install_replay_mailer(&state, &sending, true);
+        assert!(
+            state
+                .extension::<Mailer>()
+                .expect("installed")
+                .has_durable_delivery_queue()
+        );
+        let state = AppState::for_test();
+        install_replay_mailer(&state, &sending, false);
+        assert!(
+            !state
+                .extension::<Mailer>()
+                .expect("installed")
+                .has_durable_delivery_queue()
+        );
+    }
+
+    /// Codex review on #3222: the replay mailer keeps
+    /// `has_durable_delivery_queue()`, and its queue refuses.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn replay_mailer_keeps_the_durable_queue_capability() {
+        let state = AppState::for_test();
+        let mut installed = Mailer::with_transport(DisabledTransport);
+        installed.delivery_queue = Some(Arc::new(ReplayTransport { disabled: false }));
+        state.insert_extension(installed);
+        install_replay_mailer(&state, &MailConfig::default(), false);
+        let replay = state.extension::<Mailer>().expect("installed");
+        assert!(replay.has_durable_delivery_queue());
+        let queue = replay.delivery_queue.clone().expect("queue");
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Later")
+            .text("hello")
+            .build()
+            .unwrap();
+        assert!(queue.enqueue(mail).await.is_err());
+    }
+
+    /// Codex review on #3222: replay installs its mailer before the state
+    /// initializers and again after them. The second install keeps what the
+    /// first one took from the config.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_second_replay_mailer_install_keeps_the_first() {
+        let state = AppState::for_test();
+        let config = MailConfig {
+            transport: Transport::Log,
+            from: Some("app@example.com".to_owned()),
+            inline_css: true,
+            ..MailConfig::default()
+        };
+        install_replay_mailer(&state, &config, true);
+        install_replay_mailer(&state, &MailConfig::default(), false);
+        let replay = state.extension::<Mailer>().expect("installed");
+        assert!(!replay.is_disabled());
+        assert!(replay.has_durable_delivery_queue());
+        assert_eq!(replay.defaults.from.as_deref(), Some("app@example.com"));
+        assert!(replay.inline_css_default);
+    }
+
+    /// Codex review on #3222: production attaches a delivery queue only when
+    /// the transport sends mail, so a disabled replay mailer has none either.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_disabled_replay_mailer_has_no_durable_queue() {
+        let state = AppState::for_test();
+        let config = MailConfig {
+            transport: Transport::Disabled,
+            ..MailConfig::default()
+        };
+        install_replay_mailer(&state, &config, true);
+        let replay = state.extension::<Mailer>().expect("installed");
+        assert!(replay.is_disabled());
+        assert!(!replay.has_durable_delivery_queue());
+    }
+
+    /// Codex review on #3222: the production durability refusal is on the
+    /// seam, so the replay mailer (which has no such guard) reproduces it.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_production_deliver_later_refusal_replays_as_the_same_error() {
+        let mut mailer = Mailer::with_transport(DisabledTransport);
+        mailer.transport = Arc::new(CapturingTransport {
+            sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        mailer.block_deliver_later_without_durable_queue = true;
+        let mail = || {
+            Mail::builder()
+                .from("from@example.com")
+                .to("user@example.com")
+                .subject("Later")
+                .text("hello")
+                .build()
+                .unwrap()
+        };
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "refused".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let captured = crate::capsule::capture::with_capture_scope(Arc::clone(&scope), async {
+            mailer.try_deliver_later(mail())
+        })
+        .await;
+        assert!(matches!(
+            captured,
+            Err(MailError::NoDurableQueueInProduction)
+        ));
+        let effects = scope.effects_snapshot();
+        assert_eq!(effects.mail.len(), 1);
+
+        let state = AppState::for_test();
+        install_replay_mailer(&state, &MailConfig::default(), false);
+        let replay = state.extension::<Mailer>().expect("installed");
+        let tape = Arc::new(crate::capsule::ReplayEffects::new(effects));
+        let replayed = crate::capsule::with_effect_tape(Arc::clone(&tape), async {
+            replay.try_deliver_later(mail())
+        })
+        .await;
+        assert!(
+            matches!(replayed, Err(MailError::NoDurableQueueInProduction)),
+            "{replayed:?}"
+        );
+        assert!(tape.finish().is_empty(), "{:?}", tape.finish());
+    }
+
+    /// Review fix: `deliver_later` on a disabled transport is on the seam, so a
+    /// capture with mail off and a replay with mail on agree.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn deliver_later_on_a_disabled_transport_is_recorded() {
+        let mailer = Mailer::with_transport(DisabledTransport);
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "disabled".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        crate::capsule::capture::with_capture_scope(Arc::clone(&scope), async {
+            mailer
+                .try_deliver_later(
+                    Mail::builder()
+                        .from("from@example.com")
+                        .to("user@example.com")
+                        .subject("Later")
+                        .text("hello")
+                        .build()
+                        .unwrap(),
+                )
+                .expect("a disabled transport drops the mail");
+        })
+        .await;
+        assert_eq!(scope.effects_snapshot().mail.len(), 1);
+    }
+
+    /// #2351 item 3: `deliver_later` inside a transaction is recorded when it
+    /// is registered, on the request task, not on the detached commit task.
+    #[cfg(all(feature = "reporting", feature = "db"))]
+    #[tokio::test]
+    async fn deliver_later_in_a_transaction_is_recorded_at_registration() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mailer = Mailer::with_transport(CapturingTransport { sent: sent.clone() });
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "deliver-later".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let registry: Arc<std::sync::Mutex<Vec<crate::db::CommitCallback>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            crate::db::AFTER_COMMIT_REGISTRY.scope(Arc::clone(&registry), async {
+                mailer
+                    .try_deliver_later(
+                        Mail::builder()
+                            .from("from@example.com")
+                            .to("user@example.com")
+                            .subject("Later")
+                            .text("hello")
+                            .build()
+                            .unwrap(),
+                    )
+                    .expect("registered");
+            }),
+        )
+        .await;
+        assert_eq!(scope.effects_snapshot().mail.len(), 1);
+        assert!(!scope.is_truncated());
     }
 
     #[tokio::test]

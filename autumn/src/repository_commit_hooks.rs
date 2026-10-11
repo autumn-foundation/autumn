@@ -399,6 +399,20 @@ fn sqlite_repository_commit_hook_kick(pool: &RtPool) -> Arc<Notify> {
         .clone()
 }
 
+/// Drop a pool's kicker when the pool is closed for good: a fleet database
+/// closed by LRU or idle eviction (ADR 0019). Without this the registry keeps
+/// one entry per database ever opened.
+#[cfg(feature = "sqlite")]
+pub fn forget_sqlite_repository_commit_hook_kick(pool: &RtPool) {
+    let key = std::ptr::from_ref(pool.manager()).addr();
+    if let Some(registry) = SQLITE_HOOK_KICKERS.get() {
+        registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&key);
+    }
+}
+
 #[doc(hidden)]
 #[must_use]
 pub struct RepositoryCommitHookPendingHeartbeat {

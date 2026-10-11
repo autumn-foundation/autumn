@@ -609,6 +609,52 @@ mod pg {
 
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
+    async fn db_store_pages_past_corrupt_rows_to_reach_healthy_ones() {
+        let (store, pool, _container) = setup().await;
+        let max = autumn_web::push::MAX_SUBSCRIPTIONS_PER_PRINCIPAL;
+
+        // A restore or a hand-written INSERT can leave more rows than the
+        // cap, with corrupt ones first. The SQL LIMIT alone would return only
+        // those corrupt rows and hide the healthy ones after them.
+        let mut conn = pool.get().await.expect("conn");
+        for i in 0..max {
+            diesel::sql_query(format!(
+                "INSERT INTO push_subscriptions (principal_id, endpoint, p256dh, auth) \
+                 VALUES ('7', 'https://push.example.com/corrupt-{i}', 'AAAA', 'AAAA')"
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("insert corrupt row");
+        }
+        for i in 0..3 {
+            diesel::sql_query(format!(
+                "INSERT INTO push_subscriptions (principal_id, endpoint, p256dh, auth) \
+                 VALUES ('7', 'https://push.example.com/healthy-{i}', '{UA_PUBLIC}', '{UA_AUTH}')"
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("insert healthy row");
+        }
+        drop(conn);
+
+        let rows = store.list_for("7").await.expect("list");
+        let endpoints: Vec<&str> = rows
+            .iter()
+            .map(autumn_web::push::StoredSubscription::endpoint)
+            .collect();
+        assert_eq!(
+            endpoints,
+            [
+                "https://push.example.com/healthy-0",
+                "https://push.example.com/healthy-1",
+                "https://push.example.com/healthy-2",
+            ],
+            "corrupt rows must neither be returned nor hide the healthy rows behind them"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
     async fn a_missing_table_reports_how_to_create_it() {
         let (store, pool, _container) = setup().await;
         let mut conn = pool.get().await.expect("conn");

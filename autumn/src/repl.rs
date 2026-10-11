@@ -50,7 +50,7 @@ pub const PROMPT: &str = "autumn> ";
 /// at this limit.
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The limit a new [`Bridge`] gets. `None` on SQLite: it cannot stop a
+/// The limit a new [`Bridge`] gets. `None` on `SQLite`: it cannot stop a
 /// running statement, so a limit would return to the prompt while the call
 /// still holds its pooled connection.
 const DEFAULT_LIMIT: Option<Duration> = if cfg!(feature = "sqlite") {
@@ -172,7 +172,7 @@ pub struct Bridge {
 
 impl Bridge {
     /// Makes a bridge with [`DEFAULT_CALL_TIMEOUT`] on Postgres and no limit
-    /// on SQLite.
+    /// on `SQLite`.
     #[must_use]
     pub const fn new(handle: Handle, pool: ReplPool) -> Self {
         Self {

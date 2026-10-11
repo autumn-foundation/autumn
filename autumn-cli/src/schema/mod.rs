@@ -129,8 +129,9 @@ pub enum SchemaAction {
     /// Read-only w.r.t. the database (only catalog reads). Unlike `snapshot`
     /// (which derives the baseline from the declared `#[model]` structs), `pull`
     /// derives it from the live database, so a brownfield schema — or a schema
-    /// that drifted from the models — is captured exactly as it exists. Postgres
-    /// only in this slice; a `SQLite` URL is refused with a clear message.
+    /// that drifted from the models — is captured exactly as it exists. A
+    /// `SQLite` URL needs a CLI built with `--features sqlite`; the default
+    /// build refuses it with a clear message.
     Pull {
         /// Config profile whose database URL to introspect (defaults to the
         /// ambient profile resolution the other CLI commands use).

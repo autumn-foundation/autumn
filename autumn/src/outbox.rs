@@ -975,6 +975,15 @@ pub(crate) fn install(state: &AppState, config: &OutboxConfig, handlers: OutboxH
     drop(pool);
 }
 
+/// Whether [`install`] gives `deliver_later` an outbox queue.
+///
+/// Replay installs no relay, so its mailer asks this to show the queue
+/// production had (#2351).
+#[cfg(all(feature = "mail", feature = "reporting"))]
+pub(crate) fn installs_mail_queue(state: &AppState, config: &OutboxConfig) -> bool {
+    config.enabled && mail_pool(state).is_some()
+}
+
 tokio::task_local! {
     static CURRENT_MESSAGE_ID: String;
 }

@@ -1,5 +1,5 @@
-error: unsupported `#[references(...)]` argument; expected `table = "..."`
- --> tests/compile-fail/model_references_bad_key.rs:8:18
+error: unsupported `#[references(...)]` argument; expected `table`, `on_delete` or `on_update`
+ --> tests/compile-fail/model_references_bad_key.rs:9:18
   |
-8 |     #[references(bogus = "x")]
+9 |     #[references(bogus = "x")]
   |                  ^^^^^
