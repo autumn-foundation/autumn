@@ -245,23 +245,10 @@ impl BrowserSubscription {
         let p256dh = decode_base64url(self.keys.p256dh.trim()).ok_or_else(|| {
             PushError::InvalidSubscriptionKey("`p256dh` is not valid base64url".to_owned())
         })?;
-        // Parsing as a curve point rejects both a wrong length and a value
-        // that merely looks like one, so no off-curve key reaches the ECDH.
-        p256::PublicKey::from_sec1_bytes(&p256dh).map_err(|_| {
-            PushError::InvalidSubscriptionKey(
-                "`p256dh` is not an uncompressed P-256 public key on the curve".to_owned(),
-            )
-        })?;
-
         let auth = decode_base64url(self.keys.auth.trim()).ok_or_else(|| {
             PushError::InvalidSubscriptionKey("`auth` is not valid base64url".to_owned())
         })?;
-        if auth.len() != AUTH_SECRET_LEN {
-            return Err(PushError::InvalidSubscriptionKey(format!(
-                "`auth` must be exactly {AUTH_SECRET_LEN} bytes, got {}",
-                auth.len()
-            )));
-        }
+        check_key_material(&p256dh, &auth)?;
 
         Ok(StoredSubscription {
             principal_id: principal.0.clone(),
@@ -270,6 +257,27 @@ impl BrowserSubscription {
             auth,
         })
     }
+}
+
+/// Check decoded key material: a P-256 point and a 16-byte `auth` secret.
+///
+/// Shared by [`BrowserSubscription::decode`] and the database path, so a row
+/// written by other means is held to the same rules as one from the API.
+pub(crate) fn check_key_material(p256dh: &[u8], auth: &[u8]) -> Result<(), PushError> {
+    // Parsing as a curve point rejects both a wrong length and a value
+    // that merely looks like one, so no off-curve key reaches the ECDH.
+    p256::PublicKey::from_sec1_bytes(p256dh).map_err(|_| {
+        PushError::InvalidSubscriptionKey(
+            "`p256dh` is not an uncompressed P-256 public key on the curve".to_owned(),
+        )
+    })?;
+    if auth.len() != AUTH_SECRET_LEN {
+        return Err(PushError::InvalidSubscriptionKey(format!(
+            "`auth` must be exactly {AUTH_SECRET_LEN} bytes, got {}",
+            auth.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Check an endpoint URL and return it in normalized form.
@@ -573,9 +581,13 @@ impl PushSubscriptionStore for MemoryPushSubscriptionStore {
             return Err(PushError::EndpointClaimed);
         }
 
-        let is_new = !rows
-            .iter()
-            .any(|(_, row)| row.endpoint == subscription.endpoint);
+        // A move from another owner adds a row to the destination, so the cap
+        // applies. The owner is (tenant, principal).
+        let is_new = !rows.iter().any(|(t, row)| {
+            row.endpoint == subscription.endpoint
+                && *t == tenant
+                && row.principal_id == subscription.principal_id
+        });
         if is_new
             && rows
                 .iter()
@@ -705,13 +717,63 @@ mod db_store {
                     ))
                 })
             };
+            let p256dh = decode("p256dh", &row.p256dh)?;
+            let auth = decode("auth", &row.auth)?;
+            super::check_key_material(&p256dh, &auth).map_err(|e| {
+                PushError::Store(format!(
+                    "stored keys for {} are unusable: {e}",
+                    row.endpoint
+                ))
+            })?;
             Ok(Self {
-                p256dh: decode("p256dh", &row.p256dh)?,
-                auth: decode("auth", &row.auth)?,
+                p256dh,
+                auth,
                 principal_id: row.principal_id,
                 endpoint: row.endpoint,
             })
         }
+    }
+
+    /// Convert rows one by one, skipping any that do not decode.
+    ///
+    /// One corrupt row must not silence the healthy devices. The skip is
+    /// logged, so the row still gets repaired.
+    fn usable_subscriptions(
+        principal_id: &str,
+        rows: Vec<SubscriptionRow>,
+    ) -> Vec<StoredSubscription> {
+        let total = rows.len();
+        let usable: Vec<StoredSubscription> = rows
+            .into_iter()
+            .filter_map(|row| StoredSubscription::try_from(row).ok())
+            .collect();
+        if usable.len() < total {
+            tracing::warn!(
+                principal_id = %principal_id,
+                count = total - usable.len(),
+                "skipping unusable push subscription rows; key material did not decode",
+            );
+        }
+        usable
+    }
+
+    /// How many pages `list_for` reads at most while it looks past corrupt rows.
+    const MAX_LIST_PAGES: i64 = 5;
+
+    /// Add the usable rows of one page. Returns `true` when the next page is
+    /// needed: this page was full and the cap is not reached yet.
+    ///
+    /// The SQL `LIMIT` runs before corrupt rows are skipped. Without paging,
+    /// corrupt rows at the front would hide healthy rows after them.
+    fn absorb_page(
+        principal_id: &str,
+        usable: &mut Vec<StoredSubscription>,
+        page: Vec<SubscriptionRow>,
+    ) -> bool {
+        let full = page.len() >= super::MAX_SUBSCRIPTIONS_PER_PRINCIPAL;
+        usable.extend(usable_subscriptions(principal_id, page));
+        usable.truncate(super::MAX_SUBSCRIPTIONS_PER_PRINCIPAL);
+        full && usable.len() < super::MAX_SUBSCRIPTIONS_PER_PRINCIPAL
     }
 
     /// [`PushSubscriptionStore`] backed by the app's database pool.
@@ -863,19 +925,28 @@ mod db_store {
         async fn list_for(&self, principal_id: &str) -> Result<Vec<StoredSubscription>, PushError> {
             use push_subscriptions::dsl;
             let mut conn = self.conn().await?;
-            let rows: Vec<SubscriptionRow> = dsl::push_subscriptions
-                .filter(dsl::tenant_id.eq(crate::tenancy::current_tenant_id()))
-                .filter(dsl::principal_id.eq(principal_id))
-                .order(dsl::id.asc())
-                // The bound that actually caps per-notification work — applied
-                // in SQL so it holds however many rows the table contains. See
-                // `MAX_SUBSCRIPTIONS_PER_PRINCIPAL`.
-                .limit(i64::try_from(super::MAX_SUBSCRIPTIONS_PER_PRINCIPAL).unwrap_or(i64::MAX))
-                .select(SubscriptionRow::as_select())
-                .load(&mut conn)
-                .await
-                .map_err(|e| store_err(&e))?;
-            rows.into_iter().map(StoredSubscription::try_from).collect()
+            let page_size =
+                i64::try_from(super::MAX_SUBSCRIPTIONS_PER_PRINCIPAL).unwrap_or(i64::MAX);
+            let mut usable = Vec::new();
+            for page_no in 0..MAX_LIST_PAGES {
+                let page: Vec<SubscriptionRow> = dsl::push_subscriptions
+                    .filter(dsl::tenant_id.eq(crate::tenancy::current_tenant_id()))
+                    .filter(dsl::principal_id.eq(principal_id))
+                    .order(dsl::id.asc())
+                    // The bound that actually caps per-notification work —
+                    // applied in SQL so it holds however many rows the table
+                    // contains. See `MAX_SUBSCRIPTIONS_PER_PRINCIPAL`.
+                    .limit(page_size)
+                    .offset(page_no * page_size)
+                    .select(SubscriptionRow::as_select())
+                    .load(&mut conn)
+                    .await
+                    .map_err(|e| store_err(&e))?;
+                if !absorb_page(principal_id, &mut usable, page) {
+                    break;
+                }
+            }
+            Ok(usable)
         }
 
         async fn remove(
@@ -904,6 +975,94 @@ mod db_store {
             }
             .map_err(|e| store_err(&e))?;
             Ok(affected as u64)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::MAX_SUBSCRIPTIONS_PER_PRINCIPAL;
+        use super::*;
+
+        const P256DH: &str = "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4";
+        const AUTH: &str = "BTBZMqHH6r4Tts7J_aSIgg";
+
+        fn row_with(endpoint: &str, p256dh: &str, auth: &str) -> SubscriptionRow {
+            SubscriptionRow {
+                principal_id: "1".to_owned(),
+                endpoint: endpoint.to_owned(),
+                p256dh: p256dh.to_owned(),
+                auth: auth.to_owned(),
+            }
+        }
+
+        /// A row with valid keys.
+        fn good(endpoint: &str) -> SubscriptionRow {
+            row_with(endpoint, P256DH, AUTH)
+        }
+
+        /// A row whose keys are not even base64url.
+        fn bad(endpoint: &str) -> SubscriptionRow {
+            row_with(endpoint, "not base64!", "not base64!")
+        }
+
+        #[test]
+        fn corrupt_rows_in_the_first_page_do_not_starve_healthy_rows_after_it() {
+            // More rows than the cap is a supported state, and the first
+            // page can be all corrupt. Paging must go on to the next one.
+            let mut usable = Vec::new();
+            let first: Vec<SubscriptionRow> = (0..MAX_SUBSCRIPTIONS_PER_PRINCIPAL)
+                .map(|i| bad(&format!("https://push.example.com/bad{i}")))
+                .collect();
+            assert!(
+                absorb_page("1", &mut usable, first),
+                "a full page with no usable row needs the next page"
+            );
+            let last = vec![good("https://push.example.com/good")];
+            assert!(
+                !absorb_page("1", &mut usable, last),
+                "a short page is the last"
+            );
+            assert_eq!(usable.len(), 1);
+        }
+
+        #[test]
+        fn paging_stops_once_the_cap_of_usable_rows_is_collected() {
+            let mut usable = Vec::new();
+            let page: Vec<SubscriptionRow> = (0..MAX_SUBSCRIPTIONS_PER_PRINCIPAL)
+                .map(|i| good(&format!("https://push.example.com/ok{i}")))
+                .collect();
+            assert!(!absorb_page("1", &mut usable, page));
+            assert_eq!(usable.len(), MAX_SUBSCRIPTIONS_PER_PRINCIPAL);
+        }
+
+        #[test]
+        fn decodable_but_invalid_key_material_is_not_usable() {
+            // Valid base64, but not a P-256 point, and an auth of the wrong
+            // length. `deliver_one` would reject both, so they must not take
+            // a slot in the cap.
+            let rows = vec![
+                row_with("https://push.example.com/short-key", "AAAA", AUTH),
+                row_with("https://push.example.com/short-auth", P256DH, "AAAA"),
+                good("https://push.example.com/ok"),
+            ];
+            let usable = usable_subscriptions("1", rows);
+            assert_eq!(usable.len(), 1);
+            assert_eq!(usable[0].endpoint(), "https://push.example.com/ok");
+        }
+
+        #[test]
+        fn a_corrupt_row_does_not_hide_the_healthy_ones() {
+            let rows = vec![
+                good("https://push.example.com/a"),
+                bad("https://push.example.com/bad"),
+                good("https://push.example.com/b"),
+            ];
+            let usable = usable_subscriptions("1", rows);
+            let endpoints: Vec<&str> = usable.iter().map(StoredSubscription::endpoint).collect();
+            assert_eq!(
+                endpoints,
+                ["https://push.example.com/a", "https://push.example.com/b"]
+            );
         }
     }
 }
@@ -1459,6 +1618,32 @@ mod tests {
             MAX_SUBSCRIPTIONS_PER_PRINCIPAL,
             "one notification must never fan out past the cap"
         );
+    }
+
+    #[tokio::test]
+    async fn a_move_into_a_full_principal_is_refused() {
+        // A shared-device move is new to the destination, so the cap applies.
+        let store = MemoryPushSubscriptionStore::new();
+        store
+            .save(stored(1_i64, "https://push.example.com/shared"))
+            .await
+            .expect("owner A saves");
+        for i in 0..MAX_SUBSCRIPTIONS_PER_PRINCIPAL {
+            store
+                .save(stored(2_i64, &format!("https://push.example.com/d{i}")))
+                .await
+                .expect("fill B to the cap");
+        }
+        assert!(
+            matches!(
+                store
+                    .save(stored(2_i64, "https://push.example.com/shared"))
+                    .await,
+                Err(PushError::TooManySubscriptions { .. })
+            ),
+            "a move into a full principal must not exceed the cap"
+        );
+        assert_eq!(store.list_for("1").await.expect("list").len(), 1);
     }
 
     #[tokio::test]
