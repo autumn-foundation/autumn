@@ -794,11 +794,13 @@ fn api_catalog(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
         }
         linkset.push(entry);
     }
-    Some(Document {
-        content_type: "application/linkset+json; profile=\"https://www.rfc-editor.org/info/rfc9727\"",
-        headers: vec![("link", format!("<{API_CATALOG_PATH}>; rel=\"api-catalog\""))],
-        body: json_body(&json!({ "linkset": linkset })),
-    })
+    // Public like the other discovery documents, in its RFC 9727 type.
+    let mut doc = cors_json(&json!({ "linkset": linkset }));
+    doc.content_type =
+        "application/linkset+json; profile=\"https://www.rfc-editor.org/info/rfc9727\"";
+    doc.headers
+        .push(("link", format!("<{API_CATALOG_PATH}>; rel=\"api-catalog\"")));
+    Some(doc)
 }
 
 // ── MCP server card ─────────────────────────────────────────────────────────
@@ -2145,9 +2147,11 @@ mod tests {
             ARD_PATH,
             SKILLS_INDEX_PATH,
             OAUTH_RESOURCE_PATH,
+            API_CATALOG_PATH,
         ] {
             let doc = render(&facts, &origin(), path).unwrap();
             for want in [
+                ("access-control-allow-origin", "*"),
                 (
                     "access-control-allow-headers",
                     "Content-Type, If-None-Match",
