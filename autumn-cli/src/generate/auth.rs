@@ -3388,7 +3388,42 @@ pub async fn remember_me_startup(state: AppState) -> AutumnResult<()> {{
             state.config().auth.remember.clone(),
             state.auth_session_key().to_string(),
         );
+        // Re-point the tracked row after ANY session-id rotation (impersonation,
+        // idle rotation, app code), so the next request does not 401.
+        let pool = pool.clone();
+        state
+            .session_rotation_hooks()
+            .register(move |rotation| {{
+                let pool = pool.clone();
+                async move {{
+                    rebind_tracked_session_on_rotation(&pool, &rotation)
+                        .await
+                        .map_err(|e| e.to_string().into())
+                }}
+            }});
     }}
+    Ok(())
+}}
+
+/// Move the tracked row from the old session id's digest to the new one.
+///
+/// No row matches when the flow already rebound it, so a repeat is harmless.
+async fn rebind_tracked_session_on_rotation(
+    pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
+    rotation: &::autumn_web::session::SessionRotation,
+) -> AutumnResult<()> {{
+    let mut db = pool.get().await.map_err(|e| {{
+        AutumnError::internal_server_error_msg(format!("Failed to rebind tracked session: {{e}}"))
+    }})?;
+    diesel::update(
+        {sess_table}::table.filter({sess_table}::token_digest.eq(sha256_hex(&rotation.old_id))),
+    )
+    .set({sess_table}::token_digest.eq(sha256_hex(&rotation.new_id)))
+    .execute(&mut *db)
+    .await
+    .map_err(|e| {{
+        AutumnError::internal_server_error_msg(format!("Failed to rebind tracked session: {{e}}"))
+    }})?;
     Ok(())
 }}
 
@@ -11801,6 +11836,27 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Issue #2347: any `rotate_id()` while logged in moves the digest the
+    /// tracked row is keyed by. The startup hook must register a rotation hook
+    /// that re-points the row, so flows without an explicit rebind (such as
+    /// impersonation) do not 401 on the next request.
+    #[test]
+    fn startup_hook_registers_a_tracked_session_rotation_hook() {
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
+        let hook_at = routes
+            .find("pub async fn remember_me_startup")
+            .expect("startup hook is generated");
+        let body = &routes[hook_at..(hook_at + 1500).min(routes.len())];
+        assert!(
+            body.contains("session_rotation_hooks().register"),
+            "startup hook must register a rotation hook:\n{body}"
+        );
+        assert!(
+            routes.contains("async fn rebind_tracked_session_on_rotation"),
+            "rotation hook body must be generated"
+        );
+    }
 
     /// Generated request handlers must read config through `state.config_arc()`,
     /// never `state.config()`.

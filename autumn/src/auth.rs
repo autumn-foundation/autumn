@@ -434,8 +434,13 @@ where
             if let Some(user_id) = user_id {
                 // Fulfil the RateLimitPrincipal contract so key_strategy =
                 // "authenticated_principal" works without an extra middleware shim.
+                // Keyed on the operator while impersonating (issue #2347).
+                let throttle_id = match session.as_ref() {
+                    Some(session) => impersonation::audit_actor_id(session, &user_id).await,
+                    None => user_id.clone(),
+                };
                 req.extensions_mut()
-                    .insert(crate::security::RateLimitPrincipal(user_id.clone()));
+                    .insert(crate::security::RateLimitPrincipal(throttle_id));
                 // Publish the authenticated principal as the request's current
                 // actor (#1383) and tag the request-scoped log context (#1169)
                 // so handler logs for middleware-authenticated requests carry

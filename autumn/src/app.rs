@@ -1934,6 +1934,21 @@ impl AppBuilder {
         })
     }
 
+    /// Run `hook` after each stored session-id rotation.
+    ///
+    /// Use it to move state keyed by the session id (such as a tracked-session
+    /// row) to the new id. Hooks run after the new session is saved and are
+    /// skipped for a destroyed session. See
+    /// [`SessionRotationHooks`](crate::session::SessionRotationHooks).
+    #[must_use]
+    pub fn on_session_rotation<F, Fut>(self, hook: F) -> Self
+    where
+        F: Fn(crate::session::SessionRotation) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), crate::session::SessionRotationError>> + Send + 'static,
+    {
+        self.state_initializer(move |state| state.session_rotation_hooks().register(hook))
+    }
+
     /// Store or replace a typed builder extension.
     ///
     /// External crates use this to accumulate configuration across fluent

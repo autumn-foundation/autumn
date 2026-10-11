@@ -254,6 +254,11 @@ impl Session {
         inner.dirty = true;
     }
 
+    /// The id this request started with, when the id was rotated since.
+    pub(crate) async fn rotated_from(&self) -> Option<String> {
+        self.inner.read().await.old_id.clone()
+    }
+
     /// Destroy the session entirely. A new session ID will be issued
     /// on the next request.
     pub async fn destroy(&self) {
@@ -289,6 +294,103 @@ where
             .cloned()
             .expect("SessionLayer must be installed to use the Session extractor");
         async move { Ok(session) }
+    }
+}
+
+// ── Rotation hooks ──────────────────────────────────────────────
+
+/// A committed session-id rotation: the net hop for one request.
+///
+/// Several `rotate_id` calls in one request give one event, from the id the
+/// request started with to the id it ended with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SessionRotation {
+    /// The id the request started with.
+    pub old_id: String,
+    /// The id now stored and sent to the client.
+    pub new_id: String,
+}
+
+/// Error type a rotation hook returns.
+pub type SessionRotationError = Box<dyn std::error::Error + Send + Sync>;
+
+type RotationHookFn = dyn Fn(SessionRotation) -> Pin<Box<dyn Future<Output = Result<(), SessionRotationError>> + Send>>
+    + Send
+    + Sync;
+
+/// Hooks that run after a session-id rotation is stored.
+///
+/// `Session::rotate_id` changes the id that server-side rows are keyed by (for
+/// example a tracked-session row keyed by a digest of the id). A hook moves
+/// that state to the new id, so the next request does not find a missing row.
+///
+/// Hooks run after the new session is saved and before the response returns.
+/// They do not run for a destroyed session. A hook error is logged and does
+/// not change the response.
+///
+/// Get the shared registry with
+/// [`AppState::session_rotation_hooks`](crate::state::AppState::session_rotation_hooks).
+#[derive(Clone, Default)]
+pub struct SessionRotationHooks {
+    hooks: Arc<std::sync::RwLock<Vec<Arc<RotationHookFn>>>>,
+}
+
+impl std::fmt::Debug for SessionRotationHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionRotationHooks")
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+impl SessionRotationHooks {
+    /// Add a hook. Hooks run in registration order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry lock is poisoned.
+    pub fn register<F, Fut>(&self, hook: F)
+    where
+        F: Fn(SessionRotation) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), SessionRotationError>> + Send + 'static,
+    {
+        self.hooks
+            .write()
+            .expect("session rotation hooks lock poisoned")
+            .push(Arc::new(move |rotation| Box::pin(hook(rotation))));
+    }
+
+    /// Number of registered hooks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry lock is poisoned.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.hooks
+            .read()
+            .expect("session rotation hooks lock poisoned")
+            .len()
+    }
+
+    /// Whether no hook is registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    async fn run(&self, rotation: &SessionRotation) {
+        let hooks: Vec<_> = self
+            .hooks
+            .read()
+            .expect("session rotation hooks lock poisoned")
+            .clone();
+        for hook in hooks {
+            if let Err(error) = hook(rotation.clone()).await {
+                tracing::error!(%error, "session rotation hook failed");
+            }
+        }
     }
 }
 
@@ -771,6 +873,7 @@ pub struct SessionLayer<S: SessionStore> {
     signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
     entropy: Arc<dyn crate::entropy::Entropy>,
     tenancy_session_key: Option<Arc<str>>,
+    rotation_hooks: Option<SessionRotationHooks>,
 }
 
 impl<S: SessionStore> SessionLayer<S> {
@@ -782,7 +885,17 @@ impl<S: SessionStore> SessionLayer<S> {
             signing_keys: None,
             entropy: Arc::new(crate::entropy::OsEntropy),
             tenancy_session_key: None,
+            rotation_hooks: None,
         }
+    }
+
+    /// Run `hooks` after each stored session-id rotation.
+    ///
+    /// `AppBuilder` sets this from the app's shared registry.
+    #[must_use]
+    pub fn with_rotation_hooks(mut self, hooks: SessionRotationHooks) -> Self {
+        self.rotation_hooks = Some(hooks);
+        self
     }
 
     /// Inject the entropy source used to mint new and rotated session ids.
@@ -848,6 +961,7 @@ impl<S: SessionStore + Clone, Inner> Layer<Inner> for SessionLayer<S> {
             signing_keys: self.signing_keys.clone(),
             entropy: self.entropy.clone(),
             tenancy_session_key: self.tenancy_session_key.clone(),
+            rotation_hooks: self.rotation_hooks.clone(),
         }
     }
 }
@@ -861,6 +975,7 @@ pub struct SessionService<S: SessionStore, Inner> {
     signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
     entropy: Arc<dyn crate::entropy::Entropy>,
     tenancy_session_key: Option<Arc<str>>,
+    rotation_hooks: Option<SessionRotationHooks>,
 }
 
 /// `true` when the response was produced by the request-timeout layer
@@ -902,6 +1017,7 @@ where
         let signing_keys = self.signing_keys.clone();
         let entropy = self.entropy.clone();
         let tenancy_session_key = self.tenancy_session_key.clone();
+        let rotation_hooks = self.rotation_hooks.clone();
         let mut inner = self.inner.clone();
         // Swap to ensure correct poll_ready semantics
         std::mem::swap(&mut self.inner, &mut inner);
@@ -973,6 +1089,10 @@ where
                 let sid = inner_guard.id.clone();
                 let primary_replay_after_guard_denial =
                     inner_guard.cookie_backed && inner_guard.old_id.is_some();
+                let rotation = inner_guard.old_id.clone().map(|old_id| SessionRotation {
+                    old_id,
+                    new_id: sid.clone(),
+                });
                 // The tenant `[tenancy] source = "session"` will resolve for a
                 // retry presenting this finalized session — read live from the
                 // data just written rather than reusing the tenant captured
@@ -992,6 +1112,9 @@ where
                 if let Err(error) = store.save(&sid, data).await {
                     crate::idempotency::keep_deferred_session_commit_locked(&mut response);
                     return Ok(session_store_unavailable_response(&error));
+                }
+                if let (Some(hooks), Some(rotation)) = (&rotation_hooks, &rotation) {
+                    hooks.run(rotation).await;
                 }
                 // Sign the session ID when signing keys are active
                 let cookie_value = signing_keys.as_ref().map_or_else(
@@ -1921,5 +2044,146 @@ mod tests {
             b"bob",
             "previous-key-signed cookie must load session"
         );
+    }
+
+    // ── Rotation hooks (issue #2347) ──
+
+    fn rotation_log() -> (
+        SessionRotationHooks,
+        Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    ) {
+        let hooks = SessionRotationHooks::default();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        hooks.register(move |rotation| {
+            let sink = Arc::clone(&sink);
+            async move {
+                sink.lock()
+                    .unwrap()
+                    .push((rotation.old_id, rotation.new_id));
+                Ok(())
+            }
+        });
+        (hooks, log)
+    }
+
+    async fn rotation_app(hooks: SessionRotationHooks, store: MemoryStore) -> (Router, String) {
+        async fn seed(session: Session) -> String {
+            session.insert("k", "v").await;
+            session.id().await
+        }
+        async fn rotate(session: Session) -> String {
+            session.rotate_id().await;
+            session.rotate_id().await;
+            session.id().await
+        }
+        async fn destroy(session: Session) -> &'static str {
+            session.rotate_id().await;
+            session.destroy().await;
+            "gone"
+        }
+        let app = Router::new()
+            .route("/seed", get(seed))
+            .route("/rotate", get(rotate))
+            .route("/destroy", get(destroy))
+            .route("/noop", get(|| async { "ok" }))
+            .layer(SessionLayer::new(store, SessionConfig::default()).with_rotation_hooks(hooks))
+            .with_state(test_state());
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/seed")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        (app, cookie.split(';').next().unwrap().to_owned())
+    }
+
+    async fn hit(app: &Router, uri: &str, cookie: &str) -> Response {
+        app.clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(uri)
+                    .header(COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rotation_hook_gets_the_net_old_and_new_id_once() {
+        let (hooks, log) = rotation_log();
+        let (app, cookie) = rotation_app(hooks, MemoryStore::new()).await;
+        let old_id = cookie.trim_start_matches("autumn.sid=").to_owned();
+
+        let response = hit(&app, "/rotate", &cookie).await;
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let new_id = String::from_utf8(body.to_vec()).unwrap();
+
+        let seen = log.lock().unwrap().clone();
+        assert_eq!(seen, vec![(old_id, new_id)], "two rotations, one net hop");
+    }
+
+    #[tokio::test]
+    async fn rotation_hook_is_silent_without_a_rotation() {
+        let (hooks, log) = rotation_log();
+        let (app, cookie) = rotation_app(hooks, MemoryStore::new()).await;
+        hit(&app, "/noop", &cookie).await;
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rotation_hook_is_silent_when_the_session_is_destroyed() {
+        let (hooks, log) = rotation_log();
+        let (app, cookie) = rotation_app(hooks, MemoryStore::new()).await;
+        hit(&app, "/destroy", &cookie).await;
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rotation_hook_runs_after_the_new_session_is_saved() {
+        let store = MemoryStore::new();
+        let hooks = SessionRotationHooks::default();
+        let check = store.clone();
+        let saw_new = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&saw_new);
+        hooks.register(move |rotation| {
+            let check = check.clone();
+            let flag = Arc::clone(&flag);
+            async move {
+                let saved = check.load(&rotation.new_id).await.unwrap().is_some();
+                let gone = check.load(&rotation.old_id).await.unwrap().is_none();
+                flag.store(saved && gone, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        });
+        let (app, cookie) = rotation_app(hooks, store).await;
+        hit(&app, "/rotate", &cookie).await;
+        assert!(saw_new.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_failing_rotation_hook_does_not_fail_the_response() {
+        let hooks = SessionRotationHooks::default();
+        hooks.register(|_| async { Err("db down".into()) });
+        let (_, log) = rotation_log();
+        let _ = log;
+        let (app, cookie) = rotation_app(hooks, MemoryStore::new()).await;
+        let response = hit(&app, "/rotate", &cookie).await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert!(response.headers().get(SET_COOKIE).is_some());
     }
 }

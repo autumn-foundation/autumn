@@ -3861,7 +3861,11 @@ async fn populate_rate_limit_principal(
     // principal id (see `RequireApiTokenService::call`).
     if let Some(session) = req.extensions().get::<crate::session::Session>() {
         let auth_session_key = state.auth_session_key();
-        if let Some(user_id) = session.get(auth_session_key).await {
+        // The operator's id while impersonating, so their throttle events and
+        // budget stay their own.
+        if let Some(user_id) =
+            crate::auth::impersonation::throttle_principal_id(session, auth_session_key).await
+        {
             req.extensions_mut()
                 .insert(crate::security::RateLimitPrincipal(user_id));
         }
@@ -5619,7 +5623,8 @@ fn apply_middleware(
         signing_keys_opt,
         &state.entropy_arc(),
         tenancy_session_key,
-    )?;
+    )?
+    .with_rotation_hooks(state.session_rotation_hooks());
     tracing::debug!(backend = ?config.session.backend, "Session management enabled");
 
     // Read-your-own-writes middleware: installed only when the mode is not
