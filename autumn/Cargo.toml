@@ -159,6 +159,9 @@ telemetry-otlp = [
 # `[[bin]]` (W6 PR3), which is a binary and therefore cannot use dev-deps, can
 # depend on it too. `proptest` itself stays out of default builds.
 sim-testing = ["dep:proptest"]
+# Ledger profiling harnesses (`docs/perf/`). Off by default and not part of any
+# CI feature set, so the harness module is only compiled when asked for.
+ledger-profile = ["db"]
 # `dep:rustls` is not optional flavouring: `redis`'s `tokio-rustls-comp`
 # feature makes `rediss://` URLs reachable, and those panic inside
 # `rustls::ClientConfig::builder()` unless a process-level
@@ -1452,11 +1455,3 @@ workspace = true
 [[test]]
 name = "tls_client_auth_metrics"
 path = "tests/tls_client_auth_metrics.rs"
-
-# Ledger profiling harness for the data-capsule export/import statement counts
-# (`docs/perf/capsule-statements/`). `#[ignore]`d and env-gated
-# (`LEDGER_PG_URL`); its own binary so the Docker `--ignored` sweep of the
-# consolidated binary never runs it.
-[[test]]
-name = "ledger_capsule_profile"
-path = "tests/ledger_capsule_profile.rs"

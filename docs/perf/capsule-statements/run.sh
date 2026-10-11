@@ -6,18 +6,21 @@ out=${1:?outdir}; mkdir -p "$out"
 P() { psql "$LEDGER_PG_URL/postgres" -XAtq "$@"; }
 P -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements"
 log=$out/test.log; : > "$log"
-(cd "$(git rev-parse --show-toplevel)/autumn" && cargo test --test ledger_capsule_profile -- --ignored --nocapture >"$log" 2>&1) &
+gate=$out/gate; rm -rf "$gate"; mkdir -p "$gate"
+export LEDGER_GATE=$gate
+(cd "$(git rev-parse --show-toplevel)/autumn" && cargo test --features ledger-profile --test integration_tests ledger_capsule_profile -- --ignored --nocapture >"$log" 2>&1) &
 pid=$!
 snap() { # phase
   P -c "COPY (SELECT calls, shared_blks_hit+shared_blks_read AS buffers, shared_blks_hit, shared_blks_read, temp_blks_written, wal_bytes, rows, left(regexp_replace(query,'\s+',' ','g'),110) AS q FROM pg_stat_statements s JOIN pg_database d ON d.oid=s.dbid WHERE d.datname IN ('ledger_src','ledger_dst') ORDER BY 2 DESC) TO STDOUT WITH CSV HEADER" > "$out/pgss-$1.csv"
 }
-until grep -q "LEDGER-MARK export-start" "$log"; do sleep 0.2; done
-P -c "SELECT pg_stat_statements_reset()" >/dev/null
-until grep -q "LEDGER-MARK export-end" "$log"; do sleep 0.2; done
-snap export
-P -c "SELECT pg_stat_statements_reset()" >/dev/null
-until grep -q "LEDGER-MARK import-end" "$log"; do sleep 0.2; done
-snap import
+# The test blocks at every mark until it is acknowledged, so a reset or
+# snapshot always completes before the next phase issues a statement.
+wait_mark() { until grep -q "LEDGER-MARK $1" "$log"; do sleep 0.1; done; }
+ack() { touch "$gate/$1.ack"; }
+wait_mark export-start; P -c "SELECT pg_stat_statements_reset()" >/dev/null; ack export-start
+wait_mark export-end; snap export; P -c "SELECT pg_stat_statements_reset()" >/dev/null; ack export-end
+wait_mark import-start; ack import-start
+wait_mark import-end; snap import; ack import-end
 wait $pid; grep LEDGER-ROWS "$log"
 # Result-equivalence digest of the imported copy: every table's rows in key
 # order plus the state of every sequence. Must be identical before/after a change.

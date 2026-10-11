@@ -1,11 +1,9 @@
 //! Ledger profiling harness: statements and buffers per data-capsule
 //! export/import on a production-shaped schema.
 //!
-//! Needs a Postgres with `pg_stat_statements`; set `LEDGER_PG_URL` to a server
+//! Compiled only with `--features ledger-profile`. Needs a Postgres with `pg_stat_statements`; set `LEDGER_PG_URL` to a server
 //! URL without database name (`postgres://u@host:port`). Seeded and
 //! deterministic. See `docs/perf/capsule-statements/README.md`.
-
-#![cfg(all(feature = "db", not(feature = "sqlite")))]
 
 use autumn_web::gdpr::portability::{CapsuleModel, PgCapsuleStore, export_subject, import_capsule};
 use diesel::Connection as _;
@@ -49,6 +47,20 @@ fn models() -> Vec<CapsuleModel> {
     m
 }
 
+/// Announce a phase boundary and block until the driver acknowledges it by
+/// creating `$LEDGER_GATE/<mark>.ack` (after resetting or snapshotting
+/// `pg_stat_statements`), so no query of the next phase runs before that.
+async fn gate(mark: &str) {
+    eprintln!("LEDGER-MARK {mark}");
+    let Ok(dir) = std::env::var("LEDGER_GATE") else {
+        return;
+    };
+    let ack = std::path::Path::new(&dir).join(format!("{mark}.ack"));
+    while !ack.exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 fn pool(url: &str) -> Pool<AsyncPgConnection> {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     Pool::builder(manager).max_size(2).build().expect("pool")
@@ -79,8 +91,8 @@ async fn capsule_export_import_profile() {
     dst.batch_execute(&ddl).expect("schema");
     dst.batch_execute(
         &(0..TABLES)
-            .map(|t| format!("TRUNCATE t{t};"))
-            .chain(["TRUNCATE users CASCADE;".to_owned()])
+            .map(|t| format!("TRUNCATE t{t} RESTART IDENTITY;"))
+            .chain(["TRUNCATE users RESTART IDENTITY CASCADE;".to_owned()])
             .collect::<String>(),
     )
     .expect("truncate");
@@ -91,14 +103,14 @@ async fn capsule_export_import_profile() {
 
     // Measured window: the caller resets/snapshots pg_stat_statements around
     // the `LEDGER-MARK` lines.
-    eprintln!("LEDGER-MARK export-start");
+    gate("export-start").await;
     let capsule = export_subject(&models, &source, "1").await.expect("export");
-    eprintln!("LEDGER-MARK export-end");
+    gate("export-end").await;
     let rows: usize = models.iter().map(|m| capsule.records(&m.table).len()).sum();
     eprintln!("LEDGER-ROWS {rows}");
-    eprintln!("LEDGER-MARK import-start");
+    gate("import-start").await;
     import_capsule(&capsule, &models, &target)
         .await
         .expect("import");
-    eprintln!("LEDGER-MARK import-end");
+    gate("import-end").await;
 }

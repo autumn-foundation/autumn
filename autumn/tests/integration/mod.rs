@@ -92,6 +92,8 @@ mod custom_layer;
 mod data_capsule;
 #[cfg(feature = "db")]
 mod data_capsule_pg;
+#[cfg(all(feature = "ledger-profile", not(feature = "sqlite")))]
+mod ledger_capsule_profile;
 #[cfg(feature = "db")]
 mod data_classification;
 mod db_telemetry_tests;

@@ -1,6 +1,6 @@
 # Data-capsule export/import: statements per unit of work
 
-Ledger harness (`autumn/tests/ledger_capsule_profile.rs`, driven by `run.sh`).
+Ledger harness (`autumn/tests/integration/ledger_capsule_profile.rs`, driven by `run.sh`).
 
 **Fixture** (seeded, deterministic shape): `users` (200 rows) + 30 tables
 `t0..t29`, 20,000 rows each (600k rows), 7 columns each, FK `owner_id -> users`,
