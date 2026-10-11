@@ -433,18 +433,15 @@ impl Report {
     }
 }
 
-/// Run the existing route-conformance checks over a manifest's declared routes.
-///
-/// A sandboxed plugin needs no binary built and no process run: the manifest
-/// *is* the route table, and the runtime mounts exactly it. So the same checks
-/// `autumn plugin-check` applies to a native plugin apply here, offline.
-fn conformance(manifest: &SandboxManifest) -> ConformanceReport {
-    let routes: Vec<RouteInfo> = manifest
-        .routes
-        .iter()
+/// The routes the conformance checks see: what the runtime mounts, including
+/// the HEAD every declared GET also serves.
+fn conformance_routes(manifest: &SandboxManifest) -> Vec<RouteInfo> {
+    manifest
+        .route_infos()
+        .into_iter()
         .map(|route| RouteInfo {
-            method: route.method.clone(),
-            path: route.path.clone(),
+            method: route.method,
+            path: route.path,
             handler: format!("sandbox:{}", manifest.name),
             source: format!("plugin:{}", manifest.name),
             middleware: vec!["sandboxed".to_owned()],
@@ -462,7 +459,16 @@ fn conformance(manifest: &SandboxManifest) -> ConformanceReport {
             pools: Vec::new(),
             resource_shape: String::new(),
         })
-        .collect();
+        .collect()
+}
+
+/// Run the existing route-conformance checks over a manifest's declared routes.
+///
+/// A sandboxed plugin needs no binary built and no process run: the manifest
+/// *is* the route table, and the runtime mounts exactly it. So the same checks
+/// `autumn plugin-check` applies to a native plugin apply here, offline.
+fn conformance(manifest: &SandboxManifest) -> ConformanceReport {
+    let routes = conformance_routes(manifest);
 
     // A sandboxed plugin holds no session or auth capability, so a route it
     // serves is unauthenticated by construction. Declaring that here is the
@@ -784,6 +790,20 @@ job_types = ["reindex"]
         for class in ["database", "network", "filesystem", "environment"] {
             assert!(bare.denied.contains(&class.to_owned()), "{class}");
         }
+    }
+
+    #[test]
+    fn the_conformance_input_names_the_head_a_get_route_also_serves() {
+        // Same source as the report: a GET also serves HEAD, so the checks
+        // must see it.
+        let artifact = pack(&good_fixture());
+        let routes = conformance_routes(artifact.manifest());
+        let pairs: Vec<(&str, &str)> = routes
+            .iter()
+            .map(|route| (route.method.as_str(), route.path.as_str()))
+            .collect();
+        assert!(pairs.contains(&("GET", "/hello/greet")), "{pairs:?}");
+        assert!(pairs.contains(&("HEAD", "/hello/greet")), "{pairs:?}");
     }
 
     #[test]

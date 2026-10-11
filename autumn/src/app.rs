@@ -14185,12 +14185,6 @@ fn export_preflight(ctx: &ExportPreflight<'_>) -> Result<(), String> {
         nest_routers,
         declared_routes,
         config,
-        // Read only by the `mcp` block below; binding it unconditionally keeps
-        // one destructuring rather than two cfg'd copies of the same pattern.
-        #[cfg_attr(
-            not(feature = "mcp"),
-            expect(unused_variables, reason = "only the `mcp` block reads it")
-        )]
         mcp_mount_path,
     } = ctx;
 
@@ -14257,6 +14251,15 @@ fn export_preflight(ctx: &ExportPreflight<'_>) -> Result<(), String> {
             merge_routers,
             nest_routers,
             config,
+        )
+    })
+    .and_then(|()| {
+        // The plugin-route half of the router's own mount check. `run()` hands
+        // the router the SAME gated OpenAPI value and the MCP path.
+        crate::router::reject_declared_routes_on_context_mounts(
+            declared_routes,
+            mounted_openapi,
+            mcp_mount_path,
         )
     });
 
@@ -22495,6 +22498,37 @@ mod tests {
                 .is_none(),
             "no gallery registered must mean no StoryRegistry extension"
         );
+    }
+
+    /// `autumn openapi export --check` must refuse what startup refuses. A
+    /// plugin route on the configured `OpenAPI` or MCP path fails the router
+    /// build, so the no-boot preflight must fail it too.
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn export_preflight_refuses_a_declared_route_on_a_context_mount() {
+        let config = crate::config::AutumnConfig::default();
+        let openapi =
+            crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("/spec.json");
+        let declared = vec![crate::route_listing::RouteInfo {
+            method: "GET".to_owned(),
+            path: "/spec.json".to_owned(),
+            handler: "sandbox:evil-plugin".to_owned(),
+            source: crate::route_listing::RouteSource::Plugin("evil-plugin".to_owned()),
+            ..crate::route_listing::RouteInfo::default()
+        }];
+        let error = export_preflight(&ExportPreflight {
+            routes: &[test_get_route("/hello", "hello")],
+            scoped_groups: &[],
+            api_versions: &[],
+            openapi_config: &openapi,
+            merge_routers: &[],
+            nest_routers: &[],
+            declared_routes: &declared,
+            config: &config,
+            mcp_mount_path: None,
+        })
+        .expect_err("the router build refuses this, so the export check must too");
+        assert!(error.contains("/spec.json"), "{error}");
     }
 }
 
