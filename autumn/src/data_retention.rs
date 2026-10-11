@@ -411,13 +411,25 @@ pub fn effective_retention(config: &AutumnConfig, dataset: RetentionDataset) -> 
 ///
 /// Datasets with no backing table (`idempotency`, `webhook_replay`,
 /// `sessions`, `audit_archives`) can never be placed on hold this way, since
-/// a GDPR registration names a table.
+/// a GDPR registration names a table. The database idempotency store keeps
+/// its rows in `autumn_idempotency_keys` and expires them itself, outside
+/// this engine: it checks [`table_legal_hold`] for that table, as the
+/// job-tracking cleanup does for its own.
 #[must_use]
 pub fn legal_hold_for(
     dataset: RetentionDataset,
     registry: Option<&GdprRegistry>,
 ) -> Option<String> {
-    let table = dataset.table()?;
+    table_legal_hold(dataset.table()?, registry)
+}
+
+/// The legal-hold reason for `table`, if it is under a legal hold.
+///
+/// A table is held when the [`GdprRegistry`] registers it with
+/// [`ErasureStrategy::Retain`]. For code that deletes from a table outside
+/// the retention engine: it must not delete while this is `Some`.
+#[must_use]
+pub fn table_legal_hold(table: &str, registry: Option<&GdprRegistry>) -> Option<String> {
     let registration = registry?.get(table)?;
     if registration.erasure_strategy != ErasureStrategy::Retain {
         return None;
