@@ -2221,7 +2221,7 @@ mod tests {
                             }
                             // B: still running when A releases.
                             1 => {
-                                tokio::time::sleep(Duration::from_millis(2_000)).await;
+                                tokio::time::sleep(Duration::from_secs(2)).await;
                                 (StatusCode::CREATED, "created")
                             }
                             _ => (StatusCode::CREATED, "created"),

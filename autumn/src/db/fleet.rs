@@ -1422,10 +1422,9 @@ impl DatabaseFleet {
             // between the old inode and a new file. The guard refuses then,
             // and blocks new openers while the files go.
             check_contained(&root, &path)?;
-            let guard = exclusive_guard(&path, &name)?;
-            let removed = remove_database_files(&path, &root);
-            drop(guard);
-            removed
+            with_exclusive_access(&path, &name, HOLD_GUARD_WHILE_REMOVING, || {
+                remove_database_files(&path, &root, &name)
+            })
         })
         .await
         .map_err(|e| FleetError::Io {
@@ -2053,6 +2052,66 @@ fn exclusive_guard(
     Ok(Some(conn))
 }
 
+/// Whether the guard stays open while files are removed. Unix can unlink an
+/// open file. Windows cannot: `SQLite` opens files without
+/// `FILE_SHARE_DELETE`, so our own guard would block the removal.
+const HOLD_GUARD_WHILE_REMOVING: bool = !cfg!(windows);
+
+/// Run `work` once no other process has `path` open. Blocking.
+///
+/// With `hold`, the guard stays open during `work`. Without it, the guard
+/// closes first, so `work` must tolerate a late opener: Windows refuses to
+/// delete a file that is open elsewhere (see [`removal_error`]), and the
+/// no-replace publish in [`publish_restored`] refuses a file that appeared.
+fn with_exclusive_access<T>(
+    path: &Path,
+    name: &str,
+    hold: bool,
+    work: impl FnOnce() -> Result<T, FleetError>,
+) -> Result<T, FleetError> {
+    let guard = exclusive_guard(path, name)?;
+    if hold {
+        let done = work();
+        drop(guard);
+        done
+    } else {
+        drop(guard);
+        work()
+    }
+}
+
+/// Map a failed file removal. A sharing violation (Windows error 32) means
+/// another process has the file open: that is [`FleetError::InUseElsewhere`].
+fn removal_error<'a>(
+    op: &'static str,
+    name: &'a str,
+) -> impl FnOnce(std::io::Error) -> FleetError + 'a {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    move |e| {
+        if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) {
+            FleetError::InUseElsewhere {
+                name: name.to_owned(),
+            }
+        } else {
+            io_error(op)(e)
+        }
+    }
+}
+
+/// Link the staged copy to `path`. Never replaces a file: one that appeared
+/// since the removal is a conflict.
+fn publish_restored(staging: &Path, path: &Path, name: &str) -> Result<(), FleetError> {
+    std::fs::hard_link(staging, path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            FleetError::AlreadyExists {
+                name: name.to_owned(),
+            }
+        } else {
+            io_error("publish restored database")(e)
+        }
+    })
+}
+
 /// Replace the database at `path` with its replica. Blocking.
 ///
 /// The replica is rebuilt in a private staging file first, so a failed
@@ -2088,21 +2147,18 @@ fn restore_in_place(
             return Err(error);
         }
     };
-    let published = (|| {
-        let guard = exclusive_guard(path, &name)?;
+    let published = with_exclusive_access(path, &name, HOLD_GUARD_WHILE_REMOVING, || {
         for file in
             std::iter::once(path.to_path_buf()).chain(crate::fleet_layout::sidecar_paths(path))
         {
             match std::fs::remove_file(&file) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(io_error("replace database")(e)),
+                Err(e) => return Err(removal_error("replace database", &name)(e)),
             }
         }
-        std::fs::hard_link(&staging, path).map_err(io_error("publish restored database"))?;
-        drop(guard);
-        Ok(())
-    })();
+        publish_restored(&staging, path, &name)
+    });
     discard_staging(&staging);
     published.map(|()| crate::replication::RestoreOutcome {
         output: path.to_path_buf(),
@@ -2179,15 +2235,15 @@ fn build_staged_database(
 
 /// Remove a database file, its sidecars, and the directories the template
 /// created for it when they are now empty (never `root` itself). `Ok(false)`
-/// when there was no file.
-fn remove_database_files(path: &Path, root: &Path) -> Result<bool, FleetError> {
+/// when there was no file. The main file goes first.
+fn remove_database_files(path: &Path, root: &Path, name: &str) -> Result<bool, FleetError> {
     let existed = path.is_file();
     for file in std::iter::once(path.to_path_buf()).chain(crate::fleet_layout::sidecar_paths(path))
     {
         match std::fs::remove_file(&file) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io_error("delete database")(e)),
+            Err(e) => return Err(removal_error("delete database", name)(e)),
         }
     }
     let mut dir = path.parent();
@@ -2743,6 +2799,82 @@ mod tests {
             entries(tenants.root()).is_empty(),
             "nothing touched the disk"
         );
+    }
+
+    fn plain_database(dir: &Path) -> PathBuf {
+        use diesel::connection::SimpleConnection as _;
+        let path = dir.join("plain.db");
+        crate::db::establish_sqlite_migration_connection(&DatabaseFleet::url_of(&path))
+            .unwrap()
+            .batch_execute("PRAGMA journal_mode = WAL; CREATE TABLE t (id INTEGER)")
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn a_sharing_violation_is_in_use_elsewhere() {
+        let busy = removal_error("delete database", "acme")(std::io::Error::from_raw_os_error(32));
+        assert!(matches!(busy, FleetError::InUseElsewhere { name } if name == "acme"));
+        let other = removal_error("delete database", "acme")(std::io::Error::other("disk"));
+        assert!(matches!(other, FleetError::Io { .. }), "{other}");
+    }
+
+    #[test]
+    fn held_access_keeps_other_openers_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = plain_database(tmp.path());
+        let inner = with_exclusive_access(&path, "plain", true, || {
+            Ok(exclusive_guard(&path, "plain").map(drop))
+        })
+        .unwrap();
+        assert!(matches!(inner, Err(FleetError::InUseElsewhere { .. })));
+    }
+
+    #[test]
+    fn released_access_lets_the_work_open_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = plain_database(tmp.path());
+        let inner = with_exclusive_access(&path, "plain", false, || {
+            Ok(exclusive_guard(&path, "plain").map(drop))
+        })
+        .unwrap();
+        assert!(inner.is_ok(), "the guard was released first");
+    }
+
+    #[test]
+    fn access_is_refused_while_another_connection_has_the_file_open() {
+        use diesel::connection::SimpleConnection as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = plain_database(tmp.path());
+        let mut other =
+            crate::db::establish_sqlite_migration_connection(&DatabaseFleet::url_of(&path))
+                .unwrap();
+        other.batch_execute("SELECT 1 FROM t").unwrap();
+        for hold in [true, false] {
+            let ran = std::cell::Cell::new(false);
+            let err = with_exclusive_access(&path, "plain", hold, || {
+                ran.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+            assert!(matches!(err, FleetError::InUseElsewhere { .. }), "{err}");
+            assert!(!ran.get(), "no work without proof");
+        }
+    }
+
+    #[test]
+    fn publishing_over_a_file_that_appeared_is_a_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging.db");
+        let path = tmp.path().join("live.db");
+        std::fs::write(&staging, b"restored").unwrap();
+        std::fs::write(&path, b"opened by someone else").unwrap();
+        let err = publish_restored(&staging, &path, "acme").unwrap_err();
+        assert!(matches!(err, FleetError::AlreadyExists { .. }), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"opened by someone else");
+        std::fs::remove_file(&path).unwrap();
+        publish_restored(&staging, &path, "acme").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"restored");
     }
 
     #[tokio::test]
