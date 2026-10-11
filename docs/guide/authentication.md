@@ -977,12 +977,17 @@ app.on_session_rotation(|rotation| async move {
 })
 ```
 
-The hook runs after the new session is stored. It sees one hop per request,
-from the first old id to the last new id. It does not run for a destroyed
+The hook runs after the new session is stored. It sees one event per request,
+from the first old id to the last new id. `earlier_ids` lists every id in
+between. It does not run for a destroyed
 session. A hook error is logged and does not change the response.
 
 `autumn generate auth` registers a hook that re-points the tracked-session row.
 Impersonation therefore works in apps with `[auth.sessions]` tracking.
+
+Two parallel requests that rotate the same session each publish their own
+event. Only the first finds the row. Do not rotate one session from parallel
+requests.
 
 A rotation that does not change the signed-in user retires the impersonation
 record. For a rotation you trust (for example an idle-rotation policy), call
