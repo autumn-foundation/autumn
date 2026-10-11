@@ -822,16 +822,16 @@ pub(crate) fn upgrade_binary() -> Result<std::path::PathBuf, UpgradeError> {
 ///
 /// The handoff lock is held from before the rename until `on_published`
 /// returns. `on_published` makes the adopted state writable. The predecessor
-/// takes the same lock to decide whether to kill this process, so it sees
-/// either no readiness (and this process never became writable) or both.
+/// takes the same lock before it decides to kill this process. It sees
+/// either neither event or both: readiness and a writable state.
 ///
 /// Returns whether there was a predecessor to tell: `false` on an ordinary
 /// cold start, where nothing is waiting.
 ///
 /// # Errors
 ///
-/// Any IO error from taking the lock (a missing lock file means the
-/// predecessor already cleaned up), writing or renaming the file. The caller must treat this
+/// An IO error from the lock, the write or the rename. A missing lock file
+/// means the predecessor already cleaned up. The caller must treat this
 /// as a failed handover and refuse to go on: readiness that never reached the
 /// predecessor means the predecessor will time out and kill this process, so
 /// anything this process acknowledged in the meantime would be discarded.
@@ -886,7 +886,7 @@ fn lock_for_publish(
 ///
 /// Bounded, because `Drop` must not hang a drain on a stuck successor. On
 /// timeout, or if the lock file is gone, the decision runs without the lock.
-/// That is the pre-lock behaviour, with a much smaller window.
+/// The decision then runs as it did before the lock. The race window stays small.
 #[cfg(unix)]
 fn lock_for_decision(dir: &std::path::Path) -> Option<nix::fcntl::Flock<std::fs::File>> {
     use nix::fcntl::{Flock, FlockArg};
@@ -1129,11 +1129,11 @@ async fn spawn_and_await_successor(
 #[cfg(unix)]
 const LOCK_FILE: &str = "lock";
 
-/// The predecessor retries the handoff lock this many times, `LOCK_RETRY`
-/// apart (about one second), before it gives up.
+/// Number of tries the predecessor makes to take the handoff lock.
 #[cfg(unix)]
 const LOCK_ATTEMPTS: u32 = 1000;
 
+/// Wait between those tries (about one second in total).
 #[cfg(unix)]
 const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(1);
 

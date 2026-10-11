@@ -6048,10 +6048,11 @@ impl AppBuilder {
                 // process, taking anything acknowledged meanwhile with it.
                 // Refusing here ends that wait when this process exits, in ~20 ms
                 // rather than the readiness timeout, and it resumes writable.
+                // The unfreeze runs under the handoff lock.
                 match crate::upgrade::publish_upgrade_readiness(|| {
                     unfreeze_adopted_live_state(&state);
                 }) {
-                    Ok(_had_predecessor) => {}
+                    Ok(_) => {}
                     Err(error) => {
                         tracing::error!(
                             error = %error,
