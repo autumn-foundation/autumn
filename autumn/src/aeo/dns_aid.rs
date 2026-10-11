@@ -59,24 +59,30 @@ fn zone_safe(s: &str) -> bool {
 
 /// Zone file lines for the DNS-AID records.
 ///
+/// The base is read as the URL parser serializes it: an IDN host in
+/// punycode, a non-ASCII or quote character in the path percent-encoded.
 /// Empty when `base_url` is not an `http` or `https` URL with a DNS host
-/// name (an IP address has no zone), has a user name, password, query or
-/// fragment, or holds a character a zone file string cannot carry; or when
-/// `mcp_path` fails [`valid_mcp_path`].
+/// name (an IP address has no zone), or has a user name, password, query or
+/// fragment; or when `mcp_path` fails [`valid_mcp_path`].
 #[must_use]
 pub fn records(input: &DnsAidInput) -> Vec<String> {
-    let base = input.base_url.trim().trim_end_matches('/');
-    if !zone_safe(base)
-        || input
-            .mcp_path
-            .as_deref()
-            .is_some_and(|p| !valid_mcp_path(p))
+    if input
+        .mcp_path
+        .as_deref()
+        .is_some_and(|p| !valid_mcp_path(p))
     {
         return Vec::new();
     }
-    let Ok(url) = url::Url::parse(base) else {
+    let Ok(url) = url::Url::parse(input.base_url.trim()) else {
         return Vec::new();
     };
+    // The URL as parsed: an IDN host in its ASCII (punycode) form and a
+    // non-ASCII path percent-encoded, so a Unicode base still makes zone
+    // file text.
+    let base = url.as_str().trim_end_matches('/').to_owned();
+    if !zone_safe(&base) {
+        return Vec::new();
+    }
     // The records describe an HTTP service: another scheme's port and URL
     // would be wrong. Paths are appended to the base, so a query or a
     // fragment would swallow them.
@@ -137,6 +143,18 @@ mod tests {
     }
 
     #[test]
+    fn an_idn_base_url_makes_ascii_records() {
+        let lines = records(&DnsAidInput::new("https://例え.テスト/ü", None));
+        assert!(!lines.is_empty(), "{lines:?}");
+        assert!(lines.iter().all(|l| l.is_ascii()), "{lines:?}");
+        assert!(
+            lines[0].starts_with("_index._agents.xn--r8jz45g.xn--zckzah. "),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("/%C3%BC/")), "{lines:?}");
+    }
+
+    #[test]
     fn mcp_site_records() {
         let lines = records(&DnsAidInput::new("https://example.com/", Some("/mcp")));
         assert_eq!(
@@ -160,7 +178,7 @@ mod tests {
                 "_index._agents.app.example.org. 300 IN SVCB 1 app.example.org. \
                  alpn=\"http/1.1\" port=8080",
                 "_catalog._agents.app.example.org. 300 IN TXT \
-                 \"url=http://App.Example.org:8080/.well-known/ai-catalog.json\"",
+                 \"url=http://app.example.org:8080/.well-known/ai-catalog.json\"",
             ]
         );
         assert!(records(&DnsAidInput::new("not a url", None)).is_empty());
@@ -169,8 +187,16 @@ mod tests {
         assert!(records(&DnsAidInput::new("https://example.com?tenant=a", None)).is_empty());
         assert!(records(&DnsAidInput::new("https://example.com#top", None)).is_empty());
         assert!(records(&DnsAidInput::new("https://token@example.com", None)).is_empty());
-        assert!(records(&DnsAidInput::new("https://exa\nmple.com", None)).is_empty());
-        assert!(records(&DnsAidInput::new("https://example.com/a\"b", None)).is_empty());
+        // The URL parser drops a raw newline and encodes a `"`, so the zone
+        // text never carries either.
+        let lines = records(&DnsAidInput::new("https://exa\nmple.com", None));
+        assert!(
+            lines[0].starts_with("_index._agents.example.com. "),
+            "{lines:?}"
+        );
+        let lines = records(&DnsAidInput::new("https://example.com/a\"b", None));
+        assert!(lines.iter().any(|l| l.contains("/a%22b/")), "{lines:?}");
+        assert!(lines.iter().all(|l| !l.contains("a\"b")), "{lines:?}");
     }
 
     #[test]

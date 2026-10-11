@@ -1393,8 +1393,14 @@ fn validate_route_path(field: &'static str, value: &str) -> Result<(), RouterBui
 fn aeo_x402_layer(
     config: &AutumnConfig,
     state: &AppState,
+    static_paths: crate::aeo::commerce::StaticPaths,
 ) -> tower::util::Either<crate::aeo::commerce::X402Layer, tower::layer::util::Identity> {
-    tower::util::option_layer(crate::aeo::commerce::X402Layer::shared(config, state))
+    tower::util::option_layer(
+        crate::aeo::commerce::X402Layer::shared(config, state).map(|layer| match static_paths {
+            Some(paths) => layer.for_static_pages(paths),
+            None => layer,
+        }),
+    )
 }
 
 /// Without `http-client`, priced routes fail closed (`503`).
@@ -1402,8 +1408,16 @@ fn aeo_x402_layer(
 fn aeo_x402_layer(
     config: &AutumnConfig,
     _state: &AppState,
+    static_paths: crate::aeo::commerce::StaticPaths,
 ) -> tower::util::Either<crate::aeo::commerce::X402Unavailable, tower::layer::util::Identity> {
-    tower::util::option_layer(crate::aeo::commerce::X402Unavailable::from_config(config))
+    tower::util::option_layer(
+        crate::aeo::commerce::X402Unavailable::from_config(config).map(
+            |layer| match static_paths {
+                Some(paths) => layer.for_static_pages(paths),
+                None => layer,
+            },
+        ),
+    )
 }
 
 /// Build the AEO site snapshot from the route registry, the `OpenAPI` config,
@@ -5638,7 +5652,7 @@ fn apply_middleware(
             // limits, the trusted-host check, CSRF, the request timeout, and
             // CORS all apply before a facilitator call. Also present on the
             // SSG/ISG path, where the MCP dispatch clone needs it.
-            aeo_x402_layer(config, state),
+            aeo_x402_layer(config, state, None),
         ),
     );
 
@@ -6614,6 +6628,8 @@ pub fn try_build_router_with_static_inner(
         layer
     };
     let layer = Arc::new(layer);
+    let static_paths: Arc<std::collections::HashSet<String>> =
+        Arc::new(layer.manifest().routes.keys().cloned().collect());
 
     // Static-first serving: intercept GET/HEAD requests whose path is in the
     // manifest and serve pre-built HTML directly, before the dynamic router and
@@ -6733,7 +6749,9 @@ pub fn try_build_router_with_static_inner(
                 .extension::<crate::aeo::AeoSite>()
                 .and_then(|site| site.layer()),
         ),
-        aeo_x402_layer(config, &state),
+        // Only for the manifest's pages: a miss reaches the copy inside the
+        // router, which prices the route axum matched.
+        aeo_x402_layer(config, &state, Some(static_paths)),
     ));
 
     // Compression is applied outside the static-first middleware too, so
@@ -12288,6 +12306,51 @@ enabled = true
             .await
             .unwrap();
         assert_eq!(&body[..], b"<h1>secret</h1>");
+    }
+
+    /// With a static build, the x402 copy outside the static-first
+    /// middleware prices only the manifest's pages: a miss reaches the copy
+    /// inside the router, which knows the free route axum picked.
+    #[cfg(feature = "http-client")]
+    #[tokio::test]
+    async fn a_static_build_leaves_a_dynamic_miss_to_the_matched_route() {
+        let tmp = create_ssg_dist(&[("/about", "about.html", b"<h1>About</h1>")]);
+        let dist = tmp.path().join("dist");
+        let mut config = AutumnConfig::default();
+        config.aeo.x402 = toml::from_str(
+            "facilitator_url = \"https://facilitator.example\"\npay_to = \"0xabc\"\n\
+             network = \"eip155:84532\"\nasset = \"0xusdc\"",
+        )
+        .unwrap();
+        config.aeo.paid_routes = vec![crate::aeo::commerce::PaidRoute::new(
+            "GET",
+            "/files/{*path}",
+            "1",
+        )];
+        let router = try_build_router_with_static(
+            vec![duplicate_test_route(
+                http::Method::GET,
+                "/files/public",
+                "public",
+            )],
+            &config,
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let get = |uri: &'static str| {
+            router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        };
+        // `/files/public` is a free route of its own, more specific than the
+        // priced wildcard.
+        assert_eq!(get("/files/public").await.unwrap().status(), StatusCode::OK);
+        // A path only the wildcard covers is still charged.
+        assert_eq!(
+            get("/files/report.pdf").await.unwrap().status(),
+            StatusCode::PAYMENT_REQUIRED
+        );
     }
 
     /// A `HEAD` of a pre-rendered page carries the length its `GET` sends, so

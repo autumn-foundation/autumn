@@ -618,6 +618,7 @@ impl AcpDiscovery {
 #[derive(Clone)]
 pub(crate) struct X402Layer {
     state: std::sync::Arc<X402State>,
+    static_paths: StaticPaths,
 }
 
 #[cfg(feature = "http-client")]
@@ -901,6 +902,49 @@ impl PricedRoutes {
     }
 }
 
+/// The pre-rendered pages of an SSG/ISR build, for the x402 copy that runs
+/// outside the static-first middleware. That copy sees no matched route, so
+/// it prices only a request the middleware will answer from the manifest; a
+/// miss falls through to the copy inside the router, which knows the route
+/// axum picked.
+pub(crate) type StaticPaths = Option<std::sync::Arc<std::collections::HashSet<String>>>;
+
+/// `true` when `static_paths` is set and `req` is not one of those pages.
+fn static_miss(
+    static_paths: Option<&std::sync::Arc<std::collections::HashSet<String>>>,
+    req: &axum::http::Request<axum::body::Body>,
+) -> bool {
+    static_paths.is_some_and(|paths| !paths.contains(normalize(req.uri().path())))
+}
+
+#[cfg(feature = "http-client")]
+impl X402Layer {
+    /// This layer for the pages of a static build only (see
+    /// [`StaticPaths`]). It shares the used-payment cache.
+    #[must_use]
+    pub(crate) fn for_static_pages(
+        mut self,
+        paths: std::sync::Arc<std::collections::HashSet<String>>,
+    ) -> Self {
+        self.static_paths = Some(paths);
+        self
+    }
+}
+
+#[cfg(not(feature = "http-client"))]
+impl X402Unavailable {
+    /// This layer for the pages of a static build only (see
+    /// [`StaticPaths`]).
+    #[must_use]
+    pub(crate) fn for_static_pages(
+        mut self,
+        paths: std::sync::Arc<std::collections::HashSet<String>>,
+    ) -> Self {
+        self.static_paths = Some(paths);
+        self
+    }
+}
+
 /// Lets a payment client's request to an x402-priced route past CSRF.
 ///
 /// It sits outside the CSRF layer and marks a request to a priced x402
@@ -996,6 +1040,7 @@ impl X402Layer {
             );
         }
         Some(Self {
+            static_paths: None,
             state: std::sync::Arc::new(X402State {
                 config: aeo.x402.clone(),
                 priced,
@@ -1032,6 +1077,7 @@ impl X402Layer {
 #[derive(Clone)]
 pub(crate) struct X402Unavailable {
     priced: std::sync::Arc<PricedRoutes>,
+    static_paths: StaticPaths,
 }
 
 #[cfg(not(feature = "http-client"))]
@@ -1046,6 +1092,7 @@ impl X402Unavailable {
         );
         Some(Self {
             priced: std::sync::Arc::new(priced),
+            static_paths: None,
         })
     }
 }
@@ -1058,6 +1105,7 @@ impl<S> tower::Layer<S> for X402Unavailable {
         X402UnavailableService {
             inner,
             priced: std::sync::Arc::clone(&self.priced),
+            static_paths: self.static_paths.clone(),
         }
     }
 }
@@ -1068,6 +1116,7 @@ impl<S> tower::Layer<S> for X402Unavailable {
 pub(crate) struct X402UnavailableService<S> {
     inner: S,
     priced: std::sync::Arc<PricedRoutes>,
+    static_paths: StaticPaths,
 }
 
 #[cfg(not(feature = "http-client"))]
@@ -1092,7 +1141,10 @@ where
     fn call(&mut self, req: axum::http::Request<axum::body::Body>) -> Self::Future {
         use axum::response::IntoResponse as _;
 
-        if !is_internal_render(&req) && self.priced.route_for(&req).is_some() {
+        if !is_internal_render(&req)
+            && !static_miss(self.static_paths.as_ref(), &req)
+            && self.priced.route_for(&req).is_some()
+        {
             let res = (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "payments are not available",
@@ -1123,6 +1175,7 @@ impl<S> tower::Layer<S> for X402Layer {
         X402Service {
             inner,
             state: std::sync::Arc::clone(&self.state),
+            static_paths: self.static_paths.clone(),
         }
     }
 }
@@ -1133,6 +1186,7 @@ impl<S> tower::Layer<S> for X402Layer {
 pub(crate) struct X402Service<S> {
     inner: S,
     state: std::sync::Arc<X402State>,
+    static_paths: StaticPaths,
 }
 
 #[cfg(feature = "http-client")]
@@ -1168,7 +1222,10 @@ where
         // An unpriced request costs no clone and no box. A build or ISR
         // render is internal: the outer copy of this layer charges the live
         // request that reads the page.
-        let route = if req.extensions().get::<X402Handled>().is_some() || is_internal_render(&req) {
+        let route = if req.extensions().get::<X402Handled>().is_some()
+            || is_internal_render(&req)
+            || static_miss(self.static_paths.as_ref(), &req)
+        {
             None
         } else {
             self.state.priced.route_for(&req).cloned()
