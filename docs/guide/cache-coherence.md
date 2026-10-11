@@ -111,6 +111,11 @@ Two impls in one module can hold a same-named `#[cached]` function. Put
 Without a scope, both functions share one key space, and `autumn cache audit`
 reports the shared identity. The scope is opt-in.
 
+`#[cached_impl]` finds `#[cached]` by its path: `cached`, `autumn_web::cached`,
+`autumn_web::prelude::cached`, or the crate name Cargo resolves. It cannot see a
+`use` alias such as `use autumn_web as web;`. For those, write
+`#[cached(scope = "Products")]` by hand.
+
 The scope is the type path without generics: `a::Store`. Two impls can still
 share it: `impl Store<A>` and `impl Store<B>`, or two traits on one type with a
 same-named function. Give those a different `scope = "..."` by hand.

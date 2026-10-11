@@ -37,6 +37,7 @@ mod agent_authority;
 mod api_doc;
 mod authorize;
 mod cached;
+mod cached_impl;
 mod collect;
 mod edge;
 mod edge_routes_macro;
@@ -1530,7 +1531,7 @@ pub fn cached_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
             Err(err) => return err.into(),
         };
     let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(cached::cached_impl_macro(
+    autumn_macros_support::crate_path::finalize(cached_impl::cached_impl_macro(
         attr,
         item.into(),
         crate_override.as_deref(),
