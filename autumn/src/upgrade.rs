@@ -830,8 +830,7 @@ pub(crate) fn upgrade_binary() -> Result<std::path::PathBuf, UpgradeError> {
 ///
 /// # Errors
 ///
-/// An IO error from the lock, the write or the rename. A missing lock file
-/// means the predecessor already cleaned up. The caller must treat this
+/// An IO error from the lock, the write or the rename. The caller must treat this
 /// as a failed handover and refuse to go on: readiness that never reached the
 /// predecessor means the predecessor will time out and kill this process, so
 /// anything this process acknowledged in the meantime would be discarded.
@@ -860,10 +859,13 @@ pub(crate) fn publish_upgrade_readiness(
 /// Take the handoff lock beside `ready`, waiting as long as it takes.
 ///
 /// The predecessor holds it only for a stat and a kill, so the wait is short.
+/// Returns `None` when there is no lock file: a predecessor built before the
+/// lock existed never made one. If the directory is gone too, the rename that
+/// follows fails and the handover is refused.
 #[cfg(unix)]
 fn lock_for_publish(
     ready: &std::path::Path,
-) -> Result<nix::fcntl::Flock<std::fs::File>, std::io::Error> {
+) -> Result<Option<nix::fcntl::Flock<std::fs::File>>, std::io::Error> {
     use nix::fcntl::{Flock, FlockArg};
 
     let dir = ready.parent().ok_or_else(|| {
@@ -872,10 +874,14 @@ fn lock_for_publish(
             "the readiness path has no directory",
         )
     })?;
-    let mut file = std::fs::File::open(dir.join(LOCK_FILE))?;
+    let mut file = match std::fs::File::open(dir.join(LOCK_FILE)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
     loop {
         match Flock::lock(file, FlockArg::LockExclusive) {
-            Ok(lock) => return Ok(lock),
+            Ok(lock) => return Ok(Some(lock)),
             Err((back, nix::errno::Errno::EINTR)) => file = back,
             Err((_, errno)) => return Err(errno.into()),
         }
@@ -884,22 +890,34 @@ fn lock_for_publish(
 
 /// Take the handoff lock for the predecessor's decision, or `None`.
 ///
-/// Bounded, because `Drop` must not hang a drain on a stuck successor. On
-/// timeout, or if the lock file is gone, the decision runs without the lock.
-/// The decision then runs as it did before the lock. The race window stays small.
+/// `Drop` must not hang a drain, so the wait is bounded. A holder that outlasts
+/// it is stuck: kill the successor so the kernel drops its lock, then try
+/// again. Without a lock file (or after a second timeout) the decision runs
+/// unlocked.
 #[cfg(unix)]
-fn lock_for_decision(dir: &std::path::Path) -> Option<nix::fcntl::Flock<std::fs::File>> {
+fn lock_for_decision(
+    dir: &std::path::Path,
+    child: &mut Option<std::process::Child>,
+) -> Option<nix::fcntl::Flock<std::fs::File>> {
+    use nix::errno::Errno;
     use nix::fcntl::{Flock, FlockArg};
 
     let mut file = std::fs::File::open(dir.join(LOCK_FILE)).ok()?;
-    for _ in 0..LOCK_ATTEMPTS {
-        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-            Ok(lock) => return Some(lock),
-            Err((back, nix::errno::Errno::EWOULDBLOCK | nix::errno::Errno::EINTR)) => {
-                file = back;
-                std::thread::sleep(LOCK_RETRY);
+    for round in 0..2 {
+        for _ in 0..LOCK_ATTEMPTS {
+            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(lock) => return Some(lock),
+                Err((back, Errno::EWOULDBLOCK | Errno::EINTR)) => {
+                    file = back;
+                    std::thread::sleep(LOCK_RETRY);
+                }
+                Err(_) => return None,
             }
-            Err(_) => return None,
+        }
+        if round == 0 {
+            let child = child.as_mut()?;
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
     None
@@ -1003,7 +1021,7 @@ impl Drop for Handoff {
         // The lock makes that decision atomic with the successor's
         // "publish + unfreeze": a successor mid-publish finishes first, so
         // this process never kills one that has become writable.
-        let _lock = lock_for_decision(&self.dir);
+        let _lock = lock_for_decision(&self.dir, &mut self.child);
         let ready_path = self.dir.join("ready");
         let taken_over = self.completed
             || self
@@ -1867,18 +1885,36 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn a_successor_without_a_lock_file_refuses_to_publish() {
-        // The predecessor already removed its handoff directory contents.
+    fn a_predecessor_from_before_the_lock_still_hands_over() {
+        // An older build creates no lock file. Refusing would block the
+        // first upgrade into this build.
         let dir = scratch_dir(line!());
         let ready = dir.join("ready");
         let mut unfroze = false;
         temp_env::with_var(READY_FILE_ENV, Some(&ready), || {
-            publish_upgrade_readiness(|| unfroze = true)
-                .expect_err("no lock file means no handover");
+            publish_upgrade_readiness(|| unfroze = true).expect("publishes without a lock");
         });
-        assert!(!unfroze, "the state must stay frozen");
-        assert!(!ready.exists(), "no readiness without the lock");
+        assert!(unfroze);
+        assert!(ready.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_stuck_lock_holder_is_killed_instead_of_stalling_the_drop() {
+        let dir = scratch_dir(line!());
+        std::fs::write(dir.join(LOCK_FILE), "").expect("lock file");
+        let handle = LiveStateHandle::new(StatsV1::default());
+        let registry = Arc::new(LiveStateRegistry::new(&handle));
+        registry.freeze_and_snapshot(1).expect("snapshots");
+        let handoff = handoff_for_test(dir.clone(), registry);
+        let pid = handoff.child.as_ref().expect("child").id();
+
+        let _stuck = hold_handoff_lock(&dir);
+        drop(handoff);
+
+        assert!(!process_is_alive(pid), "the stuck successor is killed");
+        assert!(!handle.is_frozen(), "this process resumes");
     }
 
     #[test]
