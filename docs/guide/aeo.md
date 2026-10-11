@@ -199,6 +199,13 @@ documents link `/openapi.json`, where the build writes it, and no Swagger UI.
 The build does not write the Web Bot Auth directory, because its signature
 expires. Markdown negotiation and x402 need the server.
 
+A static host serves a file by its extension and sends no CORS headers. So
+the build also writes `dist/_headers`, the per-path headers file that Netlify
+and Cloudflare Pages read. It gives each document its `Content-Type`, its CORS
+headers, its `Link` header and its `Cache-Control`. An app that ships its own
+`_headers` keeps it, and the build logs a warning. On another host, set these
+headers in that host's configuration.
+
 ### Agent skills
 
 Autumn publishes a `site-guide` skill. It tells an agent how to read the

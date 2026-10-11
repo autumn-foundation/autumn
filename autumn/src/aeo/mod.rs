@@ -755,6 +755,8 @@ pub(crate) async fn write_static_documents(
     // The skills index waits for its skills: a `SKILL.md` already in `dist`
     // is kept, and the index must name the digest of the bytes served.
     let mut index = None;
+    // The response headers of each file written, for a static host.
+    let mut host_headers: Vec<(String, Vec<(String, String)>)> = Vec::new();
     while let Some(path) = queue.pop() {
         // A build render: x402 charges the live request for these bytes.
         let Ok(req) = Request::get(path.as_str())
@@ -769,12 +771,13 @@ pub(crate) async fn write_static_documents(
         {
             continue;
         }
+        let headers = static_host_headers(res.headers());
         let Ok(body) = axum::body::to_bytes(res.into_body(), usize::MAX).await else {
             continue;
         };
         if path == documents::SKILLS_INDEX_PATH {
             queue.extend(skill_paths(&body, &base));
-            index = Some(body);
+            index = Some((body, headers));
             continue;
         }
         let file = dist.join(path.trim_start_matches('/'));
@@ -785,9 +788,13 @@ pub(crate) async fn write_static_documents(
             tokio::fs::create_dir_all(parent).await?;
         }
         tokio::fs::write(&file, &body).await?;
+        // A host serves the script by its `.js` name; it needs no entry.
+        if path != webmcp::WEBMCP_JS_PATH {
+            host_headers.push((path.clone(), headers));
+        }
         written.push(path);
     }
-    if let Some(body) = index {
+    if let Some((body, headers)) = index {
         let file = dist.join(documents::SKILLS_INDEX_PATH.trim_start_matches('/'));
         if !tokio::fs::try_exists(&file).await.unwrap_or(false) {
             let body = index_with_disk_digests(&body, &base, dist).await;
@@ -795,7 +802,22 @@ pub(crate) async fn write_static_documents(
                 tokio::fs::create_dir_all(parent).await?;
             }
             tokio::fs::write(&file, &body).await?;
+            host_headers.push((documents::SKILLS_INDEX_PATH.to_owned(), headers));
             written.push(documents::SKILLS_INDEX_PATH.to_owned());
+        }
+    }
+    // A static host serves a file by its extension and with no CORS: the
+    // `_headers` file (Netlify, Cloudflare Pages) gives each document the
+    // headers the server sends. One the app ships stays.
+    if !host_headers.is_empty() {
+        let file = dist.join(STATIC_HEADERS_FILE);
+        if tokio::fs::try_exists(&file).await.unwrap_or(false) {
+            tracing::warn!(
+                "aeo: dist/{STATIC_HEADERS_FILE} exists; the agent documents' headers are not added to it"
+            );
+        } else {
+            tokio::fs::write(&file, headers_file(&host_headers)).await?;
+            written.push(format!("/{STATIC_HEADERS_FILE}"));
         }
     }
     written.sort();
@@ -834,6 +856,46 @@ async fn index_with_disk_digests(index: &[u8], base: &str, dist: &std::path::Pat
     } else {
         index.to_vec()
     }
+}
+
+/// The static-host headers file `autumn build` writes into `dist`.
+const STATIC_HEADERS_FILE: &str = "_headers";
+
+/// The headers of a generated document that a static host must send too:
+/// its type, CORS, `Link` and cache policy. Validators and lengths are the
+/// host's own.
+fn static_host_headers(headers: &axum::http::HeaderMap) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            let name = name.as_str();
+            name == "content-type"
+                || name == "cache-control"
+                || name == "link"
+                || name.starts_with("access-control-")
+        })
+        .filter_map(|(name, value)| {
+            Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))
+        })
+        .collect()
+}
+
+/// `files` in the `_headers` format: each path, then its headers indented.
+fn headers_file(files: &[(String, Vec<(String, String)>)]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out =
+        String::from("# Written by `autumn build`: the agent documents' response headers.\n");
+    for (path, headers) in files {
+        if headers.is_empty() {
+            continue;
+        }
+        let _ = writeln!(out, "\n{path}");
+        for (name, value) in headers {
+            let _ = writeln!(out, "  {name}: {value}");
+        }
+    }
+    out
 }
 
 /// The local `SKILL.md` paths that a skills index names.
@@ -940,6 +1002,42 @@ mod tests {
             .expect("absolute");
         assert!(read(skill).starts_with("---\n"));
         assert!(!dist.path().join(".well-known/api-catalog").exists());
+
+        // Codex review (P2): a static host gets each document's headers.
+        assert!(written.iter().any(|p| p == "/_headers"), "{written:?}");
+        let headers = read("_headers");
+        let index_entry = headers
+            .split("\n\n")
+            .find(|e| e.starts_with("/.well-known/agent-skills/index.json\n"))
+            .unwrap_or_else(|| panic!("{headers}"));
+        for want in [
+            "  content-type: application/json",
+            "  access-control-allow-origin: *",
+            "  access-control-expose-headers: ETag",
+        ] {
+            assert!(index_entry.contains(want), "{want}:\n{headers}");
+        }
+        assert!(!headers.contains("/_autumn/webmcp.js"), "{headers}");
+    }
+
+    #[tokio::test]
+    async fn a_static_build_keeps_the_apps_own_headers_file() {
+        let mut config = crate::config::AutumnConfig::default();
+        config.seo.base_url = Some("https://example.com".to_owned());
+        let dist = tempfile::tempdir().unwrap();
+        std::fs::write(dist.path().join("_headers"), "/*\n  X-Mine: 1\n").unwrap();
+        let written = write_static_documents(
+            site_router(&config),
+            config.seo.base_url.as_deref(),
+            dist.path(),
+        )
+        .await
+        .unwrap();
+        assert!(!written.iter().any(|p| p == "/_headers"), "{written:?}");
+        assert_eq!(
+            std::fs::read_to_string(dist.path().join("_headers")).unwrap(),
+            "/*\n  X-Mine: 1\n"
+        );
     }
 
     #[tokio::test]
