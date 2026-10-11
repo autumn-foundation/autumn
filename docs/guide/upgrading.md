@@ -390,8 +390,13 @@ owns at *its* root are out of scope here, and the report says so:
   nearest ancestor of the crate being built, so a crate-local copy does not add
   to the workspace's — it **shadows** it, silently dropping its lints and its
   MSRV pin with no diagnostic.
-- GitHub only runs workflows from the repository root, so a member's
-  `.github/workflows/ci.yml` never runs at all.
+- GitHub runs workflows from the **git root**, not the Cargo root. If the
+  crate is not its own git root, its `.github/workflows/ci.yml` and
+  `posture-gate.yml` never run, so they are out of scope.
+
+A nested git repository or submodule is its own git root. Its workflows do run,
+so `autumn upgrade` still reconciles them. The three Cargo files stay out of
+scope.
 
 Everything genuinely per-crate — `autumn.toml`, `Dockerfile`, `.dockerignore`,
 `build.rs`, `.gitignore`, `.env.example`, and the CSS pipeline — is reconciled as
