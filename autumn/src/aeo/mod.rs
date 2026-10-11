@@ -417,7 +417,7 @@ impl AeoSite {
         // Its targets sit below the path of `[seo] base_url`, if any.
         let base_path = documents::Origin::resolve(config.seo.base_url.as_deref(), None)
             .configured
-            .then(|| config.seo.base_url.as_deref())
+            .then_some(config.seo.base_url.as_deref())
             .flatten()
             .and_then(|base| url::Url::parse(base.trim()).ok())
             .map(|url| url.path().trim_end_matches('/').to_owned())
