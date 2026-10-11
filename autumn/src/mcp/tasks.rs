@@ -208,6 +208,9 @@ struct Entry {
 pub struct TaskStore {
     config: McpTaskConfig,
     tasks: Mutex<HashMap<String, Entry>>,
+    /// Limits how many task results buffer at the same time. Each permit is
+    /// one full-size result, so the peak is near `max_stored_bytes`.
+    buffers: tokio::sync::Semaphore,
 }
 
 /// Format a timestamp as ISO 8601 with milliseconds.
@@ -223,10 +226,19 @@ fn millis(duration: Duration) -> u64 {
 
 impl TaskStore {
     pub fn new(config: McpTaskConfig) -> Self {
+        let permits = (config.max_stored_bytes / super::MAX_TOOL_RESPONSE_BYTES).max(1);
         Self {
             config,
             tasks: Mutex::new(HashMap::new()),
+            buffers: tokio::sync::Semaphore::new(permits),
         }
+    }
+
+    /// Wait for a permit to buffer one task result. Keep it until the result
+    /// is stored or discarded.
+    pub async fn buffer_permit(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        // The semaphore is never closed, so this is always `Some`.
+        self.buffers.acquire().await.ok()
     }
 
     /// The TTL. The job of a task stops when it ends.
@@ -607,6 +619,19 @@ mod tests {
             .create("t1", owner("a"), "q", at(0))
             .unwrap();
         assert_eq!(long["ttlMs"], MAX_SAFE_INTEGER);
+    }
+
+    #[test]
+    fn buffer_permits_follow_the_byte_budget() {
+        let unit = super::super::MAX_TOOL_RESPONSE_BYTES;
+        let store = TaskStore::new(McpTaskConfig::default().max_stored_bytes(2 * unit));
+        let first = store.buffers.try_acquire().unwrap();
+        let second = store.buffers.try_acquire().unwrap();
+        assert!(store.buffers.try_acquire().is_err());
+        drop((first, second));
+        // A budget below one result still lets one task buffer.
+        let small = TaskStore::new(McpTaskConfig::default().max_stored_bytes(1));
+        assert!(small.buffers.try_acquire().is_ok());
     }
 
     #[test]

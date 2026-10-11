@@ -534,7 +534,9 @@ the TTL ends, the server stops a running task and deletes the task.
   cannot get a new quota with a new credential. Clients behind one NAT share
   a quota.
 - **Memory.** All stored results together use at most `max_stored_bytes`. If
-  a result does not fit, the task completes with a tool error.
+  a result does not fit, the task completes with a tool error. The same
+  budget limits how many task results buffer at one time (one per 10 MiB, at
+  least one).
 - **Audit.** A task call writes the same `attempt` and outcome records as a
   blocking call (see "Proving what an agent can do"). A cancelled or expired
   task writes an outcome with `result = task_aborted`. A panic outside the

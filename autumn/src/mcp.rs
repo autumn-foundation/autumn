@@ -2517,7 +2517,7 @@ fn spawn_task(
                 .finish(&job_id, state, server.state.clock().now());
             return;
         };
-        let Ok((mut result, mut outcome, disposition)) = ran else {
+        let Ok((mut result, mut outcome, disposition, permit)) = ran else {
             // A tool error is a result (`isError`). A panic outside the
             // pipeline's own panic catch is a JSON-RPC internal error.
             let error = json!({ "code": -32603, "message": "Internal error" });
@@ -2537,6 +2537,7 @@ fn spawn_task(
         server
             .tasks
             .finish(&job_id, state, server.state.clock().now());
+        drop(permit);
         outcome.record(disposition).await;
     });
     server.tasks.set_abort(task_id, &job.abort_handle());
@@ -2549,22 +2550,27 @@ fn spawn_task(
     });
 }
 
-/// Dispatch a task's request. Returns its `CallToolResult`, and the guard
-/// and disposition for the outcome record. The caller writes the record after
-/// it stores the result.
+/// Dispatch a task's request. Returns its `CallToolResult`, the guard and
+/// disposition for the outcome record, and the buffer permit. The caller
+/// writes the record after it stores the result.
 async fn run_task(
     server: &McpServer,
     idx: usize,
     request: axum::extract::Request,
     mut outcome: OutcomeGuard,
-) -> (Value, OutcomeGuard, Disposition) {
+) -> (
+    Value,
+    OutcomeGuard,
+    Disposition,
+    Option<tokio::sync::SemaphorePermit<'_>>,
+) {
     let tool = &server.tools[idx];
     let response = match server.dispatch.clone().oneshot(request).await {
         Ok(resp) => resp,
         Err(e) => {
             outcome.status = Some(StatusCode::INTERNAL_SERVER_ERROR);
             let result = tool_error(&format!("dispatch failed: {e}"));
-            return (result, outcome, Disposition::Settled);
+            return (result, outcome, Disposition::Settled, None);
         }
     };
     let Dispatched {
@@ -2576,10 +2582,13 @@ async fn run_task(
     // A task has no HTTP response to carry `Set-Cookie` or `Server-Timing`.
     outcome.status = Some(status);
     outcome.request_id = request_id;
+    // Limit how many task results buffer at once. The caller keeps the
+    // permit until the result is stored.
+    let permit = server.tasks.buffer_permit().await;
     let (result, failure) =
         read_tool_result(tool, status, is_event_stream, response.into_body()).await;
     let disposition = failure.map_or(Disposition::Settled, Disposition::Buffered);
-    (result, outcome, disposition)
+    (result, outcome, disposition, permit)
 }
 
 /// Repackage a fully-buffered handler response as the JSON-RPC tool result.
