@@ -645,13 +645,24 @@ fn read_text(absolute: &Path) -> Option<String> {
         .map(|text| normalize(&text))
 }
 
+/// What the app-code codemods plan for one file.
+#[derive(Debug, Clone)]
+pub struct Planned {
+    /// The text the codemods read.
+    pub original: String,
+    /// The text the codemods write.
+    pub updated: String,
+}
+
 /// Reconcile `files` against what is on disk under `root`.
+///
+/// `migrated` maps each path the codemods rewrite to its plan.
 #[must_use]
 pub fn classify(
     root: &Path,
     files: &BTreeMap<&'static str, String>,
     manifest: Option<&Manifest>,
-    migrated: &BTreeSet<String>,
+    migrated: &BTreeMap<String, Planned>,
 ) -> Vec<Entry> {
     let recorded = |path: &str| manifest.and_then(|manifest| manifest.digests.get(path));
     let pinned = |path: &str| manifest.is_some_and(|manifest| manifest.pinned.contains(path));
@@ -661,12 +672,24 @@ pub fn classify(
         .map(|(path, template)| {
             let absolute = root.join(path);
             let current = read_current(root, path);
+            // A migrated file is judged by its planned text. In a preview, the
+            // old file is still on disk. In `--apply`, the new file is already
+            // there. Any other text is a later edit, so the disk wins.
+            let planned = migrated.get(*path);
+            let seen = match (&current, planned) {
+                (OnDisk::Text(text), Some(plan))
+                    if *text == normalize(&plan.original) || *text == normalize(&plan.updated) =>
+                {
+                    OnDisk::Text(normalize(&plan.updated))
+                }
+                _ => current.clone(),
+            };
             let normalized = normalize(template);
             let differs = |text: &str| {
                 let diff = super::diff::render(text, template);
                 (text != normalized, diff)
             };
-            let (status, diff) = match &current {
+            let (status, diff) = match &seen {
                 // Already what this release writes. Checked before anything
                 // else, including the pin: a pinned file that happens to match
                 // is current, not an exception.
@@ -692,14 +715,11 @@ pub fn classify(
                         .unwrap_or_default(),
                 ),
                 OnDisk::Text(text) => {
-                    let status = if migrated.contains(*path) {
-                        Status::Conflict(ConflictReason::MigratedThisRun)
-                    } else {
-                        match recorded(path) {
-                            Some(baseline) if *baseline == digest(text) => Status::Update,
-                            Some(_) => Status::Conflict(ConflictReason::Edited),
-                            None => Status::Conflict(ConflictReason::NoBaseline),
-                        }
+                    let status = match recorded(path) {
+                        _ if planned.is_some() => Status::Conflict(ConflictReason::MigratedThisRun),
+                        Some(baseline) if *baseline == digest(text) => Status::Update,
+                        Some(_) => Status::Conflict(ConflictReason::Edited),
+                        None => Status::Conflict(ConflictReason::NoBaseline),
                     };
                     (status, differs(text).1)
                 }
@@ -922,18 +942,24 @@ pub struct WriteFailure {
 /// 0.6.0 while rendering 0.7.0's files would simply be false.
 #[must_use]
 pub fn plan(root: &Path, target: &str) -> ScaffoldReport {
-    plan_after(root, target, &BTreeSet::new())
+    plan_after(root, target, &BTreeMap::new())
 }
 
 /// Plan a reconciliation, knowing which paths this run's app-code migrations
-/// have already rewritten.
+/// rewrite, and to what text.
 ///
 /// `build.rs` is both a framework-owned file and a `.rs` file the codemods
-/// scan, so one `--apply` can land on it twice. Told which files the first half
-/// touched, the second half reports them honestly instead of accusing the
-/// developer of an edit this command made moments earlier.
+/// scan, so one `--apply` can land on it twice. The map names the files the
+/// first half rewrites and gives their planned text. The second half reports
+/// those files honestly, and does not accuse the developer of an edit this
+/// command made moments earlier. The diff uses the planned text, so preview and
+/// apply show the same diff.
 #[must_use]
-pub fn plan_after(root: &Path, _target: &str, migrated: &BTreeSet<String>) -> ScaffoldReport {
+pub fn plan_after(
+    root: &Path,
+    _target: &str,
+    migrated: &BTreeMap<String, Planned>,
+) -> ScaffoldReport {
     let target = env!("CARGO_PKG_VERSION").to_owned();
     let manifest = Manifest::load(root);
     let options = resolve_options(root, manifest.as_ref());
@@ -2671,7 +2697,7 @@ mod tests {
             &Status::Update
         );
 
-        let migrated: BTreeSet<String> = std::iter::once("build.rs".to_owned()).collect();
+        let migrated = BTreeMap::from([("build.rs".to_owned(), plan_of(stale, stale))]);
         let previewed = plan_after(tmp.path(), "0.7.0", &migrated);
         assert_eq!(
             status_of(&previewed.entries, "build.rs"),
@@ -2683,6 +2709,143 @@ mod tests {
                 .iter()
                 .any(|entry| entry.path == "build.rs"),
             "a file the codemods rewrite is never a writable scaffold update"
+        );
+    }
+
+    #[test]
+    fn a_preview_and_an_apply_show_the_same_build_rs_diff() {
+        // The codemods change `build.rs`. Its template has also changed. A
+        // preview reads the old bytes from disk. `--apply` reads the new bytes.
+        // Both must diff the planned bytes.
+        let tmp = scaffolded(GenerateOptions::default());
+        let before = "fn main() { old_call(); }\n";
+        let after = "fn main() { new_call(); }\n";
+        write(tmp.path(), "build.rs", before);
+        let migrated = BTreeMap::from([("build.rs".to_owned(), plan_of(before, after))]);
+
+        let preview = plan_after(tmp.path(), "0.7.0", &migrated);
+        write(tmp.path(), "build.rs", after);
+        let apply = plan_after(tmp.path(), "0.7.0", &migrated);
+
+        let diff_of = |report: &ScaffoldReport| {
+            report
+                .entries
+                .iter()
+                .find(|entry| entry.path == "build.rs")
+                .unwrap()
+                .diff
+                .clone()
+        };
+        assert_eq!(diff_of(&preview), diff_of(&apply));
+        assert!(diff_of(&preview).contains("new_call"));
+        assert!(!diff_of(&preview).contains("old_call"));
+    }
+
+    fn plan_of(original: &str, updated: &str) -> Planned {
+        Planned {
+            original: original.to_owned(),
+            updated: updated.to_owned(),
+        }
+    }
+
+    /// The verdict for `build.rs` before and after the codemods write it.
+    fn build_rs_verdicts(before: &str, planned: &str) -> (Status, Status) {
+        let tmp = scaffolded(GenerateOptions::default());
+        write(tmp.path(), "build.rs", before);
+        let migrated = BTreeMap::from([("build.rs".to_owned(), plan_of(before, planned))]);
+        let verdict = |tmp: &TempDir| {
+            let report = plan_after(tmp.path(), "0.7.0", &migrated);
+            *status_of(&report.entries, "build.rs")
+        };
+        let preview = verdict(&tmp);
+        write(tmp.path(), "build.rs", planned);
+        (preview, verdict(&tmp))
+    }
+
+    #[test]
+    fn a_codemod_that_reaches_the_template_is_up_to_date_in_both_modes() {
+        let template = current_files(
+            scaffolded(GenerateOptions::default()).path(),
+            GenerateOptions::default(),
+        )
+        .unwrap()["build.rs"]
+            .clone();
+        let (preview, apply) = build_rs_verdicts("fn main() { old_call(); }\n", &template);
+        assert_eq!(preview, Status::UpToDate);
+        assert_eq!(apply, Status::UpToDate);
+    }
+
+    #[test]
+    fn a_codemod_that_leaves_the_template_is_a_conflict_in_both_modes() {
+        let template = current_files(
+            scaffolded(GenerateOptions::default()).path(),
+            GenerateOptions::default(),
+        )
+        .unwrap()["build.rs"]
+            .clone();
+        let (preview, apply) = build_rs_verdicts(&template, "fn main() { new_call(); }\n");
+        let conflict = Status::Conflict(ConflictReason::MigratedThisRun);
+        assert_eq!(preview, conflict);
+        assert_eq!(apply, conflict);
+    }
+
+    #[test]
+    fn a_crlf_planned_text_diffs_like_its_lf_form() {
+        let tmp = scaffolded(GenerateOptions::default());
+        write(tmp.path(), "build.rs", "fn main() { old_call(); }\n");
+        let diff = |planned: &str| {
+            let migrated = BTreeMap::from([(
+                "build.rs".to_owned(),
+                plan_of("fn main() { old_call(); }\n", planned),
+            )]);
+            let report = plan_after(tmp.path(), "0.7.0", &migrated);
+            report
+                .entries
+                .into_iter()
+                .find(|entry| entry.path == "build.rs")
+                .unwrap()
+                .diff
+        };
+        let lf = diff("fn main() { new_call(); }\n");
+        assert_eq!(lf, diff("fn main() { new_call(); }\r\n"));
+        assert!(!lf.contains('\r'));
+    }
+
+    #[test]
+    fn a_file_changed_after_the_scan_keeps_its_real_diff() {
+        // The plan names neither the bytes on disk nor the bytes it writes. The
+        // report must not claim `up to date` for a file nobody wrote.
+        let tmp = scaffolded(GenerateOptions::default());
+        let template =
+            current_files(tmp.path(), GenerateOptions::default()).unwrap()["build.rs"].clone();
+        write(tmp.path(), "build.rs", "fn main() { edited_since(); }\n");
+        let migrated = BTreeMap::from([(
+            "build.rs".to_owned(),
+            plan_of("fn main() { old_call(); }\n", &template),
+        )]);
+        let report = plan_after(tmp.path(), "0.7.0", &migrated);
+        let entry = report
+            .entries
+            .iter()
+            .find(|entry| entry.path == "build.rs")
+            .unwrap();
+        assert_eq!(
+            entry.status,
+            Status::Conflict(ConflictReason::MigratedThisRun)
+        );
+        assert!(entry.diff.contains("edited_since"));
+    }
+
+    #[test]
+    fn a_migrated_path_the_scaffold_does_not_own_is_ignored() {
+        let tmp = scaffolded(GenerateOptions::default());
+        let migrated = BTreeMap::from([("src/main.rs".to_owned(), plan_of("", "fn main() {}\n"))]);
+        let report = plan_after(tmp.path(), "0.7.0", &migrated);
+        assert!(
+            report
+                .entries
+                .iter()
+                .all(|entry| entry.path != "src/main.rs")
         );
     }
 
