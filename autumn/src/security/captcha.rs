@@ -226,6 +226,17 @@ impl TurnstileProvider {
 impl CaptchaProvider for TurnstileProvider {
     fn verify<'a>(&'a self, token: &'a str) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
+            // This client is not the recorded outbound seam (#2351 item 1).
+            #[cfg(feature = "reporting")]
+            if crate::capsule::guard_egress(
+                "captcha",
+                "POST",
+                "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+            )
+            .is_err()
+            {
+                return false;
+            }
             let params = [("secret", self.secret_key.as_str()), ("response", token)];
             match self
                 .client
@@ -290,6 +301,17 @@ impl HCaptchaProvider {
 impl CaptchaProvider for HCaptchaProvider {
     fn verify<'a>(&'a self, token: &'a str) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
+            // This client is not the recorded outbound seam (#2351 item 1).
+            #[cfg(feature = "reporting")]
+            if crate::capsule::guard_egress(
+                "captcha",
+                "POST",
+                "https://api.hcaptcha.com/siteverify",
+            )
+            .is_err()
+            {
+                return false;
+            }
             let params = [("secret", self.secret_key.as_str()), ("response", token)];
             match self
                 .client

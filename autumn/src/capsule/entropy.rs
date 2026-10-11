@@ -97,6 +97,11 @@ impl Entropy for RecordingEntropy {
 pub struct ReplayEntropy {
     draws: Mutex<VecDeque<Vec<u8>>>,
     over_draws: AtomicUsize,
+    /// Draws consumed so far, for the position a width mismatch reports.
+    consumed: AtomicUsize,
+    /// `(position, recorded width, requested width)` of each draw whose width
+    /// differed from the recording (#2351 item 11).
+    width_mismatches: Mutex<Vec<(usize, usize, usize)>>,
 }
 
 impl ReplayEntropy {
@@ -106,7 +111,19 @@ impl ReplayEntropy {
         Self {
             draws: Mutex::new(draws.into()),
             over_draws: AtomicUsize::new(0),
+            consumed: AtomicUsize::new(0),
+            width_mismatches: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Each draw whose width differed from the recording, as
+    /// `(position, recorded width, requested width)`.
+    #[must_use]
+    pub fn width_mismatches(&self) -> Vec<(usize, usize, usize)> {
+        self.width_mismatches
+            .lock()
+            .map(|mismatches| mismatches.clone())
+            .unwrap_or_default()
     }
 
     /// How many draws the replayed run made past the end of the recording.
@@ -123,7 +140,11 @@ impl ReplayEntropy {
 
     /// The next recorded draw, or `None` when the tape is exhausted or this
     /// task is not the replayed request.
-    fn next_draw(&self) -> Option<Vec<u8>> {
+    ///
+    /// `width` is the number of bytes the caller asked for. A recorded draw of
+    /// another width is still consumed, so later draws stay aligned, and the
+    /// mismatch is kept for the verdict.
+    fn next_draw(&self, width: usize) -> Option<Vec<u8>> {
         if !crate::capsule::clock::in_replay_request() {
             return None;
         }
@@ -133,13 +154,20 @@ impl ReplayEntropy {
             self.over_draws.fetch_add(1, Ordering::SeqCst);
             return None;
         };
+        drop(draws);
+        let position = self.consumed.fetch_add(1, Ordering::SeqCst);
+        if bytes.len() != width
+            && let Ok(mut mismatches) = self.width_mismatches.lock()
+        {
+            mismatches.push((position, bytes.len(), width));
+        }
         Some(bytes)
     }
 }
 
 impl Entropy for ReplayEntropy {
     fn next_u64(&self) -> u64 {
-        let Some(bytes) = self.next_draw() else {
+        let Some(bytes) = self.next_draw(8) else {
             return 0;
         };
         let mut buf = [0u8; 8];
@@ -155,7 +183,7 @@ impl Entropy for ReplayEntropy {
         // deterministic, it is obviously not real randomness in a debugger,
         // and the over-draw counter makes the verdict say so out loud.
         dest.fill(0);
-        let Some(bytes) = self.next_draw() else {
+        let Some(bytes) = self.next_draw(dest.len()) else {
             return;
         };
         let take = dest.len().min(bytes.len());

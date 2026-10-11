@@ -229,6 +229,16 @@ async fn abort_multipart(client: &Client, bucket: &str, key: &str, upload_id: &s
         .await;
 }
 
+/// Check S3 egress against a failure capsule.
+///
+/// This client is not autumn-web's recorded outbound seam. A capsule replay
+/// refuses the call, and capture marks the capsule incomplete.
+fn guard_egress(method: &str) -> Result<(), BlobStoreError> {
+    // The target does not name the object: a key can hold personal data.
+    autumn_web::capsule::guard_egress("s3 blob store", method, "s3 object")
+        .map_err(|refused| BlobStoreError::backend(refused.to_string()))
+}
+
 impl BlobStore for S3BlobStore {
     fn provider_id(&self) -> &str {
         &self.options.provider_id
@@ -243,6 +253,7 @@ impl BlobStore for S3BlobStore {
         let byte_size = bytes.len() as u64;
         Box::pin(async move {
             validate_key(key)?;
+            guard_egress("PUT")?;
             let result = self
                 .client
                 .put_object()
@@ -271,6 +282,7 @@ impl BlobStore for S3BlobStore {
         let byte_size = bytes.len() as u64;
         Box::pin(async move {
             validate_key(key)?;
+            guard_egress("PUT")?;
             // `If-None-Match: *` makes S3 refuse the write (412) when the key
             // exists, so a blob of another writer is never replaced. A 409
             // means a parallel conditional write: the key is taken too.
@@ -333,6 +345,10 @@ impl BlobStore for S3BlobStore {
                     }
                 }
             }
+
+            // Not before the stream is read: a stream that fails first sends
+            // nothing. A short stream is guarded in `put`.
+            guard_egress("PUT")?;
 
             // The stream exceeded MULTIPART_PART_SIZE — use S3 multipart upload
             // so the payload is never fully buffered in memory.
@@ -455,6 +471,7 @@ impl BlobStore for S3BlobStore {
     fn get<'a>(&'a self, key: &'a str) -> BlobFuture<'a, Bytes> {
         Box::pin(async move {
             validate_key(key)?;
+            guard_egress("GET")?;
             let result = self
                 .client
                 .get_object()
@@ -482,6 +499,7 @@ impl BlobStore for S3BlobStore {
     fn delete<'a>(&'a self, key: &'a str) -> BlobFuture<'a, ()> {
         Box::pin(async move {
             validate_key(key)?;
+            guard_egress("DELETE")?;
             self.client
                 .delete_object()
                 .bucket(&self.options.bucket)
@@ -496,6 +514,7 @@ impl BlobStore for S3BlobStore {
     fn head<'a>(&'a self, key: &'a str) -> BlobFuture<'a, Option<BlobMeta>> {
         Box::pin(async move {
             validate_key(key)?;
+            guard_egress("HEAD")?;
             let result = self
                 .client
                 .head_object()
@@ -978,6 +997,50 @@ mod tests {
                 .presigned_url("avatars//user.png", Duration::from_secs(60))
                 .await,
         );
+    }
+
+    /// autumn-web #2351 item 1: under a capsule replay the store refuses to
+    /// call S3, and logs a divergence.
+    #[tokio::test]
+    async fn a_capsule_replay_refuses_s3_egress() {
+        let store = test_store();
+        let tape = std::sync::Arc::new(autumn_web::capsule::ReplayEffects::new(
+            autumn_web::capsule::CapsuleEffects::default(),
+        ));
+        let result =
+            autumn_web::capsule::with_effect_tape(std::sync::Arc::clone(&tape), store.get("a.txt"))
+                .await;
+        let error = result.expect_err("a replay refuses S3 egress");
+        assert!(
+            error.to_string().contains("blocked during replay"),
+            "{error}"
+        );
+        assert_eq!(tape.divergences().len(), 1);
+    }
+
+    /// autumn-web #2351, Codex review on #3222: a stream that fails before
+    /// the multipart threshold sends nothing, so a replay does not refuse it.
+    #[tokio::test]
+    async fn a_stream_error_before_any_upload_is_not_egress() {
+        let store = test_store();
+        let tape = std::sync::Arc::new(autumn_web::capsule::ReplayEffects::new(
+            autumn_web::capsule::CapsuleEffects::default(),
+        ));
+        let stream: autumn_web::storage::ByteStream<'_> =
+            Box::pin(futures::stream::iter(vec![Err(BlobStoreError::backend(
+                "the upload body failed",
+            ))]));
+        let result = autumn_web::capsule::with_effect_tape(
+            std::sync::Arc::clone(&tape),
+            store.put_stream("a.txt", "text/plain", stream),
+        )
+        .await;
+        let error = result.expect_err("the stream failed");
+        assert!(
+            error.to_string().contains("the upload body failed"),
+            "{error}"
+        );
+        assert!(tape.divergences().is_empty(), "{:?}", tape.divergences());
     }
 
     #[test]

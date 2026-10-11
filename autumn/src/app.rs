@@ -4474,6 +4474,8 @@ impl AppBuilder {
         #[cfg(feature = "db")]
         apply_replica_migration_readiness(&state, replica_readiness);
         if let Some(cache) = cache_backend {
+            // Wrapped once, so the global and the state hold the same `Arc`.
+            let cache = crate::cache::with_capsule_seam(cache);
             crate::cache::set_global_cache(cache.clone());
             state.shared_cache = Some(cache);
         } else {
@@ -6533,6 +6535,8 @@ impl AppBuilder {
         #[cfg(feature = "db")]
         apply_replica_migration_readiness(&state, replica_readiness);
         if let Some(cache) = cache_backend {
+            // Wrapped once, so the global and the state hold the same `Arc`.
+            let cache = crate::cache::with_capsule_seam(cache);
             crate::cache::set_global_cache(cache.clone());
             state.shared_cache = Some(cache);
         } else {
@@ -8098,6 +8102,8 @@ impl AppBuilder {
         #[cfg(feature = "db")]
         apply_replica_migration_readiness(&state, replica_readiness);
         if let Some(cache) = cache_backend {
+            // Wrapped once, so the global and the state hold the same `Arc`.
+            let cache = crate::cache::with_capsule_seam(cache);
             crate::cache::set_global_cache(cache.clone());
             state.shared_cache = Some(cache);
         } else {
@@ -8355,11 +8361,13 @@ impl AppBuilder {
     ///   request to a live service.
     /// * No job runtime, no scheduler, no startup/shutdown hooks, and only
     ///   *sync* event listeners (a durable listener needs the job runtime).
-    /// * No storage preflight, no mailer, no fail-fast configuration gates: a
-    ///   machine replaying a production capsule generally has none of that
-    ///   configured, and none of it is on the recorded path. A handler that
-    ///   extracts one of those subsystems is reported as a mismatch rather than
-    ///   killing the replay.
+    /// * A replay mailer, whose sends are served from the capsule and never
+    ///   delivered (`mail::install_replay_mailer`).
+    /// * No storage preflight, no fail-fast configuration gates: a machine
+    ///   replaying a production capsule generally has none of that configured,
+    ///   and none of it is on the recorded path. A handler that extracts one of
+    ///   those subsystems is reported as a mismatch rather than killing the
+    ///   replay.
     /// * No port is bound.
     #[cfg(feature = "reporting")]
     #[allow(clippy::too_many_lines)]
@@ -8422,14 +8430,28 @@ impl AppBuilder {
             #[cfg(all(feature = "embed-assets", feature = "i18n"))]
             embedded_locales,
             plugin_config_roots,
+            // Read only for whether it is set: calling it could reach a live
+            // queue. The replay mailer gets a refusing queue in its place.
+            #[cfg(feature = "mail")]
+            mail_delivery_queue_factory,
+            // Read only for whether it is set: replay builds no cache backend.
+            cache_backend,
             ..
         } = self;
+        #[cfg(feature = "mail")]
+        let builder_mail_queue = mail_delivery_queue_factory.is_some();
 
         // Nothing outside the capsule may be reached from here on: the router
         // this rebuilds is the real one, with the application's real outbound
         // HTTP client in its state (AC4).
         #[cfg(feature = "http-client")]
         crate::http_client::block_outbound_for_replay();
+        // Egress outside the HTTP client (`capsule::guard_egress`), in every
+        // build.
+        crate::capsule::boundary::block_egress_for_replay();
+        // A cache call with no tape (a state initializer) must not reach a
+        // live backend either.
+        crate::cache::block_backends_for_replay();
 
         let path = std::path::PathBuf::from(&capsule_path);
         let capsule = match crate::capsule::load_capsule(&path) {
@@ -8530,7 +8552,9 @@ impl AppBuilder {
         if let Some(interceptor) = db_interceptor {
             state.insert_extension(interceptor);
         }
-        crate::cache::clear_global_cache();
+        // In place of the builder's backend, which replay does not build: in
+        // the global cache and the state, as `with_cache_backend` does.
+        state.shared_cache = crate::cache::install_replay_cache(cache_backend.is_some());
 
         for register in policy_registrations {
             register(state.policy_registry());
@@ -8541,7 +8565,25 @@ impl AppBuilder {
             install_i18n_bundle_layer(custom_layers, &state, i18n_bundle, &config.i18n);
 
         install_webhook_registry(&state, &config);
+        // Production's `outbox::install` gives `deliver_later` a queue when
+        // `outbox.enabled` and the app has a database. Replay runs no relay,
+        // so the replay mailer stands in for that queue too.
+        #[cfg(all(feature = "mail", feature = "db"))]
+        let builder_mail_queue =
+            builder_mail_queue || crate::outbox::installs_mail_queue(&state, &config.outbox);
+        // Before the initializers, as production installs its mailer, so an
+        // initializer that reads the `Mailer` sees the same configuration.
+        #[cfg(feature = "mail")]
+        crate::mail::install_replay_mailer(&state, &config.mail, builder_mail_queue);
         run_state_initializers(state_initializers, &state);
+        // Again after the initializers, so it replaces a live `Mailer` one of
+        // them installed; before the router state is cloned, so a job replay
+        // gets it too (#2351 item 7).
+        #[cfg(feature = "mail")]
+        crate::mail::install_replay_mailer(&state, &config.mail, builder_mail_queue);
+        // After the initializers: a cache that only a startup hook installed,
+        // which replay does not run. Production's initializers did not see it.
+        crate::cache::install_late_replay_cache(&state, &capsule.effects);
         crate::cost::install(&state, &config);
         // Durable listeners need the job runtime this path never starts, so —
         // as in static builds — only sync listeners are registered, and a
@@ -9336,6 +9378,8 @@ fn force_offline_replay_config(config: &mut AutumnConfig) {
     // the debugging session. A per-route `#[timeout(...)]` override still applies —
     // it is part of the route table, not the configuration.
     config.server.timeouts.request_timeout_ms = None;
+    // A shadow mirror has its own client and is not a handler effect.
+    config.shadow.enabled = false;
 }
 
 /// The database topology a replay runs against: an in-process pool answering
@@ -17888,6 +17932,14 @@ mod tests {
             "the replay handler must block outbound HTTP before rebuilding the app"
         );
         assert!(
+            handler.contains("crate::capsule::boundary::block_egress_for_replay();"),
+            "the replay handler must block egress outside the HTTP client in every build"
+        );
+        assert!(
+            handler.contains("crate::cache::block_backends_for_replay();"),
+            "the replay handler must keep every cache backend offline"
+        );
+        assert!(
             handler.contains("channels_backend: _replay_ignores_custom_channels_backend,"),
             "the replay handler must drop a custom channels backend, which outranks the \
              forced in-process one"
@@ -17914,6 +17966,66 @@ mod tests {
             forcer.contains("config.server.timeouts.request_timeout_ms = None;"),
             "replay must clear the wall-clock request deadline"
         );
+        // #2351 item 1: a shadow mirror has its own client and is not a
+        // handler effect.
+        assert!(
+            forcer.contains("config.shadow.enabled = false;"),
+            "replay must not mirror traffic to a shadow target"
+        );
+    }
+
+    /// #2351 item 7: a replayed mail-sending route reaches the mail seam. The
+    /// replay installs a mailer whose sends are served from the tape.
+    #[cfg(all(feature = "reporting", feature = "mail"))]
+    #[test]
+    fn replay_installs_a_tape_backed_mailer() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let handler = replay_mode_source(&source);
+        let install =
+            "crate::mail::install_replay_mailer(&state, &config.mail, builder_mail_queue);";
+        assert!(
+            handler.contains(install),
+            "the replay handler must install the tape-backed mailer"
+        );
+        // Codex review on #3222: production installs the mailer before the
+        // state initializers, so an initializer can read it. Replay does too,
+        // and again after them, to replace a live one an initializer installed.
+        let initializers = handler
+            .find("run_state_initializers(state_initializers, &state);")
+            .expect("the replay handler runs the state initializers");
+        let first = handler.find(install).expect("installed");
+        let last = handler.rfind(install).expect("installed");
+        assert!(first < initializers, "installed before the initializers");
+        assert!(last > initializers, "and again after them");
+        // Codex review on #3222: with `outbox.enabled`, production's mailer
+        // has the outbox's queue. Replay counts it before the first install.
+        #[cfg(feature = "db")]
+        {
+            let outbox = handler
+                .find("crate::outbox::installs_mail_queue(&state, &config.outbox)")
+                .expect("the replay handler counts the outbox's mail queue");
+            assert!(outbox < first, "counted before the mailer is installed");
+        }
+    }
+
+    /// Codex review on #3222: replay installs a builder's cache before the
+    /// state initializers, and a startup hook's cache after them, as
+    /// production did.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn replay_installs_each_cache_where_production_did() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let handler = replay_mode_source(&source);
+        let initializers = handler
+            .find("run_state_initializers(state_initializers, &state);")
+            .expect("the replay handler runs the state initializers");
+        let builder = handler
+            .find("crate::cache::install_replay_cache(cache_backend.is_some())")
+            .expect("installs a builder's cache");
+        let late = handler
+            .find("crate::cache::install_late_replay_cache(&state, &capsule.effects)")
+            .expect("installs a startup hook's cache");
+        assert!(builder < initializers && late > initializers);
     }
 
     /// The knobs the helper forces, checked on a real configuration rather than

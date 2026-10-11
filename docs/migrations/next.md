@@ -1059,6 +1059,65 @@ let stats = autumn_web::shadow::ShadowStats {
 **Automation:** `manual` - the fix adds a struct update expression, and no
 codemod rewrites struct literals.
 
+### Capsules: new `CacheEffect` and `EffectSeam` variants, new `JobEffect` and `CapsuleEffects` fields
+
+**Why:** issue #2351 adds cache removals and random-draw widths to the capsule
+seam. It also records the deadline of an `enqueue_at` call when the deadline
+is already past, and the HTTP status of a failed enqueue. These types (feature `reporting`) are public and are not
+`#[non_exhaustive]`.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::capsule::{CacheEffect, JobEffect};
+
+fn key(effect: &CacheEffect) -> &str {
+    match effect {
+        CacheEffect::Get { key, .. } | CacheEffect::Insert { key, .. } => key,
+    }
+}
+
+let job = JobEffect {
+    name: "send_receipt".to_owned(),
+    payload: serde_json::json!({}),
+    delay_secs: None,
+    due_at: None,
+    error: None,
+};
+```
+
+**After (`{(X+1).0}`):** match the new variants, or call `CacheEffect::key`.
+Add `..JobEffect::default()` to a struct literal.
+
+```rust
+use autumn_web::capsule::{CacheEffect, JobEffect};
+
+fn key(effect: &CacheEffect) -> &str {
+    effect.key()
+}
+
+let job = JobEffect {
+    name: "send_receipt".to_owned(),
+    payload: serde_json::json!({}),
+    ..JobEffect::default()
+};
+```
+
+The new variants are `CacheEffect::Invalidate`, `CacheEffect::InvalidateNamespace`,
+`CacheEffect::Clear`, `EffectSeam::Random`, `EffectSeam::Detached` and
+`MailErrorKind::NoDurableQueueInProduction`. An exhaustive `match` on
+`EffectSeam` or `MailErrorKind` needs a new arm.
+
+`CapsuleEffects` has a new field `state_cache`. A struct literal of
+`CapsuleEffects` needs `..CapsuleEffects::default()`.
+
+`CAPSULE_FORMAT_VERSION` is now 4. An older build refuses a version 4 capsule
+with a version mismatch. This build reads a version 3 capsule and replays it
+with the version 3 rules, so a committed corpus keeps its verdicts. Re-record
+a capsule to get the new checks.
+
+**Automation:** `manual` - a codemod cannot know what a new match arm must do.
+
 ---
 
 ## Plugin authors

@@ -94,6 +94,33 @@ fn relay_lists_built_in_and_app_topics() {
     assert!(relay.topics_in_list.contains("'autumn.job'"));
 }
 
+/// Codex review on #3222: replay installs no relay, so it asks whether
+/// `install` would have given `deliver_later` a queue, as production did
+/// with `outbox.enabled` and a database.
+#[cfg(all(feature = "mail", feature = "reporting"))]
+#[test]
+fn replay_knows_when_install_gives_mail_a_queue() {
+    let pool = crate::db::create_pool(&crate::config::DatabaseConfig {
+        primary_url: Some(crate::test_urls::primary("unused")),
+        ..crate::config::DatabaseConfig::default()
+    })
+    .expect("pool builds")
+    .expect("url present => Some(pool)");
+    let enabled = OutboxConfig {
+        enabled: true,
+        ..OutboxConfig::default()
+    };
+    assert!(installs_mail_queue(
+        &AppState::for_test().with_pool(pool.clone()),
+        &enabled
+    ));
+    assert!(!installs_mail_queue(&AppState::for_test(), &enabled));
+    assert!(!installs_mail_queue(
+        &AppState::for_test().with_pool(pool),
+        &OutboxConfig::default()
+    ));
+}
+
 #[test]
 fn install_without_enabled_installs_nothing() {
     let state = AppState::for_test();
