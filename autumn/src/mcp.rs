@@ -2153,6 +2153,23 @@ impl Dispatched {
     }
 }
 
+/// Write the [`Dispatched::replayed`] headers onto the rebuilt `/mcp`
+/// response. A paid call's challenge or receipt also carries x402's
+/// `private, no-store`, so the paid result is not cached.
+fn apply_replayed(headers: &mut HeaderMap, replayed: Vec<(HeaderName, HeaderValue)>) {
+    let mut paid = false;
+    for (name, value) in replayed {
+        paid |= name.as_str().starts_with("payment-");
+        headers.append(name, value);
+    }
+    if paid {
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+    }
+}
+
 /// Dispatch a `tools/call` through the real router and shape the response as an
 /// MCP tool result — buffered JSON for an ordinary tool, or a progressive SSE
 /// stream for a `#[api_doc(mcp, stream)]` tool whose handler returns `Sse`.
@@ -2315,9 +2332,7 @@ async fn buffered_tool_response(
             // The handler already ran: its cookies and an x402 receipt for a
             // payment already settled still reach the client.
             let mut resp = json_response(&success(id, tool_error(&message)));
-            for (name, value) in replayed {
-                resp.headers_mut().append(name, value);
-            }
+            apply_replayed(resp.headers_mut(), replayed);
             return (resp, Some(failure));
         }
     };
@@ -2332,9 +2347,7 @@ async fn buffered_tool_response(
 
     let value = buffered_tool_result(tool, id, status, &text);
     let mut resp = json_response(&value);
-    for (name, value) in replayed {
-        resp.headers_mut().append(name, value);
-    }
+    apply_replayed(resp.headers_mut(), replayed);
     // Forward only the inner dispatch's non-`total` `Server-Timing` metrics
     // (e.g. `db;dur=…;desc="N queries"`) onto the rebuilt response, dropping the
     // inner `total`. That inner `total` measured only the dispatch clone; it was
@@ -2547,9 +2560,7 @@ fn stream_tool_result(
     let mut resp = Sse::new(stream)
         .keep_alive(crate::sse::keep_alive())
         .into_response();
-    for (name, value) in replayed {
-        resp.headers_mut().append(name, value);
-    }
+    apply_replayed(resp.headers_mut(), replayed);
     resp
 }
 
@@ -4449,6 +4460,45 @@ mod tests {
             buffered_tool_response(&t, json!(1), StatusCode::OK, false, replayed, response).await;
         assert!(failure.is_some());
         assert_eq!(resp.headers()["payment-response"], "receipt");
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "private, no-store");
+    }
+
+    /// Codex review (P2): a paid tool result keeps x402's `no-store`, on the
+    /// buffered and the streamed response alike; an unpaid one is untouched.
+    #[tokio::test]
+    async fn a_paid_tool_result_is_not_cached() {
+        let t = tool("GET", "/api/report", false, false);
+        let response = Response::builder()
+            .header("payment-response", "receipt")
+            .body(Body::from("{}"))
+            .unwrap();
+        let replayed = Dispatched::inspect(&response).replayed;
+        let (resp, _) =
+            buffered_tool_response(&t, json!(1), StatusCode::OK, false, replayed, response).await;
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "private, no-store");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        apply_replayed(
+            &mut headers,
+            vec![(
+                HeaderName::from_static("payment-required"),
+                HeaderValue::from_static("challenge"),
+            )],
+        );
+        assert_eq!(
+            headers
+                .get_all(header::CACHE_CONTROL)
+                .iter()
+                .collect::<Vec<_>>(),
+            ["private, no-store"]
+        );
+
+        let response = Response::builder().body(Body::from("{}")).unwrap();
+        let replayed = Dispatched::inspect(&response).replayed;
+        let (resp, _) =
+            buffered_tool_response(&t, json!(1), StatusCode::OK, false, replayed, response).await;
+        assert!(resp.headers().get(header::CACHE_CONTROL).is_none());
     }
 
     /// A trusted-Host policy that trusts the given hosts (plus dev loopback,

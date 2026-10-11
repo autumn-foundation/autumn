@@ -1537,12 +1537,36 @@ fn auth_md(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
             origin.url(OAUTH_SERVER_PATH)
         );
     }
-    md.push_str("\n## Pick a method\n\n- `api_key`: a bearer API token.\n");
-    if !oauth.authorization_servers.is_empty() {
+    // The issuers an agent can get an access token from: the configured
+    // ones, and this site when it publishes its own metadata.
+    let issuer = local_issuer(facts, origin);
+    let mut servers: Vec<&str> = oauth
+        .authorization_servers
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if let Some(issuer) = issuer.filter(|i| !servers.contains(i)) {
+        servers.push(issuer);
+    }
+    let agent = &oauth.authorization_server;
+    let agent_types: &[String] = if issuer.is_some() {
+        &agent.agent_credential_types
+    } else {
+        &[]
+    };
+    // An API key only when the site hands one out: its own issuer says so,
+    // or a registration page is the only way in.
+    let api_key = agent_types.iter().any(|t| t == "api_key")
+        || (servers.is_empty() && facts.auth_md.registration_url.is_some());
+    md.push_str("\n## Pick a method\n\n");
+    if api_key {
+        md.push_str("- `api_key`: a bearer API token.\n");
+    }
+    if !servers.is_empty() {
         let _ = write!(
             md,
             "- `oauth2`: an access token from {}.",
-            oauth.authorization_servers.join(", ")
+            servers.join(", ")
         );
         if !oauth.scopes_supported.is_empty() {
             let _ = write!(md, " Scopes: `{}`.", oauth.scopes_supported.join("`, `"));
@@ -1550,11 +1574,18 @@ fn auth_md(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
         md.push('\n');
     }
     md.push_str("\n## Register\n\n");
-    match &facts.auth_md.registration_url {
-        Some(url) => {
-            let _ = writeln!(md, "Get a credential at {url}.");
-        }
-        None => md.push_str("Ask the site operator for an API token.\n"),
+    let identity = issuer.and(agent.agent_identity_endpoint.as_deref());
+    let client_registration = issuer.and(agent.registration_endpoint.as_deref());
+    if let Some(url) = &facts.auth_md.registration_url {
+        let _ = writeln!(md, "Get a credential at {url}.");
+    } else if let Some(url) = identity {
+        let _ = writeln!(md, "Register the agent at {url}.");
+    } else if let Some(url) = client_registration {
+        let _ = writeln!(md, "Register an OAuth client at {url}.");
+    } else if api_key {
+        md.push_str("Ask the site operator for an API token.\n");
+    } else {
+        md.push_str("Get an access token from the authorization server above.\n");
     }
     if let Some(extra) = facts.auth_md.instructions.as_deref() {
         let _ = writeln!(md, "\n{}", extra.trim());
@@ -2357,6 +2388,44 @@ mod tests {
         assert!(render(&facts, &api_host, OAUTH_SERVER_PATH).is_none());
         let auth_host = Origin::resolve(None, Some("auth.example"));
         assert!(render(&facts, &auth_host, OAUTH_SERVER_PATH).is_some());
+    }
+
+    /// Codex review (P2): `/auth.md` lists only the methods the site has.
+    #[test]
+    fn auth_md_offers_only_configured_methods() {
+        let mut facts = api_site();
+        facts.oauth.authorization_servers = vec!["https://auth.example.com".to_owned()];
+        let body = render(&facts, &origin(), AUTH_MD_PATH).unwrap().body;
+        assert!(!body.contains("api_key"), "{body}");
+        assert!(!body.contains("API token"), "{body}");
+        assert!(
+            body.contains("- `oauth2`: an access token from https://auth.example.com."),
+            "{body}"
+        );
+
+        // This site as issuer, handing out API keys to registered agents.
+        let mut facts = api_site();
+        let c = &mut facts.oauth.authorization_server;
+        c.issuer = Some("https://shop.example.com".to_owned());
+        c.agent_identity_endpoint = Some("https://shop.example.com/agent/identity".to_owned());
+        c.agent_credential_types = vec!["api_key".to_owned()];
+        let body = render(&facts, &origin(), AUTH_MD_PATH).unwrap().body;
+        assert!(body.contains("- `api_key`"), "{body}");
+        assert!(
+            body.contains("- `oauth2`: an access token from https://shop.example.com."),
+            "{body}"
+        );
+        assert!(
+            body.contains("Register the agent at https://shop.example.com/agent/identity."),
+            "{body}"
+        );
+
+        // A token page and no OAuth: the page hands out API tokens.
+        let mut facts = api_site();
+        facts.auth_md.registration_url = Some("https://shop.example.com/tokens".to_owned());
+        let body = render(&facts, &origin(), AUTH_MD_PATH).unwrap().body;
+        assert!(body.contains("- `api_key`"), "{body}");
+        assert!(!body.contains("oauth2"), "{body}");
     }
 
     #[test]

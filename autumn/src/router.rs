@@ -1500,15 +1500,23 @@ fn build_aeo_site<O: AeoOpenApiFacts, M: AeoMcpFacts>(
     // An API-only app has no home page: list none rather than a `404`. A
     // merged router is opaque and may serve `/`, so with one the home page
     // is assumed to exist.
+    let routed_home = route_list
+        .iter()
+        .any(|r| r.method == http::Method::GET && r.path == "/");
     let has_home = merged_routers
-        || route_list
-            .iter()
-            .any(|r| r.method == http::Method::GET && r.path == "/")
+        || routed_home
         || scoped_groups.iter().any(|g| {
             g.routes.iter().any(|r| {
                 r.method == http::Method::GET && join_nested_path(&g.prefix, r.path) == "/"
             })
         });
+    // Only a `routes![...]` home is localized. A home from a scoped group or a
+    // merged router mounts outside the locale nests and answers at `/`.
+    let home_paths = if routed_home {
+        home_paths
+    } else {
+        vec!["/".to_owned()]
+    };
     let home_noindex = route_list.iter().any(|r| {
         r.method == http::Method::GET
             && r.path == "/"
@@ -9904,6 +9912,39 @@ mod tests {
 
             let target = request(&app, "/en/posts", &[]).await;
             assert_eq!(target.status(), StatusCode::OK);
+        }
+
+        /// Codex review (P2): a home page served only by a merged router
+        /// mounts outside the locale nests, so discovery lists `/`, not a
+        /// `/{locale}` home that does not exist.
+        #[test]
+        fn a_merged_router_home_stays_unprefixed() {
+            let config = config(&["en", "fr"], &[]);
+            let site = super::build_aeo_site::<(), ()>(
+                &config,
+                &test_state(),
+                &[simple_route("/posts", "posts", false)],
+                &[],
+                true,
+                None,
+                None,
+            );
+            assert_eq!(site.facts.home_paths, vec!["/".to_owned()]);
+            assert!(!site.facts.no_home);
+
+            let routed = super::build_aeo_site::<(), ()>(
+                &config,
+                &test_state(),
+                &[simple_route("/", "home", false)],
+                &[],
+                true,
+                None,
+                None,
+            );
+            assert_eq!(
+                routed.facts.home_paths,
+                vec!["/en".to_owned(), "/fr".to_owned()]
+            );
         }
 
         /// Routes registered via `AppBuilder::scoped()` are mounted by a

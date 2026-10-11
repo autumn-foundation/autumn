@@ -256,6 +256,13 @@ Autumn serves `/auth.md` when `[aeo.auth_md] registration_url` or OAuth
 settings give an agent a way to get a credential. `[aeo.auth_md] enabled =
 false` turns it off.
 
+`/auth.md` lists only the methods you configure. It lists `oauth2` when there
+is an authorization server, either `authorization_servers` or this site as the
+issuer. It lists `api_key` in two cases:
+
+- your issuer's `agent_credential_types` includes `api_key`;
+- `registration_url` is set and no OAuth is configured.
+
 ---
 
 ## WebMCP
