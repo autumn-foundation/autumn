@@ -31,4 +31,16 @@ mod tests {
         std::fs::write(tmp.path().join(".git"), "gitdir: elsewhere\n").unwrap();
         assert_eq!(find_git_root(tmp.path()).as_deref(), Some(tmp.path()));
     }
+
+    #[test]
+    fn the_nearest_root_wins() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let inner = tmp.path().join("sub");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join(".git"), "gitdir: elsewhere\n").unwrap();
+        let deep = inner.join("x");
+        std::fs::create_dir(&deep).unwrap();
+        assert_eq!(find_git_root(&deep).as_deref(), Some(inner.as_path()));
+    }
 }

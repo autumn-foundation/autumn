@@ -382,26 +382,26 @@ hatch.
 
 ### Inside a Cargo workspace
 
-If the project is a crate inside an enclosing workspace — meaning its own
-`Cargo.toml` has no `[workspace]` table of its own — the files that workspace
-owns at *its* root are out of scope here, and the report says so:
+Your crate may sit inside an enclosing workspace. Then its own `Cargo.toml`
+has no `[workspace]` table. Some files are out of scope, and the report says
+so:
 
 - `clippy.toml`, `rustfmt.toml` and `rust-toolchain.toml` are resolved from the
-  nearest ancestor of the crate being built, so a crate-local copy does not add
-  to the workspace's — it **shadows** it, silently dropping its lints and its
-  MSRV pin with no diagnostic.
-- GitHub runs workflows from the **git root**, not the Cargo root. If the
-  crate is not its own git root, its `.github/workflows/ci.yml` and
-  `posture-gate.yml` never run, so they are out of scope.
+  nearest ancestor of the crate. A crate-local copy does not add to the
+  workspace's copy. It **shadows** it, and drops its lints and MSRV pin with no
+  diagnostic.
+- GitHub runs workflows from the **git root**, not the Cargo root. If the crate
+  is not its own git root, GitHub does not run its `.github/workflows/ci.yml`
+  and `posture-gate.yml`. They are out of scope.
 
-A nested git repository or submodule is its own git root. Its workflows do run,
-so `autumn upgrade` still reconciles them. The three Cargo files stay out of
-scope.
+A nested git repository or submodule is its own git root. GitHub runs its
+workflows, so `autumn upgrade` still reconciles them. The three Cargo files
+stay out of scope.
 
 Everything genuinely per-crate — `autumn.toml`, `Dockerfile`, `.dockerignore`,
 `build.rs`, `.gitignore`, `.env.example`, and the CSS pipeline — is reconciled as
-usual. Reconcile the workspace-level files by running the command at the
-workspace root, if that root is itself an Autumn project.
+usual. Reconcile the Cargo files at the workspace root and the workflows at
+the git root, if that root is itself an Autumn project.
 
 `autumn new` writes a bare `[workspace]` table into every generated
 `Cargo.toml`, so a scaffolded project is its own workspace root wherever you
