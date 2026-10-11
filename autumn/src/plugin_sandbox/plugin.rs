@@ -1417,6 +1417,13 @@ sha256 = "{digest}"
         assert_eq!(plugin.guest_slots.available_permits(), 1);
     }
 
+    #[test]
+    fn the_public_setter_refuses_bad_limits_and_leaves_the_pool_alone() {
+        // Refused before the process-wide cell is touched.
+        assert_eq!(set_guest_slots(0), Err(0));
+        assert_eq!(set_guest_slots(usize::MAX), Err(0));
+    }
+
     #[tokio::test]
     async fn one_guest_pool_caps_two_plugins_together() {
         let pool = Arc::new(Semaphore::new(1));
