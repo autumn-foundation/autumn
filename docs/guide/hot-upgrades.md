@@ -218,9 +218,10 @@ dropping state — reviewing what each field is mapped *to* is still yours.
    always lands somewhere that keeps it. A lock file in the handoff directory protects two steps: the
    successor's publish-and-unfreeze, and the predecessor's decision to kill.
    The predecessor cannot kill a successor that has become writable. If the
-   successor dies after it publishes, the predecessor resumes from its
+   successor dies after it publishes but before the predecessor settles the
+   handoff (about one poll interval), the predecessor resumes from its
    snapshot. The service stays up, but a write that the successor acknowledged
-   can be lost.
+   can be lost. After the handoff settles, nothing watches the successor.
 4. **Drain.** The predecessor stops accepting, finishes its in-flight requests,
    runs its `on_shutdown` hooks, and exits. Connections queued on the shared
    socket are picked up by the successor — the socket is never closed, so
