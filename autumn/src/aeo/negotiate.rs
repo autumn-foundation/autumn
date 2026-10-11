@@ -105,17 +105,16 @@ where
                 None
             },
             readable,
-            markdown: if self.config.markdown && readable {
-                Choice::of(req.headers())
-            } else {
-                Choice::default()
-            },
             is_head: !is_get && readable,
         };
+        // The `Accept` to rank the response by, kept when Markdown may win.
+        let accept = (self.config.markdown && readable)
+            .then(|| accept_values(req.headers()))
+            .filter(|accept| markdown_possible(accept));
         // A Markdown request's validators are checked here, against the
         // representation sent (Markdown, or the response as it is), not by
         // the handler against its HTML.
-        let validators = if flags.markdown.possible() {
+        let validators = if accept.is_some() {
             Validators::take(req.headers_mut())
         } else {
             None
@@ -126,7 +125,7 @@ where
             .config
             .resource_metadata_from_host
             .then(|| super::documents::request_authority(&req));
-        let page = flags.markdown.possible().then(|| {
+        let page = accept.is_some().then(|| {
             req.uri()
                 .path_and_query()
                 .map_or_else(|| req.uri().path().to_owned(), ToString::to_string)
@@ -140,6 +139,7 @@ where
             validators,
             host,
             page,
+            accept,
             convert: None,
         }
     }
@@ -151,66 +151,19 @@ struct Flags {
     /// The request's entry in `home_links`.
     home: Option<usize>,
     readable: bool,
-    markdown: Choice,
     is_head: bool,
 }
 
-/// Whether `Accept` prefers Markdown over the page's HTML. A range such as
-/// `text/html;charset=us-ascii` covers only HTML that declares that
-/// charset, so the answer can depend on the response: it is worked out for
-/// both charsets the converter reads, and picked once the response is here.
-#[derive(Debug, Clone, Copy, Default)]
-struct Choice {
-    /// For HTML that is UTF-8 (declared, or by default).
-    utf8: bool,
-    /// For HTML that declares `charset=us-ascii`.
-    ascii: bool,
-}
-
-impl Choice {
-    fn of(headers: &HeaderMap) -> Self {
-        Self {
-            utf8: prefers_markdown_over(headers, HtmlCharset::Utf8),
-            ascii: prefers_markdown_over(headers, HtmlCharset::Ascii),
-        }
-    }
-
-    /// Markdown may be sent: keep what converting needs.
-    const fn possible(self) -> bool {
-        self.utf8 || self.ascii
-    }
-
-    /// The answer for a negotiable response of type `content_type`.
-    fn for_response(self, content_type: &str) -> bool {
-        match HtmlCharset::of(content_type) {
-            HtmlCharset::Utf8 => self.utf8,
-            HtmlCharset::Ascii => self.ascii,
-        }
-    }
-}
-
-/// The charset an HTML representation declares, for matching the `charset`
-/// of a `text/html` range.
+/// The charset a `charset` value names, by its common labels (the WHATWG
+/// Encoding Standard's for UTF-8; IANA's for US-ASCII). `None` for any
+/// other charset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HtmlCharset {
+enum Charset {
     Utf8,
     Ascii,
 }
 
-impl HtmlCharset {
-    fn of(content_type: &str) -> Self {
-        let ascii = content_type.split(';').skip(1).any(|param| {
-            param.split_once('=').is_some_and(|(name, value)| {
-                name.trim().eq_ignore_ascii_case("charset")
-                    && Self::label(value) == Some(Self::Ascii)
-            })
-        });
-        if ascii { Self::Ascii } else { Self::Utf8 }
-    }
-
-    /// The charset a `charset` value names, by its common labels (the
-    /// WHATWG Encoding Standard's for UTF-8; IANA's for US-ASCII). `None`
-    /// for any other charset.
+impl Charset {
     fn label(value: &str) -> Option<Self> {
         let value = value.trim().trim_matches('"');
         if ["utf-8", "utf8", "unicode-1-1-utf-8"]
@@ -283,6 +236,9 @@ pin_project_lite::pin_project! {
         host: Option<(Option<String>, Option<String>)>,
         // The request path and query, for a relative `<base href>`.
         page: Option<String>,
+        // The request's `Accept`, when Markdown may win: the response's own
+        // type decides.
+        accept: Option<Vec<HeaderValue>>,
         convert: Option<ConvertFuture>,
     }
 }
@@ -347,7 +303,11 @@ where
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default();
-        if !this.flags.markdown.for_response(content_type) {
+        if !this
+            .accept
+            .as_deref()
+            .is_some_and(|accept| markdown_wins(accept, content_type))
+        {
             // The validators, if taken, are checked against the HTML.
             return Poll::Ready(Ok(checked(res)));
         }
@@ -490,23 +450,96 @@ fn markdown_etag(headers: &mut HeaderMap) {
     }
 }
 
-/// `true` when `Accept` names `text/markdown` with a weight at least as
-/// high as the HTML weight, for UTF-8 HTML or for HTML that declares
-/// `charset=us-ascii`: Markdown may be sent, depending on the page. The HTML
-/// weight comes from the most specific range that covers HTML
-/// (`text/html`, then `text/*`, then `*/*`).
+/// `true` when `Accept` may prefer Markdown to a page's HTML: it does for
+/// UTF-8 or US-ASCII HTML, or it weighs HTML by a parameter only the page's
+/// own type can show. The response's type then decides.
 #[must_use]
 pub fn prefers_markdown(headers: &HeaderMap) -> bool {
-    Choice::of(headers).possible()
+    markdown_possible(&accept_values(headers))
 }
 
-/// [`prefers_markdown`] for HTML that declares `html`.
-fn prefers_markdown_over(headers: &HeaderMap, html_charset: HtmlCharset) -> bool {
-    // (specificity, q) of the most specific matching range, for Markdown
-    // and for HTML. RFC 9110 §12.5.1: the most specific range that matches
-    // gives the quality. A range names a type (`text/html` over `text/*`
-    // over `*/*`), then parameters: `text/markdown;variant=GFM` overrides
-    // `text/markdown`.
+/// The request's `Accept` values.
+fn accept_values(headers: &HeaderMap) -> Vec<HeaderValue> {
+    headers
+        .get_all(axum::http::header::ACCEPT)
+        .iter()
+        .cloned()
+        .collect()
+}
+
+/// See [`prefers_markdown`].
+fn markdown_possible(accept: &[HeaderValue]) -> bool {
+    markdown_wins(accept, "text/html")
+        || markdown_wins(accept, "text/html; charset=us-ascii")
+        || (ranges(accept).any(|(media, params, _)| {
+            !media.eq_ignore_ascii_case("text/markdown")
+                && params
+                    .iter()
+                    .any(|(k, _)| !k.eq_ignore_ascii_case("charset"))
+        }) && weights(accept, "text/html").0 > 0.0)
+}
+
+/// `true` when `Accept` names `text/markdown` with a weight at least as
+/// high as the weight of the HTML of type `html_type`. Each weight comes
+/// from the most specific range that covers the representation.
+fn markdown_wins(accept: &[HeaderValue], html_type: &str) -> bool {
+    let (markdown, html) = weights(accept, html_type);
+    // Markdown must be named: `*/*` alone still gets HTML.
+    markdown > 0.0 && markdown >= html
+}
+
+/// The media ranges of `accept`: type, parameters before `q`, and `q`.
+fn ranges(accept: &[HeaderValue]) -> impl Iterator<Item = (&str, Vec<(&str, &str)>, f32)> {
+    accept
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|range| {
+            let mut parts = range.split(';');
+            let media = parts.next().unwrap_or("").trim();
+            let q = accept_weight(range.split(';').skip(1));
+            let params = parts
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .take_while(|p| {
+                    !p.split_once('=')
+                        .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("q"))
+                })
+                .map(|p| {
+                    p.split_once('=')
+                        .map_or((p, ""), |(k, v)| (k.trim(), v.trim().trim_matches('"')))
+                })
+                .collect();
+            (media, params, q)
+        })
+}
+
+/// The parameters of a representation's type. HTML with no `charset` is
+/// UTF-8.
+fn type_params(content_type: &str) -> Vec<(&str, &str)> {
+    let mut params: Vec<(&str, &str)> = content_type
+        .split(';')
+        .skip(1)
+        .filter_map(|p| p.split_once('='))
+        .map(|(k, v)| (k.trim(), v.trim().trim_matches('"')))
+        .collect();
+    if !params
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("charset"))
+    {
+        params.push(("charset", "utf-8"));
+    }
+    params
+}
+
+/// The weights `accept` gives the Markdown sent and the HTML of type
+/// `html_type`. RFC 9110 §12.5.1: the most specific range that matches
+/// gives the quality. A range names a type (`text/html` over `text/*` over
+/// `*/*`), then parameters: `text/markdown;variant=GFM` overrides
+/// `text/markdown`.
+fn weights(accept: &[HeaderValue], html_type: &str) -> (f32, f32) {
+    const MARKDOWN: &[(&str, &str)] = &[("charset", "utf-8"), ("variant", "GFM")];
+    let html_params = type_params(html_type);
     let mut markdown = ((0_u8, 0_usize), 0.0_f32);
     let mut html = ((0_u8, 0_usize), 0.0_f32);
     let take = |best: &mut ((u8, usize), f32), specificity: (u8, usize), q: f32| {
@@ -514,72 +547,53 @@ fn prefers_markdown_over(headers: &HeaderMap, html_charset: HtmlCharset) -> bool
             *best = (specificity, q);
         }
     };
-    for value in headers.get_all(axum::http::header::ACCEPT) {
-        let Ok(value) = value.to_str() else { continue };
-        for range in value.split(',') {
-            let mut parts = range.split(';');
-            let media = parts.next().unwrap_or("").trim();
-            let q = accept_weight(parts);
-            let markdown_range = media.eq_ignore_ascii_case("text/markdown");
-            let level = if markdown_range || media.eq_ignore_ascii_case("text/html") {
-                3
-            } else if media.eq_ignore_ascii_case("text/*") {
-                2
-            } else if media == "*/*" {
-                1
-            } else {
-                continue;
-            };
-            // A range whose parameters the representation does not fit
-            // (another `charset` or `variant`) does not cover it.
-            let charset = if markdown_range {
-                HtmlCharset::Utf8
-            } else {
-                html_charset
-            };
-            let Some(params) = fitting_params(range.split(';').skip(1), markdown_range, charset)
-            else {
-                continue;
-            };
-            if markdown_range {
-                take(&mut markdown, (level, params), q);
-            } else {
-                take(&mut html, (level, params), q);
-            }
+    for (media, params, q) in ranges(accept) {
+        let markdown_range = media.eq_ignore_ascii_case("text/markdown");
+        let level = if markdown_range || media.eq_ignore_ascii_case("text/html") {
+            3
+        } else if media.eq_ignore_ascii_case("text/*") {
+            2
+        } else if media == "*/*" {
+            1
+        } else {
+            continue;
+        };
+        // A range whose parameters the representation does not have (another
+        // `charset`, `variant`, or `profile`) does not cover it.
+        let sent = if markdown_range {
+            MARKDOWN
+        } else {
+            &html_params[..]
+        };
+        if !params.iter().all(|&(k, v)| has_param(sent, k, v)) {
+            continue;
         }
+        let best = if markdown_range {
+            &mut markdown
+        } else {
+            &mut html
+        };
+        take(best, (level, params.len()), q);
     }
-    // Markdown must be named: `*/*` alone still gets HTML.
-    markdown.1 > 0.0 && markdown.1 >= html.1
+    (markdown.1, html.1)
 }
 
-/// How many parameters a media range names (those before `q`), when they
-/// all fit what is sent: `charset`, and for Markdown (`variant_ok`) GitHub
-/// Flavored Markdown. `None` for a range that asks for another `charset` or
-/// `variant` (RFC 7763), or names a parameter this layer does not know.
-fn fitting_params<'a>(
-    params: impl Iterator<Item = &'a str>,
-    variant_ok: bool,
-    charset: HtmlCharset,
-) -> Option<usize> {
-    let mut count = 0;
-    for param in params.filter(|p| !p.trim().is_empty()) {
-        let (key, value) = param.split_once('=')?;
-        let key = key.trim();
-        if key.eq_ignore_ascii_case("q") {
-            return Some(count);
-        }
-        let value = value.trim().trim_matches('"');
-        let fits = (key.eq_ignore_ascii_case("charset")
-            && HtmlCharset::label(value) == Some(charset))
-            || (variant_ok
-                && key.eq_ignore_ascii_case("variant")
-                && value.eq_ignore_ascii_case("GFM"));
-        if !fits {
-            return None;
-        }
-        count += 1;
-    }
-    Some(count)
+/// `true` when `sent` has parameter `key` with value `value`: a charset by
+/// what its label names, `variant` ignoring case, any other by its value.
+fn has_param(sent: &[(&str, &str)], key: &str, value: &str) -> bool {
+    sent.iter().any(|&(k, v)| {
+        k.eq_ignore_ascii_case(key)
+            && if key.eq_ignore_ascii_case("charset") {
+                match (Charset::label(value), Charset::label(v)) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => value.eq_ignore_ascii_case(v),
+                }
+            } else if key.eq_ignore_ascii_case("variant") {
+                value.eq_ignore_ascii_case(v)
+            } else {
+                value == v
+            }
+    })
 }
 
 /// The `q` weight of one media range (RFC 9110 §12.4.2). A missing `q` is
@@ -630,7 +644,7 @@ fn utf8_html(content_type: &str) -> bool {
         let Some((name, value)) = param.split_once('=') else {
             return true;
         };
-        !name.trim().eq_ignore_ascii_case("charset") || HtmlCharset::label(value).is_some()
+        !name.trim().eq_ignore_ascii_case("charset") || Charset::label(value).is_some()
     })
 }
 
@@ -858,7 +872,7 @@ mod tests {
 
     /// The choice for UTF-8 HTML, the common page.
     fn utf8(headers: &HeaderMap) -> bool {
-        prefers_markdown_over(headers, HtmlCharset::Utf8)
+        markdown_wins(&accept_values(headers), "text/html")
     }
 
     #[test]
@@ -925,38 +939,65 @@ mod tests {
     /// declares, so the choice waits for the response.
     #[test]
     fn the_html_range_matches_the_page_charset() {
-        let preferred_ascii = Choice::of(&accept(
-            "text/html;charset=us-ascii;q=1, text/markdown;q=0.5",
-        ));
-        assert!(!preferred_ascii.for_response("text/html; charset=us-ascii"));
-        assert!(!preferred_ascii.for_response("text/html; charset=\"US-ASCII\""));
-        assert!(preferred_ascii.for_response("text/html; charset=utf-8"));
-        assert!(preferred_ascii.for_response("text/html"));
-        assert!(preferred_ascii.possible());
+        let wins = |a: &str, html: &str| markdown_wins(&accept_values(&accept(a)), html);
+        let possible = |a: &str| prefers_markdown(&accept(a));
 
-        let preferred_utf8 =
-            Choice::of(&accept("text/html;charset=utf-8;q=1, text/markdown;q=0.5"));
-        assert!(!preferred_utf8.for_response("text/html; charset=utf-8"));
-        assert!(preferred_utf8.for_response("text/html; charset=us-ascii"));
+        let ascii = "text/html;charset=us-ascii;q=1, text/markdown;q=0.5";
+        assert!(!wins(ascii, "text/html; charset=us-ascii"));
+        assert!(!wins(ascii, "text/html; charset=\"US-ASCII\""));
+        assert!(wins(ascii, "text/html; charset=utf-8"));
+        assert!(wins(ascii, "text/html"));
+        assert!(possible(ascii));
 
-        let plain = Choice::of(&accept("text/html, text/markdown;q=0.5"));
-        assert!(!plain.possible());
+        let utf8 = "text/html;charset=utf-8;q=1, text/markdown;q=0.5";
+        assert!(!wins(utf8, "text/html; charset=utf-8"));
+        assert!(!wins(utf8, "text/html"));
+        assert!(wins(utf8, "text/html; charset=us-ascii"));
+
+        assert!(!possible("text/html, text/markdown;q=0.5"));
     }
 
     /// Codex review (P2): equivalent labels name the same charset.
     #[test]
     fn charset_labels_are_matched_by_what_they_name() {
+        let wins = |a: &str, html: &str| markdown_wins(&accept_values(&accept(a)), html);
         assert!(utf8(&accept("text/markdown;charset=utf8, text/html;q=0")));
         assert!(utf8(&accept(
             "text/markdown;charset=\"UTF8\", text/html;q=0.5"
         )));
-        let choice = Choice::of(&accept("text/html;charset=utf-8, text/markdown;q=0.5"));
-        assert!(!choice.for_response("text/html; charset=utf8"));
-        let choice = Choice::of(&accept("text/html;charset=ascii, text/markdown;q=0.5"));
-        assert!(!choice.for_response("text/html; charset=us-ascii"));
-        assert!(choice.for_response("text/html"));
+        assert!(!wins(
+            "text/html;charset=utf-8, text/markdown;q=0.5",
+            "text/html; charset=utf8"
+        ));
+        let ascii = "text/html;charset=ascii, text/markdown;q=0.5";
+        assert!(!wins(ascii, "text/html; charset=us-ascii"));
+        assert!(wins(ascii, "text/html"));
         assert!(utf8_html("text/html; charset=ASCII"));
         assert!(!utf8_html("text/html; charset=latin1"));
+    }
+
+    /// Codex review (P2): an HTML range's parameters are compared with the
+    /// ones the page's own type declares.
+    #[test]
+    fn html_range_parameters_match_the_page_type() {
+        let wins = |a: &str, html: &str| markdown_wins(&accept_values(&accept(a)), html);
+        let profiled = "text/html;profile=\"https://example.test/p\", text/markdown;q=0.5";
+        assert!(!wins(
+            profiled,
+            "text/html; profile=\"https://example.test/p\""
+        ));
+        assert!(!wins(
+            profiled,
+            "text/html; charset=utf-8; profile=https://example.test/p"
+        ));
+        // Another profile, or none, is not covered: Markdown wins.
+        assert!(wins(
+            profiled,
+            "text/html; profile=\"https://example.test/q\""
+        ));
+        assert!(wins(profiled, "text/html"));
+        // Such a range keeps the choice open until the response is here.
+        assert!(prefers_markdown(&accept(profiled)));
     }
 
     #[test]

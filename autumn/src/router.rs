@@ -6486,50 +6486,51 @@ fn static_page_routes<'a>(
     scoped_groups: &[ScopedGroup],
     config: &AutumnConfig,
 ) -> std::collections::HashMap<String, Option<String>> {
-    let mut matcher: matchit::Router<String> = matchit::Router::new();
-    let templates = route_list
-        .iter()
-        .filter(|r| r.method == http::Method::GET)
-        .map(|r| r.path.to_owned())
-        .chain(scoped_groups.iter().flat_map(|g| {
-            g.routes
-                .iter()
-                .filter(|r| r.method == http::Method::GET)
-                .map(|r| join_nested_path(&g.prefix, r.path))
-        }));
-    for template in templates {
-        // A conflict is the router's to report; the first one stays.
-        let _ = matcher.insert(template.clone(), template);
+    // Every `GET` route at the path it is mounted at, so the matcher picks
+    // the route axum would: a localized route under each locale nest, an
+    // excluded one and a scoped group's at their bare path.
+    let mut mounted: Vec<String> = Vec::new();
+    for route in route_list.iter().filter(|r| r.method == http::Method::GET) {
+        mounted.extend(mounted_paths(route.path, config));
     }
-    #[cfg(feature = "i18n")]
-    let locales = if config.i18n.locale_prefix_enabled {
-        validated_locale_prefix_locales(&config.i18n)
-    } else {
-        Vec::new()
-    };
-    #[cfg(not(feature = "i18n"))]
-    let locales: Vec<String> = {
-        let _ = config;
-        Vec::new()
-    };
-    // The locale nests are literal prefixes, so axum routes `/{locale}/...`
-    // into its nest before any top-level wildcard: try them first.
-    let route_of = |page: &str| -> Option<String> {
-        locales
+    mounted.extend(scoped_groups.iter().flat_map(|g| {
+        g.routes
             .iter()
-            .find_map(|locale| {
-                let prefix = format!("/{locale}");
-                let rest = page.strip_prefix(&prefix)?;
-                let rest = if rest.is_empty() { "/" } else { rest };
-                if !rest.starts_with('/') {
-                    return None;
-                }
-                let template = &matcher.at(rest).ok()?.value;
-                Some(join_nested_path(&prefix, template))
-            })
-            .or_else(|| matcher.at(page).ok().map(|hit| hit.value.clone()))
-    };
-    pages.map(|page| (page.clone(), route_of(page))).collect()
+            .filter(|r| r.method == http::Method::GET)
+            .map(|r| join_nested_path(&g.prefix, r.path))
+    }));
+    let mut matcher: matchit::Router<String> = matchit::Router::new();
+    for path in mounted {
+        // A conflict is the router's to report; the first one stays.
+        let _ = matcher.insert(path.clone(), path);
+    }
+    pages
+        .map(|page| {
+            let route = matcher.at(page).ok().map(|hit| hit.value.clone());
+            (page.clone(), route)
+        })
+        .collect()
+}
+
+/// Where a top-level route is mounted, as `MatchedPath` reports it: under
+/// each locale nest when locale-prefix routing nests it, else as written.
+#[cfg_attr(not(feature = "i18n"), allow(clippy::unnecessary_wraps))]
+fn mounted_paths(path: &str, config: &AutumnConfig) -> Vec<String> {
+    #[cfg(feature = "i18n")]
+    {
+        let i18n = &config.i18n;
+        let excluded = i18n.locale_prefix_exclude_exact.iter().any(|p| p == path)
+            || matches_locale_exclude_prefix(path, &i18n.locale_prefix_exclude);
+        if i18n.locale_prefix_enabled && !excluded {
+            return validated_locale_prefix_locales(i18n)
+                .iter()
+                .map(|locale| join_nested_path(&format!("/{locale}"), path))
+                .collect();
+        }
+    }
+    #[cfg(not(feature = "i18n"))]
+    let _ = config;
+    vec![path.to_owned()]
 }
 
 #[allow(clippy::too_many_lines)]
@@ -10011,6 +10012,31 @@ mod tests {
             let map = super::super::static_page_routes(pages.iter(), &routes, &[], &config);
             assert_eq!(map["/en/files/public"].as_deref(), Some("/en/files/public"));
             assert_eq!(map["/fr/other"].as_deref(), Some("/fr/{*path}"));
+        }
+
+        /// Codex review (P1): an excluded route mounts bare, so a page under
+        /// a locale-looking segment goes to the route axum mounts there, not
+        /// to an excluded route re-read inside a locale nest.
+        #[test]
+        fn an_excluded_route_is_matched_where_it_is_mounted() {
+            let config = config(&["en", "fr"], &["/api", "/en"]);
+            let routes = vec![
+                simple_route("/api/{id}", "api", false),
+                simple_route("/en/{*path}", "english", false),
+                simple_route("/posts", "posts", false),
+            ];
+            let pages = [
+                "/en/api/42".to_owned(),
+                "/api/42".to_owned(),
+                "/fr/posts".to_owned(),
+                "/fr/api/42".to_owned(),
+            ];
+            let map = super::super::static_page_routes(pages.iter(), &routes, &[], &config);
+            assert_eq!(map["/en/api/42"].as_deref(), Some("/en/{*path}"));
+            assert_eq!(map["/api/42"].as_deref(), Some("/api/{id}"));
+            assert_eq!(map["/fr/posts"].as_deref(), Some("/fr/posts"));
+            // `/api/{id}` is not mounted in the `fr` nest.
+            assert_eq!(map["/fr/api/42"], None);
         }
 
         /// Codex review (P2): a home page served only by a merged router

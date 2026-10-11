@@ -66,6 +66,17 @@ async fn ascii() -> impl IntoResponse {
     )
 }
 
+#[get("/profiled")]
+async fn profiled() -> impl IntoResponse {
+    (
+        [(
+            "content-type",
+            "text/html; profile=\"https://example.test/p\"",
+        )],
+        "<p>profiled</p>",
+    )
+}
+
 #[get("/big")]
 async fn big() -> Html<String> {
     Html(format!("<p>{}</p>", "x".repeat(4096)))
@@ -83,7 +94,7 @@ async fn custom_llms() -> &'static str {
 
 fn client() -> TestClient {
     TestApp::new()
-        .routes(routes![home, about, tagged, big, data, ascii])
+        .routes(routes![home, about, tagged, big, data, ascii, profiled])
         .build()
 }
 
@@ -186,6 +197,25 @@ async fn an_html_range_for_the_page_charset_keeps_html() {
     assert_eq!(
         res.header("content-type"),
         Some("text/markdown; charset=utf-8; variant=GFM")
+    );
+}
+
+/// An HTML range's parameters are matched against the page's own type.
+#[tokio::test]
+async fn an_html_range_for_the_page_profile_keeps_html() {
+    let res = client()
+        .get("/profiled")
+        .header(
+            "accept",
+            "text/html;profile=\"https://example.test/p\", text/markdown;q=0.5",
+        )
+        .send()
+        .await;
+    res.assert_ok();
+    assert!(
+        res.header("content-type").unwrap().starts_with("text/html"),
+        "{:?}",
+        res.header("content-type")
     );
 }
 
