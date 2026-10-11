@@ -326,7 +326,7 @@ Web Bot Auth proves that requests from your app's bots come from you.
 ```toml
 [aeo.web_bot_auth]
 private_key_env = "WEB_BOT_AUTH_KEY"
-signature_agent = "https://example.com"   # default: [seo] base_url; must be https
+signature_agent = "https://example.com"   # https; default: [seo] base_url when it has no path
 ```
 
 Autumn then serves the public key at

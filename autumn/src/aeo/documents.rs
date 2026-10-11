@@ -811,8 +811,10 @@ fn api_catalog(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
     let mut doc = cors_json(&json!({ "linkset": linkset }));
     doc.content_type =
         "application/linkset+json; profile=\"https://www.rfc-editor.org/info/rfc9727\"";
-    doc.headers
-        .push(("link", format!("<{API_CATALOG_PATH}>; rel=\"api-catalog\"")));
+    doc.headers.push((
+        "link",
+        format!("<{}>; rel=\"api-catalog\"", origin.url(API_CATALOG_PATH)),
+    ));
     Some(doc)
 }
 
@@ -2111,9 +2113,10 @@ mod tests {
             "application/linkset+json; profile=\"https://www.rfc-editor.org/info/rfc9727\""
         );
         assert!(
-            doc.headers
-                .iter()
-                .any(|(k, v)| *k == "link" && v.contains("rel=\"api-catalog\"")),
+            doc.headers.iter().any(|(k, v)| *k == "link"
+                && v.contains(
+                    "<https://shop.example.com/.well-known/api-catalog>; rel=\"api-catalog\""
+                )),
             "HEAD needs the api-catalog Link: {:?}",
             doc.headers
         );

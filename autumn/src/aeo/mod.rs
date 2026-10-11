@@ -486,10 +486,23 @@ impl AeoSite {
         }
         let key = self.facts.web_bot_auth.clone()?;
         let wba = &config.aeo.web_bot_auth;
+        let fallback = wba.signature_agent.is_none();
         let agent = wba
             .signature_agent
             .clone()
             .or_else(|| self.base_url.clone())?;
+        // Verifiers look the key directory up at the agent's origin root. An
+        // app below a `base_url` path serves it under that path instead, so
+        // the base URL only names the agent when it has no path.
+        if fallback && url::Url::parse(agent.trim()).is_ok_and(|u| !matches!(u.path(), "" | "/")) {
+            tracing::warn!(
+                base_url = %agent,
+                "aeo: [seo] base_url has a path, so verifiers cannot find the key \
+                 directory at its origin; set [aeo.web_bot_auth] signature_agent. \
+                 Requests are not signed"
+            );
+            return None;
+        }
         // Verifiers fetch the key directory from this origin, and accept
         // only an `https` one: a signature naming an `http` agent fails.
         if !url::Url::parse(agent.trim()).is_ok_and(|u| u.scheme() == "https" && u.has_host()) {
@@ -824,7 +837,11 @@ pub(crate) async fn write_static_documents(
                 "aeo: dist/{STATIC_HEADERS_FILE} exists; the agent documents' headers are not added to it"
             );
         } else {
-            tokio::fs::write(&file, headers_file(&host_headers)).await?;
+            // The host serves the files below the base URL's path.
+            let base_path = url::Url::parse(&base)
+                .map(|u| u.path().trim_end_matches('/').to_owned())
+                .unwrap_or_default();
+            tokio::fs::write(&file, headers_file(&host_headers, &base_path)).await?;
             written.push(format!("/{STATIC_HEADERS_FILE}"));
         }
     }
@@ -889,7 +906,7 @@ fn static_host_headers(headers: &axum::http::HeaderMap) -> Vec<(String, String)>
 }
 
 /// `files` in the `_headers` format: each path, then its headers indented.
-fn headers_file(files: &[(String, Vec<(String, String)>)]) -> String {
+fn headers_file(files: &[(String, Vec<(String, String)>)], base_path: &str) -> String {
     use std::fmt::Write as _;
 
     let mut out =
@@ -898,7 +915,7 @@ fn headers_file(files: &[(String, Vec<(String, String)>)]) -> String {
         if headers.is_empty() {
             continue;
         }
-        let _ = writeln!(out, "\n{path}");
+        let _ = writeln!(out, "\n{base_path}{path}");
         for (name, value) in headers {
             let _ = writeln!(out, "  {name}: {value}");
         }
@@ -1026,6 +1043,27 @@ mod tests {
             assert!(index_entry.contains(want), "{want}:\n{headers}");
         }
         assert!(!headers.contains("/_autumn/webmcp.js"), "{headers}");
+    }
+
+    /// Codex review (P2): the documents live below the base URL's path.
+    #[tokio::test]
+    async fn a_static_headers_file_uses_the_base_path() {
+        let mut config = crate::config::AutumnConfig::default();
+        config.seo.base_url = Some("https://example.com/shop".to_owned());
+        let dist = tempfile::tempdir().unwrap();
+        write_static_documents(
+            site_router(&config),
+            config.seo.base_url.as_deref(),
+            dist.path(),
+        )
+        .await
+        .unwrap();
+        let headers = std::fs::read_to_string(dist.path().join("_headers")).unwrap();
+        assert!(
+            headers.contains("\n/shop/.well-known/agent-skills/index.json\n"),
+            "{headers}"
+        );
+        assert!(!headers.contains("\n/.well-known/"), "{headers}");
     }
 
     #[tokio::test]

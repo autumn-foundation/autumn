@@ -120,10 +120,7 @@ pub fn robots_txt_with_policy(
     if let Some(signal) = &signal {
         txt.push_str(signal);
     }
-    for rule in additional_rules {
-        txt.push_str(rule);
-        txt.push('\n');
-    }
+    push_additional_rules(&mut txt, additional_rules, signal.as_deref());
 
     if is_prod {
         for (bots, access) in &classes {
@@ -154,6 +151,40 @@ pub fn robots_txt_with_policy(
         txt.push('\n');
     }
     txt
+}
+
+/// Append the operator's `additional_rules`. Lines before their first
+/// `User-agent` extend the `*` group, which already carries the signal. A
+/// group the operator opens is the only one its crawler obeys, so it gets
+/// `signal` too, unless it states its own `Content-Signal`.
+fn push_additional_rules(txt: &mut String, rules: &[String], signal: Option<&str>) {
+    let starts = |line: &str, field: &str| {
+        line.trim_start()
+            .get(..field.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(field))
+    };
+    // The operator group being written, and whether it has its signal.
+    let mut open: Option<bool> = None;
+    let mut after_agent = false;
+    let close = |txt: &mut String, open: Option<bool>| {
+        if let (Some(false), Some(signal)) = (open, signal) {
+            txt.push_str(signal);
+        }
+    };
+    for line in rules.iter().flat_map(|rule| rule.lines()) {
+        let agent = starts(line, "user-agent:");
+        if agent && !after_agent {
+            close(txt, open);
+            open = Some(false);
+        }
+        if starts(line, "content-signal:") {
+            open = open.map(|_| true);
+        }
+        after_agent = agent;
+        txt.push_str(line);
+        txt.push('\n');
+    }
+    close(txt, open);
 }
 
 /// The explanation block that contentsignals.org recommends, verbatim. It
@@ -320,6 +351,39 @@ mod tests {
         );
         assert_eq!(txt.matches("User-agent: GPTBot").count(), 1, "{txt}");
         assert!(txt.contains("User-agent: ClaudeBot"), "{txt}");
+    }
+
+    /// Codex review (P2): a crawler with the operator's own group obeys
+    /// only that group, so it carries the signal too.
+    #[test]
+    fn operator_groups_carry_the_signal() {
+        let rules = [
+            "Disallow: /admin".to_owned(),
+            "User-agent: GPTBot".to_owned(),
+            "Disallow: /".to_owned(),
+            "User-agent: Bingbot".to_owned(),
+            "Content-Signal: search=yes".to_owned(),
+            "Disallow: /private".to_owned(),
+        ];
+        let txt = robots_txt_with_policy(
+            "prod",
+            None,
+            &rules,
+            &BotPolicy::from_config(&AeoConfig::default()),
+        );
+        let gpt = txt
+            .split("User-agent: ")
+            .find(|g| g.starts_with("GPTBot\n"))
+            .unwrap_or_else(|| panic!("{txt}"));
+        assert!(gpt.contains("Content-Signal: "), "{txt}");
+        let bing = txt
+            .split("User-agent: ")
+            .find(|g| g.starts_with("Bingbot\n"))
+            .unwrap_or_else(|| panic!("{txt}"));
+        assert_eq!(bing.matches("Content-Signal:").count(), 1, "its own: {txt}");
+        // `Disallow: /admin` joins the `*` group, which has the signal once.
+        let star = txt.split("User-agent: GPTBot").next().unwrap();
+        assert_eq!(star.matches("Content-Signal:").count(), 1, "{txt}");
     }
 
     #[test]

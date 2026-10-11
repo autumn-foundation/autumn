@@ -384,6 +384,27 @@ mod tests {
         assert!(site.web_bot_auth_signer(&config).is_none());
     }
 
+    /// Codex review (P2): verifiers look for the key directory at the
+    /// agent's origin root, which a `base_url` below a path does not serve.
+    #[test]
+    fn a_prefixed_base_url_is_no_signature_agent() {
+        let mut config = crate::config::AutumnConfig::default();
+        let mut site = super::super::AeoSite {
+            enabled: true,
+            base_url: Some("https://example.com/shop".to_owned()),
+            ..Default::default()
+        };
+        site.facts.web_bot_auth = Some(WebBotAuthKey::from_seed_b64(RFC8037_D).unwrap());
+        assert!(site.web_bot_auth_signer(&config).is_none());
+        // An explicit agent is the operator's word that it serves the
+        // directory.
+        config.aeo.web_bot_auth.signature_agent = Some("https://example.com".to_owned());
+        assert!(site.web_bot_auth_signer(&config).is_some());
+        site.base_url = Some("https://example.com/".to_owned());
+        config.aeo.web_bot_auth.signature_agent = None;
+        assert!(site.web_bot_auth_signer(&config).is_some());
+    }
+
     #[test]
     fn a_non_http_signature_agent_signs_nothing() {
         let mut config = crate::config::AutumnConfig::default();
