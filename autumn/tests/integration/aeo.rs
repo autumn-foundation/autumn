@@ -58,6 +58,14 @@ async fn conditional(
     ([("etag", "\"v1\"")], Html("<p>cond</p>")).into_response()
 }
 
+#[get("/ascii")]
+async fn ascii() -> impl IntoResponse {
+    (
+        [("content-type", "text/html; charset=us-ascii")],
+        "<p>ascii</p>",
+    )
+}
+
 #[get("/big")]
 async fn big() -> Html<String> {
     Html(format!("<p>{}</p>", "x".repeat(4096)))
@@ -75,7 +83,7 @@ async fn custom_llms() -> &'static str {
 
 fn client() -> TestClient {
     TestApp::new()
-        .routes(routes![home, about, tagged, big, data])
+        .routes(routes![home, about, tagged, big, data, ascii])
         .build()
 }
 
@@ -150,6 +158,35 @@ async fn html_preferred_by_q_value_stays_html() {
         .send()
         .await;
     assert!(res.header("content-type").unwrap().starts_with("text/html"));
+}
+
+/// An HTML range is matched against the charset the page declares.
+#[tokio::test]
+async fn an_html_range_for_the_page_charset_keeps_html() {
+    let res = client()
+        .get("/ascii")
+        .header(
+            "accept",
+            "text/html;charset=us-ascii;q=1, text/markdown;q=0.5",
+        )
+        .send()
+        .await;
+    res.assert_ok();
+    assert_eq!(
+        res.header("content-type"),
+        Some("text/html; charset=us-ascii")
+    );
+
+    let res = client()
+        .get("/ascii")
+        .header("accept", "text/html;charset=utf-8;q=1, text/markdown;q=0.5")
+        .send()
+        .await;
+    res.assert_ok();
+    assert_eq!(
+        res.header("content-type"),
+        Some("text/markdown; charset=utf-8; variant=GFM")
+    );
 }
 
 #[tokio::test]
