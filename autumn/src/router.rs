@@ -1420,8 +1420,6 @@ fn aeo_x402_layer(
     )
 }
 
-/// Build the AEO site snapshot from the route registry, the `OpenAPI` config,
-/// and the MCP tool catalog.
 /// The `GET /` routes the route table and scoped groups declare.
 struct HomeRoutes {
     /// A `routes![...]` home, mounted inside the locale nests.
@@ -1459,6 +1457,8 @@ impl HomeRoutes {
     }
 }
 
+/// Build the AEO site snapshot from the route registry, the `OpenAPI` config,
+/// and the MCP tool catalog.
 #[cfg_attr(
     not(all(feature = "openapi", feature = "mcp")),
     allow(clippy::needless_pass_by_value, unused_variables)
@@ -6476,6 +6476,62 @@ pub const fn partition_custom_layers_for_static_render(
     (Vec::new(), custom_layers)
 }
 
+/// For each pre-rendered page, the `GET` route template axum would match
+/// it to, located with the router's own matcher. A page inside a locale nest
+/// gets its nest prefix, as axum's `MatchedPath` does. `None` when no route
+/// matches (a hand-written manifest entry).
+fn static_page_routes<'a>(
+    pages: impl Iterator<Item = &'a String>,
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+    config: &AutumnConfig,
+) -> std::collections::HashMap<String, Option<String>> {
+    let mut matcher: matchit::Router<String> = matchit::Router::new();
+    let templates = route_list
+        .iter()
+        .filter(|r| r.method == http::Method::GET)
+        .map(|r| r.path.to_owned())
+        .chain(scoped_groups.iter().flat_map(|g| {
+            g.routes
+                .iter()
+                .filter(|r| r.method == http::Method::GET)
+                .map(|r| join_nested_path(&g.prefix, r.path))
+        }));
+    for template in templates {
+        // A conflict is the router's to report; the first one stays.
+        let _ = matcher.insert(template.clone(), template);
+    }
+    #[cfg(feature = "i18n")]
+    let locales = if config.i18n.locale_prefix_enabled {
+        validated_locale_prefix_locales(&config.i18n)
+    } else {
+        Vec::new()
+    };
+    #[cfg(not(feature = "i18n"))]
+    let locales: Vec<String> = {
+        let _ = config;
+        Vec::new()
+    };
+    // The locale nests are literal prefixes, so axum routes `/{locale}/...`
+    // into its nest before any top-level wildcard: try them first.
+    let route_of = |page: &str| -> Option<String> {
+        locales
+            .iter()
+            .find_map(|locale| {
+                let prefix = format!("/{locale}");
+                let rest = page.strip_prefix(&prefix)?;
+                let rest = if rest.is_empty() { "/" } else { rest };
+                if !rest.starts_with('/') {
+                    return None;
+                }
+                let template = &matcher.at(rest).ok()?.value;
+                Some(join_nested_path(&prefix, template))
+            })
+            .or_else(|| matcher.at(page).ok().map(|hit| hit.value.clone()))
+    };
+    pages.map(|page| (page.clone(), route_of(page))).collect()
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn try_build_router_with_static_inner(
     route_list: Vec<Route>,
@@ -6619,6 +6675,12 @@ pub fn try_build_router_with_static_inner(
     let mcp_dispatch_extra_layers = custom_layers.clone();
     #[cfg(not(feature = "mcp"))]
     let mcp_dispatch_extra_layers = Vec::new();
+    let static_paths = Arc::new(static_page_routes(
+        layer.manifest().routes.keys(),
+        &route_list,
+        &ctx.scoped_groups,
+        config,
+    ));
     let (inner_router, deferred_mcp_router) = build_router_pre_state(
         route_list,
         config,
@@ -6659,8 +6721,6 @@ pub fn try_build_router_with_static_inner(
         layer
     };
     let layer = Arc::new(layer);
-    let static_paths: Arc<std::collections::HashSet<String>> =
-        Arc::new(layer.manifest().routes.keys().cloned().collect());
 
     // Static-first serving: intercept GET/HEAD requests whose path is in the
     // manifest and serve pre-built HTML directly, before the dynamic router and
@@ -9937,6 +9997,22 @@ mod tests {
             assert_eq!(target.status(), StatusCode::OK);
         }
 
+        /// A pre-rendered page inside a locale nest resolves to the nested
+        /// route, as axum's `MatchedPath` reports it, not to a top-level
+        /// wildcard.
+        #[test]
+        fn a_localized_static_page_resolves_inside_its_nest() {
+            let config = config(&["en", "fr"], &[]);
+            let routes = vec![
+                simple_route("/files/public", "public", false),
+                simple_route("/{*path}", "any", false),
+            ];
+            let pages = ["/en/files/public".to_owned(), "/fr/other".to_owned()];
+            let map = super::super::static_page_routes(pages.iter(), &routes, &[], &config);
+            assert_eq!(map["/en/files/public"].as_deref(), Some("/en/files/public"));
+            assert_eq!(map["/fr/other"].as_deref(), Some("/fr/{*path}"));
+        }
+
         /// Codex review (P2): a home page served only by a merged router
         /// mounts outside the locale nests, so discovery lists `/`, not a
         /// `/{locale}` home that does not exist.
@@ -12443,6 +12519,72 @@ enabled = true
             get("/files/report.pdf").await.unwrap().status(),
             StatusCode::PAYMENT_REQUIRED
         );
+    }
+
+    /// Codex review (P1): a pre-rendered page is priced by the route that
+    /// rendered it. A free `/files/public` page stays free next to a priced
+    /// `/files/{*path}`; a page the wildcard rendered is still charged.
+    #[cfg(feature = "http-client")]
+    #[tokio::test]
+    async fn a_static_page_is_priced_by_the_route_that_rendered_it() {
+        let tmp = create_ssg_dist(&[
+            ("/files/public", "files/public.html", b"<h1>Public</h1>"),
+            ("/files/report.pdf", "files/report.html", b"<h1>Report</h1>"),
+        ]);
+        let dist = tmp.path().join("dist");
+        let mut config = AutumnConfig::default();
+        config.aeo.x402 = toml::from_str(
+            "facilitator_url = \"https://facilitator.example\"\npay_to = \"0xabc\"\n\
+             network = \"eip155:84532\"\nasset = \"0xusdc\"",
+        )
+        .unwrap();
+        config.aeo.paid_routes = vec![crate::aeo::commerce::PaidRoute::new(
+            "GET",
+            "/files/{*path}",
+            "1",
+        )];
+        let router = try_build_router_with_static(
+            vec![
+                duplicate_test_route(http::Method::GET, "/files/public", "public"),
+                duplicate_test_route(http::Method::GET, "/files/{*path}", "files"),
+            ],
+            &config,
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let get = |uri: &'static str| {
+            router
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        };
+        let public = get("/files/public").await.unwrap();
+        assert_eq!(public.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(public.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"<h1>Public</h1>");
+        assert_eq!(
+            get("/files/report.pdf").await.unwrap().status(),
+            StatusCode::PAYMENT_REQUIRED
+        );
+    }
+
+    #[test]
+    fn static_pages_resolve_to_the_route_axum_would_match() {
+        let routes = vec![
+            duplicate_test_route(http::Method::GET, "/files/public", "public"),
+            duplicate_test_route(http::Method::GET, "/files/{*path}", "files"),
+        ];
+        let pages = [
+            "/files/public".to_owned(),
+            "/files/a.pdf".to_owned(),
+            "/hand-written".to_owned(),
+        ];
+        let map = super::static_page_routes(pages.iter(), &routes, &[], &AutumnConfig::default());
+        assert_eq!(map["/files/public"].as_deref(), Some("/files/public"));
+        assert_eq!(map["/files/a.pdf"].as_deref(), Some("/files/{*path}"));
+        assert_eq!(map["/hand-written"], None);
     }
 
     /// A `HEAD` of a pre-rendered page carries the length its `GET` sends, so

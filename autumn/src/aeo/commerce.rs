@@ -839,7 +839,8 @@ impl PricedRoutes {
         let template = req
             .extensions()
             .get::<axum::extract::MatchedPath>()
-            .map(axum::extract::MatchedPath::as_str);
+            .map(axum::extract::MatchedPath::as_str)
+            .or_else(|| req.extensions().get::<StaticRoute>().map(|r| r.0.as_str()));
         // A route outside the locale nests (a scoped group, an excluded
         // path) can itself start with a locale segment, so a path is matched
         // as it is and with the locale stripped. Both cannot name two
@@ -902,19 +903,40 @@ impl PricedRoutes {
     }
 }
 
-/// The pre-rendered pages of an SSG/ISR build, for the x402 copy that runs
-/// outside the static-first middleware. That copy sees no matched route, so
-/// it prices only a request the middleware will answer from the manifest; a
-/// miss falls through to the copy inside the router, which knows the route
-/// axum picked.
-pub(crate) type StaticPaths = Option<std::sync::Arc<std::collections::HashSet<String>>>;
+/// The pre-rendered pages of an SSG/ISR build, each with the route template
+/// that renders it, for the x402 copy that runs outside the static-first
+/// middleware. That copy sees no matched route, so it prices only a request
+/// the middleware will answer from the manifest, and prices the route that
+/// rendered the page, as the copy inside the router prices the route axum
+/// matched. A miss falls through to that inner copy.
+pub(crate) type StaticPages = std::collections::HashMap<String, Option<String>>;
+
+/// [`StaticPages`] as the layers hold it: `None` outside a static build.
+pub(crate) type StaticPaths = Option<std::sync::Arc<StaticPages>>;
+
+/// The route template that rendered a pre-rendered page, for a request the
+/// router has not matched.
+#[derive(Clone)]
+struct StaticRoute(String);
 
 /// `true` when `static_paths` is set and `req` is not one of those pages.
+/// On a hit, marks `req` with the route that rendered the page.
 fn static_miss(
-    static_paths: Option<&std::sync::Arc<std::collections::HashSet<String>>>,
-    req: &axum::http::Request<axum::body::Body>,
+    static_paths: Option<&std::sync::Arc<StaticPages>>,
+    req: &mut axum::http::Request<axum::body::Body>,
 ) -> bool {
-    static_paths.is_some_and(|paths| !paths.contains(normalize(req.uri().path())))
+    let Some(pages) = static_paths else {
+        return false;
+    };
+    match pages.get(normalize(req.uri().path())) {
+        None => true,
+        Some(template) => {
+            if let Some(t) = template {
+                req.extensions_mut().insert(StaticRoute(t.clone()));
+            }
+            false
+        }
+    }
 }
 
 #[cfg(feature = "http-client")]
@@ -922,10 +944,7 @@ impl X402Layer {
     /// This layer for the pages of a static build only (see
     /// [`StaticPaths`]). It shares the used-payment cache.
     #[must_use]
-    pub(crate) fn for_static_pages(
-        mut self,
-        paths: std::sync::Arc<std::collections::HashSet<String>>,
-    ) -> Self {
+    pub(crate) fn for_static_pages(mut self, paths: std::sync::Arc<StaticPages>) -> Self {
         self.static_paths = Some(paths);
         self
     }
@@ -936,10 +955,7 @@ impl X402Unavailable {
     /// This layer for the pages of a static build only (see
     /// [`StaticPaths`]).
     #[must_use]
-    pub(crate) fn for_static_pages(
-        mut self,
-        paths: std::sync::Arc<std::collections::HashSet<String>>,
-    ) -> Self {
+    pub(crate) fn for_static_pages(mut self, paths: std::sync::Arc<StaticPages>) -> Self {
         self.static_paths = Some(paths);
         self
     }
@@ -1138,11 +1154,11 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: axum::http::Request<axum::body::Body>) -> Self::Future {
+    fn call(&mut self, mut req: axum::http::Request<axum::body::Body>) -> Self::Future {
         use axum::response::IntoResponse as _;
 
         if !is_internal_render(&req)
-            && !static_miss(self.static_paths.as_ref(), &req)
+            && !static_miss(self.static_paths.as_ref(), &mut req)
             && self.priced.route_for(&req).is_some()
         {
             let res = (
@@ -1224,7 +1240,7 @@ where
         // request that reads the page.
         let route = if req.extensions().get::<X402Handled>().is_some()
             || is_internal_render(&req)
-            || static_miss(self.static_paths.as_ref(), &req)
+            || static_miss(self.static_paths.as_ref(), &mut req)
         {
             None
         } else {
