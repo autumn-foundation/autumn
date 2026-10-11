@@ -1113,3 +1113,216 @@ async fn the_impersonator_key_is_cleared_on_end() {
         "every reserved key is cleared on revert"
     );
 }
+
+// ── Rotation hook and rebind (issue #2347) ─────────────────────
+
+type Rotations = Arc<Mutex<Vec<(String, String)>>>;
+
+/// Rotate the id and keep the identity — a periodic rotation policy.
+#[autumn_web::post("/rotate-keep-identity")]
+async fn rotate_keep_identity(session: Session) -> &'static str {
+    session.rotate_id().await;
+    "ok"
+}
+
+/// Same, then opt in to keeping the impersonation record.
+#[autumn_web::post("/rotate-and-rebind")]
+async fn rotate_and_rebind(State(state): State<AppState>, session: Session) -> String {
+    session.rotate_id().await;
+    impersonation::rebind(&state, &session).await.to_string()
+}
+
+/// A login of the target on the same browser, then a rebind attempt.
+#[autumn_web::post("/login-as-the-target-and-rebind")]
+async fn login_as_the_target_and_rebind(State(state): State<AppState>, session: Session) -> String {
+    session.rotate_id().await;
+    session.insert("user_id", "user-9").await;
+    impersonation::rebind(&state, &session).await.to_string()
+}
+
+fn rotation_app(rotations: &Rotations) -> TestClientAlias {
+    let rotations = Arc::clone(rotations);
+    TestApp::new()
+        .routes(routes![
+            login_admin,
+            begin,
+            stop,
+            whoami,
+            rotate_keep_identity,
+            rotate_and_rebind,
+            login_as_the_target_and_rebind
+        ])
+        .state_initializer(move |state| {
+            state.insert_extension(ImpersonationGate::allow_roles(["admin"]));
+            state.insert_extension(
+                AuditLogger::new().with_sink(Arc::new(autumn_web::audit::TracingAuditSink)),
+            );
+            let rotations = Arc::clone(&rotations);
+            state.session_rotation_hooks().register(move |rotation| {
+                let rotations = Arc::clone(&rotations);
+                async move {
+                    rotations
+                        .lock()
+                        .expect("rotation lock")
+                        .push((rotation.old_id, rotation.new_id));
+                    Ok(())
+                }
+            });
+        })
+        .build()
+}
+
+#[tokio::test]
+async fn begin_and_end_publish_a_rotation_to_the_hooks() {
+    let rotations = Rotations::default();
+    let client = rotation_app(&rotations);
+    client.post("/login-admin").send().await.assert_ok();
+    let before = rotations.lock().unwrap().len();
+
+    client
+        .post("/impersonate")
+        .form("user_id=user-9")
+        .send()
+        .await
+        .assert_ok();
+    assert_eq!(rotations.lock().unwrap().len(), before + 1, "begin rotates");
+
+    client.post("/stop-impersonating").send().await.assert_ok();
+    let seen = rotations.lock().unwrap().clone();
+    assert_eq!(seen.len(), before + 2, "end rotates");
+    // Each hook call names two distinct ids, and the second hop starts where
+    // the first ended: the chain a tracked-session row must follow.
+    assert_ne!(seen[before].0, seen[before].1);
+    assert_eq!(seen[before].1, seen[before + 1].0);
+}
+
+#[tokio::test]
+async fn a_same_identity_rotation_retires_the_record_without_a_rebind() {
+    let rotations = Rotations::default();
+    let client = rotation_app(&rotations);
+    client.post("/login-admin").send().await.assert_ok();
+    client
+        .post("/impersonate")
+        .form("user_id=user-9")
+        .send()
+        .await
+        .assert_ok();
+
+    client
+        .post("/rotate-keep-identity")
+        .send()
+        .await
+        .assert_ok();
+
+    assert_eq!(
+        who(&client).await,
+        "user=user-9;impersonator=-;actor=user-9"
+    );
+    client
+        .post("/stop-impersonating")
+        .send()
+        .await
+        .assert_status(400);
+}
+
+#[tokio::test]
+async fn rebind_keeps_the_record_across_a_same_identity_rotation() {
+    let rotations = Rotations::default();
+    let client = rotation_app(&rotations);
+    client.post("/login-admin").send().await.assert_ok();
+    client
+        .post("/impersonate")
+        .form("user_id=user-9")
+        .send()
+        .await
+        .assert_ok();
+
+    let rebound = client.post("/rotate-and-rebind").send().await.text();
+    assert_eq!(rebound, "true");
+
+    assert_eq!(
+        who(&client).await,
+        "user=user-9;impersonator=admin-1;actor=admin-1"
+    );
+    client.post("/stop-impersonating").send().await.assert_ok();
+    assert_eq!(
+        who(&client).await,
+        "user=admin-1;impersonator=-;actor=admin-1"
+    );
+}
+
+#[tokio::test]
+async fn rebind_does_not_revive_a_retired_record() {
+    let rotations = Rotations::default();
+    let client = rotation_app(&rotations);
+    client.post("/login-admin").send().await.assert_ok();
+    client
+        .post("/impersonate")
+        .form("user_id=user-9")
+        .send()
+        .await
+        .assert_ok();
+
+    // The first rotation retires the record. A later `rebind` must not
+    // revive it: the record is bound to a generation that is gone.
+    client
+        .post("/rotate-keep-identity")
+        .send()
+        .await
+        .assert_ok();
+    let rebound = client
+        .post("/login-as-the-target-and-rebind")
+        .send()
+        .await
+        .text();
+    assert_eq!(rebound, "false", "a retired record cannot be revived");
+    client
+        .post("/stop-impersonating")
+        .send()
+        .await
+        .assert_status(400);
+}
+
+// ── Throttle buckets follow the operator (issue #2347) ─────────
+
+#[autumn_web::get("/throttle-principal")]
+async fn throttle_principal(
+    axum::Extension(principal): axum::Extension<autumn_web::security::RateLimitPrincipal>,
+) -> String {
+    principal.0
+}
+
+#[tokio::test]
+async fn the_rate_limit_principal_is_the_operator_while_impersonating() {
+    let client = TestApp::new()
+        .routes(routes![login_admin, begin, stop])
+        .scoped(
+            "/guarded",
+            autumn_web::auth::RequireAuth::new("user_id"),
+            routes![throttle_principal],
+        )
+        .state_initializer(|state| {
+            state.insert_extension(ImpersonationGate::allow_roles(["admin"]));
+            state.insert_extension(
+                AuditLogger::new().with_sink(Arc::new(autumn_web::audit::TracingAuditSink)),
+            );
+        })
+        .build();
+    client.post("/login-admin").send().await.assert_ok();
+    client
+        .post("/impersonate")
+        .form("user_id=user-9")
+        .send()
+        .await
+        .assert_ok();
+
+    assert_eq!(
+        client
+            .get("/guarded/throttle-principal")
+            .send()
+            .await
+            .text(),
+        "admin-1",
+        "the operator spends their own budget, never the customer's"
+    );
+}

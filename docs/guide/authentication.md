@@ -901,9 +901,9 @@ key your app writes alongside `user_id` at login (a generated `{model}_id` /
 `{model}_email`, a `tenant_id`): impersonation swaps the configured auth session
 key and nothing else, so map the rest yourself if your handlers read them.
 
-`RequireAuth` also publishes `RateLimitPrincipal` and the log context's
-`user_id` as the **effective** user, so rate-limit buckets and log lines follow
-the target while attribution follows the operator.
+`RequireAuth` publishes the log context's `user_id` as the **effective** user,
+so log lines follow the target. `RateLimitPrincipal` is the **operator**, so an
+operator spends their own throttle budget. They cannot lock the customer out.
 
 Read the state with the `Impersonation` extractor when you just want to branch
 on it:
@@ -963,6 +963,32 @@ And what it refuses:
   same browser. Belt and braces: call `impersonation::clear(&session)` from your
   own login / magic-link / passkey promotion too, so the record is gone outright
   rather than merely inert.
+
+### Session-id rotation
+
+`begin_impersonation` and `end_impersonation` rotate the session id. Any state
+that is keyed by the id must follow the new id. Register a rotation hook for
+that state:
+
+```rust,ignore
+app.on_session_rotation(|rotation| async move {
+    // Move your rows from rotation.old_id to rotation.new_id.
+    Ok(())
+})
+```
+
+The hook runs after the new session is stored. It sees one hop per request,
+from the first old id to the last new id. It does not run for a destroyed
+session. A hook error is logged and does not change the response.
+
+`autumn generate auth` registers a hook that re-points the tracked-session row.
+Impersonation therefore works in apps with `[auth.sessions]` tracking.
+
+A rotation that does not change the signed-in user retires the impersonation
+record. For a rotation you trust (for example an idle-rotation policy), call
+`impersonation::rebind(&state, &session)` right after `rotate_id()`. It returns
+`true` when the record was kept. Do not call it from a login flow. Call
+`impersonation::clear` there.
 
 Tenancy is yours to enforce — the framework checks none, and `allow_roles` does
 not look at the target at all, so it will happily impersonate any string

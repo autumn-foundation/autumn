@@ -323,6 +323,33 @@ impl AppState {
             .insert(TypeId::of::<T>(), Arc::new(value));
     }
 
+    /// The shared [`SessionRotationHooks`](crate::session::SessionRotationHooks)
+    /// registry, created on first use.
+    ///
+    /// Hooks registered here run after each stored session-id rotation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal extension map mutex is poisoned.
+    #[must_use]
+    pub fn session_rotation_hooks(&self) -> crate::session::SessionRotationHooks {
+        let entry = {
+            let mut extensions = self
+                .extensions
+                .write()
+                .expect("app state extension lock poisoned");
+            Arc::clone(
+                extensions
+                    .entry(TypeId::of::<crate::session::SessionRotationHooks>())
+                    .or_insert_with(|| Arc::new(crate::session::SessionRotationHooks::default())),
+            )
+        };
+        entry
+            .downcast::<crate::session::SessionRotationHooks>()
+            .map(|hooks| (*hooks).clone())
+            .expect("rotation hooks extension has the wrong type")
+    }
+
     /// Borrow a typed runtime extension if it has been installed.
     ///
     /// The returned [`Arc`] is cloned out of the internal registry so callers

@@ -485,6 +485,49 @@ pub async fn clear(session: &Session) {
     session.remove(IMPERSONATOR_STEP_UP_SESSION_KEY).await;
 }
 
+/// Keep a live impersonation across a rotation that did not change who is
+/// signed in.
+///
+/// The record is bound to the session id it was created under, so any later
+/// `rotate_id()` retires it. For a rotation you trust — an idle or periodic
+/// rotation policy, not a login — call this right after `rotate_id()` to move
+/// the binding to the new id. Returns `true` when the record was kept.
+///
+/// It refuses (returns `false`) unless the record was bound to the id this
+/// request started with and the session still resolves as the impersonated
+/// user. A record already retired by an earlier rotation is never revived.
+///
+/// Do **not** call it from a login flow. A login by the impersonated user
+/// matches the same checks, and the rebind would hand them the record. Login
+/// flows call [`clear`] instead.
+///
+/// ```rust,no_run
+/// # use autumn_web::{session::Session, AppState};
+/// # use autumn_web::auth::impersonation;
+/// async fn rotate_on_idle(state: &AppState, session: &Session) {
+///     session.rotate_id().await;
+///     impersonation::rebind(state, session).await;
+/// }
+/// ```
+pub async fn rebind(state: &AppState, session: &Session) -> bool {
+    let Some(previous_id) = session.rotated_from().await else {
+        return false;
+    };
+    let bound = session.get(IMPERSONATION_SESSION_ID_KEY).await;
+    let impersonated = session.get(IMPERSONATED_SESSION_KEY).await;
+    let effective = session.get(state.auth_session_key()).await;
+    let still_live = bound.as_deref() == Some(previous_id.as_str())
+        && session.contains_key(IMPERSONATOR_SESSION_KEY).await
+        && impersonated.is_some()
+        && impersonated == effective;
+    if still_live {
+        session
+            .insert(IMPERSONATION_SESSION_ID_KEY, session.id().await)
+            .await;
+    }
+    still_live
+}
+
 /// The id that audit and version writes made by this session should carry.
 ///
 /// Returns the real impersonator while impersonation is active, and
@@ -512,6 +555,16 @@ pub async fn audit_actor_id(session: &Session, effective_user_id: &str) -> Strin
         Some((impersonator, impersonated)) if impersonated == effective_user_id => impersonator,
         _ => effective_user_id.to_owned(),
     }
+}
+
+/// The id a per-user throttle should key on for `session`.
+///
+/// The real operator while impersonating, otherwise the effective user. An
+/// operator then spends their own budget and cannot throttle the customer out
+/// of their account. `None` when the session holds no user.
+pub(crate) async fn throttle_principal_id(session: &Session, auth_key: &str) -> Option<String> {
+    let effective = session.get(auth_key).await?;
+    Some(audit_actor_id(session, &effective).await)
 }
 
 // ── Extractor ────────────────────────────────────────────────────

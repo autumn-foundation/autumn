@@ -3388,7 +3388,42 @@ pub async fn remember_me_startup(state: AppState) -> AutumnResult<()> {{
             state.config().auth.remember.clone(),
             state.auth_session_key().to_string(),
         );
+        // Re-point the tracked row after ANY session-id rotation (impersonation,
+        // idle rotation, app code), so the next request does not 401.
+        let pool = pool.clone();
+        state
+            .session_rotation_hooks()
+            .register(move |rotation| {{
+                let pool = pool.clone();
+                async move {{
+                    rebind_tracked_session_on_rotation(&pool, &rotation)
+                        .await
+                        .map_err(|e| e.to_string().into())
+                }}
+            }});
     }}
+    Ok(())
+}}
+
+/// Move the tracked row from the old session id's digest to the new one.
+///
+/// No row matches when the flow already rebound it, so a repeat is harmless.
+async fn rebind_tracked_session_on_rotation(
+    pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
+    rotation: &::autumn_web::session::SessionRotation,
+) -> AutumnResult<()> {{
+    let mut db = pool.get().await.map_err(|e| {{
+        AutumnError::internal_server_error_msg(format!("Failed to rebind tracked session: {{e}}"))
+    }})?;
+    diesel::update(
+        {sess_table}::table.filter({sess_table}::token_digest.eq(sha256_hex(&rotation.old_id))),
+    )
+    .set({sess_table}::token_digest.eq(sha256_hex(&rotation.new_id)))
+    .execute(&mut *db)
+    .await
+    .map_err(|e| {{
+        AutumnError::internal_server_error_msg(format!("Failed to rebind tracked session: {{e}}"))
+    }})?;
     Ok(())
 }}
 
@@ -3851,10 +3886,20 @@ pub async fn require_tracked_session(
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
 
+    // While an operator impersonates, `{snake_name}_id` is the target but the row
+    // still belongs to the operator who signed in. Match the row by its owner.
+    let row_owner_id: i64 = ::autumn_web::auth::impersonation::audit_actor_id(
+        session,
+        &{snake_name}_id.to_string(),
+    )
+    .await
+    .parse()
+    .unwrap_or({snake_name}_id);
+
     let token_digest = session_token_digest(session).await;
     let tracked: Option<{pascal_name}Session> = {sess_table}::table
         .filter({sess_table}::token_digest.eq(&token_digest))
-        .filter({sess_table}::user_id.eq({snake_name}_id))
+        .filter({sess_table}::user_id.eq(row_owner_id))
         .select({pascal_name}Session::as_select())
         .first(&mut **db)
         .await
@@ -11801,6 +11846,45 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Issue #2347: while impersonating, `{snake}_id` is the target but the
+    /// tracked row belongs to the operator. The lookup must use the operator's
+    /// id, or the next request would miss the row and 401.
+    #[test]
+    fn require_tracked_session_matches_the_row_owner_while_impersonating() {
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
+        let start = routes
+            .find("pub async fn require_tracked_session")
+            .expect("require_tracked_session is generated");
+        let len = routes[start..].find("\n}\n").expect("fn body ends");
+        let body = &routes[start..start + len];
+        assert!(
+            body.contains("impersonation::audit_actor_id"),
+            "row owner must resolve through the impersonation record:\n{body}"
+        );
+    }
+
+    /// Issue #2347: any `rotate_id()` while logged in moves the digest the
+    /// tracked row is keyed by. The startup hook must register a rotation hook
+    /// that re-points the row, so flows without an explicit rebind (such as
+    /// impersonation) do not 401 on the next request.
+    #[test]
+    fn startup_hook_registers_a_tracked_session_rotation_hook() {
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
+        let hook_at = routes
+            .find("pub async fn remember_me_startup")
+            .expect("startup hook is generated");
+        let body_len = routes[hook_at..].find("\n}\n").expect("hook body ends");
+        let body = &routes[hook_at..hook_at + body_len];
+        assert!(
+            body.contains(".session_rotation_hooks()") && body.contains(".register("),
+            "startup hook must register a rotation hook:\n{body}"
+        );
+        assert!(
+            routes.contains("async fn rebind_tracked_session_on_rotation"),
+            "rotation hook body must be generated"
+        );
+    }
 
     /// Generated request handlers must read config through `state.config_arc()`,
     /// never `state.config()`.
