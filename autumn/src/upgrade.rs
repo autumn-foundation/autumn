@@ -907,6 +907,10 @@ fn create_lock_file(path: &std::path::Path) -> Result<std::fs::File, std::io::Er
 /// kill it so the kernel drops its lock, then try again. If it has published,
 /// it may be writable, so return `None` and let the caller leave it alone.
 #[cfg(unix)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "bounds a real OS file-lock wait; a simulated clock would never end it"
+)]
 fn lock_for_decision(
     lock: Option<std::fs::File>,
     ready: &std::path::Path,
@@ -917,7 +921,8 @@ fn lock_for_decision(
 
     let mut file = lock?;
     for round in 0..2 {
-        for _ in 0..LOCK_ATTEMPTS {
+        let give_up = std::time::Instant::now() + LOCK_WAIT;
+        while std::time::Instant::now() < give_up {
             match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
                 Ok(lock) => return Some(lock),
                 Err((back, Errno::EWOULDBLOCK | Errno::EINTR)) => {
@@ -1193,11 +1198,11 @@ async fn spawn_and_await_successor(
 #[cfg(unix)]
 const LOCK_FILE: &str = "lock";
 
-/// Number of tries the predecessor makes to take the handoff lock.
+/// Longest the predecessor waits for the handoff lock, per round.
 #[cfg(unix)]
-const LOCK_ATTEMPTS: u32 = 1000;
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Wait between those tries (about one second in total).
+/// Wait between tries.
 #[cfg(unix)]
 const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(1);
 
@@ -1733,10 +1738,10 @@ mod tests {
     /// Build a `Handoff` around a live child process, for the drop-guard tests.
     #[cfg(unix)]
     fn handoff_for_test(dir: std::path::PathBuf, registry: Arc<LiveStateRegistry>) -> Handoff {
-        // Long enough to outlive the drop under test, short enough that a
-        // panic before the explicit kill cannot leave it behind for long.
+        // Long enough to outlive a drop that waits out the lock timeout on a
+        // slow runner, short enough that a panic cannot leave it behind long.
         let child = std::process::Command::new("sleep")
-            .arg("5")
+            .arg("30")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
