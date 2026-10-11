@@ -3888,11 +3888,11 @@ fn build_ingress_cors_layer(config: &AutumnConfig) -> Option<tower_http::cors::C
             .paid_routes
             .iter()
             .any(crate::aeo::commerce::PaidRoute::is_x402)
-        && !config
-            .cors
-            .allowed_headers
-            .iter()
-            .any(|h| h == "*" || h.eq_ignore_ascii_case("payment-signature"));
+        // `*` is a wildcard only without credentials (Fetch §3.3.4).
+        && !config.cors.allowed_headers.iter().any(|h| {
+            (h == "*" && !config.cors.allow_credentials)
+                || h.eq_ignore_ascii_case("payment-signature")
+        });
     let cors = if pays {
         let mut cors = config.cors.clone();
         cors.allowed_headers.push("payment-signature".to_owned());
