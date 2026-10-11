@@ -36,6 +36,15 @@ use serde::{Deserialize, Serialize};
 use crate::config::MediaStorageConfig;
 use crate::error::MediaError;
 
+/// Check an S3 call against a failure capsule.
+///
+/// This client is not autumn-web's recorded outbound seam. A capsule replay
+/// refuses the call, and capture marks the capsule incomplete. The target does
+/// not name the object: a key can hold personal data.
+fn guard_egress(method: &str) -> Result<(), autumn_web::capsule::UnrecordedEgress> {
+    autumn_web::capsule::guard_egress("media storage", method, "s3 object")
+}
+
 /// Default content type used by [`MediaStorage::persist_file`] when the caller
 /// does not specify one.
 pub const DEFAULT_CONTENT_TYPE: &str = "video/mp4";
@@ -410,6 +419,9 @@ impl MediaStorage {
                         source: std::io::Error::other(error),
                     }
                 })?;
+                guard_egress("PUT").map_err(|refused| MediaError::ReplayRefused {
+                    message: refused.to_string(),
+                })?;
                 let client = self.build_client().await;
                 client
                     .put_object()
@@ -454,6 +466,9 @@ impl MediaStorage {
             Self::Local { .. } => Ok(()),
             Self::S3(config) => {
                 let stored_key = self.resolved_key(key);
+                guard_egress("DELETE").map_err(|refused| MediaError::ReplayRefused {
+                    message: refused.to_string(),
+                })?;
                 let client = self.build_client().await;
                 client
                     .delete_object()
@@ -756,6 +771,41 @@ mod tests {
             secret_access_key: Some("secret".to_owned()),
             public_base_url: Some("https://cdn.example.com".to_owned()),
             ..MediaStorageConfig::default()
+        }
+    }
+
+    /// autumn-web #2351, Codex review on #3222: a replay refusal names no
+    /// object key. The replay cannot scrub an unrecorded one.
+    #[tokio::test]
+    async fn a_replay_refusal_names_no_object_key() {
+        let storage = MediaStorage::from_config(&s3_config(Some("media"))).expect("s3 storage");
+        let staged = std::env::temp_dir().join("autumn-media-replay-refusal.bin");
+        std::fs::write(&staged, b"x").expect("staged file");
+        let tape = std::sync::Arc::new(autumn_web::capsule::ReplayEffects::new(
+            autumn_web::capsule::CapsuleEffects::default(),
+        ));
+        let (upload, delete) = autumn_web::capsule::with_effect_tape(
+            tape,
+            Box::pin(async {
+                (
+                    storage
+                        .persist_file("users/alice@example.com/token-s3cr3t.mp4", &staged)
+                        .await,
+                    storage
+                        .remove_object_if_present("users/alice@example.com/token-s3cr3t.mp4")
+                        .await,
+                )
+            }),
+        )
+        .await;
+        let _ = std::fs::remove_file(&staged);
+        for error in [
+            upload.expect_err("a replay refuses the upload"),
+            delete.expect_err("a replay refuses the delete"),
+        ] {
+            assert!(matches!(error, MediaError::ReplayRefused { .. }), "{error}");
+            assert!(!error.to_string().contains("alice"), "{error}");
+            assert!(!error.to_string().contains("s3cr3t"), "{error}");
         }
     }
 

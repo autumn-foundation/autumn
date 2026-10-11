@@ -487,6 +487,36 @@ pub(crate) fn to_line<T: Serialize>(frame: &T) -> Result<String, WireError> {
     Ok(line)
 }
 
+/// Like [`to_line`], but the buffer has no spare capacity.
+///
+/// Used for the request frame only. It is the one large line, and it stays
+/// resident for the whole request, so doubling slack would be memory the
+/// footprint does not count. It serialises twice (count, then write), and
+/// `encoding_fuel` charges for both passes.
+///
+/// # Errors
+///
+/// Returns [`WireError::Json`] if the frame cannot be serialized.
+pub(crate) fn to_exact_line<T: Serialize>(frame: &T) -> Result<String, WireError> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, frame)?;
+    let mut line = Vec::with_capacity(count.0.saturating_add(1));
+    serde_json::to_writer(&mut line, frame)?;
+    line.push(b'\n');
+    // JSON output is UTF-8, so this cannot fail.
+    String::from_utf8(line).map_err(|err| WireError::Json(serde::ser::Error::custom(err)))
+}
+
 /// Parse one NDJSON line into a frame.
 ///
 /// # Errors
@@ -504,7 +534,9 @@ mod body_b64 {
     use serde::{Deserialize as _, Deserializer, Serializer};
 
     pub(super) fn serialize<S: Serializer>(bytes: &[u8], ser: S) -> Result<S::Ok, S::Error> {
-        ser.serialize_str(&BASE64.encode(bytes))
+        // Streamed, not encoded to a `String` first: that copy is 4/3 of the
+        // body and lives as long as the output line does.
+        ser.collect_str(&base64::display::Base64Display::new(bytes, &BASE64))
     }
 
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<u8>, D::Error> {
@@ -1781,6 +1813,55 @@ mod tests {
         let line = format!(r#"{{"status":200,"headers":[{headers}],"body_b64":""}}"#);
         let parsed = from_line::<SandboxResponse>(&line).expect("a frame at the cap parses");
         assert_eq!(parsed.headers.len(), MAX_RESPONSE_HEADERS);
+    }
+
+    /// Records the largest single `write` it was given.
+    struct WidestWrite(usize);
+
+    impl std::io::Write for WidestWrite {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.max(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_body_is_encoded_into_the_line_without_a_whole_body_temporary() {
+        // A base64 `String` of the whole body handed to serde reaches the
+        // writer as one piece. Streaming the encoding never does.
+        const BODY: usize = 1 << 20;
+        let mut big = request();
+        big.body = vec![0xA5; BODY];
+        let frame = HostFrame::request(&big, &[]);
+
+        let mut widest = WidestWrite(0);
+        serde_json::to_writer(&mut widest, &frame).expect("serializes");
+
+        assert!(
+            widest.0 < BODY / 16,
+            "one write carried {} bytes of a {BODY}-byte body",
+            widest.0
+        );
+        // And the output is unchanged: the same line decodes to the same body.
+        let line = to_line(&frame).expect("serializes");
+        let HostFrame::Request { body, .. } = from_line(line.trim_end()).expect("parses") else {
+            panic!("a request frame must parse back as a request");
+        };
+        assert_eq!(body, big.body);
+    }
+
+    #[test]
+    fn a_line_holds_no_spare_capacity() {
+        // The line stays resident for the whole request. A buffer that grew by
+        // doubling would keep up to twice its length, which the footprint does
+        // not count.
+        let mut big = request();
+        big.body = vec![0x5A; (1 << 20) + 17];
+        let line = to_exact_line(&HostFrame::request(&big, &[])).expect("serializes");
+        assert_eq!(line.capacity(), line.len());
     }
 
     #[test]

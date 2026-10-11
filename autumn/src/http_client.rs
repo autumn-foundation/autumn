@@ -704,6 +704,10 @@ pub(crate) fn outbound_blocked_for_replay() -> bool {
 // `capsule` module. `OutboundRecorder` has a no-op twin below so `send` reads
 // the same on either build.
 
+/// The prefix of a recorded header value that is escaped bytes.
+#[cfg(feature = "reporting")]
+const OPAQUE_HEADER_PREFIX: &str = "[bytes] ";
+
 /// The headers the *caller* set, in the order they were set.
 ///
 /// One definition for both halves of the seam: the recorder stores this, and
@@ -725,7 +729,13 @@ fn caller_headers(builder: &RequestBuilder) -> Vec<(String, String)> {
         .map(|(name, value)| {
             (
                 name.as_str().to_owned(),
-                value.to_str().unwrap_or_default().to_owned(),
+                // An opaque value is kept as escaped bytes, so two different
+                // values never record the same text. A text value with the
+                // prefix is escaped too, so it cannot look like bytes.
+                match value.to_str() {
+                    Ok(text) if !text.starts_with(OPAQUE_HEADER_PREFIX) => text.to_owned(),
+                    _ => format!("{OPAQUE_HEADER_PREFIX}{}", value.as_bytes().escape_ascii()),
+                },
             )
         })
         .collect()
@@ -885,9 +895,9 @@ impl OutboundRecorder {
     ///
     /// Records the headers the *caller* set. Headers the client adds later —
     /// the injected W3C trace context, and any default the underlying
-    /// `reqwest::Client` was built with — are not on the tape, because replay
-    /// matches on method and URL and does not need them; the recorded request
-    /// half is a debugging aid, not the match key.
+    /// `reqwest::Client` was built with — are not on the tape. They change from
+    /// run to run, and replay compares the method, the URL, the caller-set
+    /// headers and the body.
     fn arm(builder: &RequestBuilder) -> Self {
         let scope = crate::capsule::current_scope();
         let Some(scope) = scope else {
@@ -1837,7 +1847,7 @@ pub struct RequestBuilder {
     redirect_mode: RedirectMode,
     /// When set, connect directly to this socket, skipping DNS resolution while
     /// preserving the original `Host` header + SNI. See [`RequestBuilder::pin_to`].
-    pin_addr: Option<SocketAddr>,
+    pin_addr: Option<Vec<SocketAddr>>,
     /// When `true`, use the composed SSRF-safe send path (resolve→validate→pin
     /// with per-hop redirect validation). Set by [`Client::get_ssrf_safe`].
     ssrf_safe: bool,
@@ -2126,8 +2136,22 @@ impl RequestBuilder {
     /// `resolve()` override applies, so a configured proxy would otherwise
     /// receive the request and re-resolve the host — defeating the pin.
     #[must_use]
-    pub const fn pin_to(mut self, addr: SocketAddr) -> Self {
-        self.pin_addr = Some(addr);
+    pub fn pin_to(self, addr: SocketAddr) -> Self {
+        self.pin_to_addrs([addr])
+    }
+
+    /// Like [`pin_to`](Self::pin_to), but accepts several addresses for one
+    /// host.
+    ///
+    /// All addresses go to one request. reqwest tries the next address only
+    /// if it cannot connect. A loop over `pin_to` could send a `POST` body
+    /// twice.
+    ///
+    /// An empty set makes `send` fail. It never drops the pin. Every other
+    /// rule of `pin_to` applies.
+    #[must_use]
+    pub fn pin_to_addrs(mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
+        self.pin_addr = Some(addrs.into_iter().collect());
         self
     }
 
@@ -2916,6 +2940,13 @@ impl RequestBuilder {
             ));
         }
 
+        // An empty pin set would send the request unpinned. Fail closed.
+        if self.pin_addr.as_ref().is_some_and(Vec::is_empty) {
+            return Err(ClientError::InvalidUrl(
+                "pin_to_addrs needs at least one address".to_owned(),
+            ));
+        }
+
         // Reject `pin_to` on an IP-literal URL host up front, deterministically, before
         // any network I/O. reqwest and hyper treat an IP-literal host as already resolved
         // and do not consult the DNS resolver, so the `resolve_to_addrs` override
@@ -2997,10 +3028,8 @@ impl RequestBuilder {
 
     /// Compute the `(host, addr)` resolve override for a pinned request, if any.
     fn pin_resolve(&self) -> Result<Option<(String, Vec<SocketAddr>)>, ClientError> {
-        match self.pin_addr {
-            // Single-address pin routed through the same set-based path as the
-            // multi-address SSRF-safe pin (a one-element slice).
-            Some(addr) => Ok(Some((host_of(&self.url)?, vec![addr]))),
+        match &self.pin_addr {
+            Some(addrs) => Ok(Some((host_of(&self.url)?, addrs.clone()))),
             None => Ok(None),
         }
     }
@@ -3034,8 +3063,8 @@ impl RequestBuilder {
         for hop in 0.. {
             // Pin only applies to the first hop's original target.
             let resolve = if hop == 0 {
-                match self.pin_addr {
-                    Some(addr) => Some((host_of(&current)?, vec![addr])),
+                match &self.pin_addr {
+                    Some(addrs) => Some((host_of(&current)?, addrs.clone())),
                     None => None,
                 }
             } else {
@@ -4749,6 +4778,24 @@ mod tests {
             ClientError::ThrottledLocally { host } => assert_eq!(host, "api.example.com:8443"),
             other => panic!("rebuilt as {other:?}"),
         }
+    }
+
+    /// Codex review on #3222: two different opaque header values record
+    /// different text, and a text value cannot look like bytes.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn opaque_header_values_record_without_collision() {
+        let recorded = |value: HeaderValue| {
+            let mut builder = Client::new().get("http://example.test/");
+            builder.extra_headers.insert("x-sig", value);
+            caller_headers(&builder).remove(0).1
+        };
+        let first = recorded(HeaderValue::from_bytes(b"a\xfe").expect("value"));
+        let second = recorded(HeaderValue::from_bytes(b"a\xff").expect("value"));
+        assert_ne!(first, second);
+        assert_eq!(recorded(HeaderValue::from_static("plain")), "plain");
+        let look_alike = recorded(HeaderValue::from_static("[bytes] a\\xfe"));
+        assert_ne!(look_alike, first);
     }
 
     /// Issue #3071: a capsule replays an injected fault as the same variant.
@@ -7327,6 +7374,42 @@ mod tests {
 
         assert_eq!(resp.status().as_u16(), 200);
         assert_eq!(resp.text(), "pong");
+    }
+
+    // `pin_to_addrs` hands the whole set to one request, so a refused first
+    // address falls back inside reqwest instead of re-sending the body.
+    #[tokio::test]
+    async fn pin_to_addrs_falls_back_to_the_next_address_on_connect_failure() {
+        use axum::{Router, routing::get};
+        let addr = spawn(Router::new().route("/ping", get(|| async { "pong" }))).await;
+        let port = addr.port();
+
+        let resp = Client::new()
+            .get(format!("http://pinned.invalid:{port}/ping"))
+            .pin_to_addrs([
+                // The listener is IPv4 only, so this address refuses at once.
+                // `127.0.0.2` is not portable: macOS does not route it.
+                SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            ])
+            .send()
+            .await
+            .expect("the second pinned address must serve the request");
+
+        assert_eq!(resp.text(), "pong");
+    }
+
+    #[tokio::test]
+    async fn pin_to_addrs_with_no_address_fails_instead_of_sending_unpinned() {
+        let result = Client::new()
+            .get("http://pinned.invalid:9/ping")
+            .pin_to_addrs([])
+            .send()
+            .await;
+        assert!(
+            matches!(result, Err(ClientError::InvalidUrl(_))),
+            "{result:?}"
+        );
     }
 
     // TEST 54: get_ssrf_safe rejects a host that resolves to a blocked IP BEFORE

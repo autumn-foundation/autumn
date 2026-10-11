@@ -85,6 +85,14 @@
 //! | `AUTUMN_DATABASE__IDLE_IN_TRANSACTION_TIMEOUT` | `database.idle_in_transaction_timeout` | duration; empty clears |
 //! | `AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT` | `database.migration_lock_timeout` | duration; empty is ignored |
 //! | `AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES` | `database.migration_lock_retries` | `u32` |
+//! | `AUTUMN_DATABASE__FLEET__MODE` | `database.fleet.mode` | `tenant` / `slot` |
+//! | `AUTUMN_DATABASE__FLEET__ROOT` | `database.fleet.root` | `String` |
+//! | `AUTUMN_DATABASE__FLEET__PATH` | `database.fleet.path` | `String` |
+//! | `AUTUMN_DATABASE__FLEET__MAX_OPEN` | `database.fleet.max_open` | `usize` |
+//! | `AUTUMN_DATABASE__FLEET__POOL_SIZE` | `database.fleet.pool_size` | `usize` |
+//! | `AUTUMN_DATABASE__FLEET__CREATE_ON_DEMAND` | `database.fleet.create_on_demand` | `Option<bool>` |
+//! | `AUTUMN_DATABASE__FLEET__IDLE_CLOSE_SECS` | `database.fleet.idle_close_secs` | `u64` |
+//! | `AUTUMN_DATABASE__FLEET__RESTORE_MISSING` | `database.fleet.restore_missing` | `bool` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__NAME` | `database.shards[i].name` | `String` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__PRIMARY_URL` | `database.shards[i].primary_url` | `String` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__SLOTS` | `database.shards[i].slots` | CSV of indices / `A-B` ranges |
@@ -6759,6 +6767,62 @@ impl AutumnConfig {
             &mut self.database.migration_lock_retries,
         );
         self.apply_shard_env_overrides(env);
+        self.apply_fleet_env_overrides(env);
+    }
+
+    /// Apply `AUTUMN_DATABASE__FLEET__*` overrides (ADR 0019).
+    ///
+    /// With no `[database.fleet]` in TOML, setting both `..._MODE` and
+    /// `..._ROOT` creates one; the other keys then adjust it.
+    fn apply_fleet_env_overrides(&mut self, env: &dyn Env) {
+        if self.database.fleet.is_none() {
+            let mode = env.var("AUTUMN_DATABASE__FLEET__MODE").ok();
+            let root = env.var("AUTUMN_DATABASE__FLEET__ROOT").ok();
+            let (Some(mode), Some(root)) = (mode, root) else {
+                return;
+            };
+            let Ok(mode) = mode.parse::<crate::fleet_layout::FleetMode>() else {
+                eprintln!("Warning: AUTUMN_DATABASE__FLEET__MODE={mode:?} is not valid, ignoring");
+                return;
+            };
+            self.database.fleet = Some(DatabaseFleetConfig {
+                mode,
+                root,
+                path: None,
+                max_open: default_fleet_max_open(),
+                pool_size: default_fleet_pool_size(),
+                create_on_demand: None,
+                idle_close_secs: default_fleet_idle_close_secs(),
+                restore_missing: false,
+            });
+        }
+        let Some(fleet) = self.database.fleet.as_mut() else {
+            return;
+        };
+        parse_env(env, "AUTUMN_DATABASE__FLEET__MODE", &mut fleet.mode);
+        parse_env(env, "AUTUMN_DATABASE__FLEET__ROOT", &mut fleet.root);
+        parse_env_option_string(env, "AUTUMN_DATABASE__FLEET__PATH", &mut fleet.path);
+        parse_env(env, "AUTUMN_DATABASE__FLEET__MAX_OPEN", &mut fleet.max_open);
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__FLEET__POOL_SIZE",
+            &mut fleet.pool_size,
+        );
+        parse_env_option_bool(
+            env,
+            "AUTUMN_DATABASE__FLEET__CREATE_ON_DEMAND",
+            &mut fleet.create_on_demand,
+        );
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__FLEET__IDLE_CLOSE_SECS",
+            &mut fleet.idle_close_secs,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_DATABASE__FLEET__RESTORE_MISSING",
+            &mut fleet.restore_missing,
+        );
     }
 
     /// Apply `AUTUMN_DATABASE__SHARDS__{i}__*` environment overrides.
@@ -10216,6 +10280,146 @@ pub struct DatabaseConfig {
     /// threshold surfaces that footgun at boot. Set to `0` to disable.
     #[serde(default = "default_max_connections_warn_threshold")]
     pub max_connections_warn_threshold: usize,
+
+    /// A fleet of `SQLite` databases: one file per tenant or one per routing
+    /// slot (ADR 0019). `None` (the default) means no fleet.
+    ///
+    /// With a fleet, the top-level `url` is the **control** database (sessions,
+    /// jobs, flags) and tenant data is routed by [`ShardedDb`](crate::sharding::ShardedDb),
+    /// [`Shards`](crate::sharding::Shards) and `#[repository(sharded)]` to a
+    /// database file opened on first use. Requires the `sqlite` feature and a
+    /// `sqlite:` control database; mutually exclusive with
+    /// [`shards`](Self::shards). See [`DatabaseFleetConfig`].
+    #[serde(default)]
+    pub fleet: Option<DatabaseFleetConfig>,
+}
+
+/// `[database.fleet]`: one `SQLite` database per tenant or per routing slot.
+///
+/// ```toml
+/// [database]
+/// url = "sqlite:///var/lib/app/control.db"
+///
+/// [database.fleet]
+/// mode = "tenant"                  # or "slot"
+/// root = "/var/lib/app/fleet"
+/// # path = "{bucket}/{tenant}.db"  # the default for mode = "tenant"
+/// max_open = 256
+/// ```
+///
+/// See [`crate::fleet_layout`] for the path template rules and ADR 0019 for
+/// the design.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DatabaseFleetConfig {
+    /// What one database holds: a tenant, or a routing slot.
+    pub mode: crate::fleet_layout::FleetMode,
+
+    /// Directory that holds the fleet. Created at boot when missing. Must be
+    /// on local storage (`SQLite` file locking is not safe on network file
+    /// systems).
+    pub root: String,
+
+    /// Path template under [`root`](Self::root). Default:
+    /// [`FleetMode::default_path`](crate::fleet_layout::FleetMode::default_path).
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// Most databases kept open at once. The least recently used idle one is
+    /// closed past this. Default: `256`. Each open database holds up to
+    /// [`pool_size`](Self::pool_size) connections and three file descriptors
+    /// per connection (database, `-wal`, `-shm`).
+    #[serde(default = "default_fleet_max_open")]
+    pub max_open: usize,
+
+    /// Connections per open database. Default: `2`. `SQLite` has one writer
+    /// per database, so a large pool only adds lock contention.
+    #[serde(default = "default_fleet_pool_size")]
+    pub pool_size: usize,
+
+    /// Create a database that does not exist yet on first use. Default:
+    /// `true` for `mode = "slot"`, `false` for `mode = "tenant"` — tenant ids
+    /// come from requests, so a tenant database is provisioned explicitly
+    /// (`DatabaseFleet::provision`, in `autumn_web::db::fleet`)
+    /// unless the app opts in here.
+    #[serde(default)]
+    pub create_on_demand: Option<bool>,
+
+    /// Close a database that has not been used for this long. Default: `300`.
+    /// `0` closes databases only when [`max_open`](Self::max_open) is reached.
+    #[serde(default = "default_fleet_idle_close_secs")]
+    pub idle_close_secs: u64,
+
+    /// With `[replication]` on, rebuild a database whose file is missing from
+    /// its replica before opening it. Default: `false`.
+    ///
+    /// This is how a host with a fresh volume takes over a slot range or a
+    /// tenant: the first request restores the database from object storage.
+    /// Only turn it on once the previous owner has stopped writing, or both
+    /// hosts will diverge (ADR 0019 §5).
+    #[serde(default)]
+    pub restore_missing: bool,
+}
+
+impl DatabaseFleetConfig {
+    /// The path template, defaulted by mode.
+    #[must_use]
+    pub fn path_template(&self) -> &str {
+        self.path
+            .as_deref()
+            .unwrap_or_else(|| self.mode.default_path())
+    }
+
+    /// Whether a missing database is created on first use.
+    #[must_use]
+    pub fn effective_create_on_demand(&self) -> bool {
+        self.create_on_demand
+            .unwrap_or_else(|| self.mode.default_create_on_demand())
+    }
+
+    /// Check the fleet section on its own (the cross-section rules live in
+    /// [`DatabaseConfig::validate`]).
+    ///
+    /// # Errors
+    ///
+    /// A [`ConfigError::Validation`] naming the field.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.root.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "database.fleet.root must name a directory".to_owned(),
+            ));
+        }
+        if self.root.starts_with("sqlite:") || self.root.starts_with("file:") {
+            return Err(ConfigError::Validation(format!(
+                "database.fleet.root {:?} is a directory, not a database URL",
+                self.root
+            )));
+        }
+        crate::fleet_layout::FleetPathTemplate::parse(self.path_template(), self.mode)
+            .map_err(|e| ConfigError::Validation(e.to_string()))?;
+        if self.max_open == 0 {
+            return Err(ConfigError::Validation(
+                "database.fleet.max_open must be at least 1".to_owned(),
+            ));
+        }
+        if self.pool_size == 0 {
+            return Err(ConfigError::Validation(
+                "database.fleet.pool_size must be at least 1".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+const fn default_fleet_max_open() -> usize {
+    256
+}
+
+const fn default_fleet_pool_size() -> usize {
+    2
+}
+
+const fn default_fleet_idle_close_secs() -> u64 {
+    300
 }
 
 /// Decide whether the aggregate connection count warrants a startup warning.
@@ -10687,8 +10891,144 @@ impl DatabaseConfig {
             }
         }
         self.resolved_slot_map()?;
+        self.validate_fleet()?;
         Ok(())
     }
+
+    /// Cross-section rules for `[database.fleet]` (ADR 0019).
+    fn validate_fleet(&self) -> Result<(), ConfigError> {
+        let Some(fleet) = &self.fleet else {
+            return Ok(());
+        };
+        fleet.validate()?;
+        if self.has_shards() {
+            return Err(ConfigError::Validation(
+                "database.fleet and [[database.shards]] are both configured; a fleet routes \
+                 tenant data to its own SQLite files, so declare one or the other"
+                    .to_owned(),
+            ));
+        }
+        if self.directory_shard_router {
+            return Err(ConfigError::Validation(
+                "database.directory_shard_router is set with database.fleet; the directory \
+                 router is a Postgres control table, and a fleet routes by its mode"
+                    .to_owned(),
+            ));
+        }
+        let control = self.effective_primary_url();
+        if control.and_then(DatabaseBackend::detect) != Some(DatabaseBackend::Sqlite)
+            || control.is_some_and(is_in_memory_sqlite_target)
+        {
+            return Err(ConfigError::Validation(
+                "database.fleet needs a file-backed sqlite: control database in database.url; \
+                 framework state (sessions, jobs, flags) lives there while tenant data lives \
+                 in the fleet"
+                    .to_owned(),
+            ));
+        }
+        if let Some(control_file) = control.and_then(sqlite_url_file) {
+            let root = lexical_absolute(Path::new(&fleet.root));
+            if control_file.starts_with(&root) {
+                return Err(ConfigError::Validation(format!(
+                    "the control database {} is inside database.fleet.root {}; a tenant or \
+                     slot path could resolve to it and migrate it as a tenant. Put the \
+                     control database outside the fleet root",
+                    control_file.display(),
+                    root.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The file a file-backed `sqlite:` URL names, made absolute without touching
+/// the file system. `None` for an in-memory target. Mirrors how the pool
+/// normalizes a target (`sqlite://`, `sqlite:` or `file:`, query dropped).
+pub(crate) fn sqlite_url_file(url: &str) -> Option<PathBuf> {
+    if is_in_memory_sqlite_target(url) {
+        return None;
+    }
+    let rest = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))
+        .unwrap_or(url);
+    // A URI path ends at `?` or `#`, and `SQLite` percent-decodes it
+    // (`%66leet` is `fleet`). After `//` comes an authority: empty
+    // (`file:///abs`) or `localhost` names this host; `SQLite` refuses any
+    // other, so there is no local file to compare.
+    // Any other spelling reaches `sqlite3_open` as a literal path: `?` and `#`
+    // are filename characters there, not a query.
+    let path = rest.strip_prefix("file:").map_or_else(
+        || rest.to_owned(),
+        |uri| {
+            let uri = uri.strip_prefix("//").map_or(uri, |authority_and_path| {
+                let (authority, path) = authority_and_path.split_at(
+                    authority_and_path
+                        .find('/')
+                        .unwrap_or(authority_and_path.len()),
+                );
+                if authority.is_empty() || authority.eq_ignore_ascii_case("localhost") {
+                    path
+                } else {
+                    ""
+                }
+            });
+            percent_decode_uri_path(uri.split(['?', '#']).next().unwrap_or_default())
+        },
+    );
+    (!path.is_empty()).then(|| lexical_absolute(Path::new(&path)))
+}
+
+/// `SQLite`'s percent-decoding of a URI path: `%XX` becomes that byte, a `%`
+/// not followed by two hex digits stays literal, and a decoded NUL ends the
+/// path. Mirrors `crate::db::percent_decode`, which is `sqlite`-gated while
+/// config validation is not.
+fn percent_decode_uri_path(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let decoded = (bytes[i] == b'%')
+            .then(|| bytes.get(i + 1..i + 3))
+            .flatten()
+            .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match decoded {
+            Some(0) => break,
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `path` made absolute against the working directory, with `.` and `..`
+/// resolved lexically (no symlink resolution, no file system access).
+fn lexical_absolute(path: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+    };
+    let mut out = PathBuf::new();
+    for part in joined.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Whether `s` is an acceptable Postgres connection string: a
@@ -11944,6 +12284,7 @@ impl Default for DatabaseConfig {
             shards: Vec::new(),
             directory_shard_router: false,
             max_connections_warn_threshold: default_max_connections_warn_threshold(),
+            fleet: None,
         }
     }
 }
@@ -19772,6 +20113,241 @@ path = "/healthz"
             err.contains("database shards require the postgres backend"),
             "message must name the postgres requirement, got: {err}"
         );
+    }
+
+    fn fleet(mode: crate::fleet_layout::FleetMode) -> DatabaseFleetConfig {
+        DatabaseFleetConfig {
+            mode,
+            root: "/var/lib/app/fleet".to_owned(),
+            path: None,
+            max_open: 16,
+            pool_size: 2,
+            create_on_demand: None,
+            idle_close_secs: 300,
+            restore_missing: false,
+        }
+    }
+
+    fn fleet_db(fleet_config: DatabaseFleetConfig) -> DatabaseConfig {
+        DatabaseConfig {
+            url: Some("sqlite:///var/lib/app/control.db".to_owned()),
+            fleet: Some(fleet_config),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "fleet path templates use {placeholders}"
+    )]
+    fn validate_accepts_a_fleet_on_a_sqlite_control_database() {
+        use crate::fleet_layout::FleetMode;
+        fleet_db(fleet(FleetMode::Tenant)).validate().unwrap();
+        fleet_db(fleet(FleetMode::Slot)).validate().unwrap();
+        let tenant = fleet(FleetMode::Tenant);
+        assert_eq!(tenant.path_template(), "{bucket}/{tenant}.db");
+        assert!(!tenant.effective_create_on_demand());
+        let slot = fleet(FleetMode::Slot);
+        assert_eq!(slot.path_template(), "{bucket}/slot-{slot}.db");
+        assert!(slot.effective_create_on_demand());
+    }
+
+    #[test]
+    fn validate_rejects_a_fleet_without_a_sqlite_control_database() {
+        use crate::fleet_layout::FleetMode;
+        for url in [
+            None,
+            Some("postgres://db/app"),
+            // In memory: framework state would vanish with the connection.
+            Some("sqlite::memory:"),
+            Some("sqlite:"),
+            Some("sqlite://"),
+            Some("file::memory:?cache=shared"),
+            Some("sqlite:file:app?mode=memory&cache=shared"),
+        ] {
+            let config = DatabaseConfig {
+                url: url.map(str::to_owned),
+                fleet: Some(fleet(FleetMode::Tenant)),
+                ..Default::default()
+            };
+            let err = config
+                .validate()
+                .expect_err("needs a file-backed sqlite control database")
+                .to_string();
+            assert!(err.contains("sqlite: control database"), "{url:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn percent_decoding_matches_sqlite_uri_paths() {
+        assert_eq!(percent_decode_uri_path("/a/%66leet/b"), "/a/fleet/b");
+        assert_eq!(percent_decode_uri_path("/a%2Fb"), "/a/b");
+        assert_eq!(percent_decode_uri_path("/50%"), "/50%", "trailing % stays");
+        assert_eq!(percent_decode_uri_path("/x%zz"), "/x%zz", "non-hex stays");
+        assert_eq!(
+            percent_decode_uri_path("/x%+1"),
+            "/x%+1",
+            "a sign is not hex"
+        );
+        assert_eq!(
+            percent_decode_uri_path("/db%00tail"),
+            "/db",
+            "NUL ends the path"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_control_database_inside_the_fleet_root() {
+        use crate::fleet_layout::FleetMode;
+        // A tenant named `control` under `{tenant}.db` would open the control
+        // database itself and migrate it as a tenant.
+        for url in [
+            "sqlite:///var/lib/app/control.db",
+            "sqlite:///var/lib/app/./sub/../control.db",
+            "sqlite:/var/lib/app/control.db?mode=rwc",
+            "sqlite:file:/var/lib/app/control.db?cache=private",
+            "sqlite:file:///var/lib/app/control.db",
+        ] {
+            let mut config = fleet_db(DatabaseFleetConfig {
+                root: "/var/lib/app".to_owned(),
+                path: Some("{tenant}.db".to_owned()),
+                ..fleet(FleetMode::Tenant)
+            });
+            config.url = Some(url.to_owned());
+            let err = config
+                .validate()
+                .expect_err("control database inside the fleet root")
+                .to_string();
+            assert!(err.contains("inside database.fleet.root"), "{url}: {err}");
+        }
+        // SQLite percent-decodes a `file:` URI path (and ends it at `?` or
+        // `#`), so `%66leet` is `fleet`: the encoded spelling must not slip by.
+        for url in [
+            "file:/var/lib/app/%66leet/control.db",
+            "sqlite:file:/var/lib/app/%66leet/control.db?mode=rwc",
+            "sqlite:file:///var/lib/app/fleet/control.db#frag",
+            // `localhost` is the local host's authority: an absolute path.
+            "file://localhost/var/lib/app/fleet/control.db",
+            "sqlite:file://LOCALHOST/var/lib/app/fleet/control.db",
+        ] {
+            let mut config = fleet_db(fleet(FleetMode::Tenant));
+            config.url = Some(url.to_owned());
+            let err = config
+                .validate()
+                .expect_err("decoded control path is inside the fleet root")
+                .to_string();
+            assert!(err.contains("inside database.fleet.root"), "{url}: {err}");
+        }
+        // Outside a `file:` URI, `?` is just a filename character: SQLite opens
+        // `/srv/fleet?data/control.db`, inside a root named `/srv/fleet?data`.
+        let mut literal = fleet_db(DatabaseFleetConfig {
+            root: "/srv/fleet?data".to_owned(),
+            ..fleet(FleetMode::Tenant)
+        });
+        literal.url = Some("sqlite:///srv/fleet?data/control.db".to_owned());
+        let err = literal
+            .validate()
+            .expect_err("a literal `?` path inside the root")
+            .to_string();
+        assert!(err.contains("inside database.fleet.root"), "{err}");
+        // Beside the root (the documented layout) is fine, and so is a sibling
+        // whose name merely starts with the root's.
+        fleet_db(fleet(FleetMode::Tenant)).validate().unwrap();
+        let mut sibling = fleet_db(fleet(FleetMode::Tenant));
+        sibling.url = Some("sqlite:///var/lib/app/fleet-control.db".to_owned());
+        sibling.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_a_fleet_alongside_shards_or_the_directory_router() {
+        use crate::fleet_layout::FleetMode;
+        let mut config = fleet_db(fleet(FleetMode::Slot));
+        config.directory_shard_router = true;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("directory_shard_router"), "{err}");
+
+        // Shards on sqlite are refused by the backend rule first; on a fleet
+        // config the dedicated message must still be reachable through
+        // `validate_fleet` itself.
+        let mut config = fleet_db(fleet(FleetMode::Slot));
+        config.shards = vec![shard("s0", "postgres://db-shard0/app")];
+        assert!(config.validate().is_err());
+        let err = config.validate_fleet().unwrap_err().to_string();
+        assert!(err.contains("declare one or the other"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_malformed_fleet_sections() {
+        use crate::fleet_layout::FleetMode;
+        type Mutate = fn(&mut DatabaseFleetConfig);
+        let cases: [(&str, Mutate); 6] = [
+            ("root", |f| f.root = "  ".to_owned()),
+            ("not a database URL", |f| f.root = "sqlite:///x".to_owned()),
+            ("{tenant}", |f| f.path = Some("{bucket}/all.db".to_owned())),
+            ("..", |f| f.path = Some("../{tenant}.db".to_owned())),
+            ("max_open", |f| f.max_open = 0),
+            ("pool_size", |f| f.pool_size = 0),
+        ];
+        for (needle, mutate) in cases {
+            let mut section = fleet(FleetMode::Tenant);
+            mutate(&mut section);
+            let err = fleet_db(section).validate().unwrap_err().to_string();
+            assert!(err.contains(needle), "expected {needle:?} in {err}");
+        }
+    }
+
+    #[test]
+    fn fleet_env_overrides_create_and_adjust_the_section() {
+        use crate::fleet_layout::FleetMode;
+        let mut config = AutumnConfig::default();
+        // MODE without ROOT does not create a half-configured fleet.
+        config.apply_env_overrides_with_env(
+            &MockEnv::new().with("AUTUMN_DATABASE__FLEET__MODE", "slot"),
+        );
+        assert!(config.database.fleet.is_none());
+
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__FLEET__MODE", "tenant")
+            .with("AUTUMN_DATABASE__FLEET__ROOT", "/data/fleet")
+            .with("AUTUMN_DATABASE__FLEET__PATH", "{tenant}/main.db")
+            .with("AUTUMN_DATABASE__FLEET__MAX_OPEN", "9")
+            .with("AUTUMN_DATABASE__FLEET__POOL_SIZE", "1")
+            .with("AUTUMN_DATABASE__FLEET__CREATE_ON_DEMAND", "true")
+            .with("AUTUMN_DATABASE__FLEET__IDLE_CLOSE_SECS", "0")
+            .with("AUTUMN_DATABASE__FLEET__RESTORE_MISSING", "true");
+        config.apply_env_overrides_with_env(&env);
+        let fleet = config.database.fleet.expect("env creates the fleet");
+        assert_eq!(fleet.mode, FleetMode::Tenant);
+        assert_eq!(fleet.root, "/data/fleet");
+        assert_eq!(fleet.path_template(), "{tenant}/main.db");
+        assert_eq!(fleet.max_open, 9);
+        assert_eq!(fleet.pool_size, 1);
+        assert!(fleet.effective_create_on_demand());
+        assert_eq!(fleet.idle_close_secs, 0);
+        assert!(fleet.restore_missing);
+    }
+
+    #[test]
+    fn fleet_section_deserializes_from_toml() {
+        use crate::fleet_layout::FleetMode;
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [database]
+            url = "sqlite:///var/lib/app/control.db"
+
+            [database.fleet]
+            mode = "slot"
+            root = "/var/lib/app/fleet"
+            "#,
+        )
+        .unwrap();
+        let fleet = config.database.fleet.as_ref().unwrap();
+        assert_eq!(fleet.mode, FleetMode::Slot);
+        assert_eq!(fleet.max_open, 256);
+        assert_eq!(fleet.pool_size, 2);
+        assert_eq!(fleet.idle_close_secs, 300);
+        config.database.validate().unwrap();
     }
 
     #[test]

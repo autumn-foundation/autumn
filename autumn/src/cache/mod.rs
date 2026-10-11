@@ -73,11 +73,15 @@ static GLOBAL_CACHE: RwLock<Option<Arc<dyn Cache>>> = RwLock::new(None);
 /// [`crate::state::AppState::set_cache`] when a plugin installs a backend
 /// during the startup-hook phase.
 ///
+/// With the `reporting` feature the backend is wrapped once, so a failure
+/// capsule records its removals and a replay never reaches it. Thus
+/// [`global_cache`] returns the wrapper, not the `Arc` given here.
+///
 /// # Panics
 ///
 /// Panics if the internal `RwLock` is poisoned.
 pub fn set_global_cache(cache: Arc<dyn Cache>) {
-    *GLOBAL_CACHE.write().expect("global cache lock poisoned") = Some(cache);
+    *GLOBAL_CACHE.write().expect("global cache lock poisoned") = Some(with_capsule_seam(cache));
 }
 
 /// Return a clone of the process-level shared cache, if one is registered.
@@ -94,6 +98,161 @@ pub fn global_cache() -> Option<Arc<dyn Cache>> {
         .read()
         .expect("global cache lock poisoned")
         .clone()
+}
+
+/// Set the global cache for `autumn replay`, before the state initializers
+/// run (#2351).
+///
+/// Replay builds no cache backend. When the app builder has one
+/// (`with_cache_backend`), production installed it before the initializers,
+/// so replay installs the capsule seam over a backend that stores nothing, in
+/// the global cache and the app state. A cache call then takes the path it
+/// took in production, and the tape answers it. Otherwise the global cache is
+/// cleared, as the build clears it in production.
+///
+/// Returns the cache for the app state.
+#[cfg(feature = "reporting")]
+pub(crate) fn install_replay_cache(builder_cache: bool) -> Option<Arc<dyn Cache>> {
+    if !builder_cache {
+        clear_global_cache();
+        return None;
+    }
+    // Wrapped once, so the global and the state hold the same `Arc`.
+    let cache = with_capsule_seam(Arc::new(ReplayBackend));
+    set_global_cache(Arc::clone(&cache));
+    Some(cache)
+}
+
+/// After the state initializers: install the replay seam for a cache the
+/// capsule recorded and nothing has installed yet. It came from a startup
+/// hook (`RedisCachePlugin`), which replay does not run. Production's
+/// initializers ran before that hook, so they did not see it either.
+#[cfg(feature = "reporting")]
+pub(crate) fn install_late_replay_cache(
+    state: &crate::state::AppState,
+    recorded: &crate::capsule::CapsuleEffects,
+) {
+    if recorded.state_cache && state.cache().is_none() {
+        state.set_cache(Arc::new(ReplayBackend));
+    }
+}
+
+/// A replay's answer to a coherence namespace removal (#2351).
+///
+/// The tape answers it, as it does for the installed cache, and no store is
+/// reached: a registered store is not on the seam. During `autumn replay`
+/// with no tape, nothing is reached either. `None` outside a replay.
+#[cfg(feature = "reporting")]
+pub(crate) fn replayed_namespace_removal(namespace: &str) -> Option<bool> {
+    if let Some(tape) = crate::capsule::effects::current_tape() {
+        return Some(tape.cache_invalidate_namespace(namespace).is_ok());
+    }
+    replay_blocked().then_some(true)
+}
+
+/// No capsule support compiled in: never a replay.
+#[cfg(not(feature = "reporting"))]
+pub(crate) const fn replayed_namespace_removal(_namespace: &str) -> Option<bool> {
+    None
+}
+
+/// A coherence namespace removal's place on the capsule seam (#2351).
+///
+/// Coherence clears the registered stores, which are not on the seam, and
+/// asks the installed cache. It returns `false` when either part fails. The
+/// capsule records that combined answer once, as a replay returns it, so the
+/// installed cache's own record of its part is suppressed: call it through
+/// [`call_installed`](Self::call_installed).
+#[cfg(feature = "reporting")]
+pub(crate) struct NamespaceRemoval(Option<(Arc<crate::capsule::CaptureScope>, usize)>);
+
+#[cfg(feature = "reporting")]
+impl NamespaceRemoval {
+    /// Take the removal's slot before any store is reached.
+    pub(crate) fn reserve() -> Self {
+        Self(
+            crate::capsule::current_scope()
+                .and_then(|scope| scope.reserve_cache().map(|index| (scope, index))),
+        )
+    }
+
+    /// Call the installed cache without it recording the removal. A future
+    /// it returns has already read the flag.
+    pub(crate) fn call_installed<R>(call: impl FnOnce() -> R) -> R {
+        let outer = COHERENCE_REMOVAL.with(|flag| flag.replace(true));
+        let restore = RestoreFlag(outer);
+        let result = call();
+        drop(restore);
+        result
+    }
+
+    /// Record the combined answer: `failure` names the part that failed.
+    pub(crate) fn record(self, namespace: &str, failure: Option<&str>) {
+        if let Some((scope, index)) = self.0 {
+            scope.fill_cache(
+                index,
+                crate::capsule::CacheEffect::InvalidateNamespace {
+                    namespace: namespace.to_owned(),
+                    error: failure.map(|reason| crate::capsule::CacheInvalidationError {
+                        attempts: 1,
+                        reason: reason.to_owned(),
+                    }),
+                },
+            );
+        }
+    }
+}
+
+// Set while coherence calls the installed cache for a removal it records.
+#[cfg(feature = "reporting")]
+thread_local! {
+    static COHERENCE_REMOVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Restores [`COHERENCE_REMOVAL`], also when the backend panics.
+#[cfg(feature = "reporting")]
+struct RestoreFlag(bool);
+
+#[cfg(feature = "reporting")]
+impl Drop for RestoreFlag {
+    fn drop(&mut self) {
+        let outer = self.0;
+        COHERENCE_REMOVAL.with(|flag| flag.set(outer));
+    }
+}
+
+/// No capsule support compiled in: nothing to record.
+#[cfg(not(feature = "reporting"))]
+pub(crate) struct NamespaceRemoval;
+
+#[cfg(not(feature = "reporting"))]
+impl NamespaceRemoval {
+    pub(crate) const fn reserve() -> Self {
+        Self
+    }
+
+    pub(crate) fn call_installed<R>(call: impl FnOnce() -> R) -> R {
+        call()
+    }
+
+    pub(crate) const fn record(self, _namespace: &str, _failure: Option<&str>) {}
+}
+
+/// The backend under the replay seam. It stores nothing.
+#[cfg(feature = "reporting")]
+struct ReplayBackend;
+
+#[cfg(feature = "reporting")]
+impl Cache for ReplayBackend {
+    fn get_value(&self, _key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+        None
+    }
+    fn insert_value(&self, _key: &str, _value: Arc<dyn Any + Send + Sync>) {}
+    fn invalidate(&self, _key: &str) {}
+    fn clear(&self) {}
+    fn invalidate_namespace(&self, _namespace: &str) -> bool {
+        true
+    }
 }
 
 /// Remove the process-level shared cache.
@@ -248,6 +407,53 @@ pub trait Cache: Send + Sync + 'static {
     /// [`insert_value`]: Cache::insert_value
     fn insert_raw_bytes(&self, _key: &str, _bytes: Vec<u8>, _ttl: Option<std::time::Duration>) {}
 
+    /// Whether this backend keeps a shared fill epoch.
+    ///
+    /// Return `true` if you override [`fill_epoch`](Cache::fill_epoch). Then a
+    /// failed [`invalidate_namespace`](Cache::invalidate_namespace) on a store
+    /// registered with `coherence::register_namespace_store` makes the
+    /// invalidation incomplete. The default is `false`.
+    fn shares_fill_epoch(&self) -> bool {
+        false
+    }
+
+    /// Read the namespace's **shared** fill epoch.
+    ///
+    /// A cross-replica backend keeps one epoch for each namespace in the
+    /// shared store.
+    /// [`invalidate_namespace`](Cache::invalidate_namespace) must raise it
+    /// **before** it sweeps. A fill reads it after a miss and before it
+    /// computes. Then the fill inserts with
+    /// [`insert_raw_bytes_if_epoch`](Cache::insert_raw_bytes_if_epoch). Then no
+    /// fill can write back a value that an invalidation has dropped. This holds
+    /// on all replicas.
+    ///
+    /// The default is [`FillEpoch::Unsupported`]. The fence stays per process.
+    fn fill_epoch(&self, _namespace: &str) -> FillEpoch {
+        FillEpoch::Unsupported
+    }
+
+    /// Store pre-serialized bytes only if the shared epoch still equals
+    /// `sampled`. The check and the store must be one atomic step.
+    ///
+    /// Returns `true` when stored. A backend that overrides
+    /// [`fill_epoch`](Cache::fill_epoch) must override this too. The default
+    /// stores without a check.
+    ///
+    /// When the epoch is [`FillEpoch::Sampled`], `insert_value` is not called.
+    /// Fill any local tier here.
+    fn insert_raw_bytes_if_epoch(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        ttl: Option<std::time::Duration>,
+        _namespace: &str,
+        _sampled: u64,
+    ) -> bool {
+        self.insert_raw_bytes(key, bytes, ttl);
+        true
+    }
+
     /// Try to acquire a cross-replica fill lock for `key`, used by
     /// [`get_or_compute_with`] to ensure at most one replica refills a hot
     /// key at a time.
@@ -293,6 +499,14 @@ pub trait Cache: Send + Sync + 'static {
         })
     }
 
+    /// Whether this backend is the framework's failure-capsule wrapper.
+    /// Framework internal. A decorator that wraps an installed backend
+    /// forwards it, so the backend is not wrapped twice.
+    #[doc(hidden)]
+    fn is_capsule_seam(&self) -> bool {
+        false
+    }
+
     /// Async form of [`invalidate_namespace`](Cache::invalidate_namespace).
     ///
     /// The default calls the sync method and maps `false` to an error.
@@ -316,6 +530,18 @@ pub trait Cache: Send + Sync + 'static {
             }
         })
     }
+}
+
+/// A namespace's shared fill epoch, as read by [`Cache::fill_epoch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillEpoch {
+    /// The backend has no shared epoch. Only the per-process fence applies.
+    Unsupported,
+    /// The epoch at the time of the read.
+    Sampled(u64),
+    /// The backend has a shared epoch but could not read it. A fill must not
+    /// insert. The result is one extra cache miss.
+    Unavailable,
 }
 
 /// Outcome of [`Cache::try_acquire_fill_lock`].
@@ -342,10 +568,60 @@ pub enum FillLockStatus {
 /// For cross-replica backends (Redis) use [`get_cached`] instead, which
 /// also handles JSON deserialization of [`RawCacheBytes`].
 pub fn get<V: Clone + Send + Sync + 'static>(cache: &dyn Cache, key: &str) -> Option<V> {
-    cache
-        .get_value(key)
-        .and_then(|arc| arc.downcast_ref::<V>().cloned())
+    // Failure-capsule seam (#2351 item 2). The value is not serializable, so
+    // a replay serves only a recorded miss, and capture can record only a
+    // miss.
+    if replayed_untyped_get(key) {
+        return None;
+    }
+    let value = helper_read(cache, key).and_then(|arc| arc.downcast_ref::<V>().cloned());
+    record_untyped_get(key, value.is_some());
+    value
 }
+
+/// Read through a helper that records the read. The capsule seam takes any
+/// other `get_value` call as a direct read that it cannot record.
+fn helper_read(cache: &dyn Cache, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+    #[cfg(feature = "reporting")]
+    let _helper = HelperCall::enter();
+    cache.get_value(key)
+}
+
+// Set while a recording helper reads or writes, so the seam can tell a
+// direct call.
+#[cfg(feature = "reporting")]
+thread_local! {
+    static HELPER_CALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks a helper call for its lifetime, also when the backend panics.
+#[cfg(feature = "reporting")]
+struct HelperCall(bool);
+
+#[cfg(feature = "reporting")]
+impl HelperCall {
+    fn enter() -> Self {
+        Self(HELPER_CALL.with(|flag| flag.replace(true)))
+    }
+}
+
+#[cfg(feature = "reporting")]
+impl Drop for HelperCall {
+    fn drop(&mut self) {
+        let outer = self.0;
+        HELPER_CALL.with(|flag| flag.set(outer));
+    }
+}
+
+/// Why a capsule with a direct cache write is not replayable.
+#[cfg(feature = "reporting")]
+const DIRECT_WRITE_NOTE: &str = "the run wrote the cache with `Cache::insert_value` or \
+     `insert_raw_bytes` directly; the write is not recorded, so replay cannot check it";
+
+/// Why a capsule with a direct cache read is not replayable.
+#[cfg(feature = "reporting")]
+const DIRECT_READ_NOTE: &str = "the run read the cache with `Cache::get_value` directly; the \
+     value is not recorded, so replay cannot serve it";
 
 /// Typed insert: wrap the value in an `Arc` and store it.
 ///
@@ -354,6 +630,13 @@ pub fn get<V: Clone + Send + Sync + 'static>(cache: &dyn Cache, key: &str) -> Op
 /// For cross-replica backends (Redis) use [`insert_cached`] instead,
 /// which also serializes the value for storage across process boundaries.
 pub fn insert<V: Clone + Send + Sync + 'static>(cache: &dyn Cache, key: &str, value: V) {
+    // Failure-capsule seam (#2351 item 2): a replay never writes, and capture
+    // cannot record the value.
+    if record_or_replay_untyped_insert(key) {
+        return;
+    }
+    #[cfg(feature = "reporting")]
+    let _helper = HelperCall::enter();
     cache.insert_value(key, Arc::new(value));
 }
 
@@ -376,7 +659,7 @@ where
         ReplayedRead::Miss => return None,
         ReplayedRead::Hit(value) => return Some(value),
     }
-    let arc = cache.get_value(key);
+    let arc = helper_read(cache, key);
     let value = arc.and_then(|arc| {
         // Fast path: in-memory backend stored the concrete type directly.
         if let Some(value) = arc.downcast_ref::<V>() {
@@ -419,12 +702,100 @@ where
     if record_or_replay_cache_insert(key, bytes.as_deref(), ttl) {
         return;
     }
+    #[cfg(feature = "reporting")]
+    let _helper = HelperCall::enter();
     // In-memory path (MokaCache, CountingCache in tests, …)
     cache.insert_value(key, Arc::new(value));
     // Serialized path (RedisCache, any cross-replica backend)
     if let Some(bytes) = bytes {
         cache.insert_raw_bytes(key, bytes, ttl);
     }
+}
+
+/// Like [`insert_cached`], but store only if the shared epoch did not change.
+///
+/// `epoch` is the [`Cache::fill_epoch`] read after the miss and before the
+/// compute. Returns `true` when the value was stored. `false` means the fill
+/// was fenced out, or the epoch was [`FillEpoch::Unavailable`].
+///
+/// With [`FillEpoch::Unsupported`] this is [`insert_cached`].
+pub fn insert_cached_fenced<V>(
+    cache: &dyn Cache,
+    key: &str,
+    value: V,
+    ttl: Option<std::time::Duration>,
+    namespace: &str,
+    epoch: FillEpoch,
+) -> bool
+where
+    V: Clone + serde::Serialize + Send + Sync + 'static,
+{
+    // A replay has no fence: `insert_cached` sends the write to the tape, or
+    // drops it during `autumn replay` with no tape. Only a sampled epoch
+    // reaches the backend, so only it is bypassed, and only after the value
+    // is encoded, as the fenced path does.
+    let epoch = match epoch {
+        FillEpoch::Sampled(_) if replaying() => {
+            if serde_json::to_vec(&value).is_err() {
+                return false;
+            }
+            FillEpoch::Unsupported
+        }
+        other => other,
+    };
+    let sampled = match epoch {
+        FillEpoch::Unsupported => {
+            insert_cached(cache, key, value, ttl);
+            return true;
+        }
+        FillEpoch::Unavailable => return false,
+        FillEpoch::Sampled(sampled) => sampled,
+    };
+    let Some(bytes) = serde_json::to_vec(&value).ok() else {
+        return false;
+    };
+    // Raw bytes only: `insert_value` would write without the check.
+    let stored = {
+        #[cfg(feature = "reporting")]
+        let _helper = HelperCall::enter();
+        cache.insert_raw_bytes_if_epoch(key, bytes.clone(), ttl, namespace, sampled)
+    };
+    if stored {
+        // Capture records the write after it happened. A replay never gets
+        // here.
+        let _ = record_or_replay_cache_insert(key, Some(&bytes), ttl);
+    }
+    stored
+}
+
+/// Read the shared fill epoch for a fill that just missed.
+///
+/// A replay serves cache effects from the tape (#1634), so it never reads the
+/// backend. It gets [`FillEpoch::Unsupported`], and [`insert_cached_fenced`]
+/// then writes to the tape. During `autumn replay`, code with no tape also
+/// gets `Unsupported`, and the write is dropped.
+#[must_use]
+pub fn sample_fill_epoch(cache: &dyn Cache, namespace: &str) -> FillEpoch {
+    if replaying() {
+        return FillEpoch::Unsupported;
+    }
+    cache.fill_epoch(namespace)
+}
+
+/// Whether an effect tape serves the current task, or this process replays a
+/// capsule.
+///
+/// Not `tape_active`: that marks the replay scope as entered. Only the
+/// reporting layer may do that.
+#[cfg(feature = "reporting")]
+fn replaying() -> bool {
+    crate::capsule::effects::current_tape().is_some() || replay_blocked()
+}
+
+/// No capsule support compiled in: there is no replay.
+#[cfg(not(feature = "reporting"))]
+const fn replaying() -> bool {
+    false
 }
 
 // ── Failure-capsule seam (#1634) ─────────────────────────────────────────────
@@ -457,6 +828,11 @@ where
 {
     use crate::capsule::effects::CachedValue;
     let Some(tape) = crate::capsule::effects::current_tape() else {
+        // Replay startup code has no tape. A raw backend it holds must not
+        // be read, so the read is a miss.
+        if replay_blocked() {
+            return ReplayedRead::Miss;
+        }
         return ReplayedRead::NoTape;
     };
     match tape.cache_get(key) {
@@ -545,6 +921,11 @@ fn record_or_replay_cache_insert(
         }
         return true;
     }
+    // Replay startup code has no tape. A raw backend it holds must not be
+    // written.
+    if replay_blocked() {
+        return true;
+    }
     if let Some(scope) = crate::capsule::current_scope() {
         if let Some(bytes) = bytes {
             use base64::Engine as _;
@@ -573,6 +954,462 @@ const fn record_or_replay_cache_insert(
     _ttl: Option<std::time::Duration>,
 ) -> bool {
     false
+}
+
+/// Serve an untyped read during a replay. Returns `true` when a replay
+/// handled it; the read is then a miss.
+#[cfg(feature = "reporting")]
+fn replayed_untyped_get(key: &str) -> bool {
+    let Some(tape) = crate::capsule::effects::current_tape() else {
+        // Replay startup code: a raw backend is not read.
+        return replay_blocked();
+    };
+    tape.cache_untyped_get(key);
+    true
+}
+
+/// No capsule support compiled in: never a replay.
+#[cfg(not(feature = "reporting"))]
+const fn replayed_untyped_get(_key: &str) -> bool {
+    false
+}
+
+/// Record an untyped read. A miss records like a typed miss. A hit has no
+/// value the capsule can hold, so the capsule is marked incomplete.
+#[cfg(feature = "reporting")]
+fn record_untyped_get(key: &str, hit: bool) {
+    let Some(scope) = crate::capsule::current_scope() else {
+        return;
+    };
+    if hit {
+        scope.note(UNRECORDABLE_CACHE_HIT_NOTE);
+        scope.mark_truncated();
+    }
+    scope.record_cache(crate::capsule::CacheEffect::Get {
+        key: key.to_owned(),
+        value: None,
+    });
+}
+
+/// No capsule support compiled in: nothing to record.
+#[cfg(not(feature = "reporting"))]
+const fn record_untyped_get(_key: &str, _hit: bool) {}
+
+/// Record an untyped write, or divert it during a replay. Returns `true` when
+/// a replay handled it and the backend must not be touched.
+#[cfg(feature = "reporting")]
+fn record_or_replay_untyped_insert(key: &str) -> bool {
+    if let Some(tape) = crate::capsule::effects::current_tape() {
+        tape.cache_untyped_insert(key);
+        return true;
+    }
+    // Replay startup code: a raw backend is not written.
+    if replay_blocked() {
+        return true;
+    }
+    if let Some(scope) = crate::capsule::current_scope() {
+        scope.note(UNRECORDABLE_CACHE_WRITE_NOTE);
+        scope.mark_truncated();
+    }
+    false
+}
+
+/// No capsule support compiled in: the backend always takes the write.
+#[cfg(not(feature = "reporting"))]
+const fn record_or_replay_untyped_insert(_key: &str) -> bool {
+    false
+}
+
+// ── Capsule seam for the removal methods (#2351 item 2) ──────────────────
+
+/// Wrap `cache` so a capsule records its removals and a replay never reaches
+/// it. Idempotent: a wrapped backend is returned as it is, so `Arc` identity
+/// (which single-flight keys on) stays stable.
+#[cfg(feature = "reporting")]
+#[must_use]
+pub(crate) fn with_capsule_seam(cache: Arc<dyn Cache>) -> Arc<dyn Cache> {
+    if cache.is_capsule_seam() {
+        return cache;
+    }
+    Arc::new(CapsuleSeamCache(cache))
+}
+
+/// No capsule support compiled in: the backend is used as it is.
+#[cfg(not(feature = "reporting"))]
+#[must_use]
+pub(crate) fn with_capsule_seam(cache: Arc<dyn Cache>) -> Arc<dyn Cache> {
+    cache
+}
+
+/// The installed backend, with the removal methods on the capsule seam.
+///
+/// Reads and writes pass through: `get_cached` / `insert_cached` and the
+/// untyped functions carry their own seam.
+#[cfg(feature = "reporting")]
+struct CapsuleSeamCache(Arc<dyn Cache>);
+
+#[cfg(feature = "reporting")]
+impl CapsuleSeamCache {
+    /// Check a write that reaches the seam. A helper write with a tape never
+    /// gets here, so with a tape this is a direct write: a divergence, as
+    /// capture refuses such a capsule. Returns `true` when the backend must
+    /// not be written.
+    fn direct_write_blocked(key: &str) -> bool {
+        let direct = !HELPER_CALL.with(std::cell::Cell::get);
+        if let Some(tape) = crate::capsule::effects::current_tape() {
+            if direct {
+                tape.cache_untyped_insert(key);
+            }
+            return true;
+        }
+        if replay_blocked() {
+            return true;
+        }
+        if direct && let Some(scope) = crate::capsule::current_scope() {
+            scope.note(DIRECT_WRITE_NOTE);
+            scope.mark_truncated();
+        }
+        false
+    }
+
+    /// Mark the capsule incomplete: the fill fence stopped a fill.
+    fn fence_stopped_fill() {
+        if let Some(scope) = crate::capsule::current_scope() {
+            scope.note(FILL_FENCE_NOTE);
+            scope.mark_truncated();
+        }
+    }
+
+    /// Take a tape slot for a removal, in call order.
+    fn reserve() -> Option<(Arc<crate::capsule::CaptureScope>, usize)> {
+        crate::capsule::current_scope()
+            .and_then(|scope| scope.reserve_cache().map(|index| (scope, index)))
+    }
+
+    /// Fill a slot taken with [`reserve`](Self::reserve).
+    fn fill(
+        slot: Option<(Arc<crate::capsule::CaptureScope>, usize)>,
+        effect: crate::capsule::CacheEffect,
+    ) {
+        if let Some((scope, index)) = slot {
+            scope.fill_cache(index, effect);
+        }
+    }
+
+    /// Run a removal that returns no result. A backend counts a failed one
+    /// with [`record_invalidation_failure`]. When the count goes up, replay
+    /// cannot know the result, so the capsule is marked incomplete. A failure
+    /// on another task can also do this; replay then only refuses.
+    fn unchecked_removal(remove: impl FnOnce()) {
+        let before = invalidation_failures_total();
+        remove();
+        if invalidation_failures_total() != before
+            && let Some(scope) = crate::capsule::current_scope()
+        {
+            scope.note(UNCHECKED_REMOVAL_NOTE);
+            scope.mark_truncated();
+        }
+    }
+}
+
+/// Set while this process replays a capsule. The capsule seam then never
+/// reaches a backend, also on a task with no tape (a state initializer, a
+/// detached task). It is never unset.
+#[cfg(feature = "reporting")]
+static REPLAY_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keep every cache backend offline from now on. `autumn replay` calls it
+/// before it builds the app (#2351).
+#[cfg(feature = "reporting")]
+pub(crate) fn block_backends_for_replay() {
+    REPLAY_BLOCKED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(feature = "reporting")]
+fn replay_blocked() -> bool {
+    #[cfg(test)]
+    if TEST_REPLAY_BLOCKED.with(std::cell::Cell::get) {
+        return true;
+    }
+    REPLAY_BLOCKED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+// The process-wide block cannot be set in a unit test: it would block every
+// other test. This thread's block stands in for it.
+#[cfg(all(test, feature = "reporting"))]
+thread_local! {
+    static TEST_REPLAY_BLOCKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the seam must not reach the backend: a tape is active, or this
+/// process replays a capsule.
+#[cfg(feature = "reporting")]
+fn offline() -> bool {
+    // Not `tape_active`: that marks the replay scope as entered. Only the
+    // reporting layer may do that.
+    crate::capsule::effects::current_tape().is_some() || replay_blocked()
+}
+
+/// Why a capsule with a removal of unknown result is not replayable.
+#[cfg(feature = "reporting")]
+const UNCHECKED_REMOVAL_NOTE: &str = "a cache removal with no result reported a failure; \
+     replay cannot know whether the entry stayed";
+
+/// Why a capsule that met a distributed fill lock is not replayable.
+#[cfg(feature = "reporting")]
+const FILL_LOCK_NOTE: &str = "a cache fill met a distributed fill lock; the lock outcome \
+     is not recorded, so replay cannot take the same path";
+
+/// Why a capsule whose fill the shared fence stopped is not replayable.
+#[cfg(feature = "reporting")]
+const FILL_FENCE_NOTE: &str = "the shared fill fence stopped a cache fill; replay \
+     has no fence, so it cannot take the same path";
+
+/// A recorded [`InvalidationError`].
+#[cfg(feature = "reporting")]
+fn recorded_error(
+    result: &Result<(), InvalidationError>,
+) -> Option<crate::capsule::CacheInvalidationError> {
+    result
+        .as_ref()
+        .err()
+        .map(|error| crate::capsule::CacheInvalidationError {
+            attempts: error.attempts(),
+            reason: error.reason().to_owned(),
+        })
+}
+
+#[cfg(feature = "reporting")]
+impl Cache for CapsuleSeamCache {
+    // During a replay the backend is never reached. A typed or untyped read
+    // or write is answered by its own seam before it gets here; anything
+    // that still arrives is a miss, a dropped write, or no fill lock.
+    fn get_value(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+        let direct = !HELPER_CALL.with(std::cell::Cell::get);
+        // A helper read with a tape never gets here, so with a tape this is a
+        // direct read: a divergence, as capture refuses such a capsule. It
+        // does not consume a read a helper recorded.
+        if let Some(tape) = crate::capsule::effects::current_tape() {
+            if direct {
+                tape.cache_direct_get(key);
+            }
+            return None;
+        }
+        if replay_blocked() {
+            return None;
+        }
+        if direct && let Some(scope) = crate::capsule::current_scope() {
+            scope.note(DIRECT_READ_NOTE);
+            scope.mark_truncated();
+        }
+        self.0.get_value(key)
+    }
+
+    fn insert_value(&self, key: &str, value: Arc<dyn Any + Send + Sync>) {
+        if Self::direct_write_blocked(key) {
+            return;
+        }
+        self.0.insert_value(key, value);
+    }
+
+    fn invalidate(&self, key: &str) {
+        if let Some(tape) = crate::capsule::effects::current_tape() {
+            let _ = tape.cache_invalidate(key);
+            return;
+        }
+        if replay_blocked() {
+            return;
+        }
+        // The slot is taken now and filled after the call, so a backend that
+        // panics leaves it unfilled and the capsule incomplete.
+        let slot = Self::reserve();
+        Self::unchecked_removal(|| self.0.invalidate(key));
+        Self::fill(
+            slot,
+            crate::capsule::CacheEffect::Invalidate {
+                key: key.to_owned(),
+                error: None,
+            },
+        );
+    }
+
+    fn clear(&self) {
+        if let Some(tape) = crate::capsule::effects::current_tape() {
+            tape.cache_clear();
+            return;
+        }
+        if replay_blocked() {
+            return;
+        }
+        let slot = Self::reserve();
+        Self::unchecked_removal(|| self.0.clear());
+        Self::fill(slot, crate::capsule::CacheEffect::Clear);
+    }
+
+    fn invalidate_namespace(&self, namespace: &str) -> bool {
+        if let Some(tape) = crate::capsule::effects::current_tape() {
+            return tape.cache_invalidate_namespace(namespace).is_ok();
+        }
+        if replay_blocked() {
+            return true;
+        }
+        // Coherence records the removal with its registered stores' part.
+        if COHERENCE_REMOVAL.with(std::cell::Cell::get) {
+            return self.0.invalidate_namespace(namespace);
+        }
+        let slot = Self::reserve();
+        let done = self.0.invalidate_namespace(namespace);
+        let result = if done {
+            Ok(())
+        } else {
+            Err(InvalidationError::new(
+                1,
+                "the backend cannot drop a namespace, or its sweep failed",
+            ))
+        };
+        Self::fill(
+            slot,
+            crate::capsule::CacheEffect::InvalidateNamespace {
+                namespace: namespace.to_owned(),
+                error: recorded_error(&result),
+            },
+        );
+        done
+    }
+
+    fn insert_raw_bytes(&self, key: &str, bytes: Vec<u8>, ttl: Option<Duration>) {
+        if Self::direct_write_blocked(key) {
+            return;
+        }
+        self.0.insert_raw_bytes(key, bytes, ttl);
+    }
+
+    fn shares_fill_epoch(&self) -> bool {
+        self.0.shares_fill_epoch()
+    }
+
+    // A replay takes the unfenced path. A capture that does not store its
+    // fill cannot replay that path, so it is incomplete.
+    fn fill_epoch(&self, namespace: &str) -> FillEpoch {
+        if offline() {
+            return FillEpoch::Unsupported;
+        }
+        let epoch = self.0.fill_epoch(namespace);
+        if epoch == FillEpoch::Unavailable {
+            Self::fence_stopped_fill();
+        }
+        epoch
+    }
+
+    fn insert_raw_bytes_if_epoch(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        ttl: Option<Duration>,
+        namespace: &str,
+        sampled: u64,
+    ) -> bool {
+        if Self::direct_write_blocked(key) {
+            return false;
+        }
+        let stored = self
+            .0
+            .insert_raw_bytes_if_epoch(key, bytes, ttl, namespace, sampled);
+        if !stored {
+            Self::fence_stopped_fill();
+        }
+        stored
+    }
+
+    fn try_acquire_fill_lock(&self, key: &str, token: &str, ttl: Duration) -> FillLockStatus {
+        if offline() {
+            return FillLockStatus::Unsupported;
+        }
+        let status = self.0.try_acquire_fill_lock(key, token, ttl);
+        // Replay answers `Unsupported`, so a lock path cannot replay.
+        if status != FillLockStatus::Unsupported
+            && let Some(scope) = crate::capsule::current_scope()
+        {
+            scope.note(FILL_LOCK_NOTE);
+            scope.mark_truncated();
+        }
+        status
+    }
+
+    fn release_fill_lock(&self, key: &str, token: &str) {
+        if offline() {
+            return;
+        }
+        self.0.release_fill_lock(key, token);
+    }
+
+    fn invalidate_async<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> CacheFuture<'a, Result<(), InvalidationError>> {
+        // The tape and the capture scope are task-locals, so they are read
+        // here, on the calling task, and carried into the future.
+        if let Some(tape) = crate::capsule::effects::current_tape() {
+            return Box::pin(async move { tape.cache_invalidate(key) });
+        }
+        if replay_blocked() {
+            return Box::pin(async { Ok(()) });
+        }
+        // The scope is read now; the tape position is taken when the future
+        // first runs, which is when replay consumes its entry. It is filled
+        // when the removal ends, so a cancelled removal leaves an unfilled
+        // slot that marks the capsule incomplete.
+        let scope = crate::capsule::current_scope();
+        Box::pin(async move {
+            let slot = scope.and_then(|scope| scope.reserve_cache().map(|index| (scope, index)));
+            let result = self.0.invalidate_async(key).await;
+            if let Some((scope, index)) = slot {
+                scope.fill_cache(
+                    index,
+                    crate::capsule::CacheEffect::Invalidate {
+                        key: key.to_owned(),
+                        error: recorded_error(&result),
+                    },
+                );
+            }
+            result
+        })
+    }
+
+    fn invalidate_namespace_async<'a>(
+        &'a self,
+        namespace: &'a str,
+    ) -> CacheFuture<'a, Result<(), InvalidationError>> {
+        if let Some(tape) = crate::capsule::effects::current_tape() {
+            return Box::pin(async move { tape.cache_invalidate_namespace(namespace) });
+        }
+        if replay_blocked() {
+            return Box::pin(async { Ok(()) });
+        }
+        // Coherence records the removal with its registered stores' part.
+        if COHERENCE_REMOVAL.with(std::cell::Cell::get) {
+            return self.0.invalidate_namespace_async(namespace);
+        }
+        let scope = crate::capsule::current_scope();
+        Box::pin(async move {
+            let slot = scope.and_then(|scope| scope.reserve_cache().map(|index| (scope, index)));
+            let result = self.0.invalidate_namespace_async(namespace).await;
+            if let Some((scope, index)) = slot {
+                scope.fill_cache(
+                    index,
+                    crate::capsule::CacheEffect::InvalidateNamespace {
+                        namespace: namespace.to_owned(),
+                        error: recorded_error(&result),
+                    },
+                );
+            }
+            result
+        })
+    }
+
+    fn is_capsule_seam(&self) -> bool {
+        true
+    }
 }
 
 // ── CacheableResult trait ────────────────────────────────────────────
@@ -623,6 +1460,397 @@ pub fn make_cache_key<K: Hash>(fn_name: &str, args: &K) -> String {
     let mut hasher = DefaultHasher::new();
     args.hash(&mut hasher);
     format!("{}:{:x}", fn_name, hasher.finish())
+}
+
+#[cfg(test)]
+mod shared_fence_tests {
+    //! A fake cross-replica backend: two handles share one store and one epoch.
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Shared {
+        data: HashMap<String, Vec<u8>>,
+        epochs: HashMap<String, u64>,
+    }
+
+    #[derive(Clone, Default)]
+    struct Replica {
+        shared: Arc<Mutex<Shared>>,
+        epoch_down: bool,
+        sweep_fails: bool,
+    }
+
+    impl Cache for Replica {
+        fn get_value(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+            let bytes = self.shared.lock().unwrap().data.get(key).cloned()?;
+            Some(Arc::new(RawCacheBytes(bytes)))
+        }
+        fn insert_value(&self, _key: &str, _value: Arc<dyn Any + Send + Sync>) {
+            panic!("a shared-fence backend must not take the unfenced path");
+        }
+        fn invalidate(&self, key: &str) {
+            self.shared.lock().unwrap().data.remove(key);
+        }
+        fn clear(&self) {
+            self.shared.lock().unwrap().data.clear();
+        }
+        fn invalidate_namespace(&self, namespace: &str) -> bool {
+            if self.sweep_fails {
+                return false;
+            }
+            let mut shared = self.shared.lock().unwrap();
+            *shared.epochs.entry(namespace.to_owned()).or_default() += 1;
+            let prefix = format!("{namespace}:");
+            shared.data.retain(|key, _| !key.starts_with(&prefix));
+            true
+        }
+        fn insert_raw_bytes(&self, key: &str, bytes: Vec<u8>, _ttl: Option<Duration>) {
+            self.shared
+                .lock()
+                .unwrap()
+                .data
+                .insert(key.to_owned(), bytes);
+        }
+        fn shares_fill_epoch(&self) -> bool {
+            true
+        }
+        fn fill_epoch(&self, namespace: &str) -> FillEpoch {
+            if self.epoch_down {
+                return FillEpoch::Unavailable;
+            }
+            let shared = self.shared.lock().unwrap();
+            FillEpoch::Sampled(shared.epochs.get(namespace).copied().unwrap_or(0))
+        }
+        fn insert_raw_bytes_if_epoch(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+            _ttl: Option<Duration>,
+            namespace: &str,
+            sampled: u64,
+        ) -> bool {
+            let mut shared = self.shared.lock().unwrap();
+            if shared.epochs.get(namespace).copied().unwrap_or(0) != sampled {
+                return false;
+            }
+            shared.data.insert(key.to_owned(), bytes);
+            true
+        }
+    }
+
+    #[test]
+    fn a_fill_on_another_replica_cannot_resurrect_an_invalidated_value() {
+        let a = Replica::default();
+        let b = Replica {
+            shared: Arc::clone(&a.shared),
+            epoch_down: false,
+            sweep_fails: false,
+        };
+        // B misses and samples the shared epoch, then starts computing.
+        let epoch = b.fill_epoch("ns");
+        // A commits a write and invalidates the namespace.
+        assert!(a.invalidate_namespace("ns"));
+        // B finishes and tries to insert the pre-write value.
+        let inserted = insert_cached_fenced(&b, "ns:k", "old".to_string(), None, "ns", epoch);
+        assert!(
+            !inserted,
+            "the shared epoch moved, so the fill is fenced out"
+        );
+        assert!(get_cached::<String>(&a, "ns:k").is_none());
+    }
+
+    /// Codex review on #3222: during `autumn replay`, the fenced helpers do
+    /// not reach a raw backend that startup code holds, with no tape.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn the_replay_block_keeps_the_fenced_helpers_offline() {
+        let replica = Replica::default();
+        let live = replica.fill_epoch("ns");
+        super::TEST_REPLAY_BLOCKED.with(|blocked| blocked.set(true));
+        let sampled = sample_fill_epoch(&replica, "ns");
+        let stored = insert_cached_fenced(&replica, "ns:k", "v".to_string(), None, "ns", live);
+        super::TEST_REPLAY_BLOCKED.with(|blocked| blocked.set(false));
+        assert_eq!(sampled, FillEpoch::Unsupported, "no epoch read");
+        assert!(stored, "the replay took the write");
+        assert!(replica.shared.lock().unwrap().data.is_empty(), "no write");
+    }
+
+    /// Codex review on #3222: a replay keeps the fenced fill's result. A
+    /// value that cannot be serialized, and an unreadable epoch, are not
+    /// stored, as in production.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_replay_keeps_the_fenced_fill_result() {
+        struct Unencodable;
+        impl serde::Serialize for Unencodable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("cannot encode"))
+            }
+        }
+        impl Clone for Unencodable {
+            fn clone(&self) -> Self {
+                Self
+            }
+        }
+        let replica = Replica::default();
+        super::TEST_REPLAY_BLOCKED.with(|blocked| blocked.set(true));
+        let unencodable = insert_cached_fenced(
+            &replica,
+            "ns:k",
+            Unencodable,
+            None,
+            "ns",
+            FillEpoch::Sampled(0),
+        );
+        let unavailable =
+            insert_cached_fenced(&replica, "ns:k", 1_u32, None, "ns", FillEpoch::Unavailable);
+        super::TEST_REPLAY_BLOCKED.with(|blocked| blocked.set(false));
+        assert!(!unencodable, "the fenced path does not store it");
+        assert!(!unavailable, "an unreadable epoch stores nothing");
+        assert!(replica.shared.lock().unwrap().data.is_empty());
+    }
+
+    #[test]
+    fn a_fill_inserts_when_no_invalidation_landed() {
+        let a = Replica::default();
+        let epoch = a.fill_epoch("ns");
+        assert!(insert_cached_fenced(
+            &a,
+            "ns:k",
+            "new".to_string(),
+            None,
+            "ns",
+            epoch
+        ));
+        assert_eq!(get_cached::<String>(&a, "ns:k").as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn an_unreadable_epoch_skips_the_insert() {
+        let a = Replica {
+            epoch_down: true,
+            ..Replica::default()
+        };
+        let epoch = a.fill_epoch("ns");
+        assert_eq!(epoch, FillEpoch::Unavailable);
+        assert!(!insert_cached_fenced(
+            &a,
+            "ns:k",
+            "v".to_string(),
+            None,
+            "ns",
+            epoch
+        ));
+        assert!(get_cached::<String>(&a, "ns:k").is_none());
+    }
+
+    #[test]
+    fn a_fragment_render_on_another_replica_cannot_resurrect_an_invalidated_value() {
+        let a = Replica::default();
+        let b = Replica {
+            shared: Arc::clone(&a.shared),
+            epoch_down: false,
+            sweep_fails: false,
+        };
+        let html = fragment::cache_fragment_in(Some(&b), "ns", "id", "v1", None, || {
+            // A writes and invalidates while B is still rendering.
+            assert!(a.invalidate_namespace("ns"));
+            maud::html! { "old" }
+        });
+        assert_eq!(html.0, "old", "the fenced-out caller still gets its markup");
+        let again = fragment::cache_fragment_in(Some(&b), "ns", "id", "v1", None, || {
+            maud::html! { "new" }
+        });
+        assert_eq!(again.0, "new", "the stale markup must not be cached");
+    }
+
+    /// A caller-owned shared store, registered with `register_namespace_store`,
+    /// must get its epoch raised by the namespace invalidation. A plain
+    /// `clear` would sweep it and leave the epoch alone.
+    #[test]
+    fn invalidating_a_registered_shared_store_raises_its_epoch() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_global_cache();
+        let store = Replica::default();
+        let handle = Arc::new(store.clone());
+        let _ = coherence::register_namespace_store("tests::shared_fence_ns", handle);
+        let before = store.fill_epoch("tests::shared_fence_ns");
+        assert!(coherence::invalidate_namespace("tests::shared_fence_ns"));
+        assert_ne!(
+            store.fill_epoch("tests::shared_fence_ns"),
+            before,
+            "an in-flight fill on another replica must be fenced out"
+        );
+    }
+
+    /// A shared store that fails to bump its epoch makes the result `false`.
+    /// A store with no shared epoch keeps the old `clear` contract.
+    #[test]
+    fn a_failed_registered_shared_store_fails_the_invalidation() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_global_cache();
+        let failing = Replica {
+            sweep_fails: true,
+            ..Replica::default()
+        };
+        let _ = coherence::register_namespace_store("tests::failing_shared_ns", Arc::new(failing));
+        assert!(!coherence::invalidate_namespace("tests::failing_shared_ns"));
+    }
+
+    #[cfg(feature = "cache-moka")]
+    #[test]
+    fn a_registered_store_without_a_shared_epoch_still_counts_as_cleared() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_global_cache();
+        let _ = coherence::register_namespace_store(
+            "tests::plain_ns",
+            Arc::new(MokaCache::new(4, None)),
+        );
+        assert!(coherence::invalidate_namespace("tests::plain_ns"));
+    }
+
+    /// A replay serves cache effects from the tape. It must not read the live
+    /// epoch, and the fenced write must land on the tape (#1634).
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_replay_never_touches_the_live_epoch_and_still_writes_the_tape() {
+        use crate::capsule::{
+            CapsuleEffects,
+            effects::{CachedValue, ReplayEffects},
+        };
+        let live = Replica {
+            epoch_down: true,
+            ..Replica::default()
+        };
+        let tape = std::sync::Arc::new(ReplayEffects::new(CapsuleEffects::default()));
+        let seen = std::sync::Arc::clone(&tape);
+        crate::capsule::effects::with_effect_tape(tape, async {
+            let epoch = sample_fill_epoch(&live, "ns");
+            assert_eq!(
+                epoch,
+                FillEpoch::Unsupported,
+                "replay must skip the backend"
+            );
+            assert!(insert_cached_fenced(
+                &live, "ns:k", 7_u32, None, "ns", epoch
+            ));
+        })
+        .await;
+        assert!(
+            live.shared.lock().unwrap().data.is_empty(),
+            "a replay must not write the live backend"
+        );
+        assert!(matches!(seen.cache_get("ns:k"), CachedValue::Hit(_)));
+    }
+
+    #[cfg(feature = "reporting")]
+    fn capture_scope() -> Arc<crate::capsule::CaptureScope> {
+        Arc::new(crate::capsule::CaptureScope::new(
+            "fence-test".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ))
+    }
+
+    /// The capsule seam wraps every installed backend. It must keep the
+    /// shared fence of the backend.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn the_capsule_seam_keeps_the_shared_fence() {
+        let a = Replica::default();
+        let b = with_capsule_seam(Arc::new(Replica {
+            shared: Arc::clone(&a.shared),
+            ..Replica::default()
+        }));
+        assert!(b.shares_fill_epoch());
+        let epoch = sample_fill_epoch(b.as_ref(), "ns");
+        assert_eq!(epoch, FillEpoch::Sampled(0));
+        assert!(a.invalidate_namespace("ns"));
+        assert!(!insert_cached_fenced(
+            b.as_ref(),
+            "ns:k",
+            "old".to_string(),
+            None,
+            "ns",
+            epoch
+        ));
+        assert!(a.shared.lock().unwrap().data.is_empty());
+    }
+
+    /// A fenced fill under capture is recorded. A fill the fence stops, or
+    /// an epoch that cannot be read, is not recorded and replay takes the
+    /// unfenced path, so the capsule is incomplete.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_fill_the_fence_stops_marks_the_capsule_incomplete() {
+        use futures::executor::block_on;
+        let fill = |replica: Replica, invalidate: bool| {
+            let shared = Arc::clone(&replica.shared);
+            let cache = with_capsule_seam(Arc::new(replica));
+            let scope = capture_scope();
+            block_on(crate::capsule::capture::with_capture_scope(
+                Arc::clone(&scope),
+                async {
+                    let epoch = sample_fill_epoch(cache.as_ref(), "ns");
+                    if invalidate {
+                        shared.lock().unwrap().epochs.insert("ns".to_owned(), 9);
+                    }
+                    let _ = insert_cached_fenced(cache.as_ref(), "ns:k", 1_u32, None, "ns", epoch);
+                },
+            ));
+            scope
+        };
+        let stored = fill(Replica::default(), false);
+        assert!(!stored.is_truncated(), "a stored fill is replayable");
+        assert_eq!(stored.effects_snapshot().cache.len(), 1);
+        assert!(fill(Replica::default(), true).is_truncated());
+        let down = Replica {
+            epoch_down: true,
+            ..Replica::default()
+        };
+        assert!(fill(down, false).is_truncated());
+    }
+
+    /// A direct fenced write is like a direct `insert_raw_bytes`.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_direct_fenced_write_marks_the_capsule_incomplete() {
+        use futures::executor::block_on;
+        let cache = with_capsule_seam(Arc::new(Replica::default()));
+        let scope = capture_scope();
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async {
+                let _ = cache.insert_raw_bytes_if_epoch("ns:k", b"1".to_vec(), None, "ns", 0);
+            },
+        ));
+        assert!(scope.is_truncated());
+    }
+
+    #[cfg(feature = "cache-moka")]
+    #[test]
+    fn a_backend_without_a_shared_epoch_inserts_as_before() {
+        let moka = MokaCache::new(10, None);
+        let epoch = moka.fill_epoch("ns");
+        assert_eq!(epoch, FillEpoch::Unsupported);
+        assert!(insert_cached_fenced(
+            &moka,
+            "ns:k",
+            "v".to_string(),
+            None,
+            "ns",
+            epoch
+        ));
+        assert_eq!(get_cached::<String>(&moka, "ns:k").as_deref(), Some("v"));
+    }
 }
 
 #[cfg(test)]
@@ -734,6 +1962,576 @@ mod tests {
         let err = block_on(backend.invalidate_namespace_async("ns"))
             .expect_err("a backend that cannot sweep must say so");
         assert_eq!(err.attempts(), 1);
+    }
+
+    /// Logs every call that reaches the backend.
+    #[cfg(feature = "reporting")]
+    #[derive(Default)]
+    struct SpyBackend {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[cfg(feature = "reporting")]
+    impl SpyBackend {
+        fn log(&self, call: impl Into<String>) {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(call.into());
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[cfg(feature = "reporting")]
+    impl Cache for SpyBackend {
+        fn get_value(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+            self.log(format!("get {key}"));
+            Some(Arc::new(7_u32))
+        }
+        fn insert_value(&self, key: &str, _value: Arc<dyn Any + Send + Sync>) {
+            self.log(format!("insert {key}"));
+        }
+        fn invalidate(&self, key: &str) {
+            self.log(format!("invalidate {key}"));
+        }
+        fn clear(&self) {
+            self.log("clear");
+        }
+        fn invalidate_namespace(&self, namespace: &str) -> bool {
+            self.log(format!("invalidate_namespace {namespace}"));
+            true
+        }
+    }
+
+    /// #2351 item 2: a replayed run never reaches the installed backend
+    /// through the untyped functions or the removal methods.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_replayed_run_never_reaches_the_installed_backend() {
+        let spy = Arc::new(SpyBackend::default());
+        let state =
+            crate::state::AppState::for_test().with_cache(Arc::clone(&spy) as Arc<dyn Cache>);
+        let tape = Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects::default(),
+        ));
+        block_on(crate::capsule::with_effect_tape(Arc::clone(&tape), async {
+            let cache = state.cache().expect("installed");
+            cache.invalidate("widgets");
+            cache.clear();
+            let _ = cache.invalidate_namespace("widgets");
+            let _ = cache.invalidate_async("widgets").await;
+            insert(cache.as_ref(), "widgets", 41_u32);
+            assert_eq!(get::<u32>(cache.as_ref(), "widgets"), None);
+        }));
+        assert!(spy.calls().is_empty(), "{:?}", spy.calls());
+        assert_eq!(tape.divergences().len(), 6, "{:?}", tape.divergences());
+    }
+
+    /// #2351 item 2: capture records a removal, and the backend still gets it.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_captured_removal_is_recorded_and_still_applied() {
+        let spy = Arc::new(SpyBackend::default());
+        let state =
+            crate::state::AppState::for_test().with_cache(Arc::clone(&spy) as Arc<dyn Cache>);
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "cache-test".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async {
+                let cache = state.cache().expect("installed");
+                cache.invalidate("widgets");
+                cache.clear();
+            },
+        ));
+        assert_eq!(spy.calls(), vec!["invalidate widgets", "clear"]);
+        assert_eq!(
+            scope.effects_snapshot().cache,
+            vec![
+                crate::capsule::CacheEffect::Invalidate {
+                    key: "widgets".to_owned(),
+                    error: None,
+                },
+                crate::capsule::CacheEffect::Clear,
+            ]
+        );
+    }
+
+    /// #2351 item 2: an untyped hit cannot be serialized, so the capsule says
+    /// it is incomplete.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_captured_untyped_hit_or_write_marks_the_capsule_incomplete() {
+        let spy = Arc::new(SpyBackend::default());
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "cache-test".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async {
+                assert_eq!(get::<u32>(spy.as_ref(), "widgets"), Some(7));
+            },
+        ));
+        assert!(scope.is_truncated());
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "cache-test".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async {
+                insert(spy.as_ref(), "widgets", 1_u32);
+            },
+        ));
+        assert!(scope.is_truncated());
+    }
+
+    /// Codex review on #3222: a direct `get_value` during a replay is an
+    /// unrecorded read. It does not consume a read a helper recorded:
+    /// capture refuses a capsule with a direct read.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_direct_read_on_replay_is_a_divergence_not_a_helper_read() {
+        let cache = with_capsule_seam(Arc::new(SpyBackend::default()) as Arc<dyn Cache>);
+        let recorded = crate::capsule::CapsuleEffects {
+            cache: vec![crate::capsule::CacheEffect::Get {
+                key: "user:7".to_owned(),
+                value: None,
+            }],
+            ..Default::default()
+        };
+        let tape = Arc::new(crate::capsule::ReplayEffects::new(recorded));
+        block_on(crate::capsule::with_effect_tape(Arc::clone(&tape), async {
+            assert!(cache.get_value("user:7").is_none());
+        }));
+        let finished = tape.finish();
+        assert!(
+            finished
+                .iter()
+                .any(|divergence| divergence.actual.contains("direct cache read")),
+            "{finished:?}"
+        );
+        assert!(
+            !finished
+                .iter()
+                .any(|divergence| divergence.actual.contains("user:7")),
+            "the key is withheld: {finished:?}"
+        );
+        assert!(
+            finished
+                .iter()
+                .any(|divergence| divergence.kind
+                    == crate::capsule::EffectDivergenceKind::Unconsumed),
+            "the helper's recorded read is still owed: {finished:?}"
+        );
+    }
+
+    /// Review fix: during a replay the wrapper reaches the backend for no
+    /// read, write or fill lock.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn the_wrapper_reaches_no_backend_during_a_replay() {
+        let spy = Arc::new(SpyBackend::default());
+        let cache = with_capsule_seam(Arc::clone(&spy) as Arc<dyn Cache>);
+        let tape = Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects::default(),
+        ));
+        block_on(crate::capsule::with_effect_tape(Arc::clone(&tape), async {
+            assert!(cache.get_value("k").is_none());
+            cache.insert_value("k", Arc::new(1_u32));
+            cache.insert_raw_bytes("k", b"1".to_vec(), None);
+            assert_eq!(
+                cache.try_acquire_fill_lock("k", "t", Duration::from_secs(1)),
+                FillLockStatus::Unsupported
+            );
+            cache.release_fill_lock("k", "t");
+            assert_eq!(cache.fill_epoch("ns"), FillEpoch::Unsupported);
+        }));
+        assert!(spy.calls().is_empty(), "{:?}", spy.calls());
+        // Codex review on #3222: only the reporting layer enters the replay
+        // scope. A cache call must not, or the missing-layer warning is lost.
+        assert!(!tape.scope_entered());
+    }
+
+    /// An async removal takes its tape position when it first runs, the
+    /// point where replay consumes its entry (Codex review on #3222).
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn an_async_removal_is_recorded_when_it_first_runs() {
+        let spy = Arc::new(SpyBackend::default());
+        let cache = with_capsule_seam(Arc::clone(&spy) as Arc<dyn Cache>);
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "cache-test".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async {
+                let first = cache.invalidate_async("a");
+                cache.clear();
+                first.await.expect("removed");
+            },
+        ));
+        assert_eq!(
+            scope.effects_snapshot().cache,
+            vec![
+                crate::capsule::CacheEffect::Clear,
+                crate::capsule::CacheEffect::Invalidate {
+                    key: "a".to_owned(),
+                    error: None,
+                },
+            ]
+        );
+    }
+
+    /// Codex review on #3222: when production had a global cache, a replay
+    /// answers a repository invalidation from the tape, so it is consumed.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn replay_installs_a_seam_cache_when_the_builder_had_one() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let recorded = crate::capsule::CapsuleEffects {
+            cache: vec![crate::capsule::CacheEffect::InvalidateNamespace {
+                namespace: "posts".to_owned(),
+                error: None,
+            }],
+            state_cache: true,
+            ..Default::default()
+        };
+        let installed = install_replay_cache(true).expect("installed");
+        assert!(installed.is_capsule_seam());
+        assert!(Arc::ptr_eq(
+            &installed,
+            &global_cache().expect("the global cache")
+        ));
+        let tape = Arc::new(crate::capsule::ReplayEffects::new(recorded));
+        let complete = block_on(crate::capsule::with_effect_tape(
+            Arc::clone(&tape),
+            coherence::invalidate_namespace_async("posts"),
+        ));
+        clear_global_cache();
+        assert!(complete);
+        assert!(tape.finish().is_empty(), "{:?}", tape.finish());
+
+        assert!(install_replay_cache(false).is_none());
+        assert!(global_cache().is_none());
+    }
+
+    /// Codex review on #3222: a cache only a startup hook installed is put
+    /// in place after the state initializers, as production's initializers
+    /// did not see it. A cache an initializer installed is kept.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_startup_hook_cache_is_installed_after_the_initializers() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let recorded = crate::capsule::CapsuleEffects {
+            state_cache: true,
+            ..Default::default()
+        };
+        let state = crate::state::AppState::for_test();
+        install_late_replay_cache(&state, &recorded);
+        let late = state.cache().expect("installed after the initializers");
+        assert!(late.is_capsule_seam());
+
+        let initializer = crate::state::AppState::for_test();
+        initializer.set_cache(Arc::new(SpyBackend::default()));
+        let kept = initializer.cache().expect("the initializer's cache");
+        install_late_replay_cache(&initializer, &recorded);
+        assert!(Arc::ptr_eq(
+            &kept,
+            &initializer.cache().expect("still there")
+        ));
+
+        let none = crate::state::AppState::for_test();
+        install_late_replay_cache(&none, &crate::capsule::CapsuleEffects::default());
+        clear_global_cache();
+        assert!(none.cache().is_none());
+    }
+
+    /// A backend whose sync removals fail, and whose fill lock is held.
+    #[cfg(feature = "reporting")]
+    struct FailingSyncBackend;
+
+    #[cfg(feature = "reporting")]
+    impl Cache for FailingSyncBackend {
+        fn get_value(&self, _key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+            None
+        }
+        fn insert_value(&self, _key: &str, _value: Arc<dyn Any + Send + Sync>) {}
+        fn invalidate(&self, _key: &str) {
+            record_invalidation_failure();
+        }
+        fn clear(&self) {
+            record_invalidation_failure();
+        }
+        fn try_acquire_fill_lock(
+            &self,
+            _key: &str,
+            _token: &str,
+            _ttl: Duration,
+        ) -> FillLockStatus {
+            FillLockStatus::Held
+        }
+    }
+
+    #[cfg(feature = "reporting")]
+    fn capture_scope() -> Arc<crate::capsule::CaptureScope> {
+        Arc::new(crate::capsule::CaptureScope::new(
+            "cache-test".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ))
+    }
+
+    /// Codex review on #3222: a sync removal that reports a failure marks
+    /// the capsule incomplete.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_failed_sync_removal_marks_the_capsule_incomplete() {
+        for remove in [
+            (|cache: &dyn Cache| cache.invalidate("k")) as fn(&dyn Cache),
+            |cache: &dyn Cache| cache.clear(),
+        ] {
+            let cache = with_capsule_seam(Arc::new(FailingSyncBackend));
+            let scope = capture_scope();
+            block_on(crate::capsule::capture::with_capture_scope(
+                Arc::clone(&scope),
+                async { remove(cache.as_ref()) },
+            ));
+            assert!(scope.is_truncated());
+        }
+    }
+
+    /// Codex review on #3222: a fill lock outcome other than `Unsupported`
+    /// marks the capsule incomplete.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_distributed_fill_lock_marks_the_capsule_incomplete() {
+        let cache = with_capsule_seam(Arc::new(FailingSyncBackend));
+        let scope = capture_scope();
+        let status = block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async { cache.try_acquire_fill_lock("k", "t", Duration::from_secs(1)) },
+        ));
+        assert_eq!(status, FillLockStatus::Held);
+        assert!(scope.is_truncated());
+
+        let moka = with_capsule_seam(Arc::new(SpyBackend::default()));
+        let scope = capture_scope();
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async {
+                let _ = moka.try_acquire_fill_lock("k", "t", Duration::from_secs(1));
+            },
+        ));
+        assert!(
+            !scope.is_truncated(),
+            "a backend with no lock is replayable"
+        );
+    }
+
+    /// Codex review on #3222: a cache installed by any route is recorded,
+    /// a startup hook (`RedisCachePlugin`) included. Replay runs no startup
+    /// hook, so it must install a cache in its place.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_cache_from_any_install_route_is_recorded() {
+        let _guard = GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let builder = crate::state::AppState::for_test()
+            .with_cache(Arc::new(SpyBackend::default()) as Arc<dyn Cache>);
+        assert!(builder.has_cache());
+        let startup = crate::state::AppState::for_test();
+        assert!(!startup.has_cache());
+        startup.set_cache(Arc::new(SpyBackend::default()));
+        clear_global_cache();
+        assert!(startup.has_cache());
+    }
+
+    /// Codex review on #3222: during `autumn replay`, a cache call with no
+    /// tape (a state initializer) does not reach the backend.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn the_replay_block_keeps_the_backend_offline_with_no_tape() {
+        let spy = Arc::new(SpyBackend::default());
+        let cache = with_capsule_seam(Arc::clone(&spy) as Arc<dyn Cache>);
+        TEST_REPLAY_BLOCKED.with(|blocked| blocked.set(true));
+        block_on(async {
+            assert!(cache.get_value("k").is_none());
+            cache.insert_value("k", Arc::new(1_u32));
+            cache.insert_raw_bytes("k", b"1".to_vec(), None);
+            cache.invalidate("k");
+            cache.clear();
+            assert!(cache.invalidate_namespace("ns"));
+            assert!(cache.invalidate_async("k").await.is_ok());
+            assert!(cache.invalidate_namespace_async("ns").await.is_ok());
+            assert_eq!(
+                cache.try_acquire_fill_lock("k", "t", Duration::from_secs(1)),
+                FillLockStatus::Unsupported
+            );
+        });
+        TEST_REPLAY_BLOCKED.with(|blocked| blocked.set(false));
+        assert!(spy.calls().is_empty(), "{:?}", spy.calls());
+    }
+
+    /// Codex review on #3222: during `autumn replay`, the cache helpers do
+    /// not reach a raw backend that startup code holds, with no tape.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn the_replay_block_keeps_a_raw_backend_offline_in_the_helpers() {
+        let spy = SpyBackend::default();
+        TEST_REPLAY_BLOCKED.with(|blocked| blocked.set(true));
+        assert_eq!(get::<u32>(&spy, "k"), None);
+        insert(&spy, "k", 1_u32);
+        assert_eq!(get_cached::<u32>(&spy, "k"), None);
+        insert_cached(&spy, "k", 1_u32, None);
+        TEST_REPLAY_BLOCKED.with(|blocked| blocked.set(false));
+        assert!(spy.calls().is_empty(), "{:?}", spy.calls());
+    }
+
+    /// A backend whose sync removals panic.
+    #[cfg(feature = "reporting")]
+    struct PanickingBackend;
+
+    #[cfg(feature = "reporting")]
+    impl Cache for PanickingBackend {
+        fn get_value(&self, _key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+            None
+        }
+        fn insert_value(&self, _key: &str, _value: Arc<dyn Any + Send + Sync>) {}
+        fn invalidate(&self, _key: &str) {
+            panic!("backend failed");
+        }
+        fn clear(&self) {
+            panic!("backend failed");
+        }
+        fn invalidate_namespace(&self, _namespace: &str) -> bool {
+            panic!("backend failed");
+        }
+    }
+
+    /// Codex review on #3222: a sync removal whose backend panics leaves
+    /// its slot unfilled, so the capsule is incomplete and records no false
+    /// success.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_panicking_sync_removal_leaves_the_capsule_incomplete() {
+        for remove in [
+            (|cache: &dyn Cache| cache.invalidate("k")) as fn(&dyn Cache),
+            |cache: &dyn Cache| cache.clear(),
+            |cache: &dyn Cache| {
+                let _ = cache.invalidate_namespace("ns");
+            },
+        ] {
+            let cache = with_capsule_seam(Arc::new(PanickingBackend));
+            let scope = capture_scope();
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                block_on(crate::capsule::capture::with_capture_scope(
+                    Arc::clone(&scope),
+                    async { remove(cache.as_ref()) },
+                ));
+            }));
+            assert!(caught.is_err(), "the backend panics");
+            let _ = scope.effects_snapshot();
+            assert!(
+                scope.is_truncated(),
+                "an unfilled slot marks the capsule incomplete"
+            );
+        }
+    }
+
+    /// Codex review on #3222: a direct `get_value` call through the seam
+    /// marks the capsule incomplete during capture, and is a divergence
+    /// during a replay. A helper read stays recorded.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_direct_get_value_is_not_silently_substituted() {
+        let cache = with_capsule_seam(Arc::new(SpyBackend::default()));
+        let scope = capture_scope();
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async {
+                let _: Option<u32> = get_cached(cache.as_ref(), "k");
+            },
+        ));
+        assert!(!scope.is_truncated(), "a helper read is recorded");
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async {
+                let _ = cache.get_value("k");
+            },
+        ));
+        assert!(scope.is_truncated(), "a direct read cannot be recorded");
+
+        let tape = Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects::default(),
+        ));
+        let read = block_on(crate::capsule::with_effect_tape(Arc::clone(&tape), async {
+            cache.get_value("k")
+        }));
+        assert!(read.is_none());
+        assert_eq!(tape.divergences().len(), 1, "{:?}", tape.divergences());
+    }
+
+    /// Codex review on #3222: a direct `insert_value` or `insert_raw_bytes`
+    /// call through the seam marks the capsule incomplete during capture, and
+    /// is a divergence during a replay. A helper write stays recorded.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn a_direct_write_is_not_silently_dropped() {
+        let cache = with_capsule_seam(Arc::new(SpyBackend::default()));
+        let scope = capture_scope();
+        block_on(crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            async { insert_cached(cache.as_ref(), "k", 1_u32, None) },
+        ));
+        assert!(!scope.is_truncated(), "a helper write is recorded");
+        for write in [
+            (|cache: &dyn Cache| cache.insert_value("k", Arc::new(1_u32))) as fn(&dyn Cache),
+            |cache: &dyn Cache| cache.insert_raw_bytes("k", b"1".to_vec(), None),
+        ] {
+            let scope = capture_scope();
+            block_on(crate::capsule::capture::with_capture_scope(
+                Arc::clone(&scope),
+                async { write(cache.as_ref()) },
+            ));
+            assert!(scope.is_truncated(), "a direct write cannot be recorded");
+
+            let tape = Arc::new(crate::capsule::ReplayEffects::new(
+                crate::capsule::CapsuleEffects::default(),
+            ));
+            block_on(crate::capsule::with_effect_tape(Arc::clone(&tape), async {
+                write(cache.as_ref());
+            }));
+            assert_eq!(tape.divergences().len(), 1, "{:?}", tape.divergences());
+        }
+    }
+
+    /// The seam wraps a backend once, so `Arc` identity stays stable.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn the_capsule_seam_wraps_a_backend_once() {
+        let spy: Arc<dyn Cache> = Arc::new(SpyBackend::default());
+        let once = with_capsule_seam(spy);
+        let twice = with_capsule_seam(Arc::clone(&once));
+        assert!(Arc::ptr_eq(&once, &twice));
     }
 
     #[test]

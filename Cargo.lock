@@ -716,6 +716,7 @@ name = "autumn-macros-model"
 version = "0.8.0"
 dependencies = [
  "autumn-macros-support",
+ "autumn-schema-core",
  "proc-macro-crate",
  "proc-macro2",
  "quote",

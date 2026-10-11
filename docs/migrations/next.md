@@ -233,6 +233,39 @@ section.
 **Automation:** `manual` — add `timeout: None` to each hand-written `JobInfo`
 literal. `#[job]` and `JobInfo::new` set it.
 
+### Schema: `ForeignKey` has `on_delete` and `on_update` fields
+
+**Why:** `#[references]` can now set a referential action (issue #1975). The
+IR `autumn_schema_core::ForeignKey` carries it as
+`on_delete` / `on_update: Option<ForeignKeyAction>`. `None` is `NO ACTION`.
+
+**Before (`0.8`):**
+
+```rust
+let fk = ForeignKey {
+    table: "users".to_string(),
+    column: "id".to_string(),
+};
+```
+
+**After (`0.9`):**
+
+```rust
+let fk = ForeignKey::new("users", "id")
+    .with_on_delete(Some(ForeignKeyAction::Cascade)); // or no call for NO ACTION
+```
+
+A struct literal also works with `on_delete: None, on_update: None`.
+
+A snapshot (`.autumn/schema-snapshot.json`) with an action is written as
+`snapshot_version` 2. An older `autumn` CLI refuses that file. Upgrade the
+CLI on each machine and CI job that reads the snapshot. A snapshot without an
+action stays at version 1. A snapshot from `autumn schema pull` before this
+release has no actions: run `autumn schema pull` again to record them.
+
+**Automation:** `manual` — use `ForeignKey::new`, or add the two fields to
+each `ForeignKey` literal.
+
 ### Config: `AutumnConfig` gains a `cost` field
 
 **Why:** Per-request cost records and cost-aware deferral (issue #1720) need
@@ -1026,6 +1059,65 @@ let stats = autumn_web::shadow::ShadowStats {
 **Automation:** `manual` - the fix adds a struct update expression, and no
 codemod rewrites struct literals.
 
+### Capsules: new `CacheEffect` and `EffectSeam` variants, new `JobEffect` and `CapsuleEffects` fields
+
+**Why:** issue #2351 adds cache removals and random-draw widths to the capsule
+seam. It also records the deadline of an `enqueue_at` call when the deadline
+is already past, and the HTTP status of a failed enqueue. These types (feature `reporting`) are public and are not
+`#[non_exhaustive]`.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::capsule::{CacheEffect, JobEffect};
+
+fn key(effect: &CacheEffect) -> &str {
+    match effect {
+        CacheEffect::Get { key, .. } | CacheEffect::Insert { key, .. } => key,
+    }
+}
+
+let job = JobEffect {
+    name: "send_receipt".to_owned(),
+    payload: serde_json::json!({}),
+    delay_secs: None,
+    due_at: None,
+    error: None,
+};
+```
+
+**After (`{(X+1).0}`):** match the new variants, or call `CacheEffect::key`.
+Add `..JobEffect::default()` to a struct literal.
+
+```rust
+use autumn_web::capsule::{CacheEffect, JobEffect};
+
+fn key(effect: &CacheEffect) -> &str {
+    effect.key()
+}
+
+let job = JobEffect {
+    name: "send_receipt".to_owned(),
+    payload: serde_json::json!({}),
+    ..JobEffect::default()
+};
+```
+
+The new variants are `CacheEffect::Invalidate`, `CacheEffect::InvalidateNamespace`,
+`CacheEffect::Clear`, `EffectSeam::Random`, `EffectSeam::Detached` and
+`MailErrorKind::NoDurableQueueInProduction`. An exhaustive `match` on
+`EffectSeam` or `MailErrorKind` needs a new arm.
+
+`CapsuleEffects` has a new field `state_cache`. A struct literal of
+`CapsuleEffects` needs `..CapsuleEffects::default()`.
+
+`CAPSULE_FORMAT_VERSION` is now 4. An older build refuses a version 4 capsule
+with a version mismatch. This build reads a version 3 capsule and replays it
+with the version 3 rules, so a committed corpus keeps its verdicts. Re-record
+a capsule to get the new checks.
+
+**Automation:** `manual` - a codemod cannot know what a new match arm must do.
+
 ---
 
 ## Plugin authors
@@ -1182,6 +1274,15 @@ If nothing changed, delete this section.
   accept a soft-deleted parent. Before, they returned `404`. Through the
   `soft_delete` repository and through the router, a soft-deleted parent is
   still `404`.
+- **Media (#3104):** a room join with a `display_name` longer than 64
+  characters is a `400` (`RoomError::DisplayNameTooLong`). Before, the store
+  kept a name of any length. `RoomService::join` applies the limit, so a custom
+  handler that calls it gets the same error. A direct `RoomStore::join_room`
+  call does not check the limit.
+- **Media (#2864, #2407):** on `room_store_backend = "db"`, a join that races
+  the last leave or the reaper for the same room can now get `404`. Before,
+  it got `200` and then lost its seat. Handle it as you handle a room that is
+  gone.
 
 ## Deprecations retained from `{X.Y}`
 

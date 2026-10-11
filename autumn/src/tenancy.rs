@@ -118,8 +118,20 @@ pub async fn extract_tenant_from_parts_with_domains(
     config: &crate::config::AutumnConfig,
     domains: Option<&crate::custom_domain::CustomDomainRegistry>,
 ) -> Result<String, crate::AutumnError> {
-    if let Some(tenant_id) = replayed_tenant() {
-        return Ok(tenant_id);
+    let replayed = replayed_tenant();
+    match &replayed {
+        ReplayedTenant::NoTape | ReplayedTenant::RecordedFailure | ReplayedTenant::Unchecked => {}
+        ReplayedTenant::Resolved(tenant_id) => return Ok(tenant_id.clone()),
+        // The capsule has no tenant lookup. Live resolution would succeed on
+        // input the recording never had, so fail closed (#2351 item 13).
+        ReplayedTenant::Unrecorded => {
+            return Err(crate::AutumnError::internal_server_error(
+                std::io::Error::other(
+                    "the replayed run resolved a tenant, which the capsule has no recording for; \
+                     live tenant resolution was not consulted",
+                ),
+            ));
+        }
     }
     // Only under `source = "subdomain"`, where the `Host` header is ALREADY the
     // tenant signal. Under `header`/`session`/`jwt` the tenant comes from a
@@ -132,49 +144,100 @@ pub async fn extract_tenant_from_parts_with_domains(
         && let Some(host) = request_host(parts)
         && let Some(tenant_id) = registry.tenant_for_host(&host)
     {
-        record_tenant(&tenant_id);
+        if matches!(replayed, ReplayedTenant::RecordedFailure) {
+            return Err(tenant_resolved_after_recorded_failure());
+        }
+        record_tenant(Some(&tenant_id));
         return Ok(tenant_id);
     }
-    // A capsule with no recorded tenant falls through to the real resolver.
-    // That is not a gap: the recorded request's headers are restored verbatim,
-    // so a run whose recorded failure *was* a tenant-resolution error
-    // reproduces that error instead of being handed a different 503 saying the
-    // capsule is too old.
+    // A recorded failed lookup runs the real resolver again. The recorded
+    // request's headers are restored verbatim, so a run whose recorded failure
+    // *was* a tenant-resolution error reproduces that error.
     let resolved = extract_tenant_from_parts_inner(parts, config).await;
-    if let Ok(tenant_id) = resolved.as_ref() {
-        record_tenant(tenant_id);
+    // The recording failed here. A lookup that now succeeds would run the
+    // request under a tenant production never had, so fail closed.
+    if matches!(replayed, ReplayedTenant::RecordedFailure) && resolved.is_ok() {
+        return Err(tenant_resolved_after_recorded_failure());
     }
+    // A failure is recorded too, so replay can tell it from a lookup the
+    // recording never made.
+    record_tenant(resolved.as_ref().ok().map(String::as_str));
     resolved
 }
 
 // The `capsule` module is behind the `reporting` feature, so both halves of the
 // seam have a no-op twin for builds without it.
 
+/// Log a lookup that resolved where the recording failed, and return the
+/// error that fails the run closed.
+fn tenant_resolved_after_recorded_failure() -> crate::AutumnError {
+    note_tenant_resolved_after_recorded_failure();
+    crate::AutumnError::internal_server_error(std::io::Error::other(
+        "the recorded tenant lookup failed, but the replayed run resolved a tenant",
+    ))
+}
+
+/// What a capsule replay says about the tenant lookup.
+enum ReplayedTenant {
+    /// No replay serves this task.
+    NoTape,
+    /// The recording resolved this tenant.
+    Resolved(String),
+    /// The recording tried and failed.
+    RecordedFailure,
+    /// The recording has no tenant lookup. The tape logged a divergence.
+    Unrecorded,
+    /// A v3 capsule with no tenant lookup. Resolve, and do not check.
+    Unchecked,
+}
+
 /// The tenant a capsule replay serves, when one is serving this task.
 #[cfg(feature = "reporting")]
-fn replayed_tenant() -> Option<String> {
-    crate::capsule::effects::current_tape().and_then(|tape| tape.tenant())
+fn replayed_tenant() -> ReplayedTenant {
+    use crate::capsule::effects::TenantVerdict;
+    let Some(tape) = crate::capsule::effects::current_tape() else {
+        return ReplayedTenant::NoTape;
+    };
+    match tape.tenant() {
+        TenantVerdict::Resolved(id) => ReplayedTenant::Resolved(id),
+        TenantVerdict::RecordedFailure => ReplayedTenant::RecordedFailure,
+        TenantVerdict::Unrecorded => ReplayedTenant::Unrecorded,
+        TenantVerdict::Unchecked => ReplayedTenant::Unchecked,
+    }
+}
+
+/// Log a tenant that resolved where the recording failed.
+#[cfg(feature = "reporting")]
+fn note_tenant_resolved_after_recorded_failure() {
+    if let Some(tape) = crate::capsule::effects::current_tape() {
+        tape.tenant_resolved_after_recorded_failure();
+    }
 }
 
 /// No capsule support compiled in: never a replay.
 #[cfg(not(feature = "reporting"))]
-const fn replayed_tenant() -> Option<String> {
-    None
+const fn note_tenant_resolved_after_recorded_failure() {}
+
+/// No capsule support compiled in: never a replay.
+#[cfg(not(feature = "reporting"))]
+const fn replayed_tenant() -> ReplayedTenant {
+    ReplayedTenant::NoTape
 }
 
-/// Tee the resolved tenant into the in-flight request's capsule.
+/// Tee the lookup's result into the in-flight request's capsule. `None` is a
+/// failed lookup.
 #[cfg(feature = "reporting")]
-fn record_tenant(tenant_id: &str) {
+fn record_tenant(tenant_id: Option<&str>) {
     if let Some(scope) = crate::capsule::current_scope() {
         scope.record_tenant(crate::capsule::TenantEffect {
-            id: Some(tenant_id.to_owned()),
+            id: tenant_id.map(ToOwned::to_owned),
         });
     }
 }
 
 /// No capsule support compiled in: nothing to record.
 #[cfg(not(feature = "reporting"))]
-const fn record_tenant(_tenant_id: &str) {}
+const fn record_tenant(_tenant_id: Option<&str>) {}
 
 /// The request's effective host, preferring the proxy-resolved one.
 ///
@@ -1050,6 +1113,71 @@ mod tests {
         let mut parts = make_parts("tenant1.example.com");
         let result = extract_tenant_from_parts(&mut parts, &config).await;
         assert_eq!(result.unwrap(), "tenant1");
+    }
+
+    /// #2351 item 13: an active replay tape with no tenant entry fails closed.
+    /// Live resolution would succeed here, and the run would depend on input
+    /// the recording never had.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_replay_with_no_recorded_tenant_fails_closed() {
+        let config = subdomain_config();
+        let mut parts = make_parts("tenant1.example.com");
+        let tape = std::sync::Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects::default(),
+        ));
+        let result = crate::capsule::with_effect_tape(
+            std::sync::Arc::clone(&tape),
+            extract_tenant_from_parts(&mut parts, &config),
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(tape.divergences().len(), 1);
+    }
+
+    /// Review fix: a lookup the recording saw fail must not succeed on replay.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_recorded_failure_that_now_resolves_fails_closed() {
+        let config = subdomain_config();
+        let mut parts = make_parts("tenant1.example.com");
+        let tape = std::sync::Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects {
+                tenant: Some(crate::capsule::TenantEffect { id: None }),
+                ..crate::capsule::CapsuleEffects::default()
+            },
+        ));
+        let result = crate::capsule::with_effect_tape(
+            std::sync::Arc::clone(&tape),
+            extract_tenant_from_parts(&mut parts, &config),
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(tape.divergences().len(), 1);
+    }
+
+    /// #2351 item 13: capture records a failed lookup, so replay can tell it
+    /// from a lookup the recording never made.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_failed_tenant_lookup_is_recorded() {
+        let config = subdomain_config();
+        let mut parts = make_parts("example.com");
+        let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+            "tenant-test".to_owned(),
+            std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+            std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let result = crate::capsule::capture::with_capture_scope(
+            std::sync::Arc::clone(&scope),
+            extract_tenant_from_parts(&mut parts, &config),
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(
+            scope.effects_snapshot().tenant,
+            Some(crate::capsule::TenantEffect { id: None })
+        );
     }
 
     /// When `ResolvedClientIdentity.host` is present, subdomain mode uses it instead

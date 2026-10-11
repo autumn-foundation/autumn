@@ -820,6 +820,33 @@ pub fn run_pending_sqlite(
     Ok(MigrationResult { applied })
 }
 
+/// [`run_pending_sqlite`] without the per-migration stdout line.
+///
+/// A fleet (ADR 0019) migrates each database as it opens, which across
+/// thousands of tenant databases would print thousands of lines; the caller
+/// logs one summary through `tracing` instead. Same lock, same atomicity.
+#[cfg(feature = "sqlite")]
+pub(crate) fn run_pending_sqlite_quiet(
+    database_url: &str,
+    migrations: impl diesel::migration::MigrationSource<diesel::sqlite::Sqlite>,
+) -> Result<MigrationResult, MigrationError> {
+    if let Some(err) = reject_in_memory_migrations(database_url, &migrations) {
+        return Err(err);
+    }
+    let mut conn = crate::db::establish_sqlite_migration_connection(database_url).map_err(|e| {
+        MigrationError::Connection(crate::db_url::redact_driver_error(
+            &e.to_string(),
+            database_url,
+        ))
+    })?;
+    let applied = with_sqlite_migration_lock(&mut conn, |conn| {
+        conn.run_pending_migrations(migrations)
+            .map(|applied| applied.iter().map(|m| format!("{m}")).collect::<Vec<_>>())
+            .map_err(|e| MigrationError::Migration(e.to_string()))
+    })?;
+    Ok(MigrationResult { applied })
+}
+
 /// Serialize a `SQLite` migration sequence under the database's write lock.
 ///
 /// The single intra-run serialization primitive shared by BOTH `SQLite`
@@ -903,7 +930,7 @@ fn with_sqlite_migration_lock<T>(
 /// Returns [`MigrationError::Connection`] if the database cannot be opened, or
 /// [`MigrationError::Migration`] if status cannot be determined.
 #[cfg(feature = "sqlite")]
-fn pending_migrations_sqlite(
+pub(crate) fn pending_migrations_sqlite(
     database_url: &str,
     migrations: impl diesel::migration::MigrationSource<diesel::sqlite::Sqlite>,
 ) -> Result<Vec<String>, MigrationError> {

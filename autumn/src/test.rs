@@ -736,6 +736,9 @@ pub struct TestApp {
     pool: Option<Pool<crate::db::RuntimeConnection>>,
     #[cfg(feature = "db")]
     replica_pool: Option<Pool<crate::db::RuntimeConnection>>,
+    /// A `SQLite` fleet that becomes the app's shard set (ADR 0019).
+    #[cfg(feature = "sqlite")]
+    fleet: Option<crate::db::fleet::DatabaseFleet>,
     #[cfg(feature = "db")]
     transactional: bool,
     #[cfg(feature = "db")]
@@ -843,6 +846,8 @@ impl TestApp {
             pool: None,
             #[cfg(feature = "db")]
             replica_pool: None,
+            #[cfg(feature = "sqlite")]
+            fleet: None,
             #[cfg(feature = "db")]
             transactional: false,
             #[cfg(feature = "db")]
@@ -1844,6 +1849,18 @@ impl TestApp {
         self
     }
 
+    /// Route tenant data through a `SQLite` fleet (ADR 0019): the fleet
+    /// becomes the app's shard set, so [`ShardedDb`](crate::sharding::ShardedDb),
+    /// [`Shards`](crate::sharding::Shards) and `#[repository(sharded)]` open
+    /// each tenant's (or slot's) own database. Needs a control pool
+    /// ([`with_db`](Self::with_db)), which seeds cross-shard repositories.
+    #[cfg(feature = "sqlite")]
+    #[must_use]
+    pub fn with_fleet(mut self, fleet: crate::db::fleet::DatabaseFleet) -> Self {
+        self.fleet = Some(fleet);
+        self
+    }
+
     /// Register a canned HTTP response for outbound requests made via the
     /// [`Client`](crate::http_client::Client) extractor during this test.
     ///
@@ -2088,6 +2105,15 @@ impl TestApp {
                 (false, _) => std::sync::Arc::new(crate::sharding::HashShardRouter),
             };
 
+        #[cfg(feature = "sqlite")]
+        let fleet_shards = self.fleet.take().map(|fleet| {
+            crate::sharding::ShardSet::from_fleet(
+                fleet,
+                pool.clone()
+                    .expect("TestApp::with_fleet needs a control pool: call with_db"),
+            )
+        });
+
         let probes = crate::probe::ProbeState::ready_for_test();
         #[cfg(feature = "ws")]
         let test_channels = crate::channels::Channels::new(32);
@@ -2143,8 +2169,13 @@ impl TestApp {
             // `begin_test_transaction` isolation); under the `sqlite` feature the
             // harness always uses the plain builder (no shard rollback isolation).
             #[cfg(all(feature = "db", feature = "sqlite"))]
-            shards: crate::sharding::create_shard_set(&self.config.database, shard_router.clone())
-                .expect("test shard pools should build from config"),
+            shards: match fleet_shards {
+                Some(shards) => Some(shards),
+                None => {
+                    crate::sharding::create_shard_set(&self.config.database, shard_router.clone())
+                        .expect("test shard pools should build from config")
+                }
+            },
             // The test harness attaches pools directly (`with_pool`), without
             // a topology to carry a capture gap; a DB test that needs the gap
             // noted asserts through the production seam instead.

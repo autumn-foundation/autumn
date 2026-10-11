@@ -175,6 +175,15 @@ database.auto_migrate
 database.auto_migrate_in_production
 database.connect_timeout_secs
 database.directory_shard_router
+database.fleet
+database.fleet.create_on_demand
+database.fleet.idle_close_secs
+database.fleet.max_open
+database.fleet.mode
+database.fleet.path
+database.fleet.pool_size
+database.fleet.restore_missing
+database.fleet.root
 database.idle_in_transaction_timeout
 database.max_connections_warn_threshold
 database.migration_lock_retries

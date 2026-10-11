@@ -344,6 +344,122 @@ fn is_identifier_char(character: char) -> bool {
 
 // ── Effect tape redaction (#1634) ───────────────────────────────────────────
 
+/// Suffix of a `redacted_keys` entry that marks compared effect data which
+/// held the placeholder text before redaction ran (#2351 item 5).
+pub const LITERAL_PLACEHOLDER_SUFFIX: &str = ":<literal placeholder>";
+
+/// The compared effect fields that already hold the placeholder text.
+///
+/// Replay reads the placeholder in a compared field as a wildcard. Text that
+/// held it before redaction is not a redaction, so the capsule is refused.
+///
+/// Only compared fields are scanned. A response body, a cache hit and the
+/// tenant are served to the code, never matched as a wildcard. Run it on the
+/// effects as recorded, before [`redact_effects`].
+#[must_use]
+pub fn literal_placeholder_locations(
+    effects: &crate::capsule::schema::CapsuleEffects,
+) -> Vec<String> {
+    compared_fields_where(effects, &|text: &str| {
+        text.contains(FILTERED_PLACEHOLDER) || text.contains("%5BFILTERED%5D")
+    })
+}
+
+/// The compared effect fields where two placeholders touch.
+///
+/// Replay cannot tell where one masked value ends and the next begins, so it
+/// learns only their joined value. An outcome that echoes one of them could
+/// not be scrubbed, so the capsule is refused. Run it on the persisted
+/// effects.
+#[must_use]
+pub fn adjacent_placeholder_locations(
+    effects: &crate::capsule::schema::CapsuleEffects,
+) -> Vec<String> {
+    compared_fields_where(effects, &crate::capsule::effects::has_adjacent_placeholders)
+}
+
+/// The compared effect fields whose text `holds` accepts.
+fn compared_fields_where(
+    effects: &crate::capsule::schema::CapsuleEffects,
+    holds: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    use crate::capsule::schema::CacheEffect;
+
+    // String values only: replay compares object keys exactly, so a key is
+    // never a wildcard.
+    fn json_holds(value: &serde_json::Value, holds: &dyn Fn(&str) -> bool) -> bool {
+        match value {
+            serde_json::Value::String(text) => holds(text),
+            serde_json::Value::Array(items) => items.iter().any(|item| json_holds(item, holds)),
+            serde_json::Value::Object(fields) => {
+                fields.values().any(|field| json_holds(field, holds))
+            }
+            _ => false,
+        }
+    }
+    let body_holds = |body: &CapsuleBody| -> bool {
+        match body {
+            CapsuleBody::Text(text) => holds(text),
+            CapsuleBody::Base64(encoded) => STANDARD
+                .decode(encoded.as_bytes())
+                // Only text: replay compares a binary body exactly, so a
+                // placeholder there is no wildcard.
+                .is_ok_and(|bytes| std::str::from_utf8(&bytes).is_ok_and(holds)),
+            CapsuleBody::Absent | CapsuleBody::Skipped { .. } => false,
+        }
+    };
+    let headers_hold = |headers: &[(String, String)]| headers.iter().any(|(_, value)| holds(value));
+
+    let mut found = Vec::new();
+    for (index, exchange) in effects.http.iter().enumerate() {
+        if holds(&exchange.url) {
+            found.push(format!("http[{index}].url"));
+        }
+        if headers_hold(&exchange.request_headers) {
+            found.push(format!("http[{index}].request_header"));
+        }
+        if body_holds(&exchange.request_body) {
+            found.push(format!("http[{index}].request_body"));
+        }
+    }
+    for (index, job) in effects.jobs.iter().enumerate() {
+        if json_holds(&job.payload, holds) {
+            found.push(format!("job[{index}].payload"));
+        }
+    }
+    for (index, mail) in effects.mail.iter().enumerate() {
+        let text_fields = mail
+            .to
+            .iter()
+            .map(String::as_str)
+            .chain([mail.subject.as_str()])
+            .chain(mail.from.as_deref())
+            .chain(mail.reply_to.as_deref())
+            .chain(mail.list_unsubscribe.as_deref())
+            .chain(mail.attachments.iter().map(|a| a.filename.as_str()));
+        if text_fields.into_iter().any(holds)
+            || body_holds(&mail.body)
+            || body_holds(&mail.alternate_body)
+            || headers_hold(&mail.extra_headers)
+        {
+            found.push(format!("mail[{index}]"));
+        }
+    }
+    for (index, entry) in effects.cache.iter().enumerate() {
+        let key_holds = holds(entry.key());
+        let value_holds = match entry {
+            CacheEffect::Insert { value, .. } => STANDARD
+                .decode(value.as_bytes())
+                .is_ok_and(|bytes| std::str::from_utf8(&bytes).is_ok_and(holds)),
+            _ => false,
+        };
+        if key_holds || value_holds {
+            found.push(format!("cache[{index}]"));
+        }
+    }
+    found
+}
+
 /// Redact everything the effect tape recorded, in place.
 ///
 /// The effect seams buffer *raw* values while the run is in flight — they have
@@ -465,6 +581,9 @@ pub fn redact_effects(
                 *value =
                     scrub_encoded_json(value, filter, &format!("cache[{index}]"), values, keys);
             }
+            crate::capsule::schema::CacheEffect::Invalidate { .. }
+            | crate::capsule::schema::CacheEffect::InvalidateNamespace { .. }
+            | crate::capsule::schema::CacheEffect::Clear => {}
         }
     }
 
@@ -497,22 +616,38 @@ pub fn redact_effects(
     }
 
     // Echo pass — everything free-form, with the fully-seeded set.
-    for exchange in &mut effects.http {
+    //
+    // A field replay hands to the code (a response body or header, a cache
+    // hit, the job entry payload) records a key when this pass changes it, as
+    // the filter pass does. Replay refuses a capsule with masked input
+    // (#2351 item 8).
+    for (index, exchange) in effects.http.iter_mut().enumerate() {
         exchange.url = mask_echoes(&exchange.url, values);
         mask_body_echoes(&mut exchange.request_body, values);
-        mask_body_echoes(&mut exchange.response_body, values);
-        for (_, value) in exchange
-            .request_headers
-            .iter_mut()
-            .chain(exchange.response_headers.iter_mut())
-        {
+        if mask_body_echoes(&mut exchange.response_body, values) {
+            keys.insert(format!("http[{index}].response_body:<echo>"));
+        }
+        for (_, value) in &mut exchange.request_headers {
             *value = mask_echoes(value, values);
         }
+        for (name, value) in &mut exchange.response_headers {
+            let masked = mask_echoes(value, values);
+            if masked != *value {
+                keys.insert(format!("http[{index}].response_header:{name}"));
+            }
+            *value = masked;
+        }
+        // Replay hands a recorded error back to the code too. Its key is not
+        // a refusal: error text compares like the outcome does.
         if let Some(error) = exchange.error.as_mut() {
-            *error = mask_echoes(error, values);
+            let masked = mask_echoes(error, values);
+            if masked != *error {
+                keys.insert(format!("http[{index}].error:<echo>"));
+            }
+            *error = masked;
         }
     }
-    for entry in &mut effects.cache {
+    for (index, entry) in effects.cache.iter_mut().enumerate() {
         match entry {
             crate::capsule::schema::CacheEffect::Get { key, .. }
             | crate::capsule::schema::CacheEffect::Insert { key, .. } => {
@@ -522,9 +657,24 @@ pub fn redact_effects(
                 // that can quote a secret back.
                 *key = mask_echoes(key, values);
             }
+            crate::capsule::schema::CacheEffect::Invalidate { key, error }
+            | crate::capsule::schema::CacheEffect::InvalidateNamespace {
+                namespace: key,
+                error,
+            } => {
+                *key = mask_echoes(key, values);
+                if let Some(error) = error.as_mut() {
+                    let masked = mask_echoes(&error.reason, values);
+                    if masked != error.reason {
+                        keys.insert(format!("cache[{index}].error:<echo>"));
+                    }
+                    error.reason = masked;
+                }
+            }
+            crate::capsule::schema::CacheEffect::Clear => {}
         }
     }
-    for mail in &mut effects.mail {
+    for (index, mail) in effects.mail.iter_mut().enumerate() {
         mail.subject = mask_echoes(&mail.subject, values);
         mask_body_echoes(&mut mail.body, values);
         mask_body_echoes(&mut mail.alternate_body, values);
@@ -556,35 +706,54 @@ pub fn redact_effects(
             *from = mask_echoes(from, values);
         }
         if let Some(error) = mail.error.as_mut() {
-            *error = mask_echoes(error, values);
+            let masked = mask_echoes(error, values);
+            if masked != *error {
+                keys.insert(format!("mail[{index}].error:<echo>"));
+            }
+            *error = masked;
         }
     }
     // Job payloads and cache values are structured, so the filter pass masked
     // them *by key*; this catches the other half — a value the request already
     // had masked that reappears under a key the filter does not name.
-    for effect in &mut effects.jobs {
+    for (index, effect) in effects.jobs.iter_mut().enumerate() {
         effect.payload = mask_json_echoes(&effect.payload, values);
         // A rejection's text is free-form and written by whatever refused the
         // enqueue — a `JobInterceptor` can quote the payload field or the
         // credential it rejected — so it can carry a value masked everywhere
         // else in the capsule.
         if let Some(error) = effect.error.as_mut() {
-            *error = mask_echoes(error, values);
+            let masked = mask_echoes(error, values);
+            if masked != *error {
+                keys.insert(format!("job[{index}].error:<echo>"));
+            }
+            *error = masked;
         }
     }
     if let Some(job) = job.as_mut() {
-        job.payload = mask_json_echoes(&job.payload, values);
+        let masked = mask_json_echoes(&job.payload, values);
+        if masked != job.payload {
+            keys.insert("job_entry.<echo>".to_owned());
+        }
+        job.payload = masked;
     }
-    for entry in &mut effects.cache {
+    for (index, entry) in effects.cache.iter_mut().enumerate() {
         match entry {
             crate::capsule::schema::CacheEffect::Get { value, .. } => {
                 if let Some(encoded) = value.as_mut() {
-                    *encoded = mask_encoded_json_echoes(encoded, values);
+                    let masked = mask_encoded_json_echoes(encoded, values);
+                    if masked != *encoded {
+                        keys.insert(format!("cache[{index}]:<echo>"));
+                    }
+                    *encoded = masked;
                 }
             }
             crate::capsule::schema::CacheEffect::Insert { value, .. } => {
                 *value = mask_encoded_json_echoes(value, values);
             }
+            crate::capsule::schema::CacheEffect::Invalidate { .. }
+            | crate::capsule::schema::CacheEffect::InvalidateNamespace { .. }
+            | crate::capsule::schema::CacheEffect::Clear => {}
         }
     }
     if let Some(tenant) = effects.tenant.as_mut()
@@ -708,7 +877,7 @@ fn redact_effect_headers(
 /// the *application's*, the operator never sees these headers in a log to
 /// notice them, and the spellings are conventional rather than app-specific.
 /// Masking a header that turns out to hold nothing secret costs a replay
-/// nothing: outbound matching is on method and URL.
+/// nothing: a masked header value matches any value.
 const OUTBOUND_SENSITIVE_HEADERS: &[&str] = &[
     "authorization",
     "proxy-authorization",
@@ -773,10 +942,15 @@ fn redact_effect_body(
 }
 
 /// Sweep a recorded body for values redaction removed elsewhere.
-fn mask_body_echoes(body: &mut CapsuleBody, values: &RedactedValues) {
-    if let CapsuleBody::Text(text) = body {
-        *text = mask_echoes(text, values);
-    }
+/// Returns whether the body changed.
+fn mask_body_echoes(body: &mut CapsuleBody, values: &RedactedValues) -> bool {
+    let CapsuleBody::Text(text) = body else {
+        return false;
+    };
+    let masked = mask_echoes(text, values);
+    let changed = masked != *text;
+    *text = masked;
+    changed
 }
 
 /// Scrub base64-encoded JSON (the form cache values are recorded in) by key,
@@ -924,7 +1098,7 @@ fn redact_headers(
 /// value (`session="abc"` records `abc`, not `"abc"`). Both are spellings a
 /// sloppy handler could hold; both predate this function's byte port and are
 /// tracked separately rather than widened into it.
-fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedValues) {
+pub(crate) fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedValues) {
     let trimmed = trim_ows(value);
     // Only headers whose *syntax* this understands. A custom sensitive header
     // named by `filter_parameters` carries whatever its application likes, and
@@ -1657,7 +1831,7 @@ fn scrub_value(
 }
 
 /// Retain the bytes of a masked JSON leaf so a bind echoing it is masked too.
-fn record_masked_value(value: &serde_json::Value, values: &mut RedactedValues) {
+pub(crate) fn record_masked_value(value: &serde_json::Value, values: &mut RedactedValues) {
     match value {
         serde_json::Value::String(text) => values.insert(text.as_bytes()),
         serde_json::Value::Null => {}
@@ -1925,7 +2099,9 @@ mod tests {
                     payload: serde_json::json!({"api_key": "sk-live-42", "order": 7}),
                     delay_secs: None,
                     due_at: None,
+                    requested_due_at: None,
                     error: None,
+                    error_status: None,
                 }],
                 cache: vec![CacheEffect::Insert {
                     key: "creds".to_owned(),
@@ -1967,6 +2143,136 @@ mod tests {
             );
         }
 
+        /// #2351 item 8: an echo mask over data replay hands to the code
+        /// records a key, so the refusal for masked input fires.
+        #[test]
+        fn an_echo_masked_consumed_field_records_a_key() {
+            let mut values = RedactedValues::default();
+            values.insert(b"hunter2secret");
+            let mut effects = CapsuleEffects {
+                http: vec![HttpEffect {
+                    response_headers: vec![("x-echo".to_owned(), "hunter2secret".to_owned())],
+                    response_body: CapsuleBody::Text(r#"{"note":"hunter2secret"}"#.to_owned()),
+                    ..exchange("https://api.example/charge")
+                }],
+                cache: vec![
+                    CacheEffect::Get {
+                        key: "k".to_owned(),
+                        value: Some(STANDARD.encode(br#"{"pw":"hunter2secret"}"#)),
+                    },
+                    CacheEffect::Insert {
+                        key: "w".to_owned(),
+                        value: STANDARD.encode(br#"{"pw":"hunter2secret"}"#),
+                        ttl_secs: None,
+                    },
+                ],
+                ..CapsuleEffects::default()
+            };
+            let mut entry = CapsuleJob {
+                name: "n".to_owned(),
+                payload: serde_json::json!({"pw": "hunter2secret"}),
+            };
+            let mut keys = BTreeSet::new();
+            redact_effects(
+                &mut effects,
+                Some(&mut entry),
+                &filter(),
+                &mut values,
+                &mut keys,
+            );
+            assert!(
+                keys.iter().any(|k| k.starts_with("http[0].response_body")),
+                "{keys:?}"
+            );
+            assert!(
+                keys.iter()
+                    .any(|k| k.starts_with("http[0].response_header:x-echo")),
+                "{keys:?}"
+            );
+            assert!(keys.iter().any(|k| k.starts_with("cache[0]")), "{keys:?}");
+            assert!(
+                !keys.iter().any(|k| k.starts_with("cache[1]")),
+                "a cache write is compared, not consumed: {keys:?}"
+            );
+            assert!(keys.iter().any(|k| k.starts_with("job_entry.")), "{keys:?}");
+        }
+
+        /// #2351 item 5: compared data that already held the placeholder text
+        /// is found before redaction runs.
+        #[test]
+        fn a_literal_placeholder_in_compared_data_is_found() {
+            let effects = CapsuleEffects {
+                http: vec![HttpEffect {
+                    request_body: CapsuleBody::Text(r#"{"note":"[FILTERED]"}"#.to_owned()),
+                    ..exchange("https://api.example/charge?q=%5BFILTERED%5D")
+                }],
+                jobs: vec![JobEffect {
+                    name: "n".to_owned(),
+                    payload: serde_json::json!({"note": "[FILTERED]"}),
+                    ..JobEffect::default()
+                }],
+                cache: vec![CacheEffect::Get {
+                    key: "k".to_owned(),
+                    value: Some(STANDARD.encode(br#""[FILTERED]""#)),
+                }],
+                ..CapsuleEffects::default()
+            };
+            let found = literal_placeholder_locations(&effects);
+            assert!(found.contains(&"http[0].url".to_owned()), "{found:?}");
+            assert!(
+                found.contains(&"http[0].request_body".to_owned()),
+                "{found:?}"
+            );
+            assert!(found.contains(&"job[0].payload".to_owned()), "{found:?}");
+            assert!(
+                !found.iter().any(|f| f.starts_with("cache[0]")),
+                "a read value is served, never a wildcard: {found:?}"
+            );
+            assert!(literal_placeholder_locations(&CapsuleEffects::default()).is_empty());
+        }
+
+        /// Codex review on #3222: replay compares a binary body exactly, so
+        /// placeholder bytes in one are not a wildcard and are not reported.
+        #[test]
+        fn placeholder_bytes_in_a_binary_body_are_not_reported() {
+            let mut bytes = vec![0xff, 0xfe];
+            bytes.extend_from_slice(b"[FILTERED][FILTERED]");
+            let effects = CapsuleEffects {
+                http: vec![HttpEffect {
+                    request_body: CapsuleBody::Base64(STANDARD.encode(&bytes)),
+                    ..exchange("https://api.example/upload")
+                }],
+                ..CapsuleEffects::default()
+            };
+            assert!(literal_placeholder_locations(&effects).is_empty());
+            assert!(adjacent_placeholder_locations(&effects).is_empty());
+        }
+
+        /// Codex review on #3222: a job payload is compared value by value,
+        /// and its object keys exactly. A key that holds the placeholder text
+        /// is not a wildcard.
+        #[test]
+        fn a_placeholder_in_a_job_payload_key_is_not_a_literal() {
+            let effects = CapsuleEffects {
+                jobs: vec![JobEffect {
+                    name: "n".to_owned(),
+                    payload: serde_json::json!({"[FILTERED]": {"list": ["plain"]}}),
+                    ..JobEffect::default()
+                }],
+                ..CapsuleEffects::default()
+            };
+            assert!(literal_placeholder_locations(&effects).is_empty());
+            let nested = CapsuleEffects {
+                jobs: vec![JobEffect {
+                    name: "n".to_owned(),
+                    payload: serde_json::json!({"a": [{"b": "x [FILTERED]"}]}),
+                    ..JobEffect::default()
+                }],
+                ..CapsuleEffects::default()
+            };
+            assert_eq!(literal_placeholder_locations(&nested), ["job[0].payload"]);
+        }
+
         #[test]
         fn a_value_masked_out_of_the_request_is_masked_wherever_an_effect_echoes_it() {
             // The two-pass design: the filter pass seeds the echo set, the echo
@@ -1981,7 +2287,9 @@ mod tests {
                     payload: serde_json::json!({"pw": "hunter2secret"}),
                     delay_secs: None,
                     due_at: None,
+                    requested_due_at: None,
                     error: None,
+                    error_status: None,
                 }],
                 mail: vec![MailEffect {
                     to: vec!["hunter2secret@example.com".to_owned()],

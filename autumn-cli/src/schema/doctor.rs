@@ -1386,6 +1386,28 @@ mod tests {
     }
 
     #[test]
+    fn compute_db_schema_drift_catches_fk_action_change() {
+        use autumn_schema_core::{Column, ColumnType, ForeignKey, ForeignKeyAction};
+        // The snapshot has `NO ACTION`; the live DB has `ON DELETE CASCADE`.
+        let build = |action: Option<ForeignKeyAction>| {
+            let mut table = drift_posts_table(None);
+            let mut author = Column::new("author_id".to_string(), ColumnType::Int64);
+            author.references = Some(ForeignKey::new("users", "id").with_on_delete(action));
+            table.columns.push(author);
+            table
+        };
+        let snapshot = vec![build(None)];
+        let db = vec![build(Some(ForeignKeyAction::Cascade))];
+        for drift in [
+            compute_db_schema_drift(&snapshot, &db),
+            compute_db_schema_drift(&db, &snapshot),
+        ] {
+            assert!(!drift.is_clean(), "a changed action is drift");
+            assert!(drift.reported_count() >= 1);
+        }
+    }
+
+    #[test]
     fn compute_db_schema_drift_catches_dropped_foreign_key() {
         use autumn_schema_core::{Column, ColumnType, ForeignKey};
         // Both tables share the same columns; the snapshot's `author_id` carries an

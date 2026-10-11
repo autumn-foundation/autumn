@@ -79,8 +79,16 @@ pub struct PushConfig {
 pub(super) fn is_valid_vapid_subject(subject: &str) -> bool {
     let subject = subject.trim();
     if let Some(rest) = subject.strip_prefix("mailto:") {
-        // `mailto:` with nothing after it names nobody.
-        return rest.contains('@') && !rest.starts_with('@') && !rest.ends_with('@');
+        // Accept one addr-spec: no whitespace, one `@`, and a non-empty local
+        // part and domain. A domain without a dot is valid, because the
+        // default is `admin@localhost`. This is not full RFC 5322. It rejects
+        // only what a push service refuses.
+        return rest.split_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty()
+                && !domain.contains('@')
+                && !domain.is_empty()
+                && !rest.chars().any(char::is_whitespace)
+        });
     }
     url::Url::parse(subject).is_ok_and(|parsed| parsed.scheme() == "https" && parsed.has_host())
 }
@@ -366,7 +374,14 @@ mod tests {
 
     #[test]
     fn a_malformed_mailto_is_rejected() {
-        for subject in ["mailto:", "mailto:@example.com", "mailto:ops@"] {
+        for subject in [
+            "mailto:",
+            "mailto:@example.com",
+            "mailto:ops@",
+            "mailto:ops team@example.com",
+            "mailto:a@@example.com",
+            "mailto:a@b@example.com",
+        ] {
             assert!(
                 config(&format!("subject = \"{subject}\""))
                     .validated_subject()

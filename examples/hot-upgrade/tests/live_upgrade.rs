@@ -177,6 +177,15 @@ fn is_mid_flight_reset(error: &std::io::Error) -> bool {
     )
 }
 
+/// True once a write answered `200` from the `v2` build.
+fn v2_accepted_a_write(writes: &Mutex<Vec<Observation>>) -> bool {
+    writes
+        .lock()
+        .expect("writes")
+        .iter()
+        .any(|w| w.status == 200 && parse_line(&w.body).is_some_and(|r| r.version == "v2"))
+}
+
 fn is_connection_refused(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::ConnectionRefused
 }
@@ -610,9 +619,12 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
     // (checking guarantees against real sustained load after the cutover,
     // not a single v2 sighting) without also being the thing that decides
     // whether the cutover count as having happened in time.
+    //
+    // Wait for a *write* served by v2, not only a read. Reads reach v2 first,
+    // and writes get `503` until v2 owns the state. On a slow instrumented
+    // run the fixed tail below can then hold no accepted write.
     let cutover_seen_by = Instant::now() + Duration::from_secs(30);
-    while successor_pid.lock().expect("successor pid").is_none() && Instant::now() < cutover_seen_by
-    {
+    while !v2_accepted_a_write(&writes) && Instant::now() < cutover_seen_by {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     tokio::time::sleep(Duration::from_millis(3_500)).await;

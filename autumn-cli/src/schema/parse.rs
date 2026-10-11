@@ -94,7 +94,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use autumn_schema_core::{
-    Backend, Column, ColumnDefault, ColumnType, ForeignKey, Index, SerialKind, Table,
+    Backend, Column, ColumnDefault, ColumnType, ForeignKey, ForeignKeyAction, Index, SerialKind,
+    Table,
 };
 
 use crate::generate::naming;
@@ -648,6 +649,13 @@ struct FieldAttrs {
     /// empty-document default.
     is_collaborative: bool,
     reference: ReferenceSpec,
+    /// `#[references(on_delete = "...")]`. `None` is `NO ACTION`.
+    on_delete: Option<ForeignKeyAction>,
+    /// `#[references(on_update = "...")]`. `None` is `NO ACTION`.
+    on_update: Option<ForeignKeyAction>,
+    /// An unknown action value. The parser skips the column and records a
+    /// diagnostic.
+    reference_error: Option<String>,
 }
 
 /// The SQL default a `#[translatable]` column's storage requires — the empty
@@ -670,6 +678,9 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
         is_translatable: false,
         is_collaborative: false,
         reference: ReferenceSpec::None,
+        on_delete: None,
+        on_update: None,
+        reference_error: None,
     };
     for attr in &field.attrs {
         let Some(ident) = attr.path().get_ident() else {
@@ -697,16 +708,27 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
             "references" => {
                 let mut target = None;
                 if !matches!(attr.meta, syn::Meta::Path(_)) {
-                    // Extract the known `table = "..."` override, but consume any
-                    // other nested list / `key = value` pair so a future arg
-                    // (e.g. `on_delete = "cascade"`) never aborts target
-                    // extraction.
+                    // Read `table`, `on_delete` and `on_update`. Consume each other
+                    // nested list or `key = value` pair. Then a new argument cannot
+                    // stop the read of the target.
                     let _ = attr.parse_nested_meta(|meta| {
+                        let action_key = ["on_delete", "on_update"]
+                            .into_iter()
+                            .find(|key| meta.path.is_ident(key));
                         if meta.path.is_ident("table")
                             && let Ok(value) = meta.value()
                             && let Ok(lit) = value.parse::<syn::LitStr>()
                         {
                             target = Some(lit.value());
+                        } else if let Some(key) = action_key
+                            && let Ok(value) = meta.value()
+                            && let Ok(lit) = value.parse::<syn::LitStr>()
+                        {
+                            match ForeignKeyAction::from_attr(&lit.value()) {
+                                Ok(action) if key == "on_delete" => out.on_delete = action,
+                                Ok(action) => out.on_update = action,
+                                Err(e) => out.reference_error = Some(e.to_string()),
+                            }
                         } else if meta.input.peek(syn::token::Paren) {
                             let _ = meta.parse_nested_meta(|_| Ok(()));
                         } else if let Ok(value) = meta.value() {
@@ -721,6 +743,27 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
         }
     }
     out
+}
+
+/// Return the problem with the `#[references]` actions of `raw`, or `None`. A
+/// problem is an unknown value, or `set_null` / `set_default` on a required
+/// column. A reference column has no default, so `SET DEFAULT` writes NULL.
+fn reference_action_problem(raw: &RawField) -> Option<String> {
+    if let Some(error) = &raw.attrs.reference_error {
+        return Some(error.clone());
+    }
+    if raw.nullable {
+        return None;
+    }
+    [raw.attrs.on_delete, raw.attrs.on_update]
+        .into_iter()
+        .flatten()
+        .find_map(|action| match action {
+            ForeignKeyAction::SetNull => Some("set_null"),
+            ForeignKeyAction::SetDefault => Some("set_default"),
+            _ => None,
+        })
+        .map(|value| format!("foreign-key action `{value}` needs an `Option<_>` field"))
 }
 
 /// A field lifted out of the struct with its name, parsed attributes, and Rust
@@ -800,6 +843,18 @@ fn build_table(
         // Resolve the column type. A `#[references]` field is always an `Int64`
         // FK column regardless of the written Rust type (which is `i64` anyway).
         let is_reference = raw.attrs.reference != ReferenceSpec::None;
+        if is_reference && let Some(problem) = reference_action_problem(raw) {
+            // Fail closed: a bad action must never become `NO ACTION`. The diff
+            // keeps a skipped column as it is.
+            diagnostics.push(SchemaDiagnostic {
+                model: model_name.clone(),
+                table: table_name.clone(),
+                field: raw.name.clone(),
+                rust_type: raw.rust_type.clone(),
+                message: format!("{problem} on `{model_name}.{}`; column skipped", raw.name),
+            });
+            continue;
+        }
         let column_ty = if is_reference {
             Some(ColumnType::Int64)
         } else if raw.attrs.is_translatable
@@ -876,6 +931,10 @@ fn build_table(
                 column.references = Some(ForeignKey::new(target.clone(), "id"));
             }
         }
+        column.references = column.references.map(|fk| {
+            fk.with_on_delete(raw.attrs.on_delete)
+                .with_on_update(raw.attrs.on_update)
+        });
 
         // Index bookkeeping (deduped/retained below, mirroring the generator).
         if raw.attrs.is_unique {
@@ -1919,14 +1978,14 @@ mod tests {
 
     #[test]
     fn references_unknown_kv_arg_is_ignored_and_target_survives() {
-        // A future `#[references(table = "...", on_delete = "...")]` arg must
-        // not abort extraction of the `table` target.
+        // An unknown `future_key = "..."` argument must not stop the read of
+        // `table`.
         let src = r#"
             #[model]
             pub struct Comment {
                 #[id]
                 pub id: i64,
-                #[references(table = "users", on_delete = "cascade")]
+                #[references(table = "users", future_key = "x")]
                 pub author_id: i64,
                 #[default]
                 pub created_at: chrono::NaiveDateTime,
@@ -2169,5 +2228,97 @@ mod tests {
             .clone()
             .unwrap();
         assert_eq!(fk.table, "authors");
+    }
+    #[test]
+    fn references_actions_are_parsed() {
+        let src = r#"
+            #[model]
+            pub struct Comment {
+                #[id]
+                pub id: i64,
+                #[references(table = "users", on_delete = "cascade", on_update = "restrict")]
+                pub author_id: i64,
+                #[references(on_delete = "set_null")]
+                pub post_id: Option<i64>,
+                #[references(on_delete = "no_action")]
+                pub thread_id: i64,
+            }
+        "#;
+        let table = parse_one(src);
+        assert_eq!(
+            col(&table, "author_id").references,
+            Some(
+                ForeignKey::new("users", "id")
+                    .with_on_delete(Some(ForeignKeyAction::Cascade))
+                    .with_on_update(Some(ForeignKeyAction::Restrict))
+            )
+        );
+        assert_eq!(
+            col(&table, "post_id").references,
+            Some(ForeignKey::new("posts", "id").with_on_delete(Some(ForeignKeyAction::SetNull)))
+        );
+        // `no_action` is the default. The IR records no action for it.
+        assert_eq!(
+            col(&table, "thread_id").references,
+            Some(ForeignKey::new("threads", "id"))
+        );
+    }
+
+    #[test]
+    fn references_unknown_action_skips_the_column_with_a_diagnostic() {
+        // A typo must not become `NO ACTION`. The parser skips the column.
+        // Then the diff does not change the table.
+        let src = r#"
+            #[model]
+            pub struct Comment {
+                #[id]
+                pub id: i64,
+                #[references(on_delete = "casade")]
+                pub author_id: i64,
+            }
+        "#;
+        let parsed = parse_model_source(src, Backend::Postgres).expect("parse");
+        assert!(
+            parsed.tables[0]
+                .columns
+                .iter()
+                .all(|c| c.name != "author_id")
+        );
+        assert_eq!(parsed.diagnostics.len(), 1);
+        let diag = &parsed.diagnostics[0];
+        assert_eq!(diag.field, "author_id");
+        assert!(diag.message.contains("`casade`"), "{}", diag.message);
+    }
+
+    #[test]
+    fn references_null_writing_action_on_a_required_column_skips_it_with_a_diagnostic() {
+        // `SET NULL` on a `NOT NULL` column fails at delete time. The column has
+        // no default, so `SET DEFAULT` also writes NULL.
+        for action in ["set_null", "set_default"] {
+            let src = format!(
+                r#"
+                #[model]
+                pub struct Comment {{
+                    #[id]
+                    pub id: i64,
+                    #[references(on_update = "{action}")]
+                    pub author_id: i64,
+                }}
+            "#
+            );
+            let parsed = parse_model_source(&src, Backend::Postgres).expect("parse");
+            assert!(
+                parsed.tables[0]
+                    .columns
+                    .iter()
+                    .all(|c| c.name != "author_id")
+            );
+            assert_eq!(parsed.diagnostics.len(), 1);
+            assert!(
+                parsed.diagnostics[0].message.contains(action),
+                "{}",
+                parsed.diagnostics[0].message
+            );
+        }
     }
 }

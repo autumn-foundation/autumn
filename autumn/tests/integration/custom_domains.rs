@@ -582,6 +582,46 @@ async fn a_stale_verification_result_is_discarded_for_a_re_registered_hostname()
 
 // ── AC3: request routing for a registered domain ─────────────────────────
 
+/// #2351 (Codex review on #3222): a capsule that recorded a failed tenant
+/// lookup must not resolve through a custom domain on replay.
+#[cfg(feature = "reporting")]
+#[tokio::test]
+async fn a_recorded_tenant_failure_does_not_resolve_through_a_custom_domain_on_replay() {
+    let mut config = AutumnConfig::default();
+    config.tenancy.enabled = true;
+    config.tenancy.source = "subdomain".to_owned();
+    config.tenancy.base_domain = Some("myapp.com".to_owned());
+
+    let registry = registry();
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    registry
+        .record_active("app.clientco.com", NOW, NOW + 86_400)
+        .await
+        .unwrap();
+
+    let tape = Arc::new(autumn_web::capsule::ReplayEffects::new(
+        autumn_web::capsule::CapsuleEffects {
+            tenant: Some(autumn_web::capsule::TenantEffect { id: None }),
+            ..autumn_web::capsule::CapsuleEffects::default()
+        },
+    ));
+    let req = Request::builder()
+        .header("Host", "app.clientco.com")
+        .body(())
+        .unwrap();
+    let (mut parts, ()) = req.into_parts();
+    let result = autumn_web::capsule::with_effect_tape(
+        Arc::clone(&tape),
+        extract_tenant_from_parts_with_domains(&mut parts, &config, Some(&registry)),
+    )
+    .await;
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(tape.divergences().len(), 1);
+}
+
 #[tokio::test]
 async fn a_verified_custom_domain_resolves_to_its_tenant() {
     let mut config = AutumnConfig::default();

@@ -116,7 +116,7 @@ installs a `RoomService` on `AppState`:
 | Method | Path | Purpose |
 |--------|------|---------|
 | `POST` | `/api/media/rooms` | Create a room. |
-| `POST` | `/api/media/rooms/{room_id}/join` | Join; returns a session token and mesh WHIP/WHEP targets. |
+| `POST` | `/api/media/rooms/{room_id}/join` | Join; returns a session token and mesh WHIP/WHEP targets. A `display_name` longer than 64 characters gets `400`. |
 | `POST` | `/api/media/rooms/{room_id}/leave` | Leave. |
 | `POST` | `/api/media/rooms/{room_id}/heartbeat` | Hold the seat: refresh liveness, renew the token expiry. |
 | `GET`  | `/api/media/rooms/{room_id}` | Member-gated roster (`Authorization: Bearer <token>`). |
@@ -136,7 +136,7 @@ A background reaper reclaims seats and rooms that go quiet. A client holds its
 seat by sending a heartbeat, or by polling the roster, on any interval under the
 idle TTL (default 15 minutes). Room state lives in process memory by default;
 set `room_store_backend = "db"` for a shared store that survives restarts and is
-safe across processes.
+safe across processes: joins from two processes never pass the seat cap.
 
 ## Status
 

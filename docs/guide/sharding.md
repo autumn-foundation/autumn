@@ -10,6 +10,10 @@ Sharding composes with the primary/replica story: **each shard is a full
 primary + optional replica topology** of its own, with the same
 `replica_fallback` semantics you already use on the control role.
 
+On the SQLite tier the same extractors route to a **fleet** instead: one
+SQLite file per tenant or per slot, opened on first use. See
+[SQLite Database Fleet](sqlite-fleet.md).
+
 ## Keys, slots, and shards
 
 ```

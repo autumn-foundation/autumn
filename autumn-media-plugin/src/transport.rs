@@ -245,6 +245,15 @@ fn ingest_status_from_path_json(json: &serde_json::Value) -> IngestStatus {
 
 // ── Control-API client ──────────────────────────────────────────────────────
 
+/// Check a `MediaMTX` call against a failure capsule.
+///
+/// This client is not autumn-web's recorded outbound seam. A capsule replay
+/// refuses the call, and capture marks the capsule incomplete. The target
+/// names the API, not the URL: a path can hold a stream key.
+fn guard_egress(method: &str) -> Result<(), autumn_web::capsule::UnrecordedEgress> {
+    autumn_web::capsule::guard_egress("mediamtx", method, "mediamtx api")
+}
+
 /// Reusable `MediaMTX` v3 control-API client.
 ///
 /// Holds one `reqwest::Client` (a 3-second read timeout) and the API base
@@ -291,6 +300,7 @@ impl MediaMtxClient {
             "{}/v3/paths/list?itemsPerPage={PATHS_ITEMS_PER_PAGE}&page={page}",
             self.api_base
         );
+        guard_egress("GET").ok()?;
         let response = self.http.get(&url).send().await.ok()?;
         if !response.status().is_success() {
             return None;
@@ -344,6 +354,9 @@ impl MediaMtxClient {
     /// transport/parse failure → [`unavailable_stream_status`].
     pub async fn fetch_stream_status(&self, stream_key: &str) -> StreamStatus {
         let url = format!("{}/v3/paths/get/live%2F{stream_key}", self.api_base);
+        if guard_egress("GET").is_err() {
+            return unavailable_stream_status();
+        }
         let Ok(response) = self.http.get(&url).send().await else {
             return unavailable_stream_status();
         };
@@ -385,6 +398,7 @@ impl MediaMtxClient {
     /// Returns `None` when the path is not active or the API is unreachable.
     pub async fn fetch_stream_quality(&self, stream_key: &str) -> Option<StreamQualityStats> {
         let url = format!("{}/v3/paths/get/live%2F{stream_key}", self.api_base);
+        guard_egress("GET").ok()?;
         let response = self.http.get(&url).send().await.ok()?;
         if !response.status().is_success() {
             return None;
@@ -402,6 +416,10 @@ impl MediaMtxClient {
     /// key is already invalidated elsewhere, so the worst outcome is the
     /// publisher continues briefly before the server drops the idle path.
     pub async fn kick_publisher(&self, old_key: &str) {
+        // The kick is a POST that disconnects a live publisher.
+        if guard_egress("POST").is_err() {
+            return;
+        }
         let path_url = format!("{}/v3/paths/get/live%2F{old_key}", self.api_base);
         let Ok(resp) = self
             .http
@@ -668,6 +686,9 @@ pub fn duration_seconds_param(duration_millis: i64) -> String {
 /// VOD, and accepts `200 OK` / `206 Partial Content` as "available". Any
 /// transport error or other status is `false`.
 pub async fn recording_available(http: &reqwest::Client, url: &str) -> bool {
+    if guard_egress("GET").is_err() {
+        return false;
+    }
     let Ok(response) = http
         .get(url)
         .header(header::RANGE, "bytes=0-0")
@@ -1112,6 +1133,31 @@ mod tests {
         assert!(
             request.to_ascii_lowercase().contains("range: bytes=0-0"),
             "probe must avoid downloading whole VODs"
+        );
+    }
+
+    /// autumn-web #2351 item 1: under a capsule replay the probe sends
+    /// nothing and logs a divergence.
+    #[tokio::test]
+    async fn a_capsule_replay_refuses_mediamtx_egress() {
+        let tape = std::sync::Arc::new(autumn_web::capsule::ReplayEffects::new(
+            autumn_web::capsule::CapsuleEffects::default(),
+        ));
+        let available = autumn_web::capsule::with_effect_tape(
+            std::sync::Arc::clone(&tape),
+            recording_available(
+                &probe_client(),
+                "http://127.0.0.1:9/get?path=live%2Fsk_test",
+            ),
+        )
+        .await;
+        assert!(!available);
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1);
+        assert!(
+            !divergences[0].detail.contains("sk_test"),
+            "a stream key must not be printed: {}",
+            divergences[0].detail
         );
     }
 
