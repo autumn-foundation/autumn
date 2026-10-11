@@ -2241,6 +2241,12 @@ jobs:
           # Shares the build above (same package and features).
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_fleet
+          # Issue #2319: the ledger's chain reads, paged verify and out-of-band
+          # refusals run against a real database. These two targets are the
+          # Docker-free half; without them Codecov reads that code as uncovered.
+          # Same package and features as the legs above, so no rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_ledger --test sqlite_ledger_out_of_band
           # Issue #2108: the admin plugin's `backend_select!` sqlite arms and
           # the cross-backend model suite. Without this lane Codecov reads them
           # as a new uncovered surface. No Docker, ~0.01s of runtime.
@@ -2267,9 +2273,9 @@ jobs:
             --test scoped_tokens_db -- --ignored
           # Issue #3072: the shard-local job runtime and the tenant DB
           # bulkhead run only in these Docker tests of the consolidated
-          # binary. A filter that matches nothing exits 0, so check the count.
+          # binary; so does the ledger's Postgres fork (#2319). A filter that matches nothing exits 0, so check the count.
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
-            --test integration_tests -- --ignored shard_local_jobs:: tenant_db_bulkhead:: \
+            --test integration_tests -- --ignored shard_local_jobs:: tenant_db_bulkhead:: ledger_postgres:: \
             | tee "$RUNNER_TEMP/isolation-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/isolation-cov.log"
           cargo llvm-cov --no-report -p autumn-admin-plugin \

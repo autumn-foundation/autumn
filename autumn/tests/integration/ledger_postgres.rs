@@ -46,6 +46,35 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    test_ledger_tenant_notes (id) {
+        id -> Int8,
+        body -> Text,
+        tenant_id -> Text,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+/// A tenant-scoped ledgered model, for the trigger-moved-tenant cases (#2319).
+#[autumn_web::model(table = "test_ledger_tenant_notes")]
+pub struct LedgerTenantNote {
+    #[id]
+    pub id: i64,
+    pub body: String,
+    pub tenant_id: String,
+    #[default]
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(
+    LedgerTenantNote,
+    table = "test_ledger_tenant_notes",
+    tenant_scoped,
+    soft_delete,
+    ledgered = true
+)]
+pub trait LedgerTenantNoteRepository {}
+
 #[autumn_web::model(table = "test_ledger_invoices")]
 pub struct LedgerInvoice {
     #[id]
@@ -111,6 +140,12 @@ async fn setup_pool() -> (
              reference TEXT NOT NULL,
              amount_cents BIGINT NOT NULL,
              amount_rate DOUBLE PRECISION NOT NULL,
+             deleted_at TIMESTAMP
+         )",
+        "CREATE TABLE IF NOT EXISTS test_ledger_tenant_notes (
+             id BIGSERIAL PRIMARY KEY,
+             body TEXT NOT NULL,
+             tenant_id TEXT NOT NULL,
              deleted_at TIMESTAMP
          )",
         VERSION_HISTORY_UP,
@@ -925,4 +960,249 @@ async fn soft_delete_appends_a_revision_and_the_chain_index_refuses_a_fork() {
     .execute(&mut conn)
     .await;
     assert!(forked.is_err(), "the chain unique index must refuse a fork");
+}
+
+// ── #2319: has_many(through) into a ledgered join table ─────────────
+
+diesel::table! {
+    test_ledger_link_posts (id) {
+        id -> Int8,
+        title -> Text,
+    }
+}
+
+diesel::table! {
+    test_ledger_link_tags (id) {
+        id -> Int8,
+        name -> Text,
+    }
+}
+
+#[autumn_web::model(table = "test_ledger_link_tags")]
+pub struct TestLedgerLinkTag {
+    #[id]
+    pub id: i64,
+    pub name: String,
+}
+
+#[autumn_web::repository(TestLedgerLinkTag, table = "test_ledger_link_tags")]
+pub trait TestLedgerLinkTagRepository {}
+
+#[autumn_web::model(table = "test_ledger_link_posts")]
+#[has_many(
+    TestLedgerLinkTag,
+    through = test_ledger_post_tags,
+    name = tags,
+    fk = post_id,
+    target_fk = tag_id,
+    helper = tag
+)]
+pub struct LedgerLinkPost {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(LedgerLinkPost, table = "test_ledger_link_posts")]
+pub trait LedgerLinkPostRepository {}
+
+/// The ledgered join table. Its own module: the `has_many(through)` macro
+/// declares a hidden table of the same name in the parent scope.
+mod link_rows {
+    diesel::table! {
+        test_ledger_post_tags (id) {
+            id -> Int8,
+            post_id -> Int8,
+            tag_id -> Int8,
+            deleted_at -> Nullable<Timestamp>,
+        }
+    }
+
+    #[autumn_web::model(table = "test_ledger_post_tags")]
+    pub struct LedgerPostTag {
+        #[id]
+        pub id: i64,
+        pub post_id: i64,
+        pub tag_id: i64,
+        #[default]
+        pub deleted_at: Option<chrono::NaiveDateTime>,
+    }
+
+    #[autumn_web::repository(
+        LedgerPostTag,
+        table = "test_ledger_post_tags",
+        soft_delete,
+        ledgered = true
+    )]
+    pub trait LedgerPostTagRepository {}
+}
+
+/// `add_*` / `remove_*` / `set_*` write the join table with raw SQL, which
+/// records no revision. On a ledgered join table they are refused.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_link_write_into_a_ledgered_join_table_is_refused() {
+    let (pool, _container) = setup_pool().await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute(
+            "CREATE TABLE test_ledger_link_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL);
+             CREATE TABLE test_ledger_link_tags (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL);
+             CREATE TABLE test_ledger_post_tags (
+                 id BIGSERIAL PRIMARY KEY,
+                 post_id BIGINT NOT NULL,
+                 tag_id BIGINT NOT NULL,
+                 deleted_at TIMESTAMP,
+                 UNIQUE (post_id, tag_id)
+             );",
+        )
+        .await
+        .expect("link tables");
+    }
+    let posts = PgLedgerLinkPostRepository::with_pool_untracked(pool.clone());
+    let tags = PgTestLedgerLinkTagRepository::with_pool_untracked(pool.clone());
+    let links = link_rows::PgLedgerPostTagRepository::with_pool_untracked(pool);
+    let post = posts
+        .save(&NewLedgerLinkPost {
+            title: "p".to_string(),
+        })
+        .await
+        .expect("post");
+    let tag = tags
+        .save(&NewTestLedgerLinkTag {
+            name: "t".to_string(),
+        })
+        .await
+        .expect("tag");
+
+    let refused = |err: &autumn_web::AutumnError| match err
+        .downcast_chain_ref::<autumn_web::ledger::LedgerError>()
+    {
+        Some(autumn_web::ledger::LedgerError::OutOfBandWrite { table, path }) => {
+            assert_eq!(table, "test_ledger_post_tags");
+            assert_eq!(*path, "has_many through");
+        }
+        other => panic!("expected OutOfBandWrite, got {other:?}"),
+    };
+    refused(&posts.add_tag(post.id, tag.id).await.expect_err("add"));
+    refused(&posts.remove_tag(post.id, tag.id).await.expect_err("remove"));
+    refused(&posts.set_tags(post.id, &[tag.id]).await.expect_err("set"));
+    {
+        use link_rows::LedgerPostTagRepository as _;
+        assert!(links.find_all().await.expect("list").is_empty());
+    }
+}
+
+/// A keyset walk over several pages on Postgres (#2319). It joins up to the
+/// full read, and `ledger_verify` pages through the same chain.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ledger_revisions_page_walks_the_chain_on_postgres() {
+    use autumn_web::ledger::LedgerPageRequest;
+
+    let (pool, _container) = setup_pool().await;
+    let repo = build_repo(pool);
+    let created = repo
+        .save(&NewLedgerInvoice {
+            reference: "INV-P".to_string(),
+            amount_cents: 0,
+            amount_rate: 1e16,
+        })
+        .await
+        .expect("insert");
+    for amount in 1..=4 {
+        repo.update(
+            created.id,
+            &UpdateLedgerInvoice {
+                amount_cents: Patch::Set(amount),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update");
+    }
+
+    let mut seqs = Vec::new();
+    let mut request = LedgerPageRequest::first(2);
+    let mut pages = 0;
+    loop {
+        let page = repo
+            .ledger_revisions_page(created.id, request)
+            .await
+            .expect("page");
+        pages += 1;
+        seqs.extend(page.revisions.iter().map(|r| r.seq));
+        match page.next_request(2) {
+            Some(next) => request = next,
+            None => break,
+        }
+    }
+    assert_eq!(pages, 3);
+    assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
+    let full: Vec<i64> = repo
+        .ledger_revisions(created.id)
+        .await
+        .expect("full read")
+        .iter()
+        .map(|r| r.seq)
+        .collect();
+    assert_eq!(seqs, full);
+    let report = repo.ledger_verify(created.id).await.expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+    assert_eq!(report.revisions_checked, 5);
+}
+
+/// A BEFORE trigger that rewrites `tenant_id` during a restore puts the new
+/// tenant into the `RETURNING` row and the reload alike, so only a comparison
+/// with the pre-restore row sees it. The restore is refused and rolled back
+/// (#2319). SQLite cannot run this case: its BEFORE triggers cannot set `NEW`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_before_trigger_cannot_move_a_ledgered_row_during_restore() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgLedgerTenantNoteRepository::with_pool_untracked(pool.clone());
+
+    autumn_web::tenancy::with_tenant("tenant-a".to_string(), async {
+        let id = repo
+            .save(&NewLedgerTenantNote {
+                body: "note".to_string(),
+                tenant_id: "tenant-a".to_string(),
+            })
+            .await
+            .expect("insert")
+            .id;
+        repo.delete_by_id(id).await.expect("delete");
+        {
+            let mut conn = pool.get().await.expect("conn");
+            conn.batch_execute(
+                "CREATE FUNCTION test_ledger_move_tenant() RETURNS trigger AS $$ \
+                 BEGIN NEW.tenant_id := 'tenant-b'; RETURN NEW; END $$ LANGUAGE plpgsql; \
+                 CREATE TRIGGER test_ledger_move_on_restore \
+                 BEFORE UPDATE OF deleted_at ON test_ledger_tenant_notes FOR EACH ROW \
+                 WHEN (NEW.deleted_at IS NULL) EXECUTE FUNCTION test_ledger_move_tenant()",
+            )
+            .await
+            .expect("install trigger");
+        }
+
+        let err = repo
+            .restore(id)
+            .await
+            .expect_err("the restore moves the row");
+        match err.downcast_chain_ref::<autumn_web::ledger::LedgerError>() {
+            Some(autumn_web::ledger::LedgerError::TenantChange { table, record_id }) => {
+                assert_eq!(table, "test_ledger_tenant_notes");
+                assert_eq!(*record_id, id);
+            }
+            other => panic!("expected TenantChange, got {other:?}"),
+        }
+        assert!(
+            repo.find_by_id(id).await.expect("read").is_none(),
+            "the restore rolled back"
+        );
+        let report = repo.ledger_verify(id).await.expect("verify");
+        assert!(report.is_intact(), "{report:?}");
+        assert_eq!(report.revisions_checked, 2);
+    })
+    .await;
 }

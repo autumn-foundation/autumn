@@ -1030,6 +1030,45 @@ applies.
 
 ---
 
+### Ledger: more writes to a ledgered table are refused (#2319)
+
+**Why:** these framework paths write raw SQL and record no revision, so the
+ledger did not match the table. A NULL tenant made a chain that no read could
+reach. A tenant move split a chain in two.
+
+**Before (`{X.Y}`):** each of these compiled and ran:
+
+```rust
+#[repository(Post, soft_delete, ledgered = true)]
+pub trait PostRepository {
+    fn delete_by_title(title: String) -> ();   // bulk delete, no revision
+}
+// `Note` is `tenant_scoped` and ledgered, with `tenant_id: Option<String>`.
+// `Post` is `#[votable]`; `react()` updated `posts.vote_score`.
+```
+
+**After (`{(X+1).0}`):**
+
+| Path | Result |
+|------|--------|
+| `#[votable]` `react()` on a ledgered target or edge table | `OutOfBandWrite` (HTTP 409) |
+| `add_comment` / `delete_comment` into a ledgered comments table | `OutOfBandWrite` |
+| `add_*` / `remove_*` / `set_*` into a ledgered `has_many(through)` join table | `OutOfBandWrite` |
+| A capsule import into a ledgered table | `DataCapsuleError::InvalidInput` |
+| A write from an unledgered repository on a ledgered table, including `with_lock`, `find_or_create_by_*` and a `destroy` cascade through it | `OutOfBandWrite` |
+| A model factory `create()` into a ledgered table | Panic |
+| An update that changes a ledgered record's `tenant_id` | `TenantChange` (HTTP 409) |
+| A derived `delete_by_*` on a ledgered repository | Compile error |
+| `Option<String>` tenant column on a ledgered `tenant_scoped` repository | Compile error |
+
+To fix: find the records, then call `delete_by_id` or `delete_many`. Make the
+tenant field `String` and the column `NOT NULL`. Write through the ledgered
+repository. Or stop ledgering the table.
+
+**Automation:** `manual` - each fix depends on the app's data model.
+
+---
+
 ### Shadow: `ShadowStats` gains `comparisons_abandoned`
 
 **Why:** the mirror deadline now covers the comparison. A comparison that does

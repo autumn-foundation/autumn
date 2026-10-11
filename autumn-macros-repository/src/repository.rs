@@ -1542,6 +1542,27 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     })
 }
 
+/// The error for a derived `delete_by_*` on a ledgered repository (#2319).
+///
+/// The derived delete is one bulk `UPDATE`. It records no revision, so the
+/// ledger would not match the table.
+fn ledgered_derived_delete_error(trait_def: &ItemTrait) -> Option<syn::Error> {
+    trait_def.items.iter().find_map(|item| {
+        let TraitItem::Fn(method) = item else {
+            return None;
+        };
+        let query = parse_query_name(&method.sig.ident.to_string())?;
+        (query.prefix == "delete").then(|| {
+            syn::Error::new_spanned(
+                &method.sig.ident,
+                "a ledgered repository cannot declare a derived `delete_by_*` method. It \
+                 deletes in one bulk write and records no revision. Find the records. \
+                 Then call `delete_by_id` or `delete_many`",
+            )
+        })
+    })
+}
+
 /// Parse a derived query method name like `find_by_title_and_published`.
 struct DerivedQuery {
     prefix: String,      // "find", "count", "delete", "exists"
@@ -2196,7 +2217,14 @@ fn vh_insert_ts(
     // Emitted here rather than at each call site so every write path version
     // history already covers is covered by the ledger too, by construction.
     let ledger_ts = if ledgered {
-        ledger_append_ts(&table_name_ts, op, record_expr, conn_ident, model_ident)
+        ledger_append_ts(
+            &table_name_ts,
+            op,
+            record_expr,
+            before_expr,
+            conn_ident,
+            model_ident,
+        )
     } else {
         quote! {}
     };
@@ -2249,6 +2277,56 @@ fn version_op_variant(op: &str) -> TokenStream {
     }
 }
 
+/// Reload a ledgered row after its write and snapshot it (#2326, #2319).
+///
+/// A revision snapshots the state after its write, but no record a write path
+/// holds shows it reliably. A delete holds its pre-delete load; an insert,
+/// update or restore holds the statement's `RETURNING` row, which does not
+/// show what an AFTER trigger changed. A trigger or a default may change any
+/// column (#2326), `tenant_id` included, so reload the whole row. The bulk
+/// paths share this builder. The reload is one indexed lookup per ledgered
+/// write, in the transaction that already reads the chain head.
+///
+/// Everything the revision takes from the row is read from this reload: the
+/// snapshot, the tenant check, the non-finite check and the valid time.
+///
+/// Expands to an expression of the model's type.
+fn ledger_reload_after_write_ts(
+    table_name_ts: &str,
+    conn_ident: &TokenStream,
+    model_ident: &proc_macro2::Ident,
+) -> TokenStream {
+    let table_ident = format_ident!("{table_name_ts}");
+    quote! {
+        {
+            use ::autumn_web::reexports::diesel::prelude::*;
+            // Named, not glob-aliased: the sync prelude also brings a
+            // `first`, and only an explicit import shadows it.
+            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+            let __lg_after: ::core::option::Option<#model_ident> = #table_ident::table
+                .find(__lg_record_id)
+                .select(#model_ident::as_select())
+                .first::<#model_ident>(&mut *#conn_ident)
+                .await
+                .optional()
+                .map_err(::autumn_web::AutumnError::from)?;
+            // A missing row would leave a stale snapshot. Refuse.
+            let ::core::option::Option::Some(__lg_row) = __lg_after else {
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::internal_server_error(
+                        ::autumn_web::ledger::LedgerError::ChainUnreadable {
+                            table: #table_name_ts.to_string(),
+                            record_id: __lg_record_id,
+                            detail: "the row cannot be read back after the write".to_string(),
+                        },
+                    ),
+                );
+            };
+            __lg_row
+        }
+    }
+}
+
 /// Generate the token stream that appends one `LedgerRevision` to
 /// `_autumn_ledger_revisions` (issue #1699).
 ///
@@ -2282,50 +2360,13 @@ fn ledger_append_ts(
     table_name_ts: &str,
     op: &str,
     record_expr: &TokenStream,
+    before_expr: Option<&TokenStream>,
     conn_ident: &TokenStream,
     model_ident: &proc_macro2::Ident,
 ) -> TokenStream {
     let op_variant = version_op_variant(op);
 
-    // `ledgered` implies `soft_delete`, so a delete here is always soft: the row
-    // survives with `deleted_at` set. The record handed to this builder is the
-    // pre-delete load, but a ledger revision snapshots the state after its write.
-    // A trigger or a default may change any column in the same UPDATE (#2326), so
-    // reload the whole row. The bulk paths share this builder. Reading the row
-    // back is one indexed lookup, on ledgered deletes only.
-    let table_ident = format_ident!("{table_name_ts}");
-    let soft_delete_stamp = if op == "delete" {
-        quote! {
-            {
-                use ::autumn_web::reexports::diesel::prelude::*;
-                // Named, not glob-aliased: the sync prelude also brings a
-                // `first`, and only an explicit import shadows it.
-                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let __lg_after: ::core::option::Option<#model_ident> = #table_ident::table
-                    .find(__lg_record_id)
-                    .select(#model_ident::as_select())
-                    .first::<#model_ident>(&mut *#conn_ident)
-                    .await
-                    .optional()
-                    .map_err(::autumn_web::AutumnError::from)?;
-                // A missing row would leave the stale pre-delete snapshot. Refuse.
-                let ::core::option::Option::Some(__lg_row) = __lg_after else {
-                    return ::core::result::Result::Err(
-                        ::autumn_web::AutumnError::internal_server_error(
-                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
-                                table: #table_name_ts.to_string(),
-                                record_id: __lg_record_id,
-                                detail: "the deleted row cannot be read back".to_string(),
-                            },
-                        ),
-                    );
-                };
-                __lg_snapshot = __lg_row.__autumn_commit_hook_to_value()?;
-            }
-        }
-    } else {
-        quote! {}
-    };
+    let reload_after_write = ledger_reload_after_write_ts(table_name_ts, conn_ident, model_ident);
 
     // #2326: a delete or restore is valid from the moment it is made. The record
     // still holds the old valid time. Reading it would back-date the revision.
@@ -2342,24 +2383,52 @@ fn ledger_append_ts(
                 ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
             > = {
                 use ::autumn_web::ledger::LedgeredRecord as _;
-                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_valid_from(&(#record_expr))
+                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_valid_from(&__lg_row)
             };
         }
     };
 
-    // #2326: refuse before the snapshot. The snapshot would turn NaN into `null`.
-    // A delete or restore writes no float, so a legacy row that holds one can
-    // still be deleted or restored.
-    let non_finite_check = if matches!(op, "insert" | "update") {
-        quote! {
-            ::autumn_web::ledger::refuse_non_finite(
+    // #2319: a chain belongs to one tenant. An update that moves the record
+    // would split it, so refuse it. A restore gets the same check: a BEFORE
+    // trigger can rewrite `tenant_id` into the `RETURNING` row itself, where
+    // the reload below cannot see a difference. An AFTER trigger can rewrite
+    // it on any write; the reload checks the row it left behind.
+    let tenant_change_check = match (op, before_expr) {
+        ("update" | "restore", Some(before)) => quote! {
+            ::autumn_web::ledger::refuse_tenant_change(
                 #table_name_ts,
                 __lg_record_id,
-                (#record_expr).__autumn_ledger_non_finite_column(),
+                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(&(#before)),
+                __lg_tenant_id,
             )?;
-        }
-    } else {
-        quote! {}
+        },
+        _ => quote! {},
+    };
+
+    // #2326: refuse before the snapshot. The snapshot would turn NaN into `null`.
+    // A delete or restore writes no float, so a legacy row that holds one can
+    // still be deleted or restored. A trigger can still write one during them
+    // (#2319): refuse when the row was finite before the write and is not now.
+    let refuse = quote! {
+        ::autumn_web::ledger::refuse_non_finite(
+            #table_name_ts,
+            __lg_record_id,
+            __lg_row.__autumn_ledger_non_finite_column(),
+        )?;
+    };
+    let before_write = match (op, before_expr) {
+        // A delete's record is its pre-delete load.
+        ("delete", _) => Some(record_expr),
+        ("restore", Some(before)) => Some(before),
+        _ => None,
+    };
+    let non_finite_check = match before_write {
+        Some(before) => quote! {
+            if (#before).__autumn_ledger_non_finite_column().is_none() {
+                #refuse
+            }
+        },
+        None => refuse,
     };
 
     quote! {
@@ -2368,15 +2437,21 @@ fn ledger_append_ts(
                 use ::autumn_web::version_history::VersionedRecord as _;
                 (#record_expr).version_record_id()
             };
+            // The row as the write left it, after any trigger ran.
+            let __lg_row: #model_ident = #reload_after_write;
             #non_finite_check
-            let __lg_tenant_id: ::core::option::Option<&str> = {
-                use ::autumn_web::version_history::VersionedRecord as _;
-                (#record_expr).version_tenant_id()
-            };
-            #[allow(unused_mut, reason = "only the delete arm rewrites the snapshot")]
-            let mut __lg_snapshot: ::autumn_web::reexports::serde_json::Value =
-                (#record_expr).__autumn_commit_hook_to_value()?;
-            #soft_delete_stamp
+            let __lg_tenant_id: ::core::option::Option<&str> =
+                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(&(#record_expr));
+            #tenant_change_check
+            // #2319: a trigger that rewrote `tenant_id` would split the chain.
+            ::autumn_web::ledger::refuse_tenant_change(
+                #table_name_ts,
+                __lg_record_id,
+                __lg_tenant_id,
+                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(&__lg_row),
+            )?;
+            let __lg_snapshot: ::autumn_web::reexports::serde_json::Value =
+                __lg_row.__autumn_commit_hook_to_value()?;
             #valid_from_stmt
             ::autumn_web::ledger::append_revision(
                 &mut *#conn_ident,
@@ -2782,6 +2857,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(t) => t,
         Err(err) => return err.to_compile_error(),
     };
+
+    // #2319: a derived `delete_by_*` is one bulk write with no revision.
+    if config.ledgered
+        && let Some(err) = ledgered_derived_delete_error(&trait_def)
+    {
+        return err.to_compile_error();
+    }
 
     if config.broadcasts && config.hooks_type.is_none() {
         config.hooks_type = Some(format_ident!("Pg{}InternalHooks", trait_def.ident));
@@ -3861,6 +3943,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             );
         }
     };
+    // #2319: this repository records no revision. If a ledgered repository
+    // owns the table, refuse the write connection. Generated reads use the read
+    // connection. `with_lock`, `find_or_create_by_*` and counter recomputes use
+    // the write connection, so they refuse too.
+    let unledgered_write_guard = if config.ledgered {
+        quote! {}
+    } else {
+        quote! {
+            ::autumn_web::ledger::refuse_out_of_band_write(
+                #table_name,
+                "a repository that is not ledgered",
+            )?;
+        }
+    };
     // #2319: marks this table as ledgered. Raw-SQL framework paths read the
     // mark and refuse to write to it.
     let ledgered_table_registration = if config.ledgered {
@@ -4089,9 +4185,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
         });
+        // #2319: one typed source for the chain's tenant. Only `String`
+        // implements `LedgerTenantColumn`, so a nullable column does not compile.
+        let tenant_method = config.tenant_scoped.then(|| {
+            quote! {
+                fn ledger_tenant_id(&self) -> ::core::option::Option<&str> {
+                    ::core::option::Option::Some(
+                        ::autumn_web::ledger::LedgerTenantColumn::ledger_tenant_id(&self.tenant_id),
+                    )
+                }
+            }
+        });
         quote! {
             impl ::autumn_web::ledger::LedgeredRecord for #model_name {
                 #valid_from_method
+                #tenant_method
             }
         }
     } else {
@@ -4456,7 +4564,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                          FROM _autumn_ledger_revisions \
                                          WHERE table_name = $1 AND record_id = $2 \
                                          AND ($3::text IS NULL OR tenant_id = $3) \
-                                         ORDER BY seq ASC"
+                                         ORDER BY seq ASC, id ASC"
                                     )
                                     .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
                                     .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
@@ -4506,7 +4614,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                          FROM _autumn_ledger_revisions \
                                          WHERE table_name = $1 AND record_id = $2 \
                                          AND ($3 IS NULL OR tenant_id = $3) \
-                                         ORDER BY seq ASC"
+                                         ORDER BY seq ASC, id ASC"
                                     )
                                     .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
                                     .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
@@ -4520,6 +4628,37 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         };
 
                     ::core::result::Result::Ok(revisions)
+                }
+
+                /// One page of the record's revision chain, oldest first (#2319).
+                ///
+                /// A keyset page on `(seq, id)`. Each page is one indexed read,
+                /// so chain length does not change its cost. Pass the returned
+                /// `next` cursor to read the next page. Pages are separate
+                /// reads, not one snapshot: a write between two pages can add
+                /// revisions to a later page.
+                ///
+                /// # Errors
+                ///
+                /// The same as [`ledger_revisions`](Self::ledger_revisions).
+                pub async fn ledger_revisions_page(
+                    &self,
+                    record_id: i64,
+                    page: ::autumn_web::ledger::LedgerPageRequest,
+                ) -> ::autumn_web::AutumnResult<::autumn_web::ledger::LedgerRevisionPage> {
+                    #ledger_cross_shard_guard
+                    #ledger_cross_tenant_guard
+                    #ledger_tenant_setup
+
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
+                    ::autumn_web::ledger::read_revisions_page(
+                        &mut *conn,
+                        #table_name,
+                        __ledger_tenant_id,
+                        record_id,
+                        page,
+                    )
+                    .await
                 }
 
                 /// The single revision in force at a bitemporal instant,
@@ -5057,7 +5196,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 /// # Errors
                 ///
                 /// Propagates read errors from
-                /// [`ledger_revisions`](Self::ledger_revisions).
+                /// [`ledger_revisions_page`](Self::ledger_revisions_page).
                 pub async fn ledger_verify(
                     &self,
                     record_id: i64,
@@ -5072,11 +5211,33 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // exists to produce trustworthy accusations. If the chain head
                     // moved under us, the live comparison is skipped rather than
                     // reported — a concurrent write is not tampering.
-                    let revisions = match self.ledger_revisions(record_id).await {
-                        ::core::result::Result::Ok(revisions) => revisions,
-                        ::core::result::Result::Err(err) =>
-                            return ::autumn_web::ledger::verification_from_read_error(record_id, err),
-                    };
+                    // #2319: read the chain in pages. Memory holds one page
+                    // and the head, however long the chain is.
+                    let mut verifier = ::autumn_web::ledger::LedgerChainVerifier::new(record_id);
+                    let mut last: ::core::option::Option<::autumn_web::ledger::LedgerRevision> =
+                        ::core::option::Option::None;
+                    let __verify_limit = ::autumn_web::ledger::LedgerPageRequest::VERIFY_LIMIT;
+                    let mut request = ::autumn_web::ledger::LedgerPageRequest::first(__verify_limit);
+                    loop {
+                        // #2326: a non-canonical snapshot is a break, not an error.
+                        let page = match self.ledger_revisions_page(record_id, request).await {
+                            ::core::result::Result::Ok(page) => page,
+                            ::core::result::Result::Err(err) =>
+                                return ::autumn_web::ledger::verification_from_read_error(record_id, err),
+                        };
+                        let next = page.next_request(__verify_limit);
+                        let mut revisions = page.revisions;
+                        for revision in &revisions {
+                            verifier.push(revision);
+                        }
+                        if let ::core::option::Option::Some(revision) = revisions.pop() {
+                            last = ::core::option::Option::Some(revision);
+                        }
+                        match next {
+                            ::core::option::Option::Some(next) => request = next,
+                            ::core::option::Option::None => break,
+                        }
+                    }
                     let live = self.__autumn_ledger_live_view(record_id).await?;
                     // Head and mark in ONE statement: read separately they could
                     // come from differently-lagged replicas, and a fresh mark
@@ -5088,10 +5249,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         high_water,
                     } = self.__autumn_ledger_settled_state(record_id).await?;
                     let stable = settled_head.as_ref().map(|h| h.seq)
-                        == revisions.last().map(|r| r.seq);
+                        == last.as_ref().map(|r| r.seq);
 
                     let live_state = if stable {
-                        match (revisions.last(), live.as_ref()) {
+                        match (last.as_ref(), live.as_ref()) {
                             (_, ::core::option::Option::None) =>
                                 ::autumn_web::ledger::LedgerLiveState::Absent,
                             (::core::option::Option::None, ::core::option::Option::Some(_)) =>
@@ -5132,14 +5293,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::autumn_web::ledger::LedgerHighWaterState::NotChecked
                     };
 
-                    ::core::result::Result::Ok(
-                        ::autumn_web::ledger::verify_chain_with_high_water(
-                            record_id,
-                            &revisions,
-                            live_state,
-                            high_water_state,
-                        ),
-                    )
+                    ::core::result::Result::Ok(verifier.finish(live_state, high_water_state))
                 }
 
                 /// Whether the head revision describes the row the table holds.
@@ -6219,6 +6373,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::autumn_web::RuntimeConnection,
                 >,
             > {
+                #unledgered_write_guard
                 let result = self.__autumn_acquire_from(&self.pool).await;
                 // Mark write only after a successful primary checkout, mirroring
                 // the guard in `Db::from_request_parts`. A failed acquire (pool
@@ -13694,6 +13849,18 @@ fn emit_dependent_cascade(
 
     let model_name = &config.model_name;
     let table_name = &config.table_name;
+    // #2319: a destroy cascade runs on the parent's connection, not through
+    // `__autumn_acquire_conn`. Check the guard here too.
+    let dependent_unledgered_guard = if config.ledgered {
+        quote! {}
+    } else {
+        quote! {
+            ::autumn_web::ledger::refuse_out_of_band_write(
+                __table,
+                "a repository that is not ledgered",
+            )?;
+        }
+    };
     let table_ident = format_ident!("{table_name}");
     let commit_hooks_enabled = config.hooks_type.is_some() && config.commit_hooks;
 
@@ -14535,6 +14702,7 @@ fn emit_dependent_cascade(
                         ::core::result::Result::Ok(::std::vec::Vec::new())
                     }
                     ::autumn_web::repository::DependentAction::Destroy => {
+                        #dependent_unledgered_guard
                         // Recursive cascade (#1739): each child row's mutation is
                         // applied inline, and BEFORE that mutation this repo's own
                         // `dependent(...)` cascade is invoked against the child id,
@@ -28148,6 +28316,7 @@ mod tests {
 
         for method in [
             "ledger_revisions",
+            "ledger_revisions_page",
             "ledger_as_of",
             "ledger_as_of_at",
             "ledger_diff",
@@ -28187,6 +28356,7 @@ mod tests {
             "posts",
             op,
             &quote! { record },
+            Some(&quote! { before }),
             &quote! { conn },
             &format_ident!("Post"),
         )
@@ -28205,8 +28375,8 @@ mod tests {
         }
         for op in ["insert", "update"] {
             assert!(
-                ledger_append_for(op).contains("ledger_valid_from"),
-                "`{op}` must keep reading the record's valid time"
+                ledger_append_for(op).contains("ledger_valid_from (& __lg_row)"),
+                "`{op}` must read the valid time of the reloaded row"
             );
         }
     }
@@ -28214,10 +28384,32 @@ mod tests {
     #[test]
     fn ledger_append_refuses_a_non_finite_float_before_hashing() {
         // #2326: the check must run before the snapshot is taken.
-        for op in ["delete", "restore"] {
+        for op in ["insert", "update", "delete", "restore"] {
+            // A trigger may write the float, so check the reloaded row.
             assert!(
-                !ledger_append_for(op).contains("__autumn_ledger_non_finite_column"),
-                "`{op}` writes no float, so it must not be refused for a legacy value"
+                ledger_append_for(op).contains("__lg_row . __autumn_ledger_non_finite_column"),
+                "`{op}` must check the reloaded row"
+            );
+        }
+        // A delete or restore writes no float, so a legacy value that was there
+        // before the write is not refused: the check is gated on the pre-write
+        // row. A delete's record is its pre-delete load; a restore has `before`.
+        assert!(
+            ledger_append_for("delete")
+                .contains("if (record) . __autumn_ledger_non_finite_column () . is_none ()"),
+            "{}",
+            ledger_append_for("delete")
+        );
+        assert!(
+            ledger_append_for("restore")
+                .contains("if (before) . __autumn_ledger_non_finite_column () . is_none ()"),
+            "{}",
+            ledger_append_for("restore")
+        );
+        for op in ["insert", "update"] {
+            assert!(
+                !ledger_append_for(op).contains(". is_none ()"),
+                "`{op}` refuses any non-finite value"
             );
         }
         let generated = ledger_append_for("update");
@@ -28231,6 +28423,111 @@ mod tests {
             check < snapshot,
             "check must precede the snapshot: {generated}"
         );
+    }
+
+    #[test]
+    fn ledger_append_refuses_a_tenant_change_on_every_mutation() {
+        // #2319: a chain belongs to one tenant. An AFTER trigger can rewrite
+        // `tenant_id` on any write, and no `RETURNING` row shows it, so every
+        // write reloads the row, checks its tenant, and snapshots that row.
+        for op in ["insert", "update", "delete", "restore"] {
+            let generated = ledger_append_for(op);
+            let reload = generated.find("__lg_after").expect("reloads the row");
+            let check = generated[reload..]
+                .find("refuse_tenant_change")
+                .map(|at| reload + at)
+                .expect("checks the reloaded row");
+            let snapshot = generated
+                .find("__lg_row . __autumn_commit_hook_to_value")
+                .expect("snapshots the reloaded row");
+            assert!(reload < check && check < snapshot, "{op}: {generated}");
+            assert_eq!(
+                generated.matches("__autumn_commit_hook_to_value").count(),
+                1,
+                "{op}: one snapshot, of the reloaded row"
+            );
+        }
+        // An update or restore also compares the written row with the one
+        // before, which catches a BEFORE trigger the reload cannot.
+        for op in ["update", "restore"] {
+            assert_eq!(
+                ledger_append_for(op)
+                    .matches("refuse_tenant_change")
+                    .count(),
+                2,
+                "{op}"
+            );
+        }
+    }
+
+    #[test]
+    fn ledger_append_reads_the_tenant_from_the_ledgered_record() {
+        // #2319: the writer and the type assertion share one source.
+        let generated = ledger_append_for("insert");
+        assert!(
+            generated.contains("LedgeredRecord > :: ledger_tenant_id"),
+            "{generated}"
+        );
+        assert!(!generated.contains("version_tenant_id"), "{generated}");
+    }
+
+    #[test]
+    fn a_tenant_scoped_ledgered_record_reads_a_non_null_tenant() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, soft_delete, ledgered = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("LedgerTenantColumn :: ledger_tenant_id (& self . tenant_id)"),
+            "{generated}"
+        );
+
+        let untenanted = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(!untenanted.contains("LedgerTenantColumn"), "{untenanted}");
+    }
+
+    #[test]
+    fn a_ledgered_repository_rejects_a_derived_delete() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! {
+                pub trait PostRepository {
+                    fn delete_by_title(title: String) -> ();
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot declare a derived `delete_by_*` method"),
+            "{generated}"
+        );
+
+        // Derived reads stay allowed, and an unledgered derived delete too.
+        let reads = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! {
+                pub trait PostRepository {
+                    fn find_by_title(title: String) -> Vec<Post>;
+                }
+            },
+        )
+        .to_string();
+        assert!(!reads.contains("compile_error"), "{reads}");
+        let plain = repository_macro(
+            quote! { Post, soft_delete },
+            quote! {
+                pub trait PostRepository {
+                    fn delete_by_title(title: String) -> ();
+                }
+            },
+        )
+        .to_string();
+        assert!(!plain.contains("compile_error"), "{plain}");
     }
 
     #[test]
