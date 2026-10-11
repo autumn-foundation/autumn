@@ -841,18 +841,13 @@ fn is_type_path(text: &str) -> bool {
 
 /// Whether a path names this crate's `cached` macro.
 ///
-/// A third-party `cached` crate has the same last segment. It must stay
-/// untouched.
+/// The crate may be renamed (`web::cached`), so any `..::cached` counts. The
+/// third-party `cached` crate (`cached::proc_macro::cached`) does not.
 fn is_cached_path(path: &syn::Path) -> bool {
-    let names: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
-    matches!(
-        names
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .as_slice(),
-        ["cached"] | ["autumn_web" | "crate", "cached"]
-    )
+    path.segments
+        .last()
+        .is_some_and(|seg| seg.ident == "cached")
+        && (path.segments.len() == 1 || path.segments[0].ident != "cached")
 }
 
 /// Append `scope = "<scope>"` (and the `crate = ".."` override, if any) to a
@@ -1110,6 +1105,15 @@ mod tests {
             out.contains("# [cached (scope = \"Products\" , crate = \"web\")]"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn cached_impl_scopes_a_renamed_crate_path() {
+        let out = scoped(
+            TokenStream::new(),
+            quote! { impl P { #[web::cached] async fn f() {} } },
+        );
+        assert!(out.contains("# [web :: cached (scope = \"P\")]"), "{out}");
     }
 
     #[test]
