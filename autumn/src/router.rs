@@ -1517,13 +1517,21 @@ fn build_aeo_site<O: AeoOpenApiFacts, M: AeoMcpFacts>(
     } else {
         vec!["/".to_owned()]
     };
-    let home_noindex = route_list.iter().any(|r| {
-        r.method == http::Method::GET
-            && r.path == "/"
-            && r.seo
-                .robots
-                .is_some_and(crate::seo::robots_directive_is_noindex)
-    });
+    let noindex = |r: &Route| {
+        r.seo
+            .robots
+            .is_some_and(crate::seo::robots_directive_is_noindex)
+    };
+    let home_noindex = route_list
+        .iter()
+        .any(|r| r.method == http::Method::GET && r.path == "/" && noindex(r))
+        || scoped_groups.iter().any(|g| {
+            g.routes.iter().any(|r| {
+                r.method == http::Method::GET
+                    && join_nested_path(&g.prefix, r.path) == "/"
+                    && noindex(r)
+            })
+        });
     let mut facts = SiteFacts {
         pages,
         home_paths,
@@ -12347,6 +12355,34 @@ enabled = true
             .await
             .unwrap();
         assert_eq!(&body[..], b"<h1>secret</h1>");
+    }
+
+    /// Codex review (P2): a `noindex` home from a scoped group at `/` is
+    /// left out of discovery, as a routed one is.
+    #[test]
+    fn a_scoped_noindex_home_is_not_listed() {
+        let mut home = duplicate_test_route(http::Method::GET, "/", "home");
+        home.seo = crate::seo::SeoRouteDefaults {
+            robots: Some("noindex"),
+            ..crate::seo::SeoRouteDefaults::EMPTY
+        };
+        let group = crate::app::ScopedGroup {
+            prefix: "/".to_owned(),
+            routes: vec![home],
+            source: crate::route_listing::RouteSource::User,
+            apply_layer: Box::new(|r| r),
+        };
+        let site = super::build_aeo_site::<(), ()>(
+            &AutumnConfig::default(),
+            &AppState::for_test(),
+            &[],
+            &[group],
+            false,
+            None,
+            None,
+        );
+        assert!(!site.facts.no_home);
+        assert!(site.facts.home_noindex);
     }
 
     /// With a static build, the x402 copy outside the static-first

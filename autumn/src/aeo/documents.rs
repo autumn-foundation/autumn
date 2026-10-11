@@ -649,11 +649,20 @@ fn json_body(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_owned())
 }
 
+/// A public JSON document any origin can read. A browser that revalidates
+/// it sends `If-None-Match`, which needs a preflight, and reads the `ETag`,
+/// which CORS hides unless exposed.
 fn cors_json(value: &Value) -> Document {
     Document {
         content_type: JSON,
         headers: vec![
             ("access-control-allow-origin", "*".to_owned()),
+            ("access-control-allow-methods", "GET".to_owned()),
+            (
+                "access-control-allow-headers",
+                "Content-Type, If-None-Match".to_owned(),
+            ),
+            ("access-control-expose-headers", "ETag".to_owned()),
             ("cache-control", "public, max-age=3600".to_owned()),
         ],
         body: json_body(value),
@@ -860,16 +869,7 @@ fn server_card(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
         // The gate is any Tower layer (or a proxy): its scheme is unknown.
         card["authentication"] = json!({ "required": true });
     }
-    let mut doc = cors_json(&card);
-    doc.headers
-        .push(("access-control-allow-methods", "GET".to_owned()));
-    doc.headers.push((
-        "access-control-allow-headers",
-        "Content-Type, If-None-Match".to_owned(),
-    ));
-    doc.headers
-        .push(("access-control-expose-headers", "ETag".to_owned()));
-    Some(doc)
+    Some(cors_json(&card))
 }
 
 /// Reverse-DNS card name: `com.example.shop/shop`.
@@ -2130,6 +2130,38 @@ mod tests {
             );
             assert_eq!(card["tools"][0]["name"], "list_todos");
             assert!(card["description"].as_str().unwrap().chars().count() <= 100);
+        }
+    }
+
+    /// Codex review (P2): every public JSON document lets a cross-origin
+    /// reader revalidate with `If-None-Match` and read the `ETag`, not just
+    /// the server card.
+    #[test]
+    fn public_json_documents_allow_cross_origin_revalidation() {
+        let mut facts = api_site();
+        facts.oauth.authorization_servers = vec!["https://auth.example.com".to_owned()];
+        for path in [
+            SERVER_CARD_PATH,
+            ARD_PATH,
+            SKILLS_INDEX_PATH,
+            OAUTH_RESOURCE_PATH,
+        ] {
+            let doc = render(&facts, &origin(), path).unwrap();
+            for want in [
+                (
+                    "access-control-allow-headers",
+                    "Content-Type, If-None-Match",
+                ),
+                ("access-control-expose-headers", "ETag"),
+            ] {
+                let count = doc.headers.iter().filter(|(k, _)| *k == want.0).count();
+                assert_eq!(count, 1, "{path}: one {}", want.0);
+                assert!(
+                    doc.headers.contains(&(want.0, want.1.to_owned())),
+                    "{path}: {:?}",
+                    doc.headers
+                );
+            }
         }
     }
 
