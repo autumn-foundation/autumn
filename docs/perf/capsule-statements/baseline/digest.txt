@@ -59,4 +59,4 @@ t6_id_seq|20000
 t7_id_seq|20000
 t8_id_seq|20000
 t9_id_seq|20000
-users_id_seq|200
+users_id_seq|1
