@@ -3225,6 +3225,7 @@ async fn write_three_revisions(repo: &PgLgInvoiceRepository) -> i64 {
         .await
         .expect("insert");
     for amount in [2, 3] {
+        tick().await;
         repo.update(
             created.id,
             &UpdateLgInvoice {
@@ -3855,7 +3856,7 @@ async fn rewrite_snapshot(
         .snapshot;
     edit(snapshot.as_object_mut().expect("object"));
     let mut conn = pool.get().await.expect("conn");
-    diesel::sql_query(
+    let changed = diesel::sql_query(
         "UPDATE _autumn_ledger_revisions SET snapshot = ? \
          WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = ?",
     )
@@ -3865,6 +3866,7 @@ async fn rewrite_snapshot(
     .execute(&mut *conn)
     .await
     .expect("simulate an older schema");
+    assert_eq!(changed, 1, "exactly one stored revision is rewritten");
 }
 
 /// A field added later as `Option` is absent from older snapshots. They
@@ -3880,7 +3882,7 @@ async fn a_revision_written_before_an_optional_field_existed_reconstructs() {
         .expect("revisions")
         .remove(0);
     rewrite_snapshot(&pool, id, first.seq, |m| {
-        m.remove("deleted_at");
+        assert!(m.remove("deleted_at").is_some(), "the key was present");
     })
     .await;
 
@@ -3889,7 +3891,7 @@ async fn a_revision_written_before_an_optional_field_existed_reconstructs() {
         .await
         .expect("old revision still reads")
         .expect("state");
-    assert_eq!(then.amount_cents, 1);
+    assert_eq!(then.amount_cents, 1, "revision 1, not a later one");
     assert_eq!(then.deleted_at, None);
 }
 
@@ -3901,7 +3903,7 @@ async fn a_diff_across_a_schema_boundary_ignores_an_absent_option() {
     let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
     let id = write_three_revisions(&repo).await;
     rewrite_snapshot(&pool, id, 1, |m| {
-        m.remove("deleted_at");
+        assert!(m.remove("deleted_at").is_some(), "the key was present");
     })
     .await;
 
@@ -3911,7 +3913,7 @@ async fn a_diff_across_a_schema_boundary_ignores_an_absent_option() {
         .ledger_diff(id, from, to)
         .await
         .expect("diff is defined");
-    assert_ne!(diff.from_seq, diff.to_seq, "the two instants differ");
+    assert_eq!((diff.from_seq, diff.to_seq), (Some(1), Some(3)));
     let fields: Vec<&str> = diff.changes.iter().map(|c| c.column.as_str()).collect();
     assert!(fields.contains(&"amount_cents"), "{fields:?}");
     assert!(
@@ -3953,5 +3955,90 @@ async fn a_bulk_delete_snapshots_the_rows_a_trigger_rewrote() {
     for id in ids {
         let report = repo.ledger_verify(id).await.expect("verify");
         assert!(report.is_intact(), "record {id}: {report:?}");
+        let head = repo
+            .ledger_revisions(id)
+            .await
+            .expect("revisions")
+            .pop()
+            .expect("head");
+        let reference = head.snapshot["reference"].as_str().expect("reference");
+        assert!(reference.ends_with("-touched"), "{reference}");
+        assert!(!head.snapshot["deleted_at"].is_null());
     }
+}
+
+/// A key that is gone must not leave ciphertext where plaintext belongs.
+/// The error names the column and the revision (#2326).
+#[tokio::test]
+async fn as_of_refuses_an_encrypted_column_that_cannot_be_recovered() {
+    install_encryption_keys();
+    let pool = boot_pool("lg_vault_lost_key").await;
+    let repo = PgLgVaultNoteRepository::with_pool_untracked(pool.clone());
+    let created = repo
+        .save(&NewLgVaultNote {
+            body: "public".to_string(),
+            secret: "hidden".to_string(),
+        })
+        .await
+        .expect("insert");
+    let first = repo
+        .ledger_revisions(created.id)
+        .await
+        .expect("revisions")
+        .remove(0);
+    {
+        let mut conn = pool.get().await.expect("conn");
+        let mut damaged = first.snapshot.clone();
+        damaged["secret"] = serde_json::json!("not-a-recoverable-envelope");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_revisions SET snapshot = ? \
+             WHERE table_name = 'lg_vault_notes' AND record_id = ? AND seq = ?",
+        )
+        .bind::<diesel::sql_types::Text, _>(autumn_web::ledger::canonical_json(&damaged))
+        .bind::<diesel::sql_types::BigInt, _>(created.id)
+        .bind::<diesel::sql_types::BigInt, _>(first.seq)
+        .execute(&mut *conn)
+        .await
+        .expect("damage the envelope");
+    }
+    let err = repo
+        .ledger_as_of(created.id, first.recorded_at)
+        .await
+        .expect_err("must not return ciphertext as plaintext");
+    let text = err.to_string();
+    assert!(text.contains("secret"), "names the column: {text}");
+    assert!(text.contains("revision 1"), "names the revision: {text}");
+}
+
+/// A duplicate key is a different byte string with the same meaning.
+/// `ledger_verify` reports it, and does not let the last key win (#2326).
+#[tokio::test]
+async fn a_duplicate_key_snapshot_is_reported_as_not_canonical() {
+    let pool = boot_pool("lg_duplicate_key").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    let head = repo
+        .ledger_revisions(id)
+        .await
+        .expect("revisions")
+        .pop()
+        .expect("head");
+    let text = autumn_web::ledger::canonical_json(&head.snapshot);
+    let doubled = text.replacen('{', "{\"id\":0,", 1);
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_revisions SET snapshot = ? \
+             WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = ?",
+        )
+        .bind::<diesel::sql_types::Text, _>(doubled)
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .bind::<diesel::sql_types::BigInt, _>(head.seq)
+        .execute(&mut *conn)
+        .await
+        .expect("plant a duplicate key");
+    }
+    let report = repo.ledger_verify(id).await.expect("verify reports it");
+    let broken = report.broken.expect("duplicate key");
+    assert_eq!(broken.kind, LedgerBreak::SnapshotNotCanonical);
 }
