@@ -2410,7 +2410,6 @@ async fn high_water_marks_are_per_tenant() {
                 created.id,
                 &UpdateLgTenantInvoice {
                     reference: Patch::Set(format!("A-1-{step}")),
-                    ..Default::default()
                 },
             )
             .await
@@ -2887,7 +2886,6 @@ async fn a_declared_valid_time_column_separates_the_two_axes() {
         &UpdateLgEffectiveNote {
             body: Patch::Set("v2".to_string()),
             effective_at: Patch::Set(earlier),
-            ..Default::default()
         },
     )
     .await
@@ -3837,4 +3835,123 @@ async fn a_snapshot_the_model_cannot_decode_reports_schema_drift() {
         text.contains("current model schema") && !text.contains("unreadable"),
         "must not read as tamper evidence: {text}"
     );
+}
+
+/// Rewrites a stored snapshot to look like an older schema wrote it.
+async fn rewrite_snapshot(
+    pool: &SqlitePool,
+    id: i64,
+    seq: i64,
+    edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) {
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let mut snapshot = repo
+        .ledger_revisions(id)
+        .await
+        .expect("revisions")
+        .into_iter()
+        .find(|r| r.seq == seq)
+        .expect("revision")
+        .snapshot;
+    edit(snapshot.as_object_mut().expect("object"));
+    let mut conn = pool.get().await.expect("conn");
+    diesel::sql_query(
+        "UPDATE _autumn_ledger_revisions SET snapshot = ? \
+         WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = ?",
+    )
+    .bind::<diesel::sql_types::Text, _>(autumn_web::ledger::canonical_json(&snapshot))
+    .bind::<diesel::sql_types::BigInt, _>(id)
+    .bind::<diesel::sql_types::BigInt, _>(seq)
+    .execute(&mut *conn)
+    .await
+    .expect("simulate an older schema");
+}
+
+/// A field added later as `Option` is absent from older snapshots. They
+/// still reconstruct, with the field empty (#2326).
+#[tokio::test]
+async fn a_revision_written_before_an_optional_field_existed_reconstructs() {
+    let pool = boot_pool("lg_schema_old_ok").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    let first = repo
+        .ledger_revisions(id)
+        .await
+        .expect("revisions")
+        .remove(0);
+    rewrite_snapshot(&pool, id, first.seq, |m| {
+        m.remove("deleted_at");
+    })
+    .await;
+
+    let then = repo
+        .ledger_as_of(id, first.recorded_at)
+        .await
+        .expect("old revision still reads")
+        .expect("state");
+    assert_eq!(then.amount_cents, 1);
+    assert_eq!(then.deleted_at, None);
+}
+
+/// A diff across a schema change is defined: the added field shows as a
+/// change from empty, not as an error (#2326).
+#[tokio::test]
+async fn a_diff_across_a_schema_boundary_names_the_added_field() {
+    let pool = boot_pool("lg_schema_diff").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    rewrite_snapshot(&pool, id, 1, |m| {
+        m.remove("deleted_at");
+    })
+    .await;
+
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    let (from, to) = (revisions[0].recorded_at, revisions[2].recorded_at);
+    let diff = repo
+        .ledger_diff(id, from, to)
+        .await
+        .expect("diff is defined");
+    assert_ne!(diff.from_seq, diff.to_seq, "the two instants differ");
+    let fields: Vec<&str> = diff.changes.iter().map(|c| c.column.as_str()).collect();
+    assert!(fields.contains(&"amount_cents"), "{fields:?}");
+    assert!(
+        !fields.contains(&"deleted_at"),
+        "an absent Option equals null, not a change: {fields:?}"
+    );
+}
+
+/// The bulk soft-delete snapshots the row a trigger rewrote (#2326).
+#[tokio::test]
+async fn a_bulk_delete_snapshots_the_rows_a_trigger_rewrote() {
+    let pool = boot_pool("lg_bulk_delete_trigger").await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute(
+            "CREATE TRIGGER lg_invoices_bulk_touch AFTER UPDATE OF deleted_at ON lg_invoices \
+             WHEN NEW.deleted_at IS NOT NULL \
+             BEGIN UPDATE lg_invoices SET reference = reference || '-touched' \
+             WHERE id = NEW.id; END",
+        )
+        .await
+        .expect("install trigger");
+    }
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool);
+    let rows = ["A", "B"].map(|r| NewLgInvoice {
+        reference: r.to_string(),
+        amount_cents: 1,
+        amount_rate: 1.0,
+        metadata: "{}".to_string(),
+    });
+    let ids: Vec<i64> = repo
+        .save_many(&rows)
+        .await
+        .expect("insert")
+        .iter()
+        .map(|r| r.id)
+        .collect();
+    repo.delete_many(&ids).await.expect("bulk delete");
+    for id in ids {
+        let report = repo.ledger_verify(id).await.expect("verify");
+        assert!(report.is_intact(), "record {id}: {report:?}");
+    }
 }

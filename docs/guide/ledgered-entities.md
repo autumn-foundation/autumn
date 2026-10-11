@@ -205,6 +205,9 @@ Some consequences worth knowing:
   evidence. To read old revisions after adding a required field, put
   `#[serde(default)]` on it. Run `ledger_verify` to rule out an edit. The ledger does not
   convert renamed fields or changed types yet.
+- A field added as `Option<T>` needs no attribute. An old snapshot without it
+  reads as `None`. `ledger_diff` across that change shows no change for the
+  field until a revision sets it.
 
 ## Bitemporality
 
