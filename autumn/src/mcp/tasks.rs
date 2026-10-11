@@ -9,7 +9,7 @@
 //! header). Tasks do not survive a restart.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -19,13 +19,20 @@ use subtle::ConstantTimeEq as _;
 use tokio::task::AbortHandle;
 
 /// The extension identifier.
-pub(crate) const EXTENSION_ID: &str = "io.modelcontextprotocol/tasks";
+pub const EXTENSION_ID: &str = "io.modelcontextprotocol/tasks";
 
 /// The `_meta` key that holds the per-request client capabilities.
 const CLIENT_CAPABILITIES_META: &str = "io.modelcontextprotocol/clientCapabilities";
 
 /// JSON-RPC error code: the client did not declare a required capability.
-pub(crate) const MISSING_CAPABILITY: i64 = -32021;
+pub const MISSING_CAPABILITY: i64 = -32021;
+
+/// The largest integer a JSON number holds exactly (2^53 - 1). Wire values
+/// above it lose precision in JavaScript clients.
+const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+/// The shortest TTL. A shorter TTL can delete a task before the client polls.
+const MIN_TTL: Duration = Duration::from_secs(1);
 
 /// Settings for MCP task tools.
 ///
@@ -38,7 +45,8 @@ pub(crate) const MISSING_CAPABILITY: i64 = -32021;
 /// let config = McpTaskConfig::default()
 ///     .ttl(Duration::from_secs(600))
 ///     .poll_interval(Duration::from_secs(2))
-///     .max_tasks(256);
+///     .max_tasks(256)
+///     .max_tasks_per_caller(16);
 /// # let _ = config;
 /// ```
 #[derive(Clone, Debug)]
@@ -46,40 +54,55 @@ pub struct McpTaskConfig {
     ttl: Duration,
     poll_interval: Duration,
     max_tasks: usize,
+    max_tasks_per_caller: usize,
 }
 
 impl Default for McpTaskConfig {
-    /// TTL 1 hour, poll interval 1 second, 1024 tasks.
+    /// TTL 1 hour, poll interval 1 second, 1024 tasks, 64 tasks per caller.
     fn default() -> Self {
         Self {
             ttl: Duration::from_secs(3600),
             poll_interval: Duration::from_secs(1),
             max_tasks: 1024,
+            max_tasks_per_caller: 64,
         }
     }
 }
 
 impl McpTaskConfig {
-    /// Time from creation until the server deletes the task. A running task
-    /// is stopped when its TTL ends.
+    /// Set the time from creation until the server deletes the task. When the
+    /// TTL ends, the server stops a running task. The minimum is 1 second.
     #[must_use]
     pub const fn ttl(mut self, ttl: Duration) -> Self {
-        self.ttl = ttl;
+        self.ttl = if ttl.as_millis() < MIN_TTL.as_millis() {
+            MIN_TTL
+        } else {
+            ttl
+        };
         self
     }
 
-    /// Poll interval that the server tells the client to use.
+    /// Set the poll interval that the server sends to the client.
     #[must_use]
     pub const fn poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
         self
     }
 
-    /// Maximum number of tasks in the store, running or terminal. When the
-    /// store is full, a task tool runs as a blocking call.
+    /// Set the maximum number of tasks in the store, running or terminal. If
+    /// the store is full, a task tool runs as a blocking call.
     #[must_use]
     pub const fn max_tasks(mut self, max: usize) -> Self {
         self.max_tasks = max;
+        self
+    }
+
+    /// Set the maximum number of tasks for one caller (one owner digest). If
+    /// a caller has this number of tasks, its next task tool call runs as a
+    /// blocking call. All anonymous callers share one quota.
+    #[must_use]
+    pub const fn max_tasks_per_caller(mut self, max: usize) -> Self {
+        self.max_tasks_per_caller = max;
         self
     }
 }
@@ -88,7 +111,7 @@ impl McpTaskConfig {
 /// `_meta["io.modelcontextprotocol/clientCapabilities"].extensions`.
 ///
 /// The value must be an object, as the extension schema requires.
-pub(crate) fn client_declares_tasks(params: &Value) -> bool {
+pub fn client_declares_tasks(params: &Value) -> bool {
     params
         .get("_meta")
         .and_then(|meta| meta.get(CLIENT_CAPABILITIES_META))
@@ -98,19 +121,19 @@ pub(crate) fn client_declares_tasks(params: &Value) -> bool {
 }
 
 /// The `data` of a `-32021` error for this extension.
-pub(crate) fn missing_capability_data() -> Value {
+pub fn missing_capability_data() -> Value {
     json!({ "requiredCapabilities": { "extensions": { EXTENSION_ID: {} } } })
 }
 
 /// A digest of the caller's credentials. Only the same caller can read,
 /// update or cancel a task.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Owner([u8; 32]);
+pub struct Owner([u8; 32]);
 
 impl Owner {
     /// Hash the credential parts. Each part has a length prefix, so two
     /// different part lists cannot give the same input.
-    pub(crate) fn new(parts: &[Option<&str>]) -> Self {
+    pub fn new(parts: &[Option<&str>]) -> Self {
         let mut hasher = Sha256::new();
         for part in parts {
             match part {
@@ -132,11 +155,12 @@ impl Owner {
 
 /// How a task ended, or `Working`.
 #[derive(Debug)]
-pub(crate) enum TaskState {
+pub enum TaskState {
     /// The tool is running.
     Working,
-    /// The tool returned. Holds the `CallToolResult`.
-    Completed(Value),
+    /// The tool returned. Holds the `CallToolResult`. An `Arc`, so that
+    /// `tasks/get` copies it outside the lock.
+    Completed(Arc<Value>),
     /// A JSON-RPC error stopped the tool. Holds the error object and a
     /// status message.
     Failed(Value, String),
@@ -164,7 +188,7 @@ struct Entry {
 }
 
 /// The in-memory task store.
-pub(crate) struct TaskStore {
+pub struct TaskStore {
     config: McpTaskConfig,
     tasks: Mutex<HashMap<String, Entry>>,
 }
@@ -174,22 +198,28 @@ fn iso(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-/// Clamp a duration to whole milliseconds for the wire.
+/// A duration in whole milliseconds for the wire, at most
+/// [`MAX_SAFE_INTEGER`].
 fn millis(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+    u64::try_from(duration.as_millis()).map_or(MAX_SAFE_INTEGER, |ms| ms.min(MAX_SAFE_INTEGER))
 }
 
 impl TaskStore {
-    pub(crate) fn new(config: McpTaskConfig) -> Self {
+    pub fn new(config: McpTaskConfig) -> Self {
         Self {
             config,
             tasks: Mutex::new(HashMap::new()),
         }
     }
 
+    /// The TTL. The job of a task stops when it ends.
+    pub const fn ttl(&self) -> Duration {
+        self.config.ttl
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Entry>> {
-        // A panic while the lock is held cannot leave an entry half-written:
-        // each change is one field assignment. So a poisoned lock is safe.
+        // No code between the field assignments of a change can panic. So a
+        // poisoned lock still holds consistent data.
         self.tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -210,8 +240,10 @@ impl TaskStore {
         });
     }
 
-    /// The task fields on the wire, with the status payload.
-    fn view(&self, id: &str, entry: &Entry, result_type: &str) -> Value {
+    /// The task fields on the wire, with the status payload. A completed
+    /// result is returned apart, so the caller can copy it after the lock is
+    /// released. See [`with_result`].
+    fn view(&self, id: &str, entry: &Entry, result_type: &str) -> (Value, Option<Arc<Value>>) {
         let mut out = json!({
             "resultType": result_type,
             "taskId": id,
@@ -221,24 +253,29 @@ impl TaskStore {
             "ttlMs": millis(self.config.ttl),
             "pollIntervalMs": millis(self.config.poll_interval),
         });
+        let mut result = None;
         match &entry.state {
             TaskState::Working => {}
-            TaskState::Completed(result) => out["result"] = result.clone(),
+            TaskState::Completed(value) => result = Some(Arc::clone(value)),
             TaskState::Failed(error, message) => {
                 out["error"] = error.clone();
                 out["statusMessage"] = json!(message);
             }
             TaskState::Cancelled => out["statusMessage"] = json!("The client cancelled the task."),
         }
-        out
+        (out, result)
     }
 
     /// Add a `working` task. Returns the `CreateTaskResult`, or `None` when
     /// the store is full.
-    pub(crate) fn create(&self, id: &str, owner: Owner, now: DateTime<Utc>) -> Option<Value> {
+    pub fn create(&self, id: &str, owner: Owner, now: DateTime<Utc>) -> Option<Value> {
         let mut tasks = self.lock();
         self.purge(&mut tasks, now);
         if tasks.len() >= self.config.max_tasks {
+            return None;
+        }
+        let owned = tasks.values().filter(|e| e.owner.matches(&owner)).count();
+        if owned >= self.config.max_tasks_per_caller {
             return None;
         }
         let entry = Entry {
@@ -248,25 +285,32 @@ impl TaskStore {
             updated_at: now,
             abort: None,
         };
-        let created = self.view(id, &entry, "task");
+        let (created, _) = self.view(id, &entry, "task");
         tasks.insert(id.to_owned(), entry);
+        drop(tasks);
         Some(created)
     }
 
     /// Keep the handle that stops the task's work.
-    pub(crate) fn set_abort(&self, id: &str, abort: AbortHandle) {
+    pub fn set_abort(&self, id: &str, abort: AbortHandle) {
         let mut tasks = self.lock();
-        match tasks.get_mut(id) {
-            Some(entry) if matches!(entry.state, TaskState::Working) => entry.abort = Some(abort),
-            // The task ended or was purged before the handle arrived.
-            Some(_) => {}
-            None => abort.abort(),
+        // No entry: the TTL ended before the handle came.
+        let Some(entry) = tasks.get_mut(id) else {
+            abort.abort();
+            return;
+        };
+        match entry.state {
+            TaskState::Working => entry.abort = Some(abort),
+            // The client cancelled before the handle came.
+            TaskState::Cancelled => abort.abort(),
+            // The task ended. Its job can still write the audit outcome.
+            TaskState::Completed(_) | TaskState::Failed(..) => {}
         }
     }
 
     /// Move a `working` task to a terminal state. A terminal task does not
     /// change.
-    pub(crate) fn finish(&self, id: &str, state: TaskState, now: DateTime<Utc>) {
+    pub fn finish(&self, id: &str, state: TaskState, now: DateTime<Utc>) {
         let mut tasks = self.lock();
         if let Some(entry) = tasks.get_mut(id)
             && matches!(entry.state, TaskState::Working)
@@ -279,16 +323,20 @@ impl TaskStore {
 
     /// The `tasks/get` result, or `None` when no task with this ID belongs to
     /// `owner`.
-    pub(crate) fn get(&self, id: &str, owner: &Owner, now: DateTime<Utc>) -> Option<Value> {
+    pub fn get(&self, id: &str, owner: &Owner, now: DateTime<Utc>) -> Option<Value> {
         let mut tasks = self.lock();
         self.purge(&mut tasks, now);
-        let entry = tasks.get(id).filter(|entry| entry.owner.matches(owner))?;
-        Some(self.view(id, entry, "complete"))
+        let view = tasks
+            .get(id)
+            .filter(|entry| entry.owner.matches(owner))
+            .map(|entry| self.view(id, entry, "complete"));
+        drop(tasks);
+        view.map(|(out, result)| with_result(out, result.as_deref()))
     }
 
     /// Cancel a `working` task and stop its work. Returns `false` when no
     /// task with this ID belongs to `owner`.
-    pub(crate) fn cancel(&self, id: &str, owner: &Owner, now: DateTime<Utc>) -> bool {
+    pub fn cancel(&self, id: &str, owner: &Owner, now: DateTime<Utc>) -> bool {
         let mut tasks = self.lock();
         self.purge(&mut tasks, now);
         let Some(entry) = tasks.get_mut(id).filter(|entry| entry.owner.matches(owner)) else {
@@ -301,17 +349,26 @@ impl TaskStore {
                 abort.abort();
             }
         }
+        drop(tasks);
         true
     }
 
     /// Whether a task with this ID belongs to `owner`.
-    pub(crate) fn contains(&self, id: &str, owner: &Owner, now: DateTime<Utc>) -> bool {
+    pub fn contains(&self, id: &str, owner: &Owner, now: DateTime<Utc>) -> bool {
         let mut tasks = self.lock();
         self.purge(&mut tasks, now);
         tasks
             .get(id)
             .is_some_and(|entry| entry.owner.matches(owner))
     }
+}
+
+/// Add a completed result to a task view.
+fn with_result(mut out: Value, result: Option<&Value>) -> Value {
+    if let Some(result) = result {
+        out["result"] = result.clone();
+    }
+    out
 }
 
 #[cfg(test)]
@@ -367,7 +424,11 @@ mod tests {
         let store = store();
         store.create("t1", owner("a"), at(0));
         assert!(store.cancel("t1", &owner("a"), at(1)));
-        store.finish("t1", TaskState::Completed(json!({"isError": false})), at(2));
+        store.finish(
+            "t1",
+            TaskState::Completed(Arc::new(json!({"isError": false}))),
+            at(2),
+        );
         let task = store.get("t1", &owner("a"), at(3)).unwrap();
         assert_eq!(task["status"], "cancelled");
         assert!(task.get("result").is_none());
@@ -378,7 +439,11 @@ mod tests {
     fn completed_and_failed_tasks_carry_their_payload() {
         let store = store();
         store.create("ok", owner("a"), at(0));
-        store.finish("ok", TaskState::Completed(json!({"isError": false})), at(1));
+        store.finish(
+            "ok",
+            TaskState::Completed(Arc::new(json!({"isError": false}))),
+            at(1),
+        );
         let ok = store.get("ok", &owner("a"), at(1)).unwrap();
         assert_eq!(ok["resultType"], "complete");
         assert_eq!(ok["result"], json!({"isError": false}));
@@ -423,6 +488,44 @@ mod tests {
         assert!(!client_declares_tasks(&malformed));
         assert!(!client_declares_tasks(&json!({})));
         assert!(!client_declares_tasks(&Value::Null));
+    }
+
+    #[test]
+    fn one_caller_cannot_fill_the_store() {
+        let store = TaskStore::new(
+            McpTaskConfig::default()
+                .max_tasks(10)
+                .max_tasks_per_caller(1),
+        );
+        assert!(store.create("a1", owner("a"), at(0)).is_some());
+        assert!(store.create("a2", owner("a"), at(0)).is_none());
+        assert!(store.create("b1", owner("b"), at(0)).is_some());
+    }
+
+    #[test]
+    fn ttl_has_a_floor_and_wire_values_are_safe_integers() {
+        let config = McpTaskConfig::default()
+            .ttl(Duration::ZERO)
+            .poll_interval(Duration::MAX);
+        let created = TaskStore::new(config)
+            .create("t1", owner("a"), at(0))
+            .unwrap();
+        assert_eq!(created["ttlMs"], 1_000);
+        assert_eq!(created["pollIntervalMs"], MAX_SAFE_INTEGER);
+        let long = TaskStore::new(McpTaskConfig::default().ttl(Duration::MAX))
+            .create("t1", owner("a"), at(0))
+            .unwrap();
+        assert_eq!(long["ttlMs"], MAX_SAFE_INTEGER);
+    }
+
+    #[tokio::test]
+    async fn abort_handle_after_cancel_stops_the_work() {
+        let store = store();
+        store.create("t1", owner("a"), at(0));
+        assert!(store.cancel("t1", &owner("a"), at(1)));
+        let job = tokio::spawn(std::future::pending::<()>());
+        store.set_abort("t1", job.abort_handle());
+        assert!(job.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]

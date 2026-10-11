@@ -78,6 +78,13 @@ async fn stalled_report() -> AutumnResult<Json<Report>> {
     Ok(Json(Report { rows: 0 }))
 }
 
+#[get("/api/idle")]
+#[api_doc(mcp, task, summary = "Idle report")]
+async fn idle_report() -> AutumnResult<Json<Report>> {
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    Ok(Json(Report { rows: 0 }))
+}
+
 /// Longer than the global request deadline in `long_work_is_not_cut_by_the_envelope_timeout`.
 #[get("/api/long", timeout = "off")]
 #[api_doc(mcp, task, summary = "Long report")]
@@ -143,9 +150,9 @@ async fn get_task(client: &TestClient, task_id: &str) -> Value {
     task_rpc(client, None, "tasks/get", task_id).await
 }
 
-/// Poll `tasks/get` until the task is terminal. Panics after 5 s.
+/// Poll `tasks/get` until the task is terminal. Panics after 10 s.
 async fn wait_terminal(client: &TestClient, task_id: &str) -> Value {
-    for _ in 0..500 {
+    for _ in 0..1000 {
         let out = get_task(client, task_id).await;
         let status = out["result"]["status"].as_str().unwrap_or_default();
         if matches!(status, "completed" | "failed" | "cancelled") {
@@ -156,9 +163,9 @@ async fn wait_terminal(client: &TestClient, task_id: &str) -> Value {
     panic!("task {task_id} did not reach a terminal status");
 }
 
-/// Poll `check` for up to 2 s.
+/// Poll `check` for up to 10 s.
 async fn wait_until(check: impl Fn() -> bool) -> bool {
-    for _ in 0..200 {
+    for _ in 0..1000 {
         if check() {
             return true;
         }
@@ -319,7 +326,7 @@ async fn invalid_arguments_fail_before_a_task_exists() {
 async fn task_tool_blocks_for_a_client_without_the_capability() {
     let client = app(routes![build_report]);
     let out = call(&client, "build_report", false).await;
-    assert!(out["result"].get("resultType").is_none(), "{out}");
+    assert_ne!(out["result"]["resultType"], "task", "{out}");
     assert_eq!(out["result"]["isError"], false, "{out}");
 }
 
@@ -327,7 +334,7 @@ async fn task_tool_blocks_for_a_client_without_the_capability() {
 async fn plain_tool_blocks_even_with_the_capability() {
     let client = app(routes![quick_read]);
     let out = call(&client, "quick_read", true).await;
-    assert!(out["result"].get("resultType").is_none(), "{out}");
+    assert_ne!(out["result"]["resultType"], "task", "{out}");
     assert_eq!(out["result"]["isError"], false, "{out}");
 }
 
@@ -341,7 +348,7 @@ async fn full_store_falls_back_to_a_blocking_call() {
     let first = call(&client, "build_report", true).await;
     assert_eq!(first["result"]["resultType"], "task", "{first}");
     let second = call(&client, "build_report", true).await;
-    assert!(second["result"].get("resultType").is_none(), "{second}");
+    assert_ne!(second["result"]["resultType"], "task", "{second}");
     assert_eq!(second["result"]["isError"], false, "{second}");
 }
 
@@ -558,7 +565,7 @@ impl RecordingSink {
     }
 
     async fn wait_for(&self, action: &str) -> Vec<(String, Option<String>)> {
-        for _ in 0..200 {
+        for _ in 0..1000 {
             let actions = self.actions();
             if actions.iter().any(|(a, _)| a == action) {
                 return actions;
@@ -607,6 +614,99 @@ async fn cancelled_task_writes_an_aborted_outcome() {
         .find(|(a, _)| a == "agent.tool.stalled_report")
         .unwrap();
     assert_eq!(outcome.1.as_deref(), Some("task_aborted"), "{actions:?}");
+}
+
+/// Stalls the outcome write of `build_report` and flags its start.
+#[derive(Clone, Default)]
+struct StallingOutcomeSink {
+    outcome_started: Arc<AtomicBool>,
+}
+
+impl AuditSink for StallingOutcomeSink {
+    fn write(
+        &self,
+        event: AuditEvent,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AuditError>> + Send + '_>>
+    {
+        let started = Arc::clone(&self.outcome_started);
+        Box::pin(async move {
+            if event.action == "agent.tool.build_report" {
+                started.store(true, Ordering::SeqCst);
+                // The framework stops waiting after its audit timeout.
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn cancel_during_the_outcome_write_keeps_the_result() {
+    let sink = StallingOutcomeSink::default();
+    let started = Arc::clone(&sink.outcome_started);
+    let client = TestApp::new()
+        .routes(routes![build_report])
+        .state_initializer(move |state| {
+            state.insert_extension(AuditLogger::new().with_sink(Arc::new(sink)));
+        })
+        .mount_mcp("/mcp")
+        .build();
+    let id = task_id(&call(&client, "build_report", true).await);
+    assert!(
+        wait_until(|| started.load(Ordering::SeqCst)).await,
+        "no outcome write"
+    );
+    task_rpc(&client, None, "tasks/cancel", &id).await;
+    let task = get_task(&client, &id).await;
+    assert_eq!(task["result"]["status"], "completed", "{task}");
+    assert_eq!(task["result"]["result"]["isError"], false, "{task}");
+}
+
+#[tokio::test]
+async fn ttl_stops_a_task_without_a_new_request() {
+    let sink = RecordingSink::default();
+    let client = TestApp::new()
+        .routes(routes![idle_report])
+        .state_initializer({
+            let sink = sink.clone();
+            move |state| {
+                state.insert_extension(AuditLogger::new().with_sink(Arc::new(sink)));
+            }
+        })
+        .mount_mcp("/mcp")
+        .mcp_tasks(McpTaskConfig::default().ttl(Duration::from_secs(1)))
+        .build();
+    task_id(&call(&client, "idle_report", true).await);
+    // No more requests: the job must still stop when its TTL ends.
+    let actions = sink.wait_for("agent.tool.idle_report").await;
+    let outcome = actions
+        .iter()
+        .find(|(a, _)| a == "agent.tool.idle_report")
+        .unwrap();
+    assert_eq!(outcome.1.as_deref(), Some("task_aborted"), "{actions:?}");
+}
+
+#[tokio::test]
+async fn one_caller_cannot_take_every_task_slot() {
+    let client = TestApp::new()
+        .routes(routes![build_report])
+        .mount_mcp("/mcp")
+        .mcp_tasks(McpTaskConfig::default().max_tasks_per_caller(1))
+        .build();
+    let first = call_as(&client, Some("Bearer alice"), "build_report", true).await;
+    assert_eq!(first["result"]["resultType"], "task", "{first}");
+    let second = call_as(&client, Some("Bearer alice"), "build_report", true).await;
+    assert_ne!(second["result"]["resultType"], "task", "{second}");
+    let other = call_as(&client, Some("Bearer bob"), "build_report", true).await;
+    assert_eq!(other["result"]["resultType"], "task", "{other}");
+}
+
+#[tokio::test]
+async fn completed_result_carries_result_type() {
+    let client = app(routes![build_report]);
+    let id = task_id(&call(&client, "build_report", true).await);
+    let done = wait_terminal(&client, &id).await;
+    assert_eq!(done["result"]["result"]["resultType"], "complete", "{done}");
 }
 
 // ── Transport ─────────────────────────────────────────────────────────

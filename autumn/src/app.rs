@@ -1062,9 +1062,11 @@ impl AppBuilder {
     }
 
     /// Set the limits for MCP task tools (`#[api_doc(mcp, task)]`): TTL,
-    /// poll interval and store size. See [`McpTaskConfig`](crate::mcp::McpTaskConfig).
+    /// poll interval, store size and per-caller quota. See
+    /// [`McpTaskConfig`](crate::mcp::McpTaskConfig).
     ///
-    /// On its own this mounts the endpoint at the default `/mcp`.
+    /// If no MCP endpoint is set, this call mounts it at `/mcp`. Call
+    /// [`mount_mcp`](Self::mount_mcp) to use a different path.
     ///
     /// Requires the `mcp` Cargo feature.
     #[cfg(feature = "mcp")]

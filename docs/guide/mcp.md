@@ -404,7 +404,7 @@ proxies don't drop a slow stream.
 ## 6. Long-running tools as tasks
 
 A blocking `tools/call` keeps the `POST /mcp` open until the handler returns,
-and the global request deadline cuts it. A **task tool** can return a task
+and the global request deadline can stop it. A **task tool** can return a task
 handle instead. The client polls for the result. This is the MCP
 [Tasks extension](https://modelcontextprotocol.io/extensions/tasks/overview)
 (`io.modelcontextprotocol/tasks`).
@@ -420,8 +420,9 @@ async fn build_report(Json(req): Json<ReportRequest>) -> AutumnResult<Json<Repor
 ```
 
 `Route::mcp_task()` does the same for a route that a plugin builds. A task
-tool must return JSON, like other tools. `stream` and `task` can be used
-together: a task buffers the stream into its final result.
+tool must return JSON, like other tools. `task` without `mcp` does nothing.
+You can use `stream` and `task` together: a task buffers the stream into its
+final result.
 
 When one or more tools are task tools, `initialize` advertises the extension:
 
@@ -451,7 +452,7 @@ task tool **and** the request declares the extension:
 
 The client then calls `tasks/get` with the `taskId` (and the same `_meta`).
 When the status is `completed`, `result` holds the `CallToolResult` that a
-blocking call gives. Other methods:
+blocking call gives, with `"resultType": "complete"` added. Other methods:
 
 | Method | Result |
 | --- | --- |
@@ -463,9 +464,12 @@ Status rules:
 
 - A handler error (4xx/5xx) is `completed` with `isError: true`, as the spec
   requires.
-- A handler panic is `failed` with error `-32603`.
-- Bad arguments or an unknown tool give the normal JSON-RPC error. No task is
-  made.
+- A handler panic gives HTTP 500, as for a blocking call. The task is
+  `completed` with `isError: true`.
+- A panic outside the handler pipeline is `failed` with error `-32603`.
+- When the TTL ends, a running task is `failed` with error `-32603`.
+- Bad arguments or an unknown tool give the normal JSON-RPC error. The server
+  does not make a task.
 
 Errors on `tasks/*`:
 
@@ -481,7 +485,8 @@ Errors on `tasks/*`:
 A task tool runs as a normal blocking call when:
 
 - the client does not declare the extension, or
-- the task store is full (`max_tasks`). The server logs a warning.
+- the task store is full (`max_tasks`), or the caller has
+  `max_tasks_per_caller` tasks. The server logs a warning.
 
 ### Timeouts and limits
 
@@ -500,39 +505,53 @@ autumn_web::app()
         McpTaskConfig::default()
             .ttl(Duration::from_secs(600))        // default: 1 hour
             .poll_interval(Duration::from_secs(2)) // default: 1 second
-            .max_tasks(256),                       // default: 1024
+            .max_tasks(256)                        // default: 1024
+            .max_tasks_per_caller(16),             // default: 64
     )
     .run()
     .await;
 ```
 
-When the TTL ends, the server deletes the task. If the task is still running,
-its work stops.
+The TTL starts when the server makes the task. The minimum is 1 second. When
+the TTL ends, the server stops a running task and deletes the task.
 
 ### Security
 
 - **Task IDs** are 256 bits from the app's entropy source.
 - **Owner binding.** Each task keeps a SHA-256 digest of the caller's
-  credentials: the resolved actor, `Authorization`, the session cookie and the
-  tenant header. `tasks/*` with other credentials gets `-32602`, the same
-  error as an unknown ID. A caller with no credentials is anonymous; then only
-  the task ID protects the task.
+  credentials: `Authorization`, the session cookie, the tenant header and the
+  mTLS certificate fingerprint. `tasks/*` with other credentials gets
+  `-32602`, the same error as an unknown ID. A caller with no credentials is
+  anonymous. Only the task ID protects such a task.
+- **Token refresh.** The digest uses the raw credential. If a client changes
+  its token while a task runs, it cannot read the task.
+- **Authentication.** `tasks/*` does not run the route's auth again. Use
+  `secure_mcp(...)` (§7) to check the credential on each `tasks/*` request,
+  for example to stop a revoked token.
+- **Quota.** One caller can hold at most `max_tasks_per_caller` tasks. All
+  anonymous callers share one quota.
 - **Audit.** A task call writes the same `attempt` and outcome records as a
   blocking call (see "Proving what an agent can do"). A cancelled or expired
-  task writes an outcome with `result = task_aborted`; a panic writes
-  `task_panicked`.
-- **Load shedding.** A task takes its own slot while it runs.
+  task writes an outcome with `result = task_aborted`. A panic outside the
+  pipeline writes `task_panicked`.
+- **Load shedding.** A task takes its own slot while it runs. With a very low
+  `server.max_concurrent_requests`, a task can start while its `POST /mcp`
+  still holds a slot. Then the task is shed and completes with an HTTP 503
+  tool error.
 
 ### Limits of this version
 
 - The store is **in memory and per process**. Tasks do not survive a restart.
   With more than one replica, route `tasks/*` on the `Mcp-Name` header (the
   client sets it to the task ID) so that polls reach the same replica.
-- A task has no HTTP response, so `Set-Cookie` and `Server-Timing` from the
-  handler are dropped.
-- `notifications/tasks` is not sent. Clients poll.
-- The `2025-11-25` core tasks (`task` request parameter, `tasks/result`,
-  `tasks/list`) are not served.
+- A task has no HTTP response. The server drops `Set-Cookie` and
+  `Server-Timing` from the handler.
+- The server does not send `notifications/tasks`. Clients poll.
+- Autumn advertises the extension in `initialize`. It does not serve
+  `server/discover` (protocol `2026-07-28`). A client that reads the
+  capability only from `server/discover` does not use tasks.
+- Autumn does not serve the `2025-11-25` core tasks (`task` request
+  parameter, `tasks/result`, `tasks/list`).
 
 ---
 
@@ -741,8 +760,8 @@ same route registry as your own, so a plugin route tagged `#[api_doc(mcp)]`
 becomes a tool exactly like a user route.
 
 More often, a plugin author doesn't want to hard-wire the decision. The
-chainable `Route` toggles — `Route::mcp()`, `Route::mcp_exclude()`, and
-`Route::mcp_stream()` — mirror the attribute forms at registration time, so
+chainable `Route` toggles — `Route::mcp()`, `Route::mcp_exclude()`,
+`Route::mcp_stream()` and `Route::mcp_task()` — mirror the attribute forms at registration time, so
 a plugin can offer a fluent switch and let the **host** decide at install
 time:
 
@@ -783,8 +802,9 @@ autumn_web::app()
 
 The toggles follow the same semantics as the attributes: an explicit
 `mcp()` exposes any verb, `mcp_exclude()` always wins (even over
-`expose_all_as_mcp()`), and `mcp_stream()` implies the opt-in while
-exempting an `Sse` route from the JSON-out gate. The flags are plain
+`expose_all_as_mcp()`), `mcp_stream()` implies the opt-in while
+exempting an `Sse` route from the JSON-out gate, and `mcp_task()` implies the
+opt-in and makes the tool a task tool (§6). The flags are plain
 `ApiDoc` metadata, so a plugin crate can set them while compiling against
 base `autumn-web` — they take effect only when the host enables the `mcp`
 feature and calls `mount_mcp`.

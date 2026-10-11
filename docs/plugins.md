@@ -537,8 +537,9 @@ autumn_web::app()
 ```
 
 The full `expose_mcp()` recipe (and the `Route::mcp_exclude()` /
-`Route::mcp_stream()` toggles that mirror the other `#[api_doc]` forms) lives
-in the [MCP guide, §10 "Plugins and route-level opt-in"](guide/mcp.md); the
+`Route::mcp_stream()` / `Route::mcp_task()` toggles that mirror the other
+`#[api_doc]` forms) lives in the
+[MCP guide, §11 "Plugins and route-level opt-in"](guide/mcp.md); the
 compile-checked canonical example is on
 [`Route::mcp`](https://docs.rs/autumn-web/latest/autumn_web/struct.Route.html#method.mcp).
 The flags are plain metadata — inert unless the host enables the `mcp`

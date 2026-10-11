@@ -866,7 +866,7 @@ impl McpToolInfo {
 
     /// Whether this is a task tool (`#[api_doc(mcp, task)]`).
     #[must_use]
-    pub const fn task(&self) -> bool {
+    pub const fn supports_tasks(&self) -> bool {
         self.task
     }
 
@@ -1292,8 +1292,8 @@ async fn serve_mcp(
         // batches calls; rejecting here keeps `tools/call` a single-message
         // request — where the per-call limiter and the 10 MiB cap both still
         // apply. Harmless metadata methods (initialize/tools/list/ping) may
-        // still be batched. `tasks/*` is refused too: its owner check reads
-        // the envelope headers, which only the single-request path has.
+        // still be batched. The server also refuses `tasks/*` in a batch. The
+        // owner check reads the request context. Only a single request has it.
         Value::Array(batch)
             if batch.iter().any(|msg| {
                 msg.get("method")
@@ -1332,7 +1332,7 @@ async fn serve_mcp(
             if let Some((id, params)) = single_request(&msg, "tools/call") {
                 serve_tools_call(&server, &ctx, id, params).await
             } else if let Some((method, id, params)) = single_task_request(&msg) {
-                json_response(&serve_task_method(&server, &headers, &method, id, &params))
+                json_response(&serve_task_method(&server, &ctx, &method, id, &params))
             } else {
                 handle_message(&server, &msg).map_or_else(
                     || StatusCode::ACCEPTED.into_response(),
@@ -1510,10 +1510,12 @@ impl McpServer {
     /// The digest of the credentials on this request. A task is visible only
     /// to a request with the same digest.
     ///
-    /// Parts: the resolved actor, `Authorization`, the session cookie and
-    /// the tenant header. A caller with none of them is anonymous; then only
-    /// the 256-bit task ID protects the task.
-    fn task_owner(&self, headers: &HeaderMap) -> tasks::Owner {
+    /// Parts: `Authorization`, the session cookie, the tenant header and the
+    /// mTLS certificate fingerprint. The envelope does not resolve a
+    /// principal, so the raw credentials are the parts. A caller with none of
+    /// them is anonymous. Only the 256-bit task ID protects such a task.
+    fn task_owner(&self, ctx: &ReplayContext<'_>) -> tasks::Owner {
+        let headers = ctx.headers;
         let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
         let session = headers
             .get_all(header::COOKIE)
@@ -1523,12 +1525,15 @@ impl McpServer {
             .filter_map(|pair| pair.trim().split_once('='))
             .find(|(name, _)| *name == self.session_cookie)
             .map(|(_, value)| value);
-        let actor = crate::current::Current::scoped_actor();
+        #[cfg(feature = "tls")]
+        let certificate = ctx.client_cert.as_deref().map(|c| c.fingerprint.as_str());
+        #[cfg(not(feature = "tls"))]
+        let certificate = None;
         tasks::Owner::new(&[
-            actor.as_deref(),
             header("authorization"),
             session,
             self.tenant_header.as_deref().and_then(header),
+            certificate,
         ])
     }
 
@@ -1546,7 +1551,7 @@ impl McpServer {
 /// Serve `tasks/get`, `tasks/update` or `tasks/cancel`.
 fn serve_task_method(
     server: &McpServer,
-    headers: &HeaderMap,
+    ctx: &ReplayContext<'_>,
     method: &str,
     id: Value,
     params: &Value,
@@ -1565,7 +1570,7 @@ fn serve_task_method(
     let Some(task_id) = params.get("taskId").and_then(Value::as_str) else {
         return error(id, -32602, "`taskId` must be a string");
     };
-    let owner = server.task_owner(headers);
+    let owner = server.task_owner(ctx);
     let now = server.state.clock().now();
     let ack = || json!({ "resultType": "complete" });
     // A task of another caller gives the same error as an unknown task, so a
@@ -2069,23 +2074,37 @@ impl StreamState {
     }
 }
 
-/// Owns the one outcome record a streaming `tools/call` still owes.
+/// Owns the one outcome record a streaming or task `tools/call` still owes.
 ///
-/// The record is written when the projection reaches a terminal state — which
-/// may be "never", if the client hangs up. `Drop` is therefore the backstop:
-/// it cannot await, so it spawns the write instead. `recorded` makes the two
-/// paths mutually exclusive, so exactly one outcome reaches the sink per call.
-struct StreamAudit {
+/// The work writes the record when it reaches a terminal state. If that does
+/// not occur (the client hangs up, or cancels the task), `Drop` writes
+/// `abandoned`. `Drop` cannot await, so it spawns the write. `recorded` makes
+/// the two paths mutually exclusive: one outcome reaches the sink per call.
+struct OutcomeGuard {
     audit: AgentAudit,
     state: crate::state::AppState,
-    status: StatusCode,
+    /// The handler's status. `None` until a task's dispatch returns.
+    status: Option<StatusCode>,
     request_id: Option<String>,
+    /// What `Drop` records: the work stopped before it ended.
+    abandoned: Disposition,
     recorded: bool,
 }
 
-impl StreamAudit {
-    /// Record the outcome inline, from the projection's own async context.
-    async fn record(&mut self, stream: StreamState) {
+impl OutcomeGuard {
+    const fn new(audit: AgentAudit, state: crate::state::AppState, abandoned: Disposition) -> Self {
+        Self {
+            audit,
+            state,
+            status: None,
+            request_id: None,
+            abandoned,
+            recorded: false,
+        }
+    }
+
+    /// Record the outcome inline, from the work's own async context.
+    async fn record(&mut self, disposition: Disposition) {
         if self.recorded {
             return;
         }
@@ -2093,23 +2112,30 @@ impl StreamAudit {
         self.audit
             .record_outcome(
                 &self.state,
-                Some(self.status),
+                self.status,
                 self.request_id.as_deref(),
-                Disposition::Stream(stream),
+                disposition,
             )
             .await;
     }
 }
 
-impl Drop for StreamAudit {
+impl Drop for OutcomeGuard {
     fn drop(&mut self) {
         if self.recorded {
             return;
         }
         self.recorded = true;
-        // The projection never reached an end: the response body was dropped
-        // while the handler still had output to give. That is an aborted
-        // action, and the trail has to say so rather than stay silent.
+        // The work never reached an end: a stream's response body was dropped
+        // while the handler still had output to give, or a task was cancelled,
+        // expired or panicked. The trail has to say so rather than stay silent.
+        let disposition = match self.abandoned {
+            // A drop during unwinding is a panic, not an abort.
+            Disposition::Task(_) if std::thread::panicking() => {
+                Disposition::Task(TaskEnd::Panicked)
+            }
+            other => other,
+        };
         let audit = self.audit.clone();
         let state = self.state.clone();
         let status = self.status;
@@ -2120,57 +2146,7 @@ impl Drop for StreamAudit {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 audit
-                    .record_outcome(
-                        &state,
-                        Some(status),
-                        request_id.as_deref(),
-                        Disposition::Stream(StreamState::Aborted),
-                    )
-                    .await;
-            });
-        }
-    }
-}
-
-/// Owns the outcome record of a task. If the task future is dropped first
-/// (cancel, TTL, panic), `Drop` writes the outcome.
-struct TaskAudit {
-    audit: AgentAudit,
-    state: crate::state::AppState,
-    recorded: bool,
-}
-
-impl TaskAudit {
-    async fn record(
-        &mut self,
-        status: StatusCode,
-        request_id: Option<&str>,
-        disposition: Disposition,
-    ) {
-        self.recorded = true;
-        self.audit
-            .record_outcome(&self.state, Some(status), request_id, disposition)
-            .await;
-    }
-}
-
-impl Drop for TaskAudit {
-    fn drop(&mut self) {
-        if self.recorded {
-            return;
-        }
-        // A drop during unwinding is a panic. Any other drop is an abort.
-        let end = if std::thread::panicking() {
-            TaskEnd::Panicked
-        } else {
-            TaskEnd::Aborted
-        };
-        let audit = self.audit.clone();
-        let state = self.state.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                audit
-                    .record_outcome(&state, None, None, Disposition::Task(end))
+                    .record_outcome(&state, status, request_id.as_deref(), disposition)
                     .await;
             });
         }
@@ -2414,14 +2390,14 @@ async fn serve_tools_call(
     }
 
     // MCP Tasks extension: give a task handle to a client that declared the
-    // extension. When the store is full, the call blocks.
+    // extension. If the store is full, the tool runs as a blocking call.
     if tool.task && tasks::client_declares_tasks(&params) {
         let task_id = server.new_task_id();
-        let owner = server.task_owner(ctx.headers);
+        let owner = server.task_owner(ctx);
         let now = server.state.clock().now();
         if let Some(created) = server.tasks.create(&task_id, owner, now) {
             apply_replay_extensions(&mut request, server, ctx, &audit, true);
-            spawn_task(server, idx, task_id, request, audit);
+            spawn_task(server, idx, &task_id, request, audit);
             return json_response(&success(id, created));
         }
         tracing::warn!(
@@ -2471,13 +2447,13 @@ async fn serve_tools_call(
         // disconnect — with no later event to correct it. The guard travels
         // with the projection and writes exactly one outcome when it reaches a
         // terminal state, or from its `Drop` if the client hangs up first.
-        let stream_audit = StreamAudit {
+        let mut stream_audit = OutcomeGuard::new(
             audit,
-            state: server.state.clone(),
-            status,
-            request_id,
-            recorded: false,
-        };
+            server.state.clone(),
+            Disposition::Stream(StreamState::Aborted),
+        );
+        stream_audit.status = Some(status);
+        stream_audit.request_id = request_id;
         return stream_tool_result(id, &params, response, cookies, stream_audit);
     }
 
@@ -2504,57 +2480,74 @@ async fn serve_tools_call(
 fn spawn_task(
     server: &Arc<McpServer>,
     idx: usize,
-    task_id: String,
+    task_id: &str,
     request: axum::extract::Request,
     audit: AgentAudit,
 ) {
-    // Made before the spawn: if the job is aborted before its first poll,
-    // the guard still writes the outcome.
-    let outcome = TaskAudit {
+    // Make the guard before the spawn. If tokio aborts the job before its
+    // first poll, the guard writes the outcome.
+    let outcome = OutcomeGuard::new(
         audit,
-        state: server.state.clone(),
-        recorded: false,
-    };
+        server.state.clone(),
+        Disposition::Task(TaskEnd::Aborted),
+    );
+    let ttl = server.tasks.ttl();
     let job_server = Arc::clone(server);
-    let job_id = task_id.clone();
+    let job_id = task_id.to_owned();
     let job = tokio::spawn(async move {
         let server = job_server;
-        let run = run_task(&server, idx, request, outcome);
-        let state = match std::panic::AssertUnwindSafe(run).catch_unwind().await {
-            Ok(result) => tasks::TaskState::Completed(result),
-            // A tool error is a result (`isError`). A panic is a JSON-RPC
-            // internal error, so the task fails.
-            Err(_) => tasks::TaskState::Failed(
-                json!({ "code": -32603, "message": "Internal error" }),
-                "The tool handler panicked.".to_owned(),
-            ),
+        let run = std::panic::AssertUnwindSafe(run_task(&server, idx, request, outcome));
+        // The TTL bounds the job, also when no request comes to purge it.
+        // A timeout drops the guard, which writes `task_aborted`.
+        let Ok(ran) = tokio::time::timeout(ttl, run.catch_unwind()).await else {
+            let error = json!({ "code": -32603, "message": "Internal error" });
+            let state = tasks::TaskState::Failed(error, "The task TTL ended.".to_owned());
+            server
+                .tasks
+                .finish(&job_id, state, server.state.clock().now());
+            return;
         };
+        let Ok((mut result, mut outcome, disposition)) = ran else {
+            // A tool error is a result (`isError`). A panic outside the
+            // pipeline's own panic catch is a JSON-RPC internal error.
+            let error = json!({ "code": -32603, "message": "Internal error" });
+            let state = tasks::TaskState::Failed(error, "The tool handler panicked.".to_owned());
+            server
+                .tasks
+                .finish(&job_id, state, server.state.clock().now());
+            return;
+        };
+        // The reference client reads `resultType` on the result.
+        if let Some(object) = result.as_object_mut() {
+            object.insert("resultType".to_owned(), json!("complete"));
+        }
+        // Finish before the audit write. After `finish`, a cancel or the TTL
+        // cannot abort the job, so the result and the outcome record stay.
+        let state = tasks::TaskState::Completed(Arc::new(result));
         server
             .tasks
             .finish(&job_id, state, server.state.clock().now());
+        outcome.record(disposition).await;
     });
-    server.tasks.set_abort(&task_id, job.abort_handle());
+    server.tasks.set_abort(task_id, job.abort_handle());
 }
 
-/// Dispatch a task's request and return its `CallToolResult`.
+/// Dispatch a task's request. Returns its `CallToolResult`, and the guard
+/// and disposition for the outcome record. The caller writes the record after
+/// it stores the result.
 async fn run_task(
     server: &McpServer,
     idx: usize,
     request: axum::extract::Request,
-    mut outcome: TaskAudit,
-) -> Value {
+    mut outcome: OutcomeGuard,
+) -> (Value, OutcomeGuard, Disposition) {
     let tool = &server.tools[idx];
     let response = match server.dispatch.clone().oneshot(request).await {
         Ok(resp) => resp,
         Err(e) => {
-            outcome
-                .record(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    None,
-                    Disposition::Settled,
-                )
-                .await;
-            return tool_error(&format!("dispatch failed: {e}"));
+            outcome.status = Some(StatusCode::INTERNAL_SERVER_ERROR);
+            let result = tool_error(&format!("dispatch failed: {e}"));
+            return (result, outcome, Disposition::Settled);
         }
     };
     let Dispatched {
@@ -2564,13 +2557,12 @@ async fn run_task(
         ..
     } = Dispatched::inspect(&response);
     // A task has no HTTP response to carry `Set-Cookie` or `Server-Timing`.
+    outcome.status = Some(status);
+    outcome.request_id = request_id;
     let (result, failure) =
         read_tool_result(tool, status, is_event_stream, response.into_body()).await;
     let disposition = failure.map_or(Disposition::Settled, Disposition::Buffered);
-    outcome
-        .record(status, request_id.as_deref(), disposition)
-        .await;
-    result
+    (result, outcome, disposition)
 }
 
 /// Repackage a fully-buffered handler response as the JSON-RPC tool result.
@@ -2826,7 +2818,7 @@ struct StreamProjection {
     /// The invocation's outstanding outcome record. Dropped with the rest of
     /// the projection when the client hangs up, which is how an aborted stream
     /// still gets a row (#1691).
-    audit: StreamAudit,
+    audit: OutcomeGuard,
 }
 
 /// Project a streaming handler's `Sse` response onto the MCP SSE channel.
@@ -2841,7 +2833,7 @@ fn stream_tool_result(
     params: &Value,
     response: Response,
     cookies: Vec<HeaderValue>,
-    audit: StreamAudit,
+    audit: OutcomeGuard,
 ) -> Response {
     let progress_token = params
         .get("_meta")
@@ -2913,7 +2905,7 @@ async fn project_next(
                     let trailing = st.parser.finish();
                     enqueue_projected(&mut st, trailing);
                     st.phase = ProjectionPhase::Final;
-                    st.audit.record(outcome).await;
+                    st.audit.record(Disposition::Stream(outcome)).await;
                 }
             },
         }

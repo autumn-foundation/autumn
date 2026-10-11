@@ -5,6 +5,13 @@
   handle to a client that declares the extension. The client polls
   `tasks/get`, and can call `tasks/cancel` and `tasks/update`. A task runs
   outside the `POST /mcp` request, so only the route's own timeout applies.
-  `AppBuilder::mcp_tasks(McpTaskConfig)` sets the TTL, poll interval and store
-  size. Tasks are in memory, per process, and bound to the caller's
-  credentials. See `docs/guide/mcp.md` §6.
+  `AppBuilder::mcp_tasks(McpTaskConfig)` sets the TTL, poll interval, store
+  size and per-caller quota. Autumn keeps tasks in memory, per process. Only a
+  caller with the same credentials can read a task. See `docs/guide/mcp.md`
+  §6.
+
+### Breaking Changes
+
+- **Breaking:** `ApiDoc` gains a public `mcp_task` field. A struct literal
+  needs `..ApiDoc::default()`
+  ([migration guide](docs/migrations/next.md)).
