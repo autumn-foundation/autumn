@@ -299,6 +299,11 @@ visitor first. The script sends each call to
 the MCP endpoint with the page cookies and the CSRF token. Auth, CSRF, and
 rate limits apply to the call.
 
+An app served below a path prefix, such as `[seo] base_url =
+"https://example.com/shop"`, uses `head_tags_at(&autumn_web::aeo::base_path(&config), …)`.
+That puts the script and the ARD link under `/shop`. The script finds the MCP
+endpoint relative to its own URL, so its calls go to `/shop/mcp`.
+
 The tags point at AEO documents, so remove them if you set
 `[aeo] enabled = false`: the script and the catalog then answer `404`.
 

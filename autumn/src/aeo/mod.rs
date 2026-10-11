@@ -415,13 +415,7 @@ impl AeoSite {
         };
         // One `Link` value per home page: each names its own Markdown copy.
         // Its targets sit below the path of `[seo] base_url`, if any.
-        let base_path = documents::Origin::resolve(config.seo.base_url.as_deref(), None)
-            .configured
-            .then_some(config.seo.base_url.as_deref())
-            .flatten()
-            .and_then(|base| url::Url::parse(base.trim()).ok())
-            .map(|url| url.path().trim_end_matches('/').to_owned())
-            .unwrap_or_default();
+        let base_path = base_path(config);
         let home_links: Vec<(String, HeaderValue)> = if aeo.link_headers && !facts.no_home {
             let homes = if facts.home_paths.is_empty() {
                 vec!["/".to_owned()]
@@ -881,6 +875,21 @@ async fn index_with_disk_digests(index: &[u8], base: &str, dist: &std::path::Pat
     } else {
         index.to_vec()
     }
+}
+
+/// The path of a usable `[seo] base_url`, without a trailing slash: `/shop`
+/// for `https://example.com/shop`, empty for none or a root URL. An app
+/// served below that prefix puts its links there, as
+/// [`webmcp::head_tags_at`] does.
+#[must_use]
+pub fn base_path(config: &crate::config::AutumnConfig) -> String {
+    documents::Origin::resolve(config.seo.base_url.as_deref(), None)
+        .configured
+        .then_some(config.seo.base_url.as_deref())
+        .flatten()
+        .and_then(|base| url::Url::parse(base.trim()).ok())
+        .map(|url| url.path().trim_end_matches('/').to_owned())
+        .unwrap_or_default()
 }
 
 /// The static-host headers file `autumn build` writes into `dist`.

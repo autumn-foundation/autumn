@@ -223,8 +223,10 @@ const CONTENT_SIGNAL_COMMENT: &str = "\
 
 /// The `User-agent` names in `rules`, without a trailing `# comment`.
 fn named_user_agents(rules: &[String]) -> Vec<&str> {
+    // An entry may hold several lines, as the writer emits them.
     rules
         .iter()
+        .flat_map(|rule| rule.lines())
         .filter_map(|r| {
             let (key, value) = r.split_once(':')?;
             let name = value.split('#').next().unwrap_or(value).trim();
@@ -384,6 +386,19 @@ mod tests {
         // `Disallow: /admin` joins the `*` group, which has the signal once.
         let star = txt.split("User-agent: GPTBot").next().unwrap();
         assert_eq!(star.matches("Content-Signal:").count(), 1, "{txt}");
+    }
+
+    /// Codex review (P2): one entry may hold a whole group.
+    #[test]
+    fn a_multi_line_rule_still_owns_its_bot() {
+        let rules = ["User-agent: GPTBot\nDisallow: /".to_owned()];
+        let txt = robots_txt_with_policy(
+            "prod",
+            None,
+            &rules,
+            &BotPolicy::from_config(&AeoConfig::default()),
+        );
+        assert_eq!(txt.matches("User-agent: GPTBot").count(), 1, "{txt}");
     }
 
     #[test]

@@ -68,7 +68,10 @@ const SCRIPT: &str = r#"// Autumn WebMCP: register this site's MCP tools with in
   "use strict";
   const mc = document.modelContext || navigator.modelContext;
   if (!mc || typeof mc.registerTool !== "function") return;
-  const endpoint = __ENDPOINT__;
+  // This script is served at `{base}/_autumn/webmcp.js`, so the endpoint
+  // sits under the same base: an app behind a path prefix keeps it.
+  const here = document.currentScript && document.currentScript.src;
+  const endpoint = here ? new URL(".." + __ENDPOINT__, here).href : __ENDPOINT__;
   const csrfHeader = __CSRF_HEADER__;
   const meta = document.querySelector(
     'meta[name="csrf-token"], meta[name="autumn-csrf-token"]'
@@ -177,12 +180,33 @@ fn hint(mcp: &Value, key: &str) -> Option<bool> {
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn head_tags(csp_nonce: Option<&str>, csrf_token: Option<&str>) -> maud::Markup {
+    head_tags_at("", csp_nonce, csrf_token)
+}
+
+/// [`head_tags`] for an app served below a path prefix (`/shop` for
+/// `[seo] base_url = "https://example.com/shop"`; see
+/// [`base_path`](super::base_path)): the ARD link and the script URL sit
+/// under it.
+///
+/// ```rust,ignore
+/// let base = autumn_web::aeo::base_path(&config);
+/// html! { head { (autumn_web::aeo::webmcp::head_tags_at(&base, None, token)) } }
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn head_tags_at(
+    base_path: &str,
+    csp_nonce: Option<&str>,
+    csrf_token: Option<&str>,
+) -> maud::Markup {
+    let catalog = format!("{base_path}{}", super::AI_CATALOG_PATH);
+    let script = format!("{base_path}{WEBMCP_JS_PATH}");
     maud::html! {
         @if let Some(token) = csrf_token {
             meta name="csrf-token" content=(token);
         }
-        link rel="ai-catalog" href=(super::AI_CATALOG_PATH) type="application/json";
-        script src=(WEBMCP_JS_PATH) defer nonce=[csp_nonce] {}
+        link rel="ai-catalog" href=(catalog) type="application/json";
+        script src=(script) defer nonce=[csp_nonce] {}
     }
 }
 
@@ -335,6 +359,22 @@ mod tests {
             html.contains("<meta name=\"csrf-token\" content=\"t&lt;1\">"),
             "{html}"
         );
+    }
+
+    /// Codex review (P2): an app below a path prefix serves the script, the
+    /// ARD and the MCP endpoint under it.
+    #[test]
+    fn a_base_path_prefixes_the_tags_and_the_endpoint() {
+        let html = head_tags_at("/shop", None, None).into_string();
+        assert!(html.contains("src=\"/shop/_autumn/webmcp.js\""), "{html}");
+        assert!(
+            html.contains("href=\"/shop/.well-known/ai-catalog.json\""),
+            "{html}"
+        );
+        // The endpoint resolves against the script's own URL, which carries
+        // the prefix.
+        let js = script(&facts(true), "x-csrf-token");
+        assert!(js.contains("new URL(\"..\" + \"/mcp\", here)"), "{js}");
     }
 
     #[test]
