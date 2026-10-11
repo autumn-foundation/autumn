@@ -877,9 +877,10 @@ async fn index_with_disk_digests(index: &[u8], base: &str, dist: &std::path::Pat
     }
 }
 
-/// The path of a usable `[seo] base_url`, without a trailing slash: `/shop`
-/// for `https://example.com/shop`, empty for none or a root URL. An app
-/// served below that prefix puts its links there, as
+/// The path of a usable `[seo] base_url`, without a trailing slash.
+///
+/// `/shop` for `https://example.com/shop`, empty for none or a root URL. An
+/// app served below that prefix puts its links there, as
 /// [`webmcp::head_tags_at`] does.
 #[must_use]
 pub fn base_path(config: &crate::config::AutumnConfig) -> String {
