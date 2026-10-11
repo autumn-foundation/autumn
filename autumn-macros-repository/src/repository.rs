@@ -2407,17 +2407,28 @@ fn ledger_append_ts(
 
     // #2326: refuse before the snapshot. The snapshot would turn NaN into `null`.
     // A delete or restore writes no float, so a legacy row that holds one can
-    // still be deleted or restored.
-    let non_finite_check = if matches!(op, "insert" | "update") {
-        quote! {
-            ::autumn_web::ledger::refuse_non_finite(
-                #table_name_ts,
-                __lg_record_id,
-                __lg_row.__autumn_ledger_non_finite_column(),
-            )?;
-        }
-    } else {
-        quote! {}
+    // still be deleted or restored. A trigger can still write one during them
+    // (#2319): refuse when the row was finite before the write and is not now.
+    let refuse = quote! {
+        ::autumn_web::ledger::refuse_non_finite(
+            #table_name_ts,
+            __lg_record_id,
+            __lg_row.__autumn_ledger_non_finite_column(),
+        )?;
+    };
+    let before_write = match (op, before_expr) {
+        // A delete's record is its pre-delete load.
+        ("delete", _) => Some(record_expr),
+        ("restore", Some(before)) => Some(before),
+        _ => None,
+    };
+    let non_finite_check = match before_write {
+        Some(before) => quote! {
+            if (#before).__autumn_ledger_non_finite_column().is_none() {
+                #refuse
+            }
+        },
+        None => refuse,
     };
 
     quote! {
@@ -28373,17 +28384,32 @@ mod tests {
     #[test]
     fn ledger_append_refuses_a_non_finite_float_before_hashing() {
         // #2326: the check must run before the snapshot is taken.
-        for op in ["delete", "restore"] {
-            assert!(
-                !ledger_append_for(op).contains("__autumn_ledger_non_finite_column"),
-                "`{op}` writes no float, so it must not be refused for a legacy value"
-            );
-        }
-        for op in ["insert", "update"] {
+        for op in ["insert", "update", "delete", "restore"] {
             // A trigger may write the float, so check the reloaded row.
             assert!(
                 ledger_append_for(op).contains("__lg_row . __autumn_ledger_non_finite_column"),
                 "`{op}` must check the reloaded row"
+            );
+        }
+        // A delete or restore writes no float, so a legacy value that was there
+        // before the write is not refused: the check is gated on the pre-write
+        // row. A delete's record is its pre-delete load; a restore has `before`.
+        assert!(
+            ledger_append_for("delete")
+                .contains("if (record) . __autumn_ledger_non_finite_column () . is_none ()"),
+            "{}",
+            ledger_append_for("delete")
+        );
+        assert!(
+            ledger_append_for("restore")
+                .contains("if (before) . __autumn_ledger_non_finite_column () . is_none ()"),
+            "{}",
+            ledger_append_for("restore")
+        );
+        for op in ["insert", "update"] {
+            assert!(
+                !ledger_append_for(op).contains(". is_none ()"),
+                "`{op}` refuses any non-finite value"
             );
         }
         let generated = ledger_append_for("update");

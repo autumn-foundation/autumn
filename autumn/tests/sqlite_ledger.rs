@@ -3033,6 +3033,61 @@ async fn a_trigger_written_infinity_is_refused_and_leaves_the_chain_intact() {
     assert!(live.amount_rate.is_finite(), "the update rolled back");
 }
 
+/// A restore writes no float, but a trigger can. The value was finite before
+/// the restore, so the restore is refused (#2319).
+#[tokio::test]
+async fn a_trigger_written_infinity_during_restore_is_refused() {
+    let pool = boot_pool("lg_non_finite_restore_trigger").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    repo.delete_by_id(id).await.expect("delete");
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute(
+            "CREATE TRIGGER lg_invoices_restore_inf AFTER UPDATE OF deleted_at ON lg_invoices \
+             WHEN NEW.deleted_at IS NULL \
+             BEGIN UPDATE lg_invoices SET amount_rate = 9e999 WHERE id = NEW.id; END",
+        )
+        .await
+        .expect("install trigger");
+    }
+
+    let err = repo
+        .restore(id)
+        .await
+        .expect_err("the trigger wrote infinity");
+    assert!(err.to_string().contains("amount_rate"), "{err}");
+    assert!(
+        repo.find_by_id(id).await.expect("read").is_none(),
+        "the restore rolled back"
+    );
+    let report = repo.ledger_verify(id).await.expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+    assert_eq!(report.revisions_checked, 4, "no revision was appended");
+}
+
+/// A row that already held infinity before the write (a legacy value) can
+/// still be deleted and restored: neither writes the float (#2326).
+#[tokio::test]
+async fn a_legacy_non_finite_row_can_still_be_deleted_and_restored() {
+    let pool = boot_pool("lg_non_finite_legacy").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query("UPDATE lg_invoices SET amount_rate = 9e999 WHERE id = ?")
+            .bind::<diesel::sql_types::BigInt, _>(id)
+            .execute(&mut *conn)
+            .await
+            .expect("a legacy value, written out of band");
+    }
+
+    repo.delete_by_id(id).await.expect("delete a legacy row");
+    repo.restore(id).await.expect("restore a legacy row");
+    let live = repo.find_by_id(id).await.expect("read").expect("row");
+    assert!(live.amount_rate.is_infinite());
+}
+
 /// A trigger that rewrites the valid-time column: the revision's `valid_from`
 /// and its snapshot both come from the reloaded row (#2319).
 #[tokio::test]
