@@ -1,0 +1,5 @@
+error: a ledgered repository cannot declare a derived `delete_by_*` method. It deletes in one bulk write and records no revision. Find the records. Then call `delete_by_id` or `delete_many`
+  --> tests/compile-fail/repository_ledgered_derived_delete.rs:35:8
+   |
+35 |     fn delete_by_title(title: String) -> ();
+   |        ^^^^^^^^^^^^^^^

@@ -436,6 +436,7 @@ impl CapsuleStore for PgCapsuleStore {
 
     fn insert_all<'a>(&'a self, batches: &'a [ImportBatch<'a>]) -> CapsuleFuture<'a, ()> {
         Box::pin(async move {
+            refuse_ledgered(batches)?;
             let mut statements = Vec::new();
             for batch in batches.iter().filter(|b| !b.records.is_empty()) {
                 let rows =
@@ -552,6 +553,23 @@ fn money_expr(field: &FieldSpec) -> String {
          WHEN 'array' THEN translate((e.j -> '{name}')::text, '[]', '{{}}')::numeric[]::money[] \
          WHEN 'string' THEN (e.j ->> '{name}')::numeric[]::money[] END"
     )
+}
+
+/// Refuse an import into a ledgered table (#2319).
+///
+/// The `INSERT` records no ledger revision, so the ledger would not match the
+/// table.
+fn refuse_ledgered(batches: &[ImportBatch<'_>]) -> Result<(), DataCapsuleError> {
+    batches
+        .iter()
+        .find(|b| !b.records.is_empty() && crate::ledger::is_ledgered_table(&b.model.table))
+        .map_or(Ok(()), |batch| {
+            Err(DataCapsuleError::InvalidInput(format!(
+                "table {} is ledgered: a capsule import records no ledger revision, so it \
+                 cannot write to that table",
+                batch.model.table
+            )))
+        })
 }
 
 /// The `INSERT` of one batch. Generated columns are skipped.
@@ -820,6 +838,64 @@ async fn plan_sequence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    inventory::submit! {
+        crate::ledger::LedgeredTableDescriptor { table: "capsule_ledgered_notes" }
+    }
+
+    fn manifest(table: &str) -> super::super::ModelManifest {
+        super::super::ModelManifest {
+            table: table.to_owned(),
+            primary_key: "id".to_owned(),
+            subject_column: "id".to_owned(),
+            fields: vec![FieldSpec::new("id", "bigint")],
+            relationships: Vec::new(),
+            blob_columns: Vec::new(),
+            record_count: 1,
+            file: format!("records/{table}.json"),
+        }
+    }
+
+    #[test]
+    fn an_import_into_a_ledgered_table_is_refused() {
+        let ledgered = manifest("capsule_ledgered_notes");
+        let plain = manifest("capsule_plain_notes");
+        let mut row = Record::new();
+        row.insert("id".to_owned(), serde_json::json!(1));
+        let rows = vec![row];
+        let none: Vec<Record> = Vec::new();
+
+        assert!(refuse_ledgered(&[ImportBatch::new(&plain, &rows)]).is_ok());
+        // An empty batch writes nothing.
+        assert!(refuse_ledgered(&[ImportBatch::new(&ledgered, &none)]).is_ok());
+        let err = refuse_ledgered(&[
+            ImportBatch::new(&plain, &rows),
+            ImportBatch::new(&ledgered, &rows),
+        ])
+        .expect_err("refused");
+        assert!(err.to_string().contains("capsule_ledgered_notes"), "{err}");
+    }
+
+    /// `insert_all` refuses before it takes a connection. The pool points at
+    /// no server, so any other path fails with a `Store` error.
+    #[tokio::test]
+    async fn insert_all_refuses_a_ledgered_table_before_it_connects() {
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+
+        let manager =
+            AsyncDieselConnectionManager::<AsyncPgConnection>::new("postgres://127.0.0.1:1/none");
+        let store = PgCapsuleStore::new(Pool::builder(manager).build().expect("pool"));
+        let ledgered = manifest("capsule_ledgered_notes");
+        let mut row = Record::new();
+        row.insert("id".to_owned(), serde_json::json!(1));
+        let rows = vec![row];
+
+        let err = store
+            .insert_all(&[ImportBatch::new(&ledgered, &rows)])
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, DataCapsuleError::InvalidInput(_)), "{err:?}");
+    }
 
     #[test]
     fn keys_are_the_decimals_that_numeric_reads() {
