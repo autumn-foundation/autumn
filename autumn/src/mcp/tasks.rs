@@ -46,7 +46,8 @@ const MIN_TTL: Duration = Duration::from_secs(1);
 ///     .ttl(Duration::from_secs(600))
 ///     .poll_interval(Duration::from_secs(2))
 ///     .max_tasks(256)
-///     .max_tasks_per_caller(16);
+///     .max_tasks_per_caller(16)
+///     .max_stored_bytes(64 * 1024 * 1024);
 /// # let _ = config;
 /// ```
 #[derive(Clone, Debug)]
@@ -55,16 +56,19 @@ pub struct McpTaskConfig {
     poll_interval: Duration,
     max_tasks: usize,
     max_tasks_per_caller: usize,
+    max_stored_bytes: usize,
 }
 
 impl Default for McpTaskConfig {
-    /// TTL 1 hour, poll interval 1 second, 1024 tasks, 64 tasks per caller.
+    /// TTL 1 hour, poll interval 1 second, 1024 tasks, 64 tasks per client,
+    /// 256 MiB of stored results.
     fn default() -> Self {
         Self {
             ttl: Duration::from_secs(3600),
             poll_interval: Duration::from_secs(1),
             max_tasks: 1024,
             max_tasks_per_caller: 64,
+            max_stored_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -97,12 +101,21 @@ impl McpTaskConfig {
         self
     }
 
-    /// Set the maximum number of tasks for one caller (one owner digest). If
-    /// a caller has this number of tasks, its next task tool call runs as a
-    /// blocking call. All anonymous callers share one quota.
+    /// Set the maximum number of tasks for one client. The key is the client
+    /// IP address that the trusted-proxy policy resolves, which the caller
+    /// cannot change. If a client has this number of tasks, its next task
+    /// tool call runs as a blocking call.
     #[must_use]
     pub const fn max_tasks_per_caller(mut self, max: usize) -> Self {
         self.max_tasks_per_caller = max;
+        self
+    }
+
+    /// Set the maximum size of all stored results, in bytes of JSON. If a
+    /// result does not fit, the task completes with a tool error.
+    #[must_use]
+    pub const fn max_stored_bytes(mut self, max: usize) -> Self {
+        self.max_stored_bytes = max;
         self
     }
 }
@@ -181,6 +194,10 @@ impl TaskState {
 
 struct Entry {
     owner: Owner,
+    /// The quota key: the client IP address.
+    quota: String,
+    /// The size of a stored result, in bytes of JSON.
+    bytes: usize,
     state: TaskState,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -267,19 +284,21 @@ impl TaskStore {
     }
 
     /// Add a `working` task. Returns the `CreateTaskResult`. Returns `None`
-    /// if the store is full or the caller has its quota of tasks.
-    pub fn create(&self, id: &str, owner: Owner, now: DateTime<Utc>) -> Option<Value> {
+    /// if the store is full or the `quota` key has its quota of tasks.
+    pub fn create(&self, id: &str, owner: Owner, quota: &str, now: DateTime<Utc>) -> Option<Value> {
         let mut tasks = self.lock();
         self.purge(&mut tasks, now);
         if tasks.len() >= self.config.max_tasks {
             return None;
         }
-        let held = tasks.values().filter(|e| e.owner.matches(&owner)).count();
+        let held = tasks.values().filter(|e| e.quota == quota).count();
         if held >= self.config.max_tasks_per_caller {
             return None;
         }
         let entry = Entry {
             owner,
+            quota: quota.to_owned(),
+            bytes: 0,
             state: TaskState::Working,
             created_at: now,
             updated_at: now,
@@ -315,15 +334,36 @@ impl TaskStore {
     }
 
     /// Move a `working` task to a terminal state. A terminal task does not
-    /// change.
+    /// change. A result that does not fit in `max_stored_bytes` becomes a
+    /// tool error.
     pub fn finish(&self, id: &str, state: TaskState, now: DateTime<Utc>) {
+        // Measure outside the lock: a result can be 10 MiB.
+        let bytes = match &state {
+            TaskState::Completed(result) => serde_json::to_vec(&**result).map_or(0, |v| v.len()),
+            _ => 0,
+        };
         let mut tasks = self.lock();
+        let stored: usize = tasks.values().map(|e| e.bytes).sum();
+        let fits = stored.saturating_add(bytes) <= self.config.max_stored_bytes;
         if let Some(entry) = tasks.get_mut(id)
             && matches!(entry.state, TaskState::Working)
         {
-            entry.state = state;
+            if fits {
+                entry.state = state;
+                entry.bytes = bytes;
+            } else {
+                entry.state = TaskState::Completed(Arc::new(over_budget_result()));
+            }
             entry.updated_at = now;
             entry.abort = None;
+        }
+        drop(tasks);
+        if !fits {
+            tracing::warn!(
+                bytes,
+                "MCP task result exceeds the task store byte budget; \
+                 the task completes with a tool error"
+            );
         }
     }
 
@@ -369,6 +409,20 @@ impl TaskStore {
     }
 }
 
+/// The `CallToolResult` for a result that does not fit in the byte budget.
+fn over_budget_result() -> Value {
+    json!({
+        "content": [{
+            "type": "text",
+            "text": "The tool result is too large for the MCP task store. \
+                     Call the tool without a task, or ask the operator to \
+                     increase `max_stored_bytes`.",
+        }],
+        "isError": true,
+        "resultType": "complete",
+    })
+}
+
 /// Add a completed result to a task view.
 fn with_result(mut out: Value, result: Option<&Value>) -> Value {
     if let Some(result) = result {
@@ -400,7 +454,7 @@ mod tests {
 
     #[test]
     fn create_returns_a_working_task_handle() {
-        let created = store().create("t1", owner("a"), at(0)).unwrap();
+        let created = store().create("t1", owner("a"), "q", at(0)).unwrap();
         assert_eq!(created["resultType"], "task");
         assert_eq!(created["status"], "working");
         assert_eq!(created["ttlMs"], 10_000);
@@ -411,7 +465,7 @@ mod tests {
     #[test]
     fn get_requires_the_same_owner() {
         let store = store();
-        store.create("t1", owner("a"), at(0));
+        store.create("t1", owner("a"), "q", at(0));
         assert!(store.get("t1", &owner("a"), at(1)).is_some());
         assert!(store.get("t1", &owner("b"), at(1)).is_none());
         assert!(!store.cancel("t1", &owner("b"), at(1)));
@@ -428,7 +482,7 @@ mod tests {
     #[test]
     fn terminal_state_does_not_change() {
         let store = store();
-        store.create("t1", owner("a"), at(0));
+        store.create("t1", owner("a"), "q", at(0));
         assert!(store.cancel("t1", &owner("a"), at(1)));
         store.finish(
             "t1",
@@ -444,7 +498,7 @@ mod tests {
     #[test]
     fn completed_and_failed_tasks_carry_their_payload() {
         let store = store();
-        store.create("ok", owner("a"), at(0));
+        store.create("ok", owner("a"), "q", at(0));
         store.finish(
             "ok",
             TaskState::Completed(Arc::new(json!({"isError": false}))),
@@ -454,7 +508,7 @@ mod tests {
         assert_eq!(ok["resultType"], "complete");
         assert_eq!(ok["result"], json!({"isError": false}));
 
-        store.create("bad", owner("a"), at(0));
+        store.create("bad", owner("a"), "q", at(0));
         let error = json!({"code": -32603, "message": "Internal error"});
         store.finish(
             "bad",
@@ -470,7 +524,7 @@ mod tests {
     #[test]
     fn expired_tasks_are_purged() {
         let store = store();
-        store.create("t1", owner("a"), at(0));
+        store.create("t1", owner("a"), "q", at(0));
         assert!(store.get("t1", &owner("a"), at(9)).is_some());
         assert!(store.get("t1", &owner("a"), at(10)).is_none());
     }
@@ -478,10 +532,10 @@ mod tests {
     #[test]
     fn full_store_refuses_until_a_task_expires() {
         let store = store();
-        assert!(store.create("t1", owner("a"), at(0)).is_some());
-        assert!(store.create("t2", owner("a"), at(1)).is_some());
-        assert!(store.create("t3", owner("a"), at(2)).is_none());
-        assert!(store.create("t3", owner("a"), at(10)).is_some());
+        assert!(store.create("t1", owner("a"), "q", at(0)).is_some());
+        assert!(store.create("t2", owner("a"), "q", at(1)).is_some());
+        assert!(store.create("t3", owner("a"), "q", at(2)).is_none());
+        assert!(store.create("t3", owner("a"), "q", at(10)).is_some());
     }
 
     #[test]
@@ -497,15 +551,39 @@ mod tests {
     }
 
     #[test]
-    fn one_caller_cannot_fill_the_store() {
+    fn one_client_cannot_fill_the_store() {
         let store = TaskStore::new(
             McpTaskConfig::default()
                 .max_tasks(10)
                 .max_tasks_per_caller(1),
         );
-        assert!(store.create("a1", owner("a"), at(0)).is_some());
-        assert!(store.create("a2", owner("a"), at(0)).is_none());
-        assert!(store.create("b1", owner("b"), at(0)).is_some());
+        assert!(store.create("a1", owner("a"), "10.0.0.1", at(0)).is_some());
+        // A new credential from the same client does not get a new quota.
+        assert!(store.create("a2", owner("b"), "10.0.0.1", at(0)).is_none());
+        assert!(store.create("c1", owner("a"), "10.0.0.2", at(0)).is_some());
+    }
+
+    #[test]
+    fn result_over_the_byte_budget_becomes_a_tool_error() {
+        let store = TaskStore::new(McpTaskConfig::default().max_stored_bytes(64));
+        store.create("big", owner("a"), "q", at(0));
+        let big = json!({"content": [{"type": "text", "text": "x".repeat(100)}], "isError": false});
+        store.finish("big", TaskState::Completed(Arc::new(big)), at(1));
+        let task = store.get("big", &owner("a"), at(1)).unwrap();
+        assert_eq!(task["status"], "completed");
+        assert_eq!(task["result"]["isError"], true, "{task}");
+
+        store.create("small", owner("a"), "q", at(0));
+        let small = json!({"isError": false});
+        store.finish(
+            "small",
+            TaskState::Completed(Arc::new(small.clone())),
+            at(1),
+        );
+        assert_eq!(
+            store.get("small", &owner("a"), at(1)).unwrap()["result"],
+            small
+        );
     }
 
     #[test]
@@ -514,12 +592,12 @@ mod tests {
             .ttl(Duration::ZERO)
             .poll_interval(Duration::MAX);
         let created = TaskStore::new(config)
-            .create("t1", owner("a"), at(0))
+            .create("t1", owner("a"), "q", at(0))
             .unwrap();
         assert_eq!(created["ttlMs"], 1_000);
         assert_eq!(created["pollIntervalMs"], MAX_SAFE_INTEGER);
         let long = TaskStore::new(McpTaskConfig::default().ttl(Duration::MAX))
-            .create("t1", owner("a"), at(0))
+            .create("t1", owner("a"), "q", at(0))
             .unwrap();
         assert_eq!(long["ttlMs"], MAX_SAFE_INTEGER);
     }
@@ -527,7 +605,7 @@ mod tests {
     #[tokio::test]
     async fn abort_handle_after_cancel_stops_the_work() {
         let store = store();
-        store.create("t1", owner("a"), at(0));
+        store.create("t1", owner("a"), "q", at(0));
         assert!(store.cancel("t1", &owner("a"), at(1)));
         let job = tokio::spawn(std::future::pending::<()>());
         store.set_abort("t1", &job.abort_handle());
@@ -537,13 +615,13 @@ mod tests {
     #[tokio::test]
     async fn cancel_and_expiry_abort_the_work() {
         let store = store();
-        store.create("t1", owner("a"), at(0));
+        store.create("t1", owner("a"), "q", at(0));
         let job = tokio::spawn(std::future::pending::<()>());
         store.set_abort("t1", &job.abort_handle());
         assert!(store.cancel("t1", &owner("a"), at(1)));
         assert!(job.await.unwrap_err().is_cancelled());
 
-        store.create("t2", owner("a"), at(0));
+        store.create("t2", owner("a"), "q", at(0));
         let job = tokio::spawn(std::future::pending::<()>());
         store.set_abort("t2", &job.abort_handle());
         assert!(!store.contains("t2", &owner("a"), at(20)));

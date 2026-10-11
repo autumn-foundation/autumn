@@ -485,7 +485,7 @@ Errors on `tasks/*`:
 A task tool runs as a normal blocking call when:
 
 - the client does not declare the extension, or
-- the task store is full (`max_tasks`), or the caller has
+- the task store is full (`max_tasks`), or the client has
   `max_tasks_per_caller` tasks. The server logs a warning.
 
 ### Timeouts and limits
@@ -506,7 +506,8 @@ autumn_web::app()
             .ttl(Duration::from_secs(600))        // default: 1 hour
             .poll_interval(Duration::from_secs(2)) // default: 1 second
             .max_tasks(256)                        // default: 1024
-            .max_tasks_per_caller(16),             // default: 64
+            .max_tasks_per_caller(16)              // default: 64
+            .max_stored_bytes(64 * 1024 * 1024),   // default: 256 MiB
     )
     .run()
     .await;
@@ -528,8 +529,12 @@ the TTL ends, the server stops a running task and deletes the task.
 - **Authentication.** `tasks/*` does not run the route's auth again. Use
   `secure_mcp(...)` (§7) to check the credential on each `tasks/*` request,
   for example to stop a revoked token.
-- **Quota.** One caller can hold at most `max_tasks_per_caller` tasks. All
-  anonymous callers share one quota.
+- **Quota.** One client can hold at most `max_tasks_per_caller` tasks. The
+  key is the client IP that the trusted-proxy policy resolves. A caller
+  cannot get a new quota with a new credential. Clients behind one NAT share
+  a quota.
+- **Memory.** All stored results together use at most `max_stored_bytes`. If
+  a result does not fit, the task completes with a tool error.
 - **Audit.** A task call writes the same `attempt` and outcome records as a
   blocking call (see "Proving what an agent can do"). A cancelled or expired
   task writes an outcome with `result = task_aborted`. A panic outside the

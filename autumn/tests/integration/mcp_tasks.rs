@@ -687,7 +687,7 @@ async fn ttl_stops_a_task_without_a_new_request() {
 }
 
 #[tokio::test]
-async fn one_caller_cannot_take_every_task_slot() {
+async fn one_client_cannot_take_every_task_slot() {
     let client = TestApp::new()
         .routes(routes![build_report])
         .mount_mcp("/mcp")
@@ -697,8 +697,22 @@ async fn one_caller_cannot_take_every_task_slot() {
     assert_eq!(first["result"]["resultType"], "task", "{first}");
     let second = call_as(&client, Some("Bearer alice"), "build_report", true).await;
     assert_ne!(second["result"]["resultType"], "task", "{second}");
-    let other = call_as(&client, Some("Bearer bob"), "build_report", true).await;
-    assert_eq!(other["result"]["resultType"], "task", "{other}");
+    // A new `Authorization` value from the same client gets no new quota.
+    let rotated = call_as(&client, Some("Bearer forged-1"), "build_report", true).await;
+    assert_ne!(rotated["result"]["resultType"], "task", "{rotated}");
+}
+
+#[tokio::test]
+async fn result_over_the_byte_budget_completes_with_is_error() {
+    let client = TestApp::new()
+        .routes(routes![build_report])
+        .mount_mcp("/mcp")
+        .mcp_tasks(McpTaskConfig::default().max_stored_bytes(8))
+        .build();
+    let id = task_id(&call(&client, "build_report", true).await);
+    let done = wait_terminal(&client, &id).await;
+    assert_eq!(done["result"]["status"], "completed", "{done}");
+    assert_eq!(done["result"]["result"]["isError"], true, "{done}");
 }
 
 #[tokio::test]

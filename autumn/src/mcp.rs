@@ -2394,8 +2394,15 @@ async fn serve_tools_call(
     if tool.task && tasks::client_declares_tasks(&params) {
         let task_id = server.new_task_id();
         let owner = server.task_owner(ctx);
+        // The quota key is the client IP. The caller cannot change it, so a
+        // new credential does not give a new quota.
+        let quota = ctx
+            .identity
+            .and_then(|id| id.addr)
+            .or_else(|| ctx.peer.map(|peer| peer.ip()))
+            .map_or_else(|| "unknown".to_owned(), |ip| ip.to_string());
         let now = server.state.clock().now();
-        if let Some(created) = server.tasks.create(&task_id, owner, now) {
+        if let Some(created) = server.tasks.create(&task_id, owner, &quota, now) {
             apply_replay_extensions(&mut request, server, ctx, &audit, true);
             spawn_task(server, idx, &task_id, request, audit);
             return json_response(&success(id, created));
