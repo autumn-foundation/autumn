@@ -947,7 +947,8 @@ fn skills_index(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
                 "name": s.name,
                 "type": "skill-md",
                 "description": s.description,
-                "url": s.path(),
+                // Absolute, so a `base_url` path prefix is kept.
+                "url": origin.url(&s.path()),
                 "digest": sha256_digest(s.to_skill_md().as_bytes()),
             })
         })
@@ -1892,9 +1893,28 @@ mod tests {
         for entry in skills {
             let url = entry["url"].as_str().unwrap();
             assert_eq!(entry["type"], "skill-md");
-            let served = render(&facts, &origin(), url).expect("artifact served");
+            let path = url
+                .strip_prefix("https://shop.example.com")
+                .expect("absolute");
+            let served = render(&facts, &origin(), path).expect("artifact served");
             assert_eq!(served.content_type, "text/markdown; charset=utf-8");
             assert_eq!(entry["digest"], sha256_digest(served.body.as_bytes()));
+        }
+    }
+
+    /// Codex review (P2): a `base_url` path prefix stays in the skill URLs.
+    #[test]
+    fn skill_urls_keep_the_base_url_path() {
+        let facts = content_site();
+        let shop = Origin::resolve(Some("https://example.com/shop"), None);
+        let doc = render(&facts, &shop, SKILLS_INDEX_PATH).unwrap();
+        let index: Value = serde_json::from_str(&doc.body).unwrap();
+        for entry in index["skills"].as_array().unwrap() {
+            let url = entry["url"].as_str().unwrap();
+            assert!(
+                url.starts_with("https://example.com/shop/.well-known/agent-skills/"),
+                "{url}"
+            );
         }
     }
 
@@ -1913,7 +1933,9 @@ mod tests {
             .filter(|e| e["name"] == "refunds")
             .collect();
         assert_eq!(refunds.len(), 1, "{index}");
-        let served = render(&facts, &origin(), refunds[0]["url"].as_str().unwrap()).unwrap();
+        let url = refunds[0]["url"].as_str().unwrap();
+        let path = url.strip_prefix("https://shop.example.com").unwrap();
+        let served = render(&facts, &origin(), path).unwrap();
         assert_eq!(refunds[0]["digest"], sha256_digest(served.body.as_bytes()));
     }
 

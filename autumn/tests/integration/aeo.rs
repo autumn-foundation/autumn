@@ -571,7 +571,9 @@ async fn skills_and_ard_are_served() {
     index.assert_ok();
     let json: serde_json::Value = serde_json::from_str(&index.text()).unwrap();
     let url = json["skills"][0]["url"].as_str().unwrap().to_owned();
-    let skill = c.get(&url).send().await;
+    // An absolute URL at this site.
+    let path = url.strip_prefix("http://localhost").expect("absolute URL");
+    let skill = c.get(path).send().await;
     skill.assert_ok();
     assert!(skill.text().starts_with("---\nname: site-guide\n"));
 
