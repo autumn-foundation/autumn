@@ -92,8 +92,6 @@ mod custom_layer;
 mod data_capsule;
 #[cfg(feature = "db")]
 mod data_capsule_pg;
-#[cfg(all(feature = "ledger-profile", not(feature = "sqlite")))]
-mod ledger_capsule_profile;
 #[cfg(feature = "db")]
 mod data_classification;
 mod db_telemetry_tests;
@@ -104,6 +102,8 @@ mod distributed_lock;
 mod download;
 mod duplicate_route_detection;
 mod edge_conformance_ci_coverage;
+#[cfg(all(feature = "ledger-profile", not(feature = "sqlite")))]
+mod ledger_capsule_profile;
 // The origin-side half of the edge capsule (#1790). `cache-moka` supplies the
 // concrete `Cache` the `CacheEdgeKv` adapter is proven against; the wasm half
 // of the parity claim lives in the example crate's conformance suite, which
