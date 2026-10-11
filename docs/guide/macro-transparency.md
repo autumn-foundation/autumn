@@ -1240,7 +1240,10 @@ Options: `ttl` (duration string, e.g. `"5m"`), `max` (entry cap, default
 `10_000`, LRU eviction), the `result` flag (cache only `Ok` values, pass `Err`
 through uncached), `key(a, b)` (hash only the named parameters — this is what
 lets a cached read take a repository handle, which is `Clone` but not `Hash`),
-and the cache-coherence pair `reads(Model, …)` / `acknowledge_stale = "…"`.
+the cache-coherence pair `reads(Model, …)` / `acknowledge_stale = "…"`,
+and `scope = "Type"` (adds the type to the identity: `module::Type::fn`).
+Put `#[cached_impl]` on an `impl` block to set `scope` on each `#[cached]`
+method. Without it, same-named methods in one module share cache keys.
 
 **Gotcha:** `#[cached]` cannot be applied to methods with a `self` receiver.
 The `__AUTUMN_CACHE_READ_ID__…` constant inherits the function's visibility, so

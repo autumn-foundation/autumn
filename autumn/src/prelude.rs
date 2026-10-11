@@ -31,9 +31,9 @@ pub use crate::paths::PathExt;
 pub use autumn_macros::ws;
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
-    api_doc, authorize, cached, delete, event, feature_flag, get, job, jobs, listener, listeners,
-    main, oauth2_callback, one_off_tasks, patch, paths, post, public, put, query_budget, routes,
-    scheduled, secured, static_get, static_routes, step_up, task, tasks, throttle,
+    api_doc, authorize, cached, cached_impl, delete, event, feature_flag, get, job, jobs, listener,
+    listeners, main, oauth2_callback, one_off_tasks, patch, paths, post, public, put, query_budget,
+    routes, scheduled, secured, static_get, static_routes, step_up, task, tasks, throttle,
 };
 /// Define a service for cross-model orchestration and non-DB side effects.
 #[cfg(feature = "db")]

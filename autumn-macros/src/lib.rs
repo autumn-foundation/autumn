@@ -37,6 +37,7 @@ mod agent_authority;
 mod api_doc;
 mod authorize;
 mod cached;
+mod cached_impl;
 mod collect;
 mod edge;
 mod edge_routes_macro;
@@ -1454,6 +1455,13 @@ pub fn derive_wire_shape(input: TokenStream) -> TokenStream {
 /// | `key` | `key(tenant_id)` | Build the key from *these* parameters only |
 /// | `reads` | `reads(Post, Comment)` | Declared cache-coherence dependency set |
 /// | `acknowledge_stale` | `"5s TTL is tight enough"` | Opt out of the coherence gate |
+/// | `scope` | `"Products"` | Enclosing type; keeps same-named associated functions apart |
+///
+/// # Associated functions
+///
+/// The cache key holds the module and function name. Two impls in one module
+/// with a same-named `#[cached]` function would share keys. Put
+/// [`cached_impl`] on each `impl` block, or set `scope` by hand.
 ///
 /// # Cache coherence (issue #1716)
 ///
@@ -1501,6 +1509,34 @@ pub fn cached(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
     let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
     autumn_macros_support::crate_path::finalize(cached::cached_macro(attr, item.into())).into()
+}
+
+/// Scope every `#[cached]` method of an `impl` block by its type.
+///
+/// Adds `scope = "<Type>"` to each `#[cached]` method, so `Products::get` and
+/// `Reviews::get` in one module get different cache keys.
+///
+/// ```ignore
+/// #[autumn_web::cached_impl]
+/// impl Products {
+///     #[cached]
+///     async fn get(id: i64) -> String { /* .. */ }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn cached_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let (crate_override, attr) =
+        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
+            Ok(pair) => pair,
+            Err(err) => return err.into(),
+        };
+    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
+    autumn_macros_support::crate_path::finalize(cached_impl::cached_impl_macro(
+        attr,
+        item.into(),
+        crate_override.as_deref(),
+    ))
+    .into()
 }
 
 /// Enrich a route handler's auto-generated `OpenAPI` documentation.

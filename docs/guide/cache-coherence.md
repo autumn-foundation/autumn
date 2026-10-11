@@ -101,9 +101,34 @@ A `(read, write)` pair fails the build when **all four** hold:
 
 ### Read identity is the cache-key namespace
 
-A cached read is identified by `module_path!() :: <fn name>` — the exact string
+A cached read is identified by `module_path!() :: <fn name>` (or `module_path!() :: <Type> :: <fn name>` with a `scope`) — the exact string
 `make_cache_key` already prefixes every one of its keys with. The manifest's
 identity and the runtime key space are the same string, by construction.
+
+Two impls in one module can hold a same-named `#[cached]` function. Put
+`#[cached_impl]` on each `impl` block. It adds the type to the identity:
+`module::Products::get`. You can also write `#[cached(scope = "Products")]`.
+Without a scope, both functions share one key space, and `autumn cache audit`
+reports the shared identity. The scope is opt-in.
+
+`#[cached_impl]` finds `#[cached]` by its path: `cached`, `autumn_web::cached`,
+`autumn_web::prelude::cached`, or the crate name Cargo resolves. It cannot see a
+`use` alias such as `use autumn_web as web;`. For those, write
+`#[cached(scope = "Products")]` by hand.
+
+The scope is the type path without generics: `a::Store`. Two impls can still
+share it: `impl Store<A>` and `impl Store<B>`, or two traits on one type with a
+same-named function. Give those a different `scope = "..."` by hand.
+
+```rust
+use autumn_web::prelude::*;
+
+#[cached_impl]
+impl Products {
+    #[cached]
+    async fn get(id: i64) -> String { /* .. */ }
+}
+```
 
 ### Invalidation edges are checked by the compiler
 
