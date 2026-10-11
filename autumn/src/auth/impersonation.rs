@@ -502,7 +502,7 @@ pub async fn clear(session: &Session) {
 /// flows call [`clear`] instead.
 ///
 /// ```rust,no_run
-/// # use autumn_web::{session::Session, state::AppState};
+/// # use autumn_web::{session::Session, AppState};
 /// # use autumn_web::auth::impersonation;
 /// async fn rotate_on_idle(state: &AppState, session: &Session) {
 ///     session.rotate_id().await;
