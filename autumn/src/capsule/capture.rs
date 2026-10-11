@@ -508,6 +508,10 @@ pub struct CaptureScope {
     notes: Mutex<Vec<String>>,
     truncated: AtomicBool,
     closed: AtomicBool,
+    /// Whether the app state had a cache when the run started.
+    state_cache: AtomicBool,
+    /// `register_after_commit` callbacks that a rollback has not dropped.
+    after_commit: std::sync::atomic::AtomicUsize,
 }
 
 impl CaptureScope {
@@ -530,7 +534,22 @@ impl CaptureScope {
             notes: Mutex::new(Vec::new()),
             truncated: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            state_cache: AtomicBool::new(false),
+            after_commit: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Note whether the app state has a cache. Any `true` is kept.
+    pub(crate) fn note_state_cache(&self, present: bool) {
+        if present {
+            self.state_cache.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether the app state had a cache when the run started.
+    #[must_use]
+    pub(crate) fn had_state_cache(&self) -> bool {
+        self.state_cache.load(Ordering::Relaxed)
     }
 
     /// The capsule id (the request id, when one was available).
@@ -852,10 +871,13 @@ impl CaptureScope {
 
     /// Complete a reserved job-enqueue slot with the backend's outcome.
     pub fn fill_job_enqueue(&self, index: usize, effect: JobEffect) {
+        // Every retained field is charged, the error text included: replay
+        // hands it back verbatim, so it is kept whole (#2351 item 19).
         let weight = effect
             .name
             .len()
-            .saturating_add(json_weight(&effect.payload));
+            .saturating_add(json_weight(&effect.payload))
+            .saturating_add(effect.error.as_ref().map_or(0, String::len));
         let budget = self.settings.max_capsule_bytes;
         let _ = self.with_effects(|buffer| {
             buffer.fill(|effects| &mut effects.jobs, index, effect, weight, budget);
@@ -875,8 +897,11 @@ impl CaptureScope {
     /// Complete a reserved mail slot.
     pub fn fill_mail(&self, index: usize, mut effect: MailEffect) {
         let cap = self.settings.max_body_bytes;
-        let over = body_weight(&effect.body) > cap;
+        // Both halves of a multipart message have the same cap (#2351 item
+        // 10).
+        let over = body_weight(&effect.body) > cap || body_weight(&effect.alternate_body) > cap;
         effect.body = clamp_body(effect.body, cap);
+        effect.alternate_body = clamp_body(effect.alternate_body, cap);
         // A skipped body is a wildcard to the replay comparison — it has to be,
         // there being nothing recorded to compare against — so a capsule
         // holding one must not present as complete. Otherwise the message
@@ -886,22 +911,63 @@ impl CaptureScope {
             self.note(MAIL_BODY_SKIPPED_NOTE);
             self.mark_truncated();
         }
+        // Every retained field is charged against the capsule budget.
         let weight = effect
             .subject
             .len()
-            .saturating_add(body_weight(&effect.body));
+            .saturating_add(body_weight(&effect.body))
+            .saturating_add(body_weight(&effect.alternate_body))
+            .saturating_add(headers_weight(&effect.extra_headers))
+            .saturating_add(
+                effect
+                    .to
+                    .iter()
+                    .fold(0, |total: usize, to| total.saturating_add(to.len())),
+            )
+            .saturating_add(effect.from.as_ref().map_or(0, String::len))
+            .saturating_add(effect.reply_to.as_ref().map_or(0, String::len))
+            .saturating_add(effect.list_unsubscribe.as_ref().map_or(0, String::len))
+            .saturating_add(effect.error.as_ref().map_or(0, String::len))
+            .saturating_add(
+                effect
+                    .attachments
+                    .iter()
+                    .fold(0, |total: usize, attachment| {
+                        total
+                            .saturating_add(attachment.filename.len())
+                            .saturating_add(attachment.content_type.len())
+                            .saturating_add(attachment.sha256.len())
+                    }),
+            );
         let budget = self.settings.max_capsule_bytes;
         let _ = self.with_effects(|buffer| {
             buffer.fill(|effects| &mut effects.mail, index, effect, weight, budget);
         });
     }
 
+    /// Reserve this run's next cache tape position, before an async removal
+    /// starts.
+    #[must_use]
+    pub fn reserve_cache(&self) -> Option<usize> {
+        let budget = self.settings.max_capsule_bytes;
+        self.with_effects(|buffer| {
+            buffer.reserve(|effects| &mut effects.cache, CacheEffect::pending(), budget)
+        })
+        .flatten()
+    }
+
+    /// Complete a reserved cache slot.
+    pub fn fill_cache(&self, index: usize, effect: CacheEffect) {
+        let weight = cache_weight(&effect);
+        let budget = self.settings.max_capsule_bytes;
+        let _ = self.with_effects(|buffer| {
+            buffer.fill(|effects| &mut effects.cache, index, effect, weight, budget);
+        });
+    }
+
     /// Record one cache read or write.
     pub fn record_cache(&self, effect: CacheEffect) {
-        let weight = effect.key().len().saturating_add(match &effect {
-            CacheEffect::Get { value, .. } => value.as_ref().map_or(0, String::len),
-            CacheEffect::Insert { value, .. } => value.len(),
-        });
+        let weight = cache_weight(&effect);
         let budget = self.settings.max_capsule_bytes;
         let _ = self.with_effects(|buffer| {
             buffer.push(|effects| &mut effects.cache, effect, weight, budget);
@@ -1008,6 +1074,22 @@ impl CaptureScope {
         self.closed.load(Ordering::Acquire)
     }
 
+    /// Count a `register_after_commit` callback (#2351 item 3).
+    pub(crate) fn after_commit_registered(&self) {
+        self.after_commit.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A rollback dropped a counted callback. Each drop follows its own
+    /// registration, so the count does not go below zero.
+    pub(crate) fn after_commit_dropped(&self) {
+        self.after_commit.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Whether a counted callback is still pending or ran.
+    pub(crate) fn after_commit_pending(&self) -> bool {
+        self.after_commit.load(Ordering::SeqCst) > 0
+    }
+
     /// Mark the capsule as incomplete; replay must refuse it.
     pub fn mark_truncated(&self) {
         self.truncated.store(true, Ordering::Relaxed);
@@ -1018,6 +1100,18 @@ impl CaptureScope {
     pub fn is_truncated(&self) -> bool {
         self.truncated.load(Ordering::Relaxed)
     }
+}
+
+/// The approximate serialized size of a cache effect.
+fn cache_weight(effect: &CacheEffect) -> usize {
+    effect.key().len().saturating_add(match effect {
+        CacheEffect::Get { value, .. } => value.as_ref().map_or(0, String::len),
+        CacheEffect::Insert { value, .. } => value.len(),
+        CacheEffect::Invalidate { error, .. } | CacheEffect::InvalidateNamespace { error, .. } => {
+            error.as_ref().map_or(0, |error| error.reason.len())
+        }
+        CacheEffect::Clear => 0,
+    })
 }
 
 /// A cloneable handle to a request's [`CaptureScope`], carried in the request
@@ -1183,7 +1277,11 @@ pub fn is_valid_scope_id(id: &str) -> bool {
 pub struct CaptureLayer {
     settings: Arc<CaptureSettings>,
     filter: Arc<ParameterFilter>,
+    state_cache: Option<StateCacheProbe>,
 }
+
+/// Tells whether the app state has a cache.
+type StateCacheProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 
 impl CaptureLayer {
     /// Build the layer from resolved settings and the shared redaction filter.
@@ -1192,7 +1290,17 @@ impl CaptureLayer {
         Self {
             settings: Arc::new(settings),
             filter,
+            state_cache: None,
         }
+    }
+
+    /// Read at each request start whether the app builder installed a cache.
+    /// Code can resolve the cache when the app is built, before a request
+    /// scope exists, so the request alone cannot tell (#2351).
+    #[must_use]
+    pub(crate) fn with_state_cache_probe(mut self, probe: StateCacheProbe) -> Self {
+        self.state_cache = Some(probe);
+        self
     }
 }
 
@@ -1204,6 +1312,7 @@ impl<S> Layer<S> for CaptureLayer {
             inner,
             settings: Arc::clone(&self.settings),
             filter: Arc::clone(&self.filter),
+            state_cache: self.state_cache.clone(),
         }
     }
 }
@@ -1214,6 +1323,7 @@ pub struct CaptureService<S> {
     inner: S,
     settings: Arc<CaptureSettings>,
     filter: Arc<ParameterFilter>,
+    state_cache: Option<StateCacheProbe>,
 }
 
 impl<S> Service<Request<Body>> for CaptureService<S>
@@ -1236,6 +1346,7 @@ where
         let mut inner = std::mem::replace(&mut self.inner, cloned);
         let settings = Arc::clone(&self.settings);
         let filter = Arc::clone(&self.filter);
+        let state_cache = self.state_cache.clone();
 
         Box::pin(async move {
             let id = scope_id(&req);
@@ -1244,6 +1355,9 @@ where
                 .get::<MatchedPath>()
                 .map(|matched| matched.as_str().to_owned());
             let scope = Arc::new(CaptureScope::new(id, settings, filter));
+            if let Some(probe) = state_cache {
+                scope.note_state_cache(probe());
+            }
             // The raw peer socket, before any trusted-proxy resolution: a
             // replay restores it verbatim so middleware and handlers that
             // inspect the peer directly (address *and* port) see what the
@@ -1528,6 +1642,35 @@ mod tests {
             .clone()
             .expect("the capture layer must publish a handle in the request extensions");
         Arc::clone(handle.scope())
+    }
+
+    /// Codex review on #3222: the layer reads at the request start whether
+    /// the app state has a cache. Code can resolve the cache when
+    /// the app is built, before any request scope exists.
+    #[tokio::test]
+    async fn the_capture_layer_records_a_state_cache() {
+        for present in [true, false] {
+            let seen: Arc<Mutex<Option<CaptureHandle>>> = Arc::new(Mutex::new(None));
+            let inner_seen = Arc::clone(&seen);
+            let inner = tower::service_fn(move |req: Request<Body>| {
+                let seen = Arc::clone(&inner_seen);
+                async move {
+                    if let Ok(mut slot) = seen.lock() {
+                        *slot = req.extensions().get::<CaptureHandle>().cloned();
+                    }
+                    Ok::<_, std::convert::Infallible>(Response::new(Body::empty()))
+                }
+            });
+            let mut service = test_layer(CaptureSettings::default())
+                .with_state_cache_probe(Arc::new(move || present))
+                .layer(inner);
+            let _ = service
+                .call(Request::new(Body::empty()))
+                .await
+                .expect("infallible");
+            let handle = seen.lock().expect("slot").clone().expect("handle");
+            assert_eq!(handle.scope().had_state_cache(), present);
+        }
     }
 
     /// An inner service that does its work in `call` itself, the way a real
@@ -1882,6 +2025,123 @@ mod tests {
             "{:?}",
             scope.notes()
         );
+    }
+
+    /// #2351 item 10: the alternate half of a multipart message has the same
+    /// per-body cap as the main body.
+    #[test]
+    fn an_oversized_alternate_mail_body_is_skipped_and_truncates() {
+        let settings = CaptureSettings {
+            max_body_bytes: 8,
+            ..CaptureSettings::default()
+        };
+        let scope = CaptureScope::new(
+            "mail".to_owned(),
+            Arc::new(settings),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        );
+        let slot = scope.reserve_mail().expect("a slot is available");
+        scope.fill_mail(
+            slot,
+            MailEffect {
+                to: vec!["a@example.com".to_owned()],
+                subject: "Receipt".to_owned(),
+                body: CapsuleBody::Text("short".to_owned()),
+                alternate_body: CapsuleBody::Text("<p>an html half past the cap</p>".to_owned()),
+                ..Default::default()
+            },
+        );
+        let effects = scope.effects_snapshot();
+        assert!(
+            matches!(effects.mail[0].alternate_body, CapsuleBody::Skipped { .. }),
+            "{:?}",
+            effects.mail[0].alternate_body
+        );
+        assert!(scope.is_truncated());
+    }
+
+    /// #2351 item 10: every retained mail field counts against the capsule
+    /// budget.
+    #[test]
+    fn the_alternate_mail_body_is_charged_against_the_capsule_budget() {
+        let settings = CaptureSettings {
+            max_body_bytes: 1 << 20,
+            max_capsule_bytes: 256,
+            ..CaptureSettings::default()
+        };
+        let scope = CaptureScope::new(
+            "mail".to_owned(),
+            Arc::new(settings),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        );
+        let slot = scope.reserve_mail().expect("a slot is available");
+        scope.fill_mail(
+            slot,
+            MailEffect {
+                to: vec!["a@example.com".to_owned()],
+                subject: "Receipt".to_owned(),
+                body: CapsuleBody::Text("short".to_owned()),
+                alternate_body: CapsuleBody::Text("x".repeat(4096)),
+                ..Default::default()
+            },
+        );
+        assert!(scope.is_truncated());
+    }
+
+    /// Codex review on #3222: every attachment field is charged.
+    #[test]
+    fn attachment_metadata_is_charged_against_the_capsule_budget() {
+        let settings = CaptureSettings {
+            max_capsule_bytes: 256,
+            ..CaptureSettings::default()
+        };
+        let scope = CaptureScope::new(
+            "mail".to_owned(),
+            Arc::new(settings),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        );
+        let slot = scope.reserve_mail().expect("a slot is available");
+        scope.fill_mail(
+            slot,
+            MailEffect {
+                to: vec!["a@example.com".to_owned()],
+                subject: "Receipt".to_owned(),
+                body: CapsuleBody::Text("short".to_owned()),
+                attachments: vec![crate::capsule::schema::MailAttachmentEffect {
+                    filename: "a.pdf".to_owned(),
+                    content_type: "x".repeat(4096),
+                    len: 1,
+                    sha256: String::new(),
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(scope.is_truncated());
+    }
+
+    /// #2351 item 19: an enqueue error is retained, so it is charged.
+    #[test]
+    fn an_enqueue_error_is_charged_against_the_capsule_budget() {
+        let settings = CaptureSettings {
+            max_capsule_bytes: 256,
+            ..CaptureSettings::default()
+        };
+        let scope = CaptureScope::new(
+            "job".to_owned(),
+            Arc::new(settings),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        );
+        let slot = scope.reserve_job_enqueue().expect("a slot is available");
+        scope.fill_job_enqueue(
+            slot,
+            JobEffect {
+                name: "j".to_owned(),
+                payload: serde_json::json!({}),
+                error: Some("x".repeat(4096)),
+                ..Default::default()
+            },
+        );
+        assert!(scope.is_truncated());
     }
 
     /// A seam reserves its tape position when the effect starts and fills it

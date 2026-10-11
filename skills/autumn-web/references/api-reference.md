@@ -1913,6 +1913,20 @@ max_capsules = 50         # oldest-first prune (capsule-named files only), befor
 - **A capsule is production data** — result rows, path segments, and SQL text
   are not maskable; treat the directory like a database dump and read
   `docs/guide/failure-capsules.md` (security section leads) before enabling.
+- Seam gaps closed (#2351): cache removals (`invalidate`, `invalidate_namespace`,
+  `clear`) and untyped `cache::get`/`insert` are recorded and replayed — a replay
+  never reaches the installed backend. `autumn replay` installs a tape-backed
+  `Mailer`. Capsule format is 4; v3 capsules still load and replay with v3 rules.
+- `autumn_web::capsule::guard_egress(subsystem, method, url)` — call it before a
+  request on your own HTTP/S3 client: replay refuses the call (an unrecorded
+  divergence), capture marks the capsule incomplete. CAPTCHA, OAuth2, SES,
+  `autumn-storage-s3` and the media plugin already call it.
+- `autumn_web::capsule::spawn(fut)` — use instead of `tokio::spawn` for work a
+  request does not await: capture marks the capsule incomplete; replay carries
+  the tape into the task. A raw `tokio::spawn` is invisible to both sides.
+- Replay refuses a capsule that started detached work (`db::register_after_commit`,
+  a stale-while-revalidate refresh), ran a tracked job, read/wrote an untyped
+  cache value, or whose compared data held the literal text `[FILTERED]`.
 
 ### `[server.tls]` (feature `tls`, 0.6.0, #1603)
 

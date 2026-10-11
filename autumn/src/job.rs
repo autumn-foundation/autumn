@@ -2991,6 +2991,50 @@ async fn run_job_handler(
         .await
 }
 
+/// Why a tracked job's capsule is not replayable.
+#[cfg(feature = "reporting")]
+const TRACKED_JOB_CAPSULE_NOTE: &str = "the job was tracked; replay runs a job untracked, so a \
+     handler that reads its job context would take a path production did not take";
+
+/// The capture settings and filter a job capsule uses, built once per app
+/// (#2351 item 6).
+#[cfg(feature = "reporting")]
+struct JobCaptureContext {
+    /// The configuration these were built from. A different one rebuilds them.
+    config: Arc<crate::config::AutumnConfig>,
+    settings: Arc<crate::capsule::CaptureSettings>,
+    filter: Arc<crate::log::filter::ParameterFilter>,
+}
+
+/// The app's [`JobCaptureContext`], when failure capture is on.
+#[cfg(feature = "reporting")]
+fn job_capture_context(state: &AppState) -> Option<Arc<JobCaptureContext>> {
+    let config = state.extension::<crate::config::AutumnConfig>()?;
+    if !config.failure_capture.enabled {
+        return None;
+    }
+    if let Some(context) = state.extension::<JobCaptureContext>()
+        && Arc::ptr_eq(&context.config, &config)
+    {
+        return Some(context);
+    }
+    // The same filter composition the capture layer uses, so one
+    // `[log] filter_parameters` list governs a job capsule and a request
+    // capsule identically.
+    let mut filter_parameters = config.log.filter_parameters.clone();
+    filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
+    filter_parameters.extend(crate::confidential::registered_confidential_column_names());
+    state.insert_extension(JobCaptureContext {
+        settings: Arc::new(crate::capsule::settings_from_config(&config)),
+        filter: Arc::new(crate::log::filter::ParameterFilter::new(
+            &filter_parameters,
+            &config.log.unfilter_parameters,
+        )),
+        config,
+    });
+    state.extension::<JobCaptureContext>()
+}
+
 async fn run_job_handler_unmetered(
     name: &str,
     handler: JobHandler,
@@ -3010,35 +3054,40 @@ async fn run_job_handler_unmetered(
     let (tracked_key, payload) = crate::job_tracking::take_tracked_payload(payload);
 
     #[cfg(feature = "reporting")]
-    if let Some(config) = state.extension::<crate::config::AutumnConfig>()
-        && config.failure_capture.enabled
-    {
-        let settings = std::sync::Arc::new(crate::capsule::settings_from_config(&config));
-        // The same filter composition the capture layer uses, so one
-        // `[log] filter_parameters` list governs a job capsule and a request
-        // capsule identically.
-        let mut filter_parameters = config.log.filter_parameters.clone();
-        filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
-        filter_parameters.extend(crate::confidential::registered_confidential_column_names());
-        let filter = std::sync::Arc::new(crate::log::filter::ParameterFilter::new(
-            &filter_parameters,
-            &config.log.unfilter_parameters,
-        ));
+    if let Some(context) = job_capture_context(&state) {
         let payload_for_capsule = payload.clone();
+        let tracked = tracked_key.is_some();
+        let state_cache = state.has_cache();
+        // Boxed, so the capture branch does not add a second copy of the run
+        // to this future.
+        let run = Box::pin(run_job_handler_inner(
+            name,
+            handler,
+            state,
+            tracked_key,
+            payload,
+            final_attempt,
+            bounds,
+        ));
         return crate::capsule::capture::capture_job(
             name,
             &payload_for_capsule,
-            settings,
-            filter,
-            run_job_handler_inner(
-                name,
-                handler,
-                state,
-                tracked_key,
-                payload,
-                final_attempt,
-                bounds,
-            ),
+            Arc::clone(&context.settings),
+            Arc::clone(&context.filter),
+            async move {
+                // Capture strips the tracking envelope, and replay runs the
+                // handler untracked. A tracked handler can branch on
+                // `is_tracked()` or report progress, so its capsule says it
+                // cannot replay (#2351 item 14).
+                if let Some(scope) = crate::capsule::current_scope() {
+                    scope.note_state_cache(state_cache);
+                    if tracked {
+                        scope.note(TRACKED_JOB_CAPSULE_NOTE);
+                        scope.mark_truncated();
+                    }
+                }
+                run.await
+            },
             |outcome| job_capsule_outcome(outcome, final_attempt),
         )
         .await;
@@ -3307,9 +3356,9 @@ fn replayed_enqueue(
             // puts this text into the capsule's outcome, and the replay verdict
             // compares outcome text exactly, so a prefix here would report an
             // unchanged queue-failure capsule as a mismatch.
-            EnqueueVerdict::Failed(error) => Err(AutumnError::internal_server_error(
-                std::io::Error::other(error),
-            )),
+            // The recorded status goes back too, so a handler that branches on
+            // it takes the same path. An older capsule has none: a 500.
+            EnqueueVerdict::Failed(error, status) => Err(rebuilt_enqueue_error(error, status)),
             // `next_job` already logged the divergence; the enqueue fails
             // closed so the handler sees an error rather than a silent success
             // against a queue that was never touched.
@@ -3377,55 +3426,143 @@ pub(crate) async fn run_handler_with_interceptor(
         .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
         .map(|arc| (*arc).clone());
     let payload_for_handler = payload.clone();
+    // The contexts of a production run (#2351 item 14): the replayed app for
+    // events, the background transaction timeouts, and an untracked job
+    // context whose run is never cancelled. Replay refuses a tracked job's
+    // capsule, so untracked is what production saw.
+    let event_app = state.clone();
+    #[cfg(feature = "db")]
+    let tx_timeout_state = state.clone();
     let next = Box::pin(async move { (handler)(state, payload_for_handler).await });
-    match interceptor {
-        Some(interceptor) => interceptor.intercept_execute(name, &payload, next).await,
-        None => next.await,
-    }
+    let execution = async move {
+        match interceptor {
+            Some(interceptor) => interceptor.intercept_execute(name, &payload, next).await,
+            None => next.await,
+        }
+    };
+    #[cfg(feature = "db")]
+    let execution = crate::db::scope_background_tx_timeouts(&tx_timeout_state, execution);
+    let ctx = crate::job_tracking::JobContext::none()
+        .with_run(crate::job_tracking::RunSignals::default());
+    crate::job_tracking::scope(ctx, crate::events::scope_event_app(event_app, execution)).await
 }
 
-/// Record an after-commit enqueue at the moment the handler *registers* it.
+/// Run an after-commit registration on the enqueue seam.
 ///
 /// The deferred callback runs from `tokio::task::spawn`, which does not inherit
 /// task-locals, so the capture scope is gone by the time the enqueue actually
-/// reaches a backend and nothing would be recorded at all. Replay, meanwhile,
-/// answers from the tape here at the registration point — so without this every
-/// faithful `enqueue_after_commit` would find an empty tape and diverge.
+/// reaches a backend. So the seam is the registration: replay answers here,
+/// and capture records here.
 ///
-/// Recording at registration is also the more honest of the two: what the
-/// capsule is describing is the handler's behaviour, and "this handler asks for
-/// a job once its transaction commits" is exactly that. The backend outcome is
-/// not knowable here (it happens after the response), so the entry carries no
-/// error, and a transaction that rolls back leaves a recorded enqueue that
-/// never reached a queue — the same thing the handler asked for either way.
+/// The tape position is taken before the registration runs. It is filled with
+/// the result after, error included (#2351 item 9). A registration can fail,
+/// for example with no job runtime. If capture recorded a success, replay
+/// would return `Ok(())` to a handler that got an error. With no open
+/// transaction, the registration enqueues at once on this task. Capture does
+/// not record that inner enqueue a second time.
+async fn after_commit_seam(
+    name: &str,
+    payload: &Value,
+    schedule: EnqueueSchedule,
+    // Boxed: the registration holds a whole enqueue, and the seam must not
+    // copy it into each caller's future.
+    register: Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + '_>>,
+) -> AutumnResult<()> {
+    if let Some(answer) = replayed_enqueue(name, payload, schedule) {
+        return answer;
+    }
+    let slot = reserve_enqueue(payload);
+    let result = without_enqueue_tee(register).await;
+    fill_after_commit_enqueue(slot, name, schedule, result.as_ref().err());
+    result
+}
+
+/// The error a replay gives for a recorded enqueue failure: its message,
+/// with its status when the capsule has one.
 #[cfg(feature = "reporting")]
-fn record_after_commit_enqueue(name: &str, payload: &Value, schedule: EnqueueSchedule) {
-    let Some(scope) = crate::capsule::current_scope() else {
+fn rebuilt_enqueue_error(message: String, status: Option<u16>) -> AutumnError {
+    let error = AutumnError::internal_server_error(std::io::Error::other(message));
+    match status.and_then(|status| http::StatusCode::from_u16(status).ok()) {
+        Some(status) => error.with_status(status),
+        None => error,
+    }
+}
+
+/// Mark the capsule incomplete when replay cannot rebuild a failed
+/// enqueue's error: field details or a problem type the tape does not keep
+/// change its public `code()`.
+#[cfg(feature = "reporting")]
+fn note_unrebuildable_enqueue_error(scope: &crate::capsule::CaptureScope, error: &AutumnError) {
+    let rebuilt = rebuilt_enqueue_error(error.message(), Some(error.status().as_u16()));
+    // `details()` too: an empty field map has the plain error's code, but
+    // the rebuilt error has no details at all.
+    if rebuilt.code() != error.code() || error.details().is_some() {
+        scope.note(
+            "an enqueue failed with an error that replay cannot rebuild (field details or a \
+             problem type); the capsule is not replayable",
+        );
+        scope.mark_truncated();
+    }
+}
+
+/// Complete an after-commit slot with the registration's result.
+#[cfg(feature = "reporting")]
+fn fill_after_commit_enqueue(
+    slot: Option<EnqueueSlot>,
+    name: &str,
+    schedule: EnqueueSchedule,
+    error: Option<&AutumnError>,
+) {
+    let Some(slot) = slot else {
         return;
     };
-    let Some(index) = scope.reserve_job_enqueue() else {
-        return;
-    };
+    if let Some(error) = error {
+        note_unrebuildable_enqueue_error(&slot.scope, error);
+    }
     let (delay_secs, due_at) = match schedule {
         EnqueueSchedule::Immediate => (None, None),
-        EnqueueSchedule::After(delay) => (Some(delay), None),
+        EnqueueSchedule::After(delay) => (Some(delay_seconds(delay)), None),
         EnqueueSchedule::At(deadline) => (None, Some(deadline)),
     };
-    scope.fill_job_enqueue(
-        index,
+    slot.scope.fill_job_enqueue(
+        slot.index,
         crate::capsule::JobEffect {
             name: name.to_owned(),
-            payload: capsule_job_payload(payload),
+            payload: capsule_job_payload(&slot.payload),
             delay_secs,
             due_at,
-            error: None,
+            requested_due_at: None,
+            // `message`, not `Display`: recorded on the capsule tape.
+            error: error.map(AutumnError::message),
+            error_status: error.map(|error| error.status().as_u16()),
         },
     );
 }
 
 /// No capsule support compiled in: nothing to record.
 #[cfg(not(feature = "reporting"))]
-const fn record_after_commit_enqueue(_name: &str, _payload: &Value, _schedule: EnqueueSchedule) {}
+const fn fill_after_commit_enqueue(
+    _slot: Option<EnqueueSlot>,
+    _name: &str,
+    _schedule: EnqueueSchedule,
+    _error: Option<&AutumnError>,
+) {
+}
+
+tokio::task_local! {
+    /// Set while an outer seam owns this enqueue's tape slot.
+    static ENQUEUE_TEE_SUPPRESSED: ();
+}
+
+/// Run `future` with the inner enqueue seam silent: the caller records it.
+async fn without_enqueue_tee<F: Future>(future: F) -> F::Output {
+    ENQUEUE_TEE_SUPPRESSED.scope((), future).await
+}
+
+/// Whether an outer seam owns the current enqueue's tape slot.
+fn enqueue_tee_suppressed() -> bool {
+    ENQUEUE_TEE_SUPPRESSED.try_with(|()| ()).is_ok()
+}
 
 /// A relative delay in whole seconds, for the capsule's enqueue comparison.
 ///
@@ -3444,14 +3581,32 @@ const fn record_after_commit_enqueue(_name: &str, _payload: &Value, _schedule: E
 pub(crate) enum EnqueueSchedule {
     /// Run as soon as a worker takes it.
     Immediate,
-    /// Run after a relative delay, in whole seconds.
-    After(i64),
+    /// Run after a relative delay. Kept exact: capture records whole seconds
+    /// rounded up, and a v3 capsule recorded them cut off.
+    After(std::time::Duration),
     /// Run at an absolute instant.
     At(chrono::DateTime<chrono::Utc>),
 }
 
-fn delay_seconds(delay: std::time::Duration) -> i64 {
-    i64::try_from(delay.as_secs()).unwrap_or(i64::MAX)
+pub(crate) fn delay_seconds(delay: std::time::Duration) -> i64 {
+    // Rounded up, as capture records it: a positive sub-second delay is not
+    // immediate.
+    let secs = delay
+        .as_secs()
+        .saturating_add(u64::from(delay.subsec_nanos() > 0));
+    i64::try_from(secs).unwrap_or(i64::MAX)
+}
+
+/// The delay capture records for `due_at - now`: whole seconds, rounded up,
+/// as replay computes it in `delay_seconds`.
+#[cfg(any(test, feature = "reporting"))]
+const fn recorded_delay(delay: chrono::TimeDelta) -> i64 {
+    let secs = delay.num_seconds();
+    if delay.subsec_nanos() > 0 {
+        secs.saturating_add(1)
+    } else {
+        secs
+    }
 }
 
 /// No capsule support compiled in: never a replay.
@@ -3525,11 +3680,37 @@ struct EnqueueSlot {
     scope: Arc<crate::capsule::CaptureScope>,
     index: usize,
     payload: Value,
+    /// The absolute deadline the caller gave, before a past one was run at
+    /// once (#2351 item 18).
+    requested_due_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Reserve an enqueue slot that keeps the deadline the caller gave.
+#[cfg(feature = "reporting")]
+fn reserve_enqueue_due(
+    payload: &Value,
+    requested: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<EnqueueSlot> {
+    let mut slot = reserve_enqueue(payload)?;
+    slot.requested_due_at = requested;
+    Some(slot)
+}
+
+/// No capsule support compiled in: there is no slot.
+#[cfg(not(feature = "reporting"))]
+const fn reserve_enqueue_due(
+    _payload: &Value,
+    _requested: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<EnqueueSlot> {
+    None
 }
 
 /// Reserve an enqueue slot, when a capsule is being recorded.
 #[cfg(feature = "reporting")]
 fn reserve_enqueue(payload: &Value) -> Option<EnqueueSlot> {
+    if enqueue_tee_suppressed() {
+        return None;
+    }
     let scope = crate::capsule::current_scope()?;
     let index = scope.reserve_job_enqueue()?;
     Some(EnqueueSlot {
@@ -3538,6 +3719,7 @@ fn reserve_enqueue(payload: &Value) -> Option<EnqueueSlot> {
         // Cloned only once a slot exists, so an app with capture off never
         // pays for it.
         payload: payload.clone(),
+        requested_due_at: None,
     })
 }
 
@@ -3553,6 +3735,9 @@ fn fill_enqueue(
     let Some(slot) = slot else {
         return;
     };
+    if let Some(error) = error {
+        note_unrebuildable_enqueue_error(&slot.scope, error);
+    }
     slot.scope.fill_job_enqueue(
         slot.index,
         crate::capsule::JobEffect {
@@ -3561,12 +3746,25 @@ fn fill_enqueue(
             // `signed_duration_since` rather than `-`: this module's panic gate
             // denies `arithmetic_side_effects`, and the subtraction operator on
             // `DateTime` is not total.
-            delay_secs: due_at.map(|due| due.signed_duration_since(now).num_seconds()),
+            delay_secs: due_at.map(|due| recorded_delay(due.signed_duration_since(now))),
             due_at,
+            // Kept only when the deadline had passed and the job ran at once.
+            requested_due_at: due_at.map_or(slot.requested_due_at, |_| None),
             // `message`, not `Display`: recorded on the capsule tape.
             error: error.map(crate::AutumnError::message),
+            error_status: error.map(|error| error.status().as_u16()),
         },
     );
+}
+
+/// The entropy source a job client mints job ids from.
+///
+/// A replay answers an enqueue before a job id is drawn, so the draw must not
+/// go on the capsule's random tape: it would shift every later draw by one
+/// (#2351 item 11).
+fn job_client_entropy(state: &AppState) -> Arc<dyn crate::entropy::Entropy> {
+    let entropy = state.entropy_arc();
+    entropy.unrecorded().unwrap_or(entropy)
 }
 
 /// Retrieves the global initialized job client.
@@ -3756,9 +3954,7 @@ pub async fn enqueue_in(
     // app B, whose runtime filters due-at against its own clock, so the job would be
     // years off B's timeline and never become due. Same failure mode as the real-time
     // bug this migration fixed, reached from the other direction.
-    if let Some(answer) =
-        replayed_enqueue(name, &payload, EnqueueSchedule::After(delay_seconds(delay)))
-    {
+    if let Some(answer) = replayed_enqueue(name, &payload, EnqueueSchedule::After(delay)) {
         return answer;
     }
     let client = require_job_client()?;
@@ -3860,9 +4056,7 @@ pub async fn enqueue_in_on_conn<A: serde::Serialize>(
             "job args serialization failed: {e}"
         )))
     })?;
-    if let Some(answer) =
-        replayed_enqueue(name, &payload, EnqueueSchedule::After(delay_seconds(delay)))
-    {
+    if let Some(answer) = replayed_enqueue(name, &payload, EnqueueSchedule::After(delay)) {
         return answer;
     }
     let client = require_job_client()?;
@@ -3926,18 +4120,27 @@ pub async fn enqueue_after_commit<A: serde::Serialize>(name: &str, args: A) -> A
             "job args serialization failed: {e}"
         )))
     })?;
-    if let Some(answer) = replayed_enqueue(name, &payload, EnqueueSchedule::Immediate) {
-        return answer;
-    }
-    // Recorded here, where replay also answers: the deferred callback
-    // runs without this task's capture scope, so nothing else would.
-    record_after_commit_enqueue(name, &payload, EnqueueSchedule::Immediate);
-    let Some(client) = global_job_client() else {
-        return Err(AutumnError::internal_server_error(std::io::Error::other(
+    let registration = payload.clone();
+    after_commit_seam(
+        name,
+        &payload,
+        EnqueueSchedule::Immediate,
+        Box::pin(async move {
+            after_commit_client()?
+                .enqueue_after_commit(name, registration)
+                .await
+        }),
+    )
+    .await
+}
+
+/// The job client an after-commit registration uses.
+fn after_commit_client() -> AutumnResult<Arc<JobClient>> {
+    global_job_client().ok_or_else(|| {
+        AutumnError::internal_server_error(std::io::Error::other(
             "job runtime is not initialized; register jobs with AppBuilder::jobs()",
-        )));
-    };
-    client.enqueue_after_commit(name, payload).await
+        ))
+    })
 }
 
 /// Delayed variant of [`enqueue_after_commit`]: after the surrounding
@@ -3961,24 +4164,21 @@ pub async fn enqueue_in_after_commit<A: serde::Serialize>(
             "job args serialization failed: {e}"
         )))
     })?;
-    if let Some(answer) =
-        replayed_enqueue(name, &payload, EnqueueSchedule::After(delay_seconds(delay)))
-    {
-        return answer;
-    }
-    // Recorded here, where replay also answers: the deferred callback
-    // runs without this task's capture scope, so nothing else would.
-    record_after_commit_enqueue(name, &payload, EnqueueSchedule::After(delay_seconds(delay)));
-    let Some(client) = global_job_client() else {
-        return Err(AutumnError::internal_server_error(std::io::Error::other(
-            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
-        )));
-    };
-    // `enqueue_after_commit_delay` computes `when` inside the callback so
-    // the delay is measured from commit time, not from this call site.
-    client
-        .enqueue_after_commit_delay(name, payload, delay)
-        .await
+    let registration = payload.clone();
+    let schedule = EnqueueSchedule::After(delay);
+    after_commit_seam(
+        name,
+        &payload,
+        schedule,
+        Box::pin(async move {
+            // `enqueue_after_commit_delay` computes `when` inside the callback so
+            // the delay is measured from commit time, not from this call site.
+            after_commit_client()?
+                .enqueue_after_commit_delay(name, registration, delay)
+                .await
+        }),
+    )
+    .await
 }
 
 /// Absolute-instant variant of [`enqueue_in_after_commit`].
@@ -3997,20 +4197,18 @@ pub async fn enqueue_at_after_commit<A: serde::Serialize>(
             "job args serialization failed: {e}"
         )))
     })?;
-    if let Some(answer) = replayed_enqueue(name, &payload, EnqueueSchedule::At(when)) {
-        return answer;
-    }
-    // Recorded here, where replay also answers: the deferred callback
-    // runs without this task's capture scope, so nothing else would.
-    record_after_commit_enqueue(name, &payload, EnqueueSchedule::At(when));
-    let Some(client) = global_job_client() else {
-        return Err(AutumnError::internal_server_error(std::io::Error::other(
-            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
-        )));
-    };
-    client
-        .enqueue_after_commit_due(name, payload, Some(when))
-        .await
+    let registration = payload.clone();
+    after_commit_seam(
+        name,
+        &payload,
+        EnqueueSchedule::At(when),
+        Box::pin(async move {
+            after_commit_client()?
+                .enqueue_after_commit_due(name, registration, Some(when))
+                .await
+        }),
+    )
+    .await
 }
 
 /// Enqueue a job inside an **already-open connection**, writing the job row
@@ -4252,10 +4450,13 @@ impl JobClient {
         // rather than in the inner method so the capsule's clock tape gains
         // exactly one entry per enqueue, however the seam wraps it.
         let now = self.due_origin();
+        let requested = due_at;
         // Only treat a due time strictly in the future as "delayed"; a past or
         // absent due time enqueues for immediate execution exactly as before.
         let due_at = due_at.filter(|due| *due > now);
 
+        // A past deadline is still compared as the deadline the caller gave
+        // (`requested_due_at`), so a plain `enqueue` cannot consume it.
         // Failure-capsule seam (#1634). The free enqueue functions guard ahead
         // of the client lookup (a replay starts no job runtime), so by the time
         // control reaches here a replay can only have come through a *held*
@@ -4265,14 +4466,16 @@ impl JobClient {
         if let Some(answer) = replayed_enqueue(
             name,
             &payload,
-            due_at.map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At),
+            due_at
+                .or(requested)
+                .map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At),
         ) {
             return answer.map(|()| EnqueueOutcome::Queued);
         }
         // Reserve before the backend is asked and fill in after, so concurrent
         // enqueues keep initiation order and a backend *rejection* is recorded
         // as the failure the handler actually saw.
-        let slot = reserve_enqueue(&payload);
+        let slot = reserve_enqueue_due(&payload, requested);
         let result = self
             .enqueue_with_outcome_due_inner(name, payload, due_at, now, None)
             .await;
@@ -4774,13 +4977,16 @@ impl JobClient {
                 continue;
             }
             let now = self.due_origin();
+            let requested = due_at;
             let due_at = due_at.filter(|due| *due > now);
-            let schedule = due_at.map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At);
+            let schedule = due_at
+                .or(requested)
+                .map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At);
             if let Some(answer) = replayed_enqueue(name, &payload, schedule) {
                 resolved.push((result_index, answer.map(|()| EnqueueOutcome::Queued)));
                 continue;
             }
-            let slot = reserve_enqueue(&payload);
+            let slot = reserve_enqueue_due(&payload, requested);
             let id = self.entropy.uuid_v4().to_string();
             let constraints = ResolvedJobConstraints::for_payload(settings, &payload);
 
@@ -5059,6 +5265,34 @@ impl JobClient {
         payload: impl serde::Serialize,
         due: AfterCommitDue,
     ) -> AutumnResult<()> {
+        let payload = serde_json::to_value(payload).map_err(|e| {
+            AutumnError::internal_server_error(std::io::Error::other(format!(
+                "enqueue_after_commit: failed to serialize payload for job '{name}': {e}"
+            )))
+        })?;
+        // A free `*_after_commit` function owns the seam already; a held
+        // client (the event bus's durable dispatch) is on the seam here.
+        let recorded = payload.clone();
+        let register = Box::pin(self.register_after_commit(name, payload, due));
+        if enqueue_tee_suppressed() {
+            return register.await;
+        }
+        let schedule = match due {
+            AfterCommitDue::At(None) => EnqueueSchedule::Immediate,
+            AfterCommitDue::At(Some(at)) => EnqueueSchedule::At(at),
+            AfterCommitDue::After(delay) => EnqueueSchedule::After(delay),
+        };
+        after_commit_seam(name, &recorded, schedule, register).await
+    }
+
+    /// Validate an after-commit enqueue and register it, or enqueue at once
+    /// with no open transaction.
+    async fn register_after_commit(
+        &self,
+        name: &str,
+        payload: Value,
+        due: AfterCommitDue,
+    ) -> AutumnResult<()> {
         // Validate name eagerly so a typo/unregistered job fails the
         // transaction (before any DB commit) rather than being silently
         // dropped later when the deferred callback runs.
@@ -5069,11 +5303,6 @@ impl JobClient {
         }
 
         let name = name.to_string();
-        let payload = serde_json::to_value(payload).map_err(|e| {
-            AutumnError::internal_server_error(std::io::Error::other(format!(
-                "enqueue_after_commit: failed to serialize payload for job '{name}': {e}"
-            )))
-        })?;
         // Also validate eagerly: the deferred callback below calls
         // enqueue_due (which re-checks this), but that runs after the
         // transaction has already committed — by then it's too late for the
@@ -5374,8 +5603,9 @@ impl JobClient {
     ) -> AutumnResult<()> {
         // Same origin that stamped the deadline — see `enqueue_with_outcome_due`.
         let now = self.due_origin();
+        let requested = due_at;
         let due_at = due_at.filter(|due| *due > now);
-        self.enqueue_on_conn_due_dispatch(name, payload, conn, due_at, now, None)
+        self.enqueue_on_conn_due_dispatch(name, payload, conn, due_at, now, None, requested)
             .await
     }
 
@@ -5394,14 +5624,26 @@ impl JobClient {
         let (monotonic_origin, now) = self.relative_delay_origins();
         let due_at = Some(due_at_from(now, delay)).filter(|due| *due > now);
         let relative_delay = RelativeDelay::new(delay, monotonic_origin);
-        self.enqueue_on_conn_due_dispatch(name, payload, conn, due_at, now, Some(relative_delay))
-            .await
+        self.enqueue_on_conn_due_dispatch(
+            name,
+            payload,
+            conn,
+            due_at,
+            now,
+            Some(relative_delay),
+            None,
+        )
+        .await
     }
 
     /// Shared body of [`Self::enqueue_on_conn_due`] and
     /// [`Self::enqueue_on_conn_relative_due`] — only `due_at`/`relative_delay`
     /// resolution differs between the two.
     #[cfg(feature = "db")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the deadline the caller gave travels beside the resolved one"
+    )]
     async fn enqueue_on_conn_due_dispatch(
         &self,
         name: &str,
@@ -5410,6 +5652,7 @@ impl JobClient {
         due_at: Option<chrono::DateTime<chrono::Utc>>,
         now: chrono::DateTime<chrono::Utc>,
         relative_delay: Option<RelativeDelay>,
+        requested: Option<chrono::DateTime<chrono::Utc>>,
     ) -> AutumnResult<()> {
         // Failure-capsule seam (#1634). This is the transactional chokepoint —
         // it never funnels through `enqueue_with_outcome_due`, so without its
@@ -5418,7 +5661,9 @@ impl JobClient {
         if let Some(answer) = replayed_enqueue(
             name,
             &payload,
-            due_at.map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At),
+            due_at
+                .or(requested)
+                .map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At),
         ) {
             return answer;
         }
@@ -5431,7 +5676,7 @@ impl JobClient {
         if self.pg_pool.is_some() {
             note_transactional_enqueue();
         }
-        let slot = reserve_enqueue(&payload);
+        let slot = reserve_enqueue_due(&payload, requested);
         let result = self
             .enqueue_on_conn_due_inner(name, payload, conn, due_at, relative_delay)
             .await;
@@ -6108,7 +6353,7 @@ pub(crate) fn start_local_runtime_inner(
         interceptor: state
             .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
             .map(|arc| (*arc).clone()),
-        entropy: state.entropy_arc(),
+        entropy: job_client_entropy(state),
         clock: state.clock_arc(),
         resilience_config: state
             .extension::<crate::config::AutumnConfig>()
@@ -10204,7 +10449,7 @@ fn start_redis_runtime(
             interceptor: state
                 .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
                 .map(|arc| (*arc).clone()),
-            entropy: state.entropy_arc(),
+            entropy: job_client_entropy(state),
             clock: state.clock_arc(),
             resilience_config: state
                 .extension::<crate::config::AutumnConfig>()
@@ -13066,7 +13311,7 @@ fn start_postgres_runtime(
             interceptor: state
                 .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
                 .map(|arc| (*arc).clone()),
-            entropy: state.entropy_arc(),
+            entropy: job_client_entropy(state),
             clock: state.clock_arc(),
             resilience_config: state
                 .extension::<crate::config::AutumnConfig>()
@@ -14259,6 +14504,181 @@ mod tests {
                 .contains("only failed jobs can be retried"),
             "unexpected second retry error: {second}"
         );
+    }
+
+    /// #2351 item 6: the capture settings and filter are built once per app,
+    /// not on every job execution.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn job_capture_context_is_built_once_per_app() {
+        let state = AppState::for_test();
+        let mut config = crate::config::AutumnConfig::default();
+        config.failure_capture.enabled = true;
+        state.insert_extension(config);
+        let first = job_capture_context(&state).expect("capture is on");
+        let second = job_capture_context(&state).expect("capture is on");
+        assert!(Arc::ptr_eq(&first, &second));
+        let off = AppState::for_test();
+        assert!(job_capture_context(&off).is_none());
+    }
+
+    /// #2351 item 14: a replayed job runs in the event app it ran in
+    /// during production, so a free `publish` reaches the same app.
+    #[tokio::test]
+    async fn replay_dispatch_publishes_against_the_replayed_app() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct ReplayProbe {
+            n: u8,
+        }
+        impl crate::events::Event for ReplayProbe {
+            const NAME: &'static str = "replay_probe";
+        }
+        fn publishing_handler(
+            _state: AppState,
+            _payload: Value,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+            Box::pin(async move { crate::events::publish(ReplayProbe { n: 1 }).await })
+        }
+        let state = AppState::for_test();
+        state.insert_extension(crate::events::EventRecorder::default());
+        run_handler_with_interceptor(
+            "probe",
+            publishing_handler,
+            state.clone(),
+            serde_json::json!({}),
+        )
+        .await
+        .expect("publish succeeds");
+        let recorder = state
+            .extension::<crate::events::EventRecorder>()
+            .expect("installed");
+        assert_eq!(recorder.count::<ReplayProbe>(), 1);
+    }
+
+    /// #2351 item 9: a registration that fails is recorded as the failure
+    /// it was, not as a queued job.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_failed_after_commit_registration_is_recorded_as_a_failure() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let result = crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            enqueue_after_commit("never_registered", serde_json::json!({})),
+        )
+        .await;
+        let error = result.expect_err("no job runtime");
+        let jobs = scope.effects_snapshot().jobs;
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert_eq!(jobs[0].error.as_deref(), Some(error.message().as_str()));
+    }
+
+    /// Codex review on #3222: a positive sub-second delay is not immediate.
+    /// Capture and replay both round it up to whole seconds.
+    #[test]
+    fn a_sub_second_delay_rounds_up_on_both_sides() {
+        assert_eq!(delay_seconds(Duration::from_millis(500)), 1);
+        assert_eq!(delay_seconds(Duration::from_secs(2)), 2);
+        assert_eq!(delay_seconds(Duration::ZERO), 0);
+        assert_eq!(recorded_delay(chrono::TimeDelta::milliseconds(500)), 1);
+        assert_eq!(recorded_delay(chrono::TimeDelta::seconds(2)), 2);
+        assert_eq!(recorded_delay(chrono::TimeDelta::zero()), 0);
+    }
+
+    /// Codex review on #3222: a rejected enqueue replays with the status it
+    /// had, not always as a 500. A reserved payload key is a 400.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_recorded_enqueue_error_replays_with_its_status() {
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let payload = serde_json::json!({"order": 7});
+        let recorded = crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            after_commit_seam(
+                "send_receipt",
+                &payload,
+                EnqueueSchedule::Immediate,
+                Box::pin(async { Err(AutumnError::bad_request_msg("reserved key")) }),
+            ),
+        )
+        .await
+        .expect_err("the registration failed");
+        assert_eq!(recorded.status(), http::StatusCode::BAD_REQUEST);
+
+        let tape = Arc::new(crate::capsule::ReplayEffects::new(scope.effects_snapshot()));
+        let replayed = crate::capsule::with_effect_tape(Arc::clone(&tape), async {
+            after_commit_seam(
+                "send_receipt",
+                &payload,
+                EnqueueSchedule::Immediate,
+                Box::pin(async { Ok(()) }),
+            )
+            .await
+        })
+        .await
+        .expect_err("the replay reproduces the failure");
+        assert_eq!(replayed.status(), http::StatusCode::BAD_REQUEST);
+        assert_eq!(replayed.message(), recorded.message());
+        assert_eq!(replayed.code(), recorded.code());
+        assert!(tape.divergences().is_empty(), "{:?}", tape.divergences());
+        assert!(!scope.is_truncated(), "a plain error replays as recorded");
+    }
+
+    /// Codex review on #3222: an enqueue error that carries field details
+    /// cannot be rebuilt on replay, so the capsule is marked incomplete.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn an_enqueue_error_with_field_details_marks_the_capsule_incomplete() {
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let details =
+            std::collections::HashMap::from([("email".to_owned(), vec!["is taken".to_owned()])]);
+        let _ = crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            after_commit_seam(
+                "send_receipt",
+                &serde_json::json!({}),
+                EnqueueSchedule::Immediate,
+                Box::pin(async move { Err(AutumnError::validation(details)) }),
+            ),
+        )
+        .await;
+        assert!(scope.is_truncated());
+    }
+
+    /// Codex review on #3222: an empty field map has the plain error's
+    /// `code()`, but replay would give it no `details()`. Refused too.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn an_enqueue_error_with_an_empty_details_map_marks_the_capsule_incomplete() {
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let _ = crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            after_commit_seam(
+                "send_receipt",
+                &serde_json::json!({}),
+                EnqueueSchedule::Immediate,
+                Box::pin(async { Err(AutumnError::validation(std::collections::HashMap::new())) }),
+            ),
+        )
+        .await;
+        assert!(scope.is_truncated());
     }
 
     #[tokio::test]

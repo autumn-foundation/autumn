@@ -1,0 +1,5 @@
+error: foreign-key action `set_null` needs an `Option<_>` field
+ --> tests/compile-fail/model_references_set_null_required.rs:8:47
+  |
+8 |     #[references(table = "posts", on_delete = "set_null")]
+  |                                               ^^^^^^^^^^

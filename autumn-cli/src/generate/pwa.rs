@@ -403,14 +403,22 @@ self.addEventListener('push', (event) => {
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const target = new URL(
-    (event.notification.data && event.notification.data.url) || '/',
-    self.location.origin
-  );
   // Cross-origin targets are dropped: the payload travels through a third-party
   // push service, so a notification must never be able to navigate this app's
-  // users off-origin.
-  const url = target.origin === self.location.origin ? target.href : self.location.origin + '/';
+  // users off-origin. A malformed URL makes `new URL()` throw and the click
+  // does nothing. The handler falls back to the app root.
+  let url = self.location.origin + '/';
+  try {
+    const target = new URL(
+      (event.notification.data && event.notification.data.url) || '/',
+      self.location.origin
+    );
+    if (target.origin === self.location.origin) {
+      url = target.href;
+    }
+  } catch (e) {
+    // Use the root fallback.
+  }
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windows) => {
       // Prefer focusing a tab that is already on the target rather than
@@ -724,7 +732,14 @@ window.autumnPushUnsubscribe = async function autumnPushUnsubscribe() {{
   if (!('serviceWorker' in navigator) || !('PushManager' in window)) {{
     return false;
   }}
-  await window.autumnPushForget();
+  try {{
+    await window.autumnPushForget();
+  }} catch (e) {{
+    // Offline or a transient error: the server row may stay. The push service
+    // reports 410 on the next send, and the row is pruned.
+    console.error(e);
+  }}
+  // Always revoke. The visitor asked to stop receiving here.
   const registration = await navigator.serviceWorker.ready;
   const subscription = await registration.pushManager.getSubscription();
   return subscription ? subscription.unsubscribe() : true;
@@ -2232,6 +2247,29 @@ async fn main() {
     }
 
     #[test]
+    fn notificationclick_guards_url_parsing_with_a_root_fallback() {
+        // `new URL()` throws on a malformed absolute URL. Unguarded, the throw
+        // lands after `close()` and before `waitUntil`, so the click does nothing.
+        let sw = render_service_worker();
+        let handler = sw
+            .split_once("addEventListener('notificationclick'")
+            .expect("handler")
+            .1;
+        let (before_wait, _) = handler.split_once("event.waitUntil").expect("waitUntil");
+        let parse = before_wait.find("= new URL(").expect("URL parse");
+        let guard = before_wait.find("try {").expect("a try block");
+        assert!(
+            guard < parse,
+            "the parse must sit inside a try block:\n{handler}"
+        );
+        assert!(before_wait.contains("catch"), "{handler}");
+        assert!(
+            before_wait[..guard].contains("self.location.origin + '/'"),
+            "the root fallback must be set before the try:\n{handler}"
+        );
+    }
+
+    #[test]
     fn client_snippet_subscribes_against_the_frameworks_public_key_endpoint() {
         let js = render_pwa_register_js();
         assert!(
@@ -2411,6 +2449,27 @@ async fn main() {
     }
 
     #[test]
+    fn a_router_mount_inside_a_string_literal_does_not_count_as_mounted() {
+        for literal in [
+            "const HELP: &str = \"add .merge(autumn_web::push::router())\";",
+            "const HELP: &str = r#\"add .merge(autumn_web::push::router())\"#;",
+        ] {
+            let source = DEFAULT_MAIN.replace(
+                "#[autumn_web::main]",
+                &format!("{literal}\n#[autumn_web::main]"),
+            );
+            assert!(
+                !push_router_already_mounted(&source),
+                "a mount inside a string literal must not count:\n{source}"
+            );
+            assert!(
+                push_router_already_mounted(&inject_pwa_into_main(&source)),
+                "injection must still happen"
+            );
+        }
+    }
+
+    #[test]
     fn a_real_router_mount_does_count_as_mounted() {
         let injected = inject_pwa_into_main(DEFAULT_MAIN);
         assert!(push_router_already_mounted(&injected));
@@ -2463,6 +2522,26 @@ async fn main() {
         assert!(
             !forget.contains("unsubscribe()"),
             "the sign-out path must never revoke the shared subscription:\n{forget}"
+        );
+    }
+
+    #[test]
+    fn a_failed_server_cleanup_still_revokes_the_local_subscription() {
+        // The visitor asked to stop receiving here. An offline `Forget` must
+        // not leave the browser subscription live.
+        let js = render_push_opt_in();
+        let opt_out = js
+            .split_once("window.autumnPushUnsubscribe = ")
+            .expect("opt-out")
+            .1;
+        let try_at = opt_out.find("try {").expect("forget runs in a try block");
+        let forget_at = opt_out.find("autumnPushForget()").expect("forget call");
+        let catch_at = opt_out.find("catch").expect("a catch block");
+        let revoke_at = opt_out.find("subscription.unsubscribe()").expect("revoke");
+        assert!(try_at < forget_at && forget_at < catch_at, "{opt_out}");
+        assert!(
+            catch_at < revoke_at,
+            "revoke must follow the catch:\n{opt_out}"
         );
     }
 

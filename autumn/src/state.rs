@@ -26,6 +26,9 @@ use crate::time::{ClockSource, MonotonicInstant, SystemClock};
 
 /// Newtype wrapper used to store the global cache in the extension map so that
 /// `set_cache` (called from startup hooks) is visible to all `AppState` clones.
+///
+/// Use [`AppState::set_cache`]: a backend inserted here directly is not on the
+/// failure-capsule seam.
 pub struct GlobalCacheEntry(pub Arc<dyn Cache>);
 
 use crate::actuator;
@@ -671,10 +674,19 @@ impl AppState {
             .or_else(|| self.shared_cache.clone())
     }
 
+    /// Whether the app state has a cache, from the builder, a state
+    /// initializer or a startup hook. A failure capsule records it, and a
+    /// replay installs a cache in its place before the initializers run
+    /// again (#2351). Replay runs no startup hook.
+    #[cfg(feature = "reporting")]
+    pub(crate) fn has_cache(&self) -> bool {
+        self.cache().is_some()
+    }
+
     /// Register a global cache backend (builder / test helper, build-time).
     #[must_use]
     pub fn with_cache(mut self, cache: Arc<dyn Cache>) -> Self {
-        self.shared_cache = Some(cache);
+        self.shared_cache = Some(crate::cache::with_capsule_seam(cache));
         self
     }
 
@@ -811,6 +823,8 @@ impl AppState {
     /// Updates both the process-level global (used by `#[cached]` functions) and
     /// the extension map (used by `CacheResponseLayer::from_app` and `state.cache()`).
     pub fn set_cache(&self, cache: Arc<dyn Cache>) {
+        // Wrapped once, so the global and the extension are the same `Arc`.
+        let cache = crate::cache::with_capsule_seam(cache);
         crate::cache::set_global_cache(cache.clone());
         self.insert_extension(GlobalCacheEntry(cache));
     }

@@ -1740,7 +1740,8 @@ jobs:
           # block.
           cargo test -p autumn-media-plugin --test room_reaper_batch_profile -- --ignored
           # The DB-backed RoomStore lifecycle suite (create/join/roster/leave
-          # persistence, member-gating, heartbeat renewal, the reap sweep).
+          # persistence, member-gating, heartbeat renewal, the reap sweep,
+          # and the seat-cap and room-delete races, #2864 / #2407).
           # autumn-media-plugin has no crate-wide `--ignored` sweep, so each of
           # its Docker test targets is named here (#1974).
           cargo test -p autumn-media-plugin --test room_store_db -- --ignored
@@ -2286,6 +2287,11 @@ jobs:
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test experiment_admin_bulk_delete_batch_profile -- --ignored
           cargo llvm-cov --no-report -p autumn-cache-redis -- --ignored
+          # The DB room store runs only in these Docker tests (#1974).
+          cargo llvm-cov --no-report -p autumn-media-plugin \
+            --test room_store_db -- --ignored
+          cargo llvm-cov --no-report -p autumn-media-plugin \
+            --test room_reaper_batch_profile -- --ignored
           cargo llvm-cov --no-report -p autumn-search -- --ignored
           cargo llvm-cov --no-report -p autumn-billing --test mirror_db -- --ignored
           cargo llvm-cov --no-report -p autumn-billing \
@@ -2295,10 +2301,15 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --test flags -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test config -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test experiments -- --ignored
-          # autumn-cli's own unit tests (the `autumn` bin target). No lane ran
-          # them, so a change under autumn-cli/src showed 0% patch coverage
-          # however well its unit tests covered it.
-          cargo llvm-cov --no-report -p autumn-cli --bin autumn
+          # The `autumn` bin target's unit tests are instrumented by no other
+          # lane, so without this line a change under autumn-cli/src reads as 0%
+          # patch coverage however well its unit tests cover it. Two modules so
+          # far: the declarative-schema engine (issue #1975) and `autumn upgrade`
+          # (issue #2342). Add a filter here for the next one. A filter that
+          # matches nothing exits 0, so check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- schema:: upgrade:: \
+            | tee "$RUNNER_TEMP/cli-schema-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-schema-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
@@ -2440,6 +2451,22 @@ jobs:
           grep -qE 'test result: ok\. [1-9][0-9]* passed' \
             "${RUNNER_TEMP}/admin-plugin-sqlite.log" \
             || { echo "::error::no admin-plugin sqlite test ran — the #[ignore] or the target name changed"; exit 1; }
+      - name: Run the autumn-cli declarative-schema suite under sqlite
+        # Issue #1975. The SQLite arm of `autumn schema` (`schema pull`
+        # introspection, `schema migrate`, the recreate emitter) compiles only
+        # with `--no-default-features --features sqlite`. No other job builds
+        # it. No Docker: the tests use a temporary SQLite file. The pass count
+        # is checked, because a filter that matches nothing exits 0.
+        run: |
+          set -o pipefail
+          cargo test -p autumn-cli --no-default-features --features sqlite \
+            --bin autumn schema:: | tee "${RUNNER_TEMP}/cli-schema-sqlite-unit.log"
+          cargo test -p autumn-cli --no-default-features --features sqlite \
+            --test cli_tests schema_ | tee "${RUNNER_TEMP}/cli-schema-sqlite-it.log"
+          for log in cli-schema-sqlite-unit cli-schema-sqlite-it; do
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/${log}.log" \
+              || { echo "::error::no autumn-cli sqlite schema test ran (${log})"; exit 1; }
+          done
       - name: Clippy autumn-search under the sqlite backend
         # Issue #2539 §5. The Postgres store binds a `BIGINT[]`, which SQLite
         # does not have, so the crate did not compile under the flip. It now

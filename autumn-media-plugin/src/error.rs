@@ -89,6 +89,15 @@ pub enum MediaError {
         message: String,
     },
 
+    /// A failure-capsule replay refused a storage call that the capsule did
+    /// not record. It names no object key: an unrecorded key can hold
+    /// personal data or a token, and the replay cannot scrub it.
+    #[error("{message}")]
+    ReplayRefused {
+        /// The refusal, with no object key.
+        message: String,
+    },
+
     /// A source recording an encode command needed was not present on disk.
     #[error("ffmpeg source recording does not exist: {path}")]
     FfmpegSourceMissing {

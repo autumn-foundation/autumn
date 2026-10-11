@@ -205,7 +205,12 @@ my-app/
 > `managed`, then run `autumn schema diff --write-migration`.
 > `autumn schema doctor` reports a stale `src/schema.rs` block
 > (`schema-rs-drift`) and an unmanaged model that differs from its table
-> (`unmanaged-drift`). See `docs/guide/declarative-schema.md`.
+> (`unmanaged-drift`). For a referential action, write
+> `#[references(table = "users", on_delete = "cascade")]` (also `on_update`;
+> values `cascade`, `restrict`, `set_null`, `set_default`, `no_action`).
+> `set_null` and `set_default` need an `Option<_>` field. The diff refuses a
+> changed action on an existing foreign key. If the database already has the
+> action, declare it on the model. See `docs/guide/declarative-schema.md`.
 
 ## Cargo.toml
 
@@ -1763,6 +1768,10 @@ encryption (RFC 8291) are the framework's.
   &PushMessage::new(title, body).url(target))`.
 - **`WebPush` is an extractor** (like `Session`/`Db`/`Notifications`):
   `send`, `send_many`, `subscribe`, `unsubscribe`, `vapid_public_key`.
+  `send_many` serves up to four principals at once and finishes every one
+  before it returns an error. For a pinned outbound request to a host with
+  several checked addresses, use `RequestBuilder::pin_to_addrs`. Do not loop
+  over `pin_to`: a loop can send a `POST` body twice.
 - **`PushPrincipal` accepts both id shapes** — `i64` (as the notification feed
   uses) and `&str`/`String` (as auth tokens carry) — so composing with #1148
   needs no conversion.
@@ -4167,7 +4176,10 @@ under the idle TTL (default 15 min); a client that does neither is reaped from
 signaling, though its live WebRTC path survives and it can re-join. After
 `joined_at + [media] room_session_max_seconds` (default 12 h), heartbeat and
 roster return `404`; the client leaves, then joins again. `[media] room_rate_limit_per_minute`
-(default `0` = off) limits each client IP per room route.
+(default `0` = off) limits each client IP per room route. A join `display_name`
+longer than 64 characters gets `400`. On `room_store_backend = "db"`, join, leave
+and the reaper lock the room row, so two processes cannot pass the seat cap; a
+join that races the last leave or the reaper can get `404`.
 
 `autumn deploy status [--json] [--strict]` is read-only and safe mid-incident:
 one row per host (mode, release from the `current` symlink, live slot, `/ready`

@@ -243,6 +243,14 @@ jobs:
     # each, so the old budget would have started failing on timeout rather
     # than on a real regression.
     timeout-minutes: 150
+    env:
+      # The generated projects build with line tables only, not full debug
+      # info. With full debug info, the `cargo test` link of an attachment
+      # scaffold peaks at about 11 GB on 4 vCPUs (1.88.0). That exhausted the
+      # 16 GB hosted runner, which then got a shutdown signal (exit 143).
+      # With line tables only, the peak is about 4.5 GB. Backtraces keep their
+      # file and line.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     strategy:
       matrix:
         toolchain: [stable, "1.88.0"]

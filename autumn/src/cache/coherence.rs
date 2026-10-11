@@ -1256,6 +1256,11 @@ pub fn with_fill_fence<R>(
 /// Panics if the internal `RwLock` is poisoned.
 #[must_use = "a `false` means stale entries can still be served"]
 pub fn invalidate_namespace(namespace: &str) -> bool {
+    // A replay answers from the tape and reaches no store (#2351).
+    if let Some(answer) = super::replayed_namespace_removal(namespace) {
+        return answer;
+    }
+    let removal = super::NamespaceRemoval::reserve();
     let mut complete = true;
     for store in fence_and_collect_stores(namespace) {
         // A shared store raises its epoch here. `clear` alone would not.
@@ -1269,17 +1274,31 @@ pub fn invalidate_namespace(namespace: &str) -> bool {
     // function store holds nothing. Ask the backend — `MokaCache` and
     // `RedisCache` both drop the namespace; a backend that cannot, or one whose
     // sweep failed, says so, and that `false` is what the caller reports.
-    let global_complete = super::global_cache().is_none_or(|global| {
-        let complete = global.invalidate_namespace(namespace);
-        if !complete {
-            report_incomplete_invalidation(
-                namespace,
-                "the backend cannot drop a namespace, or its sweep failed",
-            );
+    let global_failure = super::global_cache().and_then(|global| {
+        if super::NamespaceRemoval::call_installed(|| global.invalidate_namespace(namespace)) {
+            return None;
         }
-        complete
+        let reason = "the backend cannot drop a namespace, or its sweep failed";
+        report_incomplete_invalidation(namespace, reason);
+        Some(reason.to_owned())
     });
-    complete && global_complete
+    finish_removal(removal, namespace, complete, global_failure)
+}
+
+/// Record a namespace removal's combined answer on the capsule seam, and
+/// return it.
+fn finish_removal(
+    removal: super::NamespaceRemoval,
+    namespace: &str,
+    stores_complete: bool,
+    global_failure: Option<String>,
+) -> bool {
+    let failure = global_failure.or_else(|| {
+        (!stores_complete).then(|| "a registered store could not drop the namespace".to_owned())
+    });
+    let complete = failure.is_none();
+    removal.record(namespace, failure.as_deref());
+    complete
 }
 
 /// Whether a registered store counts as invalidated.
@@ -1309,10 +1328,15 @@ fn registered_store_complete(store: &dyn super::Cache, swept: bool, namespace: &
 /// `autumn_cache_invalidation_failures_total`.
 #[must_use = "a `false` means stale entries can still be served"]
 pub async fn invalidate_namespace_async(namespace: &str) -> bool {
+    // A replay answers from the tape and reaches no store (#2351).
+    if let Some(answer) = super::replayed_namespace_removal(namespace) {
+        return answer;
+    }
     // The fence is a std `RwLock`. A fill holds it shared during its insert,
     // which can be a Redis round trip. Take it at once when it is free. Else
     // wait for it on the blocking pool, so a writer never parks a runtime
     // worker (and so never starves the task that the fill waits on).
+    let removal = super::NamespaceRemoval::reserve();
     let stores = if let Some(stores) = try_fence_and_collect_stores(namespace) {
         stores
     } else {
@@ -1322,8 +1346,9 @@ pub async fn invalidate_namespace_async(namespace: &str) -> bool {
             Err(join) => match join.try_into_panic() {
                 Ok(panic) => std::panic::resume_unwind(panic),
                 Err(_cancelled) => {
-                    report_incomplete_invalidation(namespace, "the runtime is shutting down");
-                    return false;
+                    let reason = "the runtime is shutting down";
+                    report_incomplete_invalidation(namespace, reason);
+                    return finish_removal(removal, namespace, false, Some(reason.to_owned()));
                 }
             },
         }
@@ -1335,16 +1360,17 @@ pub async fn invalidate_namespace_async(namespace: &str) -> bool {
         store.clear();
         complete &= registered_store_complete(&*store, swept, namespace);
     }
-    let Some(global) = super::global_cache() else {
-        return complete;
-    };
-    match global.invalidate_namespace_async(namespace).await {
-        Ok(()) => complete,
-        Err(error) => {
+    let mut global_failure = None;
+    if let Some(global) = super::global_cache() {
+        let sweep = super::NamespaceRemoval::call_installed(|| {
+            global.invalidate_namespace_async(namespace)
+        });
+        if let Err(error) = sweep.await {
             report_incomplete_invalidation(namespace, error.reason());
-            false
+            global_failure = Some(error.reason().to_owned());
         }
     }
+    finish_removal(removal, namespace, complete, global_failure)
 }
 
 /// Runs a repository's declared invalidation after each commit of a write
@@ -1398,10 +1424,22 @@ impl InvalidateAfterWrite {
             report_skipped_invalidation("the write ran outside a Tokio runtime");
             return false;
         };
-        handle.spawn((self.make)()).await.unwrap_or_else(|_| {
+        // Awaited at once, so the capsule scope and the replay tape go along:
+        // the removal is recorded and replayed like inline work (#2351).
+        #[cfg(feature = "reporting")]
+        let invalidation = crate::capsule::boundary::carry_scopes((self.make)());
+        #[cfg(not(feature = "reporting"))]
+        let invalidation = (self.make)();
+        // A caller dropped while it waits leaves the task detached.
+        #[cfg(feature = "reporting")]
+        let detached = crate::capsule::boundary::DetachGuard::arm();
+        let complete = handle.spawn(invalidation).await.unwrap_or_else(|_| {
             report_skipped_invalidation("the invalidation task panicked or was cancelled");
             false
-        })
+        });
+        #[cfg(feature = "reporting")]
+        detached.disarm();
+        complete
     }
 
     /// Flush at the end of the write.
@@ -1423,7 +1461,16 @@ impl Drop for InvalidateAfterWrite {
         }
         self.pending = false;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn((self.make)());
+            // Not awaited: the capsule says so, and a replay gives the task
+            // the tape (#2351).
+            #[cfg(feature = "reporting")]
+            let invalidation = {
+                crate::capsule::boundary::note_detached_work();
+                crate::capsule::boundary::carry_detached((self.make)())
+            };
+            #[cfg(not(feature = "reporting"))]
+            let invalidation = (self.make)();
+            handle.spawn(invalidation);
         } else {
             report_skipped_invalidation("the write ended outside a Tokio runtime");
         }
@@ -2034,6 +2081,132 @@ mod tests {
 
     // ── Namespace invalidation ───────────────────────────────────────
 
+    #[cfg(all(feature = "cache-moka", feature = "reporting"))]
+    #[test]
+    fn a_local_namespace_invalidation_is_on_the_capsule_seam() {
+        // Codex review on #3222: with no installed cache, an invalidation
+        // reaches only process-local stores, off the seam. It is recorded
+        // here, and a replay answers it from the tape without the stores.
+        let _guard = super::super::GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::super::clear_global_cache();
+        let store = std::sync::Arc::new(super::super::MokaCache::new(16, None));
+        register_namespace_store("tests::seam_ns", store.clone());
+
+        let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+            "coherence".to_owned(),
+            std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+            std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert!(rt.block_on(crate::capsule::capture::with_capture_scope(
+            std::sync::Arc::clone(&scope),
+            invalidate_namespace_async("tests::seam_ns"),
+        )));
+        let recorded = scope.effects_snapshot();
+        assert_eq!(recorded.cache.len(), 1, "{:?}", recorded.cache);
+
+        // Replayed: the recorded removal is consumed, and the store is left.
+        super::super::insert(&*store, "tests::seam_ns:1", 1_i32);
+        let tape = std::sync::Arc::new(crate::capsule::ReplayEffects::new(recorded));
+        assert!(rt.block_on(crate::capsule::with_effect_tape(
+            std::sync::Arc::clone(&tape),
+            invalidate_namespace_async("tests::seam_ns"),
+        )));
+        assert!(tape.finish().is_empty(), "{:?}", tape.finish());
+        assert_eq!(
+            super::super::get::<i32>(&*store, "tests::seam_ns:1"),
+            Some(1)
+        );
+
+        // A replay with no recorded removal diverges.
+        let empty = std::sync::Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects::default(),
+        ));
+        let _ = rt.block_on(crate::capsule::with_effect_tape(
+            std::sync::Arc::clone(&empty),
+            invalidate_namespace_async("tests::seam_ns"),
+        ));
+        assert!(!empty.divergences().is_empty());
+    }
+
+    /// Codex review on #3222: a shared registered store that fails while
+    /// the installed cache succeeds makes the call return `false`. The
+    /// capsule records that combined answer, once, so a replay returns it.
+    #[cfg(all(feature = "cache-moka", feature = "reporting"))]
+    #[test]
+    fn a_failed_registered_store_is_in_the_recorded_namespace_removal() {
+        struct SharedFailingStore;
+        impl super::super::Cache for SharedFailingStore {
+            fn get_value(
+                &self,
+                _key: &str,
+            ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+                None
+            }
+            fn insert_value(
+                &self,
+                _key: &str,
+                _value: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+            ) {
+            }
+            fn invalidate(&self, _key: &str) {}
+            fn clear(&self) {}
+            fn invalidate_namespace(&self, _namespace: &str) -> bool {
+                false
+            }
+            fn shares_fill_epoch(&self) -> bool {
+                true
+            }
+        }
+
+        let _guard = super::super::GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::super::set_global_cache(std::sync::Arc::new(super::super::MokaCache::new(16, None)));
+        register_namespace_store(
+            "tests::seam_mixed_ns",
+            std::sync::Arc::new(SharedFailingStore),
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for sync in [true, false] {
+            let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+                "coherence".to_owned(),
+                std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+                std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+            ));
+            let run = || async move {
+                if sync {
+                    invalidate_namespace("tests::seam_mixed_ns")
+                } else {
+                    invalidate_namespace_async("tests::seam_mixed_ns").await
+                }
+            };
+            assert!(!rt.block_on(crate::capsule::capture::with_capture_scope(
+                std::sync::Arc::clone(&scope),
+                run(),
+            )));
+            let recorded = scope.effects_snapshot();
+            assert_eq!(recorded.cache.len(), 1, "sync={sync}: {:?}", recorded.cache);
+
+            let tape = std::sync::Arc::new(crate::capsule::ReplayEffects::new(recorded));
+            assert!(
+                !rt.block_on(crate::capsule::with_effect_tape(
+                    std::sync::Arc::clone(&tape),
+                    run(),
+                )),
+                "sync={sync}: the replay returns the recorded `false`"
+            );
+            assert!(tape.finish().is_empty(), "{:?}", tape.finish());
+        }
+        super::super::clear_global_cache();
+    }
+
     #[cfg(feature = "cache-moka")]
     #[test]
     fn invalidating_a_namespace_clears_only_that_reads_store() {
@@ -2517,6 +2690,88 @@ mod tests {
 
     fn guard_runs() -> usize {
         GUARD_RUNS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    static SAW_SCOPE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(feature = "reporting")]
+    fn note_scope() -> crate::cache::CacheFuture<'static, bool> {
+        Box::pin(async {
+            SAW_SCOPE.store(
+                crate::capsule::current_scope().is_some(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            true
+        })
+    }
+
+    /// Review fix (#2351): a flushed invalidation runs on a spawned task, and
+    /// still records into the request's capsule.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_flushed_invalidation_keeps_the_capture_scope() {
+        let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+            "coherence".to_owned(),
+            std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+            std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        crate::capsule::capture::with_capture_scope(std::sync::Arc::clone(&scope), async {
+            assert!(InvalidateAfterWrite::new(note_scope).run().await);
+        })
+        .await;
+        assert!(SAW_SCOPE.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !scope.is_truncated(),
+            "an awaited invalidation is not detached"
+        );
+    }
+
+    #[cfg(feature = "reporting")]
+    fn never_ends() -> crate::cache::CacheFuture<'static, bool> {
+        Box::pin(std::future::pending())
+    }
+
+    /// Codex review on #3222: a caller dropped while it waits for a flushed
+    /// invalidation leaves the task detached, so the capsule is incomplete.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_flush_dropped_while_waiting_marks_the_capsule_incomplete() {
+        let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+            "coherence".to_owned(),
+            std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+            std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        crate::capsule::capture::with_capture_scope(std::sync::Arc::clone(&scope), async {
+            let mut guard = InvalidateAfterWrite::new(never_ends);
+            let waited =
+                tokio::time::timeout(std::time::Duration::from_millis(10), guard.flush()).await;
+            assert!(waited.is_err(), "the invalidation never ends");
+        })
+        .await;
+        assert!(scope.is_truncated(), "the invalidation runs detached");
+    }
+
+    /// Codex review on #3222: a replay that drops the flush while it waits
+    /// logs the detached task now, before the verdict.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_replay_flush_dropped_while_waiting_is_a_divergence() {
+        let tape = std::sync::Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects::default(),
+        ));
+        crate::capsule::with_effect_tape(std::sync::Arc::clone(&tape), async {
+            let mut guard = InvalidateAfterWrite::new(never_ends);
+            let waited =
+                tokio::time::timeout(std::time::Duration::from_millis(10), guard.flush()).await;
+            assert!(waited.is_err(), "the invalidation never ends");
+        })
+        .await;
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert_eq!(
+            divergences[0].seam,
+            crate::capsule::effects::EffectSeam::Detached
+        );
     }
 
     #[tokio::test]

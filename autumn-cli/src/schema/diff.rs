@@ -156,8 +156,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use autumn_schema_core::{
-    Backend, CheckConstraint, Column, ColumnDefault, ColumnType, IdKind, Index, SerialKind,
-    SqliteAffinity, Table,
+    Backend, CheckConstraint, Column, ColumnDefault, ColumnType, ForeignKey, ForeignKeyAction,
+    IdKind, Index, SerialKind, SqliteAffinity, Table,
 };
 
 use crate::schema::parse::ParsedSchema;
@@ -346,9 +346,10 @@ pub enum SchemaChange {
         table: String,
     },
 
-    /// A same-named column whose **existing** explicit foreign key changed target
-    /// (e.g. `author_id` from `users(id)` to `accounts(id)`). A non-emittable
-    /// marker: [`guard_plan`] refuses any plan containing it (with no override).
+    /// A column whose existing foreign key changed its target or its
+    /// `ON DELETE` / `ON UPDATE` action. For example, `author_id` changes from
+    /// `users(id)` to `accounts(id)`. [`guard_plan`] refuses each plan that
+    /// contains this marker. No flag overrides it.
     ///
     /// It exists because a conservative engine cannot safely retarget an FK: it
     /// has no `DropForeignKey` variant to remove the baseline constraint (whose
@@ -361,6 +362,10 @@ pub enum SchemaChange {
         table: String,
         /// The column whose FK target changed.
         column: String,
+        /// The baseline key, for example `users(id) ON DELETE CASCADE`.
+        from: String,
+        /// The desired key.
+        to: String,
     },
 
     /// A same-named column whose `GENERATED … AS IDENTITY` clause changed between
@@ -546,20 +551,27 @@ pub enum DiffError {
         table: String,
     },
 
-    /// An existing explicit foreign key changed its target (unsupported this
-    /// slice, no override — see [`SchemaChange::ForeignKeyChange`]).
+    /// An existing foreign key changed its target or its `ON DELETE` /
+    /// `ON UPDATE` action. No flag overrides it. See
+    /// [`SchemaChange::ForeignKeyChange`].
     #[error(
-        "foreign-key retarget on `{table}.{column}` is not supported in this slice: \
-         the baseline already has a foreign key on this column, and this engine has no \
-         way to drop it before adding the new one without colliding on the \
-         `{table}_{column}_fkey` constraint name. Retargeting a foreign key is deferred \
-         to a later slice."
+        "foreign-key change on `{table}.{column}` is not supported: the baseline has \
+         `REFERENCES {from}`, the model has `REFERENCES {to}`. The engine cannot drop \
+         the `{table}_{column}_fkey` constraint before it adds the new one. If the \
+         database is correct, change the model to agree with it (for example \
+         `#[references(on_delete = \"cascade\")]`). If the model is correct, write a \
+         manual migration (`autumn generate migration`), apply it, then run \
+         `autumn schema pull`."
     )]
     ForeignKeyChange {
         /// The owning table name.
         table: String,
         /// The column whose FK target changed.
         column: String,
+        /// The baseline key.
+        from: String,
+        /// The desired key.
+        to: String,
     },
 
     /// A column's `GENERATED … AS IDENTITY` clause changed between two authoritative
@@ -1287,8 +1299,8 @@ fn diff_column(
     //   * baseline had none → the FK may already exist invisibly → the refused
     //     `AddForeignKeyToExistingColumn` marker, with no override.
     //   * baseline had the same FK → no change.
-    //   * baseline had a different FK → a retarget we cannot safely emit, since there is
-    //     no `DropForeignKey` and re-`ADD CONSTRAINT`-ing the default
+    //   * baseline had a different FK (target or action) → a change we cannot safely
+    //     emit, since there is no `DropForeignKey` and re-`ADD CONSTRAINT`-ing the default
     //     `<table>_<column>_fkey` name would collide → the refused `ForeignKeyChange`
     //     marker, mirroring `PrimaryKeyChange`.
     //
@@ -1301,9 +1313,11 @@ fn diff_column(
                 column: want.name.clone(),
             }),
             Some(existing) if existing == fk => {}
-            Some(_) => changes.push(SchemaChange::ForeignKeyChange {
+            Some(existing) => changes.push(SchemaChange::ForeignKeyChange {
                 table: table.to_owned(),
                 column: want.name.clone(),
+                from: describe_foreign_key(existing),
+                to: describe_foreign_key(fk),
             }),
         }
     }
@@ -1757,6 +1771,24 @@ fn plan_backend(baseline: &[Table], desired: &ParsedSchema) -> Backend {
 // Policy guard
 // ---------------------------------------------------------------------------
 
+/// The refusal for the first [`SchemaChange::ForeignKeyChange`] in `plan`.
+fn foreign_key_change_error(plan: &MigrationPlan) -> Option<DiffError> {
+    plan.changes.iter().find_map(|c| match c {
+        SchemaChange::ForeignKeyChange {
+            table,
+            column,
+            from,
+            to,
+        } => Some(DiffError::ForeignKeyChange {
+            table: table.clone(),
+            column: column.clone(),
+            from: from.clone(),
+            to: to.clone(),
+        }),
+        _ => None,
+    })
+}
+
 /// Policy guard, run AFTER [`diff_schema`] by the command. Refuses a plan that is
 /// structurally computable but unsafe to emit unless permitted.
 ///
@@ -1782,12 +1814,9 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
         return Err(DiffError::PrimaryKeyChange { table });
     }
 
-    // 2. Foreign-key retarget — no override (there is no safe drop+recreate).
-    if let Some((table, column)) = plan.changes.iter().find_map(|c| match c {
-        SchemaChange::ForeignKeyChange { table, column } => Some((table.clone(), column.clone())),
-        _ => None,
-    }) {
-        return Err(DiffError::ForeignKeyChange { table, column });
+    // 2. Foreign-key change — no override (there is no safe drop+recreate).
+    if let Some(err) = foreign_key_change_error(plan) {
+        return Err(err);
     }
 
     // 2a. Identity-generation change — no override (needs ADD/DROP/SET GENERATED,
@@ -2656,6 +2685,19 @@ fn emit_sqlite_rebuild(
             ),
         });
     }
+    if let Some((child, action)) = rebuild_fires_child_action(table, ctx) {
+        return Err(EmitError::SqliteRebuildUnsupported {
+            table: table.to_owned(),
+            kind: "table rebuild",
+            reason: format!(
+                "`{child}` references it with ON DELETE {}. The migration runs in a \
+                 transaction, where `PRAGMA foreign_keys=OFF` has no effect, so the \
+                 rebuild's DROP TABLE would change the rows of `{child}`. Write this \
+                 change as a manual migration",
+                action.sql()
+            ),
+        });
+    }
     // Fetched as a validated precondition (a missing desired shape is a directed
     // error, exercised by the up leg's missing-context path); neither leg copies
     // from the parser's partial desired table any more.
@@ -2699,6 +2741,32 @@ fn emit_sqlite_rebuild(
             ))
         }
     }
+}
+
+/// A foreign key as SQL, for example `users(id) ON DELETE CASCADE`.
+fn describe_foreign_key(fk: &ForeignKey) -> String {
+    format!("{}({}){}", fk.table, fk.column, fk.action_clauses())
+}
+
+/// The first column in `ctx` whose foreign key to `table` deletes or changes
+/// rows on delete (`CASCADE`, `SET NULL`, `SET DEFAULT`). A rebuild drops
+/// `table`, so it would fire that action. This includes a self-reference: the
+/// staging table's rows reference the old table too.
+fn rebuild_fires_child_action(
+    table: &str,
+    ctx: &SchemaContext,
+) -> Option<(String, ForeignKeyAction)> {
+    ctx.baseline
+        .values()
+        .chain(ctx.desired.values())
+        .flat_map(|t| t.columns.iter().map(move |c| (t, c)))
+        .find_map(|(t, c)| {
+            let fk = c.references.as_ref().filter(|fk| fk.table == table)?;
+            match fk.on_delete? {
+                ForeignKeyAction::Restrict => None,
+                action => Some((format!("{}.{}", t.name, c.name), action)),
+            }
+        })
 }
 
 /// Apply the table's own plan changes to its baseline shape, preserving every
@@ -3291,8 +3359,10 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
             let constraint = bounded_pg_identifier(&format!("{table}_{column}_fkey"));
             Ok(format!(
                 "ALTER TABLE {table} ADD CONSTRAINT {constraint} \
-                 FOREIGN KEY ({column}) REFERENCES {}({});\n",
-                foreign_key.table, foreign_key.column
+                 FOREIGN KEY ({column}) REFERENCES {}({}){};\n",
+                foreign_key.table,
+                foreign_key.column,
+                foreign_key.action_clauses()
             ))
         }
         // Non-emittable markers: the guard refuses them, so they never reach here
@@ -3539,7 +3609,7 @@ fn emit_add_column(table: &str, column: &Column, backend: Backend) -> Result<Str
 }
 
 /// Render a column definition body: `{name} {type} {NOT NULL|NULL} [REFERENCES
-/// t(c)] [DEFAULT d]`. Shared by `CREATE TABLE` (non-PK columns) and `ADD
+/// t(c) [ON DELETE a] [ON UPDATE a]] [DEFAULT d]`. Shared by `CREATE TABLE` (non-PK columns) and `ADD
 /// COLUMN`.
 fn render_column_def(column: &Column, backend: Backend, render_unique: bool) -> String {
     let mut def = format!(
@@ -3559,7 +3629,13 @@ fn render_column_def(column: &Column, backend: Backend, render_unique: bool) -> 
         def.push_str(" UNIQUE");
     }
     if let Some(fk) = &column.references {
-        let _ = write!(def, " REFERENCES {}({})", fk.table, fk.column);
+        let _ = write!(
+            def,
+            " REFERENCES {}({}){}",
+            fk.table,
+            fk.column,
+            fk.action_clauses()
+        );
     }
     if let Some(default) = &column.default {
         let _ = write!(def, " DEFAULT {}", default_sql(default, backend));
@@ -3815,8 +3891,13 @@ fn describe_change(change: &SchemaChange) -> String {
         SchemaChange::PrimaryKeyChange { table } => {
             format!("! PRIMARY KEY CHANGE on {table} (refused)")
         }
-        SchemaChange::ForeignKeyChange { table, column } => {
-            format!("! FOREIGN KEY RETARGET on {table}.{column} (refused)")
+        SchemaChange::ForeignKeyChange {
+            table,
+            column,
+            from,
+            to,
+        } => {
+            format!("! FOREIGN KEY CHANGE on {table}.{column}: {from} -> {to} (refused)")
         }
         SchemaChange::IdentityChange { table, column } => {
             format!("! IDENTITY CHANGE on {table}.{column} (refused)")
@@ -3849,7 +3930,7 @@ fn describe_change(change: &SchemaChange) -> String {
 #[allow(clippy::needless_raw_string_hashes)]
 mod tests {
     use super::*;
-    use autumn_schema_core::{ForeignKey, Table};
+    use autumn_schema_core::{ForeignKey, ForeignKeyAction, Table};
 
     use crate::schema::parse::SchemaDiagnostic;
 
@@ -5295,6 +5376,8 @@ mod tests {
             vec![SchemaChange::ForeignKeyChange {
                 table: "posts".to_owned(),
                 column: "author_id".to_owned(),
+                from: "users(id)".to_owned(),
+                to: "accounts(id)".to_owned(),
             }],
             "an FK retarget is the refused marker, not an AddForeignKey: {plan:?}"
         );
@@ -8767,5 +8850,261 @@ PRAGMA foreign_keys=ON;
             email_at < index_at && tenant_at < index_at,
             "both dependent columns must be re-added BEFORE the index is recreated: {down}"
         );
+    }
+    // -- foreign-key actions (#1975) -------------------------------------------
+
+    fn cascade_fk() -> ForeignKey {
+        ForeignKey::new("users", "id")
+            .with_on_delete(Some(ForeignKeyAction::Cascade))
+            .with_on_update(Some(ForeignKeyAction::Restrict))
+    }
+
+    #[test]
+    fn fk_actions_render_on_add_column() {
+        for (backend, ty) in [(Backend::Postgres, "BIGINT"), (Backend::Sqlite, "INTEGER")] {
+            let mut author = col("author_id", ColumnType::Int64);
+            author.nullable = true;
+            author.references = Some(cascade_fk());
+            let plan = MigrationPlan {
+                backend,
+                changes: vec![SchemaChange::AddColumn {
+                    table: "posts".to_owned(),
+                    column: author,
+                }],
+            };
+            let up = emit_up_sql(&plan).expect("emit");
+            assert!(
+                up.contains(&format!(
+                    "ADD COLUMN author_id {ty} NULL REFERENCES users(id) \
+                     ON DELETE CASCADE ON UPDATE RESTRICT;"
+                )),
+                "{backend:?}: {up}"
+            );
+        }
+    }
+
+    #[test]
+    fn fk_actions_render_on_create_table() {
+        let mut author = col("author_id", ColumnType::Int64);
+        author.references =
+            Some(ForeignKey::new("users", "id").with_on_delete(Some(ForeignKeyAction::SetDefault)));
+        let plan = diff_schema(
+            &[],
+            &parsed(vec![posts_with(vec![author])], vec![]),
+            DEFAULT_OPTS,
+        );
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(
+            up.contains("author_id BIGINT NOT NULL REFERENCES users(id) ON DELETE SET DEFAULT"),
+            "{up}"
+        );
+    }
+
+    #[test]
+    fn fk_actions_render_on_add_foreign_key() {
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::AddForeignKey {
+                table: "posts".to_owned(),
+                column: "author_id".to_owned(),
+                foreign_key: cascade_fk(),
+            }],
+        };
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(
+            up.contains(
+                "FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE ON UPDATE RESTRICT;"
+            ),
+            "{up}"
+        );
+    }
+
+    #[test]
+    fn fk_actions_are_restored_by_the_down_of_a_drop_table() {
+        let mut author = col("author_id", ColumnType::Int64);
+        author.references = Some(cascade_fk());
+        let base = vec![posts_with(vec![author])];
+        let plan = diff_schema(&base, &parsed(vec![], vec![]), ALLOW);
+        guard_plan(&plan, ALLOW).expect("drop allowed");
+        let down = emit_down_sql(&plan).expect("emit down");
+        assert!(
+            down.contains("REFERENCES users(id) ON DELETE CASCADE ON UPDATE RESTRICT"),
+            "{down}"
+        );
+    }
+
+    #[test]
+    fn fk_action_change_is_refused_with_no_override() {
+        // The engine has no step that drops the old constraint, so it refuses.
+        let mut base_author = col("author_id", ColumnType::Int64);
+        base_author.references = Some(ForeignKey::new("users", "id"));
+        let mut want_author = col("author_id", ColumnType::Int64);
+        want_author.references = Some(cascade_fk());
+        let plan = diff_schema(
+            &[posts_with(vec![base_author])],
+            &parsed(vec![posts_with(vec![want_author])], vec![]),
+            DEFAULT_OPTS,
+        );
+        assert_eq!(
+            plan.changes,
+            vec![SchemaChange::ForeignKeyChange {
+                table: "posts".to_owned(),
+                column: "author_id".to_owned(),
+                from: "users(id)".to_owned(),
+                to: "users(id) ON DELETE CASCADE ON UPDATE RESTRICT".to_owned(),
+            }]
+        );
+        let err = guard_plan(&plan, ALLOW).unwrap_err();
+        assert!(matches!(err, DiffError::ForeignKeyChange { .. }), "{err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`REFERENCES users(id) ON DELETE CASCADE ON UPDATE RESTRICT`"),
+            "{msg}"
+        );
+        assert!(msg.contains("on_delete = \"cascade\""), "{msg}");
+        assert!(
+            describe_change(&plan.changes[0]).contains("FOREIGN KEY CHANGE"),
+            "the plan label names a change, not a retarget"
+        );
+    }
+
+    #[test]
+    fn sqlite_recreate_keeps_fk_actions() {
+        let mut base_posts = sqlite_posts_with_author(ColumnType::Int64);
+        base_posts.columns[1].references = Some(cascade_fk());
+        let mut want_posts = base_posts.clone();
+        // A NOT NULL -> NULL change forces a recreate on SQLite.
+        let mut body = col("body", ColumnType::Text);
+        base_posts.columns.push(body.clone());
+        body.nullable = true;
+        want_posts.columns.push(body);
+        let baseline = vec![sqlite_users_table(), base_posts];
+        let desired = vec![sqlite_users_table(), want_posts];
+        let plan = diff_schema(&baseline, &parsed(desired.clone(), vec![]), DEFAULT_OPTS);
+        guard_plan(&plan, DEFAULT_OPTS).expect("drop not null is safe");
+        let ctx = SchemaContext::from_tables(&desired, &baseline);
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit sqlite rebuild");
+        assert!(
+            up.contains(
+                "author_id INTEGER NULL REFERENCES users(id) ON DELETE CASCADE ON UPDATE RESTRICT"
+            ),
+            "{up}"
+        );
+    }
+    /// The migration runs in a transaction, where `PRAGMA foreign_keys=OFF` has
+    /// no effect. So `DROP TABLE users` in a rebuild of `users` fires the child
+    /// actions. The emitter must refuse when a child cascades or sets values.
+    #[test]
+    fn sqlite_rebuild_of_a_cascade_target_is_refused() {
+        for action in [
+            ForeignKeyAction::Cascade,
+            ForeignKeyAction::SetNull,
+            ForeignKeyAction::SetDefault,
+        ] {
+            let mut posts = sqlite_posts_with_author(ColumnType::Int64);
+            posts.columns[1].references =
+                Some(ForeignKey::new("users", "id").with_on_delete(Some(action)));
+            let mut base_users = sqlite_users_table();
+            base_users.columns.push(col("name", ColumnType::Text));
+            let mut want_users = sqlite_users_table();
+            let mut name = col("name", ColumnType::Text);
+            name.nullable = true;
+            want_users.columns.push(name);
+            let baseline = vec![base_users, posts.clone()];
+            let desired = vec![want_users, posts];
+            let plan = diff_schema(&baseline, &parsed(desired.clone(), vec![]), DEFAULT_OPTS);
+            guard_plan(&plan, DEFAULT_OPTS).expect("drop not null is safe");
+            let ctx = SchemaContext::from_tables(&desired, &baseline);
+            for result in [
+                emit_up_sql_with_context(&plan, &ctx),
+                emit_down_sql_with_context(&plan, &ctx),
+            ] {
+                let err = result.expect_err("a rebuild must not fire child actions");
+                assert!(
+                    matches!(err, EmitError::SqliteRebuildUnsupported { .. }),
+                    "{err:?}"
+                );
+                assert!(err.to_string().contains("posts.author_id"), "{err}");
+                assert!(err.to_string().contains(action.sql()), "{err}");
+            }
+        }
+    }
+
+    /// A `NO ACTION` or `RESTRICT` child does not change rows. The rebuild
+    /// stays as before.
+    #[test]
+    fn sqlite_rebuild_of_a_restrict_target_is_emitted() {
+        let mut posts = sqlite_posts_with_author(ColumnType::Int64);
+        posts.columns[1].references =
+            Some(ForeignKey::new("users", "id").with_on_delete(Some(ForeignKeyAction::Restrict)));
+        let mut base_users = sqlite_users_table();
+        base_users.columns.push(col("name", ColumnType::Text));
+        let mut want_users = sqlite_users_table();
+        let mut name = col("name", ColumnType::Text);
+        name.nullable = true;
+        want_users.columns.push(name);
+        let baseline = vec![base_users, posts.clone()];
+        let desired = vec![want_users, posts];
+        let plan = diff_schema(&baseline, &parsed(desired.clone(), vec![]), DEFAULT_OPTS);
+        let ctx = SchemaContext::from_tables(&desired, &baseline);
+        emit_up_sql_with_context(&plan, &ctx).expect("a RESTRICT child does not block");
+    }
+
+    /// A typo in an action skips the column. The diff then keeps the column,
+    /// its foreign key and its index as they are.
+    #[test]
+    fn a_bad_action_keeps_the_existing_column() {
+        let src = r#"
+            #[model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                #[references(table = "users", on_delete = "casade")]
+                pub author_id: i64,
+                #[default]
+                pub created_at: chrono::NaiveDateTime,
+            }
+        "#;
+        let desired =
+            crate::schema::parse::parse_model_source(src, Backend::Postgres).expect("parse");
+        assert_eq!(desired.diagnostics.len(), 1, "{:?}", desired.diagnostics);
+        // The baseline is the same model with a valid FK.
+        let valid = src.replace(", on_delete = \"casade\"", "");
+        let baseline = crate::schema::parse::parse_model_source(&valid, Backend::Postgres)
+            .expect("parse baseline")
+            .tables;
+        assert!(
+            baseline[0]
+                .indexes
+                .iter()
+                .any(|i| i.name == "idx_posts_author_id"),
+            "{baseline:?}"
+        );
+        let plan = diff_schema(&baseline, &desired, DEFAULT_OPTS);
+        assert!(
+            plan.is_empty(),
+            "the skipped column must not change: {plan:?}"
+        );
+    }
+
+    /// A self-reference is a child too. The staging table's rows reference
+    /// the old table, so its `DROP TABLE` would fire the action on them.
+    #[test]
+    fn sqlite_rebuild_of_a_self_cascade_table_is_refused() {
+        let mut base = sqlite_users_table();
+        let mut parent = col("parent_id", ColumnType::Int64);
+        parent.nullable = true;
+        parent.references =
+            Some(ForeignKey::new("users", "id").with_on_delete(Some(ForeignKeyAction::Cascade)));
+        base.columns.push(parent);
+        base.columns.push(col("name", ColumnType::Text));
+        let mut want = base.clone();
+        want.columns[2].nullable = true;
+        let baseline = vec![base];
+        let desired = vec![want];
+        let plan = diff_schema(&baseline, &parsed(desired.clone(), vec![]), DEFAULT_OPTS);
+        let ctx = SchemaContext::from_tables(&desired, &baseline);
+        let err = emit_up_sql_with_context(&plan, &ctx).expect_err("a self cascade must refuse");
+        assert!(err.to_string().contains("users.parent_id"), "{err}");
     }
 }

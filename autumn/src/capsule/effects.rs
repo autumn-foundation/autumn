@@ -49,7 +49,7 @@ use base64::engine::general_purpose::STANDARD;
 use serde::Serialize;
 
 use crate::capsule::schema::{
-    CacheEffect, CapsuleBody, CapsuleEffects, HttpEffect, JobEffect, MailEffect,
+    CacheEffect, CapsuleBody, CapsuleEffects, HttpEffect, JobEffect, MailEffect, TenantEffect,
 };
 
 // ── Divergences ─────────────────────────────────────────────────────────────
@@ -68,6 +68,10 @@ pub enum EffectSeam {
     Mail,
     /// The tenant context the run resolved.
     Tenant,
+    /// A draw from the framework's entropy source.
+    Random,
+    /// Work started on a detached task (`capsule::spawn`).
+    Detached,
 }
 
 impl EffectSeam {
@@ -80,6 +84,8 @@ impl EffectSeam {
             Self::Cache => "cache",
             Self::Mail => "mail",
             Self::Tenant => "tenancy",
+            Self::Random => "randomness",
+            Self::Detached => "detached task",
         }
     }
 }
@@ -149,8 +155,8 @@ pub(crate) enum EnqueueVerdict {
     /// Matched a recorded enqueue that succeeded; nothing reaches a queue.
     Queued,
     /// Matched a recorded enqueue that the backend **rejected**; the caller
-    /// reproduces the error.
-    Failed(String),
+    /// reproduces the error, with its recorded status when there is one.
+    Failed(String, Option<u16>),
     /// Did not match the recording. A divergence has been logged.
     Diverged,
 }
@@ -172,6 +178,22 @@ pub(crate) enum MailVerdict {
     Failed(String, Option<crate::capsule::schema::MailErrorKind>),
     /// Did not match the recording. A divergence has been logged.
     Diverged,
+}
+
+/// What the tape can say about a tenant lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TenantVerdict {
+    /// The recording resolved this tenant.
+    Resolved(String),
+    /// The recording tried and failed. The caller runs the resolver again on
+    /// the restored request, so the same error comes back.
+    RecordedFailure,
+    /// The recording has no tenant lookup. A divergence has been logged; the
+    /// caller fails closed.
+    Unrecorded,
+    /// A v3 capsule has no tenant lookup: v3 did not record a failed one.
+    /// The caller runs the resolver and does not check the result.
+    Unchecked,
 }
 
 // ── The tape ────────────────────────────────────────────────────────────────
@@ -212,8 +234,16 @@ pub struct ReplayEffects {
     /// Tracked like every other seam: a router whose updated code no longer
     /// resolves a tenant would otherwise leave the recording untouched and
     /// still report `Reproduced` on an unchanged response.
-    tenant: Option<String>,
+    tenant: RecordedTenant,
     tenant_read: std::sync::atomic::AtomicBool,
+    /// The capsule is format version 3. Seams that version did not record
+    /// (cache removals, untyped reads, failed tenant lookups, draw widths)
+    /// replay with the v3 rules, so an older corpus keeps its verdicts.
+    legacy_v3: bool,
+    /// Values that stood behind a placeholder in a recorded effect the run
+    /// matched. The actual outcome is masked with them before it is judged,
+    /// as persistence masked the recorded one (#2351 item 16).
+    observed: Mutex<crate::capsule::redact::RedactedValues>,
     divergences: Mutex<Vec<EffectDivergence>>,
     /// Total effects the tape was built with, so the verdict can say how much
     /// of the recording the run actually met.
@@ -227,17 +257,187 @@ pub struct ReplayEffects {
     /// serving stable non-consuming values and still be able to report
     /// `Reproduced`. The verdict warns instead of pretending.
     scope_entered: std::sync::atomic::AtomicBool,
+    /// `register_after_commit` callbacks that a rollback has not dropped.
+    after_commit: AtomicUsize,
 }
 
-/// One recorded cache write.
+/// One recorded cache write: a value written, or entries removed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CacheWrite {
-    key: String,
-    /// `None` when the recorded value was not decodable; the key still has to
-    /// match.
-    value: Option<Vec<u8>>,
-    /// The expiry the recorded write asked for, in seconds.
-    ttl_secs: Option<u64>,
+enum CacheWrite {
+    Insert {
+        key: String,
+        /// `None` when the recorded value was not decodable; the key still has
+        /// to match.
+        value: Option<Vec<u8>>,
+        /// The expiry the recorded write asked for, in seconds.
+        ttl_secs: Option<u64>,
+    },
+    Invalidate {
+        key: String,
+        error: Option<crate::capsule::schema::CacheInvalidationError>,
+    },
+    InvalidateNamespace {
+        namespace: String,
+        error: Option<crate::capsule::schema::CacheInvalidationError>,
+    },
+    Clear,
+}
+
+impl CacheWrite {
+    /// The write tape entry a recorded effect describes, or `None` for a read.
+    fn from_effect(effect: &CacheEffect) -> Option<Self> {
+        match effect {
+            CacheEffect::Get { .. } => None,
+            CacheEffect::Insert {
+                key,
+                value,
+                ttl_secs,
+            } => Some(Self::Insert {
+                key: key.clone(),
+                value: decode(value),
+                ttl_secs: *ttl_secs,
+            }),
+            CacheEffect::Invalidate { key, error } => Some(Self::Invalidate {
+                key: key.clone(),
+                error: error.clone(),
+            }),
+            CacheEffect::InvalidateNamespace { namespace, error } => {
+                Some(Self::InvalidateNamespace {
+                    namespace: namespace.clone(),
+                    error: error.clone(),
+                })
+            }
+            CacheEffect::Clear => Some(Self::Clear),
+        }
+    }
+
+    /// Whether this recorded write is the one the replayed run made.
+    ///
+    /// The recorded key and value may have been masked on their way to disk,
+    /// so they compare the way every other redacted recording does. The expiry
+    /// is part of the mutation: a five-second entry and a permanent one are
+    /// different writes, whatever the bytes say.
+    fn matches(&self, actual: &Self) -> bool {
+        match (self, actual) {
+            (
+                Self::Insert {
+                    key,
+                    value,
+                    ttl_secs,
+                },
+                Self::Insert {
+                    key: actual_key,
+                    value: actual_value,
+                    ttl_secs: actual_ttl,
+                },
+            ) => {
+                matches_redacted(key, actual_key)
+                    && ttl_secs == actual_ttl
+                    && value.as_ref().is_none_or(|recorded| {
+                        actual_value
+                            .as_ref()
+                            .is_some_and(|actual| bytes_match_redacted(recorded, actual))
+                    })
+            }
+            (Self::Invalidate { key, .. }, Self::Invalidate { key: actual, .. })
+            | (
+                Self::InvalidateNamespace { namespace: key, .. },
+                Self::InvalidateNamespace {
+                    namespace: actual, ..
+                },
+            ) => matches_redacted(key, actual),
+            (Self::Clear, Self::Clear) => true,
+            _ => false,
+        }
+    }
+
+    /// How the write is named in a divergence report.
+    fn describe(&self) -> String {
+        match self {
+            Self::Insert { key, .. } => key.clone(),
+            Self::Invalidate { key, .. } => format!("invalidate {key}"),
+            Self::InvalidateNamespace { namespace, .. } => {
+                format!("invalidate namespace {namespace}")
+            }
+            Self::Clear => "clear".to_owned(),
+        }
+    }
+
+    /// The key or namespace the write names.
+    fn identifier(&self) -> Option<&str> {
+        match self {
+            Self::Insert { key, .. } | Self::Invalidate { key, .. } => Some(key),
+            Self::InvalidateNamespace { namespace, .. } => Some(namespace),
+            Self::Clear => None,
+        }
+    }
+
+    /// [`describe`](Self::describe) with no key or namespace.
+    fn describe_withheld(&self) -> String {
+        match self {
+            Self::Insert { .. } => "a cache write (key withheld)".to_owned(),
+            Self::Invalidate { .. } => "invalidate (key withheld)".to_owned(),
+            Self::InvalidateNamespace { .. } => {
+                "invalidate namespace (namespace withheld)".to_owned()
+            }
+            Self::Clear => "clear".to_owned(),
+        }
+    }
+}
+
+/// Whether a recorded key is in `namespace`: `"{namespace}:..."`, the shape
+/// [`make_cache_key`](crate::cache::make_cache_key) makes. A recorded key can
+/// be masked, so its prefix compares like other redacted text.
+fn in_namespace(key: &str, namespace: &str) -> bool {
+    if key
+        .strip_prefix(namespace)
+        .is_some_and(|rest| rest.starts_with(':'))
+    {
+        return true;
+    }
+    // The key suffix can hold a colon too, so try each boundary.
+    key.match_indices(':')
+        .filter_map(|(index, _)| key.get(..index))
+        .any(|prefix| matches_redacted(prefix, namespace))
+}
+
+/// Which read-map slots a replayed write changes.
+#[derive(Debug, Clone, Copy)]
+enum SlotUpdate<'a> {
+    Key(&'a str),
+    Namespace(&'a str),
+    All,
+}
+
+/// The recorded slot a live key reads from: the exact key, or the one masked
+/// key it matches.
+///
+/// Exactly one match, or none. A masked key such as `user:[FILTERED]:profile`
+/// matches the entry of each subject. If replay served the first match, a read
+/// of the wrong subject would get the recorded value. The bug would then look
+/// like a clean reproduction.
+fn resolve_slot(cache: &BTreeMap<String, CacheSlot>, key: &str) -> Option<String> {
+    if cache.contains_key(key) {
+        return Some(key.to_owned());
+    }
+    let mut candidates = cache
+        .keys()
+        .filter(|recorded| matches_redacted(recorded, key));
+    match (candidates.next().cloned(), candidates.next()) {
+        (Some(only), None) => Some(only),
+        _ => None,
+    }
+}
+
+/// What the capsule recorded about the tenant lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecordedTenant {
+    /// No lookup was recorded.
+    None,
+    /// The lookup resolved this tenant.
+    Resolved(String),
+    /// The lookup failed.
+    Failed,
 }
 
 /// One cache key's recorded value and whether the run has read it.
@@ -249,7 +449,8 @@ struct CacheSlot {
     /// Whether the recording ever *read* this key, as opposed to only writing
     /// it. Only recorded reads are owed back by the replay.
     was_read: bool,
-    /// Whether the replayed run has touched it.
+    /// Whether the replayed run has read it. A write does not count: a
+    /// recorded read the run dropped is still owed.
     touched: bool,
 }
 
@@ -282,18 +483,7 @@ impl ReplayEffects {
         let cache_writes: Vec<CacheWrite> = effects
             .cache
             .iter()
-            .filter_map(|entry| match entry {
-                CacheEffect::Insert {
-                    key,
-                    value,
-                    ttl_secs,
-                } => Some(CacheWrite {
-                    key: key.clone(),
-                    value: decode(value),
-                    ttl_secs: *ttl_secs,
-                }),
-                CacheEffect::Get { .. } => None,
-            })
+            .filter_map(CacheWrite::from_effect)
             .collect();
         let recorded = effects
             .http
@@ -308,13 +498,34 @@ impl ReplayEffects {
             mail: Mutex::new(Ordered::new(effects.mail)),
             cache: Mutex::new(cache),
             cache_writes: Mutex::new(Ordered::new(cache_writes)),
-            tenant: effects.tenant.and_then(|tenant| tenant.id),
+            tenant: match effects.tenant {
+                None => RecordedTenant::None,
+                Some(TenantEffect { id: Some(id) }) => RecordedTenant::Resolved(id),
+                Some(TenantEffect { id: None }) => RecordedTenant::Failed,
+            },
+            legacy_v3: false,
             tenant_read: std::sync::atomic::AtomicBool::new(false),
+            observed: Mutex::new(crate::capsule::redact::RedactedValues::default()),
             divergences: Mutex::new(Vec::new()),
             recorded,
             served: AtomicUsize::new(0),
             scope_entered: std::sync::atomic::AtomicBool::new(false),
+            after_commit: AtomicUsize::new(0),
         }
+    }
+
+    /// Replay with the rules of the capsule's format version. See
+    /// [`CAPSULE_FORMAT_VERSION`](crate::capsule::CAPSULE_FORMAT_VERSION).
+    #[must_use]
+    pub const fn for_format_version(mut self, format_version: u32) -> Self {
+        self.legacy_v3 = format_version < 4;
+        self
+    }
+
+    /// Whether the capsule is format version 3.
+    #[must_use]
+    pub(crate) const fn legacy_v3(&self) -> bool {
+        self.legacy_v3
     }
 
     /// Record that the replayed router entered the consuming scope.
@@ -411,7 +622,11 @@ impl ReplayEffects {
         {
             let expected = describe_http(&next.method, &next.url);
             let changed = describe_request_mismatch(next, request);
+            let recorded_url = next.url.clone();
             drop(seam);
+            // The URL matched: learn what its masked values stood for before
+            // the report prints the live URL.
+            self.observe_text(&recorded_url, url);
             let actual = describe_http(method, url);
             self.diverge(EffectDivergence {
                 seam: EffectSeam::Http,
@@ -429,6 +644,11 @@ impl ReplayEffects {
         let served = seam.pending.pop_front();
         seam.consumed = seam.consumed.saturating_add(1);
         drop(seam);
+        if let Some(recorded) = served.as_ref() {
+            self.observe_text(&recorded.url, url);
+            self.observe_headers(&recorded.request_headers, request.headers);
+            self.observe_body(&recorded.request_body, request.body);
+        }
         self.served.fetch_add(1, Ordering::SeqCst);
         served
     }
@@ -482,12 +702,39 @@ impl ReplayEffects {
         // about timing, so there is nothing to compare — an entry point that
         // takes no schedule cannot have changed one.
         let schedule_diverged = match schedule {
-            crate::job::EnqueueSchedule::Immediate => false,
-            crate::job::EnqueueSchedule::After(delay) => next.delay_secs != Some(delay),
-            crate::job::EnqueueSchedule::At(deadline) => next.due_at != Some(deadline),
+            // A plain enqueue states no timing, so it needs an entry that ran
+            // at once: no positive delay and no future deadline (#2351 item
+            // 17). A zero delay is still immediate.
+            crate::job::EnqueueSchedule::Immediate => {
+                next.delay_secs.is_some_and(|delay| delay > 0)
+                    || next.due_at.is_some()
+                    || next.requested_due_at.is_some()
+            }
+            // Capture rounds a sub-second remainder up. A v3 capture cut it
+            // off, so a v3 capsule is compared the way it was recorded.
+            crate::job::EnqueueSchedule::After(delay) => {
+                let recorded = if self.legacy_v3 {
+                    i64::try_from(delay.as_secs()).unwrap_or(i64::MAX)
+                } else {
+                    crate::job::delay_seconds(delay)
+                };
+                // Capture runs a zero delay at once and records no delay.
+                let ran_at_once = delay.is_zero()
+                    && next.delay_secs.is_none()
+                    && next.due_at.is_none()
+                    && next.requested_due_at.is_none();
+                next.delay_secs != Some(recorded) && !ran_at_once
+            }
+            // Capture runs a past deadline at once and records `due_at: None`.
+            // It keeps the deadline the caller gave in `requested_due_at`, so
+            // replay compares that one (#2351 item 18).
+            crate::job::EnqueueSchedule::At(deadline) => {
+                next.due_at != Some(deadline)
+                    && !(next.due_at.is_none() && next.requested_due_at == Some(deadline))
+            }
         };
-        let delay_diverged = schedule_diverged;
-        if next.name != name || delay_diverged || !json_matches_redacted(&next.payload, payload) {
+        if next.name != name || schedule_diverged || !json_matches_redacted(&next.payload, payload)
+        {
             let expected = describe_job(&next.name, &next.payload);
             drop(seam);
             let actual = describe_job(name, payload);
@@ -504,11 +751,18 @@ impl ReplayEffects {
             });
             return EnqueueVerdict::Diverged;
         }
-        let error = seam.pending.pop_front().and_then(|recorded| recorded.error);
+        let recorded = seam.pending.pop_front();
         seam.consumed = seam.consumed.saturating_add(1);
         drop(seam);
+        if let Some(recorded) = recorded.as_ref() {
+            self.observe_json(&recorded.payload, payload);
+        }
         self.served.fetch_add(1, Ordering::SeqCst);
-        error.map_or(EnqueueVerdict::Queued, EnqueueVerdict::Failed)
+        recorded
+            .and_then(|recorded| Some((recorded.error?, recorded.error_status)))
+            .map_or(EnqueueVerdict::Queued, |(error, status)| {
+                EnqueueVerdict::Failed(error, status)
+            })
     }
 
     /// What the capsule recorded for a cache key.
@@ -521,44 +775,52 @@ impl ReplayEffects {
         let Ok(mut cache) = self.cache.lock() else {
             return CachedValue::Unrecorded;
         };
-        // A cache key is routinely built out of request values, so redaction
-        // may have masked part of it on the way to disk; fall back to a
-        // placeholder-tolerant scan before calling the read unrecorded.
-        let resolved = if cache.contains_key(key) {
-            Some(key.to_owned())
-        } else {
-            // Exactly one match, or none. A masked key like
-            // `user:[FILTERED]:profile` matches every subject's entry, and
-            // serving the first would hand a handler that read the *wrong*
-            // subject's cache entry the recorded value and report no
-            // divergence — turning a real bug into a clean reproduction.
-            let mut candidates = cache
-                .keys()
-                .filter(|recorded| matches_redacted(recorded, key));
-            match (candidates.next().cloned(), candidates.next()) {
-                (Some(only), None) => Some(only),
-                _ => None,
-            }
-        };
-        let Some(slot) = resolved.and_then(|recorded| cache.get_mut(&recorded)) else {
+        let recorded_key = resolve_slot(&cache, key);
+        let Some(slot) = recorded_key
+            .as_ref()
+            .and_then(|recorded| cache.get_mut(recorded))
+        else {
             drop(cache);
+            // No recorded key teaches the verdict what to mask, and a key can
+            // hold a secret, so it is not printed.
             self.diverge(EffectDivergence {
                 seam: EffectSeam::Cache,
                 kind: EffectDivergenceKind::Unrecorded,
                 index: 0,
                 expected: None,
-                actual: key.to_owned(),
-                detail: format!(
-                    "the replayed run read cache key {key:?}, which the capsule has no \
-                     recording for; it was served as a miss"
-                ),
+                actual: "a cache read (key withheld)".to_owned(),
+                detail: "the replayed run read a cache key the capsule has no recording for; \
+                         it was served as a miss"
+                    .to_owned(),
             });
             return CachedValue::Unrecorded;
         };
         let first_touch = !slot.touched;
         slot.touched = true;
+        let was_read = slot.was_read;
         let value = slot.value.clone();
         drop(cache);
+        if let Some(recorded_key) = recorded_key {
+            self.observe_text(&recorded_key, key);
+        }
+        if !was_read {
+            // The recording wrote this key and never read it. A read here is a
+            // new cache dependency, not a read-back (#2351 item 15). The run's
+            // own write is still served, as production would serve it.
+            // The slot can hold the run's own unrecorded key, which no
+            // recorded identifier masks, so the key is not printed.
+            self.diverge(EffectDivergence {
+                seam: EffectSeam::Cache,
+                kind: EffectDivergenceKind::Unrecorded,
+                index: 0,
+                expected: None,
+                actual: "a cache read (key withheld)".to_owned(),
+                detail: "the replayed run read a cache key that the recording wrote but never \
+                         read; the run's own write was served"
+                    .to_owned(),
+            });
+            return value.map_or(CachedValue::Miss, CachedValue::Hit);
+        }
         if first_touch {
             self.served.fetch_add(1, Ordering::SeqCst);
         }
@@ -575,66 +837,286 @@ impl ReplayEffects {
     /// without this it could ride along under an unchanged response and still
     /// report `Reproduced`. Nothing is ever sent to a live backend.
     pub(crate) fn cache_insert(&self, key: &str, value: &[u8], ttl_secs: Option<u64>) {
-        if let Ok(mut cache) = self.cache.lock() {
-            cache
-                .entry(key.to_owned())
-                .and_modify(|slot| {
-                    slot.value = Some(value.to_vec());
-                    slot.touched = true;
-                })
-                .or_insert_with(|| CacheSlot {
-                    value: Some(value.to_vec()),
-                    was_read: false,
-                    touched: true,
-                });
+        self.update_slots(SlotUpdate::Key(key), Some(value));
+        let _ = self.next_cache_write(&CacheWrite::Insert {
+            key: key.to_owned(),
+            value: Some(value.to_vec()),
+            ttl_secs,
+        });
+    }
+
+    /// Apply a key removal made during replay, and check it against the
+    /// recording. Returns the recorded result.
+    ///
+    /// # Errors
+    ///
+    /// The recorded failure, or a failure when the removal does not match the
+    /// recording (the divergence is logged).
+    pub(crate) fn cache_invalidate(
+        &self,
+        key: &str,
+    ) -> Result<(), crate::cache::InvalidationError> {
+        // A v3 capsule did not record removals.
+        let result = if self.legacy_v3 {
+            Ok(())
+        } else {
+            self.removal_result(&CacheWrite::Invalidate {
+                key: key.to_owned(),
+                error: None,
+            })
+        };
+        // A removal that failed in production kept the entry.
+        if result.is_ok() {
+            self.update_slots(SlotUpdate::Key(key), None);
         }
-        let Ok(mut seam) = self.cache_writes.lock() else {
+        result
+    }
+
+    /// Apply a namespace removal made during replay, and check it against the
+    /// recording. Returns the recorded result.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::cache_invalidate`].
+    pub(crate) fn cache_invalidate_namespace(
+        &self,
+        namespace: &str,
+    ) -> Result<(), crate::cache::InvalidationError> {
+        let result = if self.legacy_v3 {
+            Ok(())
+        } else {
+            self.removal_result(&CacheWrite::InvalidateNamespace {
+                namespace: namespace.to_owned(),
+                error: None,
+            })
+        };
+        if result.is_ok() {
+            self.update_slots(SlotUpdate::Namespace(namespace), None);
+        }
+        result
+    }
+
+    /// Apply a removal of all entries made during replay, and check it
+    /// against the recording.
+    pub(crate) fn cache_clear(&self) {
+        self.update_slots(SlotUpdate::All, None);
+        if !self.legacy_v3 {
+            let _ = self.next_cache_write(&CacheWrite::Clear);
+        }
+    }
+
+    /// Serve an untyped read during replay. A recorded untyped read is always
+    /// a miss: capture marks a capsule with an untyped hit incomplete.
+    pub(crate) fn cache_untyped_get(&self, key: &str) {
+        // A v3 capsule did not record untyped reads.
+        if !self.legacy_v3 {
+            let _ = self.cache_get(key);
+        }
+    }
+
+    /// Log an untyped write made during replay.
+    ///
+    /// Capture cannot record an untyped value, and marks such a capsule
+    /// incomplete, so a replayed untyped write is always unrecorded.
+    pub(crate) fn cache_untyped_insert(&self, key: &str) {
+        if self.legacy_v3 {
             return;
+        }
+        // No recorded key teaches the verdict what to mask, and a key can
+        // hold a secret, so it is not printed.
+        let _ = key;
+        self.diverge(EffectDivergence {
+            seam: EffectSeam::Cache,
+            kind: EffectDivergenceKind::Unrecorded,
+            index: 0,
+            expected: None,
+            actual: "an untyped cache write (key withheld)".to_owned(),
+            detail: "the replayed run wrote an untyped cache value; a capsule cannot record \
+                     one, so the write was not applied"
+                .to_owned(),
+        });
+    }
+
+    /// Log a direct `Cache::get_value` made during replay, outside the
+    /// cache helpers.
+    ///
+    /// Capture marks a capsule with a direct read incomplete, so the
+    /// recording had none. The read does not consume a read a helper
+    /// recorded for the same key.
+    pub(crate) fn cache_direct_get(&self, key: &str) {
+        if self.legacy_v3 {
+            return;
+        }
+        // As for an untyped write: no recorded key teaches the verdict what
+        // to mask, so the key is not printed.
+        let _ = key;
+        self.diverge(EffectDivergence {
+            seam: EffectSeam::Cache,
+            kind: EffectDivergenceKind::Unrecorded,
+            index: 0,
+            expected: None,
+            actual: "a direct cache read (key withheld)".to_owned(),
+            detail: "the replayed run read the cache backend directly rather than through                      a cache helper; a capsule cannot record such a read, so it was a miss"
+                .to_owned(),
+        });
+    }
+
+    /// Count a `register_after_commit` callback (#2351 item 3).
+    pub(crate) fn after_commit_registered(&self) {
+        self.after_commit.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A rollback dropped a counted callback. Each drop follows its own
+    /// registration, so the count does not go below zero.
+    pub(crate) fn after_commit_dropped(&self) {
+        self.after_commit.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Whether a counted callback is still pending or ran.
+    pub(crate) fn after_commit_pending(&self) -> bool {
+        self.after_commit.load(Ordering::SeqCst) > 0
+    }
+
+    /// Log work the replayed run started on a detached task. Capture marks
+    /// a capsule with detached work incomplete, so the recording had none.
+    /// It is logged at the spawn, so the verdict sees it even when the task
+    /// runs after the response.
+    pub(crate) fn detached_work_started(&self) {
+        if self.legacy_v3 {
+            return;
+        }
+        self.diverge(EffectDivergence {
+            seam: EffectSeam::Detached,
+            kind: EffectDivergenceKind::Unrecorded,
+            index: 0,
+            expected: None,
+            actual: "a detached task".to_owned(),
+            detail: "the replayed run started work on a detached task; the recorded run \
+                     started none"
+                .to_owned(),
+        });
+    }
+
+    /// Set the read map the way a write sets the live cache, so a later read
+    /// in the same run finds what production found.
+    fn update_slots(&self, target: SlotUpdate<'_>, value: Option<&[u8]>) {
+        let Ok(mut cache) = self.cache.lock() else {
+            return;
+        };
+        match target {
+            SlotUpdate::Key(key) => {
+                // Resolved like a read, so a write to a key the capsule holds
+                // masked lands on the recorded slot.
+                if let Some(slot) =
+                    resolve_slot(&cache, key).and_then(|recorded| cache.get_mut(&recorded))
+                {
+                    slot.value = value.map(<[u8]>::to_vec);
+                } else if let Some(value) = value {
+                    cache.insert(
+                        key.to_owned(),
+                        CacheSlot {
+                            value: Some(value.to_vec()),
+                            was_read: false,
+                            touched: false,
+                        },
+                    );
+                }
+            }
+            SlotUpdate::Namespace(namespace) => {
+                for (key, slot) in cache.iter_mut() {
+                    if in_namespace(key, namespace) {
+                        slot.value = None;
+                    }
+                }
+            }
+            SlotUpdate::All => {
+                for slot in cache.values_mut() {
+                    slot.value = None;
+                }
+            }
+        }
+    }
+
+    /// The result a replayed removal returns: the recorded one, or a failure
+    /// when the removal diverged.
+    fn removal_result(&self, actual: &CacheWrite) -> Result<(), crate::cache::InvalidationError> {
+        match self.next_cache_write(actual) {
+            Some(
+                CacheWrite::Invalidate {
+                    error: Some(error), ..
+                }
+                | CacheWrite::InvalidateNamespace {
+                    error: Some(error), ..
+                },
+            ) => Err(crate::cache::InvalidationError::new(
+                error.attempts,
+                error.reason,
+            )),
+            Some(_) => Ok(()),
+            None => Err(crate::cache::InvalidationError::new(
+                1,
+                "the replayed run removed a cache entry the capsule has no recording for",
+            )),
+        }
+    }
+
+    /// Consume the next recorded cache write when it is the one the run just
+    /// made. Logs a divergence and returns `None` when it is not.
+    fn next_cache_write(&self, actual: &CacheWrite) -> Option<CacheWrite> {
+        let Ok(mut seam) = self.cache_writes.lock() else {
+            return None;
         };
         let index = seam.consumed;
         let Some(next) = seam.pending.front() else {
             drop(seam);
+            // No recorded identifier teaches the verdict what to mask, and a
+            // key can hold a secret, so it is not printed.
+            let described = actual.describe_withheld();
             self.diverge(EffectDivergence {
                 seam: EffectSeam::Cache,
                 kind: EffectDivergenceKind::Unrecorded,
                 index,
                 expected: None,
-                actual: key.to_owned(),
+                actual: described.clone(),
                 detail: format!(
-                    "the replayed run wrote cache key {key:?}, which the capsule has no \
+                    "the replayed run made cache write {described:?}, which the capsule has no \
                      recording for"
                 ),
             });
-            return;
+            return None;
         };
-        // The recorded value may have been masked on its way to disk, so it is
-        // compared the way every other redacted recording is.
-        let value_matches = next
-            .value
-            .as_ref()
-            .is_none_or(|recorded| bytes_match_redacted(recorded, value));
-        // The expiry is part of the mutation: a five-second entry and a
-        // permanent one are different writes, whatever the bytes say.
-        if !matches_redacted(&next.key, key) || !value_matches || next.ttl_secs != ttl_secs {
-            let expected = next.key.clone();
+        if !next.matches(actual) {
+            let expected = next.describe();
+            let recorded_identifier = next.identifier().map(ToOwned::to_owned);
             drop(seam);
+            // The verdict masks a value it learned. A masked identifier that
+            // does not match teaches nothing, so it is not printed.
+            let described = if self.observe_identifier(recorded_identifier.as_deref(), actual) {
+                actual.describe()
+            } else {
+                actual.describe_withheld()
+            };
             self.diverge(EffectDivergence {
                 seam: EffectSeam::Cache,
                 kind: EffectDivergenceKind::Mismatch,
                 index,
                 expected: Some(expected.clone()),
-                actual: key.to_owned(),
+                actual: described.clone(),
                 detail: format!(
-                    "the replayed run wrote cache key {key:?}, but the capsule's next recorded \
-                     write was {expected:?}"
+                    "the replayed run made cache write {described:?}, but the capsule's next \
+                     recorded write was {expected:?}"
                 ),
             });
-            return;
+            return None;
         }
-        seam.pending.pop_front();
+        let recorded = seam.pending.pop_front();
         seam.consumed = seam.consumed.saturating_add(1);
         drop(seam);
+        if let Some(recorded) = recorded.as_ref() {
+            self.observe_write(recorded, actual);
+        }
         self.served.fetch_add(1, Ordering::SeqCst);
+        recorded
     }
 
     /// Whether the next recorded mail send is the one the run just made, and
@@ -697,39 +1179,17 @@ impl ReplayEffects {
         // config. Reading that absence as "the code changed its sender" is the
         // same false signal as reporting a subsystem replay never booted. A
         // sender the run did choose, and chose differently, is a real change.
-        let sender_match = sent.from.is_none_or(|actual| {
-            next.from
-                .as_deref()
-                .is_some_and(|recorded| matches_redacted(recorded, actual))
-        });
-        // Everything a recipient would notice, not only what addresses the
-        // envelope: an invoice removed, an HTML template rewritten under an
-        // untouched text fallback, an unsubscribe header dropped. Each is a
-        // materially different email, and serving the recorded success for one
-        // would leave the final audit nothing to catch.
-        let changed = if !sender_match {
-            Some("its sender")
-        } else if !body_matches_redacted(&next.body, sent.body) {
-            Some("its body")
-        } else if !body_matches_redacted(&next.alternate_body, sent.alternate_body) {
-            Some("the other half of its multipart body")
-        } else if !optional_matches_redacted(next.reply_to.as_deref(), sent.reply_to) {
-            Some("its reply-to")
-        } else if !optional_matches_redacted(
-            next.list_unsubscribe.as_deref(),
-            sent.list_unsubscribe,
-        ) {
-            Some("its list-unsubscribe header")
-        } else if !headers_match_redacted(&next.extra_headers, sent.extra_headers) {
-            Some("its headers")
-        } else if !attachments_match_redacted(&next.attachments, sent.attachments) {
-            Some("its attachments")
-        } else {
-            None
-        };
+        let changed = mail_change(next, sent);
         if let Some(changed) = changed {
             let expected = describe_mail(&next.to, &next.subject);
+            let (recorded_to, recorded_subject) = (next.to.clone(), next.subject.clone());
             drop(seam);
+            // The envelope matched: learn what its masked values stood for
+            // before the report prints the live subject and domains.
+            for (recorded, actual) in recorded_to.iter().zip(to.iter()) {
+                self.observe_text(recorded, actual);
+            }
+            self.observe_text(&recorded_subject, subject);
             let actual = describe_mail(to, subject);
             self.diverge(EffectDivergence {
                 seam: EffectSeam::Mail,
@@ -744,25 +1204,240 @@ impl ReplayEffects {
             });
             return MailVerdict::Diverged;
         }
-        let error = seam
-            .pending
-            .pop_front()
-            .and_then(|recorded| recorded.error.map(|text| (text, recorded.error_kind)));
+        let recorded = seam.pending.pop_front();
         seam.consumed = seam.consumed.saturating_add(1);
         drop(seam);
+        if let Some(recorded) = recorded.as_ref() {
+            self.observe_mail(recorded, sent);
+        }
+        let error =
+            recorded.and_then(|recorded| recorded.error.map(|text| (text, recorded.error_kind)));
         self.served.fetch_add(1, Ordering::SeqCst);
         error.map_or(MailVerdict::Sent, |(text, kind)| {
             MailVerdict::Failed(text, kind)
         })
     }
 
-    /// The tenant the recording resolved, when it resolved one.
+    /// What the recording says about the tenant lookup.
+    ///
+    /// A lookup the recording never made is a divergence (#2351 item 13):
+    /// live resolution would succeed on input the recording never had.
     #[must_use]
-    pub(crate) fn tenant(&self) -> Option<String> {
-        if self.tenant.is_some() {
-            self.tenant_read.store(true, Ordering::SeqCst);
+    pub(crate) fn tenant(&self) -> TenantVerdict {
+        let first_read = !self.tenant_read.swap(true, Ordering::SeqCst);
+        match &self.tenant {
+            RecordedTenant::Resolved(id) => TenantVerdict::Resolved(id.clone()),
+            RecordedTenant::Failed => TenantVerdict::RecordedFailure,
+            // A v3 capsule did not record a failed lookup.
+            RecordedTenant::None if self.legacy_v3 => TenantVerdict::Unchecked,
+            RecordedTenant::None => {
+                if first_read {
+                    self.diverge(EffectDivergence {
+                        seam: EffectSeam::Tenant,
+                        kind: EffectDivergenceKind::Unrecorded,
+                        index: 0,
+                        expected: None,
+                        actual: "tenant lookup".to_owned(),
+                        detail: "the replayed run resolved a tenant, which the capsule has no \
+                                 recording for; live tenant resolution was not consulted"
+                            .to_owned(),
+                    });
+                }
+                TenantVerdict::Unrecorded
+            }
         }
-        self.tenant.clone()
+    }
+
+    /// Log a lookup the recording saw fail and the replayed run resolved.
+    /// The caller fails closed.
+    pub(crate) fn tenant_resolved_after_recorded_failure(&self) {
+        self.diverge(EffectDivergence {
+            seam: EffectSeam::Tenant,
+            kind: EffectDivergenceKind::Mismatch,
+            index: 0,
+            expected: Some("a failed tenant lookup".to_owned()),
+            actual: "a resolved tenant".to_owned(),
+            detail: "the recorded tenant lookup failed, but the replayed run resolved a tenant; \
+                     the run would continue under a tenant production never had"
+                .to_owned(),
+        });
+    }
+
+    /// Log egress a subsystem tried to make outside the outbound-HTTP seam.
+    /// The caller refuses the call.
+    pub(crate) fn refuse_unrecorded_egress(&self, subsystem: &str, method: &str, url: &str) {
+        let index = self.http.lock().map_or(0, |seam| seam.consumed);
+        let actual = describe_http(method, url);
+        self.diverge(EffectDivergence {
+            seam: EffectSeam::Http,
+            kind: EffectDivergenceKind::Unrecorded,
+            index,
+            expected: None,
+            actual: actual.clone(),
+            detail: format!(
+                "the replayed run's {subsystem} made {actual} outside the recorded outbound-HTTP \
+                 seam; it was refused rather than sent"
+            ),
+        });
+    }
+
+    /// The values that stood behind a placeholder in the recorded effects the
+    /// run matched.
+    #[must_use]
+    pub(crate) fn observed_redactions(&self) -> crate::capsule::redact::RedactedValues {
+        self.observed
+            .lock()
+            .map(|values| values.clone())
+            .unwrap_or_default()
+    }
+
+    /// Keep what each placeholder in `recorded` stood for in `actual`.
+    fn observe_text(&self, recorded: &str, actual: &str) {
+        let Some(spans) = redacted_spans(recorded, actual) else {
+            return;
+        };
+        if spans.is_empty() {
+            return;
+        }
+        // A URL-encoded placeholder stood for an encoded value. Capture kept
+        // its decoded spelling too, so keep it here.
+        if let Ok(mut observed) = self.observed.lock() {
+            for (span, encoded) in spans {
+                observed.insert(span.as_bytes());
+                if encoded {
+                    let decoded = form_decoded(span);
+                    if !decoded.is_empty() && decoded != span {
+                        observed.insert(decoded.as_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    fn observe_headers(&self, recorded: &[(String, String)], actual: &[(String, String)]) {
+        for ((name, recorded), (_, actual)) in recorded.iter().zip(actual.iter()) {
+            self.observe_text(recorded, actual);
+            // Capture also kept the parts of a credential header (the token
+            // of `Bearer <token>`), so an outcome that quotes one part was
+            // masked. Keep the same parts here.
+            if recorded != actual
+                && let Ok(mut observed) = self.observed.lock()
+            {
+                crate::capsule::redact::record_credential_components(
+                    name,
+                    actual.as_bytes(),
+                    &mut observed,
+                );
+            }
+        }
+    }
+
+    fn observe_body(&self, recorded: &CapsuleBody, actual: &CapsuleBody) {
+        let (recorded, actual) = (body_bytes(recorded), body_bytes(actual));
+        if let (Ok(recorded), Ok(actual)) =
+            (std::str::from_utf8(&recorded), std::str::from_utf8(&actual))
+        {
+            self.observe_text(recorded, actual);
+        }
+    }
+
+    fn observe_json(&self, recorded: &serde_json::Value, actual: &serde_json::Value) {
+        use serde_json::Value;
+        match (recorded, actual) {
+            (Value::String(recorded), Value::String(actual)) => {
+                self.observe_text(recorded, actual);
+            }
+            (Value::String(recorded), actual) if recorded == FILTERED => {
+                if let Ok(mut observed) = self.observed.lock() {
+                    crate::capsule::redact::record_masked_value(actual, &mut observed);
+                }
+            }
+            (Value::Object(recorded), Value::Object(actual)) => {
+                for (key, recorded) in recorded {
+                    if let Some(actual) = actual.get(key) {
+                        self.observe_json(recorded, actual);
+                    }
+                }
+            }
+            (Value::Array(recorded), Value::Array(actual)) => {
+                for (recorded, actual) in recorded.iter().zip(actual.iter()) {
+                    self.observe_json(recorded, actual);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(any(test, feature = "mail"))]
+    fn observe_mail(&self, recorded: &MailEffect, sent: &SentMail<'_>) {
+        for (recorded, actual) in recorded.to.iter().zip(sent.to.iter()) {
+            self.observe_text(recorded, actual);
+        }
+        self.observe_text(&recorded.subject, sent.subject);
+        if let (Some(recorded), Some(actual)) = (recorded.from.as_deref(), sent.from) {
+            self.observe_text(recorded, actual);
+        }
+        self.observe_body(&recorded.body, sent.body);
+        self.observe_body(&recorded.alternate_body, sent.alternate_body);
+        if let (Some(recorded), Some(actual)) = (recorded.reply_to.as_deref(), sent.reply_to) {
+            self.observe_text(recorded, actual);
+        }
+        if let (Some(recorded), Some(actual)) =
+            (recorded.list_unsubscribe.as_deref(), sent.list_unsubscribe)
+        {
+            self.observe_text(recorded, actual);
+        }
+        self.observe_headers(&recorded.extra_headers, sent.extra_headers);
+        for (recorded, actual) in recorded.attachments.iter().zip(sent.attachments.iter()) {
+            self.observe_text(&recorded.filename, &actual.filename);
+        }
+    }
+
+    /// Learn what a masked recorded key or namespace stood for in `actual`.
+    /// Returns whether `actual`'s identifier is safe to print.
+    fn observe_identifier(&self, recorded: Option<&str>, actual: &CacheWrite) -> bool {
+        let (Some(recorded), Some(actual)) = (recorded, actual.identifier()) else {
+            return true;
+        };
+        // An unmasked recorded identifier: print only the same one. Another
+        // one can hold a secret that the scrub has not learned.
+        if !recorded.contains(FILTERED) && !recorded.contains(FILTERED_URLENCODED) {
+            return recorded == actual;
+        }
+        if redacted_spans(recorded, actual).is_none() {
+            return false;
+        }
+        self.observe_text(recorded, actual);
+        true
+    }
+
+    fn observe_write(&self, recorded: &CacheWrite, actual: &CacheWrite) {
+        match (recorded, actual) {
+            (
+                CacheWrite::Insert { key, value, .. },
+                CacheWrite::Insert {
+                    key: actual_key,
+                    value: actual_value,
+                    ..
+                },
+            ) => {
+                self.observe_text(key, actual_key);
+                if let (Some(recorded), Some(actual)) = (value, actual_value)
+                    && let (Ok(recorded), Ok(actual)) =
+                        (std::str::from_utf8(recorded), std::str::from_utf8(actual))
+                {
+                    self.observe_text(recorded, actual);
+                }
+            }
+            (CacheWrite::Invalidate { key, .. }, CacheWrite::Invalidate { key: actual, .. })
+            | (
+                CacheWrite::InvalidateNamespace { namespace: key, .. },
+                CacheWrite::InvalidateNamespace {
+                    namespace: actual, ..
+                },
+            ) => self.observe_text(key, actual),
+            _ => {}
+        }
     }
 
     /// Close the tape and report every recorded effect the run never asked
@@ -802,8 +1477,15 @@ impl ReplayEffects {
                 seam.pending.front().map(|next| next.subject.clone()),
             ));
         }
-        if self.tenant.is_some() && !self.tenant_read.load(Ordering::SeqCst) {
-            divergences.push(unconsumed(EffectSeam::Tenant, 0, 1, self.tenant.clone()));
+        let recorded_tenant = match &self.tenant {
+            RecordedTenant::None => None,
+            RecordedTenant::Resolved(id) => Some(id.clone()),
+            RecordedTenant::Failed => Some("a failed tenant lookup".to_owned()),
+        };
+        if let Some(recorded) = recorded_tenant
+            && !self.tenant_read.load(Ordering::SeqCst)
+        {
+            divergences.push(unconsumed(EffectSeam::Tenant, 0, 1, Some(recorded)));
         }
         if let Ok(seam) = self.cache_writes.lock()
             && !seam.pending.is_empty()
@@ -812,7 +1494,7 @@ impl ReplayEffects {
                 EffectSeam::Cache,
                 seam.consumed,
                 seam.pending.len(),
-                seam.pending.front().map(|next| next.key.clone()),
+                seam.pending.front().map(CacheWrite::describe),
             ));
         }
         if let Ok(cache) = self.cache.lock() {
@@ -831,6 +1513,26 @@ impl ReplayEffects {
             }
         }
         divergences
+    }
+}
+
+/// The divergence a draw of a different width than the recording reports
+/// (#2351 item 11).
+pub(crate) fn random_width_divergence(
+    index: usize,
+    recorded: usize,
+    actual: usize,
+) -> EffectDivergence {
+    EffectDivergence {
+        seam: EffectSeam::Random,
+        kind: EffectDivergenceKind::Mismatch,
+        index,
+        expected: Some(format!("{recorded} byte(s)")),
+        actual: format!("{actual} byte(s)"),
+        detail: format!(
+            "the replayed run drew {actual} random byte(s) where the recording drew {recorded}; \
+             the value it minted is not the one production used"
+        ),
     }
 }
 
@@ -913,6 +1615,39 @@ const fn json_kind(value: &serde_json::Value) -> &'static str {
     }
 }
 
+/// What a replayed letter changed from the recorded one with the same
+/// envelope, if anything.
+#[cfg(any(test, feature = "mail"))]
+fn mail_change(next: &MailEffect, sent: &SentMail<'_>) -> Option<&'static str> {
+    let sender_match = sent.from.is_none_or(|actual| {
+        next.from
+            .as_deref()
+            .is_some_and(|recorded| matches_redacted(recorded, actual))
+    });
+    // Everything a recipient would notice, not only what addresses the
+    // envelope: an invoice removed, an HTML template rewritten under an
+    // untouched text fallback, an unsubscribe header dropped. Each is a
+    // materially different email, and serving the recorded success for one
+    // would leave the final audit nothing to catch.
+    if !sender_match {
+        Some("its sender")
+    } else if !body_matches_redacted(&next.body, sent.body) {
+        Some("its body")
+    } else if !body_matches_redacted(&next.alternate_body, sent.alternate_body) {
+        Some("the other half of its multipart body")
+    } else if !optional_matches_redacted(next.reply_to.as_deref(), sent.reply_to) {
+        Some("its reply-to")
+    } else if !optional_matches_redacted(next.list_unsubscribe.as_deref(), sent.list_unsubscribe) {
+        Some("its list-unsubscribe header")
+    } else if !headers_match_redacted(&next.extra_headers, sent.extra_headers) {
+        Some("its headers")
+    } else if !attachments_match_redacted(&next.attachments, sent.attachments) {
+        Some("its attachments")
+    } else {
+        None
+    }
+}
+
 /// How a mail send is named in a divergence report.
 ///
 /// Recipients are the PII here, so only their count and domains reach the
@@ -954,44 +1689,103 @@ const FILTERED_URLENCODED: &str = "%5BFILTERED%5D";
 /// placeholder is — the capsule does not carry those bytes, so nothing *can*
 /// be asserted about them.
 fn matches_redacted(recorded: &str, actual: &str) -> bool {
+    redacted_spans(recorded, actual).is_some()
+}
+
+/// A form-encoded value, decoded as capture decodes a query or form value.
+fn form_decoded(value: &str) -> String {
+    url::form_urlencoded::parse(format!("={value}").as_bytes())
+        .next()
+        .map(|(_, decoded)| decoded.into_owned())
+        .unwrap_or_default()
+}
+
+/// [`matches_redacted`], and on a match the text each placeholder stood for,
+/// with whether that placeholder was the URL-encoded one.
+///
+/// A recorded text can hold both spellings (a value echoed into a path, and
+/// a masked query parameter), so both are matched. Empty spans are left out:
+/// there is nothing to mask.
+fn redacted_spans<'a>(recorded: &str, actual: &'a str) -> Option<Vec<(&'a str, bool)>> {
     if recorded == actual {
-        return true;
+        return Some(Vec::new());
     }
-    let placeholder = if recorded.contains(FILTERED) {
-        FILTERED
-    } else if recorded.contains(FILTERED_URLENCODED) {
-        FILTERED_URLENCODED
-    } else {
+    let (segments, encoded) = split_placeholders(recorded);
+    if encoded.is_empty() {
         // No placeholder and not equal: an ordinary difference.
-        return false;
+        return None;
+    }
+    let mut spans = Vec::new();
+    let mut push = |span: &'a str, encoded: bool| {
+        if !span.is_empty() {
+            spans.push((span, encoded));
+        }
     };
     let mut rest = actual;
-    let mut segments = recorded.split(placeholder).peekable();
-    let mut first = true;
-    while let Some(segment) = segments.next() {
+    let mut segments = segments.into_iter();
+    rest = rest.strip_prefix(segments.next().unwrap_or_default())?;
+    let mut segments = segments.zip(encoded).peekable();
+    while let Some((segment, encoded)) = segments.next() {
         let last = segments.peek().is_none();
-        if first {
-            let Some(stripped) = rest.strip_prefix(segment) else {
-                return false;
-            };
-            rest = stripped;
-            first = false;
-        } else if segment.is_empty() {
+        if segment.is_empty() {
             // Back-to-back placeholders, or one at the very end: nothing to
-            // anchor on, so whatever remains is accepted.
-        } else if let Some(found) = rest.find(segment) {
-            let after = found.saturating_add(segment.len());
-            rest = rest.get(after..).unwrap_or_default();
-        } else {
-            return false;
-        }
-        if last && !segment.is_empty() && !recorded.ends_with(placeholder) {
+            // anchor on. At the end, the placeholder takes what remains.
+            if last {
+                push(rest, encoded);
+                rest = "";
+            }
+        } else if last {
             // The final literal segment has to be the *tail*, or a recorded
             // `?a=1` would match an actual `?a=1&b=2`.
-            return rest.is_empty();
+            let head = rest.strip_suffix(segment)?;
+            push(head, encoded);
+            rest = "";
+        } else {
+            let found = rest.find(segment)?;
+            push(rest.get(..found).unwrap_or_default(), encoded);
+            let after = found.saturating_add(segment.len());
+            rest = rest.get(after..).unwrap_or_default();
         }
     }
-    true
+    Some(spans)
+}
+
+/// Whether two placeholders touch in a recorded text, so that nothing marks
+/// where one masked value ends and the next begins.
+pub(crate) fn has_adjacent_placeholders(recorded: &str) -> bool {
+    let (segments, _) = split_placeholders(recorded);
+    let between = segments.len().saturating_sub(2);
+    segments
+        .iter()
+        .skip(1)
+        .take(between)
+        .any(|segment| segment.is_empty())
+}
+
+/// Split a recorded text at its placeholders, in either spelling. Returns
+/// the literal segments (one more than the placeholders), and for each
+/// placeholder whether it was the URL-encoded one.
+fn split_placeholders(recorded: &str) -> (Vec<&str>, Vec<bool>) {
+    let mut segments = Vec::new();
+    let mut encoded = Vec::new();
+    let mut rest = recorded;
+    loop {
+        let next = match (rest.find(FILTERED), rest.find(FILTERED_URLENCODED)) {
+            (Some(raw), Some(url)) if url < raw => Some((url, FILTERED_URLENCODED, true)),
+            (Some(raw), _) => Some((raw, FILTERED, false)),
+            (None, Some(url)) => Some((url, FILTERED_URLENCODED, true)),
+            (None, None) => None,
+        };
+        let Some((at, placeholder, is_encoded)) = next else {
+            segments.push(rest);
+            return (segments, encoded);
+        };
+        segments.push(rest.get(..at).unwrap_or_default());
+        encoded.push(is_encoded);
+        rest = rest
+            .get(at.saturating_add(placeholder.len())..)
+            .unwrap_or_default();
+    }
 }
 
 /// The request half of an outbound call, as replay sees it.
@@ -1197,6 +1991,11 @@ tokio::task_local! {
     /// recorded, so it must not consume tape entries the recorded handler is
     /// still owed — and, just as importantly, several capsules must be able to
     /// replay concurrently inside one `cargo test` process.
+    ///
+    /// `capsule::spawn` and the framework's detached work carry the tape into
+    /// their task on purpose. Capture marks such a capsule incomplete, so
+    /// replay refuses it; the carried tape only makes a changed run fail
+    /// closed rather than reach a live service.
     static REPLAY_EFFECTS: Arc<ReplayEffects>;
 }
 
@@ -1319,7 +2118,9 @@ mod tests {
                 payload: serde_json::json!({"to": "a@example.com", "token": "[FILTERED]"}),
                 delay_secs: None,
                 due_at: None,
+                requested_due_at: None,
                 error: None,
+                error_status: None,
             }],
             ..CapsuleEffects::default()
         });
@@ -1369,7 +2170,9 @@ mod tests {
                 payload: serde_json::json!({"token": "[FILTERED]"}),
                 delay_secs: None,
                 due_at: None,
+                requested_due_at: None,
                 error: None,
+                error_status: None,
             }],
             ..CapsuleEffects::default()
         });
@@ -1468,7 +2271,9 @@ mod tests {
                 payload: serde_json::json!({"order": 7}),
                 delay_secs: None,
                 due_at: None,
+                requested_due_at: None,
                 error: None,
+                error_status: None,
             }],
             ..CapsuleEffects::default()
         });
@@ -1504,7 +2309,9 @@ mod tests {
                 payload: serde_json::json!({}),
                 delay_secs: None,
                 due_at: None,
+                requested_due_at: None,
                 error: None,
+                error_status: None,
             }],
             ..CapsuleEffects::default()
         });
@@ -1512,11 +2319,451 @@ mod tests {
             tape.next_job(
                 "send_receipt",
                 &serde_json::json!({}),
-                crate::job::EnqueueSchedule::After(3600)
+                crate::job::EnqueueSchedule::After(std::time::Duration::from_secs(3600))
             ),
             EnqueueVerdict::Diverged
         );
         assert_eq!(tape.divergences().len(), 1);
+    }
+
+    /// #2351 item 17: a plain `enqueue` must not consume a recorded delayed
+    /// or future-deadline entry.
+    #[test]
+    fn a_relative_delay_is_compared_the_way_its_format_recorded_it() {
+        let recorded = |delay_secs: i64| CapsuleEffects {
+            jobs: vec![JobEffect {
+                name: "send_receipt".to_owned(),
+                payload: serde_json::json!({}),
+                delay_secs: Some(delay_secs),
+                ..JobEffect::default()
+            }],
+            ..CapsuleEffects::default()
+        };
+        let after = |millis: u64| {
+            crate::job::EnqueueSchedule::After(std::time::Duration::from_millis(millis))
+        };
+        let verdict = |tape: &ReplayEffects, millis: u64| {
+            tape.next_job("send_receipt", &serde_json::json!({}), after(millis))
+        };
+        // v4 rounds up: 500 ms was recorded as 1 s.
+        assert_eq!(
+            verdict(&ReplayEffects::new(recorded(1)), 500),
+            EnqueueVerdict::Queued
+        );
+        // v3 cut it off: 500 ms was recorded as 0 s.
+        let v3 = |secs| ReplayEffects::new(recorded(secs)).for_format_version(3);
+        assert_eq!(verdict(&v3(0), 500), EnqueueVerdict::Queued);
+        // Codex review on #3222: a whole-second change is still a change in v3.
+        assert_eq!(verdict(&v3(5), 6_000), EnqueueVerdict::Diverged);
+        assert_eq!(verdict(&v3(5), 5_000), EnqueueVerdict::Queued);
+    }
+
+    /// Codex review on #3222: capture runs an `enqueue_in` with a zero delay
+    /// at once and records no delay, so a zero delay matches that entry.
+    #[test]
+    fn a_zero_relative_delay_matches_the_immediate_entry_it_recorded() {
+        let immediate = CapsuleEffects {
+            jobs: vec![JobEffect {
+                name: "send_receipt".to_owned(),
+                payload: serde_json::json!({}),
+                ..JobEffect::default()
+            }],
+            ..CapsuleEffects::default()
+        };
+        let after = |millis: u64| {
+            crate::job::EnqueueSchedule::After(std::time::Duration::from_millis(millis))
+        };
+        let tape = ReplayEffects::new(immediate.clone());
+        assert_eq!(
+            tape.next_job("send_receipt", &serde_json::json!({}), after(0)),
+            EnqueueVerdict::Queued
+        );
+        assert!(tape.finish().is_empty(), "{:?}", tape.finish());
+        // A positive delay is still not the immediate entry.
+        let tape = ReplayEffects::new(immediate);
+        assert_eq!(
+            tape.next_job("send_receipt", &serde_json::json!({}), after(1_000)),
+            EnqueueVerdict::Diverged
+        );
+    }
+
+    #[test]
+    fn an_immediate_enqueue_does_not_satisfy_a_recorded_delayed_one() {
+        let delayed = JobEffect {
+            name: "send_receipt".to_owned(),
+            payload: serde_json::json!({}),
+            delay_secs: Some(3600),
+            ..JobEffect::default()
+        };
+        let future = JobEffect {
+            due_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            ..delayed.clone()
+        };
+        for recorded in [delayed, future] {
+            let tape = ReplayEffects::new(CapsuleEffects {
+                jobs: vec![recorded],
+                ..CapsuleEffects::default()
+            });
+            assert_eq!(
+                tape.next_job(
+                    "send_receipt",
+                    &serde_json::json!({}),
+                    crate::job::EnqueueSchedule::Immediate
+                ),
+                EnqueueVerdict::Diverged
+            );
+        }
+        // A zero delay is still immediate.
+        let tape = ReplayEffects::new(CapsuleEffects {
+            jobs: vec![JobEffect {
+                name: "send_receipt".to_owned(),
+                payload: serde_json::json!({}),
+                delay_secs: Some(0),
+                ..JobEffect::default()
+            }],
+            ..CapsuleEffects::default()
+        });
+        assert_eq!(
+            tape.next_job(
+                "send_receipt",
+                &serde_json::json!({}),
+                crate::job::EnqueueSchedule::Immediate
+            ),
+            EnqueueVerdict::Queued
+        );
+    }
+
+    /// #2351 item 18: capture records a past deadline as an immediate
+    /// enqueue, and keeps the deadline the caller asked for. Replay compares
+    /// the same deadline.
+    #[test]
+    fn a_past_deadline_enqueue_at_matches_its_normalized_recording() {
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        let recorded = JobEffect {
+            name: "send_receipt".to_owned(),
+            payload: serde_json::json!({}),
+            requested_due_at: Some(past),
+            ..JobEffect::default()
+        };
+        let tape = ReplayEffects::new(CapsuleEffects {
+            jobs: vec![recorded.clone()],
+            ..CapsuleEffects::default()
+        });
+        assert_eq!(
+            tape.next_job(
+                "send_receipt",
+                &serde_json::json!({}),
+                crate::job::EnqueueSchedule::At(past)
+            ),
+            EnqueueVerdict::Queued,
+            "{:?}",
+            tape.divergences()
+        );
+        // A plain enqueue is not the recorded `enqueue_at` (Codex review on
+        // #3222).
+        let tape = ReplayEffects::new(CapsuleEffects {
+            jobs: vec![recorded.clone()],
+            ..CapsuleEffects::default()
+        });
+        assert_eq!(
+            tape.next_job(
+                "send_receipt",
+                &serde_json::json!({}),
+                crate::job::EnqueueSchedule::Immediate
+            ),
+            EnqueueVerdict::Diverged
+        );
+        // A different past deadline is a changed call.
+        let tape = ReplayEffects::new(CapsuleEffects {
+            jobs: vec![recorded],
+            ..CapsuleEffects::default()
+        });
+        assert_eq!(
+            tape.next_job(
+                "send_receipt",
+                &serde_json::json!({}),
+                crate::job::EnqueueSchedule::At(past - chrono::Duration::hours(1))
+            ),
+            EnqueueVerdict::Diverged
+        );
+    }
+
+    /// Review fix: a v3 capsule did not record removals, untyped reads or a
+    /// failed tenant lookup, so replay does not check those seams for it.
+    #[test]
+    fn a_v3_capsule_replays_with_the_v3_rules() {
+        let tape = ReplayEffects::new(CapsuleEffects::default()).for_format_version(3);
+        assert_eq!(tape.cache_invalidate("k"), Ok(()));
+        tape.cache_clear();
+        assert_eq!(tape.cache_invalidate_namespace("ns"), Ok(()));
+        tape.cache_untyped_insert("k");
+        tape.cache_untyped_get("k");
+        tape.cache_direct_get("k");
+        assert_eq!(tape.tenant(), super::TenantVerdict::Unchecked);
+        assert!(tape.finish().is_empty(), "{:?}", tape.finish());
+    }
+
+    /// Review fix: a write does not stand in for a recorded read the run
+    /// dropped.
+    #[test]
+    fn a_dropped_read_is_owed_even_when_the_key_was_written() {
+        let tape = ReplayEffects::new(CapsuleEffects {
+            cache: vec![
+                CacheEffect::Get {
+                    key: "widgets".to_owned(),
+                    value: Some(base64_of(b"41")),
+                },
+                CacheEffect::Invalidate {
+                    key: "widgets".to_owned(),
+                    error: None,
+                },
+            ],
+            ..CapsuleEffects::default()
+        });
+        assert_eq!(tape.cache_invalidate("widgets"), Ok(()));
+        let divergences = tape.finish();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert_eq!(divergences[0].kind, EffectDivergenceKind::Unconsumed);
+    }
+
+    /// Codex review on #3222: a masked namespace matches when the key
+    /// suffix holds a colon.
+    #[test]
+    fn a_masked_namespace_matches_a_key_with_a_colon_in_its_suffix() {
+        assert!(super::in_namespace(
+            "tenant:[FILTERED]:user:42",
+            "tenant:secret"
+        ));
+        assert!(super::in_namespace("ns:k", "ns"));
+        assert!(!super::in_namespace("other:k", "ns"));
+    }
+
+    /// Review fix: a namespace removal clears a recorded key that is masked.
+    #[test]
+    fn a_namespace_removal_clears_a_masked_recorded_key() {
+        let tape = ReplayEffects::new(CapsuleEffects {
+            cache: vec![
+                CacheEffect::Get {
+                    key: "t:[FILTERED]:x".to_owned(),
+                    value: Some(base64_of(b"41")),
+                },
+                CacheEffect::InvalidateNamespace {
+                    namespace: "t:[FILTERED]".to_owned(),
+                    error: None,
+                },
+            ],
+            ..CapsuleEffects::default()
+        });
+        assert_eq!(tape.cache_get("t:acme:x"), CachedValue::Hit(b"41".to_vec()));
+        assert_eq!(tape.cache_invalidate_namespace("t:acme"), Ok(()));
+        assert_eq!(tape.cache_get("t:acme:x"), CachedValue::Miss);
+        assert!(tape.finish().is_empty(), "{:?}", tape.finish());
+    }
+
+    /// Review fix: the part of a credential header that stood behind the
+    /// placeholder is masked in the outcome, as capture masked it.
+    #[test]
+    fn a_credential_header_token_is_observed() {
+        let tape = ReplayEffects::new(CapsuleEffects {
+            http: vec![HttpEffect {
+                request_headers: vec![("authorization".to_owned(), "[FILTERED]".to_owned())],
+                ..http("POST", "https://api.example/charge", 502)
+            }],
+            ..CapsuleEffects::default()
+        });
+        let headers = vec![(
+            "authorization".to_owned(),
+            "Bearer sk-live-42-long-token".to_owned(),
+        )];
+        let body = CapsuleBody::Absent;
+        let served = tape.next_http(&OutboundRequest {
+            method: "POST",
+            url: "https://api.example/charge",
+            headers: &headers,
+            body: &body,
+        });
+        assert!(served.is_some());
+        let masked = crate::capsule::redact::mask_echoes(
+            "upstream rejected sk-live-42-long-token",
+            &tape.observed_redactions(),
+        );
+        assert!(!masked.contains("sk-live-42"), "{masked}");
+    }
+
+    /// Codex review on #3222: a URL-encoded masked value is observed in its
+    /// decoded spelling too, as capture kept both.
+    #[test]
+    fn a_url_encoded_masked_value_is_observed_decoded() {
+        let tape = ReplayEffects::new(CapsuleEffects {
+            http: vec![http(
+                "GET",
+                "https://api.example/x?token=%5BFILTERED%5D",
+                502,
+            )],
+            ..CapsuleEffects::default()
+        });
+        let body = CapsuleBody::Absent;
+        let served = tape.next_http(&OutboundRequest {
+            method: "GET",
+            url: "https://api.example/x?token=sk%2Flive+42",
+            headers: &[],
+            body: &body,
+        });
+        assert!(served.is_some());
+        let masked = crate::capsule::redact::mask_echoes(
+            "upstream rejected sk/live 42",
+            &tape.observed_redactions(),
+        );
+        assert!(!masked.contains("sk/live"), "{masked}");
+    }
+
+    /// Codex review on #3222: a cache write mismatch does not print a
+    /// secret that stood behind a masked recorded key.
+    #[test]
+    fn a_cache_write_mismatch_does_not_print_a_masked_key() {
+        let recorded = |key: &str| CapsuleEffects {
+            cache: vec![CacheEffect::Invalidate {
+                key: key.to_owned(),
+                error: None,
+            }],
+            ..CapsuleEffects::default()
+        };
+        // The identifier matches, so its value is learned and masked.
+        let tape = ReplayEffects::new(recorded("user:[FILTERED]"));
+        let _ = tape.cache_invalidate_namespace("user:sk-live-42");
+        assert!(tape.observed_redactions().contains(b"sk-live-42"));
+        // The identifier does not match, so it is not printed.
+        let tape = ReplayEffects::new(recorded("tok:[FILTERED]:x"));
+        let _ = tape.cache_invalidate_namespace("other:sk-live-42");
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert!(!divergences[0].actual.contains("sk-live-42"));
+        assert!(!divergences[0].detail.contains("sk-live-42"));
+        // With no recorded write, the identifier is not printed.
+        let tape = ReplayEffects::new(CapsuleEffects::default());
+        let _ = tape.cache_invalidate("token:sk-live-42");
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert!(!divergences[0].actual.contains("sk-live-42"));
+        assert!(!divergences[0].detail.contains("sk-live-42"));
+    }
+
+    /// Codex review on #3222: an invalidation of another key prints no key
+    /// when the recorded key has no placeholder. The live key can hold a
+    /// secret, and the scrub has not learned it.
+    #[test]
+    fn a_mismatched_invalidation_prints_no_live_key() {
+        let tape = ReplayEffects::new(CapsuleEffects {
+            cache: vec![CacheEffect::Invalidate {
+                key: "user:7".to_owned(),
+                error: None,
+            }],
+            ..CapsuleEffects::default()
+        });
+        let _ = tape.cache_invalidate("token:sk-live-42");
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert!(!divergences[0].actual.contains("sk-live-42"));
+        assert!(!divergences[0].detail.contains("sk-live-42"));
+    }
+
+    /// Codex review on #3222: a request that changed only its message
+    /// learns the masked URL value first, so the scrub masks it in the report.
+    #[test]
+    fn a_request_mismatch_learns_the_masked_url_value() {
+        let mut recorded = http("POST", "https://api.example/users/[FILTERED]/charge", 200);
+        recorded.request_body = CapsuleBody::Text("amount=10".to_owned());
+        let tape = ReplayEffects::new(CapsuleEffects {
+            http: vec![recorded],
+            ..CapsuleEffects::default()
+        });
+        let body = CapsuleBody::Text("amount=99".to_owned());
+        let served = tape.next_http(&OutboundRequest {
+            method: "POST",
+            url: "https://api.example/users/sk-live-42/charge",
+            headers: &[],
+            body: &body,
+        });
+        assert!(served.is_none(), "the body changed");
+        assert_eq!(tape.divergences().len(), 1);
+        assert!(tape.observed_redactions().contains(b"sk-live-42"));
+    }
+
+    /// Codex review on #3222: a letter that changed only its contents
+    /// learns the masked envelope first, so the scrub masks it in the report.
+    #[test]
+    fn a_mail_content_mismatch_learns_the_masked_envelope() {
+        let tape = ReplayEffects::new(CapsuleEffects {
+            mail: vec![MailEffect {
+                to: vec!["[FILTERED]@shop.example".to_owned()],
+                subject: "Code [FILTERED]".to_owned(),
+                body: CapsuleBody::Text("hi".to_owned()),
+                error: None,
+                ..Default::default()
+            }],
+            ..CapsuleEffects::default()
+        });
+        let to = ["sk-live-42@shop.example".to_owned()];
+        let body = CapsuleBody::Text("bye".to_owned());
+        assert_eq!(
+            tape.next_mail(&sent(&to, "Code 991827", &body)),
+            MailVerdict::Diverged
+        );
+        let learned = tape.observed_redactions();
+        assert!(learned.contains(b"sk-live-42"));
+        assert!(learned.contains(b"991827"));
+    }
+
+    /// Codex review on #3222: a read-back of a key that only the replayed
+    /// run wrote prints no key.
+    #[test]
+    fn a_read_back_of_an_unrecorded_write_prints_no_key() {
+        let tape = ReplayEffects::new(CapsuleEffects::default());
+        tape.cache_insert("token:sk-live-42", b"1", None);
+        let _ = tape.cache_get("token:sk-live-42");
+        let divergences = tape.divergences();
+        assert!(!divergences.is_empty());
+        for divergence in &divergences {
+            assert!(!divergence.actual.contains("sk-live-42"), "{divergence:?}");
+            assert!(!divergence.detail.contains("sk-live-42"), "{divergence:?}");
+        }
+    }
+
+    /// Codex review on #3222: one recorded text can hold both placeholder
+    /// spellings. Both match, and only the URL-encoded span is decoded.
+    #[test]
+    fn both_placeholder_spellings_match_in_one_text() {
+        let recorded = "https://api.example/u/[FILTERED]/x?token=%5BFILTERED%5D";
+        let actual = "https://api.example/u/alice/x?token=sk%2Flive";
+        assert!(super::matches_redacted(recorded, actual));
+        assert_eq!(
+            super::redacted_spans(recorded, actual),
+            Some(vec![("alice", false), ("sk%2Flive", true)])
+        );
+        assert!(!super::matches_redacted(
+            recorded,
+            "https://api.example/u/alice/y?token=sk%2Flive"
+        ));
+    }
+
+    /// #2351 item 13: an active tape with no tenant entry fails closed.
+    #[test]
+    fn a_tenant_lookup_the_capsule_never_recorded_is_a_divergence() {
+        let tape = ReplayEffects::new(CapsuleEffects::default());
+        assert_eq!(tape.tenant(), super::TenantVerdict::Unrecorded);
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert_eq!(divergences[0].seam, EffectSeam::Tenant);
+        assert_eq!(divergences[0].kind, EffectDivergenceKind::Unrecorded);
+
+        // A recorded failure is not a divergence: the resolver runs again on
+        // the restored request.
+        let tape = ReplayEffects::new(CapsuleEffects {
+            tenant: Some(TenantEffect { id: None }),
+            ..CapsuleEffects::default()
+        });
+        assert_eq!(tape.tenant(), super::TenantVerdict::RecordedFailure);
+        assert!(tape.finish().is_empty());
     }
 
     #[test]
@@ -2018,7 +3265,9 @@ mod tests {
                 payload: serde_json::json!({}),
                 delay_secs: None,
                 due_at: None,
+                requested_due_at: None,
                 error: Some("queue is down".to_owned()),
+                error_status: None,
             }],
             ..CapsuleEffects::default()
         });
@@ -2028,7 +3277,7 @@ mod tests {
                 &serde_json::json!({}),
                 crate::job::EnqueueSchedule::Immediate
             ),
-            EnqueueVerdict::Failed("queue is down".to_owned())
+            EnqueueVerdict::Failed("queue is down".to_owned(), None)
         );
         assert!(tape.divergences().is_empty());
     }
@@ -2067,7 +3316,9 @@ mod tests {
     }
 
     #[test]
-    fn a_matching_cache_write_is_consumed_and_readable_back() {
+    fn a_read_of_a_key_the_recording_only_wrote_diverges() {
+        // #2351 item 15: the recording wrote the key and did not read it. A
+        // new read is a new cache dependency, not a read-back.
         let tape = ReplayEffects::new(CapsuleEffects {
             cache: vec![CacheEffect::Insert {
                 key: "widgets".to_owned(),
@@ -2077,12 +3328,183 @@ mod tests {
             ..CapsuleEffects::default()
         });
         tape.cache_insert("widgets", b"41", None);
+        let _ = tape.cache_get("widgets");
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert_eq!(divergences[0].kind, EffectDivergenceKind::Unrecorded);
+        assert_eq!(divergences[0].seam, EffectSeam::Cache);
+    }
+
+    #[test]
+    fn a_masked_fill_then_read_back_is_not_a_divergence() {
+        // The key is masked on disk. The fill and the read-back on replay use
+        // the clear key, and must find the one recorded slot.
+        let tape = ReplayEffects::new(CapsuleEffects {
+            cache: vec![
+                CacheEffect::Get {
+                    key: "user:[FILTERED]".to_owned(),
+                    value: None,
+                },
+                CacheEffect::Insert {
+                    key: "user:[FILTERED]".to_owned(),
+                    value: base64_of(b"41"),
+                    ttl_secs: None,
+                },
+                CacheEffect::Get {
+                    key: "user:[FILTERED]".to_owned(),
+                    value: Some(base64_of(b"41")),
+                },
+            ],
+            ..CapsuleEffects::default()
+        });
+        assert_eq!(tape.cache_get("user:alice"), CachedValue::Miss);
+        tape.cache_insert("user:alice", b"41", None);
+        assert_eq!(
+            tape.cache_get("user:alice"),
+            CachedValue::Hit(b"41".to_vec())
+        );
+        let divergences = tape.finish();
+        assert!(divergences.is_empty(), "{divergences:?}");
+    }
+
+    #[test]
+    fn a_recorded_invalidate_is_consumed_and_the_next_read_misses() {
+        // #2351 item 2: an invalidate is a write. Replay consumes it and
+        // never reaches a backend.
+        let tape = ReplayEffects::new(CapsuleEffects {
+            cache: vec![
+                CacheEffect::Get {
+                    key: "widgets".to_owned(),
+                    value: Some(base64_of(b"41")),
+                },
+                CacheEffect::Invalidate {
+                    key: "widgets".to_owned(),
+                    error: None,
+                },
+                CacheEffect::Clear,
+            ],
+            ..CapsuleEffects::default()
+        });
+        assert_eq!(tape.cache_get("widgets"), CachedValue::Hit(b"41".to_vec()));
+        assert_eq!(tape.cache_invalidate("widgets"), Ok(()));
+        assert_eq!(tape.cache_get("widgets"), CachedValue::Miss);
+        tape.cache_clear();
+        let divergences = tape.finish();
+        assert!(divergences.is_empty(), "{divergences:?}");
+    }
+
+    #[test]
+    fn a_dropped_or_added_invalidate_is_a_divergence() {
+        let tape = ReplayEffects::new(CapsuleEffects {
+            cache: vec![CacheEffect::Invalidate {
+                key: "widgets".to_owned(),
+                error: None,
+            }],
+            ..CapsuleEffects::default()
+        });
+        let divergences = tape.finish();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert_eq!(divergences[0].kind, EffectDivergenceKind::Unconsumed);
+
+        let tape = ReplayEffects::new(CapsuleEffects::default());
+        let _ = tape.cache_invalidate("widgets");
+        tape.cache_clear();
+        let _ = tape.cache_invalidate_namespace("widgets");
+        tape.cache_untyped_insert("widgets");
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 4, "{divergences:?}");
+        assert!(
+            divergences
+                .iter()
+                .all(|d| d.kind == EffectDivergenceKind::Unrecorded)
+        );
+    }
+
+    #[test]
+    fn a_recorded_invalidate_failure_replays_as_a_failure() {
+        let tape = ReplayEffects::new(CapsuleEffects {
+            cache: vec![
+                CacheEffect::Invalidate {
+                    key: "widgets".to_owned(),
+                    error: Some(crate::capsule::schema::CacheInvalidationError {
+                        attempts: 3,
+                        reason: "READONLY".to_owned(),
+                    }),
+                },
+                CacheEffect::InvalidateNamespace {
+                    namespace: "widgets".to_owned(),
+                    error: Some(crate::capsule::schema::CacheInvalidationError {
+                        attempts: 1,
+                        reason: "no sweep".to_owned(),
+                    }),
+                },
+            ],
+            ..CapsuleEffects::default()
+        });
+        let err = tape
+            .cache_invalidate("widgets")
+            .expect_err("recorded failure");
+        assert_eq!(err.attempts(), 3);
+        assert_eq!(err.reason(), "READONLY");
+        assert!(tape.cache_invalidate_namespace("widgets").is_err());
+        assert!(tape.finish().is_empty());
+    }
+
+    /// Codex review on #3222: a removal that failed in production kept the
+    /// entry, so a read after it still hits.
+    #[test]
+    fn a_failed_removal_keeps_the_entry() {
+        let failed = Some(crate::capsule::schema::CacheInvalidationError {
+            attempts: 1,
+            reason: "READONLY".to_owned(),
+        });
+        let tape = ReplayEffects::new(CapsuleEffects {
+            cache: vec![
+                CacheEffect::Get {
+                    key: "ns:k".to_owned(),
+                    value: Some(base64_of(b"41")),
+                },
+                CacheEffect::Invalidate {
+                    key: "ns:k".to_owned(),
+                    error: failed.clone(),
+                },
+                CacheEffect::InvalidateNamespace {
+                    namespace: "ns".to_owned(),
+                    error: failed,
+                },
+            ],
+            ..CapsuleEffects::default()
+        });
+        assert_eq!(tape.cache_get("ns:k"), CachedValue::Hit(b"41".to_vec()));
+        assert!(tape.cache_invalidate("ns:k").is_err());
+        assert!(tape.cache_invalidate_namespace("ns").is_err());
+        assert_eq!(tape.cache_get("ns:k"), CachedValue::Hit(b"41".to_vec()));
         assert!(tape.finish().is_empty(), "{:?}", tape.finish());
+    }
+
+    #[test]
+    fn a_matching_cache_write_is_consumed_and_readable_back() {
+        let tape = ReplayEffects::new(CapsuleEffects {
+            cache: vec![
+                CacheEffect::Insert {
+                    key: "widgets".to_owned(),
+                    value: base64_of(b"41"),
+                    ttl_secs: None,
+                },
+                CacheEffect::Get {
+                    key: "widgets".to_owned(),
+                    value: Some(base64_of(b"41")),
+                },
+            ],
+            ..CapsuleEffects::default()
+        });
+        tape.cache_insert("widgets", b"41", None);
         assert_eq!(
             tape.cache_get("widgets"),
             CachedValue::Hit(b"41".to_vec()),
             "the run's own write is readable back, as it was in production"
         );
+        assert!(tape.finish().is_empty(), "{:?}", tape.finish());
     }
 
     #[test]
@@ -2109,7 +3531,10 @@ mod tests {
             }),
             ..CapsuleEffects::default()
         });
-        assert_eq!(tape.tenant().as_deref(), Some("acme"));
+        assert_eq!(
+            tape.tenant(),
+            super::TenantVerdict::Resolved("acme".to_owned())
+        );
     }
 
     fn base64_of(bytes: &[u8]) -> String {

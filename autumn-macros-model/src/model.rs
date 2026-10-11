@@ -91,6 +91,9 @@ fn parse_attr_args(attr: TokenStream) -> syn::Result<ModelArgs> {
 ///   ...]`) is an error.
 /// - `#[references]` — bare; the target table is inferred from the field name.
 /// - `#[references(table = "other_table")]` — an explicit target table.
+/// - `#[references(on_delete = "...", on_update = "...")]` — a referential
+///   action, one of [`REFERENCES_ACTION_VALUES`]. `set_null` and
+///   `set_default` need an `Option<_>` field.
 /// - `#[renamed_from("old_name")]` — one `snake_case` old column name.
 fn validate_field_schema_markers(field: &Field) -> syn::Result<()> {
     validate_model_renamed_from(&field.attrs)?;
@@ -133,13 +136,50 @@ fn validate_field_schema_markers(field: &Field) -> syn::Result<()> {
                 if meta.path.is_ident("table") {
                     let _value: LitStr = meta.value()?.parse()?;
                     Ok(())
+                } else if meta.path.is_ident("on_delete") || meta.path.is_ident("on_update") {
+                    let value: LitStr = meta.value()?.parse()?;
+                    validate_references_action(&value, &field.ty)
                 } else {
                     Err(meta.error(
-                        "unsupported `#[references(...)]` argument; expected `table = \"...\"`",
+                        "unsupported `#[references(...)]` argument; expected `table`, \
+                         `on_delete` or `on_update`",
                     ))
                 }
             })?;
         }
+    }
+    Ok(())
+}
+
+/// The `on_delete` / `on_update` values of `#[references(...)]`. Keep this list
+/// equal to `autumn_schema_core::FOREIGN_KEY_ACTION_ATTR_VALUES`. A unit test
+/// checks this.
+const REFERENCES_ACTION_VALUES: [&str; 5] = [
+    "cascade",
+    "restrict",
+    "set_null",
+    "set_default",
+    "no_action",
+];
+
+/// Validate one `#[references]` action value on a field of type `ty`.
+fn validate_references_action(value: &LitStr, ty: &syn::Type) -> syn::Result<()> {
+    let action = value.value();
+    if !REFERENCES_ACTION_VALUES.contains(&action.as_str()) {
+        let expected = REFERENCES_ACTION_VALUES
+            .map(|v| format!("`{v}`"))
+            .join(", ");
+        return Err(syn::Error::new_spanned(
+            value,
+            format!("unknown foreign-key action `{action}`; expected one of {expected}"),
+        ));
+    }
+    // A reference column has no default, so `set_default` also writes NULL.
+    if matches!(action.as_str(), "set_null" | "set_default") && option_inner(ty).is_none() {
+        return Err(syn::Error::new_spanned(
+            value,
+            format!("foreign-key action `{action}` needs an `Option<_>` field"),
+        ));
     }
     Ok(())
 }
@@ -18055,6 +18095,61 @@ mod tests {
             err.to_string()
                 .contains("unsupported `#[references(...)]` argument"),
             "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn references_actions_pass_validation() {
+        let field: syn::Field = syn::parse_quote! {
+            #[references(table = "accounts", on_delete = "cascade", on_update = "restrict")]
+            pub account_id: i64
+        };
+        validate_field_schema_markers(&field).expect("actions must validate");
+
+        let nullable: syn::Field = syn::parse_quote! {
+            #[references(on_delete = "set_null")]
+            pub account_id: Option<i64>
+        };
+        validate_field_schema_markers(&nullable).expect("`set_null` on `Option` must validate");
+    }
+
+    #[test]
+    fn references_unknown_action_rejected() {
+        let field: syn::Field = syn::parse_quote! {
+            #[references(on_delete = "casade")]
+            pub account_id: i64
+        };
+        let err = validate_field_schema_markers(&field).expect_err("a typo must be rejected");
+        assert!(
+            err.to_string()
+                .contains("unknown foreign-key action `casade`"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn references_set_null_or_set_default_on_required_field_rejected() {
+        // The column has no default, so `SET DEFAULT` also writes NULL.
+        for action in ["set_null", "set_default"] {
+            let field: syn::Field = syn::parse_quote! {
+                #[references(on_update = #action)]
+                pub account_id: i64
+            };
+            let err = validate_field_schema_markers(&field)
+                .expect_err("a NULL-writing action on a required field must be rejected");
+            assert!(
+                err.to_string()
+                    .contains(&format!("`{action}` needs an `Option<_>` field")),
+                "unexpected message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn references_action_values_match_schema_core() {
+        assert_eq!(
+            REFERENCES_ACTION_VALUES,
+            autumn_schema_core::FOREIGN_KEY_ACTION_ATTR_VALUES
         );
     }
 

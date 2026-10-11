@@ -2522,8 +2522,17 @@ mod tests {
         settle(&fleet).await;
         assert_eq!(fleet.stats().open, 3, "a burst inside the grace stays open");
         tokio::time::sleep(Duration::from_millis(200)).await;
-        fleet.enforce_capacity(None);
-        settle(&fleet).await;
+        // A sweep closes only an idle database. On a busy runner a pool can
+        // still hold a connection after the sleep, so sweep as the sweeper
+        // does, until the burst is closed or the deadline passes.
+        for _ in 0..100 {
+            fleet.enforce_capacity(None);
+            settle(&fleet).await;
+            if fleet.stats().open == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert_eq!(
             fleet.stats().open,
             1,
