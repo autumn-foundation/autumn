@@ -2277,6 +2277,63 @@ fn version_op_variant(op: &str) -> TokenStream {
     }
 }
 
+/// Reload a ledgered row after a soft delete or restore (#2326, #2319).
+///
+/// `ledgered` implies `soft_delete`, so a delete here is always soft: the row
+/// survives with `deleted_at` set. The record handed to [`ledger_append_ts`]
+/// is the pre-delete load, but a ledger revision snapshots the state after its write.
+/// A trigger or a default may change any column in the same UPDATE (#2326), so
+/// reload the whole row. A restore needs the same: its record is the UPDATE's
+/// `RETURNING` row, which does not show what an AFTER trigger changed. The
+/// bulk paths share this builder. Reading the row back is one indexed lookup,
+/// on ledgered deletes and restores only.
+fn ledger_reload_after_write_ts(
+    table_name_ts: &str,
+    op: &str,
+    conn_ident: &TokenStream,
+    model_ident: &proc_macro2::Ident,
+) -> TokenStream {
+    let table_ident = format_ident!("{table_name_ts}");
+    if !matches!(op, "delete" | "restore") {
+        return quote! {};
+    }
+    quote! {
+        {
+            use ::autumn_web::reexports::diesel::prelude::*;
+            // Named, not glob-aliased: the sync prelude also brings a
+            // `first`, and only an explicit import shadows it.
+            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+            let __lg_after: ::core::option::Option<#model_ident> = #table_ident::table
+                .find(__lg_record_id)
+                .select(#model_ident::as_select())
+                .first::<#model_ident>(&mut *#conn_ident)
+                .await
+                .optional()
+                .map_err(::autumn_web::AutumnError::from)?;
+            // A missing row would leave the stale pre-delete snapshot. Refuse.
+            let ::core::option::Option::Some(__lg_row) = __lg_after else {
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::internal_server_error(
+                        ::autumn_web::ledger::LedgerError::ChainUnreadable {
+                            table: #table_name_ts.to_string(),
+                            record_id: __lg_record_id,
+                            detail: "the row cannot be read back after the write".to_string(),
+                        },
+                    ),
+                );
+            };
+            // #2319: a trigger that rewrote `tenant_id` would split the chain.
+            ::autumn_web::ledger::refuse_tenant_change(
+                #table_name_ts,
+                __lg_record_id,
+                __lg_tenant_id,
+                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(&__lg_row),
+            )?;
+            __lg_snapshot = __lg_row.__autumn_commit_hook_to_value()?;
+        }
+    }
+}
+
 /// Generate the token stream that appends one `LedgerRevision` to
 /// `_autumn_ledger_revisions` (issue #1699).
 ///
@@ -2316,45 +2373,8 @@ fn ledger_append_ts(
 ) -> TokenStream {
     let op_variant = version_op_variant(op);
 
-    // `ledgered` implies `soft_delete`, so a delete here is always soft: the row
-    // survives with `deleted_at` set. The record handed to this builder is the
-    // pre-delete load, but a ledger revision snapshots the state after its write.
-    // A trigger or a default may change any column in the same UPDATE (#2326), so
-    // reload the whole row. The bulk paths share this builder. Reading the row
-    // back is one indexed lookup, on ledgered deletes only.
-    let table_ident = format_ident!("{table_name_ts}");
-    let soft_delete_stamp = if op == "delete" {
-        quote! {
-            {
-                use ::autumn_web::reexports::diesel::prelude::*;
-                // Named, not glob-aliased: the sync prelude also brings a
-                // `first`, and only an explicit import shadows it.
-                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let __lg_after: ::core::option::Option<#model_ident> = #table_ident::table
-                    .find(__lg_record_id)
-                    .select(#model_ident::as_select())
-                    .first::<#model_ident>(&mut *#conn_ident)
-                    .await
-                    .optional()
-                    .map_err(::autumn_web::AutumnError::from)?;
-                // A missing row would leave the stale pre-delete snapshot. Refuse.
-                let ::core::option::Option::Some(__lg_row) = __lg_after else {
-                    return ::core::result::Result::Err(
-                        ::autumn_web::AutumnError::internal_server_error(
-                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
-                                table: #table_name_ts.to_string(),
-                                record_id: __lg_record_id,
-                                detail: "the deleted row cannot be read back".to_string(),
-                            },
-                        ),
-                    );
-                };
-                __lg_snapshot = __lg_row.__autumn_commit_hook_to_value()?;
-            }
-        }
-    } else {
-        quote! {}
-    };
+    let soft_delete_stamp =
+        ledger_reload_after_write_ts(table_name_ts, op, conn_ident, model_ident);
 
     // #2326: a delete or restore is valid from the moment it is made. The record
     // still holds the old valid time. Reading it would back-date the revision.
@@ -2377,7 +2397,8 @@ fn ledger_append_ts(
     };
 
     // #2319: a chain belongs to one tenant. An update that moves the record
-    // would split it, so refuse it.
+    // would split it, so refuse it. A delete or restore sets only `deleted_at`,
+    // but a trigger can rewrite `tenant_id`; those check the reloaded row above.
     let tenant_change_check = match (op, before_expr) {
         ("update", Some(before)) => quote! {
             ::autumn_web::ledger::refuse_tenant_change(
@@ -28371,14 +28392,27 @@ mod tests {
     }
 
     #[test]
-    fn ledger_append_refuses_a_tenant_change_on_update_only() {
-        // #2319: a chain belongs to one tenant.
-        assert!(ledger_append_for("update").contains("refuse_tenant_change"));
-        for op in ["insert", "delete", "restore"] {
+    fn ledger_append_refuses_a_tenant_change_on_every_mutation() {
+        // #2319: a chain belongs to one tenant. A trigger can rewrite
+        // `tenant_id` during a delete or restore, so those are checked too.
+        for op in ["update", "delete", "restore"] {
             assert!(
-                !ledger_append_for(op).contains("refuse_tenant_change"),
-                "`{op}` cannot move a record"
+                ledger_append_for(op).contains("refuse_tenant_change"),
+                "`{op}` must refuse a tenant change"
             );
+        }
+        // An insert starts the chain, so there is nothing to compare.
+        assert!(!ledger_append_for("insert").contains("refuse_tenant_change"));
+        // A delete or restore compares against the reloaded row, after any
+        // trigger ran, and snapshots that row.
+        for op in ["delete", "restore"] {
+            let generated = ledger_append_for(op);
+            let reload = generated.find("__lg_after").expect("reloads the row");
+            let check = generated.find("refuse_tenant_change").expect("checks");
+            let snapshot = generated
+                .find("__lg_row . __autumn_commit_hook_to_value")
+                .expect("snapshots the reloaded row");
+            assert!(reload < check && check < snapshot, "{op}: {generated}");
         }
     }
 

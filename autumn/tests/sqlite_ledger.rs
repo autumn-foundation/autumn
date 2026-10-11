@@ -3160,6 +3160,97 @@ async fn a_ledgered_row_cannot_move_between_tenants() {
     .await;
 }
 
+fn assert_tenant_change(err: &autumn_web::AutumnError, id: i64) {
+    match err.downcast_chain_ref::<autumn_web::ledger::LedgerError>() {
+        Some(autumn_web::ledger::LedgerError::TenantChange { table, record_id }) => {
+            assert_eq!(table, "lg_movable_invoices");
+            assert_eq!(*record_id, id);
+        }
+        other => panic!("expected TenantChange, got {other:?}"),
+    }
+}
+
+async fn install_tenant_rewrite_trigger(pool: &SqlitePool, name: &str, when: &str) {
+    let mut conn = pool.get().await.expect("conn");
+    conn.batch_execute(&format!(
+        "CREATE TRIGGER {name} AFTER UPDATE OF deleted_at ON lg_movable_invoices \
+         WHEN {when} \
+         BEGIN UPDATE lg_movable_invoices SET tenant_id = 'tenant-b' WHERE id = NEW.id; END"
+    ))
+    .await
+    .expect("install trigger");
+}
+
+/// A trigger that moves the row to another tenant during a soft delete would
+/// split the chain. The delete is refused and rolled back.
+#[tokio::test]
+async fn a_trigger_cannot_move_a_ledgered_row_during_delete() {
+    let pool = boot_pool("lg_tenant_delete_trigger").await;
+    install_tenant_rewrite_trigger(&pool, "lg_move_on_delete", "NEW.deleted_at IS NOT NULL").await;
+    let repo = PgLgMovableInvoiceRepository::with_pool_untracked(pool);
+
+    with_tenant("tenant-a".to_string(), async {
+        let id = repo
+            .save(&NewLgMovableInvoice {
+                reference: "A-1".to_string(),
+                tenant_id: "tenant-a".to_string(),
+            })
+            .await
+            .expect("insert")
+            .id;
+        let err = repo
+            .delete_by_id(id)
+            .await
+            .expect_err("the delete moves the row");
+        assert_tenant_change(&err, id);
+
+        let live = repo
+            .find_by_id(id)
+            .await
+            .expect("read")
+            .expect("the delete rolled back");
+        assert_eq!(live.tenant_id, "tenant-a");
+        let report = repo.ledger_verify(id).await.expect("verify");
+        assert!(report.is_intact(), "{report:?}");
+        assert_eq!(report.revisions_checked, 1);
+    })
+    .await;
+}
+
+/// The same for a restore: the undelete is refused and rolled back.
+#[tokio::test]
+async fn a_trigger_cannot_move_a_ledgered_row_during_restore() {
+    let pool = boot_pool("lg_tenant_restore_trigger").await;
+    let repo = PgLgMovableInvoiceRepository::with_pool_untracked(pool.clone());
+
+    with_tenant("tenant-a".to_string(), async {
+        let id = repo
+            .save(&NewLgMovableInvoice {
+                reference: "A-1".to_string(),
+                tenant_id: "tenant-a".to_string(),
+            })
+            .await
+            .expect("insert")
+            .id;
+        repo.delete_by_id(id).await.expect("delete");
+        install_tenant_rewrite_trigger(&pool, "lg_move_on_restore", "NEW.deleted_at IS NULL").await;
+        let err = repo
+            .restore(id)
+            .await
+            .expect_err("the restore moves the row");
+        assert_tenant_change(&err, id);
+
+        assert!(
+            repo.find_by_id(id).await.expect("read").is_none(),
+            "the restore rolled back"
+        );
+        let report = repo.ledger_verify(id).await.expect("verify");
+        assert!(report.is_intact(), "{report:?}");
+        assert_eq!(report.revisions_checked, 2);
+    })
+    .await;
+}
+
 /// No read mode interleaves two tenants' chains: every ledger read refuses
 /// `across_tenants()`.
 #[tokio::test]
@@ -3389,6 +3480,49 @@ async fn a_delete_snapshots_the_row_a_trigger_rewrote() {
         .expect("as-of")
         .expect("state");
     assert_eq!(then.reference, "INV-T-touched");
+}
+
+/// The same for a restore: its `RETURNING` row does not show what an AFTER
+/// trigger changed, so the revision snapshots the reloaded row (#2319).
+#[tokio::test]
+async fn a_restore_snapshots_the_row_a_trigger_rewrote() {
+    let pool = boot_pool("lg_restore_trigger").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let created = repo
+        .save(&NewLgInvoice {
+            reference: "INV-R".to_string(),
+            amount_cents: 1,
+            amount_rate: 1.0,
+            metadata: "{}".to_string(),
+        })
+        .await
+        .expect("insert");
+    repo.delete_by_id(created.id).await.expect("soft delete");
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute(
+            "CREATE TRIGGER lg_invoices_restore_touch AFTER UPDATE OF deleted_at ON lg_invoices \
+             WHEN NEW.deleted_at IS NULL \
+             BEGIN UPDATE lg_invoices SET reference = reference || '-restored' \
+             WHERE id = NEW.id; END",
+        )
+        .await
+        .expect("install trigger");
+    }
+    repo.restore(created.id).await.expect("restore");
+
+    let report = repo.ledger_verify(created.id).await.expect("verify");
+    assert!(
+        report.is_intact(),
+        "no false positive after restore: {report:?}"
+    );
+    let head = repo
+        .ledger_revisions(created.id)
+        .await
+        .expect("revisions")
+        .pop()
+        .expect("head");
+    assert_eq!(head.snapshot["reference"], "INV-R-restored");
 }
 
 #[tokio::test]
