@@ -360,14 +360,14 @@ impl SessionRotationHooks {
             .push(Arc::new(move |rotation| Box::pin(hook(rotation))));
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.hooks
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 

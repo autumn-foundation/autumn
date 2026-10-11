@@ -16017,6 +16017,21 @@ async fn canary_rollback_signal(path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
+    /// Issue #2347: `on_session_rotation` puts one hook on the shared registry
+    /// when the state initializers run.
+    #[test]
+    fn on_session_rotation_registers_hooks_on_the_state() {
+        let builder = super::app()
+            .on_session_rotation(|_| async { Ok(()) })
+            .on_session_rotation(|_| async { Ok(()) });
+        let state = crate::state::AppState::test_default();
+        assert!(state.session_rotation_hooks().is_empty());
+
+        super::run_state_initializers(builder.state_initializers, &state);
+
+        assert_eq!(state.session_rotation_hooks().len(), 2);
+    }
+
     /// Regression (#1620): DNS-01 must not silence the multi-replica warning.
     ///
     /// DNS-01 retires the HTTP-01 token-map hazard — the CA never connects to
