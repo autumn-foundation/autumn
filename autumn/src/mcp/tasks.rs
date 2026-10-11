@@ -399,6 +399,13 @@ impl TaskStore {
         true
     }
 
+    /// Delete the tasks whose TTL ended, and stop their work. A timer calls
+    /// this at the end of each TTL, so an idle server also frees memory.
+    pub fn sweep(&self, now: DateTime<Utc>) {
+        let mut tasks = self.lock();
+        self.purge(&mut tasks, now);
+    }
+
     /// Whether a task with this ID belongs to `owner`.
     pub fn contains(&self, id: &str, owner: &Owner, now: DateTime<Utc>) -> bool {
         let mut tasks = self.lock();
@@ -600,6 +607,17 @@ mod tests {
             .create("t1", owner("a"), "q", at(0))
             .unwrap();
         assert_eq!(long["ttlMs"], MAX_SAFE_INTEGER);
+    }
+
+    #[test]
+    fn sweep_deletes_expired_tasks() {
+        let store = store();
+        store.create("t1", owner("a"), "q", at(0));
+        store.finish("t1", TaskState::Completed(Arc::new(json!({}))), at(1));
+        store.sweep(at(9));
+        assert_eq!(store.lock().len(), 1);
+        store.sweep(at(10));
+        assert_eq!(store.lock().len(), 0);
     }
 
     #[tokio::test]

@@ -1578,8 +1578,11 @@ fn serve_task_method(
     let found = match method {
         "tasks/get" => server.tasks.get(task_id, &owner, now),
         "tasks/cancel" => server.tasks.cancel(task_id, &owner, now).then(ack),
-        // Autumn never asks for input, so no `inputResponses` key is
-        // outstanding. The spec says to ignore such keys.
+        // `inputResponses` is required. Autumn never asks for input, so no
+        // key is outstanding. The spec says to ignore such keys.
+        _ if !params.get("inputResponses").is_some_and(Value::is_object) => {
+            return error(id, -32602, "`inputResponses` must be a JSON object");
+        }
         _ => server.tasks.contains(task_id, &owner, now).then(ack),
     };
     found.map_or_else(
@@ -2537,6 +2540,13 @@ fn spawn_task(
         outcome.record(disposition).await;
     });
     server.tasks.set_abort(task_id, &job.abort_handle());
+    // Delete the task when its TTL ends, also when no request comes. The job
+    // can end early, so this timer is a separate task.
+    let sweep_server = Arc::clone(server);
+    tokio::spawn(async move {
+        tokio::time::sleep(ttl).await;
+        sweep_server.tasks.sweep(sweep_server.state.clock().now());
+    });
 }
 
 /// Dispatch a task's request. Returns its `CallToolResult`, and the guard

@@ -481,6 +481,24 @@ async fn update_is_acknowledged() {
     assert_eq!(ack["result"], json!({"resultType": "complete"}), "{ack}");
 }
 
+#[tokio::test]
+async fn update_needs_an_input_responses_object() {
+    let client = app(routes![build_report]);
+    let id = task_id(&call(&client, "build_report", true).await);
+    for params in [
+        json!({"taskId": id, "_meta": task_meta()}),
+        json!({"taskId": id, "inputResponses": [], "_meta": task_meta()}),
+    ] {
+        let out = rpc(
+            &client,
+            None,
+            json!({"jsonrpc":"2.0","id":5,"method":"tasks/update","params":params}),
+        )
+        .await;
+        assert_eq!(out["error"]["code"], -32602, "{out}");
+    }
+}
+
 // ── TTL ───────────────────────────────────────────────────────────────
 
 #[tokio::test]
