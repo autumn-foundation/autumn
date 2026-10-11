@@ -1245,6 +1245,14 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   ImpersonationBanner, AdminImpersonation, IMPERSONATION_BANNER_CSS}`, routes
   `POST {prefix}/impersonate` (gated) and `POST {prefix}/impersonate/stop`
   (ungated on purpose). Session-based auth only.
+- **(#2347)**: session-rotation hooks —
+  `AppBuilder::on_session_rotation(|SessionRotation { old_id, new_id }| async
+  { Ok(()) })` and `AppState::session_rotation_hooks()` run after a rotated
+  session is stored (not for a destroyed one). Use them to move state keyed by
+  the session id. Generated auth registers one for the tracked-session row.
+  `impersonation::rebind(&state, &session)` keeps a record across a trusted
+  same-user `rotate_id()`; never call it from a login flow. The rate-limit
+  principal is the operator while impersonating.
 
 ## Submit tokens (0.6.0, #1360)
 
