@@ -2529,7 +2529,7 @@ fn spawn_task(
             .finish(&job_id, state, server.state.clock().now());
         outcome.record(disposition).await;
     });
-    server.tasks.set_abort(task_id, job.abort_handle());
+    server.tasks.set_abort(task_id, &job.abort_handle());
 }
 
 /// Dispatch a task's request. Returns its `CallToolResult`, and the guard

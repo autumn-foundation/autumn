@@ -266,16 +266,16 @@ impl TaskStore {
         (out, result)
     }
 
-    /// Add a `working` task. Returns the `CreateTaskResult`, or `None` when
-    /// the store is full.
+    /// Add a `working` task. Returns the `CreateTaskResult`. Returns `None`
+    /// if the store is full or the caller has its quota of tasks.
     pub fn create(&self, id: &str, owner: Owner, now: DateTime<Utc>) -> Option<Value> {
         let mut tasks = self.lock();
         self.purge(&mut tasks, now);
         if tasks.len() >= self.config.max_tasks {
             return None;
         }
-        let owned = tasks.values().filter(|e| e.owner.matches(&owner)).count();
-        if owned >= self.config.max_tasks_per_caller {
+        let held = tasks.values().filter(|e| e.owner.matches(&owner)).count();
+        if held >= self.config.max_tasks_per_caller {
             return None;
         }
         let entry = Entry {
@@ -292,19 +292,25 @@ impl TaskStore {
     }
 
     /// Keep the handle that stops the task's work.
-    pub fn set_abort(&self, id: &str, abort: AbortHandle) {
+    pub fn set_abort(&self, id: &str, abort: &AbortHandle) {
         let mut tasks = self.lock();
-        // No entry: the TTL ended before the handle came.
-        let Some(entry) = tasks.get_mut(id) else {
-            abort.abort();
-            return;
+        let stop = match tasks.get_mut(id) {
+            // No entry: the TTL ended before the handle came.
+            None => true,
+            Some(entry) => match entry.state {
+                TaskState::Working => {
+                    entry.abort = Some(abort.clone());
+                    false
+                }
+                // The client cancelled before the handle came.
+                TaskState::Cancelled => true,
+                // The task ended. Its job can still write the audit outcome.
+                TaskState::Completed(_) | TaskState::Failed(..) => false,
+            },
         };
-        match entry.state {
-            TaskState::Working => entry.abort = Some(abort),
-            // The client cancelled before the handle came.
-            TaskState::Cancelled => abort.abort(),
-            // The task ended. Its job can still write the audit outcome.
-            TaskState::Completed(_) | TaskState::Failed(..) => {}
+        drop(tasks);
+        if stop {
+            abort.abort();
         }
     }
 
@@ -524,7 +530,7 @@ mod tests {
         store.create("t1", owner("a"), at(0));
         assert!(store.cancel("t1", &owner("a"), at(1)));
         let job = tokio::spawn(std::future::pending::<()>());
-        store.set_abort("t1", job.abort_handle());
+        store.set_abort("t1", &job.abort_handle());
         assert!(job.await.unwrap_err().is_cancelled());
     }
 
@@ -533,13 +539,13 @@ mod tests {
         let store = store();
         store.create("t1", owner("a"), at(0));
         let job = tokio::spawn(std::future::pending::<()>());
-        store.set_abort("t1", job.abort_handle());
+        store.set_abort("t1", &job.abort_handle());
         assert!(store.cancel("t1", &owner("a"), at(1)));
         assert!(job.await.unwrap_err().is_cancelled());
 
         store.create("t2", owner("a"), at(0));
         let job = tokio::spawn(std::future::pending::<()>());
-        store.set_abort("t2", job.abort_handle());
+        store.set_abort("t2", &job.abort_handle());
         assert!(!store.contains("t2", &owner("a"), at(20)));
         assert!(job.await.unwrap_err().is_cancelled());
     }
