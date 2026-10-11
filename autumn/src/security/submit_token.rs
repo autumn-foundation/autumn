@@ -732,6 +732,7 @@ async fn cache_consumed_token_response(
                     .store
                     .set(key, owner, record, Vec::new(), settings.ttl)
                     .await
+                    .and_then(crate::idempotency::stored)
                 {
                     tracing::error!(
                         error = %error,
@@ -1583,6 +1584,79 @@ mod tests {
             1,
             "the handler must run at most once even when persistence fails"
         );
+    }
+
+    /// A store whose writes are always fenced out: `set` stores nothing and
+    /// returns `false`, as when a newer request took the key.
+    struct FencedSetStore {
+        inner: MemoryIdempotencyStore,
+    }
+
+    impl IdempotencyStore for FencedSetStore {
+        fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
+            self.inner.get(key)
+        }
+
+        fn set<'a>(
+            &'a self,
+            _key: &'a str,
+            _owner: &'a str,
+            _record: IdempotencyRecord,
+            _body_hash: Vec<u8>,
+            _ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
+            Box::pin(std::future::ready(Ok(false)))
+        }
+
+        fn try_lock<'a>(
+            &'a self,
+            key: &'a str,
+            owner: &'a str,
+            lock_ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
+            self.inner.try_lock(key, owner, lock_ttl)
+        }
+
+        fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
+            self.inner.unlock(key, owner)
+        }
+    }
+
+    /// A fenced-out token write after the handler succeeded fails closed like
+    /// a failed write: `503`, and the lock stays, so a retry gets `409`.
+    #[tokio::test]
+    async fn fenced_out_write_fails_closed_and_holds_lock() {
+        let store: Arc<dyn IdempotencyStore> = Arc::new(FencedSetStore {
+            inner: MemoryIdempotencyStore::new(Duration::from_secs(600)),
+        });
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let app = Router::new()
+            .route(
+                "/submit",
+                post(move || {
+                    let count = count_inner.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        "created"
+                    }
+                }),
+            )
+            .layer(layer_with_store(store));
+
+        let first = app
+            .clone()
+            .oneshot(urlencoded_post("tok-fenced"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let second = app
+            .clone()
+            .oneshot(urlencoded_post("tok-fenced"))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     /// Finding (fail closed on response-stream error): when the handler has

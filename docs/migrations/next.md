@@ -518,8 +518,8 @@ impl IdempotencyStore for MyStore {
   expired: a request that outlived its lock must not replace the newer
   request's response. Store the owner with the response to check this.
 - `set` returns `true` when it stored the response and `false` when another
-  owner fenced it out. A session rewrite that is fenced out fails closed
-  with `503`.
+  owner fenced it out. The middleware and submit tokens treat `false` as a
+  failed write: `503`, with the key held until its in-flight TTL.
 - `renew_lock` is new and optional. It runs `owner`'s lock for `ttl` from now,
   only while `owner` holds it. The middleware and submit tokens call it when
   the work between taking the lock and running the handler used more than a

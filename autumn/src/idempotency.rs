@@ -1482,13 +1482,7 @@ impl DeferredIdempotencyCommit {
                     state.ttl,
                 )
                 .await
-                .and_then(|written| {
-                    written.then_some(()).ok_or_else(|| {
-                        IdempotencyStoreError::backend(
-                            "another request holds the idempotency key or stored its response",
-                        )
-                    })
-                });
+                .and_then(stored);
             if let Err(error) = written {
                 tracing::error!(
                     idempotency.key = %state.idempotency_key,
@@ -1706,6 +1700,17 @@ async fn acquire_lock(
             false
         }
     }
+}
+
+/// A response that another owner's lock or response fenced out was not
+/// stored: a retry would replay the other response, or run the mutation
+/// again. Callers fail closed on it as on a store error.
+pub(crate) fn stored(written: bool) -> Result<(), IdempotencyStoreError> {
+    written.then_some(()).ok_or_else(|| {
+        IdempotencyStoreError::backend(
+            "another request holds the idempotency key or stored its response",
+        )
+    })
 }
 
 /// What became of a lock that the work before the handler may have outlived.
@@ -2301,6 +2306,7 @@ where
         } else if let Err(error) = store
             .set(&storage_key, &lock.owner, record, body_hash, ttl)
             .await
+            .and_then(stored)
         {
             tracing::error!(
                 idempotency.key = %idempotency_key,
@@ -3374,5 +3380,71 @@ mod tests {
             !memory.try_lock_now("primary", "retry", Duration::from_secs(60)),
             "the primary key stays locked until its TTL"
         );
+    }
+
+    /// A store whose writes are always fenced out: `set` stores nothing and
+    /// returns `false`, as when a newer request took the key.
+    struct FencedSetStore {
+        inner: MemoryIdempotencyStore,
+    }
+
+    impl IdempotencyStore for FencedSetStore {
+        fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
+            self.inner.get(key)
+        }
+
+        fn set<'a>(
+            &'a self,
+            _key: &'a str,
+            _owner: &'a str,
+            _record: IdempotencyRecord,
+            _body_hash: Vec<u8>,
+            _ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
+            Box::pin(std::future::ready(Ok(false)))
+        }
+
+        fn try_lock<'a>(
+            &'a self,
+            key: &'a str,
+            owner: &'a str,
+            lock_ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
+            self.inner.try_lock(key, owner, lock_ttl)
+        }
+
+        fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
+            self.inner.unlock(key, owner)
+        }
+    }
+
+    /// A fenced-out write after the handler succeeded is not a stored
+    /// response: the request fails closed with `503` and keeps its lock, so a
+    /// retry gets `409` instead of running the mutation again.
+    #[tokio::test]
+    async fn fenced_out_write_after_success_fails_closed() {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let store = Arc::new(FencedSetStore {
+            inner: MemoryIdempotencyStore::new(Duration::from_secs(60)),
+        });
+        let service = IdempotencyLayer::new(store).layer(tower::service_fn(
+            |_req: Request<Body>| async move {
+                CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, Infallible>(Response::new(Body::from("charged")))
+            },
+        ));
+
+        let first = service
+            .clone()
+            .oneshot(idempotent_post("/fenced", "fenced-key", ""))
+            .await
+            .expect("infallible");
+        assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry = service
+            .oneshot(idempotent_post("/fenced", "fenced-key", ""))
+            .await
+            .expect("infallible");
+        assert_eq!(retry.status(), StatusCode::CONFLICT);
+        assert_eq!(CALLS.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
