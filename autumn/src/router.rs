@@ -1422,6 +1422,43 @@ fn aeo_x402_layer(
 
 /// Build the AEO site snapshot from the route registry, the `OpenAPI` config,
 /// and the MCP tool catalog.
+/// The `GET /` routes the route table and scoped groups declare.
+struct HomeRoutes {
+    /// A `routes![...]` home, mounted inside the locale nests.
+    routed: bool,
+    /// A scoped-group home, mounted outside them.
+    scoped: bool,
+    /// One of them is `noindex`.
+    noindex: bool,
+}
+
+impl HomeRoutes {
+    fn find(route_list: &[Route], scoped_groups: &[ScopedGroup]) -> Self {
+        let routed: Vec<&Route> = route_list
+            .iter()
+            .filter(|r| r.method == http::Method::GET && r.path == "/")
+            .collect();
+        let scoped: Vec<&Route> = scoped_groups
+            .iter()
+            .flat_map(|g| {
+                g.routes.iter().filter(|r| {
+                    r.method == http::Method::GET && join_nested_path(&g.prefix, r.path) == "/"
+                })
+            })
+            .collect();
+        let noindex = routed.iter().chain(&scoped).any(|r| {
+            r.seo
+                .robots
+                .is_some_and(crate::seo::robots_directive_is_noindex)
+        });
+        Self {
+            routed: !routed.is_empty(),
+            scoped: !scoped.is_empty(),
+            noindex,
+        }
+    }
+}
+
 #[cfg_attr(
     not(all(feature = "openapi", feature = "mcp")),
     allow(clippy::needless_pass_by_value, unused_variables)
@@ -1497,41 +1534,19 @@ fn build_aeo_site<O: AeoOpenApiFacts, M: AeoMcpFacts>(
     pages.sort_by(|a, b| a.path.cmp(&b.path));
     pages.dedup_by(|a, b| a.path == b.path);
 
+    let home = HomeRoutes::find(route_list, scoped_groups);
     // An API-only app has no home page: list none rather than a `404`. A
     // merged router is opaque and may serve `/`, so with one the home page
     // is assumed to exist.
-    let routed_home = route_list
-        .iter()
-        .any(|r| r.method == http::Method::GET && r.path == "/");
-    let has_home = merged_routers
-        || routed_home
-        || scoped_groups.iter().any(|g| {
-            g.routes.iter().any(|r| {
-                r.method == http::Method::GET && join_nested_path(&g.prefix, r.path) == "/"
-            })
-        });
+    let has_home = merged_routers || home.routed || home.scoped;
     // Only a `routes![...]` home is localized. A home from a scoped group or a
     // merged router mounts outside the locale nests and answers at `/`.
-    let home_paths = if routed_home {
+    let home_paths = if home.routed {
         home_paths
     } else {
         vec!["/".to_owned()]
     };
-    let noindex = |r: &Route| {
-        r.seo
-            .robots
-            .is_some_and(crate::seo::robots_directive_is_noindex)
-    };
-    let home_noindex = route_list
-        .iter()
-        .any(|r| r.method == http::Method::GET && r.path == "/" && noindex(r))
-        || scoped_groups.iter().any(|g| {
-            g.routes.iter().any(|r| {
-                r.method == http::Method::GET
-                    && join_nested_path(&g.prefix, r.path) == "/"
-                    && noindex(r)
-            })
-        });
+    let home_noindex = home.noindex;
     let mut facts = SiteFacts {
         pages,
         home_paths,
