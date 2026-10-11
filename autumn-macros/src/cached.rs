@@ -40,7 +40,7 @@ use syn::punctuated::Punctuated;
 use syn::visit_mut::VisitMut;
 use syn::{Expr, Ident, ItemFn, LitInt, LitStr, Token};
 
-struct CachedAttrs {
+pub struct CachedAttrs {
     ttl: Option<String>,
     max: Option<usize>,
     result: bool,
@@ -60,6 +60,10 @@ struct CachedAttrs {
     /// gate. The reason is mandatory and must be non-blank so an escape hatch
     /// always carries its justification into the manifest.
     acknowledge_stale: Option<String>,
+    /// Enclosing type of an associated function. It joins the read identity,
+    /// so same-named functions in different impls do not share cache keys
+    /// (#2358).
+    pub scope: Option<String>,
 }
 
 /// Try to parse `max` as either a string literal or an integer literal.
@@ -81,7 +85,7 @@ fn parse_max_value(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<usize> 
     }
 }
 
-fn parse_cached_args(attr: TokenStream) -> syn::Result<CachedAttrs> {
+pub fn parse_cached_args(attr: TokenStream) -> syn::Result<CachedAttrs> {
     let mut result = CachedAttrs {
         ttl: None,
         max: None,
@@ -89,6 +93,7 @@ fn parse_cached_args(attr: TokenStream) -> syn::Result<CachedAttrs> {
         key: Vec::new(),
         reads: Vec::new(),
         acknowledge_stale: None,
+        scope: None,
     };
 
     if attr.is_empty() {
@@ -151,10 +156,24 @@ fn parse_cached_args(attr: TokenStream) -> syn::Result<CachedAttrs> {
             }
             result.acknowledge_stale = Some(reason);
             Ok(())
+        } else if meta.path.is_ident("scope") {
+            let value: LitStr = meta.value()?.parse()?;
+            if result.scope.is_some() {
+                return Err(meta.error("`scope` is set twice"));
+            }
+            let name = value.value();
+            if !is_type_path(name.trim()) {
+                return Err(syn::Error::new_spanned(
+                    &value,
+                    "`scope` must be a type name, such as \"Products\" or \"a::Store\"",
+                ));
+            }
+            result.scope = Some(name.trim().to_owned());
+            Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected ttl, max, result, key, reads, or \
-                 acknowledge_stale",
+                "unsupported attribute: expected ttl, max, result, key, reads, \
+                 acknowledge_stale, or scope",
             ))
         }
     })
@@ -333,8 +352,15 @@ fn read_id_const_ident(fn_name: &syn::Ident) -> syn::Ident {
 /// the constant by path. In an `impl` block the constant is an ASSOCIATED
 /// const, which a bare path cannot reach; and `module_path!()` names the
 /// enclosing module either way, so every splice is the same string.
-fn read_id_expr(fn_name_str: &str) -> TokenStream {
-    quote! { concat!(module_path!(), "::", #fn_name_str) }
+///
+/// `scope` is the enclosing type of an associated function. The identity must
+/// stay a `const` string and `type_name` is not `const`, so the type comes from
+/// the macro, not from rustc.
+fn read_id_expr(fn_name_str: &str, scope: Option<&str>) -> TokenStream {
+    scope.map_or_else(
+        || quote! { concat!(module_path!(), "::", #fn_name_str) },
+        |scope| quote! { concat!(module_path!(), "::", #scope, "::", #fn_name_str) },
+    )
 }
 
 /// Name of the generated per-read invalidator.
@@ -369,7 +395,7 @@ fn generate_coherence_items(
 ) -> CoherenceItems {
     let vis = &input_fn.vis;
     let id_const = read_id_const_ident(fn_name);
-    let id_expr = read_id_expr(fn_name_str);
+    let id_expr = read_id_expr(fn_name_str, attrs.scope.as_deref());
     let invalidator = invalidator_ident(fn_name);
 
     // Declared beats derived: an explicit `reads(...)` is the strongest claim
@@ -569,7 +595,7 @@ fn generate_cache_body(
         quote! { (|| #fn_block)() }
     };
 
-    let id_expr = read_id_expr(&fn_name.to_string());
+    let id_expr = read_id_expr(&fn_name.to_string(), attrs.scope.as_deref());
     let cache_init = quote! {
         // `Arc` rather than a bare `MokaCache` (#1716): the store stays a
         // per-function static, but a clone is handed to the coherence registry
@@ -753,6 +779,16 @@ pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+/// Whether `text` is a plain type path: `Store` or `a::Store`.
+///
+/// No leading `::`, no generics, no spaces. `crate`, `self` and `super` count,
+/// because `impl crate::a::Store` is a legal self type.
+fn is_type_path(text: &str) -> bool {
+    text.split("::").all(|segment| {
+        matches!(segment, "crate" | "self" | "super") || syn::parse_str::<Ident>(segment).is_ok()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -895,6 +931,85 @@ mod tests {
             output_str.contains("10_000"),
             "default max should be 10_000"
         );
+    }
+
+    #[test]
+    fn scope_enters_the_read_identity() {
+        let out = cached_macro(
+            quote! { scope = "Products" },
+            quote! { async fn get(id: i64) -> String { String::new() } },
+        )
+        .to_string();
+        assert!(!out.contains("compile_error"), "{out}");
+        assert!(
+            out.contains("concat ! (module_path ! () , \"::\" , \"Products\" , \"::\" , \"get\")"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("concat ! (module_path ! () , \"::\" , \"get\")"),
+            "the unscoped identity must not remain: {out}"
+        );
+    }
+
+    #[test]
+    fn without_scope_the_identity_is_unchanged() {
+        let out = cached_macro(
+            TokenStream::new(),
+            quote! { async fn get(id: i64) -> String { String::new() } },
+        )
+        .to_string();
+        assert!(
+            out.contains("concat ! (module_path ! () , \"::\" , \"get\")"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_scope_that_is_not_a_type_name_is_a_compile_error() {
+        for bad in [" ", "x:", "::a", "Foo<T>", "a b", "1x", "a::"] {
+            let out = cached_macro(
+                quote! { scope = #bad },
+                quote! { async fn get(id: i64) -> String { String::new() } },
+            )
+            .to_string();
+            assert!(out.contains("compile_error"), "{bad}: {out}");
+        }
+    }
+
+    #[test]
+    fn a_repeated_scope_is_a_compile_error() {
+        let out = cached_macro(
+            quote! { scope = "A", scope = "B" },
+            quote! { async fn get(id: i64) -> String { String::new() } },
+        )
+        .to_string();
+        assert!(out.contains("compile_error"), "{out}");
+    }
+
+    #[test]
+    fn scope_combines_with_key_and_reads() {
+        let out = cached_macro(
+            quote! { scope = "Products", key(id), reads(Product) },
+            quote! { async fn get(id: i64, repo: &Repo) -> String { String::new() } },
+        )
+        .to_string();
+        assert!(!out.contains("compile_error"), "{out}");
+        assert!(out.contains("\"Products\""), "{out}");
+    }
+
+    #[test]
+    fn a_scope_may_use_path_keywords() {
+        for scope in ["crate::a::Store", "self::Store", "super::Store"] {
+            let out = cached_macro(quote! { scope = #scope }, quote! { fn get() {} }).to_string();
+            assert!(!out.contains("compile_error"), "{scope}: {out}");
+        }
+    }
+
+    #[test]
+    fn a_qualified_scope_enters_the_identity() {
+        let out = cached_macro(quote! { scope = "a::Store" }, quote! { fn get() {} }).to_string();
+        assert!(!out.contains("compile_error"), "{out}");
+        assert!(out.contains("\"a::Store\""), "{out}");
     }
 
     #[test]

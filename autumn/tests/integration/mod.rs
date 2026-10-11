@@ -34,6 +34,8 @@ mod cache_coherence;
 mod cache_invalidation_after_commit;
 #[cfg(feature = "cache-moka")]
 mod cache_stampede;
+#[cfg(feature = "cache-moka")]
+mod cached_impl_scope;
 #[cfg(all(feature = "db", feature = "cache-moka"))]
 mod cached_tenant_scope;
 mod chaos_cache_jitter_proptest;

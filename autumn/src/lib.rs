@@ -1580,6 +1580,11 @@ pub use autumn_macros::routes;
 /// ```
 pub use autumn_macros::cached;
 
+/// Scope every `#[cached]` method of an `impl` block by its type.
+///
+/// Keeps same-named associated functions in one module from sharing cache keys.
+pub use autumn_macros::cached_impl;
+
 /// Annotate an async function as a WebSocket route handler.
 ///
 /// The function follows the **two-function pattern**: it runs at HTTP
