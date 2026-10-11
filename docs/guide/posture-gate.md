@@ -167,10 +167,13 @@ required check as satisfied).
 
 ### If your app is a Cargo workspace member
 
-`autumn upgrade` will not write this workflow into a workspace *member*, for
-the same reason it does not write `ci.yml` there: GitHub only runs workflows
-from the repository root, so a member's `.github/workflows/` never executes at
-all, and seeding one would look like adoption while gating nothing.
+`autumn upgrade` will not write this workflow into a workspace *member* that
+is not its own git root. It does not write `ci.yml` there either. GitHub runs
+workflows from the git root only. A workflow in the member never runs, and
+seeding one would look like adoption while gating nothing.
+
+A nested git repository or submodule is its own git root. `autumn upgrade`
+reconciles its workflows as usual.
 
 Adopt it by hand at the root instead — three edits to the scaffolded file:
 
@@ -187,8 +190,8 @@ env:
 
 Everything else — the base read, the acknowledgment harvest, the diff, the
 verdict — works unchanged, because it only ever reads the manifest path.
-Teaching `autumn upgrade` to reconcile workspace-root files on a member's
-behalf is tracked separately.
+Teaching `autumn upgrade` to reconcile root files for a member is tracked
+separately.
 
 ---
 

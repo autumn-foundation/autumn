@@ -34,6 +34,7 @@ mod experiments;
 mod export;
 mod flags;
 mod generate;
+mod git_root;
 mod graph;
 mod http;
 mod i18n;

@@ -2308,6 +2308,12 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- schema:: \
             | tee "$RUNNER_TEMP/cli-schema-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-schema-cov.log"
+          # Issue #2344: same gap for `upgrade::` and `git_root::`. No other lane
+          # instruments the `autumn` bin unit tests, so their patch coverage
+          # reads as 0%. Check the count: a filter that matches nothing exits 0.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- upgrade:: git_root:: \
+            | tee "$RUNNER_TEMP/cli-upgrade-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-upgrade-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
