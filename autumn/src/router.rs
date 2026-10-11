@@ -1546,21 +1546,21 @@ fn build_aeo_site<O: AeoOpenApiFacts, M: AeoMcpFacts>(
     // to any localized ones.
     // Each home's own `noindex` leaves only that page out of the sitemap.
     let mut noindex_homes = Vec::new();
-    let home_paths = if let Some(routed_noindex) = home.routed {
-        if routed_noindex {
-            noindex_homes.clone_from(&home_paths);
-        }
-        let mut paths = home_paths;
-        if home.scoped.is_some() && !paths.iter().any(|p| p == "/") {
-            paths.push("/".to_owned());
-        }
-        paths
-    } else {
-        vec!["/".to_owned()]
-    };
+    if home.routed == Some(true) {
+        noindex_homes.clone_from(&home_paths);
+    }
     if home.scoped == Some(true) {
         noindex_homes.push("/".to_owned());
     }
+    let mut home_paths = if home.routed.is_some() {
+        home_paths
+    } else {
+        Vec::new()
+    };
+    if home.routed.is_none() || home.scoped.is_some() {
+        home_paths.push("/".to_owned());
+    }
+    home_paths.dedup();
     let mut facts = SiteFacts {
         pages,
         home_paths,
