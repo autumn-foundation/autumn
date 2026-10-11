@@ -810,7 +810,10 @@ mod with_mcp {
                 .starts_with("application/linkset+json")
         );
         assert_eq!(catalog.header("access-control-allow-origin"), Some("*"));
-        assert_eq!(catalog.header("access-control-expose-headers"), Some("ETag"));
+        assert_eq!(
+            catalog.header("access-control-expose-headers"),
+            Some("ETag")
+        );
         let head = c.head("/.well-known/api-catalog").send().await;
         assert!(head.header("link").unwrap().contains("rel=\"api-catalog\""));
         // A cross-origin revalidation's preflight succeeds.
