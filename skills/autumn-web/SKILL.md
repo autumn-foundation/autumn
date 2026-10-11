@@ -500,6 +500,21 @@ omit the URL from the source instead. `sitemap_xml` truncates past 50,000 URLs.
 `autumn build` writes both files into `dist/`. Guide: `docs/guide/seo.md`; runnable
 example: `examples/reddit-clone` (`src/seo.rs`, `autumn.toml`).
 
+**Agent readiness (AEO, on by default):** `[aeo]` in `autumn.toml`. No code:
+`Accept: text/markdown` on an HTML page returns Markdown (`Vary: Accept`); the
+homepage sends agent `Link` headers; the router fallback serves `/robots.txt`
+(AI crawler groups + `Content-Signal`), `/llms.txt`, the agent skills index,
+the ARD manifest, and, when the app has them, the MCP server card, the RFC 9727
+API catalog, OAuth metadata, and `/auth.md`. An app route at the same path
+wins. Add `(autumn_web::aeo::webmcp::head_tags(None, csrf_token))` to the layout `<head>`
+for WebMCP. Register skills with `.agent_skill(AgentSkill::parse(..)?)`. Price
+a route with `[[aeo.paid_routes]]` + `[aeo.x402]` (x402; MPP `x-payment-info`
+in `/openapi.json`). Sign outbound calls with
+`RequestBuilder::sign_web_bot_auth`. `autumn aeo dns` prints DNS-AID records.
+Traps: set `[seo] base_url` in prod (else documents use the request `Host` and
+are `no-store`); `[aeo] enabled = false` turns it all off and restores the
+`/robots.txt` 404. Guide: `docs/guide/aeo.md`.
+
 **Locale-prefixed routing (issue #1251, 0.7.0):** set
 `[i18n] locale_prefix_enabled = true` in `autumn.toml` (default `false`) and
 every route registered via `routes![...]` becomes reachable under

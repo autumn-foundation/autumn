@@ -1589,6 +1589,10 @@ jobs:
         # and exit non-zero without it on PATH. Same install command as
         # generator-conformance.yml's `scaffold-postgres` job.
         run: cargo install diesel_cli --version "=2.2.0" --no-default-features --features postgres --locked
+      - name: Pull Docker Hub images through a mirror
+        if: runner.os == 'Linux'
+        # The runner's unauthenticated Docker Hub pull limit is often spent.
+        run: ./scripts/ci-docker-hub-mirror.sh
       - name: Pre-pull the testcontainer images
         if: runner.os == 'Linux'
         # The module default `postgres:11-alpine` is what 100+ tests start, all at
@@ -2247,6 +2251,10 @@ jobs:
           cargo llvm-cov --no-report -p autumn-admin-plugin --features autumn-web/sqlite \
             --test custom_admin_model -- --ignored
           cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Pull Docker Hub images through a mirror
+        if: matrix.lane == 'db-ignored'
+        # The runner's unauthenticated Docker Hub pull limit is often spent.
+        run: ./scripts/ci-docker-hub-mirror.sh
       - name: Pre-pull the testcontainer images
         if: matrix.lane == 'db-ignored'
         # Same reason as the `test-docker` job: pull once, with retries, before

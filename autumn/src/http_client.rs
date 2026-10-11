@@ -704,22 +704,28 @@ pub(crate) fn outbound_blocked_for_replay() -> bool {
 // `capsule` module. `OutboundRecorder` has a no-op twin below so `send` reads
 // the same on either build.
 
+/// The prefix of a recorded header value that is escaped bytes.
+#[cfg(feature = "reporting")]
+const OPAQUE_HEADER_PREFIX: &str = "[bytes] ";
+
 /// The headers the *caller* set, in the order they were set.
 ///
 /// One definition for both halves of the seam: the recorder stores this, and
 /// replay compares against it. Headers the client adds later — the injected
 /// W3C trace context, and any default the underlying `reqwest::Client` was
 /// built with — are deliberately outside it, so a client-side default can
-/// never be read as the handler changing its request.
-/// The prefix of a recorded header value that is escaped bytes.
-#[cfg(feature = "reporting")]
-const OPAQUE_HEADER_PREFIX: &str = "[bytes] ";
-
+/// never be read as the handler changing its request. So is a Web Bot Auth
+/// `Signature` and `Signature-Input`: the client makes them new for each
+/// send, so they differ on every replay.
 #[cfg(feature = "reporting")]
 fn caller_headers(builder: &RequestBuilder) -> Vec<(String, String)> {
     builder
         .extra_headers
         .iter()
+        .filter(|(name, _)| {
+            builder.web_bot_auth.is_none()
+                || !matches!(name.as_str(), "signature" | "signature-input")
+        })
         .map(|(name, value)| {
             (
                 name.as_str().to_owned(),
@@ -1614,6 +1620,7 @@ impl Client {
             entropy: self.entropy.clone(),
             throttle: self.throttle.clone(),
             criticality: None,
+            web_bot_auth: None,
         }
     }
 
@@ -1864,6 +1871,8 @@ pub struct RequestBuilder {
     throttle: Option<Arc<crate::admission::AdaptiveThrottle>>,
     /// The criticality to send. `None` sends the inbound request's.
     criticality: Option<crate::admission::Criticality>,
+    /// Web Bot Auth signer: each attempt sends a fresh signature.
+    web_bot_auth: Option<Arc<crate::aeo::web_bot_auth::WebBotAuthSigner>>,
 }
 
 impl RequestBuilder {
@@ -1909,6 +1918,32 @@ impl RequestBuilder {
                 tracing::warn!(header.name = name_str, error = %e, "invalid header value — header skipped");
             }
         }
+        self
+    }
+
+    /// Sign this request with Web Bot Auth (RFC 9421 HTTP Message
+    /// Signatures), so the receiving site can verify that it comes from this
+    /// app. Adds `Signature-Agent`, `Signature-Input`, and `Signature`.
+    ///
+    /// The URL must be absolute. Each attempt (a retry, a same-origin
+    /// redirect) sends a new signature, so a held builder or a late retry
+    /// never sends an expired one. See [`crate::aeo::web_bot_auth`].
+    #[must_use]
+    pub fn sign_web_bot_auth(
+        mut self,
+        signer: &crate::aeo::web_bot_auth::WebBotAuthSigner,
+    ) -> Self {
+        if let Some(h) = signer.sign_url(&self.url) {
+            self.web_bot_auth = Some(Arc::new(signer.clone()));
+            return self
+                .header("signature-agent", h.signature_agent)
+                .header("signature-input", h.signature_input)
+                .header("signature", h.signature);
+        }
+        self.pending_error = Some(ClientError::InvalidUrl(format!(
+            "Web Bot Auth needs an absolute URL, got {:?}",
+            self.url
+        )));
         self
     }
 
@@ -2385,14 +2420,7 @@ impl RequestBuilder {
         let start = crate::time::ambient_instant();
         let max_attempts = self.max_attempts(suppress_retries);
         let mut gate = self.retry_gate(url_host(&self.url).as_deref());
-        // A caller's own deadline header also needs a new value per attempt
-        // and per hop, so the client follows redirects itself then too.
-        let caller_header = self
-            .extra_headers
-            .get(DEADLINE_HEADER)
-            .and_then(crate::deadline::parse_header)
-            .is_some();
-        if gate.deadline.is_some() || caller_header {
+        if gate.deadline.is_some() || self.follows_redirects_itself() {
             return self.follow_pooled(suppress_retries, &gate).await;
         }
         let mut last_retry = None;
@@ -2504,11 +2532,28 @@ impl RequestBuilder {
 
     /// The deadline and retry budget for one send to `host`.
     fn retry_gate(&self, host: Option<&str>) -> RetryGate {
-        RetryGate::start(
+        let mut gate = RetryGate::start(
             self.retry.budgets.clone(),
             host,
             self.retry.send_deadline_header,
-        )
+        );
+        gate.signer.clone_from(&self.web_bot_auth);
+        gate
+    }
+
+    /// `true` when a header needs the client to follow redirects itself:
+    ///
+    /// - A caller's own deadline header needs a new value per attempt and
+    ///   per hop.
+    /// - An HTTP message signature is a credential that the pooled client's
+    ///   redirects would carry to the next host; the manual follow strips it
+    ///   on a cross-origin hop.
+    fn follows_redirects_itself(&self) -> bool {
+        self.extra_headers
+            .get(DEADLINE_HEADER)
+            .and_then(crate::deadline::parse_header)
+            .is_some()
+            || self.extra_headers.contains_key("signature")
     }
 
     /// The plain path under a request deadline. The pooled client does not
@@ -2627,7 +2672,7 @@ impl RequestBuilder {
             req = req.timeout(timeout);
         }
         req = span.in_scope(|| inject_trace_context(req, &self.extra_headers));
-        req = with_caller_headers(req, gate, timeout, &self.extra_headers);
+        req = with_caller_headers(req, gate, timeout, &self.extra_headers, &self.url);
         if let Some(body) = &self.body {
             req = req.body(body.clone());
         }
@@ -3450,6 +3495,8 @@ struct RetryGate {
     /// first attempt. The value is relative, so a retry or a later hop sends
     /// what is left of it, not the whole value again.
     caller_deadline: std::sync::OnceLock<Option<Deadline>>,
+    /// Signs each attempt again (Web Bot Auth), see [`with_caller_headers`].
+    signer: Option<Arc<crate::aeo::web_bot_auth::WebBotAuthSigner>>,
 }
 
 impl Drop for RetryGate {
@@ -3491,6 +3538,7 @@ impl RetryGate {
             refill_pending: AtomicBool::new(true),
             pending_retry: std::sync::Mutex::new(None),
             caller_deadline: std::sync::OnceLock::new(),
+            signer: None,
         }
     }
 
@@ -3551,6 +3599,7 @@ impl RetryGate {
             refill_pending: AtomicBool::new(false),
             pending_retry: std::sync::Mutex::new(None),
             caller_deadline: self.caller_deadline.clone(),
+            signer: self.signer.clone(),
         };
         hop.rekey(url);
         if url_host(url).is_some_and(|host| refilled.insert(host)) {
@@ -3689,17 +3738,39 @@ fn with_caller_headers(
     gate: &RetryGate,
     timeout: Option<Duration>,
     caller: &HeaderMap,
+    url: &str,
 ) -> reqwest::RequestBuilder {
     let deadline_value = gate.header(timeout, caller);
     let sends_deadline = deadline_value.is_some();
     if let Some(value) = deadline_value {
         req = req.header(DEADLINE_HEADER, value);
     }
+    // A Web Bot Auth signature is made new for each attempt. A cross-origin
+    // hop already dropped the old one, and gets none.
+    let fresh = gate
+        .signer
+        .as_ref()
+        .filter(|_| caller.contains_key("signature"))
+        .and_then(|signer| signer.sign_url(url));
     for (name, value) in caller {
         if sends_deadline && name == DEADLINE_HEADER {
             continue;
         }
+        if fresh.is_some()
+            && matches!(
+                name.as_str(),
+                "signature" | "signature-input" | "signature-agent"
+            )
+        {
+            continue;
+        }
         req = req.header(name.clone(), value.clone());
+    }
+    if let Some(h) = fresh {
+        req = req
+            .header("signature-agent", h.signature_agent)
+            .header("signature-input", h.signature_input)
+            .header("signature", h.signature);
     }
     req
 }
@@ -3751,11 +3822,32 @@ async fn serve_sim_host(
     {
         builder = builder.header(reqwest::header::CONTENT_LENGTH, body.len());
     }
+    // A Web Bot Auth signature is made new for each attempt, as on the real
+    // send path (`with_caller_headers`).
+    let fresh = request
+        .web_bot_auth
+        .as_ref()
+        .filter(|_| request.extra_headers.contains_key("signature"))
+        .and_then(|signer| signer.sign_url(url.as_str()));
     for (name, value) in &request.extra_headers {
         if sends_deadline && name == DEADLINE_HEADER {
             continue;
         }
+        if fresh.is_some()
+            && matches!(
+                name.as_str(),
+                "signature" | "signature-input" | "signature-agent"
+            )
+        {
+            continue;
+        }
         builder = builder.header(name, value);
+    }
+    if let Some(h) = fresh {
+        builder = builder
+            .header("signature-agent", h.signature_agent)
+            .header("signature-input", h.signature_input)
+            .header("signature", h.signature);
     }
     let body = request.body.clone().unwrap_or_default();
     let http_request = builder
@@ -4107,7 +4199,7 @@ async fn send_one(
         }
         let span = client_attempt_span(method, url, attempt);
         req = span.in_scope(|| inject_trace_context(req, extra_headers));
-        req = with_caller_headers(req, gate, attempt_timeout, extra_headers);
+        req = with_caller_headers(req, gate, attempt_timeout, extra_headers, url);
         if let Some(body) = body {
             req = req.body(body.clone());
         }
@@ -4302,6 +4394,10 @@ fn strip_sensitive_headers_if_cross_origin(
         headers.remove("cookie2");
         headers.remove(reqwest::header::PROXY_AUTHORIZATION);
         headers.remove(reqwest::header::WWW_AUTHENTICATE);
+        // RFC 9421 signatures (Web Bot Auth) bind to the first authority.
+        headers.remove("signature");
+        headers.remove("signature-input");
+        headers.remove("signature-agent");
     }
     Ok(())
 }
@@ -5793,6 +5889,52 @@ mod tests {
                 assert_eq!(seen, host, "{url}");
             }
         });
+    }
+
+    /// A sim attempt signs Web Bot Auth again, as the real send path does, so
+    /// a held builder never sends a stale signature to a simulated host.
+    #[test]
+    fn sim_host_gets_a_fresh_web_bot_auth_signature() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let echo = axum::Router::new().fallback(|headers: HeaderMap| async move {
+            let count = headers.get_all("signature").iter().count();
+            let input = headers
+                .get("signature-input")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            format!("{count} {input}")
+        });
+        let key = crate::aeo::web_bot_auth::WebBotAuthKey::from_seed_b64(
+            "nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A",
+        )
+        .unwrap();
+        let signer = crate::aeo::web_bot_auth::WebBotAuthSigner::new(key, "https://bot.example");
+        let created = |input: &str| -> u64 {
+            input
+                .split(";created=")
+                .nth(1)
+                .and_then(|r| r.split(';').next())
+                .and_then(|v| v.parse().ok())
+                .unwrap()
+        };
+        let url = "https://payments/charge";
+        let first = created(&signer.sign_url(url).unwrap().signature_input);
+        let request = Client::new().get(url).sign_web_bot_auth(&signer);
+        std::thread::sleep(Duration::from_millis(1100));
+        let parsed = reqwest::Url::parse(url).unwrap();
+        let seen = runtime.block_on(async {
+            serve_sim_host(echo, &request, parsed, None)
+                .await
+                .unwrap()
+                .text()
+        });
+        let (count, input) = seen.split_once(' ').unwrap();
+        assert_eq!(count, "1", "{seen}");
+        assert!(created(input) > first, "{seen}");
     }
 
     /// A sim request with a body carries its `Content-Length`, as the real
@@ -7522,6 +7664,130 @@ mod tests {
         assert!(
             headers.get("proxy-authorization").is_none(),
             "proxy-authorization must be stripped on a cross-origin redirect"
+        );
+    }
+
+    // A Web Bot Auth signature is a credential: on the default send path a
+    // cross-origin redirect must not carry it to the next host.
+    #[tokio::test]
+    async fn default_redirects_strip_message_signatures_cross_origin() {
+        use axum::{Router, routing::get};
+
+        let seen: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let seen2 = seen.clone();
+        let b_addr = spawn(Router::new().route(
+            "/dst",
+            get(move |headers: HeaderMap| {
+                let slot = seen2.clone();
+                async move {
+                    *slot.lock().unwrap() = Some(headers);
+                    "ok"
+                }
+            }),
+        ))
+        .await;
+        let b_port = b_addr.port();
+        let a_addr = spawn(Router::new().route(
+            "/",
+            get(move || async move { redirect_302(format!("http://127.0.0.1:{b_port}/dst")) }),
+        ))
+        .await;
+
+        let resp = Client::new()
+            .get(format!("http://127.0.0.1:{}/", a_addr.port()))
+            .header("signature-agent", "\"https://bot.example\"")
+            .header("signature-input", "sig1=(\"@authority\")")
+            .header("signature", "sig1=:AAAA:")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "the redirect is still followed"
+        );
+        let headers = seen.lock().unwrap().clone().expect("B reached");
+        for name in ["signature", "signature-input", "signature-agent"] {
+            assert!(headers.get(name).is_none(), "{name} must be stripped");
+        }
+    }
+
+    // A Web Bot Auth signature is made when the request is sent, not when
+    // the builder is configured, so a held builder never sends a stale one.
+    #[tokio::test]
+    async fn web_bot_auth_signs_at_send_time() {
+        use axum::{Router, routing::get};
+
+        let seen: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let seen2 = seen.clone();
+        let addr = spawn(Router::new().route(
+            "/",
+            get(move |headers: HeaderMap| {
+                let slot = seen2.clone();
+                async move {
+                    *slot.lock().unwrap() = Some(headers);
+                    "ok"
+                }
+            }),
+        ))
+        .await;
+        let key = crate::aeo::web_bot_auth::WebBotAuthKey::from_seed_b64(
+            "nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A",
+        )
+        .unwrap();
+        let signer = crate::aeo::web_bot_auth::WebBotAuthSigner::new(key, "https://bot.example");
+        let created = |input: &str| -> u64 {
+            input
+                .split(";created=")
+                .nth(1)
+                .and_then(|r| r.split(';').next())
+                .and_then(|v| v.parse().ok())
+                .unwrap()
+        };
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        let first = created(&signer.sign_url(&url).unwrap().signature_input);
+        let builder = Client::new().get(&url).sign_web_bot_auth(&signer);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        builder.send().await.unwrap();
+
+        let headers = seen.lock().unwrap().clone().expect("reached");
+        let sent = headers.get("signature-input").unwrap().to_str().unwrap();
+        assert!(created(sent) > first, "{sent}");
+        assert_eq!(headers.get_all("signature").iter().count(), 1);
+    }
+
+    // A failure capsule matches a replayed call on the headers the handler
+    // chose. A Web Bot Auth signature is made new for each send, so it is
+    // left out, or no replay of a signed call would ever match.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn capsule_matching_skips_the_web_bot_auth_signature() {
+        let key = crate::aeo::web_bot_auth::WebBotAuthKey::from_seed_b64(
+            "nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A",
+        )
+        .unwrap();
+        let signer = crate::aeo::web_bot_auth::WebBotAuthSigner::new(key, "https://bot.example");
+        let builder = Client::new()
+            .get("https://api.example/x")
+            .header("x-kept", "1")
+            .sign_web_bot_auth(&signer);
+        let names: Vec<String> = caller_headers(&builder)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(names.contains(&"x-kept".to_owned()), "{names:?}");
+        assert!(names.contains(&"signature-agent".to_owned()), "{names:?}");
+        assert!(!names.contains(&"signature".to_owned()), "{names:?}");
+        assert!(!names.contains(&"signature-input".to_owned()), "{names:?}");
+
+        // A handler's own `Signature` header, with no signer, still counts.
+        let plain = Client::new()
+            .get("https://api.example/x")
+            .header("signature", "mine");
+        assert_eq!(
+            caller_headers(&plain),
+            vec![("signature".to_owned(), "mine".to_owned())]
         );
     }
 
@@ -9407,6 +9673,7 @@ mod tests {
                 refill_pending: AtomicBool::new(false),
                 pending_retry: std::sync::Mutex::new(None),
                 caller_deadline: std::sync::OnceLock::new(),
+                signer: None,
             };
             assert!(gate.allow(RetryKind::Transient, Duration::ZERO));
             // The retry starts.

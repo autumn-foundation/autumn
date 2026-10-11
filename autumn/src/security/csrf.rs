@@ -111,6 +111,15 @@ pub struct CsrfFormField(pub String);
 #[derive(Clone, Debug)]
 pub struct CsrfTokenHeader(pub String);
 
+/// Set by a layer outside CSRF on a request a cross-site page cannot forge,
+/// to a route another layer gates itself: an x402-priced route that runs no
+/// handler without a `PAYMENT-SIGNATURE` header. The request carries no
+/// `Cookie` (no ambient credential to ride) or carries that header (which a
+/// cross-site page cannot send without passing CORS). CSRF validation does
+/// not apply to it. Crate-private, so only Autumn's own layers set it.
+#[derive(Debug, Clone, Copy)]
+pub struct CsrfNotApplicable;
+
 /// A CSRF token extracted from the request.
 ///
 /// Use this as a handler parameter to access the CSRF token for embedding
@@ -440,7 +449,8 @@ where
         // browser cannot add a CSRF header to it.
         let is_safe = is_exempt
             || self.settings.safe_methods.contains(req.method())
-            || crate::security::is_websocket_connect(&req);
+            || crate::security::is_websocket_connect(&req)
+            || req.extensions().get::<CsrfNotApplicable>().is_some();
         let raw_cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name);
 
         // When signing is active, discard any cookie that fails HMAC verification

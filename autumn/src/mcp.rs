@@ -107,7 +107,15 @@ const FORWARDED_HEADERS: &[&str] = &[
     // when no locale query/cookie is present, so forward it for the tool result
     // to match the localized data a direct HTTP call would return.
     "accept-language",
+    // x402: the payment for a priced route (`[[aeo.paid_routes]]`). Without it
+    // a priced tool could only ever answer `402`.
+    "payment-signature",
 ];
+
+/// Response headers copied from the replayed handler response onto the
+/// rebuilt `/mcp` response: session and CSRF cookies, and the x402 challenge
+/// and settlement receipt of a priced route.
+const REPLAYED_RESPONSE_HEADERS: &[&str] = &["set-cookie", "payment-required", "payment-response"];
 
 /// Layer applier for the optional whole-endpoint auth gate (e.g.
 /// `RequireApiToken`). Boxed so any `tower::Layer` can be erased; applied to
@@ -2108,10 +2116,11 @@ struct Dispatched {
     request_id: Option<String>,
     /// Whether the handler answered with `text/event-stream`.
     is_event_stream: bool,
-    /// Any `Set-Cookie` the inner handler or middleware set (session renewal,
-    /// CSRF-cookie refresh, login), replayed onto the outer HTTP response so a
-    /// tool call sends what the equivalent direct call would have.
-    cookies: Vec<HeaderValue>,
+    /// The [`REPLAYED_RESPONSE_HEADERS`] the inner handler or middleware set
+    /// (session renewal, CSRF-cookie refresh, login, an x402 receipt),
+    /// replayed onto the outer HTTP response so a tool call sends what the
+    /// equivalent direct call would have.
+    replayed: Vec<(HeaderName, HeaderValue)>,
 }
 
 impl Dispatched {
@@ -2131,10 +2140,14 @@ impl Dispatched {
                         .to_ascii_lowercase()
                         .starts_with("text/event-stream")
                 }),
-            cookies: headers
-                .get_all(header::SET_COOKIE)
+            replayed: REPLAYED_RESPONSE_HEADERS
                 .iter()
-                .cloned()
+                .flat_map(|&name| {
+                    headers
+                        .get_all(name)
+                        .iter()
+                        .map(move |value| (HeaderName::from_static(name), value.clone()))
+                })
                 .collect(),
         }
     }
@@ -2204,7 +2217,7 @@ async fn serve_tools_call(
         status,
         request_id,
         is_event_stream,
-        cookies,
+        replayed,
     } = Dispatched::inspect(&response);
     let client_accepts_sse = ctx
         .headers
@@ -2232,7 +2245,7 @@ async fn serve_tools_call(
             request_id,
             recorded: false,
         };
-        return stream_tool_result(id, &params, response, cookies, stream_audit);
+        return stream_tool_result(id, &params, response, replayed, stream_audit);
     }
 
     // Buffered path: the outcome is recorded only once the body has actually
@@ -2241,7 +2254,7 @@ async fn serve_tools_call(
     // mid-read, and the agent would then see a tool error while the audit row
     // claimed success (issue #1691 review round 2).
     let (resp, failure) =
-        buffered_tool_response(tool, id, status, is_event_stream, cookies, response).await;
+        buffered_tool_response(tool, id, status, is_event_stream, replayed, response).await;
     let disposition = failure.map_or(Disposition::Settled, Disposition::Buffered);
     audit
         .record_outcome(&server.state, status, request_id.as_deref(), disposition)
@@ -2263,7 +2276,7 @@ async fn buffered_tool_response(
     id: Value,
     status: StatusCode,
     is_event_stream: bool,
-    cookies: Vec<HeaderValue>,
+    replayed: Vec<(HeaderName, HeaderValue)>,
     response: Response,
 ) -> (Response, Option<BufferedFailure>) {
     // Capture the dispatch clone's `Server-Timing` header (#1348) so its
@@ -2299,10 +2312,13 @@ async fn buffered_tool_response(
                     format!("handler response body failed mid-read: {error}")
                 }
             };
-            return (
-                json_response(&success(id, tool_error(&message))),
-                Some(failure),
-            );
+            // The handler already ran: its cookies and an x402 receipt for a
+            // payment already settled still reach the client.
+            let mut resp = json_response(&success(id, tool_error(&message)));
+            for (name, value) in replayed {
+                resp.headers_mut().append(name, value);
+            }
+            return (resp, Some(failure));
         }
     };
     // A streaming handler buffered for a non-SSE client: collapse the SSE wire
@@ -2316,8 +2332,8 @@ async fn buffered_tool_response(
 
     let value = buffered_tool_result(tool, id, status, &text);
     let mut resp = json_response(&value);
-    for cookie in cookies {
-        resp.headers_mut().append(header::SET_COOKIE, cookie);
+    for (name, value) in replayed {
+        resp.headers_mut().append(name, value);
     }
     // Forward only the inner dispatch's non-`total` `Server-Timing` metrics
     // (e.g. `db;dur=…;desc="N queries"`) onto the rebuilt response, dropping the
@@ -2506,7 +2522,7 @@ fn stream_tool_result(
     id: Value,
     params: &Value,
     response: Response,
-    cookies: Vec<HeaderValue>,
+    replayed: Vec<(HeaderName, HeaderValue)>,
     audit: StreamAudit,
 ) -> Response {
     let progress_token = params
@@ -2531,8 +2547,8 @@ fn stream_tool_result(
     let mut resp = Sse::new(stream)
         .keep_alive(crate::sse::keep_alive())
         .into_response();
-    for cookie in cookies {
-        resp.headers_mut().append(header::SET_COOKIE, cookie);
+    for (name, value) in replayed {
+        resp.headers_mut().append(name, value);
     }
     resp
 }
@@ -4385,6 +4401,54 @@ mod tests {
             .map(|v| v.to_str().unwrap().to_owned())
             .collect();
         assert_eq!(cookies, ["session=abc", "csrf=dup1", "csrf=dup2"]);
+    }
+
+    #[test]
+    fn x402_headers_cross_the_replay_both_ways() {
+        let t = tool("GET", "/api/report", false, false);
+        let mut headers = HeaderMap::new();
+        headers.insert("payment-signature", "eyJ4IjoxfQ==".parse().unwrap());
+        let req =
+            build_request(&t, &headers, &json!({}), "x-csrf-token", None).expect("request builds");
+        assert_eq!(req.headers()["payment-signature"], "eyJ4IjoxfQ==");
+
+        let response = Response::builder()
+            .header(header::SET_COOKIE, "session=abc")
+            .header("payment-response", "receipt")
+            .header("payment-required", "challenge")
+            .header("x-other", "kept inside")
+            .body(Body::empty())
+            .unwrap();
+        let replayed: Vec<_> = Dispatched::inspect(&response)
+            .replayed
+            .into_iter()
+            .map(|(name, value)| format!("{name}: {}", value.to_str().unwrap()))
+            .collect();
+        assert_eq!(
+            replayed,
+            [
+                "set-cookie: session=abc",
+                "payment-required: challenge",
+                "payment-response: receipt"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_still_returns_the_payment_receipt() {
+        let t = tool("GET", "/api/report", false, false);
+        let body = Body::from_stream(futures::stream::iter([Err::<Bytes, _>(
+            std::io::Error::other("boom"),
+        )]));
+        let response = Response::builder()
+            .header("payment-response", "receipt")
+            .body(body)
+            .unwrap();
+        let replayed = Dispatched::inspect(&response).replayed;
+        let (resp, failure) =
+            buffered_tool_response(&t, json!(1), StatusCode::OK, false, replayed, response).await;
+        assert!(failure.is_some());
+        assert_eq!(resp.headers()["payment-response"], "receipt");
     }
 
     /// A trusted-Host policy that trusts the given hosts (plus dev loopback,

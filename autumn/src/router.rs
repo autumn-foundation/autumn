@@ -669,6 +669,37 @@ fn build_router_pre_state(
         None
     };
 
+    // Agent readiness (AEO): record what the app has before `route_list` is
+    // consumed. The documents are served from the router fallback and the
+    // response layer reads the same snapshot (see `crate::aeo`).
+    #[cfg(feature = "openapi")]
+    let aeo_openapi = ctx.openapi.as_ref();
+    #[cfg(not(feature = "openapi"))]
+    let aeo_openapi: Option<&()> = None;
+    #[cfg(feature = "mcp")]
+    let aeo_mcp = mcp_prepared.as_ref();
+    #[cfg(not(feature = "mcp"))]
+    let aeo_mcp: Option<&()> = None;
+    if config.aeo.enabled
+        && ctx.nest_routers.iter().any(|(prefix, _)| {
+            let prefix = prefix.trim_end_matches('/');
+            prefix.is_empty() || prefix == "/.well-known"
+        })
+    {
+        tracing::warn!(
+            "aeo: a router nested at /.well-known answers every path under it; the \
+             generated /.well-known documents (agent skills, ARD, server card) are hidden"
+        );
+    }
+    state.insert_extension(build_aeo_site(
+        config,
+        state,
+        &route_list,
+        &ctx.scoped_groups,
+        aeo_openapi,
+        aeo_mcp,
+    ));
+
     // Build the per-route timeout override table before `route_list` and the
     // scoped groups are consumed by the mounting steps below.
     let route_timeouts = build_route_timeout_table(&route_list, &ctx.scoped_groups, config);
@@ -1192,8 +1223,13 @@ async fn serve_openapi_spec(
     let refs: Vec<&crate::openapi::ApiDoc> = docs.iter().collect();
     let now = state.clock().now();
     let spec = crate::openapi::generate_spec_at(&config, &refs, now);
-    let spec_json = serde_json::to_string_pretty(&spec)
-        .unwrap_or_else(|e| format!("{{\"error\": \"failed to serialize spec: {e}\"}}"));
+    // MPP discovery: `x-payment-info` on priced operations.
+    let spec_json = state.extension::<AutumnConfig>().map_or_else(
+        || serde_json::to_string_pretty(&spec),
+        |app| crate::aeo::commerce::spec_json_with_mpp(&spec, &app),
+    );
+    let spec_json =
+        spec_json.unwrap_or_else(|e| format!("{{\"error\": \"failed to serialize spec: {e}\"}}"));
     (
         [(http::header::CONTENT_TYPE, "application/json")],
         spec_json,
@@ -1349,6 +1385,200 @@ fn validate_route_path(field: &'static str, value: &str) -> Result<(), RouterBui
         return reject("(OpenAPI mount paths must be static; `{…}` captures are not allowed)");
     }
     Ok(())
+}
+
+/// The x402 layer, or a no-op when no route is priced.
+#[cfg(feature = "http-client")]
+fn aeo_x402_layer(
+    config: &AutumnConfig,
+    state: &AppState,
+) -> tower::util::Either<crate::aeo::commerce::X402Layer, tower::layer::util::Identity> {
+    tower::util::option_layer(crate::aeo::commerce::X402Layer::shared(config, state))
+}
+
+/// Without `http-client`, priced routes fail closed (`503`).
+#[cfg(not(feature = "http-client"))]
+fn aeo_x402_layer(
+    config: &AutumnConfig,
+    _state: &AppState,
+) -> tower::util::Either<crate::aeo::commerce::X402Unavailable, tower::layer::util::Identity> {
+    tower::util::option_layer(crate::aeo::commerce::X402Unavailable::from_config(config))
+}
+
+/// Build the AEO site snapshot from the route registry, the `OpenAPI` config,
+/// and the MCP tool catalog.
+#[cfg_attr(
+    not(all(feature = "openapi", feature = "mcp")),
+    allow(clippy::needless_pass_by_value, unused_variables)
+)]
+fn build_aeo_site<O: AeoOpenApiFacts, M: AeoMcpFacts>(
+    config: &AutumnConfig,
+    state: &AppState,
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+    openapi: Option<&O>,
+    mcp: Option<&M>,
+) -> crate::aeo::AeoSite {
+    use crate::aeo::documents::{PageFacts, SiteFacts};
+
+    let page = |path: String, seo: crate::seo::SeoRouteDefaults| {
+        let title = seo.title?;
+        let indexable = !seo
+            .robots
+            .is_some_and(crate::seo::robots_directive_is_noindex);
+        (indexable && !path.contains('{') && !path.contains('*')).then(|| PageFacts {
+            path,
+            title: title.to_owned(),
+            description: seo.description.map(str::to_owned),
+        })
+    };
+    let pages: Vec<PageFacts> = route_list
+        .iter()
+        .filter(|r| r.method == http::Method::GET)
+        .filter_map(|r| page(r.path.to_owned(), r.seo))
+        .collect();
+    // With locale-prefixed routing the top-level routes are served under
+    // `/{locale}` and the bare paths only redirect: list the localized pages,
+    // as the `[seo]` sitemap does. Scoped groups mount outside the locale
+    // nests, so their pages keep their paths.
+    #[cfg(feature = "i18n")]
+    let locales = if config.i18n.locale_prefix_enabled {
+        // The locales that get a nest, so discovery lists reachable URLs.
+        validated_locale_prefix_locales(&config.i18n)
+    } else {
+        Vec::new()
+    };
+    #[cfg(feature = "i18n")]
+    let localize = |pages: Vec<PageFacts>| {
+        crate::aeo::localize_pages(
+            pages,
+            &locales,
+            &config.i18n.locale_prefix_exclude,
+            &config.i18n.locale_prefix_exclude_exact,
+        )
+    };
+    #[cfg(not(feature = "i18n"))]
+    let localize = |pages: Vec<PageFacts>| pages;
+    let mut pages = localize(pages);
+    // The home page paths: `/`, or `/{locale}` for each locale when `/` is
+    // localized.
+    let home_paths: Vec<String> = localize(vec![PageFacts {
+        path: "/".to_owned(),
+        ..PageFacts::default()
+    }])
+    .into_iter()
+    .map(|p| p.path)
+    .collect();
+    for group in scoped_groups {
+        pages.extend(
+            group
+                .routes
+                .iter()
+                .filter(|r| r.method == http::Method::GET)
+                .filter_map(|r| page(join_nested_path(&group.prefix, r.path), r.seo)),
+        );
+    }
+    pages.sort_by(|a, b| a.path.cmp(&b.path));
+    pages.dedup_by(|a, b| a.path == b.path);
+
+    // An API-only app has no home page: list none rather than a `404`.
+    let has_home = route_list
+        .iter()
+        .any(|r| r.method == http::Method::GET && r.path == "/")
+        || scoped_groups.iter().any(|g| {
+            g.routes.iter().any(|r| {
+                r.method == http::Method::GET && join_nested_path(&g.prefix, r.path) == "/"
+            })
+        });
+    let home_noindex = route_list.iter().any(|r| {
+        r.method == http::Method::GET
+            && r.path == "/"
+            && r.seo
+                .robots
+                .is_some_and(crate::seo::robots_directive_is_noindex)
+    });
+    let mut facts = SiteFacts {
+        pages,
+        home_paths,
+        home_noindex,
+        no_home: !has_home,
+        health_path: config.health.enabled.then(|| config.health.path.clone()),
+        skills: state
+            .extension::<crate::aeo::RegisteredAgentSkills>()
+            .map(|s| s.0.clone())
+            .unwrap_or_default(),
+        commerce: state
+            .extension::<crate::aeo::RegisteredCommerceDocs>()
+            .map(|c| (*c).clone())
+            .unwrap_or_default(),
+        ..SiteFacts::default()
+    };
+    if let Some(api) = openapi {
+        api.fill(&mut facts);
+    }
+    if let Some(mcp) = mcp {
+        mcp.fill(&mut facts);
+    }
+    crate::aeo::AeoSite::new(config, facts)
+}
+
+/// Copies what AEO needs from the `OpenAPI` config. A trait so
+/// [`build_aeo_site`] compiles without the `openapi` feature.
+trait AeoOpenApiFacts {
+    fn fill(&self, facts: &mut crate::aeo::documents::SiteFacts);
+}
+
+impl AeoOpenApiFacts for () {
+    fn fill(&self, _: &mut crate::aeo::documents::SiteFacts) {}
+}
+
+#[cfg(feature = "openapi")]
+impl AeoOpenApiFacts for crate::openapi::OpenApiConfig {
+    fn fill(&self, facts: &mut crate::aeo::documents::SiteFacts) {
+        facts.name = Some(self.title.clone()).filter(|t| !t.trim().is_empty());
+        facts.description.clone_from(&self.description);
+        facts.openapi = Some(crate::aeo::documents::OpenApiFacts {
+            json_path: self.openapi_json_path.clone(),
+            docs_path: self.swagger_ui_path.clone(),
+            version: self.version.clone(),
+        });
+    }
+}
+
+/// Copies what AEO needs from the prepared MCP endpoint.
+trait AeoMcpFacts {
+    fn fill(&self, facts: &mut crate::aeo::documents::SiteFacts);
+}
+
+impl AeoMcpFacts for () {
+    fn fill(&self, _: &mut crate::aeo::documents::SiteFacts) {}
+}
+
+#[cfg(feature = "mcp")]
+impl AeoMcpFacts for McpPrepared {
+    fn fill(&self, facts: &mut crate::aeo::documents::SiteFacts) {
+        let (path, tools, endpoint_layer) = self;
+        // A gated endpoint (`secure_mcp`) keeps its tool list private.
+        let public_tools = endpoint_layer.is_none();
+        let tools = if public_tools {
+            tools
+                .iter()
+                .map(|t| crate::aeo::documents::ToolFacts {
+                    name: t.name().to_owned(),
+                    description: t.description().map(str::to_owned),
+                    input_schema: t.input_schema().clone(),
+                    annotations: t.annotations().clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        facts.mcp = Some(crate::aeo::documents::McpFacts {
+            path: path.clone(),
+            tools,
+            public_tools,
+        });
+    }
 }
 
 /// Collect the exact `GET`/`WS` paths owned by the user's *typed* route table
@@ -2606,7 +2836,7 @@ fn is_valid_locale_segment(locale: &str) -> bool {
 /// that was silently skipped and has no nest, trading a config typo's
 /// build-time no-op for a runtime 404 (Codex review).
 #[cfg(feature = "i18n")]
-fn validated_locale_prefix_locales(i18n: &crate::i18n::I18nConfig) -> Vec<String> {
+pub fn validated_locale_prefix_locales(i18n: &crate::i18n::I18nConfig) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     i18n.supported_locales
         .iter()
@@ -3513,7 +3743,12 @@ impl tower_http::compression::predicate::Predicate for CompressionPredicate {
     where
         B: http_body::Body,
     {
+        // A digest covers the bytes the handler sent; encoding them after
+        // would break it, and any signature made over it (Web Bot Auth).
+        let headers = response.headers();
         self.default.should_compress(response)
+            && !headers.contains_key("content-digest")
+            && !headers.contains_key("repr-digest")
             && response
                 .headers()
                 .get(http::header::CONTENT_TYPE)
@@ -5230,7 +5465,14 @@ fn apply_middleware(
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
     // 404 fallback handler for unmatched routes must be registered BEFORE global middleware
     // so that unmatched routes are still protected by rate limiting, CSRF, CORS, etc.
-    router = router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
+    // The fallback also serves the AEO documents (`/llms.txt`, the
+    // `/.well-known/*` agent files): an application route at the same path
+    // always wins, and a generated path cannot collide with one.
+    let aeo_site = state.extension::<crate::aeo::AeoSite>();
+    let fallback_site = aeo_site.clone();
+    router = router.fallback(move |req: axum::extract::Request| {
+        crate::aeo::fallback(fallback_site.clone(), req)
+    });
 
     // Resolve signing keys once; shared across session and CSRF layers.
     let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
@@ -5364,14 +5606,35 @@ fn apply_middleware(
         // that declares no `required_paths`.
         tower::util::option_layer(build_client_cert_requirement_layer(config)),
         tower::util::option_layer(build_bot_protection_layer(config)),
-        tower::util::option_layer(build_csrf_layer(config, signing_keys_opt.clone())),
+        (
+            // Outer to CSRF: a request to an x402-priced route with no
+            // cookie, or with a `PAYMENT-SIGNATURE` header, cannot be forged
+            // cross-site and is gated by x402 itself, so a payment client's
+            // `POST` reaches x402 instead of a CSRF `403`.
+            tower::util::option_layer(
+                config
+                    .security
+                    .csrf
+                    .enabled
+                    .then(|| crate::aeo::commerce::X402CsrfLayer::from_config(config))
+                    .flatten(),
+            ),
+            tower::util::option_layer(build_csrf_layer(config, signing_keys_opt.clone())),
+        ),
         // Inner to the CSRF layer so CSRF is validated first on the request
         // path; a replayed `_submit_token` is still short-circuited even when
         // the request carries a valid `_csrf` (issue #1360, AC #4).
         tower::util::option_layer(submit_token_layer),
         TrustedHostLayer::new(trusted_host_policy),
         tower::util::option_layer(build_ingress_cors_layer(config)),
-        tower::util::option_layer(fault_route_layer),
+        (
+            tower::util::option_layer(fault_route_layer),
+            // x402 payments for `[[aeo.paid_routes]]`: innermost, so rate
+            // limits, the trusted-host check, CSRF, the request timeout, and
+            // CORS all apply before a facilitator call. Also present on the
+            // SSG/ISG path, where the MCP dispatch clone needs it.
+            aeo_x402_layer(config, state),
+        ),
     );
 
     // User-registered Tower layers (`AppBuilder::layer`) wrap the group above.
@@ -5402,7 +5665,7 @@ fn apply_middleware(
     //   Session → SecurityHeaders → RequestId → LogContext → ServerTiming →
     //   AccessLog-primary → FailureCapture → Reporting → Timeout → Tenancy →
     //   TrustedProxies → [user layers] → BodyLimit/UploadConfig → MethodOverride →
-    //   RateLimit → CSRF → CORS → handler
+    //   RateLimit → CSRF → CORS → AeoX402 → handler
     // `mirror_cors = true`: this layer is outside `CorsLayer`, so its timeout 503
     // must carry CORS headers itself.
     //
@@ -5719,7 +5982,8 @@ fn apply_middleware(
     //   MCP dispatch clone, outside session and the static cache] ->
     //   [event-bus context, oauth2 interceptor] -> Inspector (dev) ->
     //   dev live-reload (dev)   (all applied in build_router_pre_state) ->
-    //   Compression -> ShadowMirror -> Metrics -> ExceptionFilter -> ErrorPageContext ->
+    //   Compression -> ShadowMirror -> AeoNegotiate -> Metrics -> ExceptionFilter ->
+    //   ErrorPageContext ->
     //   ReadYourWrites -> Session -> NormalizeBody ->
     //   RequestId -> LogContext -> ServerTiming -> Cost -> AccessLog-primary ->
     //   Reporting -> Timeout -> Tenancy -> TrustedProxies ->
@@ -5728,7 +5992,7 @@ fn apply_middleware(
     //   Maintenance -> RateLimitPrincipal -> RateLimit ->
     //   MethodOverrideRejection -> RequireClientCert (mTLS, #1640) ->
     //   BotProtection -> CSRF -> SubmitToken ->
-    //   TrustedHost -> CORS -> [asset cache-control] -> handler
+    //   TrustedHost -> CORS -> FaultRoute -> AeoX402 -> [asset cache-control] -> handler
     // Everything from `Compression` through `CORS` is ONE `Router::layer` call:
     // the merged tuple below. `NormalizeBody` is a body-type adapter with no
     // request-path behaviour, listed only so this order reads against that tuple
@@ -5768,6 +6032,16 @@ fn apply_middleware(
         tower::util::option_layer(
             (!defer_shadow)
                 .then(|| build_shadow_layer(config, state))
+                .flatten(),
+        ),
+        // AEO response layer: Markdown negotiation, `Vary: Accept`, and the
+        // homepage `Link` header. It is inside compression, so it reads plain
+        // bytes. It is outside the exception filter, so it sees the final
+        // page. The SSG/ISG path adds it later, outside the static-first
+        // layer (same reason as `defer_shadow`).
+        tower::util::option_layer(
+            (!defer_shadow)
+                .then(|| aeo_site.as_ref().and_then(|site| site.layer()))
                 .flatten(),
         ),
         crate::middleware::MetricsLayer::new(state.metrics.clone()),
@@ -5873,6 +6147,17 @@ fn trusted_host_rejection<B>(
         .filter(|h| !h.is_empty());
     let host_source_present = raw_host.is_some();
     if host.is_none() && !host_source_present && policy.allow_missing_host {
+        return None;
+    }
+    // A build render (`autumn build`, an ISR refresh) is made in process and
+    // carries no `Host`. Only server code can attach the marker, so a client
+    // request can never take this branch.
+    if !host_source_present
+        && req
+            .extensions()
+            .get::<crate::static_gen::RenderDeadlineExempt>()
+            .is_some()
+    {
         return None;
     }
     if host.as_deref().is_some_and(|host| policy.allows_host(host)) {
@@ -6359,16 +6644,22 @@ pub fn try_build_router_with_static_inner(
                         // layer is applied outside this middleware and
                         // negotiates gzip/brotli by content type: it encodes
                         // compressible SSG pages and leaves binary assets alone.
+                        // A `HEAD` carries the length the `GET` would send, so
+                        // a layer outside (Markdown negotiation) can tell
+                        // whether that body fits.
+                        let len = contents.len();
                         let body = if is_head {
                             axum::body::Body::empty()
                         } else {
                             axum::body::Body::from(contents)
                         };
-                        return http::Response::builder()
+                        let mut response = http::Response::builder()
                             .status(http::StatusCode::OK)
-                            .header(http::header::CONTENT_TYPE, hit.content_type)
-                            .body(body)
-                            .expect("infallible response builder");
+                            .header(http::header::CONTENT_TYPE, hit.content_type);
+                        if is_head {
+                            response = response.header(http::header::CONTENT_LENGTH, len);
+                        }
+                        return response.body(body).expect("infallible response builder");
                     }
                 }
                 next.run(req).await
@@ -6418,9 +6709,20 @@ pub fn try_build_router_with_static_inner(
     // every pre-rendered page the candidate generated differently went
     // uncompared. Outer to the user layers and inner to compression, matching its
     // position in the dynamic path.
-    if let Some(shadow) = build_shadow_layer(config, &state) {
-        router = router.layer(shadow);
-    }
+    //
+    // The AEO response layer and x402 sit here too, for the same reason: a
+    // pre-rendered page must be negotiated and charged. One `Router::layer`
+    // call for all three keeps the SSG path one box level deep (#2193). The
+    // inner x402 copy skips a request this one already handled.
+    router = router.layer((
+        tower::util::option_layer(build_shadow_layer(config, &state)),
+        tower::util::option_layer(
+            state
+                .extension::<crate::aeo::AeoSite>()
+                .and_then(|site| site.layer()),
+        ),
+        aeo_x402_layer(config, &state),
+    ));
 
     // Compression is applied outside the static-first middleware too, so
     // pre-rendered HTML that `StaticFileLayer` serves without reaching
@@ -11976,6 +12278,47 @@ enabled = true
         assert_eq!(&body[..], b"<h1>secret</h1>");
     }
 
+    /// A `HEAD` of a pre-rendered page carries the length its `GET` sends, so
+    /// Markdown negotiation gives `HEAD` the same headers as `GET`.
+    #[tokio::test]
+    async fn ssg_head_mirrors_the_markdown_get() {
+        let html = b"<html><body><main><h1>About</h1></main></body></html>";
+        let tmp = create_ssg_dist(&[("/about", "about.html", html)]);
+        let dist = tmp.path().join("dist");
+        let router = try_build_router_with_static(
+            Vec::new(),
+            &AutumnConfig::default(),
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let send = |method: http::Method| {
+            router.clone().oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/about")
+                    .header(http::header::ACCEPT, "text/markdown")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+        let head = send(http::Method::HEAD).await.unwrap();
+        let get = send(http::Method::GET).await.unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(
+            head.headers().get(http::header::CONTENT_TYPE),
+            get.headers().get(http::header::CONTENT_TYPE),
+        );
+        assert!(
+            head.headers()[http::header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/markdown"),
+            "{:?}",
+            head.headers()
+        );
+    }
+
     /// A manifest-backed HTML page is gzip-compressed when the client accepts
     /// gzip and framework compression is enabled, and it carries
     /// `Vary: Accept-Encoding`.
@@ -12015,11 +12358,14 @@ enabled = true
             Some("gzip"),
             "manifest-backed SSG HTML page must be gzip-compressed"
         );
+        // The page carries `Vary: Accept` too (AEO), so read every value.
         let vary = response
             .headers()
-            .get(http::header::VARY)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+            .get_all(http::header::VARY)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect::<Vec<_>>()
+            .join(", ");
         assert!(
             vary.to_lowercase().contains("accept-encoding"),
             "Vary must advertise Accept-Encoding, got {vary:?}"
@@ -15454,6 +15800,7 @@ mod trusted_host_tests {
         assert_unboxed::<crate::middleware::method_override::MethodOverrideRejectionService<Inner>>(
             "MethodOverrideRejectionService",
         );
+        assert_unboxed::<crate::aeo::negotiate::NegotiateService<Inner>>("NegotiateService");
         #[cfg(feature = "oauth2")]
         assert_unboxed::<super::HttpInterceptorService<Inner>>("HttpInterceptorService");
     }

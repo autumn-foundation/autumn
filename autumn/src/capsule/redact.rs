@@ -1007,7 +1007,9 @@ pub fn mask_binds(binds: &mut [BindValue], redacted: &RedactedValues) {
 /// `proxyauthorization` ≠ `authorization`), so an exact-match filter would
 /// copy them verbatim. A capsule is a production-data artifact; a standard
 /// credential header must never depend on app configuration to be masked.
-const ALWAYS_SENSITIVE_HEADERS: &[&str] = &["proxy-authorization"];
+/// `payment-signature` is an x402 payment: until it is settled or expires,
+/// anyone holding it can spend it.
+const ALWAYS_SENSITIVE_HEADERS: &[&str] = &["proxy-authorization", "payment-signature"];
 
 /// Whether a header must be masked out of the capsule.
 fn header_is_sensitive(name: &str, filter: &ParameterFilter) -> bool {
@@ -2451,6 +2453,21 @@ mod tests {
             "the 123rd attempt",
             "substring masking keeps its length floor"
         );
+    }
+
+    #[test]
+    fn an_x402_payment_is_masked_unconditionally() {
+        let (request, values) = redact(
+            Request::get("/x").header("payment-signature", "eyJ4NDAyVmVyc2lvbiI6Mn0"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert_eq!(
+            header_value(&request, "payment-signature"),
+            FILTERED_PLACEHOLDER,
+            "an unspent payment must never be stored in a capsule"
+        );
+        assert!(values.contains(b"eyJ4NDAyVmVyc2lvbiI6Mn0"));
     }
 
     #[test]

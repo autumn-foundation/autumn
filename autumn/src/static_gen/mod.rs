@@ -70,7 +70,9 @@ mod types;
 /// — there is no inbound client connection whose `request_timeout_ms` deadline
 /// should apply, and a legitimately slow prerender must not fail the build or
 /// skip an ISR refresh with a `503`. The request-timeout middleware skips its
-/// deadline whenever this marker is present on the request.
+/// deadline whenever this marker is present on the request. The trusted-host
+/// check lets a marked render with no `Host` through: a build has no client
+/// to send one, and the `prod` profile refuses an unmarked request without it.
 ///
 /// Live inbound requests to the same route (a manifest miss, no `dist`, or a
 /// cache read that falls through to the dynamic router) do NOT carry this

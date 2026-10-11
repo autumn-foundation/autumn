@@ -161,6 +161,8 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "oauth2")]
         http_interceptor: None,
         seo_sources: Vec::new(),
+        agent_skills: Vec::new(),
+        commerce_docs: crate::aeo::RegisteredCommerceDocs::default(),
         metrics_sources: Vec::new(),
         health_indicators: Vec::new(),
         #[cfg(feature = "inbound-mail")]
@@ -615,6 +617,11 @@ pub struct AppBuilder {
     /// Sitemap sources registered via [`AppBuilder::seo_source`].
     /// Each source provides dynamic URL entries for `/sitemap.xml`.
     seo_sources: Vec<Arc<dyn crate::seo::SitemapSource>>,
+    /// Agent skills registered via [`AppBuilder::agent_skill`].
+    agent_skills: Vec<crate::aeo::AgentSkill>,
+    /// UCP/ACP documents registered via [`AppBuilder::ucp_profile`] and
+    /// [`AppBuilder::acp_discovery`].
+    commerce_docs: crate::aeo::RegisteredCommerceDocs,
 
     /// Plugin-contributed metrics sources registered via [`AppBuilder::metrics_source`].
     pub(crate) metrics_sources: Vec<(String, Arc<dyn crate::actuator::MetricsSource>)>,
@@ -925,6 +932,42 @@ impl AppBuilder {
     #[must_use]
     pub fn seo_source<S: crate::seo::SitemapSource + 'static>(mut self, source: S) -> Self {
         self.seo_sources.push(Arc::new(source));
+        self
+    }
+
+    /// Publish an agent skill at `/.well-known/agent-skills/<name>/SKILL.md`
+    /// and list it in `/.well-known/agent-skills/index.json`.
+    ///
+    /// A skill with the name `site-guide` replaces the generated one. A second
+    /// skill with a name already registered is ignored.
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::aeo::AgentSkill;
+    ///
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// let skill = AgentSkill::new("refunds", "Draft a refund for an order.", "# Refunds\n")
+    ///     .expect("valid skill");
+    /// autumn_web::app().agent_skill(skill).run().await;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn agent_skill(mut self, skill: crate::aeo::AgentSkill) -> Self {
+        self.agent_skills.push(skill);
+        self
+    }
+
+    /// Serve a UCP business profile at `/.well-known/ucp`.
+    #[must_use]
+    pub fn ucp_profile(mut self, profile: crate::aeo::commerce::UcpProfile) -> Self {
+        self.commerce_docs.ucp = Some(profile);
+        self
+    }
+
+    /// Serve an ACP discovery document at `/.well-known/acp.json`.
+    #[must_use]
+    pub fn acp_discovery(mut self, document: crate::aeo::commerce::AcpDiscovery) -> Self {
+        self.commerce_docs.acp = Some(document);
         self
     }
 
@@ -3840,6 +3883,8 @@ impl AppBuilder {
             #[cfg(feature = "oauth2")]
             http_interceptor,
             seo_sources,
+            agent_skills,
+            commerce_docs,
             metrics_sources,
             health_indicators,
             #[cfg(feature = "inbound-mail")]
@@ -4652,9 +4697,13 @@ impl AppBuilder {
         // `/{locale}`-look-alike path was ever actually locale-prefixed
         // (Codex review).
         state.insert_extension(config.clone());
+        state.insert_extension(crate::aeo::RegisteredAgentSkills(agent_skills));
+        state.insert_extension(commerce_docs);
 
         // Register SEO routes (/robots.txt and /sitemap.xml) when any SEO
-        // configuration is present or dynamic sources are registered.
+        // configuration is present or dynamic sources are registered. With
+        // neither, AEO serves a default `/robots.txt` from the router
+        // fallback, so an application route at that path always wins.
         if !seo_sources.is_empty() || crate::seo::has_seo_config(&config.seo) {
             let seo_cfg = &config.seo;
             let raw_profile = config.profile.as_deref().unwrap_or("dev");
@@ -4667,7 +4716,7 @@ impl AppBuilder {
                 .filter(|m| !crate::seo::defaults_exclude_from_sitemap(m.seo))
                 .map(|m| m.path)
                 .collect();
-            let (robots_body, sitemap_body) = crate::seo::assemble_seo_bodies(
+            let (robots_body, sitemap_body) = crate::seo::assemble_seo_bodies_with_policy(
                 profile,
                 seo_cfg.base_url.as_deref(),
                 seo_cfg.robots.sitemap_url.as_deref(),
@@ -4675,6 +4724,7 @@ impl AppBuilder {
                 &seo_sources,
                 &static_paths,
                 sitemap_locale_config(&config),
+                &crate::aeo::robots_policy(&config),
             )
             .await;
             let seo_router = crate::seo::build_seo_router_from_bodies(robots_body, sitemap_body);
@@ -6322,6 +6372,8 @@ impl AppBuilder {
             #[cfg(feature = "oauth2")]
             http_interceptor,
             seo_sources,
+            agent_skills,
+            commerce_docs,
             metrics_sources,
             health_indicators,
             #[cfg(feature = "inbound-mail")]
@@ -6654,6 +6706,8 @@ impl AppBuilder {
         // Refresh the AppState-stored config snapshot — see the matching
         // comment in `run()` (Codex review).
         state.insert_extension(config.clone());
+        state.insert_extension(crate::aeo::RegisteredAgentSkills(agent_skills));
+        state.insert_extension(commerce_docs);
         // Publish the architecture graph this process serves (#1747) before the
         // router is built, so `/actuator/graph` can answer from the first
         // request rather than after some later warm-up.
@@ -6679,8 +6733,14 @@ impl AppBuilder {
                 #[cfg(feature = "maud")]
                 error_page_renderer: None,
                 session_store,
+                // The agent documents list the API that `dist/openapi.json`
+                // (written below) describes. The build writes that file at the
+                // site root whatever path the runtime serves it on, and writes
+                // no Swagger UI, so the documents link only what `dist` holds.
                 #[cfg(feature = "openapi")]
-                openapi: None,
+                openapi: openapi
+                    .clone()
+                    .map(|api| api.openapi_json_path("/openapi.json").swagger_ui_path(None)),
                 #[cfg(feature = "mcp")]
                 mcp: None,
             },
@@ -6696,7 +6756,9 @@ impl AppBuilder {
 
         eprintln!("Building {} static route(s)...", static_metas.len());
 
-        match crate::static_gen::render_static_routes(router, &static_metas, &dist_dir).await {
+        match crate::static_gen::render_static_routes(router.clone(), &static_metas, &dist_dir)
+            .await
+        {
             Ok(()) => {
                 eprintln!(
                     "\n  \u{2713} Static build complete \u{2192} {}",
@@ -6710,6 +6772,30 @@ impl AppBuilder {
             }
         }
 
+        // Agent documents (llms.txt, skills, ARD, ...). Their URLs are
+        // absolute, so they need `[seo] base_url`.
+        if config.aeo.enabled {
+            match crate::aeo::write_static_documents(
+                router,
+                config.seo.base_url.as_deref(),
+                &dist_dir,
+            )
+            .await
+            {
+                Ok(paths) => {
+                    for path in paths {
+                        eprintln!("  \u{2713} AEO: {path} written");
+                    }
+                    if config.seo.base_url.is_none() {
+                        eprintln!(
+                            "  \u{2139} AEO: set [seo] base_url to write the agent documents"
+                        );
+                    }
+                }
+                Err(e) => eprintln!("  \u{26A0} Failed to write the agent documents: {e}"),
+            }
+        }
+
         // When OpenAPI is configured, write the spec to dist/ so consumers
         // can retrieve a machine-readable API contract alongside the HTML.
         #[cfg(feature = "openapi")]
@@ -6719,7 +6805,9 @@ impl AppBuilder {
                 openapi_config.session_cookie_name(config.session.cookie_name.clone());
             let docs: Vec<&crate::openapi::ApiDoc> = api_docs_snapshot.iter().collect();
             let spec = crate::openapi::generate_spec(&openapi_config, &docs);
-            match crate::openapi::write_openapi_spec_to_dist(&spec, &dist_dir) {
+            let written = crate::openapi::write_openapi_spec_to_dist(&spec, &dist_dir)
+                .and_then(|()| crate::aeo::commerce::write_mpp_spec(&spec, &config, &dist_dir));
+            match written {
                 Ok(()) => {
                     eprintln!(
                         "  \u{2713} OpenAPI spec written \u{2192} {}/openapi.json",
@@ -6732,13 +6820,22 @@ impl AppBuilder {
             }
         }
 
-        // Write robots.txt and sitemap.xml to dist/ — only when SEO is explicitly
-        // configured or dynamic sources are registered, and never overwrite files
+        // Write robots.txt and sitemap.xml to dist/ — when SEO is configured,
+        // dynamic sources are registered, or AEO is on; never overwrite files
         // already produced by a custom #[static_get("/robots.txt")] route.
-        if !seo_sources.is_empty() || crate::seo::has_seo_config(&config.seo) {
+        if !seo_sources.is_empty() || crate::seo::has_seo_config(&config.seo) || config.aeo.enabled
+        {
             let seo_cfg = &config.seo;
             let raw_profile = config.profile.as_deref().unwrap_or("dev");
-            let profile = crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all);
+            // Here for AEO alone, the file is AEO's: it classes profiles as
+            // the server's AEO `robots.txt` does, so a custom production
+            // profile does not ship `Disallow: /`.
+            let aeo_only = seo_sources.is_empty() && !crate::seo::has_seo_config(seo_cfg);
+            let profile = if aeo_only {
+                crate::aeo::robots_profile(&config)
+            } else {
+                crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all)
+            };
             // A static route that declared `seo(robots = "noindex")` must not
             // be advertised in sitemap.xml — otherwise the app tells crawlers
             // "here is this URL" and "do not index it" at the same time (#1182).
@@ -6747,7 +6844,7 @@ impl AppBuilder {
                 .filter(|m| !crate::seo::defaults_exclude_from_sitemap(m.seo))
                 .map(|m| m.path)
                 .collect();
-            let (robots_body, sitemap_body) = crate::seo::assemble_seo_bodies(
+            let (robots_body, sitemap_body) = crate::seo::assemble_seo_bodies_with_policy(
                 profile,
                 seo_cfg.base_url.as_deref(),
                 seo_cfg.robots.sitemap_url.as_deref(),
@@ -6755,6 +6852,7 @@ impl AppBuilder {
                 &seo_sources,
                 &static_paths,
                 sitemap_locale_config(&config),
+                &crate::aeo::robots_policy(&config),
             )
             .await;
             // Write each file only if it wasn't already produced by a
@@ -7162,13 +7260,13 @@ impl AppBuilder {
 
         let mut openapi_config = openapi_config;
         openapi_config.api_versions = api_versions;
-        let openapi_config = openapi_config.session_cookie_name(config.session.cookie_name);
+        let openapi_config = openapi_config.session_cookie_name(config.session.cookie_name.clone());
 
         let docs = crate::router::collect_openapi_docs(&routes, &scoped_groups);
         let refs: Vec<&crate::openapi::ApiDoc> = docs.iter().collect();
         let spec = crate::openapi::generate_spec(&openapi_config, &refs);
 
-        let json = serde_json::to_string_pretty(&spec).unwrap_or_else(|e| {
+        let json = crate::aeo::commerce::spec_json_with_mpp(&spec, &config).unwrap_or_else(|e| {
             eprintln!("Failed to serialize OpenAPI spec: {e}");
             std::process::exit(1);
         });
@@ -8430,6 +8528,8 @@ impl AppBuilder {
             #[cfg(all(feature = "embed-assets", feature = "i18n"))]
             embedded_locales,
             plugin_config_roots,
+            agent_skills,
+            commerce_docs,
             // Read only for whether it is set: calling it could reach a live
             // queue. The replay mailer gets a refusing queue in its place.
             #[cfg(feature = "mail")]
@@ -8548,6 +8648,9 @@ impl AppBuilder {
         state.probes = crate::probe::ProbeState::default();
         state.apply_health_config(&config.health);
         state.insert_extension(RegisteredApiVersions(api_versions));
+        // The AEO documents must replay as captured.
+        state.insert_extension(crate::aeo::RegisteredAgentSkills(agent_skills));
+        state.insert_extension(commerce_docs);
         #[cfg(feature = "db")]
         if let Some(interceptor) = db_interceptor {
             state.insert_extension(interceptor);

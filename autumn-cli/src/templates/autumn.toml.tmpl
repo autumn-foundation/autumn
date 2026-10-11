@@ -22,6 +22,20 @@ port = 3000
 level = "info"
 # format = "Auto"  # Auto | Pretty | Json
 
+# Agent readiness (AEO) is on by default. It serves Markdown for agents,
+# llms.txt, robots.txt AI rules, agent skills, and the ARD manifest.
+# Set base_url to get absolute links. See docs/guide/aeo.md.
+# [seo]
+# base_url = "https://example.com"
+#
+# [aeo]
+# enabled = true
+#
+# [aeo.content_signals]
+# search = true
+# ai_input = true
+# ai_train = false
+
 [health]
 path = "/health"
 # live_path = "/live"
