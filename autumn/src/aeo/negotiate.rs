@@ -679,14 +679,16 @@ fn content_length(res: &Response) -> Option<u64> {
         .and_then(|v| v.parse::<u64>().ok())
 }
 
-/// `true` when the body is known to be larger than `max`: from
-/// `Content-Length`, else from an exact body size.
-fn too_large(res: &Response, max: usize) -> bool {
+/// `true` when the body's length is known, from `Content-Length` or an
+/// exact body size, and fits in `max`. A body of unknown length (a stream)
+/// is not collected: this layer runs outside the request timeout and the
+/// admission limits, so a slow stream would hold the request open.
+fn fits(res: &Response, max: usize) -> bool {
     use http_body::Body as _;
 
     content_length(res)
         .or_else(|| res.body().size_hint().exact())
-        .is_some_and(|len| len > max as u64)
+        .is_some_and(|len| len <= max as u64)
 }
 
 /// `true` when a `HEAD` response's `GET` body is known to fit in `max`.
@@ -701,7 +703,7 @@ fn known_to_fit(res: &Response, max: usize) -> bool {
 }
 
 async fn to_markdown(res: Response, config: &NegotiateConfig, page: Option<&str>) -> Response {
-    if too_large(&res, config.max_bytes) {
+    if !fits(&res, config.max_bytes) {
         return res;
     }
     let (mut parts, body) = res.into_parts();
@@ -1111,6 +1113,48 @@ mod tests {
         ] {
             assert!(h.get(name).is_none(), "{name}");
         }
+    }
+
+    /// Codex review (P1): a stream of unknown length is never collected,
+    /// so a slow one cannot hold the request open; it stays HTML.
+    #[tokio::test]
+    async fn a_stream_of_unknown_length_stays_html() {
+        let config = NegotiateConfig {
+            markdown: true,
+            max_bytes: 1024,
+            home_links: Vec::new(),
+            content_signal: None,
+            resource_metadata: None,
+            resource_metadata_from_host: false,
+        };
+        let html = || Response::builder().header(CONTENT_TYPE, "text/html; charset=utf-8");
+        let streamed = html()
+            .body(Body::from_stream(futures::stream::pending::<
+                Result<Bytes, std::io::Error>,
+            >()))
+            .unwrap();
+        // A pending stream would hang `to_markdown` if it were collected.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            to_markdown(streamed, &config, None),
+        )
+        .await
+        .expect("not collected");
+        assert!(
+            res.headers()[CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+
+        let known = html().body(Body::from("<h1>Hi</h1>")).unwrap();
+        let res = to_markdown(known, &config, None).await;
+        assert!(
+            res.headers()[CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/markdown")
+        );
     }
 
     #[tokio::test]

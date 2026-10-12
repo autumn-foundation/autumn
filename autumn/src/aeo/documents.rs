@@ -825,8 +825,13 @@ fn api_catalog(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
 
 // ── MCP server card ─────────────────────────────────────────────────────────
 
-/// MCP protocol versions the endpoint speaks. Keep in step with `mcp.rs`.
-const MCP_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+/// MCP protocol versions the endpoint speaks, newest first. Keep in step
+/// with `mcp.rs` (`SUPPORTED_PROTOCOL_VERSIONS` and `modern::VERSIONS`).
+const MCP_PROTOCOL_VERSIONS: &[&str] = &["2026-07-28", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// The version a client that negotiates with `initialize` gets by default
+/// (the newest legacy one); `2026-07-28` clients name theirs per request.
+const MCP_DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 
 fn server_card(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
     let mcp = facts.mcp.as_ref()?;
@@ -860,7 +865,7 @@ fn server_card(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
         }],
         // SEP-1649 fields, which the isitagentready.com scanner reads.
         "serverInfo": { "name": name, "title": display, "version": version },
-        "protocolVersion": MCP_PROTOCOL_VERSIONS[0],
+        "protocolVersion": MCP_DEFAULT_PROTOCOL_VERSION,
         "transport": { "type": "streamable-http", "endpoint": endpoint },
         "capabilities": { "tools": { "listChanged": false } },
     });
@@ -2172,6 +2177,13 @@ mod tests {
             assert_eq!(card["version"], "2.1.0");
             assert_eq!(card["remotes"][0]["type"], "streamable-http");
             assert_eq!(card["remotes"][0]["url"], "https://shop.example.com/mcp");
+            // Codex review (P2): the modern protocol is advertised too; the
+            // `initialize` default stays the newest legacy version.
+            assert_eq!(
+                card["remotes"][0]["supportedProtocolVersions"][0],
+                "2026-07-28"
+            );
+            assert_eq!(card["protocolVersion"], "2025-06-18");
             assert_eq!(
                 card["transport"]["endpoint"],
                 "https://shop.example.com/mcp"
