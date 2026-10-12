@@ -138,7 +138,13 @@ pub struct PluginMounts {
 }
 
 /// Prefixes the framework always owns. [`PluginMounts::reserve`] adds more.
-const BASE_RESERVED: &[&str] = &["/static", "/_autumn", "/favicon.ico", "/.well-known"];
+const BASE_RESERVED: &[&str] = &[
+    "/static",
+    "/_autumn",
+    "/__autumn",
+    "/favicon.ico",
+    "/.well-known",
+];
 
 /// The prefixes this app configuration gives to the framework.
 ///
@@ -484,7 +490,12 @@ mod tests {
     #[test]
     fn a_framework_prefix_is_refused() {
         let mounts = PluginMounts::new();
-        for prefix in ["/static", "/_autumn/x", "/.well-known/x"] {
+        for prefix in [
+            "/static",
+            "/_autumn/x",
+            "/__autumn/live-reload",
+            "/.well-known/x",
+        ] {
             assert!(
                 matches!(
                     mounts.mount(&hello(prefix)),
