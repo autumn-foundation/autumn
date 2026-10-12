@@ -46,6 +46,12 @@
 //! hand out connections, and the `on_close` hooks run only after the last
 //! in-flight connection has gone back. A request for a database that is
 //! draining waits for the drain, then opens it fresh.
+//!
+//! # Cancellation
+//!
+//! `open`, `close`, `delete`, `restore` and `provision` do their work in owned
+//! tasks. If the caller is dropped, the work still finishes: a drain always
+//! ends, and a started open stays tracked. See ADR 0019, section 3.
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
@@ -55,7 +61,7 @@
 // #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
 #![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -528,6 +534,10 @@ impl Drain {
 struct State {
     open: HashMap<FleetDbKey, Arc<Entry>>,
     draining: HashMap<FleetDbKey, Arc<Drain>>,
+    /// Serializes the in-process provisions of one key.
+    provisioning: HashMap<FleetDbKey, Arc<tokio::sync::Mutex<()>>>,
+    /// Keys a provision created but no caller has seen succeed yet.
+    unacknowledged: HashSet<FleetDbKey>,
     seq: u64,
 }
 
@@ -881,20 +891,69 @@ impl DatabaseFleet {
     /// `create_on_demand` says. The way to admit a new tenant to a tenant
     /// fleet.
     ///
+    /// Cancellation-safe: the publish runs in an owned task. If the caller is
+    /// dropped after the file is published, the next `provision` of the key
+    /// reports the creation, so exactly one call does.
+    ///
     /// # Errors
     ///
     /// [`FleetError::AlreadyExists`] when the file is already there, or an
     /// [`open`](Self::open) error.
     pub async fn provision(&self, key: &FleetDbKey) -> Result<FleetDatabase, FleetError> {
         self.check_key(key)?;
-        let path = self.path_of(key);
-        if path.exists() {
+        let (fleet, task_key) = (self.clone(), key.clone());
+        tokio::spawn(async move { fleet.publish_owned(&task_key).await })
+            .await
+            .map_err(|e| FleetError::Unavailable {
+                name: key.name(),
+                detail: format!("create task failed: {e}"),
+            })??;
+        if !self.lock_state().unacknowledged.contains(key) {
             return Err(FleetError::AlreadyExists { name: key.name() });
         }
-        // Publish here, outside the single-flight open, so the publish result
-        // decides: of two concurrent provisions (in this process or another)
-        // only the one whose link created the file succeeds, and its caller
-        // alone runs whatever signup work follows.
+        let db = self.open_with(key, false).await?;
+        // Of the callers that got this far, one removes the marker.
+        if self.lock_state().unacknowledged.remove(key) {
+            Ok(db)
+        } else {
+            Err(FleetError::AlreadyExists { name: key.name() })
+        }
+    }
+
+    /// Publish the file for [`provision`](Self::provision), one task per key
+    /// at a time. Records the creation until a caller claims it.
+    async fn publish_owned(&self, key: &FleetDbKey) -> Result<(), FleetError> {
+        let lock = Arc::clone(
+            self.lock_state()
+                .provisioning
+                .entry(key.clone())
+                .or_default(),
+        );
+        let result = {
+            let _turn = lock.lock().await;
+            self.publish(key).await
+        };
+        drop(lock);
+        let mut state = self.lock_state();
+        if state
+            .provisioning
+            .get(key)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            state.provisioning.remove(key);
+        }
+        drop(state);
+        result
+    }
+
+    async fn publish(&self, key: &FleetDbKey) -> Result<(), FleetError> {
+        let path = self.path_of(key);
+        if path.exists() {
+            return Ok(());
+        }
+        // The publish result decides: of two concurrent provisions (in this
+        // process or another) only the one whose link created the file
+        // records a creation, and its caller alone runs the signup work.
         let fleet = self.clone();
         let name = key.name();
         let created = crate::time::spawn_blocking(move || {
@@ -908,15 +967,15 @@ impl DatabaseFleet {
             name: key.name(),
             detail: format!("create task failed: {e}"),
         })??;
-        if !created {
-            return Err(FleetError::AlreadyExists { name: key.name() });
+        if created {
+            let counters = &self.inner.counters;
+            counters.created.fetch_add(1, Ordering::Relaxed);
+            counters
+                .migrations_applied
+                .fetch_add(self.inner.migrations.count() as u64, Ordering::Relaxed);
+            self.lock_state().unacknowledged.insert(key.clone());
         }
-        let counters = &self.inner.counters;
-        counters.created.fetch_add(1, Ordering::Relaxed);
-        counters
-            .migrations_applied
-            .fetch_add(self.inner.migrations.count() as u64, Ordering::Relaxed);
-        self.open_with(key, false).await
+        Ok(())
     }
 
     /// Whether the database's file exists.
@@ -936,11 +995,10 @@ impl DatabaseFleet {
                 }
                 Next::Open(entry) => entry,
             };
-            let result = entry
-                .cell
-                .get_or_try_init(|| self.open_now(key.clone(), create))
-                .await
-                .cloned();
+            let result = match entry.cell.get() {
+                Some(db) => Ok(db.clone()),
+                None => self.open_owned(key, create, &entry).await,
+            };
             match result {
                 Ok(db) => {
                     // The pool is closed when the database was drained between
@@ -951,16 +1009,46 @@ impl DatabaseFleet {
                     self.enforce_capacity(Some(key));
                     return Ok(db);
                 }
-                Err(error) => {
-                    self.inner
-                        .counters
-                        .open_failures
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.forget_entry(key, &entry);
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             }
         }
+    }
+
+    /// Run the single-flight open in an owned task. A cancelled caller only
+    /// stops waiting: the open (file, migrations, `on_open` hooks) still ends
+    /// in the entry, where a later open, close or delete finds it. Without
+    /// this, hooks that already started would outlive an empty entry.
+    async fn open_owned(
+        &self,
+        key: &FleetDbKey,
+        create: bool,
+        entry: &Arc<Entry>,
+    ) -> Result<FleetDatabase, FleetError> {
+        let (fleet, task_key, task_entry) = (self.clone(), key.clone(), Arc::clone(entry));
+        let opened = tokio::spawn(async move {
+            let result = task_entry
+                .cell
+                .get_or_try_init(|| fleet.open_now(task_key.clone(), create))
+                .await
+                .cloned();
+            if result.is_err() {
+                fleet
+                    .inner
+                    .counters
+                    .open_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                fleet.forget_entry(&task_key, &task_entry);
+            }
+            result
+        })
+        .await;
+        opened.unwrap_or_else(|error| {
+            self.forget_entry(key, entry);
+            Err(FleetError::Unavailable {
+                name: key.name(),
+                detail: format!("open task failed: {error}"),
+            })
+        })
     }
 
     /// Under the lock: wait for a drain of `key`, or take (or make) its entry
@@ -1309,7 +1397,16 @@ impl DatabaseFleet {
 
     /// Close one database now (waiting for its in-flight connections). A
     /// no-op when it is not open.
+    ///
+    /// Cancellation-safe: the work runs in an owned task, so a dropped caller
+    /// only stops waiting.
     pub async fn close(&self, key: &FleetDbKey) {
+        let (fleet, key) = (self.clone(), key.clone());
+        // A task panic has nothing to report to: `close` returns no result.
+        let _ = tokio::spawn(async move { fleet.close_owned(&key).await }).await;
+    }
+
+    async fn close_owned(&self, key: &FleetDbKey) {
         let begun = self.begin_drains(|_| vec![key.clone()]).pop();
         if let Some((key, db, drain)) = begun {
             self.drain(&key, db).await;
@@ -1392,12 +1489,25 @@ impl DatabaseFleet {
     /// The database's replica, if any, is not deleted here: a lifecycle hook
     /// (`on_delete`) decides.
     ///
+    /// Cancellation-safe: the work runs in an owned task, so a dropped caller
+    /// only stops waiting.
+    ///
     /// # Errors
     ///
     /// [`FleetError::Deleting`] when a delete is already running, or
     /// [`FleetError::Io`].
     pub async fn delete(&self, key: &FleetDbKey) -> Result<bool, FleetError> {
         self.check_key(key)?;
+        let (fleet, key) = (self.clone(), key.clone());
+        tokio::spawn(async move { fleet.delete_owned(&key).await })
+            .await
+            .map_err(|error| FleetError::Io {
+                op: "delete database",
+                detail: error.to_string(),
+            })?
+    }
+
+    async fn delete_owned(&self, key: &FleetDbKey) -> Result<bool, FleetError> {
         self.settle_opening(key).await;
         let begun = self.begin_exclusive(key, true)?;
         let Some((key, db, drain)) = begun else {
@@ -1406,7 +1516,7 @@ impl DatabaseFleet {
             if let Some(pending) = pending {
                 pending.wait().await;
             }
-            return Box::pin(self.delete(key)).await;
+            return Box::pin(self.delete_owned(key)).await;
         };
         self.drain(&key, db).await;
         // Hooks let go of the files first (a parked replicator holds one open).
@@ -1433,6 +1543,9 @@ impl DatabaseFleet {
             detail: e.to_string(),
         })
         .and_then(|r| r);
+        if removed.is_ok() {
+            self.lock_state().unacknowledged.remove(&key);
+        }
         if matches!(removed, Ok(true)) {
             self.inner.counters.deleted.fetch_add(1, Ordering::Relaxed);
             // Only now: a refused delete (another process has the file open)
@@ -1538,6 +1651,9 @@ impl DatabaseFleet {
     /// `None`), over whatever is on disk. Openers wait until it is done, then
     /// open the restored file. Needs [`install_replication`](Self::install_replication).
     ///
+    /// Cancellation-safe: the work runs in an owned task, so a dropped caller
+    /// only stops waiting.
+    ///
     /// # Errors
     ///
     /// [`FleetError::NotReplicated`] without replication,
@@ -1549,6 +1665,20 @@ impl DatabaseFleet {
         target: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<crate::replication::RestoreOutcome, FleetError> {
         self.check_key(key)?;
+        let (fleet, key, name) = (self.clone(), key.clone(), key.name());
+        tokio::spawn(async move { fleet.restore_owned(&key, target).await })
+            .await
+            .map_err(|error| FleetError::Restore {
+                name,
+                detail: error.to_string(),
+            })?
+    }
+
+    async fn restore_owned(
+        &self,
+        key: &FleetDbKey,
+        target: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<crate::replication::RestoreOutcome, FleetError> {
         let replication = self
             .inner
             .replication
@@ -3345,6 +3475,158 @@ mod tests {
         // A slot fleet creates on demand: the slot comes back empty.
         let fresh = fleet.open(&key).await.unwrap();
         assert!(!table_exists(&fresh, "notes").await);
+    }
+
+    // ── Cancellation safety (#3229) ──────────────────────────────────────
+
+    /// Hook whose `on_open` blocks for a while, like a slow replicator start.
+    struct SlowOpen {
+        delay: Duration,
+        inner: Recorder,
+    }
+
+    impl FleetLifecycle for SlowOpen {
+        fn on_open(&self, db: &FleetDatabase) -> Result<(), String> {
+            std::thread::sleep(self.delay);
+            self.inner.on_open(db)
+        }
+        fn on_close(&self, db: &FleetDatabase) {
+            self.inner.on_close(db);
+        }
+    }
+
+    /// Cancel `call` after `after`, as a request timeout does.
+    async fn cancelled<T>(after: Duration, call: impl Future<Output = T>) {
+        assert!(
+            tokio::time::timeout(after, call).await.is_err(),
+            "the call finished before the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_delete_still_finishes_and_frees_the_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let key = FleetDbKey::Slot(21);
+        let db = fleet.open(&key).await.unwrap();
+        let held = db.pool().get().await.unwrap();
+        cancelled(Duration::from_millis(60), fleet.delete(&key)).await;
+        drop(held);
+        drop(db);
+        settle(&fleet).await;
+        assert!(!fleet.exists(&key), "the delete ran to the end");
+        // A slot fleet creates on demand: the key opens again, empty.
+        let fresh = tokio::time::timeout(Duration::from_secs(5), fleet.open(&key))
+            .await
+            .expect("open is not stuck on a stranded drain")
+            .unwrap();
+        assert!(!table_exists(&fresh, "notes").await);
+        drop(fresh);
+        tokio::time::timeout(Duration::from_secs(5), fleet.close_all())
+            .await
+            .expect("close_all does not wait on a stranded drain");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_close_still_finishes_and_frees_the_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let recorder = Arc::new(Recorder::default());
+        fleet.add_lifecycle(recorder.clone());
+        let key = FleetDbKey::Slot(22);
+        let db = fleet.open(&key).await.unwrap();
+        let held = db.pool().get().await.unwrap();
+        cancelled(Duration::from_millis(60), fleet.close(&key)).await;
+        drop(held);
+        drop(db);
+        settle(&fleet).await;
+        assert_eq!(recorder.closed.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(Duration::from_secs(5), fleet.open(&key))
+            .await
+            .expect("open is not stuck on a stranded drain")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), fleet.close_all())
+            .await
+            .expect("close_all returns");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_first_open_leaves_nothing_untracked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let hook = Arc::new(SlowOpen {
+            delay: Duration::from_millis(400),
+            inner: Recorder::default(),
+        });
+        fleet.add_lifecycle(hook.clone());
+        let key = FleetDbKey::Slot(23);
+        cancelled(Duration::from_millis(100), fleet.open(&key)).await;
+        // The delete waits for the open that is still running, then drains it.
+        assert!(fleet.delete(&key).await.unwrap());
+        settle(&fleet).await;
+        let (opened, closed) = (
+            hook.inner.opened.load(Ordering::SeqCst),
+            hook.inner.closed.load(Ordering::SeqCst),
+        );
+        assert_eq!(opened, closed, "every on_open has its on_close");
+        assert!(!fleet.exists(&key));
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_first_open_is_kept_for_the_next_opener() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let hook = Arc::new(SlowOpen {
+            delay: Duration::from_millis(300),
+            inner: Recorder::default(),
+        });
+        fleet.add_lifecycle(hook.clone());
+        let key = FleetDbKey::Slot(24);
+        cancelled(Duration::from_millis(60), fleet.open(&key)).await;
+        fleet.open(&key).await.unwrap();
+        assert_eq!(
+            hook.inner.opened.load(Ordering::SeqCst),
+            1,
+            "one open, not one per caller"
+        );
+        fleet.close_all().await;
+        assert_eq!(hook.inner.closed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_provision_is_reported_once_by_the_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Tenant, |_| {});
+        let key = fleet.key_for("acme").unwrap();
+        // A zero timeout drops the call at its first wait, mid-publish.
+        cancelled(Duration::ZERO, fleet.provision(&key)).await;
+        // Let the abandoned publish finish.
+        for _ in 0..500 {
+            if fleet.exists(&key) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let retry = fleet.provision(&key).await;
+        assert!(retry.is_ok(), "the retry sees the creation: {retry:?}");
+        let again = fleet.provision(&key).await;
+        assert!(
+            matches!(again, Err(FleetError::AlreadyExists { .. })),
+            "the creation is reported once: {again:?}"
+        );
+        assert_eq!(fleet.stats().created_total, 1);
+    }
+
+    #[tokio::test]
+    async fn a_provision_that_finishes_is_not_reported_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Tenant, |_| {});
+        let key = fleet.key_for("acme").unwrap();
+        fleet.provision(&key).await.unwrap();
+        assert!(matches!(
+            fleet.provision(&key).await,
+            Err(FleetError::AlreadyExists { .. })
+        ));
     }
 
     #[test]
