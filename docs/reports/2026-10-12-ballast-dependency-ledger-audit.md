@@ -289,14 +289,27 @@ python3 -c "import yaml; yaml.safe_load(open('.github/dependabot.yml'))"
 
 ## Follow-ups still open
 
-1. **GitHub-native Dependabot/security alert count (16: 4 high, 10 moderate, 2
-   low as of last pass's push) — still no tool in any session's GitHub MCP
-   toolset exposes it.** Re-confirmed this pass by a dedicated subagent
-   search (actions_get/list, get_commit, search_*, pull_request_read,
-   issue_read — nothing named anything like "dependabot alert" or "security
-   advisory" exists). Three passes running without resolution. Needs a human
-   to look at `github.com/autumn-foundation/autumn/security/dependabot`
-   directly; this session cannot.
+1. **GitHub-native Dependabot/security alert count moved again — 16→17 (4
+   high, 10 moderate, 2 low → 5 high, 10 moderate, 2 low) — and still no tool
+   in any session's GitHub MCP toolset exposes it.** The 17-count comes from
+   this very pass's own `git push` output (printed when pushing this report's
+   branch), the same mechanism that surfaced last pass's 16. High moved again
+   (4→5), third consecutive week it has moved rather than held flat.
+   Re-confirmed the no-visibility gap this pass by a dedicated subagent search
+   (actions_get/list, get_commit, search_*, pull_request_read, issue_read —
+   nothing named anything like "dependabot alert" or "security advisory"
+   exists). Four passes running without resolution, and the trend (9 → 16 →
+   17, high 2 → 2 → 4 → 5) is now consistently upward, not noise. Needs a
+   human to look at `github.com/autumn-foundation/autumn/security/dependabot`
+   directly; this session cannot. Given the "all 5 `cargo deny`-audited Rust
+   graphs show 0 unwaived advisories" finding has now held for 4 consecutive
+   passes while this count keeps climbing, the most likely location for
+   these alerts is one of the two manifests outside this harness's coverage
+   (`examples/react-graphql/frontend/package-lock.json`,
+   `benchmarks/runtime/django/requirements.txt`) or GitHub's own advisory
+   database surfacing matches this session's `cargo-deny` database (fetched
+   fresh each run) hasn't yet synced — not a gap in the Rust-side gate
+   itself.
 2. **The opentelemetry cluster (#3143/#3144/#3148/#3149) needs a human
    decision**: close all four and open one combined PR (this pass's
    recommendation, posted on all four), or leave them open as a visible
