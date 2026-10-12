@@ -1,17 +1,20 @@
 //! Mount and unmount a sandboxed plugin on a running app (issue #2433).
 //!
-//! The served router is not swapped. Mounted plugins sit in a table that the
-//! app's 404 fallback reads. A request that matches a static route never
-//! touches the table, so ordinary routes pay nothing.
+//! The app does not swap its router. The app's 404 fallback reads a table of
+//! mounted plugins. A request that matches a static route never reads the
+//! table. Ordinary routes therefore have no added cost.
 //!
 //! # Rules
 //!
-//! - A static route wins over a mounted prefix. Mount a prefix that no static
+//! - A static route wins over a mounted prefix. Use a prefix that no static
 //!   route uses.
-//! - A prefix is held by one plugin. A prefix inside, or around, a held prefix
-//!   is refused.
-//! - **Unmount drains.** New requests get 404 at once. A request already
-//!   running finishes and keeps its concurrency permit until it ends.
+//! - A framework prefix, such as `/actuator`, is refused.
+//! - One plugin holds a prefix. A prefix that contains, or is inside, a held
+//!   prefix is refused.
+//! - **Unmount drains.** New requests get 404 immediately. A running request
+//!   finishes. It keeps its concurrency permit until it ends.
+//! - A new plugin instance at a reused prefix has its own permits. While the
+//!   old instance drains, both can run requests.
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
 // #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
@@ -56,7 +59,7 @@ pub struct MountedPluginInfo {
     pub artifact_sha256: Option<String>,
     /// Granted capabilities.
     pub capabilities: Vec<String>,
-    /// Counts up with each mount. A re-mounted prefix gets a new number.
+    /// The mount number. Each mount gets a higher number.
     pub generation: u64,
     /// Requests running now.
     pub in_flight: usize,
@@ -66,6 +69,11 @@ pub struct MountedPluginInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MountError {
+    /// The prefix belongs to the framework.
+    Reserved {
+        /// The prefix that was asked for.
+        prefix: String,
+    },
     /// Another plugin holds this prefix, or one that overlaps it.
     PrefixTaken {
         /// The prefix that was asked for.
@@ -78,6 +86,7 @@ pub enum MountError {
 impl fmt::Display for MountError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Reserved { prefix } => write!(f, "prefix {prefix} belongs to the framework"),
             Self::PrefixTaken { prefix, held_by } => {
                 write!(f, "prefix {prefix} overlaps a prefix held by {held_by}")
             }
@@ -126,6 +135,19 @@ pub struct PluginMounts {
     table: Arc<RwLock<Table>>,
 }
 
+/// Prefixes that the framework owns. A plugin cannot take them.
+const RESERVED_PREFIXES: &[&str] = &[
+    "/actuator",
+    "/static",
+    "/health",
+    "/live",
+    "/ready",
+    "/startup",
+    "/mcp",
+    "/favicon.ico",
+    "/.well-known",
+];
+
 /// `true` if `path` is `prefix` or lies under it, on a segment boundary.
 fn is_under(path: &str, prefix: &str) -> bool {
     path.strip_prefix(prefix)
@@ -149,13 +171,21 @@ impl PluginMounts {
 
     /// Mount a plugin at its manifest prefix. Returns its generation.
     ///
-    /// Logs the capability grant, as a boot-time mount does.
+    /// Logs the capability grant, like a boot-time mount.
     ///
     /// # Errors
     ///
+    /// [`MountError::Reserved`] for a framework prefix.
     /// [`MountError::PrefixTaken`] if the prefix overlaps a held one.
     pub fn mount(&self, plugin: &SandboxedPlugin) -> Result<u64, MountError> {
         let prefix = plugin.manifest().prefix.clone();
+        if RESERVED_PREFIXES
+            .iter()
+            .any(|reserved| is_under(&prefix, reserved))
+        {
+            tracing::warn!(prefix, "refusing to mount a plugin on a framework prefix");
+            return Err(MountError::Reserved { prefix });
+        }
         let mut table = self.write();
         if let Some(held) = table
             .by_prefix
@@ -166,6 +196,11 @@ impl PluginMounts {
             })
             .map(|entry| entry.plugin.manifest().name.clone())
         {
+            tracing::warn!(
+                prefix,
+                held_by = held,
+                "refusing to mount an overlapping prefix"
+            );
             return Err(MountError::PrefixTaken {
                 prefix,
                 held_by: held,
@@ -186,9 +221,8 @@ impl PluginMounts {
         Ok(generation)
     }
 
-    /// Unmount the plugin at `prefix`. New requests get 404 at once.
+    /// Unmount the plugin at `prefix`. New requests get 404 immediately.
     /// Running requests finish.
-    #[must_use]
     pub fn unmount(&self, prefix: &str) -> Option<MountedPluginInfo> {
         let entry = self.write().by_prefix.remove(prefix)?;
         let info = entry.info();
@@ -237,6 +271,7 @@ impl fmt::Debug for PluginMounts {
 }
 
 /// The app's 404 fallback. Serves a mounted plugin, else the usual 404.
+#[doc(hidden)]
 pub async fn mounts_fallback(State(state): State<AppState>, request: Request) -> Response {
     let router = state
         .extension::<PluginMounts>()
@@ -370,6 +405,30 @@ mod tests {
     }
 
     #[test]
+    fn a_framework_prefix_is_refused() {
+        let mounts = PluginMounts::new();
+        for prefix in ["/actuator", "/static", "/.well-known/x", "/mcp"] {
+            assert!(
+                matches!(
+                    mounts.mount(&hello(prefix)),
+                    Err(MountError::Reserved { .. })
+                ),
+                "{prefix}"
+            );
+        }
+        assert!(mounts.list().is_empty());
+        mounts.mount(&hello("/actuators")).expect("a sibling name");
+    }
+
+    #[tokio::test]
+    async fn an_app_without_mounts_still_answers_404() {
+        let app = axum::Router::new()
+            .fallback(mounts_fallback)
+            .with_state(AppState::for_test());
+        assert_eq!(get(&app, "/hello/greet").await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
     fn a_released_prefix_can_be_claimed_again_with_a_new_generation() {
         let mounts = PluginMounts::new();
         let first = mounts.mount(&hello("/hello")).expect("mounts");
@@ -429,14 +488,28 @@ mod tests {
             let app = app.clone();
             async move { get(&app, "/spin/greet").await.0 }
         });
-        tokio::task::yield_now().await;
+        // Unmount only once the request runs, so the test shows a real drain.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while spin.in_flight() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "request never started"
+            );
+            tokio::task::yield_now().await;
+        }
         let _ = mounts.unmount("/spin");
         let status = tokio::time::timeout(std::time::Duration::from_secs(30), running)
             .await
             .expect("deadline")
             .expect("joined");
-        assert_ne!(status, StatusCode::NOT_FOUND, "drained, not cancelled");
-        assert_eq!(spin.in_flight(), 0);
+        assert!(status.is_server_error(), "drained, not cancelled: {status}");
+        while spin.in_flight() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "permit never came back"
+            );
+            tokio::task::yield_now().await;
+        }
         assert_eq!(get(&app, "/healthz").await.0, StatusCode::OK);
     }
 

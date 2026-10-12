@@ -315,7 +315,7 @@ impl SandboxedPlugin {
         Self::from_artifact(&SandboxArtifact::read_file(path)?)
     }
 
-    /// Requests running now.
+    /// Count the requests that run now.
     pub(super) fn in_flight(&self) -> usize {
         self.manifest()
             .limits
@@ -323,7 +323,7 @@ impl SandboxedPlugin {
             .saturating_sub(self.permits.available_permits())
     }
 
-    /// Take one permit, as a running request does. For tests.
+    /// Take one permit, like a running request. Tests use this.
     #[cfg(test)]
     pub(super) fn hold_permit_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
         Arc::clone(&self.permits)

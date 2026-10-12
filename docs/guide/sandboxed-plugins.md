@@ -732,18 +732,25 @@ mounts.unmount("/hello");
 
 Rules:
 
-- The router is not swapped. Mounted plugins answer from the 404 fallback.
+- The app does not swap its router. The 404 fallback serves mounted plugins.
   A request that matches a static route never reads the table.
 - A static route wins over a mounted prefix. Use a prefix that no static route
   uses.
-- One plugin holds a prefix. A prefix inside, or around, a held prefix is
-  refused with `MountError::PrefixTaken`.
-- **Unmount drains.** New requests get 404 at once. A running request
-  finishes and keeps its concurrency permit until it ends.
+- A framework prefix, such as `/actuator` or `/static`, is refused with
+  `MountError::Reserved`.
+- One plugin holds a prefix. A prefix that contains, or is inside, a held
+  prefix is refused with `MountError::PrefixTaken`.
+- **Unmount drains.** New requests get 404 immediately. A running request
+  finishes. It keeps its concurrency permit until it ends.
+- A new plugin instance at a reused prefix has its own permits. While the old
+  instance drains, both can run requests.
 - Each mount logs the capability grant and a new `generation`.
-  `PluginMounts::list` shows what is mounted now. `PluginMounts::routes`
-  shows its routes. `autumn routes` and `autumn plugin-check` read the
-  build, so they do not show runtime mounts.
+- `PluginMounts::list` shows what is mounted now. `PluginMounts::routes` shows
+  the routes of those plugins.
+- `autumn routes` and `autumn plugin-check` read the build. They do not show
+  runtime mounts.
+
+---
 
 ## Limits of this slice
 
@@ -770,7 +777,7 @@ Rules:
   upstream means implementing `OutboundHttp` against the framework client and
   honouring the contract on the trait.
 - A plugin loaded at boot cannot be unmounted. To upgrade or remove a plugin
-  without a restart, mount it at runtime (see below).
+  without a restart, mount it at runtime (see above).
 - There is no registry; you get artifacts the same way you get any other file.
 - An interpreter is slower than native code. For a hello-world route the
   overhead is sub-millisecond, but a sandboxed plugin is not where compute-heavy
