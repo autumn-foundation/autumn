@@ -1155,7 +1155,7 @@ async fn ledger_revisions_page_walks_the_chain_on_postgres() {
 /// A BEFORE trigger that rewrites `tenant_id` during a restore puts the new
 /// tenant into the `RETURNING` row and the reload alike, so only a comparison
 /// with the pre-restore row sees it. The restore is refused and rolled back
-/// (#2319). SQLite cannot run this case: its BEFORE triggers cannot set `NEW`.
+/// (#2319). `SQLite` cannot run this case: its BEFORE triggers cannot set `NEW`.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn a_before_trigger_cannot_move_a_ledgered_row_during_restore() {

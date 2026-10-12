@@ -8,7 +8,8 @@
 //!
 //! - A static route wins over a mounted prefix. Use a prefix that no static
 //!   route uses.
-//! - A framework prefix, such as `/actuator`, is refused.
+//! - A framework prefix is refused. The configured actuator and probe paths
+//!   count. Add more with [`PluginMounts::reserve`].
 //! - One plugin holds a prefix. A prefix that contains, or is inside, a held
 //!   prefix is refused.
 //! - **Unmount drains.** New requests get 404 immediately. A running request
@@ -124,6 +125,7 @@ impl Entry {
 #[derive(Default)]
 struct Table {
     next_generation: u64,
+    reserved: Vec<String>,
     by_prefix: BTreeMap<String, Entry>,
 }
 
@@ -135,18 +137,8 @@ pub struct PluginMounts {
     table: Arc<RwLock<Table>>,
 }
 
-/// Prefixes that the framework owns. A plugin cannot take them.
-const RESERVED_PREFIXES: &[&str] = &[
-    "/actuator",
-    "/static",
-    "/health",
-    "/live",
-    "/ready",
-    "/startup",
-    "/mcp",
-    "/favicon.ico",
-    "/.well-known",
-];
+/// Prefixes the framework always owns. [`PluginMounts::reserve`] adds more.
+const BASE_RESERVED: &[&str] = &["/static", "/_autumn", "/favicon.ico", "/.well-known"];
 
 /// `true` if `path` is `prefix` or lies under it, on a segment boundary.
 fn is_under(path: &str, prefix: &str) -> bool {
@@ -169,6 +161,20 @@ impl PluginMounts {
         self.table.write().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Refuse plugins under these prefixes, such as a custom MCP path.
+    ///
+    /// [`AppBuilder::plugin_mounts`](crate::app::AppBuilder::plugin_mounts)
+    /// already reserves the configured actuator and probe paths.
+    pub fn reserve<I, S>(&self, prefixes: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.write()
+            .reserved
+            .extend(prefixes.into_iter().map(Into::into));
+    }
+
     /// Mount a plugin at its manifest prefix. Returns its generation.
     ///
     /// Logs the capability grant, like a boot-time mount.
@@ -179,14 +185,16 @@ impl PluginMounts {
     /// [`MountError::PrefixTaken`] if the prefix overlaps a held one.
     pub fn mount(&self, plugin: &SandboxedPlugin) -> Result<u64, MountError> {
         let prefix = plugin.manifest().prefix.clone();
-        if RESERVED_PREFIXES
+        let mut table = self.write();
+        if BASE_RESERVED
             .iter()
+            .copied()
+            .chain(table.reserved.iter().map(String::as_str))
             .any(|reserved| is_under(&prefix, reserved))
         {
             tracing::warn!(prefix, "refusing to mount a plugin on a framework prefix");
             return Err(MountError::Reserved { prefix });
         }
-        let mut table = self.write();
         if let Some(held) = table
             .by_prefix
             .values()
@@ -407,7 +415,7 @@ mod tests {
     #[test]
     fn a_framework_prefix_is_refused() {
         let mounts = PluginMounts::new();
-        for prefix in ["/actuator", "/static", "/.well-known/x", "/mcp"] {
+        for prefix in ["/static", "/_autumn/x", "/.well-known/x"] {
             assert!(
                 matches!(
                     mounts.mount(&hello(prefix)),
@@ -417,7 +425,12 @@ mod tests {
             );
         }
         assert!(mounts.list().is_empty());
-        mounts.mount(&hello("/actuators")).expect("a sibling name");
+        mounts.reserve(["/ops"]);
+        assert!(matches!(
+            mounts.mount(&hello("/ops/admin")),
+            Err(MountError::Reserved { .. })
+        ));
+        mounts.mount(&hello("/staticx")).expect("a sibling name");
     }
 
     #[tokio::test]

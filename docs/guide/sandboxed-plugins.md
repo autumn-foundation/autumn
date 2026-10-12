@@ -736,8 +736,9 @@ Rules:
   A request that matches a static route never reads the table.
 - A static route wins over a mounted prefix. Use a prefix that no static route
   uses.
-- A framework prefix, such as `/actuator` or `/static`, is refused with
-  `MountError::Reserved`.
+- A framework prefix is refused with `MountError::Reserved`. `/static` and
+  `/_autumn` always count. `plugin_mounts` adds the configured actuator and
+  probe paths. Add more, such as a custom MCP path, with `PluginMounts::reserve`.
 - One plugin holds a prefix. A prefix that contains, or is inside, a held
   prefix is refused with `MountError::PrefixTaken`.
 - **Unmount drains.** New requests get 404 immediately. A running request

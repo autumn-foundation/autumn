@@ -1760,11 +1760,21 @@ impl AppBuilder {
     /// Serve plugins that `mounts` mounts while the app runs (issue #2433).
     ///
     /// Keep a clone of `mounts`. Call `mount` and `unmount` on it at any time,
-    /// with no restart. See [`PluginMounts`](crate::plugin_sandbox::PluginMounts).
+    /// with no restart. The configured actuator and probe paths are reserved. See [`PluginMounts`](crate::plugin_sandbox::PluginMounts).
     #[cfg(feature = "plugin-sandbox")]
     #[must_use]
     pub fn plugin_mounts(self, mounts: crate::plugin_sandbox::PluginMounts) -> Self {
-        self.state_initializer(move |state| state.insert_extension(mounts))
+        self.state_initializer(move |state| {
+            let config = state.config();
+            mounts.reserve([
+                config.actuator.prefix.clone(),
+                config.health.path.clone(),
+                config.health.live_path.clone(),
+                config.health.ready_path.clone(),
+                config.health.startup_path,
+            ]);
+            state.insert_extension(mounts);
+        })
     }
 
     /// Designate a block of typed in-memory state to survive an in-place
