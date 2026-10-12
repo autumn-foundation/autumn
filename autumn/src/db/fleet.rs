@@ -1481,7 +1481,7 @@ impl DatabaseFleet {
         self.settle_opening(key).await;
         let begun = self.begin_exclusive(key, true)?;
         let Some((key, db, drain)) = begun else {
-            // A plain close is running; wait, then delete.
+            // A plain close runs or an open is in flight; wait, then retry.
             let pending = self.lock_state().draining.get(key).cloned();
             if let Some(pending) = pending {
                 pending.wait().await;
@@ -1573,7 +1573,7 @@ impl DatabaseFleet {
 
     /// Under the lock: take `key` out of service for a delete (openers get
     /// `410`) or a restore (openers wait). `Ok(None)` when a plain close is
-    /// running: the caller waits for it, then retries.
+    /// running or an open is in flight: the caller waits, settles, and retries.
     fn begin_exclusive(
         &self,
         key: &FleetDbKey,
@@ -1589,6 +1589,11 @@ impl DatabaseFleet {
         }
         if let Some(begun) = self.begin_drain_locked(&mut state, key, deleting) {
             return Ok(Some(begun));
+        }
+        // An opener retried after its entry was cancelled and made a new one.
+        // The drain cannot stop that open, so the caller settles it first.
+        if state.open.contains_key(key) {
+            return Ok(None);
         }
         let drain = Arc::new(Drain {
             deleting,
@@ -3637,6 +3642,27 @@ mod tests {
         fleet.close_all().await;
         let err = fleet.provision(&key).await.unwrap_err();
         assert!(matches!(err, FleetError::Unavailable { .. }), "{err}");
+        assert!(!fleet.path_of(&key).exists());
+    }
+
+    #[tokio::test]
+    async fn a_retrying_opener_is_settled_before_the_drain_starts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let key = FleetDbKey::Slot(24);
+        let Next::Open(first) = fleet.claim_entry(&key).unwrap() else {
+            panic!("expected an entry");
+        };
+        fleet.settle_entry(&key, &first).await;
+        // The cancelled opener retries before the delete takes the key.
+        let Next::Open(_retry) = fleet.claim_entry(&key).unwrap() else {
+            panic!("expected an entry");
+        };
+        assert!(
+            fleet.begin_exclusive(&key, true).unwrap().is_none(),
+            "an opener is in flight: settle it first"
+        );
+        assert!(!fleet.delete(&key).await.unwrap());
         assert!(!fleet.path_of(&key).exists());
     }
 }
