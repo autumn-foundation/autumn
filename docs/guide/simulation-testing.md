@@ -8,14 +8,15 @@ run. A failure prints a copy-pasteable line that reproduces it exactly, and a
 seed-sweep runner (`sweep_proptest`, see below) lets you drive *your own*
 workload against many seeds looking for rare-interleaving bugs a single-seed
 test would never stumble into. **This sweeping is opt-in, not automatic**:
-autumn's own CI runs a built-in `sim-sweep` job over a few hundred seeds. It
+autumn's own CI runs a built-in `sim-sweep` job over a few hundred seeds, and
+sweeps one example app each night (see "The reddit-clone nightly"). It
 sweeps a toy scenario (a smoke check of the harness) and three framework
 scenarios: jobs, scheduler and lock across replicas (see "Multiple
 replicas"). It does not explore your application's interleavings. Wiring
 `sweep_proptest` against your own scenario, in your own CI, is how you get
 that coverage for your app; see "Property-based op-driving + the seed sweep"
 below. For a complete app sweep to copy, see "The reddit-clone nightly"
-below: 4,000,000 seeds each night over the whole public DST API.
+below: 4,000,000 seeds each night.
 
 ```
 ┌──────────────────┐
@@ -734,17 +735,18 @@ Each seed mounts the app on a new sim runtime and runs these phases:
 
 | Phase | DST API |
 |---|---|
+| Setup: the plan, the faults and the network | `rng`, `gen_ops`, `gen_ops_with`, `Chaos`, `FaultPlan`, `SimNet`, `SeededLlm` |
 | Sign-ups; the welcome mail retries with full jitter | `Chaos::smtp_faults`, `smtp_transient_errors`, `backoff::*`, `advance` |
-| Posts enqueue a rank job, an auto-mod job and a webhook job | `FaultPlan`, `SeededLlm`, `SimNet`, `Chaos::job_duplicate_delivery` |
+| Posts enqueue a rank job, an auto-mod job and a webhook job | `Chaos::job_duplicate_delivery`, the `FaultPlan` job faults |
 | Votes race through the real vote rule (`src/vote_core.rs`) | `interleave`, `record_broadcasts` |
-| The real `PostPolicy` and the feed experiment | `rng`, `gen_ops`, `gen_ops_with` |
-| Posts age; the scheduled rank sweep runs | `advance`, `advance_to`, `advance_to_local`, `try_run_to_idle`, `time::ambient_*` |
+| The real `PostPolicy` and the feed experiment | plain requests |
+| Posts age; the scheduled rank sweep runs; the fault ledger | `advance`, `advance_to`, `advance_to_local`, `try_run_to_idle`, `time::ambient_*`, `fault_outcome` |
 | Replicas with skewed clocks, and a vote worker task | `mount_replica`, `Replica`, `step_replica_clock`, `run_for`, `spawn`, `kill_replica`, `restart_replica` |
 | A crash at a seeded await, then a restart on the same store | `crash_point`, `crash_at`, `crash_and_restart`, `kill`, `restart` |
-| End checks | `fault_outcome`, `FaultOutcome::to_json_string`, `SimNet::events`, `SeededLlm::calls` |
+| End checks | `SimNet::events`, `SeededLlm::calls` |
 
-An in-memory store is the database of the fleet. All apps of one seed share it,
-and it lives longer than a crashed app. Each step that is a database round trip
+An in-memory store is the database of all apps of one seed. It lives longer
+than a crashed app. Each step that is a database round trip
 in the real app yields a seeded number of times, so the races of the real app
 can occur. The checks include:
 
@@ -759,14 +761,19 @@ can occur. The checks include:
 - **The planted bug.** `sim_nightly_catches_unordered_publish` runs the vote
   rule without `PublishOrder`. The sweep must fail, and the failing seed must
   fail again alone.
-- **The trace check.** The first seeds of each process run twice. The two
-  traces must be the same.
-- **Not vacuous.** Each `sometimes!` label must be true in at least one seed.
-- **The API surface gate.** `dst_api_surface_is_fully_exercised` reads each
-  public `fn` of `autumn_web::sim` from the source. The nightly must call each
-  one, or list it in `EXCLUDED` with a reason. Only `Sim::db_link` is excluded:
-  it needs the `sqlite` feature, which reddit-clone cannot enable, because
-  `backend_select!` then compiles the whole app for `SQLite`.
+- **The trace check.** The first `AUTUMN_SIM_TRACE_CHECKS` seeds of each
+  process (2 by default, 8 in the nightly) run twice. The two traces must be
+  the same.
+- **Not vacuous.** Each `sometimes!` label that a seed reaches must be true in
+  at least one seed of the same process. A window of fewer than 8 seeds, such
+  as a one-seed replay, skips this check.
+- **The API surface gate.** `dst_api_surface_is_fully_exercised` reads the
+  public `fn` items of the sim files that do not need `sqlite`. The nightly
+  must call each one, or `EXCLUDED` lists it with a reason. The check is
+  textual: it shows that a call exists, not what the call asserts. The `SQLite`
+  parts (`Sim::db_link`, `DbLink`, the substrate, the fleet scenarios) are left
+  out. reddit-clone cannot enable `sqlite`, because `backend_select!` then
+  compiles the whole app for `SQLite`. The `sim-sweep` job covers them.
 
 ### Cost and scale
 
@@ -774,10 +781,11 @@ One process runs one seed at a time: the framework keeps the job runtime and
 the event bus per process. A release build runs about 45 seeds/s on one core,
 and about 150 seeds/s with 4 processes on a 4-vCPU runner. So 4,000,000 seeds
 take about 7.5 runner-hours: about 30 minutes on 16 runners. Each night sweeps
-a new window (`start = UTC day number × seeds`), so the coverage adds up.
+a new window (`start = UTC day number × seeds`), so each night tests new
+seeds.
 
 ```bash
-# The PR default: 8 seeds and the DoD tests.
+# The default: 8 seeds and the guard tests. CI runs this on each PR, in debug.
 cargo test -p reddit-clone --release --test sim_nightly
 # One shard of a large window, with a JSON report.
 AUTUMN_SIM_SEED_START=0 AUTUMN_SIM_SEEDS=4000000 AUTUMN_SIM_SHARD=3/64 \
@@ -792,11 +800,12 @@ A failure prints the seed and a replay command for only that seed.
 
 ### What it found
 
-On its first sweep the nightly found a bug in reddit-clone. A replica whose
-clock runs more than 2 hours slow saw a new post "from the future". The rank
-formula `score / (age + 2)^1.5` then gave NaN, and Postgres refuses the same
-`POWER` in the scheduled rank UPDATE, so one such post stopped the rank update
-for all posts. `calculate_hot_rank` and its SQL now keep the age at 0 or more.
+On its first sweep the nightly found a bug in reddit-clone. A replica clock
+that was more than 2 hours slow saw a new post "from the future". The rank
+formula `score / (age + 2)^1.5` then gave NaN. Postgres raised an error on the
+same `POWER` in the scheduled rank `UPDATE`. Thus one such post stopped the
+rank update for all posts. `calculate_hot_rank` and its SQL now keep the age at
+0 or more.
 
 ## What's virtualized (and what isn't)
 

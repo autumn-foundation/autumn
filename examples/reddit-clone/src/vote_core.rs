@@ -1,7 +1,7 @@
 //! The vote rule, with no database in it.
 //!
 //! [`cast`] records a vote and publishes the new score to live subscribers.
-//! The rule it keeps: subscribers never get an older score after a newer one.
+//! The guarantee: subscribers never get an older score after a newer one.
 //!
 //! [`crate::routes::votes`] uses it with Postgres. The DST nightly
 //! (`tests/sim_nightly.rs`) uses it with an in-memory store, and races many
@@ -48,7 +48,7 @@ pub trait VoteBackend {
 pub struct PublishOrder(tokio::sync::Mutex<()>);
 
 impl PublishOrder {
-    /// A new, free lock.
+    /// A new, unlocked order.
     #[must_use]
     pub const fn new() -> Self {
         Self(tokio::sync::Mutex::const_new(()))
@@ -81,7 +81,12 @@ pub async fn cast<B: VoteBackend + Sync>(
     let aggregate = match order.run(backend.reload_and_publish(post_id)).await {
         Ok(score) => score,
         Err(error) => {
-            tracing::warn!(post_id, error = %error, "vote committed but SSE fan-out failed");
+            tracing::warn!(
+                target: "reddit_clone::routes::votes",
+                post_id,
+                error = %error,
+                "vote committed but SSE fan-out failed"
+            );
             committed.aggregate
         }
     };
@@ -125,6 +130,21 @@ mod tests {
             self.published.lock().unwrap().push(score);
             Ok(score)
         }
+    }
+
+    /// The sweep races `cast`, not the route. This check ties the route to
+    /// `cast` with one order per process. A new `PublishOrder` per request
+    /// compiles, but it orders nothing.
+    #[test]
+    fn the_vote_route_uses_cast_with_the_process_order() {
+        let route = include_str!("routes/votes.rs");
+        assert!(route.contains("crate::vote_core::cast(&backend, &BROADCAST_ORDER,"));
+        assert!(route.contains("static BROADCAST_ORDER: crate::vote_core::PublishOrder"));
+        assert_eq!(
+            route.matches("PublishOrder::new()").count(),
+            1,
+            "only the static"
+        );
     }
 
     #[tokio::test]

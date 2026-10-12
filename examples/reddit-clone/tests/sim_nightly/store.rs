@@ -1,4 +1,4 @@
-//! The in-memory store of the nightly: the database of the simulated fleet.
+//! The in-memory store of the nightly: the database of all apps of one seed.
 //!
 //! Each seed makes a new store. All apps of a seed (the main app, the
 //! replicas, a restarted app) share it, as processes share a database. It

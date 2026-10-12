@@ -1,8 +1,8 @@
 //! The seed sweep driver of the nightly.
 //!
 //! It runs the seeds of one window one after the other, in one process. The
-//! app state of the framework is global to the process, so two seeds cannot
-//! run at the same time in one process. The nightly workflow gets parallel
+//! framework keeps the job runtime and the event bus per process, so two seeds
+//! cannot run at the same time in one process. The nightly workflow gets parallel
 //! work from many processes, each with its own shard of the window.
 
 use std::collections::BTreeSet;
@@ -19,6 +19,22 @@ pub const DEFAULT_SEEDS: u64 = 8;
 
 /// The trace check count when `AUTUMN_SIM_TRACE_CHECKS` is not set.
 pub const DEFAULT_TRACE_CHECKS: u64 = 2;
+
+/// A shard with fewer seeds skips the `sometimes!` check. One seed cannot
+/// make every label true, so a one-seed replay must report its own result.
+pub const MIN_SEEDS_FOR_REACH: u64 = 8;
+
+/// The framework keeps the job runtime and the event bus per process, so two
+/// sims in one process disturb each other. Each scenario test holds this lock.
+/// CI also runs the `sim_` tests with `--test-threads=1`.
+static ONE_SIM_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Hold the lock of [`ONE_SIM_AT_A_TIME`].
+pub fn one_sim_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    ONE_SIM_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// What one sweep process runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +172,10 @@ pub fn run(config: &SweepConfig, variant: Variant) -> Outcome {
     let mut ran = 0;
     for seed in seeds.clone() {
         ran += 1;
+        // A log line now and then shows how far a process got, if it is killed.
+        if ran % 10_000 == 0 {
+            println!("reddit-clone DST nightly: {ran} seed(s) done, at seed {seed}");
+        }
         let first = scenario::run(seed, variant);
         let (seen, true_once) = sometimes_snapshot();
         observed.extend(seen);
@@ -195,7 +215,7 @@ pub fn run(config: &SweepConfig, variant: Variant) -> Outcome {
         }
     }
     let unsatisfied: BTreeSet<String> = observed.difference(&satisfied).cloned().collect();
-    if !unsatisfied.is_empty() {
+    if ran >= MIN_SEEDS_FOR_REACH && !unsatisfied.is_empty() {
         return Outcome::Vacuous {
             seeds: ran,
             unsatisfied,
@@ -344,6 +364,16 @@ mod tests {
     #[should_panic(expected = "AUTUMN_SIM_SHARD")]
     fn a_bad_shard_is_a_panic_not_a_silent_skip() {
         let _ = SweepConfig::parse(None, None, Some("4/4"), None, None);
+    }
+
+    #[test]
+    fn a_one_seed_replay_reports_its_own_result() {
+        let _serial = one_sim_at_a_time();
+        let outcome = run(&SweepConfig::window(3..4), Variant::Correct);
+        assert!(
+            matches!(outcome, Outcome::Passed { seeds: 1, .. }),
+            "{outcome:?}"
+        );
     }
 
     #[test]

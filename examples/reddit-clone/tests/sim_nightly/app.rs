@@ -151,22 +151,22 @@ impl VoteBackend for SimVotes<'_> {
     }
 }
 
-/// The planted bug: the same rule without [`PublishOrder`].
-async fn cast_unordered<B: VoteBackend + Sync>(
+/// Cast with the vote rule of `variant`. The planted bug is the realistic
+/// regression: a new `PublishOrder` for each request, which orders nothing.
+async fn cast_with<B: VoteBackend + Sync>(
+    variant: Variant,
     backend: &B,
+    order: &PublishOrder,
     user_id: i64,
     post_id: i64,
     value: i16,
 ) -> AutumnResult<VoteState> {
-    let committed = backend.react(user_id, post_id, value).await?;
-    let aggregate = backend
-        .reload_and_publish(post_id)
-        .await
-        .unwrap_or(committed.aggregate);
-    Ok(VoteState {
-        aggregate,
-        value: committed.value,
-    })
+    match variant {
+        Variant::Correct => vote_core::cast(backend, order, user_id, post_id, value).await,
+        Variant::UnorderedPublish => {
+            vote_core::cast(backend, &PublishOrder::new(), user_id, post_id, value).await
+        }
+    }
 }
 
 /// A vote worker outside the HTTP apps: a third process that writes votes
@@ -189,10 +189,15 @@ impl Worker {
 
     /// Cast one vote with the rule of the variant.
     pub async fn cast(&self, user_id: i64, post_id: i64, value: i16) -> AutumnResult<VoteState> {
-        match self.shared.variant {
-            Variant::Correct => vote_core::cast(self, &self.order, user_id, post_id, value).await,
-            Variant::UnorderedPublish => cast_unordered(self, user_id, post_id, value).await,
-        }
+        cast_with(
+            self.shared.variant,
+            self,
+            &self.order,
+            user_id,
+            post_id,
+            value,
+        )
+        .await
     }
 }
 
@@ -235,12 +240,15 @@ async fn vote(
         reddit: &reddit,
         state: &state,
     };
-    let voted = match reddit.shared.variant {
-        Variant::Correct => {
-            vote_core::cast(&backend, &reddit.order, user_id, post_id, value).await?
-        }
-        Variant::UnorderedPublish => cast_unordered(&backend, user_id, post_id, value).await?,
-    };
+    let voted = cast_with(
+        reddit.shared.variant,
+        &backend,
+        &reddit.order,
+        user_id,
+        post_id,
+        value,
+    )
+    .await?;
     Ok(format!("{} {}", voted.aggregate, voted.value.unwrap_or(0)))
 }
 

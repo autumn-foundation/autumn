@@ -63,9 +63,9 @@ fn replay_command(scenario: &str, seed: u64) -> String {
 
 /// The scenarios this build can run.
 fn available_scenarios() -> Vec<&'static str> {
-    let mut scenarios = vec!["account"];
+    let scenarios = vec!["account"];
     #[cfg(feature = "sqlite")]
-    scenarios.extend_from_slice(autumn_web::sim::fleet::SCENARIOS);
+    let scenarios = [scenarios.as_slice(), autumn_web::sim::fleet::SCENARIOS].concat();
     scenarios
 }
 
@@ -124,7 +124,11 @@ fn main() {
         std::process::exit(1);
     }
     if scenarios.contains(&"account") {
+        // Without `sqlite` nothing reads `seeds` after this call.
+        #[cfg(feature = "sqlite")]
         sweep_account(seeds.clone());
+        #[cfg(not(feature = "sqlite"))]
+        sweep_account(seeds);
     }
     #[cfg(feature = "sqlite")]
     {

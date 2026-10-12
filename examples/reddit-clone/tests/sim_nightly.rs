@@ -36,18 +36,7 @@ use autumn_web::sim::{Sim, assert_all_sometimes_satisfied, reset_sometimes_regis
 use autumn_web::sim_test;
 
 use sim_nightly::scenario::{self, Variant};
-use sim_nightly::sweep::{self, Outcome, SweepConfig};
-
-/// The framework keeps the job runtime and the event bus per process, so two
-/// sims in one process disturb each other. Each scenario test holds this lock.
-/// CI also runs the `sim_` tests with `--test-threads=1`.
-static ONE_SIM_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn one_sim_at_a_time() -> std::sync::MutexGuard<'static, ()> {
-    ONE_SIM_AT_A_TIME
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
+use sim_nightly::sweep::{self, Outcome, SweepConfig, one_sim_at_a_time};
 
 /// The nightly entry. A small default window runs on every PR. The nightly
 /// workflow sets the environment for a large window.
@@ -64,8 +53,9 @@ fn sim_nightly_sweep() {
     );
 }
 
-/// The sweep must find a real race. This variant publishes a vote score
-/// without `PublishOrder`, so an older score can reach subscribers last.
+/// The sweep must find a real race. This variant gives `vote_core::cast` a new
+/// `PublishOrder` for each request, so an older score can reach subscribers
+/// last.
 #[test]
 fn sim_nightly_catches_unordered_publish() {
     let _serial = one_sim_at_a_time();
@@ -97,8 +87,8 @@ fn sim_nightly_same_seed_same_trace() {
     );
 }
 
-/// The full window reaches every `sometimes!` label, so a green sweep is not
-/// vacuous.
+/// Seeds 0..32 make each observed `sometimes!` label true, so a green sweep is
+/// not vacuous.
 #[test]
 fn sim_nightly_window_is_not_vacuous() {
     let _serial = one_sim_at_a_time();
@@ -145,8 +135,8 @@ fn sim_nightly_hot_rank_proptest_lane() {
     }
 }
 
-/// Every public sim API item is called by this nightly, or is on the
-/// exclusion list with a reason.
+/// This nightly calls each public sim function, or `EXCLUDED` lists it with a
+/// reason.
 #[test]
 fn dst_api_surface_is_fully_exercised() {
     let missing = sim_nightly::surface::missing_items();

@@ -5,17 +5,17 @@ name: DST nightly (reddit-clone)
 # docs/guide/simulation-testing.md, "The reddit-clone nightly".
 #
 # The jobs:
-# - plan: find the seed window. Each night sweeps a new window, so the
-#   coverage adds up: start = (UTC day number) x seeds.
+# - plan: find the seed window. Each night tests new seeds:
+#   start = (UTC day number) x seeds.
 # - build: compile the test binary one time, and upload it.
 # - sweep: each matrix leg runs PROCESSES sweep processes. Each process runs a
-#   contiguous part of the window, one seed after the other. One process runs
-#   one seed at a time, because the framework keeps some state per process.
+#   contiguous part of the window, one seed at a time, because the framework
+#   keeps the job runtime and the event bus per process.
 # - summary: add the shard reports, and fail if a seed failed or a seed did
 #   not run.
 #
-# A red night is a real failure. The summary gives the replay command for the
-# seed. Measured cost: about 150 seeds/s on a 4-vCPU runner, so 4,000,000
+# A failed run is a real bug, not a flaky test. The summary gives the replay
+# command for the seed. Measured cost: about 150 seeds/s on a 4-vCPU runner, so 4,000,000
 # seeds take about 7.5 runner-hours (about 30 minutes on 16 runners).
 
 on:
@@ -33,7 +33,7 @@ on:
         required: false
         default: ""
       shards:
-        description: "How many runners (1-64)"
+        description: "How many runners (1-32)"
         required: false
         default: "16"
 
@@ -70,7 +70,12 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$SEEDS" =~ ^[0-9]+$ ]] && (( SEEDS > 0 )) || { echo "seeds must be a positive number: $SEEDS"; exit 1; }
-          [[ "$SHARDS" =~ ^[0-9]+$ ]] && (( SHARDS >= 1 && SHARDS <= 64 )) || { echo "shards must be 1-64: $SHARDS"; exit 1; }
+          [[ "$SHARDS" =~ ^[0-9]+$ ]] && (( SHARDS >= 1 && SHARDS <= 32 )) || { echo "shards must be 1-32: $SHARDS"; exit 1; }
+          # Each process needs enough seeds to make every sometimes! label true,
+          # and few enough to finish before the job timeout (about 36 seeds/s).
+          per_process=$(( SEEDS / (SHARDS * PROCESSES) ))
+          (( per_process >= 256 )) || { echo "seeds must be at least $(( SHARDS * PROCESSES * 256 )) for $SHARDS shard(s)"; exit 1; }
+          (( per_process <= 150000 )) || { echo "too many seeds per process ($per_process); add shards"; exit 1; }
           if [[ -z "$START" ]]; then
             START=$(( $(date -u +%s) / 86400 * SEEDS ))
           fi
@@ -101,9 +106,9 @@ jobs:
           [[ -x "$exe" ]] || { echo "no sim_nightly binary: '$exe'"; exit 1; }
           mkdir -p dist
           cp "$exe" dist/sim_nightly
-      - name: Run the DoD tests of the binary
-        # The planted bug must be caught, a seed must replay, and the API
-        # surface gate must pass, before the large sweep means anything.
+      - name: Run the guard tests of the binary
+        # The sweep finds the planted bug, a seed replays, and the API surface
+        # gate passes. The large sweep is valid only if these pass.
         run: dist/sim_nightly --test-threads=1
         working-directory: ${{ github.workspace }}
       - uses: actions/upload-artifact@v7
@@ -143,13 +148,14 @@ jobs:
             part=$(( SHARD * PROCESSES + p ))
             AUTUMN_SIM_SEED_START="$START" AUTUMN_SIM_SEEDS="$SEEDS" \
             AUTUMN_SIM_SHARD="$part/$total" AUTUMN_SIM_REPORT="reports/part-$part.json" \
-              dist/sim_nightly --exact sim_nightly_sweep --nocapture > "reports/part-$part.log" 2>&1 &
+              timeout 105m dist/sim_nightly --exact sim_nightly_sweep --nocapture > "reports/part-$part.log" 2>&1 &
             pids+=("$!")
           done
           status=0
           for pid in "${pids[@]}"; do wait "$pid" || status=1; done
           for log in reports/part-*.log; do
-            grep -E '^(reddit-clone DST nightly|PASSED|FAILED|NONDETERMINISTIC|VACUOUS|EMPTY|replay)' "$log" || tail -20 "$log"
+            # A process that timed out shows its last progress line.
+            grep -E '^(reddit-clone DST nightly|PASSED|FAILED|NONDETERMINISTIC|VACUOUS|EMPTY|replay)' "$log" | tail -8 || tail -20 "$log"
           done
           exit "$status"
       - name: Upload the reports

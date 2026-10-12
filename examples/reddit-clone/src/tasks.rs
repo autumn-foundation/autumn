@@ -19,8 +19,8 @@ pub fn calculate_hot_rank(
     created_at: chrono::NaiveDateTime,
     now: chrono::NaiveDateTime,
 ) -> f64 {
-    // A post from the future (clock skew between replicas) ranks as new. A
-    // negative age would make `(age + 2) ^ 1.5` NaN.
+    // A post from the future (clock skew) ranks as a new post. An age below
+    // -2 hours makes `(age + 2) ^ 1.5` NaN.
     #[allow(clippy::cast_precision_loss)] // Ranking math intentionally uses floats.
     let age_hours = ((now - created_at).num_seconds() as f64 / 3600.0).max(0.0);
     #[allow(clippy::cast_precision_loss)]
@@ -77,9 +77,9 @@ pub async fn prune_live_feed_events(state: AppState) -> AutumnResult<()> {
 mod tests {
     use super::calculate_hot_rank;
 
-    /// Found by the DST nightly: a replica clock that runs more than 2 hours
-    /// slow sees a new post "from the future". The age must not go below 0,
-    /// or `(age + 2) ^ 1.5` is NaN.
+    /// Found by the DST nightly. A replica clock that is more than 2 hours
+    /// slow sees a new post "from the future". An age below -2 hours makes
+    /// `(age + 2) ^ 1.5` NaN.
     #[test]
     fn a_post_from_the_future_ranks_as_a_new_post() {
         let now = chrono::NaiveDateTime::default();
@@ -89,8 +89,9 @@ mod tests {
         assert!((rank - calculate_hot_rank(100, now, now)).abs() < 1e-12);
     }
 
-    /// The SQL twin of the rule above. Postgres raises an error for a negative
-    /// base to a fractional power, so one future post failed the whole UPDATE.
+    /// The same check for the SQL in `recalculate_hot_ranks`. Postgres raises
+    /// an error for a negative base to a fractional power. Thus one future
+    /// post made the whole UPDATE fail.
     #[test]
     fn the_rank_sql_does_not_let_the_age_go_below_zero() {
         // Split, so that this test does not match its own text.

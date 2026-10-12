@@ -52,7 +52,8 @@ use super::store::Store;
 pub enum Variant {
     /// `vote_core::cast`, the rule of the real app.
     Correct,
-    /// The planted bug: no `PublishOrder`. The sweep must catch it.
+    /// The planted bug: a new `PublishOrder` for each vote. The sweep must
+    /// catch it.
     UnorderedPublish,
 }
 
@@ -69,6 +70,10 @@ const MAX_REPLICA_OFFSET: Duration = Duration::from_secs(3 * 3600);
 /// The interval of the scheduled rank sweep.
 const SWEEP_EVERY: Duration = Duration::from_secs(15 * 60);
 
+/// A seed that takes more virtual time than this has hung: all its tasks wait
+/// and no timer can wake them. One seed uses about 2 virtual days.
+const LIVENESS_BUDGET: Duration = Duration::from_secs(30 * 24 * 3600);
+
 /// Run one seed on a new sim runtime.
 ///
 /// # Errors
@@ -79,10 +84,21 @@ pub fn run(seed: u64, variant: Variant) -> Result<Trace, String> {
     let (outcome, trace) = runtime.block_on(async move {
         let mut sim = Sim::from_seed(seed);
         sim.anchor();
-        capture_targets(
-            TRACE_TARGETS,
-            AssertUnwindSafe(body(&mut sim, variant)).catch_unwind(),
-        )
+        capture_targets(TRACE_TARGETS, async {
+            // The paused clock jumps to the budget only when no task can run.
+            match tokio::time::timeout(
+                LIVENESS_BUDGET,
+                AssertUnwindSafe(body(&mut sim, variant)).catch_unwind(),
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(_) => Err(Box::new(format!(
+                    "seed {seed} hung: no task could run for {} virtual days",
+                    LIVENESS_BUDGET.as_secs() / 86_400
+                )) as Box<dyn std::any::Any + Send>),
+            }
+        })
         .await
     });
     match outcome {
@@ -230,8 +246,8 @@ pub async fn body(sim: &mut Sim, variant: Variant) {
     check_fault_ledger(sim, &faults).await;
     replicas(sim, &shared, &posts, &plan).await;
     // The job runtime is process-wide: it belongs to the app mounted last.
-    // The restart in this phase mounts the main app last again, so its job
-    // worker runs the jobs that `settle` waits for.
+    // `crash_and_recover` mounts the main app last again, so its job worker
+    // runs the jobs that `settle` waits for.
     crash_and_recover(sim, &shared, &faults, &plan).await;
     settle(sim).await;
     check_end_state(sim, &shared, &net);
@@ -298,7 +314,9 @@ fn replica_app(shared: &Arc<Shared>, entropy_seed: u64) -> TestApp {
 // ── Phases ───────────────────────────────────────────────────────────────────
 
 async fn signups(sim: &Sim, shared: &Shared, plan: &Plan) {
-    let jitter = sim.seeded_entropy();
+    // Its own stream: `sim.seeded_entropy()` gives the same numbers as the
+    // entropy of the first app mount.
+    let jitter = SeededEntropy::shared(sim.seed() ^ 0x5167_A11E);
     for user in 1..=plan.users {
         let mut attempt = 0;
         loop {
@@ -406,9 +424,9 @@ fn payloads(client: &TestClient) -> Vec<String> {
         .collect()
 }
 
-/// Check the publish log of one process. `complete`: each app vote was sent
-/// through this app, so the last publish must carry the final version when no
-/// fan-out failed.
+/// Check the publish log of one process. `complete`: all votes went through
+/// this app. If no fan-out failed, the last publish of each post must have its
+/// current version.
 fn check_publish_order(log: &[String], shared: &Shared, app: &str, complete: bool) {
     let mut last: BTreeMap<i64, u64> = BTreeMap::new();
     for payload in log {
@@ -629,7 +647,8 @@ async fn crash_and_recover(sim: &mut Sim, shared: &Arc<Shared>, faults: &FaultPl
     );
     always!(!schedule.points().is_empty());
 
-    let author = 1 + i64::try_from(point.seq).unwrap_or(0) % plan.users;
+    let users = u64::try_from(plan.users).expect("positive");
+    let author = 1 + i64::try_from(sim.rng().next_u64() % users).expect("small");
     let uri = format!("/posts/new/{author}");
     let outcome = crash_at(point.await_index, sim.client().post(&uri).send()).await;
     if outcome.is_crashed() {
@@ -747,8 +766,9 @@ async fn replicas(sim: &mut Sim, shared: &Arc<Shared>, posts: &[i64], plan: &Pla
 }
 
 /// Let 90 minutes pass one timer event at a time, so that each job retry
-/// runs at its backoff and the rank sweep runs six times. `advance` jumps
-/// and fires each due timer once at the end.
+/// runs at its backoff and the rank sweep runs six times. Use `run_for`, not
+/// `advance`: `advance` jumps to the end and fires each due timer one time
+/// only.
 async fn settle(sim: &Sim) {
     sim.run_for(6 * SWEEP_EVERY).await;
     sim.run_to_idle().await;

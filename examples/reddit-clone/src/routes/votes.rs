@@ -3,9 +3,9 @@
 //! Demonstrates: the declarative `#[votable(by = User, aggregate = sum)]`
 //! association (#1362) replacing ~90 lines of hand-written toggle/flip/upsert
 //! SQL and a raw `UPDATE posts SET score = (SELECT SUM(...))` recompute with a
-//! single race-safe `posts.react(...)` call (the vote logic itself is now one
-//! statement); htmx partial updates with a full-page redirect for plain form
-//! POSTs; session auth.
+//! single race-safe `posts.react(...)` call; the vote rule in
+//! [`crate::vote_core`]; htmx partial updates with a full-page redirect for
+//! plain form POSTs; session auth.
 
 use autumn_web::Redirect;
 use autumn_web::extract::Path;
@@ -52,7 +52,8 @@ pub async fn downvote(
     cast_vote(post_id, -1, &hx, &session, &csrf, &posts_repo, &state).await
 }
 
-/// Cast a vote on a post: authenticate, `react`, re-render the control.
+/// Cast a vote on a post: authenticate, run `vote_core::cast`, re-render the
+/// control.
 ///
 /// NOTE: no `Db` extractor anywhere in this path. `react()` checks out its
 /// *own* pooled connection (it does not join a caller's transaction), so a
@@ -86,17 +87,8 @@ async fn cast_vote(
         .parse()
         .map_err(|_| AutumnError::bad_request_msg("Invalid session"))?;
 
-    // `vote_core::cast` holds the rule; this backend is the Postgres half.
-    //
-    // `react()` toggles, flips or inserts this user's vote AND recomputes
-    // `posts.score` from ground truth, atomically and race-safely, in one call:
-    // the target row is locked for the whole read-decide-write-recompute
-    // window. A missing or soft-deleted post is `NotFound`.
-    //
-    // The fan-out after the commit is best effort, and its score is published
-    // in load order under `BROADCAST_ORDER`, so it is at least as new as this
-    // commit. See `crate::vote_core` for why, and `tests/sim_nightly.rs` for the
-    // seed sweep that races votes against this rule.
+    // See `crate::vote_core` for the vote rule, and `tests/sim_nightly.rs`
+    // for the sweep that races votes against it.
     let backend = PgVotes { posts_repo, state };
     let voted = crate::vote_core::cast(&backend, &BROADCAST_ORDER, user_id, post_id, value).await?;
     let score = voted.aggregate;
@@ -110,11 +102,15 @@ async fn cast_vote(
 }
 
 /// One order per process for the reload-and-publish step. See
-/// [`crate::vote_core::PublishOrder`]. One global lock is plenty at example
-/// scale; a hot production app would shard it per post id.
+/// [`crate::vote_core::PublishOrder`]. One lock for all posts is sufficient
+/// for this example. A high-traffic app can use one lock per post id.
 static BROADCAST_ORDER: crate::vote_core::PublishOrder = crate::vote_core::PublishOrder::new();
 
-/// The Postgres half of [`crate::vote_core::cast`].
+/// The Postgres storage and the SSE fan-out for [`crate::vote_core::cast`].
+///
+/// `react()` toggles, flips or inserts the vote. It then sets `posts.score`
+/// to the sum of the votes. It does both in one transaction, with a lock on
+/// the post row. A missing or soft-deleted post is `NotFound`.
 struct PgVotes<'a> {
     posts_repo: &'a PgPostRepository,
     state: &'a AppState,
