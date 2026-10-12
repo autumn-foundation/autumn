@@ -249,7 +249,7 @@ pub async fn body(sim: &mut Sim, variant: Variant) {
     // `crash_and_recover` mounts the main app last again, so its job worker
     // runs the jobs that `settle` waits for.
     crash_and_recover(sim, &shared, &faults, &plan).await;
-    settle(sim).await;
+    settle(sim, &shared).await;
     check_end_state(sim, &shared, &net);
 
     tracing::info!(
@@ -478,7 +478,7 @@ async fn policy_and_feed(sim: &mut Sim, shared: &Shared, posts: &[i64], plan: &P
     for post in posts {
         let users = u64::try_from(plan.users).expect("positive");
         let actor = 1 + i64::try_from(sim.rng().next_u64() % users).expect("small");
-        let admin = sim.rng().next_u64().is_multiple_of(4);
+        let admin = sim.rng().next_u64().is_multiple_of(2);
         let author = shared.store.with(|t| t.posts[post].author_id);
         let response = sim
             .client()
@@ -769,9 +769,17 @@ async fn replicas(sim: &mut Sim, shared: &Arc<Shared>, posts: &[i64], plan: &Pla
 /// runs at its backoff and the rank sweep runs six times. Use `run_for`, not
 /// `advance`: `advance` jumps to the end and fires each due timer one time
 /// only.
-async fn settle(sim: &Sim) {
+async fn settle(sim: &Sim, shared: &Shared) {
+    let before = shared.store.with(|t| t.sweep_runs);
     sim.run_for(6 * SWEEP_EVERY).await;
     sim.run_to_idle().await;
+    // Each sweep starts new job chains. With fewer sweeps, a correct app can
+    // fail the end checks by chance (about 1e-9 per seed with 2 sweeps).
+    let sweeps = shared.store.with(|t| t.sweep_runs) - before;
+    always!(
+        sweeps >= 5,
+        "the rank sweep ran {sweeps} time(s) while the app settled"
+    );
 }
 
 fn check_end_state(sim: &Sim, shared: &Shared, net: &SimNet) {

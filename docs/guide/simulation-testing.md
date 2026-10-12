@@ -765,8 +765,9 @@ can occur. The checks include:
   process (2 by default, 8 in the nightly) run twice. The two traces must be
   the same.
 - **Not vacuous.** Each `sometimes!` label that a seed reaches must be true in
-  at least one seed of the same process. A window of fewer than 8 seeds, such
-  as a one-seed replay, skips this check.
+  at least one seed of the same process. A window of fewer than 32 seeds, such
+  as a one-seed replay, skips this check. A failure also prints a second
+  replay that runs the earlier seeds of the process too.
 - **The API surface gate.** `dst_api_surface_is_fully_exercised` reads the
   public `fn` items of the sim files that do not need `sqlite`. The nightly
   must call each one, or `EXCLUDED` lists it with a reason. The check is
@@ -780,7 +781,7 @@ can occur. The checks include:
 One process runs one seed at a time: the framework keeps the job runtime and
 the event bus per process. A release build runs about 45 seeds/s on one core,
 and about 150 seeds/s with 4 processes on a 4-vCPU runner. So 4,000,000 seeds
-take about 7.5 runner-hours: about 30 minutes on 16 runners. Each night sweeps
+take about 7.5 runner-hours: about 25 minutes on 20 runners. Each night sweeps
 a new window (`start = UTC day number × seeds`), so each night tests new
 seeds.
 

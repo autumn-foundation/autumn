@@ -15,8 +15,14 @@ name: DST nightly (reddit-clone)
 #   not run.
 #
 # A failed run is a real bug, not a flaky test. The summary gives the replay
-# command for the seed. Measured cost: about 150 seeds/s on a 4-vCPU runner, so 4,000,000
-# seeds take about 7.5 runner-hours (about 30 minutes on 16 runners).
+# command for the seed.
+#
+# Measured cost: about 150 seeds/s on a 4-vCPU runner, so 4,000,000 seeds take
+# about 7.5 runner-hours (about 25 minutes on 20 runners). The timeouts allow
+# 3 times that, for slower runners.
+#
+# "Re-run all jobs" on a later day sweeps the window of that day. To sweep one
+# window again, dispatch the workflow with its `start`.
 
 on:
   schedule:
@@ -35,7 +41,7 @@ on:
       shards:
         description: "How many runners (1-32)"
         required: false
-        default: "16"
+        default: "20"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -66,7 +72,7 @@ jobs:
         env:
           SEEDS: ${{ inputs.seeds || '4000000' }}
           START: ${{ inputs.start || '' }}
-          SHARDS: ${{ inputs.shards || '16' }}
+          SHARDS: ${{ inputs.shards || '20' }}
         run: |
           set -euo pipefail
           [[ "$SEEDS" =~ ^[0-9]+$ ]] && (( SEEDS > 0 )) || { echo "seeds must be a positive number: $SEEDS"; exit 1; }
@@ -75,7 +81,7 @@ jobs:
           # and few enough to finish before the job timeout (about 36 seeds/s).
           per_process=$(( SEEDS / (SHARDS * PROCESSES) ))
           (( per_process >= 256 )) || { echo "seeds must be at least $(( SHARDS * PROCESSES * 256 )) for $SHARDS shard(s)"; exit 1; }
-          (( per_process <= 150000 )) || { echo "too many seeds per process ($per_process); add shards"; exit 1; }
+          (( per_process <= 100000 )) || { echo "too many seeds per process ($per_process); add shards"; exit 1; }
           if [[ -z "$START" ]]; then
             START=$(( $(date -u +%s) / 86400 * SEEDS ))
           fi
@@ -121,7 +127,7 @@ jobs:
     name: Sweep (shard ${{ matrix.shard }})
     needs: [plan, build]
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -148,7 +154,7 @@ jobs:
             part=$(( SHARD * PROCESSES + p ))
             AUTUMN_SIM_SEED_START="$START" AUTUMN_SIM_SEEDS="$SEEDS" \
             AUTUMN_SIM_SHARD="$part/$total" AUTUMN_SIM_REPORT="reports/part-$part.json" \
-              timeout 105m dist/sim_nightly --exact sim_nightly_sweep --nocapture > "reports/part-$part.log" 2>&1 &
+              timeout 170m dist/sim_nightly --exact sim_nightly_sweep --nocapture > "reports/part-$part.log" 2>&1 &
             pids+=("$!")
           done
           status=0

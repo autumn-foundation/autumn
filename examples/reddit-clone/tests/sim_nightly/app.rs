@@ -472,6 +472,7 @@ async fn notify_hooks(state: AppState, args: PostArgs) -> AutumnResult<()> {
 async fn rank_sweep(state: AppState) -> AutumnResult<()> {
     let now = state.clock().now().naive_utc();
     let lost: Vec<(i64, &'static str)> = reddit(&state).shared.store.with(|t| {
+        t.sweep_runs += 1;
         let mut lost = Vec::new();
         for post in t.posts.values_mut() {
             post.hot_rank = calculate_hot_rank(post.score, post.created_at, now);

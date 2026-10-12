@@ -1,7 +1,7 @@
 //! The DST API surface gate.
 //!
-//! This module reads the public `fn` items of `autumn_web::sim` from the
-//! source. Each item must have a call in `tests/sim_nightly/`, or an entry in
+//! This module reads the public `fn` items and the `pub trait` methods of
+//! `autumn_web::sim` from the source. Each item must have a call in `tests/sim_nightly/`, or an entry in
 //! [`EXCLUDED`] with a reason. A new public sim API item that the nightly does
 //! not call makes the gate fail.
 //!
@@ -88,16 +88,35 @@ fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The public `fn` names of one source file, as `file:name`. The scan stops
-/// at the first `#[cfg(test)]` line. It skips `__` names and items after a
+/// The public `fn` names of one source file, as `file:name`: each `pub fn`,
+/// and each method of a `pub trait`. The scan stops at the first
+/// `#[cfg(test)]` line. It skips `__` names and items after a
 /// `#[doc(hidden)]` attribute.
 fn public_fns(file: &str, source: &str) -> Vec<String> {
     let mut found = Vec::new();
     let mut hidden = false;
+    // The brace depth inside a `pub trait` block, if the scan is in one.
+    let mut trait_depth: Option<usize> = None;
     for line in source.lines() {
         let trimmed = line.trim_start();
         if line.starts_with("#[cfg(test)]") {
             break;
+        }
+        if let Some(depth) = trait_depth {
+            if depth == 1
+                && let Some(name) = trimmed.strip_prefix("fn ").map(ident)
+                && !name.starts_with("__")
+            {
+                found.push(format!("{file}:{name}"));
+            }
+            let depth =
+                (depth + trimmed.matches('{').count()).saturating_sub(trimmed.matches('}').count());
+            trait_depth = (depth > 0).then_some(depth);
+            continue;
+        }
+        if trimmed.starts_with("pub trait ") && !hidden {
+            trait_depth = Some(trimmed.matches('{').count()).filter(|d| *d > 0);
+            continue;
         }
         if trimmed.starts_with("#[doc(hidden)]") {
             hidden = true;
@@ -122,11 +141,15 @@ fn fn_name(line: &str) -> Option<&str> {
     let rest = line.strip_prefix("pub ")?;
     let rest = rest.strip_prefix("const ").unwrap_or(rest);
     let rest = rest.strip_prefix("async ").unwrap_or(rest);
-    let rest = rest.strip_prefix("fn ")?;
-    let end = rest
+    Some(ident(rest.strip_prefix("fn ")?))
+}
+
+/// The identifier at the start of `text`.
+fn ident(text: &str) -> &str {
+    let end = text
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .unwrap_or(rest.len());
-    Some(&rest[..end])
+        .unwrap_or(text.len());
+    &text[..end]
 }
 
 /// Every surface item, as `(key, needle)`.
@@ -206,6 +229,22 @@ mod tests {
         assert_eq!(fn_name("pub async fn advance(&self)"), Some("advance"));
         assert_eq!(fn_name("pub(crate) fn hidden()"), None);
         assert_eq!(fn_name("fn private()"), None);
+    }
+
+    #[test]
+    fn public_fns_reads_the_methods_of_a_public_trait() {
+        let source = "pub trait Client: Send {\n    /// Doc.\n    fn complete<'a>(\n        &'a self,\n    ) -> u8;\n}\n\
+                      trait Private {\n    fn hidden(&self);\n}\nfn private() {}\n";
+        assert_eq!(public_fns("x.rs", source), vec!["x.rs:complete".to_owned()]);
+    }
+
+    #[test]
+    fn the_surface_has_the_llm_client_trait_method() {
+        assert!(
+            surface()
+                .iter()
+                .any(|(key, _)| key == "sim/llm.rs:complete")
+        );
     }
 
     #[test]

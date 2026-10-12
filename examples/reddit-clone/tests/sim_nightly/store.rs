@@ -61,6 +61,8 @@ pub struct Tables {
     pub hooks_received: BTreeMap<i64, u32>,
     /// `post_id -> failed vote fan-outs`.
     pub fanout_failures: BTreeMap<i64, u32>,
+    /// How many times the scheduled rank sweep ran.
+    pub sweep_runs: u32,
 }
 
 /// The store. Each method locks it for one short, synchronous step.

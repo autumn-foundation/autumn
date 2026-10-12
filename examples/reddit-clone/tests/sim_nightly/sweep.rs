@@ -22,7 +22,8 @@ pub const DEFAULT_TRACE_CHECKS: u64 = 2;
 
 /// A shard with fewer seeds skips the `sometimes!` check. One seed cannot
 /// make every label true, so a one-seed replay must report its own result.
-pub const MIN_SEEDS_FOR_REACH: u64 = 8;
+/// The 32-seed test `sim_nightly_window_is_not_vacuous` keeps the check on PRs.
+pub const MIN_SEEDS_FOR_REACH: u64 = 32;
 
 /// The framework keeps the job runtime and the event bus per process, so two
 /// sims in one process disturb each other. Each scenario test holds this lock.
@@ -133,6 +134,17 @@ pub fn replay_command(seed: u64) -> String {
     )
 }
 
+/// If the seed passes alone, the earlier seeds of the process can be the cause.
+/// This command runs them too, in the same order.
+fn replay_in_context(start: u64, seed: u64) -> String {
+    format!(
+        "replay with the earlier seeds of this process: AUTUMN_SIM_SEED_START={start} \
+         AUTUMN_SIM_SEEDS={} cargo test -p reddit-clone --release --test sim_nightly \
+         -- --nocapture sim_nightly_sweep",
+        seed - start + 1
+    )
+}
+
 /// The result of one sweep.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -240,6 +252,7 @@ pub fn render(config: &SweepConfig, outcome: &Outcome) -> String {
         seeds.start,
         seeds.end,
     );
+    let start = seeds.start;
     let body = match outcome {
         Outcome::Passed {
             seeds,
@@ -248,9 +261,14 @@ pub fn render(config: &SweepConfig, outcome: &Outcome) -> String {
         } => {
             #[allow(clippy::cast_precision_loss)] // A rate for people to read.
             let rate = *seeds as f64 / (*millis).max(1) as f64 * 1000.0;
+            let reach = if *seeds >= MIN_SEEDS_FOR_REACH {
+                "not vacuous"
+            } else {
+                "vacuity not checked (fewer than 32 seeds)"
+            };
             format!(
                 "PASSED: {seeds} seed(s), {trace_checks} trace check(s), {millis} ms, \
-                 {rate:.1} seeds/s, not vacuous"
+                 {rate:.1} seeds/s, {reach}"
             )
         }
         Outcome::Failed {
@@ -258,13 +276,15 @@ pub fn render(config: &SweepConfig, outcome: &Outcome) -> String {
             seed,
             reason,
         } => format!(
-            "FAILED at seed {seed} after {seeds} seed(s)\n{reason}\nreplay: {}",
-            replay_command(*seed)
+            "FAILED at seed {seed} after {seeds} seed(s)\n{reason}\nreplay: {}\n{}",
+            replay_command(*seed),
+            replay_in_context(start, *seed),
         ),
         Outcome::Nondeterministic { seeds, seed, diff } => format!(
             "NONDETERMINISTIC: seed {seed} (after {seeds} seed(s)) gave two traces\n{diff}\n\
-             replay: {}",
-            replay_command(*seed)
+             replay: {}\n{}",
+            replay_command(*seed),
+            replay_in_context(start, *seed),
         ),
         Outcome::Vacuous { seeds, unsatisfied } => format!(
             "VACUOUS: {seeds} seed(s) passed, but no seed made these labels true: {}",
