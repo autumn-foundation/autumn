@@ -159,6 +159,7 @@ REQUEST_PATH_MODULES=(
   autumn/src/plugin_sandbox/capability/mod.rs:plugin-sandbox
   autumn/src/plugin_sandbox/grants.rs:plugin-sandbox
   autumn/src/plugin_sandbox/slots.rs:plugin-sandbox
+  autumn/src/plugin_sandbox/dynamic.rs:plugin-sandbox
   autumn-search/src/lib.rs:default
   autumn/src/replication/wal.rs:db
   autumn/src/replication/segment.rs:db
