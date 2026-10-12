@@ -381,6 +381,11 @@ impl AeoSite {
         facts.markdown = aeo.markdown;
         facts.auth_md = aeo.auth_md.clone();
         facts.oauth = aeo.oauth.clone();
+        // RFC 8414 discovery for an issuer asks the host root, which an app
+        // served below a path prefix does not answer: publish no issuer there.
+        if !base_path(config).is_empty() {
+            facts.oauth.authorization_server.issuer = None;
+        }
         facts
             .csrf_header
             .clone_from(&config.security.csrf.token_header);
@@ -706,7 +711,14 @@ fn warn_on_config(config: &crate::config::AutumnConfig) {
             oauth: aeo.oauth.clone(),
             ..documents::SiteFacts::default()
         };
-        if documents::render(&facts, &origin, documents::OAUTH_SERVER_PATH).is_none() {
+        if !base_path(config).is_empty() {
+            tracing::warn!(
+                issuer,
+                "aeo: [aeo.oauth.authorization_server] needs an app served at the host \
+                 root: [seo] base_url has a path, and RFC 8414 discovery asks the root; \
+                 Autumn does not publish its metadata"
+            );
+        } else if documents::render(&facts, &origin, documents::OAUTH_SERVER_PATH).is_none() {
             tracing::warn!(
                 issuer,
                 "aeo: [aeo.oauth.authorization_server] issuer must be this site's origin \
@@ -1008,6 +1020,26 @@ mod tests {
     fn site_router(config: &crate::config::AutumnConfig) -> axum::Router {
         let site = Arc::new(AeoSite::new(config, documents::SiteFacts::default()));
         axum::Router::new().fallback(move |req| fallback(Some(Arc::clone(&site)), req))
+    }
+
+    #[test]
+    fn a_prefixed_app_publishes_no_issuer() {
+        // Codex review: RFC 8414 discovery for `https://example.com` asks
+        // `/.well-known/oauth-authorization-server` at the host root, which
+        // an app below `/shop` does not answer.
+        let mut config = crate::config::AutumnConfig::default();
+        config.aeo.oauth.authorization_server.issuer = Some("https://example.com".to_owned());
+        config.aeo.oauth.authorization_server.token_endpoint =
+            Some("https://example.com/token".to_owned());
+        let published = |config: &crate::config::AutumnConfig| {
+            let site = AeoSite::new(config, documents::SiteFacts::default());
+            let origin = documents::Origin::resolve(config.seo.base_url.as_deref(), None);
+            documents::render(&site.facts, &origin, documents::OAUTH_SERVER_PATH).is_some()
+        };
+        config.seo.base_url = Some("https://example.com".to_owned());
+        assert!(published(&config));
+        config.seo.base_url = Some("https://example.com/shop".to_owned());
+        assert!(!published(&config));
     }
 
     #[tokio::test]
