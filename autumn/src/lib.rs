@@ -599,6 +599,14 @@ pub use http_client as http;
 // Retry budget for outbound HTTP (issue #3058). Internal: the client uses it.
 #[cfg(feature = "http-client")]
 pub(crate) mod retry_budget;
+pub(crate) mod sync_shim;
+/// The crate-private types that the loom and Shuttle model checks drive.
+/// Built only under `--cfg loom_models` or `--cfg shuttle_models`.
+#[cfg(any(loom_models, shuttle_models))]
+#[doc(hidden)]
+pub mod __concurrency_models {
+    pub use crate::retry_budget::{MAX_HOSTS, RetryBudget, RetryBudgets, RetryKind};
+}
 
 #[cfg(feature = "flash")]
 pub mod flash;

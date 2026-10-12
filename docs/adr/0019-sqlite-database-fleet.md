@@ -117,19 +117,30 @@ Uppercase is refused, not folded: on a case-insensitive file system `Acme` and
   this needs a cross-process reservation of the path (a lock file or
   tombstone). That is roadmap work.
 - Delete and restore install the drain first, so no new entry can appear.
-  They then settle the entry that was open: the settle probe joins a running
-  open, or sets `cancelled` under the cell's init permit. An opener that
-  still holds a cancelled entry cannot create the file. It claims a new entry
-  and sees the drain. An entry whose open failed is cancelled the same way.
-- `close_all` sets `shutting_down`. Every open then fails with `503`. It
-  settles opens in flight, closes every database, and waits until no database
-  is open or draining.
+  They then take the entry that was open and wait for its opener task to end.
+  A running open is never interrupted, and a late opener cannot start one:
+  the drain refuses it. The delete then drains the database that open made.
+- `close_all` waits for owned delete, restore and provision tasks, then sets
+  `shutting_down`. Every open then fails with `503`. It closes every database
+  and waits until none is open or draining.
 - Keys are checked against the fleet (mode, slot range, a tenant's own slot)
   before anything touches the disk.
 - Closing calls `Pool::close` (a stale handle can no longer check out), waits
   for in-flight connections, then runs lifecycle hooks. An opener for a
   draining key waits for the drain, then opens fresh. Deleting a key refuses
   openers with `410` until the files are gone.
+- Fleet operations are cancellation-safe. `open` (first open), `close`,
+  `delete`, `restore` and `provision` run their work in owned tasks. A caller
+  that is dropped (timeout, client disconnect) only stops waiting:
+  - A claimed key always leaves its drain, so no later opener gets a stranded
+    `410`, and `close_all` does not hang.
+  - A first open that already started its `on_open` hooks ends in the open
+    map. A later `close` or `delete` runs the matching `on_close`.
+  - A `provision` can publish its file and then lose its caller. The fleet
+    keeps a record of that creation. The next `provision` of the key reports
+    it. Exactly one call does. `delete` clears the record. The record is in
+    memory only.
+  - `close_all` waits for opens that are still running, then closes them.
 
 ### 4. Migrations: on create, on open, or refused
 

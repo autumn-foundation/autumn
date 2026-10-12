@@ -67,12 +67,8 @@ use proc_macro::TokenStream;
 /// writes that do not use the repository. See `docs/guide/cache-coherence.md`.
 #[proc_macro_attribute]
 pub fn repository(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(repository::repository_macro(attr, item.into()))
-        .into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        repository::repository_macro(attr, item)
+    })
+    .into()
 }

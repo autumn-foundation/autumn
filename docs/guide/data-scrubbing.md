@@ -95,10 +95,11 @@ Two sources need **no declaration at all**:
   the registration statically, so it needs a string-literal table name; a
   computed one is reported rather than silently ignored.
 
-Primary- and foreign-key columns are never claimed by the table-level
-inference: rewriting a key would break referential integrity. Neither are
-generated columns, which Postgres refuses to `UPDATE` and which a scrub of their
-source columns already covers.
+Table-level inference never claims primary-key, foreign-key or partition-key
+columns. A rewrite would break referential integrity or move rows between
+partitions. Declare a partition key `safe`. Inference also skips generated
+columns. Postgres refuses to `UPDATE` them, and a scrub of their source columns
+already covers them.
 
 `[defaults] safe_columns` is a cross-table convenience, not a per-column review,
 so it does **not** narrow a GDPR anonymize registration — only an explicit
@@ -721,8 +722,9 @@ apply-time error.
 - **Constraints survive.** PII is refused outright on a primary key, on **either
   side** of any foreign key (including every component of a composite one — so a
   natural key another table references, like `users.email` ← `orders.user_email`,
-  is protected too), and on a `CHECK`-constrained column, where no fabricated
-  value can be proven to satisfy the predicate. `null` is refused on a `NOT NULL`
+  is protected too), on a **partition key** (a rewrite moves rows between
+  partitions or aborts), and on a `CHECK`-constrained column, where no
+  fabricated value can be proven to satisfy the predicate. `null` is refused on a `NOT NULL`
   column and on a `NULLS NOT DISTINCT` unique index; a constant replacement is
   refused on any column covered by a unique index — composite, partial, and the
   input columns of a unique *expression* index (`(lower(email))`), whose

@@ -29,7 +29,9 @@
 )]
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, PoisonError};
+
+use crate::sync_shim::Mutex;
 
 /// A cap on the in-flight work of each tenant.
 ///

@@ -2361,12 +2361,18 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- schema:: upgrade:: \
             | tee "$RUNNER_TEMP/cli-schema-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-schema-cov.log"
-          # Issue #2344: same gap for `upgrade::` and `git_root::`. No other lane
-          # instruments the `autumn` bin unit tests, so their patch coverage
-          # reads as 0%. Check the count: a filter that matches nothing exits 0.
-          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- upgrade:: git_root:: \
+          # Issue #2344: same gap for `upgrade::` and `git_root::`. Issue #2386:
+          # same gap for `sbom::`. No other lane instruments the `autumn` bin
+          # unit tests, so their patch coverage reads as 0%. Check the count: a
+          # filter that matches nothing exits 0.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- upgrade:: git_root:: sbom:: \
             | tee "$RUNNER_TEMP/cli-upgrade-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-upgrade-cov.log"
+          # Issue #2366: same gap for `db::scrub::`. Its classifier is unit
+          # tested, and no other lane instruments it. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- db::scrub:: \
+            | tee "$RUNNER_TEMP/cli-scrub-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-scrub-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
@@ -2670,12 +2676,37 @@ jobs:
           RUSTFLAGS: "--cfg loom_models"
           LOOM_MAX_PREEMPTIONS: "3"
 
+  # Shuttle checks of the real retry budget, tenant bulkhead and circuit
+  # breaker (`autumn/tests/shuttle_models.rs`). Like `loom`, the binary is
+  # empty unless its neutral cfg is set; under `--cfg shuttle_models`,
+  # `autumn/src/sync_shim.rs` gives those modules Shuttle's locks and atomics,
+  # so the shipped code runs under the scheduler. loom explores every
+  # interleaving of two or three threads; Shuttle samples random and PCT
+  # schedules of more threads and of async tasks. One test is a seeded lost
+  # update that Shuttle must find, so a scheduler that stopped interleaving
+  # would fail here rather than pass vacuously.
+  shuttle:
+    name: Shuttle
+    # `test`, NOT `test-gate` — same reasoning as `coverage` above.
+    needs: [test, meta]
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Run Shuttle checks
+        run: cargo test -p autumn-web --release --test shuttle_models
+        env:
+          RUSTFLAGS: "--cfg shuttle_models"
+          SHUTTLE_ITERATIONS: "2000"
+
   # Stateright models of job claims, tick election and lease locks (#3071).
   # Each model checks all reachable states within small bounds.
   # Each seeded bug must give a counterexample.
   # `cargo test --workspace` also runs the models.
   # This job gives them their own check name.
-  # `verus.yml` runs the Verus proofs.
+  # `verus.yml` runs the Verus proofs, and `kani.yml` the Kani proofs.
   protocol-models:
     name: Protocol models
     runs-on: ubuntu-latest

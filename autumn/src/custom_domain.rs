@@ -2628,6 +2628,39 @@ fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Kani proofs over the certificate retry backoff. Run with
+/// `cargo kani -p autumn-web --lib`.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// The delay is 0 before any failure, at most `max` after one, never
+    /// overflows, and never decreases as failures add up.
+    #[kani::proof]
+    fn backoff_is_capped_and_monotonic() {
+        let failures: u32 = kani::any();
+        let base: u64 = kani::any();
+        let max: u64 = kani::any();
+        let delay = backoff_secs(failures, base, max);
+        if failures == 0 {
+            assert_eq!(delay, 0);
+        } else {
+            assert!(delay <= max);
+        }
+        if failures < u32::MAX {
+            assert!(delay <= backoff_secs(failures + 1, base, max));
+        }
+    }
+
+    /// The first failure waits exactly `min(base, max)`.
+    #[kani::proof]
+    fn first_failure_waits_the_base() {
+        let base: u64 = kani::any();
+        let max: u64 = kani::any();
+        assert_eq!(backoff_secs(1, base, max), base.min(max));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

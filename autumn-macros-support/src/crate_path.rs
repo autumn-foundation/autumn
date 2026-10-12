@@ -269,6 +269,41 @@ pub fn finalize(ts: TokenStream) -> TokenStream {
     rewrite(ts, &target)
 }
 
+/// Apply this module's crate-path override protocol around an attribute
+/// macro's own expansion.
+///
+/// Extracts and validates `crate = "..."` out of `attr`, makes it (or the
+/// automatically detected default) the resolution target for `macro_fn`'s
+/// entire call, then rewrites every `::autumn_web` path in its result to
+/// that target.
+///
+/// Every `#[proc_macro_attribute]` entry point in `autumn-macros`,
+/// `autumn-macros-model` and `autumn-macros-repository`'s `lib.rs` wraps its
+/// own macro function in exactly this sequence; `macro_fn` is the part that
+/// varies between them. `#[api_doc]` is the one attribute macro that does
+/// not call this — it strips the override but always finalizes against the
+/// *unoverridden* default, since it never itself emits an `::autumn_web`
+/// path (see its own doc comment in `autumn-macros`'s `lib.rs`).
+///
+/// # Errors (as a returned compile-error token stream)
+///
+/// When `crate = ...` isn't a valid override, `macro_fn` is never called and
+/// the target is never changed — the error tokens from
+/// [`extract_crate_override`] are returned as-is.
+#[must_use]
+pub fn with_override(
+    attr: TokenStream,
+    item: TokenStream,
+    macro_fn: impl FnOnce(TokenStream, TokenStream) -> TokenStream,
+) -> TokenStream {
+    let (crate_override, attr) = match extract_crate_override(attr) {
+        Ok(pair) => pair,
+        Err(err) => return err,
+    };
+    let _guard = set_target(crate_override.as_deref());
+    finalize(macro_fn(attr, item))
+}
+
 /// Recursively walk a token stream, rewriting `:: autumn_web` path segments —
 /// never a bare, non-`::`-prefixed `autumn_web` (that form is under the
 /// user's own control, e.g. inside a handler body this crate re-emits
@@ -395,6 +430,95 @@ mod tests {
 
     fn ts_string(ts: &TokenStream) -> String {
         ts.to_string()
+    }
+
+    // Characterizes the composition every attribute-macro entry point in
+    // `autumn-macros`/`autumn-macros-model`/`autumn-macros-repository`'s
+    // `lib.rs` performs by hand: extract the override, set it as the target
+    // for the macro's own call, then finalize that call's result against the
+    // same target. `with_override` (below) is this exact sequence as one
+    // function; this test pins the sequence's observable behavior
+    // independently of that function so a future change to the composition
+    // can't silently drift from what every entry point already does.
+    #[test]
+    fn override_protocol_composes_extract_then_target_then_finalize() {
+        let attr = quote! { crate = "renamed_web", "/x" };
+        let (crate_override, remaining_attr) = extract_crate_override(attr).unwrap();
+        assert_eq!(crate_override.as_deref(), Some("renamed_web"));
+        assert_eq!(ts_string(&remaining_attr), ts_string(&quote! { "/x" }));
+
+        let _guard = set_target(crate_override.as_deref());
+        // The macro's own body — generators and recognizers alike — must see
+        // the override while it runs, not just once `finalize` rewrites its
+        // returned tokens.
+        assert_eq!(current_target(), "renamed_web");
+
+        let generated = quote! { fn foo() -> ::autumn_web::Route { } };
+        let out = finalize(generated);
+        let s = ts_string(&out);
+        assert!(s.contains(":: renamed_web :: Route"), "got: {s}");
+        assert!(!s.contains("autumn_web"), "got: {s}");
+    }
+
+    #[test]
+    fn override_protocol_rejects_an_invalid_override_before_any_target_change() {
+        let attr = quote! { crate = "not an ident" };
+        let err = extract_crate_override(attr).unwrap_err();
+        assert!(ts_string(&err).contains("is not a valid Rust identifier"));
+        // No guard was ever set, so the ambient target is still the default.
+        assert_eq!(current_target(), DEFAULT_NAME);
+    }
+
+    #[test]
+    fn with_override_matches_the_hand_written_composition() {
+        let attr = quote! { crate = "renamed_web", "/x" };
+        let item = quote! { fn foo() {} };
+        let out = with_override(attr, item, |attr, item| {
+            quote! { fn foo() -> ::autumn_web::Route { #attr #item } }
+        });
+        let s = ts_string(&out);
+        assert!(s.contains(":: renamed_web :: Route"), "got: {s}");
+        assert!(!s.contains("autumn_web"), "got: {s}");
+        // The guard is scoped to the call: it's gone once with_override returns.
+        assert_eq!(current_target(), DEFAULT_NAME);
+    }
+
+    #[test]
+    fn with_override_rejects_an_invalid_override_without_calling_macro_fn() {
+        let attr = quote! { crate = "not an ident" };
+        let item = quote! { fn foo() {} };
+        let out = with_override(attr, item, |_attr, _item| {
+            panic!("macro_fn must not run when the override is invalid")
+        });
+        assert!(ts_string(&out).contains("is not a valid Rust identifier"));
+    }
+
+    #[test]
+    fn with_override_defaults_to_no_rewrite_without_an_override() {
+        // No override given, so `with_override` falls back to
+        // `resolve_autumn_web_name`, which reads the process-wide
+        // `CARGO_MANIFEST_DIR`. Pin it via `with_fixture_manifest` like every
+        // other test that exercises that path, rather than relying on the
+        // ambient value — a concurrently running fixture test's own
+        // `temp_env::with_var` swap is otherwise a real race (#2895).
+        let out = with_fixture_manifest(
+            r#"
+                [package]
+                name = "downstream"
+                version = "0.1.0"
+
+                [dependencies]
+                autumn-web = "0.7"
+            "#,
+            || {
+                let attr = quote! {};
+                let item = quote! { fn foo() {} };
+                with_override(attr, item, |attr, item| {
+                    quote! { fn foo() -> ::autumn_web::Route { #attr #item } }
+                })
+            },
+        );
+        assert!(ts_string(&out).contains(":: autumn_web :: Route"));
     }
 
     #[test]
