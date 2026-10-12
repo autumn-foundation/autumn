@@ -1527,16 +1527,16 @@ fn payment_required(
 /// Let a cross-origin browser client read the x402 challenge and receipt:
 /// CORS hides any response header it does not expose. Added to what the
 /// response already exposes. Without an allowed origin a browser reads none
-/// of the response, so this grants nothing on its own.
+/// of the response, so this grants nothing on its own. A `*` already there
+/// does not count: for a credentialed request it names no header (Fetch
+/// §3.3.4).
 pub(crate) fn expose_payment_headers(headers: &mut axum::http::HeaderMap) {
     const EXPOSE: &str = "PAYMENT-REQUIRED, PAYMENT-RESPONSE";
     let name = axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS;
     let covered = headers.get_all(&name).iter().any(|v| {
         v.to_str().is_ok_and(|v| {
-            v.split(',').any(|h| {
-                let h = h.trim();
-                h == "*" || h.eq_ignore_ascii_case("payment-response")
-            })
+            v.split(',')
+                .any(|h| h.trim().eq_ignore_ascii_case("payment-response"))
         })
     });
     if !covered {
@@ -1592,6 +1592,33 @@ async fn facilitator(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Codex review (P2): a `*` the handler exposes names no header for a
+    /// credentialed request, so the payment headers are named too.
+    #[test]
+    fn payment_headers_are_named_past_a_wildcard() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            axum::http::HeaderValue::from_static("*"),
+        );
+        expose_payment_headers(&mut headers);
+        let exposed: Vec<&str> = headers
+            .get_all(axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(exposed, ["*", "PAYMENT-REQUIRED, PAYMENT-RESPONSE"]);
+        // Named already: not repeated.
+        expose_payment_headers(&mut headers);
+        assert_eq!(
+            headers
+                .get_all(axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS)
+                .iter()
+                .count(),
+            2
+        );
+    }
 
     fn x402() -> X402Config {
         X402Config {

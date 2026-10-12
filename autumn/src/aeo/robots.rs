@@ -172,6 +172,14 @@ fn push_additional_rules(txt: &mut String, rules: &[String], signal: Option<&str
         }
     };
     for line in rules.iter().flat_map(|rule| rule.lines()) {
+        // A blank or comment line is no rule (RFC 9309 §2.2): it neither
+        // ends a run of `User-agent` lines nor starts a group.
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            txt.push_str(line);
+            txt.push('\n');
+            continue;
+        }
         let agent = starts(line, "user-agent:");
         if agent && !after_agent {
             close(txt, open);
@@ -386,6 +394,32 @@ mod tests {
         // `Disallow: /admin` joins the `*` group, which has the signal once.
         let star = txt.split("User-agent: GPTBot").next().unwrap();
         assert_eq!(star.matches("Content-Signal:").count(), 1, "{txt}");
+    }
+
+    /// Codex review (P2): a comment between `User-agent` lines keeps them in
+    /// one group, so the signal goes after the group's rules.
+    #[test]
+    fn a_comment_keeps_user_agents_in_one_group() {
+        let rules = [
+            "User-agent: GPTBot".to_owned(),
+            "# AI crawlers".to_owned(),
+            "User-agent: ClaudeBot".to_owned(),
+            "Disallow: /private".to_owned(),
+        ];
+        let txt = robots_txt_with_policy(
+            "prod",
+            None,
+            &rules,
+            &BotPolicy::from_config(&AeoConfig::default()),
+        );
+        let start = txt.find("User-agent: GPTBot").unwrap();
+        let group = &txt[start..];
+        let disallow = group.find("Disallow: /private").unwrap();
+        assert!(
+            !group[..disallow].contains("Content-Signal:"),
+            "the signal splits the group:\n{txt}"
+        );
+        assert!(group[disallow..].contains("Content-Signal:"), "{txt}");
     }
 
     /// Codex review (P2): one entry may hold a whole group.
