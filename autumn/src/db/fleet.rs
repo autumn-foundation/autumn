@@ -961,6 +961,8 @@ impl DatabaseFleet {
     /// when the create task fails. Or an [`open`](Self::open) error.
     pub async fn provision(&self, key: &FleetDbKey) -> Result<FleetDatabase, FleetError> {
         self.check_key(key)?;
+        // Held to the end, so `close_all` also sees the open that follows.
+        let _open_counted = MutationGuard::new(self);
         let (fleet, task_key, counted) = (self.clone(), key.clone(), MutationGuard::new(self));
         tokio::spawn(async move {
             let _counted = counted;
