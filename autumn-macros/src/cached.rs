@@ -184,17 +184,11 @@ pub fn parse_cached_args(attr: TokenStream) -> syn::Result<CachedAttrs> {
 
 // ── #1716: dependency derivation ─────────────────────────────────────
 
-/// Associated functions that only a model has.
+/// Associated functions that name a model.
 ///
 /// `Post::find_all(db)` names `Post`; `Post::new(..)` does not. These verbs are
-/// unlikely on a non-model type, so they can establish a dependency.
+/// rare on other types. The macro does not check the owner.
 const MODEL_READ_VERBS: &[&str] = &["find_all", "find_by_id", "exists_by_id"];
-
-/// Verbs that are common on any type (`Config::load()`).
-///
-/// The owner cannot be checked as a model here, so the call proves nothing.
-/// It makes the read `undetermined` instead.
-const AMBIGUOUS_READ_VERBS: &[&str] = &["count", "list", "page", "all", "load", "first"];
 
 /// Recover the model name from a repository type name.
 ///
@@ -248,10 +242,6 @@ struct DerivedDependencies {
     /// wrong dependency — and a wrong dependency makes a real violation audit
     /// clean — so the read is recorded `Undetermined` instead.
     unresolved_repository: bool,
-    /// An `Owner::verb()` call with a common verb (`Config::load()`). The owner
-    /// may not be a model, so it is no dependency. It also shows the analysis
-    /// does not know every call, so the read is `undetermined`.
-    unresolved_call: bool,
 }
 
 /// Walks a function looking for evidence of which models it reads.
@@ -301,28 +291,53 @@ impl VisitMut for DependencyVisitor {
         syn::visit_mut::visit_path_mut(self, path);
     }
 
-    fn visit_expr_call_mut(&mut self, call: &mut syn::ExprCall) {
-        // `Post::find_all(db)` — a reading associated function on a model type.
-        if let Expr::Path(p) = &*call.func {
-            let segments = &p.path.segments;
-            if segments.len() >= 2 {
-                let verb = segments[segments.len() - 1].ident.to_string();
-                let owner = segments[segments.len() - 2].ident.to_string();
-                if MODEL_READ_VERBS.contains(&verb.as_str())
-                    && is_model_ident(&owner)
-                    && model_from_repository_ident(&owner).is_none()
-                {
-                    self.found.models.insert(owner);
-                } else if AMBIGUOUS_READ_VERBS.contains(&verb.as_str())
-                    && is_model_ident(&owner)
-                    && model_from_repository_ident(&owner).is_none()
-                {
-                    self.found.unresolved_call = true;
-                }
+    fn visit_expr_path_mut(&mut self, expr: &mut syn::ExprPath) {
+        // Covers `Post::find_all(db)`, a function reference such as
+        // `.map(Post::find_all)`, and `<Post>::find_all(db)`.
+        if let Some((owner, verb)) = owner_and_verb(expr)
+            && is_plain_model_owner(&owner)
+            && MODEL_READ_VERBS.contains(&verb.as_str())
+        {
+            self.found.models.insert(owner);
+        }
+        syn::visit_mut::visit_expr_path_mut(self, expr);
+    }
+
+    fn visit_macro_mut(&mut self, mac: &mut syn::Macro) {
+        // `format!("{}", Post::find_all(db))`: read the arguments when they parse
+        // as expressions. Other macro bodies stay unseen.
+        if let Ok(mut args) =
+            Punctuated::<Expr, Token![,]>::parse_terminated.parse2(mac.tokens.clone())
+        {
+            for arg in &mut args {
+                self.visit_expr_mut(arg);
             }
         }
-        syn::visit_mut::visit_expr_call_mut(self, call);
+        syn::visit_mut::visit_macro_mut(self, mac);
     }
+}
+
+/// The `(owner, verb)` of a path such as `Post::find_all` or `<Post>::find_all`.
+fn owner_and_verb(expr: &syn::ExprPath) -> Option<(String, String)> {
+    let verb = expr.path.segments.last()?.ident.to_string();
+    let owner = if let Some(qself) = &expr.qself {
+        let syn::Type::Path(ty) = &*qself.ty else {
+            return None;
+        };
+        ty.path.segments.last()?.ident.to_string()
+    } else {
+        let n = expr.path.segments.len();
+        if n < 2 {
+            return None;
+        }
+        expr.path.segments[n - 2].ident.to_string()
+    };
+    Some((owner, verb))
+}
+
+/// Whether an owner could be a model type: not `Self`, not a repository.
+fn is_plain_model_owner(owner: &str) -> bool {
+    owner != "Self" && is_model_ident(owner) && model_from_repository_ident(owner).is_none()
 }
 
 /// Recover the set of models a cached function reads, from its signature and
@@ -426,16 +441,12 @@ fn generate_coherence_items(
         exprs.extend(derived.models.iter().map(|m| quote! { || #m }));
 
         // Honest over useful: a repository reached only through its trait has
-        // no constant to resolve, and an unrelated `Owner::verb()` call shows
-        // a dependency was missed. The set is *unknown*, not empty and not
-        // guessable. `Undetermined` is reported and never gates,
-        // which is the right answer for something this analysis cannot see.
-        let provenance =
-            if derived.unresolved_repository || derived.unresolved_call || exprs.is_empty() {
-                quote! { Undetermined }
-            } else {
-                quote! { Derived }
-            };
+        // no constant to resolve, so the dependency set is *unknown*.
+        let provenance = if derived.unresolved_repository || exprs.is_empty() {
+            quote! { Undetermined }
+        } else {
+            quote! { Derived }
+        };
         (exprs, provenance)
     } else {
         let exprs: Vec<TokenStream> = attrs
@@ -1332,24 +1343,6 @@ mod tests {
         assert_eq!(derived_repositories(&f), [] as [String; 0]);
     }
 
-    /// #2362: `Config::load()` is capitalised, not a model. It must not
-    /// become a dependency, and it must not hide the unseen real one.
-    #[test]
-    fn an_unrelated_generic_call_is_unresolved_not_a_model() {
-        for verb in ["load", "count", "all", "list", "page", "first"] {
-            let verb = format_ident!("{verb}");
-            let f: ItemFn = syn::parse_quote! {
-                async fn dashboard() -> Data {
-                    let cfg = Config::#verb();
-                    posts_via_helper(&cfg).await
-                }
-            };
-            let derived = derive_dependencies(&f);
-            assert!(derived.models.is_empty(), "{verb}");
-            assert!(derived.unresolved_call, "{verb}");
-        }
-    }
-
     #[test]
     fn a_model_specific_verb_still_names_the_model() {
         for verb in ["find_all", "find_by_id", "exists_by_id"] {
@@ -1361,8 +1354,51 @@ mod tests {
                 }
             };
             assert_eq!(derived_models(&f), vec!["Post".to_string()], "{verb}");
-            assert!(!derive_dependencies(&f).unresolved_call, "{verb}");
         }
+    }
+
+    #[test]
+    fn a_common_verb_names_no_model() {
+        for verb in ["load", "count", "all", "list", "page", "first"] {
+            let verb = format_ident!("{verb}");
+            let f: ItemFn = syn::parse_quote! {
+                async fn dashboard() -> Data { Config::#verb() }
+            };
+            assert!(derived_models(&f).is_empty(), "{verb}");
+        }
+    }
+
+    #[test]
+    fn a_model_read_is_found_in_every_call_shape() {
+        let shapes: [ItemFn; 4] = [
+            syn::parse_quote! { fn f() { let _ = Some(1).map(Post::find_all); } },
+            syn::parse_quote! { fn f(db: u8) { let _ = <Post>::find_all(db); } },
+            syn::parse_quote! { fn f(db: u8) { let _ = format!("{}", Post::find_all(db)); } },
+            syn::parse_quote! { fn f(db: u8) { let _ = crate::Post::<T>::find_all(db); } },
+        ];
+        for f in &shapes {
+            assert_eq!(
+                derived_models(f),
+                vec!["Post".to_string()],
+                "{}",
+                quote!(#f)
+            );
+        }
+    }
+
+    /// A recovered model is still checked. An unrelated call must not hide it.
+    #[test]
+    fn a_model_read_beside_an_unrelated_call_stays_derived() {
+        let f: ItemFn = syn::parse_quote! {
+            async fn dashboard(db: u8) -> Data {
+                let _ = Post::find_all(db);
+                helper(&Config::load()).await
+            }
+        };
+        let out = cached_macro(TokenStream::new(), quote! { #f }).to_string();
+        assert!(out.contains("DependencyProvenance :: Derived"), "{out}");
+        assert!(out.contains("\"Post\""), "{out}");
+        assert!(!out.contains("\"Config\""), "{out}");
     }
 
     #[test]
@@ -1381,21 +1417,21 @@ mod tests {
         assert!(!out.contains("\"Config\""), "{out}");
     }
 
-    /// A real model read next to an unrelated call is still partly unseen.
     #[test]
-    fn a_model_read_beside_an_unrelated_call_is_undetermined() {
+    fn self_is_never_a_model() {
         let f: ItemFn = syn::parse_quote! {
-            async fn dashboard(db: &mut Db) -> Data {
-                let _ = Post::find_all(db);
-                let cfg = Config::load();
-                helper(&cfg).await
-            }
+            fn f(db: &mut Db) { let _ = Self::find_all(db); }
         };
-        let out = cached_macro(TokenStream::new(), quote! { #f }).to_string();
-        assert!(
-            out.contains("DependencyProvenance :: Undetermined"),
-            "{out}"
-        );
+        assert!(derived_models(&f).is_empty());
+    }
+
+    #[test]
+    fn a_declared_read_ignores_an_unrelated_call() {
+        let f: ItemFn = syn::parse_quote! {
+            async fn f() -> u8 { let _ = Config::load(); 0 }
+        };
+        let out = cached_macro(quote! { reads(Post) }, quote! { #f }).to_string();
+        assert!(out.contains("Declared"), "{out}");
     }
 
     #[test]

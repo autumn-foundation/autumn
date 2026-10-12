@@ -81,6 +81,20 @@ pub async fn coherence_opaque(seed: i64) -> i64 {
     seed
 }
 
+/// An unrelated `Type::verb()` call is no dependency (#2362).
+pub struct CoherenceSettings;
+
+impl CoherenceSettings {
+    pub fn load() -> i64 {
+        1
+    }
+}
+
+#[autumn_web::cached]
+pub async fn coherence_unrelated_call(seed: i64) -> i64 {
+    seed + CoherenceSettings::load()
+}
+
 #[autumn_web::repository(CoherencePost, invalidates(coherence_recent_titles))]
 pub trait CoherencePostRepository {}
 
@@ -218,6 +232,13 @@ fn a_cached_read_id_is_its_cache_key_namespace() {
 #[test]
 fn an_underivable_read_is_undetermined_not_silently_coherent() {
     let read = read_named("coherence_opaque");
+    assert_eq!(read.provenance, DependencyProvenance::Undetermined);
+    assert!(read.reads.is_empty());
+}
+
+#[test]
+fn an_unrelated_call_does_not_make_a_read_derived() {
+    let read = read_named("coherence_unrelated_call");
     assert_eq!(read.provenance, DependencyProvenance::Undetermined);
     assert!(read.reads.is_empty());
 }
