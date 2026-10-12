@@ -700,6 +700,13 @@ fn build_router_pre_state(
         aeo_openapi,
         aeo_mcp,
     ));
+    if config.aeo.enabled && !config.aeo.paid_routes.is_empty() {
+        state.insert_extension(crate::aeo::commerce::RoutedTemplates(routed_templates(
+            &route_list,
+            &ctx.scoped_groups,
+            config,
+        )));
+    }
 
     // Build the per-route timeout override table before `route_list` and the
     // scoped groups are consumed by the mounting steps below.
@@ -1407,16 +1414,16 @@ fn aeo_x402_layer(
 #[cfg(not(feature = "http-client"))]
 fn aeo_x402_layer(
     config: &AutumnConfig,
-    _state: &AppState,
+    state: &AppState,
     static_paths: crate::aeo::commerce::StaticPaths,
 ) -> tower::util::Either<crate::aeo::commerce::X402Unavailable, tower::layer::util::Identity> {
     tower::util::option_layer(
-        crate::aeo::commerce::X402Unavailable::from_config(config).map(
-            |layer| match static_paths {
+        crate::aeo::commerce::X402Unavailable::from_config(config, state).map(|layer| {
+            match static_paths {
                 Some(paths) => layer.for_static_pages(paths),
                 None => layer,
-            },
-        ),
+            }
+        }),
     )
 }
 
@@ -5699,7 +5706,7 @@ fn apply_middleware(
                     .security
                     .csrf
                     .enabled
-                    .then(|| crate::aeo::commerce::X402CsrfLayer::from_config(config))
+                    .then(|| crate::aeo::commerce::X402CsrfLayer::from_config(config, state))
                     .flatten(),
             ),
             tower::util::option_layer(build_csrf_layer(config, signing_keys_opt.clone())),
@@ -6543,6 +6550,27 @@ fn static_page_routes<'a>(
             (page.clone(), route)
         })
         .collect()
+}
+
+/// Every route template the app mounts, for any method, as `MatchedPath`
+/// names it. x402 reads it to tell `/report` from `/report/`.
+fn routed_templates(
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+    config: &AutumnConfig,
+) -> Vec<String> {
+    let mut mounted: Vec<String> = route_list
+        .iter()
+        .flat_map(|r| mounted_paths(r.path, config))
+        .collect();
+    mounted.extend(
+        scoped_groups
+            .iter()
+            .flat_map(|g| g.routes.iter().map(|r| join_nested_path(&g.prefix, r.path))),
+    );
+    mounted.sort_unstable();
+    mounted.dedup();
+    mounted
 }
 
 /// Where a top-level route is mounted, as `MatchedPath` reports it: under

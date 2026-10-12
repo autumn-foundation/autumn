@@ -1354,6 +1354,16 @@ mod commerce {
         assert_eq!(free.status, 200);
         assert_eq!(free.text(), "free");
         assert_eq!(c.get("/api").send().await.status, 402);
+
+        // With one form routed, a config `/api/` still prices the app's `/api`.
+        let mut config = paid_config();
+        for route in &mut config.aeo.paid_routes {
+            if route.path == "/api" {
+                route.path = "/api/".to_owned();
+            }
+        }
+        let c = TestApp::new().config(config).routes(routes![api]).build();
+        assert_eq!(c.get("/api").send().await.status, 402);
     }
 
     #[tokio::test]

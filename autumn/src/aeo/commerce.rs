@@ -231,9 +231,15 @@ pub fn mixed_protocol_route(routes: &[PaidRoute]) -> Option<String> {
 
 /// `true` when two route templates name the same route: the same literal
 /// segments, and a capture (any name) or a catch-all at the same places.
-/// A trailing `/` counts: axum routes `/report` and `/report/` apart, so a
-/// free `/report/` never takes the price of `/report`.
+/// One trailing `/` does not count; [`PricedRoutes::lookup`] tells the two
+/// apart when the app routes both.
 fn same_template(left: &str, right: &str) -> bool {
+    same_shape(normalize(left), normalize(right))
+}
+
+/// [`same_template`], with a trailing `/` counting: axum routes `/report`
+/// and `/report/` apart.
+fn same_shape(left: &str, right: &str) -> bool {
     let kind = |segment: &str| {
         if segment.starts_with("{*") && segment.ends_with('}') {
             "*"
@@ -778,11 +784,21 @@ struct PricedRoutes {
     /// Priced paths `locale_prefix_exclude` keeps out of the locale nests:
     /// `/en/x` is never one of them, but may be another route of its own.
     unprefixed: Vec<String>,
+    /// Every template the app mounts (see [`RoutedTemplates`]).
+    mounted: Vec<String>,
 }
+
+/// Every route template the app mounts, as `MatchedPath` names it. With it,
+/// a priced `/report` does not price the app's own free `/report/`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RoutedTemplates(pub(crate) Vec<String>);
 
 impl PricedRoutes {
     /// The priced routes, or `None` when AEO is off or no route is priced.
-    fn from_config(config: &crate::config::AutumnConfig) -> Option<Self> {
+    fn from_config(
+        config: &crate::config::AutumnConfig,
+        state: &crate::state::AppState,
+    ) -> Option<Self> {
         let aeo = &config.aeo;
         // An invalid x402 route stays matched, so it answers 503 and never
         // runs free. MPP routes are kept so a static file picks the same
@@ -816,10 +832,15 @@ impl PricedRoutes {
             .collect();
         #[cfg(not(feature = "i18n"))]
         let (locales, unprefixed) = (Vec::new(), Vec::new());
+        let mounted = state
+            .extension::<RoutedTemplates>()
+            .map(|r| r.0.clone())
+            .unwrap_or_default();
         Some(Self {
             routes,
             locales,
             unprefixed,
+            mounted,
         })
     }
 
@@ -854,11 +875,14 @@ impl PricedRoutes {
             // listed first never prices a more specific static route.
             return routes
                 .clone()
-                .find(|r| same_template(&r.path, t))
+                .find(|r| same_template(&r.path, t) && !self.another_route(&r.path, t, t))
                 .or_else(|| {
-                    routes
-                        .clone()
-                        .find(|r| self.localized(r) && same_template(&r.path, self.strip_locale(t)))
+                    let bare = self.strip_locale(t);
+                    routes.clone().find(|r| {
+                        self.localized(r)
+                            && same_template(&r.path, bare)
+                            && !self.another_route(&r.path, bare, t)
+                    })
                 });
         }
         // No matched route: only a `GET` or `HEAD` can be a static file. An
@@ -881,6 +905,21 @@ impl PricedRoutes {
             })
             .rev()
             .max_by_key(|r| specificity(&r.path))
+    }
+
+    /// `true` when the priced `path` differs from the matched template only
+    /// by a trailing `/` (`compared` is `matched`, maybe without its locale)
+    /// and the app mounts a route at the other form too: axum picked
+    /// `matched` over that route, so the price is not this route's.
+    fn another_route(&self, path: &str, compared: &str, matched: &str) -> bool {
+        if path.ends_with('/') == compared.ends_with('/') {
+            return false;
+        }
+        let other = match matched.strip_suffix('/') {
+            Some(bare) if !bare.is_empty() => bare.to_owned(),
+            _ => format!("{matched}/"),
+        };
+        self.mounted.iter().any(|r| same_shape(r, &other))
     }
 
     /// `true` when `route` is mounted in the locale nests too.
@@ -979,9 +1018,12 @@ pub(crate) struct X402CsrfLayer {
 impl X402CsrfLayer {
     /// The layer, or `None` when no x402 route is priced.
     #[must_use]
-    pub(crate) fn from_config(config: &crate::config::AutumnConfig) -> Option<Self> {
+    pub(crate) fn from_config(
+        config: &crate::config::AutumnConfig,
+        state: &crate::state::AppState,
+    ) -> Option<Self> {
         Some(Self {
-            priced: std::sync::Arc::new(PricedRoutes::from_config(config)?),
+            priced: std::sync::Arc::new(PricedRoutes::from_config(config, state)?),
         })
     }
 }
@@ -1042,7 +1084,7 @@ impl X402Layer {
         state: &crate::state::AppState,
     ) -> Option<Self> {
         let aeo = &config.aeo;
-        let priced = PricedRoutes::from_config(config)?;
+        let priced = PricedRoutes::from_config(config, state)?;
         let complete = aeo.x402.is_complete();
         let safe = facilitator_url_is_safe(aeo.x402.facilitator_url.as_deref().unwrap_or_default());
         if !complete {
@@ -1101,8 +1143,11 @@ pub(crate) struct X402Unavailable {
 impl X402Unavailable {
     /// The layer, or `None` when no route is priced.
     #[must_use]
-    pub(crate) fn from_config(config: &crate::config::AutumnConfig) -> Option<Self> {
-        let priced = PricedRoutes::from_config(config)?;
+    pub(crate) fn from_config(
+        config: &crate::config::AutumnConfig,
+        state: &crate::state::AppState,
+    ) -> Option<Self> {
+        let priced = PricedRoutes::from_config(config, state)?;
         tracing::error!(
             "aeo: [[aeo.paid_routes]] has x402 routes, but x402 needs the `http-client` \
              feature; those routes answer 503"
@@ -1532,6 +1577,7 @@ fn payment_required(
 /// of the response, so this grants nothing on its own. A `*` already there
 /// does not count: for a credentialed request it names no header (Fetch
 /// §3.3.4).
+#[cfg_attr(not(any(feature = "http-client", feature = "mcp")), allow(dead_code))]
 pub(crate) fn expose_payment_headers(headers: &mut axum::http::HeaderMap) {
     const EXPOSE: &str = "PAYMENT-REQUIRED, PAYMENT-RESPONSE";
     let name = axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS;
@@ -1652,7 +1698,8 @@ mod tests {
         let mut config = crate::config::AutumnConfig::default();
         config.aeo.x402 = x402();
         config.aeo.paid_routes.push(route());
-        let layer = X402Unavailable::from_config(&config).expect("a route is priced");
+        let layer = X402Unavailable::from_config(&config, &crate::state::AppState::for_test())
+            .expect("a route is priced");
         let inner = tower::service_fn(|_req: axum::http::Request<axum::body::Body>| async {
             Ok::<_, std::convert::Infallible>(axum::response::Response::new(
                 axum::body::Body::empty(),
@@ -1677,6 +1724,7 @@ mod tests {
             ],
             locales: vec!["en".to_owned()],
             unprefixed: Vec::new(),
+            mounted: Vec::new(),
         };
         let get = |path: &str| {
             axum::http::Request::get(path)
@@ -1691,11 +1739,53 @@ mod tests {
     }
 
     #[test]
+    fn a_trailing_slash_route_of_its_own_keeps_its_price() {
+        // Codex review (P1): axum routes `/report` and `/report/` apart.
+        let priced = |paths: &[&str], mounted: &[&str]| PricedRoutes {
+            routes: paths
+                .iter()
+                .map(|&p| PaidRoute::new("GET", p, "1"))
+                .collect(),
+            locales: vec!["en".to_owned()],
+            unprefixed: Vec::new(),
+            mounted: mounted.iter().map(|&r| r.to_owned()).collect(),
+        };
+        let matched = |template: &str| {
+            let mut req = axum::http::Request::get(template)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(StaticRoute(template.to_owned()));
+            req
+        };
+        let charged = |p: &PricedRoutes, template: &str| p.route_for(&matched(template)).is_some();
+
+        // The app routes both forms: each is its own route.
+        let both = priced(&["/report"], &["/report", "/report/"]);
+        assert!(charged(&both, "/report"));
+        assert!(!charged(&both, "/report/"), "a free /report/ stays free");
+        let both = priced(&["/report/"], &["/report", "/report/"]);
+        assert!(!charged(&both, "/report"));
+        assert!(charged(&both, "/report/"));
+        // Under a locale nest, against the nested templates.
+        let nested = priced(&["/report"], &["/en/report", "/en/report/"]);
+        assert!(charged(&nested, "/en/report"));
+        assert!(!charged(&nested, "/en/report/"));
+
+        // One form only: the config's slash does not matter.
+        assert!(charged(&priced(&["/report/"], &["/report"]), "/report"));
+        assert!(charged(&priced(&["/report"], &["/report/"]), "/report/"));
+        // Nothing recorded (a router built without the extension): as before.
+        assert!(charged(&priced(&["/report"], &[]), "/report/"));
+    }
+
+    #[test]
     fn an_excluded_route_is_not_priced_under_a_locale() {
         let priced = PricedRoutes {
             routes: vec![PaidRoute::new("GET", "/api", "1")],
             locales: vec!["en".to_owned()],
             unprefixed: vec!["/api".to_owned()],
+            mounted: Vec::new(),
         };
         let get = |path: &str| {
             axum::http::Request::get(path)
@@ -1717,6 +1807,7 @@ mod tests {
             ],
             locales: Vec::new(),
             unprefixed: Vec::new(),
+            mounted: Vec::new(),
         };
         let req = |path: &str| {
             axum::http::Request::get(path)
@@ -1726,9 +1817,10 @@ mod tests {
         // Structural template comparison: names do not matter, kinds do.
         // (A matched route is covered by the integration test.)
         assert!(same_template("/reports/{id}", "/reports/{rid}"));
-        // Codex review (P1): axum routes these apart.
-        assert!(!same_template("/report/", "/report"));
-        assert!(same_template("/report/", "/report/"));
+        // A trailing `/` counts only for the exact shape.
+        assert!(same_template("/report/", "/report"));
+        assert!(!same_shape("/report/", "/report"));
+        assert!(same_shape("/report/", "/report/"));
         assert!(!same_template("/reports/{id}", "/reports/admin"));
         assert!(!same_template("/files/{*p}", "/files/{p}"));
         // Without a matched route, the most specific match wins.
@@ -1774,6 +1866,7 @@ mod tests {
             ],
             locales: Vec::new(),
             unprefixed: Vec::new(),
+            mounted: Vec::new(),
         };
         let req = |method: &str, path: &str| {
             axum::http::Request::builder()
@@ -1802,6 +1895,7 @@ mod tests {
             routes: vec![PaidRoute::new("GET", "/downloads/{*path}", "1"), mpp],
             locales: Vec::new(),
             unprefixed: Vec::new(),
+            mounted: Vec::new(),
         };
         let amount = |method: &str, path: &str| {
             let req = axum::http::Request::builder()
@@ -1833,6 +1927,7 @@ mod tests {
                 routes,
                 locales: Vec::new(),
                 unprefixed: Vec::new(),
+                mounted: Vec::new(),
             };
             let amount = |path: &str| {
                 let req = axum::http::Request::get(path)
@@ -1852,6 +1947,7 @@ mod tests {
             ],
             locales: Vec::new(),
             unprefixed: Vec::new(),
+            mounted: Vec::new(),
         };
         let req = axum::http::Request::get("/downloads/a.pdf")
             .body(axum::body::Body::empty())
@@ -1870,6 +1966,7 @@ mod tests {
             ],
             locales: Vec::new(),
             unprefixed: Vec::new(),
+            mounted: Vec::new(),
         };
         let amount = |method: &str| {
             let req = axum::http::Request::builder()
@@ -1885,6 +1982,7 @@ mod tests {
             routes: vec![PaidRoute::new("GET", "/report", "1")],
             locales: Vec::new(),
             unprefixed: Vec::new(),
+            mounted: Vec::new(),
         };
         let head = axum::http::Request::head("/report")
             .body(axum::body::Body::empty())
