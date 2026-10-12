@@ -718,6 +718,33 @@ middleware, because one compiled plugin serves every tenant.
 
 ---
 
+## Mount and unmount at runtime
+
+Give the app a `PluginMounts` and keep a clone:
+
+```rust,ignore
+let mounts = PluginMounts::new();
+let app = autumn_web::app().plugin_mounts(mounts.clone());
+// Later, with the app running:
+mounts.mount(&SandboxedPlugin::from_file(path)?)?;
+mounts.unmount("/hello");
+```
+
+Rules:
+
+- The router is not swapped. Mounted plugins answer from the 404 fallback.
+  A request that matches a static route never reads the table.
+- A static route wins over a mounted prefix. Use a prefix that no static route
+  uses.
+- One plugin holds a prefix. A prefix inside, or around, a held prefix is
+  refused with `MountError::PrefixTaken`.
+- **Unmount drains.** New requests get 404 at once. A running request
+  finishes and keeps its concurrency permit until it ends.
+- Each mount logs the capability grant and a new `generation`.
+  `PluginMounts::list` shows what is mounted now. `PluginMounts::routes`
+  shows its routes. `autumn routes` and `autumn plugin-check` read the
+  build, so they do not show runtime mounts.
+
 ## Limits of this slice
 
 - Sessions, mail and file storage are not "not granted" — they do not exist as
@@ -742,7 +769,8 @@ middleware, because one compiled plugin serves every tenant.
   `RecordingHttp` answers from a fixed table and is a test double. Wiring a real
   upstream means implementing `OutboundHttp` against the framework client and
   honouring the contract on the trait.
-- Upgrading a sandboxed plugin needs an app restart.
+- A plugin loaded at boot cannot be unmounted. To upgrade or remove a plugin
+  without a restart, mount it at runtime (see below).
 - There is no registry; you get artifacts the same way you get any other file.
 - An interpreter is slower than native code. For a hello-world route the
   overhead is sub-millisecond, but a sandboxed plugin is not where compute-heavy

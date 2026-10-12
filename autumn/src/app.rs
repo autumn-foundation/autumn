@@ -1757,6 +1757,16 @@ impl AppBuilder {
         self
     }
 
+    /// Serve plugins that `mounts` mounts while the app runs (issue #2433).
+    ///
+    /// Keep a clone of `mounts`. Call `mount` and `unmount` on it at any time,
+    /// with no restart. See [`PluginMounts`](crate::plugin_sandbox::PluginMounts).
+    #[cfg(feature = "plugin-sandbox")]
+    #[must_use]
+    pub fn plugin_mounts(self, mounts: crate::plugin_sandbox::PluginMounts) -> Self {
+        self.state_initializer(move |state| state.insert_extension(mounts))
+    }
+
     /// Designate a block of typed in-memory state to survive an in-place
     /// upgrade (issue #1674).
     ///

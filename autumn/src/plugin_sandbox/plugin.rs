@@ -331,6 +331,44 @@ impl SandboxedPlugin {
             .expect("a free permit")
     }
 
+    /// The artifact digest, if the plugin came from an artifact.
+    pub(super) fn artifact_sha256(&self) -> Option<&str> {
+        self.artifact_sha256.as_deref()
+    }
+
+    /// Log the capability grant. `generation` is 0 for a boot-time mount.
+    pub(super) fn log_grant(&self, message: &str, generation: u64) {
+        let manifest = self.manifest();
+        // The grant reaches the operator's log before the plugin serves its
+        // first request, so "what did we agree to run" is answerable from a
+        // production log alone, without the artifact in hand.
+        tracing::info!(
+            plugin = manifest.name,
+            version = manifest.version,
+            prefix = manifest.prefix,
+            module_sha256 = manifest.sha256,
+            // The number to compare against the one `plugin inspect` printed:
+            // it covers the manifest too, so a grant rewritten after review
+            // does not match a log line from before it.
+            artifact_sha256 = self
+                .artifact_sha256
+                .as_deref()
+                .unwrap_or("(built from a host, not an artifact)"),
+            capabilities = manifest
+                .capabilities
+                .iter()
+                .map(|capability| capability.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            generation,
+            routes = manifest.routes.len(),
+            fuel = manifest.limits.fuel,
+            memory_bytes = manifest.limits.memory_bytes,
+            max_concurrency = manifest.limits.max_concurrency,
+            "{message}"
+        );
+    }
+
     /// The manifest this plugin is mounted under.
     #[must_use]
     pub fn manifest(&self) -> &SandboxManifest {
@@ -519,32 +557,9 @@ impl Plugin for SandboxedPlugin {
 
     fn build(self, app: AppBuilder) -> AppBuilder {
         let manifest = self.manifest().clone();
-        // The grant reaches the operator's log before the plugin serves its
-        // first request, so "what did we agree to run" is answerable from a
-        // production log alone, without the artifact in hand.
-        tracing::info!(
-            plugin = manifest.name,
-            version = manifest.version,
-            prefix = manifest.prefix,
-            module_sha256 = manifest.sha256,
-            // The number to compare against the one `plugin inspect` printed:
-            // it covers the manifest too, so a grant rewritten after review
-            // does not match a log line from before it.
-            artifact_sha256 = self
-                .artifact_sha256
-                .as_deref()
-                .unwrap_or("(built from a host, not an artifact)"),
-            capabilities = manifest
-                .capabilities
-                .iter()
-                .map(|capability| capability.as_str())
-                .collect::<Vec<_>>()
-                .join(","),
-            routes = manifest.routes.len(),
-            fuel = manifest.limits.fuel,
-            memory_bytes = manifest.limits.memory_bytes,
-            max_concurrency = manifest.limits.max_concurrency,
-            "mounting a sandboxed plugin under its declared capability grant"
+        self.log_grant(
+            "mounting a sandboxed plugin under its declared capability grant",
+            0,
         );
         app.nest(&manifest.prefix, self.router())
             .declare_plugin_routes(manifest.route_infos())

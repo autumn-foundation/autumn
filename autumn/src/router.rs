@@ -5279,7 +5279,16 @@ fn apply_middleware(
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
     // 404 fallback handler for unmatched routes must be registered BEFORE global middleware
     // so that unmatched routes are still protected by rate limiting, CSRF, CORS, etc.
-    router = router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
+    // With `plugin-sandbox`, the fallback also serves plugins mounted at runtime
+    // (issue #2433). Static routes match first, so they never reach it.
+    #[cfg(feature = "plugin-sandbox")]
+    {
+        router = router.fallback(crate::plugin_sandbox::mounts_fallback);
+    }
+    #[cfg(not(feature = "plugin-sandbox"))]
+    {
+        router = router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
+    }
 
     // Resolve signing keys once; shared across session and CSRF layers.
     let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));

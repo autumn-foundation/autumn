@@ -30,11 +30,13 @@
     )
 )]
 
+use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use axum::extract::{Request, State};
 use axum::response::Response;
+use tower::ServiceExt as _;
 
 use super::plugin::SandboxedPlugin;
 use crate::route_listing::RouteInfo;
@@ -85,10 +87,49 @@ impl fmt::Display for MountError {
 
 impl std::error::Error for MountError {}
 
+struct Entry {
+    plugin: SandboxedPlugin,
+    router: axum::Router,
+    generation: u64,
+}
+
+impl Entry {
+    fn info(&self) -> MountedPluginInfo {
+        let manifest = self.plugin.manifest();
+        MountedPluginInfo {
+            name: manifest.name.clone(),
+            version: manifest.version.clone(),
+            prefix: manifest.prefix.clone(),
+            artifact_sha256: self.plugin.artifact_sha256().map(str::to_owned),
+            capabilities: manifest
+                .capabilities
+                .iter()
+                .map(|capability| capability.as_str().to_owned())
+                .collect(),
+            generation: self.generation,
+            in_flight: self.plugin.in_flight(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct Table {
+    next_generation: u64,
+    by_prefix: BTreeMap<String, Entry>,
+}
+
 /// The table of plugins mounted on a running app. Clones share one table.
+///
+/// Install it with [`AppBuilder::plugin_mounts`](crate::app::AppBuilder::plugin_mounts).
 #[derive(Clone, Default)]
 pub struct PluginMounts {
-    _table: Arc<()>,
+    table: Arc<RwLock<Table>>,
+}
+
+/// `true` if `path` is `prefix` or lies under it, on a segment boundary.
+fn is_under(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 impl PluginMounts {
@@ -98,36 +139,94 @@ impl PluginMounts {
         Self::default()
     }
 
+    fn read(&self) -> RwLockReadGuard<'_, Table> {
+        self.table.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, Table> {
+        self.table.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Mount a plugin at its manifest prefix. Returns its generation.
+    ///
+    /// Logs the capability grant, as a boot-time mount does.
     ///
     /// # Errors
     ///
     /// [`MountError::PrefixTaken`] if the prefix overlaps a held one.
-    pub fn mount(&self, _plugin: &SandboxedPlugin) -> Result<u64, MountError> {
-        todo!()
+    pub fn mount(&self, plugin: &SandboxedPlugin) -> Result<u64, MountError> {
+        let prefix = plugin.manifest().prefix.clone();
+        let mut table = self.write();
+        if let Some(held) = table
+            .by_prefix
+            .values()
+            .find(|entry| {
+                let held = &entry.plugin.manifest().prefix;
+                is_under(&prefix, held) || is_under(held, &prefix)
+            })
+            .map(|entry| entry.plugin.manifest().name.clone())
+        {
+            return Err(MountError::PrefixTaken {
+                prefix,
+                held_by: held,
+            });
+        }
+        table.next_generation = table.next_generation.saturating_add(1);
+        let generation = table.next_generation;
+        plugin.log_grant("mounting a sandboxed plugin on a running app", generation);
+        table.by_prefix.insert(
+            prefix,
+            Entry {
+                plugin: plugin.clone(),
+                router: plugin.mounted_router(),
+                generation,
+            },
+        );
+        drop(table);
+        Ok(generation)
     }
 
     /// Unmount the plugin at `prefix`. New requests get 404 at once.
     /// Running requests finish.
     #[must_use]
-    pub fn unmount(&self, _prefix: &str) -> Option<MountedPluginInfo> {
-        todo!()
+    pub fn unmount(&self, prefix: &str) -> Option<MountedPluginInfo> {
+        let entry = self.write().by_prefix.remove(prefix)?;
+        let info = entry.info();
+        tracing::info!(
+            plugin = info.name,
+            prefix = info.prefix,
+            generation = info.generation,
+            in_flight = info.in_flight,
+            "unmounted a sandboxed plugin; running requests will finish"
+        );
+        Some(info)
     }
 
     /// What is mounted now, ordered by prefix.
     #[must_use]
     pub fn list(&self) -> Vec<MountedPluginInfo> {
-        todo!()
+        self.read().by_prefix.values().map(Entry::info).collect()
     }
 
     /// The routes of every mounted plugin.
     #[must_use]
     pub fn routes(&self) -> Vec<RouteInfo> {
-        todo!()
+        self.read()
+            .by_prefix
+            .values()
+            .flat_map(|entry| entry.plugin.manifest().route_infos())
+            .collect()
     }
 
-    fn router_for(&self, _path: &str) -> Option<axum::Router> {
-        todo!()
+    /// The router for the plugin that owns `path`. The clone keeps a running
+    /// request alive after an unmount.
+    fn router_for(&self, path: &str) -> Option<axum::Router> {
+        let table = self.read();
+        table
+            .by_prefix
+            .iter()
+            .find(|(prefix, _)| is_under(path, prefix))
+            .map(|(_, entry)| entry.router.clone())
     }
 }
 
@@ -138,8 +237,18 @@ impl fmt::Debug for PluginMounts {
 }
 
 /// The app's 404 fallback. Serves a mounted plugin, else the usual 404.
-pub async fn mounts_fallback(State(_state): State<AppState>, _request: Request) -> Response {
-    todo!()
+pub async fn mounts_fallback(State(state): State<AppState>, request: Request) -> Response {
+    let router = state
+        .extension::<PluginMounts>()
+        .and_then(|mounts| mounts.router_for(request.uri().path()));
+    if let Some(router) = router {
+        return match router.oneshot(request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        };
+    }
+    let (method, uri) = (request.method().clone(), request.uri().clone());
+    crate::middleware::error_page_filter::fallback_404_handler(method, uri).await
 }
 
 #[cfg(test)]
@@ -150,7 +259,6 @@ mod tests {
     use crate::plugin_sandbox::test_guests as guests;
     use axum::body::Body;
     use http::{Request as HttpRequest, StatusCode};
-    use tower::ServiceExt as _;
 
     fn plugin(prefix: &str, wat: &str, limits: ResourceLimits) -> SandboxedPlugin {
         let toml = format!(
@@ -239,7 +347,10 @@ mod tests {
         let mounts = PluginMounts::new();
         let app = app(&mounts);
         mounts.mount(&hello("/hello")).expect("mounts");
-        assert_eq!(get(&app, "/hellothere/greet").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            get(&app, "/hellothere/greet").await.0,
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[test]
@@ -327,5 +438,39 @@ mod tests {
         assert_ne!(status, StatusCode::NOT_FOUND, "drained, not cancelled");
         assert_eq!(spin.in_flight(), 0);
         assert_eq!(get(&app, "/healthz").await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn the_real_router_serves_a_plugin_mounted_after_it_was_built() {
+        let mounts = PluginMounts::new();
+        let state = AppState::for_test();
+        state.insert_extension(mounts.clone());
+        let router = crate::router::try_build_router_inner(
+            Vec::new(),
+            &crate::config::AutumnConfig::default(),
+            state,
+            crate::router::RouterContext {
+                exception_filters: Vec::new(),
+                scoped_groups: Vec::new(),
+                merge_routers: Vec::new(),
+                nest_routers: Vec::new(),
+                declared_routes: Vec::new(),
+                custom_layers: Vec::new(),
+                static_gate_layers: Vec::new(),
+                #[cfg(feature = "maud")]
+                error_page_renderer: None,
+                session_store: None,
+                #[cfg(feature = "openapi")]
+                openapi: None,
+                #[cfg(feature = "mcp")]
+                mcp: None,
+            },
+        )
+        .expect("router builds");
+        assert_eq!(get(&router, "/hello/greet").await.0, StatusCode::NOT_FOUND);
+        mounts.mount(&hello("/hello")).expect("mounts");
+        assert_eq!(get(&router, "/hello/greet").await.0, StatusCode::OK);
+        let _ = mounts.unmount("/hello");
+        assert_eq!(get(&router, "/hello/greet").await.0, StatusCode::NOT_FOUND);
     }
 }
