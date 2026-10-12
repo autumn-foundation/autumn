@@ -239,6 +239,9 @@ impl<T> LiveStateHandle<T> {
 
     /// Mutate the state under an exclusive lock.
     ///
+    /// During an in-place upgrade, a successor also journals the whole state to
+    /// disk under this lock, so a large block makes each write slower.
+    ///
     /// # Errors
     ///
     /// [`LiveStateFrozen`] once the state has been snapshotted for an in-place
@@ -304,6 +307,7 @@ impl<T> LiveStateHandle<T> {
         self.unfreeze();
     }
 
+    #[cfg_attr(not(unix), allow(dead_code, reason = "the journal is Unix-only"))]
     /// Replace the value, frozen or not. A predecessor takes back what its
     /// successor wrote.
     fn replace(&self, value: T) {
@@ -409,6 +413,7 @@ type Restore = Box<dyn Fn(&StateEnvelope) -> Result<(), AdoptError> + Send + Syn
 /// Installed into the [`AppState`](crate::AppState) extension map by
 /// [`AppBuilder::with_live_state`](crate::app::AppBuilder::with_live_state) so
 /// the upgrade path can snapshot the block without knowing its type.
+#[cfg_attr(not(unix), allow(dead_code, reason = "the journal is Unix-only"))]
 pub(crate) struct LiveStateRegistry {
     freeze_and_snapshot: Box<dyn Fn(u64) -> Result<StateEnvelope, UpgradeError> + Send + Sync>,
     unfreeze: Box<dyn Fn() + Send + Sync>,
@@ -425,6 +430,7 @@ impl std::fmt::Debug for LiveStateRegistry {
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code, reason = "the journal is Unix-only"))]
 impl LiveStateRegistry {
     /// Register `handle` as the app's designated live-state block.
     #[must_use]
@@ -523,8 +529,8 @@ impl LiveStateRegistry {
 /// Build the closure that journals a state to `path`.
 ///
 /// Written to a sibling and renamed, so a reader never sees half a file. It
-/// stops at the first failure. The usual cause is the predecessor removing the
-/// handoff directory: the window it covered has closed.
+/// stops at the first failure. The usual cause is that the predecessor removed
+/// the handoff directory. The handoff is then over, so the journal stops.
 fn journal_writer<T: LiveState>(path: std::path::PathBuf) -> impl Fn(&T) + Send + Sync {
     let live = AtomicBool::new(true);
     move |value| {
@@ -540,7 +546,12 @@ fn journal_writer<T: LiveState>(path: std::path::PathBuf) -> impl Fn(&T) + Send 
             payload: match serde_json::to_value(value) {
                 Ok(payload) => payload,
                 Err(error) => {
-                    tracing::warn!(%error, "live-state journal: state does not serialize");
+                    live.store(false, Ordering::Release);
+                    tracing::warn!(
+                        %error,
+                        "live-state journal stopped: the state does not serialize. A later \
+                         successor crash can lose writes made after this point"
+                    );
                     return;
                 }
             },
@@ -551,7 +562,14 @@ fn journal_writer<T: LiveState>(path: std::path::PathBuf) -> impl Fn(&T) + Send 
         if let Err(error) = written {
             live.store(false, Ordering::Release);
             let _ = std::fs::remove_file(&tmp);
-            tracing::debug!(%error, "live-state journal stopped");
+            // A missing directory is the normal end: the predecessor finished.
+            if path.parent().is_some_and(std::path::Path::exists) {
+                tracing::warn!(
+                    %error,
+                    "live-state journal stopped. A later successor crash can lose writes made \
+                     after this point"
+                );
+            }
         }
     }
 }
@@ -560,7 +578,7 @@ fn journal_writer<T: LiveState>(path: std::path::PathBuf) -> impl Fn(&T) + Send 
 #[cfg(unix)]
 pub(crate) fn journal_path() -> Option<std::path::PathBuf> {
     let ready = std::env::var_os(READY_FILE_ENV).filter(|value| !value.is_empty())?;
-    Some(std::path::Path::new(&ready).parent()?.join(RETURN_FILE))
+    Some(std::path::Path::new(&ready).parent()?.join(JOURNAL_FILE))
 }
 
 /// This process's upgrade generation: `0` on a cold start, incremented by each
@@ -1206,7 +1224,7 @@ impl Handoff {
             // acknowledged writes first: take those back, then resume.
             if let Some(registry) = &self.registry {
                 if ready_path.exists() {
-                    registry.restore_journal(&self.dir.join(RETURN_FILE));
+                    registry.restore_journal(&self.dir.join(JOURNAL_FILE));
                 }
                 registry.unfreeze();
             }
@@ -1222,7 +1240,13 @@ impl Drop for Handoff {
         self.settle();
         // The handoff directory carries application state; it never outlives
         // the handoff, completed or abandoned.
-        let _ = std::fs::remove_dir_all(&self.dir);
+        // Twice: a successor that journals during the first pass can leave a
+        // file behind.
+        for _ in 0..2 {
+            if std::fs::remove_dir_all(&self.dir).is_ok() {
+                break;
+            }
+        }
     }
 }
 
@@ -1326,7 +1350,7 @@ async fn spawn_and_await_successor(
 
 /// Name of the successor's write journal in the handoff directory.
 #[cfg(unix)]
-const RETURN_FILE: &str = "return";
+const JOURNAL_FILE: &str = "journal";
 
 /// Name of the lock file in the handoff directory.
 #[cfg(unix)]
@@ -2337,14 +2361,15 @@ mod tests {
         assert!(matches!(err, AdoptError::Read { .. }), "{err}");
     }
 
-    /// Journal a successor's writes beside a stand-in `ready` file.
+    /// A handle that journals its writes into `dir`.
     #[cfg(unix)]
     fn journaled_handle(dir: &std::path::Path) -> LiveStateHandle<StatsV1> {
         let handle = LiveStateHandle::new(StatsV1::default());
-        LiveStateRegistry::new(&handle).start_journal(dir.join(RETURN_FILE));
+        LiveStateRegistry::new(&handle).start_journal(dir.join(JOURNAL_FILE));
         handle
     }
 
+    #[cfg(unix)]
     fn stats(hits: u64) -> StatsV1 {
         StatsV1 {
             hits,
@@ -2360,7 +2385,7 @@ mod tests {
 
         handle.write(|s| s.hits = 7).expect("writes");
 
-        let envelope = read_snapshot(&dir.join(RETURN_FILE)).expect("the journal exists");
+        let envelope = read_snapshot(&dir.join(JOURNAL_FILE)).expect("the journal exists");
         assert_eq!(decode::<StatsV1>(&envelope).expect("decodes"), stats(7));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2374,7 +2399,7 @@ mod tests {
 
         handle.write(|s| s.hits = 7).expect_err("frozen");
 
-        assert!(!dir.join(RETURN_FILE).exists());
+        assert!(!dir.join(JOURNAL_FILE).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2390,7 +2415,7 @@ mod tests {
         handle.write(|s| s.hits = 2).expect("still writable");
 
         assert!(
-            !dir.join(RETURN_FILE).exists(),
+            !dir.join(JOURNAL_FILE).exists(),
             "a window that ended stays ended"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2401,9 +2426,11 @@ mod tests {
     fn a_successor_that_dies_after_an_acknowledged_write_hands_it_back() {
         let dir = scratch_dir(line!());
         std::fs::write(dir.join("ready"), "1").expect("published");
-        let theirs = LiveStateHandle::new(stats(7));
-        LiveStateRegistry::new(&theirs).start_journal(dir.join(RETURN_FILE));
-        theirs.write(|s| s.hits += 1).expect("acknowledged");
+        let successor_handle = LiveStateHandle::new(stats(7));
+        LiveStateRegistry::new(&successor_handle).start_journal(dir.join(JOURNAL_FILE));
+        successor_handle
+            .write(|s| s.hits += 1)
+            .expect("acknowledged");
 
         let handle = LiveStateHandle::new(stats(0));
         let registry = Arc::new(LiveStateRegistry::new(&handle));
@@ -2430,7 +2457,7 @@ mod tests {
         std::fs::write(dir.join("ready"), "1").expect("published");
         let mut envelope = envelope_of(&stats(9), 1);
         envelope.version = 99;
-        write_snapshot(&dir.join(RETURN_FILE), &envelope).expect("writes");
+        write_snapshot(&dir.join(JOURNAL_FILE), &envelope).expect("writes");
 
         let handle = LiveStateHandle::new(stats(3));
         let registry = Arc::new(LiveStateRegistry::new(&handle));
@@ -2448,9 +2475,59 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn a_failed_journal_write_leaves_no_temporary_file_and_stops_the_journal() {
+        let dir = scratch_dir(line!());
+        let handle = journaled_handle(&dir);
+        // A non-empty directory in the way makes the rename fail.
+        let blocker = dir.join(JOURNAL_FILE);
+        std::fs::create_dir_all(blocker.join("x")).expect("blocker");
+
+        handle.write(|s| s.hits = 1).expect("the write still works");
+
+        assert!(!dir.join("journal.tmp").exists(), "no temporary file stays");
+        std::fs::remove_dir_all(&blocker).expect("clear");
+        handle.write(|s| s.hits = 2).expect("still writable");
+        assert!(!blocker.exists(), "a stopped journal stays stopped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_successor_without_a_journal_leaves_the_snapshot_in_place() {
+        let dir = scratch_dir(line!());
+        std::fs::write(dir.join("ready"), "1").expect("published");
+
+        let handle = LiveStateHandle::new(stats(3));
+        let registry = Arc::new(LiveStateRegistry::new(&handle));
+        registry.freeze_and_snapshot(1).expect("snapshots");
+        let mut handoff = handoff_for_test(dir.clone(), registry);
+        let child = handoff.child.as_mut().expect("child");
+        child.kill().expect("dies");
+        child.wait().expect("reaped");
+        drop(handoff);
+
+        assert!(!handle.is_frozen());
+        assert_eq!(handle.read(|s| s.hits), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_journal_sits_beside_the_readiness_file() {
+        temp_env::with_var(READY_FILE_ENV, Some("/run/x/ready"), || {
+            assert_eq!(
+                journal_path(),
+                Some(std::path::PathBuf::from("/run/x/journal"))
+            );
+        });
+        temp_env::with_var_unset(READY_FILE_ENV, || assert_eq!(journal_path(), None));
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn a_journal_without_readiness_is_ignored() {
         let dir = scratch_dir(line!());
-        write_snapshot(&dir.join(RETURN_FILE), &envelope_of(&stats(9), 1)).expect("writes");
+        write_snapshot(&dir.join(JOURNAL_FILE), &envelope_of(&stats(9), 1)).expect("writes");
 
         let handle = LiveStateHandle::new(stats(3));
         let registry = Arc::new(LiveStateRegistry::new(&handle));
