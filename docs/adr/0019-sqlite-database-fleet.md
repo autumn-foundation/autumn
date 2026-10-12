@@ -109,6 +109,13 @@ Uppercase is refused, not folded: on a case-insensitive file system `Acme` and
   path, and nothing of ours may touch it after that. A database created there
   after a delete is the documented outcome (a fresh database, when created on
   demand).
+- An absent path has no guard. Delete unlinks nothing there. A stray `-wal`
+  of an absent database (from a crash or a manual removal of the main file)
+  survives until an explicit `restore` clears it. Create and
+  `restore_missing` publish over it without clearing, because clearing it
+  races with another process that has just published the same path. Closing
+  this needs a cross-process reservation of the path (a lock file or
+  tombstone). That is roadmap work.
 - Delete and restore cancel an open in flight: the settle probe sets
   `cancelled` on the entry under the cell's init permit, so an opener that
   still holds the entry cannot create the file. It claims a new entry and sees
