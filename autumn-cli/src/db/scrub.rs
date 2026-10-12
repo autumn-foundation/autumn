@@ -479,7 +479,7 @@ impl std::fmt::Display for ScrubError {
                 "{} column(s) are primary, foreign or partition keys but declared PII:\n{}\n  \
                  Rewriting a key column would break referential integrity or move rows \
                  between partitions. Declare these columns `safe`. For a foreign key, \
-                 scrub the referenced table's own PII columns.,
+                 scrub the referenced table's own PII columns.",
                 columns.len(),
                 bullet_list(columns),
             ),
