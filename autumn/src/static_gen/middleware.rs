@@ -1878,7 +1878,7 @@ mod tests {
     #[tokio::test]
     async fn isr_guards_extensioned_string_route_built_by_render_static_routes() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let dist = dir.path().join("dist");
+        let dist_dir = dir.path().join("dist");
         let string_router =
             || axum::Router::new().fallback(axum::routing::get(|| async { "a{}".to_owned() }));
         let meta = crate::static_gen::StaticRouteMeta {
@@ -1888,14 +1888,14 @@ mod tests {
             params_fn: None,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
         };
-        crate::static_gen::render_static_routes(string_router(), &[meta], &dist)
+        crate::static_gen::render_static_routes(string_router(), &[meta], &dist_dir)
             .await
             .expect("render");
-        let manifest = StaticManifest::load(&dist.join("manifest.json")).expect("manifest");
+        let manifest = StaticManifest::load(&dist_dir.join("manifest.json")).expect("manifest");
         let recorded = manifest.routes["/theme.css"].content_type.clone();
         assert_eq!(recorded.as_deref(), Some("text/css; charset=utf-8"));
 
-        let dest = dist.join(&manifest.routes["/theme.css"].file);
+        let dest = dist_dir.join(&manifest.routes["/theme.css"].file);
         regenerate_page(&string_router(), "/theme.css", &dest, recorded.as_deref())
             .await
             .expect("String handler still regenerates");
