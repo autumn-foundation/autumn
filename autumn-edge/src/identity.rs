@@ -1,6 +1,8 @@
 //! Normalized authenticated claims that may cross the edge wire.
 
 use axum::extract::FromRequestParts;
+use axum::extract::Request;
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use http::StatusCode;
 use http::request::Parts;
@@ -96,5 +98,63 @@ impl<S: Send + Sync> FromRequestParts<S> for EdgeIdentity {
             .get::<Self>()
             .cloned()
             .ok_or(EdgeIdentityRequired)
+    }
+}
+
+/// Require the host-resolved edge identity before invoking a native handler.
+///
+/// Route macros apply this middleware to origin mounts for handlers declaring
+/// `#[edge(needs(identity))]`. This keeps origin fallback subject to the same
+/// identity capability gate as capsule dispatch, even when the handler does
+/// not extract [`EdgeIdentity`] itself.
+pub async fn require_edge_identity(request: Request, next: Next) -> Response {
+    if request.extensions().get::<EdgeIdentity>().is_none() {
+        return EdgeIdentityRequired.into_response();
+    }
+    next.run(request).await
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{Router, routing::get};
+    use tower::ServiceExt as _;
+
+    use super::*;
+
+    fn gated_router() -> Router {
+        Router::new().route(
+            "/",
+            get(|| async { "protected" }).layer(axum::middleware::from_fn(require_edge_identity)),
+        )
+    }
+
+    #[test]
+    fn native_identity_gate_rejects_anonymous_requests() {
+        let response = futures::executor::block_on(
+            gated_router().oneshot(Request::new(axum::body::Body::empty())),
+        )
+        .expect("router is infallible");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get(FALLTHROUGH_SENTINEL)
+                .and_then(|value| value.to_str().ok()),
+            Some(FallthroughReason::MissingCapability.as_str())
+        );
+    }
+
+    #[test]
+    fn native_identity_gate_forwards_authenticated_requests() {
+        let mut request = Request::new(axum::body::Body::empty());
+        request
+            .extensions_mut()
+            .insert(EdgeIdentity::new(EdgeUserId::new("alice"), Vec::new()));
+
+        let response = futures::executor::block_on(gated_router().oneshot(request))
+            .expect("router is infallible");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
