@@ -1240,12 +1240,28 @@ impl Drop for Handoff {
         self.settle();
         // The handoff directory carries application state; it never outlives
         // the handoff, completed or abandoned.
-        // Twice: a successor that journals during the first pass can leave a
-        // file behind.
-        for _ in 0..2 {
-            if std::fs::remove_dir_all(&self.dir).is_ok() {
-                break;
-            }
+        remove_handoff_dir(&self.dir);
+    }
+}
+
+/// Remove the handoff directory, and make the successor's journal stop.
+///
+/// The directory is renamed first. The journal's paths then vanish at once, so
+/// its next write fails and it stops. A write already in flight can still land
+/// in the renamed directory, so the removal is tried a few times.
+#[cfg(unix)]
+fn remove_handoff_dir(dir: &std::path::Path) {
+    let mut gone = dir.as_os_str().to_owned();
+    gone.push(".gone");
+    let gone = std::path::PathBuf::from(gone);
+    let target = if std::fs::rename(dir, &gone).is_ok() {
+        &gone
+    } else {
+        dir
+    };
+    for _ in 0..3 {
+        if std::fs::remove_dir_all(target).is_ok() {
+            return;
         }
     }
 }
@@ -2489,6 +2505,25 @@ mod tests {
         handle.write(|s| s.hits = 2).expect("still writable");
         assert!(!blocker.exists(), "a stopped journal stays stopped");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn removing_the_handoff_directory_stops_the_journal_and_leaves_nothing() {
+        let dir = scratch_dir(line!());
+        let handle = journaled_handle(&dir);
+        handle.write(|s| s.hits = 1).expect("writes");
+
+        remove_handoff_dir(&dir);
+        handle.write(|s| s.hits = 2).expect("still writable");
+
+        let mut gone = dir.as_os_str().to_owned();
+        gone.push(".gone");
+        assert!(!dir.exists(), "the directory is gone");
+        assert!(
+            !std::path::Path::new(&gone).exists(),
+            "no copy of the state stays"
+        );
     }
 
     #[test]
