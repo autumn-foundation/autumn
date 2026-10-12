@@ -749,6 +749,9 @@ Rules:
 - Each mount logs the capability grant and a new `generation`.
 - `PluginMounts::list` shows what is mounted now. `PluginMounts::routes` shows
   the routes of those plugins.
+- The access log and metrics name a plugin route from its response. A request
+  that middleware rejects first, such as a bad CSRF token or a rate limit, is
+  logged as `_unmatched`.
 - `autumn routes` and `autumn plugin-check` read the build. They do not show
   runtime mounts.
 

@@ -140,6 +140,19 @@ pub struct PluginMounts {
 /// Prefixes the framework always owns. [`PluginMounts::reserve`] adds more.
 const BASE_RESERVED: &[&str] = &["/static", "/_autumn", "/favicon.ico", "/.well-known"];
 
+/// A reservation as a rooted path with no trailing slash. `None` for the root,
+/// which would reserve every path.
+fn normalize_reserved(prefix: &str) -> Option<String> {
+    let trimmed = prefix.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        None
+    } else if trimmed.starts_with('/') {
+        Some(trimmed.to_owned())
+    } else {
+        Some(format!("/{trimmed}"))
+    }
+}
+
 /// `true` if one prefix is the other, or lies under it.
 fn overlaps(a: &str, b: &str) -> bool {
     is_under(a, b) || is_under(b, a)
@@ -179,6 +192,9 @@ impl PluginMounts {
     {
         let mut table = self.write();
         for prefix in prefixes.into_iter().map(Into::into) {
+            let Some(prefix) = normalize_reserved(&prefix) else {
+                continue;
+            };
             let clashing: Vec<String> = table
                 .by_prefix
                 .keys()
@@ -447,7 +463,7 @@ mod tests {
             );
         }
         assert!(mounts.list().is_empty());
-        mounts.reserve(["/ops"]);
+        mounts.reserve(["/ops/", "", "/"]);
         assert!(matches!(
             mounts.mount(&hello("/ops/admin")),
             Err(MountError::Reserved { .. })
