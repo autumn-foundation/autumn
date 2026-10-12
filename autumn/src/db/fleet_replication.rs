@@ -263,8 +263,11 @@ impl FleetReplication {
     /// Tick every registered replicator once, and retire each parked one
     /// that has caught up. Blocking. The loop calls this; tests call it to
     /// step replication without sleeping.
+    ///
+    /// After the shutdown cutoff (see
+    /// [`set_shutdown_cutoff`](Self::set_shutdown_cutoff)), it starts no work.
     pub fn tick_all(&self) {
-        self.tick_pass(None);
+        self.tick_pass(self.shutdown_cutoff());
     }
 
     /// One tick pass. With a `cutoff`, no replica starts after it, and a
@@ -1248,5 +1251,29 @@ mod tests {
         replication.set_shutdown_cutoff(Some(std::time::Instant::now()));
         fleet.close(&key).await;
         assert_eq!(replication.closing(), 1, "parked, not shipped");
+    }
+
+    #[tokio::test]
+    async fn the_background_loop_stops_ticking_at_the_shutdown_cutoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        park_one(&fleet).await;
+        flaky.down.store(false, Ordering::SeqCst);
+        replication.set_shutdown_cutoff(Some(std::time::Instant::now()));
+        crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || replication.tick_all()
+        })
+        .await
+        .unwrap();
+        assert_eq!(replication.closing(), 1, "the loop ticks nothing after it");
+        replication.set_shutdown_cutoff(None);
+        crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || replication.tick_all()
+        })
+        .await
+        .unwrap();
+        assert_eq!(replication.closing(), 0);
     }
 }
