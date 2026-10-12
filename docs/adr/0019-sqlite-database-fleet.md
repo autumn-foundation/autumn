@@ -117,9 +117,11 @@ Uppercase is refused, not folded: on a case-insensitive file system `Acme` and
     `410`, and `close_all` does not hang.
   - A first open that already started its `on_open` hooks ends in the open
     map. A later `close` or `delete` runs the matching `on_close`.
-  - A `provision` that published its file but lost its caller is recorded as
-    created and not yet acknowledged. The next `provision` of the key reports
-    the creation. Exactly one call does. `delete` clears the record.
+  - A `provision` can publish its file and then lose its caller. The fleet
+    keeps a record of that creation. The next `provision` of the key reports
+    it. Exactly one call does. `delete` clears the record. The record is in
+    memory only.
+  - `close_all` waits for opens that are still running, then closes them.
 
 ### 4. Migrations: on create, on open, or refused
 

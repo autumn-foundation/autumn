@@ -511,6 +511,19 @@ enum Next {
     Open(Arc<Entry>),
 }
 
+/// Finishes a drain when dropped, so a panic cannot strand the key.
+struct DrainGuard<'a> {
+    fleet: &'a DatabaseFleet,
+    key: FleetDbKey,
+    drain: Arc<Drain>,
+}
+
+impl Drop for DrainGuard<'_> {
+    fn drop(&mut self) {
+        self.fleet.finish_drain(&self.key, &self.drain);
+    }
+}
+
 /// A key that is closing or being deleted. Openers wait on `done`.
 struct Drain {
     deleting: bool,
@@ -893,12 +906,14 @@ impl DatabaseFleet {
     ///
     /// Cancellation-safe: the publish runs in an owned task. If the caller is
     /// dropped after the file is published, the next `provision` of the key
-    /// reports the creation, so exactly one call does.
+    /// reports the creation. Exactly one call does, but it is not always the
+    /// call that made the file. The record is in memory: a restart loses it.
     ///
     /// # Errors
     ///
-    /// [`FleetError::AlreadyExists`] when the file is already there, or an
-    /// [`open`](Self::open) error.
+    /// [`FleetError::AlreadyExists`] when the file is already there, or
+    /// another call already reported the creation. [`FleetError::Unavailable`]
+    /// when the create task fails. Or an [`open`](Self::open) error.
     pub async fn provision(&self, key: &FleetDbKey) -> Result<FleetDatabase, FleetError> {
         self.check_key(key)?;
         let (fleet, task_key) = (self.clone(), key.clone());
@@ -923,6 +938,13 @@ impl DatabaseFleet {
     /// Publish the file for [`provision`](Self::provision), one task per key
     /// at a time. Records the creation until a caller claims it.
     async fn publish_owned(&self, key: &FleetDbKey) -> Result<(), FleetError> {
+        self.with_provision_turn(key, self.publish(key)).await
+    }
+
+    /// Run `work` while no other provision or delete of `key` runs its file
+    /// step. A delete then cannot clear the marker of a creation that
+    /// follows its removal.
+    async fn with_provision_turn<T>(&self, key: &FleetDbKey, work: impl Future<Output = T>) -> T {
         let lock = Arc::clone(
             self.lock_state()
                 .provisioning
@@ -931,7 +953,7 @@ impl DatabaseFleet {
         );
         let result = {
             let _turn = lock.lock().await;
-            self.publish(key).await
+            work.await
         };
         drop(lock);
         let mut state = self.lock_state();
@@ -1347,8 +1369,12 @@ impl DatabaseFleet {
     fn spawn_drain(&self, key: FleetDbKey, db: Option<FleetDatabase>, drain: Arc<Drain>) {
         let fleet = self.clone();
         tokio::spawn(async move {
+            let _finish = DrainGuard {
+                fleet: &fleet,
+                key: key.clone(),
+                drain,
+            };
             fleet.drain(&key, db).await;
-            fleet.finish_drain(&key, &drain);
         });
     }
 
@@ -1409,8 +1435,12 @@ impl DatabaseFleet {
     async fn close_owned(&self, key: &FleetDbKey) {
         let begun = self.begin_drains(|_| vec![key.clone()]).pop();
         if let Some((key, db, drain)) = begun {
+            let _finish = DrainGuard {
+                fleet: self,
+                key: key.clone(),
+                drain,
+            };
             self.drain(&key, db).await;
-            self.finish_drain(&key, &drain);
         } else {
             let pending = self.lock_state().draining.get(key).cloned();
             if let Some(drain) = pending {
@@ -1423,6 +1453,8 @@ impl DatabaseFleet {
     pub async fn close_all(&self) {
         let keys: Vec<FleetDbKey> = self.lock_state().open.keys().cloned().collect();
         for key in keys {
+            // A cold open is never interrupted: let it end, then close it.
+            self.settle_opening(&key).await;
             self.close(&key).await;
         }
         loop {
@@ -1518,6 +1550,11 @@ impl DatabaseFleet {
             }
             return Box::pin(self.delete_owned(key)).await;
         };
+        let _finish = DrainGuard {
+            fleet: self,
+            key: key.clone(),
+            drain,
+        };
         self.drain(&key, db).await;
         // Hooks let go of the files first (a parked replicator holds one open).
         for hook in self.hooks() {
@@ -1526,26 +1563,31 @@ impl DatabaseFleet {
         let path = self.path_of(&key);
         let root = self.inner.root.clone();
         let name = key.name();
-        let removed = crate::time::spawn_blocking(move || {
-            // Another process sharing the root may still serve the file;
-            // unlinking it under that process would split the tenant's data
-            // between the old inode and a new file. The guard refuses then.
-            // On Unix it also blocks new openers while the files go. On
-            // Windows it closes first.
-            check_contained(&root, &path)?;
-            with_exclusive_access(&path, &name, HOLD_GUARD_WHILE_REMOVING, || {
-                remove_database_files(&path, &root, &name)
+        let removed = self
+            .with_provision_turn(&key, async {
+                let removed = crate::time::spawn_blocking(move || {
+                    // Another process sharing the root may still serve the file;
+                    // unlinking it under that process would split the tenant's data
+                    // between the old inode and a new file. The guard refuses then.
+                    // On Unix it also blocks new openers while the files go. On
+                    // Windows it closes first.
+                    check_contained(&root, &path)?;
+                    with_exclusive_access(&path, &name, HOLD_GUARD_WHILE_REMOVING, || {
+                        remove_database_files(&path, &root, &name)
+                    })
+                })
+                .await
+                .map_err(|e| FleetError::Io {
+                    op: "delete database",
+                    detail: e.to_string(),
+                })
+                .and_then(|r| r);
+                if removed.is_ok() {
+                    self.lock_state().unacknowledged.remove(&key);
+                }
+                removed
             })
-        })
-        .await
-        .map_err(|e| FleetError::Io {
-            op: "delete database",
-            detail: e.to_string(),
-        })
-        .and_then(|r| r);
-        if removed.is_ok() {
-            self.lock_state().unacknowledged.remove(&key);
-        }
+            .await;
         if matches!(removed, Ok(true)) {
             self.inner.counters.deleted.fetch_add(1, Ordering::Relaxed);
             // Only now: a refused delete (another process has the file open)
@@ -1554,7 +1596,6 @@ impl DatabaseFleet {
                 hook.on_delete(&key);
             }
         }
-        self.finish_drain(&key, &drain);
         removed
     }
 
@@ -1688,6 +1729,11 @@ impl DatabaseFleet {
         loop {
             self.settle_opening(key).await;
             if let Some((key, db, drain)) = self.begin_exclusive(key, false)? {
+                let _finish = DrainGuard {
+                    fleet: self,
+                    key: key.clone(),
+                    drain,
+                };
                 self.drain(&key, db).await;
                 for hook in self.hooks() {
                     hook.release(&key);
@@ -1695,9 +1741,8 @@ impl DatabaseFleet {
                 let path = self.path_of(&key);
                 let root = self.inner.root.clone();
                 let restore_key = key.clone();
-                // Everything after the claim runs to `finish_drain`, whatever
-                // fails: an error that skipped it would strand every later
-                // opener of this key on a drain that never finishes.
+                // The guard finishes the drain whatever fails: an error that
+                // skipped it would strand every later opener of this key.
                 let restored = crate::time::spawn_blocking(move || {
                     check_contained(&root, &path)?;
                     restore_in_place(&replication, &restore_key, target, &path)
@@ -1708,7 +1753,6 @@ impl DatabaseFleet {
                     detail: error.to_string(),
                 })
                 .and_then(|r| r);
-                self.finish_drain(&key, &drain);
                 return restored;
             }
             let pending = self.lock_state().draining.get(key).cloned();
@@ -3482,11 +3526,23 @@ mod tests {
     /// Hook whose `on_open` blocks for a while, like a slow replicator start.
     struct SlowOpen {
         delay: Duration,
+        started: AtomicUsize,
         inner: Recorder,
+    }
+
+    impl SlowOpen {
+        fn new(delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                delay,
+                started: AtomicUsize::new(0),
+                inner: Recorder::default(),
+            })
+        }
     }
 
     impl FleetLifecycle for SlowOpen {
         fn on_open(&self, db: &FleetDatabase) -> Result<(), String> {
+            self.started.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(self.delay);
             self.inner.on_open(db)
         }
@@ -3503,6 +3559,30 @@ mod tests {
         );
     }
 
+    /// Cancel `call` once the slow `on_open` hook is running.
+    async fn cancelled_in_hook<T>(hook: &SlowOpen, call: impl Future<Output = T>) {
+        let started = async {
+            while hook.started.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        };
+        tokio::select! {
+            _ = call => panic!("the call finished before the hook started"),
+            () = started => {}
+        }
+    }
+
+    /// Wait until `key` has a file, as a publish that outlived its caller does.
+    async fn published(fleet: &DatabaseFleet, key: &FleetDbKey) {
+        for _ in 0..1000 {
+            if fleet.exists(key) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the file was never published");
+    }
+
     #[tokio::test]
     async fn a_cancelled_delete_still_finishes_and_frees_the_key() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3515,6 +3595,7 @@ mod tests {
         drop(db);
         settle(&fleet).await;
         assert!(!fleet.exists(&key), "the delete ran to the end");
+        assert_eq!(fleet.stats().deleted_total, 1);
         // A slot fleet creates on demand: the key opens again, empty.
         let fresh = tokio::time::timeout(Duration::from_secs(5), fleet.open(&key))
             .await
@@ -3554,13 +3635,10 @@ mod tests {
     async fn a_cancelled_first_open_leaves_nothing_untracked() {
         let tmp = tempfile::tempdir().unwrap();
         let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
-        let hook = Arc::new(SlowOpen {
-            delay: Duration::from_millis(400),
-            inner: Recorder::default(),
-        });
+        let hook = SlowOpen::new(Duration::from_millis(400));
         fleet.add_lifecycle(hook.clone());
         let key = FleetDbKey::Slot(23);
-        cancelled(Duration::from_millis(100), fleet.open(&key)).await;
+        cancelled_in_hook(&hook, fleet.open(&key)).await;
         // The delete waits for the open that is still running, then drains it.
         assert!(fleet.delete(&key).await.unwrap());
         settle(&fleet).await;
@@ -3568,21 +3646,37 @@ mod tests {
             hook.inner.opened.load(Ordering::SeqCst),
             hook.inner.closed.load(Ordering::SeqCst),
         );
+        assert_eq!(opened, 1, "the abandoned open ran its hook");
         assert_eq!(opened, closed, "every on_open has its on_close");
         assert!(!fleet.exists(&key));
+    }
+
+    #[tokio::test]
+    async fn close_all_waits_for_an_open_that_is_still_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let hook = SlowOpen::new(Duration::from_millis(300));
+        fleet.add_lifecycle(hook.clone());
+        let key = FleetDbKey::Slot(25);
+        cancelled_in_hook(&hook, fleet.open(&key)).await;
+        fleet.close_all().await;
+        assert_eq!(hook.inner.opened.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            hook.inner.closed.load(Ordering::SeqCst),
+            1,
+            "the late open was closed, not left running"
+        );
+        assert!(fleet.open_keys().is_empty());
     }
 
     #[tokio::test]
     async fn a_cancelled_first_open_is_kept_for_the_next_opener() {
         let tmp = tempfile::tempdir().unwrap();
         let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
-        let hook = Arc::new(SlowOpen {
-            delay: Duration::from_millis(300),
-            inner: Recorder::default(),
-        });
+        let hook = SlowOpen::new(Duration::from_millis(300));
         fleet.add_lifecycle(hook.clone());
         let key = FleetDbKey::Slot(24);
-        cancelled(Duration::from_millis(60), fleet.open(&key)).await;
+        cancelled_in_hook(&hook, fleet.open(&key)).await;
         fleet.open(&key).await.unwrap();
         assert_eq!(
             hook.inner.opened.load(Ordering::SeqCst),
@@ -3601,12 +3695,7 @@ mod tests {
         // A zero timeout drops the call at its first wait, mid-publish.
         cancelled(Duration::ZERO, fleet.provision(&key)).await;
         // Let the abandoned publish finish.
-        for _ in 0..500 {
-            if fleet.exists(&key) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        published(&fleet, &key).await;
         let retry = fleet.provision(&key).await;
         assert!(retry.is_ok(), "the retry sees the creation: {retry:?}");
         let again = fleet.provision(&key).await;
@@ -3627,6 +3716,45 @@ mod tests {
             fleet.provision(&key).await,
             Err(FleetError::AlreadyExists { .. })
         ));
+        assert_eq!(fleet.stats().created_total, 1);
+    }
+
+    #[tokio::test]
+    async fn a_provision_cancelled_while_opening_is_reported_by_the_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Tenant, |_| {});
+        let hook = SlowOpen::new(Duration::from_millis(200));
+        fleet.add_lifecycle(hook.clone());
+        let key = fleet.key_for("acme").unwrap();
+        // The file is published; the caller leaves during the open.
+        cancelled_in_hook(&hook, fleet.provision(&key)).await;
+        let retry = fleet.provision(&key).await;
+        assert!(retry.is_ok(), "the retry reports the creation: {retry:?}");
+        assert!(matches!(
+            fleet.provision(&key).await,
+            Err(FleetError::AlreadyExists { .. })
+        ));
+        assert_eq!(hook.inner.opened.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_delete_clears_an_unclaimed_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Tenant, |_| {});
+        let key = fleet.key_for("acme").unwrap();
+        cancelled(Duration::ZERO, fleet.provision(&key)).await;
+        published(&fleet, &key).await;
+        assert!(fleet.delete(&key).await.unwrap());
+        // Another process creates the file. This fleet did not.
+        let other = self::fleet(tmp.path(), FleetMode::Tenant, |_| {});
+        other.provision(&key).await.unwrap();
+        assert!(
+            matches!(
+                fleet.provision(&key).await,
+                Err(FleetError::AlreadyExists { .. })
+            ),
+            "a stale marker must not claim another process's creation"
+        );
     }
 
     #[test]

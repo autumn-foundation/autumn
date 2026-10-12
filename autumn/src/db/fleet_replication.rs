@@ -824,11 +824,23 @@ mod tests {
         );
     }
 
+    /// Counts the `release` calls a restore makes once its drain is over.
+    #[derive(Default)]
+    struct Releases(std::sync::atomic::AtomicUsize);
+
+    impl super::FleetLifecycle for Releases {
+        fn release(&self, _key: &FleetDbKey) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     #[tokio::test]
     async fn a_cancelled_restore_still_releases_the_database() {
         let tmp = tempfile::tempdir().unwrap();
         let replicas = tmp.path().join("replicas");
         let (fleet, replication) = replicated_fleet(&tmp.path().join("a"), &replicas, false);
+        let releases = Arc::new(Releases::default());
+        fleet.add_lifecycle(releases.clone());
         let key = fleet.key_for("acme").unwrap();
         let db = fleet.open(&key).await.unwrap();
         exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
@@ -851,6 +863,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(fleet.stats().draining, 0, "the restore ran to the end");
+        assert_eq!(
+            releases.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the restore went on past its drain"
+        );
         let reopened = tokio::time::timeout(Duration::from_secs(5), fleet.open(&key))
             .await
             .expect("open must not hang after a cancelled restore")
