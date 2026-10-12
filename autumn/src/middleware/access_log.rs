@@ -372,4 +372,56 @@ mod tests {
         assert!(!is_excluded("/users/1", &exclude(&["/"])));
         assert!(!is_excluded("/users/1", &[]));
     }
+
+    #[tokio::test]
+    async fn a_response_route_names_the_log_line_when_the_request_had_none() {
+        use std::sync::{Arc, Mutex};
+        use tower::ServiceExt as _;
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if let Ok(mut held) = self.0.lock() {
+                    held.extend_from_slice(bytes);
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let service = AccessLogLayer::new(Vec::new()).layer(tower::service_fn(
+            |_request: Request<axum::body::Body>| async {
+                let mut response = Response::new(axum::body::Body::empty());
+                response
+                    .extensions_mut()
+                    .insert(ResponseRoute("/p/x".to_owned()));
+                Ok::<_, std::convert::Infallible>(response)
+            },
+        ));
+        let request = Request::builder()
+            .uri("/p/x")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        service.oneshot(request).await.expect("infallible");
+
+        let out = String::from_utf8(buf.0.lock().expect("lock").clone()).expect("utf8");
+        assert!(out.contains("/p/x"), "{out}");
+        assert!(!out.contains(UNMATCHED_ROUTE), "{out}");
+    }
 }
