@@ -184,22 +184,17 @@ pub fn parse_cached_args(attr: TokenStream) -> syn::Result<CachedAttrs> {
 
 // ── #1716: dependency derivation ─────────────────────────────────────
 
-/// Associated functions on a model type that read persistent rows.
+/// Associated functions that only a model has.
 ///
-/// Deliberately a closed list of *reading* verbs. A path call like
-/// `Post::find_all(db)` is evidence the cached value is derived from `Post`
-/// rows; `Post::new(..)` is not.
-const MODEL_READ_VERBS: &[&str] = &[
-    "find_all",
-    "find_by_id",
-    "count",
-    "exists_by_id",
-    "list",
-    "page",
-    "all",
-    "load",
-    "first",
-];
+/// `Post::find_all(db)` names `Post`; `Post::new(..)` does not. These verbs are
+/// unlikely on a non-model type, so they can establish a dependency.
+const MODEL_READ_VERBS: &[&str] = &["find_all", "find_by_id", "exists_by_id"];
+
+/// Verbs that are common on any type (`Config::load()`).
+///
+/// The owner cannot be checked as a model here, so the call proves nothing.
+/// It makes the read `undetermined` instead.
+const AMBIGUOUS_READ_VERBS: &[&str] = &["count", "list", "page", "all", "load", "first"];
 
 /// Recover the model name from a repository type name.
 ///
@@ -253,6 +248,10 @@ struct DerivedDependencies {
     /// wrong dependency — and a wrong dependency makes a real violation audit
     /// clean — so the read is recorded `Undetermined` instead.
     unresolved_repository: bool,
+    /// An `Owner::verb()` call with a common verb (`Config::load()`). The owner
+    /// may not be a model, so it is no dependency. It also shows the analysis
+    /// does not know every call, so the read is `undetermined`.
+    unresolved_call: bool,
 }
 
 /// Walks a function looking for evidence of which models it reads.
@@ -314,6 +313,11 @@ impl VisitMut for DependencyVisitor {
                     && model_from_repository_ident(&owner).is_none()
                 {
                     self.found.models.insert(owner);
+                } else if AMBIGUOUS_READ_VERBS.contains(&verb.as_str())
+                    && is_model_ident(&owner)
+                    && model_from_repository_ident(&owner).is_none()
+                {
+                    self.found.unresolved_call = true;
                 }
             }
         }
@@ -422,14 +426,16 @@ fn generate_coherence_items(
         exprs.extend(derived.models.iter().map(|m| quote! { || #m }));
 
         // Honest over useful: a repository reached only through its trait has
-        // no constant to resolve, so the dependency set is *unknown*, not
-        // empty and not guessable. `Undetermined` is reported and never gates,
+        // no constant to resolve, and an unrelated `Owner::verb()` call shows
+        // a dependency was missed. The set is *unknown*, not empty and not
+        // guessable. `Undetermined` is reported and never gates,
         // which is the right answer for something this analysis cannot see.
-        let provenance = if derived.unresolved_repository || exprs.is_empty() {
-            quote! { Undetermined }
-        } else {
-            quote! { Derived }
-        };
+        let provenance =
+            if derived.unresolved_repository || derived.unresolved_call || exprs.is_empty() {
+                quote! { Undetermined }
+            } else {
+                quote! { Derived }
+            };
         (exprs, provenance)
     } else {
         let exprs: Vec<TokenStream> = attrs
@@ -1324,6 +1330,72 @@ mod tests {
         };
         assert_eq!(derived_models(&f), vec!["Post".to_string()]);
         assert_eq!(derived_repositories(&f), [] as [String; 0]);
+    }
+
+    /// #2362: `Config::load()` is capitalised, not a model. It must not
+    /// become a dependency, and it must not hide the unseen real one.
+    #[test]
+    fn an_unrelated_generic_call_is_unresolved_not_a_model() {
+        for verb in ["load", "count", "all", "list", "page", "first"] {
+            let verb = format_ident!("{verb}");
+            let f: ItemFn = syn::parse_quote! {
+                async fn dashboard() -> Data {
+                    let cfg = Config::#verb();
+                    posts_via_helper(&cfg).await
+                }
+            };
+            let derived = derive_dependencies(&f);
+            assert!(derived.models.is_empty(), "{verb}");
+            assert!(derived.unresolved_call, "{verb}");
+        }
+    }
+
+    #[test]
+    fn a_model_specific_verb_still_names_the_model() {
+        for verb in ["find_all", "find_by_id", "exists_by_id"] {
+            let verb = format_ident!("{verb}");
+            let f: ItemFn = syn::parse_quote! {
+                async fn recent(db: &mut Db) -> u8 {
+                    let _ = Post::#verb(db);
+                    0
+                }
+            };
+            assert_eq!(derived_models(&f), vec!["Post".to_string()], "{verb}");
+            assert!(!derive_dependencies(&f).unresolved_call, "{verb}");
+        }
+    }
+
+    #[test]
+    fn generated_output_marks_an_unrelated_call_undetermined() {
+        let f: ItemFn = syn::parse_quote! {
+            async fn dashboard() -> Data {
+                let cfg = Config::load();
+                posts_via_helper(&cfg).await
+            }
+        };
+        let out = cached_macro(TokenStream::new(), quote! { #f }).to_string();
+        assert!(
+            out.contains("DependencyProvenance :: Undetermined"),
+            "{out}"
+        );
+        assert!(!out.contains("\"Config\""), "{out}");
+    }
+
+    /// A real model read next to an unrelated call is still partly unseen.
+    #[test]
+    fn a_model_read_beside_an_unrelated_call_is_undetermined() {
+        let f: ItemFn = syn::parse_quote! {
+            async fn dashboard(db: &mut Db) -> Data {
+                let _ = Post::find_all(db);
+                let cfg = Config::load();
+                helper(&cfg).await
+            }
+        };
+        let out = cached_macro(TokenStream::new(), quote! { #f }).to_string();
+        assert!(
+            out.contains("DependencyProvenance :: Undetermined"),
+            "{out}"
+        );
     }
 
     #[test]

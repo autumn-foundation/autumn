@@ -175,9 +175,14 @@ signature and body:
   and `#[repository(Comment)] trait ModerationRepository` correctly yields
   `Comment` rather than the `Moderation` its name suggests;
 * a reading associated call on a model type, from a **closed list** of verbs
-  (`find_all`, `find_by_id`, `count`, `exists_by_id`, `list`, `page`, `all`,
-  `load`, `first`) — `Post::find_all(db)` names `Post`, `Post::find_by_slug(…)`
-  does not.
+  (`find_all`, `find_by_id`, `exists_by_id`) — `Post::find_all(db)` names
+  `Post`, `Post::find_by_slug(…)` does not.
+
+A capitalised call with a common verb — `Config::load()`, `Metrics::count()`,
+`Registry::all()` (`count`, `list`, `page`, `all`, `load`, `first`) — proves
+nothing, because the macro cannot check that the owner is a model. The call is
+not a dependency. It makes the read `undetermined`, so it cannot hide a
+dependency the analysis did not see.
 
 A repository reached only through its **trait** — `repo: &impl PostRepository`
 — is the one case derivation cannot resolve: the constant lives on the concrete
@@ -192,10 +197,11 @@ weaker claim than `declared`:
   cannot read is missed. That is why a read it recovers nothing from is recorded
   as `undetermined` rather than as having no dependencies.
 
-It is not, however, *wrong*: every model in a derived set comes either from a
-model type named outright or from a repository's own declaration, so a derived
-dependency naming a model that does not exist — which would make a real
-violation audit clean — cannot happen.
+It is rarely *wrong*: every model in a derived set comes from a repository's
+own declaration or from a call to `find_all`, `find_by_id` or `exists_by_id` on
+a named type. The macro does not check that the type is a model. A non-model
+type with one of those three methods is still named, so declare `reads(...)`
+there.
 
 Declare `reads(...)` wherever the answer matters.
 
