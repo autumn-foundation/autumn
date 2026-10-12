@@ -1433,6 +1433,8 @@ impl DatabaseFleet {
     }
 
     async fn close_owned(&self, key: &FleetDbKey) {
+        // A cold open is never interrupted: let it end, then close it.
+        self.settle_opening(key).await;
         let begun = self.begin_drains(|_| vec![key.clone()]).pop();
         if let Some((key, db, drain)) = begun {
             let _finish = DrainGuard {
@@ -1453,8 +1455,6 @@ impl DatabaseFleet {
     pub async fn close_all(&self) {
         let keys: Vec<FleetDbKey> = self.lock_state().open.keys().cloned().collect();
         for key in keys {
-            // A cold open is never interrupted: let it end, then close it.
-            self.settle_opening(&key).await;
             self.close(&key).await;
         }
         loop {
@@ -3649,6 +3649,20 @@ mod tests {
         assert_eq!(opened, 1, "the abandoned open ran its hook");
         assert_eq!(opened, closed, "every on_open has its on_close");
         assert!(!fleet.exists(&key));
+    }
+
+    #[tokio::test]
+    async fn close_waits_for_an_open_that_is_still_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let hook = SlowOpen::new(Duration::from_millis(200));
+        fleet.add_lifecycle(hook.clone());
+        let key = FleetDbKey::Slot(26);
+        cancelled_in_hook(&hook, fleet.open(&key)).await;
+        fleet.close(&key).await;
+        settle(&fleet).await;
+        assert_eq!(hook.inner.closed.load(Ordering::SeqCst), 1);
+        assert!(fleet.open_keys().is_empty());
     }
 
     #[tokio::test]
