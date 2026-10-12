@@ -315,6 +315,22 @@ impl SandboxedPlugin {
         Self::from_artifact(&SandboxArtifact::read_file(path)?)
     }
 
+    /// Requests running now.
+    pub(super) fn in_flight(&self) -> usize {
+        self.manifest()
+            .limits
+            .max_concurrency
+            .saturating_sub(self.permits.available_permits())
+    }
+
+    /// Take one permit, as a running request does. For tests.
+    #[cfg(test)]
+    pub(super) fn hold_permit_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&self.permits)
+            .try_acquire_owned()
+            .expect("a free permit")
+    }
+
     /// The manifest this plugin is mounted under.
     #[must_use]
     pub fn manifest(&self) -> &SandboxManifest {
