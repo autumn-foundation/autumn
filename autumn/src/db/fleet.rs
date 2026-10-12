@@ -2266,7 +2266,7 @@ fn restore_in_place(
         }
     };
     let published = with_exclusive_access(path, &name, HOLD_GUARD_WHILE_REMOVING, || {
-        unlink_database_set(path, "replace database", &name, |file| {
+        unlink_database_set(path, "replace database", &name, true, |file| {
             std::fs::remove_file(file)
         })?;
         publish_restored(&staging, path, &name)
@@ -2352,7 +2352,7 @@ fn build_staged_database(
 /// refuses a non-empty directory.
 fn remove_database_files(path: &Path, root: &Path, name: &str) -> Result<bool, FleetError> {
     let existed = path.is_file();
-    unlink_database_set(path, "delete database", name, |file| {
+    unlink_database_set(path, "delete database", name, false, |file| {
         std::fs::remove_file(file)
     })?;
     let mut dir = path.parent();
@@ -2376,7 +2376,10 @@ fn remove_database_files(path: &Path, root: &Path, name: &str) -> Result<bool, F
 /// new database at the path. Any unlink after that could hit the new
 /// database's `-wal`.
 ///
-/// An absent main file stays untouched, and only its stray sidecars go.
+/// An absent main file stays untouched. With `strays`, its sidecars go. Only
+/// a restore sets that: a stale `-wal` could replay onto the restored
+/// database. A delete leaves strays, which `SQLite` ignores without a main
+/// file.
 ///
 /// On Windows, a process that has the database open also holds its `-wal`.
 /// The sharing violation then stops the unlink at the sidecar, before the
@@ -2385,11 +2388,15 @@ fn unlink_database_set(
     path: &Path,
     op: &'static str,
     name: &str,
+    strays: bool,
     mut unlink: impl FnMut(&Path) -> std::io::Result<()>,
 ) -> Result<(), FleetError> {
-    // No guard covers an absent path. A file there after the sidecar pass is
-    // another process's new database, so the main file is left alone.
+    // No guard covers an absent path. Another process can publish there at
+    // any time, and an unlink could hit its new files.
     let had_main = path.is_file();
+    if !had_main && !strays {
+        return Ok(());
+    }
     let main = had_main.then(|| path.to_path_buf());
     for file in crate::fleet_layout::sidecar_paths(path)
         .into_iter()
@@ -3512,7 +3519,7 @@ mod tests {
         let path = plain_database(tmp.path());
         let sidecars = crate::fleet_layout::sidecar_paths(&path);
         let mut seen: Vec<PathBuf> = Vec::new();
-        unlink_database_set(&path, "delete database", "acme", |file| {
+        unlink_database_set(&path, "delete database", "acme", false, |file| {
             seen.push(file.to_path_buf());
             Ok(())
         })
@@ -3532,7 +3539,7 @@ mod tests {
         std::fs::write(&wal, b"old").unwrap();
         // Another process publishes a new database the moment the main file
         // is gone, and commits to its `-wal`.
-        unlink_database_set(&path, "delete database", "acme", |file| {
+        unlink_database_set(&path, "delete database", "acme", false, |file| {
             let done = std::fs::remove_file(file);
             if file == path {
                 std::fs::write(&path, b"new").unwrap();
@@ -3621,7 +3628,7 @@ mod tests {
     fn a_sharing_violation_on_a_sidecar_stops_before_the_main_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = plain_database(tmp.path());
-        let err = unlink_database_set(&path, "delete database", "acme", |file| {
+        let err = unlink_database_set(&path, "delete database", "acme", false, |file| {
             if file == path {
                 std::fs::remove_file(file)
             } else {
@@ -3682,21 +3689,30 @@ mod tests {
     }
 
     #[test]
-    fn a_database_published_while_the_path_was_absent_is_not_unlinked() {
+    fn an_absent_path_is_not_touched_by_delete() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("plain.db");
-        // No guard held the absent path. Another process publishes during
-        // the sidecar pass.
-        unlink_database_set(&path, "delete database", "acme", |file| {
-            if file != path {
-                std::fs::write(&path, b"new").unwrap();
-            }
-            match std::fs::remove_file(file) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-                _ => Ok(()),
-            }
+        // No guard holds an absent path. Another process may publish there
+        // at any time, so delete unlinks nothing, not even stray sidecars.
+        let mut calls = 0;
+        unlink_database_set(&path, "delete database", "acme", false, |_| {
+            calls += 1;
+            Ok(())
         })
         .unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn restore_clears_the_stray_sidecars_of_an_absent_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("plain.db");
+        let mut seen = Vec::new();
+        unlink_database_set(&path, "replace database", "acme", true, |file| {
+            seen.push(file.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, crate::fleet_layout::sidecar_paths(&path).to_vec());
     }
 }
