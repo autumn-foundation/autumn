@@ -3410,6 +3410,46 @@ pub fn call_then_overrun(pad: usize) -> String {
     )
 }
 
+/// Writes `pad` bytes of JSON whitespace to stdout, then a normal 200 response
+/// frame. Two modules from this generator are identical except the one
+/// `i32.const` carrying `pad`, so any `fuel_used` gap between two runs is
+/// host-side charging, not guest work — the shape the parse-fuel gate needs.
+pub fn whitespace_padded_frame(pad: u32) -> String {
+    const PAD_BYTES: usize = 65536;
+    // Written out rather than escaped from a Rust literal: the WAT string needs
+    // `\"` for its quotes and `\0a` for the newline, and getting that wrong
+    // silently produces a frame the host cannot parse — which would make this
+    // guest prove nothing while still passing.
+    const FRAME: &str =
+        r#"{\"op\":\"response\",\"status\":200,\"headers\":[],\"body_b64\":\"\"}\0a"#;
+    // The frame's length in bytes, not in source characters: `\"` is one byte
+    // and `\0a` is one byte — the same arithmetic `call_then_overrun` uses.
+    let frame_len =
+        FRAME.len() - (FRAME.matches(r#"\""#).count() + 2 * FRAME.matches(r"\0a").count());
+    let pad_addr = 4096;
+    let frame_addr = pad_addr + PAD_BYTES;
+    let padding = " ".repeat(PAD_BYTES);
+    format!(
+        r#"(module
+  (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 2 4)
+  (data (i32.const {pad_addr}) "{padding}")
+  (data (i32.const {frame_addr}) "{FRAME}")
+
+  (func (export "_start")
+    ;; The padding: `pad` bytes of whitespace, no newline, one `fd_write`.
+    (i32.store (i32.const 0) (i32.const {pad_addr}))
+    (i32.store (i32.const 4) (i32.const {pad}))
+    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 16)))
+    ;; The frame: a normal 200, newline-terminated, completing the line.
+    (i32.store (i32.const 0) (i32.const {frame_addr}))
+    (i32.store (i32.const 4) (i32.const {frame_len}))
+    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 16))))
+)
+"#
+    )
+}
+
 // ── Capability-channel guests (issue #1632) ──────────────────────────────
 
 /// A plugin that uses the capability channel: it reads the request frame,
