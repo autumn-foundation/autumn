@@ -892,12 +892,19 @@ impl PricedRoutes {
             // the router nested is not at its own path but at
             // `/{locale}{path}`: a priced `/en/report` is mounted at
             // `/en/en/report`, and `/en/report` is the free `/report`.
+            // The exact spelling first: a merged router's routes are not in
+            // `mounted`, so `another_route` cannot tell `/report` from
+            // `/report/` there, but an entry for each still prices each.
+            let unnested = |r: &&PaidRoute| !self.nested.iter().any(|n| same_template(n, &r.path));
             return routes
                 .clone()
-                .find(|r| {
-                    same_template(&r.path, t)
-                        && !self.another_route(&r.path, t, t)
-                        && !self.nested.iter().any(|n| same_template(n, &r.path))
+                .find(|r| same_shape(&r.path, t) && unnested(r))
+                .or_else(|| {
+                    routes.clone().find(|r| {
+                        same_template(&r.path, t)
+                            && !self.another_route(&r.path, t, t)
+                            && unnested(r)
+                    })
                 })
                 .or_else(|| {
                     let bare = self.strip_locale(t);
@@ -1881,6 +1888,32 @@ mod tests {
         };
         assert!(priced.route_for(&matched("/en/report")).is_none());
         assert!(priced.route_for(&matched("/en/en/report")).is_some());
+    }
+
+    #[test]
+    fn an_exact_entry_wins_without_a_route_inventory() {
+        // Codex review: a merged router's `/report` and `/report/` are not in
+        // `mounted`; an entry for each still prices its own route.
+        let priced = PricedRoutes {
+            routes: vec![
+                PaidRoute::new("GET", "/report", "1"),
+                PaidRoute::new("GET", "/report/", "2"),
+            ],
+            locales: Vec::new(),
+            unprefixed: Vec::new(),
+            mounted: Vec::new(),
+            nested: Vec::new(),
+        };
+        let amount = |template: &str| {
+            let mut req = axum::http::Request::get(template)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(StaticRoute(template.to_owned()));
+            priced.route_for(&req).map(|r| r.amount.clone())
+        };
+        assert_eq!(amount("/report").as_deref(), Some("1"));
+        assert_eq!(amount("/report/").as_deref(), Some("2"));
     }
 
     #[test]
