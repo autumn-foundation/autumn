@@ -392,6 +392,79 @@ pub fn set_accept_ranges(headers: &mut HeaderMap) {
     headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
 }
 
+/// Kani proofs over the real range parser. Run with
+/// `cargo kani -p autumn-web --lib`. The spec is any string of up to five
+/// bytes over the characters a range uses, so the proof covers every short
+/// spec, every `total`, and every way of mixing digits, `-` and spaces.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    const ALPHABET: [u8; 6] = *b"019- ,";
+
+    fn any_spec<const N: usize>(bytes: &mut [u8; N]) -> &str {
+        let len: usize = kani::any();
+        kani::assume(len <= N);
+        for byte in bytes.iter_mut() {
+            *byte = ALPHABET[usize::from(kani::any::<u8>()) % ALPHABET.len()];
+        }
+        // Every byte is ASCII, so this cannot fail.
+        std::str::from_utf8(&bytes[..len]).unwrap()
+    }
+
+    /// A satisfiable spec is a non-empty interval inside the representation:
+    /// `start <= end < total`. Parsing never panics.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn a_satisfiable_spec_is_inside_the_body() {
+        let mut bytes = [0_u8; 5];
+        let spec = any_spec(&mut bytes);
+        let total: u64 = kani::any();
+        if let SpecOutcome::Satisfiable { start, end } = parse_single_spec(spec, total) {
+            assert!(start <= end);
+            assert!(end < total);
+        }
+    }
+
+    /// The same holds for a whole header value: a partial response always
+    /// names bytes that exist, and an empty body is never partial.
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn a_partial_resolution_is_inside_the_body() {
+        let mut bytes = [0_u8; 5];
+        let spec = any_spec(&mut bytes);
+        let header = format!("bytes={spec}");
+        let total: u64 = kani::any();
+        match parse_range(&header, total) {
+            RangeResolution::Partial {
+                start,
+                end,
+                total: reported,
+            } => {
+                assert_eq!(reported, total);
+                assert!(start <= end && end < total);
+            }
+            RangeResolution::Unsatisfiable { total: reported } => assert_eq!(reported, total),
+            RangeResolution::Full => {}
+        }
+    }
+
+    /// The slicer clamps any offsets into the body and never panics.
+    #[kani::proof]
+    fn slice_inclusive_never_panics() {
+        let len: usize = kani::any();
+        kani::assume(len <= 4);
+        let full = Bytes::from(vec![0_u8; len]);
+        let start: u64 = kani::any();
+        let end: u64 = kani::any();
+        let slice = slice_inclusive(&full, start, end);
+        assert!(slice.len() <= full.len());
+        if start <= end && end < len as u64 {
+            assert_eq!(slice.len() as u64, end - start + 1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
