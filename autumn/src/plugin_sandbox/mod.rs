@@ -81,7 +81,9 @@ pub use capability::{
     PluginActivityLog, PluginJob, PluginRow, PluginStore, PluginValue, QueryPage, RecordingHttp,
     RenderError, Scope, StoreError, bounded_rows, row_weight, tenant_segment,
 };
-pub use dynamic::{MountError, MountedPluginInfo, PluginMounts, mounts_fallback};
+pub use dynamic::{
+    MountError, MountedPluginInfo, PluginMounts, framework_prefixes, mounts_fallback,
+};
 pub use grants::{
     CapabilityGrants, CapabilityQuotas, ConsentDelta, MAX_GRANT_ENTRIES, MAX_GRANT_IDENT_LEN,
     MAX_HOST_LEN, MAX_QUOTA, is_grantable_host, is_grantable_ident, is_grantable_name,

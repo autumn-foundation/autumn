@@ -1760,37 +1760,13 @@ impl AppBuilder {
     /// Serve plugins that `mounts` mounts while the app runs (issue #2433).
     ///
     /// Keep a clone of `mounts`. Call `mount` and `unmount` on it at any time,
-    /// with no restart. The configured actuator and probe paths are reserved. See [`PluginMounts`](crate::plugin_sandbox::PluginMounts).
+    /// with no restart. The configured actuator and probe paths are reserved.
+    /// See [`PluginMounts`](crate::plugin_sandbox::PluginMounts).
     #[cfg(feature = "plugin-sandbox")]
     #[must_use]
     pub fn plugin_mounts(self, mounts: crate::plugin_sandbox::PluginMounts) -> Self {
         self.state_initializer(move |state| {
-            let config = state.config();
-            // The router mounts the normalized prefix; reserve that one. An empty
-            // prefix is the root, which would reserve every path.
-            let actuator = crate::actuator::normalize_actuator_prefix(&config.actuator.prefix);
-            let mut reserved = Vec::new();
-            if !actuator.is_empty() {
-                reserved.push(actuator);
-            }
-            // Probes are the framework's only when it mounts them.
-            if config.health.enabled {
-                reserved.extend([
-                    config.health.path,
-                    config.health.live_path,
-                    config.health.ready_path,
-                    config.health.startup_path,
-                ]);
-            }
-            // The inspector runs in the dev profile only.
-            if crate::config::profile_is_dev(config.profile.as_deref()) {
-                reserved.push(config.dev.inspector_path);
-            }
-            #[cfg(feature = "maud")]
-            if config.stories.enabled {
-                reserved.push(crate::stories::STORIES_PATH.to_owned());
-            }
-            mounts.reserve(reserved);
+            mounts.reserve(crate::plugin_sandbox::framework_prefixes(&state.config()));
             state.insert_extension(mounts);
         })
     }

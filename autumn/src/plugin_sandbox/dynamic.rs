@@ -140,6 +140,37 @@ pub struct PluginMounts {
 /// Prefixes the framework always owns. [`PluginMounts::reserve`] adds more.
 const BASE_RESERVED: &[&str] = &["/static", "/_autumn", "/favicon.ico", "/.well-known"];
 
+/// The prefixes this app configuration gives to the framework.
+///
+/// The router mounts the normalized actuator prefix, so that is the one to
+/// reserve. A root prefix is left out: it would reserve every path.
+#[must_use]
+pub fn framework_prefixes(config: &crate::config::AutumnConfig) -> Vec<String> {
+    let mut reserved = Vec::new();
+    let actuator = crate::actuator::normalize_actuator_prefix(&config.actuator.prefix);
+    if !actuator.is_empty() {
+        reserved.push(actuator);
+    }
+    // Probes are the framework's only when it mounts them.
+    if config.health.enabled {
+        reserved.extend([
+            config.health.path.clone(),
+            config.health.live_path.clone(),
+            config.health.ready_path.clone(),
+            config.health.startup_path.clone(),
+        ]);
+    }
+    // The inspector runs in the dev profile only.
+    if crate::config::profile_is_dev(config.profile.as_deref()) {
+        reserved.push(config.dev.inspector_path.clone());
+    }
+    #[cfg(feature = "maud")]
+    if config.stories.enabled {
+        reserved.push(crate::stories::STORIES_PATH.to_owned());
+    }
+    reserved
+}
+
 /// A reservation as a rooted path with no trailing slash. `None` for the root,
 /// which would reserve every path.
 fn normalize_reserved(prefix: &str) -> Option<String> {
@@ -475,6 +506,34 @@ mod tests {
             Err(MountError::Reserved { .. })
         ));
         mounts.mount(&hello("/staticx")).expect("a sibling name");
+    }
+
+    #[test]
+    fn the_configured_framework_paths_are_reserved() {
+        let mut config = crate::config::AutumnConfig {
+            profile: Some("prod".to_owned()),
+            ..crate::config::AutumnConfig::default()
+        };
+        let defaults = framework_prefixes(&config);
+        for path in ["/actuator", "/health", "/live", "/ready", "/startup"] {
+            assert!(defaults.iter().any(|p| p == path), "{path}: {defaults:?}");
+        }
+        assert!(!defaults.contains(&config.dev.inspector_path), "prod");
+
+        config.actuator.prefix = "ops/".to_owned();
+        assert!(framework_prefixes(&config).contains(&"/ops".to_owned()));
+
+        config.actuator.prefix = "/".to_owned();
+        assert!(!framework_prefixes(&config).iter().any(String::is_empty));
+
+        config.health.enabled = false;
+        assert!(framework_prefixes(&config).is_empty(), "probes are free");
+
+        config.profile = Some("dev".to_owned());
+        assert_eq!(
+            framework_prefixes(&config),
+            [config.dev.inspector_path.clone()]
+        );
     }
 
     #[test]
