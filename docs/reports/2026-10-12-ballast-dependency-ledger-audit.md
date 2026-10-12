@@ -226,9 +226,21 @@ for `automated` and `ci` both returned "not found in
 autumn-foundation/autumn"; only `dependencies` exists. `.github/dependabot.yml`
 listed `[dependencies, automated]` for the cargo block and `[ci, automated]`
 for the github-actions block. Not merge-blocking (the PRs are still created
-fine), but a real, fixable fact about this repo's own config, sitting
-unnoticed since whenever those labels were first added — a `get_label` check
-neither this nor any prior Ballast pass had run before.
+fine). Corrected per a Codex review comment: per GitHub's own [`labels`
+reference](https://docs.github.com/en/code-security/reference/supply-chain-security/dependabot-options-reference#labels),
+an undefined custom label is skipped individually, not the whole list — so
+the defect's actual blast radius was narrower than first written. Checked
+directly rather than trusting either account: #3209 (a cargo-block PR)
+carries `"labels": ["dependencies"]` right now, confirming `dependencies`
+*was* being applied to every cargo PR all along, only `automated` silently
+dropped; #3140 (a github-actions-block PR) carries no labels at all,
+confirming that block really did lose every label (`ci` and `automated`
+both undefined, nothing left to fall back to). So this is still a real,
+fixable config bug, sitting unnoticed since whenever those labels were first
+added — a `get_label` check neither this nor any prior Ballast pass had run
+before — but only the github-actions block was labelling nothing; the cargo
+block's defect was the extraneous bot comment and a label that would never
+resolve, not an unlabelled PR.
 
 First attempt at the fix was itself wrong, caught by a Codex review comment
 on this PR's own diff before merge: dropping `labels` entirely from the
@@ -284,8 +296,11 @@ after deepening past the shallow-clone boundary that obscured it).
 
 **Policy** (dependabot.yml label fix): mechanically confirmed broken config
 (`get_label` 404 on both non-existent names), silently wasting every
-Dependabot PR's labelling since whenever this was written — a real,
-cheaply-fixed fact, not motion for its own sake.
+github-actions-block Dependabot PR's labelling entirely (confirmed on #3140:
+no labels applied) and leaving a dead, never-resolving label plus a stray
+bot comment on every cargo-block PR (`dependencies` itself kept applying
+fine there, confirmed on #3209) — a real, cheaply-fixed fact either way, not
+motion for its own sake.
 
 **Upgrade triage** (opentelemetry cluster): the forcing fact is the rehearsal
 itself — four PRs look independent and are not; merging any subset other than

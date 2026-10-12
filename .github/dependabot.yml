@@ -46,8 +46,11 @@ updates:
       - dependency-name: "matchit"
     # `automated` doesn't exist as a repo label (confirmed via the GitHub API,
     # 2026-10-12): every PR this ecosystem opened was posting Dependabot's
-    # own "labels could not be found" comment instead of actually labelling
-    # anything. `dependencies` is a real label; keep only that one.
+    # own "labels could not be found" comment. Per GitHub's own `labels`
+    # reference, an undefined custom label is skipped individually, not the
+    # whole list — `dependencies` (a real label) was still applied to every
+    # cargo PR (confirmed: #3209 carries it), only `automated` was dropped.
+    # Keeping just the one label that was actually working.
     labels:
       - dependencies
 
