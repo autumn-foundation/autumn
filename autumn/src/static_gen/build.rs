@@ -131,12 +131,12 @@ fn substitute_params(pattern: &str, params: &StaticParams) -> String {
 /// fails [`usable_recorded_content_type`](super::middleware::usable_recorded_content_type)
 /// (the same screen the serve path uses).
 ///
-/// Otherwise records
+/// Otherwise it records
 /// [`effective_content_type`](super::middleware::effective_content_type): an
 /// axum return-type default (`String`, `Vec<u8>`) on a route with a
 /// disagreeing asset extension becomes the extension type. So
 /// `#[static_get("/theme.css")] async fn theme() -> String` records
-/// `text/css; charset=utf-8`, not `text/plain` (which `nosniff` would block).
+/// `text/css; charset=utf-8`, not `text/plain` (which `nosniff` blocks).
 /// ISR applies the same function to fresh responses, so the type guard still
 /// holds on these routes (#2409).
 fn recorded_content_type(headers: &axum::http::HeaderMap, url: &str) -> Option<String> {
@@ -871,7 +871,7 @@ mod tests {
         assert_eq!(
             manifest.routes["/theme.css"].content_type.as_deref(),
             Some("text/css; charset=utf-8"),
-            "a String handler's generic text/plain must not override the .css route"
+            "records the extension type, not the String default"
         );
     }
 
@@ -895,7 +895,7 @@ mod tests {
         assert_eq!(
             manifest.routes["/logo.png"].content_type.as_deref(),
             Some("image/png"),
-            "a Vec<u8> handler's generic octet-stream must not override the .png route"
+            "records the extension type, not the Vec<u8> default"
         );
     }
 

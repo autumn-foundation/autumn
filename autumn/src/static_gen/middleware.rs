@@ -115,17 +115,16 @@ fn is_legal_content_type_byte(b: u8) -> bool {
 const GENERIC_RETURN_TYPE_DEFAULTS: [&str; 2] =
     ["text/plain; charset=utf-8", "application/octet-stream"];
 
-/// Normalize a declared `Content-Type` for `route_path` (#2409).
+/// Return the `Content-Type` to record or compare for `route_path` (#2409).
 ///
-/// A generic return-type default is replaced by the route's asset-extension
-/// type when the two disagree. Any other value is returned as is. Build and
-/// ISR both use this function. Build records the result. ISR normalizes the
-/// fresh response with it before comparing.
+/// A generic return-type default becomes the route's asset-extension type.
+/// Any other value stays as it is. Build records the result. ISR applies it
+/// to the expected and the fresh type before comparing.
 ///
-/// Axum builds `String`'s header exactly like a hand-written
-/// `text/plain; charset=utf-8` tuple, so the two cannot be told apart. The
-/// extension wins, because a stylesheet served as `text/plain` is dropped
-/// under `nosniff`. Write `text/plain` (no charset) to opt out.
+/// Axum's `String` header is the same as a hand-written
+/// `text/plain; charset=utf-8`. The two look equal, so the extension wins:
+/// `nosniff` blocks a stylesheet served as `text/plain`. To opt out, write
+/// bare `text/plain`, or `application/octet-stream` with a parameter.
 pub(super) fn effective_content_type<'a>(declared: &'a str, route_path: &str) -> &'a str {
     if GENERIC_RETURN_TYPE_DEFAULTS.contains(&declared)
         && let Some(from_extension) = crate::assets::content_type_for_opt(route_path)
@@ -218,7 +217,7 @@ pub fn resolved_content_type(
     file_path: &Path,
 ) -> http::HeaderValue {
     if let Some(recorded) = usable_recorded_content_type(recorded)
-        && let Ok(value) = http::HeaderValue::from_str(recorded)
+        && let Ok(value) = http::HeaderValue::from_str(effective_content_type(recorded, route_path))
     {
         return value;
     }
@@ -373,7 +372,8 @@ impl StaticFileLayer {
                 // Only a value the serve path would actually honour: an
                 // unusable one is ignored there, so treating it as the ISR
                 // expectation would refuse every regeneration forever.
-                usable_recorded_content_type(entry.content_type.as_deref()),
+                usable_recorded_content_type(entry.content_type.as_deref())
+                    .map(|recorded| effective_content_type(recorded, request_path)),
             );
         }
 
@@ -732,7 +732,7 @@ async fn regenerate_page(
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .map(|v| effective_content_type(v, url));
+            .map(|v| effective_content_type(v.trim(), url));
         if !actual.is_some_and(|actual| content_type_equivalent(actual, expected)) {
             // Logged here as well as by the caller: an ordinary regeneration
             // failure is transient, but this one repeats every cooldown until
@@ -1835,6 +1835,80 @@ mod tests {
         .expect_err("JSON must not replace a text/css file");
         assert!(err.to_string().contains("Content-Type changed"), "{err}");
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "a{}");
+    }
+
+    /// #2409: an old or edited manifest holding a generic default on an
+    /// extensioned route serves the extension type.
+    #[test]
+    fn resolved_content_type_normalizes_recorded_generic_default() {
+        let value = resolved_content_type(
+            Some("text/plain; charset=utf-8"),
+            "/theme.css",
+            Path::new("theme.css/index.html"),
+        );
+        assert_eq!(value, "text/css; charset=utf-8");
+    }
+
+    /// #2409: ISR must not freeze on a recorded generic default.
+    #[tokio::test]
+    async fn regenerate_page_accepts_trimmed_generic_default_header() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("theme.css");
+        std::fs::write(&dest, "a{}").expect("write");
+        let router = axum::Router::new().fallback(axum::routing::get(|| async {
+            (
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    " text/plain; charset=utf-8",
+                )],
+                "b{}",
+            )
+        }));
+        regenerate_page(
+            &router,
+            "/theme.css",
+            &dest,
+            Some("text/css; charset=utf-8"),
+        )
+        .await
+        .expect("padded generic default normalizes");
+    }
+
+    /// #2409 end to end: build a `String` route on `/theme.css`, then ISR it.
+    #[tokio::test]
+    async fn isr_guards_extensioned_string_route_built_by_render_static_routes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dist = dir.path().join("dist");
+        let string_router =
+            || axum::Router::new().fallback(axum::routing::get(|| async { "a{}".to_owned() }));
+        let meta = crate::static_gen::StaticRouteMeta {
+            path: "/theme.css",
+            name: "theme",
+            revalidate: Some(1),
+            params_fn: None,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
+        };
+        crate::static_gen::render_static_routes(string_router(), &[meta], &dist)
+            .await
+            .expect("render");
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).expect("manifest");
+        let recorded = manifest.routes["/theme.css"].content_type.clone();
+        assert_eq!(recorded.as_deref(), Some("text/css; charset=utf-8"));
+
+        let dest = dist.join(&manifest.routes["/theme.css"].file);
+        regenerate_page(&string_router(), "/theme.css", &dest, recorded.as_deref())
+            .await
+            .expect("String handler still regenerates");
+
+        let json_router = axum::Router::new().fallback(axum::routing::get(|| async {
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                "{}",
+            )
+        }));
+        regenerate_page(&json_router, "/theme.css", &dest, recorded.as_deref())
+            .await
+            .expect_err("JSON must not overwrite the stylesheet");
     }
 
     #[test]
