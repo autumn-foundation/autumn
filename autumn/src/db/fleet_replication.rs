@@ -158,18 +158,22 @@ impl FleetReplication {
     ///
     /// The deadline uses real elapsed time, ticks included. A pinned or
     /// virtual clock cannot make the loop run forever. A tick that is already
-    /// running cannot be stopped, so the call can overrun by one tick.
+    /// running cannot be stopped, so the call can overrun by one tick. No tick
+    /// starts after the deadline.
     pub fn flush_closing(&self, deadline: Duration) -> Vec<String> {
         // Real time on purpose: the wait is blocking I/O, not simulated work.
         #[allow(clippy::disallowed_methods)]
         let started = std::time::Instant::now();
         loop {
-            self.tick_all();
             let left = deadline.saturating_sub(started.elapsed());
-            if self.closing() == 0 || left.is_zero() {
+            if left.is_zero() {
                 break;
             }
-            std::thread::sleep(FLUSH_RETRY.min(left));
+            self.tick_all();
+            if self.closing() == 0 {
+                break;
+            }
+            std::thread::sleep(FLUSH_RETRY.min(deadline.saturating_sub(started.elapsed())));
         }
         let mut unshipped: Vec<String> = self.parked().keys().map(FleetDbKey::name).collect();
         unshipped.sort();
@@ -1128,5 +1132,21 @@ mod tests {
         assert_eq!(replication.closing(), 1);
         let health = replication.indicator().check().await;
         assert_eq!(health.details["unshipped"], serde_json::json!([key.name()]));
+    }
+
+    #[tokio::test]
+    async fn an_expired_flush_starts_no_tick() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        let key = park_one(&fleet).await;
+        flaky.down.store(false, Ordering::SeqCst);
+        let left = crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || replication.flush_closing(Duration::ZERO)
+        })
+        .await
+        .unwrap();
+        assert_eq!(left, vec![key.name()], "no time, so no tick");
+        assert_eq!(replication.closing(), 1);
     }
 }
