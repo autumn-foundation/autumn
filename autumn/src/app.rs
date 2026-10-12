@@ -10430,6 +10430,12 @@ fn unfreeze_adopted_live_state(state: &AppState) {
         return;
     }
     if let Some(registry) = state.extension::<crate::upgrade::LiveStateRegistry>() {
+        // Journal before unfreezing: no write can precede the journal, so the
+        // predecessor can take back every write this build acknowledges.
+        #[cfg(unix)]
+        if let Some(path) = crate::upgrade::journal_path() {
+            registry.start_journal(path);
+        }
         registry.unfreeze();
     }
 }
