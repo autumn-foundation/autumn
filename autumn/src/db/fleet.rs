@@ -2348,7 +2348,6 @@ fn remove_database_files(
     name: &str,
     present: bool,
 ) -> Result<bool, FleetError> {
-    let existed = path.is_file();
     unlink_database_set(path, "delete database", name, present, false, |file| {
         std::fs::remove_file(file)
     })?;
@@ -2363,7 +2362,7 @@ fn remove_database_files(
         }
         dir = current.parent();
     }
-    Ok(existed)
+    Ok(present)
 }
 
 /// Unlink a database's sidecars, then its main file, with `unlink`. A missing
@@ -3752,5 +3751,14 @@ mod tests {
         })
         .unwrap();
         assert!(!seen);
+    }
+
+    #[test]
+    fn a_database_published_after_an_absent_guard_is_not_reported_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The guard saw no file. Another process publishes one before the work.
+        let path = plain_database(tmp.path());
+        assert!(!remove_database_files(&path, tmp.path(), "acme", false).unwrap());
+        assert!(path.is_file(), "the new database stays");
     }
 }
