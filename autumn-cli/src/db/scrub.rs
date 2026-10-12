@@ -476,9 +476,10 @@ impl std::fmt::Display for ScrubError {
             ),
             Self::PiiOnKeyColumn { columns } => write!(
                 f,
-                "{} column(s) are primary or foreign keys but declared PII:\n{}\n  \
-                 Rewriting a key column would break referential integrity. Scrub the \
-                 referenced table's own PII columns instead, and declare these `safe`.",
+                "{} column(s) are primary, foreign or partition keys but declared PII:\n{}\n  \
+                 Rewriting a key column would break referential integrity or move rows \
+                 between partitions. Scrub the referenced table's own PII columns \
+                 instead, and declare these `safe`.",
                 columns.len(),
                 bullet_list(columns),
             ),
@@ -1773,7 +1774,8 @@ fn unreachable_tables(facts: &DatabaseFacts, introspected: &[Table]) -> Vec<Stri
 }
 
 /// Whether a column is structural — a primary key, either side of any foreign
-/// key, or a generated column Postgres will not let an `UPDATE` touch.
+/// key, a partition key, or a generated column Postgres will not let an
+/// `UPDATE` touch.
 ///
 /// The foreign-key half comes from [`DatabaseFacts`], not from the schema IR:
 /// the IR records only the *referencing* side and only a composite key's first
@@ -1787,6 +1789,7 @@ fn is_key_column(table: &Table, column: &Column, facts: &DatabaseFacts) -> bool 
         || table.primary_key.contains(&column.name)
         || column.references.is_some()
         || facts.foreign_key_columns.contains(&pair)
+        || facts.partition_key_columns.contains(&pair)
         || facts.generated_columns.contains(&pair)
 }
 
@@ -4041,6 +4044,10 @@ pub struct DatabaseFacts {
     /// them again double-updates — and the mapping also says whose role decides
     /// whether a key declared on a leaf can be ignored.
     pub partitions: BTreeMap<String, String>,
+    /// Partition-key columns, keyed by the top-level table. A rewrite through
+    /// the parent moves each row to the partition its new key belongs to: it
+    /// aborts when none exists, and collapses the table into one when one does.
+    pub partition_key_columns: BTreeSet<(String, String)>,
     /// Tables with row-level security enabled. A non-bypassing role silently
     /// updates only the rows its policies expose — a fail-open a scrub cannot
     /// tolerate.
@@ -4235,6 +4242,33 @@ fn pair_rows(sql: &str, conn: &mut PgConnection) -> Result<BTreeMap<String, Stri
         .load(conn)
         .map_err(|e| ScrubError::Sql(e.to_string()))?;
     Ok(rows.into_iter().map(|r| (r.tbl, r.col)).collect())
+}
+
+/// Every `(partitioned table, key column)` pair, at any depth.
+///
+/// A plain key is read from `partattrs`. An expression key records no column
+/// there (and `pg_depend` holds none), so the key definition is matched by whole
+/// word instead.
+const PARTITION_KEY_COLUMNS: &str = "SELECT rel.relname AS tbl, att.attname AS col \
+     FROM pg_partitioned_table p \
+     JOIN pg_class rel ON rel.oid = p.partrelid \
+     JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+     JOIN pg_attribute att ON att.attrelid = p.partrelid \
+       AND att.attnum > 0 AND NOT att.attisdropped \
+     WHERE att.attnum = ANY (p.partattrs::int2[]) \
+        OR (0 = ANY (p.partattrs::int2[]) AND pg_get_partkeydef(p.partrelid) ~ ( \
+             '(^|[^[:alnum:]_])' \
+             || regexp_replace(quote_ident(att.attname), '([^[:alnum:]_])', '\\\\\\1', 'g') \
+             || '($|[^[:alnum:]_])'))";
+
+/// Move each sub-partitioned table's key columns onto its root table.
+fn fold_partition_keys(
+    keys: impl IntoIterator<Item = (String, String)>,
+    partitions: &BTreeMap<String, String>,
+) -> BTreeSet<(String, String)> {
+    keys.into_iter()
+        .map(|(table, column)| (partitions.get(&table).cloned().unwrap_or(table), column))
+        .collect()
 }
 
 fn pair_set(rows: Vec<PairRow>) -> BTreeSet<(String, String)> {
@@ -4526,6 +4560,23 @@ fn probe_database_facts(
             )?
         } else {
             BTreeMap::new()
+        };
+
+    // Partition-key columns. `partattrs` holds `0` for an expression key, which
+    // names no column, so those tables fall back to the columns their key
+    // definition spells: an over-match refuses a column that is not a key, which
+    // is the safe direction. Sub-partitions fold into the root, because a
+    // rewrite through the root moves rows across them too.
+    let partition_key_columns: BTreeSet<(String, String)> =
+        if has_catalog_column(&mut conn, "pg_class", "relispartition")? {
+            let rows = pair_set(
+                sql_query(PARTITION_KEY_COLUMNS)
+                    .load(&mut conn)
+                    .map_err(|e| ScrubError::Sql(e.to_string()))?,
+            );
+            fold_partition_keys(rows, &partitions)
+        } else {
+            BTreeSet::new()
         };
 
     // A declarative partition is also a `pg_inherits` child, so the partition
@@ -4857,6 +4908,7 @@ fn probe_database_facts(
         unique_columns,
         nulls_not_distinct_columns,
         partitions,
+        partition_key_columns,
         rls_tables,
         legacy_inheritance,
         triggered_tables,
@@ -7825,6 +7877,104 @@ mod tests {
         assert!(
             matches!(err, ScrubError::PiiOnKeyColumn { ref columns } if columns == &vec!["users.email".to_owned()]),
             "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_partition_key_column_is_refused_as_pii() {
+        // Rewriting the key moves every row between partitions, or aborts.
+        let facts = DatabaseFacts {
+            partition_key_columns: BTreeSet::from([("users".to_owned(), "email".to_owned())]),
+            ..DatabaseFacts::default()
+        };
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "full_name", "bio"]
+            [tables.users.pii]
+            email = "email"
+            "#,
+        )
+        .unwrap();
+        let err = plan_with_facts(
+            &[users_table()],
+            &config,
+            &empty_encrypted(),
+            &no_anonymize(),
+            &facts,
+        )
+        .expect_err("a partition key must not be rewritten");
+        assert!(
+            matches!(err, ScrubError::PiiOnKeyColumn { ref columns } if columns == &vec!["users.email".to_owned()]),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_partition_key_column_declared_safe_is_left_alone() {
+        let facts = DatabaseFacts {
+            partition_key_columns: BTreeSet::from([("users".to_owned(), "email".to_owned())]),
+            ..DatabaseFacts::default()
+        };
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "email", "bio"]
+            [tables.users.pii]
+            full_name = "name"
+            "#,
+        )
+        .unwrap();
+        let plan = plan_with_facts(
+            &[users_table()],
+            &config,
+            &empty_encrypted(),
+            &no_anonymize(),
+            &facts,
+        )
+        .expect("a safe partition key needs no refusal");
+        assert!(plan.column("users", "email").is_none());
+    }
+
+    #[test]
+    fn a_table_level_anonymize_skips_the_partition_key() {
+        let facts = DatabaseFacts {
+            partition_key_columns: BTreeSet::from([("users".to_owned(), "email".to_owned())]),
+            ..DatabaseFacts::default()
+        };
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at"]
+            "#,
+        )
+        .unwrap();
+        let anonymize = BTreeSet::from(["users".to_owned()]);
+        let plan = plan_with_facts(
+            &[users_table()],
+            &config,
+            &empty_encrypted(),
+            &anonymize,
+            &facts,
+        )
+        .expect("anonymize leaves structural columns alone");
+        assert!(plan.column("users", "email").is_none());
+        assert!(plan.column("users", "full_name").is_some());
+    }
+
+    #[test]
+    fn a_sub_partition_key_is_folded_into_the_root() {
+        let facts = DatabaseFacts {
+            partitions: BTreeMap::from([("users_2026".to_owned(), "users".to_owned())]),
+            ..DatabaseFacts::default()
+        };
+        let keys = fold_partition_keys(
+            vec![("users_2026".to_owned(), "email".to_owned())],
+            &facts.partitions,
+        );
+        assert_eq!(
+            keys,
+            BTreeSet::from([("users".to_owned(), "email".to_owned())])
         );
     }
 

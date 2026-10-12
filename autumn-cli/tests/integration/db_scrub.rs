@@ -2975,6 +2975,66 @@ async fn a_view_reached_through_an_ordinary_view_is_refreshed_in_dependency_orde
     }
 }
 
+/// A scrubbed column that is the partition key is refused, not rewritten.
+///
+/// Rewriting the key through the parent makes Postgres move every row to the
+/// partition the new value belongs to: it aborts when none exists, and
+/// collapses the table into one partition when one does. Both are avoidable at
+/// plan time, so the plan refuses and the rows stay put.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_partition_key_column_is_refused_before_any_row_moves() {
+    let (_pg, host, port) = start_postgres().await;
+    let base = format!("postgres://postgres:postgres@{host}:{port}");
+    let admin = connect(&format!("{base}/postgres")).await;
+    let client = seed_sample_fixture(&admin, &base, "partition_key").await;
+    client
+        .batch_execute(
+            "CREATE TABLE ledger_events ( \
+                 id BIGINT NOT NULL, \
+                 occurred_at TIMESTAMP NOT NULL, \
+                 note TEXT NOT NULL \
+             ) PARTITION BY RANGE (occurred_at); \
+             CREATE TABLE ledger_events_2026 PARTITION OF ledger_events \
+                 FOR VALUES FROM ('2026-01-01') TO ('2027-01-01'); \
+             INSERT INTO ledger_events VALUES (1, '2026-03-04 05:06:07', 'n');",
+        )
+        .await
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    write_project_sources(dir);
+    std::fs::write(
+        dir.join("scrub.toml"),
+        format!(
+            "{SAMPLE_SCRUB_TOML}\n\
+             [tables.ledger_events]\n\
+             safe = [\"note\"]\n\
+             [tables.ledger_events.pii]\n\
+             occurred_at = \"epoch\"\n"
+        ),
+    )
+    .unwrap();
+    let url = format!("{base}/partition_key");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub"], &envs);
+    assert!(
+        stderr.contains("ledger_events.occurred_at"),
+        "the refusal must name the partition key: {stderr}"
+    );
+    assert_eq!(
+        count(
+            &client,
+            "SELECT count(*) FROM ledger_events WHERE occurred_at = '2026-03-04 05:06:07'"
+        )
+        .await,
+        1,
+        "a refused scrub must leave the row where it was"
+    );
+}
+
 /// A view read through a function `PostgreSQL` does not track is refused; one
 /// read through a `BEGIN ATOMIC` function is ordered normally.
 ///

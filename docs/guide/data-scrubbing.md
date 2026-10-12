@@ -95,8 +95,9 @@ Two sources need **no declaration at all**:
   the registration statically, so it needs a string-literal table name; a
   computed one is reported rather than silently ignored.
 
-Primary- and foreign-key columns are never claimed by the table-level
-inference: rewriting a key would break referential integrity. Neither are
+Primary-key, foreign-key and partition-key columns are never claimed by the
+table-level inference: rewriting a key would break referential integrity or move
+rows between partitions. Declare a partition key `safe`. Neither are
 generated columns, which Postgres refuses to `UPDATE` and which a scrub of their
 source columns already covers.
 
@@ -721,7 +722,8 @@ apply-time error.
 - **Constraints survive.** PII is refused outright on a primary key, on **either
   side** of any foreign key (including every component of a composite one — so a
   natural key another table references, like `users.email` ← `orders.user_email`,
-  is protected too), and on a `CHECK`-constrained column, where no fabricated
+  is protected too), on a **partition key** (a rewrite would move every row
+  between partitions, or abort), and on a `CHECK`-constrained column, where no fabricated
   value can be proven to satisfy the predicate. `null` is refused on a `NOT NULL`
   column and on a `NULLS NOT DISTINCT` unique index; a constant replacement is
   refused on any column covered by a unique index — composite, partial, and the
