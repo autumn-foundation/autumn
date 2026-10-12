@@ -3518,12 +3518,19 @@ impl tower_http::compression::predicate::Predicate for CompressionPredicate {
                 .headers()
                 .get(http::header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
-                .is_none_or(|content_type| {
-                    !COMPRESSION_EXCLUDED_CONTENT_TYPES
-                        .iter()
-                        .any(|excluded| content_type.starts_with(excluded))
-                })
+                .is_none_or(|content_type| !is_compression_excluded(content_type))
     }
+}
+
+/// Returns true if `content_type` starts with an excluded prefix. The match
+/// ignores ASCII case (RFC 9110 §8.3.1). The header is not changed.
+fn is_compression_excluded(content_type: &str) -> bool {
+    COMPRESSION_EXCLUDED_CONTENT_TYPES.iter().any(|excluded| {
+        content_type
+            .as_bytes()
+            .get(..excluded.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(excluded.as_bytes()))
+    })
 }
 
 fn compression_predicate() -> CompressionPredicate {
@@ -12289,6 +12296,64 @@ enabled = true
                 "{route}: raw SFNT fonts are uncompressed data and must still be \
                  gzipped — only WOFF/WOFF2 embed their own compression"
             );
+        }
+    }
+
+    /// Returns true if the predicate compresses a 4 KiB body of this type.
+    fn predicate_compresses(content_type: &str) -> bool {
+        use tower_http::compression::predicate::Predicate;
+        let response = http::Response::builder()
+            .header(http::header::CONTENT_TYPE, content_type)
+            .body(Body::from(vec![b'A'; 4096]))
+            .unwrap();
+        compression_predicate().should_compress(&response)
+    }
+
+    /// Media types are case-insensitive (RFC 9110 §8.3.1). The excluded types
+    /// must stay uncompressed in any case (#2416).
+    #[test]
+    fn compression_carve_outs_ignore_case() {
+        for ct in [
+            "Audio/MPEG",
+            "VIDEO/mp4",
+            "Application/Zip",
+            "Application/Octet-Stream",
+            "Font/WOFF2",
+            "font/WOFF",
+            "Font/Woff2; foo=bar",
+            "audio/mpeg",
+            "application/zip",
+            "font/woff2",
+        ] {
+            assert!(!predicate_compresses(ct), "{ct} must stay uncompressed");
+        }
+    }
+
+    /// Fonts that are not excluded (ttf, otf) and other types are still
+    /// compressed in any case. Near-miss prefixes (`application/zi`,
+    /// `Font/WOF`) are also compressed.
+    #[test]
+    fn compression_still_applies_to_other_types_in_any_case() {
+        for ct in [
+            "font/ttf",
+            "Font/TTF",
+            "font/otf",
+            "text/html",
+            "Text/HTML",
+            "Application/JSON; charset=utf-8",
+            "application/zi",
+            "Font/WOF",
+            "au",
+        ] {
+            assert!(predicate_compresses(ct), "{ct} must be compressed");
+        }
+    }
+
+    /// Short and non-ASCII values must not panic or match.
+    #[test]
+    fn compression_exclusion_is_safe_on_short_and_non_ascii_input() {
+        for ct in ["", "a", "au", "é", "audiö/x", "fönt/woff2"] {
+            assert!(!is_compression_excluded(ct), "{ct:?} must not match");
         }
     }
 
