@@ -2784,47 +2784,83 @@ pub async fn page_paths_under(
 ) -> AutumnResult<Vec<Vec<String>>> {
     let mut ids = vec![post_id];
     ids.extend(descendant_ids(conn, post_id).await?);
-    let mut paths = Vec::new();
-    for id in ids {
-        if let Some(path) = page_path_of(conn, id).await? {
-            paths.push(path);
+
+    // Every row any of the walks below can touch, loaded a level at a time for
+    // the whole set at once: the edited page and its descendants first, then
+    // the parents none of them has been loaded for yet. Each walk climbs at
+    // most `MAX_PAGE_DEPTH` ancestors, so that many rounds reach everything —
+    // and the ancestors a subtree shares are fetched once, not once per page.
+    let mut rows: std::collections::HashMap<i64, PathRow> = std::collections::HashMap::new();
+    let mut absent: HashSet<i64> = HashSet::new();
+    let mut wanted = ids.clone();
+    for _ in 0..=MAX_PAGE_DEPTH {
+        wanted.retain(|id| !rows.contains_key(id) && !absent.contains(id));
+        wanted.sort_unstable();
+        wanted.dedup();
+        if wanted.is_empty() {
+            break;
         }
+        let mut next = Vec::new();
+        for chunk in wanted.chunks(PATH_ROW_CHUNK) {
+            let loaded: Vec<PathRow> = posts::table
+                .filter(posts::id.eq_any(chunk))
+                .select((posts::id, posts::slug, posts::post_type, posts::parent_id))
+                .load(&mut *conn)
+                .await?;
+            for row in loaded {
+                next.extend(row.3);
+                rows.insert(row.0, row);
+            }
+        }
+        absent.extend(wanted.iter().filter(|id| !rows.contains_key(id)));
+        wanted = next;
     }
-    Ok(paths)
+
+    Ok(ids
+        .into_iter()
+        .filter_map(|id| page_path_in(&rows, id))
+        .collect())
 }
 
-/// One nested page's canonical path, walking up to its root.
+/// `(id, slug, post_type, parent_id)` — all `page_paths_under` needs of a post.
+type PathRow = (i64, String, String, Option<i64>);
+
+/// How many ids one `page_paths_under` row load binds. A subtree can be large,
+/// and a single `= ANY($1)` over tens of thousands of ids has a planning cost
+/// of its own.
+const PATH_ROW_CHUNK: usize = 1000;
+
+/// One nested page's canonical path, walking up to its root through rows
+/// already loaded.
 ///
 /// `None` for anything that is not a nested page: a top-level page and a
 /// non-page type are addressed by other rules, checked elsewhere.
-async fn page_path_of(
-    conn: &mut AsyncPgConnection,
+fn page_path_in(
+    rows: &std::collections::HashMap<i64, PathRow>,
     post_id: i64,
-) -> AutumnResult<Option<Vec<String>>> {
-    let Some(post) = post_by_id(conn, post_id).await? else {
-        return Ok(None);
-    };
-    if post.post_type != "page" || post.parent_id.is_none() {
-        return Ok(None);
+) -> Option<Vec<String>> {
+    let (id, slug, post_type, parent_id) = rows.get(&post_id)?;
+    if post_type != "page" || parent_id.is_none() {
+        return None;
     }
 
-    let mut segments = vec![post.slug.clone()];
-    let mut cursor = post.parent_id;
-    let mut seen = vec![post.id];
+    let mut segments = vec![slug.clone()];
+    let mut cursor = *parent_id;
+    let mut seen = vec![*id];
     while let Some(parent_id) = cursor {
         if segments.len() > MAX_PAGE_DEPTH || seen.contains(&parent_id) {
             break;
         }
         seen.push(parent_id);
-        let Some(parent) = post_by_id(conn, parent_id).await? else {
+        let Some(parent) = rows.get(&parent_id) else {
             break;
         };
-        segments.push(parent.slug.clone());
-        cursor = parent.parent_id;
+        segments.push(parent.1.clone());
+        cursor = parent.3;
     }
     segments.reverse();
 
-    Ok(Some(segments))
+    Some(segments)
 }
 
 /// The refusal reason for a path a framework route already serves.
