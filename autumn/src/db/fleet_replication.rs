@@ -216,7 +216,7 @@ impl FleetReplication {
             if expired(cutoff) {
                 break;
             }
-            self.tick_pass(cutoff);
+            self.tick_pass(&|| cutoff);
             if self.closing() == 0 {
                 break;
             }
@@ -294,22 +294,25 @@ impl FleetReplication {
     /// After the shutdown cutoff (see
     /// [`set_shutdown_cutoff`](Self::set_shutdown_cutoff)), it starts no work.
     pub fn tick_all(&self) {
-        self.tick_pass(self.shutdown_cutoff());
+        self.tick_pass(&|| self.shutdown_cutoff());
     }
 
-    /// One tick pass. With a `cutoff`, no replica starts after it, and a
-    /// replica that another thread holds is skipped, not waited for.
-    fn tick_pass(&self, cutoff: Option<std::time::Instant>) {
+    /// One tick pass. `cutoff` is read again for each replica and each ship
+    /// step, so a cutoff installed mid-pass takes effect. With a cutoff, no
+    /// replica starts after it, and a replica that another thread holds is
+    /// skipped, not waited for.
+    fn tick_pass(&self, cutoff: &dyn Fn() -> Option<std::time::Instant>) {
         let active: Vec<(FleetDbKey, Arc<ActiveReplica>)> = self
             .active()
             .iter()
             .map(|(key, replica)| (key.clone(), Arc::clone(replica)))
             .collect();
         for (key, replica) in active {
-            if expired(cutoff) {
+            let now_cutoff = cutoff();
+            if expired(now_cutoff) {
                 return;
             }
-            let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
+            let Some(mut replicator) = lock_replicator(&replica, now_cutoff) else {
                 continue;
             };
             if let Err(error) = replicator.tick() {
@@ -322,13 +325,14 @@ impl FleetReplication {
             .map(|(key, replica)| (key.clone(), Arc::clone(replica)))
             .collect();
         for (key, replica) in parked {
-            if expired(cutoff) {
+            let now_cutoff = cutoff();
+            if expired(now_cutoff) {
                 return;
             }
-            let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
+            let Some(mut replicator) = lock_replicator(&replica, now_cutoff) else {
                 continue;
             };
-            let caught_up = ship_until_caught_up(&mut replicator, &|| cutoff).is_ok();
+            let caught_up = ship_until_caught_up(&mut replicator, cutoff).is_ok();
             drop(replicator);
             if caught_up && self.retire_parked(&key, &replica) {
                 tracing::info!(database = %key, "fleet replication: closed database caught up");
@@ -1255,14 +1259,14 @@ mod tests {
         crate::time::spawn_blocking({
             let replication = Arc::clone(&replication);
             // The cutoff is already behind us when the pass checks it.
-            move || replication.tick_pass(Some(std::time::Instant::now()))
+            move || replication.tick_pass(&|| Some(std::time::Instant::now()))
         })
         .await
         .unwrap();
         assert_eq!(replication.closing(), 1, "the pass stopped at the cutoff");
         crate::time::spawn_blocking({
             let replication = Arc::clone(&replication);
-            move || replication.tick_pass(None)
+            move || replication.tick_pass(&|| None)
         })
         .await
         .unwrap();
@@ -1354,5 +1358,31 @@ mod tests {
         if let Err(error) = shipped {
             assert!(error.contains("ran out of time"), "{error}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_running_pass_reads_a_cutoff_installed_after_it_began() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        park_one(&fleet).await;
+        flaky.down.store(false, Ordering::SeqCst);
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || {
+                // No cutoff when the pass starts; a passed one right after.
+                replication.tick_pass(&|| {
+                    if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                        None
+                    } else {
+                        Some(std::time::Instant::now())
+                    }
+                });
+            }
+        })
+        .await
+        .unwrap();
+        // The pass read the cutoff again before it shipped the parked replica.
+        assert_eq!(replication.closing(), 1);
     }
 }
