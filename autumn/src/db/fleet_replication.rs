@@ -162,14 +162,20 @@ impl FleetReplication {
     /// charged to the shared budget.
     pub fn set_shutdown_deadline_in(&self, left: Duration) {
         // Real time on purpose: the cutoff bounds blocking I/O.
-        #[allow(clippy::disallowed_methods)]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "real time: the shutdown bound covers blocking I/O"
+        )]
         let now = std::time::Instant::now();
         self.set_shutdown_cutoff(now.checked_add(left));
     }
 
     /// Time until the shutdown cutoff. `None` when none is set.
     pub(crate) fn cutoff_left(&self) -> Option<Duration> {
-        #[allow(clippy::disallowed_methods)]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "real time: the shutdown bound covers blocking I/O"
+        )]
         let now = std::time::Instant::now();
         self.shutdown_cutoff()
             .map(|cutoff| cutoff.saturating_duration_since(now))
@@ -200,7 +206,10 @@ impl FleetReplication {
     /// overrun by one tick.
     pub fn flush_closing(&self, deadline: Duration) -> Vec<String> {
         // Real time on purpose: the wait is blocking I/O, not simulated work.
-        #[allow(clippy::disallowed_methods)]
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "real time: the shutdown bound covers blocking I/O"
+        )]
         let started = std::time::Instant::now();
         let cutoff = started.checked_add(deadline);
         loop {
@@ -569,7 +578,10 @@ fn ship_until_caught_up(
 /// Whether `cutoff` has passed. Real time on purpose: the flush bounds
 /// blocking I/O, not simulated work.
 fn expired(cutoff: Option<std::time::Instant>) -> bool {
-    #[allow(clippy::disallowed_methods)]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real time: the shutdown bound covers blocking I/O"
+    )]
     cutoff.is_some_and(|cutoff| std::time::Instant::now() >= cutoff)
 }
 

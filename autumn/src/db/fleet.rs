@@ -1444,7 +1444,10 @@ impl DatabaseFleet {
                 }
             }
             // Real time on purpose: the flush budget covers blocking I/O.
-            #[allow(clippy::disallowed_methods)]
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "real time: the shutdown bound covers blocking I/O"
+            )]
             let shutdown_began = std::time::Instant::now();
             if let Some(replication) = fleet.replication() {
                 // Closing ships each database's last frames. Bound that too.
