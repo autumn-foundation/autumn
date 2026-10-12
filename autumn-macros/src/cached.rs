@@ -302,19 +302,6 @@ impl VisitMut for DependencyVisitor {
         }
         syn::visit_mut::visit_expr_path_mut(self, expr);
     }
-
-    fn visit_macro_mut(&mut self, mac: &mut syn::Macro) {
-        // `format!("{}", Post::find_all(db))`: read the arguments when they parse
-        // as expressions. Other macro bodies stay unseen.
-        if let Ok(mut args) =
-            Punctuated::<Expr, Token![,]>::parse_terminated.parse2(mac.tokens.clone())
-        {
-            for arg in &mut args {
-                self.visit_expr_mut(arg);
-            }
-        }
-        syn::visit_mut::visit_macro_mut(self, mac);
-    }
 }
 
 /// The `(owner, verb)` of a path such as `Post::find_all` or `<Post>::find_all`.
@@ -1370,10 +1357,9 @@ mod tests {
 
     #[test]
     fn a_model_read_is_found_in_every_call_shape() {
-        let shapes: [ItemFn; 4] = [
+        let shapes: [ItemFn; 3] = [
             syn::parse_quote! { fn f() { let _ = Some(1).map(Post::find_all); } },
             syn::parse_quote! { fn f(db: u8) { let _ = <Post>::find_all(db); } },
-            syn::parse_quote! { fn f(db: u8) { let _ = format!("{}", Post::find_all(db)); } },
             syn::parse_quote! { fn f(db: u8) { let _ = crate::Post::<T>::find_all(db); } },
         ];
         for f in &shapes {

@@ -202,7 +202,7 @@ repository's own declaration, or from `find_all`, `find_by_id` or
 `exists_by_id` on a named type. The macro does not check that the type is a
 model. A non-model type with one of those methods is still named. An alias
 (`use Post as P`) is named as `P`. The macro cannot see a method call, a
-helper function, or a macro body that does not parse as expressions.
+helper function, or a macro body.
 Declare `reads(...)` there.
 
 Declare `reads(...)` wherever the answer matters.
