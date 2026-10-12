@@ -46,6 +46,10 @@
 //! `tools/call` returns a task handle and the tool runs in the background.
 //! The client polls `tasks/get`. See the `tasks` submodule.
 //!
+//! The endpoint is dual-era. A request with the protocol version in
+//! `params._meta` uses revision `2026-07-28`. Other requests use the legacy
+//! `initialize` flow. See the `modern` submodule.
+//!
 //! [`AppBuilder::expose_all_as_mcp`]: crate::app::AppBuilder::expose_all_as_mcp
 //!
 //! [mcp]: https://modelcontextprotocol.io
@@ -69,6 +73,7 @@ use crate::sse::{Event, Sse};
 
 use crate::openapi::{ApiDoc, schema_entry_to_value};
 
+mod modern;
 mod tasks;
 
 pub use tasks::McpTaskConfig;
@@ -299,6 +304,9 @@ pub struct McpServer {
     /// True when one or more tools are task tools. Only then does the server
     /// advertise the extension and serve `tasks/*`.
     has_task_tools: bool,
+    /// True when `secure_mcp` gates the endpoint. Then the catalog is not for
+    /// shared caches (`cacheScope: "private"`).
+    catalog_private: bool,
     server_name: String,
     server_version: String,
 }
@@ -927,6 +935,7 @@ impl McpServer {
             session_cookie: wiring.session_cookie,
             tasks: tasks::TaskStore::new(wiring.tasks),
             has_task_tools,
+            catalog_private: false,
             server_name: "autumn-mcp".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
@@ -947,7 +956,9 @@ pub(crate) fn build_mcp_router(
     wiring: McpWiring,
     endpoint_layer: Option<McpEndpointLayer>,
 ) -> axum::Router<crate::state::AppState> {
-    let server = Arc::new(McpServer::new(tools, dispatch, wiring));
+    let mut server = McpServer::new(tools, dispatch, wiring);
+    server.catalog_private = endpoint_layer.is_some();
+    let server = Arc::new(server);
     tracing::debug!(
         path = mount_path,
         tools = server.tools.len(),
@@ -1151,6 +1162,9 @@ struct ReplayContext<'a> {
     /// arrived on (#1640), when there is one.
     #[cfg(feature = "tls")]
     client_cert: Option<std::sync::Arc<crate::tls::client_auth::ClientIdentity>>,
+    /// True for a request in the modern era (protocol `2026-07-28`). Its
+    /// results get `resultType` and `_meta.serverInfo`.
+    modern: bool,
 }
 
 /// Reject an untrusted `Host`/`:authority` or a disallowed browser `Origin`
@@ -1263,7 +1277,10 @@ async fn serve_mcp(
         }
     };
 
-    if let Some(rejection) = reject_unsupported_protocol_version(&headers, &parsed) {
+    // A request with the modern `_meta` fields uses protocol `2026-07-28`.
+    // Other requests use the legacy flow and its version header check.
+    let modern = modern::wants_modern(&headers, &parsed);
+    if !modern && let Some(rejection) = reject_unsupported_protocol_version(&headers, &parsed) {
         return rejection;
     }
 
@@ -1274,9 +1291,25 @@ async fn serve_mcp(
         envelope_admission: envelope_admission.map(|ext| ext.0),
         #[cfg(feature = "tls")]
         client_cert,
+        modern,
     };
 
-    let mut response = match parsed {
+    let mut response = if modern {
+        serve_modern(&server, &ctx, parsed).await
+    } else {
+        serve_legacy(&server, &ctx, parsed).await
+    };
+
+    // The endpoint sits outside the global CORS layer, so an allowlisted
+    // browser client needs the grant on the actual response to read the body.
+    apply_cors_headers(&server.cors, origin.as_deref(), &mut response);
+    response
+}
+
+/// Serve a legacy request: one JSON-RPC message or a batch, after an
+/// `initialize` handshake (protocol `2025-06-18` and earlier).
+async fn serve_legacy(server: &Arc<McpServer>, ctx: &ReplayContext<'_>, parsed: Value) -> Response {
+    match parsed {
         // JSON-RPC 2.0: an empty batch is itself an Invalid Request.
         Value::Array(batch) if batch.is_empty() => {
             json_response(&error(Value::Null, -32600, "Invalid Request: empty batch"))
@@ -1313,7 +1346,7 @@ async fn serve_mcp(
             for msg in batch {
                 // Only metadata methods reach here (a batched `tools/call` is
                 // rejected above), so none set a `Set-Cookie`.
-                if let Some(resp) = handle_message(&server, &msg) {
+                if let Some(resp) = handle_message(server, &msg) {
                     out.push(resp);
                 }
             }
@@ -1330,11 +1363,11 @@ async fn serve_mcp(
         // is buffered. A notification (no `id`) yields `None` → 202.
         msg @ Value::Object(_) => {
             if let Some((id, params)) = single_request(&msg, "tools/call") {
-                serve_tools_call(&server, &ctx, id, params).await
+                serve_tools_call(server, ctx, id, params).await
             } else if let Some((method, id, params)) = single_task_request(&msg) {
-                json_response(&serve_task_method(&server, &ctx, &method, id, &params))
+                json_response(&serve_task_method(server, ctx, &method, id, &params))
             } else {
-                handle_message(&server, &msg).map_or_else(
+                handle_message(server, &msg).map_or_else(
                     || StatusCode::ACCEPTED.into_response(),
                     |v| json_response(&v),
                 )
@@ -1346,12 +1379,76 @@ async fn serve_mcp(
             -32600,
             "Invalid Request: expected a JSON object or array",
         )),
-    };
+    }
+}
 
-    // The endpoint sits outside the global CORS layer, so an allowlisted
-    // browser client needs the grant on the actual response to read the body.
-    apply_cors_headers(&server.cors, origin.as_deref(), &mut response);
-    response
+/// Serve a modern request (protocol `2026-07-28`). Each POST carries one
+/// message, with its version and client capabilities in `_meta`.
+async fn serve_modern(server: &Arc<McpServer>, ctx: &ReplayContext<'_>, parsed: Value) -> Response {
+    let reply = |status: StatusCode, mut message: Value| {
+        modern::stamp(&mut message, &server.server_info());
+        let mut response = json_response(&message);
+        *response.status_mut() = status;
+        response
+    };
+    let rejected = |rejection: modern::Rejection| reply(rejection.status, rejection.body);
+
+    if parsed.is_array() {
+        return rejected(modern::batch_rejection());
+    }
+    // This revision defines no client notifications over HTTP. Accept one
+    // and send no body, as the transport requires.
+    if parsed.is_object() && parsed.get("id").is_none() && parsed.get("method").is_some() {
+        return StatusCode::ACCEPTED.into_response();
+    }
+    if let Err(rejection) = modern::validate(ctx.headers, &parsed) {
+        return rejected(rejection);
+    }
+    let id = parsed.get("id").cloned().unwrap_or(Value::Null);
+    let method = parsed.get("method").and_then(Value::as_str).unwrap_or("");
+    let params = parsed.get("params").cloned().unwrap_or(Value::Null);
+    match method {
+        "server/discover" => reply(StatusCode::OK, success(id, discover_result(server))),
+        "tools/list" => {
+            let mut result = tools_list_result(server);
+            modern::add_cache_hints(&mut result, server.catalog_private);
+            reply(StatusCode::OK, success(id, result))
+        }
+        "tools/call" => {
+            let response = serve_tools_call(server, ctx, id, params).await;
+            stamp_json_response(response, &server.server_info()).await
+        }
+        m if is_task_method(m) => {
+            let message = serve_task_method(server, ctx, m, id, &params);
+            reply(modern::status_for(&message), message)
+        }
+        other => rejected(modern::method_not_found(id, other)),
+    }
+}
+
+/// Add the modern result fields to a buffered JSON response from
+/// [`serve_tools_call`]. An SSE response gets them in the stream instead.
+async fn stamp_json_response(response: Response, server_info: &Value) -> Response {
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|c| c.starts_with("application/json"));
+    if !is_json {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    // The body is the JSON this module made, already in memory.
+    let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
+        return Response::from_parts(parts, Body::empty());
+    };
+    let Ok(mut message) = serde_json::from_slice::<Value>(&bytes) else {
+        return Response::from_parts(parts, Body::from(bytes));
+    };
+    modern::stamp(&mut message, server_info);
+    parts.headers.remove(header::CONTENT_LENGTH);
+    let body = serde_json::to_vec(&message).unwrap_or_else(|_| bytes.to_vec());
+    Response::from_parts(parts, Body::from(body))
 }
 
 /// Enforce the Streamable-HTTP `MCP-Protocol-Version` header. Returns a 400
@@ -1438,6 +1535,33 @@ fn handle_message(server: &McpServer, msg: &Value) -> Option<Value> {
     })
 }
 
+impl McpServer {
+    /// The server capabilities. The tasks extension is listed only when a
+    /// task tool exists.
+    fn capabilities(&self) -> Value {
+        let mut capabilities = json!({ "tools": { "listChanged": false } });
+        if self.has_task_tools {
+            capabilities["extensions"] = json!({ tasks::EXTENSION_ID: {} });
+        }
+        capabilities
+    }
+
+    /// The server name and version (an MCP `Implementation`).
+    fn server_info(&self) -> Value {
+        json!({ "name": self.server_name, "version": self.server_version })
+    }
+}
+
+/// The `server/discover` result (protocol `2026-07-28`).
+fn discover_result(server: &McpServer) -> Value {
+    let mut result = json!({
+        "supportedVersions": modern::VERSIONS,
+        "capabilities": server.capabilities(),
+    });
+    modern::add_cache_hints(&mut result, server.catalog_private);
+    result
+}
+
 fn initialize_result(server: &McpServer, params: &Value) -> Value {
     // Echo the client's requested version only if we actually implement it;
     // otherwise advertise our newest supported version (MCP negotiation).
@@ -1445,13 +1569,9 @@ fn initialize_result(server: &McpServer, params: &Value) -> Value {
         Some(requested) if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) => requested,
         _ => DEFAULT_PROTOCOL_VERSION,
     };
-    let mut capabilities = json!({ "tools": { "listChanged": false } });
-    if server.has_task_tools {
-        capabilities["extensions"] = json!({ tasks::EXTENSION_ID: {} });
-    }
     json!({
         "protocolVersion": protocol,
-        "capabilities": capabilities,
+        "capabilities": server.capabilities(),
         "serverInfo": {
             "name": server.server_name,
             "version": server.server_version,
@@ -2464,7 +2584,8 @@ async fn serve_tools_call(
         );
         stream_audit.status = Some(status);
         stream_audit.request_id = request_id;
-        return stream_tool_result(id, &params, response, cookies, stream_audit);
+        let stamp = ctx.modern.then(|| server.server_info());
+        return stream_tool_result(id, &params, response, cookies, stream_audit, stamp);
     }
 
     // Buffered path: the outcome is recorded only once the body has actually
@@ -2845,6 +2966,9 @@ struct StreamProjection {
     /// the projection when the client hangs up, which is how an aborted stream
     /// still gets a row (#1691).
     audit: OutcomeGuard,
+    /// The server info for a modern request. The final result gets
+    /// `resultType` and `_meta.serverInfo`.
+    stamp: Option<Value>,
 }
 
 /// Project a streaming handler's `Sse` response onto the MCP SSE channel.
@@ -2860,6 +2984,7 @@ fn stream_tool_result(
     response: Response,
     cookies: Vec<HeaderValue>,
     audit: OutcomeGuard,
+    stamp: Option<Value>,
 ) -> Response {
     let progress_token = params
         .get("_meta")
@@ -2877,6 +3002,7 @@ fn stream_tool_result(
         result_parts: Vec::new(),
         phase: ProjectionPhase::Streaming,
         audit,
+        stamp,
     };
 
     let stream = futures::stream::unfold(state, project_next);
@@ -2907,7 +3033,10 @@ async fn project_next(
                 } else {
                     st.result_parts.concat()
                 };
-                let value = success(st.id.clone(), tool_ok(&content));
+                let mut value = success(st.id.clone(), tool_ok(&content));
+                if let Some(server_info) = &st.stamp {
+                    modern::stamp(&mut value, server_info);
+                }
                 st.phase = ProjectionPhase::Done;
                 return Some((Ok(Event::default().data(value.to_string())), st));
             }

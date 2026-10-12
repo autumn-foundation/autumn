@@ -6,9 +6,17 @@
   `tasks/get`, and can call `tasks/cancel` and `tasks/update`. A task runs
   outside the `POST /mcp` request, so only the route's own timeout applies.
   `AppBuilder::mcp_tasks(McpTaskConfig)` sets the TTL, poll interval, store
-  size, per-client quota and stored-result byte budget. Autumn keeps tasks in memory, per process. Only a
-  caller with the same credentials can read a task. See `docs/guide/mcp.md`
-  §6.
+  size, per-client quota and stored-result byte budget. Autumn keeps tasks in
+  memory, per process. Only a caller with the same credentials can read a
+  task. See `docs/guide/mcp.md` §6.
+
+- **mcp:** MCP protocol revision `2026-07-28`. The endpoint is dual-era: a
+  request with `io.modelcontextprotocol/protocolVersion` in `params._meta`
+  is served with the modern rules (`server/discover`, per-request client
+  capabilities, `resultType` and `serverInfo` on results, the
+  `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` header checks, and the
+  `-32020`, `-32021` and `-32022` errors). Legacy clients keep the
+  `initialize` flow. See `docs/guide/mcp.md` §3.
 
 ### Breaking Changes
 

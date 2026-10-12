@@ -110,8 +110,15 @@ async fn discover_lists_versions_capabilities_and_identity() {
     assert_eq!(out["id"], 7);
     assert_eq!(result["resultType"], "complete", "{out}");
     assert_eq!(result["supportedVersions"], json!([MODERN]), "{out}");
-    assert_eq!(result["capabilities"]["tools"], json!({"listChanged": false}));
-    assert_eq!(result["capabilities"]["extensions"][TASKS], json!({}), "{out}");
+    assert_eq!(
+        result["capabilities"]["tools"],
+        json!({"listChanged": false})
+    );
+    assert_eq!(
+        result["capabilities"]["extensions"][TASKS],
+        json!({}),
+        "{out}"
+    );
     assert!(result["ttlMs"].as_u64().is_some(), "{out}");
     assert!(
         matches!(result["cacheScope"].as_str(), Some("public" | "private")),
@@ -344,7 +351,10 @@ async fn header_mismatches_are_rejected() {
             ("mcp-name", "quick_read"),
         ],
         // No Mcp-Name on tools/call.
-        &[("mcp-protocol-version", MODERN), ("mcp-method", "tools/call")],
+        &[
+            ("mcp-protocol-version", MODERN),
+            ("mcp-method", "tools/call"),
+        ],
         // Mcp-Name differs from params.name.
         &[
             ("mcp-protocol-version", MODERN),
@@ -381,7 +391,12 @@ async fn base64_mcp_name_is_decoded() {
 #[tokio::test]
 async fn unknown_method_is_a_404() {
     let client = app();
-    for method in ["ping", "resources/list", "initialize", "subscriptions/listen"] {
+    for method in [
+        "ping",
+        "resources/list",
+        "initialize",
+        "subscriptions/listen",
+    ] {
         let resp = modern(&client, method, json!({})).await;
         resp.assert_status(404);
         assert_eq!(body(&resp)["error"]["code"], -32601, "{method}");

@@ -86,6 +86,54 @@ methods an MCP client needs:
 `notifications/initialized`) are handled too — notifications get an empty
 `202 Accepted`, per the spec.
 
+### Protocol versions
+
+The endpoint serves two protocol eras on the same path:
+
+- **Legacy** (`2025-06-18`, `2025-03-26`, `2024-11-05`). The client opens
+  with `initialize`. The methods above apply.
+- **Modern** (`2026-07-28`). There is no handshake. Each request carries
+  its version and client capabilities in `params._meta`, and the
+  `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers mirror the
+  body. `initialize` and `ping` are not part of this revision.
+
+A request whose `_meta` has `io.modelcontextprotocol/protocolVersion` uses
+the modern era:
+
+```jsonc
+// POST /mcp
+// MCP-Protocol-Version: 2026-07-28
+// Mcp-Method: tools/call
+// Mcp-Name: create_todo
+{ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+  "params": { "name": "create_todo", "arguments": { "body": { "title": "buy milk" } },
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {} } } }
+```
+
+In the modern era:
+
+| Method | Result |
+| --- | --- |
+| `server/discover` | `supportedVersions`, `capabilities`, and the caching hints `ttlMs` and `cacheScope`. |
+| `tools/list` | The catalog, with `ttlMs` and `cacheScope`. |
+| `tools/call` | As in the legacy era. |
+
+Each result has `resultType` (`"complete"`, or `"task"` for a task handle)
+and `_meta["io.modelcontextprotocol/serverInfo"]`. `cacheScope` is
+`"private"` when `secure_mcp` gates the endpoint, else `"public"`.
+
+Errors:
+
+| Code | HTTP | When |
+| --- | --- | --- |
+| `-32602` | 400 | `_meta` has no `protocolVersion` or no `clientCapabilities`. |
+| `-32020` | 400 | A standard header is missing or does not match the body. `Mcp-Name` can use the `=?base64?…?=` form. |
+| `-32022` | 400 | The version is not served. `data.supported` lists the served versions. |
+| `-32601` | 404 | The method is not served (for example `ping`, `resources/list`, `subscriptions/listen`). |
+| `-32600` | 400 | The body is a JSON-RPC batch. |
+
 A `tools/list` entry looks like this — `name`, `description`, `inputSchema`,
 and `annotations` are all derived from the handler's `ApiDoc`:
 
@@ -424,7 +472,8 @@ tool must return JSON, like other tools. `task` without `mcp` does nothing.
 You can use `stream` and `task` together: a task buffers the stream into its
 final result.
 
-When one or more tools are task tools, `initialize` advertises the extension:
+When one or more tools are task tools, `server/discover` (modern) and
+`initialize` (legacy) advertise the extension:
 
 ```json
 { "capabilities": { "tools": { "listChanged": false },
@@ -554,9 +603,6 @@ the TTL ends, the server stops a running task and deletes the task.
 - A task has no HTTP response. The server drops `Set-Cookie` and
   `Server-Timing` from the handler.
 - The server does not send `notifications/tasks`. Clients poll.
-- Autumn advertises the extension in `initialize`. It does not serve
-  `server/discover` (protocol `2026-07-28`). A client that reads the
-  capability only from `server/discover` does not use tasks.
 - Autumn does not serve the `2025-11-25` core tasks (`task` request
   parameter, `tasks/result`, `tasks/list`).
 
