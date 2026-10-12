@@ -67,6 +67,11 @@ system-tests = ["autumn-web/system-tests"]
 name = "smoke"
 path = "tests/system/smoke.rs"
 
+# The DST nightly. `sim-nightly.yml` builds and runs it on its own.
+[[test]]
+name = "sim_nightly"
+path = "tests/sim_nightly.rs"
+
 # Determinism seam gate (autumn #1797): `clippy.toml`'s workspace-global
 # `disallowed-methods` config arms `clippy::disallowed_methods` (warn-by-default)
 # in every crate that sees it. This package is outside the gate's manifest, so

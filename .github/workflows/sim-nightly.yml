@@ -75,8 +75,12 @@ jobs:
           SHARDS: ${{ inputs.shards || '20' }}
         run: |
           set -euo pipefail
-          [[ "$SEEDS" =~ ^[0-9]+$ ]] && (( SEEDS > 0 )) || { echo "seeds must be a positive number: $SEEDS"; exit 1; }
-          [[ "$SHARDS" =~ ^[0-9]+$ ]] && (( SHARDS >= 1 && SHARDS <= 32 )) || { echo "shards must be 1-32: $SHARDS"; exit 1; }
+          [[ "$SEEDS" =~ ^[0-9]{1,18}$ ]] || { echo "seeds must be a number: $SEEDS"; exit 1; }
+          [[ "$SHARDS" =~ ^[0-9]{1,18}$ ]] || { echo "shards must be a number: $SHARDS"; exit 1; }
+          # Base 10: a leading zero must not make bash read the value as octal.
+          SEEDS=$(( 10#$SEEDS )); SHARDS=$(( 10#$SHARDS ))
+          (( SEEDS > 0 )) || { echo "seeds must be positive: $SEEDS"; exit 1; }
+          (( SHARDS >= 1 && SHARDS <= 32 )) || { echo "shards must be 1-32: $SHARDS"; exit 1; }
           # Each process needs enough seeds to make every sometimes! label true,
           # and few enough to finish before the job timeout (about 36 seeds/s).
           per_process=$(( SEEDS / (SHARDS * PROCESSES) ))
@@ -85,7 +89,8 @@ jobs:
           if [[ -z "$START" ]]; then
             START=$(( $(date -u +%s) / 86400 * SEEDS ))
           fi
-          [[ "$START" =~ ^[0-9]+$ ]] || { echo "start must be a number: $START"; exit 1; }
+          [[ "$START" =~ ^[0-9]{1,18}$ ]] || { echo "start must be a number: $START"; exit 1; }
+          START=$(( 10#$START ))
           {
             echo "start=$START"
             echo "seeds=$SEEDS"
