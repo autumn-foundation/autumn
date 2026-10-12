@@ -437,7 +437,8 @@ a paid one carries `PAYMENT-RESPONSE`.
 ### MPP
 
 Add `mpp_method` to a priced route. `/openapi.json` then carries
-`x-payment-info` and a `402` response for that operation. x402 skips that
+`x-payment-info` and a `402` response for that operation (a `402` the
+operation documents already is kept). x402 skips that
 route: your handler (or `autumn-billing`) runs the MPP payment.
 
 ```toml

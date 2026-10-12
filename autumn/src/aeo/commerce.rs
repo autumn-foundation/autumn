@@ -443,12 +443,12 @@ pub(crate) fn apply_mpp(spec: &mut Value, routes: &[PaidRoute]) {
             info["description"] = json!(d);
         }
         op.insert("x-payment-info".to_owned(), info);
+        // A `402` the app documents already is kept as it is.
         let responses = op.entry("responses").or_insert_with(|| json!({}));
         if let Some(responses) = responses.as_object_mut() {
-            responses.insert(
-                "402".to_owned(),
-                json!({ "description": "Payment Required" }),
-            );
+            responses
+                .entry("402")
+                .or_insert_with(|| json!({ "description": "Payment Required" }));
         }
     }
 }
@@ -2404,6 +2404,26 @@ mod tests {
         other_wallet["payTo"] = json!("0xevil");
         assert!(!accepted_matches(&other_wallet, &offered));
         assert!(!accepted_matches(&Value::Null, &offered));
+    }
+
+    /// Codex review (P2): an operation's own `402` is the app's
+    /// documentation, so MPP leaves it as it is.
+    #[test]
+    fn mpp_keeps_a_documented_402() {
+        let documented = json!({
+            "description": "Pay first",
+            "headers": { "WWW-Authenticate": { "schema": { "type": "string" } } },
+            "content": { "application/json": { "schema": { "type": "object" } } }
+        });
+        let mut spec = json!({
+            "paths": {
+                "/api/reports/{id}": { "get": { "responses": { "402": documented } } }
+            }
+        });
+        apply_mpp(&mut spec, &[route()]);
+        let op = &spec["paths"]["/api/reports/{id}"]["get"];
+        assert!(op.get("x-payment-info").is_some());
+        assert_eq!(op["responses"]["402"], documented);
     }
 
     #[test]
