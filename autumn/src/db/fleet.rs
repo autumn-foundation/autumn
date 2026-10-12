@@ -1443,6 +1443,11 @@ impl DatabaseFleet {
             // Real time on purpose: the flush budget covers blocking I/O.
             #[allow(clippy::disallowed_methods)]
             let shutdown_began = std::time::Instant::now();
+            if let Some(replication) = fleet.replication() {
+                // Closing ships each database's last frames. Bound that too.
+                replication
+                    .set_shutdown_cutoff(shutdown_began.checked_add(replication.final_flush()));
+            }
             fleet.close_all().await;
             // Every database is closed. Keep shipping parked replicators until
             // they catch up or the flush deadline passes, then stop the loop

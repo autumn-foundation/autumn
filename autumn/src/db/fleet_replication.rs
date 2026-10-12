@@ -99,6 +99,8 @@ pub struct FleetReplication {
     final_flush_ms: AtomicU64,
     /// Names still unshipped when the last shutdown flush ended.
     unshipped: Mutex<Vec<String>>,
+    /// When shutdown must be done. Close-time shipping stops at it.
+    shutdown_cutoff: Mutex<Option<std::time::Instant>>,
 }
 
 impl FleetReplication {
@@ -127,6 +129,7 @@ impl FleetReplication {
             stopped: AtomicBool::new(false),
             final_flush_ms: AtomicU64::new(5_000),
             unshipped: Mutex::new(Vec::new()),
+            shutdown_cutoff: Mutex::new(None),
         }
     }
 
@@ -143,6 +146,22 @@ impl FleetReplication {
     pub fn set_final_flush(&self, deadline: Duration) {
         let millis = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
         self.final_flush_ms.store(millis, Ordering::Release);
+    }
+
+    /// Set the time by which shutdown must be done. A database that closes
+    /// after it parks its replicator and ships nothing more at close.
+    pub fn set_shutdown_cutoff(&self, cutoff: Option<std::time::Instant>) {
+        *self
+            .shutdown_cutoff
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = cutoff;
+    }
+
+    fn shutdown_cutoff(&self) -> Option<std::time::Instant> {
+        *self
+            .shutdown_cutoff
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The longest the shutdown flush keeps shipping.
@@ -477,7 +496,7 @@ impl FleetLifecycle for FleetReplication {
                 .replicator
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            ship_until_caught_up(&mut replicator, None)
+            ship_until_caught_up(&mut replicator, self.shutdown_cutoff())
         };
         if let Err(error) = shipped {
             tracing::warn!(
@@ -1214,5 +1233,20 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(replication.closing(), 0, "an open pass ships");
+    }
+
+    #[tokio::test]
+    async fn a_close_after_the_shutdown_cutoff_parks_without_shipping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        flaky.down.store(false, Ordering::SeqCst);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        drop(db);
+        // The destination is up, but the shutdown time is already gone.
+        replication.set_shutdown_cutoff(Some(std::time::Instant::now()));
+        fleet.close(&key).await;
+        assert_eq!(replication.closing(), 1, "parked, not shipped");
     }
 }
