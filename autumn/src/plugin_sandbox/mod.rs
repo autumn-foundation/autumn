@@ -51,6 +51,7 @@
 
 pub mod artifact;
 pub mod capability;
+pub mod dynamic;
 pub mod grants;
 pub mod host;
 pub mod manifest;
@@ -79,6 +80,9 @@ pub use capability::{
     MemoryKvStore, MemoryPluginStore, NO_TENANT, OutboundHttp, OutboundRequest, OutboundResponse,
     PluginActivityLog, PluginJob, PluginRow, PluginStore, PluginValue, QueryPage, RecordingHttp,
     RenderError, Scope, StoreError, bounded_rows, row_weight, tenant_segment,
+};
+pub use dynamic::{
+    MountError, MountedPluginInfo, PluginMounts, framework_prefixes, mounts_fallback,
 };
 pub use grants::{
     CapabilityGrants, CapabilityQuotas, ConsentDelta, MAX_GRANT_ENTRIES, MAX_GRANT_IDENT_LEN,

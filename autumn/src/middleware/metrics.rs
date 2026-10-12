@@ -987,8 +987,15 @@ where
                     let elapsed =
                         crate::time::ambient_instant().saturating_duration_since(*this.start);
                     let method_str = this.method.as_str();
-                    let route_str = this.route.as_ref().map_or(
-                        super::access_log::UNMATCHED_ROUTE,
+                    let route_str = this.route.as_ref().map_or_else(
+                        || {
+                            response
+                                .extensions()
+                                .get::<super::access_log::ResponseRoute>()
+                                .map_or(super::access_log::UNMATCHED_ROUTE, |route| {
+                                    route.0.as_str()
+                                })
+                        },
                         axum::extract::MatchedPath::as_str,
                     );
                     let status = response.status().as_u16();
@@ -1347,5 +1354,32 @@ mod tests {
         let snap = collector.snapshot();
         assert_eq!(snap.http.requests_total, 1);
         assert_eq!(snap.http.requests_shed_total, 1);
+    }
+
+    #[tokio::test]
+    async fn a_response_route_names_the_series_when_the_request_had_none() {
+        use tower::ServiceExt as _;
+
+        let collector = MetricsCollector::new();
+        let service = MetricsLayer::new(collector.clone()).layer(tower::service_fn(
+            |_request: http::Request<axum::body::Body>| async {
+                let mut response = http::Response::new(axum::body::Body::empty());
+                response
+                    .extensions_mut()
+                    .insert(super::super::access_log::ResponseRoute("/p/x".to_owned()));
+                Ok::<_, std::convert::Infallible>(response)
+            },
+        ));
+        let request = http::Request::builder()
+            .uri("/p/x")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        service.oneshot(request).await.expect("infallible");
+        let routes: Vec<String> = collector
+            .duration_series()
+            .iter()
+            .map(|series| series.route.clone())
+            .collect();
+        assert_eq!(routes, ["/p/x"]);
     }
 }

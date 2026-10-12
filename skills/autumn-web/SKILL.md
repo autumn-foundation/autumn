@@ -3372,6 +3372,21 @@ rest of the app.
 - A plugin row may not carry `tenant_id` (it would choose its own tenant); a
   `row_id` echoed back from `db-get` is stripped, so read-modify-write works.
 
+**Mount at runtime (issue #2433).** No restart is needed:
+
+```rust
+let mounts = PluginMounts::new();
+let app = autumn_web::app().plugin_mounts(mounts.clone());
+mounts.mount(&SandboxedPlugin::from_file(path)?)?; // later, app running
+mounts.unmount("/hello");
+```
+
+- The 404 fallback serves mounted plugins. A static route matches first.
+- A framework prefix (`/actuator`, `/static`) or an overlapping prefix is refused.
+- Unmount drains. New requests get 404. A running request finishes and keeps
+  its permit.
+- `list()` and `routes()` show what is mounted. `autumn routes` does not.
+
 Guide: `docs/guide/sandboxed-plugins.md`. Trust model: `docs/plugins.md`.
 
 

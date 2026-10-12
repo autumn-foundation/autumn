@@ -436,12 +436,10 @@ one in the same crate — still fails, and the gate itself stays on. The id and
 the rationale are committed to your repository, so the decision is reviewable
 in a pull request rather than living in someone's memory.
 
-Your generated `deny.toml` ships with two waivers already in it.
-`RUSTSEC-2023-0071`: `rsa` reaches every Autumn app through `jsonwebtoken`,
+Your generated `deny.toml` ships with a waiver already in it:
+`RUSTSEC-2023-0071`. `rsa` reaches every Autumn app through `jsonwebtoken`,
 which `autumn-web` depends on unconditionally, and no patched `rsa` release
-exists. `RUSTSEC-2024-0449`: `unsafe-libyaml` is unmaintained and reaches your
-app through `serde_yaml`, which `autumn-web` uses to write the OpenAPI spec; no
-safe upgrade exists. An app generated with `--bundled-pg` gets a third one
+exists. An app generated with `--bundled-pg` gets a second one
 (`RUSTSEC-2024-0384`, `instant`, unmaintained, reachable only through the
 embedded-Postgres build stack) — and only that flavor gets it, so cargo-deny's
 "this waiver is unused" warning stays available to tell you when one of *your*

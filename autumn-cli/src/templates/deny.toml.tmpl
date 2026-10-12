@@ -93,14 +93,15 @@ ignore = [
     # RUSTSEC-2024-0449 — `unsafe-libyaml` is unmaintained.
     # https://rustsec.org/advisories/RUSTSEC-2024-0449
     #
-    # Ships pre-waived like the one above: `unsafe-libyaml` arrives through
-    # `serde_yaml`, an autumn-web dependency (the `openapi` feature), and no
-    # safe upgrade exists. Unmaintained, not vulnerable. autumn-web only EMITS
-    # the OpenAPI spec from your typed routes with it; it parses no YAML you
-    # did not write. Autumn re-triages this every release and drops the waiver
-    # once it moves off `serde_yaml`.
-    # Review-by: 2026-11-09 (new advisory 2026-10-12).
-    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained; reaches this app only through autumn-web's serde_yaml (openapi, emit-only); no safe upgrade; review-by 2026-11-09" },
+    # Ships pre-waived because it is unavoidable: it arrives through
+    # `serde_yaml` (itself deprecated), a dependency of autumn-web. Unmaintained,
+    # not vulnerable — there is no exploit here, and no safe upgrade exists.
+    # autumn-web only serializes the OpenAPI document with it; it parses no
+    # untrusted YAML. Autumn drops this waiver when it moves to a safe-Rust YAML
+    # crate, so the review-by below is Autumn's cadence: on a date that has
+    # passed, take the newest autumn-web and re-run the audit.
+    # Review-by: 2026-11-12.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained (not a vulnerability); reaches this app only through autumn-web's serde_yaml, which serializes the OpenAPI document and parses no untrusted YAML; no safe upgrade; review-by 2026-11-12" },
     # >>> autumn:bundled-pg-waiver
     # RUSTSEC-2024-0384 — `instant` is unmaintained.
     # https://rustsec.org/advisories/RUSTSEC-2024-0384
