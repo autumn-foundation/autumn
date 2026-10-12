@@ -2977,10 +2977,8 @@ async fn a_view_reached_through_an_ordinary_view_is_refreshed_in_dependency_orde
 
 /// A scrubbed column that is the partition key is refused, not rewritten.
 ///
-/// Rewriting the key through the parent makes Postgres move every row to the
-/// partition the new value belongs to: it aborts when none exists, and
-/// collapses the table into one partition when one does. Both are avoidable at
-/// plan time, so the plan refuses and the rows stay put.
+/// Postgres would move each row to a new partition, or abort. The plan refuses
+/// first, so the rows stay put.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn a_partition_key_column_is_refused_before_any_row_moves() {
@@ -3021,7 +3019,7 @@ async fn a_partition_key_column_is_refused_before_any_row_moves() {
 
     let (_o, stderr) = run_autumn_fail(dir, &["db", "scrub"], &envs);
     assert!(
-        stderr.contains("ledger_events.occurred_at"),
+        stderr.contains("ledger_events.occurred_at") && stderr.contains("partition keys"),
         "the refusal must name the partition key: {stderr}"
     );
     assert_eq!(

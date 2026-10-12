@@ -162,8 +162,8 @@ pub enum ScrubError {
         /// `table.column`, sorted.
         columns: Vec<String>,
     },
-    /// PII was declared on a primary- or foreign-key column, which a scrub may
-    /// never rewrite without breaking referential integrity.
+    /// PII was declared on a primary-, foreign- or partition-key column. A scrub
+    /// may not rewrite these.
     PiiOnKeyColumn {
         /// `table.column`, sorted.
         columns: Vec<String>,
@@ -478,8 +478,8 @@ impl std::fmt::Display for ScrubError {
                 f,
                 "{} column(s) are primary, foreign or partition keys but declared PII:\n{}\n  \
                  Rewriting a key column would break referential integrity or move rows \
-                 between partitions. Scrub the referenced table's own PII columns \
-                 instead, and declare these `safe`.",
+                 between partitions. Declare these columns `safe`. For a foreign key, \
+                 scrub the referenced table's own PII columns.,
                 columns.len(),
                 bullet_list(columns),
             ),
@@ -4248,7 +4248,8 @@ fn pair_rows(sql: &str, conn: &mut PgConnection) -> Result<BTreeMap<String, Stri
 ///
 /// A plain key is read from `partattrs`. An expression key records no column
 /// there (and `pg_depend` holds none), so the key definition is matched by whole
-/// word instead.
+/// word instead. The escape uses `chr(92)`, so it does not depend on
+/// `standard_conforming_strings`.
 const PARTITION_KEY_COLUMNS: &str = "SELECT rel.relname AS tbl, att.attname AS col \
      FROM pg_partitioned_table p \
      JOIN pg_class rel ON rel.oid = p.partrelid \
@@ -4258,7 +4259,8 @@ const PARTITION_KEY_COLUMNS: &str = "SELECT rel.relname AS tbl, att.attname AS c
      WHERE att.attnum = ANY (p.partattrs::int2[]) \
         OR (0 = ANY (p.partattrs::int2[]) AND pg_get_partkeydef(p.partrelid) ~ ( \
              '(^|[^[:alnum:]_])' \
-             || regexp_replace(quote_ident(att.attname), '([^[:alnum:]_])', '\\\\\\1', 'g') \
+             || regexp_replace(quote_ident(att.attname), '([^[:alnum:]_])', \
+             chr(92) || chr(92) || chr(92) || '1', 'g') \
              || '($|[^[:alnum:]_])'))";
 
 /// Move each sub-partitioned table's key columns onto its root table.
@@ -4562,11 +4564,10 @@ fn probe_database_facts(
             BTreeMap::new()
         };
 
-    // Partition-key columns. `partattrs` holds `0` for an expression key, which
-    // names no column, so those tables fall back to the columns their key
-    // definition spells: an over-match refuses a column that is not a key, which
-    // is the safe direction. Sub-partitions fold into the root, because a
-    // rewrite through the root moves rows across them too.
+    // Partition-key columns. `partattrs` holds `0` for an expression key. For
+    // those tables, match the column names in the key definition. An over-match
+    // refuses a non-key column, which is safe. Sub-partition keys fold into the
+    // root, because a rewrite through the root moves rows across them.
     let partition_key_columns: BTreeSet<(String, String)> =
         if has_catalog_column(&mut conn, "pg_class", "relispartition")? {
             let rows = pair_set(
@@ -7882,7 +7883,7 @@ mod tests {
 
     #[test]
     fn a_partition_key_column_is_refused_as_pii() {
-        // Rewriting the key moves every row between partitions, or aborts.
+        // Rewriting the key moves rows between partitions, or aborts.
         let facts = DatabaseFacts {
             partition_key_columns: BTreeSet::from([("users".to_owned(), "email".to_owned())]),
             ..DatabaseFacts::default()
