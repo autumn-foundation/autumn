@@ -1,0 +1,332 @@
+# ⚓ Ballast: weekly dependency ledger audit, 2026-10-12
+
+Sixth Ballast pass, one week after the fifth
+(`docs/reports/2026-10-05-ballast-dependency-ledger-audit.md`), which reran the
+harness clean, closed out #1897/#2615 via `.github/dependabot.yml` ignore
+entries (PR #3138, merged 2026-10-05), and left the Dependabot queue at **0**
+for the first time in five passes. This pass finds that queue refilled to 12,
+rehearses the one PR that is a clean scheduled-batch candidate, rehearses and
+rejects four PRs that looked independent but are not, and fixes a Dependabot
+labelling bug the GitHub API surfaced along the way.
+
+## 🎯 Class
+
+Mixed: **policy** (`.github/dependabot.yml` label fix) plus a **scheduled-batch
+rehearsal** (PR #3209, not merged by this pass — see Change) and **upgrade
+triage** on five PRs (#3143/#3144/#3148/#3149 opentelemetry family,
+documented as un-mergeable individually; other majors documented as
+no-forcing-fact deferrals). No dependency version bumped in this repository's
+own `Cargo.lock` by this pass — every version change discussed here lives on
+Dependabot's own PR branches, not on `trunk-dev`.
+
+## 📈 Evidence
+
+**Harness re-run, all 5 graphs, `cargo-deny 0.20.2`** (installed fresh this
+session; not present at session start):
+
+```
+cargo fetch --locked (root, fuzz/, examples/island-flock/) → all clean
+./scripts/check-advisories.sh              → OK, 0 unwaived advisories, all 5 graphs
+./scripts/check-advisories.sh --self-test  → OK, RUSTSEC-2020-0071 blocked then waived, all 4 policies
+cargo deny check licenses sources          → licenses ok, sources ok
+cargo deny --config deny-sqlite.toml check licenses sources → licenses ok, sources ok
+cargo deny check bans                      → 90 duplicate-name warnings (warn-level; unchanged from 2026-10-05)
+cargo deny check                           → advisories ok, bans ok, licenses ok, sources ok
+```
+
+Identical clean outcome to last pass on advisories/licenses/sources/bans — the
+duplicate-name warning count (90) did not move, so none of this week's real
+code merges (11 commits touching `Cargo.lock` since 2026-10-05 — GDPR capsules
+#1811, job-leasing protocol models #3071, SQLite database fleet, h2/ALPN
+coverage #2321, admission control #3068, SLO/Kubernetes packaging #3069, the
+edge node #1790, among others) changed the duplicate-version picture.
+
+**A shallow-clone trap, caught before it corrupted this report.** This
+session's checkout started shallow (50 commits). Diffing a commit at or near
+the shallow boundary (`166977c`) against `.github/dependabot.yml` and
+`deny.toml` at first appeared to show those files being newly created that
+week — a `git log`/`git diff` artifact of the shallow boundary (everything
+before it diffs against an empty tree), not a real change. `git fetch
+--deepen=200` fixed it; the lesson, for whoever runs this pass next on a fresh
+clone, is to deepen before trusting any diff that touches a commit within ~50
+commits of `HEAD`.
+
+**Dependabot PR queue: refilled from 0 to 12.** Last pass's clearance was real
+but temporary — Dependabot's weekly Monday run (2026-10-05, 2026-10-08) reopened
+the queue:
+
+| # | Title | Opened | Ecosystem |
+| --- | --- | --- | --- |
+| 3209 | `rust-deps` group, 8 updates | 2026-10-08 | cargo (grouped, minor/patch) |
+| 3169 | `source-map-js` 1.2.1→1.2.2 | 2026-10-06 | npm (`examples/react-graphql`, transitive) |
+| 3150 | `getrandom` 0.2.17→0.4.3 | 2026-10-05 | cargo (major, ungrouped) |
+| 3149 | `opentelemetry-otlp` 0.32.0→0.33.0 | 2026-10-05 | cargo (major, ungrouped) |
+| 3148 | `opentelemetry_sdk` 0.32.1→0.33.0 | 2026-10-05 | cargo (major, ungrouped) |
+| 3147 | `croner` 3.0.1→4.0.1 | 2026-10-05 | cargo (major, ungrouped) |
+| 3146 | `css-inline` 0.21.2→0.22.0 | 2026-10-05 | cargo (major, ungrouped) |
+| 3145 | `wasmi` 0.40.0→2.0.0 | 2026-10-05 | cargo (major, ungrouped) |
+| 3144 | `tracing-opentelemetry` 0.33.0→0.34.0 | 2026-10-05 | cargo (major, ungrouped) |
+| 3143 | `opentelemetry` 0.32.0→0.33.0 | 2026-10-05 | cargo (major, ungrouped) |
+| 3142 | `brotli` 8.0.4→9.0.0 | 2026-10-05 | cargo (major, ungrouped) |
+| 3140 | `taiki-e/install-action` 2.87.20→2.87.22 | 2026-10-05 | github-actions (patch) |
+
+All 12 confirmed real and still open via `pull_request_read`, not inferred
+from a search count. Everything other than #3209 and #3140 is a 0.x "minor"
+bump that Cargo/Dependabot treats as **major** (breaking) and so falls outside
+the `rust-deps` group's `update-types: [minor, patch]` filter — that filter is
+why 10 of these 12 PRs are singletons instead of one batch.
+
+**#3209 rehearsed and found clean — the one real scheduled-batch candidate
+this week.** Cherry-picked its single commit (`bc05ce2`: ammonia 4.2.0→4.2.1,
+syn 3.0.3→3.0.6, rand 0.10.2→0.10.3, h2 0.4.18→0.4.19, hyper 1.11.0→1.11.1,
+libc 0.2.189→0.2.190, tokio-rustls 0.26.5→0.26.6, and the wasm-tools quartet
+wasm-encoder/wasmparser/wast/wat 259.0.0→261.0.0) onto current `trunk-dev`
+(clean cherry-pick, no conflicts — the PR's own base had drifted ~70 commits
+behind, so testing the PR branch as-is would have shown unrelated failures
+from that drift, not from the bump; isolating the one dependency commit onto
+fresh `trunk-dev` was necessary to get a clean signal):
+
+```
+cargo deny check                          → advisories ok, bans ok (90, unchanged), licenses ok, sources ok
+cargo check --workspace --all-targets     → Finished `dev` profile [unoptimized + debuginfo] target(s) in 10m 53s, 0 errors
+```
+
+Posted the rehearsal on #3209 recommending merge. Not merged by this pass —
+every prior pass's actual merges were done by the repo's human maintainer, not
+by Ballast itself, and this pass follows that precedent.
+
+**#3143/#3144/#3148/#3149 rehearsed and found individually un-mergeable — a
+real, previously-undetected ledger hazard, not a hypothetical one.** These
+four PRs bump `opentelemetry`, `opentelemetry_sdk`, `opentelemetry-otlp`
+(0.32→0.33) and `tracing-opentelemetry` (0.33→0.34) separately, because each
+is a 0.x "major" bump excluded from the `rust-deps` group. But
+`tracing-opentelemetry` 0.34.0's own published `Cargo.toml` pins `opentelemetry
+= "0.33.0"` (confirmed by reading it directly from the registry cache, not
+inferred from the changelog — though the changelog excerpt on #3144 says the
+same thing: "Upgrade to OpenTelemetry 0.33"). Rehearsed on current
+`trunk-dev`:
+
+```
+sed -i 's/tracing-opentelemetry = "0.33.0"/tracing-opentelemetry = "0.34.0"/' Cargo.toml
+cargo update -p tracing-opentelemetry
+# → Adding opentelemetry v0.33.1 (alongside the workspace's pinned 0.32.0/0.32.1)
+cargo check -p autumn-web --no-default-features --features telemetry-otlp
+# → error: could not compile `autumn-web` (lib) due to 11 previous errors
+#   - `SdkTracer: opentelemetry::trace::tracer::Tracer` not satisfied
+#   - `Layered<OpenTelemetryLayer<...>, ...>` missing `Subscriber`/`.with()`
+#   - no method `span` on `opentelemetry::context::Context`
+```
+
+Merging `tracing-opentelemetry` alone forces a second, incompatible
+`opentelemetry` version into the graph, and `autumn/src/telemetry.rs`'s own
+`tracing_subscriber` layer stack (used under the `telemetry-otlp` feature)
+mixes types from both — a real compile break, not a theoretical one. The
+correct unit of change is all four crates together. Posted the rehearsal and
+a close-and-recombine recommendation on all four PRs; left the full mechanism
+on #3144 and pointed #3143/#3148/#3149 at it rather than repeating it four
+times.
+
+**The other 6 ungrouped majors (#3142, #3145, #3146, #3147, #3150) and the
+npm/action PRs (#3140, #3169): no forcing fact found, not individually
+rehearsed.** `wasmi` 0.40.0→2.0.0 is a scheme-reset major touching two
+security-relevant WASM host boundaries (`autumn/src/plugin_sandbox/host.rs`,
+`autumn-edge/src/host.rs`); `getrandom` 0.2.17→0.4.3 skips a whole major line;
+`croner`, `css-inline`, `brotli` are each direct, single-crate bumps with a
+real call site (`autumn/src/app.rs`, `autumn/src/mail.rs`,
+`autumn/src/router.rs`+`shadow/transport.rs` respectively) but no CVE, EOL, or
+named-consumer feature behind any of them — "staying current" is the only
+stated reason on every one of these PRs, which this repo's dependency charter
+treats as not a forcing fact for a major. `cargo deny check advisories`
+reports all of them clean at their *current* pinned versions, so none is a
+reachable-fire upgrade either. Rehearsing five independent major-version
+bumps (two of them touching a WASM interpreter boundary) is itself real
+engineering work this pass's time budget did not have room for; left as
+documented deferrals rather than rehearsed-and-rejected like the opentelemetry
+cluster, since no mechanical conflict was found for any of them (absence of
+evidence, not evidence of absence — unlike the opentelemetry case, these were
+not actually rehearsed). #3169 (npm, `source-map-js`, transitive in
+`examples/react-graphql/frontend/package-lock.json`) and #3140
+(`taiki-e/install-action`, a CI-tool-installer patch bump) are both low-risk
+on their face but outside this harness's `cargo deny` coverage and this pass's
+rehearsal budget; left open.
+
+**A Dependabot config bug, found while reading each PR's comments, not
+flagged by any prior pass.** Every PR above carries this exact comment from
+`dependabot[bot]`:
+
+```
+### Labels
+The following labels could not be found: `automated`. Please create it before
+Dependabot can add it to a pull request.
+```
+
+Confirmed mechanically, not just by reading the bot's comment: `get_label`
+for `automated` and `ci` both returned "not found in
+autumn-foundation/autumn"; only `dependencies` exists. `.github/dependabot.yml`
+listed `[dependencies, automated]` for the cargo block and `[ci, automated]`
+for the github-actions block — so every PR from the github-actions block has
+been getting **zero** labels applied (both of its names are wrong), and every
+cargo-ecosystem PR has been getting only `dependencies` with Dependabot
+posting the same warning comment every time. Not merge-blocking (the PRs are
+still created fine), but a real, fixable fact about this repo's own config,
+sitting unnoticed since whenever those labels were first added — a `get_label`
+check neither this nor any prior Ballast pass had run before.
+
+**Waivers — not yet due.** All five review-by dates (`RUSTSEC-2023-0071`,
+`RUSTSEC-2024-0384`, `RUSTSEC-2026-0253`, `RUSTSEC-2024-0370`,
+`RUSTSEC-2025-0141`) were re-dated to **2026-11-02** last pass; today is
+2026-10-12, three weeks early. Not re-verified or re-dated this pass — doing so
+before the trigger date would just be motion, not hygiene (and the charter's
+own cadence law treats a review-by date as the actual checkpoint, not a
+suggestion to recheck early).
+
+**Supply-chain facts, re-verified**: zero wildcard version ranges, zero
+unpinned git refs, main workspace and both satellites — unchanged.
+
+**Scheduled-batch size** (`cargo update --dry-run --verbose`, informational
+only — a count of what a full update would touch, not a diff from last week's
+methodology, since the workspace itself grew in the interim from real feature
+merges):
+
+| Graph | Packages a full update would lock |
+| --- | --- |
+| root (Rust 1.88.0) | 128 |
+| `fuzz/` (Rust 1.88.0) | 95 |
+| `examples/island-flock/` (this session's toolchain) | 31 |
+
+Workspace membership is 39 crates (37 reported last pass; the +2,
+`examples/mesh-catalog` and `examples/mesh-storefront`, predates this report
+window — added 2026-09-18, per `git log --diff-filter=A` — so it is not this
+week's movement, just a number this pass is the first to state correctly
+after deepening past the shallow-clone boundary that obscured it).
+
+## 💡 Mechanism / forcing fact
+
+**Policy** (dependabot.yml label fix): mechanically confirmed broken config
+(`get_label` 404 on both non-existent names), silently wasting every
+Dependabot PR's labelling since whenever this was written — a real,
+cheaply-fixed fact, not motion for its own sake.
+
+**Upgrade triage** (opentelemetry cluster): the forcing fact is the rehearsal
+itself — four PRs look independent and are not; merging any subset other than
+all four breaks `autumn-web`'s compile under `--features telemetry-otlp`. No
+CVE or EOL involved; this is a correctness/compatibility fact, not a security
+one.
+
+**Scheduled batch** (#3209): routine, grouped, minor/patch, rehearsed clean —
+exactly the class the charter asks Ballast to validate and let through.
+
+No forcing fact found for the five remaining ungrouped majors; per the
+charter, "staying current" does not supply one, so none is actioned.
+
+## 🔧 Change
+
+- `.github/dependabot.yml`: dropped the non-existent `automated` label from
+  the cargo block (kept `dependencies`, which is real) and dropped the
+  non-existent `ci`/`automated` labels entirely from the github-actions block
+  (no real replacement name to put there instead). Validated with a YAML
+  parse. No `ignore` entries touched.
+- Posted rehearsal comments on GitHub PRs #3209 (clean, recommend merge),
+  #3144 (full mechanism, recommend closing all four and recombining), and
+  #3143/#3148/#3149 (pointing at #3144's rehearsal, same recommendation).
+- No PR merged or closed by this pass — every merge/close decision in this
+  repo's Ballast history has been made by its human maintainer, not by
+  Ballast itself, and that precedent held here too.
+- No dependency version changed in this repository's own `Cargo.lock`.
+
+## 📊 Measurement
+
+| Check | 2026-10-05 | 2026-10-12 |
+| --- | --- | --- |
+| Unwaived advisories, all 5 graphs | 0 | 0 |
+| Advisory gate self-test (4 policies) | OK | OK |
+| Root/SQLite licenses + sources | clean | clean |
+| Duplicate crate names (warn-level, `cargo deny check bans`) | 90 | 90 |
+| Workspace members | 37 (stale count, see Evidence) | 39 (corrected) |
+| Open Dependabot PRs | 0 | 12 |
+| PRs rehearsed clean (ready to merge) | — | 1 (#3209) |
+| PRs rehearsed and found individually un-mergeable | — | 4 (#3143/#3144/#3148/#3149) |
+| PRs deferred, no forcing fact, not rehearsed | — | 7 (#3140, #3142, #3145, #3146, #3147, #3150, #3169) |
+| Dependabot label config | broken (`automated`/`ci` both 404) | fixed (`dependencies` only, cargo block; none, github-actions block) |
+| Wildcard ranges / unpinned git refs | 0 / 0 | 0 / 0 |
+| Scheduled-batch size, root / fuzz / island-flock | 98 / 78 / 31 packages | 128 / 95 / 31 packages |
+
+## 🔬 Reproduce
+
+```
+git fetch --deepen=200 origin trunk-dev   # avoid the shallow-clone diff trap — see Evidence
+cargo fetch --locked
+(cd fuzz && cargo fetch --locked)
+(cd examples/island-flock && cargo fetch --locked)
+./scripts/check-advisories.sh
+./scripts/check-advisories.sh --self-test
+cargo deny check
+cargo deny check bans   # duplicate-name count
+cargo metadata --format-version 1 --no-deps | python3 -c "import json,sys; print(len(json.load(sys.stdin)['packages']))"  # workspace members
+
+cargo update --dry-run --verbose 2>&1 | grep Locking
+(cd fuzz && cargo update --dry-run --verbose 2>&1 | grep Locking)
+(cd examples/island-flock && cargo update --dry-run --verbose 2>&1 | grep Locking)
+
+# PR #3209 rehearsal
+git fetch origin pull/3209/head:ballast-pr-3209
+git checkout origin/trunk-dev -b rehearsal-3209 && git cherry-pick bc05ce2
+cargo deny check && cargo check --workspace --all-targets
+
+# opentelemetry lockstep rehearsal
+git checkout origin/trunk-dev -b rehearsal-otlp
+sed -i 's/tracing-opentelemetry = "0.33.0"/tracing-opentelemetry = "0.34.0"/' Cargo.toml
+cargo update -p tracing-opentelemetry
+cargo check -p autumn-web --no-default-features --features telemetry-otlp
+
+# dependabot label check (via GitHub MCP get_label, or the API directly)
+# GET /repos/autumn-foundation/autumn/labels/automated  → 404
+# GET /repos/autumn-foundation/autumn/labels/ci          → 404
+# GET /repos/autumn-foundation/autumn/labels/dependencies → 200
+
+python3 -c "import yaml; yaml.safe_load(open('.github/dependabot.yml'))"
+```
+
+## Follow-ups still open
+
+1. **GitHub-native Dependabot/security alert count (16: 4 high, 10 moderate, 2
+   low as of last pass's push) — still no tool in any session's GitHub MCP
+   toolset exposes it.** Re-confirmed this pass by a dedicated subagent
+   search (actions_get/list, get_commit, search_*, pull_request_read,
+   issue_read — nothing named anything like "dependabot alert" or "security
+   advisory" exists). Three passes running without resolution. Needs a human
+   to look at `github.com/autumn-foundation/autumn/security/dependabot`
+   directly; this session cannot.
+2. **The opentelemetry cluster (#3143/#3144/#3148/#3149) needs a human
+   decision**: close all four and open one combined PR (this pass's
+   recommendation, posted on all four), or leave them open as a visible
+   "don't merge piecemeal" marker until Dependabot itself notices the group
+   exclusion is wrong. Either way, `dependabot.yml`'s `rust-deps` group
+   exclusion of 0.x "major" bumps is working as configured, not malfunctioning
+   — the gap is that nothing currently re-groups a *cluster* of excluded
+   majors that happen to be interdependent. No generic fix proposed; flagging
+   for a human rather than guessing at a dependabot.yml rule that might
+   misfire on some other, unrelated cluster of excluded majors.
+3. Five majors (#3142 `brotli`, #3145 `wasmi`, #3146 `css-inline`, #3147
+   `croner`, #3150 `getrandom`) deferred without rehearsal — no forcing fact,
+   but also not disproven the way the opentelemetry cluster was. `wasmi`
+   0.40→2.0 is the one worth a dedicated pass of its own given its blast
+   radius (two WASM host boundaries, one of them the plugin sandbox); the
+   other four are lower-stakes single-crate bumps.
+4. `examples/island-flock/deny.toml`'s `RUSTSEC-2025-0141` (`bincode`,
+   reachability undetermined): still unresolved, now six passes running.
+   `build-island.sh` still hasn't rerun.
+5. The NCSA-via-`libfuzzer-sys` license-class decision for `fuzz/deny.toml`:
+   still open, unchanged since the first pass.
+6. Cost attribution (`cargo build --timings`) and a usage/unused-feature audit
+   on the root graph's heaviest hires: still not run, sixth pass running.
+7. `fuzz/` (95 packages) and `island-flock/` (31 packages) remain uncovered by
+   any scheduled-batch process — `dependabot.yml`'s `updates:` list still has
+   only the two root entries. Same two options as every prior pass: extend
+   `dependabot.yml`, or have Ballast own satellite-graph batches on its own
+   cadence.
+8. Waivers re-verified last pass, re-dated to 2026-11-02 — next due that date,
+   not before.
+9. The `cargo deny list` vs `cargo deny check bans` discrepancy (flagged
+   2026-09-21): not investigated this pass either; bans' count (90) tracked
+   cleanly against last week's own number, so no fresh discrepancy to chase.
