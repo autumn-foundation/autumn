@@ -525,13 +525,12 @@ impl FleetLifecycle for FleetReplication {
         // Every pooled connection is gone. Ship everything they committed
         // before the replicator's own connection — the last one — closes and
         // lets SQLite checkpoint.
-        let shipped = {
-            let mut replicator = replica
-                .replicator
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            ship_until_caught_up(&mut replicator, &|| self.shutdown_cutoff())
-        };
+        // The cutoff-aware lock: another thread may hold the replica, and
+        // shutdown must not wait for it past the cutoff.
+        let shipped = lock_replicator(&replica, &|| self.shutdown_cutoff()).map_or_else(
+            || Err("the shutdown cutoff passed before the close could ship".to_owned()),
+            |mut replicator| ship_until_caught_up(&mut replicator, &|| self.shutdown_cutoff()),
+        );
         if let Err(error) = shipped {
             tracing::warn!(
                 database = %db.key(),
@@ -1430,5 +1429,35 @@ mod tests {
         );
         holder.join().unwrap();
         assert_eq!(replication.closing(), 1, "nothing shipped");
+    }
+
+    #[tokio::test]
+    async fn a_close_waiting_on_a_replica_lock_gives_up_at_the_cutoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        flaky.down.store(false, Ordering::SeqCst);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        drop(db);
+        // The loop thread holds the replica for three seconds.
+        let replica = replication.active().get(&key).cloned().unwrap();
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = replica.replicator.lock().unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        held.recv().unwrap();
+        replication.set_shutdown_cutoff(Some(std::time::Instant::now()));
+        let began = std::time::Instant::now();
+        fleet.close(&key).await;
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "the close must not wait out the lock: {:?}",
+            began.elapsed()
+        );
+        holder.join().unwrap();
+        assert_eq!(replication.closing(), 1, "parked, not shipped");
     }
 }
