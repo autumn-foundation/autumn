@@ -82,7 +82,9 @@ Agentmap: https://example.com/.well-known/ai-catalog.json
 
 The AI crawlers are in the `*` group. The `[seo.robots] additional_rules`
 also apply to them. A bot that `additional_rules` names (for example
-`User-agent: GPTBot`) keeps only your group.
+`User-agent: GPTBot`) keeps only your group. When `additional_rules` opens
+its own `User-agent: *` group, Autumn does not name the allowed AI crawlers,
+so that group binds them too.
 
 - `search`: use the content for a search index.
 - `ai-input`: use the content as input to AI answers.

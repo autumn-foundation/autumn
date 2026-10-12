@@ -104,11 +104,16 @@ pub fn robots_txt_with_policy(
     if signal.is_some() {
         txt.push_str(CONTENT_SIGNAL_COMMENT);
     }
+    // An operator `*` group binds only crawlers that no group names: a
+    // crawler named here would obey this group and skip the operator's
+    // (RFC 9309 §2.2.1). Such a crawler is then left to the `*` groups,
+    // which merge.
+    let operator_wildcard = named.contains(&"*");
     txt.push_str("User-agent: *\n");
     // A crawler class shares the `*` group when it is allowed, or when the
     // whole site is closed (dev/test): one group then holds every rule.
     for (bots, access) in &classes {
-        if *access == CrawlerAccess::Allow || !is_prod {
+        if !operator_wildcard && (*access == CrawlerAccess::Allow || !is_prod) {
             push_user_agents(&mut txt, bots);
         }
     }
@@ -361,6 +366,41 @@ mod tests {
         );
         assert_eq!(txt.matches("User-agent: GPTBot").count(), 1, "{txt}");
         assert!(txt.contains("User-agent: ClaudeBot"), "{txt}");
+    }
+
+    /// Codex review (P2): a crawler named in the generated group would skip
+    /// an operator `*` group, so with one it is named only to be blocked.
+    #[test]
+    fn an_operator_wildcard_group_binds_the_allowed_crawlers() {
+        let rules = ["User-agent: *".to_owned(), "Disallow: /private".to_owned()];
+        let policy = |training| {
+            BotPolicy::from_config(&AeoConfig {
+                ai_crawlers: AiCrawlersConfig {
+                    training,
+                    ..AiCrawlersConfig::default()
+                },
+                ..AeoConfig::default()
+            })
+        };
+        let txt = robots_txt_with_policy("prod", None, &rules, &policy(CrawlerAccess::Allow));
+        for bot in AI_SEARCH_CRAWLERS
+            .iter()
+            .chain(AI_USER_FETCHERS)
+            .chain(AI_TRAINING_CRAWLERS)
+        {
+            assert!(!txt.contains(&format!("User-agent: {bot}\n")), "{txt}");
+        }
+        assert!(txt.contains("User-agent: *\nDisallow: /private"), "{txt}");
+
+        // A blocked class keeps its own group.
+        let txt = robots_txt_with_policy("prod", None, &rules, &policy(CrawlerAccess::Disallow));
+        assert!(!txt.contains("User-agent: OAI-SearchBot"), "{txt}");
+        let training = txt
+            .split("\n\n")
+            .find(|g| g.contains("User-agent: GPTBot"))
+            .unwrap_or_else(|| panic!("no GPTBot group:\n{txt}"));
+        assert!(training.contains("Disallow: /\n"), "{training}");
+        assert!(!training.contains("User-agent: *"), "{training}");
     }
 
     /// Codex review (P2): a crawler with the operator's own group obeys
