@@ -89,6 +89,14 @@ pub const ACCESS_LOG_TARGET: &str = "autumn::access";
 /// `route` field low-cardinality. Mirrors the metrics layer.
 pub const UNMATCHED_ROUTE: &str = "_unmatched";
 
+/// The route pattern a response carries when the request had no `MatchedPath`.
+///
+/// A plugin mounted at runtime is routed from the 404 fallback. That happens
+/// after the access log and metrics layers read the request. The plugin sets
+/// this on its response, and those layers use it when the request has no route.
+#[derive(Debug, Clone)]
+pub struct ResponseRoute(pub String);
+
 /// Shared sentinel coordinating the primary and fallback access-log layers.
 ///
 /// The fallback inserts it into the **request** extensions on the way in, and
@@ -299,7 +307,16 @@ where
                     tracing::info!(
                         target: ACCESS_LOG_TARGET,
                         method = %meta.method,
-                        route = meta.route.as_deref().unwrap_or(UNMATCHED_ROUTE),
+                        route = meta
+                            .route
+                            .as_deref()
+                            .or_else(|| {
+                                response
+                                    .extensions()
+                                    .get::<ResponseRoute>()
+                                    .map(|route| route.0.as_str())
+                            })
+                            .unwrap_or(UNMATCHED_ROUTE),
                         status = response.status().as_u16(),
                         duration_ms,
                         request_id,

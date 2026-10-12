@@ -622,6 +622,18 @@ async fn serve(
     params: axum::extract::RawPathParams,
     request: axum::extract::Request,
 ) -> Response {
+    let route = crate::middleware::access_log::ResponseRoute(pattern.clone());
+    let mut response = serve_inner(mounted, pattern, params, request).await;
+    response.extensions_mut().insert(route);
+    response
+}
+
+async fn serve_inner(
+    mounted: Mounted,
+    pattern: String,
+    params: axum::extract::RawPathParams,
+    request: axum::extract::Request,
+) -> Response {
     let Mounted {
         host,
         permits,

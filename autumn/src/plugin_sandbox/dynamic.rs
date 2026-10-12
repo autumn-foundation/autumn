@@ -592,4 +592,21 @@ mod tests {
         let _ = mounts.unmount("/hello");
         assert_eq!(get(&router, "/hello/greet").await.0, StatusCode::NOT_FOUND);
     }
+
+    #[tokio::test]
+    async fn a_mounted_response_names_its_route_for_logs_and_metrics() {
+        let mounts = PluginMounts::new();
+        let app = app(&mounts);
+        mounts.mount(&hello("/hello")).expect("mounts");
+        let request = HttpRequest::builder()
+            .uri("/hello/greet")
+            .body(Body::empty())
+            .expect("request");
+        let response = app.oneshot(request).await.expect("infallible");
+        let route = response
+            .extensions()
+            .get::<crate::middleware::access_log::ResponseRoute>()
+            .expect("the route rides on the response");
+        assert_eq!(route.0, "/hello/greet");
+    }
 }

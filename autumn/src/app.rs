@@ -1780,6 +1780,10 @@ impl AppBuilder {
             if crate::config::profile_is_dev(config.profile.as_deref()) {
                 reserved.push(config.dev.inspector_path);
             }
+            #[cfg(feature = "maud")]
+            if config.stories.enabled {
+                reserved.push(crate::stories::STORIES_PATH.to_owned());
+            }
             mounts.reserve(reserved);
             state.insert_extension(mounts);
         })

@@ -987,8 +987,15 @@ where
                     let elapsed =
                         crate::time::ambient_instant().saturating_duration_since(*this.start);
                     let method_str = this.method.as_str();
-                    let route_str = this.route.as_ref().map_or(
-                        super::access_log::UNMATCHED_ROUTE,
+                    let route_str = this.route.as_ref().map_or_else(
+                        || {
+                            response
+                                .extensions()
+                                .get::<super::access_log::ResponseRoute>()
+                                .map_or(super::access_log::UNMATCHED_ROUTE, |route| {
+                                    route.0.as_str()
+                                })
+                        },
                         axum::extract::MatchedPath::as_str,
                     );
                     let status = response.status().as_u16();
