@@ -533,9 +533,9 @@ impl AeoSite {
 /// always wins, and a generated path can never collide with one.
 #[cfg(test)]
 pub(crate) async fn fallback(site: Option<Arc<AeoSite>>, req: Request<Body>) -> Response {
-    match serve_document(site, req) {
-        Ok(res) => res,
-        Err(req) => {
+    match serve_document(site, &req) {
+        Some(res) => res,
+        None => {
             crate::middleware::error_page_filter::fallback_404_handler(
                 req.method().clone(),
                 req.uri().clone(),
@@ -545,12 +545,9 @@ pub(crate) async fn fallback(site: Option<Arc<AeoSite>>, req: Request<Body>) -> 
     }
 }
 
-/// The generated document at `req`'s path, or `req` back when there is none
-/// (the caller answers it: a mounted plugin, else the framework 404).
-pub(crate) fn serve_document(
-    site: Option<Arc<AeoSite>>,
-    req: Request<Body>,
-) -> Result<Response, Request<Body>> {
+/// The generated document at `req`'s path, if there is one (else the caller
+/// answers: a mounted plugin, or the framework 404).
+pub(crate) fn serve_document(site: Option<Arc<AeoSite>>, req: &Request<Body>) -> Option<Response> {
     let method = req.method().clone();
     let uri = req.uri().clone();
     let readable = method == Method::GET || method == Method::HEAD;
@@ -558,7 +555,7 @@ pub(crate) fn serve_document(
         && (readable || method == Method::OPTIONS)
         && documents::is_document_path(uri.path())
     {
-        let (origin, host) = documents::Origin::for_request(site.base_url.as_deref(), &req);
+        let (origin, host) = documents::Origin::for_request(site.base_url.as_deref(), req);
         let host = host.as_deref();
         if let Some(mut doc) = documents::render(&site.facts, &origin, uri.path()) {
             // The directory signature covers `@authority`: through another
@@ -567,10 +564,10 @@ pub(crate) fn serve_document(
                 doc.headers
                     .retain(|(name, _)| !matches!(*name, "signature" | "signature-input"));
             }
-            return Ok(document_response(doc, &method, req.headers()));
+            return Some(document_response(doc, &method, req.headers()));
         }
     }
-    Err(req)
+    None
 }
 
 /// Marks a generated document, so the response layer removes any

@@ -5641,9 +5641,9 @@ fn apply_middleware(
                 }
                 #[cfg(not(feature = "plugin-sandbox"))]
                 let _ = app;
-                match crate::aeo::serve_document(site, req) {
-                    Ok(res) => res,
-                    Err(req) => {
+                match crate::aeo::serve_document(site, &req) {
+                    Some(res) => res,
+                    None => {
                         crate::middleware::error_page_filter::fallback_404_handler(
                             req.method().clone(),
                             req.uri().clone(),
