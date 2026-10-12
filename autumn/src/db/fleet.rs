@@ -2370,6 +2370,8 @@ fn remove_database_files(path: &Path, root: &Path, name: &str) -> Result<bool, F
 /// new database at the path. Any unlink after that could hit the new
 /// database's `-wal`.
 ///
+/// An absent main file stays untouched, and only its stray sidecars go.
+///
 /// On Windows, a process that has the database open also holds its `-wal`.
 /// The sharing violation then stops the unlink at the sidecar, before the
 /// main file goes.
@@ -2379,9 +2381,13 @@ fn unlink_database_set(
     name: &str,
     mut unlink: impl FnMut(&Path) -> std::io::Result<()>,
 ) -> Result<(), FleetError> {
+    // No guard covers an absent path. A file there after the sidecar pass is
+    // another process's new database, so the main file is left alone.
+    let had_main = path.is_file();
+    let main = had_main.then(|| path.to_path_buf());
     for file in crate::fleet_layout::sidecar_paths(path)
         .into_iter()
-        .chain(std::iter::once(path.to_path_buf()))
+        .chain(main)
     {
         match unlink(&file) {
             Ok(()) => {}
@@ -3667,5 +3673,24 @@ mod tests {
         );
         assert!(!fleet.delete(&key).await.unwrap());
         assert!(!fleet.path_of(&key).exists());
+    }
+
+    #[test]
+    fn a_database_published_while_the_path_was_absent_is_not_unlinked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("plain.db");
+        // No guard held the absent path. Another process publishes during
+        // the sidecar pass.
+        unlink_database_set(&path, "delete database", "acme", |file| {
+            if file != path {
+                std::fs::write(&path, b"new").unwrap();
+            }
+            match std::fs::remove_file(file) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
 }
