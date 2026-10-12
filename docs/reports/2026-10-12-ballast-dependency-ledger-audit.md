@@ -244,13 +244,21 @@ too — reusing the one label already confirmed to exist, matching the cargo
 block, rather than trusting an unverified ecosystem-label name or an
 untested empty list.
 
-**Waivers — not yet due.** All five review-by dates (`RUSTSEC-2023-0071`,
+**Waivers — not yet due.** All six live waivers (`RUSTSEC-2023-0071`,
 `RUSTSEC-2024-0384`, `RUSTSEC-2026-0253`, `RUSTSEC-2024-0370`,
-`RUSTSEC-2025-0141`) were re-dated to **2026-11-02** last pass; today is
-2026-10-12, three weeks early. Not re-verified or re-dated this pass — doing so
-before the trigger date would just be motion, not hygiene (and the charter's
-own cadence law treats a review-by date as the actual checkpoint, not a
-suggestion to recheck early).
+`RUSTSEC-2025-0141`, `RUSTSEC-2026-0319`) were re-dated to **2026-11-02** last
+pass; today is 2026-10-12, three weeks early. Corrected per a Codex review
+comment: the first version of this section dropped the sixth waiver,
+`RUSTSEC-2026-0319` (anymap2, `examples/island-flock/deny.toml:66-67`), along
+with its second trigger — that entry is due at **2026-11-02, or when #3095
+lands**, whichever comes first, not on the date alone. Checked #3095
+directly rather than assuming the date is what governs: still open, 0 closing
+PRs, so the "not yet due" conclusion holds for this waiver too, but by
+actually checking the open issue, not by only reading a calendar. Not
+re-verified or re-dated this pass otherwise — doing so before either trigger
+fires would just be motion, not hygiene (and the charter's own cadence law
+treats a review-by date, or a named triggering event, as the actual
+checkpoint, not a suggestion to recheck early).
 
 **Supply-chain facts, re-verified**: zero wildcard version ranges, zero
 unpinned git refs, main workspace and both satellites — unchanged.
