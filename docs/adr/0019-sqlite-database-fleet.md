@@ -109,13 +109,16 @@ Uppercase is refused, not folded: on a case-insensitive file system `Acme` and
   path, and nothing of ours may touch it after that. A database created there
   after a delete is the documented outcome (a fresh database, when created on
   demand).
-- An absent path has no guard. Delete unlinks nothing there. A stray `-wal`
-  of an absent database (from a crash or a manual removal of the main file)
-  survives until an explicit `restore` clears it. Create and
-  `restore_missing` publish over it without clearing, because clearing it
-  races with another process that has just published the same path. Closing
-  this needs a cross-process reservation of the path (a lock file or
-  tombstone). That is roadmap work.
+- A path lock covers every step that publishes or removes a database file:
+  create, restore (explicit and on open) and delete. It is a lock file in
+  `<root>/.fleet-locks/`, one of 256 chosen by a stable hash of the key. The
+  lock is `flock` on Unix and `LockFileEx` on Windows, so the OS drops it when
+  a process dies. A lock file is never deleted. A process that finds the path
+  empty under the lock knows that none can publish there until it lets go, so
+  it clears the stray sidecars of the absent database first: a stale `-wal`
+  would replay onto the new file. Other keys on the same lock file wait, so
+  hold it only for the publish. A restore on open holds it for the download
+  too. The lock needs a file system with working `flock` (not NFS).
 - Delete and restore install the drain first, so no new entry can appear.
   They then take the entry that was open and wait for its opener task to end.
   A running open is never interrupted, and a late opener cannot start one:

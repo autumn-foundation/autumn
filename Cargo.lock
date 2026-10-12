@@ -871,6 +871,7 @@ dependencies = [
  "diesel",
  "diesel-async",
  "diesel_migrations",
+ "fd-lock",
  "filetime",
  "flate2",
  "futures",

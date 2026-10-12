@@ -306,6 +306,10 @@ pub trait FleetLifecycle: Send + Sync + 'static {
     /// then treats it as an existing database. Runs on a blocking thread. An
     /// error refuses the open.
     ///
+    /// The fleet holds the path lock while the hook runs, and has cleared the
+    /// stray sidecars of the absent database first. Other keys that share the
+    /// lock file wait, so do the slow work (a download) only as needed.
+    ///
     /// # Errors
     ///
     /// A message that becomes [`FleetError::Restore`].
@@ -1037,7 +1041,7 @@ impl DatabaseFleet {
             // Before any file work: staging and publish would otherwise follow
             // a bucket symlink and leave a database outside the root.
             check_contained(fleet.root(), &path)?;
-            create_database_file(&path, &name, &fleet.inner.migrations)
+            create_database_file(fleet.root(), &path, &name, &fleet.inner.migrations)
         })
         .await
         .map_err(|e| FleetError::Unavailable {
@@ -1207,7 +1211,12 @@ impl DatabaseFleet {
             let fleet = self.clone();
             let (create_path, create_name) = (path.clone(), name.clone());
             crate::time::spawn_blocking(move || {
-                create_database_file(&create_path, &create_name, &fleet.inner.migrations)
+                create_database_file(
+                    fleet.root(),
+                    &create_path,
+                    &create_name,
+                    &fleet.inner.migrations,
+                )
             })
             .await
             .map_err(|e| FleetError::Unavailable {
@@ -1323,21 +1332,41 @@ impl DatabaseFleet {
             return Ok(false);
         }
         let (hook_key, hook_path) = (key.clone(), path.to_path_buf());
+        let root = self.inner.root.clone();
+        let name = key.name();
         crate::time::spawn_blocking(move || {
-            for hook in hooks {
-                if hook.restore_missing(&hook_key, &hook_path)? {
-                    return Ok(true);
+            // The hook publishes the restored file. Hold the path lock so no
+            // other process publishes meanwhile, and clear the stale sidecars
+            // of the absent database first: they would replay onto it.
+            with_path_lock(&root, &name, || {
+                if !hook_path.exists() {
+                    unlink_database_set(
+                        &hook_path,
+                        "clear stray sidecars",
+                        &name,
+                        false,
+                        |file| std::fs::remove_file(file),
+                    )?;
                 }
-            }
-            Ok(false)
+                for hook in hooks {
+                    let restored =
+                        hook.restore_missing(&hook_key, &hook_path)
+                            .map_err(|detail| FleetError::Restore {
+                                name: name.clone(),
+                                detail,
+                            })?;
+                    if restored {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })
         })
         .await
-        .map_err(|e| e.to_string())
-        .and_then(|r| r)
-        .map_err(|detail| FleetError::Restore {
+        .map_err(|error| FleetError::Restore {
             name: key.name(),
-            detail,
-        })
+            detail: error.to_string(),
+        })?
     }
 
     // ── Close ────────────────────────────────────────────────────────────
@@ -1655,10 +1684,11 @@ impl DatabaseFleet {
     /// while this runs, and `404` (or a fresh database, when created on
     /// demand) after.
     ///
-    /// Another process that shares the root can publish a new database at
-    /// the path as soon as the main file is gone. That is not an error. This
-    /// call touches nothing after that unlink, so the new database keeps its
-    /// files. To hold the path, use a tombstone.
+    /// The call holds the path lock, which every process that shares the
+    /// root takes to publish or remove a database at that path. So no other
+    /// process publishes a database there while this call runs. One that does
+    /// so afterwards keeps its files: this call touches nothing after the
+    /// unlink.
     ///
     /// The database's replica, if any, is not deleted here: a lifecycle hook
     /// (`on_delete`) decides.
@@ -1719,8 +1749,10 @@ impl DatabaseFleet {
                     // On Unix it also blocks new openers while the files go. On
                     // Windows it closes first.
                     check_contained(&root, &path)?;
-                    with_exclusive_access(&path, &name, HOLD_GUARD_WHILE_REMOVING, |present| {
-                        remove_database_files(&path, &root, &name, present)
+                    with_path_lock(&root, &name, || {
+                        with_exclusive_access(&path, &name, HOLD_GUARD_WHILE_REMOVING, |present| {
+                            remove_database_files(&path, &root, &name, present)
+                        })
                     })
                 })
                 .await
@@ -1899,7 +1931,7 @@ impl DatabaseFleet {
                 // skipped it would strand every later opener of this key.
                 let restored = crate::time::spawn_blocking(move || {
                     check_contained(&root, &path)?;
-                    restore_in_place(&replication, &restore_key, target, &path)
+                    restore_in_place(&root, &replication, &restore_key, target, &path)
                 })
                 .await
                 .map_err(|error| FleetError::Restore {
@@ -2470,6 +2502,7 @@ fn publish_restored(staging: &Path, path: &Path, name: &str) -> Result<(), Fleet
 /// the exclusive guard stays open for this. On Windows, it closes first. A file that appears in that gap
 /// gives `AlreadyExists`.
 fn restore_in_place(
+    root: &Path,
     replication: &super::fleet_replication::FleetReplication,
     key: &FleetDbKey,
     target: Option<chrono::DateTime<chrono::Utc>>,
@@ -2498,11 +2531,13 @@ fn restore_in_place(
             return Err(error);
         }
     };
-    let published = with_exclusive_access(path, &name, HOLD_GUARD_WHILE_REMOVING, |present| {
-        unlink_database_set(path, "replace database", &name, present, true, |file| {
-            std::fs::remove_file(file)
-        })?;
-        publish_restored(&staging, path, &name)
+    let published = with_path_lock(root, &name, || {
+        with_exclusive_access(path, &name, HOLD_GUARD_WHILE_REMOVING, |present| {
+            unlink_database_set(path, "replace database", &name, present, |file| {
+                std::fs::remove_file(file)
+            })?;
+            publish_restored(&staging, path, &name)
+        })
     });
     discard_staging(&staging);
     published.map(|()| crate::replication::RestoreOutcome {
@@ -2520,6 +2555,7 @@ fn restore_in_place(
 /// made; a failure removes only the staging file; and when another process
 /// publishes first, its file wins and this returns `Ok(false)`.
 fn create_database_file(
+    root: &Path,
     path: &Path,
     name: &str,
     migrations: &FleetMigrations,
@@ -2536,8 +2572,19 @@ fn create_database_file(
         discard(&staging);
         return Err(error);
     }
-    let published = std::fs::hard_link(&staging, path);
+    // The path lock is held only for the publish, not for the build above.
+    let published = with_path_lock(root, name, || {
+        // Under the lock nobody else can publish here. A path with no main
+        // file holds no live database, so its stray sidecars are stale.
+        if !path.exists() {
+            unlink_database_set(path, "clear stray sidecars", name, false, |file| {
+                std::fs::remove_file(file)
+            })?;
+        }
+        Ok(std::fs::hard_link(&staging, path))
+    });
     discard(&staging);
+    let published = published?;
     match published {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
@@ -2589,7 +2636,7 @@ fn remove_database_files(
     name: &str,
     present: bool,
 ) -> Result<bool, FleetError> {
-    unlink_database_set(path, "delete database", name, present, false, |file| {
+    unlink_database_set(path, "delete database", name, present, |file| {
         std::fs::remove_file(file)
     })?;
     let mut dir = path.parent();
@@ -2613,11 +2660,10 @@ fn remove_database_files(
 /// new database at the path. Any unlink after that could hit the new
 /// database's `-wal`.
 ///
-/// An absent main file stays untouched. With `strays`, its sidecars go. Only
-/// a restore sets that: a stale `-wal` could replay onto the restored
-/// database. A delete leaves strays. Create and automatic restore do not
-/// clear them either: that needs a cross-process reservation of the path
-/// (see ADR 0019 §3).
+/// An absent main file stays untouched, and only its stray sidecars go. The
+/// caller holds the path lock ([`with_path_lock`]), so no other process can
+/// publish a database at the path meanwhile. A stale `-wal` left by a crash
+/// would otherwise replay onto the next database made there.
 ///
 /// On Windows, a process that has the database open also holds its `-wal`.
 /// The sharing violation then stops the unlink at the sidecar, before the
@@ -2627,15 +2673,9 @@ fn unlink_database_set(
     op: &'static str,
     name: &str,
     had_main: bool,
-    strays: bool,
     mut unlink: impl FnMut(&Path) -> std::io::Result<()>,
 ) -> Result<(), FleetError> {
-    // `had_main` is what the exclusive guard saw. Do not look again: no guard
-    // covers an absent path, and another process can publish there at any
-    // time. An unlink could then hit its new files.
-    if !had_main && !strays {
-        return Ok(());
-    }
+    // `had_main` is what the exclusive guard saw. Do not look again.
     let main = had_main.then(|| path.to_path_buf());
     for file in crate::fleet_layout::sidecar_paths(path)
         .into_iter()
@@ -2648,6 +2688,79 @@ fn unlink_database_set(
         }
     }
     Ok(())
+}
+
+// ── The path lock ────────────────────────────────────────────────────────────
+
+/// Directory under the fleet root that holds the path locks.
+const LOCK_DIR: &str = ".fleet-locks";
+
+/// How many lock files the fleet uses. A key maps to one of them by a stable
+/// hash, so a fleet of millions of tenants needs no file per tenant, and a
+/// lock file is never deleted (deleting one would break the exclusion).
+const LOCK_STRIPES: u64 = 256;
+
+/// Pause between attempts to take a held path lock.
+const LOCK_POLL: Duration = Duration::from_millis(5);
+
+/// Attempts before a path lock times out: about 60 seconds.
+const LOCK_POLLS: u32 = 12_000;
+
+/// FNV-1a over the key name. Not `DefaultHasher`: processes built by
+/// different compilers share one root and must agree on the lock file.
+fn lock_stripe(name: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in name.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash % LOCK_STRIPES
+}
+
+/// Run `work` while holding the cross-process lock for `name`'s path.
+/// Blocking. Every process that shares the root takes this lock to publish a
+/// database at a path (create, restore) or to remove one (delete). So a
+/// process that finds the path empty under the lock knows that no other
+/// process can publish there until it lets go. It can then clear the stray
+/// sidecars of the absent database without risking a live `-wal`.
+///
+/// The OS drops the lock when a process dies, so a crash leaves no stale lock.
+/// Keep `work` short: other keys on the same lock file wait for it.
+fn with_path_lock<T>(
+    root: &Path,
+    name: &str,
+    work: impl FnOnce() -> Result<T, FleetError>,
+) -> Result<T, FleetError> {
+    let dir = root.join(LOCK_DIR);
+    std::fs::create_dir_all(&dir).map_err(io_error("create lock directory"))?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(format!("{:02x}.lock", lock_stripe(name))))
+        .map_err(io_error("open path lock"))?;
+    let mut lock = fd_lock::RwLock::new(file);
+    let mut polls = 0_u32;
+    let guard = loop {
+        match lock.try_write() {
+            Ok(guard) => break guard,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                polls += 1;
+                if polls >= LOCK_POLLS {
+                    return Err(FleetError::Unavailable {
+                        name: name.to_owned(),
+                        detail: "timed out waiting for the path lock".to_owned(),
+                    });
+                }
+                std::thread::sleep(LOCK_POLL);
+            }
+            Err(e) => return Err(io_error("lock database path")(e)),
+        }
+    };
+    let done = work();
+    drop(guard);
+    done
 }
 
 /// Readiness indicator `db:fleet`: the root directory is usable, with the
@@ -3005,6 +3118,9 @@ mod tests {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(dir).unwrap() {
             let entry = entry.unwrap();
+            if entry.file_name() == LOCK_DIR {
+                continue;
+            }
             if entry.file_type().unwrap().is_dir() {
                 out.extend(walk(&entry.path()));
             } else {
@@ -3084,7 +3200,7 @@ mod tests {
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         std::fs::write(&target, b"their bytes").unwrap();
         let migrations = FleetMigrations::new(Arc::new(Vec::new()), |_| true, true);
-        let created = create_database_file(&target, "slot:00001", &migrations).unwrap();
+        let created = create_database_file(tmp.path(), &target, "slot:00001", &migrations).unwrap();
         assert!(!created, "the other process won the race");
         assert_eq!(std::fs::read(&target).unwrap(), b"their bytes");
         assert_eq!(
@@ -3094,7 +3210,7 @@ mod tests {
         );
 
         let fresh = tmp.path().join("000/slot-00002.db");
-        assert!(create_database_file(&fresh, "slot:00002", &migrations).unwrap());
+        assert!(create_database_file(tmp.path(), &fresh, "slot:00002", &migrations).unwrap());
         assert!(fresh.is_file());
     }
 
@@ -4077,7 +4193,7 @@ mod tests {
         let path = plain_database(tmp.path());
         let sidecars = crate::fleet_layout::sidecar_paths(&path);
         let mut seen: Vec<PathBuf> = Vec::new();
-        unlink_database_set(&path, "delete database", "acme", true, false, |file| {
+        unlink_database_set(&path, "delete database", "acme", true, |file| {
             seen.push(file.to_path_buf());
             Ok(())
         })
@@ -4097,7 +4213,7 @@ mod tests {
         std::fs::write(&wal, b"old").unwrap();
         // Another process publishes a new database the moment the main file
         // is gone, and commits to its `-wal`.
-        unlink_database_set(&path, "delete database", "acme", true, false, |file| {
+        unlink_database_set(&path, "delete database", "acme", true, |file| {
             let done = std::fs::remove_file(file);
             if file == path {
                 std::fs::write(&path, b"new").unwrap();
@@ -4113,7 +4229,7 @@ mod tests {
     fn a_sharing_violation_on_a_sidecar_stops_before_the_main_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = plain_database(tmp.path());
-        let err = unlink_database_set(&path, "delete database", "acme", true, false, |file| {
+        let err = unlink_database_set(&path, "delete database", "acme", true, |file| {
             if file == path {
                 std::fs::remove_file(file)
             } else {
@@ -4142,26 +4258,12 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_path_is_not_touched_by_delete() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("plain.db");
-        // No guard holds an absent path. Another process may publish there
-        // at any time, so delete unlinks nothing, not even stray sidecars.
-        let mut calls = 0;
-        unlink_database_set(&path, "delete database", "acme", false, false, |_| {
-            calls += 1;
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(calls, 0);
-    }
-
-    #[test]
-    fn restore_clears_the_stray_sidecars_of_an_absent_path() {
+    fn the_strays_of_an_absent_path_go_and_a_main_file_is_never_unlinked() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("plain.db");
         let mut seen = Vec::new();
-        unlink_database_set(&path, "replace database", "acme", false, true, |file| {
+        // The caller holds the path lock, so no other process can publish.
+        unlink_database_set(&path, "delete database", "acme", false, |file| {
             seen.push(file.to_path_buf());
             Ok(())
         })
@@ -4288,5 +4390,185 @@ mod tests {
         // `restore` checks the shutdown flag before it needs replication.
         let err = fleet.restore(&key, None).await.unwrap_err();
         assert!(matches!(err, FleetError::Unavailable { .. }), "{err}");
+    }
+
+    #[test]
+    fn path_locks_exclude_each_other() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let first = {
+            let (root, log) = (tmp.path().to_path_buf(), Arc::clone(&log));
+            std::thread::spawn(move || {
+                with_path_lock(&root, "slot:00001", || {
+                    entered_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(200));
+                    log.lock().unwrap().push("first leaves");
+                    Ok(())
+                })
+                .unwrap();
+            })
+        };
+        entered.recv().unwrap();
+        with_path_lock(tmp.path(), "slot:00001", || {
+            log.lock().unwrap().push("second enters");
+            Ok(())
+        })
+        .unwrap();
+        first.join().unwrap();
+        assert_eq!(*log.lock().unwrap(), vec!["first leaves", "second enters"]);
+    }
+
+    #[test]
+    fn a_create_waits_for_a_publisher_and_leaves_its_wal_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("000/slot-00005.db");
+        let wal = tmp.path().join("000/slot-00005.db-wal");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        // Another process holds the path lock. It publishes a database and
+        // commits to it while the lock is held.
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let publisher = {
+            let (root, target, wal) = (tmp.path().to_path_buf(), target.clone(), wal.clone());
+            std::thread::spawn(move || {
+                with_path_lock(&root, "slot:00005", || {
+                    held_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(300));
+                    std::fs::write(&target, b"their database").unwrap();
+                    std::fs::write(&wal, b"their live frames").unwrap();
+                    Ok(())
+                })
+                .unwrap();
+            })
+        };
+        held.recv().unwrap();
+        let migrations = FleetMigrations::new(Arc::new(Vec::new()), |_| true, true);
+        let created = create_database_file(tmp.path(), &target, "slot:00005", &migrations).unwrap();
+        publisher.join().unwrap();
+        assert!(!created, "the publisher won: this create waited for it");
+        assert_eq!(std::fs::read(&target).unwrap(), b"their database");
+        assert_eq!(std::fs::read(&wal).unwrap(), b"their live frames");
+    }
+
+    #[test]
+    fn a_new_database_does_not_inherit_a_stray_wal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("000/slot-00003.db");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let wal = tmp.path().join("000/slot-00003.db-wal");
+        std::fs::write(&wal, b"left behind by a crash").unwrap();
+        let migrations = FleetMigrations::new(Arc::new(Vec::new()), |_| true, true);
+        assert!(create_database_file(tmp.path(), &target, "slot:00003", &migrations).unwrap());
+        assert!(!wal.exists(), "a stale -wal would replay onto the new file");
+    }
+
+    #[test]
+    fn a_stray_wal_beside_a_published_database_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("000/slot-00004.db");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"their bytes").unwrap();
+        let wal = tmp.path().join("000/slot-00004.db-wal");
+        std::fs::write(&wal, b"their frames").unwrap();
+        let migrations = FleetMigrations::new(Arc::new(Vec::new()), |_| true, true);
+        assert!(!create_database_file(tmp.path(), &target, "slot:00004", &migrations).unwrap());
+        assert_eq!(std::fs::read(&wal).unwrap(), b"their frames");
+    }
+
+    #[tokio::test]
+    async fn delete_waits_for_the_path_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let key = FleetDbKey::Slot(32);
+        let path = fleet.open(&key).await.unwrap().path().to_path_buf();
+        fleet.close(&key).await;
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let holder = {
+            let (root, name) = (tmp.path().to_path_buf(), key.name());
+            std::thread::spawn(move || {
+                with_path_lock(&root, &name, || {
+                    held_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(400));
+                    Ok(())
+                })
+                .unwrap();
+            })
+        };
+        held.recv().unwrap();
+        let began = std::time::Instant::now();
+        let deleting = {
+            let (fleet, key) = (fleet.clone(), key.clone());
+            tokio::spawn(async move { fleet.delete(&key).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(path.is_file(), "the delete waits for the lock holder");
+        assert!(deleting.await.unwrap().unwrap());
+        assert!(began.elapsed() >= Duration::from_millis(300));
+        assert!(!path.exists());
+        holder.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_clears_the_strays_of_an_absent_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let key = FleetDbKey::Slot(33);
+        let path = fleet.path_of(&key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let wal = crate::fleet_layout::sidecar_paths(&path)[0].clone();
+        std::fs::write(&wal, b"left behind by a crash").unwrap();
+        assert!(!fleet.delete(&key).await.unwrap(), "there was no database");
+        assert!(!wal.exists());
+    }
+
+    /// A restore hook that records whether the stray `-wal` of the absent
+    /// database was still there when it ran. It restores nothing.
+    struct SeesStrays {
+        wal_present: AtomicUsize,
+        locked: AtomicUsize,
+        root: PathBuf,
+        name: String,
+    }
+
+    impl FleetLifecycle for SeesStrays {
+        fn restore_missing(&self, _key: &FleetDbKey, path: &Path) -> Result<bool, String> {
+            if crate::fleet_layout::sidecar_paths(path)[0].exists() {
+                self.wal_present.fetch_add(1, Ordering::SeqCst);
+            }
+            // The fleet must hold the path lock while the hook runs: taking
+            // it here from this thread must time out, so only try it.
+            let dir = self.root.join(LOCK_DIR);
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(dir.join(format!("{:02x}.lock", lock_stripe(&self.name))))
+                .map_err(|e| e.to_string())?;
+            let mut lock = fd_lock::RwLock::new(file);
+            if lock.try_write().is_err() {
+                self.locked.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restore_on_open_runs_under_the_lock_after_the_strays_go() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let key = FleetDbKey::Slot(34);
+        let hook = Arc::new(SeesStrays {
+            wal_present: AtomicUsize::new(0),
+            locked: AtomicUsize::new(0),
+            root: tmp.path().to_path_buf(),
+            name: key.name(),
+        });
+        fleet.add_lifecycle(hook.clone());
+        let path = fleet.path_of(&key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let wal = crate::fleet_layout::sidecar_paths(&path)[0].clone();
+        std::fs::write(&wal, b"left behind by a crash").unwrap();
+        fleet.open(&key).await.unwrap();
+        assert_eq!(hook.wal_present.load(Ordering::SeqCst), 0, "strays cleared");
+        assert_eq!(hook.locked.load(Ordering::SeqCst), 1, "the hook ran locked");
     }
 }
