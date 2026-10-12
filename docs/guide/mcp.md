@@ -121,18 +121,23 @@ In the modern era:
 | `tools/call` | As in the legacy era. |
 
 Each result has `resultType` (`"complete"`, or `"task"` for a task handle)
-and `_meta["io.modelcontextprotocol/serverInfo"]`. `cacheScope` is
-`"private"` when `secure_mcp` gates the endpoint, else `"public"`.
+and `_meta["io.modelcontextprotocol/serverInfo"]`. `cacheScope` is always
+`"private"`: the endpoint can sit behind auth, so a shared cache must not
+serve the catalog to another caller.
 
 Errors:
 
 | Code | HTTP | When |
 | --- | --- | --- |
 | `-32602` | 400 | `_meta` has no `protocolVersion` or no `clientCapabilities`. |
-| `-32020` | 400 | A standard header is missing or does not match the body. `Mcp-Name` can use the `=?base64?…?=` form. |
+| `-32020` | 400 | A standard header is missing, repeated, or does not match the body. `Mcp-Name` can use the `=?base64?…?=` form. |
 | `-32022` | 400 | The version is not served. `data.supported` lists the served versions. |
 | `-32601` | 404 | The method is not served (for example `ping`, `resources/list`, `subscriptions/listen`). |
-| `-32600` | 400 | The body is a JSON-RPC batch. |
+| `-32600` | 400 | The body is a JSON-RPC batch, or the id is not a string or an integer. |
+| `-32700` | 400 | The body is not JSON (with a modern `MCP-Protocol-Version` header). |
+
+An error with no known id has no `id` field. An `initialize` request always
+uses the legacy era, also with a modern header.
 
 A `tools/list` entry looks like this — `name`, `description`, `inputSchema`,
 and `annotations` are all derived from the handler's `ApiDoc`:

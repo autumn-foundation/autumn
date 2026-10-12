@@ -21,8 +21,7 @@ use tokio::task::AbortHandle;
 /// The extension identifier.
 pub const EXTENSION_ID: &str = "io.modelcontextprotocol/tasks";
 
-/// The `_meta` key that holds the per-request client capabilities.
-const CLIENT_CAPABILITIES_META: &str = "io.modelcontextprotocol/clientCapabilities";
+use super::modern::META_CLIENT_CAPABILITIES as CLIENT_CAPABILITIES_META;
 
 /// JSON-RPC error code: the client did not declare a required capability.
 pub const MISSING_CAPABILITY: i64 = -32021;

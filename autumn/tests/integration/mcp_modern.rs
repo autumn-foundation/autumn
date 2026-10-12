@@ -53,7 +53,7 @@ fn app() -> TestClient {
         .build()
 }
 
-fn meta(capabilities: Value) -> Value {
+fn meta(capabilities: &Value) -> Value {
     json!({
         "io.modelcontextprotocol/protocolVersion": MODERN,
         "io.modelcontextprotocol/clientInfo": { "name": "test-client", "version": "1.0.0" },
@@ -73,7 +73,7 @@ fn mcp_name(method: &str, params: &Value) -> Option<String> {
 /// Send a conforming modern request: `_meta` plus the standard headers.
 async fn modern(client: &TestClient, method: &str, mut params: Value) -> TestResponse {
     if params.get("_meta").is_none() {
-        params["_meta"] = meta(json!({}));
+        params["_meta"] = meta(&json!({}));
     }
     let mut req = client
         .post("/mcp")
@@ -120,10 +120,7 @@ async fn discover_lists_versions_capabilities_and_identity() {
         "{out}"
     );
     assert!(result["ttlMs"].as_u64().is_some(), "{out}");
-    assert!(
-        matches!(result["cacheScope"].as_str(), Some("public" | "private")),
-        "{out}"
-    );
+    assert_eq!(result["cacheScope"], "private", "{out}");
     assert_server_info(result);
 }
 
@@ -151,7 +148,8 @@ async fn tools_list_carries_result_type_and_cache_hints() {
     let result = &out["result"];
     assert_eq!(result["resultType"], "complete", "{out}");
     assert!(result["ttlMs"].as_u64().is_some(), "{out}");
-    assert!(result["cacheScope"].is_string(), "{out}");
+    // The catalog can sit behind auth this module cannot see.
+    assert_eq!(result["cacheScope"], "private", "{out}");
     assert_server_info(result);
     let names: Vec<&str> = result["tools"]
         .as_array()
@@ -160,6 +158,51 @@ async fn tools_list_carries_result_type_and_cache_hints() {
         .map(|t| t["name"].as_str().unwrap())
         .collect();
     assert!(names.contains(&"quick_read"), "{names:?}");
+}
+
+#[tokio::test]
+async fn initialize_with_the_modern_header_stays_legacy() {
+    let client = app();
+    let resp = client
+        .post("/mcp")
+        .header("mcp-protocol-version", MODERN)
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+                      "params":{"protocolVersion":MODERN}}))
+        .send()
+        .await;
+    resp.assert_ok();
+    // Negotiated down to the newest legacy version.
+    assert_eq!(body(&resp)["result"]["protocolVersion"], "2025-06-18");
+}
+
+#[tokio::test]
+async fn duplicate_standard_headers_are_rejected() {
+    let client = app();
+    let resp = client
+        .post("/mcp")
+        .header("mcp-protocol-version", MODERN)
+        .header("mcp-method", "tools/call")
+        .header("mcp-name", "quick_read")
+        .header("mcp-name", "build_report")
+        .json(&json!({"jsonrpc":"2.0","id":4,"method":"tools/call",
+                      "params":{"name":"quick_read","arguments":{},"_meta":meta(&json!({}))}}))
+        .send()
+        .await;
+    resp.assert_status(400);
+    assert_eq!(body(&resp)["error"]["code"], -32020);
+}
+
+#[tokio::test]
+async fn malformed_modern_notification_is_invalid() {
+    let client = app();
+    let resp = client
+        .post("/mcp")
+        .header("mcp-protocol-version", MODERN)
+        .json(&json!({"method": 5}))
+        .send()
+        .await;
+    resp.assert_status(400);
+    assert_eq!(body(&resp)["error"]["code"], -32600);
 }
 
 #[tokio::test]
@@ -178,7 +221,7 @@ async fn secured_endpoint_marks_the_tool_list_private() {
         .header("authorization", &format!("Bearer {token}"))
         .header("mcp-protocol-version", MODERN)
         .header("mcp-method", "tools/list")
-        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":meta(json!({}))}}))
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":meta(&json!({}))}}))
         .send()
         .await;
     resp.assert_ok();
@@ -217,7 +260,7 @@ async fn streaming_result_carries_result_type() {
         .lines()
         .filter_map(|l| l.strip_prefix("data:"))
         .filter_map(|d| serde_json::from_str::<Value>(d.trim()).ok())
-        .last()
+        .next_back()
         .expect("a final SSE message");
     assert_eq!(last["id"], 7, "{last}");
     assert_eq!(last["result"]["resultType"], "complete", "{last}");
@@ -234,7 +277,7 @@ async fn task_flow_works_in_the_modern_era() {
         &modern(
             &client,
             "tools/call",
-            json!({"name":"build_report","arguments":{},"_meta":meta(caps.clone())}),
+            json!({"name":"build_report","arguments":{},"_meta":meta(&caps)}),
         )
         .await,
     );
@@ -247,7 +290,7 @@ async fn task_flow_works_in_the_modern_era() {
             &modern(
                 &client,
                 "tasks/get",
-                json!({"taskId": id, "_meta": meta(caps.clone())}),
+                json!({"taskId": id, "_meta": meta(&caps)}),
             )
             .await,
         );
@@ -301,7 +344,7 @@ async fn modern_header_without_meta_is_invalid_params() {
 #[tokio::test]
 async fn unsupported_version_lists_the_supported_ones() {
     let client = app();
-    let mut meta = meta(json!({}));
+    let mut meta = meta(&json!({}));
     meta["io.modelcontextprotocol/protocolVersion"] = json!("2099-01-01");
     let resp = client
         .post("/mcp")
@@ -325,7 +368,7 @@ async fn call_with_headers(client: &TestClient, headers: &[(&str, &str)]) -> Tes
         req = req.header(name, value);
     }
     req.json(&json!({"jsonrpc":"2.0","id":4,"method":"tools/call",
-                     "params":{"name":"quick_read","arguments":{},"_meta":meta(json!({}))}}))
+                     "params":{"name":"quick_read","arguments":{},"_meta":meta(&json!({}))}}))
         .send()
         .await
 }
@@ -390,13 +433,10 @@ async fn base64_mcp_name_is_decoded() {
 
 #[tokio::test]
 async fn unknown_method_is_a_404() {
+    // `initialize` selects the legacy era: see
+    // `initialize_with_the_modern_header_stays_legacy`.
     let client = app();
-    for method in [
-        "ping",
-        "resources/list",
-        "initialize",
-        "subscriptions/listen",
-    ] {
+    for method in ["ping", "resources/list", "subscriptions/listen"] {
         let resp = modern(&client, method, json!({})).await;
         resp.assert_status(404);
         assert_eq!(body(&resp)["error"]["code"], -32601, "{method}");
@@ -409,11 +449,109 @@ async fn modern_batch_is_refused() {
     let resp = client
         .post("/mcp")
         .header("mcp-protocol-version", MODERN)
-        .json(&json!([{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":meta(json!({}))}}]))
+        .json(&json!([{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":meta(&json!({}))}}]))
         .send()
         .await;
     resp.assert_status(400);
     assert_eq!(body(&resp)["error"]["code"], -32600);
+}
+
+#[tokio::test]
+async fn modern_errors_without_an_id_omit_it() {
+    let client = app();
+    // A batch has no single id.
+    let batch = client
+        .post("/mcp")
+        .header("mcp-protocol-version", MODERN)
+        .json(&json!([{"jsonrpc":"2.0","id":1,"method":"tools/list"}]))
+        .send()
+        .await;
+    batch.assert_status(400);
+    assert!(body(&batch).get("id").is_none(), "{}", batch.text());
+    // A body that is not JSON.
+    let garbage = client
+        .post("/mcp")
+        .header("mcp-protocol-version", MODERN)
+        .header("content-type", "application/json")
+        .body("{not json")
+        .send()
+        .await;
+    garbage.assert_status(400);
+    let out = body(&garbage);
+    assert_eq!(out["error"]["code"], -32700, "{out}");
+    assert!(out.get("id").is_none(), "{out}");
+}
+
+#[tokio::test]
+async fn unsupported_version_wins_over_missing_capabilities() {
+    let client = app();
+    let resp = client
+        .post("/mcp")
+        .header("mcp-protocol-version", "2027-01-01")
+        .header("mcp-method", "tools/list")
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list",
+                      "params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2027-01-01"}}}))
+        .send()
+        .await;
+    resp.assert_status(400);
+    assert_eq!(body(&resp)["error"]["code"], -32022);
+}
+
+#[tokio::test]
+async fn fractional_id_is_invalid() {
+    let client = app();
+    let resp = client
+        .post("/mcp")
+        .header("mcp-protocol-version", MODERN)
+        .header("mcp-method", "tools/list")
+        .json(&json!({"jsonrpc":"2.0","id":1.5,"method":"tools/list","params":{"_meta":meta(&json!({}))}}))
+        .send()
+        .await;
+    resp.assert_status(400);
+    assert_eq!(body(&resp)["error"]["code"], -32600);
+}
+
+#[tokio::test]
+async fn unserved_method_is_a_404_even_without_mcp_name() {
+    let client = TestApp::new()
+        .routes(routes![quick_read])
+        .mount_mcp("/mcp")
+        .build();
+    // `resources/read` names `Mcp-Name`, but the server does not serve it.
+    // No task tool here, so `tasks/get` is not served either.
+    for (method, params) in [
+        (
+            "resources/read",
+            json!({"uri": "file:///x", "_meta": meta(&json!({}))}),
+        ),
+        (
+            "tasks/get",
+            json!({"taskId": "x", "_meta": meta(&json!({"extensions": {TASKS: {}}}))}),
+        ),
+    ] {
+        let resp = client
+            .post("/mcp")
+            .header("mcp-protocol-version", MODERN)
+            .header("mcp-method", method)
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
+            .send()
+            .await;
+        resp.assert_status(404);
+        assert_eq!(body(&resp)["error"]["code"], -32601, "{method}");
+    }
+}
+
+#[tokio::test]
+async fn streaming_response_disables_proxy_buffering() {
+    let client = app();
+    let resp = modern(
+        &client,
+        "tools/call",
+        json!({"name":"streaming_search","arguments":{}}),
+    )
+    .await;
+    resp.assert_ok();
+    assert_eq!(resp.header("x-accel-buffering"), Some("no"));
 }
 
 #[tokio::test]

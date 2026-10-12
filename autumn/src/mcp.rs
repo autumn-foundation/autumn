@@ -304,9 +304,6 @@ pub struct McpServer {
     /// True when one or more tools are task tools. Only then does the server
     /// advertise the extension and serve `tasks/*`.
     has_task_tools: bool,
-    /// True when `secure_mcp` gates the endpoint. Then the catalog is not for
-    /// shared caches (`cacheScope: "private"`).
-    catalog_private: bool,
     server_name: String,
     server_version: String,
 }
@@ -935,7 +932,6 @@ impl McpServer {
             session_cookie: wiring.session_cookie,
             tasks: tasks::TaskStore::new(wiring.tasks),
             has_task_tools,
-            catalog_private: false,
             server_name: "autumn-mcp".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
@@ -956,9 +952,7 @@ pub(crate) fn build_mcp_router(
     wiring: McpWiring,
     endpoint_layer: Option<McpEndpointLayer>,
 ) -> axum::Router<crate::state::AppState> {
-    let mut server = McpServer::new(tools, dispatch, wiring);
-    server.catalog_private = endpoint_layer.is_some();
-    let server = Arc::new(server);
+    let server = Arc::new(McpServer::new(tools, dispatch, wiring));
     tracing::debug!(
         path = mount_path,
         tools = server.tools.len(),
@@ -1273,6 +1267,12 @@ async fn serve_mcp(
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
+            if modern::header_is_modern(&headers) {
+                let rejection = modern::parse_error(&e.to_string());
+                let mut response = json_response(&rejection.body);
+                *response.status_mut() = rejection.status;
+                return response;
+            }
             return json_response(&parse_error(&e.to_string()));
         }
     };
@@ -1398,10 +1398,10 @@ async fn serve_modern(server: &Arc<McpServer>, ctx: &ReplayContext<'_>, parsed: 
     }
     // This revision defines no client notifications over HTTP. Accept one
     // and send no body, as the transport requires.
-    if parsed.is_object() && parsed.get("id").is_none() && parsed.get("method").is_some() {
+    if modern::is_notification(&parsed) {
         return StatusCode::ACCEPTED.into_response();
     }
-    if let Err(rejection) = modern::validate(ctx.headers, &parsed) {
+    if let Err(rejection) = modern::validate(ctx.headers, &parsed, |m| server.serves(m)) {
         return rejected(rejection);
     }
     let id = parsed.get("id").cloned().unwrap_or(Value::Null);
@@ -1411,44 +1411,16 @@ async fn serve_modern(server: &Arc<McpServer>, ctx: &ReplayContext<'_>, parsed: 
         "server/discover" => reply(StatusCode::OK, success(id, discover_result(server))),
         "tools/list" => {
             let mut result = tools_list_result(server);
-            modern::add_cache_hints(&mut result, server.catalog_private);
+            modern::add_cache_hints(&mut result);
             reply(StatusCode::OK, success(id, result))
         }
-        "tools/call" => {
-            let response = serve_tools_call(server, ctx, id, params).await;
-            stamp_json_response(response, &server.server_info()).await
-        }
+        "tools/call" => serve_tools_call(server, ctx, id, params).await,
         m if is_task_method(m) => {
             let message = serve_task_method(server, ctx, m, id, &params);
             reply(modern::status_for(&message), message)
         }
         other => rejected(modern::method_not_found(id, other)),
     }
-}
-
-/// Add the modern result fields to a buffered JSON response from
-/// [`serve_tools_call`]. An SSE response gets them in the stream instead.
-async fn stamp_json_response(response: Response, server_info: &Value) -> Response {
-    let is_json = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|c| c.starts_with("application/json"));
-    if !is_json {
-        return response;
-    }
-    let (mut parts, body) = response.into_parts();
-    // The body is the JSON this module made, already in memory.
-    let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
-        return Response::from_parts(parts, Body::empty());
-    };
-    let Ok(mut message) = serde_json::from_slice::<Value>(&bytes) else {
-        return Response::from_parts(parts, Body::from(bytes));
-    };
-    modern::stamp(&mut message, server_info);
-    parts.headers.remove(header::CONTENT_LENGTH);
-    let body = serde_json::to_vec(&message).unwrap_or_else(|_| bytes.to_vec());
-    Response::from_parts(parts, Body::from(body))
 }
 
 /// Enforce the Streamable-HTTP `MCP-Protocol-Version` header. Returns a 400
@@ -1546,6 +1518,12 @@ impl McpServer {
         capabilities
     }
 
+    /// Whether a modern request for `method` is served. Others get `-32601`.
+    fn serves(&self, method: &str) -> bool {
+        matches!(method, "server/discover" | "tools/list" | "tools/call")
+            || (is_task_method(method) && self.has_task_tools)
+    }
+
     /// The server name and version (an MCP `Implementation`).
     fn server_info(&self) -> Value {
         json!({ "name": self.server_name, "version": self.server_version })
@@ -1558,7 +1536,7 @@ fn discover_result(server: &McpServer) -> Value {
         "supportedVersions": modern::VERSIONS,
         "capabilities": server.capabilities(),
     });
-    modern::add_cache_hints(&mut result, server.catalog_private);
+    modern::add_cache_hints(&mut result);
     result
 }
 
@@ -2477,6 +2455,14 @@ async fn serve_tools_call(
     id: Value,
     params: Value,
 ) -> Response {
+    // A modern request's result gets `resultType` and `_meta.serverInfo`.
+    let server_info = ctx.modern.then(|| server.server_info());
+    let reply = |mut message: Value| {
+        if let Some(info) = &server_info {
+            modern::stamp(&mut message, info);
+        }
+        json_response(&message)
+    };
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     // `inputSchema` is always an object; reject a non-object `arguments`
     // (null/string/array) rather than coercing it to `{}` and dispatching.
@@ -2509,31 +2495,18 @@ async fn serve_tools_call(
     // The last thing before the action runs: if this record cannot be written
     // and the action is not provably reversible, it does not run.
     if let Err(refusal) = audit.record_attempt(&server.state).await {
-        return json_response(&success(id, tool_error(refusal)));
+        return reply(success(id, tool_error(refusal)));
     }
 
     // MCP Tasks extension: give a task handle to a client that declared the
     // extension. If the store is full, the tool runs as a blocking call.
-    if tool.task && tasks::client_declares_tasks(&params) {
-        let task_id = server.new_task_id();
-        let owner = server.task_owner(ctx);
-        // The quota key is the client IP. The caller cannot change it, so a
-        // new credential does not give a new quota.
-        let quota = ctx
-            .identity
-            .and_then(|id| id.addr)
-            .or_else(|| ctx.peer.map(|peer| peer.ip()))
-            .map_or_else(|| "unknown".to_owned(), |ip| ip.to_string());
-        let now = server.state.clock().now();
-        if let Some(created) = server.tasks.create(&task_id, owner, &quota, now) {
-            apply_replay_extensions(&mut request, server, ctx, &audit, true);
-            spawn_task(server, idx, &task_id, request, audit);
-            return json_response(&success(id, created));
-        }
-        tracing::warn!(
-            tool = %tool.name,
-            "MCP task store is full; the tool call runs as a blocking call"
-        );
+    if tool.task
+        && tasks::client_declares_tasks(&params)
+        && let Some((task_id, created)) = reserve_task(server, ctx, &tool.name)
+    {
+        apply_replay_extensions(&mut request, server, ctx, &audit, true);
+        spawn_task(server, idx, &task_id, request, audit);
+        return reply(success(id, created));
     }
     apply_replay_extensions(&mut request, server, ctx, &audit, false);
 
@@ -2548,7 +2521,7 @@ async fn serve_tools_call(
                     Disposition::Settled,
                 )
                 .await;
-            return json_response(&success(id, tool_error(&format!("dispatch failed: {e}"))));
+            return reply(success(id, tool_error(&format!("dispatch failed: {e}"))));
         }
     };
 
@@ -2584,8 +2557,7 @@ async fn serve_tools_call(
         );
         stream_audit.status = Some(status);
         stream_audit.request_id = request_id;
-        let stamp = ctx.modern.then(|| server.server_info());
-        return stream_tool_result(id, &params, response, cookies, stream_audit, stamp);
+        return stream_tool_result(id, &params, response, cookies, stream_audit, server_info);
     }
 
     // Buffered path: the outcome is recorded only once the body has actually
@@ -2593,8 +2565,16 @@ async fn serve_tools_call(
     // anything — the body can still overflow the tool-result cap or error
     // mid-read, and the agent would then see a tool error while the audit row
     // claimed success (issue #1691 review round 2).
-    let (resp, failure) =
-        buffered_tool_response(tool, id, status, is_event_stream, cookies, response).await;
+    let (resp, failure) = buffered_tool_response(
+        tool,
+        id,
+        status,
+        is_event_stream,
+        cookies,
+        response,
+        server_info.as_ref(),
+    )
+    .await;
     let disposition = failure.map_or(Disposition::Settled, Disposition::Buffered);
     audit
         .record_outcome(
@@ -2605,6 +2585,33 @@ async fn serve_tools_call(
         )
         .await;
     resp
+}
+
+/// Add a `working` task to the store. Returns its ID and `CreateTaskResult`,
+/// or `None` (with a warning) when the store or the client's quota is full.
+fn reserve_task(
+    server: &McpServer,
+    ctx: &ReplayContext<'_>,
+    tool: &str,
+) -> Option<(String, Value)> {
+    let task_id = server.new_task_id();
+    let owner = server.task_owner(ctx);
+    // The quota key is the client IP. The caller cannot change it, so a new
+    // credential does not give a new quota.
+    let quota = ctx
+        .identity
+        .and_then(|id| id.addr)
+        .or_else(|| ctx.peer.map(|peer| peer.ip()))
+        .map_or_else(|| "unknown".to_owned(), |ip| ip.to_string());
+    let now = server.state.clock().now();
+    let Some(created) = server.tasks.create(&task_id, owner, &quota, now) else {
+        tracing::warn!(
+            tool = %tool,
+            "MCP task store is full; the tool call runs as a blocking call"
+        );
+        return None;
+    };
+    Some((task_id, created))
 }
 
 /// Run a task tool call in the background. The task is already in the store.
@@ -2728,6 +2735,7 @@ async fn buffered_tool_response(
     is_event_stream: bool,
     cookies: Vec<HeaderValue>,
     response: Response,
+    server_info: Option<&Value>,
 ) -> (Response, Option<BufferedFailure>) {
     // Capture the dispatch clone's `Server-Timing` header (#1348) so its
     // non-`total` metrics can be forwarded onto the rebuilt response. The clone
@@ -2746,7 +2754,11 @@ async fn buffered_tool_response(
 
     let (value, failure) =
         read_tool_result(tool, status, is_event_stream, response.into_body()).await;
-    let mut resp = json_response(&success(id, value));
+    let mut message = success(id, value);
+    if let Some(info) = server_info {
+        modern::stamp(&mut message, info);
+    }
+    let mut resp = json_response(&message);
     if failure.is_some() {
         return (resp, failure);
     }
@@ -3009,6 +3021,9 @@ fn stream_tool_result(
     let mut resp = Sse::new(stream)
         .keep_alive(crate::sse::keep_alive())
         .into_response();
+    // Ask reverse proxies (nginx) not to buffer the stream.
+    resp.headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
     for cookie in cookies {
         resp.headers_mut().append(header::SET_COOKIE, cookie);
     }

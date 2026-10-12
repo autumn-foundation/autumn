@@ -19,7 +19,7 @@ pub const VERSIONS: &[&str] = &["2026-07-28"];
 const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
 
 /// The `_meta` key that holds the request's client capabilities.
-const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+pub const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
 
 /// The `_meta` key that identifies the server on a result.
 const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
@@ -52,14 +52,28 @@ fn reject(
     if let Some(data) = data {
         error["data"] = data;
     }
+    let mut body = serde_json::Map::new();
+    body.insert("jsonrpc".to_owned(), json!("2.0"));
+    // The 2026 schema allows no `null` id: an error with no known id omits it.
+    if !id.is_null() {
+        body.insert("id".to_owned(), id);
+    }
+    body.insert("error".to_owned(), error);
     Rejection {
         status,
-        body: json!({ "jsonrpc": "2.0", "id": id, "error": error }),
+        body: Value::Object(body),
     }
 }
 
+/// The value of a header that occurs once. A repeated header gives `None`:
+/// a proxy can read another copy than the server, so the server must not
+/// trust either.
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name).and_then(|v| v.to_str().ok())
+    let mut values = headers.get_all(name).iter();
+    match (values.next(), values.next()) {
+        (Some(value), None) => value.to_str().ok(),
+        _ => None,
+    }
 }
 
 fn meta(msg: &Value) -> Option<&Value> {
@@ -76,9 +90,13 @@ fn message_is_modern(msg: &Value) -> bool {
 ///
 /// True when a message carries the modern `_meta` field, when the
 /// `MCP-Protocol-Version` header names a modern version, or for
-/// `server/discover`, which only the modern era defines.
+/// `server/discover`, which only the modern era defines. `initialize`
+/// always selects the legacy era.
 pub fn wants_modern(headers: &HeaderMap, parsed: &Value) -> bool {
-    if header(headers, "mcp-protocol-version").is_some_and(|v| VERSIONS.contains(&v)) {
+    if parsed.get("method").and_then(Value::as_str) == Some("initialize") {
+        return false;
+    }
+    if header_is_modern(headers) {
         return true;
     }
     match parsed {
@@ -118,12 +136,39 @@ fn mcp_name_source<'a>(method: &str, params: &'a Value) -> Option<&'a str> {
     params.get(key).and_then(Value::as_str)
 }
 
+/// Whether the `MCP-Protocol-Version` header names a modern version.
+pub fn header_is_modern(headers: &HeaderMap) -> bool {
+    header(headers, "mcp-protocol-version").is_some_and(|v| VERSIONS.contains(&v))
+}
+
+/// The rejection for a body that is not JSON.
+pub fn parse_error(message: &str) -> Rejection {
+    reject(
+        StatusCode::BAD_REQUEST,
+        Value::Null,
+        -32700,
+        &format!("parse error: {message}"),
+        None,
+    )
+}
+
 /// Check one modern request: the `_meta` fields and the request headers.
 ///
+/// The checks run in this order: the message shape, the protocol version
+/// (present, same as the header, served), the client capabilities, then the
+/// `Mcp-Method` and `Mcp-Name` headers. `served` tells whether the server
+/// serves the method. `Mcp-Name` is checked only for a served method, so an
+/// unknown method still gets `-32601`.
+///
 /// The caller handles batches and notifications before this.
-pub fn validate(headers: &HeaderMap, msg: &Value) -> Result<(), Rejection> {
+pub fn validate(
+    headers: &HeaderMap,
+    msg: &Value,
+    served: impl Fn(&str) -> bool,
+) -> Result<(), Rejection> {
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
-    let id_ok = id.is_string() || id.is_number();
+    // A request id is a string or an integer.
+    let id_ok = id.is_string() || id.is_i64() || id.is_u64();
     let method = msg.get("method").and_then(Value::as_str);
     let (true, Some(method), true) = (
         msg.get("jsonrpc").and_then(Value::as_str) == Some("2.0"),
@@ -154,18 +199,6 @@ pub fn validate(headers: &HeaderMap, msg: &Value) -> Result<(), Rejection> {
             None,
         ));
     };
-    if !meta
-        .and_then(|m| m.get(META_CLIENT_CAPABILITIES))
-        .is_some_and(Value::is_object)
-    {
-        return Err(reject(
-            StatusCode::BAD_REQUEST,
-            id,
-            -32602,
-            "Invalid params: `_meta` must have `io.modelcontextprotocol/clientCapabilities` (an object)",
-            None,
-        ));
-    }
 
     // The standard headers must be present and match the body.
     let mismatch = |message: &str| {
@@ -191,19 +224,41 @@ pub fn validate(headers: &HeaderMap, msg: &Value) -> Result<(), Rejection> {
             Some(json!({ "supported": VERSIONS, "requested": version })),
         ));
     }
+    if !meta
+        .and_then(|m| m.get(META_CLIENT_CAPABILITIES))
+        .is_some_and(Value::is_object)
+    {
+        return Err(reject(
+            StatusCode::BAD_REQUEST,
+            id.clone(),
+            -32602,
+            "Invalid params: `_meta` must have `io.modelcontextprotocol/clientCapabilities` (an object)",
+            None,
+        ));
+    }
     if header(headers, "mcp-method") != Some(method) {
         return Err(mismatch(
             "Header mismatch: Mcp-Method must match the method",
         ));
     }
     let params = msg.get("params").unwrap_or(&Value::Null);
-    if let Some(expected) = mcp_name_source(method, params) {
+    if served(method)
+        && let Some(expected) = mcp_name_source(method, params)
+    {
         let sent = header(headers, "mcp-name").and_then(decode_header_value);
         if sent.as_deref() != Some(expected) {
             return Err(mismatch("Header mismatch: Mcp-Name must match the body"));
         }
     }
     Ok(())
+}
+
+/// Whether `msg` is a well-formed notification: JSON-RPC 2.0, a string
+/// `method`, and no `id`.
+pub fn is_notification(msg: &Value) -> bool {
+    msg.get("id").is_none()
+        && msg.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+        && msg.get("method").is_some_and(Value::is_string)
 }
 
 /// The rejection for a modern batch. A modern POST carries one message.
@@ -261,16 +316,20 @@ pub fn stamp(message: &mut Value, server_info: &Value) {
 }
 
 /// Add the caching hints (`ttlMs`, `cacheScope`) to a result object.
-pub fn add_cache_hints(result: &mut Value, private: bool) {
+///
+/// The scope is always `"private"`. The catalog does not vary by caller, but
+/// the endpoint can sit behind auth (`secure_mcp`, mTLS, a proxy) that this
+/// module cannot see. A shared cache must not serve it to another caller.
+pub fn add_cache_hints(result: &mut Value) {
     result["ttlMs"] = json!(CATALOG_TTL_MS);
-    result["cacheScope"] = json!(if private { "private" } else { "public" });
+    result["cacheScope"] = json!("private");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn request(method: &str, params: Value) -> Value {
+    fn request(method: &str, params: &Value) -> Value {
         json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})
     }
 
@@ -301,38 +360,38 @@ mod tests {
         let none = HeaderMap::new();
         assert!(wants_modern(
             &none,
-            &request("tools/list", json!({"_meta": modern_meta()}))
+            &request("tools/list", &json!({"_meta": modern_meta()}))
         ));
-        assert!(wants_modern(&none, &request("server/discover", json!({}))));
-        assert!(!wants_modern(&none, &request("tools/list", json!({}))));
+        assert!(wants_modern(&none, &request("server/discover", &json!({}))));
+        assert!(!wants_modern(&none, &request("tools/list", &json!({}))));
         let modern_header = headers(&[("mcp-protocol-version", "2026-07-28")]);
         assert!(wants_modern(
             &modern_header,
-            &request("tools/list", json!({}))
+            &request("tools/list", &json!({}))
         ));
         let legacy_header = headers(&[("mcp-protocol-version", "2025-06-18")]);
         assert!(!wants_modern(
             &legacy_header,
-            &request("initialize", json!({}))
+            &request("initialize", &json!({}))
         ));
     }
 
     #[test]
     fn validate_accepts_a_conforming_request() {
-        let msg = request("tools/call", json!({"name": "t", "_meta": modern_meta()}));
+        let msg = request("tools/call", &json!({"name": "t", "_meta": modern_meta()}));
         let ok = headers(&[
             ("mcp-protocol-version", "2026-07-28"),
             ("mcp-method", "tools/call"),
             ("mcp-name", "t"),
         ]);
-        assert!(validate(&ok, &msg).is_ok());
+        assert!(validate(&ok, &msg, |_| true).is_ok());
     }
 
     #[test]
     fn validate_rejects_a_null_id() {
-        let mut msg = request("tools/list", json!({"_meta": modern_meta()}));
+        let mut msg = request("tools/list", &json!({"_meta": modern_meta()}));
         msg["id"] = Value::Null;
-        let err = validate(&HeaderMap::new(), &msg).err().unwrap();
+        let err = validate(&HeaderMap::new(), &msg, |_| true).err().unwrap();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.body["error"]["code"], -32600);
     }
