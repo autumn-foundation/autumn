@@ -418,7 +418,8 @@ Only a type you *declare* is recorded. axum attaches one to every response, but
 for `String` (`text/plain; charset=utf-8`) and `Vec<u8>`
 (`application/octet-stream`) it comes from the return type, not from you — so on
 a route whose own extension says otherwise (`/theme.css`, `/logo.png`) those two
-exact values are ignored and the extension wins, which is what stops a `->
+exact values are replaced by the extension type (recorded, so ISR still guards
+the route), which is what stops a `->
 String` stylesheet from being served as plain text and dropped by `nosniff`.
 The two are indistinguishable in the response, so if you genuinely want one of
 them on such a route, declare it distinctly (bare `text/plain`, or

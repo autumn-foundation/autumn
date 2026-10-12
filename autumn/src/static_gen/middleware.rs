@@ -109,6 +109,32 @@ fn is_legal_content_type_byte(b: u8) -> bool {
     b == b'\t' || (0x20..0x7f).contains(&b)
 }
 
+/// The `Content-Type` values axum attaches only because of a handler's Rust
+/// return type: `String`/`&str` give the first, `Vec<u8>`/`Bytes` the second.
+/// They state no intent about the page.
+const GENERIC_RETURN_TYPE_DEFAULTS: [&str; 2] =
+    ["text/plain; charset=utf-8", "application/octet-stream"];
+
+/// Normalize a declared `Content-Type` for `route_path` (#2409).
+///
+/// A generic return-type default is replaced by the route's asset-extension
+/// type when the two disagree. Any other value is returned as is. Build and
+/// ISR both use this function. Build records the result. ISR normalizes the
+/// fresh response with it before comparing.
+///
+/// Axum builds `String`'s header exactly like a hand-written
+/// `text/plain; charset=utf-8` tuple, so the two cannot be told apart. The
+/// extension wins, because a stylesheet served as `text/plain` is dropped
+/// under `nosniff`. Write `text/plain` (no charset) to opt out.
+pub(super) fn effective_content_type<'a>(declared: &'a str, route_path: &str) -> &'a str {
+    if GENERIC_RETURN_TYPE_DEFAULTS.contains(&declared)
+        && let Some(from_extension) = crate::assets::content_type_for_opt(route_path)
+    {
+        return from_extension;
+    }
+    declared
+}
+
 /// The recorded `Content-Type` a manifest entry can actually be served with, or
 /// `None` when the stored value is unusable (#1832).
 ///
@@ -700,10 +726,13 @@ async fn regenerate_page(
     // caller's existing `warn!`, and the ISR cooldown throttles the retries; a
     // rebuild (`autumn build`) is what re-records the type.
     if let Some(expected) = expected_content_type {
+        // Same normalization as build, so a generic default compares equal to
+        // the extension type it was recorded as (#2409).
         let actual = response
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok());
+            .and_then(|v| v.to_str().ok())
+            .map(|v| effective_content_type(v, url));
         if !actual.is_some_and(|actual| content_type_equivalent(actual, expected)) {
             // Logged here as well as by the caller: an ordinary regeneration
             // failure is transient, but this one repeats every cooldown until
@@ -1757,6 +1786,84 @@ mod tests {
             .expect("matching Content-Type regenerates");
 
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "<h1>fresh</h1>");
+    }
+
+    /// #2409: a `String` handler on `/theme.css` records `text/css`. Its fresh
+    /// `text/plain` default must normalize to the same type, not freeze the route.
+    #[tokio::test]
+    async fn regenerate_page_accepts_generic_default_normalized_to_extension_type() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("theme.css");
+        std::fs::write(&dest, "a{}").expect("write");
+
+        let router =
+            axum::Router::new().fallback(axum::routing::get(|| async { "b{}".to_owned() }));
+
+        regenerate_page(
+            &router,
+            "/theme.css",
+            &dest,
+            Some("text/css; charset=utf-8"),
+        )
+        .await
+        .expect("generic default normalizes to the recorded extension type");
+
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "b{}");
+    }
+
+    /// #2409: a JSON response must not overwrite a recorded `text/css` file.
+    #[tokio::test]
+    async fn regenerate_page_refuses_json_over_recorded_extension_type() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("theme.css");
+        std::fs::write(&dest, "a{}").expect("write");
+
+        let router = axum::Router::new().fallback(axum::routing::get(|| async {
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"x":1}"#,
+            )
+        }));
+
+        let err = regenerate_page(
+            &router,
+            "/theme.css",
+            &dest,
+            Some("text/css; charset=utf-8"),
+        )
+        .await
+        .expect_err("JSON must not replace a text/css file");
+        assert!(err.to_string().contains("Content-Type changed"), "{err}");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "a{}");
+    }
+
+    #[test]
+    fn effective_content_type_maps_generic_default_to_extension_type() {
+        assert_eq!(
+            effective_content_type("text/plain; charset=utf-8", "/theme.css"),
+            "text/css; charset=utf-8"
+        );
+        assert_eq!(
+            effective_content_type("application/octet-stream", "/logo.png"),
+            "image/png"
+        );
+        // Explicit, agreeing, or unknown-extension types stay as declared.
+        assert_eq!(
+            effective_content_type("application/json", "/n.txt"),
+            "application/json"
+        );
+        assert_eq!(
+            effective_content_type("text/plain; charset=utf-8", "/n.txt"),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            effective_content_type("application/octet-stream", "/r.pdf"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            effective_content_type("text/plain", "/theme.css"),
+            "text/plain"
+        );
     }
 
     /// A route that records no type has nothing to desync, so regeneration is
