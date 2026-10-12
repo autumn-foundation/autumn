@@ -32,7 +32,9 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-autumn-web = { path = "../../autumn", features = ["test-support"] }
+autumn-web = { path = "../../autumn", features = ["test-support", "sim-testing"] }
+proptest = "1.4"
+tower = { workspace = true, features = ["util"] }
 autumn-storage-s3 = { path = "../../autumn-storage-s3" }
 # default-features = false to avoid re-enabling aws-sdk-s3's legacy hyper 0.14 /
 # rustls 0.21 connector stack workspace-wide (features are additive); see the

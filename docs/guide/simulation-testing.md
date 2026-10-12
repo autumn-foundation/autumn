@@ -14,7 +14,8 @@ scenarios: jobs, scheduler and lock across replicas (see "Multiple
 replicas"). It does not explore your application's interleavings. Wiring
 `sweep_proptest` against your own scenario, in your own CI, is how you get
 that coverage for your app; see "Property-based op-driving + the seed sweep"
-below.
+below. For a complete app sweep to copy, see "The reddit-clone nightly"
+below: 4,000,000 seeds each night over the whole public DST API.
 
 ```
 ┌──────────────────┐
@@ -721,6 +722,81 @@ arranges two deliberately-separated input bands so that
 [`assert_all_sometimes_satisfied`](https://docs.rs/autumn-web/latest/autumn_web/sim/assert/fn.assert_all_sometimes_satisfied.html)
 holds at every seed — the pattern to copy when you want a single-run
 non-vacuity check rather than a sweep.
+
+## The reddit-clone nightly
+
+`examples/reddit-clone/tests/sim_nightly.rs` is a seed sweep over the whole
+reddit-clone app. The `sim-nightly.yml` workflow runs it each night.
+
+### What one seed does
+
+Each seed mounts the app on a new sim runtime and runs these phases:
+
+| Phase | DST API |
+|---|---|
+| Sign-ups; the welcome mail retries with full jitter | `Chaos::smtp_faults`, `smtp_transient_errors`, `backoff::*`, `advance` |
+| Posts enqueue a rank job, an auto-mod job and a webhook job | `FaultPlan`, `SeededLlm`, `SimNet`, `Chaos::job_duplicate_delivery` |
+| Votes race through the real vote rule (`src/vote_core.rs`) | `interleave`, `record_broadcasts` |
+| The real `PostPolicy` and the feed experiment | `rng`, `gen_ops`, `gen_ops_with` |
+| Posts age; the scheduled rank sweep runs | `advance`, `advance_to`, `advance_to_local`, `try_run_to_idle`, `time::ambient_*` |
+| Replicas with skewed clocks, and a vote worker task | `mount_replica`, `Replica`, `step_replica_clock`, `run_for`, `spawn`, `kill_replica`, `restart_replica` |
+| A crash at a seeded await, then a restart on the same store | `crash_point`, `crash_at`, `crash_and_restart`, `kill`, `restart` |
+| End checks | `fault_outcome`, `FaultOutcome::to_json_string`, `SimNet::events`, `SeededLlm::calls` |
+
+An in-memory store is the database of the fleet. All apps of one seed share it,
+and it lives longer than a crashed app. Each step that is a database round trip
+in the real app yields a seeded number of times, so the races of the real app
+can occur. The checks include:
+
+- Subscribers never get an older vote score after a newer one, per process.
+- The score of a post is the sum of its votes.
+- Ranks are finite, in order, and fall as a post ages.
+- Each post is ranked, has its verdict and has its webhook at the end, after
+  the faults, the partition and the crash.
+
+### The guards
+
+- **The planted bug.** `sim_nightly_catches_unordered_publish` runs the vote
+  rule without `PublishOrder`. The sweep must fail, and the failing seed must
+  fail again alone.
+- **The trace check.** The first seeds of each process run twice. The two
+  traces must be the same.
+- **Not vacuous.** Each `sometimes!` label must be true in at least one seed.
+- **The API surface gate.** `dst_api_surface_is_fully_exercised` reads each
+  public `fn` of `autumn_web::sim` from the source. The nightly must call each
+  one, or list it in `EXCLUDED` with a reason. Only `Sim::db_link` is excluded:
+  it needs the `sqlite` feature, which reddit-clone cannot enable, because
+  `backend_select!` then compiles the whole app for `SQLite`.
+
+### Cost and scale
+
+One process runs one seed at a time: the framework keeps the job runtime and
+the event bus per process. A release build runs about 45 seeds/s on one core,
+and about 150 seeds/s with 4 processes on a 4-vCPU runner. So 4,000,000 seeds
+take about 7.5 runner-hours: about 30 minutes on 16 runners. Each night sweeps
+a new window (`start = UTC day number × seeds`), so the coverage adds up.
+
+```bash
+# The PR default: 8 seeds and the DoD tests.
+cargo test -p reddit-clone --release --test sim_nightly
+# One shard of a large window, with a JSON report.
+AUTUMN_SIM_SEED_START=0 AUTUMN_SIM_SEEDS=4000000 AUTUMN_SIM_SHARD=3/64 \
+AUTUMN_SIM_REPORT=report.json \
+  cargo test -p reddit-clone --release --test sim_nightly -- --nocapture sim_nightly_sweep
+```
+
+<!-- config-key-allow: AUTUMN_SIM_SHARD — a sweep variable read by examples/reddit-clone/tests/sim_nightly/sweep.rs, not an app config key -->
+<!-- config-key-allow: AUTUMN_SIM_REPORT — a sweep variable read by examples/reddit-clone/tests/sim_nightly/sweep.rs, not an app config key -->
+
+A failure prints the seed and a replay command for only that seed.
+
+### What it found
+
+On its first sweep the nightly found a bug in reddit-clone. A replica whose
+clock runs more than 2 hours slow saw a new post "from the future". The rank
+formula `score / (age + 2)^1.5` then gave NaN, and Postgres refuses the same
+`POWER` in the scheduled rank UPDATE, so one such post stopped the rank update
+for all posts. `calculate_hot_rank` and its SQL now keep the age at 0 or more.
 
 ## What's virtualized (and what isn't)
 

@@ -86,64 +86,70 @@ async fn cast_vote(
         .parse()
         .map_err(|_| AutumnError::bad_request_msg("Invalid session"))?;
 
-    // Toggle / flip / insert this user's vote AND recompute `posts.score` from
-    // ground truth, atomically and race-safely, in one call: the target row is
-    // locked for the whole read-decide-write-recompute window. A missing or
-    // soft-deleted post is `NotFound`. The returned `Reaction` carries the new
-    // aggregate and the user's own value, so re-rendering needs no follow-up
-    // query.
-    let reaction = posts_repo.react(user_id, post_id, value).await?;
-
-    // Best-effort from here on: the vote is committed. Failing the request
-    // over a lost SSE refresh would invite a retry, and a retried toggle
-    // *undoes* the vote — exactly the hazard `react()`'s docs warn about. The
-    // viewer still sees the fresh score from the fragment/redirect below;
-    // only other subscribers' live tiles go stale until the next update.
+    // `vote_core::cast` holds the rule; this backend is the Postgres half.
     //
-    // Render the targeted fragment from the score the broadcast loaded under
-    // `BROADCAST_ORDER`, not from `reaction.aggregate`: the broadcast's reload
-    // happens after this vote's commit, so it is at least as new — while
-    // `reaction.aggregate` is this commit's value and would swap an *older*
-    // score back into this viewer's page if a concurrent vote committed and
-    // broadcast in between. `reaction.aggregate` is only the fallback when the
-    // fan-out failed (nothing newer was published to be overwritten).
-    let score = match broadcast_post_update(post_id, state).await {
-        Ok(score) => score,
-        Err(error) => {
-            tracing::warn!(post_id, error = %error, "vote committed but SSE fan-out failed");
-            reaction.aggregate
-        }
-    };
+    // `react()` toggles, flips or inserts this user's vote AND recomputes
+    // `posts.score` from ground truth, atomically and race-safely, in one call:
+    // the target row is locked for the whole read-decide-write-recompute
+    // window. A missing or soft-deleted post is `NotFound`.
+    //
+    // The fan-out after the commit is best effort, and its score is published
+    // in load order under `BROADCAST_ORDER`, so it is at least as new as this
+    // commit. See `crate::vote_core` for why, and `tests/sim_nightly.rs` for the
+    // seed sweep that races votes against this rule.
+    let backend = PgVotes { posts_repo, state };
+    let voted = crate::vote_core::cast(&backend, &BROADCAST_ORDER, user_id, post_id, value).await?;
+    let score = voted.aggregate;
 
     if hx.is_htmx {
-        Ok(vote_controls(post_id, score, reaction.value, Some(csrf)).into_response())
+        Ok(vote_controls(post_id, score, voted.value, Some(csrf)).into_response())
     } else {
         // `/posts/{id}` canonicalizes to the post's full URL (`show_by_id`).
         Ok(Redirect::to(&format!("/posts/{post_id}")).into_response())
     }
 }
 
-/// Serializes the reload-and-publish window below. `react()`'s row lock is
-/// released at commit, so two near-simultaneous votes could otherwise reload
-/// in one order and publish in the other — the *older* score broadcast last,
-/// every SSE subscriber showing a regressed aggregate until the next update.
-/// Holding this across load→publish makes publish order equal load order, and
-/// each load happens after its own vote's commit, so the published score never
-/// goes backwards. One global lock is plenty at example scale; a hot
-/// production app would shard it per post id.
-static BROADCAST_ORDER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// One order per process for the reload-and-publish step. See
+/// [`crate::vote_core::PublishOrder`]. One global lock is plenty at example
+/// scale; a hot production app would shard it per post id.
+static BROADCAST_ORDER: crate::vote_core::PublishOrder = crate::vote_core::PublishOrder::new();
+
+/// The Postgres half of [`crate::vote_core::cast`].
+struct PgVotes<'a> {
+    posts_repo: &'a PgPostRepository,
+    state: &'a AppState,
+}
+
+impl crate::vote_core::VoteBackend for PgVotes<'_> {
+    async fn react(
+        &self,
+        user_id: i64,
+        post_id: i64,
+        value: i16,
+    ) -> AutumnResult<crate::vote_core::VoteState> {
+        let reaction = self.posts_repo.react(user_id, post_id, value).await?;
+        Ok(crate::vote_core::VoteState {
+            aggregate: reaction.aggregate,
+            value: reaction.value,
+        })
+    }
+
+    async fn reload_and_publish(&self, post_id: i64) -> AutumnResult<i64> {
+        broadcast_post_update(post_id, self.state).await
+    }
+}
 
 /// Publish the updated post fragment to the global and per-subreddit SSE
 /// topics (presentation, not vote logic), returning the score it loaded —
-/// read after the caller's commit and under [`BROADCAST_ORDER`], so it is the
-/// newest published value and safe for the caller's own fragment to render.
+/// read after the caller's commit. [`crate::vote_core::cast`] calls it under
+/// [`BROADCAST_ORDER`], so it is the newest published value and safe for the
+/// caller's own fragment to render.
 ///
 /// Pool discipline: `react()` released its connection before returning, and
 /// this helper's checkout is short-lived and dropped before the fan-out, so a
 /// request never holds two connections at once — which is exactly what keeps
 /// the pool from deadlocking under concurrent votes.
 async fn broadcast_post_update(post_id: i64, state: &AppState) -> AutumnResult<i64> {
-    let _publish_in_load_order = BROADCAST_ORDER.lock().await;
     let pool = state
         .pool()
         .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?;

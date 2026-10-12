@@ -39,6 +39,7 @@ showcasing the framework's major features in a single cohesive application.
 | **No-JavaScript fallbacks** (forms and pagination carry no `hx-*` attributes; vote and comment controls degrade to form POSTs) | `routes/posts.rs`, `routes/subreddits.rs`, `routes/layout.rs` |
 | **Failure capsules** (record a failing request, replay it offline with `autumn replay`) | `autumn-capsules.toml`, `capsules/`, `tests/failure_capsule.rs` |
 | **Deterministic simulation testing** (`#[sim_test]`, virtual clock, `always!` / `sometimes!`) | `tests/sim_hot_rank.rs` |
+| **DST nightly**: a seed sweep of the whole app over the full public DST API | `tests/sim_nightly.rs`, `src/vote_core.rs` |
 
 ## Prerequisites
 
@@ -227,6 +228,26 @@ invariants (a rank never climbs as a post ages; a positive score never decays to
 zero) and `sometimes!` for reachability, with an explicit
 `assert_all_sometimes_satisfied()` so a green run is provably non-vacuous. See
 [`docs/guide/simulation-testing.md`](../../docs/guide/simulation-testing.md).
+
+### The DST nightly
+
+`tests/sim_nightly.rs` runs one full scenario per seed: votes that race, posts
+that age in virtual time, jobs, the scheduled rank sweep, replicas with skewed
+clocks, a crash, a webhook over `SimNet`, an LLM stub and SMTP faults. The
+vote rule it races is the real one: `src/vote_core.rs`, which
+`routes/votes.rs` also uses. The `sim-nightly.yml` workflow sweeps 4,000,000
+seeds each night.
+
+```bash
+cargo test -p reddit-clone --release --test sim_nightly                 # 8 seeds and the DoD tests
+AUTUMN_SIM_SEEDS=10000 cargo test -p reddit-clone --release --test sim_nightly \
+    -- --nocapture sim_nightly_sweep                                     # about 45 seeds/s per core
+```
+
+The nightly found one bug on its first sweep: a replica whose clock runs more
+than 2 hours slow ranked a new post as NaN, and Postgres refused the same
+`POWER` in the scheduled rank UPDATE. `calculate_hot_rank` and its SQL now
+keep the age at 0 or more.
 
 ## Why This Example Uses Jobs Instead Of Harvest
 
