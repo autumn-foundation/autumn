@@ -1766,7 +1766,13 @@ impl AppBuilder {
     pub fn plugin_mounts(self, mounts: crate::plugin_sandbox::PluginMounts) -> Self {
         self.state_initializer(move |state| {
             let config = state.config();
-            let mut reserved = vec![config.actuator.prefix.clone()];
+            // The router mounts the normalized prefix; reserve that one. An empty
+            // prefix is the root, which would reserve every path.
+            let actuator = crate::actuator::normalize_actuator_prefix(&config.actuator.prefix);
+            let mut reserved = Vec::new();
+            if !actuator.is_empty() {
+                reserved.push(actuator);
+            }
             // Probes are the framework's only when it mounts them.
             if config.health.enabled {
                 reserved.extend([

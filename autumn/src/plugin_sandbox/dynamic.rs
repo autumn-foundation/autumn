@@ -240,7 +240,10 @@ impl PluginMounts {
             prefix,
             Entry {
                 plugin: plugin.clone(),
-                router: plugin.mounted_router(),
+                // An undeclared path under the prefix gets the framework 404.
+                router: plugin
+                    .mounted_router()
+                    .fallback(crate::middleware::error_page_filter::fallback_404_handler),
                 generation,
             },
         );
@@ -591,6 +594,16 @@ mod tests {
         assert_eq!(get(&router, "/hello/greet").await.0, StatusCode::OK);
         let _ = mounts.unmount("/hello");
         assert_eq!(get(&router, "/hello/greet").await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn an_undeclared_path_under_a_prefix_gets_the_framework_404() {
+        let mounts = PluginMounts::new();
+        let app = app(&mounts);
+        mounts.mount(&hello("/hello")).expect("mounts");
+        let (status, body) = get(&app, "/hello/missing").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("No route matches /hello/missing"), "{body}");
     }
 
     #[tokio::test]
