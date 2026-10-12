@@ -215,16 +215,17 @@ impl Component {
         }
     }
 
-    /// Sort key. `purl` and then the cargo package id participate, so two
-    /// packages sharing a name and version — a vendored copy beside a registry
-    /// one — still order deterministically rather than by whatever order
-    /// `cargo metadata` happened to emit them in.
-    fn sort_key(&self) -> (&str, &str, &str, &str) {
+    /// Sort key. `purl`, the cargo package id and the `bom-ref` take part, so
+    /// two packages with one name and version still sort the same way
+    /// whatever the input order. The `bom-ref` covers audit data, which has no
+    /// package id and often no purl.
+    fn sort_key(&self) -> (&str, &str, &str, &str, &str) {
         (
             self.name.as_str(),
             self.version.as_str(),
             self.purl.as_deref().unwrap_or(""),
             self.source_id.as_deref().unwrap_or(""),
+            self.bom_ref.as_deref().unwrap_or(""),
         )
     }
 }
@@ -263,15 +264,17 @@ impl<'a> Origin<'a> {
             Some(_) => Self::Other,
         }
     }
+}
 
+impl Origin<'static> {
     /// Classify a `cargo-auditable` source category. It records no URLs.
-    fn from_audit_source(source: Option<&str>) -> Origin<'static> {
+    fn from_audit_source(source: Option<&str>) -> Self {
         match source {
-            Some("crates.io") => Origin::CratesIo,
-            Some("registry") => Origin::Registry(None),
-            Some("git") => Origin::Git(None),
-            Some("local") | None => Origin::Path,
-            Some(_) => Origin::Other,
+            Some("crates.io") => Self::CratesIo,
+            Some("registry") => Self::Registry(None),
+            Some("git") => Self::Git(None),
+            Some("local") | None => Self::Path,
+            Some(_) => Self::Other,
         }
     }
 }
@@ -838,7 +841,7 @@ struct AuditData {
 
 fn component_from_audit(pkg: &AuditPackage) -> Component {
     // cargo-auditable records a category, not a URL, so only "crates.io"
-    // earns a purl.
+    // gets a purl.
     let (purl, bom_ref) = package_url(
         &pkg.name,
         &pkg.version,
@@ -2577,8 +2580,52 @@ mod tests {
                     .any(|p| p["name"] == "cargo:source"),
                 "missing cargo:source: {c}"
             );
-            let purl = c.get("purl").and_then(|p| p.as_str());
-            assert!(purl.is_none_or(|p| !p.contains("vcs_url=")), "{c}");
+        }
+        let purls: Vec<&str> = comps.iter().filter_map(|c| c["purl"].as_str()).collect();
+        assert_eq!(purls, vec!["pkg:cargo/dup@1.0.0"]);
+    }
+
+    #[test]
+    fn audit_output_does_not_depend_on_input_order() {
+        let a = r#"{"packages":[
+            {"name":"dup","version":"1.0.0","source":"git"},
+            {"name":"dup","version":"1.0.0","source":"registry"},
+            {"name":"dup","version":"1.0.0","source":"local"}]}"#;
+        let b = r#"{"packages":[
+            {"name":"dup","version":"1.0.0","source":"local"},
+            {"name":"dup","version":"1.0.0","source":"registry"},
+            {"name":"dup","version":"1.0.0","source":"git"}]}"#;
+        let render_of = |json| render(&bom_from_audit_data(json, "0.7.0").unwrap()).unwrap();
+        assert_eq!(render_of(a), render_of(b));
+    }
+
+    #[test]
+    fn cargo_sources_map_to_an_origin_and_purl() {
+        let cases: [(Option<&str>, &str, Option<&str>); 7] = [
+            (None, "path:x@1.0.0", None),
+            (
+                Some(CRATES_IO_SOURCE),
+                "pkg:cargo/x@1.0.0",
+                Some("pkg:cargo/x@1.0.0"),
+            ),
+            (Some("git+"), "git:x@1.0.0", None),
+            (Some("registry+"), "registry:x@1.0.0", None),
+            (Some("future+https://e.com"), "other:x@1.0.0", None),
+            (
+                Some("sparse+https://e.com/i/"),
+                "pkg:cargo/x@1.0.0?repository_url=https%3A%2F%2Fe%2Ecom%2Fi%2F",
+                Some("pkg:cargo/x@1.0.0?repository_url=https%3A%2F%2Fe%2Ecom%2Fi%2F"),
+            ),
+            (
+                Some("git+https://e.com/r"),
+                "pkg:cargo/x@1.0.0?vcs_url=https%3A%2F%2Fe%2Ecom%2Fr",
+                Some("pkg:cargo/x@1.0.0?vcs_url=https%3A%2F%2Fe%2Ecom%2Fr"),
+            ),
+        ];
+        for (source, bom_ref, purl) in cases {
+            let (got_purl, got_ref) = package_url("x", "1.0.0", Origin::from_cargo_source(source));
+            assert_eq!(got_ref, bom_ref, "{source:?}");
+            assert_eq!(got_purl.as_deref(), purl, "{source:?}");
         }
     }
 
