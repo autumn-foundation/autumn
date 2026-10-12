@@ -3522,9 +3522,8 @@ impl tower_http::compression::predicate::Predicate for CompressionPredicate {
     }
 }
 
-/// Does `content_type` start with an excluded prefix? Media types are
-/// case-insensitive (RFC 9110 §8.3.1), so the match ignores ASCII case. The
-/// header itself stays unchanged.
+/// Returns true if `content_type` starts with an excluded prefix. The match
+/// ignores ASCII case (RFC 9110 §8.3.1). The header is not changed.
 fn is_compression_excluded(content_type: &str) -> bool {
     COMPRESSION_EXCLUDED_CONTENT_TYPES.iter().any(|excluded| {
         content_type
@@ -12300,7 +12299,7 @@ enabled = true
         }
     }
 
-    /// Does the shared predicate compress a 4 KiB body of this type?
+    /// Returns true if the predicate compresses a 4 KiB body of this type.
     fn predicate_compresses(content_type: &str) -> bool {
         use tower_http::compression::predicate::Predicate;
         let response = http::Response::builder()
@@ -12310,8 +12309,8 @@ enabled = true
         compression_predicate().should_compress(&response)
     }
 
-    /// Media types are case-insensitive (RFC 9110 §8.3.1), so the carve-outs
-    /// must match in any case (#2416).
+    /// Media types are case-insensitive (RFC 9110 §8.3.1). The excluded types
+    /// must stay uncompressed in any case (#2416).
     #[test]
     fn compression_carve_outs_ignore_case() {
         for ct in [
@@ -12330,7 +12329,9 @@ enabled = true
         }
     }
 
-    /// The font gap stays open in any case, and other types still compress.
+    /// Fonts that are not excluded (ttf, otf) and other types are still
+    /// compressed in any case. Near-miss prefixes (`application/zi`,
+    /// `Font/WOF`) are also compressed.
     #[test]
     fn compression_still_applies_to_other_types_in_any_case() {
         for ct in [
@@ -12342,6 +12343,8 @@ enabled = true
             "Application/JSON; charset=utf-8",
             "application/zi",
             "Font/WOF",
+            "au",
+            "audiö/x",
         ] {
             assert!(predicate_compresses(ct), "{ct} must be compressed");
         }

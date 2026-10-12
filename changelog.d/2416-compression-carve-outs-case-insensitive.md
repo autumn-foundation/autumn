@@ -1,5 +1,5 @@
 ### Fixed
 
-- **compression:** the already-compressed type carve-outs (`audio/`, `video/`,
-  archives, WOFF fonts) now match in any letter case (issue #2416). Before,
-  `Audio/MPEG` was compressed again.
+- **compression:** the match for already-compressed types (`audio/`, `video/`,
+  archives, WOFF fonts) now ignores letter case (issue #2416). Before, the
+  server compressed `Audio/MPEG` again.
