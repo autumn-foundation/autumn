@@ -157,7 +157,25 @@ impl FleetReplication {
             .unwrap_or_else(PoisonError::into_inner) = cutoff;
     }
 
-    fn shutdown_cutoff(&self) -> Option<std::time::Instant> {
+    /// Set the shutdown cutoff to `left` from now. The caller does this
+    /// before it wakes the maintenance task, so the task's start-up delay is
+    /// charged to the shared budget.
+    pub fn set_shutdown_deadline_in(&self, left: Duration) {
+        // Real time on purpose: the cutoff bounds blocking I/O.
+        #[allow(clippy::disallowed_methods)]
+        let now = std::time::Instant::now();
+        self.set_shutdown_cutoff(now.checked_add(left));
+    }
+
+    /// Time until the shutdown cutoff. `None` when none is set.
+    pub(crate) fn cutoff_left(&self) -> Option<Duration> {
+        #[allow(clippy::disallowed_methods)]
+        let now = std::time::Instant::now();
+        self.shutdown_cutoff()
+            .map(|cutoff| cutoff.saturating_duration_since(now))
+    }
+
+    pub(crate) fn shutdown_cutoff(&self) -> Option<std::time::Instant> {
         *self
             .shutdown_cutoff
             .lock()
@@ -1275,5 +1293,26 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(replication.closing(), 0);
+    }
+
+    #[tokio::test]
+    async fn maintenance_keeps_a_cutoff_the_caller_set_before_it_woke() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The final flush alone would allow a minute.
+        let (fleet, replication, _flaky) = outage_fleet(tmp.path(), Duration::from_secs(60));
+        let shutdown = CancellationToken::new();
+        let maintenance = fleet.spawn_maintenance(shutdown.clone());
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        drop(db);
+        // The caller's deadline has already passed when maintenance wakes.
+        replication.set_shutdown_cutoff(Some(std::time::Instant::now()));
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(10), maintenance)
+            .await
+            .expect("the caller's cutoff bounds the flush")
+            .unwrap();
+        assert_eq!(replication.closing(), 1);
     }
 }

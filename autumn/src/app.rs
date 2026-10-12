@@ -6148,13 +6148,14 @@ impl AppBuilder {
         #[cfg(feature = "sqlite")]
         if let Some(maintenance) = fleet_maintenance.take() {
             let wait = shutdown_budget.saturating_sub(elapsed_since_drain_start());
-            // The final flush gets what is left of the shared budget.
+            // Fix the cutoff now. The maintenance task may wake late, and the
+            // wait above counts from here.
             if let Some(replication) = state
                 .shards()
                 .and_then(|s| s.fleet())
                 .and_then(|f| f.replication())
             {
-                replication.set_final_flush(wait);
+                replication.set_shutdown_deadline_in(wait);
             }
             fleet_shutdown.cancel();
             if tokio::time::timeout(wait, maintenance).await.is_ok() {
@@ -13173,7 +13174,7 @@ fn start_fleet_replication(
             restore_missing,
             state.clock_arc(),
         )
-        // The server path lowers this to the budget left at shutdown.
+        // The server path sets a tighter cutoff from the budget left.
         .with_final_flush(std::time::Duration::from_secs(
             config.server.shutdown_timeout_secs,
         )),

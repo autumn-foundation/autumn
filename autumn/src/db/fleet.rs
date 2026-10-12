@@ -1448,8 +1448,11 @@ impl DatabaseFleet {
             let shutdown_began = std::time::Instant::now();
             if let Some(replication) = fleet.replication() {
                 // Closing ships each database's last frames. Bound that too.
-                replication
-                    .set_shutdown_cutoff(shutdown_began.checked_add(replication.final_flush()));
+                // Keep a cutoff the caller set before it woke this task.
+                if replication.cutoff_left().is_none() {
+                    replication
+                        .set_shutdown_cutoff(shutdown_began.checked_add(replication.final_flush()));
+                }
             }
             fleet.close_all().await;
             // Every database is closed. Keep shipping parked replicators until
@@ -1458,9 +1461,11 @@ impl DatabaseFleet {
             // server). Closing the databases used part of the deadline.
             if let Some(replication) = fleet.replication().cloned() {
                 let _ = crate::time::spawn_blocking(move || {
-                    let left = replication
-                        .final_flush()
-                        .saturating_sub(shutdown_began.elapsed());
+                    let left = replication.cutoff_left().unwrap_or_else(|| {
+                        replication
+                            .final_flush()
+                            .saturating_sub(shutdown_began.elapsed())
+                    });
                     replication.flush_closing(left);
                     replication.stop();
                 })
