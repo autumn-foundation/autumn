@@ -258,8 +258,9 @@ agent_credential_types = ["api_key"]
 The issuer must be this site's origin with no path: an `https` URL with no
 query or fragment (RFC 8414). Autumn does not publish
 metadata for another issuer. An app served below a path prefix (`[seo]
-base_url = "https://example.com/shop"`) publishes none: discovery asks the
-host root, which the app does not answer.
+base_url = "https://example.com/shop"`) publishes neither OAuth metadata
+document, nor the `401` pointer to one: discovery (RFC 8414, RFC 9728) asks
+the host root, which the app does not answer.
 
 Autumn serves `/auth.md` when `[aeo.auth_md] registration_url` or OAuth
 settings give an agent a way to get a credential. `[aeo.auth_md] enabled =

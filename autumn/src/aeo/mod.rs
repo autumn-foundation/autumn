@@ -381,11 +381,9 @@ impl AeoSite {
         facts.markdown = aeo.markdown;
         facts.auth_md = aeo.auth_md.clone();
         facts.oauth = aeo.oauth.clone();
-        // RFC 8414 discovery for an issuer asks the host root, which an app
-        // served below a path prefix does not answer: publish no issuer there.
-        if !base_path(config).is_empty() {
-            facts.oauth.authorization_server.issuer = None;
-        }
+        // OAuth discovery (RFC 8414, RFC 9728) asks the host root, which an
+        // app served below a path prefix does not answer.
+        facts.prefixed = !base_path(config).is_empty();
         facts
             .csrf_header
             .clone_from(&config.security.csrf.token_header);
@@ -444,16 +442,17 @@ impl AeoSite {
             .flatten();
         // RFC 9728 §5.1: a `401` points at the protected resource metadata.
         let configured = documents::Origin::resolve(config.seo.base_url.as_deref(), None);
-        let resource_metadata = (!aeo.oauth.authorization_servers.is_empty()
-            && configured.configured)
-            .then(|| {
-                HeaderValue::from_str(&format!(
-                    "Bearer resource_metadata=\"{}\"",
-                    configured.url(documents::OAUTH_RESOURCE_PATH)
-                ))
-                .ok()
-            })
-            .flatten();
+        let prefixed = facts.prefixed;
+        let resource_metadata =
+            (!aeo.oauth.authorization_servers.is_empty() && configured.configured && !prefixed)
+                .then(|| {
+                    HeaderValue::from_str(&format!(
+                        "Bearer resource_metadata=\"{}\"",
+                        configured.url(documents::OAUTH_RESOURCE_PATH)
+                    ))
+                    .ok()
+                })
+                .flatten();
         Self {
             enabled: aeo.enabled,
             base_url: config.seo.base_url.clone(),
@@ -464,6 +463,7 @@ impl AeoSite {
                 home_links,
                 content_signal,
                 resource_metadata_from_host: !aeo.oauth.authorization_servers.is_empty()
+                    && !prefixed
                     && resource_metadata.is_none(),
                 resource_metadata,
             },
@@ -700,6 +700,13 @@ fn warn_on_config(config: &crate::config::AutumnConfig) {
         tracing::warn!(
             "aeo: [[aeo.paid_routes]] {problem}; an x402 route answers 503, and the route \
              is not in the OpenAPI payment info"
+        );
+    }
+    if !aeo.oauth.authorization_servers.is_empty() && !base_path(config).is_empty() {
+        tracing::warn!(
+            "aeo: [aeo.oauth] authorization_servers needs an app served at the host root: \
+             [seo] base_url has a path, and RFC 9728 discovery asks the root; Autumn does \
+             not publish the protected resource metadata"
         );
     }
     if let Some(issuer) = aeo.oauth.authorization_server.issuer.as_deref() {
@@ -1023,7 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prefixed_app_publishes_no_issuer() {
+    fn a_prefixed_app_publishes_no_oauth_metadata() {
         // Codex review: RFC 8414 discovery for `https://example.com` asks
         // `/.well-known/oauth-authorization-server` at the host root, which
         // an app below `/shop` does not answer.
@@ -1040,6 +1047,20 @@ mod tests {
         assert!(published(&config));
         config.seo.base_url = Some("https://example.com/shop".to_owned());
         assert!(!published(&config));
+
+        // RFC 9728 §3 puts the protected resource metadata for
+        // `https://example.com/shop` at the host root too.
+        config.aeo.oauth.authorization_servers = vec!["https://auth.example".to_owned()];
+        let site = AeoSite::new(&config, documents::SiteFacts::default());
+        let origin = documents::Origin::resolve(config.seo.base_url.as_deref(), None);
+        assert!(documents::render(&site.facts, &origin, documents::OAUTH_RESOURCE_PATH).is_none());
+        assert!(site.negotiate.resource_metadata.is_none());
+        assert!(!site.negotiate.resource_metadata_from_host);
+        config.seo.base_url = Some("https://example.com".to_owned());
+        let site = AeoSite::new(&config, documents::SiteFacts::default());
+        let origin = documents::Origin::resolve(config.seo.base_url.as_deref(), None);
+        assert!(documents::render(&site.facts, &origin, documents::OAUTH_RESOURCE_PATH).is_some());
+        assert!(site.negotiate.resource_metadata.is_some());
     }
 
     #[tokio::test]

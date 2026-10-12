@@ -701,11 +701,14 @@ fn build_router_pre_state(
         aeo_mcp,
     ));
     if config.aeo.enabled && !config.aeo.paid_routes.is_empty() {
-        state.insert_extension(crate::aeo::commerce::RoutedTemplates(routed_templates(
-            &route_list,
-            &ctx.scoped_groups,
-            config,
-        )));
+        state.insert_extension(crate::aeo::commerce::RoutedTemplates {
+            mounted: routed_templates(&route_list, &ctx.scoped_groups, config),
+            nested: route_list
+                .iter()
+                .filter(|r| mounted_paths(r.path, config) != [r.path])
+                .map(|r| r.path.to_owned())
+                .collect(),
+        });
     }
 
     // Build the per-route timeout override table before `route_list` and the

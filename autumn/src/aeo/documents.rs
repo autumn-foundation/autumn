@@ -81,6 +81,10 @@ pub struct SiteFacts {
     /// Serve a `/sitemap.xml` of the known pages when no route does, so the
     /// links in `llms.txt` and the site guide always resolve.
     pub sitemap: bool,
+    /// The app is served below a path prefix (`[seo] base_url` has a path).
+    /// OAuth discovery (RFC 8414, RFC 9728) asks the host root, which the
+    /// app does not answer, so neither metadata document is published.
+    pub prefixed: bool,
     /// The home page paths: `/`, or `/{locale}` for each locale when the
     /// root is locale-prefixed. Empty means `/`.
     pub home_paths: Vec<String>,
@@ -1392,7 +1396,7 @@ fn ard_manifest(facts: &SiteFacts, origin: &Origin) -> Document {
 
 fn protected_resource(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
     let oauth = &facts.oauth;
-    if oauth.authorization_servers.is_empty() {
+    if oauth.authorization_servers.is_empty() || facts.prefixed {
         return None;
     }
     let mut prm = json!({
@@ -1413,6 +1417,9 @@ fn protected_resource(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
 /// The configured issuer, when this origin may publish its metadata: the
 /// issuer has no path, and its origin is the site origin (RFC 8414 §3).
 fn local_issuer<'a>(facts: &'a SiteFacts, origin: &Origin) -> Option<&'a str> {
+    if facts.prefixed {
+        return None;
+    }
     let issuer = facts
         .oauth
         .authorization_server
@@ -1541,7 +1548,7 @@ fn auth_md(facts: &SiteFacts, origin: &Origin) -> Option<Document> {
     if has_api(facts) {
         let _ = writeln!(md, "- API catalog: {}", origin.url(API_CATALOG_PATH));
     }
-    if !oauth.authorization_servers.is_empty() {
+    if !oauth.authorization_servers.is_empty() && !facts.prefixed {
         let _ = writeln!(
             md,
             "- OAuth protected resource metadata: {}",
