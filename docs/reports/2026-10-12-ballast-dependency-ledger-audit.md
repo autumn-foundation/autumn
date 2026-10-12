@@ -164,13 +164,24 @@ Confirmed mechanically, not just by reading the bot's comment: `get_label`
 for `automated` and `ci` both returned "not found in
 autumn-foundation/autumn"; only `dependencies` exists. `.github/dependabot.yml`
 listed `[dependencies, automated]` for the cargo block and `[ci, automated]`
-for the github-actions block — so every PR from the github-actions block has
-been getting **zero** labels applied (both of its names are wrong), and every
-cargo-ecosystem PR has been getting only `dependencies` with Dependabot
-posting the same warning comment every time. Not merge-blocking (the PRs are
-still created fine), but a real, fixable fact about this repo's own config,
-sitting unnoticed since whenever those labels were first added — a `get_label`
-check neither this nor any prior Ballast pass had run before.
+for the github-actions block. Not merge-blocking (the PRs are still created
+fine), but a real, fixable fact about this repo's own config, sitting
+unnoticed since whenever those labels were first added — a `get_label` check
+neither this nor any prior Ballast pass had run before.
+
+First attempt at the fix was itself wrong, caught by a Codex review comment
+on this PR's own diff before merge: dropping `labels` entirely from the
+github-actions block (reasoning: no verified replacement name to put there)
+does not mean "no labels" — [GitHub's own docs](https://docs.github.com/en/code-security/tutorials/secure-your-dependencies/customizing-dependabot-prs)
+confirm (fetched and read directly, not taken on the bot's word) that
+omitting `labels` makes Dependabot fall back to its *defaults*: the
+`dependencies` label plus an ecosystem label such as `github-actions`,
+auto-created if either is missing. So the first fix would have silently
+introduced a never-verified `github-actions` label instead of fixing
+anything. Corrected to `labels: [dependencies]` on the github-actions block
+too — reusing the one label already confirmed to exist, matching the cargo
+block, rather than trusting an unverified ecosystem-label name or an
+untested empty list.
 
 **Waivers — not yet due.** All five review-by dates (`RUSTSEC-2023-0071`,
 `RUSTSEC-2024-0384`, `RUSTSEC-2026-0253`, `RUSTSEC-2024-0370`,
@@ -222,10 +233,14 @@ charter, "staying current" does not supply one, so none is actioned.
 ## 🔧 Change
 
 - `.github/dependabot.yml`: dropped the non-existent `automated` label from
-  the cargo block (kept `dependencies`, which is real) and dropped the
-  non-existent `ci`/`automated` labels entirely from the github-actions block
-  (no real replacement name to put there instead). Validated with a YAML
-  parse. No `ignore` entries touched.
+  the cargo block and the non-existent `ci`/`automated` labels from the
+  github-actions block, replacing both with `labels: [dependencies]` — the
+  one label confirmed to exist. (First pushed this PR with `labels` dropped
+  entirely on the github-actions block instead of set to `[dependencies]`;
+  corrected after a Codex review comment showed that omitting `labels`
+  triggers Dependabot's own default labelling, not "no labels" — see
+  Evidence.) Validated with a YAML parse after each edit. No `ignore`
+  entries touched.
 - Posted rehearsal comments on GitHub PRs #3209 (clean, recommend merge),
   #3144 (full mechanism, recommend closing all four and recombining), and
   #3143/#3148/#3149 (pointing at #3144's rehearsal, same recommendation).
@@ -247,7 +262,7 @@ charter, "staying current" does not supply one, so none is actioned.
 | PRs rehearsed clean (ready to merge) | — | 1 (#3209) |
 | PRs rehearsed and found individually un-mergeable | — | 4 (#3143/#3144/#3148/#3149) |
 | PRs deferred, no forcing fact, not rehearsed | — | 7 (#3140, #3142, #3145, #3146, #3147, #3150, #3169) |
-| Dependabot label config | broken (`automated`/`ci` both 404) | fixed (`dependencies` only, cargo block; none, github-actions block) |
+| Dependabot label config | broken (`automated`/`ci` both 404) | fixed (`dependencies` only, both blocks) |
 | Wildcard ranges / unpinned git refs | 0 / 0 | 0 / 0 |
 | Scheduled-batch size, root / fuzz / island-flock | 98 / 78 / 31 packages | 128 / 95 / 31 packages |
 

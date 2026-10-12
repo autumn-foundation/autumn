@@ -74,6 +74,14 @@ updates:
       - dependency-name: "dtolnay/rust-toolchain"
     # Neither `ci` nor `automated` exists as a repo label (confirmed via the
     # GitHub API, 2026-10-12), so this ecosystem's PRs got the same broken
-    # "labels could not be found" comment as the cargo block above. No
-    # replacement label listed: dropping the key entirely rather than
-    # guessing at an unverified name.
+    # "labels could not be found" comment as the cargo block above. Omitting
+    # `labels` entirely does NOT mean "no labels": GitHub's own docs say
+    # Dependabot then falls back to its defaults (the `dependencies` label
+    # plus an ecosystem label, auto-created if missing) — which would have
+    # silently introduced an unverified `github-actions` label instead of
+    # fixing anything (caught by a Codex review comment on this change's own
+    # diff). Reuse the same verified `dependencies` label as the cargo block
+    # instead, rather than an unverified ecosystem label or an untested empty
+    # list.
+    labels:
+      - dependencies
