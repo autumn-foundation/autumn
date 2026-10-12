@@ -140,6 +140,11 @@ pub struct PluginMounts {
 /// Prefixes the framework always owns. [`PluginMounts::reserve`] adds more.
 const BASE_RESERVED: &[&str] = &["/static", "/_autumn", "/favicon.ico", "/.well-known"];
 
+/// `true` if one prefix is the other, or lies under it.
+fn overlaps(a: &str, b: &str) -> bool {
+    is_under(a, b) || is_under(b, a)
+}
+
 /// `true` if `path` is `prefix` or lies under it, on a segment boundary.
 fn is_under(path: &str, prefix: &str) -> bool {
     path.strip_prefix(prefix)
@@ -165,14 +170,31 @@ impl PluginMounts {
     ///
     /// [`AppBuilder::plugin_mounts`](crate::app::AppBuilder::plugin_mounts)
     /// already reserves the configured actuator and probe paths.
+    ///
+    /// A plugin that is already mounted on a reserved prefix is unmounted.
     pub fn reserve<I, S>(&self, prefixes: I)
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.write()
-            .reserved
-            .extend(prefixes.into_iter().map(Into::into));
+        let mut table = self.write();
+        for prefix in prefixes.into_iter().map(Into::into) {
+            let clashing: Vec<String> = table
+                .by_prefix
+                .keys()
+                .filter(|held| overlaps(held, &prefix))
+                .cloned()
+                .collect();
+            for held in clashing {
+                tracing::warn!(
+                    prefix = held,
+                    reserved = prefix,
+                    "unmounting a plugin on a reserved prefix"
+                );
+                table.by_prefix.remove(&held);
+            }
+            table.reserved.push(prefix);
+        }
     }
 
     /// Mount a plugin at its manifest prefix. Returns its generation.
@@ -190,7 +212,7 @@ impl PluginMounts {
             .iter()
             .copied()
             .chain(table.reserved.iter().map(String::as_str))
-            .any(|reserved| is_under(&prefix, reserved))
+            .any(|reserved| overlaps(&prefix, reserved))
         {
             tracing::warn!(prefix, "refusing to mount a plugin on a framework prefix");
             return Err(MountError::Reserved { prefix });
@@ -198,10 +220,7 @@ impl PluginMounts {
         if let Some(held) = table
             .by_prefix
             .values()
-            .find(|entry| {
-                let held = &entry.plugin.manifest().prefix;
-                is_under(&prefix, held) || is_under(held, &prefix)
-            })
+            .find(|entry| overlaps(&prefix, &entry.plugin.manifest().prefix))
             .map(|entry| entry.plugin.manifest().name.clone())
         {
             tracing::warn!(
@@ -430,7 +449,21 @@ mod tests {
             mounts.mount(&hello("/ops/admin")),
             Err(MountError::Reserved { .. })
         ));
+        // A prefix that contains a reserved one is refused too.
+        mounts.reserve(["/internal/ops"]);
+        assert!(matches!(
+            mounts.mount(&hello("/internal")),
+            Err(MountError::Reserved { .. })
+        ));
         mounts.mount(&hello("/staticx")).expect("a sibling name");
+    }
+
+    #[test]
+    fn reserving_a_prefix_unmounts_a_plugin_already_on_it() {
+        let mounts = PluginMounts::new();
+        mounts.mount(&hello("/ops")).expect("mounts");
+        mounts.reserve(["/ops"]);
+        assert!(mounts.list().is_empty());
     }
 
     #[tokio::test]

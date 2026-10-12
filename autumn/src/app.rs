@@ -1766,13 +1766,21 @@ impl AppBuilder {
     pub fn plugin_mounts(self, mounts: crate::plugin_sandbox::PluginMounts) -> Self {
         self.state_initializer(move |state| {
             let config = state.config();
-            mounts.reserve([
-                config.actuator.prefix.clone(),
-                config.health.path.clone(),
-                config.health.live_path.clone(),
-                config.health.ready_path.clone(),
-                config.health.startup_path,
-            ]);
+            let mut reserved = vec![config.actuator.prefix.clone()];
+            // Probes are the framework's only when it mounts them.
+            if config.health.enabled {
+                reserved.extend([
+                    config.health.path,
+                    config.health.live_path,
+                    config.health.ready_path,
+                    config.health.startup_path,
+                ]);
+            }
+            // The inspector runs in the dev profile only.
+            if crate::config::profile_is_dev(config.profile.as_deref()) {
+                reserved.push(config.dev.inspector_path);
+            }
+            mounts.reserve(reserved);
             state.insert_extension(mounts);
         })
     }
