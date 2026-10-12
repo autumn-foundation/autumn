@@ -1446,14 +1446,20 @@ impl DatabaseFleet {
                     }
                 }
             }
+            // Real time on purpose: the flush budget covers blocking I/O.
+            #[allow(clippy::disallowed_methods)]
+            let shutdown_began = std::time::Instant::now();
             fleet.close_all().await;
             // Every database is closed. Keep shipping parked replicators until
             // they catch up or the flush deadline passes, then stop the loop
             // thread so it does not outlive the app (an embedded or restarted
-            // server).
+            // server). Closing the databases used part of the deadline.
             if let Some(replication) = fleet.replication().cloned() {
                 let _ = crate::time::spawn_blocking(move || {
-                    replication.flush_closing(replication.final_flush());
+                    let left = replication
+                        .final_flush()
+                        .saturating_sub(shutdown_began.elapsed());
+                    replication.flush_closing(left);
                     replication.stop();
                 })
                 .await;

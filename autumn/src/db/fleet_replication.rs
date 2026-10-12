@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -59,9 +59,6 @@ const FINAL_SHIP_MAX_TICKS: usize = 64;
 
 /// Pause between flush passes at shutdown.
 const FLUSH_RETRY: Duration = Duration::from_millis(100);
-
-/// Default longest shutdown flush.
-const DEFAULT_FINAL_FLUSH: Duration = Duration::from_secs(5);
 
 /// The destination key prefix of one fleet database, under the control
 /// database's replication root.
@@ -99,7 +96,7 @@ pub struct FleetReplication {
     parked: Mutex<HashMap<FleetDbKey, Arc<ActiveReplica>>>,
     stopped: AtomicBool,
     /// Longest the shutdown flush keeps shipping parked replicators.
-    final_flush: Duration,
+    final_flush_ms: AtomicU64,
     /// Names still unshipped when the last shutdown flush ended.
     unshipped: Mutex<Vec<String>>,
 }
@@ -128,7 +125,7 @@ impl FleetReplication {
             active: Mutex::new(HashMap::new()),
             parked: Mutex::new(HashMap::new()),
             stopped: AtomicBool::new(false),
-            final_flush: DEFAULT_FINAL_FLUSH,
+            final_flush_ms: AtomicU64::new(5_000),
             unshipped: Mutex::new(Vec::new()),
         }
     }
@@ -136,15 +133,22 @@ impl FleetReplication {
     /// Set the longest the shutdown flush keeps shipping. The default is 5
     /// seconds.
     #[must_use]
-    pub const fn with_final_flush(mut self, deadline: Duration) -> Self {
-        self.final_flush = deadline;
+    pub fn with_final_flush(self, deadline: Duration) -> Self {
+        self.set_final_flush(deadline);
         self
+    }
+
+    /// Change the longest the shutdown flush keeps shipping. Call it before
+    /// shutdown starts, with the time the shutdown still has left.
+    pub fn set_final_flush(&self, deadline: Duration) {
+        let millis = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
+        self.final_flush_ms.store(millis, Ordering::Release);
     }
 
     /// The longest the shutdown flush keeps shipping.
     #[must_use]
-    pub const fn final_flush(&self) -> Duration {
-        self.final_flush
+    pub fn final_flush(&self) -> Duration {
+        Duration::from_millis(self.final_flush_ms.load(Ordering::Acquire))
     }
 
     /// Tick until no replicator is parked, or until `deadline` passes.
@@ -1110,7 +1114,9 @@ mod tests {
     #[tokio::test]
     async fn shutdown_reports_a_destination_that_stays_down() {
         let tmp = tempfile::tempdir().unwrap();
-        let (fleet, replication, _flaky) = outage_fleet(tmp.path(), Duration::from_millis(300));
+        let (fleet, replication, _flaky) = outage_fleet(tmp.path(), Duration::from_secs(60));
+        // The shutdown shortens the deadline to what it has left.
+        replication.set_final_flush(Duration::from_millis(300));
         let shutdown = CancellationToken::new();
         let maintenance = fleet.spawn_maintenance(shutdown.clone());
         let key = fleet.key_for("acme").unwrap();

@@ -6147,8 +6147,16 @@ impl AppBuilder {
         // and same reasoning as the control replication flush below.
         #[cfg(feature = "sqlite")]
         if let Some(maintenance) = fleet_maintenance.take() {
-            fleet_shutdown.cancel();
             let wait = shutdown_budget.saturating_sub(elapsed_since_drain_start());
+            // The final flush gets what is left of the shared budget.
+            if let Some(replication) = state
+                .shards()
+                .and_then(|s| s.fleet())
+                .and_then(|f| f.replication())
+            {
+                replication.set_final_flush(wait);
+            }
+            fleet_shutdown.cancel();
             if tokio::time::timeout(wait, maintenance).await.is_ok() {
                 tracing::info!("shutdown: SQLite fleet databases closed");
             } else {
@@ -13165,7 +13173,7 @@ fn start_fleet_replication(
             restore_missing,
             state.clock_arc(),
         )
-        // The deadline is the full timeout. The shutdown wait also bounds it.
+        // The server path lowers this to the budget left at shutdown.
         .with_final_flush(std::time::Duration::from_secs(
             config.server.shutdown_timeout_secs,
         )),
