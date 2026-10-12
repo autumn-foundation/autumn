@@ -224,6 +224,8 @@ mod maud_render;
 #[cfg(feature = "mcp")]
 mod mcp_endpoint;
 #[cfg(feature = "mcp")]
+mod mcp_modern;
+#[cfg(feature = "mcp")]
 mod mcp_plugin;
 #[cfg(all(feature = "db", feature = "mcp"))]
 mod mcp_repository;
