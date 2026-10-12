@@ -3755,8 +3755,15 @@ mod tests {
         let callers = futures::future::join_all((0..5).map(|_| fleet.open(&key)));
         // Drop all five callers while the one opener runs its hook.
         let _ = tokio::time::timeout(Duration::from_millis(60), callers).await;
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // The opener fails on its own task; wait for its entry to go.
+        for _ in 0..1000 {
+            if fleet.stats().open_failures_total > 0 && fleet.open_keys().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert_eq!(hook.0.load(Ordering::SeqCst), 1, "one opener, not five");
+        assert_eq!(fleet.stats().open_failures_total, 1);
         assert!(fleet.open_keys().is_empty(), "the failed entry is gone");
     }
 
