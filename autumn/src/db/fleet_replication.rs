@@ -297,10 +297,10 @@ impl FleetReplication {
         self.tick_pass(&|| self.shutdown_cutoff());
     }
 
-    /// One tick pass. `cutoff` is read again for each replica and each ship
-    /// step, so a cutoff installed mid-pass takes effect. With a cutoff, no
-    /// replica starts after it, and a replica that another thread holds is
-    /// skipped, not waited for.
+    /// One tick pass. `cutoff` is read again for each replica, each lock
+    /// attempt and each ship step, so a cutoff installed mid-pass takes
+    /// effect. After it, no replica starts, and a replica that another thread
+    /// holds is given up on.
     fn tick_pass(&self, cutoff: &dyn Fn() -> Option<std::time::Instant>) {
         let active: Vec<(FleetDbKey, Arc<ActiveReplica>)> = self
             .active()
@@ -312,7 +312,7 @@ impl FleetReplication {
             if expired(now_cutoff) {
                 return;
             }
-            let Some(mut replicator) = lock_replicator(&replica, now_cutoff) else {
+            let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
                 continue;
             };
             if let Err(error) = replicator.tick() {
@@ -329,7 +329,7 @@ impl FleetReplication {
             if expired(now_cutoff) {
                 return;
             }
-            let Some(mut replicator) = lock_replicator(&replica, now_cutoff) else {
+            let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
                 continue;
             };
             let caught_up = ship_until_caught_up(&mut replicator, cutoff).is_ok();
@@ -590,23 +590,28 @@ fn expired(cutoff: Option<std::time::Instant>) -> bool {
     cutoff.is_some_and(|cutoff| std::time::Instant::now() >= cutoff)
 }
 
-/// Lock a replicator. With a `cutoff`, do not wait for another thread.
-fn lock_replicator(
-    replica: &ActiveReplica,
-    cutoff: Option<std::time::Instant>,
-) -> Option<std::sync::MutexGuard<'_, Replicator>> {
-    if cutoff.is_none() {
-        return Some(
-            replica
-                .replicator
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        );
-    }
-    match replica.replicator.try_lock() {
-        Ok(guard) => Some(guard),
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+/// Pause between lock attempts while another thread holds a replicator.
+const LOCK_POLL: Duration = Duration::from_millis(5);
+
+/// Lock a replicator. Never block without a way out: poll, and read the
+/// cutoff again on every attempt and after the lock is won. `None` once the
+/// cutoff has passed, so shutdown work cannot start late behind another
+/// thread's tick.
+fn lock_replicator<'a>(
+    replica: &'a ActiveReplica,
+    cutoff: &dyn Fn() -> Option<std::time::Instant>,
+) -> Option<std::sync::MutexGuard<'a, Replicator>> {
+    loop {
+        if expired(cutoff()) {
+            return None;
+        }
+        match replica.replicator.try_lock() {
+            Ok(guard) => return (!expired(cutoff())).then_some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                return (!expired(cutoff())).then(|| poisoned.into_inner());
+            }
+            Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(LOCK_POLL),
+        }
     }
 }
 
@@ -1384,5 +1389,46 @@ mod tests {
         .unwrap();
         // The pass read the cutoff again before it shipped the parked replica.
         assert_eq!(replication.closing(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pass_waiting_on_a_replica_lock_gives_up_at_a_new_cutoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        let key = park_one(&fleet).await;
+        flaky.down.store(false, Ordering::SeqCst);
+        // Another thread holds the replica for three seconds.
+        let replica = replication.parked().get(&key).cloned().unwrap();
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = replica.replicator.lock().unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        held.recv().unwrap();
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let began = std::time::Instant::now();
+        crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || {
+                // No cutoff at first, a passed one from the second read on.
+                replication.tick_pass(&|| {
+                    if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                        None
+                    } else {
+                        Some(std::time::Instant::now())
+                    }
+                });
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "the pass must not wait out the lock: {:?}",
+            began.elapsed()
+        );
+        holder.join().unwrap();
+        assert_eq!(replication.closing(), 1, "nothing shipped");
     }
 }
