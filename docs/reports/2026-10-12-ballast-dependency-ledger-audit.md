@@ -71,10 +71,17 @@ the queue:
 | 3140 | `taiki-e/install-action` 2.87.20→2.87.22 | 2026-10-05 | github-actions (patch) |
 
 All 12 confirmed real and still open via `pull_request_read`, not inferred
-from a search count. Everything other than #3209 and #3140 is a 0.x "minor"
-bump that Cargo/Dependabot treats as **major** (breaking) and so falls outside
-the `rust-deps` group's `update-types: [minor, patch]` filter — that filter is
-why 10 of these 12 PRs are singletons instead of one batch.
+from a search count. Corrected per a Codex review comment on this PR's own
+diff: the `rust-deps` group only covers the **cargo** ecosystem block, so
+#3169 (npm) and #3140 (github-actions) were never eligible for it regardless
+of semver — a different ecosystem, not a version-type exclusion. Of the
+remaining 9 cargo-ecosystem PRs, 7 are genuinely excluded by the *0.x "minor
+counts as major"* quirk (`opentelemetry`/`opentelemetry_sdk`/
+`opentelemetry-otlp`/`tracing-opentelemetry`, `css-inline`, `getrandom`,
+`wasmi` — each still below 1.0, or crossing into it from below); the other 2
+(`croner` 3.0.1→4.0.1, `brotli` 8.0.4→9.0.0) are ordinary major bumps on
+already-stable (1.0+) crates, excluded for the plain reason that a
+minor/patch-only group was never going to include a major, 0.x quirk or not.
 
 **#3209 rehearsed and found clean — the one real scheduled-batch candidate
 this week.** Cherry-picked its single commit (`bc05ce2`: ammonia 4.2.0→4.2.1,
@@ -95,32 +102,47 @@ Posted the rehearsal on #3209 recommending merge. Not merged by this pass —
 every prior pass's actual merges were done by the repo's human maintainer, not
 by Ballast itself, and this pass follows that precedent.
 
-**#3143/#3144/#3148/#3149 rehearsed and found individually un-mergeable — a
-real, previously-undetected ledger hazard, not a hypothetical one.** These
-four PRs bump `opentelemetry`, `opentelemetry_sdk`, `opentelemetry-otlp`
-(0.32→0.33) and `tracing-opentelemetry` (0.33→0.34) separately, because each
-is a 0.x "major" bump excluded from the `rust-deps` group. But
-`tracing-opentelemetry` 0.34.0's own published `Cargo.toml` pins `opentelemetry
-= "0.33.0"` (confirmed by reading it directly from the registry cache, not
-inferred from the changelog — though the changelog excerpt on #3144 says the
-same thing: "Upgrade to OpenTelemetry 0.33"). Rehearsed on current
-`trunk-dev`:
+**Both halves of the opentelemetry split rehearsed independently; both
+break.** A Codex review comment correctly caught that the first version of
+this section only executed one direction (bumping `tracing-opentelemetry`
+alone) and inferred the other three PRs' fate from it rather than running
+them — worth fixing rather than leaving an unverified inference in a ledger
+report. Rehearsed the missing direction and it also breaks, which makes this
+a stronger finding than first written, not a weaker one: these four PRs are
+mutually interdependent in *both* directions, confirmed by two separate
+compiles, not one.
+
+`tracing-opentelemetry` 0.34.0's own published `Cargo.toml` pins
+`opentelemetry = "0.33.0"`, and the *current* `tracing-opentelemetry` 0.33.0
+(unchanged by #3143/#3148/#3149) pins `opentelemetry = "0.32.0"` (both
+confirmed by reading the registry-cached `Cargo.toml` directly, not inferred
+from a changelog). Rehearsed each direction on current `trunk-dev`:
 
 ```
+# Direction 1: bump tracing-opentelemetry alone (PR #3144 in isolation)
 sed -i 's/tracing-opentelemetry = "0.33.0"/tracing-opentelemetry = "0.34.0"/' Cargo.toml
 cargo update -p tracing-opentelemetry
 # → Adding opentelemetry v0.33.1 (alongside the workspace's pinned 0.32.0/0.32.1)
 cargo check -p autumn-web --no-default-features --features telemetry-otlp
 # → error: could not compile `autumn-web` (lib) due to 11 previous errors
-#   - `SdkTracer: opentelemetry::trace::tracer::Tracer` not satisfied
-#   - `Layered<OpenTelemetryLayer<...>, ...>` missing `Subscriber`/`.with()`
-#   - no method `span` on `opentelemetry::context::Context`
+
+# Direction 2: bump the other three alone (PRs #3143/#3148/#3149 together, #3144 untouched)
+sed -i -e 's/opentelemetry = { version = "0.32.0"/opentelemetry = { version = "0.33.0"/' \
+       -e 's/opentelemetry_sdk = { version = "0.32.1"/opentelemetry_sdk = { version = "0.33.0"/' \
+       -e 's/opentelemetry-otlp = { version = "0.32.0"/opentelemetry-otlp = { version = "0.33.0"/' Cargo.toml
+cargo update -p opentelemetry -p opentelemetry_sdk -p opentelemetry-otlp
+# → Adding opentelemetry v0.33.1 (tracing-opentelemetry 0.33.0 still pins opentelemetry 0.32.0,
+#   so the lockfile now carries BOTH 0.32.0 and 0.33.1 of `opentelemetry`)
+cargo check -p autumn-web --no-default-features --features telemetry-otlp
+# → error: could not compile `autumn-web` (lib) due to 11 previous errors (identical signature:
+#   `SdkTracer: opentelemetry::trace::tracer::Tracer` not satisfied, `Layered<OpenTelemetryLayer<...>,
+#   ...>` missing `Subscriber`/`.with()`, no method `span` on `opentelemetry::context::Context`)
 ```
 
-Merging `tracing-opentelemetry` alone forces a second, incompatible
-`opentelemetry` version into the graph, and `autumn/src/telemetry.rs`'s own
-`tracing_subscriber` layer stack (used under the `telemetry-otlp` feature)
-mixes types from both — a real compile break, not a theoretical one. The
+Either direction forces two incompatible `opentelemetry` versions into the
+graph at once, and `autumn/src/telemetry.rs`'s own `tracing_subscriber` layer
+stack (used under the `telemetry-otlp` feature) mixes types from both — a
+real compile break in both directions, not a theoretical one in either. The
 correct unit of change is all four crates together. Posted the rehearsal and
 a close-and-recombine recommendation on all four PRs; left the full mechanism
 on #3144 and pointed #3143/#3148/#3149 at it rather than repeating it four
@@ -260,7 +282,8 @@ charter, "staying current" does not supply one, so none is actioned.
 | Workspace members | 37 (stale count, see Evidence) | 39 (corrected) |
 | Open Dependabot PRs | 0 | 12 |
 | PRs rehearsed clean (ready to merge) | — | 1 (#3209) |
-| PRs rehearsed and found individually un-mergeable | — | 4 (#3143/#3144/#3148/#3149) |
+| Opentelemetry split: directions actually compiled | — | 2 of 2 (both break) |
+| PRs affected by that finding (not all individually compiled) | — | 4 (#3143/#3144/#3148/#3149) |
 | PRs deferred, no forcing fact, not rehearsed | — | 7 (#3140, #3142, #3145, #3146, #3147, #3150, #3169) |
 | Dependabot label config | broken (`automated`/`ci` both 404) | fixed (`dependencies` only, both blocks) |
 | Wildcard ranges / unpinned git refs | 0 / 0 | 0 / 0 |
@@ -288,11 +311,18 @@ git fetch origin pull/3209/head:ballast-pr-3209
 git checkout origin/trunk-dev -b rehearsal-3209 && git cherry-pick bc05ce2
 cargo deny check && cargo check --workspace --all-targets
 
-# opentelemetry lockstep rehearsal
-git checkout origin/trunk-dev -b rehearsal-otlp
+# opentelemetry lockstep rehearsal — both directions
+git checkout origin/trunk-dev -b rehearsal-otlp-a
 sed -i 's/tracing-opentelemetry = "0.33.0"/tracing-opentelemetry = "0.34.0"/' Cargo.toml
 cargo update -p tracing-opentelemetry
-cargo check -p autumn-web --no-default-features --features telemetry-otlp
+cargo check -p autumn-web --no-default-features --features telemetry-otlp   # breaks
+
+git checkout origin/trunk-dev -b rehearsal-otlp-b
+sed -i -e 's/opentelemetry = { version = "0.32.0"/opentelemetry = { version = "0.33.0"/' \
+       -e 's/opentelemetry_sdk = { version = "0.32.1"/opentelemetry_sdk = { version = "0.33.0"/' \
+       -e 's/opentelemetry-otlp = { version = "0.32.0"/opentelemetry-otlp = { version = "0.33.0"/' Cargo.toml
+cargo update -p opentelemetry -p opentelemetry_sdk -p opentelemetry-otlp
+cargo check -p autumn-web --no-default-features --features telemetry-otlp   # also breaks
 
 # dependabot label check (via GitHub MCP get_label, or the API directly)
 # GET /repos/autumn-foundation/autumn/labels/automated  → 404
