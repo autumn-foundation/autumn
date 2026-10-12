@@ -948,6 +948,9 @@ impl DatabaseFleet {
                     if db.pool.is_closed() {
                         continue;
                     }
+                    // The claim stamped the entry before the file was created and
+                    // migrated. A slow open must not count as idle time.
+                    entry.mark_used_now();
                     self.enforce_capacity(Some(key));
                     return Ok(db);
                 }
@@ -1778,6 +1781,13 @@ impl Entry {
             .last_use_at
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn mark_used_now(&self) {
+        *self
+            .last_use_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = crate::time::ambient_instant();
     }
 
     fn touch(&self, seq: u64) {
