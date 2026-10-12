@@ -328,7 +328,7 @@ impl FleetReplication {
             let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
                 continue;
             };
-            let caught_up = ship_until_caught_up(&mut replicator, cutoff).is_ok();
+            let caught_up = ship_until_caught_up(&mut replicator, &|| cutoff).is_ok();
             drop(replicator);
             if caught_up && self.retire_parked(&key, &replica) {
                 tracing::info!(database = %key, "fleet replication: closed database caught up");
@@ -526,7 +526,7 @@ impl FleetLifecycle for FleetReplication {
                 .replicator
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            ship_until_caught_up(&mut replicator, self.shutdown_cutoff())
+            ship_until_caught_up(&mut replicator, &|| self.shutdown_cutoff())
         };
         if let Err(error) = shipped {
             tracing::warn!(
@@ -554,10 +554,11 @@ impl FleetLifecycle for FleetReplication {
 /// [`FINAL_SHIP_MAX_TICKS`].
 fn ship_until_caught_up(
     replicator: &mut Replicator,
-    cutoff: Option<std::time::Instant>,
+    cutoff: &dyn Fn() -> Option<std::time::Instant>,
 ) -> Result<(), String> {
     for _ in 0..FINAL_SHIP_MAX_TICKS {
-        if expired(cutoff) {
+        // Read it each step: shutdown can install it while a close ships.
+        if expired(cutoff()) {
             return Err("the shutdown flush ran out of time".to_owned());
         }
         let report = replicator.tick().map_err(|e| e.to_string())?;
@@ -1326,5 +1327,32 @@ mod tests {
             .expect("the caller's cutoff bounds the flush")
             .unwrap();
         assert_eq!(replication.closing(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_ship_loop_reads_the_cutoff_on_every_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        let key = park_one(&fleet).await;
+        flaky.down.store(false, Ordering::SeqCst);
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let shipped = {
+            let replica = replication.parked().get(&key).cloned().unwrap();
+            let mut replicator = replica.replicator.lock().unwrap();
+            // No cutoff at the first read, a passed one after it.
+            ship_until_caught_up(&mut replicator, &|| {
+                if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    None
+                } else {
+                    Some(std::time::Instant::now())
+                }
+            })
+        };
+        assert!(reads.load(Ordering::SeqCst) >= 1);
+        // The destination is up: it either caught up on the first step, or
+        // it stopped at the cutoff it read on the next one.
+        if let Err(error) = shipped {
+            assert!(error.contains("ran out of time"), "{error}");
+        }
     }
 }
