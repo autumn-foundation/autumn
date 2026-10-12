@@ -94,6 +94,15 @@ ignore = [
     # default. Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05), or whenever the MSRV floor rises far enough
     # to take an aws-sdk-s3 that resolves a fixed `lru`.
     { id = "RUSTSEC-2026-0253", reason = "lru 0.16.4 only, via MSRV-pinned aws-sdk-s3 1.122 (no patched 0.16.x exists; workspace's own lru is fixed at 0.18.2); S3 Express cache keys are String and pop() is never called, so neither UB precondition holds; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    # RUSTSEC-2024-0449 — unsafe-libyaml unmaintained (archived upstream
+    # 2024-03-25). No safe upgrade: the only users are `serde_yaml` (deprecated)
+    # and its forks. Ingress: serde_yaml -> autumn-web (`openapi` feature) and
+    # autumn-cli (dev-dependency). The runtime use only EMITS the OpenAPI spec
+    # from Autumn's own typed data; the CLI parses YAML that `autumn slo
+    # generate` wrote itself, in tests. No path parses untrusted YAML. Replace
+    # serde_yaml with a safe-Rust YAML crate (e.g. serde-saphyr) when one is
+    # chosen. Review-by: 2026-11-09 (new advisory 2026-10-12).
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained; only via serde_yaml (openapi emit-only in autumn-web, test-only parse in autumn-cli); no untrusted YAML parsed; no safe upgrade; review-by 2026-11-09" },
 ]
 
 [licenses]

@@ -37,6 +37,11 @@ ignore = [
     # JWT sign/verify path specifically. Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05), matching the
     # root policy's own review-by for this same advisory.
     { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; RSA-JWT path only via jsonwebtoken, same as root deny.toml; not exercised by any fuzz target; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    # RUSTSEC-2024-0449 — unsafe-libyaml unmaintained. Same ingress and verdict
+    # as the root `deny.toml`: serde_yaml -> autumn-web (`openapi`). Emit-only
+    # on Autumn's own typed data; no fuzz target parses YAML. No safe upgrade.
+    # Review-by: 2026-11-09, matching the root policy for this advisory.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained; only via serde_yaml (openapi emit-only); no fuzz target parses YAML; no safe upgrade; same as root deny.toml; review-by 2026-11-09" },
 ]
 
 [sources]
