@@ -120,8 +120,12 @@ fn capsule_paths(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Wait for a capsule to appear; capsules are written on a detached task.
+/// Polls (20 ms apart) before a wait gives up: 10 s. A slow runner, such as
+/// Windows CI, can take more than 2 s to write and prune.
+const SETTLE_POLLS: u32 = 500;
+
 async fn await_capsules(dir: &Path, expected: usize) -> Vec<PathBuf> {
-    for _ in 0..100 {
+    for _ in 0..SETTLE_POLLS {
         let paths = capsule_paths(dir);
         if paths.len() >= expected {
             return paths;
@@ -148,7 +152,7 @@ fn write_aged_capsule(dir: &Path, age_secs: i64, sequence: u32) -> PathBuf {
 /// Poll until `settled` holds; capsules are written (and pruned) on a detached
 /// task, so a directory's final shape only arrives after the response does.
 async fn await_settled(settled: impl Fn() -> bool) {
-    for _ in 0..100 {
+    for _ in 0..SETTLE_POLLS {
         if settled() {
             return;
         }

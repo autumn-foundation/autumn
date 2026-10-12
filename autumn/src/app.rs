@@ -1977,6 +1977,21 @@ impl AppBuilder {
         })
     }
 
+    /// Run `hook` after each stored session-id rotation.
+    ///
+    /// Use it to move state keyed by the session id (such as a tracked-session
+    /// row) to the new id. Hooks run after the new session is saved and are
+    /// skipped for a destroyed session. See
+    /// [`SessionRotationHooks`](crate::session::SessionRotationHooks).
+    #[must_use]
+    pub fn on_session_rotation<F, Fut>(self, hook: F) -> Self
+    where
+        F: Fn(crate::session::SessionRotation) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), crate::session::SessionRotationError>> + Send + 'static,
+    {
+        self.state_initializer(move |state| state.session_rotation_hooks().register(hook))
+    }
+
     /// Store or replace a typed builder extension.
     ///
     /// External crates use this to accumulate configuration across fluent
@@ -6098,12 +6113,11 @@ impl AppBuilder {
                 // process, taking anything acknowledged meanwhile with it.
                 // Refusing here ends that wait when this process exits, in ~20 ms
                 // rather than the readiness timeout, and it resumes writable.
-                match crate::upgrade::publish_upgrade_readiness() {
-                    Ok(had_predecessor) => {
-                        if had_predecessor {
-                            unfreeze_adopted_live_state(&state);
-                        }
-                    }
+                // The unfreeze runs under the handoff lock.
+                match crate::upgrade::publish_upgrade_readiness(|| {
+                    unfreeze_adopted_live_state(&state);
+                }) {
+                    Ok(_) => {}
                     Err(error) => {
                         tracing::error!(
                             error = %error,
@@ -16105,6 +16119,21 @@ async fn canary_rollback_signal(path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
+    /// Issue #2347: `on_session_rotation` puts one hook on the shared registry
+    /// when the state initializers run.
+    #[test]
+    fn on_session_rotation_registers_hooks_on_the_state() {
+        let builder = super::app()
+            .on_session_rotation(|_| async { Ok(()) })
+            .on_session_rotation(|_| async { Ok(()) });
+        let state = crate::state::AppState::test_default();
+        assert!(state.session_rotation_hooks().is_empty());
+
+        super::run_state_initializers(builder.state_initializers, &state);
+
+        assert_eq!(state.session_rotation_hooks().len(), 2);
+    }
+
     /// Regression (#1620): DNS-01 must not silence the multi-replica warning.
     ///
     /// DNS-01 retires the HTTP-01 token-map hazard — the CA never connects to

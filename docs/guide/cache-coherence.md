@@ -101,9 +101,34 @@ A `(read, write)` pair fails the build when **all four** hold:
 
 ### Read identity is the cache-key namespace
 
-A cached read is identified by `module_path!() :: <fn name>` — the exact string
+A cached read is identified by `module_path!() :: <fn name>` (or `module_path!() :: <Type> :: <fn name>` with a `scope`) — the exact string
 `make_cache_key` already prefixes every one of its keys with. The manifest's
 identity and the runtime key space are the same string, by construction.
+
+Two impls in one module can hold a same-named `#[cached]` function. Put
+`#[cached_impl]` on each `impl` block. It adds the type to the identity:
+`module::Products::get`. You can also write `#[cached(scope = "Products")]`.
+Without a scope, both functions share one key space, and `autumn cache audit`
+reports the shared identity. The scope is opt-in.
+
+`#[cached_impl]` finds `#[cached]` by its path: `cached`, `autumn_web::cached`,
+`autumn_web::prelude::cached`, or the crate name Cargo resolves. It cannot see a
+`use` alias such as `use autumn_web as web;`. For those, write
+`#[cached(scope = "Products")]` by hand.
+
+The scope is the type path without generics: `a::Store`. Two impls can still
+share it: `impl Store<A>` and `impl Store<B>`, or two traits on one type with a
+same-named function. Give those a different `scope = "..."` by hand.
+
+```rust
+use autumn_web::prelude::*;
+
+#[cached_impl]
+impl Products {
+    #[cached]
+    async fn get(id: i64) -> String { /* .. */ }
+}
+```
 
 ### Invalidation edges are checked by the compiler
 
@@ -150,12 +175,17 @@ signature and body:
   and `#[repository(Comment)] trait ModerationRepository` correctly yields
   `Comment` rather than the `Moderation` its name suggests;
 * a reading associated call on a model type, from a **closed list** of verbs
-  (`find_all`, `find_by_id`, `count`, `exists_by_id`, `list`, `page`, `all`,
-  `load`, `first`) — `Post::find_all(db)` names `Post`, `Post::find_by_slug(…)`
-  does not.
+  (`find_all`, `find_by_id`, `exists_by_id`) — `Post::find_all(db)` names
+  `Post`, `Post::find_by_slug(…)` does not.
+
+Common verbs name nothing. `Config::load()`, `Metrics::count()` and
+`Post::all(db)` are not dependencies, because the macro cannot check that the
+owner is a model. If nothing else is recovered, the read is `undetermined`.
+If the macro recovers a model elsewhere, the read stays `derived` and checks
+that model only. Declare `reads(Post)` to name the model of `Post::all(db)`.
 
 A repository reached only through its **trait** — `repo: &impl PostRepository`
-— is the one case derivation cannot resolve: the constant lives on the concrete
+— cannot be resolved: the constant lives on the concrete
 struct, and the trait's name is not evidence of anything. Such a read is
 recorded `undetermined`, so it is reported and never gates. Take the concrete
 `Pg*` type, or declare `reads(...)`.
@@ -167,10 +197,13 @@ weaker claim than `declared`:
   cannot read is missed. That is why a read it recovers nothing from is recorded
   as `undetermined` rather than as having no dependencies.
 
-It is not, however, *wrong*: every model in a derived set comes either from a
-model type named outright or from a repository's own declaration, so a derived
-dependency naming a model that does not exist — which would make a real
-violation audit clean — cannot happen.
+Derivation can also be wrong. Every model in a derived set comes from a
+repository's own declaration, or from `find_all`, `find_by_id` or
+`exists_by_id` on a named type. The macro does not check that the type is a
+model. A non-model type with one of those methods is still named. An alias
+(`use Post as P`) is named as `P`. The macro cannot see a method call, a
+helper function, or a macro body.
+Declare `reads(...)` there.
 
 Declare `reads(...)` wherever the answer matters.
 

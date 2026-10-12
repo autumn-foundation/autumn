@@ -1337,6 +1337,12 @@ jobs:
           cargo test -p autumn-web --features "redis,ws" --lib job::tests::redis_page_spans \
             | tee "${RUNNER_TEMP}/redis-page-spans.log"
           assert_ran "${RUNNER_TEMP}/redis-page-spans.log" "redis_page_spans unit tests"
+          # Issue #3061: the Redis idempotency store on a current-thread
+          # runtime. It used `block_in_place`, which panics there. No Docker:
+          # the store points at a closed port and must fail closed.
+          cargo test -p autumn-web --features "redis,ws" --lib idempotency::tests::redis_store_on_current_thread \
+            | tee "${RUNNER_TEMP}/redis-idempotency-current-thread.log"
+          assert_ran "${RUNNER_TEMP}/redis-idempotency-current-thread.log" "redis idempotency current-thread test"
           # The Redis PING health indicator (#3059): fake RESP servers, no
           # Docker. Named here so it does not run only by feature unification.
           cargo test -p autumn-web --features "redis,ws" --lib redis_health:: \
@@ -1725,6 +1731,18 @@ jobs:
           )
           grep -qE 'test result: ok\. 9 passed' "${RUNNER_TEMP}/migration-lock-timeout.log" \
             || { echo "::error::the migration lock_timeout tests did not all run — the ci.yml filters no longer match"; exit 1; }
+          # Issue #3061: the database idempotency store's Postgres row-lock
+          # test is `--lib`: it drives the crate-private recovery-point copy.
+          # Named by full path, with a pass count, as above.
+          (
+            set -o pipefail
+            cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
+              --ignored --test-threads=1 \
+              idempotency::db_store::pg_tests:: \
+              | tee "${RUNNER_TEMP}/idempotency-db-store-pg.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/idempotency-db-store-pg.log" \
+            || { echo "::error::no idempotency db_store Postgres tests ran — the ci.yml filter no longer matches"; exit 1; }
           cargo test -p autumn-admin-plugin --test token_admin_db -- --ignored
           # Issue #2108: the same AdminModel cover as token_admin_db, for the
           # two models that read a `timestamptz` column. Both assert the audit
@@ -2240,11 +2258,32 @@ jobs:
           # uncovered.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_jobs_scheduler_e2e
+          # Issue #3061: the database idempotency store and `IdempotencyTx`.
+          # Outside this leg they run only in the `sqlite-runtime` job and the
+          # Docker-gated Postgres suite inside the consolidated binary, which
+          # no lane measures, so Codecov read `idempotency/db_store.rs` as
+          # wholly uncovered. Same feature set as the leg above, so the
+          # instrumented library build is shared.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sim_idempotency_db
+          # Its lib unit tests (the `SQLite` store, the copy and lock fencing,
+          # `IdempotencyTx`) are measured here too, or Codecov reads the store's
+          # in-file tests and the paths only they reach as uncovered. A filter
+          # that matches nothing exits 0, so check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --lib -- idempotency:: | tee "$RUNNER_TEMP/idempotency-sqlite-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/idempotency-sqlite-cov.log"
           # The fleet's HTTP suite: `ShardedDb`, sharded repositories and fan-out
           # resolving to fleet databases (the fleet arms of `sharding.rs`).
           # Shares the build above (same package and features).
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_fleet
+          # Issue #2319: the ledger's chain reads, paged verify and out-of-band
+          # refusals run against a real database. These two targets are the
+          # Docker-free half; without them Codecov reads that code as uncovered.
+          # Same package and features as the legs above, so no rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_ledger --test sqlite_ledger_out_of_band
           # Issue #2108: the admin plugin's `backend_select!` sqlite arms and
           # the cross-backend model suite. Without this lane Codecov reads them
           # as a new uncovered surface. No Docker, ~0.01s of runtime.
@@ -2275,11 +2314,23 @@ jobs:
             --test scoped_tokens_db -- --ignored
           # Issue #3072: the shard-local job runtime and the tenant DB
           # bulkhead run only in these Docker tests of the consolidated
-          # binary. A filter that matches nothing exits 0, so check the count.
+          # binary; so does the ledger's Postgres fork (#2319). A filter that matches nothing exits 0, so check the count.
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
-            --test integration_tests -- --ignored shard_local_jobs:: tenant_db_bulkhead:: \
+            --test integration_tests -- --ignored shard_local_jobs:: tenant_db_bulkhead:: ledger_postgres:: \
             | tee "$RUNNER_TEMP/isolation-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/isolation-cov.log"
+          # Issue #3061: the Postgres side of the database idempotency store
+          # runs only in these Docker tests, the `--lib` pg_tests and the
+          # consolidated binary's idempotency suites. Both filters are checked
+          # for a non-zero count.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --lib -- --ignored idempotency::db_store::pg_tests:: \
+            | tee "$RUNNER_TEMP/idempotency-pg-lib-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/idempotency-pg-lib-cov.log"
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored idempotency_ \
+            | tee "$RUNNER_TEMP/idempotency-pg-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/idempotency-pg-cov.log"
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_db -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \
@@ -2309,13 +2360,21 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --test flags -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test config -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test experiments -- --ignored
-          # Issue #1975: the declarative-schema engine (`autumn-cli/src/schema/`)
-          # is tested by unit tests in the `autumn` bin target. No other lane
-          # instruments that target, so without this line its patch coverage
-          # reads as 0%. A filter that matches nothing exits 0, so check the count.
-          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- schema:: \
+          # The `autumn` bin target's unit tests are instrumented by no other
+          # lane, so without this line a change under autumn-cli/src reads as 0%
+          # patch coverage however well its unit tests cover it. Two modules so
+          # far: the declarative-schema engine (issue #1975) and `autumn upgrade`
+          # (issue #2342). Add a filter here for the next one. A filter that
+          # matches nothing exits 0, so check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- schema:: upgrade:: \
             | tee "$RUNNER_TEMP/cli-schema-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-schema-cov.log"
+          # Issue #2344: same gap for `upgrade::` and `git_root::`. No other lane
+          # instruments the `autumn` bin unit tests, so their patch coverage
+          # reads as 0%. Check the count: a filter that matches nothing exits 0.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- upgrade:: git_root:: \
+            | tee "$RUNNER_TEMP/cli-upgrade-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-upgrade-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
@@ -2521,6 +2580,7 @@ jobs:
             --test sqlite_framework_migrations \
             --test sim_chaos \
             --test sim_fault_plan_db \
+            --test sim_idempotency_db \
             --test sqlite_jobs_scheduler_e2e \
             --test confidential_repository_bidx \
             --test sim_sqlite_substrate \
@@ -2739,6 +2799,29 @@ jobs:
               exit 1
             fi
           done
+
+  sqlite-fleet-windows:
+    name: SQLite fleet (windows-latest)
+    # Windows cannot delete a file that SQLite holds open (#3227). The fleet
+    # delete and restore paths differ there, and no other lane runs them.
+    runs-on: windows-latest
+    needs: [lint]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Fleet unit tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p autumn-web --features "sqlite,test-support" --lib db::fleet \
+            | tee "${RUNNER_TEMP}/fleet-lib.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/fleet-lib.log" \
+            || { echo "::error::no fleet unit test ran"; exit 1; }
+      - name: Fleet integration tests
+        shell: bash
+        run: cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet
 
   windows-tier1:
     name: Windows Tier 1 journey

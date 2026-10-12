@@ -819,6 +819,8 @@ pub async fn add_comment(
     // Every entry point checks: a helper-only app never mounts the router.
     assert_unique_discriminators();
     spec.validate()?;
+    // #2319: the comment insert records no ledger revision.
+    crate::ledger::refuse_out_of_band_write(spec.comments_table, "commentable")?;
     let body = body.trim();
     if body.is_empty() {
         return Err(AutumnError::unprocessable_msg("Comment cannot be empty"));
@@ -919,6 +921,8 @@ pub async fn delete_comment(
     // Every entry point checks: a helper-only app never mounts the router.
     assert_unique_discriminators();
     spec.validate()?;
+    // #2319: the comment delete records no ledger revision.
+    crate::ledger::refuse_out_of_band_write(spec.comments_table, "commentable")?;
     // Before the copy: see `add_comment`.
     let soft_deletes = resolve_soft_deletes(spec, soft_delete);
     let spec = *spec;

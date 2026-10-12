@@ -414,12 +414,12 @@ async fn feed() -> impl IntoResponse {
 }
 ```
 
-Only a type you *declare* is recorded. axum attaches one to every response, but
+Autumn records the type you *declare*. axum attaches one to every response, but
 for `String` (`text/plain; charset=utf-8`) and `Vec<u8>`
 (`application/octet-stream`) it comes from the return type, not from you — so on
 a route whose own extension says otherwise (`/theme.css`, `/logo.png`) those two
-exact values are ignored and the extension wins, which is what stops a `->
-String` stylesheet from being served as plain text and dropped by `nosniff`.
+exact values are replaced by the extension type (recorded, so ISR still guards
+the route). That stops a `-> String` stylesheet from being served as plain text and dropped by `nosniff`.
 The two are indistinguishable in the response, so if you genuinely want one of
 them on such a route, declare it distinctly (bare `text/plain`, or
 `application/octet-stream` with a parameter) and it is recorded; to force a
@@ -430,7 +430,8 @@ Return `Markup` (or `Html<String>`) for HTML pages: on an extensionless route a
 handler returning a bare `String` declares `text/plain; charset=utf-8`, which is
 what will now be served.
 A `dist/` built before this release records nothing and keeps its previous derived
-type until the next `autumn build`. ISR refuses a regeneration whose handler
+type until the next `autumn build`. Such a `dist/` also has no ISR type guard on
+`/theme.css`-style routes until you rebuild. ISR refuses a regeneration whose handler
 declares a *different* type than the manifest recorded, so a stale-but-correctly
 -typed page is served instead of fresh bytes under the wrong header — re-run
 `autumn build` after changing a route's type.
@@ -1045,7 +1046,7 @@ raw Diesel:
 | `from_shard(&ShardedDb)`, `with_pool_untracked(pool)` | **(0.6.0)** shard-scoped construction. `with_pool_untracked` is the 0.6.0 rename of `with_pool`; 0.5.x repositories had **no** pool constructor at all. An app carrying the older `with_pool` name is migrated by `autumn upgrade --apply` (codemod `0.6.0-repository-with-pool-untracked`, issue #1629) rather than by hand |
 | `find_in_batches(batch_size)`, `find_each(batch_size)` | **(0.6.0)** Bounded-memory whole-table iteration via a primary-key keyset cursor (`WHERE id > last ORDER BY id ASC LIMIT batch_size` — never `LIMIT`/`OFFSET`), generated on every repository. `find_in_batches` returns a `FindInBatches` handle — drive with `while let Some(chunk) = b.next_batch().await?`; `find_each` returns `FindEach` yielding one model per `next().await?`. Inherits soft-delete filtering, tenant scoping, and read routing like `find_all`; errors are retryable (cursor advances only on success; `Ok(None)` always means completion); `batch_size == 0` errors instead of spinning; `batch_size` is **not** clamped to `MAX_PAGE_SIZE`; sharded repos reject cross-shard `across_tenants()` iteration (iterate per shard via `from_shard`). Handle types: `autumn_web::batches::{FindInBatches, FindEach, BatchSource}` (not in the prelude). See "Batched iteration" in `docs/guide/pagination.md` |
 | `find_or_create_by_<field>[_and_<field>...](<field>, &new)` | **(0.6.0)** Race-safe get-or-insert; declare `fn find_or_create_by_slug(slug: String);` (lookup fields only) to generate an inherent `find_or_create_by_slug(&self, slug: String, new: &NewModel) -> AutumnResult<(Model, bool)>`. Reads on the read path first (tenant/soft-delete aware, canonicalizing a `#[normalize]` lookup column), else normalizes and validates the payload (#2586 — an existing row still wins over a rejected one, re-checked on the primary) and inserts on the primary with `ON CONFLICT DO NOTHING` — under concurrency exactly one row is created, exactly one caller sees `created == true`, and no `23505` escapes. `before_/after_create` + commit hooks fire only on the created path; works on hooked repos (unlike `upsert_many`). **Requires a unique constraint on the lookup column(s)** (`_or_` is rejected). See "Race-safe get-or-insert" in `docs/guide/repositories.md` |
-| `ledgered = true` / `ledgered(valid_time = "col")` (attr) | **(0.8.0, issue #1699)** Makes the entity bitemporal and tamper-evident: every insert, update and soft-delete appends an immutable, hash-chained revision carrying a **full row snapshot** to `_autumn_ledger_revisions`. Adds `ledger_as_of(id, at)`, `ledger_as_of_at(id, LedgerAsOf)`, `ledger_diff(id, from, to)`, `ledger_revisions(id)`, `ledger_verify(id)`, `ledger_head(id)`, `ledger_high_water(id)` and `ledger_pin(id)` (both at once, from one snapshot — what an audit posture pins outside the database). Implies `versioned = true` and **requires `soft_delete`** (a hard DELETE would erase the row the ledger reconstructs); `purge` is not generated, and `#[version_history(sensitive = [...])]` / `no_versioned_record_impl` are compile errors. See "Ledgered entities" below |
+| `ledgered = true` / `ledgered(valid_time = "col")` (attr) | **(0.8.0, issue #1699)** Makes the entity bitemporal and tamper-evident: every insert, update and soft-delete appends an immutable, hash-chained revision carrying a **full row snapshot** to `_autumn_ledger_revisions`. Adds `ledger_as_of(id, at)`, `ledger_as_of_at(id, LedgerAsOf)`, `ledger_diff(id, from, to)`, `ledger_revisions(id)`, `ledger_revisions_page(id, page)`, `ledger_verify(id)`, `ledger_head(id)`, `ledger_high_water(id)` and `ledger_pin(id)` (both at once, from one snapshot — what an audit posture pins outside the database). Implies `versioned = true` and **requires `soft_delete`** (a hard DELETE would erase the row the ledger reconstructs); `purge` is not generated, and `#[version_history(sensitive = [...])]` / `no_versioned_record_impl` are compile errors. See "Ledgered entities" below |
 | `retention(after = "30d", basis = created_at)` / `retention(purge_deleted_after = "90d")` (attr) | **(0.7.0)** Declarative data-retention: reach for this instead of hand-writing a `#[scheduled]` cleanup fn for expiring sessions, drafts, one-time codes, or other transient rows. Compiles to a batched (`batch_size`, default 500), cursor-paginated sweep auto-registered with fleet coordination — no `tasks![...]` entry needed. On a `soft_delete` repository, `after` soft-deletes (never re-touching an already-deleted row) and `purge_deleted_after` hard-purges (re-checking `deleted_at` at delete time so a concurrent `restore()` survives); without `soft_delete`, `after` hard-deletes. Sweeps run across **all** tenants on a `tenant_scoped` repository (no per-tenant opt-out) and are not supported on `sharded` repositories (compile error). `autumn retention --dry-run [--model NAME]` reports rows-that-would-be-swept without deleting. Emits `retention_sweep_rows_total` / `retention_sweep_duration_seconds` metrics + a structured log line per run. See `docs/guide/retention-sweeps.md` |
 
 Read routing: with `database.replica_url` set, all generated reads use the
@@ -1075,8 +1076,20 @@ appends a revision automatically.
 What to know when writing app code against it:
 
 - **Raw-SQL framework paths are refused.** A counter cache on a ledgered
-  parent, and `dependent(.., on_delete = delete_all | nullify)` into a ledgered
-  child, fail with `LedgerError::OutOfBandWrite`. Use `on_delete = destroy`.
+  parent, `dependent(.., on_delete = delete_all | nullify)` into a ledgered
+  child, `#[votable]` / `#[commentable]` / `has_many(through)` writes into a
+  ledgered table, and writes from an unledgered repository on the same table
+  fail with `LedgerError::OutOfBandWrite`. A model factory panics. For a
+  dependent, use `on_delete = destroy`. For the other paths, write through the
+  ledgered repository.
+- **No derived `delete_by_*`** on a ledgered repository (compile error): it
+  records no revision. Find the records. Then call `delete_by_id` or
+  `delete_many`.
+- **Tenant column is `String`.** A ledgered `tenant_scoped` repository with
+  `tenant_id: Option<String>` does not compile, and an update that changes
+  `tenant_id` fails with `LedgerError::TenantChange`.
+- **Paged reads.** `ledger_revisions_page(id, LedgerPageRequest)` reads the
+  chain in keyset pages. `ledger_verify` pages internally.
 - **`soft_delete` is mandatory** and `purge` does not exist. `delete_by_id`
   records a delete revision; `restore` records the undelete. Both keep the
   ledger and the table in agreement.
