@@ -679,10 +679,11 @@ fn content_length(res: &Response) -> Option<u64> {
         .and_then(|v| v.parse::<u64>().ok())
 }
 
-/// `true` when the body is already in memory (an exact body size) and fits
-/// in `max`. A stream is not collected, even one that declares a
-/// `Content-Length`: this layer runs outside the request timeout and the
-/// admission limits, so a slow stream would hold the request open.
+/// `true` when the body has an exact size that fits in `max`. A stream is not
+/// collected, even one that declares a `Content-Length`: this layer runs
+/// outside the request timeout and the admission limits, so a slow stream
+/// would hold the request open. An exact size is not proof the bytes are in
+/// memory, so [`collect_limited`] also gives up after [`COLLECT_WITHIN`].
 fn fits(res: &Response, max: usize) -> bool {
     use http_body::Body as _;
 
@@ -708,7 +709,7 @@ async fn to_markdown(res: Response, config: &NegotiateConfig, page: Option<&str>
         return res;
     }
     let (mut parts, body) = res.into_parts();
-    let bytes = match collect_limited(body, config.max_bytes).await {
+    let bytes = match collect_limited(body, config.max_bytes, COLLECT_WITHIN).await {
         Ok(bytes) => bytes,
         Err(body) => return Response::from_parts(parts, body),
     };
@@ -734,6 +735,10 @@ async fn to_markdown(res: Response, config: &NegotiateConfig, page: Option<&str>
     );
     Response::from_parts(parts, Body::from(markdown))
 }
+
+/// How long Markdown conversion waits for an HTML body. A body in memory is
+/// ready at once; one that is still being produced past this goes out as HTML.
+const COLLECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Pages larger than this convert on a blocking thread.
 const BLOCKING_THRESHOLD: usize = 256 * 1024;
@@ -773,13 +778,23 @@ fn markdown_headers(headers: &mut HeaderMap, config: &NegotiateConfig, tokens: O
     }
 }
 
-/// Read `body` up to `limit` bytes. Over the limit, return a body that
-/// sends the bytes read, then the remaining bytes.
-async fn collect_limited(mut body: Body, limit: usize) -> Result<Bytes, Body> {
+/// Read `body` up to `limit` bytes, waiting at most `within`. Over the limit,
+/// or past the deadline, return a body that sends the bytes read, then the
+/// remaining bytes.
+async fn collect_limited(
+    mut body: Body,
+    limit: usize,
+    within: std::time::Duration,
+) -> Result<Bytes, Body> {
+    let deadline = tokio::time::Instant::now() + within;
     let mut chunks: Vec<Bytes> = Vec::new();
     let mut total = 0usize;
     loop {
-        match body.frame().await {
+        // A body still producing at the deadline is sent on as it is.
+        let Ok(frame) = tokio::time::timeout_at(deadline, body.frame()).await else {
+            return Err(replay(chunks, body));
+        };
+        match frame {
             None => break,
             Some(Ok(frame)) => {
                 let Ok(data) = frame.into_data() else {
@@ -788,14 +803,7 @@ async fn collect_limited(mut body: Body, limit: usize) -> Result<Bytes, Body> {
                 total += data.len();
                 chunks.push(data);
                 if total > limit {
-                    // Replay every frame, trailers too: the response stays HTML.
-                    let head = futures::stream::iter(
-                        chunks
-                            .into_iter()
-                            .map(|b| Ok::<_, axum::Error>(http_body::Frame::data(b))),
-                    );
-                    let rest = http_body_util::BodyStream::new(body);
-                    return Err(Body::new(http_body_util::StreamBody::new(head.chain(rest))));
+                    return Err(replay(chunks, body));
                 }
             }
             Some(Err(err)) => {
@@ -811,6 +819,18 @@ async fn collect_limited(mut body: Body, limit: usize) -> Result<Bytes, Body> {
         buf.extend_from_slice(&chunk);
     }
     Ok(Bytes::from(buf))
+}
+
+/// The frames read so far, then the rest of `body`, trailers too: the
+/// response stays HTML.
+fn replay(chunks: Vec<Bytes>, body: Body) -> Body {
+    let head = futures::stream::iter(
+        chunks
+            .into_iter()
+            .map(|b| Ok::<_, axum::Error>(http_body::Frame::data(b))),
+    );
+    let rest = http_body_util::BodyStream::new(body);
+    Body::new(http_body_util::StreamBody::new(head.chain(rest)))
 }
 
 #[cfg(test)]
@@ -1178,6 +1198,62 @@ mod tests {
         );
     }
 
+    /// An exact size hint whose bytes are produced later: the first frame
+    /// is ready, the rest never comes.
+    struct ExactButLazy {
+        sent: bool,
+    }
+
+    impl http_body::Body for ExactButLazy {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+            if self.sent {
+                return std::task::Poll::Pending;
+            }
+            self.sent = true;
+            std::task::Poll::Ready(Some(Ok(http_body::Frame::data(Bytes::from("<h1>")))))
+        }
+
+        fn size_hint(&self) -> http_body::SizeHint {
+            http_body::SizeHint::with_exact(11)
+        }
+    }
+
+    // Codex review (P1): an exact size hint is not a buffered body. The wait
+    // is bounded, and the page goes out as HTML with the bytes already read.
+    #[tokio::test(start_paused = true)]
+    async fn an_exact_but_lazy_body_stays_html_after_the_deadline() {
+        let config = NegotiateConfig {
+            markdown: true,
+            max_bytes: 1024,
+            home_links: Vec::new(),
+            content_signal: None,
+            resource_metadata: None,
+            resource_metadata_from_host: false,
+        };
+        let res = Response::builder()
+            .header(CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Body::new(ExactButLazy { sent: false }))
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let res = to_markdown(res, &config, None).await;
+        assert_eq!(started.elapsed(), COLLECT_WITHIN);
+        assert!(
+            res.headers()[CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        let mut body = res.into_body();
+        let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(first, Bytes::from("<h1>"));
+    }
+
     #[tokio::test]
     async fn collect_limited_keeps_trailers_of_an_oversized_body() {
         let mut trailers = HeaderMap::new();
@@ -1188,7 +1264,7 @@ mod tests {
             Ok(http_body::Frame::trailers(trailers)),
         ]);
         let body = Body::new(http_body_util::StreamBody::new(frames));
-        let Err(body) = collect_limited(body, 6).await else {
+        let Err(body) = collect_limited(body, 6, COLLECT_WITHIN).await else {
             panic!("over the limit")
         };
         let collected = body.collect().await.unwrap();
@@ -1204,12 +1280,14 @@ mod tests {
         let body = Body::from_stream(futures::stream::iter(
             ["aaaa", "bbbb", "cccc"].map(|s| Ok::<_, std::io::Error>(Bytes::from(s))),
         ));
-        let Err(body) = collect_limited(body, 6).await else {
+        let Err(body) = collect_limited(body, 6, COLLECT_WITHIN).await else {
             panic!("over the limit")
         };
         let all = body.collect().await.unwrap().to_bytes();
         assert_eq!(&all[..], b"aaaabbbbcccc");
-        let ok = collect_limited(Body::from("abc"), 6).await.unwrap();
+        let ok = collect_limited(Body::from("abc"), 6, COLLECT_WITHIN)
+            .await
+            .unwrap();
         assert_eq!(&ok[..], b"abc");
     }
 }

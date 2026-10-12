@@ -153,7 +153,8 @@ those, add `Accept` to the cache key.
 Autumn does not convert:
 
 - a page larger than `markdown_max_bytes` (it stays HTML),
-- a streamed page, whose length is unknown,
+- a streamed page, whose length is unknown, or a body not ready within two
+  seconds,
 - a status other than `200`,
 - a compressed body, a range, or a download,
 - a page in a charset other than UTF-8 (or US-ASCII).
