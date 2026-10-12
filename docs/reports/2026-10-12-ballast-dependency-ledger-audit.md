@@ -98,6 +98,28 @@ cargo deny check                          → advisories ok, bans ok (90, unchan
 cargo check --workspace --all-targets     → Finished `dev` profile [unoptimized + debuginfo] target(s) in 10m 53s, 0 errors
 ```
 
+A P1 Codex review comment correctly caught that `cargo check` never links — it
+validates types, not the actual link step, and this repo's own
+`./scripts/pre-push-check.sh` exists specifically because a narrower check
+("misses cross-package compile breaks the CI `cargo test --workspace` gate
+catches" — CLAUDE.md, "Pre-push gate") can stay green while the consolidated
+`integration_tests` binary fails to link. Ran the real gate on this
+rehearsal branch rather than accepting the gap: it failed twice on an
+unrelated session constraint (`ld terminated with signal 7 [Bus error]` /
+"No space left on device" — this session's disk allowance, not a defect in
+the dependency bump; confirmed by `df` reading 100K free at the moment of
+failure both times, and by the failure point shifting between runs with no
+change to the code). Freeing `target/` and narrowing to exactly the
+mechanism Codex named — `cargo test -p autumn-web --no-run`, which compiles
+and links `autumn-web`'s own consolidated `tests/integration_tests.rs`
+binary along with every isolated test target — completed clean with 0
+errors, confirming the specific link-level risk a `cargo check`-only
+rehearsal would have missed. The full-workspace `cargo test --workspace
+--no-run` (every example, bench, and plugin crate, not just `autumn-web`)
+was not completed to a clean finish given this session's disk ceiling; the
+narrower run is the part of the gate that bears directly on this PR's own
+bumped crates.
+
 Posted the rehearsal on #3209 recommending merge. Not merged by this pass —
 every prior pass's actual merges were done by the repo's human maintainer, not
 by Ballast itself, and this pass follows that precedent.
@@ -310,6 +332,8 @@ cargo update --dry-run --verbose 2>&1 | grep Locking
 git fetch origin pull/3209/head:ballast-pr-3209
 git checkout origin/trunk-dev -b rehearsal-3209 && git cherry-pick bc05ce2
 cargo deny check && cargo check --workspace --all-targets
+./scripts/pre-push-check.sh          # the real gate; needs ~30GB+ free disk for the full workspace
+cargo test -p autumn-web --no-run    # narrower equivalent that still links integration_tests
 
 # opentelemetry lockstep rehearsal — both directions
 git checkout origin/trunk-dev -b rehearsal-otlp-a
@@ -346,15 +370,24 @@ python3 -c "import yaml; yaml.safe_load(open('.github/dependabot.yml'))"
    exists). Four passes running without resolution, and the trend (9 → 16 →
    17, high 2 → 2 → 4 → 5) is now consistently upward, not noise. Needs a
    human to look at `github.com/autumn-foundation/autumn/security/dependabot`
-   directly; this session cannot. Given the "all 5 `cargo deny`-audited Rust
-   graphs show 0 unwaived advisories" finding has now held for 4 consecutive
-   passes while this count keeps climbing, the most likely location for
-   these alerts is one of the two manifests outside this harness's coverage
-   (`examples/react-graphql/frontend/package-lock.json`,
-   `benchmarks/runtime/django/requirements.txt`) or GitHub's own advisory
-   database surfacing matches this session's `cargo-deny` database (fetched
-   fresh each run) hasn't yet synced — not a gap in the Rust-side gate
-   itself.
+   directly; this session cannot. **Corrected per a Codex review comment: "0
+   unwaived advisories" does not point away from the Rust graphs the way the
+   first version of this section implied.** `cargo-deny`'s waivers are a
+   local policy decision this repo made — GitHub's own scanner has no idea
+   this repo waived anything, and scans the raw dependency graph against its
+   own advisory database regardless. The 6 distinct RUSTSEC ids this repo
+   has deliberately waived (`RUSTSEC-2023-0071` rsa, `RUSTSEC-2024-0384`
+   instant, `RUSTSEC-2026-0253` lru, `RUSTSEC-2024-0370` proc-macro-error,
+   `RUSTSEC-2025-0141` bincode, `RUSTSEC-2026-0319` anymap2 — counted
+   directly from `deny.toml`/`deny-sqlite.toml`/`fuzz/deny.toml`/
+   `examples/island-flock/deny.toml`) are very plausibly counted among
+   GitHub's 17, alongside whatever is in the two manifests outside this
+   harness's coverage (`examples/react-graphql/frontend/package-lock.json`,
+   `benchmarks/runtime/django/requirements.txt`). "0 unwaived" only means
+   `cargo-deny`'s own gate — which deliberately lets these exact 6 through —
+   stays green; it says nothing about what GitHub's unrelated scanner
+   counts. A human checking the Security tab should expect GitHub's own list
+   to include these 6 by name, not be surprised by them.
 2. **The opentelemetry cluster (#3143/#3144/#3148/#3149) needs a human
    decision**: close all four and open one combined PR (this pass's
    recommendation, posted on all four), or leave them open as a visible
