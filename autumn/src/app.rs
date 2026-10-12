@@ -13157,13 +13157,19 @@ fn start_fleet_replication(
         .fleet
         .as_ref()
         .is_some_and(|f| f.restore_missing);
-    let replication = Arc::new(crate::db::fleet_replication::FleetReplication::new(
-        Arc::clone(runtime.replicator.destination()),
-        runtime.settings.clone(),
-        lag_alert_after,
-        restore_missing,
-        state.clock_arc(),
-    ));
+    let replication = Arc::new(
+        crate::db::fleet_replication::FleetReplication::new(
+            Arc::clone(runtime.replicator.destination()),
+            runtime.settings.clone(),
+            lag_alert_after,
+            restore_missing,
+            state.clock_arc(),
+        )
+        // The flush runs inside the shutdown budget.
+        .with_final_flush(std::time::Duration::from_secs(
+            config.server.shutdown_timeout_secs,
+        )),
+    );
     fleet
         .install_replication(Arc::clone(&replication))
         .map_err(|_| "the fleet already replicates".to_owned())?;

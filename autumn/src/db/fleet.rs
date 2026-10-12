@@ -492,6 +492,9 @@ impl diesel::migration::MigrationSource<diesel::sqlite::Sqlite> for ChainedMigra
 /// One entry of the open map. `cell` is filled once by the single opener.
 struct Entry {
     cell: OnceCell<FleetDatabase>,
+    /// Set under the state lock by a delete, restore or shutdown that took the
+    /// key. A late initializer must not open the file.
+    cancelled: AtomicBool,
     last_use_seq: AtomicU64,
     last_use_at: Mutex<std::time::Instant>,
 }
@@ -503,6 +506,20 @@ type Draining = (FleetDbKey, Option<FleetDatabase>, Arc<Drain>);
 enum Next {
     Wait(Arc<Drain>),
     Open(Arc<Entry>),
+}
+
+/// Why an entry did not open.
+enum Opening {
+    /// The entry was cancelled. Claim a new one.
+    Cancelled,
+    Failed(FleetError),
+}
+
+/// What `close_all` still has to close.
+struct ShutdownSnapshot {
+    opening: Vec<(FleetDbKey, Arc<Entry>)>,
+    open: Vec<FleetDbKey>,
+    draining: Vec<Arc<Drain>>,
 }
 
 /// A key that is closing or being deleted. Openers wait on `done`.
@@ -529,6 +546,8 @@ struct State {
     open: HashMap<FleetDbKey, Arc<Entry>>,
     draining: HashMap<FleetDbKey, Arc<Drain>>,
     seq: u64,
+    /// Set by `close_all`. No entry is claimed after it.
+    shutting_down: bool,
 }
 
 #[derive(Default)]
@@ -936,12 +955,7 @@ impl DatabaseFleet {
                 }
                 Next::Open(entry) => entry,
             };
-            let result = entry
-                .cell
-                .get_or_try_init(|| self.open_now(key.clone(), create))
-                .await
-                .cloned();
-            match result {
+            match self.init_entry(key, create, &entry).await {
                 Ok(db) => {
                     // The pool is closed when the database was drained between
                     // our lookup and now; go round and open it fresh.
@@ -951,7 +965,8 @@ impl DatabaseFleet {
                     self.enforce_capacity(Some(key));
                     return Ok(db);
                 }
-                Err(error) => {
+                Err(Opening::Cancelled) => {}
+                Err(Opening::Failed(error)) => {
                     self.inner
                         .counters
                         .open_failures
@@ -963,10 +978,40 @@ impl DatabaseFleet {
         }
     }
 
+    /// Open `key` through `entry`. The first caller runs the open.
+    async fn init_entry(
+        &self,
+        key: &FleetDbKey,
+        create: bool,
+        entry: &Arc<Entry>,
+    ) -> Result<FleetDatabase, Opening> {
+        entry
+            .cell
+            .get_or_try_init(|| async {
+                // Under the cell's init permit, so it is ordered against
+                // `settle_entry`: either that ran first and set this, or it
+                // finds the database this open made.
+                if entry.cancelled.load(Ordering::Acquire) {
+                    return Err(Opening::Cancelled);
+                }
+                self.open_now(key.clone(), create)
+                    .await
+                    .map_err(Opening::Failed)
+            })
+            .await
+            .cloned()
+    }
+
     /// Under the lock: wait for a drain of `key`, or take (or make) its entry
     /// and mark it used.
     fn claim_entry(&self, key: &FleetDbKey) -> Result<Next, FleetError> {
         let mut state = self.lock_state();
+        if state.shutting_down {
+            return Err(FleetError::Unavailable {
+                name: key.name(),
+                detail: "the fleet is shutting down".to_owned(),
+            });
+        }
         if let Some(drain) = state.draining.get(key).cloned() {
             drop(state);
             if drain.deleting {
@@ -979,6 +1024,7 @@ impl DatabaseFleet {
         let entry = Arc::clone(state.open.entry(key.clone()).or_insert_with(|| {
             Arc::new(Entry {
                 cell: OnceCell::new(),
+                cancelled: AtomicBool::new(false),
                 last_use_seq: AtomicU64::new(seq),
                 last_use_at: Mutex::new(crate::time::ambient_instant()),
             })
@@ -1323,20 +1369,42 @@ impl DatabaseFleet {
     }
 
     /// Close every open database and wait for all drains, for shutdown.
+    /// An open still in flight finishes first and is then closed. After this
+    /// starts, every open fails with [`FleetError::Unavailable`].
     pub async fn close_all(&self) {
-        let keys: Vec<FleetDbKey> = self.lock_state().open.keys().cloned().collect();
-        for key in keys {
-            self.close(&key).await;
-        }
+        self.lock_state().shutting_down = true;
         loop {
-            let pending: Vec<Arc<Drain>> = self.lock_state().draining.values().cloned().collect();
-            if pending.is_empty() {
+            let snapshot = self.shutdown_snapshot();
+            if snapshot.open.is_empty() && snapshot.draining.is_empty() {
                 return;
             }
-            for drain in pending {
+            for (key, entry) in snapshot.opening {
+                self.settle_entry(&key, &entry).await;
+            }
+            for key in snapshot.open {
+                self.close(&key).await;
+            }
+            for drain in snapshot.draining {
                 drain.wait().await;
             }
         }
+    }
+
+    /// Under one lock, for `close_all`: what is left to close.
+    fn shutdown_snapshot(&self) -> ShutdownSnapshot {
+        let state = self.lock_state();
+        let snapshot = ShutdownSnapshot {
+            opening: state
+                .open
+                .iter()
+                .filter(|(_, entry)| entry.cell.get().is_none())
+                .map(|(key, entry)| (key.clone(), Arc::clone(entry)))
+                .collect(),
+            open: state.open.keys().cloned().collect(),
+            draining: state.draining.values().cloned().collect(),
+        };
+        drop(state);
+        snapshot
     }
 
     /// How often the sweeper runs: often enough to close idle databases on
@@ -1370,12 +1438,13 @@ impl DatabaseFleet {
                 }
             }
             fleet.close_all().await;
-            // Every database is closed and shipped. Give parked replicators a
-            // last chance to catch up, then stop the loop thread so it does
-            // not outlive the app (an embedded or restarted server).
+            // Every database is closed. Keep shipping parked replicators until
+            // they catch up or the flush deadline passes, then stop the loop
+            // thread so it does not outlive the app (an embedded or restarted
+            // server).
             if let Some(replication) = fleet.replication().cloned() {
                 let _ = crate::time::spawn_blocking(move || {
-                    replication.tick_all();
+                    replication.flush_closing(replication.final_flush());
                     replication.stop();
                 })
                 .await;
@@ -1388,6 +1457,11 @@ impl DatabaseFleet {
     /// Delete a database and its sidecar files. Requests for it get `410`
     /// while this runs, and `404` (or a fresh database, when created on
     /// demand) after.
+    ///
+    /// Another process that shares the root can publish a new database at
+    /// the path as soon as the main file is gone. That is not an error. This
+    /// call touches nothing after that unlink, so the new database keeps its
+    /// files. To hold the path, use a tombstone.
     ///
     /// The database's replica, if any, is not deleted here: a lifecycle hook
     /// (`on_delete`) decides.
@@ -1445,9 +1519,10 @@ impl DatabaseFleet {
         removed
     }
 
-    /// Wait until no open of `key` is in progress. An open is never
-    /// interrupted: the probe joins the running initializer, or fails at once
-    /// when there is none.
+    /// Wait until no open of `key` is in progress, or cancel it. The probe
+    /// joins a running initializer. Otherwise it cancels the entry (see
+    /// [`settle_entry`](Self::settle_entry)), so a later initializer opens
+    /// nothing.
     async fn settle_opening(&self, key: &FleetDbKey) {
         loop {
             let opening = self
@@ -1459,14 +1534,34 @@ impl DatabaseFleet {
             let Some(entry) = opening else {
                 break;
             };
-            let _ = entry
-                .cell
-                .get_or_try_init(|| async { Err::<FleetDatabase, ()>(()) })
-                .await;
-            if entry.cell.get().is_none() {
-                // Our probe settled it as failed: drop the empty entry.
-                self.forget_entry(key, &entry);
-            }
+            self.settle_entry(key, &entry).await;
+        }
+    }
+
+    /// Join the running open of `entry`, or cancel it. The probe's
+    /// initializer holds the cell's init permit, and `OnceCell` runs one
+    /// initializer at a time. So every opener init either finished before the
+    /// probe, and the cell has a value, or runs after it and sees `cancelled`.
+    async fn settle_entry(&self, key: &FleetDbKey, entry: &Arc<Entry>) {
+        let _ = entry
+            .cell
+            .get_or_try_init(|| async {
+                self.cancel_entry(key, entry);
+                Err::<FleetDatabase, Opening>(Opening::Cancelled)
+            })
+            .await;
+    }
+
+    /// Under the lock: mark `entry` cancelled and drop it from the open map.
+    fn cancel_entry(&self, key: &FleetDbKey, entry: &Arc<Entry>) {
+        let mut state = self.lock_state();
+        entry.cancelled.store(true, Ordering::Release);
+        if state
+            .open
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            state.open.remove(key);
         }
     }
 
@@ -2118,8 +2213,8 @@ fn publish_restored(staging: &Path, path: &Path, name: &str) -> Result<(), Fleet
 ///
 /// The replica is rebuilt in a private staging file first, so a failed
 /// restore leaves the current file untouched. Then the old files go and the
-/// staging file is linked into place. On Unix, the exclusive guard stays open
-/// for this. On Windows, it closes first. A file that appears in that gap
+/// staging file is linked into place. The old main file goes last. On Unix,
+/// the exclusive guard stays open for this. On Windows, it closes first. A file that appears in that gap
 /// gives `AlreadyExists`.
 fn restore_in_place(
     replication: &super::fleet_replication::FleetReplication,
@@ -2151,15 +2246,9 @@ fn restore_in_place(
         }
     };
     let published = with_exclusive_access(path, &name, HOLD_GUARD_WHILE_REMOVING, || {
-        for file in
-            std::iter::once(path.to_path_buf()).chain(crate::fleet_layout::sidecar_paths(path))
-        {
-            match std::fs::remove_file(&file) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(removal_error("replace database", &name)(e)),
-            }
-        }
+        unlink_database_set(path, "replace database", &name, |file| {
+            std::fs::remove_file(file)
+        })?;
         publish_restored(&staging, path, &name)
     });
     discard_staging(&staging);
@@ -2238,18 +2327,14 @@ fn build_staged_database(
 
 /// Remove a database file, its sidecars, and the directories the template
 /// created for it when they are now empty (never `root` itself). `Ok(false)`
-/// when there was no file. Remove the main file first: on Windows, a sharing
-/// violation then stops the delete before any sidecar is lost.
+/// when there was no file. The main file goes last (see
+/// [`unlink_database_set`]). After that, only `remove_dir` runs, and it
+/// refuses a non-empty directory.
 fn remove_database_files(path: &Path, root: &Path, name: &str) -> Result<bool, FleetError> {
     let existed = path.is_file();
-    for file in std::iter::once(path.to_path_buf()).chain(crate::fleet_layout::sidecar_paths(path))
-    {
-        match std::fs::remove_file(&file) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(removal_error("delete database", name)(e)),
-        }
-    }
+    unlink_database_set(path, "delete database", name, |file| {
+        std::fs::remove_file(file)
+    })?;
     let mut dir = path.parent();
     while let Some(current) = dir {
         if current == root || !current.starts_with(root) {
@@ -2262,6 +2347,31 @@ fn remove_database_files(path: &Path, root: &Path, name: &str) -> Result<bool, F
         dir = current.parent();
     }
     Ok(existed)
+}
+
+/// Unlink a database's sidecars, then its main file, with `unlink`. A missing
+/// file is fine.
+///
+/// The main file goes last. Once it is gone, another process can publish a
+/// new database at the path. Any unlink after that could hit the new
+/// database's `-wal`.
+fn unlink_database_set(
+    path: &Path,
+    op: &'static str,
+    name: &str,
+    mut unlink: impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<(), FleetError> {
+    for file in crate::fleet_layout::sidecar_paths(path)
+        .into_iter()
+        .chain(std::iter::once(path.to_path_buf()))
+    {
+        match unlink(&file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(removal_error(op, name)(e)),
+        }
+    }
+    Ok(())
 }
 
 /// Readiness indicator `db:fleet`: the root directory is usable, with the
@@ -3364,5 +3474,116 @@ mod tests {
             FleetDbKey::Slot(1)
         );
         assert!(slots.key_for_name("tenant:acme").is_err());
+    }
+
+    #[test]
+    fn the_main_file_is_unlinked_last() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = plain_database(tmp.path());
+        let sidecars = crate::fleet_layout::sidecar_paths(&path);
+        let mut seen: Vec<PathBuf> = Vec::new();
+        unlink_database_set(&path, "delete database", "acme", |file| {
+            seen.push(file.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen.last(), Some(&path));
+        assert_eq!(seen.len(), sidecars.len() + 1);
+    }
+
+    #[test]
+    fn a_database_published_after_the_unlink_keeps_its_wal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = plain_database(tmp.path());
+        let wal = tmp.path().join(format!(
+            "{}-wal",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&wal, b"old").unwrap();
+        // Another process publishes a new database the moment the main file
+        // is gone, and commits to its `-wal`.
+        unlink_database_set(&path, "delete database", "acme", |file| {
+            let done = std::fs::remove_file(file);
+            if file == path {
+                std::fs::write(&path, b"new").unwrap();
+                std::fs::write(&wal, b"new frames").unwrap();
+            }
+            done
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&wal).unwrap(), b"new frames");
+    }
+
+    #[tokio::test]
+    async fn an_opener_whose_entry_was_settled_does_not_open_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let key = FleetDbKey::Slot(21);
+        // The opener holds its entry but has not started the open.
+        let Next::Open(entry) = fleet.claim_entry(&key).unwrap() else {
+            panic!("expected an entry");
+        };
+        assert!(!fleet.delete(&key).await.unwrap());
+        let late = fleet.init_entry(&key, true, &entry).await;
+        assert!(matches!(late, Err(Opening::Cancelled)));
+        assert!(!fleet.path_of(&key).exists(), "nothing was created");
+        assert_eq!(fleet.stats().open, 0, "no untracked pool");
+    }
+
+    /// An `on_open` hook that holds the open until `release` is sent.
+    struct Gate {
+        entered: std::sync::mpsc::Sender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl FleetLifecycle for Gate {
+        fn on_open(&self, _db: &FleetDatabase) -> Result<(), String> {
+            let _ = self.entered.send(());
+            let _ = self.release.lock().unwrap().recv();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn close_all_waits_for_an_open_in_flight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let recorder = Arc::new(Recorder::default());
+        fleet.add_lifecycle(recorder.clone());
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        fleet.add_lifecycle(Arc::new(Gate {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }));
+        let key = FleetDbKey::Slot(22);
+        let opener = {
+            let (fleet, key) = (fleet.clone(), key.clone());
+            tokio::spawn(async move { fleet.open(&key).await })
+        };
+        crate::time::spawn_blocking(move || entered.recv().unwrap())
+            .await
+            .unwrap();
+        let closing = {
+            let fleet = fleet.clone();
+            tokio::spawn(async move { fleet.close_all().await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!closing.is_finished(), "close_all must wait for the open");
+        release.send(()).unwrap();
+        closing.await.unwrap();
+        // The open finished before shutdown closed it, or was refused.
+        match opener.await.unwrap() {
+            Ok(db) => assert!(db.pool().is_closed()),
+            Err(error) => assert!(matches!(error, FleetError::Unavailable { .. }), "{error}"),
+        }
+        assert_eq!(fleet.stats().open, 0);
+        assert_eq!(
+            recorder.opened.load(Ordering::SeqCst),
+            recorder.closed.load(Ordering::SeqCst),
+            "every open database ran on_close"
+        );
+        let after = fleet.open(&FleetDbKey::Slot(23)).await;
+        assert!(matches!(after, Err(FleetError::Unavailable { .. })));
     }
 }

@@ -104,6 +104,18 @@ Uppercase is refused, not folded: on a case-insensitive file system `Acme` and
   of WAL under `locking_mode = EXCLUSIVE` with no busy wait, which `SQLite`
   refuses while any other connection has the file open. A refusal is `409`;
   a success also keeps new openers out until the files are replaced.
+  Delete and restore unlink the sidecars first and the main file last: once
+  the main file is gone, another process can publish a new database at the
+  path, and nothing of ours may touch it after that. A database created there
+  after a delete is the documented outcome (a fresh database, when created on
+  demand).
+- Delete and restore cancel an open in flight: the settle probe sets
+  `cancelled` on the entry under the cell's init permit, so an opener that
+  still holds the entry cannot create the file. It claims a new entry and sees
+  the drain.
+- `close_all` sets `shutting_down`. Every open then fails with `503`. It
+  settles opens in flight, closes every database, and waits until no database
+  is open or draining.
 - Keys are checked against the fleet (mode, slot range, a tenant's own slot)
   before anything touches the disk.
 - Closing calls `Pool::close` (a stale handle can no longer check out), waits
@@ -142,6 +154,10 @@ destination as the control database:
   destination is down, the replicator is parked rather than dropped: it keeps
   the file open, the loop keeps shipping until it catches up, health reports
   it under `closing`, and a reopen takes it back (one replicator per file);
+- at shutdown, the fleet keeps ticking parked replicators until all caught up
+  or the final-flush deadline passes (`server.shutdown_timeout_secs`). For
+  each database still unshipped, it logs an `error!` and lists the name under
+  `unshipped` in the `replication:fleet` health details;
 - `DatabaseFleet::restore` rebuilds one database: into a private staging file
   first, then published under the guard above. With `restore_missing = true`,
   opening a database whose file is missing restores it first: a host that

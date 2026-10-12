@@ -57,6 +57,12 @@ const STOP_POLL: Duration = Duration::from_millis(100);
 /// several.
 const FINAL_SHIP_MAX_TICKS: usize = 64;
 
+/// Pause between flush passes at shutdown.
+const FLUSH_RETRY: Duration = Duration::from_millis(100);
+
+/// Default longest shutdown flush.
+const DEFAULT_FINAL_FLUSH: Duration = Duration::from_secs(5);
+
 /// The destination key prefix of one fleet database, under the control
 /// database's replication root.
 #[must_use]
@@ -92,6 +98,10 @@ pub struct FleetReplication {
     /// replicator back instead of starting a second one.
     parked: Mutex<HashMap<FleetDbKey, Arc<ActiveReplica>>>,
     stopped: AtomicBool,
+    /// Longest the shutdown flush keeps shipping parked replicators.
+    final_flush: Duration,
+    /// Names still unshipped when the last shutdown flush ended.
+    unshipped: Mutex<Vec<String>>,
 }
 
 impl FleetReplication {
@@ -118,7 +128,51 @@ impl FleetReplication {
             active: Mutex::new(HashMap::new()),
             parked: Mutex::new(HashMap::new()),
             stopped: AtomicBool::new(false),
+            final_flush: DEFAULT_FINAL_FLUSH,
+            unshipped: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Set the longest the shutdown flush keeps shipping.
+    #[must_use]
+    pub const fn with_final_flush(mut self, deadline: Duration) -> Self {
+        self.final_flush = deadline;
+        self
+    }
+
+    /// The longest the shutdown flush keeps shipping.
+    #[must_use]
+    pub const fn final_flush(&self) -> Duration {
+        self.final_flush
+    }
+
+    /// Tick until no replicator is parked, or until `deadline` passes.
+    /// Blocking. Return the names still unshipped. Each one is logged with
+    /// `error!` and shown in the health details.
+    pub fn flush_closing(&self, deadline: Duration) -> Vec<String> {
+        let started = self.clock.monotonic();
+        loop {
+            self.tick_all();
+            let left =
+                deadline.saturating_sub(self.clock.monotonic().saturating_duration_since(started));
+            if self.closing() == 0 || left.is_zero() {
+                break;
+            }
+            std::thread::sleep(FLUSH_RETRY.min(left));
+        }
+        let mut unshipped: Vec<String> = self.parked().keys().map(FleetDbKey::name).collect();
+        unshipped.sort();
+        for name in &unshipped {
+            tracing::error!(
+                database = %name,
+                "fleet shutdown: committed WAL is not shipped and stays on this volume"
+            );
+        }
+        self.unshipped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone_from(&unshipped);
+        unshipped
     }
 
     fn root_for(&self, key: &FleetDbKey) -> String {
@@ -296,6 +350,14 @@ impl FleetReplication {
         details.insert("databases".to_owned(), replicas.len().into());
         details.insert("closing".to_owned(), closing.into());
         details.insert("failing".to_owned(), failing.into());
+        details.insert(
+            "unshipped".to_owned(),
+            self.unshipped
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+                .into(),
+        );
         details.insert("pending_bytes".to_owned(), pending_bytes.into());
         details.insert(
             "lag_alert_after_seconds".to_owned(),
@@ -931,5 +993,127 @@ mod tests {
         replication.stop();
         handle.join().unwrap();
         fleet.close_all().await;
+    }
+
+    /// A fleet whose destination is down, with a short final flush.
+    fn outage_fleet(
+        tmp: &Path,
+        final_flush: Duration,
+    ) -> (DatabaseFleet, Arc<FleetReplication>, Arc<Flaky>) {
+        let fleet = DatabaseFleet::builder(DatabaseFleetConfig {
+            mode: FleetMode::Tenant,
+            root: tmp.join("a").display().to_string(),
+            path: None,
+            max_open: 8,
+            pool_size: 2,
+            create_on_demand: Some(true),
+            idle_close_secs: 0,
+            restore_missing: false,
+        })
+        .build()
+        .unwrap();
+        let flaky = Arc::new(Flaky {
+            inner: FileDestination::new(tmp.join("replicas")).unwrap(),
+            down: AtomicBool::new(true),
+        });
+        let replication = Arc::new(
+            FleetReplication::new(
+                Arc::clone(&flaky) as Arc<dyn ReplicaDestination>,
+                settings(),
+                Duration::from_secs(30),
+                false,
+                Arc::new(crate::time::SystemClock),
+            )
+            .with_final_flush(final_flush),
+        );
+        assert!(fleet.install_replication(Arc::clone(&replication)).is_ok());
+        (fleet, replication, flaky)
+    }
+
+    /// Write a row, close the database and leave its replicator parked.
+    async fn park_one(fleet: &DatabaseFleet) -> FleetDbKey {
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        exec(&db, "INSERT INTO notes VALUES ('unshipped')").await;
+        drop(db);
+        fleet.close(&key).await;
+        key
+    }
+
+    fn recover_after(flaky: &Arc<Flaky>, delay: Duration) {
+        let flaky = Arc::clone(flaky);
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            flaky.down.store(false, Ordering::SeqCst);
+        });
+    }
+
+    #[tokio::test]
+    async fn the_final_flush_ships_once_the_destination_recovers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        park_one(&fleet).await;
+        assert_eq!(replication.closing(), 1);
+        recover_after(&flaky, Duration::from_millis(200));
+        let left = crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || replication.flush_closing(Duration::from_secs(5))
+        })
+        .await
+        .unwrap();
+        assert!(left.is_empty(), "{left:?}");
+        assert_eq!(replication.closing(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_final_flush_names_what_it_could_not_ship() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, _flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        let key = park_one(&fleet).await;
+        let left = crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || replication.flush_closing(Duration::from_millis(300))
+        })
+        .await
+        .unwrap();
+        assert_eq!(left, vec![key.name()]);
+        assert_eq!(replication.closing(), 1);
+        let health = replication.indicator().check().await;
+        assert_eq!(health.details["unshipped"], serde_json::json!([key.name()]));
+    }
+
+    #[tokio::test]
+    async fn shutdown_keeps_shipping_until_the_destination_recovers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        let shutdown = CancellationToken::new();
+        let maintenance = fleet.spawn_maintenance(shutdown.clone());
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        exec(&db, "INSERT INTO notes VALUES ('written before shutdown')").await;
+        drop(db);
+        recover_after(&flaky, Duration::from_millis(300));
+        shutdown.cancel();
+        maintenance.await.unwrap();
+        assert_eq!(replication.closing(), 0, "everything shipped");
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_a_destination_that_stays_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, _flaky) = outage_fleet(tmp.path(), Duration::from_millis(300));
+        let shutdown = CancellationToken::new();
+        let maintenance = fleet.spawn_maintenance(shutdown.clone());
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        drop(db);
+        shutdown.cancel();
+        maintenance.await.unwrap();
+        assert_eq!(replication.closing(), 1);
+        let health = replication.indicator().check().await;
+        assert_eq!(health.details["unshipped"], serde_json::json!([key.name()]));
     }
 }
