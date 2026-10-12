@@ -1541,7 +1541,8 @@ impl DatabaseFleet {
         idle
     }
 
-    /// Count a new `provision` unless shutdown has begun. The check and the
+    /// Count a new `provision`, `delete` or `restore` unless shutdown has
+    /// begun. The check and the
     /// count share one lock hold, and `close_all` sets the flag under the same
     /// lock. So a call is either counted before `close_all` looks, or refused.
     fn admit_mutation(&self, key: &FleetDbKey) -> Result<MutationGuard, FleetError> {
@@ -1667,11 +1668,13 @@ impl DatabaseFleet {
     ///
     /// # Errors
     ///
-    /// [`FleetError::Deleting`] when a delete is already running, or
+    /// [`FleetError::Deleting`] when a delete is already running,
+    /// [`FleetError::Unavailable`] once a shutdown has begun, or
     /// [`FleetError::Io`].
     pub async fn delete(&self, key: &FleetDbKey) -> Result<bool, FleetError> {
         self.check_key(key)?;
-        let (fleet, key, counted) = (self.clone(), key.clone(), MutationGuard::new(self));
+        let counted = self.admit_mutation(key)?;
+        let (fleet, key) = (self.clone(), key.clone());
         tokio::spawn(async move {
             let _counted = counted;
             fleet.delete_owned(&key).await
@@ -1844,7 +1847,9 @@ impl DatabaseFleet {
     ///
     /// [`FleetError::NotReplicated`] without replication,
     /// [`FleetError::NotFound`] when nothing was ever shipped for the key,
-    /// [`FleetError::Deleting`] during a delete, or [`FleetError::Restore`].
+    /// [`FleetError::Deleting`] during a delete,
+    /// [`FleetError::Unavailable`] once a shutdown has begun, or
+    /// [`FleetError::Restore`].
     pub async fn restore(
         &self,
         key: &FleetDbKey,
@@ -1852,7 +1857,7 @@ impl DatabaseFleet {
     ) -> Result<crate::replication::RestoreOutcome, FleetError> {
         self.check_key(key)?;
         let (fleet, key, name) = (self.clone(), key.clone(), key.name());
-        let counted = MutationGuard::new(self);
+        let counted = self.admit_mutation(&key)?;
         tokio::spawn(async move {
             let _counted = counted;
             fleet.restore_owned(&key, target).await
@@ -4267,5 +4272,21 @@ mod tests {
         let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
         fleet.close_all().await;
         assert!(fleet.admit_mutation(&FleetDbKey::Slot(30)).is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_and_restore_are_refused_once_shutdown_is_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let key = FleetDbKey::Slot(31);
+        fleet.open(&key).await.unwrap();
+        fleet.close_all().await;
+        let path = fleet.path_of(&key);
+        let err = fleet.delete(&key).await.unwrap_err();
+        assert!(matches!(err, FleetError::Unavailable { .. }), "{err}");
+        assert!(path.is_file(), "a refused delete removes nothing");
+        // `restore` checks the shutdown flag before it needs replication.
+        let err = fleet.restore(&key, None).await.unwrap_err();
+        assert!(matches!(err, FleetError::Unavailable { .. }), "{err}");
     }
 }
