@@ -38,7 +38,8 @@ No index added. Per-claim WAL unchanged.
 ## 🔬 Reproduce
 ```
 createdb ledger_bench && psql -d ledger_bench -c "CREATE EXTENSION pg_stat_statements"   # preload + track=all
+export PGDATABASE=ledger_bench   # run.sh and psql both read it
 sh docs/reports/2026-10-12-ledger-job-claim-multi-queue/fixture/run.sh before baseline   # at the baseline commit's query
 sh docs/reports/2026-10-12-ledger-job-claim-multi-queue/fixture/run.sh after after
-psql -d ledger_bench -f docs/reports/2026-10-12-ledger-job-claim-multi-queue/fixture/equivalence.sql
+psql -f docs/reports/2026-10-12-ledger-job-claim-multi-queue/fixture/equivalence.sql
 ```
