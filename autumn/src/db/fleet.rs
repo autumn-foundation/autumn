@@ -2274,6 +2274,7 @@ fn restore_in_place(
 
 /// Create a fleet database atomically. Blocking.
 ///
+/// Stray sidecars of an absent path are cleared just before the link.
 /// The database is built — identity row, every migration — in a private
 /// staging file beside `path` (`.<name>.creating-<pid>-<n>`, which no
 /// template matches), then published with a hard link, which refuses an
@@ -2296,6 +2297,17 @@ fn create_database_file(
     if let Err(error) = built {
         discard(&staging);
         return Err(error);
+    }
+    // A stray sidecar of an absent database, left by a crash, would replay
+    // onto the new file. Clear it only while the path is still absent.
+    if !path.exists() {
+        let cleared = unlink_database_set(path, "clear stray sidecars", name, true, |file| {
+            std::fs::remove_file(file)
+        });
+        if let Err(error) = cleared {
+            discard(&staging);
+            return Err(error);
+        }
     }
     let published = std::fs::hard_link(&staging, path);
     discard(&staging);
@@ -2371,9 +2383,8 @@ fn remove_database_files(path: &Path, root: &Path, name: &str) -> Result<bool, F
 /// database's `-wal`.
 ///
 /// An absent main file stays untouched. With `strays`, its sidecars go. Only
-/// a restore sets that: a stale `-wal` could replay onto the restored
-/// database. A delete leaves strays, which `SQLite` ignores without a main
-/// file.
+/// a restore or a create sets that: a stale `-wal` could replay onto the new
+/// database. A delete leaves strays. The next create clears them.
 ///
 /// On Windows, a process that has the database open also holds its `-wal`.
 /// The sharing violation then stops the unlink at the sidecar, before the
@@ -3724,5 +3735,30 @@ mod tests {
         let late = fleet.init_entry(&key, true, &waiter).await;
         assert!(matches!(late, Err(Opening::Cancelled)));
         assert_eq!(fleet.stats().open, 0, "no untracked pool");
+    }
+
+    #[test]
+    fn a_new_database_does_not_inherit_a_stray_wal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("000/slot-00003.db");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let wal = tmp.path().join("000/slot-00003.db-wal");
+        std::fs::write(&wal, b"left behind by a crash").unwrap();
+        let migrations = FleetMigrations::new(Arc::new(Vec::new()), |_| true, true);
+        assert!(create_database_file(&target, "slot:00003", &migrations).unwrap());
+        assert!(!wal.exists(), "a stale -wal would replay onto the new file");
+    }
+
+    #[test]
+    fn a_stray_wal_beside_a_published_database_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("000/slot-00004.db");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"their bytes").unwrap();
+        let wal = tmp.path().join("000/slot-00004.db-wal");
+        std::fs::write(&wal, b"their frames").unwrap();
+        let migrations = FleetMigrations::new(Arc::new(Vec::new()), |_| true, true);
+        assert!(!create_database_file(&target, "slot:00004", &migrations).unwrap());
+        assert_eq!(std::fs::read(&wal).unwrap(), b"their frames");
     }
 }
