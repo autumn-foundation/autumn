@@ -679,15 +679,16 @@ fn content_length(res: &Response) -> Option<u64> {
         .and_then(|v| v.parse::<u64>().ok())
 }
 
-/// `true` when the body's length is known, from `Content-Length` or an
-/// exact body size, and fits in `max`. A body of unknown length (a stream)
-/// is not collected: this layer runs outside the request timeout and the
+/// `true` when the body is already in memory (an exact body size) and fits
+/// in `max`. A stream is not collected, even one that declares a
+/// `Content-Length`: this layer runs outside the request timeout and the
 /// admission limits, so a slow stream would hold the request open.
 fn fits(res: &Response, max: usize) -> bool {
     use http_body::Body as _;
 
-    content_length(res)
-        .or_else(|| res.body().size_hint().exact())
+    res.body()
+        .size_hint()
+        .exact()
         .is_some_and(|len| len <= max as u64)
 }
 
@@ -1137,6 +1138,26 @@ mod tests {
         let res = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             to_markdown(streamed, &config, None),
+        )
+        .await
+        .expect("not collected");
+        assert!(
+            res.headers()[CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        // Codex review (P1): a declared `Content-Length` does not make a
+        // stream safe to wait for.
+        let declared = html()
+            .header(CONTENT_LENGTH, "11")
+            .body(Body::from_stream(futures::stream::pending::<
+                Result<Bytes, std::io::Error>,
+            >()))
+            .unwrap();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            to_markdown(declared, &config, None),
         )
         .await
         .expect("not collected");
