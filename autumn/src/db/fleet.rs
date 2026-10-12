@@ -967,15 +967,7 @@ impl DatabaseFleet {
     pub async fn provision(&self, key: &FleetDbKey) -> Result<FleetDatabase, FleetError> {
         self.check_key(key)?;
         // Held to the end, so `close_all` also sees the open that follows.
-        let _open_counted = MutationGuard::new(self);
-        // After the count: `close_all` either waits for this call, or it has
-        // set the flag already and this call sees it.
-        if self.lock_state().shutting_down {
-            return Err(FleetError::Unavailable {
-                name: key.name(),
-                detail: "the fleet is shutting down".to_owned(),
-            });
-        }
+        let _open_counted = self.admit_mutation(key)?;
         let (fleet, task_key, counted) = (self.clone(), key.clone(), MutationGuard::new(self));
         tokio::spawn(async move {
             let _counted = counted;
@@ -1537,18 +1529,46 @@ impl DatabaseFleet {
         }
     }
 
+    /// Set `shutting_down` if no counted work runs. Only then: a provision
+    /// counted before this must finish its own open.
+    fn stop_admitting_if_idle(&self) -> bool {
+        let mut state = self.lock_state();
+        let idle = self.inner.mutations.load(Ordering::Acquire) == 0;
+        if idle {
+            state.shutting_down = true;
+        }
+        drop(state);
+        idle
+    }
+
+    /// Count a new `provision` unless shutdown has begun. The check and the
+    /// count share one lock hold, and `close_all` sets the flag under the same
+    /// lock. So a call is either counted before `close_all` looks, or refused.
+    fn admit_mutation(&self, key: &FleetDbKey) -> Result<MutationGuard, FleetError> {
+        let state = self.lock_state();
+        if state.shutting_down {
+            return Err(FleetError::Unavailable {
+                name: key.name(),
+                detail: "the fleet is shutting down".to_owned(),
+            });
+        }
+        let counted = MutationGuard::new(self);
+        drop(state);
+        Ok(counted)
+    }
+
     /// Close every open database and wait for all drains, for shutdown.
     pub async fn close_all(&self) {
         // Mutations first: one that just started may open or drain a key.
         loop {
             let ended = self.inner.mutations_done.notified();
-            if self.inner.mutations.load(Ordering::Acquire) == 0 {
+            // Under the lock `admit_mutation` takes: no call slips in between
+            // the count and the flag.
+            if self.stop_admitting_if_idle() {
                 break;
             }
             ended.await;
         }
-        // Only now: a provision counted above must finish its own open.
-        self.lock_state().shutting_down = true;
         let keys: Vec<FleetDbKey> = self.lock_state().open.keys().cloned().collect();
         for key in keys {
             self.close(&key).await;
@@ -4219,5 +4239,33 @@ mod tests {
         let err = fleet.open(&key).await.unwrap_err();
         assert!(matches!(err, FleetError::Unavailable { .. }), "{err}");
         assert_eq!(err.http_status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn close_all_refuses_opens_only_after_the_counted_work_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        // A counted operation (a provision, say) is still running.
+        let pending = MutationGuard::new(&fleet);
+        let closing = {
+            let fleet = fleet.clone();
+            tokio::spawn(async move { fleet.close_all().await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!closing.is_finished(), "close_all waits for the work");
+        // The work may still open its database: the flag is not set yet.
+        fleet.open(&FleetDbKey::Slot(28)).await.unwrap();
+        drop(pending);
+        closing.await.unwrap();
+        let after = fleet.open(&FleetDbKey::Slot(29)).await;
+        assert!(matches!(after, Err(FleetError::Unavailable { .. })));
+    }
+
+    #[tokio::test]
+    async fn no_work_is_admitted_once_shutdown_is_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        fleet.close_all().await;
+        assert!(fleet.admit_mutation(&FleetDbKey::Slot(30)).is_err());
     }
 }
