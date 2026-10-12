@@ -12344,9 +12344,16 @@ enabled = true
             "application/zi",
             "Font/WOF",
             "au",
-            "audiö/x",
         ] {
             assert!(predicate_compresses(ct), "{ct} must be compressed");
+        }
+    }
+
+    /// Short and non-ASCII values must not panic or match.
+    #[test]
+    fn compression_exclusion_is_safe_on_short_and_non_ascii_input() {
+        for ct in ["", "a", "au", "é", "audiö/x", "fönt/woff2"] {
+            assert!(!is_compression_excluded(ct), "{ct:?} must not match");
         }
     }
 
