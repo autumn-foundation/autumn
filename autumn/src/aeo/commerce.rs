@@ -888,10 +888,17 @@ impl PricedRoutes {
                 return None;
             }
             // axum picked the route: price exactly that one, so a wildcard
-            // listed first never prices a more specific static route.
+            // listed first never prices a more specific static route. A route
+            // the router nested is not at its own path but at
+            // `/{locale}{path}`: a priced `/en/report` is mounted at
+            // `/en/en/report`, and `/en/report` is the free `/report`.
             return routes
                 .clone()
-                .find(|r| same_template(&r.path, t) && !self.another_route(&r.path, t, t))
+                .find(|r| {
+                    same_template(&r.path, t)
+                        && !self.another_route(&r.path, t, t)
+                        && !self.nested.iter().any(|n| same_template(n, &r.path))
+                })
                 .or_else(|| {
                     let bare = self.strip_locale(t);
                     routes.clone().find(|r| {
@@ -1851,6 +1858,29 @@ mod tests {
         };
         assert!(priced.route_for(&matched("/submit")).is_none());
         assert!(priced.route_for(&matched("/en/submit")).is_some());
+    }
+
+    #[test]
+    fn a_nested_route_is_priced_at_its_mounted_path() {
+        // Codex review (P1): a free `/report` is mounted at `/en/report`, a
+        // priced top-level `/en/report` at `/en/en/report`.
+        let priced = PricedRoutes {
+            routes: vec![PaidRoute::new("GET", "/en/report", "1")],
+            locales: vec!["en".to_owned()],
+            unprefixed: Vec::new(),
+            mounted: Vec::new(),
+            nested: vec!["/report".to_owned(), "/en/report".to_owned()],
+        };
+        let matched = |template: &str| {
+            let mut req = axum::http::Request::get(template)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(StaticRoute(template.to_owned()));
+            req
+        };
+        assert!(priced.route_for(&matched("/en/report")).is_none());
+        assert!(priced.route_for(&matched("/en/en/report")).is_some());
     }
 
     #[test]
