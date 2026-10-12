@@ -2792,6 +2792,29 @@ jobs:
             fi
           done
 
+  sqlite-fleet-windows:
+    name: SQLite fleet (windows-latest)
+    # Windows cannot delete a file that SQLite holds open (#3227). The fleet
+    # delete and restore paths differ there, and no other lane runs them.
+    runs-on: windows-latest
+    needs: [lint]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Fleet unit tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p autumn-web --features "sqlite,test-support" --lib db::fleet \
+            | tee "${RUNNER_TEMP}/fleet-lib.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/fleet-lib.log" \
+            || { echo "::error::no fleet unit test ran"; exit 1; }
+      - name: Fleet integration tests
+        shell: bash
+        run: cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet
+
   windows-tier1:
     name: Windows Tier 1 journey
     needs: [lint]
