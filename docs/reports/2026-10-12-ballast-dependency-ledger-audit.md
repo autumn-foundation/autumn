@@ -103,22 +103,39 @@ validates types, not the actual link step, and this repo's own
 `./scripts/pre-push-check.sh` exists specifically because a narrower check
 ("misses cross-package compile breaks the CI `cargo test --workspace` gate
 catches" — CLAUDE.md, "Pre-push gate") can stay green while the consolidated
-`integration_tests` binary fails to link. Ran the real gate on this
-rehearsal branch rather than accepting the gap: it failed twice on an
-unrelated session constraint (`ld terminated with signal 7 [Bus error]` /
-"No space left on device" — this session's disk allowance, not a defect in
-the dependency bump; confirmed by `df` reading 100K free at the moment of
-failure both times, and by the failure point shifting between runs with no
-change to the code). Freeing `target/` and narrowing to exactly the
-mechanism Codex named — `cargo test -p autumn-web --no-run`, which compiles
-and links `autumn-web`'s own consolidated `tests/integration_tests.rs`
-binary along with every isolated test target — completed clean with 0
-errors, confirming the specific link-level risk a `cargo check`-only
-rehearsal would have missed. The full-workspace `cargo test --workspace
---no-run` (every example, bench, and plugin crate, not just `autumn-web`)
-was not completed to a clean finish given this session's disk ceiling; the
-narrower run is the part of the gate that bears directly on this PR's own
-bumped crates.
+`integration_tests` binary fails to link. Ran `./scripts/pre-push-check.sh` on
+this rehearsal branch three separate times rather than accepting the gap,
+each with `target/` freed first: all three failed on the same unrelated
+session constraint (`ld terminated with signal 7 [Bus error]` / "No space
+left on device" — this session's own disk allowance, not a defect in the
+dependency bump), confirmed three independent ways — `df` reading at or near
+0 free at the moment of each failure; the failure point moving later in the
+build each time (run 1 broke mid-compile, run 2 during `autumn-web`'s own
+link step, run 3 — with `CARGO_PROFILE_TEST_DEBUG=0` set to shrink debug
+symbols — during the last few crates in the whole workspace, `autumn-cli`'s
+own test binary) with no change to the code between runs; and no compile
+*error* ever appearing in any of the three logs, only the OS-level ENOSPC.
+A second Codex comment correctly pointed out that the fallback this report
+first settled for, `cargo test -p autumn-web --no-run`, left `autumn-cli` and
+`autumn-edge` uncovered even though this bump touches crates (`syn`, `libc`,
+`hyper`, `h2`, `tokio-rustls`) both depend on directly. Added both, each a
+clean, disk-cheap package-level build (no full-workspace linking required):
+
+```
+cargo test -p autumn-web --no-run    # links the consolidated integration_tests binary — 0 errors
+cargo test -p autumn-cli --no-run    # links the consolidated cli_tests binary — 0 errors
+cargo test -p autumn-edge --no-run   # links autumn-edge's own test binaries — 0 errors
+```
+
+Between them, every workspace member CLAUDE.md names as a consolidated-binary
+linking risk (`autumn`/`autumn-web` and `autumn-cli`) is now independently
+link-verified for this exact dependency bump, plus the other workspace member
+(`autumn-edge`) most directly exposed to it. What's still not completed is a
+clean full-workspace run covering every example, bench, and plugin crate
+simultaneously, and the gate's separate clippy/doctest legs on the full set —
+genuinely short of `./scripts/pre-push-check.sh` end to end, not quietly
+redefined as equivalent to it, and stated as such rather than folded into
+"ready to merge" without the caveat.
 
 Posted the rehearsal on #3209 recommending merge. Not merged by this pass —
 every prior pass's actual merges were done by the repo's human maintainer, not
@@ -332,8 +349,11 @@ cargo update --dry-run --verbose 2>&1 | grep Locking
 git fetch origin pull/3209/head:ballast-pr-3209
 git checkout origin/trunk-dev -b rehearsal-3209 && git cherry-pick bc05ce2
 cargo deny check && cargo check --workspace --all-targets
-./scripts/pre-push-check.sh          # the real gate; needs ~30GB+ free disk for the full workspace
-cargo test -p autumn-web --no-run    # narrower equivalent that still links integration_tests
+./scripts/pre-push-check.sh          # the real gate; ran 3x, ENOSPC each time on this session's disk ceiling
+CARGO_PROFILE_TEST_DEBUG=0 ./scripts/pre-push-check.sh   # 3rd attempt, shrunk debug info; still ENOSPC, later
+cargo test -p autumn-web --no-run    # links integration_tests  — 0 errors
+cargo test -p autumn-cli --no-run    # links cli_tests          — 0 errors
+cargo test -p autumn-edge --no-run   # links autumn-edge's tests — 0 errors
 
 # opentelemetry lockstep rehearsal — both directions
 git checkout origin/trunk-dev -b rehearsal-otlp-a
@@ -341,6 +361,9 @@ sed -i 's/tracing-opentelemetry = "0.33.0"/tracing-opentelemetry = "0.34.0"/' Ca
 cargo update -p tracing-opentelemetry
 cargo check -p autumn-web --no-default-features --features telemetry-otlp   # breaks
 
+git checkout -- Cargo.toml Cargo.lock   # discard rehearsal-otlp-a's uncommitted edits first --
+                                         # `checkout -b` from the same origin/trunk-dev otherwise
+                                         # carries them into -b, testing all 4 bumps together
 git checkout origin/trunk-dev -b rehearsal-otlp-b
 sed -i -e 's/opentelemetry = { version = "0.32.0"/opentelemetry = { version = "0.33.0"/' \
        -e 's/opentelemetry_sdk = { version = "0.32.1"/opentelemetry_sdk = { version = "0.33.0"/' \
