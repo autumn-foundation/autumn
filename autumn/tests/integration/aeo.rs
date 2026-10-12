@@ -1433,6 +1433,27 @@ mod commerce {
         Json(vec!["checked_out".to_owned()])
     }
 
+    /// Codex review (P1): with locale-prefix routing, a bare `POST
+    /// /api/checkout` is the router's 308 to `/en/api/checkout`. It is not
+    /// charged: a payment settled there would be spent on the redirect.
+    #[cfg(all(feature = "i18n", feature = "mcp"))]
+    #[tokio::test]
+    async fn a_locale_redirect_is_not_charged() {
+        let mut config = paid_config();
+        config.aeo.paid_routes = vec![PaidRoute::new("POST", "/api/checkout", "500")];
+        config.i18n.locale_prefix_enabled = true;
+        config.i18n.supported_locales = vec!["en".to_owned(), "fr".to_owned()];
+        config.i18n.default_locale = "en".to_owned();
+        let c = TestApp::new()
+            .config(config)
+            .routes(routes![checkout])
+            .build();
+        let bare = c.post("/api/checkout").send().await;
+        assert_eq!(bare.status, 308, "{}", bare.text());
+        assert!(bare.header("payment-required").is_none());
+        assert_eq!(c.post("/en/api/checkout").send().await.status, 402);
+    }
+
     /// A priced tool called through `POST /mcp` with CSRF on: the envelope
     /// carries no route of its own, and the replay to the tool's route is
     /// what CSRF and x402 see.

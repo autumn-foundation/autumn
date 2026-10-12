@@ -880,6 +880,13 @@ impl PricedRoutes {
         // different routes: a localized `/x` is mounted at `/{locale}/x`.
         let routes = self.routes.iter().filter(|r| accepts(r));
         if let Some(t) = template {
+            // The bare path of a route nested under each locale is the
+            // router's 308 to `/{locale}/...`: the operation runs there, so
+            // the redirect is never priced (an unsafe request would settle
+            // before it, and the proof would be spent on the 308).
+            if self.nested.iter().any(|n| same_shape(n, t)) {
+                return None;
+            }
             // axum picked the route: price exactly that one, so a wildcard
             // listed first never prices a more specific static route.
             return routes
@@ -1821,6 +1828,29 @@ mod tests {
         );
         // Not nested: `/en/report` can only be a route of its own.
         assert!(priced(&[]).route_for(&matched("/en/report")).is_none());
+    }
+
+    #[test]
+    fn a_locale_redirect_is_never_priced() {
+        // Codex review (P1): the router answers a nested route's bare path
+        // with a 308 to `/{locale}/...`; only the nested route is charged.
+        let priced = PricedRoutes {
+            routes: vec![PaidRoute::new("POST", "/submit", "1")],
+            locales: vec!["en".to_owned()],
+            unprefixed: Vec::new(),
+            mounted: Vec::new(),
+            nested: vec!["/submit".to_owned()],
+        };
+        let matched = |template: &str| {
+            let mut req = axum::http::Request::post(template)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(StaticRoute(template.to_owned()));
+            req
+        };
+        assert!(priced.route_for(&matched("/submit")).is_none());
+        assert!(priced.route_for(&matched("/en/submit")).is_some());
     }
 
     #[test]
