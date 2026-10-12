@@ -308,3 +308,95 @@ fn verus_script_fails_when_a_proof_fails() {
         "the script must name the failed spec: {stderr}"
     );
 }
+
+// ── 5. Kani proofs and the model-check binaries in CI ───────────────────────
+
+const KANI_WORKFLOW: &str = ".github/workflows/kani.yml";
+
+/// Every `.rs` file under `dir` (relative to the workspace root), recursively.
+fn rust_files(dir: &str) -> Vec<String> {
+    let root = workspace_root();
+    let mut pending = vec![root.join(dir)];
+    let mut files = Vec::new();
+    while let Some(path) = pending.pop() {
+        for entry in std::fs::read_dir(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()))
+        {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let relative = path.strip_prefix(&root).expect("under the root");
+                files.push(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// The Kani workflow runs only when a file it names changes. A harness in a
+/// file it does not name would never run on the PR that breaks it.
+#[test]
+fn kani_workflow_runs_when_a_proven_file_changes() {
+    let workflow = read(KANI_WORKFLOW);
+    assert!(
+        workflow.contains("cargo kani -p autumn-web --lib"),
+        "{KANI_WORKFLOW} must run the autumn-web harnesses:\n{workflow}"
+    );
+    for trigger in ["pull_request:", "schedule:", "workflow_dispatch:"] {
+        assert!(
+            workflow.contains(trigger),
+            "{KANI_WORKFLOW} must trigger on `{trigger}`"
+        );
+    }
+    let proven: Vec<String> = rust_files("autumn/src")
+        .into_iter()
+        .filter(|file| read(file).contains("#[kani::proof]"))
+        .collect();
+    assert!(!proven.is_empty(), "autumn/src must hold Kani harnesses");
+    for file in &proven {
+        assert_eq!(
+            workflow.matches(&format!("\"{file}\"")).count(),
+            2,
+            "{KANI_WORKFLOW} must name `{file}` under both `pull_request` and `push`, \
+             because it holds a `#[kani::proof]`"
+        );
+    }
+    // Non-blocking at first: no CI job depends on it.
+    let ci = read(".github/workflows/ci.yml");
+    for line in ci.lines().filter(|line| line.contains("needs:")) {
+        assert!(
+            !line.to_ascii_lowercase().contains("kani"),
+            "ci.yml must not depend on the Kani job while it is non-blocking: {line}"
+        );
+    }
+}
+
+/// `tests/loom_models.rs` and `tests/shuttle_models.rs` are empty unless their
+/// cfg is set, so a CI job that forgot the cfg would pass with zero tests.
+#[test]
+fn model_check_jobs_set_their_cfg() {
+    let ci = read(".github/workflows/ci.yml");
+    for (test, cfg) in [
+        ("loom_models", "--cfg loom_models"),
+        ("shuttle_models", "--cfg shuttle_models"),
+    ] {
+        let run = format!("cargo test -p autumn-web --release --test {test}");
+        let at = ci
+            .find(&run)
+            .unwrap_or_else(|| panic!("ci.yml must run `{run}`"));
+        let step = &ci[at..ci[at..].find("\n\n").map_or(ci.len(), |end| at + end)];
+        assert!(
+            step.contains(&format!("RUSTFLAGS: \"{cfg}\"")),
+            "the `{test}` step must set RUSTFLAGS to `{cfg}`:\n{step}"
+        );
+    }
+    let shim = read("autumn/src/sync_shim.rs");
+    for cfg in ["loom_models", "shuttle_models"] {
+        assert!(
+            shim.contains(cfg),
+            "autumn/src/sync_shim.rs must swap the primitives under `{cfg}`"
+        );
+    }
+}

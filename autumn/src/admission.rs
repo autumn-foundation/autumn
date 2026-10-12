@@ -30,11 +30,12 @@
 
 use std::fmt;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+use crate::sync_shim::{AtomicUsize, Mutex, Ordering};
 
 /// The header that carries a request's [`Criticality`] between services.
 ///
@@ -961,6 +962,125 @@ fn probability(requests: u64, accepts: u64, k: f64) -> f64 {
     #[allow(clippy::cast_precision_loss, reason = "window counts far below 2^52")]
     let (r, a) = (requests as f64, accepts as f64);
     (k.mul_add(-a, r) / (r + 1.0)).max(0.0)
+}
+
+/// Kani proofs over the real partition and AIMD code. Run with
+/// `cargo kani -p autumn-web --lib`. `verification/admission_partitions.rs`
+/// proves the same rules on a Verus model; these harnesses check the
+/// shipped integer code, for every input.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    fn any_shares() -> PartitionShares {
+        let default_permille: u16 = kani::any();
+        let sheddable_permille: u16 = kani::any();
+        kani::assume(default_permille <= PERMILLE);
+        kani::assume(sheddable_permille <= default_permille);
+        PartitionShares {
+            default_permille,
+            sheddable_permille,
+        }
+    }
+
+    /// No class threshold is above the limit, for every `usize` limit, and
+    /// a critical request gets the whole limit.
+    ///
+    /// The nesting `sheddable <= default <= critical` follows from two
+    /// proofs together: `scale_permille_is_a_floor` (the shipped scale is the
+    /// exact floor for every `usize`) and `scaled_is_monotone` in
+    /// `verification/admission_partitions.rs` (the floor is monotonic in the
+    /// share). Kani does not compare two symbolic `u128` divisions directly,
+    /// because that is very slow for a SAT solver.
+    #[kani::proof]
+    #[kani::solver(cadical)]
+    fn thresholds_never_exceed_the_limit() {
+        let shares = any_shares();
+        let limit: usize = kani::any();
+        let class = if kani::any() {
+            Criticality::Default
+        } else {
+            Criticality::Sheddable
+        };
+        assert!(shares.threshold(class, limit) <= limit);
+        assert_eq!(shares.threshold(Criticality::Critical, limit), limit);
+    }
+
+    /// A positive share never sheds a class at idle, and a zero share
+    /// always does.
+    #[kani::proof]
+    #[kani::solver(cadical)]
+    fn a_positive_share_admits_at_idle() {
+        let shares = any_shares();
+        let limit: usize = kani::any();
+        let sheddable = shares.threshold(Criticality::Sheddable, limit);
+        if limit > 0 && shares.sheddable_permille > 0 {
+            assert!(sheddable >= 1);
+        }
+        if shares.sheddable_permille == 0 {
+            assert_eq!(sheddable, 0);
+        }
+    }
+
+    /// `scale_permille` is `floor(limit * permille / 1000)` and never exceeds
+    /// the limit.
+    #[kani::proof]
+    #[kani::solver(cadical)]
+    fn scale_permille_is_a_floor() {
+        let limit: usize = kani::any();
+        let permille: u16 = kani::any();
+        kani::assume(permille <= PERMILLE);
+        let scaled = scale_permille(limit, permille);
+        assert!(scaled <= limit);
+        let wide = scaled as u128 * u128::from(PERMILLE);
+        let exact = limit as u128 * u128::from(permille);
+        assert!(wide <= exact);
+        assert!(exact < wide + u128::from(PERMILLE));
+    }
+
+    /// One AIMD update keeps the limit in `min..=max`, from any state in
+    /// bounds and for any sample.
+    #[kani::proof]
+    fn aimd_stays_in_bounds() {
+        let min: usize = kani::any();
+        let max: usize = kani::any();
+        let initial: usize = kani::any();
+        let Ok(bounds) = LimitBounds::new(min, max, initial) else {
+            return;
+        };
+        let mut aimd = Aimd::new(bounds, Duration::from_millis(kani::any::<u16>().into()));
+        let sample = Sample {
+            rtt: Duration::from_millis(kani::any::<u16>().into()),
+            in_flight: kani::any(),
+            dropped: kani::any(),
+            at: Duration::ZERO,
+        };
+        let before = aimd.limit;
+        let after = aimd.update(sample);
+        assert!(after >= bounds.min() && after <= bounds.max());
+        // An increase is by at most one.
+        assert!(after <= before.saturating_add(1));
+        // A drop never raises the limit.
+        if sample.dropped {
+            assert!(after <= before);
+        }
+    }
+
+    /// The `f64` clamp that Gradient2 and Vegas use maps every value,
+    /// including NaN and both infinities, into the bounds. Limits are below
+    /// 2^52, as `usize_to_f64` documents; above that the cast can round.
+    #[kani::proof]
+    fn clamp_f64_lands_in_bounds() {
+        let min: usize = kani::any();
+        let max: usize = kani::any();
+        kani::assume(max < (1 << 52));
+        let Ok(bounds) = LimitBounds::new(min, max, min) else {
+            return;
+        };
+        let value: f64 = kani::any();
+        let limit = f64_to_usize(bounds.clamp_f64(value));
+        assert!(limit >= bounds.min() && limit <= bounds.max());
+    }
 }
 
 #[cfg(test)]

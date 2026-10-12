@@ -242,3 +242,76 @@ mod tests {
         }
     }
 }
+
+/// Kani proofs over the real functions (issue #3066 follow-up). Run with
+/// `cargo kani -p autumn-web --lib`. Each harness checks every input, not a
+/// sample, and Kani also checks that no arithmetic overflows or panics.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Entropy whose one draw is any `u64`.
+    #[derive(Debug)]
+    struct AnyDraw(u64);
+
+    impl Entropy for AnyDraw {
+        fn next_u64(&self) -> u64 {
+            self.0
+        }
+        fn fill_bytes(&self, dest: &mut [u8]) {
+            dest.fill(0);
+        }
+    }
+
+    /// The ceiling is at most `cap`, and is exactly `base * 2^retry` while
+    /// that product is below `cap` and does not overflow.
+    #[kani::proof]
+    fn ceiling_is_capped_and_exact_below_the_cap() {
+        let base: u64 = kani::any();
+        let cap: u64 = kani::any();
+        let retry: u32 = kani::any();
+        let ceiling = ceiling_ms(base, cap, retry);
+        assert!(ceiling <= cap);
+        if retry < u64::BITS {
+            if let Some(raw) = base.checked_mul(1_u64 << retry) {
+                assert_eq!(ceiling, raw.min(cap));
+            }
+        }
+    }
+
+    /// The ceiling never decreases from one retry to the next.
+    #[kani::proof]
+    fn ceiling_is_monotonic() {
+        let base: u64 = kani::any();
+        let cap: u64 = kani::any();
+        let retry: u32 = kani::any();
+        kani::assume(retry < u32::MAX);
+        assert!(ceiling_ms(base, cap, retry) <= ceiling_ms(base, cap, retry + 1));
+    }
+
+    /// Every draw gives a delay in `[0, ceiling]`, with no overflow, and the
+    /// two ends are reachable.
+    #[kani::proof]
+    fn full_jitter_is_within_the_ceiling() {
+        let base: u64 = kani::any();
+        let cap: u64 = kani::any();
+        let retry: u32 = kani::any();
+        let entropy = AnyDraw(kani::any());
+        let delay = full_jitter_ms(&entropy, base, cap, retry);
+        assert!(delay <= ceiling_ms(base, cap, retry));
+        assert!(delay <= cap);
+        kani::cover!(delay == 0);
+        kani::cover!(delay == cap && cap > 0);
+    }
+
+    /// The hinted wait is in `[backoff, backoff + 5 s]`, saturating.
+    #[kani::proof]
+    fn retry_after_wait_is_in_its_window() {
+        let backoff = Duration::new(kani::any(), kani::any::<u32>() % 1_000_000_000);
+        let hint = Duration::new(kani::any(), kani::any::<u32>() % 1_000_000_000);
+        let wait = retry_after_wait(hint, backoff);
+        assert!(wait >= backoff);
+        assert!(wait <= backoff.saturating_add(RETRY_AFTER_SLACK));
+        assert!(wait >= hint.min(RETRY_AFTER_SLACK));
+    }
+}

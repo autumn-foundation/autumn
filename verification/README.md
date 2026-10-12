@@ -108,6 +108,98 @@ runtime rounds it down. The clamp makes the property true for both. The model
 does not include the floating-point algorithms. Unit tests and sim tests
 examine them.
 
+## Circuit breaker half-open accounting
+
+`circuit_breaker.rs` models `CircuitBreakerInner` in
+`autumn/src/circuit_breaker.rs`. Each step is one critical section of the
+runtime. It proves:
+
+- Every step keeps the invariant: in the half-open state, the successful
+  trials plus the running trials never exceed `half_open_trial_count`.
+- A fresh half-open breaker admits a trial. This needs at least one trial.
+  With 0 trials, the breaker refuses every call for ever, and the proof
+  `zero_trials_strand_the_breaker` shows it. That found a real bug: a policy
+  built in code skipped the clamp to 1. `CircuitBreakerPolicy::clamped` now
+  applies it.
+- A call from an older generation changes nothing, and the generation never
+  goes back.
+
+## Retry budget
+
+`retry_budget.rs` models the token bucket in `autumn/src/retry_budget.rs`
+(issue #3058). It proves that a step never passes the capacity, that a
+release undoes its acquire, and that a full bucket grants exactly
+`capacity / cost` retries. Shuttle and loom check the compare-exchange loop
+around each step (see below).
+
+## Tenant bulkhead
+
+`bulkhead.rs` models `TenantBulkhead` in `autumn/src/bulkhead.rs`. It proves
+that no tenant passes its cap, that tenants are isolated, and that a permit
+that comes back leaves the map exactly as it was. Thus the map cannot leak
+entries for tenant ids from requests.
+
+## Backoff and jitter
+
+`backoff.rs` models `ceiling_ms` and `full_jitter_ms` in
+`autumn/src/backoff.rs` (issue #3054), and the equal jitter of the outbox
+relay. Its `ceiling_ms` uses the runtime's shift and saturating multiply, and
+Verus proves that it equals `min(cap, base * 2^retry)`. It also proves that
+the ceiling never decreases, and that no jitter overflows.
+
+## Kani proofs
+
+Kani checks the shipped functions, not a model of them. The harnesses are in
+`#[cfg(kani)] mod kani_proofs` blocks next to the code:
+
+| File | Proves |
+| --- | --- |
+| `autumn/src/backoff.rs` | The ceiling is capped, exact and monotonic. Every jitter draw is in `[0, ceiling]`. A `Retry-After` wait is in its window. |
+| `autumn/src/admission.rs` | The `u128` scale is the exact floor for every `usize` limit, so with `scaled_is_monotone` above the thresholds are nested for every limit. No threshold is above the limit, and a positive share never sheds at idle. An AIMD step stays in bounds. The `f64` clamp maps NaN and both infinities into bounds. |
+| `autumn/src/range.rs` | A satisfiable range is inside the body, for every short spec and every size. The slicer never panics. |
+| `autumn/src/outbox.rs` | The relay retry delay is in `[ceiling / 2, ceiling]` and never overflows. |
+| `autumn/src/custom_domain.rs` | The certificate backoff is capped, monotonic, and starts at the base. |
+| `autumn/src/time_math.rs` | `saturating_time_delta_secs` never panics, and is exact when the count fits. |
+
+Run them with:
+
+```sh
+cargo install --locked kani-verifier --version 0.68.0
+cargo kani setup
+cargo kani -p autumn-web --lib
+```
+
+`.github/workflows/kani.yml` runs them when a file with a harness changes, and
+each Monday. It is not a required check yet. The workflow names each file that
+holds a harness. `resilience_hygiene.rs` fails when a harness is in a file that
+it does not name.
+
+## loom and Shuttle over the real code
+
+`autumn/src/sync_shim.rs` gives the retry budget, the tenant bulkhead, the
+circuit breaker and the adaptive limiter their locks and atomics. In a normal
+build they are `std::sync`. Under `--cfg loom_models` they are loom's, and
+under `--cfg shuttle_models` they are Shuttle's. Thus the `real_code` models
+in `autumn/tests/loom_models.rs` and every test in
+`autumn/tests/shuttle_models.rs` run the shipped code:
+
+```sh
+RUSTFLAGS="--cfg loom_models" LOOM_MAX_PREEMPTIONS=3 \
+  cargo test -p autumn-web --release --test loom_models
+RUSTFLAGS="--cfg shuttle_models" \
+  cargo test -p autumn-web --release --test shuttle_models
+```
+
+loom checks every interleaving of two or three threads. Shuttle samples random
+and PCT schedules, so it checks more threads and async tasks that hold a lock
+or a permit across an `.await`. Its test `shuttle_finds_a_seeded_lost_update`
+must find a lost update in a racy counter. If it does not, the scheduler is
+not interleaving and the other tests prove nothing.
+
+A module can use the shim only when it creates every lock and atomic at run
+time. A `static` is created outside the checker, and loom and Shuttle types
+panic there.
+
 ## Protocol models
 
 `models/` is the `autumn-protocol-models` crate (issue #3071). It holds

@@ -312,16 +312,17 @@ fn if_range_matches(if_range: &str, validator: Option<&Validator<'_>>) -> bool {
 /// this clamps defensively (and via `try_from`, not `as`, so it never truncates
 /// on a 32-bit target) so a bad caller can never panic on slice bounds.
 fn slice_inclusive(full: &Bytes, start: u64, end: u64) -> Bytes {
-    if full.is_empty() {
-        return Bytes::new();
-    }
-    let last = full.len() - 1;
+    inclusive_bounds(full.len(), start, end).map_or_else(Bytes::new, |(lo, hi)| full.slice(lo..=hi))
+}
+
+/// The inclusive indices `[lo, hi]` that [`slice_inclusive`] takes from a body
+/// of `len` bytes: `[start, end]` clamped to the body, or `None` when that is
+/// empty. Always `lo <= hi < len`, so the slice cannot panic; Kani proves it.
+fn inclusive_bounds(len: usize, start: u64, end: u64) -> Option<(usize, usize)> {
+    let last = len.checked_sub(1)?;
     let lo = usize::try_from(start).unwrap_or(usize::MAX).min(last);
     let hi = usize::try_from(end).unwrap_or(usize::MAX).min(last);
-    if lo > hi {
-        return Bytes::new();
-    }
-    full.slice(lo..=hi)
+    (lo <= hi).then_some((lo, hi))
 }
 
 /// Build the in-memory response for a resolved range over `full` bytes.
@@ -390,6 +391,61 @@ pub fn unsatisfied_content_range(total: u64) -> String {
 /// Set `Accept-Ranges: bytes` on a header map, advertising range support.
 pub fn set_accept_ranges(headers: &mut HeaderMap) {
     headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+}
+
+/// Kani proofs over the real range parser. Run with
+/// `cargo kani -p autumn-web --lib`. A spec is any string of up to four bytes
+/// over `0`, `9`, `-` and a space, so the proof covers every short spec shape
+/// (`N-`, `N-M`, `-N`, backwards, empty, padded) and every `total`.
+/// `parse_range` returns the first satisfiable spec unchanged, so this bound
+/// carries over to a whole header.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    const ALPHABET: [u8; 4] = *b"09- ";
+
+    /// A satisfiable spec is a non-empty interval inside the representation:
+    /// `start <= end < total`. Parsing never panics.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    #[kani::solver(cadical)]
+    fn a_satisfiable_spec_is_inside_the_body() {
+        let mut bytes = [0_u8; 4];
+        for byte in &mut bytes {
+            *byte = ALPHABET[usize::from(kani::any::<u8>() % 4)];
+        }
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        // Every byte is ASCII, so this cannot fail.
+        let spec = std::str::from_utf8(&bytes[..len]).unwrap();
+        let total: u64 = kani::any();
+        if let SpecOutcome::Satisfiable { start, end } = parse_single_spec(spec, total) {
+            assert!(start <= end);
+            assert!(end < total);
+        }
+    }
+
+    /// The slicer's indices are always inside the body, for every length
+    /// and every pair of offsets, so `Bytes::slice` cannot panic. A range
+    /// inside the body is taken exactly. (`Bytes` itself is too large for
+    /// the solver, so the harness checks the index math it is fed.)
+    #[kani::proof]
+    fn slice_bounds_are_inside_the_body() {
+        let len: usize = kani::any();
+        let start: u64 = kani::any();
+        let end: u64 = kani::any();
+        match inclusive_bounds(len, start, end) {
+            Some((lo, hi)) => assert!(lo <= hi && hi < len),
+            None => assert!(len == 0 || start > end),
+        }
+        if start <= end && end < len as u64 {
+            assert_eq!(
+                inclusive_bounds(len, start, end),
+                Some((start as usize, end as usize))
+            );
+        }
+    }
 }
 
 #[cfg(test)]
