@@ -1092,6 +1092,8 @@ impl DatabaseFleet {
             match guard.fleet.open_now(guard.key.clone(), create).await {
                 Ok(db) => {
                     let _ = guard.entry.cell.set(db.clone());
+                    // The caller may be gone; the cap is the opener's to keep.
+                    guard.fleet.enforce_capacity(Some(&guard.key));
                     Ok(db)
                 }
                 Err(error) => {
@@ -3596,10 +3598,11 @@ mod tests {
         );
     }
 
-    /// Cancel `call` once the slow `on_open` hook is running.
+    /// Cancel `call` once a new run of the slow `on_open` hook has started.
     async fn cancelled_in_hook<T>(hook: &SlowOpen, call: impl Future<Output = T>) {
+        let before = hook.started.load(Ordering::SeqCst);
         let started = async {
-            while hook.started.load(Ordering::SeqCst) == 0 {
+            while hook.started.load(Ordering::SeqCst) == before {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
         };
@@ -3712,6 +3715,25 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert_eq!(hook.0.load(Ordering::SeqCst), 1, "one opener, not five");
         assert!(fleet.open_keys().is_empty(), "the failed entry is gone");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_open_still_keeps_the_fleet_within_max_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |c| c.max_open = 1);
+        let hook = SlowOpen::new(Duration::from_millis(100));
+        fleet.add_lifecycle(hook.clone());
+        fleet.open(&FleetDbKey::Slot(28)).await.unwrap();
+        let second = FleetDbKey::Slot(29);
+        // The caller leaves; the opener task still fills the entry.
+        cancelled_in_hook(&hook, fleet.open(&second)).await;
+        for _ in 0..500 {
+            if fleet.stats().open == 1 && fleet.stats().draining == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the older database stayed open: {:?}", fleet.open_keys());
     }
 
     #[tokio::test]
