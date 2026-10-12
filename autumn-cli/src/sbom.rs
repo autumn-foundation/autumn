@@ -232,46 +232,83 @@ impl Component {
 /// Canonical crates.io registry source, as `cargo metadata` spells it.
 const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
+/// Where a package came from, as far as the input says.
+///
+/// A URL is only present when the input recorded one, so a purl qualifier
+/// cannot be built from an empty URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin<'a> {
+    /// Workspace member or path dependency. Not published.
+    Path,
+    /// The canonical crates.io registry.
+    CratesIo,
+    /// Another registry. `None` when the input does not name it.
+    Registry(Option<&'a str>),
+    /// A git repository. `None` when the input has no URL.
+    Git(Option<&'a str>),
+    /// A source kind this code does not know.
+    Other,
+}
+
+impl<'a> Origin<'a> {
+    /// Classify a `cargo metadata` source string (`None` is a path package).
+    fn from_cargo_source(source: Option<&'a str>) -> Self {
+        match source {
+            None => Self::Path,
+            Some(CRATES_IO_SOURCE) => Self::CratesIo,
+            Some(src) if src.starts_with("git+") => Self::Git(url_part(src)),
+            Some(src) if src.starts_with("registry+") || src.starts_with("sparse+") => {
+                Self::Registry(url_part(src))
+            }
+            Some(_) => Self::Other,
+        }
+    }
+
+    /// Classify a `cargo-auditable` source category. It records no URLs.
+    fn from_audit_source(source: Option<&str>) -> Origin<'static> {
+        match source {
+            Some("crates.io") => Origin::CratesIo,
+            Some("registry") => Origin::Registry(None),
+            Some("git") => Origin::Git(None),
+            Some("local") | None => Origin::Path,
+            Some(_) => Origin::Other,
+        }
+    }
+}
+
+/// The URL after the `scheme+` prefix, if it is not empty.
+fn url_part(src: &str) -> Option<&str> {
+    src.split_once('+')
+        .map(|(_, url)| url)
+        .filter(|url| !url.is_empty())
+}
+
 /// A package URL, plus the `bom-ref` to use when there is no meaningful one.
 ///
-/// `pkg:cargo/<name>@<version>` asserts a **crates.io** identity. Emitting it
-/// for a path dependency points a scanner at a package that either does not
-/// exist or belongs to somebody else — this workspace alone has 27 path
-/// packages, several of which (`blog`, `bookmarks`, …) are not published
-/// anywhere. A git or alternate-registry dependency is not crates.io either,
-/// so it carries a qualifier naming where it actually came from.
+/// `pkg:cargo/<name>@<version>` asserts a **crates.io** identity. Claiming it
+/// for a path, git or other-registry package points a scanner at a different
+/// crate. Such a package gets a qualifier that names its source, or no purl
+/// when the source is not known.
 ///
 /// Returns `(purl, bom_ref)`; `purl` is `None` when the component has no
-/// registry identity to claim, and `bom_ref` then uses a scheme that says so.
-fn package_url(name: &str, version: &str, source: Option<&str>) -> (Option<String>, String) {
+/// identity to claim, and `bom_ref` then uses a scheme that says so.
+fn package_url(name: &str, version: &str, origin: Origin<'_>) -> (Option<String>, String) {
     let bare = format!("pkg:cargo/{name}@{version}");
-    match source {
-        // Unpublished: a workspace member or path dependency.
-        None => (None, format!("path:{name}@{version}")),
-        Some(CRATES_IO_SOURCE) => (Some(bare.clone()), bare),
-        Some(src) if src.starts_with("git+") => {
-            let qualified = format!(
-                "{bare}?vcs_url={}",
-                percent_encoding::utf8_percent_encode(
-                    src.trim_start_matches("git+"),
-                    percent_encoding::NON_ALPHANUMERIC
-                )
-            );
-            (Some(qualified.clone()), qualified)
-        }
-        Some(src) if src.starts_with("registry+") || src.starts_with("sparse+") => {
-            let qualified = format!(
-                "{bare}?repository_url={}",
-                percent_encoding::utf8_percent_encode(
-                    src.split_once('+').map_or(src, |(_, url)| url),
-                    percent_encoding::NON_ALPHANUMERIC
-                )
-            );
-            (Some(qualified.clone()), qualified)
-        }
-        // Something cargo grew since this was written: record it without
-        // claiming it is crates.io.
-        Some(_) => (None, format!("other:{name}@{version}")),
+    let qualified = |key: &str, url: &str| {
+        let q = format!(
+            "{bare}?{key}={}",
+            percent_encoding::utf8_percent_encode(url, percent_encoding::NON_ALPHANUMERIC)
+        );
+        (Some(q.clone()), q)
+    };
+    match origin {
+        Origin::Path => (None, format!("path:{name}@{version}")),
+        Origin::CratesIo => (Some(bare.clone()), bare),
+        Origin::Git(Some(url)) => qualified("vcs_url", url),
+        Origin::Git(None) => (None, format!("git:{name}@{version}")),
+        Origin::Registry(Some(url)) => qualified("repository_url", url),
+        Origin::Registry(None) => (None, format!("registry:{name}@{version}")),
+        Origin::Other => (None, format!("other:{name}@{version}")),
     }
 }
 
@@ -408,7 +445,11 @@ fn component_from_package(pkg: &serde_json::Value) -> Result<Component, SbomErro
         .ok_or_else(|| SbomError::Metadata("a package has no `name`".into()))?;
     let version = str_field(pkg, "version")
         .ok_or_else(|| SbomError::Metadata(format!("package `{name}` has no `version`")))?;
-    let (purl, bom_ref) = package_url(name, version, str_field(pkg, "source"));
+    let (purl, bom_ref) = package_url(
+        name,
+        version,
+        Origin::from_cargo_source(str_field(pkg, "source")),
+    );
     Ok(Component {
         kind: "library".into(),
         bom_ref: Some(bom_ref),
@@ -796,19 +837,12 @@ struct AuditData {
 }
 
 fn component_from_audit(pkg: &AuditPackage) -> Component {
-    // cargo-auditable records a vocabulary of its own ("crates.io", "registry",
-    // "git", "local", …) rather than a cargo source URL, so translate it to the
-    // same "only claim a crates.io identity when it IS one" rule.
+    // cargo-auditable records a category, not a URL, so only "crates.io"
+    // earns a purl.
     let (purl, bom_ref) = package_url(
         &pkg.name,
         &pkg.version,
-        match pkg.source.as_deref() {
-            Some("crates.io" | "registry") => Some(CRATES_IO_SOURCE),
-            // No URL is recorded, so there is nothing to qualify with; say it
-            // is not a registry package rather than claiming it is.
-            Some("git") => Some("git+"),
-            _ => None,
-        },
+        Origin::from_audit_source(pkg.source.as_deref()),
     );
     let kind = pkg.kind.as_deref().unwrap_or("runtime");
     let mut properties = Vec::new();
@@ -2469,6 +2503,83 @@ mod tests {
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
         assert_eq!(v["components"].as_array().unwrap().len(), 1);
+    }
+
+    /// One package per audit source category, all sharing `name@version`.
+    const AUDIT_MIXED_JSON: &str = r#"{"packages":[
+        {"name":"app","version":"1.0.0","source":"local","root":true},
+        {"name":"dup","version":"1.0.0","source":"crates.io"},
+        {"name":"dup","version":"1.0.0","source":"registry"},
+        {"name":"dup","version":"1.0.0","source":"git"},
+        {"name":"dup","version":"1.0.0","source":"local"},
+        {"name":"dup","version":"1.0.0","source":"future-kind"}]}"#;
+
+    fn audit_components(json: &str) -> Vec<serde_json::Value> {
+        let bom = bom_from_audit_data(json, "0.7.0").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
+        v["components"].as_array().unwrap().clone()
+    }
+
+    fn audit_component(source: &str) -> serde_json::Value {
+        let json =
+            format!(r#"{{"packages":[{{"name":"dup","version":"1.0.0","source":"{source}"}}]}}"#);
+        audit_components(&json).remove(0)
+    }
+
+    #[test]
+    fn audit_crates_io_keeps_the_canonical_purl() {
+        let c = audit_component("crates.io");
+        assert_eq!(c["purl"], "pkg:cargo/dup@1.0.0");
+        assert_eq!(c["bom-ref"], "pkg:cargo/dup@1.0.0");
+    }
+
+    #[test]
+    fn audit_registry_claims_no_purl() {
+        let c = audit_component("registry");
+        assert!(c.get("purl").is_none(), "{c}");
+        assert_eq!(c["bom-ref"], "registry:dup@1.0.0");
+    }
+
+    #[test]
+    fn audit_git_claims_no_purl() {
+        let c = audit_component("git");
+        assert!(c.get("purl").is_none(), "{c}");
+        assert_eq!(c["bom-ref"], "git:dup@1.0.0");
+    }
+
+    #[test]
+    fn audit_local_and_unknown_claim_no_purl() {
+        let local = audit_component("local");
+        assert!(local.get("purl").is_none(), "{local}");
+        assert_eq!(local["bom-ref"], "path:dup@1.0.0");
+        let other = audit_component("future-kind");
+        assert!(other.get("purl").is_none(), "{other}");
+        assert_eq!(other["bom-ref"], "other:dup@1.0.0");
+    }
+
+    #[test]
+    fn audit_mixed_sources_keep_origin_and_unique_refs() {
+        let comps = audit_components(AUDIT_MIXED_JSON);
+        assert_eq!(comps.len(), 5);
+        let mut refs: Vec<&str> = comps
+            .iter()
+            .map(|c| c["bom-ref"].as_str().unwrap())
+            .collect();
+        refs.sort_unstable();
+        refs.dedup();
+        assert_eq!(refs.len(), 5, "bom-refs must be unique: {refs:?}");
+        for c in &comps {
+            assert!(
+                c["properties"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p["name"] == "cargo:source"),
+                "missing cargo:source: {c}"
+            );
+            let purl = c.get("purl").and_then(|p| p.as_str());
+            assert!(purl.is_none_or(|p| !p.contains("vcs_url=")), "{c}");
+        }
     }
 
     #[test]
