@@ -906,6 +906,12 @@ impl DatabaseFleet {
     /// [`open`](Self::open) error.
     pub async fn provision(&self, key: &FleetDbKey) -> Result<FleetDatabase, FleetError> {
         self.check_key(key)?;
+        if self.lock_state().shutting_down {
+            return Err(FleetError::Unavailable {
+                name: key.name(),
+                detail: "the fleet is shutting down".to_owned(),
+            });
+        }
         let path = self.path_of(key);
         if path.exists() {
             return Err(FleetError::AlreadyExists { name: key.name() });
@@ -1540,8 +1546,8 @@ impl DatabaseFleet {
 
     /// Join the running open of `entry`, or cancel it. The probe's
     /// initializer holds the cell's init permit, and `OnceCell` runs one
-    /// initializer at a time. So every opener init either finished before the
-    /// probe, and the cell has a value, or runs after it and sees `cancelled`.
+    /// initializer at a time. An opener that ran first has filled the cell.
+    /// An opener that runs later sees `cancelled`.
     async fn settle_entry(&self, key: &FleetDbKey, entry: &Arc<Entry>) {
         let _ = entry
             .cell
@@ -2214,8 +2220,8 @@ fn publish_restored(staging: &Path, path: &Path, name: &str) -> Result<(), Fleet
 /// The replica is rebuilt in a private staging file first, so a failed
 /// restore leaves the current file untouched. Then the old files go and the
 /// staging file is linked into place. The old main file goes last. On Unix,
-/// the exclusive guard stays open for this. On Windows, it closes first. A file that appears in that gap
-/// gives `AlreadyExists`.
+/// the exclusive guard stays open for this. On Windows, it closes first.
+/// A file that appears in that gap gives `AlreadyExists`.
 fn restore_in_place(
     replication: &super::fleet_replication::FleetReplication,
     key: &FleetDbKey,
@@ -2355,6 +2361,10 @@ fn remove_database_files(path: &Path, root: &Path, name: &str) -> Result<bool, F
 /// The main file goes last. Once it is gone, another process can publish a
 /// new database at the path. Any unlink after that could hit the new
 /// database's `-wal`.
+///
+/// On Windows, a process that has the database open also holds its `-wal`.
+/// The sharing violation then stops the unlink at the sidecar, before the
+/// main file goes.
 fn unlink_database_set(
     path: &Path,
     op: &'static str,
@@ -3585,5 +3595,48 @@ mod tests {
         );
         let after = fleet.open(&FleetDbKey::Slot(23)).await;
         assert!(matches!(after, Err(FleetError::Unavailable { .. })));
+    }
+
+    #[test]
+    fn a_sharing_violation_on_a_sidecar_stops_before_the_main_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = plain_database(tmp.path());
+        let err = unlink_database_set(&path, "delete database", "acme", |file| {
+            if file == path {
+                std::fs::remove_file(file)
+            } else {
+                Err(std::io::Error::from_raw_os_error(32))
+            }
+        });
+        if cfg!(windows) {
+            assert!(matches!(err, Err(FleetError::InUseElsewhere { .. })));
+        } else {
+            assert!(err.is_err());
+        }
+        assert!(path.is_file(), "the main file is still there");
+    }
+
+    #[test]
+    fn remove_database_files_removes_everything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = plain_database(tmp.path());
+        let sidecars = crate::fleet_layout::sidecar_paths(&path);
+        for sidecar in &sidecars {
+            std::fs::write(sidecar, b"x").unwrap();
+        }
+        assert!(remove_database_files(&path, tmp.path(), "acme").unwrap());
+        assert!(!path.exists());
+        assert!(sidecars.iter().all(|sidecar| !sidecar.exists()));
+    }
+
+    #[tokio::test]
+    async fn provision_after_shutdown_creates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Tenant, |_| {});
+        let key = fleet.key_for("acme").unwrap();
+        fleet.close_all().await;
+        let err = fleet.provision(&key).await.unwrap_err();
+        assert!(matches!(err, FleetError::Unavailable { .. }), "{err}");
+        assert!(!fleet.path_of(&key).exists());
     }
 }

@@ -13165,7 +13165,7 @@ fn start_fleet_replication(
             restore_missing,
             state.clock_arc(),
         )
-        // The flush runs inside the shutdown budget.
+        // The deadline is the full timeout. The shutdown wait also bounds it.
         .with_final_flush(std::time::Duration::from_secs(
             config.server.shutdown_timeout_secs,
         )),

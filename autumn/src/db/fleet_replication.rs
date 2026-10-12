@@ -133,7 +133,8 @@ impl FleetReplication {
         }
     }
 
-    /// Set the longest the shutdown flush keeps shipping.
+    /// Set the longest the shutdown flush keeps shipping. The default is 5
+    /// seconds.
     #[must_use]
     pub const fn with_final_flush(mut self, deadline: Duration) -> Self {
         self.final_flush = deadline;
@@ -147,18 +148,23 @@ impl FleetReplication {
     }
 
     /// Tick until no replicator is parked, or until `deadline` passes.
-    /// Blocking. Return the names still unshipped. Each one is logged with
-    /// `error!` and shown in the health details.
+    /// This call blocks. It returns the names still unshipped. Each one is
+    /// logged with `error!`. The call replaces the `unshipped` list in the
+    /// health details.
+    ///
+    /// The deadline counts the sleeps, not a clock. A pinned or virtual clock
+    /// cannot make the loop run forever.
     pub fn flush_closing(&self, deadline: Duration) -> Vec<String> {
-        let started = self.clock.monotonic();
+        let mut waited = Duration::ZERO;
         loop {
             self.tick_all();
-            let left =
-                deadline.saturating_sub(self.clock.monotonic().saturating_duration_since(started));
+            let left = deadline.saturating_sub(waited);
             if self.closing() == 0 || left.is_zero() {
                 break;
             }
-            std::thread::sleep(FLUSH_RETRY.min(left));
+            let step = FLUSH_RETRY.min(left);
+            std::thread::sleep(step);
+            waited += step;
         }
         let mut unshipped: Vec<String> = self.parked().keys().map(FleetDbKey::name).collect();
         unshipped.sort();

@@ -9,6 +9,6 @@
   - `close_all` waits for an open in flight and closes it. After it starts,
     every open fails with `503`.
   - At shutdown, the fleet keeps shipping parked replicators until they catch
-    up or the flush deadline (`server.shutdown_timeout_secs`) passes. It logs
+    up or the flush deadline passes (`server.shutdown_timeout_secs`, bounded by the shutdown wait). It logs
     an `error!` for each database it could not ship and lists them as
     `unshipped` in the `replication:fleet` health details.
