@@ -157,19 +157,20 @@ impl FleetReplication {
     /// health details.
     ///
     /// The deadline uses real elapsed time, ticks included. A pinned or
-    /// virtual clock cannot make the loop run forever. A tick that is already
-    /// running cannot be stopped, so the call can overrun by one tick. No tick
-    /// starts after the deadline.
+    /// virtual clock cannot make the loop run forever. No tick starts after
+    /// the deadline, and a replica that another thread holds is skipped. A
+    /// tick that is already running cannot be stopped, so the call can
+    /// overrun by one tick.
     pub fn flush_closing(&self, deadline: Duration) -> Vec<String> {
         // Real time on purpose: the wait is blocking I/O, not simulated work.
         #[allow(clippy::disallowed_methods)]
         let started = std::time::Instant::now();
+        let cutoff = started.checked_add(deadline);
         loop {
-            let left = deadline.saturating_sub(started.elapsed());
-            if left.is_zero() {
+            if expired(cutoff) {
                 break;
             }
-            self.tick_all();
+            self.tick_pass(cutoff);
             if self.closing() == 0 {
                 break;
             }
@@ -244,16 +245,24 @@ impl FleetReplication {
     /// that has caught up. Blocking. The loop calls this; tests call it to
     /// step replication without sleeping.
     pub fn tick_all(&self) {
+        self.tick_pass(None);
+    }
+
+    /// One tick pass. With a `cutoff`, no replica starts after it, and a
+    /// replica that another thread holds is skipped, not waited for.
+    fn tick_pass(&self, cutoff: Option<std::time::Instant>) {
         let active: Vec<(FleetDbKey, Arc<ActiveReplica>)> = self
             .active()
             .iter()
             .map(|(key, replica)| (key.clone(), Arc::clone(replica)))
             .collect();
         for (key, replica) in active {
-            let mut replicator = replica
-                .replicator
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            if expired(cutoff) {
+                return;
+            }
+            let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
+                continue;
+            };
             if let Err(error) = replicator.tick() {
                 tracing::warn!(database = %key, error = %error, "fleet replication tick failed");
             }
@@ -264,13 +273,14 @@ impl FleetReplication {
             .map(|(key, replica)| (key.clone(), Arc::clone(replica)))
             .collect();
         for (key, replica) in parked {
-            let caught_up = {
-                let mut replicator = replica
-                    .replicator
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                ship_until_caught_up(&mut replicator).is_ok()
+            if expired(cutoff) {
+                return;
+            }
+            let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
+                continue;
             };
+            let caught_up = ship_until_caught_up(&mut replicator, cutoff).is_ok();
+            drop(replicator);
             if caught_up && self.retire_parked(&key, &replica) {
                 tracing::info!(database = %key, "fleet replication: closed database caught up");
             }
@@ -467,7 +477,7 @@ impl FleetLifecycle for FleetReplication {
                 .replicator
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            ship_until_caught_up(&mut replicator)
+            ship_until_caught_up(&mut replicator, None)
         };
         if let Err(error) = shipped {
             tracing::warn!(
@@ -493,8 +503,14 @@ impl FleetLifecycle for FleetReplication {
 ///
 /// A tick failed, made no progress, or the backlog outlasted
 /// [`FINAL_SHIP_MAX_TICKS`].
-fn ship_until_caught_up(replicator: &mut Replicator) -> Result<(), String> {
+fn ship_until_caught_up(
+    replicator: &mut Replicator,
+    cutoff: Option<std::time::Instant>,
+) -> Result<(), String> {
     for _ in 0..FINAL_SHIP_MAX_TICKS {
+        if expired(cutoff) {
+            return Err("the shutdown flush ran out of time".to_owned());
+        }
         let report = replicator.tick().map_err(|e| e.to_string())?;
         if report.pending_bytes == 0 {
             return Ok(());
@@ -508,6 +524,33 @@ fn ship_until_caught_up(replicator: &mut Replicator) -> Result<(), String> {
         }
     }
     Err(format!("still behind after {FINAL_SHIP_MAX_TICKS} ticks"))
+}
+
+/// Whether `cutoff` has passed. Real time on purpose: the flush bounds
+/// blocking I/O, not simulated work.
+fn expired(cutoff: Option<std::time::Instant>) -> bool {
+    #[allow(clippy::disallowed_methods)]
+    cutoff.is_some_and(|cutoff| std::time::Instant::now() >= cutoff)
+}
+
+/// Lock a replicator. With a `cutoff`, do not wait for another thread.
+fn lock_replicator(
+    replica: &ActiveReplica,
+    cutoff: Option<std::time::Instant>,
+) -> Option<std::sync::MutexGuard<'_, Replicator>> {
+    if cutoff.is_none() {
+        return Some(
+            replica
+                .replicator
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+    }
+    match replica.replicator.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
 }
 
 struct FleetReplicationIndicator {
@@ -1148,5 +1191,28 @@ mod tests {
         .unwrap();
         assert_eq!(left, vec![key.name()], "no time, so no tick");
         assert_eq!(replication.closing(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pass_past_its_cutoff_ships_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        park_one(&fleet).await;
+        flaky.down.store(false, Ordering::SeqCst);
+        crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            // The cutoff is already behind us when the pass checks it.
+            move || replication.tick_pass(Some(std::time::Instant::now()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(replication.closing(), 1, "the pass stopped at the cutoff");
+        crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || replication.tick_pass(None)
+        })
+        .await
+        .unwrap();
+        assert_eq!(replication.closing(), 0, "an open pass ships");
     }
 }
