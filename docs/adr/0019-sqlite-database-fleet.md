@@ -116,10 +116,11 @@ Uppercase is refused, not folded: on a case-insensitive file system `Acme` and
   races with another process that has just published the same path. Closing
   this needs a cross-process reservation of the path (a lock file or
   tombstone). That is roadmap work.
-- Delete and restore cancel an open in flight: the settle probe sets
-  `cancelled` on the entry under the cell's init permit, so an opener that
-  still holds the entry cannot create the file. It claims a new entry and sees
-  the drain.
+- Delete and restore install the drain first, so no new entry can appear.
+  They then settle the entry that was open: the settle probe joins a running
+  open, or sets `cancelled` under the cell's init permit. An opener that
+  still holds a cancelled entry cannot create the file. It claims a new entry
+  and sees the drain. An entry whose open failed is cancelled the same way.
 - `close_all` sets `shutting_down`. Every open then fails with `503`. It
   settles opens in flight, closes every database, and waits until no database
   is open or draining.

@@ -502,6 +502,9 @@ struct Entry {
 /// A database leaving the open map: its key, its handle, its drain marker.
 type Draining = (FleetDbKey, Option<FleetDatabase>, Arc<Drain>);
 
+/// A key taken out of service: its open entry, if any, and its drain marker.
+type Exclusive = (FleetDbKey, Option<Arc<Entry>>, Arc<Drain>);
+
 /// What an opener does next: wait for a drain, or open through an entry.
 enum Next {
     Wait(Arc<Drain>),
@@ -1486,16 +1489,16 @@ impl DatabaseFleet {
     /// [`FleetError::Io`].
     pub async fn delete(&self, key: &FleetDbKey) -> Result<bool, FleetError> {
         self.check_key(key)?;
-        self.settle_opening(key).await;
         let begun = self.begin_exclusive(key, true)?;
-        let Some((key, db, drain)) = begun else {
-            // A plain close runs or an open is in flight; wait, then retry.
+        let Some((key, entry, drain)) = begun else {
+            // A plain close is running; wait, then delete.
             let pending = self.lock_state().draining.get(key).cloned();
             if let Some(pending) = pending {
                 pending.wait().await;
             }
             return Box::pin(self.delete(key)).await;
         };
+        let db = self.take_database(&key, entry).await;
         self.drain(&key, db).await;
         // Hooks let go of the files first (a parked replicator holds one open).
         for hook in self.hooks() {
@@ -1511,8 +1514,8 @@ impl DatabaseFleet {
             // On Unix it also blocks new openers while the files go. On
             // Windows it closes first.
             check_contained(&root, &path)?;
-            with_exclusive_access(&path, &name, HOLD_GUARD_WHILE_REMOVING, || {
-                remove_database_files(&path, &root, &name)
+            with_exclusive_access(&path, &name, HOLD_GUARD_WHILE_REMOVING, |present| {
+                remove_database_files(&path, &root, &name, present)
             })
         })
         .await
@@ -1531,25 +1534,6 @@ impl DatabaseFleet {
         }
         self.finish_drain(&key, &drain);
         removed
-    }
-
-    /// Wait until no open of `key` is in progress, or cancel it. The probe
-    /// joins a running initializer. Otherwise it cancels the entry (see
-    /// [`settle_entry`](Self::settle_entry)), so a later initializer opens
-    /// nothing.
-    async fn settle_opening(&self, key: &FleetDbKey) {
-        loop {
-            let opening = self
-                .lock_state()
-                .open
-                .get(key)
-                .filter(|entry| entry.cell.get().is_none())
-                .cloned();
-            let Some(entry) = opening else {
-                break;
-            };
-            self.settle_entry(key, &entry).await;
-        }
     }
 
     /// Join the running open of `entry`, or cancel it. The probe's
@@ -1580,13 +1564,15 @@ impl DatabaseFleet {
     }
 
     /// Under the lock: take `key` out of service for a delete (openers get
-    /// `410`) or a restore (openers wait). `Ok(None)` when a plain close is
-    /// running or an open is in flight: the caller waits, settles, and retries.
+    /// `410`) or a restore (openers wait). The drain goes in first, so no new
+    /// entry can appear. The caller settles the returned entry with
+    /// [`take_database`](Self::take_database). `Ok(None)` when a plain close
+    /// is running: the caller waits for it, then retries.
     fn begin_exclusive(
         &self,
         key: &FleetDbKey,
         deleting: bool,
-    ) -> Result<Option<Draining>, FleetError> {
+    ) -> Result<Option<Exclusive>, FleetError> {
         let mut state = self.lock_state();
         if let Some(drain) = state.draining.get(key) {
             return if drain.deleting {
@@ -1595,14 +1581,7 @@ impl DatabaseFleet {
                 Ok(None)
             };
         }
-        if let Some(begun) = self.begin_drain_locked(&mut state, key, deleting) {
-            return Ok(Some(begun));
-        }
-        // An opener retried after its entry was cancelled and made a new one.
-        // The drain cannot stop that open, so the caller settles it first.
-        if state.open.contains_key(key) {
-            return Ok(None);
-        }
+        let entry = state.open.remove(key);
         let drain = Arc::new(Drain {
             deleting,
             finished: AtomicBool::new(false),
@@ -1611,7 +1590,20 @@ impl DatabaseFleet {
         state.draining.insert(key.clone(), Arc::clone(&drain));
         drop(state);
         self.inner.in_flight_drains.fetch_add(1, Ordering::Relaxed);
-        Ok(Some((key.clone(), None, drain)))
+        Ok(Some((key.clone(), entry, drain)))
+    }
+
+    /// The database behind an entry that `begin_exclusive` took out of the
+    /// open map. A running open finishes first. An open that has not started
+    /// is cancelled, so it opens nothing.
+    async fn take_database(
+        &self,
+        key: &FleetDbKey,
+        entry: Option<Arc<Entry>>,
+    ) -> Option<FleetDatabase> {
+        let entry = entry?;
+        self.settle_entry(key, &entry).await;
+        entry.cell.get().cloned()
     }
 
     /// Write a consistent copy of a database to `dest` with `VACUUM INTO`.
@@ -1670,8 +1662,8 @@ impl DatabaseFleet {
             .cloned()
             .ok_or_else(|| FleetError::NotReplicated { name: key.name() })?;
         loop {
-            self.settle_opening(key).await;
-            if let Some((key, db, drain)) = self.begin_exclusive(key, false)? {
+            if let Some((key, entry, drain)) = self.begin_exclusive(key, false)? {
+                let db = self.take_database(&key, entry).await;
                 self.drain(&key, db).await;
                 for hook in self.hooks() {
                     hook.release(&key);
@@ -2173,7 +2165,8 @@ fn exclusive_guard(
 /// so our guard would block the removal.
 const HOLD_GUARD_WHILE_REMOVING: bool = !cfg!(windows);
 
-/// Run `work` once no other process has `path` open. Blocking.
+/// Run `work` once no other process has `path` open. Blocking. `work` gets
+/// whether the guard found the file.
 ///
 /// With `hold`, the guard stays open during `work`. Without it, the guard
 /// closes first. Then another process can open the file before `work` runs,
@@ -2183,16 +2176,17 @@ fn with_exclusive_access<T>(
     path: &Path,
     name: &str,
     hold: bool,
-    work: impl FnOnce() -> Result<T, FleetError>,
+    work: impl FnOnce(bool) -> Result<T, FleetError>,
 ) -> Result<T, FleetError> {
     let guard = exclusive_guard(path, name)?;
+    let present = guard.is_some();
     if hold {
-        let done = work();
+        let done = work(present);
         drop(guard);
         done
     } else {
         drop(guard);
-        work()
+        work(present)
     }
 }
 
@@ -2264,8 +2258,8 @@ fn restore_in_place(
             return Err(error);
         }
     };
-    let published = with_exclusive_access(path, &name, HOLD_GUARD_WHILE_REMOVING, || {
-        unlink_database_set(path, "replace database", &name, true, |file| {
+    let published = with_exclusive_access(path, &name, HOLD_GUARD_WHILE_REMOVING, |present| {
+        unlink_database_set(path, "replace database", &name, present, true, |file| {
             std::fs::remove_file(file)
         })?;
         publish_restored(&staging, path, &name)
@@ -2348,9 +2342,14 @@ fn build_staged_database(
 /// when there was no file. The main file goes last (see
 /// [`unlink_database_set`]). After that, only `remove_dir` runs, and it
 /// refuses a non-empty directory.
-fn remove_database_files(path: &Path, root: &Path, name: &str) -> Result<bool, FleetError> {
+fn remove_database_files(
+    path: &Path,
+    root: &Path,
+    name: &str,
+    present: bool,
+) -> Result<bool, FleetError> {
     let existed = path.is_file();
-    unlink_database_set(path, "delete database", name, false, |file| {
+    unlink_database_set(path, "delete database", name, present, false, |file| {
         std::fs::remove_file(file)
     })?;
     let mut dir = path.parent();
@@ -2387,12 +2386,13 @@ fn unlink_database_set(
     path: &Path,
     op: &'static str,
     name: &str,
+    had_main: bool,
     strays: bool,
     mut unlink: impl FnMut(&Path) -> std::io::Result<()>,
 ) -> Result<(), FleetError> {
-    // No guard covers an absent path. Another process can publish there at
-    // any time, and an unlink could hit its new files.
-    let had_main = path.is_file();
+    // `had_main` is what the exclusive guard saw. Do not look again: no guard
+    // covers an absent path, and another process can publish there at any
+    // time. An unlink could then hit its new files.
     if !had_main && !strays {
         return Ok(());
     }
@@ -2979,7 +2979,7 @@ mod tests {
     fn held_access_keeps_other_openers_out() {
         let tmp = tempfile::tempdir().unwrap();
         let path = plain_database(tmp.path());
-        let inner = with_exclusive_access(&path, "plain", true, || {
+        let inner = with_exclusive_access(&path, "plain", true, |_| {
             Ok(exclusive_guard(&path, "plain").map(drop))
         })
         .unwrap();
@@ -2990,7 +2990,7 @@ mod tests {
     fn released_access_lets_the_work_open_the_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = plain_database(tmp.path());
-        let inner = with_exclusive_access(&path, "plain", false, || {
+        let inner = with_exclusive_access(&path, "plain", false, |_| {
             Ok(exclusive_guard(&path, "plain").map(drop))
         })
         .unwrap();
@@ -3008,7 +3008,7 @@ mod tests {
         other.batch_execute("SELECT 1 FROM t").unwrap();
         for hold in [true, false] {
             let ran = std::cell::Cell::new(false);
-            let err = with_exclusive_access(&path, "plain", hold, || {
+            let err = with_exclusive_access(&path, "plain", hold, |_| {
                 ran.set(true);
                 Ok(())
             })
@@ -3518,7 +3518,7 @@ mod tests {
         let path = plain_database(tmp.path());
         let sidecars = crate::fleet_layout::sidecar_paths(&path);
         let mut seen: Vec<PathBuf> = Vec::new();
-        unlink_database_set(&path, "delete database", "acme", false, |file| {
+        unlink_database_set(&path, "delete database", "acme", true, false, |file| {
             seen.push(file.to_path_buf());
             Ok(())
         })
@@ -3538,7 +3538,7 @@ mod tests {
         std::fs::write(&wal, b"old").unwrap();
         // Another process publishes a new database the moment the main file
         // is gone, and commits to its `-wal`.
-        unlink_database_set(&path, "delete database", "acme", false, |file| {
+        unlink_database_set(&path, "delete database", "acme", true, false, |file| {
             let done = std::fs::remove_file(file);
             if file == path {
                 std::fs::write(&path, b"new").unwrap();
@@ -3627,7 +3627,7 @@ mod tests {
     fn a_sharing_violation_on_a_sidecar_stops_before_the_main_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = plain_database(tmp.path());
-        let err = unlink_database_set(&path, "delete database", "acme", false, |file| {
+        let err = unlink_database_set(&path, "delete database", "acme", true, false, |file| {
             if file == path {
                 std::fs::remove_file(file)
             } else {
@@ -3650,7 +3650,7 @@ mod tests {
         for sidecar in &sidecars {
             std::fs::write(sidecar, b"x").unwrap();
         }
-        assert!(remove_database_files(&path, tmp.path(), "acme").unwrap());
+        assert!(remove_database_files(&path, tmp.path(), "acme", true).unwrap());
         assert!(!path.exists());
         assert!(sidecars.iter().all(|sidecar| !sidecar.exists()));
     }
@@ -3667,7 +3667,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_retrying_opener_is_settled_before_the_drain_starts() {
+    async fn the_drain_goes_in_before_a_retrying_opener_is_settled() {
         let tmp = tempfile::tempdir().unwrap();
         let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
         let key = FleetDbKey::Slot(24);
@@ -3676,15 +3676,21 @@ mod tests {
         };
         fleet.settle_entry(&key, &first).await;
         // The cancelled opener retries before the delete takes the key.
-        let Next::Open(_retry) = fleet.claim_entry(&key).unwrap() else {
+        let Next::Open(retry) = fleet.claim_entry(&key).unwrap() else {
             panic!("expected an entry");
         };
-        assert!(
-            fleet.begin_exclusive(&key, true).unwrap().is_none(),
-            "an opener is in flight: settle it first"
-        );
-        assert!(!fleet.delete(&key).await.unwrap());
-        assert!(!fleet.path_of(&key).exists());
+        let (taken, entry, drain) = fleet.begin_exclusive(&key, true).unwrap().unwrap();
+        assert!(entry.is_some(), "the retry entry is handed to the caller");
+        // No new opener gets in, however busy the key is.
+        assert!(matches!(
+            fleet.claim_entry(&key),
+            Err(FleetError::Deleting { .. })
+        ));
+        assert!(fleet.take_database(&taken, entry).await.is_none());
+        let late = fleet.init_entry(&key, true, &retry).await;
+        assert!(matches!(late, Err(Opening::Cancelled)));
+        assert!(!fleet.path_of(&key).exists(), "nothing was created");
+        fleet.finish_drain(&taken, &drain);
     }
 
     #[test]
@@ -3694,7 +3700,7 @@ mod tests {
         // No guard holds an absent path. Another process may publish there
         // at any time, so delete unlinks nothing, not even stray sidecars.
         let mut calls = 0;
-        unlink_database_set(&path, "delete database", "acme", false, |_| {
+        unlink_database_set(&path, "delete database", "acme", false, false, |_| {
             calls += 1;
             Ok(())
         })
@@ -3707,7 +3713,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("plain.db");
         let mut seen = Vec::new();
-        unlink_database_set(&path, "replace database", "acme", true, |file| {
+        unlink_database_set(&path, "replace database", "acme", false, true, |file| {
             seen.push(file.to_path_buf());
             Ok(())
         })
@@ -3729,5 +3735,22 @@ mod tests {
         let late = fleet.init_entry(&key, true, &waiter).await;
         assert!(matches!(late, Err(Opening::Cancelled)));
         assert_eq!(fleet.stats().open, 0, "no untracked pool");
+    }
+
+    #[test]
+    fn the_guard_tells_the_work_whether_the_file_was_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = plain_database(tmp.path());
+        let seen = with_exclusive_access(&path, "plain", true, Ok).unwrap();
+        assert!(seen);
+        let absent = tmp.path().join("missing.db");
+        // The file appears after the guard looked. The work still sees what
+        // the guard saw.
+        let seen = with_exclusive_access(&absent, "missing", true, |present| {
+            std::fs::write(&absent, b"new").unwrap();
+            Ok(present)
+        })
+        .unwrap();
+        assert!(!seen);
     }
 }
