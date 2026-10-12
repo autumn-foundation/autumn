@@ -3,6 +3,9 @@
 # Needs shared_preload_libraries=pg_stat_statements and a superuser role.
 set -euo pipefail
 out=${1:?outdir}; mkdir -p "$out"
+# Absolute: the test runs from the crate directory, where a relative path
+# would name a different place (or none).
+out=$(cd "$out" && pwd)
 P() { psql "$LEDGER_PG_URL/postgres" -XAtq "$@"; }
 P -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements"
 log=$out/test.log; : > "$log"
