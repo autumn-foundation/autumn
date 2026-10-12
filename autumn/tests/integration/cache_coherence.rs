@@ -85,7 +85,9 @@ pub async fn coherence_opaque(seed: i64) -> i64 {
 pub struct CoherenceSettings;
 
 impl CoherenceSettings {
-    pub fn load() -> i64 {
+    // Only the cached read below calls this; nothing runs that read.
+    #[allow(dead_code)]
+    pub const fn load() -> i64 {
         1
     }
 }
