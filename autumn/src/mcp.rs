@@ -2533,8 +2533,11 @@ async fn serve_tools_call(
 
     // MCP Tasks extension: give a task handle to a client that declared the
     // extension. If the store is full, the tool runs as a blocking call.
+    // An x402-priced tool always answers on `/mcp`: a task has no response
+    // to carry the payment challenge or the receipt.
     if tool.task
         && tasks::client_declares_tasks(&params)
+        && !crate::aeo::commerce::prices_route(&server.state, &tool.method, &tool.path_template)
         && let Some((task_id, created)) = reserve_task(server, ctx, &tool.name)
     {
         apply_replay_extensions(&mut request, server, ctx, &audit, true);

@@ -990,6 +990,41 @@ pub(crate) type StaticPages = std::collections::HashMap<String, Option<String>>;
 /// [`StaticPages`] as the layers hold it: `None` outside a static build.
 pub(crate) type StaticPaths = Option<std::sync::Arc<StaticPages>>;
 
+/// `true` when x402 prices `method template`, an MCP tool's route. A task
+/// has no HTTP response to carry the x402 challenge or receipt, so `/mcp`
+/// runs a priced tool as a blocking call even when the client asked for a
+/// task.
+#[cfg(feature = "mcp")]
+#[must_use]
+pub(crate) fn prices_route(state: &crate::state::AppState, method: &str, template: &str) -> bool {
+    #[cfg(feature = "http-client")]
+    {
+        let Some(layer) = state.extension::<SharedX402>().and_then(|s| s.0.clone()) else {
+            return false;
+        };
+        let Ok(method) = axum::http::Method::from_bytes(method.as_bytes()) else {
+            return false;
+        };
+        let Ok(mut req) = axum::http::Request::builder()
+            .method(method)
+            .uri("/")
+            .body(axum::body::Body::empty())
+        else {
+            return false;
+        };
+        req.extensions_mut()
+            .insert(StaticRoute(template.to_owned()));
+        layer.state.priced.route_for(&req).is_some()
+    }
+    #[cfg(not(feature = "http-client"))]
+    {
+        // Without a facilitator a priced route answers `503`, which a task
+        // result carries as well as a blocking call.
+        let _ = (state, method, template);
+        false
+    }
+}
+
 /// The pre-rendered pages x402 prices, split by whether a route renders
 /// them. A routed page is left to the router by the static-first
 /// middleware, so the ingress limits (load shedding, bot protection, rate

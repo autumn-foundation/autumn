@@ -1427,10 +1427,53 @@ mod commerce {
     }
 
     #[cfg(feature = "mcp")]
+    #[get("/api/task-report")]
+    #[api_doc(mcp, task, summary = "Build a report")]
+    async fn task_report() -> Json<Vec<String>> {
+        Json(vec!["report".to_owned()])
+    }
+
+    #[cfg(feature = "mcp")]
     #[post("/api/checkout")]
     #[api_doc(mcp, summary = "Check out")]
     async fn checkout() -> Json<Vec<String>> {
         Json(vec!["checked_out".to_owned()])
+    }
+
+    /// Codex review (P2): a priced tool answers on `/mcp` even when the
+    /// client asks for a task, so the challenge (and later the receipt)
+    /// reaches the client.
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn a_priced_task_tool_answers_with_its_challenge() {
+        let mut config = paid_config();
+        config.aeo.paid_routes = vec![PaidRoute::new("GET", "/api/task-report", "500")];
+        let c = TestApp::new()
+            .config(config)
+            .routes(routes![task_report])
+            .openapi(autumn_web::openapi::OpenApiConfig::new("Shop", "1.0.0"))
+            .mount_mcp("/mcp")
+            .build();
+        let call = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "task_report",
+                "arguments": {},
+                "_meta": {
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "extensions": { "io.modelcontextprotocol/tasks": {} }
+                    }
+                },
+            },
+        });
+        let res = c.post("/mcp").json(&call).send().await;
+        assert!(
+            res.header("payment-required").is_some(),
+            "no challenge: {}",
+            res.text()
+        );
+        let body = res.json::<serde_json::Value>();
+        assert!(body["result"].get("task").is_none(), "{body}");
     }
 
     /// Codex review (P1): with locale-prefix routing, a bare `POST

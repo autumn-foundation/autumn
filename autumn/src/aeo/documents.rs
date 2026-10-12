@@ -674,7 +674,8 @@ fn cors_json(value: &Value) -> Document {
         content_type: JSON,
         headers: vec![
             ("access-control-allow-origin", "*".to_owned()),
-            ("access-control-allow-methods", "GET".to_owned()),
+            // `HEAD` too: the fallback answers it with the same validators.
+            ("access-control-allow-methods", "GET, HEAD".to_owned()),
             (
                 "access-control-allow-headers",
                 "Content-Type, If-None-Match".to_owned(),
@@ -2197,6 +2198,8 @@ mod tests {
             let doc = render(&facts, &origin(), path).unwrap();
             for want in [
                 ("access-control-allow-origin", "*"),
+                // Codex review (P2): a `HEAD` revalidation preflights too.
+                ("access-control-allow-methods", "GET, HEAD"),
                 (
                     "access-control-allow-headers",
                     "Content-Type, If-None-Match",
