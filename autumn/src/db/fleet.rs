@@ -980,7 +980,6 @@ impl DatabaseFleet {
                         .counters
                         .open_failures
                         .fetch_add(1, Ordering::Relaxed);
-                    self.forget_entry(key, &entry);
                     return Err(error);
                 }
             }
@@ -1003,9 +1002,16 @@ impl DatabaseFleet {
                 if entry.cancelled.load(Ordering::Acquire) {
                     return Err(Opening::Cancelled);
                 }
-                self.open_now(key.clone(), create)
-                    .await
-                    .map_err(Opening::Failed)
+                match self.open_now(key.clone(), create).await {
+                    Ok(db) => Ok(db),
+                    Err(error) => {
+                        // Still under the init permit: a waiter on this entry
+                        // sees `cancelled` and goes back to `claim_entry`,
+                        // not to an untracked open.
+                        self.cancel_entry(key, entry);
+                        Err(Opening::Failed(error))
+                    }
+                }
             })
             .await
             .cloned()
@@ -1041,18 +1047,6 @@ impl DatabaseFleet {
         drop(state);
         entry.touch(seq);
         Ok(Next::Open(entry))
-    }
-
-    /// Remove `entry` from the open map, if it is still the one there.
-    fn forget_entry(&self, key: &FleetDbKey, entry: &Arc<Entry>) {
-        let mut state = self.lock_state();
-        if state
-            .open
-            .get(key)
-            .is_some_and(|current| Arc::ptr_eq(current, entry))
-        {
-            state.open.remove(key);
-        }
     }
 
     async fn open_now(&self, key: FleetDbKey, create: bool) -> Result<FleetDatabase, FleetError> {
@@ -3714,5 +3708,21 @@ mod tests {
         })
         .unwrap();
         assert_eq!(seen, crate::fleet_layout::sidecar_paths(&path).to_vec());
+    }
+
+    #[tokio::test]
+    async fn a_waiter_on_a_failed_open_goes_back_to_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        fleet.add_lifecycle(Arc::new(Refuse));
+        let key = FleetDbKey::Slot(25);
+        // A second caller holds the same entry as the opener.
+        let Next::Open(waiter) = fleet.claim_entry(&key).unwrap() else {
+            panic!("expected an entry");
+        };
+        assert!(fleet.open(&key).await.is_err());
+        let late = fleet.init_entry(&key, true, &waiter).await;
+        assert!(matches!(late, Err(Opening::Cancelled)));
+        assert_eq!(fleet.stats().open, 0, "no untracked pool");
     }
 }
