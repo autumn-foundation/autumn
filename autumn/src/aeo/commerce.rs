@@ -412,16 +412,19 @@ pub(crate) fn apply_mpp(spec: &mut Value, routes: &[PaidRoute]) {
         let Some(method) = route.mpp_method.as_deref() else {
             continue;
         };
-        // Match the operation as `PricedRoutes` matches a route: one
-        // trailing `/` and the capture names do not count.
+        // Match the operation as `PricedRoutes` matches a route: capture
+        // names do not count, and one trailing `/` counts only when the spec
+        // has both forms (the exact one wins).
         let Some(op) = spec
             .get_mut("paths")
             .and_then(Value::as_object_mut)
             .and_then(|paths| {
-                paths
-                    .iter_mut()
-                    .find(|(k, _)| same_template(k, &route.path))
-                    .map(|(_, v)| v)
+                let key = paths
+                    .keys()
+                    .find(|k| same_shape(k, &route.path))
+                    .or_else(|| paths.keys().find(|k| same_template(k, &route.path)))?
+                    .clone();
+                paths.get_mut(&key)
             })
             .and_then(|p| p.get_mut(route.method.to_ascii_lowercase()))
             .and_then(Value::as_object_mut)
@@ -2252,6 +2255,27 @@ mod tests {
             spec["paths"]["/api/free"]["get"]
                 .get("x-payment-info")
                 .is_none()
+        );
+
+        // With both forms in the spec, the exact one is priced (Codex review).
+        let mut both = json!({
+            "paths": {
+                "/report": { "get": { "responses": {} } },
+                "/report/": { "get": { "responses": {} } }
+            }
+        });
+        let mut slashed = route();
+        slashed.path = "/report/".to_owned();
+        apply_mpp(&mut both, &[slashed]);
+        assert!(
+            both["paths"]["/report"]["get"]
+                .get("x-payment-info")
+                .is_none()
+        );
+        assert!(
+            both["paths"]["/report/"]["get"]
+                .get("x-payment-info")
+                .is_some()
         );
 
         // A trailing `/` in the config still finds the operation.
