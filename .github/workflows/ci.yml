@@ -2367,6 +2367,11 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --bin autumn -- upgrade:: git_root:: \
             | tee "$RUNNER_TEMP/cli-upgrade-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-upgrade-cov.log"
+          # Issue #2366: same gap for `db::scrub::`. Its classifier is unit
+          # tested, and no other lane instruments it. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- db::scrub:: \
+            | tee "$RUNNER_TEMP/cli-scrub-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-scrub-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
