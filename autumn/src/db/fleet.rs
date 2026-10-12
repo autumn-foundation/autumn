@@ -515,6 +515,24 @@ enum Next {
     Open(Arc<Entry>, bool),
 }
 
+/// Counts an owned mutation until it ends, so `close_all` can wait for it.
+/// Made before the task is spawned: no window exists where it is unseen.
+struct MutationGuard(DatabaseFleet);
+
+impl MutationGuard {
+    fn new(fleet: &DatabaseFleet) -> Self {
+        fleet.inner.mutations.fetch_add(1, Ordering::AcqRel);
+        Self(fleet.clone())
+    }
+}
+
+impl Drop for MutationGuard {
+    fn drop(&mut self) {
+        self.0.inner.mutations.fetch_sub(1, Ordering::AcqRel);
+        self.0.inner.mutations_done.notify_waiters();
+    }
+}
+
 /// Ends an open: forgets the entry if it holds no database, then wakes the
 /// waiters. A dropped guard (a panic) does the same.
 struct OpenGuard {
@@ -602,6 +620,9 @@ struct Inner {
     lifecycle: std::sync::RwLock<Vec<Arc<dyn FleetLifecycle>>>,
     counters: Counters,
     in_flight_drains: AtomicUsize,
+    /// Owned `delete`, `restore` and `provision` tasks that have not ended.
+    mutations: AtomicUsize,
+    mutations_done: Notify,
 }
 
 /// A fleet of `SQLite` databases. Cheap to clone. See the module docs.
@@ -720,6 +741,8 @@ impl DatabaseFleet {
                 lifecycle: std::sync::RwLock::new(Vec::new()),
                 counters: Counters::default(),
                 in_flight_drains: AtomicUsize::new(0),
+                mutations: AtomicUsize::new(0),
+                mutations_done: Notify::new(),
             }),
         })
     }
@@ -938,13 +961,16 @@ impl DatabaseFleet {
     /// when the create task fails. Or an [`open`](Self::open) error.
     pub async fn provision(&self, key: &FleetDbKey) -> Result<FleetDatabase, FleetError> {
         self.check_key(key)?;
-        let (fleet, task_key) = (self.clone(), key.clone());
-        tokio::spawn(async move { fleet.publish_owned(&task_key).await })
-            .await
-            .map_err(|e| FleetError::Unavailable {
-                name: key.name(),
-                detail: format!("create task failed: {e}"),
-            })??;
+        let (fleet, task_key, counted) = (self.clone(), key.clone(), MutationGuard::new(self));
+        tokio::spawn(async move {
+            let _counted = counted;
+            fleet.publish_owned(&task_key).await
+        })
+        .await
+        .map_err(|e| FleetError::Unavailable {
+            name: key.name(),
+            detail: format!("create task failed: {e}"),
+        })??;
         if !self.lock_state().unacknowledged.contains(key) {
             return Err(FleetError::AlreadyExists { name: key.name() });
         }
@@ -1489,6 +1515,14 @@ impl DatabaseFleet {
 
     /// Close every open database and wait for all drains, for shutdown.
     pub async fn close_all(&self) {
+        // Mutations first: one that just started may open or drain a key.
+        loop {
+            let ended = self.inner.mutations_done.notified();
+            if self.inner.mutations.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            ended.await;
+        }
         let keys: Vec<FleetDbKey> = self.lock_state().open.keys().cloned().collect();
         for key in keys {
             self.close(&key).await;
@@ -1566,13 +1600,16 @@ impl DatabaseFleet {
     /// [`FleetError::Io`].
     pub async fn delete(&self, key: &FleetDbKey) -> Result<bool, FleetError> {
         self.check_key(key)?;
-        let (fleet, key) = (self.clone(), key.clone());
-        tokio::spawn(async move { fleet.delete_owned(&key).await })
-            .await
-            .map_err(|error| FleetError::Io {
-                op: "delete database",
-                detail: error.to_string(),
-            })?
+        let (fleet, key, counted) = (self.clone(), key.clone(), MutationGuard::new(self));
+        tokio::spawn(async move {
+            let _counted = counted;
+            fleet.delete_owned(&key).await
+        })
+        .await
+        .map_err(|error| FleetError::Io {
+            op: "delete database",
+            detail: error.to_string(),
+        })?
     }
 
     async fn delete_owned(&self, key: &FleetDbKey) -> Result<bool, FleetError> {
@@ -1735,12 +1772,16 @@ impl DatabaseFleet {
     ) -> Result<crate::replication::RestoreOutcome, FleetError> {
         self.check_key(key)?;
         let (fleet, key, name) = (self.clone(), key.clone(), key.name());
-        tokio::spawn(async move { fleet.restore_owned(&key, target).await })
-            .await
-            .map_err(|error| FleetError::Restore {
-                name,
-                detail: error.to_string(),
-            })?
+        let counted = MutationGuard::new(self);
+        tokio::spawn(async move {
+            let _counted = counted;
+            fleet.restore_owned(&key, target).await
+        })
+        .await
+        .map_err(|error| FleetError::Restore {
+            name,
+            detail: error.to_string(),
+        })?
     }
 
     async fn restore_owned(
@@ -3734,6 +3775,22 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("the older database stayed open: {:?}", fleet.open_keys());
+    }
+
+    #[tokio::test]
+    async fn close_all_waits_for_a_delete_that_just_started() {
+        use futures::FutureExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let key = FleetDbKey::Slot(30);
+        fleet.open(&key).await.unwrap();
+        // Closed, so `close_all` has no open key or drain to wait on.
+        fleet.close(&key).await;
+        // One poll starts the owned delete; the caller then leaves.
+        assert!(fleet.delete(&key).now_or_never().is_none());
+        fleet.close_all().await;
+        assert_eq!(fleet.stats().deleted_total, 1, "the delete ended first");
+        assert!(!fleet.exists(&key));
     }
 
     #[tokio::test]
