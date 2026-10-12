@@ -133,12 +133,23 @@ link-verified for this exact dependency bump, plus the other workspace member
 (`autumn-edge`) most directly exposed to it. What's still not completed is a
 clean full-workspace run covering every example, bench, and plugin crate
 simultaneously, and the gate's separate clippy/doctest legs on the full set —
-genuinely short of `./scripts/pre-push-check.sh` end to end, not quietly
-redefined as equivalent to it, and stated as such rather than folded into
-"ready to merge" without the caveat.
+genuinely short of `./scripts/pre-push-check.sh` end to end. A third Codex
+comment on this point is correct that no amount of caveat in this prose
+changes what the report's own summary lines were still asserting
+unconditionally elsewhere; this pass is not classifying #3209 as a clean
+"ready to merge" — the honest status is **clean at every scope this
+session's disk allowed to verify (deny, full `cargo check`, and link-level
+tests for all three directly-affected crates), full-workspace link/clippy
+pass not completed**, and that is the status recorded in Measurement and
+Change below, not a rounded-up "ready."
 
-Posted the rehearsal on #3209 recommending merge. Not merged by this pass —
-every prior pass's actual merges were done by the repo's human maintainer, not
+Posted the rehearsal's real, current status on #3209 (superseding this
+pass's own earlier, premature "recommend merging as-is" comment, posted
+before the pre-push gate was run at all) — findings, not a merge verdict;
+whether the package-level evidence is sufficient or the full gate should be
+re-run in an environment with more disk is the maintainer's call, not
+Ballast's. Not merged by this pass — every prior pass's actual merges were
+done by the repo's human maintainer, not
 by Ballast itself, and this pass follows that precedent.
 
 **Both halves of the opentelemetry split rehearsed independently; both
@@ -336,9 +347,11 @@ charter, "staying current" does not supply one, so none is actioned.
   triggers Dependabot's own default labelling, not "no labels" — see
   Evidence.) Validated with a YAML parse after each edit. No `ignore`
   entries touched.
-- Posted rehearsal comments on GitHub PRs #3209 (clean, recommend merge),
-  #3144 (full mechanism, recommend closing all four and recombining), and
-  #3143/#3148/#3149 (pointing at #3144's rehearsal, same recommendation).
+- Posted/updated rehearsal comments on GitHub PRs #3209 (verified clean at
+  every scope this session's disk allowed; full-workspace pre-push gate not
+  completed — findings, not a merge verdict), #3144 (full mechanism,
+  recommend closing all four and recombining), and #3143/#3148/#3149
+  (pointing at #3144's rehearsal, same recommendation).
 - No PR merged or closed by this pass — every merge/close decision in this
   repo's Ballast history has been made by its human maintainer, not by
   Ballast itself, and that precedent held here too.
@@ -354,7 +367,7 @@ charter, "staying current" does not supply one, so none is actioned.
 | Duplicate crate names (warn-level, `cargo deny check bans`) | 90 | 90 |
 | Workspace members | 37 (stale count, see Evidence) | 39 (corrected) |
 | Open Dependabot PRs | 0 | 12 |
-| PRs rehearsed clean (ready to merge) | — | 1 (#3209) |
+| PRs rehearsed clean at verified scope (full pre-push gate incomplete, disk) | — | 1 (#3209) |
 | Opentelemetry split: directions actually compiled | — | 2 of 2 (both break) |
 | PRs affected by that finding (not all individually compiled) | — | 4 (#3143/#3144/#3148/#3149) |
 | PRs deferred, no forcing fact, not rehearsed | — | 7 (#3140, #3142, #3145, #3146, #3147, #3150, #3169) |
@@ -483,10 +496,21 @@ python3 -c "import yaml; yaml.safe_load(open('.github/dependabot.yml'))"
    reruns; `RUSTSEC-2026-0319` anymap2
    (`examples/island-flock/deny.toml:66-67`) when #3095 lands. Only
    `RUSTSEC-2024-0384` instant and `RUSTSEC-2024-0370` proc-macro-error are
-   genuinely date-only. None of the four event triggers fired this pass
-   (no new rsa/lru release checked, `build-island.sh` hasn't rerun, #3095
-   still open), so 2026-11-02 remains the earliest any of them is due — but
-   the next pass should check each trigger, not just the calendar.
+   genuinely date-only. A second Codex comment correctly pointed out that
+   the first version of this item asserted "none of the four fired" in the
+   same breath as admitting neither release had actually been checked —
+   checked both for real rather than assuming: the advisory database itself
+   (`~/.cargo/advisory-dbs/.../RUSTSEC-2023-0071.md`, freshly fetched this
+   session) states `patched = []` and explicitly "Still affected as of
+   2026-09-12: rsa 0.9.10 (latest stable) and rsa 0.10.0-rc.18 (latest)" —
+   `cargo info rsa` shows the true latest is now `0.10.0-rc.19`, one patch
+   past that note, with no indication its tracking issues (RustCrypto/RSA
+   #626/#680/#702) closed since; `cargo info aws-sdk-s3@1.123.0` (the very
+   next release after the pinned 1.122.0) already requires `rust-version
+   1.91.0`, exceeding this workspace's 1.88.0 MSRV, confirming 1.122.0 is
+   still the ceiling with no gap to a `lru`-fixed version. `build-island.sh`
+   hasn't rerun and #3095 is still open (0 closing PRs). All four checked,
+   none fired; 2026-11-02 remains the earliest any of the six is due.
 9. The `cargo deny list` vs `cargo deny check bans` discrepancy (flagged
    2026-09-21): not investigated this pass either; bans' count (90) tracked
    cleanly against last week's own number, so no fresh discrepancy to chase.
