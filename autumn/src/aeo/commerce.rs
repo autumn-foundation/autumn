@@ -231,6 +231,8 @@ pub fn mixed_protocol_route(routes: &[PaidRoute]) -> Option<String> {
 
 /// `true` when two route templates name the same route: the same literal
 /// segments, and a capture (any name) or a catch-all at the same places.
+/// A trailing `/` counts: axum routes `/report` and `/report/` apart, so a
+/// free `/report/` never takes the price of `/report`.
 fn same_template(left: &str, right: &str) -> bool {
     let kind = |segment: &str| {
         if segment.starts_with("{*") && segment.ends_with('}') {
@@ -241,8 +243,8 @@ fn same_template(left: &str, right: &str) -> bool {
             ""
         }
     };
-    let mut lhs = normalize(left).split('/');
-    let mut rhs = normalize(right).split('/');
+    let mut lhs = left.split('/');
+    let mut rhs = right.split('/');
     loop {
         match (lhs.next(), rhs.next()) {
             (None, None) => return true,
@@ -1724,6 +1726,9 @@ mod tests {
         // Structural template comparison: names do not matter, kinds do.
         // (A matched route is covered by the integration test.)
         assert!(same_template("/reports/{id}", "/reports/{rid}"));
+        // Codex review (P1): axum routes these apart.
+        assert!(!same_template("/report/", "/report"));
+        assert!(same_template("/report/", "/report/"));
         assert!(!same_template("/reports/{id}", "/reports/admin"));
         assert!(!same_template("/files/{*p}", "/files/{p}"));
         // Without a matched route, the most specific match wins.

@@ -913,6 +913,12 @@ mod commerce {
         Json(json!({ "data": 42 }))
     }
 
+    /// A free route that differs from the priced `/api` only by its slash.
+    #[get("/api/")]
+    async fn api_slash() -> &'static str {
+        "free"
+    }
+
     #[get("/api/broken")]
     async fn broken() -> autumn_web::reexports::http::StatusCode {
         autumn_web::reexports::http::StatusCode::INTERNAL_SERVER_ERROR
@@ -1335,6 +1341,20 @@ mod commerce {
     }
 
     static RENDERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Codex review (P1): axum routes `/api/` apart from `/api`, so a free
+    /// `/api/` is not charged the price of `/api`.
+    #[tokio::test]
+    async fn a_free_trailing_slash_route_is_not_charged() {
+        let c = TestApp::new()
+            .config(paid_config())
+            .routes(routes![api, api_slash])
+            .build();
+        let free = c.get("/api/").send().await;
+        assert_eq!(free.status, 200);
+        assert_eq!(free.text(), "free");
+        assert_eq!(c.get("/api").send().await.status, 402);
+    }
 
     #[tokio::test]
     async fn head_and_trailing_slash_requests_are_charged() {

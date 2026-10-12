@@ -405,7 +405,9 @@ header once on each replica before settlement fails. Make priced handlers
 idempotent (see [idempotency](idempotency.md)).
 
 The route match ignores one trailing `/`, a locale prefix (`/en/...`), and
-capture names (`{rid}` matches a `{id}` route). A `GET` entry also prices
+capture names (`{rid}` matches a `{id}` route). When the app has its own
+route for the slashed form, that route keeps its own price: a free
+`/report/` stays free beside a priced `/report`. A `GET` entry also prices
 `HEAD`, unless a `HEAD` entry for the same route sets its own price. `{name}` matches one segment, `{*name}` the rest.
 The facilitator URL must use `https` (`http` only for `localhost`), with no
 query or fragment. Scanners probe `GET /api`
