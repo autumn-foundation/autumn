@@ -413,7 +413,13 @@ route for the slashed form, that route keeps its own price: a free
 `/report/` stays free beside a priced `/report`. Autumn cannot see inside a
 router added with `merge`, so there a priced `/report` also prices a free
 `/report/` (it never serves a priced route free). Give each form its own
-entry to price them apart. A `GET` entry also prices
+entry to price them apart.
+
+A priced page in a static (SSG/ISR) build is rendered by its route on each
+request rather than served from the manifest, so rate limiting, bot
+protection, load shedding and CORS run before Autumn calls the facilitator.
+A priced manifest entry that no route renders is still served from the
+manifest, outside those limits; startup warns about it. A `GET` entry also prices
 `HEAD`, unless a `HEAD` entry for the same route sets its own price. `{name}` matches one segment, `{*name}` the rest.
 The facilitator URL must use `https` (`http` only for `localhost`), with no
 query or fragment. Scanners probe `GET /api`

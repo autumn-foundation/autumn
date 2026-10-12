@@ -6755,6 +6755,17 @@ pub fn try_build_router_with_static_inner(
         true,
         mcp_dispatch_extra_layers,
     )?;
+    // After `build_router_pre_state`, which records the routes x402 reads.
+    let (priced_static, unrouted_static) =
+        crate::aeo::commerce::priced_static_pages(config, &state, &static_paths);
+    if !unrouted_static.is_empty() {
+        tracing::warn!(
+            pages = ?unrouted_static.keys().collect::<Vec<_>>(),
+            "aeo: x402 prices pre-rendered pages no route renders; they are served from \
+             the manifest, before rate limiting, bot protection, load shedding and CORS"
+        );
+    }
+    let priced_static = Arc::new(priced_static);
 
     // Attach the inner router for ISR background regeneration. Because user
     // layers are excluded, re-renders produce raw HTML (no compression, etc.)
@@ -6798,6 +6809,7 @@ pub fn try_build_router_with_static_inner(
     let mut router: axum::Router<AppState> = inner_router.layer(axum::middleware::from_fn(
         move |req: axum::extract::Request, next: axum::middleware::Next| {
             let static_layer = static_layer.clone();
+            let priced_static = Arc::clone(&priced_static);
             async move {
                 let is_get = req.method() == http::Method::GET;
                 let is_head = req.method() == http::Method::HEAD;
@@ -6815,6 +6827,11 @@ pub fn try_build_router_with_static_inner(
                     } else {
                         path
                     };
+                    // A page x402 prices renders through the router, so the
+                    // ingress limits and CORS run before the facilitator call.
+                    if priced_static.contains(normalized) {
+                        return next.run(req).await;
+                    }
                     if let Some(hit) = static_layer.resolve_entry(normalized)
                         && let Ok(contents) = tokio::fs::read(&hit.file_path).await
                     {
@@ -6905,9 +6922,10 @@ pub fn try_build_router_with_static_inner(
                 .extension::<crate::aeo::AeoSite>()
                 .and_then(|site| site.layer()),
         ),
-        // Only for the manifest's pages: a miss reaches the copy inside the
-        // router, which prices the route axum matched.
-        aeo_x402_layer(config, &state, Some(static_paths)),
+        // Only for the priced pages no route renders: the static-first
+        // middleware leaves every routed priced page to the router, whose copy
+        // prices the route axum matched behind the ingress limits.
+        aeo_x402_layer(config, &state, Some(Arc::new(unrouted_static))),
     ));
 
     // Compression is applied outside the static-first middleware too, so
@@ -12705,6 +12723,60 @@ enabled = true
             get("/files/report.pdf").await.unwrap().status(),
             StatusCode::PAYMENT_REQUIRED
         );
+    }
+
+    /// Codex review: a priced pre-rendered page renders through the router,
+    /// so the ingress stack (rate limiting, bot protection, load shedding,
+    /// CORS) runs before x402 calls the facilitator. A free page is still
+    /// served from the manifest.
+    #[cfg(feature = "http-client")]
+    #[tokio::test]
+    async fn a_priced_static_page_passes_the_ingress_stack() {
+        let tmp = create_ssg_dist(&[
+            ("/report", "report.html", b"<h1>Report</h1>"),
+            ("/about", "about.html", b"<h1>About</h1>"),
+        ]);
+        let dist = tmp.path().join("dist");
+        let mut config = AutumnConfig::default();
+        config.aeo.x402 = toml::from_str(
+            "facilitator_url = \"https://facilitator.example\"\npay_to = \"0xabc\"\n\
+             network = \"eip155:84532\"\nasset = \"0xusdc\"",
+        )
+        .unwrap();
+        config.aeo.paid_routes = vec![crate::aeo::commerce::PaidRoute::new("GET", "/report", "1")];
+        config.cors.allowed_origins = vec!["https://app.example".to_owned()];
+        let router = try_build_router_with_static(
+            vec![
+                duplicate_test_route(http::Method::GET, "/report", "report"),
+                duplicate_test_route(http::Method::GET, "/about", "about"),
+            ],
+            &config,
+            test_state(),
+            Some(&dist),
+        )
+        .expect("router builds");
+        let get = |uri: &'static str| {
+            router.clone().oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(http::header::ORIGIN, "https://app.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+        let report = get("/report").await.unwrap();
+        assert_eq!(report.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            report.headers()[http::header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://app.example",
+            "the CORS layer ran"
+        );
+        let about = get("/about").await.unwrap();
+        assert_eq!(about.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(about.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"<h1>About</h1>", "served from the manifest");
     }
 
     #[test]

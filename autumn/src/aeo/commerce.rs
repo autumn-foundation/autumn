@@ -990,6 +990,53 @@ pub(crate) type StaticPages = std::collections::HashMap<String, Option<String>>;
 /// [`StaticPages`] as the layers hold it: `None` outside a static build.
 pub(crate) type StaticPaths = Option<std::sync::Arc<StaticPages>>;
 
+/// The pre-rendered pages x402 prices, split by whether a route renders
+/// them. A routed page is left to the router by the static-first
+/// middleware, so the ingress limits (load shedding, bot protection, rate
+/// limiting, CORS) run before any facilitator call, as for every priced
+/// route. A page with no route (a hand-written manifest entry) can only be
+/// served from the manifest, so the x402 copy outside that middleware
+/// prices it there.
+pub(crate) fn priced_static_pages(
+    config: &crate::config::AutumnConfig,
+    state: &crate::state::AppState,
+    pages: &StaticPages,
+) -> (std::collections::HashSet<String>, StaticPages) {
+    let mut routed = std::collections::HashSet::new();
+    let mut unrouted = StaticPages::new();
+    let Some(priced) = PricedRoutes::from_config(config, state) else {
+        return (routed, unrouted);
+    };
+    for (page, template) in pages {
+        let charged = [axum::http::Method::GET, axum::http::Method::HEAD]
+            .into_iter()
+            .any(|method| {
+                // A page that is no valid URI can never be requested.
+                let Ok(mut req) = axum::http::Request::builder()
+                    .method(method)
+                    .uri(page.as_str())
+                    .body(axum::body::Body::empty())
+                else {
+                    return false;
+                };
+                if let Some(t) = template {
+                    req.extensions_mut().insert(StaticRoute(t.clone()));
+                }
+                priced.route_for(&req).is_some()
+            });
+        match template {
+            Some(_) if charged => {
+                routed.insert(page.clone());
+            }
+            None if charged => {
+                unrouted.insert(page.clone(), None);
+            }
+            _ => {}
+        }
+    }
+    (routed, unrouted)
+}
+
 /// The route template that rendered a pre-rendered page, for a request the
 /// router has not matched.
 #[derive(Clone)]
