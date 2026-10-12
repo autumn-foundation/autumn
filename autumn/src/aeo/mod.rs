@@ -531,7 +531,26 @@ impl AeoSite {
 ///
 /// Serving from the fallback means an application route at the same path
 /// always wins, and a generated path can never collide with one.
+#[cfg(test)]
 pub(crate) async fn fallback(site: Option<Arc<AeoSite>>, req: Request<Body>) -> Response {
+    match serve_document(site, req) {
+        Ok(res) => res,
+        Err(req) => {
+            crate::middleware::error_page_filter::fallback_404_handler(
+                req.method().clone(),
+                req.uri().clone(),
+            )
+            .await
+        }
+    }
+}
+
+/// The generated document at `req`'s path, or `req` back when there is none
+/// (the caller answers it: a mounted plugin, else the framework 404).
+pub(crate) fn serve_document(
+    site: Option<Arc<AeoSite>>,
+    req: Request<Body>,
+) -> Result<Response, Request<Body>> {
     let method = req.method().clone();
     let uri = req.uri().clone();
     let readable = method == Method::GET || method == Method::HEAD;
@@ -548,10 +567,10 @@ pub(crate) async fn fallback(site: Option<Arc<AeoSite>>, req: Request<Body>) -> 
                 doc.headers
                     .retain(|(name, _)| !matches!(*name, "signature" | "signature-input"));
             }
-            return document_response(doc, &method, req.headers());
+            return Ok(document_response(doc, &method, req.headers()));
         }
     }
-    crate::middleware::error_page_filter::fallback_404_handler(method, uri).await
+    Err(req)
 }
 
 /// Marks a generated document, so the response layer removes any

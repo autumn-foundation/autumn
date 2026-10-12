@@ -5621,12 +5621,39 @@ fn apply_middleware(
     // so that unmatched routes are still protected by rate limiting, CSRF, CORS, etc.
     // The fallback also serves the AEO documents (`/llms.txt`, the
     // `/.well-known/*` agent files): an application route at the same path
-    // always wins, and a generated path cannot collide with one.
+    // always wins, and a generated path cannot collide with one. With
+    // `plugin-sandbox` it serves plugins mounted at runtime too (issue #2433);
+    // like an application route, a mounted plugin wins over a document.
     let aeo_site = state.extension::<crate::aeo::AeoSite>();
     let fallback_site = aeo_site.clone();
-    router = router.fallback(move |req: axum::extract::Request| {
-        crate::aeo::fallback(fallback_site.clone(), req)
-    });
+    router = router.fallback(
+        move |axum::extract::State(app): axum::extract::State<AppState>,
+              req: axum::extract::Request| {
+            let site = fallback_site.clone();
+            async move {
+                #[cfg(feature = "plugin-sandbox")]
+                if app
+                    .extension::<crate::plugin_sandbox::PluginMounts>()
+                    .is_some_and(|mounts| mounts.owns(req.uri().path()))
+                {
+                    return crate::plugin_sandbox::mounts_fallback(axum::extract::State(app), req)
+                        .await;
+                }
+                #[cfg(not(feature = "plugin-sandbox"))]
+                let _ = app;
+                match crate::aeo::serve_document(site, req) {
+                    Ok(res) => res,
+                    Err(req) => {
+                        crate::middleware::error_page_filter::fallback_404_handler(
+                            req.method().clone(),
+                            req.uri().clone(),
+                        )
+                        .await
+                    }
+                }
+            }
+        },
+    );
 
     // Resolve signing keys once; shared across session and CSRF layers.
     let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
