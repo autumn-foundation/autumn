@@ -212,14 +212,25 @@ on their face but outside this harness's `cargo deny` coverage and this pass's
 rehearsal budget; left open.
 
 **A Dependabot config bug, found while reading each PR's comments, not
-flagged by any prior pass.** Every PR above carries this exact comment from
-`dependabot[bot]`:
+flagged by any prior pass.** Corrected per a Codex review comment: not every
+PR in the queue table carries the same comment, or any comment at all —
+custom labels apply only to the ecosystem block that defines them. Every
+**cargo**-block PR (#3209, #3150, #3149, #3148, #3147, #3146, #3145, #3144,
+#3143, #3142) carries this exact comment from `dependabot[bot]` (confirmed on
+#3209's own comment thread):
 
 ```
 ### Labels
 The following labels could not be found: `automated`. Please create it before
 Dependabot can add it to a pull request.
 ```
+
+The **github-actions**-block PR (#3140) carries a different comment naming
+*both* missing labels (confirmed on #3140's own thread: "could not be found:
+`automated`, `ci`"), since that block's config had two undefined names, not
+one. The **npm**-block PR (#3169) carries neither — confirmed zero comments
+on its thread — because `dependabot.yml` has no npm entry at all, so no
+custom labels were ever defined for it to warn about.
 
 Confirmed mechanically, not just by reading the bot's comment: `get_label`
 for `automated` and `ci` both returned "not found in
@@ -462,8 +473,20 @@ python3 -c "import yaml; yaml.safe_load(open('.github/dependabot.yml'))"
    only the two root entries. Same two options as every prior pass: extend
    `dependabot.yml`, or have Ballast own satellite-graph batches on its own
    cadence.
-8. Waivers re-verified last pass, re-dated to 2026-11-02 — next due that date,
-   not before.
+8. Waivers re-verified last pass, re-dated to 2026-11-02. Corrected per a
+   Codex review comment: that date is not the only trigger for four of the
+   six — `RUSTSEC-2023-0071` rsa (`deny.toml:62`) is also due the moment a
+   fixed rsa release ships; `RUSTSEC-2026-0253` lru (`deny.toml:94-95`) the
+   moment the MSRV floor rises enough to take an `aws-sdk-s3` that resolves
+   a patched `lru`; `RUSTSEC-2025-0141` bincode
+   (`examples/island-flock/deny.toml:45-47`) the next time `build-island.sh`
+   reruns; `RUSTSEC-2026-0319` anymap2
+   (`examples/island-flock/deny.toml:66-67`) when #3095 lands. Only
+   `RUSTSEC-2024-0384` instant and `RUSTSEC-2024-0370` proc-macro-error are
+   genuinely date-only. None of the four event triggers fired this pass
+   (no new rsa/lru release checked, `build-island.sh` hasn't rerun, #3095
+   still open), so 2026-11-02 remains the earliest any of them is due — but
+   the next pass should check each trigger, not just the calendar.
 9. The `cargo deny list` vs `cargo deny check bans` discrepancy (flagged
    2026-09-21): not investigated this pass either; bans' count (90) tracked
    cleanly against last week's own number, so no fresh discrepancy to chase.
