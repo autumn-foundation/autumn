@@ -904,6 +904,9 @@ impl DatabaseFleet {
     ///
     /// [`FleetError::AlreadyExists`] when the file is already there, or an
     /// [`open`](Self::open) error.
+    ///
+    /// A shutdown that starts during the call can refuse the final open. The
+    /// database then exists, and a retry gets `AlreadyExists`.
     pub async fn provision(&self, key: &FleetDbKey) -> Result<FleetDatabase, FleetError> {
         self.check_key(key)?;
         if self.lock_state().shutting_down {

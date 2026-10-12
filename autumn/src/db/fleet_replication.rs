@@ -152,19 +152,20 @@ impl FleetReplication {
     /// logged with `error!`. The call replaces the `unshipped` list in the
     /// health details.
     ///
-    /// The deadline counts the sleeps, not a clock. A pinned or virtual clock
-    /// cannot make the loop run forever.
+    /// The deadline uses real elapsed time, ticks included. A pinned or
+    /// virtual clock cannot make the loop run forever. A tick that is already
+    /// running cannot be stopped, so the call can overrun by one tick.
     pub fn flush_closing(&self, deadline: Duration) -> Vec<String> {
-        let mut waited = Duration::ZERO;
+        // Real time on purpose: the wait is blocking I/O, not simulated work.
+        #[allow(clippy::disallowed_methods)]
+        let started = std::time::Instant::now();
         loop {
             self.tick_all();
-            let left = deadline.saturating_sub(waited);
+            let left = deadline.saturating_sub(started.elapsed());
             if self.closing() == 0 || left.is_zero() {
                 break;
             }
-            let step = FLUSH_RETRY.min(left);
-            std::thread::sleep(step);
-            waited += step;
+            std::thread::sleep(FLUSH_RETRY.min(left));
         }
         let mut unshipped: Vec<String> = self.parked().keys().map(FleetDbKey::name).collect();
         unshipped.sort();
