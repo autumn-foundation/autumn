@@ -35,6 +35,9 @@ pub const SLOTS_PER_BUCKET: u16 = 64;
 /// Longest tenant id that can name a database file.
 pub const TENANT_DB_ID_MAX_LEN: usize = 128;
 
+/// Root directory name the fleet keeps for its lock files.
+pub(crate) const RESERVED_DIR: &str = ".fleet-locks";
+
 /// What one database file in the fleet holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -338,6 +341,7 @@ struct Captures {
 /// Rules, all checked by [`FleetPathTemplate::parse`]:
 ///
 /// - relative, no `.`/`..`/empty segments, no `\`;
+/// - the first segment is not `.fleet-locks`, which holds the lock files;
 /// - only the three placeholders, never two placeholders side by side;
 /// - a tenant fleet must use `{tenant}`; a slot fleet must use `{slot}` and
 ///   may not use `{tenant}`;
@@ -372,6 +376,15 @@ impl FleetPathTemplate {
             return Err(refuse(
                 "it must be relative to database.fleet.root".to_owned(),
             ));
+        }
+        if raw
+            .split('/')
+            .next()
+            .is_some_and(|first| first.eq_ignore_ascii_case(RESERVED_DIR))
+        {
+            return Err(refuse(format!(
+                "`{RESERVED_DIR}` is reserved for the fleet's lock files"
+            )));
         }
         let mut segments = Vec::new();
         for segment in raw.split('/') {
@@ -694,6 +707,15 @@ mod tests {
             assert!(TenantDbId::parse(bad).is_err(), "{bad:?} must be refused");
         }
         assert!(TenantDbId::parse(&"a".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn a_template_under_the_lock_directory_is_refused() {
+        for bad in [".fleet-locks/{tenant}.lock", ".FLEET-LOCKS/{tenant}.db"] {
+            let err = FleetPathTemplate::parse(bad, FleetMode::Tenant).unwrap_err();
+            assert!(err.to_string().contains("reserved"), "{bad}: {err}");
+        }
+        assert!(FleetPathTemplate::parse("a/.fleet-locks/{tenant}.db", FleetMode::Tenant).is_ok());
     }
 
     #[test]

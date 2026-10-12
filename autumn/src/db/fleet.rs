@@ -2693,7 +2693,7 @@ fn unlink_database_set(
 // ── The path lock ────────────────────────────────────────────────────────────
 
 /// Directory under the fleet root that holds the path locks.
-const LOCK_DIR: &str = ".fleet-locks";
+const LOCK_DIR: &str = crate::fleet_layout::RESERVED_DIR;
 
 /// How many lock files the fleet uses. A key maps to one of them by a stable
 /// hash, so a fleet of millions of tenants needs no file per tenant, and a
