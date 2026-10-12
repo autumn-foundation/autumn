@@ -225,6 +225,11 @@ an unpublished crate points a scanner at somebody else's project. Git and
 alternate-registry dependencies get a `?vcs_url=` / `?repository_url=`
 qualifier naming where they actually came from.
 
+`cargo-auditable` records only a source category, not a URL. In `--binary`
+output, a git or alternate-registry package therefore has no `purl`. Its
+`bom-ref` starts with `git:` or `registry:`. The `cargo:source` property keeps
+the category.
+
 The sidecar SBOM is generated from `cargo metadata` and is therefore *broader*:
 it covers the whole resolved graph for the image's own target triple and
 feature set — minus dev-dependencies, which are resolved but never linked into

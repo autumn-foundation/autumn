@@ -177,7 +177,7 @@ unsafe_code = "forbid"
 # neutral custom cfg is used instead of the usual `--cfg loom` so the flag does
 # not poison dependency crates (hyper-util/tokio) that carry their own
 # `#[cfg(loom)]` paths.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(loom_models)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(loom_models)', 'cfg(kani)', 'cfg(shuttle_models)'] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

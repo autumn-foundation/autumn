@@ -1253,6 +1253,42 @@ a capsule to get the new checks.
 
 ---
 
+### MCP: `ApiDoc` gains a `mcp_task` field
+
+**Why:** MCP task tools (`#[api_doc(mcp, task)]`) need a flag on the route
+metadata. `ApiDoc` has public fields and is not `#[non_exhaustive]`, so a new
+field breaks a struct literal. The route macros set the field for you.
+
+**Before (`{X.Y}`):**
+
+```rust
+use autumn_web::openapi::ApiDoc;
+
+let doc = ApiDoc {
+    method: "GET",
+    path: "/api/report",
+    // …every other field spelled out…
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use autumn_web::openapi::ApiDoc;
+
+let doc = ApiDoc {
+    method: "GET",
+    path: "/api/report",
+    ..ApiDoc::default()
+};
+```
+
+The new field is `pub mcp_task: bool`. It is `false` by default, so a route
+that does not opt in behaves as before.
+
+**Automation:** `manual` — a codemod cannot know which fields a struct literal
+means to leave at their defaults.
+
 ## Plugin authors
 
 Everything here is addressed to someone maintaining an `autumn-plugin-*` /

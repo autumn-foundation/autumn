@@ -500,6 +500,19 @@ image = { workspace = true, optional = true }
 # an open handle, so a swapped link cannot redirect it (#1811).
 nix = { version = "0.31.2", features = ["fs", "dir", "time"] }
 
+# The loom and Shuttle model checks (`tests/loom_models.rs`,
+# `tests/shuttle_models.rs`) build the library with `--cfg loom_models` or
+# `--cfg shuttle_models`. `src/sync_shim.rs` then gives the checked modules
+# the checker's locks and atomics, so the checks run the shipped code. A
+# normal build never sets these cfgs and never compiles either crate.
+[target.'cfg(loom_models)'.dependencies]
+# `futures` adds `loom::future::block_on`, which drives the async circuit
+# breaker inside a model.
+loom = { version = "0.7.2", features = ["futures"] }
+
+[target.'cfg(shuttle_models)'.dependencies]
+shuttle = "0.9.6"
+
 [target.'cfg(unix)'.dev-dependencies]
 # `getrusage` for the process CPU time that `tests/cost_reconcile.rs` checks
 # the per-tenant cost against (issue #1720).
@@ -1458,6 +1471,14 @@ path = "tests/capsule_cache_effect.rs"
 [[test]]
 name = "loom_models"
 path = "tests/loom_models.rs"
+
+# Isolated: Shuttle checking binary. Empty under a normal build
+# (`#![cfg(shuttle_models)]`); only compiles/runs under
+# `RUSTFLAGS="--cfg shuttle_models"`, in the `shuttle` CI job. That cfg also
+# swaps the sync primitives of the checked modules (`src/sync_shim.rs`).
+[[test]]
+name = "shuttle_models"
+path = "tests/shuttle_models.rs"
 
 [lints]
 workspace = true

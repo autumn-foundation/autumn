@@ -226,6 +226,8 @@ mod maud_render;
 #[cfg(feature = "mcp")]
 mod mcp_endpoint;
 #[cfg(feature = "mcp")]
+mod mcp_modern;
+#[cfg(feature = "mcp")]
 mod mcp_plugin;
 #[cfg(all(feature = "db", feature = "mcp"))]
 mod mcp_repository;
@@ -239,6 +241,8 @@ mod mcp_step_up_guard;
 mod mcp_streaming;
 #[cfg(feature = "mcp")]
 mod mcp_structured_query;
+#[cfg(feature = "mcp")]
+mod mcp_tasks;
 #[cfg(feature = "mcp")]
 mod mcp_throttle_guard;
 mod middleware_introspection;

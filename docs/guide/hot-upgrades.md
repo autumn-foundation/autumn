@@ -217,11 +217,15 @@ dropping state — reviewing what each field is mapped *to* is still yours.
    the snapshot. Only one of the two processes is ever writable, so a retry
    always lands somewhere that keeps it. A lock file in the handoff directory protects two steps: the
    successor's publish-and-unfreeze, and the predecessor's decision to kill.
-   The predecessor cannot kill a successor that has become writable. If the
-   successor dies after it publishes but before the predecessor settles the
-   handoff (about one poll interval), the predecessor resumes from its
-   snapshot. The service stays up, but a write that the successor acknowledged
-   can be lost. After the handoff settles, nothing watches the successor.
+   The predecessor cannot kill a successor that has become writable.
+   The successor also writes each change to a journal in the handoff directory.
+   It does this before it acknowledges the change. Suppose the successor dies
+   after it publishes, but before the predecessor settles (about one poll
+   interval). The predecessor then reads the journal and resumes from it. If the
+   new build changed the state version, the predecessor cannot read the journal.
+   It then resumes from its snapshot and logs an error. The journal also stops
+   if a disk write fails, and the successor logs a warning.
+   After the handoff settles, nothing watches the successor.
 4. **Drain.** The predecessor stops accepting, finishes its in-flight requests,
    runs its `on_shutdown` hooks, and exits. Connections queued on the shared
    socket are picked up by the successor — the socket is never closed, so

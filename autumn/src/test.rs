@@ -1030,6 +1030,19 @@ impl TestApp {
         self
     }
 
+    /// Set the limits for MCP task tools, mirroring
+    /// [`AppBuilder::mcp_tasks`](crate::app::AppBuilder::mcp_tasks).
+    ///
+    /// Gated behind the `mcp` Cargo feature.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn mcp_tasks(mut self, config: crate::mcp::McpTaskConfig) -> Self {
+        self.mcp
+            .get_or_insert_with(|| crate::mcp::McpRuntime::new("/mcp"))
+            .tasks = config;
+        self
+    }
+
     /// Merge a router into the internal application state.
     ///
     /// This is useful when testing modular route definitions without building

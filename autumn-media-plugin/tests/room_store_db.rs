@@ -829,9 +829,16 @@ async fn hold_room_row(pool: &Pool<AsyncPgConnection>, room_id: &str) -> PooledC
 }
 
 /// End the transaction that [`hold_room_row`] opened.
+///
+/// This rolls back (the held `UPDATE` is a no-op, so nothing is lost) rather
+/// than commits. After a commit, every waiter sees the row as updated and
+/// re-locks the new version through `EvalPlanQual`, re-queueing behind the
+/// others, so the waiter that queued first does not reliably win. After a
+/// rollback the waiters take the row in the order they queued, which is the
+/// order these tests assert.
 async fn release(holder: &mut PooledConn) {
     use diesel_async::SimpleAsyncConnection as _;
-    holder.batch_execute("COMMIT").await.expect("release");
+    holder.batch_execute("ROLLBACK").await.expect("release");
 }
 
 /// Spawn one join on `store`.

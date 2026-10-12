@@ -110,6 +110,18 @@ Uppercase is refused, not folded: on a case-insensitive file system `Acme` and
   for in-flight connections, then runs lifecycle hooks. An opener for a
   draining key waits for the drain, then opens fresh. Deleting a key refuses
   openers with `410` until the files are gone.
+- Fleet operations are cancellation-safe. `open` (first open), `close`,
+  `delete`, `restore` and `provision` run their work in owned tasks. A caller
+  that is dropped (timeout, client disconnect) only stops waiting:
+  - A claimed key always leaves its drain, so no later opener gets a stranded
+    `410`, and `close_all` does not hang.
+  - A first open that already started its `on_open` hooks ends in the open
+    map. A later `close` or `delete` runs the matching `on_close`.
+  - A `provision` can publish its file and then lose its caller. The fleet
+    keeps a record of that creation. The next `provision` of the key reports
+    it. Exactly one call does. `delete` clears the record. The record is in
+    memory only.
+  - `close_all` waits for opens that are still running, then closes them.
 
 ### 4. Migrations: on create, on open, or refused
 

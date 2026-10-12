@@ -522,6 +522,7 @@ type McpPrepared = (
     String,
     Vec<crate::mcp::McpToolInfo>,
     Option<crate::mcp::McpEndpointLayer>,
+    crate::mcp::McpTaskConfig,
 );
 
 /// Like [`try_build_router_inner`] but returns `Router<AppState>` before
@@ -664,7 +665,7 @@ fn build_router_pre_state(
         // Pass the app's OpenAPI config (if any) so MCP tool `inputSchema`s
         // reuse the same registered component schemas as the served spec.
         let tools = crate::mcp::derive_tools(&docs, rt.expose_all, ctx.openapi.as_ref());
-        Some((rt.mount_path, tools, rt.endpoint_layer))
+        Some((rt.mount_path, tools, rt.endpoint_layer, rt.tasks))
     } else {
         None
     };
@@ -937,7 +938,7 @@ fn build_router_pre_state(
     // it in *after* its own `custom_layers` reapplication.
     #[cfg(feature = "mcp")]
     let (router, deferred_mcp_router) =
-        if let Some((mount_path, tools, endpoint_layer)) = mcp_prepared {
+        if let Some((mount_path, tools, endpoint_layer, tasks)) = mcp_prepared {
             // The outermost `SecurityHeadersLayer` is applied after this clone, so
             // the dispatch snapshot would otherwise miss it. That layer also injects
             // `CspNonce` into request extensions, so a `tools/call` replay of a
@@ -985,6 +986,10 @@ fn build_router_pre_state(
                 // installed `AuditLogger` and mints its correlation id from the
                 // injected entropy seam, both reached from state.
                 state: state.clone(),
+                // Task requests are bound to the caller. The session cookie is
+                // one of the credentials in that binding.
+                session_cookie: config.session.cookie_name.clone(),
+                tasks,
             };
             let mut mcp_router =
                 crate::mcp::build_mcp_router(&mount_path, tools, dispatch, wiring, endpoint_layer);
@@ -1631,7 +1636,7 @@ impl AeoMcpFacts for () {
 #[cfg(feature = "mcp")]
 impl AeoMcpFacts for McpPrepared {
     fn fill(&self, facts: &mut crate::aeo::documents::SiteFacts) {
-        let (path, tools, endpoint_layer) = self;
+        let (path, tools, endpoint_layer, _) = self;
         // A gated endpoint (`secure_mcp`) keeps its tool list private.
         let public_tools = endpoint_layer.is_none();
         let tools = if public_tools {
@@ -8818,6 +8823,8 @@ mod tests {
             envelope_rate_limited: false,
             envelope_load_shed: false,
             state: test_state(),
+            session_cookie: "autumn.sid".to_owned(),
+            tasks: crate::mcp::McpTaskConfig::default(),
         };
         let mcp_router =
             crate::mcp::build_mcp_router("/mcp", Vec::new(), axum::Router::new(), wiring, None);
@@ -11672,6 +11679,7 @@ enabled = true
                 mount_path: "/agent-tools".to_owned(),
                 expose_all: false,
                 endpoint_layer: None,
+                tasks: crate::mcp::McpTaskConfig::default(),
             });
             ctx.declared_routes = vec![declared_route(method, "/agent-tools", "evil-plugin")];
             let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
@@ -11697,6 +11705,7 @@ enabled = true
             mount_path: "/agent-tools".to_owned(),
             expose_all: false,
             endpoint_layer: None,
+            tasks: crate::mcp::McpTaskConfig::default(),
         });
         ctx.declared_routes = vec![declared_route("DELETE", "/agent-tools", "honest-plugin")];
         let _built = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
@@ -16122,6 +16131,7 @@ mod trusted_host_tests {
                 mount_path: "/mcp".to_owned(),
                 expose_all: true,
                 endpoint_layer: None,
+                tasks: crate::mcp::McpTaskConfig::default(),
             }),
         };
 
@@ -16279,6 +16289,7 @@ mod trusted_host_tests {
                 mount_path: "/mcp".to_owned(),
                 expose_all: true,
                 endpoint_layer: None,
+                tasks: crate::mcp::McpTaskConfig::default(),
             }),
         };
         let (_tmp, dist) = build_empty_dist();
