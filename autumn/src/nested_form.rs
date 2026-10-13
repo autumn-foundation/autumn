@@ -1878,6 +1878,29 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn wrong_content_type_is_rejected_with_415() {
+        use tower::ServiceExt;
+        async fn handler(_f: NestedChangesetForm<Order, LineItem>) -> &'static str {
+            "unreachable"
+        }
+        let req = Request::builder()
+            .method("POST")
+            .uri("/t")
+            .header("Content-Type", "text/plain")
+            .body(axum::body::Body::from("name=Order"))
+            .unwrap();
+        let resp = axum::Router::new()
+            .route("/t", axum::routing::post(handler))
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+    }
+
     fn p(k: &str, v: &str) -> (String, String) {
         (k.to_owned(), v.to_owned())
     }
