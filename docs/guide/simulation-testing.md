@@ -768,6 +768,10 @@ can occur. The checks include:
   at least one seed of the same process. A window of fewer than 32 seeds, such
   as a one-seed replay, skips this check. A failure also prints a second
   replay that runs the earlier seeds of the process too.
+- **No leak.** Each 1,000 seeds, the sweep reads the memory of its process.
+  If the process grew by more than 256 MiB since the first 1,000 seeds, the
+  sweep fails with a memory-leak message. Without this check, a leak fills
+  the runner, and the runner stops with no report.
 - **The API surface gate.** `dst_api_surface_is_fully_exercised` reads the
   public `fn` items of the sim files that do not need `sqlite`. The nightly
   must call each one, or `EXCLUDED` lists it with a reason. The check is

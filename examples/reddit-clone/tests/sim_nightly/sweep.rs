@@ -37,6 +37,41 @@ pub fn one_sim_at_a_time() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// The memory one sweep process can gain after its first seeds. A seed
+/// frees what it uses, so more growth is a leak. Before this check, a leak of
+/// 0.5 MiB per seed filled the runner and the runner stopped with no report.
+pub const MAX_GROWTH_KB: u64 = 256 * 1024;
+
+/// The memory check runs after this many seeds, and again after each next block.
+const MEMORY_CHECK_EVERY: u64 = 1_000;
+
+/// The resident memory of this process in KiB. `None` off Linux.
+pub fn rss_kb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))?
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The failure reason if memory grew from `baseline` to `now` (KiB) by more
+/// than [`MAX_GROWTH_KB`] over `seeds` seeds.
+pub fn leak(baseline: u64, now: u64, seeds: u64) -> Option<String> {
+    let growth = now.saturating_sub(baseline);
+    (growth > MAX_GROWTH_KB).then(|| {
+        format!(
+            "memory leak: the process grew from {} MiB to {} MiB over {seeds} seed(s). \
+             A seed must free what it uses; find what keeps the apps of old seeds alive.",
+            baseline / 1024,
+            now / 1024,
+        )
+    })
+}
+
 /// What one sweep process runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepConfig {
@@ -182,6 +217,7 @@ pub fn run(config: &SweepConfig, variant: Variant) -> Outcome {
     let mut observed = BTreeSet::new();
     let mut satisfied = BTreeSet::new();
     let mut ran = 0;
+    let mut baseline = None;
     for seed in seeds.clone() {
         ran += 1;
         // A log line now and then shows how far a process got, if it is killed.
@@ -223,6 +259,20 @@ pub fn run(config: &SweepConfig, variant: Variant) -> Outcome {
                         diff: format!("the first run passed, the second run failed: {reason}"),
                     };
                 }
+            }
+        }
+        // Sample after the seed ran, so the report names a seed that ran.
+        // The first block warms the caches, so it sets the baseline.
+        if ran % MEMORY_CHECK_EVERY == 0
+            && let Some(now) = rss_kb()
+        {
+            let since = *baseline.get_or_insert((ran, now));
+            if let Some(reason) = leak(since.1, now, ran - since.0) {
+                return Outcome::Failed {
+                    seeds: ran,
+                    seed,
+                    reason,
+                };
             }
         }
     }
@@ -394,6 +444,26 @@ mod tests {
             matches!(outcome, Outcome::Passed { seeds: 1, .. }),
             "{outcome:?}"
         );
+    }
+
+    #[test]
+    fn memory_growth_past_the_limit_is_a_leak() {
+        assert_eq!(leak(100_000, 100_000 + MAX_GROWTH_KB, 5_000), None);
+        let reason = leak(100_000, 100_001 + MAX_GROWTH_KB, 5_000).expect("a leak");
+        assert!(reason.contains("5000 seed(s)"), "{reason}");
+        assert!(reason.contains("MiB"), "{reason}");
+        assert_eq!(
+            leak(100_000, 50_000, 5_000),
+            None,
+            "memory that shrinks is not a leak"
+        );
+    }
+
+    #[test]
+    fn this_process_reports_its_memory_on_linux() {
+        if cfg!(target_os = "linux") {
+            assert!(rss_kb().is_some_and(|kb| kb > 0));
+        }
     }
 
     #[test]
