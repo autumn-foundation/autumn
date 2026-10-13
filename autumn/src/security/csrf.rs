@@ -644,12 +644,8 @@ async fn verify_csrf_token(
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
 
-    // Media types are case-insensitive (RFC 9110 8.3.1) and the header may carry
-    // leading whitespace; normalize the type token for the urlencoded check.
-    let is_urlencoded = content_type
-        .trim_start()
-        .to_ascii_lowercase()
-        .starts_with("application/x-www-form-urlencoded");
+    let is_urlencoded =
+        crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded");
     // Parse the boundary with `multer::parse_boundary` — the exact parser
     // `axum::extract::Multipart` uses downstream (via `mime`) — so this CSRF
     // guard and the extractor can never disagree about the boundary, and it

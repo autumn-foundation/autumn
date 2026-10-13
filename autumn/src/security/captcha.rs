@@ -645,7 +645,7 @@ async fn extract_token_from_form(
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
 
-    if !content_type.starts_with("application/x-www-form-urlencoded") {
+    if !crate::media_type::is_media_type(&content_type, "application/x-www-form-urlencoded") {
         return None;
     }
 
@@ -745,7 +745,7 @@ where
             .and_then(|v| v.to_str().ok())
             .map(str::to_ascii_lowercase)
             .unwrap_or_default();
-        if !content_type.starts_with("application/x-www-form-urlencoded") {
+        if !crate::media_type::is_media_type(&content_type, "application/x-www-form-urlencoded") {
             let mut inner = self.inner.clone();
             std::mem::swap(&mut self.inner, &mut inner);
             return Box::pin(async move { inner.call(req).await });

@@ -1269,7 +1269,7 @@ where
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_string();
-        if !content_type.starts_with("application/x-www-form-urlencoded") {
+        if !crate::media_type::is_media_type(&content_type, "application/x-www-form-urlencoded") {
             return Err((
                 axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "Nested form requests must have `Content-Type: application/x-www-form-urlencoded`",
@@ -1856,6 +1856,26 @@ mod tests {
 
     impl NestedChild for Contact {
         const COLLECTION: &'static str = "contacts";
+    }
+
+    #[tokio::test]
+    async fn mixed_case_urlencoded_content_type_is_accepted() {
+        use tower::ServiceExt;
+        async fn handler(_f: NestedChangesetForm<Order, LineItem>) -> &'static str {
+            "ok"
+        }
+        let req = Request::builder()
+            .method("POST")
+            .uri("/t")
+            .header("Content-Type", "Application/X-WWW-Form-Urlencoded")
+            .body(axum::body::Body::from("name=Order"))
+            .unwrap();
+        let resp = axum::Router::new()
+            .route("/t", axum::routing::post(handler))
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
     }
 
     fn p(k: &str, v: &str) -> (String, String) {
