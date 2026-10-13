@@ -63,6 +63,12 @@ const STOP_POLL: Duration = Duration::from_millis(100);
 /// several.
 const FINAL_SHIP_MAX_TICKS: usize = 64;
 
+/// Longest a closing non-owner waits for the owner to hand over the lock.
+const CLAIM_WAIT: Duration = Duration::from_secs(2);
+
+/// Pause between claim attempts at close.
+const CLAIM_POLL: Duration = Duration::from_millis(25);
+
 /// Pause between flush passes at shutdown.
 const FLUSH_RETRY: Duration = Duration::from_millis(100);
 
@@ -581,6 +587,33 @@ impl FleetReplication {
     }
 }
 
+impl FleetReplication {
+    /// Claim at close. An owner that closes at the same time still holds the
+    /// lock while it ships, so wait for it, within `CLAIM_WAIT` and the
+    /// shutdown cutoff.
+    fn claim_for_close(&self, replica: &ActiveReplica, key: &FleetDbKey) -> bool {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "real time: the wait bounds blocking I/O"
+        )]
+        let limit = std::time::Instant::now() + CLAIM_WAIT;
+        loop {
+            if replica.claim(key) {
+                return true;
+            }
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "real time: the wait bounds blocking I/O"
+            )]
+            let now = std::time::Instant::now();
+            if now >= limit || expired(self.shutdown_cutoff()) {
+                return false;
+            }
+            std::thread::sleep(CLAIM_POLL);
+        }
+    }
+}
+
 impl FleetLifecycle for FleetReplication {
     fn restore_missing(&self, key: &FleetDbKey, path: &Path) -> Result<bool, String> {
         if !self.restore_missing {
@@ -652,7 +685,7 @@ impl FleetLifecycle for FleetReplication {
         };
         // The owner may have left since the last tick. Try once, so commits
         // made meanwhile ship. Then no later tick may claim for this replica.
-        let owner = replica.claim(db.key());
+        let owner = self.claim_for_close(&replica, db.key());
         replica.retired.store(true, Ordering::Release);
         if !owner {
             return;
@@ -1155,6 +1188,40 @@ mod tests {
         assert!(fleet.delete(&key).await.unwrap());
         assert!(!lock.exists());
         assert!(!bucket.exists());
+    }
+
+    #[tokio::test]
+    async fn a_non_owner_closing_with_the_owner_waits_for_the_handover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, replicas) = (tmp.path().join("shared"), tmp.path().join("replicas"));
+        let (a, _ra) = replicated_fleet(&root, &replicas, false);
+        let (b, rb) = replicated_fleet(&root, &replicas, false);
+        let key = a.key_for("acme").unwrap();
+        let db_a = a.open(&key).await.unwrap();
+        let db_b = b.open(&key).await.unwrap();
+        exec(&db_a, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        exec(&db_b, "INSERT INTO notes VALUES ('from b')").await;
+        drop(db_b);
+        // A lets go shortly after B starts to close.
+        drop(db_a);
+        let closer = tokio::spawn({
+            let (a, key) = (a.clone(), key.clone());
+            async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                a.close(&key).await;
+            }
+        });
+        b.close(&key).await;
+        closer.await.unwrap();
+        assert_eq!(rb.closing(), 0);
+
+        let path = b.path_of(&key);
+        std::fs::remove_file(&path).unwrap();
+        for sidecar in crate::fleet_layout::sidecar_paths(&path) {
+            let _ = std::fs::remove_file(sidecar);
+        }
+        b.restore(&key, None).await.unwrap();
+        assert_eq!(count(&b.open(&key).await.unwrap()).await, 1);
     }
 
     /// A destination that can be switched off, for an outage mid-close.
