@@ -2679,6 +2679,7 @@ fn unlink_database_set(
     let main = had_main.then(|| path.to_path_buf());
     for file in crate::fleet_layout::sidecar_paths(path)
         .into_iter()
+        .chain([crate::fleet_layout::replicator_lock_path(path)])
         .chain(main)
     {
         match unlink(&file) {
@@ -4203,7 +4204,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(seen.last(), Some(&path));
-        assert_eq!(seen.len(), sidecars.len() + 1);
+        assert_eq!(seen.len(), sidecars.len() + 2, "sidecars, lock file, main");
     }
 
     #[test]
@@ -4272,7 +4273,9 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(seen, crate::fleet_layout::sidecar_paths(&path).to_vec());
+        let mut strays = crate::fleet_layout::sidecar_paths(&path).to_vec();
+        strays.push(crate::fleet_layout::replicator_lock_path(&path));
+        assert_eq!(seen, strays);
     }
 
     #[tokio::test]

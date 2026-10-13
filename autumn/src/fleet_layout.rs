@@ -683,6 +683,16 @@ pub fn sidecar_paths(db: &Path) -> [PathBuf; 3] {
     [with("-wal"), with("-shm"), with("-journal")]
 }
 
+/// The lock file that elects the replicator of a database. It sits beside
+/// the database, so a delete removes it too.
+#[must_use]
+#[cfg(feature = "sqlite")]
+pub(crate) fn replicator_lock_path(db: &Path) -> PathBuf {
+    let mut name = db.as_os_str().to_owned();
+    name.push(".replicator.lock");
+    PathBuf::from(name)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::literal_string_with_formatting_args,

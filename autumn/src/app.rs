@@ -3646,7 +3646,7 @@ impl AppBuilder {
         // When AUTUMN_BUILD_STATIC=1, render static routes to dist/ and exit
         // instead of starting the HTTP server. This is triggered by `autumn build`.
         if is_static_build_mode() {
-            self.run_build_mode().await;
+            Box::pin(self.run_build_mode()).await;
             return;
         }
 
