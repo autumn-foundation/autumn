@@ -224,19 +224,6 @@ pub fn run(config: &SweepConfig, variant: Variant) -> Outcome {
         if ran % 10_000 == 0 {
             println!("reddit-clone DST nightly: {ran} seed(s) done, at seed {seed}");
         }
-        // The first block warms the caches, so it sets the baseline.
-        if ran % MEMORY_CHECK_EVERY == 0
-            && let Some(now) = rss_kb()
-        {
-            let since = *baseline.get_or_insert((ran, now));
-            if let Some(reason) = leak(since.1, now, ran - since.0) {
-                return Outcome::Failed {
-                    seeds: ran,
-                    seed,
-                    reason,
-                };
-            }
-        }
         let first = scenario::run(seed, variant);
         let (seen, true_once) = sometimes_snapshot();
         observed.extend(seen);
@@ -272,6 +259,20 @@ pub fn run(config: &SweepConfig, variant: Variant) -> Outcome {
                         diff: format!("the first run passed, the second run failed: {reason}"),
                     };
                 }
+            }
+        }
+        // Sample after the seed ran, so the report names a seed that ran.
+        // The first block warms the caches, so it sets the baseline.
+        if ran % MEMORY_CHECK_EVERY == 0
+            && let Some(now) = rss_kb()
+        {
+            let since = *baseline.get_or_insert((ran, now));
+            if let Some(reason) = leak(since.1, now, ran - since.0) {
+                return Outcome::Failed {
+                    seeds: ran,
+                    seed,
+                    reason,
+                };
             }
         }
     }
