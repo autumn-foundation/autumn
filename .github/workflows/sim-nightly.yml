@@ -1,0 +1,229 @@
+name: DST nightly (reddit-clone)
+
+# A large seed sweep of the reddit-clone DST scenario
+# (examples/reddit-clone/tests/sim_nightly.rs). See
+# docs/guide/simulation-testing.md, "The reddit-clone nightly".
+#
+# The jobs:
+# - plan: find the seed window. Each night tests new seeds:
+#   start = (UTC day number) x seeds.
+# - build: compile the test binary one time, and upload it.
+# - sweep: each matrix leg runs PROCESSES sweep processes. Each process runs a
+#   contiguous part of the window, one seed at a time, because the framework
+#   keeps the job runtime and the event bus per process.
+# - summary: add the shard reports, and fail if a seed failed or a seed did
+#   not run.
+#
+# A failed run is a real bug, not a flaky test. The summary gives the replay
+# command for the seed.
+#
+# Measured cost: about 150 seeds/s on a 4-vCPU runner, so 4,000,000 seeds take
+# about 7.5 runner-hours (about 25 minutes on 20 runners). The timeouts allow
+# 3 times that, for slower runners.
+#
+# "Re-run all jobs" on a later day sweeps the window of that day. To sweep one
+# window again, dispatch the workflow with its `start`.
+
+on:
+  schedule:
+    # 02:41 UTC daily: off-peak, and not on the hour.
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "How many seeds (decimal)"
+        required: false
+        default: "4000000"
+      start:
+        description: "The first seed (decimal). Empty: the window of today."
+        required: false
+        default: ""
+      shards:
+        description: "How many runners (1-32)"
+        required: false
+        default: "20"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Sweep processes per runner. ubuntu-latest has 4 vCPUs.
+  PROCESSES: 4
+
+jobs:
+  plan:
+    name: Plan the seed window
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      start: ${{ steps.window.outputs.start }}
+      seeds: ${{ steps.window.outputs.seeds }}
+      shards: ${{ steps.window.outputs.shards }}
+      matrix: ${{ steps.window.outputs.matrix }}
+    steps:
+      - name: Find the window
+        id: window
+        env:
+          SEEDS: ${{ inputs.seeds || '4000000' }}
+          START: ${{ inputs.start || '' }}
+          SHARDS: ${{ inputs.shards || '20' }}
+        run: |
+          set -euo pipefail
+          [[ "$SEEDS" =~ ^[0-9]{1,18}$ ]] || { echo "seeds must be a number: $SEEDS"; exit 1; }
+          [[ "$SHARDS" =~ ^[0-9]{1,18}$ ]] || { echo "shards must be a number: $SHARDS"; exit 1; }
+          # Base 10: a leading zero must not make bash read the value as octal.
+          SEEDS=$(( 10#$SEEDS )); SHARDS=$(( 10#$SHARDS ))
+          (( SEEDS > 0 )) || { echo "seeds must be positive: $SEEDS"; exit 1; }
+          (( SHARDS >= 1 && SHARDS <= 32 )) || { echo "shards must be 1-32: $SHARDS"; exit 1; }
+          # Each process needs enough seeds to make every sometimes! label true,
+          # and few enough to finish before the job timeout (about 36 seeds/s).
+          per_process=$(( SEEDS / (SHARDS * PROCESSES) ))
+          (( per_process >= 256 )) || { echo "seeds must be at least $(( SHARDS * PROCESSES * 256 )) for $SHARDS shard(s)"; exit 1; }
+          (( per_process <= 100000 )) || { echo "too many seeds per process ($per_process); add shards"; exit 1; }
+          if [[ -z "$START" ]]; then
+            START=$(( $(date -u +%s) / 86400 * SEEDS ))
+          fi
+          [[ "$START" =~ ^[0-9]{1,18}$ ]] || { echo "start must be a number: $START"; exit 1; }
+          START=$(( 10#$START ))
+          {
+            echo "start=$START"
+            echo "seeds=$SEEDS"
+            echo "shards=$SHARDS"
+            echo "matrix=$(jq -cn --argjson n "$SHARDS" '[range($n)]')"
+          } >> "$GITHUB_OUTPUT"
+          echo "Window: seeds $START..$(( START + SEEDS )) on $SHARDS runner(s) x $PROCESSES process(es)" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build the sweep binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2.7.8
+        with:
+          key: sim-nightly
+      - name: Build
+        run: |
+          set -euo pipefail
+          exe=$(cargo test -p reddit-clone --release --test sim_nightly --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "sim_nightly" and .executable != null) | .executable')
+          [[ -x "$exe" ]] || { echo "no sim_nightly binary: '$exe'"; exit 1; }
+          mkdir -p dist
+          cp "$exe" dist/sim_nightly
+      - name: Run the guard tests of the binary
+        # The sweep finds the planted bug, a seed replays, and the API surface
+        # gate passes. The large sweep is valid only if these pass.
+        run: dist/sim_nightly --test-threads=1
+        working-directory: ${{ github.workspace }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sim-nightly-binary
+          path: dist/sim_nightly
+          retention-days: 3
+
+  sweep:
+    name: Sweep (shard ${{ matrix.shard }})
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: sim-nightly-binary
+          path: dist
+      - name: Sweep
+        env:
+          START: ${{ needs.plan.outputs.start }}
+          SEEDS: ${{ needs.plan.outputs.seeds }}
+          SHARDS: ${{ needs.plan.outputs.shards }}
+          SHARD: ${{ matrix.shard }}
+          AUTUMN_SIM_TRACE_CHECKS: "8"
+        run: |
+          set -euo pipefail
+          chmod +x dist/sim_nightly
+          mkdir -p reports
+          total=$(( SHARDS * PROCESSES ))
+          pids=()
+          for p in $(seq 0 $(( PROCESSES - 1 ))); do
+            part=$(( SHARD * PROCESSES + p ))
+            AUTUMN_SIM_SEED_START="$START" AUTUMN_SIM_SEEDS="$SEEDS" \
+            AUTUMN_SIM_SHARD="$part/$total" AUTUMN_SIM_REPORT="reports/part-$part.json" \
+              timeout 170m dist/sim_nightly --exact sim_nightly_sweep --nocapture > "reports/part-$part.log" 2>&1 &
+            pids+=("$!")
+          done
+          status=0
+          for pid in "${pids[@]}"; do wait "$pid" || status=1; done
+          for log in reports/part-*.log; do
+            # A process that timed out shows its last progress line.
+            grep -E '^(reddit-clone DST nightly|PASSED|FAILED|NONDETERMINISTIC|VACUOUS|EMPTY|replay)' "$log" | tail -8 || tail -20 "$log"
+          done
+          exit "$status"
+      - name: Upload the reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sim-nightly-reports-${{ matrix.shard }}
+          path: reports/
+          retention-days: 14
+
+  summary:
+    name: DST nightly summary
+    needs: [plan, sweep]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: sim-nightly-reports-*
+          path: reports
+          merge-multiple: true
+      - name: Add the reports
+        env:
+          SEEDS: ${{ needs.plan.outputs.seeds }}
+          SHARDS: ${{ needs.plan.outputs.shards }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(reports/part-*.json)
+          expected=$(( SHARDS * PROCESSES ))
+          ran=0
+          [[ ${#files[@]} -gt 0 ]] && ran=$(jq -s 'map(.seeds_run) | add' "${files[@]}")
+          {
+            echo "## reddit-clone DST nightly"
+            echo
+            echo "- Reports: ${#files[@]} of $expected processes"
+            echo "- Seeds run: $ran of $SEEDS"
+          } >> "$GITHUB_STEP_SUMMARY"
+          failed=0
+          for file in "${files[@]}"; do
+            if [[ "$(jq -r .status "$file")" != "passed" ]]; then
+              failed=1
+              {
+                echo
+                echo '```text'
+                jq -r '.summary' "$file"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          if (( ${#files[@]} != expected )); then
+            echo "Some processes wrote no report (cancelled, timed out or crashed)." >> "$GITHUB_STEP_SUMMARY"
+            failed=1
+          elif (( ran != SEEDS )); then
+            echo "Not all seeds ran." >> "$GITHUB_STEP_SUMMARY"
+            failed=1
+          fi
+          cat "$GITHUB_STEP_SUMMARY"
+          exit "$failed"

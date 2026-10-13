@@ -34,7 +34,7 @@ enum Op {
 
 impl Arbitrary for Op {
     type Parameters = ();
-    type Strategy = BoxedStrategy<Op>;
+    type Strategy = BoxedStrategy<Self>;
 
     fn arbitrary_with((): ()) -> Self::Strategy {
         prop_oneof![
