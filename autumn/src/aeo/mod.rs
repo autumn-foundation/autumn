@@ -866,11 +866,10 @@ pub(crate) async fn write_static_documents(
                 "aeo: dist/{STATIC_HEADERS_FILE} exists; the agent documents' headers are not added to it"
             );
         } else {
-            // The host serves the files below the base URL's path.
-            let base_path = url::Url::parse(&base)
-                .map(|u| u.path().trim_end_matches('/').to_owned())
-                .unwrap_or_default();
-            tokio::fs::write(&file, headers_file(&host_headers, &base_path)).await?;
+            // Paths as the host sees `dist`. An app below a path prefix
+            // deploys `dist` at that prefix, as it does its static pages,
+            // which the build writes at their route paths too.
+            tokio::fs::write(&file, headers_file(&host_headers)).await?;
             written.push(format!("/{STATIC_HEADERS_FILE}"));
         }
     }
@@ -951,7 +950,7 @@ fn static_host_headers(headers: &axum::http::HeaderMap) -> Vec<(String, String)>
 }
 
 /// `files` in the `_headers` format: each path, then its headers indented.
-fn headers_file(files: &[(String, Vec<(String, String)>)], base_path: &str) -> String {
+fn headers_file(files: &[(String, Vec<(String, String)>)]) -> String {
     use std::fmt::Write as _;
 
     let mut out =
@@ -960,7 +959,7 @@ fn headers_file(files: &[(String, Vec<(String, String)>)], base_path: &str) -> S
         if headers.is_empty() {
             continue;
         }
-        let _ = writeln!(out, "\n{base_path}{path}");
+        let _ = writeln!(out, "\n{path}");
         for (name, value) in headers {
             let _ = writeln!(out, "  {name}: {value}");
         }
@@ -1124,9 +1123,11 @@ mod tests {
         assert!(!headers.contains("/_autumn/webmcp.js"), "{headers}");
     }
 
-    /// Codex review (P2): the documents live below the base URL's path.
+    /// Codex review (P2): `dist` is deployed at the base URL's path, pages
+    /// and documents alike, so each `_headers` path is the file's path in
+    /// `dist`.
     #[tokio::test]
-    async fn a_static_headers_file_uses_the_base_path() {
+    async fn a_static_headers_file_matches_the_files_in_dist() {
         let mut config = crate::config::AutumnConfig::default();
         config.seo.base_url = Some("https://example.com/shop".to_owned());
         let dist = tempfile::tempdir().unwrap();
@@ -1138,11 +1139,13 @@ mod tests {
         .await
         .unwrap();
         let headers = std::fs::read_to_string(dist.path().join("_headers")).unwrap();
+        let entry = "/.well-known/agent-skills/index.json";
+        assert!(headers.contains(&format!("\n{entry}\n")), "{headers}");
         assert!(
-            headers.contains("\n/shop/.well-known/agent-skills/index.json\n"),
+            dist.path().join(entry.trim_start_matches('/')).exists(),
             "{headers}"
         );
-        assert!(!headers.contains("\n/.well-known/"), "{headers}");
+        assert!(!headers.contains("/shop/"), "{headers}");
     }
 
     #[tokio::test]

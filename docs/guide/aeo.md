@@ -213,6 +213,11 @@ headers, its `Link` header and its `Cache-Control`. An app that ships its own
 `_headers` keeps it, and the build logs a warning. On another host, set these
 headers in that host's configuration.
 
+The build writes every file at its route path, pages and documents alike. An
+app below a path prefix (`[seo] base_url = "https://example.com/shop"`)
+deploys `dist` at `/shop`, as it does the server. The documents' links name
+`/shop/...`; the files in `dist` and the `_headers` paths do not.
+
 ### Agent skills
 
 Autumn publishes a `site-guide` skill. It tells an agent how to read the
