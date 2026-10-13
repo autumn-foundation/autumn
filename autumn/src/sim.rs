@@ -335,6 +335,10 @@ struct ReplicaSlot {
     name: String,
     clock: replica::NodeClock,
     client: Option<crate::test::TestClient>,
+    /// The network this replica is a host of. [`Sim::net`] can set a new
+    /// network later, so the kill and the drop clean this one.
+    #[cfg(feature = "http-client")]
+    net: Option<net::SimNet>,
 }
 
 impl Sim {
@@ -674,6 +678,8 @@ impl Sim {
             name: replica.name().to_owned(),
             clock,
             client: None,
+            #[cfg(feature = "http-client")]
+            net: None,
         });
         let index = self.replicas.len() - 1;
         self.mount_replica_at(index, app)
@@ -710,7 +716,7 @@ impl Sim {
             return;
         };
         #[cfg(feature = "http-client")]
-        if let Some(net) = &self.net {
+        if let Some(net) = self.replicas[index].net.take() {
             net.remove_host(name);
         }
         abort_app_tasks(&client);
@@ -856,6 +862,7 @@ impl Sim {
         #[cfg(feature = "http-client")]
         if let Some(net) = &self.net {
             net.insert_host(&slot.name, client.router());
+            slot.net = Some(net.clone());
         }
         slot.client.insert(client)
     }
@@ -1360,8 +1367,8 @@ impl Drop for Sim {
         // A replica is a host of the sim network, and its app holds the
         // network: a cycle. Remove the hosts, so the replica apps drop.
         #[cfg(feature = "http-client")]
-        if let Some(net) = &self.net {
-            for slot in self.replicas.iter().filter(|slot| slot.client.is_some()) {
+        for slot in &mut self.replicas {
+            if let Some(net) = slot.net.take() {
                 net.remove_host(&slot.name);
             }
         }
@@ -2327,6 +2334,42 @@ mod tests {
         assert!(
             freed.upgrade().is_none(),
             "the replica app is still alive after its sim dropped"
+        );
+    }
+
+    /// A replica stays a host of the network it joined, even after
+    /// [`Sim::net`] sets a new network. The kill and the drop must clean that
+    /// network, and leave a host of the same name on the new one.
+    #[cfg(feature = "http-client")]
+    #[tokio::test(start_paused = true)]
+    async fn a_replica_is_cleaned_from_the_network_it_joined() {
+        let marker = std::sync::Arc::new(());
+        let freed = std::sync::Arc::downgrade(&marker);
+        let first = super::net::SimNet::new();
+        let held = std::sync::Arc::clone(&marker);
+        let router = axum::Router::new().route(
+            "/held",
+            axum::routing::get(move || {
+                let holders = std::sync::Arc::strong_count(&held);
+                async move { holders.to_string() }
+            }),
+        );
+        let second = super::net::SimNet::new().host("a", axum::Router::new());
+        {
+            let mut sim = Sim::from_seed(22);
+            sim.net(first.clone());
+            sim.mount_replica("a", crate::test::TestApp::new().merge(router));
+            sim.net(second.clone());
+        }
+        drop(marker);
+        assert!(
+            freed.upgrade().is_none(),
+            "the replica app is still alive in the network it joined"
+        );
+        assert!(first.service("a").is_none());
+        assert!(
+            second.service("a").is_some(),
+            "a host of another network stays"
         );
     }
 }
