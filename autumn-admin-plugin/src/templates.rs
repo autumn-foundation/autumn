@@ -559,21 +559,101 @@ pub fn impersonation_banner(banner: &ImpersonationBanner) -> Markup {
 
 // ── Layout ──────────────────────────────────────────────────────────
 
+/// Layout-wide values that every admin page shares.
+///
+/// A handler builds one `AdminChrome` per request and passes it to the
+/// page function. The page adds only its own data.
+#[derive(Clone, Copy)]
+pub struct AdminChrome<'a> {
+    /// Registered models. Drives the sidebar.
+    pub registry: &'a AdminRegistry,
+    /// URL prefix the admin panel is mounted at.
+    pub prefix: &'a str,
+    /// URL prefix of the actuator UI.
+    pub actuator_prefix: &'a str,
+    /// CSRF token. Empty when no `CsrfLayer` is installed.
+    pub csrf_token: &'a str,
+    /// Name of the CSRF form field.
+    pub csrf_form_field: &'a str,
+    /// Name of the CSRF request header.
+    pub csrf_token_header: &'a str,
+    /// Flash messages to show on this page.
+    pub messages: &'a [FlashMessage],
+    /// Whether the sidebar links to the runtime config page.
+    pub show_config: bool,
+    /// Impersonation banner, if the session is impersonating.
+    pub impersonation: Option<&'a ImpersonationBanner>,
+}
+
+/// Model-list data that is specific to `model_list_page`.
+#[derive(Clone, Copy)]
+pub struct ModelListView<'a> {
+    pub model_slug: &'a str,
+    pub model_name_plural: &'a str,
+    pub fields: &'a [AdminField],
+    pub actions: &'a [AdminAction],
+    pub result: &'a ListResult,
+    pub search_query: &'a str,
+    pub sort_by: Option<&'a str>,
+    pub sort_dir: SortDirection,
+    /// Active filters (already validated by the handler). Carried into
+    /// every generated sort and pagination URL, so navigation keeps them.
+    pub filters: &'a [(String, String)],
+    pub supports_csv_export: bool,
+    pub supports_csv_import: bool,
+}
+
+/// Record data that is specific to `model_detail_page`.
+#[derive(Clone, Copy)]
+pub struct ModelDetailView<'a> {
+    pub model_slug: &'a str,
+    pub model_name: &'a str,
+    pub model_name_plural: &'a str,
+    pub fields: &'a [AdminField],
+    pub record: &'a Value,
+    pub record_display: &'a str,
+    /// Path-based ID from the handler. It is authoritative: the edit and
+    /// delete links must route to the record the URL named, not to an ID
+    /// that appears in the JSON payload.
+    pub id: i64,
+    pub has_history: bool,
+}
+
+/// Form data that is specific to `model_form_page`.
+#[derive(Clone, Copy)]
+pub struct ModelFormView<'a> {
+    pub model_slug: &'a str,
+    pub model_name: &'a str,
+    pub model_name_plural: &'a str,
+    pub fields: &'a [AdminField],
+    pub record: Option<&'a Value>,
+    /// Path-based ID from the handler on edit pages. `None` for the "new"
+    /// form. Never trust the JSON payload for mutation routing.
+    pub id: Option<i64>,
+    /// Names of fields in `record` whose value is raw, unvalidated form
+    /// input from a failed submission, not a stored or coerced value. See
+    /// `render_form_widget`. Empty for every ordinary render.
+    pub raw_fields: &'a [&'a str],
+}
+
 /// Render the full admin page layout with sidebar navigation.
-#[allow(clippy::too_many_arguments)]
 pub fn admin_layout(
-    registry: &AdminRegistry,
+    chrome: &AdminChrome<'_>,
     active_slug: Option<&str>,
     title: &str,
-    prefix: &str,
-    actuator_prefix: &str,
-    csrf_token: &str,
-    csrf_token_header: &str,
-    messages: &[FlashMessage],
-    show_config: bool,
-    impersonation: Option<&ImpersonationBanner>,
     content: &Markup,
 ) -> Markup {
+    let AdminChrome {
+        registry,
+        prefix,
+        actuator_prefix,
+        csrf_token,
+        csrf_token_header,
+        messages,
+        show_config,
+        impersonation,
+        ..
+    } = *chrome;
     // Each nav item's href is computed once here and reused both to
     // synthesize current_path (so nav_link's own path-comparison logic
     // decides which sidebar item is active) and as the anchor's href below —
@@ -675,19 +755,13 @@ fn csrf_hidden_input(csrf_token: &str, csrf_form_field: &str) -> Markup {
 }
 
 /// Render the built-in jobs admin dashboard.
-#[allow(clippy::too_many_arguments)]
-pub fn jobs_page(
-    registry: &AdminRegistry,
-    snapshot: &JobAdminSnapshot,
-    messages: &[FlashMessage],
-    csrf_token: &str,
-    csrf_form_field: &str,
-    csrf_token_header: &str,
-    prefix: &str,
-    actuator_prefix: &str,
-    show_config: bool,
-    impersonation: Option<&ImpersonationBanner>,
-) -> Markup {
+pub fn jobs_page(chrome: &AdminChrome<'_>, snapshot: &JobAdminSnapshot) -> Markup {
+    let AdminChrome {
+        prefix,
+        csrf_token,
+        csrf_form_field,
+        ..
+    } = *chrome;
     let content = html! {
         div class="breadcrumbs" {
             a href=(prefix) { "Admin" }
@@ -754,19 +828,7 @@ pub fn jobs_page(
         }
     };
 
-    admin_layout(
-        registry,
-        Some(JOBS_NAV_SLUG),
-        "Jobs",
-        prefix,
-        actuator_prefix,
-        csrf_token,
-        csrf_token_header,
-        messages,
-        show_config,
-        impersonation,
-        &content,
-    )
+    admin_layout(chrome, Some(JOBS_NAV_SLUG), "Jobs", &content)
 }
 
 /// Render the HTMX-refreshable job counter fragment.
@@ -1005,18 +1067,15 @@ fn optional_text(value: Option<&str>) -> Markup {
 // ── Dashboard ───────────────────────────────────────────────────────
 
 /// Render the admin dashboard with model counts.
-#[allow(clippy::too_many_arguments)]
 pub fn dashboard_page(
-    registry: &AdminRegistry,
+    chrome: &AdminChrome<'_>,
     model_counts: &[(&str, &str, u64)], // (slug, display_name_plural, count)
-    messages: &[FlashMessage],
-    csrf_token: &str,
-    csrf_token_header: &str,
-    prefix: &str,
-    actuator_prefix: &str,
-    show_config: bool,
-    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
+    let AdminChrome {
+        prefix,
+        actuator_prefix,
+        ..
+    } = *chrome;
     let content = html! {
         h1 style="font-size: 1.5rem; font-weight: 700; margin-bottom: 1.5rem;" {
             "Dashboard"
@@ -1041,50 +1100,34 @@ pub fn dashboard_page(
             card(&body, &CardConfig::new().title("System Health").header_action(action))
         })
     };
-    admin_layout(
-        registry,
-        None,
-        "Dashboard",
-        prefix,
-        actuator_prefix,
-        csrf_token,
-        csrf_token_header,
-        messages,
-        show_config,
-        impersonation,
-        &content,
-    )
+    admin_layout(chrome, None, "Dashboard", &content)
 }
 
 // ── Model list view ─────────────────────────────────────────────────
 
 /// Render the list view for a model (table + search + pagination).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub fn model_list_page(
-    registry: &AdminRegistry,
-    model_slug: &str,
-    model_name_plural: &str,
-    fields: &[AdminField],
-    actions: &[AdminAction],
-    result: &ListResult,
-    search_query: &str,
-    sort_by: Option<&str>,
-    sort_dir: SortDirection,
-    // Active filters (already validated by the handler). Carried into
-    // every generated sort/pagination URL so navigation doesn't silently
-    // revert to unfiltered results.
-    filters: &[(String, String)],
-    messages: &[FlashMessage],
-    csrf_token: &str,
-    csrf_form_field: &str,
-    csrf_token_header: &str,
-    prefix: &str,
-    actuator_prefix: &str,
-    show_config: bool,
-    supports_csv_export: bool,
-    supports_csv_import: bool,
-    impersonation: Option<&ImpersonationBanner>,
-) -> Markup {
+#[allow(clippy::too_many_lines)]
+pub fn model_list_page(chrome: &AdminChrome<'_>, view: &ModelListView<'_>) -> Markup {
+    let AdminChrome {
+        prefix,
+        csrf_token,
+        csrf_form_field,
+        ..
+    } = *chrome;
+    let ModelListView {
+        model_slug,
+        model_name_plural,
+        fields,
+        actions,
+        result,
+        search_query,
+        sort_by,
+        sort_dir,
+        filters,
+        supports_csv_export,
+        supports_csv_import,
+        ..
+    } = *view;
     // Password fields are documented as write-only — never surface their
     // values (raw or hashed) in the index view. Hidden fields are
     // documented as "shown in detail, not editable" — so they should
@@ -1310,38 +1353,23 @@ pub fn model_list_page(
             card(&body, &CardConfig::new().title_html(title).header_action(header_action))
         })
     };
-    admin_layout(
-        registry,
-        Some(model_slug),
-        model_name_plural,
-        prefix,
-        actuator_prefix,
-        csrf_token,
-        csrf_token_header,
-        messages,
-        show_config,
-        impersonation,
-        &content,
-    )
+    admin_layout(chrome, Some(model_slug), model_name_plural, &content)
 }
 
 // ── CSV import form ──────────────────────────────────────────────────
 
 /// Render the CSV import upload form.
-#[allow(clippy::too_many_arguments)]
 pub fn model_import_form_page(
-    registry: &AdminRegistry,
+    chrome: &AdminChrome<'_>,
     model_slug: &str,
     model_name_plural: &str,
-    messages: &[FlashMessage],
-    csrf_token: &str,
-    csrf_form_field: &str,
-    csrf_token_header: &str,
-    prefix: &str,
-    actuator_prefix: &str,
-    show_config: bool,
-    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
+    let AdminChrome {
+        prefix,
+        csrf_token,
+        csrf_form_field,
+        ..
+    } = *chrome;
     let content = html! {
         div class="breadcrumbs" {
             a href=(prefix) { "Admin" }
@@ -1411,37 +1439,18 @@ pub fn model_import_form_page(
         })
     };
 
-    admin_layout(
-        registry,
-        Some(model_slug),
-        model_name_plural,
-        prefix,
-        actuator_prefix,
-        csrf_token,
-        csrf_token_header,
-        messages,
-        show_config,
-        impersonation,
-        &content,
-    )
+    admin_layout(chrome, Some(model_slug), model_name_plural, &content)
 }
 
 /// Render the result page after a CSV import.
-#[allow(clippy::too_many_arguments)]
 pub fn model_import_result_page(
-    registry: &AdminRegistry,
+    chrome: &AdminChrome<'_>,
     model_slug: &str,
     model_name_plural: &str,
     report: &AdminImportReport,
     mode: CsvImportMode,
-    messages: &[FlashMessage],
-    csrf_token: &str,
-    csrf_token_header: &str,
-    prefix: &str,
-    actuator_prefix: &str,
-    show_config: bool,
-    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
+    let AdminChrome { prefix, .. } = *chrome;
     let mode_label = match mode {
         CsvImportMode::DryRun => "Dry Run",
         CsvImportMode::Insert => "Insert",
@@ -1527,47 +1536,30 @@ pub fn model_import_result_page(
         })
     };
 
-    admin_layout(
-        registry,
-        Some(model_slug),
-        model_name_plural,
-        prefix,
-        actuator_prefix,
-        csrf_token,
-        csrf_token_header,
-        messages,
-        show_config,
-        impersonation,
-        &content,
-    )
+    admin_layout(chrome, Some(model_slug), model_name_plural, &content)
 }
 
 // ── Detail view ─────────────────────────────────────────────────────
 
 /// Render the detail view for a single record.
-#[allow(clippy::too_many_arguments)]
-pub fn model_detail_page(
-    registry: &AdminRegistry,
-    model_slug: &str,
-    model_name: &str,
-    model_name_plural: &str,
-    fields: &[AdminField],
-    record: &Value,
-    record_display: &str,
-    // Path-based ID from the handler. Authoritative — edit/delete links
-    // must route to the same record the URL addressed, not whatever ID
-    // happens to appear in the JSON payload.
-    id: i64,
-    messages: &[FlashMessage],
-    csrf_token: &str,
-    csrf_form_field: &str,
-    csrf_token_header: &str,
-    prefix: &str,
-    actuator_prefix: &str,
-    has_history: bool,
-    show_config: bool,
-    impersonation: Option<&ImpersonationBanner>,
-) -> Markup {
+pub fn model_detail_page(chrome: &AdminChrome<'_>, view: &ModelDetailView<'_>) -> Markup {
+    let AdminChrome {
+        prefix,
+        csrf_token,
+        csrf_form_field,
+        ..
+    } = *chrome;
+    let ModelDetailView {
+        model_slug,
+        model_name,
+        model_name_plural,
+        fields,
+        record,
+        record_display,
+        id,
+        has_history,
+        ..
+    } = *view;
     let content = html! {
         div class="breadcrumbs" {
             a href=(prefix) { "Admin" }
@@ -1619,50 +1611,29 @@ pub fn model_detail_page(
             card(&body, &CardConfig::new().title(record_display).header_action(header_action))
         })
     };
-    admin_layout(
-        registry,
-        Some(model_slug),
-        record_display,
-        prefix,
-        actuator_prefix,
-        csrf_token,
-        csrf_token_header,
-        messages,
-        show_config,
-        impersonation,
-        &content,
-    )
+    admin_layout(chrome, Some(model_slug), record_display, &content)
 }
 
 // ── Create / Edit form ──────────────────────────────────────────────
 
 /// Render the create or edit form for a model.
-#[allow(clippy::too_many_arguments)]
-pub fn model_form_page(
-    registry: &AdminRegistry,
-    model_slug: &str,
-    model_name: &str,
-    model_name_plural: &str,
-    fields: &[AdminField],
-    record: Option<&Value>,
-    // Path-based ID from the handler on edit pages (`None` when rendering
-    // the "new" form). Never trust the JSON payload for mutation routing.
-    id: Option<i64>,
-    // Names of fields in `record` whose value is raw, unvalidated form
-    // input from a failed submission rather than a genuine stored/coerced
-    // value — see `render_form_widget`. Empty for every ordinary render
-    // (fresh "new" form, a real stored record, or a resubmission that
-    // failed for a reason unrelated to that field's own syntax).
-    raw_fields: &[&str],
-    messages: &[FlashMessage],
-    csrf_token: &str,
-    csrf_form_field: &str,
-    csrf_token_header: &str,
-    prefix: &str,
-    actuator_prefix: &str,
-    show_config: bool,
-    impersonation: Option<&ImpersonationBanner>,
-) -> Markup {
+pub fn model_form_page(chrome: &AdminChrome<'_>, view: &ModelFormView<'_>) -> Markup {
+    let AdminChrome {
+        prefix,
+        csrf_token,
+        csrf_form_field,
+        ..
+    } = *chrome;
+    let ModelFormView {
+        model_slug,
+        model_name,
+        model_name_plural,
+        fields,
+        record,
+        id,
+        raw_fields,
+        ..
+    } = *view;
     let is_edit = id.is_some();
     let title = if is_edit {
         format!("Edit {model_name}")
@@ -1724,36 +1695,20 @@ pub fn model_form_page(
             card(&body, &CardConfig::new().title(&title))
         })
     };
-    admin_layout(
-        registry,
-        Some(model_slug),
-        &title,
-        prefix,
-        actuator_prefix,
-        csrf_token,
-        csrf_token_header,
-        messages,
-        show_config,
-        impersonation,
-        &content,
-    )
+    admin_layout(chrome, Some(model_slug), &title, &content)
 }
 
 // ── Runtime config page ─────────────────────────────────────────────
 
 /// Render the runtime config management page.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub fn config_page(
-    registry: &AdminRegistry,
-    entries: &[ConfigEntry],
-    messages: &[FlashMessage],
-    csrf_token: &str,
-    csrf_form_field: &str,
-    csrf_token_header: &str,
-    prefix: &str,
-    actuator_prefix: &str,
-    impersonation: Option<&ImpersonationBanner>,
-) -> Markup {
+#[allow(clippy::too_many_lines)]
+pub fn config_page(chrome: &AdminChrome<'_>, entries: &[ConfigEntry]) -> Markup {
+    let AdminChrome {
+        prefix,
+        csrf_token,
+        csrf_form_field,
+        ..
+    } = *chrome;
     let content = html! {
         div class="breadcrumbs" {
             a href=(prefix) { "Admin" }
@@ -1851,34 +1806,26 @@ pub fn config_page(
             }, &CardConfig::new()))
         }
     };
+    // The config pages always show the "Runtime Config" nav link.
+    let chrome = AdminChrome {
+        show_config: true,
+        ..*chrome
+    };
     admin_layout(
-        registry,
+        &chrome,
         Some(RUNTIME_CONFIG_NAV_SLUG),
         "Runtime Config",
-        prefix,
-        actuator_prefix,
-        csrf_token,
-        csrf_token_header,
-        messages,
-        true,
-        impersonation,
         &content,
     )
 }
 
 /// Render the change history page for a single config key.
-#[allow(clippy::too_many_arguments)]
 pub fn config_history_page(
-    registry: &AdminRegistry,
+    chrome: &AdminChrome<'_>,
     key: &str,
     history: &[ConfigChangeRecord],
-    messages: &[FlashMessage],
-    csrf_token: &str,
-    csrf_token_header: &str,
-    prefix: &str,
-    actuator_prefix: &str,
-    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
+    let AdminChrome { prefix, .. } = *chrome;
     let title = format!("History: {key}");
     let content = html! {
         div class="breadcrumbs" {
@@ -1950,19 +1897,12 @@ pub fn config_history_page(
             "← Back to Runtime Config"
         }
     };
-    admin_layout(
-        registry,
-        Some(RUNTIME_CONFIG_NAV_SLUG),
-        &title,
-        prefix,
-        actuator_prefix,
-        csrf_token,
-        csrf_token_header,
-        messages,
-        true,
-        impersonation,
-        &content,
-    )
+    // The config pages always show the "Runtime Config" nav link.
+    let chrome = AdminChrome {
+        show_config: true,
+        ..*chrome
+    };
+    admin_layout(&chrome, Some(RUNTIME_CONFIG_NAV_SLUG), &title, &content)
 }
 
 fn format_timestamp(ts: u64) -> String {
@@ -2395,7 +2335,6 @@ fn render_form_widget(
 /// `search_enc` and `filters_enc` are expected to be already URL-encoded;
 /// callers pass the raw form for rendering and the encoded form for link
 /// building.
-#[allow(clippy::too_many_arguments)]
 fn render_pagination(
     result: &ListResult,
     model_slug: &str,
@@ -2477,20 +2416,16 @@ fn page_meta(page: u64, per_page: u64, total: u64, total_pages: u64) -> Page<()>
 ///
 /// Called by `GET /admin/{slug}/{id}/history`. Lists entries in
 /// chronological order with actor, timestamp, and column-level diff.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)]
 pub fn model_history_page(
-    registry: &AdminRegistry,
+    chrome: &AdminChrome<'_>,
     model_slug: &str,
     model_name: &str,
     model_name_plural: &str,
     record_id_val: i64,
     history: &AdminHistoryPage,
-    prefix: &str,
-    actuator_prefix: &str,
-    csrf_token_header: &str,
-    show_config: bool,
-    impersonation: Option<&ImpersonationBanner>,
 ) -> Markup {
+    let AdminChrome { prefix, .. } = *chrome;
     let record_display = format!("{model_name} #{record_id_val}");
     let history_page_href = |page: u64| {
         format!(
@@ -2498,7 +2433,6 @@ pub fn model_history_page(
             history.per_page
         )
     };
-    let empty_messages: &[FlashMessage] = &[];
     let content = html! {
         div class="breadcrumbs" {
             a href=(prefix) { "Admin" }
@@ -2606,24 +2540,33 @@ pub fn model_history_page(
             card(&body, &CardConfig::new().title("Version History").header_action(header_action))
         })
     };
-    admin_layout(
-        registry,
-        Some(model_slug),
-        &record_display,
-        prefix,
-        actuator_prefix,
-        "",
-        csrf_token_header,
-        empty_messages,
-        show_config,
-        impersonation,
-        &content,
-    )
+    // History pages carry no flash messages and no CSRF token.
+    let chrome = AdminChrome {
+        csrf_token: "",
+        messages: &[],
+        ..*chrome
+    };
+    admin_layout(&chrome, Some(model_slug), &record_display, &content)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Default chrome for tests. Tests override single fields with `..`.
+    fn test_chrome(registry: &AdminRegistry) -> AdminChrome<'_> {
+        AdminChrome {
+            registry,
+            prefix: "/admin",
+            actuator_prefix: "/actuator",
+            csrf_token: "t",
+            csrf_form_field: "_csrf",
+            csrf_token_header: "X-CSRF-Token",
+            messages: &[],
+            show_config: false,
+            impersonation: None,
+        }
+    }
 
     // WCAG 1.4.3 (contrast minimum) relative-luminance / contrast-ratio
     // formulas, applied to the admin plugin's own `tokens.css` color pairs.
@@ -2760,15 +2703,11 @@ mod tests {
             description: None,
         }];
         let html = config_page(
-            &r,
+            &AdminChrome {
+                csrf_token: "tok",
+                ..test_chrome(&r)
+            },
             &entries,
-            &[],
-            "tok",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            None,
         )
         .into_string();
         assert!(
@@ -3228,17 +3167,15 @@ mod tests {
         };
 
         let html = model_history_page(
-            &r,
+            &AdminChrome {
+                actuator_prefix: "/ops",
+                ..test_chrome(&r)
+            },
             "posts",
             "Post",
             "Posts",
             42,
             &history,
-            "/admin",
-            "/ops",
-            "X-CSRF-Token",
-            false,
-            None,
         )
         .into_string();
 
@@ -3256,15 +3193,12 @@ mod tests {
     fn dashboard_emits_csrf_meta_and_script() {
         let r = dummy_registry();
         let html = dashboard_page(
-            &r,
+            &AdminChrome {
+                actuator_prefix: "/ops",
+                csrf_token: "tok-123",
+                ..test_chrome(&r)
+            },
             &[],
-            &[],
-            "tok-123",
-            "X-CSRF-Token",
-            "/admin",
-            "/ops",
-            false,
-            None,
         )
         .into_string();
         assert!(
@@ -3286,15 +3220,12 @@ mod tests {
     fn dashboard_uses_configured_actuator_prefix() {
         let r = dummy_registry();
         let html = dashboard_page(
-            &r,
+            &AdminChrome {
+                actuator_prefix: "/ops",
+                csrf_token: "tok",
+                ..test_chrome(&r)
+            },
             &[],
-            &[],
-            "tok",
-            "X-CSRF-Token",
-            "/admin",
-            "/ops",
-            false,
-            None,
         )
         .into_string();
         assert!(
@@ -3435,16 +3366,12 @@ mod tests {
         };
 
         let html = jobs_page(
-            &r,
+            &AdminChrome {
+                csrf_token: "tok-job",
+                csrf_form_field: "authenticity_token",
+                ..test_chrome(&r)
+            },
             &snapshot,
-            &[],
-            "tok-job",
-            "authenticity_token",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false,
-            None,
         )
         .into_string();
         assert!(html.contains("Jobs"));
@@ -3550,22 +3477,20 @@ mod tests {
         let r = dummy_registry();
         let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
         let html = model_form_page(
-            &r,
-            "widgets",
-            "Widget",
-            "Widgets",
-            &fields,
-            None,
-            None,
-            &[],
-            &[],
-            "tok-xyz",
-            "authenticity_token",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false,
-            None,
+            &AdminChrome {
+                csrf_token: "tok-xyz",
+                csrf_form_field: "authenticity_token",
+                ..test_chrome(&r)
+            },
+            &ModelFormView {
+                model_slug: "widgets",
+                model_name: "Widget",
+                model_name_plural: "Widgets",
+                fields: &fields,
+                record: None,
+                id: None,
+                raw_fields: &[],
+            },
         )
         .into_string();
         assert!(
@@ -3582,22 +3507,16 @@ mod tests {
         // RFC 3339 with `Z` — would render as empty without normalization.
         let record = serde_json::json!({"id": 1, "created_at": "2026-04-24T12:34:56Z"});
         let html = model_form_page(
-            &r,
-            "widgets",
-            "Widget",
-            "Widgets",
-            &fields,
-            Some(&record),
-            Some(1),
-            &[],
-            &[],
-            "t",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false,
-            None,
+            &test_chrome(&r),
+            &ModelFormView {
+                model_slug: "widgets",
+                model_name: "Widget",
+                model_name_plural: "Widgets",
+                fields: &fields,
+                record: Some(&record),
+                id: Some(1),
+                raw_fields: &[],
+            },
         )
         .into_string();
         assert!(
@@ -3618,22 +3537,16 @@ mod tests {
         let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
         let record = serde_json::json!({"id": 99, "name": "x"});
         let html = model_form_page(
-            &r,
-            "widgets",
-            "Widget",
-            "Widgets",
-            &fields,
-            Some(&record),
-            Some(42),
-            &[],
-            &[],
-            "t",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false,
-            None,
+            &test_chrome(&r),
+            &ModelFormView {
+                model_slug: "widgets",
+                model_name: "Widget",
+                model_name_plural: "Widgets",
+                fields: &fields,
+                record: Some(&record),
+                id: Some(42),
+                raw_fields: &[],
+            },
         )
         .into_string();
         assert!(
@@ -3652,23 +3565,17 @@ mod tests {
         let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
         let record = serde_json::json!({"id": 99, "name": "x"});
         let html = model_detail_page(
-            &r,
-            "widgets",
-            "Widget",
-            "Widgets",
-            &fields,
-            &record,
-            "#42",
-            42,
-            &[],
-            "t",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false,
-            false,
-            None,
+            &test_chrome(&r),
+            &ModelDetailView {
+                model_slug: "widgets",
+                model_name: "Widget",
+                model_name_plural: "Widgets",
+                fields: &fields,
+                record: &record,
+                record_display: "#42",
+                id: 42,
+                has_history: false,
+            },
         )
         .into_string();
         assert!(
@@ -3704,23 +3611,17 @@ mod tests {
         let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
         let record = serde_json::json!({"id": 42, "name": "x"});
         let html = model_detail_page(
-            &r,
-            "widgets",
-            "Widget",
-            "Widgets",
-            &fields,
-            &record,
-            "#42",
-            42,
-            &[],
-            "t",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false,
-            false,
-            None,
+            &test_chrome(&r),
+            &ModelDetailView {
+                model_slug: "widgets",
+                model_name: "Widget",
+                model_name_plural: "Widgets",
+                fields: &fields,
+                record: &record,
+                record_display: "#42",
+                id: 42,
+                has_history: false,
+            },
         )
         .into_string();
         assert!(!html.contains("hx-confirm"), "{html}");
@@ -3747,23 +3648,20 @@ mod tests {
         let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
         let record = serde_json::json!({"id": 42, "name": "x"});
         let html = model_detail_page(
-            &r,
-            "widgets",
-            "Widget",
-            "Widgets",
-            &fields,
-            &record,
-            "#42",
-            42,
-            &[],
-            "t",
-            "authenticity_token",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false,
-            false,
-            None,
+            &AdminChrome {
+                csrf_form_field: "authenticity_token",
+                ..test_chrome(&r)
+            },
+            &ModelDetailView {
+                model_slug: "widgets",
+                model_name: "Widget",
+                model_name_plural: "Widgets",
+                fields: &fields,
+                record: &record,
+                record_display: "#42",
+                id: 42,
+                has_history: false,
+            },
         )
         .into_string();
         assert!(
@@ -3787,23 +3685,17 @@ mod tests {
             "meta": {"xss": "<script>alert(1)</script>"},
         });
         let html = model_detail_page(
-            &r,
-            "widgets",
-            "Widget",
-            "Widgets",
-            &fields,
-            &record,
-            "#1",
-            1,
-            &[],
-            "t",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false,
-            false,
-            None,
+            &test_chrome(&r),
+            &ModelDetailView {
+                model_slug: "widgets",
+                model_name: "Widget",
+                model_name_plural: "Widgets",
+                fields: &fields,
+                record: &record,
+                record_display: "#1",
+                id: 1,
+                has_history: false,
+            },
         )
         .into_string();
         assert!(
@@ -3823,18 +3715,7 @@ mod tests {
         // Instead it must load the plugin-owned asset at its fingerprinted
         // `/static/_plugins/autumn-admin/admin.<hash>.js` URL.
         let r = dummy_registry();
-        let html = dashboard_page(
-            &r,
-            &[],
-            &[],
-            "t",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false,
-            None,
-        )
-        .into_string();
+        let html = dashboard_page(&test_chrome(&r), &[]).into_string();
         let asset = crate::routes::ASSETS
             .get("admin.js")
             .expect("admin.js is in the bundle");
@@ -3891,26 +3772,20 @@ mod tests {
             per_page: 25,
         };
         let html = model_list_page(
-            &r,
-            "users",
-            "Users",
-            &fields,
-            &[],
-            &result,
-            "",
-            None,
-            SortDirection::Asc,
-            &[],
-            &[],
-            "t",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false,
-            false,
-            false,
-            None,
+            &test_chrome(&r),
+            &ModelListView {
+                model_slug: "users",
+                model_name_plural: "Users",
+                fields: &fields,
+                actions: &[],
+                result: &result,
+                search_query: "",
+                sort_by: None,
+                sort_dir: SortDirection::Asc,
+                filters: &[],
+                supports_csv_export: false,
+                supports_csv_import: false,
+            },
         )
         .into_string();
         assert!(
@@ -3944,26 +3819,20 @@ mod tests {
             per_page: 25,
         };
         let html = model_list_page(
-            &r,
-            "users",
-            "Users",
-            &fields,
-            &[],
-            &result,
-            "",
-            None,
-            SortDirection::Asc,
-            &[],
-            &[],
-            "t",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false,
-            false,
-            false,
-            None,
+            &test_chrome(&r),
+            &ModelListView {
+                model_slug: "users",
+                model_name_plural: "Users",
+                fields: &fields,
+                actions: &[],
+                result: &result,
+                search_query: "",
+                sort_by: None,
+                sort_dir: SortDirection::Asc,
+                filters: &[],
+                supports_csv_export: false,
+                supports_csv_import: false,
+            },
         )
         .into_string();
         assert!(
@@ -3994,26 +3863,20 @@ mod tests {
             per_page: 25,
         };
         let html = model_list_page(
-            &r,
-            "widgets",
-            "Widgets",
-            &fields,
-            &[],
-            &result,
-            "",
-            None,
-            SortDirection::Asc,
-            &[],
-            &[],
-            "t",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false,
-            false,
-            false,
-            None,
+            &test_chrome(&r),
+            &ModelListView {
+                model_slug: "widgets",
+                model_name_plural: "Widgets",
+                fields: &fields,
+                actions: &[],
+                result: &result,
+                search_query: "",
+                sort_by: None,
+                sort_dir: SortDirection::Asc,
+                filters: &[],
+                supports_csv_export: false,
+                supports_csv_import: false,
+            },
         )
         .into_string();
         // Row with id renders working links and a checkbox.
@@ -4056,26 +3919,20 @@ mod tests {
             ("tier".to_owned(), "premium".to_owned()),
         ];
         let html = model_list_page(
-            &r,
-            "users",
-            "Users",
-            &fields,
-            &[],
-            &result,
-            "",
-            None,
-            SortDirection::Asc,
-            &active_filters,
-            &[],
-            "t",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false,
-            false,
-            false,
-            None,
+            &test_chrome(&r),
+            &ModelListView {
+                model_slug: "users",
+                model_name_plural: "Users",
+                fields: &fields,
+                actions: &[],
+                result: &result,
+                search_query: "",
+                sort_by: None,
+                sort_dir: SortDirection::Asc,
+                filters: &active_filters,
+                supports_csv_export: false,
+                supports_csv_import: false,
+            },
         )
         .into_string();
         // Sort header link carries both filters.
@@ -4113,26 +3970,20 @@ mod tests {
             ("tier".to_owned(), "premium".to_owned()),
         ];
         let html = model_list_page(
-            &r,
-            "users",
-            "Users",
-            &fields,
-            &[],
-            &result,
-            "",
-            None,
-            SortDirection::Asc,
-            &active_filters,
-            &[],
-            "t",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false,
-            false,
-            false,
-            None,
+            &test_chrome(&r),
+            &ModelListView {
+                model_slug: "users",
+                model_name_plural: "Users",
+                fields: &fields,
+                actions: &[],
+                result: &result,
+                search_query: "",
+                sort_by: None,
+                sort_dir: SortDirection::Asc,
+                filters: &active_filters,
+                supports_csv_export: false,
+                supports_csv_import: false,
+            },
         )
         .into_string();
         assert!(
@@ -4171,26 +4022,20 @@ mod tests {
         };
         let active_filters = vec![("q".to_owned(), "a&b=c".to_owned())];
         let html = model_list_page(
-            &r,
-            "users",
-            "Users",
-            &fields,
-            &[],
-            &result,
-            "",
-            None,
-            SortDirection::Asc,
-            &active_filters,
-            &[],
-            "t",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false,
-            false,
-            false,
-            None,
+            &test_chrome(&r),
+            &ModelListView {
+                model_slug: "users",
+                model_name_plural: "Users",
+                fields: &fields,
+                actions: &[],
+                result: &result,
+                search_query: "",
+                sort_by: None,
+                sort_dir: SortDirection::Asc,
+                filters: &active_filters,
+                supports_csv_export: false,
+                supports_csv_import: false,
+            },
         )
         .into_string();
         assert!(
@@ -4225,26 +4070,24 @@ mod tests {
             per_page: 25,
         };
         let html = model_list_page(
-            &r,
-            "widgets",
-            "Widgets",
-            &fields,
-            &actions,
-            &result,
-            "",
-            None,
-            SortDirection::Asc,
-            &[],
-            &[],
-            "tok",
-            "admin_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false,
-            false,
-            false,
-            None,
+            &AdminChrome {
+                csrf_token: "tok",
+                csrf_form_field: "admin_csrf",
+                ..test_chrome(&r)
+            },
+            &ModelListView {
+                model_slug: "widgets",
+                model_name_plural: "Widgets",
+                fields: &fields,
+                actions: &actions,
+                result: &result,
+                search_query: "",
+                sort_by: None,
+                sort_dir: SortDirection::Asc,
+                filters: &[],
+                supports_csv_export: false,
+                supports_csv_import: false,
+            },
         )
         .into_string();
         // Form posts to the bulk-action endpoint with the CSRF token.
@@ -4305,26 +4148,24 @@ mod tests {
             per_page: 25,
         };
         let html = model_list_page(
-            &r,
-            "widgets",
-            "Widgets",
-            &fields,
-            &actions,
-            &result,
-            "",
-            None,
-            SortDirection::Asc,
-            &[],
-            &[],
-            "tok",
-            "admin_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false,
-            false,
-            false,
-            None,
+            &AdminChrome {
+                csrf_token: "tok",
+                csrf_form_field: "admin_csrf",
+                ..test_chrome(&r)
+            },
+            &ModelListView {
+                model_slug: "widgets",
+                model_name_plural: "Widgets",
+                fields: &fields,
+                actions: &actions,
+                result: &result,
+                search_query: "",
+                sort_by: None,
+                sort_dir: SortDirection::Asc,
+                filters: &[],
+                supports_csv_export: false,
+                supports_csv_import: false,
+            },
         )
         .into_string();
         assert!(
@@ -4345,26 +4186,21 @@ mod tests {
             per_page: 25,
         };
         let html = model_list_page(
-            &r,
-            "widgets",
-            "Widgets",
-            &fields,
-            &[], // no actions
+            &test_chrome(&r),
+            &ModelListView {
+model_slug: "widgets",
+model_name_plural: "Widgets",
+fields: &fields,
+actions: &[],
+result: // no actions
             &result,
-            "",
-            None,
-            SortDirection::Asc,
-            &[],
-            &[],
-            "t",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false,
-            false,
-            false,
-            None,
+search_query: "",
+sort_by: None,
+sort_dir: SortDirection::Asc,
+filters: &[],
+supports_csv_export: false,
+supports_csv_import: false,
+},
         )
         .into_string();
         assert!(
@@ -4388,26 +4224,23 @@ mod tests {
             per_page: 25,
         };
         let html = model_list_page(
-            &r,
-            "widgets",
-            "Widgets",
-            &fields,
-            &[],
-            &result,
-            "",
-            None,
-            SortDirection::Asc,
-            &[],
-            &[],
-            "tok",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false,
-            false,
-            false,
-            None,
+            &AdminChrome {
+                csrf_token: "tok",
+                ..test_chrome(&r)
+            },
+            &ModelListView {
+                model_slug: "widgets",
+                model_name_plural: "Widgets",
+                fields: &fields,
+                actions: &[],
+                result: &result,
+                search_query: "",
+                sort_by: None,
+                sort_dir: SortDirection::Asc,
+                filters: &[],
+                supports_csv_export: false,
+                supports_csv_import: false,
+            },
         )
         .into_string();
         // Sortable field gets a sort link.
@@ -4440,26 +4273,26 @@ mod tests {
         };
         // supports_csv_export = true, supports_csv_import = false
         let html = model_list_page(
-            &r,
-            "widgets",
-            "Widgets",
-            &fields,
-            &[],
-            &result,
-            "",
+            &AdminChrome {
+impersonation: // supports_csv_import
             None,
-            SortDirection::Asc,
-            &[],
-            &[],
-            "t",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false, // show_config
-            true,  // supports_csv_export
-            false, // supports_csv_import
-            None,
+..test_chrome(&r)
+},
+            &ModelListView {
+model_slug: "widgets",
+model_name_plural: "Widgets",
+fields: &fields,
+actions: &[],
+result: &result,
+search_query: "",
+sort_by: None,
+sort_dir: SortDirection::Asc,
+filters: &[],
+supports_csv_export: // show_config
+            true,
+supports_csv_import: // supports_csv_export
+            false,
+},
         )
         .into_string();
         assert!(
@@ -4484,26 +4317,26 @@ mod tests {
             per_page: 25,
         };
         let html = model_list_page(
-            &r,
-            "widgets",
-            "Widgets",
-            &fields,
-            &[],
-            &result,
-            "",
+            &AdminChrome {
+impersonation: // supports_csv_import
             None,
-            SortDirection::Asc,
-            &[],
-            &[],
-            "t",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false, // show_config
-            false, // supports_csv_export
-            true,  // supports_csv_import
-            None,
+..test_chrome(&r)
+},
+            &ModelListView {
+model_slug: "widgets",
+model_name_plural: "Widgets",
+fields: &fields,
+actions: &[],
+result: &result,
+search_query: "",
+sort_by: None,
+sort_dir: SortDirection::Asc,
+filters: &[],
+supports_csv_export: // show_config
+            false,
+supports_csv_import: // supports_csv_export
+            true,
+},
         )
         .into_string();
         assert!(
@@ -4528,26 +4361,20 @@ mod tests {
             per_page: 25,
         };
         let html = model_list_page(
-            &r,
-            "widgets",
-            "Widgets",
-            &fields,
-            &[],
-            &result,
-            "",
-            None,
-            SortDirection::Asc,
-            &[],
-            &[],
-            "t",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            false,
-            false,
-            false,
-            None,
+            &test_chrome(&r),
+            &ModelListView {
+                model_slug: "widgets",
+                model_name_plural: "Widgets",
+                fields: &fields,
+                actions: &[],
+                result: &result,
+                search_query: "",
+                sort_by: None,
+                sort_dir: SortDirection::Asc,
+                filters: &[],
+                supports_csv_export: false,
+                supports_csv_import: false,
+            },
         )
         .into_string();
         assert!(
@@ -4738,15 +4565,11 @@ mod tests {
     fn config_page_empty_shows_no_keys_registered_message() {
         let r = dummy_registry();
         let html = config_page(
-            &r,
+            &AdminChrome {
+                csrf_token: "tok",
+                ..test_chrome(&r)
+            },
             &[],
-            &[],
-            "tok",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            None,
         )
         .into_string();
         assert!(
@@ -4773,15 +4596,11 @@ mod tests {
             description: Some("Max upload in MB".to_owned()),
         }];
         let html = config_page(
-            &r,
+            &AdminChrome {
+                csrf_token: "tok",
+                ..test_chrome(&r)
+            },
             &entries,
-            &[],
-            "tok",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            None,
         )
         .into_string();
         assert!(html.contains("max_upload_mb"), "key name missing: {html}");
@@ -4813,15 +4632,11 @@ mod tests {
             description: None,
         }];
         let html = config_page(
-            &r,
+            &AdminChrome {
+                csrf_token: "tok",
+                ..test_chrome(&r)
+            },
             &entries,
-            &[],
-            "tok",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            None,
         )
         .into_string();
         assert!(
@@ -4844,15 +4659,11 @@ mod tests {
             description: None,
         }];
         let html = config_page(
-            &r,
+            &AdminChrome {
+                csrf_token: "tok",
+                ..test_chrome(&r)
+            },
             &entries,
-            &[],
-            "tok",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            None,
         )
         .into_string();
         assert!(
@@ -4875,15 +4686,11 @@ mod tests {
             description: None,
         }];
         let html = config_page(
-            &r,
+            &AdminChrome {
+                csrf_token: "tok",
+                ..test_chrome(&r)
+            },
             &entries,
-            &[],
-            "tok",
-            "_csrf",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            None,
         )
         .into_string();
         assert!(
@@ -4906,15 +4713,12 @@ mod tests {
             description: None,
         }];
         let html = config_page(
-            &r,
+            &AdminChrome {
+                csrf_token: "csrf-tok-789",
+                csrf_form_field: "authenticity_token",
+                ..test_chrome(&r)
+            },
             &entries,
-            &[],
-            "csrf-tok-789",
-            "authenticity_token",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            None,
         )
         .into_string();
         assert!(
@@ -4927,15 +4731,12 @@ mod tests {
     fn config_history_page_shows_empty_state() {
         let r = dummy_registry();
         let html = config_history_page(
-            &r,
+            &AdminChrome {
+                csrf_token: "tok",
+                ..test_chrome(&r)
+            },
             "rate_limit",
             &[],
-            &[],
-            "tok",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            None,
         )
         .into_string();
         assert!(
@@ -4958,15 +4759,12 @@ mod tests {
             timestamp_secs: 1_700_000_000,
         }];
         let html = config_history_page(
-            &r,
+            &AdminChrome {
+                csrf_token: "tok",
+                ..test_chrome(&r)
+            },
             "rate_limit",
             &history,
-            &[],
-            "tok",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            None,
         )
         .into_string();
         assert!(html.contains("rate_limit"), "key name missing: {html}");
@@ -4988,15 +4786,12 @@ mod tests {
             timestamp_secs: 0,
         }];
         let html = config_history_page(
-            &r,
+            &AdminChrome {
+                csrf_token: "tok",
+                ..test_chrome(&r)
+            },
             "flag",
             &history,
-            &[],
-            "tok",
-            "X-CSRF-Token",
-            "/admin",
-            "/actuator",
-            None,
         )
         .into_string();
         assert!(html.contains("flag"), "key name missing: {html}");
@@ -5118,16 +4913,13 @@ mod tests {
     fn render_layout(active_slug: Option<&str>) -> String {
         let registry = AdminRegistry::new();
         admin_layout(
-            &registry,
+            &AdminChrome {
+                csrf_token: "tok",
+                show_config: true,
+                ..test_chrome(&registry)
+            },
             active_slug,
             "Title",
-            "/admin",
-            "/actuator",
-            "tok",
-            "X-CSRF-Token",
-            &[],
-            true,
-            None,
             &html! {},
         )
         .into_string()
@@ -5181,16 +4973,13 @@ mod tests {
 
     fn render_layout_with_registry(registry: &AdminRegistry, active_slug: Option<&str>) -> String {
         admin_layout(
-            registry,
+            &AdminChrome {
+                csrf_token: "tok",
+                show_config: true,
+                ..test_chrome(registry)
+            },
             active_slug,
             "Title",
-            "/admin",
-            "/actuator",
-            "tok",
-            "X-CSRF-Token",
-            &[],
-            true,
-            None,
             &html! {},
         )
         .into_string()
@@ -5300,16 +5089,14 @@ mod tests {
             },
         ];
         let html = admin_layout(
-            &registry,
+            &AdminChrome {
+                csrf_token: "tok",
+                messages: &messages,
+                show_config: true,
+                ..test_chrome(&registry)
+            },
             None,
             "Title",
-            "/admin",
-            "/actuator",
-            "tok",
-            "X-CSRF-Token",
-            &messages,
-            true,
-            None,
             &html! {},
         )
         .into_string();

@@ -322,11 +322,13 @@ impl Plugin for AdminPlugin {
             Arc::clone(&registry),
             &prefix,
             actuator_prefix.clone(),
-            auth_session_key.clone(),
-            require_role.clone(),
+            routes::AdminGuards {
+                auth_session_key: auth_session_key.clone(),
+                require_role: require_role.clone(),
+                step_up_mutations,
+                step_up_max_age_secs,
+            },
             runtime_config,
-            step_up_mutations,
-            step_up_max_age_secs,
             impersonation.is_some(),
         );
 
