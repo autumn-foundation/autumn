@@ -624,10 +624,14 @@ fn accept_weight<'a>(params: impl Iterator<Item = &'a str>) -> f32 {
     1.0
 }
 
-/// A whole `200` HTML document: not encoded, not a range, not a download.
+/// A whole `200` HTML document: not encoded, not a range, not a download,
+/// and not signed. An RFC 9421 signature can cover the body's digest or its
+/// type, and the Markdown would carry a signature that no longer verifies.
 fn is_negotiable(res: &Response) -> bool {
     let headers = res.headers();
     res.status() == StatusCode::OK
+        && !headers.contains_key("signature")
+        && !headers.contains_key("signature-input")
         && headers
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
@@ -882,6 +886,25 @@ mod tests {
         assert!(!utf8_html("text/html; charset=iso-8859-1"));
         assert!(!utf8_html("text/html;charset=windows-1252"));
         assert!(!utf8_html("application/json"));
+    }
+
+    /// Codex review (P2): a signed response keeps its body, so its
+    /// signature still verifies.
+    #[test]
+    fn a_signed_response_is_not_converted() {
+        let html = || {
+            Response::builder()
+                .header(CONTENT_TYPE, "text/html; charset=utf-8")
+                .body(Body::from("<h1>Hi</h1>"))
+                .unwrap()
+        };
+        assert!(is_negotiable(&html()));
+        for name in ["signature", "signature-input"] {
+            let mut res = html();
+            res.headers_mut()
+                .insert(name, HeaderValue::from_static("sig1=:YQ==:"));
+            assert!(!is_negotiable(&res), "{name}");
+        }
     }
 
     #[test]

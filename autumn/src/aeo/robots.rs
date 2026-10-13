@@ -122,7 +122,12 @@ pub fn robots_txt_with_policy(
     } else {
         "Disallow: /\n"
     });
-    if let Some(signal) = &signal {
+    // The `*` groups merge, so an operator signal for `*` replaces this one
+    // rather than contradicting it.
+    if let Some(signal) = signal
+        .as_deref()
+        .filter(|_| !operator_wildcard_signal(additional_rules))
+    {
         txt.push_str(signal);
     }
     push_additional_rules(&mut txt, additional_rules, signal.as_deref());
@@ -161,7 +166,8 @@ pub fn robots_txt_with_policy(
 /// Append the operator's `additional_rules`. Lines before their first
 /// `User-agent` extend the `*` group, which already carries the signal. A
 /// group the operator opens is the only one its crawler obeys, so it gets
-/// `signal` too, unless it states its own `Content-Signal`.
+/// `signal` too, unless it states its own `Content-Signal` or names only `*`
+/// (it then merges with the generated `*` group, which has one).
 fn push_additional_rules(txt: &mut String, rules: &[String], signal: Option<&str>) {
     let starts = |line: &str, field: &str| {
         line.trim_start()
@@ -170,9 +176,11 @@ fn push_additional_rules(txt: &mut String, rules: &[String], signal: Option<&str
     };
     // The operator group being written, and whether it has its signal.
     let mut open: Option<bool> = None;
+    // The open group names only `*`, so it merges with the generated one.
+    let mut wildcard_only = false;
     let mut after_agent = false;
-    let close = |txt: &mut String, open: Option<bool>| {
-        if let (Some(false), Some(signal)) = (open, signal) {
+    let close = |txt: &mut String, open: Option<bool>, wildcard_only: bool| {
+        if let (Some(false), Some(signal), false) = (open, signal, wildcard_only) {
             txt.push_str(signal);
         }
     };
@@ -187,8 +195,12 @@ fn push_additional_rules(txt: &mut String, rules: &[String], signal: Option<&str
         }
         let agent = starts(line, "user-agent:");
         if agent && !after_agent {
-            close(txt, open);
+            close(txt, open, wildcard_only);
             open = Some(false);
+            wildcard_only = true;
+        }
+        if agent {
+            wildcard_only &= agent_name(line) == Some("*");
         }
         if starts(line, "content-signal:") {
             open = open.map(|_| true);
@@ -197,7 +209,7 @@ fn push_additional_rules(txt: &mut String, rules: &[String], signal: Option<&str
         txt.push_str(line);
         txt.push('\n');
     }
-    close(txt, open);
+    close(txt, open, wildcard_only);
 }
 
 /// The explanation block that contentsignals.org recommends, verbatim. It
@@ -235,16 +247,49 @@ const CONTENT_SIGNAL_COMMENT: &str = "\
 ";
 
 /// The `User-agent` names in `rules`, without a trailing `# comment`.
+/// The value of a `User-agent:` line, without a trailing comment.
+fn agent_name(line: &str) -> Option<&str> {
+    let (key, value) = line.split_once(':')?;
+    let name = value.split('#').next().unwrap_or(value).trim();
+    (key.trim().eq_ignore_ascii_case("user-agent") && !name.is_empty()).then_some(name)
+}
+
+/// `true` when `additional_rules` states a `Content-Signal` for `*`: before
+/// its first `User-agent`, or in a group that names `*`.
+fn operator_wildcard_signal(rules: &[String]) -> bool {
+    // Lines before the first group extend the `*` group.
+    let mut wildcard = true;
+    let mut after_agent = false;
+    for line in rules.iter().flat_map(|rule| rule.lines()) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(name) = agent_name(trimmed) {
+            if !after_agent {
+                wildcard = false;
+            }
+            wildcard |= name == "*";
+            after_agent = true;
+            continue;
+        }
+        after_agent = false;
+        let signal = trimmed
+            .split_once(':')
+            .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case("content-signal"));
+        if wildcard && signal {
+            return true;
+        }
+    }
+    false
+}
+
 fn named_user_agents(rules: &[String]) -> Vec<&str> {
     // An entry may hold several lines, as the writer emits them.
     rules
         .iter()
         .flat_map(|rule| rule.lines())
-        .filter_map(|r| {
-            let (key, value) = r.split_once(':')?;
-            let name = value.split('#').next().unwrap_or(value).trim();
-            (key.trim().eq_ignore_ascii_case("user-agent") && !name.is_empty()).then_some(name)
-        })
+        .filter_map(agent_name)
         .collect()
 }
 
@@ -401,6 +446,56 @@ mod tests {
             .unwrap_or_else(|| panic!("no GPTBot group:\n{txt}"));
         assert!(training.contains("Disallow: /\n"), "{training}");
         assert!(!training.contains("User-agent: *"), "{training}");
+    }
+
+    /// Codex review (P2): the `*` groups merge, so an operator signal for
+    /// `*` replaces the generated one instead of contradicting it.
+    #[test]
+    fn an_operator_wildcard_signal_replaces_the_generated_one() {
+        let policy = BotPolicy::from_config(&AeoConfig::default());
+        let generated = format!(
+            "Content-Signal: {}",
+            content_signal_value(AeoConfig::default().content_signals)
+        );
+        let own = "Content-Signal: search=yes, ai-input=yes, ai-train=yes";
+        let cases: [&[&str]; 2] = [
+            // Before the first group, the rule extends `*`.
+            &[own, "Disallow: /admin"],
+            // A group of its own that names `*`.
+            &["User-agent: Bingbot", "User-agent: *", own, "Disallow: /x"],
+        ];
+        for rules in cases {
+            let rules: Vec<String> = rules.iter().map(|r| (*r).to_owned()).collect();
+            let txt = robots_txt_with_policy("prod", None, &rules, &policy);
+            assert_eq!(txt.matches(own).count(), 1, "{txt}");
+            assert!(!txt.contains(&generated), "{txt}");
+        }
+
+        // An operator `*` group with no signal shares the generated one,
+        // once.
+        let rules = ["User-agent: *".to_owned(), "Disallow: /x".to_owned()];
+        let txt = robots_txt_with_policy("prod", None, &rules, &policy);
+        assert_eq!(txt.matches(&generated).count(), 1, "{txt}");
+
+        // A group naming `*` and another crawler still carries the signal:
+        // that crawler obeys only this group.
+        let rules = [
+            "User-agent: Bingbot".to_owned(),
+            "User-agent: *".to_owned(),
+            "Disallow: /x".to_owned(),
+        ];
+        let txt = robots_txt_with_policy("prod", None, &rules, &policy);
+        let mixed = txt
+            .split("User-agent: Bingbot")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no Bingbot group:\n{txt}"));
+        assert!(mixed.contains(&generated), "{txt}");
+
+        // A signal in another crawler's group leaves `*` alone.
+        let rules = ["User-agent: Bingbot".to_owned(), own.to_owned()];
+        let txt = robots_txt_with_policy("prod", None, &rules, &policy);
+        assert_eq!(txt.matches(&generated).count(), 1, "{txt}");
+        assert_eq!(txt.matches(own).count(), 1, "{txt}");
     }
 
     /// Codex review (P2): a crawler with the operator's own group obeys

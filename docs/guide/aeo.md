@@ -84,7 +84,9 @@ The AI crawlers are in the `*` group. The `[seo.robots] additional_rules`
 also apply to them. A bot that `additional_rules` names (for example
 `User-agent: GPTBot`) keeps only your group. When `additional_rules` opens
 its own `User-agent: *` group, Autumn does not name the allowed AI crawlers,
-so that group binds them too.
+so that group binds them too. A `Content-Signal` in your `*` rules (before
+the first `User-agent`, or in a `User-agent: *` group) replaces the
+generated one.
 
 - `search`: use the content for a search index.
 - `ai-input`: use the content as input to AI answers.
@@ -159,6 +161,7 @@ Autumn does not convert:
   seconds,
 - a status other than `200`,
 - a compressed body, a range, or a download,
+- a signed response (an RFC 9421 `Signature` or `Signature-Input`),
 - a page in a charset other than UTF-8 (or US-ASCII).
 
 Call the converter yourself with `autumn_web::aeo::markdown::html_to_markdown`.
