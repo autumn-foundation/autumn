@@ -446,47 +446,72 @@ fn rfc2822(dt: DateTime<Utc>) -> String {
 /// XML document even when escaped. Escaping `>` also neutralises any `]]>`
 /// sequence so untrusted titles/bodies cannot break out of the document.
 ///
-/// Real titles/bodies are overwhelmingly plain ASCII text containing none of
-/// the five special characters, but the byte-by-byte `chars()` loop below
-/// pays a full UTF-8 decode + 5-way match per character even for that common
-/// case. `needs_escaping` does one cheap byte scan to detect it and returns
-/// the input unchanged (one allocation, one memcpy) instead of rebuilding it
-/// one `char` at a time. Any non-ASCII byte falls straight through to the
-/// per-`char` path unconditionally, so `is_xml_char`'s
-/// `U+FFFE`/`U+FFFF`-filtering — which only matters for non-ASCII code
-/// points — is never bypassed.
+/// Scans bytes against a lookup table rather than decoding every `char`: in
+/// valid UTF-8 every special ASCII byte is its own character, and the only
+/// non-ASCII characters outside the XML 1.0 `Char` set are `U+FFFE`/`U+FFFF`
+/// (`EF BF BE` / `EF BF BF`). Input with nothing to change is returned with
+/// one allocation and one memcpy.
 fn escape(s: &str) -> String {
-    if !needs_escaping(s) {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && !NEEDS_ATTENTION[bytes[i] as usize] {
+        i += 1;
+    }
+    if i == bytes.len() {
         return s.to_owned();
     }
     let mut out = String::with_capacity(s.len());
-    // Copy maximal runs of characters that pass through unchanged with one
+    // Copy maximal runs of bytes that pass through unchanged with one
     // `push_str` each, flushing only around a dropped or escaped character.
     let mut run_start = 0;
-    for (i, c) in s.char_indices() {
-        let replacement = match c {
-            '&' => "&amp;",
-            '<' => "&lt;",
-            '>' => "&gt;",
-            '"' => "&quot;",
-            '\'' => "&apos;",
-            _ if is_xml_char(c) => continue,
-            _ => "",
+    while i < bytes.len() {
+        if !NEEDS_ATTENTION[bytes[i] as usize] {
+            i += 1;
+            continue;
+        }
+        let (replacement, len) = match bytes[i] {
+            b'&' => ("&amp;", 1),
+            b'<' => ("&lt;", 1),
+            b'>' => ("&gt;", 1),
+            b'"' => ("&quot;", 1),
+            b'\'' => ("&apos;", 1),
+            0xEF if bytes[i + 1] == 0xBF && matches!(bytes[i + 2], 0xBE | 0xBF) => ("", 3),
+            0xEF => {
+                i += 1;
+                continue;
+            }
+            _ => ("", 1),
         };
         out.push_str(&s[run_start..i]);
         out.push_str(replacement);
-        run_start = i + c.len_utf8();
+        i += len;
+        run_start = i;
     }
     out.push_str(&s[run_start..]);
     out
 }
 
-/// Whether `s` contains anything `escape` would change: a byte outside the
-/// ASCII range (conservatively routed to the full per-`char` path, since only
-/// non-ASCII code points can be `U+FFFE`/`U+FFFF` or otherwise need
-/// `is_xml_char`'s multi-byte-aware filtering), one of the five characters
-/// `escape` turns into an entity, or an ASCII control byte `is_xml_char`
-/// drops (below `0x20`, excluding tab/newline/carriage return).
+/// Bytes `escape` must look at: the five entity characters, ASCII control
+/// bytes `is_xml_char` drops (below `0x20`, excluding tab/newline/carriage
+/// return), and `0xEF`, the lead byte of `U+FFFE`/`U+FFFF`.
+const NEEDS_ATTENTION: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut b = 0;
+    while b < 0x20 {
+        t[b] = !matches!(b, 0x9 | 0xA | 0xD);
+        b += 1;
+    }
+    t[b'&' as usize] = true;
+    t[b'<' as usize] = true;
+    t[b'>' as usize] = true;
+    t[b'"' as usize] = true;
+    t[b'\'' as usize] = true;
+    t[0xEF] = true;
+    t
+};
+
+/// Whether `s` contains anything `escape` would change (test oracle).
+#[cfg(test)]
 fn needs_escaping(s: &str) -> bool {
     s.bytes().any(|b| {
         !b.is_ascii()
@@ -498,6 +523,7 @@ fn needs_escaping(s: &str) -> bool {
 /// Whether `c` is a valid XML 1.0 character (XML 1.0 §2.2 `Char` production).
 /// Rust `char` already excludes surrogates, so only the low control range and
 /// the two non-characters `U+FFFE`/`U+FFFF` need filtering here.
+#[cfg(test)]
 const fn is_xml_char(c: char) -> bool {
     matches!(
         c,
