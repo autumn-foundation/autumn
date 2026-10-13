@@ -126,7 +126,7 @@ pub fn robots_txt_with_policy(
     // rather than contradicting it.
     if let Some(signal) = signal
         .as_deref()
-        .filter(|_| !operator_wildcard_signal(additional_rules))
+        .filter(|_| wildcard_signal(additional_rules).is_none())
     {
         txt.push_str(signal);
     }
@@ -254,9 +254,12 @@ fn agent_name(line: &str) -> Option<&str> {
     (key.trim().eq_ignore_ascii_case("user-agent") && !name.is_empty()).then_some(name)
 }
 
-/// `true` when `additional_rules` states a `Content-Signal` for `*`: before
-/// its first `User-agent`, or in a group that names `*`.
-fn operator_wildcard_signal(rules: &[String]) -> bool {
+/// The `Content-Signal` value that `additional_rules` states for `*`: before
+/// its first `User-agent`, or in a group that names `*`. It replaces the
+/// generated signal, in `robots.txt` and in the Markdown `Content-Signal`
+/// header alike.
+#[must_use]
+pub(crate) fn wildcard_signal(rules: &[String]) -> Option<&str> {
     // Lines before the first group extend the `*` group.
     let mut wildcard = true;
     let mut after_agent = false;
@@ -274,14 +277,17 @@ fn operator_wildcard_signal(rules: &[String]) -> bool {
             continue;
         }
         after_agent = false;
-        let signal = trimmed
-            .split_once(':')
-            .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case("content-signal"));
-        if wildcard && signal {
-            return true;
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        if wildcard && key.trim().eq_ignore_ascii_case("content-signal") {
+            let value = value.split('#').next().unwrap_or(value).trim();
+            if !value.is_empty() {
+                return Some(value);
+            }
         }
     }
-    false
+    None
 }
 
 fn named_user_agents(rules: &[String]) -> Vec<&str> {
@@ -470,6 +476,11 @@ mod tests {
             assert_eq!(txt.matches(own).count(), 1, "{txt}");
             assert!(!txt.contains(&generated), "{txt}");
         }
+
+        assert_eq!(
+            wildcard_signal(&[own.to_owned()]),
+            Some("search=yes, ai-input=yes, ai-train=yes")
+        );
 
         // An operator `*` group with no signal shares the generated one,
         // once.

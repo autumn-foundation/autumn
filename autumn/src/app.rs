@@ -6787,6 +6787,9 @@ impl AppBuilder {
             // merge count is the whole opaque surface here.
             omitted_router_count(merge_routers.len(), std::iter::empty::<&str>(), &[]),
         ));
+        // The router build installs the AEO site in the state's shared
+        // extensions; the agent documents below read its home `Link`s.
+        let aeo_state = state.clone();
         let router = crate::router::try_build_router_inner(
             all_routes,
             &config,
@@ -6844,9 +6847,14 @@ impl AppBuilder {
         // Agent documents (llms.txt, skills, ARD, ...). Their URLs are
         // absolute, so they need `[seo] base_url`.
         if config.aeo.enabled {
+            let home_links = aeo_state
+                .extension::<crate::aeo::AeoSite>()
+                .map(|site| site.negotiate.home_links.clone())
+                .unwrap_or_default();
             match crate::aeo::write_static_documents(
                 router,
                 config.seo.base_url.as_deref(),
+                &home_links,
                 &dist_dir,
             )
             .await

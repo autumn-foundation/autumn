@@ -435,11 +435,16 @@ impl AeoSite {
         } else {
             Vec::new()
         };
-        let content_signal = aeo
-            .content_signals
-            .enabled
-            .then(|| HeaderValue::from_str(&robots::content_signal_value(aeo.content_signals)).ok())
-            .flatten();
+        // The `*` signal `robots.txt` states: the operator's own, when
+        // `additional_rules` sets one, else the configured one.
+        let content_signal = robots::wildcard_signal(&config.seo.robots.additional_rules)
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                aeo.content_signals
+                    .enabled
+                    .then(|| robots::content_signal_value(aeo.content_signals))
+            })
+            .and_then(|value| HeaderValue::from_str(&value).ok());
         // RFC 9728 §5.1: a `401` points at the protected resource metadata.
         let configured = documents::Origin::resolve(config.seo.base_url.as_deref(), None);
         let prefixed = facts.prefixed;
@@ -775,7 +780,8 @@ const STATIC_DOCUMENT_PATHS: &[&str] = &[
 /// The documents hold absolute URLs, so without `[seo] base_url`
 /// (`base_url` is `None`) only the `WebMCP` script is written: it holds none,
 /// and a page's `head_tags` load it. A file that is already in `dist`
-/// stays. Returns the paths it wrote.
+/// stays. `home_links` are the home pages' agent `Link` values: a home page
+/// the build wrote gets its own in `_headers`. Returns the paths it wrote.
 ///
 /// # Errors
 ///
@@ -783,13 +789,15 @@ const STATIC_DOCUMENT_PATHS: &[&str] = &[
 pub(crate) async fn write_static_documents(
     router: axum::Router,
     base_url: Option<&str>,
+    home_links: &[(String, HeaderValue)],
     dist: &std::path::Path,
 ) -> std::io::Result<Vec<String>> {
     use tower::ServiceExt as _;
 
     // The build has no request `Host`: without a usable base URL every
     // absolute link would point at localhost.
-    let mut queue: Vec<String> = if documents::Origin::resolve(base_url, None).configured {
+    let configured = documents::Origin::resolve(base_url, None).configured;
+    let mut queue: Vec<String> = if configured {
         STATIC_DOCUMENT_PATHS
             .iter()
             .map(|p| (*p).to_owned())
@@ -854,6 +862,18 @@ pub(crate) async fn write_static_documents(
             tokio::fs::write(&file, &body).await?;
             host_headers.push((documents::SKILLS_INDEX_PATH.to_owned(), headers));
             written.push(documents::SKILLS_INDEX_PATH.to_owned());
+        }
+    }
+    // A home page the build wrote keeps its agent `Link`, once the
+    // documents it names are written too.
+    if configured {
+        for (home, link) in home_links {
+            let Some(link) = link.to_str().ok().and_then(static_home_link) else {
+                continue;
+            };
+            if static_page_exists(dist, home).await {
+                host_headers.push((home.clone(), vec![("link".to_owned(), link)]));
+            }
         }
     }
     // A static host serves a file by its extension and with no CORS: the
@@ -947,6 +967,31 @@ fn static_host_headers(headers: &axum::http::HeaderMap) -> Vec<(String, String)>
             Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned()))
         })
         .collect()
+}
+
+/// A home page's `Link` for a static host: every link but the Markdown copy,
+/// which only the server can negotiate.
+fn static_home_link(link: &str) -> Option<String> {
+    let kept: Vec<String> = link
+        .split(", <")
+        .enumerate()
+        .map(|(i, entry)| {
+            if i == 0 {
+                entry.to_owned()
+            } else {
+                format!("<{entry}")
+            }
+        })
+        .filter(|entry| !entry.contains("type=\"text/markdown\""))
+        .collect();
+    (!kept.is_empty()).then(|| kept.join(", "))
+}
+
+/// `true` when the static build wrote the page at `path`
+/// (`<path>/index.html`).
+async fn static_page_exists(dist: &std::path::Path, path: &str) -> bool {
+    let page = dist.join(path.trim_matches('/')).join("index.html");
+    tokio::fs::try_exists(page).await.unwrap_or(false)
 }
 
 /// `files` in the `_headers` format: each path, then its headers indented.
@@ -1088,6 +1133,7 @@ mod tests {
         let written = write_static_documents(
             site_router(&config),
             config.seo.base_url.as_deref(),
+            &[],
             dist.path(),
         )
         .await
@@ -1123,6 +1169,61 @@ mod tests {
         assert!(!headers.contains("/_autumn/webmcp.js"), "{headers}");
     }
 
+    /// Codex review (P2): a static home page keeps its agent `Link` on a
+    /// static host, less the Markdown copy the host cannot negotiate.
+    #[tokio::test]
+    async fn a_static_home_page_keeps_its_link_header() {
+        let mut config = crate::config::AutumnConfig::default();
+        config.seo.base_url = Some("https://example.com".to_owned());
+        let dist = tempfile::tempdir().unwrap();
+        std::fs::write(dist.path().join("index.html"), "<h1>Home</h1>").unwrap();
+        let link = HeaderValue::from_static(
+            "</llms.txt>; rel=\"describedby\"; type=\"text/plain\", \
+             </>; rel=\"alternate\"; type=\"text/markdown\"",
+        );
+        let homes = [
+            ("/".to_owned(), link.clone()),
+            // No page in `dist`, so no entry.
+            ("/fr".to_owned(), link),
+        ];
+        write_static_documents(
+            site_router(&config),
+            config.seo.base_url.as_deref(),
+            &homes,
+            dist.path(),
+        )
+        .await
+        .unwrap();
+        let headers = std::fs::read_to_string(dist.path().join("_headers")).unwrap();
+        assert!(
+            headers
+                .contains("\n/\n  link: </llms.txt>; rel=\"describedby\"; type=\"text/plain\"\n"),
+            "{headers}"
+        );
+        assert!(!headers.contains("rel=\"alternate\""), "{headers}");
+        assert!(!headers.contains("\n/fr\n"), "{headers}");
+    }
+
+    /// Codex review (P2): an operator `*` signal in `additional_rules`
+    /// replaces the configured one in the Markdown header too, as it does
+    /// in `robots.txt`.
+    #[test]
+    fn the_markdown_signal_follows_the_robots_wildcard_signal() {
+        let mut config = crate::config::AutumnConfig::default();
+        let site = AeoSite::new(&config, documents::SiteFacts::default());
+        assert_eq!(
+            site.negotiate.content_signal.as_ref().unwrap(),
+            robots::content_signal_value(config.aeo.content_signals).as_str()
+        );
+        config.seo.robots.additional_rules =
+            vec!["Content-Signal: search=yes, ai-input=no, ai-train=yes".to_owned()];
+        let site = AeoSite::new(&config, documents::SiteFacts::default());
+        assert_eq!(
+            site.negotiate.content_signal.as_ref().unwrap(),
+            "search=yes, ai-input=no, ai-train=yes"
+        );
+    }
+
     /// Codex review (P2): `dist` is deployed at the base URL's path, pages
     /// and documents alike, so each `_headers` path is the file's path in
     /// `dist`.
@@ -1134,6 +1235,7 @@ mod tests {
         write_static_documents(
             site_router(&config),
             config.seo.base_url.as_deref(),
+            &[],
             dist.path(),
         )
         .await
@@ -1157,6 +1259,7 @@ mod tests {
         let written = write_static_documents(
             site_router(&config),
             config.seo.base_url.as_deref(),
+            &[],
             dist.path(),
         )
         .await
@@ -1182,6 +1285,7 @@ mod tests {
         write_static_documents(
             site_router(&config),
             config.seo.base_url.as_deref(),
+            &[],
             dist.path(),
         )
         .await
@@ -1213,7 +1317,7 @@ mod tests {
             Some("https://example.com?tenant=a"),
             Some("ftp://example.com"),
         ] {
-            let written = write_static_documents(site_router(&config), base, dist.path())
+            let written = write_static_documents(site_router(&config), base, &[], dist.path())
                 .await
                 .unwrap();
             assert!(
@@ -1288,7 +1392,7 @@ mod tests {
     async fn a_static_build_needs_a_base_url() {
         let config = crate::config::AutumnConfig::default();
         let dist = tempfile::tempdir().unwrap();
-        let written = write_static_documents(site_router(&config), None, dist.path())
+        let written = write_static_documents(site_router(&config), None, &[], dist.path())
             .await
             .unwrap();
         // Only the script, which holds no absolute URL.

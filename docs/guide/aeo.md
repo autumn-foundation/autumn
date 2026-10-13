@@ -86,7 +86,7 @@ also apply to them. A bot that `additional_rules` names (for example
 its own `User-agent: *` group, Autumn does not name the allowed AI crawlers,
 so that group binds them too. A `Content-Signal` in your `*` rules (before
 the first `User-agent`, or in a `User-agent: *` group) replaces the
-generated one.
+generated one, in `robots.txt` and in the Markdown `Content-Signal` header.
 
 - `search`: use the content for a search index.
 - `ai-input`: use the content as input to AI answers.
@@ -209,7 +209,9 @@ expires. Markdown negotiation and x402 need the server.
 A static host serves a file by its extension and sends no CORS headers. So
 the build also writes `dist/_headers`, the per-path headers file that Netlify
 and Cloudflare Pages read. It gives each document its `Content-Type`, its CORS
-headers, its `Link` header and its `Cache-Control`. An app that ships its own
+headers, its `Link` header and its `Cache-Control`, and each home page that
+the build wrote its agent `Link` header (without the Markdown link: a static
+host cannot serve the Markdown copy). An app that ships its own
 `_headers` keeps it, and the build logs a warning. On another host, set these
 headers in that host's configuration.
 
