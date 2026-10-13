@@ -548,6 +548,29 @@ fn profile_section_from_base_toml(base: &toml::Value, profile: &str) -> Option<t
         .map(|table| toml::Value::Table(table.clone()))
 }
 
+/// `(prestop_grace_secs, shutdown_timeout_secs)` the runtime uses for `profile`
+/// when no config file or environment variable overrides them.
+///
+/// Reads the same smart defaults the loader merges, so tooling cannot drift
+/// from the runtime. A profile without smart defaults gets the struct defaults.
+#[must_use]
+pub fn profile_shutdown_defaults(profile: &str) -> (u64, u64) {
+    let name = normalize_profile_name(profile).unwrap_or_else(|| profile.trim().to_owned());
+    let defaults = profile_defaults_as_toml(&name);
+    let read = |key: &str, fallback: u64| {
+        defaults
+            .get("server")
+            .and_then(|server| server.get(key))
+            .and_then(toml::Value::as_integer)
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(fallback)
+    };
+    (
+        read("prestop_grace_secs", default_prestop_grace()),
+        read("shutdown_timeout_secs", default_shutdown_timeout()),
+    )
+}
+
 /// Profile-specific smart defaults as a TOML table.
 ///
 /// Only `dev` and `prod` have smart defaults. Custom profiles

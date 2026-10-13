@@ -72,6 +72,12 @@ pub enum SbomError {
     Json(#[from] serde_json::Error),
     #[error("unsupported object file format")]
     UnsupportedObjectFormat,
+    #[error(
+        "byte-swapped fat Mach-O header (FAT_CIGAM): fat headers are always big-endian on \
+         disk and no Apple toolchain writes this layout — the file is corrupt or not a \
+         universal binary"
+    )]
+    ByteSwappedFatMachO,
     #[error("truncated or malformed object file")]
     MalformedObject,
     #[error(
@@ -1240,6 +1246,7 @@ fn extract_from_pe(bytes: &[u8]) -> Result<&[u8], SbomError> {
 /// # Errors
 ///
 /// * [`SbomError::UnsupportedObjectFormat`] — not a recognized object file.
+/// * [`SbomError::ByteSwappedFatMachO`] — `FAT_CIGAM`, which no toolchain writes.
 /// * [`SbomError::NoAuditData`] — a valid object file with no embedded list.
 /// * [`SbomError::MalformedObject`] — truncated or self-inconsistent headers.
 pub fn extract_dep_section(bytes: &[u8]) -> Result<&[u8], SbomError> {
@@ -1250,6 +1257,7 @@ pub fn extract_dep_section(bytes: &[u8]) -> Result<&[u8], SbomError> {
         }
         Some([0xca, 0xfe, 0xba, 0xbe]) => extract_from_macho_fat(bytes, false),
         Some([0xca, 0xfe, 0xba, 0xbf]) => extract_from_macho_fat(bytes, true),
+        Some([0xbe | 0xbf, 0xba, 0xfe, 0xca]) => Err(SbomError::ByteSwappedFatMachO),
         Some([b'M', b'Z', ..]) => extract_from_pe(bytes),
         _ => Err(SbomError::UnsupportedObjectFormat),
     }
@@ -2751,6 +2759,19 @@ mod tests {
             extract_dep_section(&elf),
             Err(SbomError::NoAuditData)
         ));
+    }
+
+    #[test]
+    fn rejects_byte_swapped_fat_magic_with_a_specific_error() {
+        // #2394: Apple fat headers are always big-endian, so no toolchain
+        // writes FAT_CIGAM. The error must say so, not "unsupported format".
+        for magic in [[0xbe, 0xba, 0xfe, 0xca], [0xbf, 0xba, 0xfe, 0xca]] {
+            let mut bytes = magic.to_vec();
+            bytes.extend_from_slice(&[0; 32]);
+            let err = extract_dep_section(&bytes).expect_err("must reject");
+            assert!(matches!(err, SbomError::ByteSwappedFatMachO), "{err:?}");
+            assert!(err.to_string().contains("big-endian"), "{err}");
+        }
     }
 
     #[test]
