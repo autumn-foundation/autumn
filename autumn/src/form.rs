@@ -7134,6 +7134,27 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "multipart")]
+        #[tokio::test]
+        async fn mixed_case_multipart_content_type_is_accepted() {
+            async fn handler(_form: ChangesetForm<TestForm>) -> &'static str {
+                "ok"
+            }
+            let mut req = multipart_req("/test", "name", "Alice");
+            let ct = req.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .replace("multipart/form-data", "Multipart/Form-Data");
+            req.headers_mut()
+                .insert("content-type", ct.parse().unwrap());
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(req)
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        }
+
         #[tokio::test]
         async fn missing_content_type_is_rejected_not_decoded_anyway() {
             async fn handler(_form: ChangesetForm<TestForm>) -> String {

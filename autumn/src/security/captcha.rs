@@ -642,10 +642,9 @@ async fn extract_token_from_form(
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(str::to_ascii_lowercase)
         .unwrap_or_default();
 
-    if !crate::media_type::is_media_type(&content_type, "application/x-www-form-urlencoded") {
+    if !crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded") {
         return None;
     }
 
@@ -738,14 +737,12 @@ where
 
         // Only enforce CAPTCHA on application/x-www-form-urlencoded requests.
         // JSON APIs, multipart uploads, and external webhooks pass through unchallenged.
-        // Use ASCII lowercase comparison — HTTP media types are case-insensitive.
         let content_type = req
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .map(str::to_ascii_lowercase)
             .unwrap_or_default();
-        if !crate::media_type::is_media_type(&content_type, "application/x-www-form-urlencoded") {
+        if !crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded") {
             let mut inner = self.inner.clone();
             std::mem::swap(&mut self.inner, &mut inner);
             return Box::pin(async move { inner.call(req).await });

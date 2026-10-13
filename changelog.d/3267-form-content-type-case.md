@@ -1,6 +1,7 @@
 ### Fixed
 
-- **forms:** `ChangesetForm`, `NestedChangesetForm` and the `_method` override
-  now accept a mixed-case `Content-Type` such as
-  `Application/X-WWW-Form-Urlencoded` (issue #3267). They returned `415`, or
-  skipped the override, while the CSRF layer accepted the same request.
+- **forms:** Form gates now match `Content-Type` without regard to case
+  (issue #3267). `ChangesetForm` and `NestedChangesetForm` returned `415` for
+  `Application/X-WWW-Form-Urlencoded`. The `_method` override did nothing for
+  it. The CSRF layer accepted the same request. The captcha and inbound-mail
+  gates now also accept leading whitespace.
