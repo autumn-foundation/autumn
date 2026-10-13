@@ -261,8 +261,9 @@ pub struct FleetDatabase {
     /// Counts the holders of this database. The fleet's own copy is one; any
     /// more and the database is in use, so it is never closed.
     lease: Arc<()>,
-    /// Background work to stop before the pool closes.
-    workers: Arc<Mutex<Vec<Worker>>>,
+    /// Background work to stop before the pool closes. `None` once the stop
+    /// has begun: a later registration is stopped at once.
+    workers: Arc<Mutex<Option<Vec<Worker>>>>,
 }
 
 /// A task registered with [`FleetDatabase::register_worker`].
@@ -312,21 +313,28 @@ impl FleetDatabase {
     /// Keep `stop` apart from [`closed`](Self::closed): that token means the
     /// pool is closed.
     pub fn register_worker(&self, stop: CancellationToken, handle: tokio::task::JoinHandle<()>) {
-        self.workers
+        let mut workers = self
+            .workers
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(Worker { stop, handle });
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(workers) = workers.as_mut() {
+            workers.push(Worker { stop, handle });
+        } else {
+            // Too late to settle: the pool is about to close.
+            stop.cancel();
+            handle.abort();
+        }
     }
 
     /// Stop the registered workers. With `settle`, wait for them within the
     /// timeout; without it, abort them now.
     async fn quiesce_workers(&self, settle: bool) {
-        let workers = std::mem::take(
-            &mut *self
-                .workers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        let workers = self
+            .workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap_or_default();
         for worker in &workers {
             worker.stop.cancel();
         }
@@ -1304,7 +1312,7 @@ impl DatabaseFleet {
             pool,
             closed: CancellationToken::new(),
             lease: Arc::new(()),
-            workers: Arc::default(),
+            workers: Arc::new(Mutex::new(Some(Vec::new()))),
         };
         // The file is complete here — published fully migrated, restored, or
         // already there — so a failure below closes the pool and never
@@ -3934,6 +3942,23 @@ mod tests {
         assert!(deleted.unwrap());
         assert!(db.pool().is_closed());
         assert!(!acked.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_worker_registered_after_the_stop_began_is_stopped_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let key = FleetDbKey::Slot(30);
+        let db = fleet.open(&key).await.unwrap();
+        fleet.close(&key).await;
+        let stop = CancellationToken::new();
+        let task_stop = stop.clone();
+        let handle = tokio::spawn(async move { task_stop.cancelled().await });
+        let probe = handle.abort_handle();
+        db.register_worker(stop.clone(), handle);
+        assert!(stop.is_cancelled());
+        tokio::task::yield_now().await;
+        assert!(probe.is_finished());
     }
 
     #[tokio::test(start_paused = true)]
