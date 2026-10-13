@@ -1835,7 +1835,7 @@ pub mod pg {
             // A kept connection can be dead. Then retry once on a new one.
             let loaded = conn
                 .take()
-                .map_or_else(&fresh, |mut open| {
+                .map_or_else(fresh, |mut open| {
                     load_all(&mut open)
                         .map(|all| (open, all))
                         .or_else(|_| fresh())
