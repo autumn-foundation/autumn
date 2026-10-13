@@ -1833,17 +1833,18 @@ pub mod pg {
                 Ok((open, all))
             };
             // A kept connection can be dead. Then retry once on a new one.
-            let loaded = match conn.take() {
-                Some(mut open) => load_all(&mut open)
-                    .map(|all| (open, all))
-                    .or_else(|_| fresh()),
-                None => fresh(),
-            }
-            .map(|(open, all)| {
-                // Keep the connection only after a good load.
-                *conn = Some(open);
-                all
-            });
+            let loaded = conn
+                .take()
+                .map_or_else(&fresh, |mut open| {
+                    load_all(&mut open)
+                        .map(|all| (open, all))
+                        .or_else(|_| fresh())
+                })
+                .map(|(open, all)| {
+                    // Keep the connection only after a good load.
+                    *conn = Some(open);
+                    all
+                });
             if let Ok(all) = &loaded {
                 // Install before the lock drops, so loads install in order.
                 let mut snapshot = self
