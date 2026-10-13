@@ -67,18 +67,19 @@
 //! [`ImpersonationGate::allow_roles`] in particular does not look at the target
 //! at all, so a multi-tenant app wants a real [`ImpersonationPolicy`].
 //!
-//! # Extra identity keys
-//!
-//! Only the auth session key swaps by default. If the app keeps more identity
-//! in the session (for example `user_email`), return those keys from
-//! [`ImpersonationPolicy::target_session_values`]. [`begin_impersonation`]
-//! swaps them and [`end_impersonation`] restores the operator's values.
-//!
 //! Step-up does **not** carry over: [`begin_impersonation`] stashes the
 //! operator's `last_strong_auth_at` claim and drops it from the impersonated
 //! session, so a `#[step_up]` route cannot run a sensitive action on the
 //! target's account on the strength of the *operator's* re-authentication.
 //! [`end_impersonation`] restores the operator's own claim.
+//!
+//! # Extra identity keys
+//!
+//! Only the auth session key swaps by default. If the app stores other
+//! identity values in the session (for example `user_email`), return those
+//! keys from [`ImpersonationPolicy::target_session_values`].
+//! [`begin_impersonation`] swaps them. [`end_impersonation`] restores the
+//! operator's values. [`clear`] removes them and restores nothing.
 //!
 //! # Reserved session keys
 //!
@@ -148,9 +149,10 @@ pub const IMPERSONATOR_STEP_UP_SESSION_KEY: &str = "impersonator_last_strong_aut
 
 /// Session key stashing the operator's values for the extra identity keys.
 ///
-/// A JSON object of `key -> value | null`, written by [`begin_impersonation`]
-/// for each key [`ImpersonationPolicy::target_session_values`] returns, and
-/// read back by [`end_impersonation`]. Reserved by the framework, like
+/// The value is a JSON object. It maps each key to the operator's old value,
+/// or to `null` if the key was unset. [`begin_impersonation`] writes it for
+/// each key that [`ImpersonationPolicy::target_session_values`] returns.
+/// [`end_impersonation`] reads it. Reserved by the framework, like
 /// [`IMPERSONATOR_SESSION_KEY`].
 pub const IMPERSONATOR_IDENTITY_SESSION_KEY: &str = "impersonator_identity_keys";
 
@@ -324,14 +326,16 @@ pub trait ImpersonationPolicy: Send + Sync + 'static {
 
     /// Extra session keys to swap to the target, as `(key, value)` pairs.
     ///
-    /// Use it when the app keeps more than the auth key for identity, for
-    /// example `user_email`. [`begin_impersonation`] stashes the operator's
+    /// Use this when the app stores identity in keys other than the auth key,
+    /// for example `user_email`. [`begin_impersonation`] saves the operator's
     /// value for each key and writes the target's value.
     /// [`end_impersonation`] restores the operator's values. Resolve the values
     /// server-side from the app's user store.
     ///
-    /// Default: no keys. A key that is reserved (see [`RESERVED_SESSION_KEYS`])
-    /// or equal to the auth key makes [`begin_impersonation`] fail with `500`.
+    /// Default: no keys. If the policy returns a reserved key (see
+    /// [`RESERVED_SESSION_KEYS`]) or the auth key, [`begin_impersonation`]
+    /// fails with `500`. The policy must not return other keys the framework
+    /// reads, such as the flash, locale or time-zone keys.
     fn target_session_values<'a>(
         &'a self,
         _ctx: &'a PolicyContext,
@@ -493,7 +497,8 @@ pub async fn impersonation_state(
 
 /// Drop any impersonation record from the session.
 ///
-/// Audits nothing and restores nothing.
+/// Audits nothing and restores nothing. It removes the extra identity keys that
+/// the impersonation swapped in.
 ///
 /// This is **not** the revert — use [`end_impersonation`] for that. It exists
 /// for identity transitions that replace the session's user outright, where the
@@ -517,7 +522,7 @@ pub async fn clear(session: &Session) {
     session.remove(IMPERSONATION_SESSION_ID_KEY).await;
     session.remove(IMPERSONATOR_ROLE_SESSION_KEY).await;
     session.remove(IMPERSONATOR_STEP_UP_SESSION_KEY).await;
-    session.remove(IMPERSONATOR_IDENTITY_SESSION_KEY).await;
+    drop_identity_keys(session).await;
 }
 
 /// Keep a live impersonation across a rotation that did not change who is
@@ -707,13 +712,15 @@ async fn swap_identity(
 
 /// Save the operator's value for each extra key, then write the target's.
 async fn stash_identity_keys(session: &Session, extra: &[(String, String)]) {
+    // Drop a stale stash first, so an old record cannot restore its keys later.
+    session.remove(IMPERSONATOR_IDENTITY_SESSION_KEY).await;
     if extra.is_empty() {
         return;
     }
     let mut saved = serde_json::Map::new();
     for (key, value) in extra {
-        // Save the operator's value once; a repeated key must not save the
-        // target's value.
+        // Save the operator's value only once. A repeated key must not
+        // overwrite the saved value.
         if !saved.contains_key(key) {
             let old = session.get(key).await;
             saved.insert(key.clone(), old.map_or(serde_json::Value::Null, Into::into));
@@ -726,6 +733,19 @@ async fn stash_identity_keys(session: &Session, extra: &[(String, String)]) {
             serde_json::Value::Object(saved).to_string(),
         )
         .await;
+}
+
+/// Remove the extra keys named in the stash, and the stash. Restores nothing.
+async fn drop_identity_keys(session: &Session) {
+    let Some(raw) = session.remove(IMPERSONATOR_IDENTITY_SESSION_KEY).await else {
+        return;
+    };
+    let Ok(saved) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw) else {
+        return;
+    };
+    for key in saved.keys().filter(|key| !is_reserved_session_key(key)) {
+        session.remove(key).await;
+    }
 }
 
 /// Put back the operator's extra-key values saved by [`stash_identity_keys`].
@@ -896,8 +916,8 @@ pub async fn begin_impersonation(
         ));
     }
 
-    // Resolve and check the extra identity keys before anything is written, so a
-    // bad declaration fails the whole begin and leaves the session untouched.
+    // Check the extra keys before any write. A bad key then fails the begin
+    // and leaves the session unchanged.
     let extra = match gate.as_deref() {
         Some(gate) => gate.policy().target_session_values(&ctx, &target).await,
         None => Vec::new(),
@@ -1182,7 +1202,7 @@ mod tests {
         // the reserved-key check refuses the configuration instead.
         assert!(is_reserved_session_key(crate::step_up::STEP_UP_SESSION_KEY));
         assert_eq!(crate::step_up::STEP_UP_SESSION_KEY, "last_strong_auth_at");
-        assert_eq!(RESERVED_SESSION_KEYS.len(), 7);
+        assert_eq!(RESERVED_SESSION_KEYS.len(), 8);
     }
 
     #[test]

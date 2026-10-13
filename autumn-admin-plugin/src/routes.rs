@@ -471,11 +471,6 @@ fn render(markup: maud::Markup) -> Response {
     Html(markup.into_string()).into_response()
 }
 
-/// Re-render the create/edit form after a validation failure instead of
-/// navigating away to the generic error page. Preserves every value the
-/// admin typed (`submitted`) and surfaces `error_message` through the same
-/// persistent, accessible flash banner every other page uses — no toast, no
-/// blank form, no lost input.
 /// What failed validation, and what to show the admin again.
 struct FormFailure<'a> {
     /// Values to put back in the form.
@@ -489,6 +484,11 @@ struct FormFailure<'a> {
     message: String,
 }
 
+/// Re-render the create/edit form after a validation failure instead of
+/// navigating away to the generic error page. Preserves every value the
+/// admin typed (`submitted`) and surfaces `error_message` through the same
+/// persistent, accessible flash banner every other page uses — no toast, no
+/// blank form, no lost input.
 fn invalid_form_response(
     ctx: &AdminPageCtx,
     slug: &str,
@@ -930,7 +930,7 @@ async fn model_detail(
             fields: &fields,
             record: &record,
             record_display: &display,
-            id: id,
+            id,
             has_history: model.has_history(),
         },
     ))
