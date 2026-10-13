@@ -3239,6 +3239,10 @@ mod tests {
         let db = fleet.open(&FleetDbKey::Slot(1)).await.unwrap();
         let (pool, closed) = (db.pool().clone(), db.closed().clone());
         drop(db);
+        // The first open stamps its use before creating and migrating the
+        // file, which can take over a second on a slow runner. Using the open
+        // database again (a cached hit) stamps it now.
+        drop(fleet.open(&FleetDbKey::Slot(1)).await.unwrap());
         assert_eq!(fleet.close_idle(), 0, "not idle long enough yet");
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert_eq!(fleet.close_idle(), 1);

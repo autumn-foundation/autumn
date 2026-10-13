@@ -94,7 +94,9 @@ jobs:
       # mask a fresh user's failure. The image's default database (named
       # after POSTGRES_USER) only serves as the createdb maintenance DB.
       postgres:
-        image: postgres:16
+        # Docker Hub's official image, through Google's mirror: a shared
+        # runner's unauthenticated Docker Hub pull limit is often spent.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_USER: autumn
           POSTGRES_PASSWORD: autumn

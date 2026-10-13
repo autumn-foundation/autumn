@@ -1123,6 +1123,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Pull Docker Hub images through a mirror
+        # The runner's unauthenticated Docker Hub pull limit is often spent.
+        run: ./scripts/ci-docker-hub-mirror.sh
+
+      - name: Pre-pull the testcontainer image
+        # The daemon mirror above does not cover every pull path; this pulls
+        # the image the test starts from a mirror explicitly, and tags it with
+        # its Docker Hub name so testcontainers finds it in the cache.
+        run: ./scripts/ci-prepull-images.sh postgres:11-alpine
+
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android \

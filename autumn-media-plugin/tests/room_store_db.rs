@@ -809,12 +809,19 @@ async fn finish<T>(task: tokio::task::JoinHandle<T>) -> T {
 
 /// Hold the row of `room_id` from a connection outside every store, as an
 /// in-flight writer does. Release it with [`release`].
+///
+/// The lock is `FOR UPDATE`, not an `UPDATE`: it blocks every store write
+/// the same way, but leaves no new row version. After an `UPDATE` commits,
+/// each waiter re-checks the new version and they race to lock it, so the
+/// session that queued first can lose to the next one, and a test that
+/// orders a join before the reaper fails now and then on a busy runner.
+/// With only a lock, the first waiter keeps its place.
 async fn hold_room_row(pool: &Pool<AsyncPgConnection>, room_id: &str) -> PooledConn {
     use diesel_async::SimpleAsyncConnection as _;
     let mut conn = pool.get().await.expect("conn");
     conn.batch_execute("BEGIN").await.expect("begin");
     conn.batch_execute(&format!(
-        "UPDATE media_rooms SET max_participants = max_participants WHERE room_id = '{room_id}'"
+        "SELECT 1 FROM media_rooms WHERE room_id = '{room_id}' FOR UPDATE"
     ))
     .await
     .expect("lock room row");

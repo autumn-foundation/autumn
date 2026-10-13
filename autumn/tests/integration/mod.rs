@@ -10,6 +10,8 @@ mod acme_fake_ca;
 #[cfg(feature = "acme-pebble")]
 mod acme_pebble;
 mod acting_as_integration;
+#[cfg(feature = "maud")]
+mod aeo;
 mod after_commit_integration;
 #[cfg(feature = "mcp")]
 mod agent_authority;

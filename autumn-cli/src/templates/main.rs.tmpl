@@ -39,6 +39,17 @@ pub fn layout(title: &str, current_path: &str, flash: maud::Markup, content: mau
                 link rel="stylesheet" href="/static/css/app.css";
                 (javascript_include_tag("htmx"))
                 script src=(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH) defer {}
+                // Agent readiness: the ARD link and the WebMCP script, which
+                // lets in-browser AI agents call the app's MCP tools once you
+                // mount MCP. A tool call is a POST, so with CSRF protection on
+                // (the production default) it needs the page's CSRF token:
+                // take `Option<CsrfToken>` in the handler, pass it to
+                // `layout`, and hand `csrf.as_ref().map(CsrfToken::token)` in
+                // as the second argument. Without one, the script offers no
+                // tools in production (only read-only ones where CSRF is
+                // off). Remove this line if you set `[aeo] enabled = false`:
+                // both URLs then answer 404.
+                (autumn_web::aeo::webmcp::head_tags(None, None))
             }
             body {
                 (skip_link("#main-content", "Skip to main content"))

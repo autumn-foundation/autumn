@@ -335,6 +335,16 @@ impl PluginMounts {
             .collect()
     }
 
+    /// `true` when a mounted plugin owns `path`: the router's fallback then
+    /// gives it the request before anything the framework generates there.
+    pub(crate) fn owns(&self, path: &str) -> bool {
+        let table = self.read();
+        table
+            .by_prefix
+            .iter()
+            .any(|(prefix, _)| is_under(path, prefix))
+    }
+
     /// The router for the plugin that owns `path`. The clone keeps a running
     /// request alive after an unmount.
     fn router_for(&self, path: &str) -> Option<axum::Router> {
@@ -680,6 +690,47 @@ mod tests {
         assert_eq!(get(&router, "/hello/greet").await.0, StatusCode::OK);
         let _ = mounts.unmount("/hello");
         assert_eq!(get(&router, "/hello/greet").await.0, StatusCode::NOT_FOUND);
+    }
+
+    /// A mounted plugin wins over a generated AEO document at its path, as an
+    /// application route does: both are served from the router's fallback.
+    #[tokio::test]
+    async fn a_mounted_plugin_wins_over_a_generated_document() {
+        let mounts = PluginMounts::new();
+        let state = AppState::for_test();
+        state.insert_extension(mounts.clone());
+        let router = crate::router::try_build_router_inner(
+            Vec::new(),
+            &crate::config::AutumnConfig::default(),
+            state,
+            crate::router::RouterContext {
+                exception_filters: Vec::new(),
+                scoped_groups: Vec::new(),
+                merge_routers: Vec::new(),
+                nest_routers: Vec::new(),
+                declared_routes: Vec::new(),
+                custom_layers: Vec::new(),
+                static_gate_layers: Vec::new(),
+                #[cfg(feature = "maud")]
+                error_page_renderer: None,
+                session_store: None,
+                #[cfg(feature = "openapi")]
+                openapi: None,
+                #[cfg(feature = "mcp")]
+                mcp: None,
+            },
+        )
+        .expect("router builds");
+        let (status, body) = get(&router, "/llms.txt").await;
+        assert_eq!(status, StatusCode::OK, "the generated document");
+        assert!(body.starts_with("# "), "{body}");
+        mounts.mount(&hello("/llms.txt")).expect("mounts");
+        assert_eq!(get(&router, "/llms.txt/greet").await.0, StatusCode::OK);
+        assert_eq!(
+            get(&router, "/llms.txt").await.0,
+            StatusCode::NOT_FOUND,
+            "the plugin owns the path now"
+        );
     }
 
     #[tokio::test]

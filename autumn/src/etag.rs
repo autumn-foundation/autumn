@@ -1099,6 +1099,43 @@ fn rebuild_oversized_body(
 
 // ── not_modified helpers ───────────────────────────────────────────────────────
 
+/// `true` when a `GET` or `HEAD` with these validators is not modified
+/// against a response with `response` headers (RFC 9110 §13.2.2):
+/// `If-None-Match` when present (weak comparison), else
+/// `If-Modified-Since` against `Last-Modified`.
+pub(crate) fn validators_match(
+    if_none_match: &[HeaderValue],
+    if_modified_since: Option<&HeaderValue>,
+    response: &HeaderMap,
+) -> bool {
+    if !if_none_match.is_empty() {
+        let tag = response.get(ETAG).and_then(header_str).and_then(single_tag);
+        return fields_match(tag, if_none_match.iter().map(header_str));
+    }
+    let date = |v: &HeaderValue| v.to_str().ok().and_then(parse_http_date);
+    match (
+        if_modified_since.and_then(date),
+        response.get(LAST_MODIFIED).and_then(date),
+    ) {
+        (Some(since), Some(modified)) => modified <= since,
+        _ => false,
+    }
+}
+
+/// A `304` for a response with `headers`: the `ETag` and the headers RFC
+/// 9110 §15.4.5 keeps, no body.
+pub(crate) fn not_modified_from(headers: &HeaderMap) -> Response<Body> {
+    let mut response = Response::builder()
+        .status(StatusCode::NOT_MODIFIED)
+        .body(Body::empty())
+        .expect("304 body is always valid");
+    if let Some(etag) = headers.get(ETAG) {
+        response.headers_mut().insert(ETAG, etag.clone());
+    }
+    copy_304_headers(headers, &mut response);
+    response
+}
+
 /// Build a minimal `304 Not Modified` response.
 ///
 /// Preserves the headers RFC 7232 §4.1 requires intermediaries to pass through:

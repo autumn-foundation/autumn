@@ -91,9 +91,10 @@ const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// MCP Streamable-HTTP transport headers a browser client attaches to its
-/// JSON-RPC requests. They are always added to the `OPTIONS` preflight's
-/// `Access-Control-Allow-Headers` (on top of the app's configured list) so a
-/// default CORS config doesn't block the follow-up `POST`. See
+/// JSON-RPC requests, and the x402 `payment-signature` of a paid tool call
+/// (forwarded to the priced route). They are always added to the `OPTIONS`
+/// preflight's `Access-Control-Allow-Headers` (on top of the app's configured
+/// list) so a default CORS config doesn't block the follow-up `POST`. See
 /// <https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#protocol-version-header>.
 /// `Mcp-Name` and `Mcp-Method` are the routing headers a client sets on
 /// `tasks/*` requests (MCP Tasks extension).
@@ -102,6 +103,7 @@ const MCP_REQUEST_HEADERS: &[&str] = &[
     "mcp-session-id",
     "mcp-name",
     "mcp-method",
+    "payment-signature",
 ];
 
 /// Upper bound on a tool's buffered response body (10 MiB). MCP tool results
@@ -128,7 +130,15 @@ const FORWARDED_HEADERS: &[&str] = &[
     // when no locale query/cookie is present, so forward it for the tool result
     // to match the localized data a direct HTTP call would return.
     "accept-language",
+    // x402: the payment for a priced route (`[[aeo.paid_routes]]`). Without it
+    // a priced tool could only ever answer `402`.
+    "payment-signature",
 ];
+
+/// Response headers copied from the replayed handler response onto the
+/// rebuilt `/mcp` response: session and CSRF cookies, and the x402 challenge
+/// and settlement receipt of a priced route.
+const REPLAYED_RESPONSE_HEADERS: &[&str] = &["set-cookie", "payment-required", "payment-response"];
 
 /// Layer applier for the optional whole-endpoint auth gate (e.g.
 /// `RequireApiToken`). Boxed so any `tower::Layer` can be erased; applied to
@@ -2414,10 +2424,11 @@ struct Dispatched {
     request_id: Option<String>,
     /// Whether the handler answered with `text/event-stream`.
     is_event_stream: bool,
-    /// Any `Set-Cookie` the inner handler or middleware set (session renewal,
-    /// CSRF-cookie refresh, login), replayed onto the outer HTTP response so a
-    /// tool call sends what the equivalent direct call would have.
-    cookies: Vec<HeaderValue>,
+    /// The [`REPLAYED_RESPONSE_HEADERS`] the inner handler or middleware set
+    /// (session renewal, CSRF-cookie refresh, login, an x402 receipt),
+    /// replayed onto the outer HTTP response so a tool call sends what the
+    /// equivalent direct call would have.
+    replayed: Vec<(HeaderName, HeaderValue)>,
 }
 
 impl Dispatched {
@@ -2437,12 +2448,34 @@ impl Dispatched {
                         .to_ascii_lowercase()
                         .starts_with("text/event-stream")
                 }),
-            cookies: headers
-                .get_all(header::SET_COOKIE)
+            replayed: REPLAYED_RESPONSE_HEADERS
                 .iter()
-                .cloned()
+                .flat_map(|&name| {
+                    headers
+                        .get_all(name)
+                        .iter()
+                        .map(move |value| (HeaderName::from_static(name), value.clone()))
+                })
                 .collect(),
         }
+    }
+}
+
+/// Write the [`Dispatched::replayed`] headers onto the rebuilt `/mcp`
+/// response. A paid call's challenge or receipt also carries x402's
+/// `private, no-store`, so the paid result is not cached.
+fn apply_replayed(headers: &mut HeaderMap, replayed: Vec<(HeaderName, HeaderValue)>) {
+    let mut paid = false;
+    for (name, value) in replayed {
+        paid |= name.as_str().starts_with("payment-");
+        headers.append(name, value);
+    }
+    if paid {
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+        crate::aeo::commerce::expose_payment_headers(headers);
     }
 }
 
@@ -2500,8 +2533,11 @@ async fn serve_tools_call(
 
     // MCP Tasks extension: give a task handle to a client that declared the
     // extension. If the store is full, the tool runs as a blocking call.
+    // An x402-priced tool always answers on `/mcp`: a task has no response
+    // to carry the payment challenge or the receipt.
     if tool.task
         && tasks::client_declares_tasks(&params)
+        && !crate::aeo::commerce::prices_route(&server.state, &tool.method, &tool.path_template)
         && let Some((task_id, created)) = reserve_task(server, ctx, &tool.name)
     {
         apply_replay_extensions(&mut request, server, ctx, &audit, true);
@@ -2529,7 +2565,7 @@ async fn serve_tools_call(
         status,
         request_id,
         is_event_stream,
-        cookies,
+        replayed,
     } = Dispatched::inspect(&response);
     let client_accepts_sse = ctx
         .headers
@@ -2557,7 +2593,7 @@ async fn serve_tools_call(
         );
         stream_audit.status = Some(status);
         stream_audit.request_id = request_id;
-        return stream_tool_result(id, &params, response, cookies, stream_audit, server_info);
+        return stream_tool_result(id, &params, response, replayed, stream_audit, server_info);
     }
 
     // Buffered path: the outcome is recorded only once the body has actually
@@ -2570,7 +2606,7 @@ async fn serve_tools_call(
         id,
         status,
         is_event_stream,
-        cookies,
+        replayed,
         response,
         server_info.as_ref(),
     )
@@ -2733,7 +2769,7 @@ async fn buffered_tool_response(
     id: Value,
     status: StatusCode,
     is_event_stream: bool,
-    cookies: Vec<HeaderValue>,
+    replayed: Vec<(HeaderName, HeaderValue)>,
     response: Response,
     server_info: Option<&Value>,
 ) -> (Response, Option<BufferedFailure>) {
@@ -2759,11 +2795,11 @@ async fn buffered_tool_response(
         modern::stamp(&mut message, info);
     }
     let mut resp = json_response(&message);
+    // The handler already ran: its cookies, and an x402 receipt for a payment
+    // already settled, reach the client even when its body failed to read.
+    apply_replayed(resp.headers_mut(), replayed);
     if failure.is_some() {
         return (resp, failure);
-    }
-    for cookie in cookies {
-        resp.headers_mut().append(header::SET_COOKIE, cookie);
     }
     // Forward only the inner dispatch's non-`total` `Server-Timing` metrics
     // (e.g. `db;dur=…;desc="N queries"`) onto the rebuilt response, dropping the
@@ -2994,7 +3030,7 @@ fn stream_tool_result(
     id: Value,
     params: &Value,
     response: Response,
-    cookies: Vec<HeaderValue>,
+    replayed: Vec<(HeaderName, HeaderValue)>,
     audit: OutcomeGuard,
     stamp: Option<Value>,
 ) -> Response {
@@ -3024,9 +3060,7 @@ fn stream_tool_result(
     // Ask reverse proxies (nginx) not to buffer the stream.
     resp.headers_mut()
         .insert("x-accel-buffering", HeaderValue::from_static("no"));
-    for cookie in cookies {
-        resp.headers_mut().append(header::SET_COOKIE, cookie);
-    }
+    apply_replayed(resp.headers_mut(), replayed);
     resp
 }
 
@@ -4890,6 +4924,122 @@ mod tests {
         assert_eq!(cookies, ["session=abc", "csrf=dup1", "csrf=dup2"]);
     }
 
+    #[test]
+    fn x402_headers_cross_the_replay_both_ways() {
+        let t = tool("GET", "/api/report", false, false);
+        let mut headers = HeaderMap::new();
+        headers.insert("payment-signature", "eyJ4IjoxfQ==".parse().unwrap());
+        let req =
+            build_request(&t, &headers, &json!({}), "x-csrf-token", None).expect("request builds");
+        assert_eq!(req.headers()["payment-signature"], "eyJ4IjoxfQ==");
+
+        let response = Response::builder()
+            .header(header::SET_COOKIE, "session=abc")
+            .header("payment-response", "receipt")
+            .header("payment-required", "challenge")
+            .header("x-other", "kept inside")
+            .body(Body::empty())
+            .unwrap();
+        let replayed: Vec<_> = Dispatched::inspect(&response)
+            .replayed
+            .into_iter()
+            .map(|(name, value)| format!("{name}: {}", value.to_str().unwrap()))
+            .collect();
+        assert_eq!(
+            replayed,
+            [
+                "set-cookie: session=abc",
+                "payment-required: challenge",
+                "payment-response: receipt"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_still_returns_the_payment_receipt() {
+        let t = tool("GET", "/api/report", false, false);
+        let body = Body::from_stream(futures::stream::iter([Err::<Bytes, _>(
+            std::io::Error::other("boom"),
+        )]));
+        let response = Response::builder()
+            .header("payment-response", "receipt")
+            .body(body)
+            .unwrap();
+        let replayed = Dispatched::inspect(&response).replayed;
+        let (resp, failure) = buffered_tool_response(
+            &t,
+            json!(1),
+            StatusCode::OK,
+            false,
+            replayed,
+            response,
+            None,
+        )
+        .await;
+        assert!(failure.is_some());
+        assert_eq!(resp.headers()["payment-response"], "receipt");
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "private, no-store");
+        // A cross-origin browser client can read the receipt.
+        assert_eq!(
+            resp.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS],
+            "PAYMENT-REQUIRED, PAYMENT-RESPONSE"
+        );
+    }
+
+    /// Codex review (P2): a paid tool result keeps x402's `no-store`, on the
+    /// buffered and the streamed response alike; an unpaid one is untouched.
+    #[tokio::test]
+    async fn a_paid_tool_result_is_not_cached() {
+        let t = tool("GET", "/api/report", false, false);
+        let response = Response::builder()
+            .header("payment-response", "receipt")
+            .body(Body::from("{}"))
+            .unwrap();
+        let replayed = Dispatched::inspect(&response).replayed;
+        let (resp, _) = buffered_tool_response(
+            &t,
+            json!(1),
+            StatusCode::OK,
+            false,
+            replayed,
+            response,
+            None,
+        )
+        .await;
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "private, no-store");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        apply_replayed(
+            &mut headers,
+            vec![(
+                HeaderName::from_static("payment-required"),
+                HeaderValue::from_static("challenge"),
+            )],
+        );
+        assert_eq!(
+            headers
+                .get_all(header::CACHE_CONTROL)
+                .iter()
+                .collect::<Vec<_>>(),
+            ["private, no-store"]
+        );
+
+        let response = Response::builder().body(Body::from("{}")).unwrap();
+        let replayed = Dispatched::inspect(&response).replayed;
+        let (resp, _) = buffered_tool_response(
+            &t,
+            json!(1),
+            StatusCode::OK,
+            false,
+            replayed,
+            response,
+            None,
+        )
+        .await;
+        assert!(resp.headers().get(header::CACHE_CONTROL).is_none());
+    }
+
     /// A trusted-Host policy that trusts the given hosts (plus dev loopback,
     /// which `from_config` adds for non-production profiles).
     fn trusted(hosts: &[&str]) -> crate::router::TrustedHostPolicy {
@@ -5038,6 +5188,11 @@ mod tests {
         assert!(
             allow_headers.contains("mcp-protocol-version"),
             "allow-headers missing MCP-Protocol-Version: {allow_headers}"
+        );
+        // A paid tool call's retry carries the x402 payment.
+        assert!(
+            allow_headers.contains("payment-signature"),
+            "allow-headers missing Payment-Signature: {allow_headers}"
         );
 
         // Non-allowlisted origin → no CORS grant (browser will block the POST).
