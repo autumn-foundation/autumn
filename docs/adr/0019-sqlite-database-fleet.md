@@ -185,7 +185,17 @@ destination as the control database:
   opening a database whose file is missing restores it first: a host that
   takes over a slot range serves it from the replicas. That restore also
   publishes with a no-replace link, so two processes restoring the same
-  database at once end up on the first one's file.
+  database at once end up on the first one's file;
+- processes that share a root elect one replicator per database. The owner
+  holds an OS lock on the sidecar `<db>.replicator.lock`. Other processes open
+  the database, never checkpoint it, and retry the lock on each tick. The OS
+  frees the lock when the owner exits or dies, and the new owner starts a new
+  generation. Two replicators would have independent generations, and a
+  restore of the newest one could miss commits of the other. A lock file was
+  chosen over a lease row in the database: a lease row writes to the WAL on
+  every renewal, and it is copied into every replica;
+- health reports the databases this process has open but does not own under
+  `unowned`.
 
 Taking over a slot range needs the old owner stopped first (a fencing epoch is
 roadmap item 2).

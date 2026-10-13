@@ -711,7 +711,6 @@ async fn refused_paths_and_repository_writes_never_report_a_mismatch() {
                 post.id,
                 &UpdateLgoPost {
                     title: Patch::Set(format!("p{step}")),
-                    ..Default::default()
                 },
             )
             .await

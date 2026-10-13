@@ -345,7 +345,7 @@ async fn queued_hook_survives_restart_and_is_delivered_exactly_once_on_sqlite() 
 
     wait_until("hook delivered", || {
         let observed = observed.clone();
-        async move { observed.lock().unwrap().len() >= 1 }
+        async move { !observed.lock().unwrap().is_empty() }
     })
     .await;
     // Give any (erroneous) duplicate delivery a chance to also land before asserting once.

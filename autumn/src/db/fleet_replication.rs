@@ -19,6 +19,12 @@
 //! The databases run with `wal_autocheckpoint = 0`; the replicator is the only
 //! checkpointer, and it checkpoints only what is already offsite. That is the
 //! control database's invariant, applied per database.
+//!
+//! Processes can share a fleet root. Only one of them replicates a database:
+//! the one that holds the OS lock `<db>.replicator.lock`. The others open the
+//! database, never checkpoint it, and try the lock again on each tick. The OS
+//! frees the lock when its holder exits or dies. The new holder starts a new
+//! generation, so a restore never misses a commit.
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
@@ -57,6 +63,12 @@ const STOP_POLL: Duration = Duration::from_millis(100);
 /// several.
 const FINAL_SHIP_MAX_TICKS: usize = 64;
 
+/// Longest a closing non-owner waits for the owner to hand over the lock.
+const CLAIM_WAIT: Duration = Duration::from_secs(2);
+
+/// Pause between claim attempts at close.
+const CLAIM_POLL: Duration = Duration::from_millis(25);
+
 /// Pause between flush passes at shutdown.
 const FLUSH_RETRY: Duration = Duration::from_millis(100);
 
@@ -72,9 +84,99 @@ pub fn replica_root(base: &str, key: &FleetDbKey) -> String {
 }
 
 struct ActiveReplica {
+    /// Never ticked while the lock is not held, so it opens no connection.
     replicator: Mutex<Replicator>,
+    /// Declared after `replicator`: the replicator's connection closes before
+    /// the lock is freed.
+    lock: Mutex<Option<ReplicaLock>>,
+    path: std::path::PathBuf,
+    /// Why the last claim failed, when it was not simply held by another
+    /// process. Such a database is never replicated.
+    lock_error: Mutex<Option<String>>,
+    /// Set once the database closes. A tick pass that still holds this
+    /// replica must not claim the lock for it.
+    retired: AtomicBool,
     status: Arc<ReplicationStatus>,
     registered_at: DateTime<Utc>,
+}
+
+impl ActiveReplica {
+    fn owned(&self) -> bool {
+        self.lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Try to become the replicator of this database. `true` when this
+    /// process owns it.
+    fn claim(&self, key: &FleetDbKey) -> bool {
+        if self.owned() {
+            return true;
+        }
+        if self.retired.load(Ordering::Acquire) {
+            return false;
+        }
+        match ReplicaLock::try_acquire(&self.path) {
+            Ok(Some(held)) if self.retired.load(Ordering::Acquire) => {
+                drop(held);
+                false
+            }
+            Ok(Some(held)) => {
+                *self
+                    .lock_error
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = None;
+                tracing::info!(database = %key, "fleet replication: this process now replicates the database");
+                *self.lock.lock().unwrap_or_else(PoisonError::into_inner) = Some(held);
+                true
+            }
+            Ok(None) => {
+                *self
+                    .lock_error
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = None;
+                false
+            }
+            Err(error) => {
+                tracing::warn!(database = %key, error = %error, "fleet replication: cannot take the replicator lock");
+                *self
+                    .lock_error
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(error.to_string());
+                false
+            }
+        }
+    }
+}
+
+/// The OS lock that makes one process the replicator of a database. The OS
+/// frees it when the file closes or the process ends.
+struct ReplicaLock {
+    _file: std::fs::File,
+}
+
+impl ReplicaLock {
+    fn try_acquire(db: &Path) -> std::io::Result<Option<Self>> {
+        let name = crate::fleet_layout::replicator_lock_path(db);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(name)?;
+        let mut lock = fd_lock::RwLock::new(file);
+        match lock.try_write() {
+            // Keep the lock held: closing the file frees it, so the guard
+            // must not unlock early.
+            Ok(guard) => std::mem::forget(guard),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        Ok(Some(Self {
+            _file: lock.into_inner(),
+        }))
+    }
 }
 
 /// Replicates the open databases of one fleet. Installed by
@@ -281,10 +383,16 @@ impl FleetReplication {
         replicas
     }
 
-    /// Databases replicating now.
+    /// Open databases that another process replicates.
+    #[must_use]
+    pub fn unowned(&self) -> usize {
+        self.active().values().filter(|r| !r.owned()).count()
+    }
+
+    /// Databases this process replicates now.
     #[must_use]
     pub fn replicating(&self) -> usize {
-        self.active().len()
+        self.active().values().filter(|r| r.owned()).count()
     }
 
     /// Tick every registered replicator once, and retire each parked one
@@ -311,6 +419,10 @@ impl FleetReplication {
             let now_cutoff = cutoff();
             if expired(now_cutoff) {
                 return;
+            }
+            // A database that another process replicates is retried each tick.
+            if !replica.claim(&key) {
+                continue;
             }
             let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
                 continue;
@@ -403,7 +515,10 @@ impl FleetReplication {
     fn health(&self) -> HealthCheckOutput {
         let now = self.clock.now();
         let closing = self.closing();
-        let replicas = self.all_replicas();
+        let (replicas, unowned): (Vec<_>, Vec<_>) = self
+            .all_replicas()
+            .into_iter()
+            .partition(|(_, replica)| replica.owned());
         let mut worst: Option<(Duration, String)> = None;
         let mut failing = 0_u64;
         let mut pending_bytes = 0_u64;
@@ -427,6 +542,19 @@ impl FleetReplication {
         let mut details: HashMap<String, serde_json::Value> = HashMap::new();
         details.insert("databases".to_owned(), replicas.len().into());
         details.insert("closing".to_owned(), closing.into());
+        details.insert("unowned".to_owned(), unowned.len().into());
+        let lock_failures: Vec<String> = unowned
+            .iter()
+            .filter(|(_, replica)| {
+                replica
+                    .lock_error
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_some()
+            })
+            .map(|(key, _)| key.name())
+            .collect();
+        details.insert("lock_failures".to_owned(), lock_failures.len().into());
         details.insert("failing".to_owned(), failing.into());
         details.insert(
             "unshipped".to_owned(),
@@ -442,17 +570,46 @@ impl FleetReplication {
             self.lag_alert_after.as_secs().into(),
         );
         details.insert("destination".to_owned(), self.destination.describe().into());
-        let healthy = if let Some((lag, name)) = worst {
+        let lag_ok = if let Some((lag, name)) = worst {
             details.insert("worst_lag_seconds".to_owned(), lag.as_secs().into());
             details.insert("worst_database".to_owned(), name.into());
             lag <= self.lag_alert_after
         } else {
             true
         };
+        // A database whose lock cannot be taken is never replicated.
+        let healthy = lag_ok && lock_failures.is_empty();
         if healthy {
             HealthCheckOutput::up().with_details(details)
         } else {
             HealthCheckOutput::down().with_details(details)
+        }
+    }
+}
+
+impl FleetReplication {
+    /// Claim at close. An owner that closes at the same time still holds the
+    /// lock while it ships, so wait for it, within `CLAIM_WAIT` and the
+    /// shutdown cutoff.
+    fn claim_for_close(&self, replica: &ActiveReplica, key: &FleetDbKey) -> bool {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "real time: the wait bounds blocking I/O"
+        )]
+        let limit = std::time::Instant::now() + CLAIM_WAIT;
+        loop {
+            if replica.claim(key) {
+                return true;
+            }
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "real time: the wait bounds blocking I/O"
+            )]
+            let now = std::time::Instant::now();
+            if now >= limit || expired(self.shutdown_cutoff()) {
+                return false;
+            }
+            std::thread::sleep(CLAIM_POLL);
         }
     }
 }
@@ -507,14 +664,18 @@ impl FleetLifecycle for FleetReplication {
         let replicator =
             Replicator::new(settings, Arc::clone(&self.destination), Arc::clone(&status))
                 .with_clock(Arc::clone(&self.clock));
-        self.active().insert(
-            db.key().clone(),
-            Arc::new(ActiveReplica {
-                replicator: Mutex::new(replicator),
-                status,
-                registered_at: self.clock.now(),
-            }),
-        );
+        let replica = Arc::new(ActiveReplica {
+            replicator: Mutex::new(replicator),
+            lock: Mutex::new(None),
+            lock_error: Mutex::new(None),
+            retired: AtomicBool::new(false),
+            path: db.path().to_path_buf(),
+            status,
+            registered_at: self.clock.now(),
+        });
+        // Another process may own it. The loop claims it when that one lets go.
+        replica.claim(db.key());
+        self.active().insert(db.key().clone(), replica);
         Ok(())
     }
 
@@ -522,6 +683,13 @@ impl FleetLifecycle for FleetReplication {
         let Some(replica) = self.active().remove(db.key()) else {
             return;
         };
+        // The owner may have left since the last tick. Try once, so commits
+        // made meanwhile ship. Then no later tick may claim for this replica.
+        let owner = self.claim_for_close(&replica, db.key());
+        replica.retired.store(true, Ordering::Release);
+        if !owner {
+            return;
+        }
         // Every pooled connection is gone. Ship everything they committed
         // before the replicator's own connection — the last one — closes and
         // lets SQLite checkpoint.
@@ -862,6 +1030,198 @@ mod tests {
         assert_eq!(output.details["failing"], 0);
         assert_eq!(output.details["worst_database"], "tenant:acme");
         fleet.close_all().await;
+    }
+
+    async fn tick(replication: &Arc<FleetReplication>) {
+        crate::time::spawn_blocking({
+            let replication = Arc::clone(replication);
+            move || replication.tick_all()
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_fleets_on_one_root_elect_one_replicator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, replicas) = (tmp.path().join("shared"), tmp.path().join("replicas"));
+        let (a, ra) = replicated_fleet(&root, &replicas, false);
+        let (b, rb) = replicated_fleet(&root, &replicas, false);
+        let key = a.key_for("acme").unwrap();
+        let _db_a = a.open(&key).await.unwrap();
+        let _db_b = b.open(&key).await.unwrap();
+        assert_eq!(ra.replicating() + rb.replicating(), 1);
+        assert_eq!(ra.unowned() + rb.unowned(), 1);
+        let loser = if ra.unowned() == 1 { &rb } else { &ra };
+        assert_eq!(loser.replicating(), 1, "the other process owns it");
+    }
+
+    #[tokio::test]
+    async fn the_other_process_takes_over_and_a_restore_has_every_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, replicas) = (tmp.path().join("shared"), tmp.path().join("replicas"));
+        let (a, ra) = replicated_fleet(&root, &replicas, false);
+        let (b, rb) = replicated_fleet(&root, &replicas, false);
+        let key = a.key_for("acme").unwrap();
+        let db_a = a.open(&key).await.unwrap();
+        let db_b = b.open(&key).await.unwrap();
+        assert_eq!(
+            (ra.replicating(), rb.replicating()),
+            (1, 0),
+            "A opened first"
+        );
+
+        exec(&db_a, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        exec(&db_a, "INSERT INTO notes VALUES ('from a')").await;
+        tick(&ra).await;
+        tick(&rb).await;
+        assert_eq!(rb.replicating(), 0, "B waits while A lives");
+
+        // A closes: it ships the last frames and lets go.
+        drop(db_a);
+        a.close(&key).await;
+        tick(&rb).await;
+        assert_eq!((rb.replicating(), rb.unowned()), (1, 0), "B took over");
+        exec(&db_b, "INSERT INTO notes VALUES ('from b')").await;
+        drop(db_b);
+        b.close(&key).await;
+
+        let path = b.path_of(&key);
+        std::fs::remove_file(&path).unwrap();
+        for sidecar in crate::fleet_layout::sidecar_paths(&path) {
+            let _ = std::fs::remove_file(sidecar);
+        }
+        b.restore(&key, None).await.unwrap();
+        assert_eq!(count(&b.open(&key).await.unwrap()).await, 2);
+    }
+
+    #[tokio::test]
+    async fn health_counts_databases_this_process_does_not_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, replicas) = (tmp.path().join("shared"), tmp.path().join("replicas"));
+        let (a, _ra) = replicated_fleet(&root, &replicas, false);
+        let (b, rb) = replicated_fleet(&root, &replicas, false);
+        let key = a.key_for("acme").unwrap();
+        let _db_a = a.open(&key).await.unwrap();
+        let _db_b = b.open(&key).await.unwrap();
+        let output = rb.indicator().check().await;
+        assert_eq!(output.status, crate::actuator::HealthStatus::Up);
+        assert_eq!(output.details["unowned"], 1);
+        assert_eq!(output.details["databases"], 0);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_owner_frees_the_database_for_the_other_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, replicas) = (tmp.path().join("shared"), tmp.path().join("replicas"));
+        let (a, ra) = replicated_fleet(&root, &replicas, false);
+        let (b, rb) = replicated_fleet(&root, &replicas, false);
+        let key = a.key_for("acme").unwrap();
+        let db_a = a.open(&key).await.unwrap();
+        let _db_b = b.open(&key).await.unwrap();
+        exec(&db_a, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        exec(&db_a, "INSERT INTO notes VALUES ('from a')").await;
+        tick(&ra).await;
+        // The owner ends without a close.
+        ra.active().clear();
+        tick(&rb).await;
+        assert_eq!(rb.replicating(), 1, "B took over after A ended");
+    }
+
+    #[tokio::test]
+    async fn closing_a_database_another_process_owns_keeps_the_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, replicas) = (tmp.path().join("shared"), tmp.path().join("replicas"));
+        let (a, ra) = replicated_fleet(&root, &replicas, false);
+        let (b, rb) = replicated_fleet(&root, &replicas, false);
+        let key = a.key_for("acme").unwrap();
+        let _db_a = a.open(&key).await.unwrap();
+        let db_b = b.open(&key).await.unwrap();
+        drop(db_b);
+        b.close(&key).await;
+        assert_eq!((rb.replicating(), rb.unowned(), rb.closing()), (0, 0, 0));
+        assert_eq!(ra.replicating(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_owner_can_reopen_after_a_close() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication) =
+            replicated_fleet(&tmp.path().join("a"), &tmp.path().join("replicas"), false);
+        let key = fleet.key_for("acme").unwrap();
+        drop(fleet.open(&key).await.unwrap());
+        fleet.close(&key).await;
+        fleet.open(&key).await.unwrap();
+        assert_eq!((replication.replicating(), replication.unowned()), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn a_lock_that_cannot_be_taken_turns_health_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication) =
+            replicated_fleet(&tmp.path().join("a"), &tmp.path().join("replicas"), false);
+        let key = fleet.key_for("acme").unwrap();
+        drop(fleet.open(&key).await.unwrap());
+        fleet.close(&key).await;
+        // A directory in the lock path makes the next claim fail.
+        let lock = crate::fleet_layout::replicator_lock_path(&fleet.path_of(&key));
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        fleet.open(&key).await.unwrap();
+        assert_eq!(replication.unowned(), 1);
+        let output = replication.indicator().check().await;
+        assert_eq!(output.status, crate::actuator::HealthStatus::Down);
+        assert_eq!(output.details["lock_failures"], 1);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_lock_file_and_the_bucket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, _) =
+            replicated_fleet(&tmp.path().join("a"), &tmp.path().join("replicas"), false);
+        let key = fleet.key_for("acme").unwrap();
+        let path = fleet.path_of(&key);
+        let bucket = path.parent().unwrap().to_path_buf();
+        drop(fleet.open(&key).await.unwrap());
+        let lock = crate::fleet_layout::replicator_lock_path(&path);
+        assert!(lock.exists());
+        assert!(fleet.delete(&key).await.unwrap());
+        assert!(!lock.exists());
+        assert!(!bucket.exists());
+    }
+
+    #[tokio::test]
+    async fn a_non_owner_closing_with_the_owner_waits_for_the_handover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, replicas) = (tmp.path().join("shared"), tmp.path().join("replicas"));
+        let (a, _ra) = replicated_fleet(&root, &replicas, false);
+        let (b, rb) = replicated_fleet(&root, &replicas, false);
+        let key = a.key_for("acme").unwrap();
+        let db_a = a.open(&key).await.unwrap();
+        let db_b = b.open(&key).await.unwrap();
+        exec(&db_a, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        exec(&db_b, "INSERT INTO notes VALUES ('from b')").await;
+        drop(db_b);
+        // A lets go shortly after B starts to close.
+        drop(db_a);
+        let closer = tokio::spawn({
+            let (a, key) = (a.clone(), key.clone());
+            async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                a.close(&key).await;
+            }
+        });
+        b.close(&key).await;
+        closer.await.unwrap();
+        assert_eq!(rb.closing(), 0);
+
+        let path = b.path_of(&key);
+        std::fs::remove_file(&path).unwrap();
+        for sidecar in crate::fleet_layout::sidecar_paths(&path) {
+            let _ = std::fs::remove_file(sidecar);
+        }
+        b.restore(&key, None).await.unwrap();
+        assert_eq!(count(&b.open(&key).await.unwrap()).await, 1);
     }
 
     /// A destination that can be switched off, for an outage mid-close.
