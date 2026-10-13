@@ -2504,6 +2504,8 @@ pub mod pg {
         fn running(name: &str) -> ExperimentConfig {
             let mut config = ExperimentConfig::new(name, vec![VariantConfig::new("control", 100)]);
             config.state = ExperimentState::Running;
+            // `new` stamps the wall clock. Pin it so equal configs compare equal.
+            config.updated_at_secs = 0;
             config
         }
 
