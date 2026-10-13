@@ -17899,6 +17899,17 @@ mod tests {
     }
 
     #[test]
+    fn experiment_store_with_sink_preloads_too() {
+        let store = Arc::new(crate::experiments::ProbeStore::default());
+        let builder = app().with_experiment_store_and_sink(
+            Arc::clone(&store),
+            Arc::new(crate::experiments::NoOpExposureSink),
+        );
+        run_state_initializers(builder.state_initializers, &AppState::for_test());
+        assert_eq!(store.preloads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn static_builds_run_state_initializers_before_router_build() {
         let source = include_str!("app.rs").replace("\r\n", "\n");
         let build_mode_start = source

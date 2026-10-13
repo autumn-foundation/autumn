@@ -296,7 +296,7 @@ assert_eq!(variant, again);
 `PgExperimentStore` keeps all experiment configs in memory. A config read does
 not connect to the database on the request thread. When the snapshot is older
 than the TTL (default 1 second), the store refreshes it on Tokio's blocking
-pool and returns the current value at once. `AppBuilder::with_experiment_store`
+pool and returns the last-known value without waiting. `AppBuilder::with_experiment_store`
 loads the snapshot at startup.
 
 When the database fails, the last-known configs stay in use. The store logs a

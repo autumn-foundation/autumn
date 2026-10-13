@@ -1058,7 +1058,7 @@ pub mod pg {
     ///
     /// A cache miss connects on the calling thread. Unlike `PgFlagStore` and
     /// `PgExperimentStore`, no per-request extractor reads this store: the
-    /// callers are admin routes and the cost-signal refresh task. So it keeps
+    /// callers are admin routes and the cost-signal refresh task. Therefore it keeps
     /// the read-through cache. Do not read it on a hot request path.
     #[derive(Debug)]
     pub struct PgConfigStore {

@@ -632,8 +632,8 @@ struct StoreInner {
 /// All data is lost when the process exits. Best suited for tests and single-
 /// replica development setups where cross-restart persistence is not required.
 ///
-/// For production, use the Postgres-backed store (coming soon) which persists
-/// assignments across restarts. Replicas poll for weight changes.
+/// For production, use `pg::PgExperimentStore`. It persists assignments across
+/// restarts.
 #[derive(Default)]
 pub struct InMemoryExperimentStore {
     inner: RwLock<StoreInner>,
@@ -1827,15 +1827,23 @@ pub mod pg {
                 .write()
                 .unwrap_or_else(PoisonError::into_inner)
                 .checked_at = Some(crate::time::system_instant());
-            let loaded = conn
-                .take()
-                .map_or_else(|| self.connect(), Ok)
-                .and_then(|mut open| {
-                    let all = load_all(&mut open)?;
-                    // Keep the connection only after a good load.
-                    *conn = Some(open);
-                    Ok(all)
-                });
+            let fresh = || {
+                let mut open = self.connect()?;
+                let all = load_all(&mut open)?;
+                Ok((open, all))
+            };
+            // A kept connection can be dead. Then retry once on a new one.
+            let loaded = match conn.take() {
+                Some(mut open) => load_all(&mut open)
+                    .map(|all| (open, all))
+                    .or_else(|_| fresh()),
+                None => fresh(),
+            }
+            .map(|(open, all)| {
+                // Keep the connection only after a good load.
+                *conn = Some(open);
+                all
+            });
             if let Ok(all) = &loaded {
                 // Install before the lock drops, so loads install in order.
                 let mut snapshot = self
@@ -1890,7 +1898,7 @@ pub mod pg {
     /// `get` reads an in-memory snapshot of all experiments. It does not
     /// connect on the calling thread when a Tokio runtime is present. When the
     /// snapshot is older than the cache TTL, `get` starts one refresh on the
-    /// blocking pool and returns the current value at once. With no runtime,
+    /// blocking pool and returns the last-known value without waiting. With no runtime,
     /// `get` refreshes on the calling thread.
     ///
     /// When a refresh fails, the store keeps the last-known snapshot, logs a
@@ -2577,6 +2585,34 @@ pub mod pg {
         }
 
         #[test]
+        fn failed_refresh_after_write_marks_the_snapshot_stale() {
+            let store = PgExperimentStore::with_cache_ttl(DEAD_URL, Duration::from_secs(60));
+            store.install_for_test(vec![running("exp")]);
+            assert!(!store.shared.is_stale());
+            store.refresh_after_write();
+            assert!(store.shared.is_stale());
+        }
+
+        #[test]
+        fn cold_get_without_runtime_reports_the_refresh_error() {
+            let store = PgExperimentStore::new(
+                "postgres://autumn:hunter2@127.0.0.1:1/autumn?connect_timeout=2",
+            );
+            let error = store.get("exp").unwrap_err().to_string();
+            assert!(!error.contains("not loaded"), "{error}");
+            assert!(!error.contains("hunter2"), "{error}");
+        }
+
+        #[test]
+        fn cold_get_while_a_refresh_runs_does_not_connect() {
+            let store = PgExperimentStore::with_cache_ttl(DEAD_URL, Duration::ZERO);
+            let _slot = store.begin_refresh_for_test();
+            let error = store.get("exp").unwrap_err().to_string();
+            assert!(error.contains("not loaded"), "{error}");
+            assert!(store.connect_threads_for_test().is_empty());
+        }
+
+        #[test]
         fn refresh_reports_backend_error() {
             let store = PgExperimentStore::new(DEAD_URL);
             assert!(store.refresh().is_err());
@@ -2770,6 +2806,104 @@ mod tests {
         assert!(!threads.contains(&worker));
         let sticky = store.get_assignment("exp", "user:7").unwrap().unwrap();
         assert_eq!(sticky.variant, variant);
+    }
+
+    /// Panics on the first per-actor call.
+    struct PanicStore(InMemoryExperimentStore);
+
+    impl ExperimentStore for PanicStore {
+        fn get(&self, name: &str) -> Result<Option<ExperimentConfig>, ExperimentStoreError> {
+            self.0.get(name)
+        }
+        fn list(&self) -> Result<Vec<ExperimentConfig>, ExperimentStoreError> {
+            self.0.list()
+        }
+        fn upsert(&self, config: ExperimentConfig) -> Result<(), ExperimentStoreError> {
+            self.0.upsert(config)
+        }
+        fn set_state(
+            &self,
+            name: &str,
+            state: ExperimentState,
+            winner: Option<&str>,
+        ) -> Result<(), ExperimentStoreError> {
+            self.0.set_state(name, state, winner)
+        }
+        fn set_variants(
+            &self,
+            name: &str,
+            variants: Vec<VariantConfig>,
+            actor: Option<&str>,
+        ) -> Result<(), ExperimentStoreError> {
+            self.0.set_variants(name, variants, actor)
+        }
+        fn get_assignment(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<Assignment>, ExperimentStoreError> {
+            panic!("store call panicked");
+        }
+        fn record_assignment(&self, a: Assignment) -> Result<String, ExperimentStoreError> {
+            self.0.record_assignment(a)
+        }
+        fn get_override(&self, e: &str, a: &str) -> Result<Option<String>, ExperimentStoreError> {
+            self.0.get_override(e, a)
+        }
+        fn set_override(&self, e: &str, a: &str, v: &str) -> Result<(), ExperimentStoreError> {
+            self.0.set_override(e, a, v)
+        }
+        fn has_assignment_in_group(
+            &self,
+            a: &str,
+            g: &str,
+            x: &str,
+        ) -> Result<bool, ExperimentStoreError> {
+            self.0.has_assignment_in_group(a, g, x)
+        }
+        fn history(&self, e: &str, l: usize) -> Result<Vec<ChangeRecord>, ExperimentStoreError> {
+            self.0.history(e, l)
+        }
+    }
+
+    #[tokio::test]
+    async fn assign_async_maps_a_store_panic_to_a_store_error() {
+        let store = PanicStore(InMemoryExperimentStore::new());
+        store.upsert(running_config("exp")).unwrap();
+        let svc = ExperimentService::new(Arc::new(store));
+        let result = svc.assign_async("exp", "user:1", None).await;
+        assert!(
+            matches!(
+                &result,
+                Err(ExperimentError::Store(ExperimentStoreError::Backend(m)))
+                    if m.contains("assignment task failed")
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn preload_with_returns_after_the_wait_when_the_load_is_slow() {
+        let started = std::time::Instant::now();
+        crate::feature_flags::preload_with(
+            "test",
+            "none",
+            std::time::Duration::from_millis(10),
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                Ok::<(), String>(())
+            },
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(250));
+    }
+
+    #[test]
+    fn preload_with_returns_when_the_load_panics_or_fails() {
+        let wait = std::time::Duration::from_secs(5);
+        crate::feature_flags::preload_with("test", "none", wait, || -> Result<(), String> {
+            panic!("load panicked")
+        });
+        crate::feature_flags::preload_with("test", "none", wait, || Err("failed".to_owned()));
     }
 
     #[test]
