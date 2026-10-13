@@ -3892,14 +3892,34 @@ mod tests {
     async fn close_gives_up_on_a_worker_that_never_settles() {
         let tmp = tempfile::tempdir().unwrap();
         let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
-        let (worker, _release, _acked) = settling(true);
+        let (worker, _release, acked) = settling(true);
         fleet.add_lifecycle(worker);
         let key = FleetDbKey::Slot(22);
         let db = fleet.open(&key).await.unwrap();
+        let began = tokio::time::Instant::now();
         fleet.close(&key).await;
         assert!(
             db.pool().is_closed(),
             "a stuck worker cannot block the close"
+        );
+        assert!(began.elapsed() >= WORKER_QUIESCE_TIMEOUT);
+        assert!(!acked.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_all_pays_the_worker_timeout_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let (worker, _release, _acked) = settling(true);
+        fleet.add_lifecycle(worker);
+        for slot in 25..28 {
+            fleet.open(&FleetDbKey::Slot(slot)).await.unwrap();
+        }
+        let began = tokio::time::Instant::now();
+        fleet.close_all().await;
+        assert!(
+            began.elapsed() < WORKER_QUIESCE_TIMEOUT * 2,
+            "three stuck workers cost one timeout, not three"
         );
     }
 
