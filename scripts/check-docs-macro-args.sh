@@ -306,6 +306,7 @@ OWNERS = {
     "api_doc": "api_doc.rs",
     "authorize": "authorize.rs",
     "cached": "cached.rs",
+    "cached_impl": "cached_impl.rs",
     # Wire contracts (#1755). `#[contract_checked]` has one key, `client`, and
     # reads nothing from the route grammar: it parses its own argument list and
     # then walks the annotated function's body. `#[endpoint]` takes `service`

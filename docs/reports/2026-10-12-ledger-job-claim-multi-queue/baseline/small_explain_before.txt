@@ -1,0 +1,49 @@
+BEGIN
+                                                                                                                                            QUERY PLAN                                                                                                                                            
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on public.autumn_jobs  (cost=39295.68..39303.71 rows=0 width=0) (actual time=11.703..11.707 rows=0 loops=1)
+   Buffers: shared hit=805 dirtied=1 written=1
+   InitPlan 2 (returns $3)
+     ->  Limit  (cost=39295.25..39295.26 rows=1 width=25) (actual time=11.474..11.477 rows=1 loops=1)
+           Output: candidate.id, (array_position('{high,default,low}'::text[], candidate.queue)), candidate.run_at, candidate.ctid
+           Buffers: shared hit=783
+           ->  LockRows  (cost=39295.25..39354.75 rows=4760 width=25) (actual time=11.472..11.475 rows=1 loops=1)
+                 Output: candidate.id, (array_position('{high,default,low}'::text[], candidate.queue)), candidate.run_at, candidate.ctid
+                 Buffers: shared hit=783
+                 ->  Sort  (cost=39295.25..39307.15 rows=4760 width=25) (actual time=11.445..11.448 rows=1 loops=1)
+                       Output: candidate.id, (array_position('{high,default,low}'::text[], candidate.queue)), candidate.run_at, candidate.ctid
+                       Sort Key: (array_position('{high,default,low}'::text[], candidate.queue)), candidate.run_at
+                       Sort Method: quicksort  Memory: 460kB
+                       Buffers: shared hit=781
+                       ->  Bitmap Heap Scan on public.autumn_jobs candidate  (cost=142.31..39271.45 rows=4760 width=25) (actual time=0.714..6.050 rows=4900 loops=1)
+                             Output: candidate.id, array_position('{high,default,low}'::text[], candidate.queue), candidate.run_at, candidate.ctid
+                             Recheck Cond: ((candidate.queue = ANY ('{high,default,low}'::text[])) AND (candidate.run_at <= now()) AND (candidate.status = 'enqueued'::text))
+                             Filter: ((candidate.concurrency_limit IS NULL) OR ((SubPlan 1) < candidate.concurrency_limit))
+                             Rows Removed by Filter: 100
+                             Heap Blocks: exact=533
+                             Buffers: shared hit=775
+                             ->  Bitmap Index Scan on idx_autumn_jobs_queue_ready  (cost=0.00..141.12 rows=4827 width=0) (actual time=0.603..0.604 rows=5000 loops=1)
+                                   Index Cond: ((candidate.queue = ANY ('{high,default,low}'::text[])) AND (candidate.run_at <= now()))
+                                   Buffers: shared hit=41
+                             SubPlan 1
+                               ->  Aggregate  (cost=7.46..7.47 rows=1 width=8) (actual time=0.009..0.009 rows=1 loops=100)
+                                     Output: count(*)
+                                     Buffers: shared hit=201
+                                     ->  Index Only Scan using idx_autumn_jobs_concurrency_running on public.autumn_jobs running  (cost=0.28..7.46 rows=2 width=0) (actual time=0.002..0.006 rows=24 loops=100)
+                                           Output: running.name, running.concurrency_key
+                                           Index Cond: (running.name = candidate.name)
+                                           Filter: (NOT (running.concurrency_key IS DISTINCT FROM candidate.concurrency_key))
+                                           Heap Fetches: 0
+                                           Buffers: shared hit=201
+   ->  Index Scan using autumn_jobs_pkey on public.autumn_jobs  (cost=0.42..8.45 rows=1 width=150) (actual time=11.504..11.505 rows=1 loops=1)
+         Output: 'running'::text, now(), '''w'''::text, now(), CASE WHEN (autumn_jobs.unique_window = 'pending'::text) THEN NULL::text ELSE autumn_jobs.unique_key END, CASE WHEN (autumn_jobs.unique_window = 'pending'::text) THEN autumn_jobs.unique_key ELSE NULL::text END, autumn_jobs.ctid
+         Index Cond: (autumn_jobs.id = $3)
+         Buffers: shared hit=787
+ Query Identifier: -7688793435890723683
+ Planning:
+   Buffers: shared hit=301
+ Planning Time: 1.269 ms
+ Execution Time: 11.911 ms
+(43 rows)
+
+ROLLBACK

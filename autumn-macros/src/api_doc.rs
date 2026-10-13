@@ -44,7 +44,7 @@ pub use autumn_macros_support::schema::{
 
 /// Parsed `#[api_doc(...)]` attribute arguments.
 // Each bool models a distinct, orthogonal attribute flag (`hidden`, `mcp`,
-// `mcp = false`, `stream`); grouping them would obscure rather than clarify.
+// `mcp = false`, `stream`, `task`); grouping them would obscure rather than clarify.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 pub struct ApiDocAttr {
@@ -67,6 +67,9 @@ pub struct ApiDocAttr {
     /// the JSON-response eligibility gate (an `Sse` handler has no JSON
     /// response schema).
     pub mcp_stream: bool,
+    /// `#[api_doc(mcp, task)]` — this MCP tool can return a task handle
+    /// (MCP Tasks extension) instead of a blocking result.
+    pub mcp_task: bool,
 }
 
 enum KeyValue {
@@ -81,6 +84,8 @@ enum KeyValue {
     Mcp(bool),
     /// `stream` flag — this MCP tool streams over SSE.
     Stream,
+    /// `task` flag — this MCP tool can run as a task.
+    Task,
 }
 
 impl Parse for KeyValue {
@@ -130,6 +135,20 @@ impl Parse for KeyValue {
             return Ok(KeyValue::Stream);
         }
 
+        if key_str == "task" {
+            if input.peek(Token![=]) {
+                let _eq: Token![=] = input.parse()?;
+                let value: LitBool = input.parse()?;
+                // `task = false` is the default: a no-op marker.
+                return Ok(if value.value {
+                    KeyValue::Task
+                } else {
+                    KeyValue::Tags(Vec::new())
+                });
+            }
+            return Ok(KeyValue::Task);
+        }
+
         let _eq: Token![=] = input.parse()?;
         match key_str.as_str() {
             "summary" => Ok(KeyValue::Summary(input.parse()?)),
@@ -153,7 +172,7 @@ impl Parse for KeyValue {
                 key.span(),
                 format!(
                     "unknown key `{other}` in `#[api_doc(...)]`. \
-                     Supported keys: summary, description, tag, tags, operation_id, status, hidden, mcp, stream."
+                     Supported keys: summary, description, tag, tags, operation_id, status, hidden, mcp, stream, task."
                 ),
             )),
         }
@@ -188,6 +207,7 @@ impl ApiDocAttr {
             KeyValue::Mcp(true) => self.mcp_tool = true,
             KeyValue::Mcp(false) => self.mcp_exclude = true,
             KeyValue::Stream => self.mcp_stream = true,
+            KeyValue::Task => self.mcp_task = true,
         }
     }
 }
@@ -273,6 +293,9 @@ impl ApiDocAttr {
         if other.mcp_stream {
             self.mcp_stream = true;
         }
+        if other.mcp_task {
+            self.mcp_task = true;
+        }
     }
 
     /// Emit field initializers `summary: ..., description: ..., tags: ..., hidden: ...`
@@ -294,6 +317,7 @@ impl ApiDocAttr {
         let mcp_tool = self.mcp_tool;
         let mcp_exclude = self.mcp_exclude;
         let mcp_stream = self.mcp_stream;
+        let mcp_task = self.mcp_task;
         quote! {
             operation_id: #op_id,
             summary: #summary,
@@ -304,6 +328,7 @@ impl ApiDocAttr {
             mcp_tool: #mcp_tool,
             mcp_exclude: #mcp_exclude,
             mcp_stream: #mcp_stream,
+            mcp_task: #mcp_task,
         }
     }
 }

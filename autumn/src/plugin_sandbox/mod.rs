@@ -51,6 +51,7 @@
 
 pub mod artifact;
 pub mod capability;
+pub mod dynamic;
 pub mod grants;
 pub mod host;
 pub mod manifest;
@@ -80,6 +81,9 @@ pub use capability::{
     PluginActivityLog, PluginJob, PluginRow, PluginStore, PluginValue, QueryPage, RecordingHttp,
     RenderError, Scope, StoreError, bounded_rows, row_weight, tenant_segment,
 };
+pub use dynamic::{
+    MountError, MountedPluginInfo, PluginMounts, framework_prefixes, mounts_fallback,
+};
 pub use grants::{
     CapabilityGrants, CapabilityQuotas, ConsentDelta, MAX_GRANT_ENTRIES, MAX_GRANT_IDENT_LEN,
     MAX_HOST_LEN, MAX_QUOTA, is_grantable_host, is_grantable_ident, is_grantable_name,
@@ -95,7 +99,10 @@ pub use manifest::{
     MAX_REQUEST_BODY_BYTES, MAX_REQUEST_BODY_TIMEOUT_MS, MAX_RESPONSE_BYTES, ManifestError,
     ResourceLimits, SandboxCapability, SandboxManifest, WIRE_VERSION,
 };
-pub use plugin::{SANDBOX_ATTRIBUTION_HEADER, SandboxPluginError, SandboxedPlugin};
+pub use plugin::{
+    DEFAULT_GUEST_SLOTS, SANDBOX_ATTRIBUTION_HEADER, SandboxPluginError, SandboxedPlugin,
+    set_guest_slots,
+};
 pub use slots::{RenderSlots, SlotError};
 pub use wire::{
     ALLOWED_REQUEST_HEADERS, ALLOWED_RESPONSE_CONTENT_TYPES, ALLOWED_RESPONSE_HEADERS, OwnedRoutes,

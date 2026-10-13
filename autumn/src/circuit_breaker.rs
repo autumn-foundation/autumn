@@ -148,10 +148,16 @@ impl CircuitBreakerPolicy {
         }
     }
 
-    /// Clamps both ratio thresholds into `(0, 1]`.
+    /// Clamps both ratio thresholds into `(0, 1]`, and the half-open trial
+    /// count to at least 1, as `apply` does for a configured count.
+    ///
+    /// With 0 trials, a half-open breaker admits no call, so no trial can
+    /// close it: it refuses every call for ever. `verification/circuit_breaker.rs`
+    /// proves that one trial is enough to leave the half-open state.
     fn clamped(mut self) -> Self {
         self.failure_ratio_threshold = clamp_ratio(self.failure_ratio_threshold);
         self.slow_call_rate_threshold = clamp_ratio(self.slow_call_rate_threshold);
+        self.half_open_trial_count = self.half_open_trial_count.max(1);
         self
     }
 
@@ -308,7 +314,8 @@ impl SampleWindow {
 #[derive(Clone)]
 pub struct CircuitBreaker {
     name: String,
-    pub(crate) inner: Arc<Mutex<CircuitBreakerInner>>,
+    /// A shim lock: loom and Shuttle swap it in their model checks.
+    pub(crate) inner: Arc<crate::sync_shim::Mutex<CircuitBreakerInner>>,
     /// Read the system clock, never a `Sim`'s. Set for breakers in the
     /// process-global registry: they outlive any `Sim`, so a virtual instant
     /// stored in one would later be compared with real time (issue #2967).
@@ -449,7 +456,7 @@ impl CircuitBreaker {
         let origin = read_clock(system_clock);
         Self {
             name: name.into(),
-            inner: Arc::new(Mutex::new(CircuitBreakerInner {
+            inner: Arc::new(crate::sync_shim::Mutex::new(CircuitBreakerInner {
                 state: CircuitState::Closed,
                 window: SampleWindow::new(config.sample_window, origin),
                 open_until: None,
@@ -480,7 +487,7 @@ impl CircuitBreaker {
     /// still safe to use. Recovering here keeps a single panicking lock
     /// holder from permanently poisoning the breaker and panicking every
     /// subsequent call.
-    fn lock_inner(&self) -> MutexGuard<'_, CircuitBreakerInner> {
+    fn lock_inner(&self) -> crate::sync_shim::MutexGuard<'_, CircuitBreakerInner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -871,6 +878,32 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A policy built in code with 0 half-open trials used to strand the
+    /// breaker: half-open admitted no call, so nothing could close it.
+    #[tokio::test]
+    async fn zero_half_open_trials_still_admit_one_trial() {
+        let policy = CircuitBreakerPolicy {
+            failure_ratio_threshold: 0.5,
+            minimum_sample_count: 1,
+            open_duration: Duration::ZERO,
+            half_open_trial_count: 0,
+            ..CircuitBreakerPolicy::default()
+        };
+        let breaker = CircuitBreaker::new("zero-trials", policy.clone());
+        assert_eq!(breaker.config().half_open_trial_count, 1);
+        let tripped: Result<(), _> = breaker.run(async { Err("down") }).await;
+        assert!(tripped.is_err());
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+        let trial: Result<(), CircuitBreakerError<&'static str>> =
+            breaker.run(async { Ok(()) }).await;
+        assert!(trial.is_ok(), "the half-open breaker refused its trial");
+        assert_eq!(breaker.state(), CircuitState::Closed);
+
+        // `update_config` clamps the count too.
+        breaker.update_config(policy);
+        assert_eq!(breaker.config().half_open_trial_count, 1);
+    }
 
     #[tokio::test]
     async fn test_circuit_breaker_transitions_to_open() {

@@ -3,8 +3,9 @@
 //! Emits a curated set of files (Dockerfile, .dockerignore, config example,
 //! and optional target-specific scaffolds) at the project root.
 
+use crate::git_root::find_git_root;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 mod templates {
     pub const DOCKERFILE: &str = include_str!("templates/release/Dockerfile.tmpl");
@@ -416,21 +417,6 @@ pub fn read_project_name(dir: &Path) -> Result<String, ReleaseError> {
         .and_then(|n| n.as_str())
         .map(str::to_owned)
         .ok_or_else(|| ReleaseError::CargoToml("missing [package] name".into()))
-}
-
-/// Locate the nearest ancestor of `dir` (inclusive) containing a `.git`
-/// entry. A worktree or submodule uses a `.git` FILE rather than a
-/// directory, so this checks existence generally rather than requiring a
-/// directory. Returns `None` if no ancestor up to the filesystem root has
-/// one (`dir` isn't inside a git repository at all).
-fn find_git_root(dir: &Path) -> Option<PathBuf> {
-    let mut current = dir;
-    loop {
-        if current.join(".git").exists() {
-            return Some(current.to_path_buf());
-        }
-        current = current.parent()?;
-    }
 }
 
 /// For targets that scaffold a nested workflow file (currently

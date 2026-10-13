@@ -1,0 +1,70 @@
+name: Kani proofs
+
+# Runs every `#[kani::proof]` harness in autumn-web. The harnesses live next to
+# the code they check, in `#[cfg(kani)] mod kani_proofs`, and check the shipped
+# functions for every input: no overflow, no panic, and each stated bound.
+# `verification/README.md` lists them.
+#
+# This is not a required check yet. A red run shows a broken proof, but it does
+# not block a merge. The `paths` below name each file that holds a harness;
+# `autumn-cli/tests/integration/resilience_hygiene.rs` fails when a harness is
+# added to a file that is not listed, so a change to proven code always runs
+# its proof. The weekly run catches a dependency or toolchain change.
+
+on:
+  pull_request:
+    paths:
+      - "autumn/src/admission.rs"
+      - "autumn/src/backoff.rs"
+      - "autumn/src/custom_domain.rs"
+      - "autumn/src/outbox.rs"
+      - "autumn/src/range.rs"
+      - "autumn/src/time_math.rs"
+      - ".github/workflows/kani.yml"
+  push:
+    branches: [trunk, trunk-dev]
+    paths:
+      - "autumn/src/admission.rs"
+      - "autumn/src/backoff.rs"
+      - "autumn/src/custom_domain.rs"
+      - "autumn/src/outbox.rs"
+      - "autumn/src/range.rs"
+      - "autumn/src/time_math.rs"
+      - ".github/workflows/kani.yml"
+  schedule:
+    # Mondays 05:41 UTC, after the Verus run.
+    - cron: "41 5 * * 1"
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # The release the harnesses were written against. Bump it on purpose: a new
+  # Kani can change the solvers or the harness API.
+  KANI_VERSION: "0.68.0"
+
+jobs:
+  kani:
+    name: Kani proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      # Kani installs and pins its own nightly toolchain in `cargo kani setup`.
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2.7.8
+        with:
+          # Kani builds into `target/kani`; cache it apart from the normal
+          # build, whose artifacts it cannot reuse.
+          key: kani-${{ env.KANI_VERSION }}
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier --version "$KANI_VERSION"
+          cargo kani setup
+      - name: Run the proofs
+        run: cargo kani -p autumn-web --lib

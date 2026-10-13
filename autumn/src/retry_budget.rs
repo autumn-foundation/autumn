@@ -15,8 +15,9 @@
 //! is the Google SRE limit of 10 %.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, PoisonError};
+
+use crate::sync_shim::{AtomicU64, Mutex, Ordering};
 
 use crate::config::RetryBudgetConfig;
 

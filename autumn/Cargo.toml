@@ -145,7 +145,10 @@ offline-sync = ["db", "http-client"]
 # searchable repositories emit FTS5 virtual tables + bm25 ranking) is always
 # available. Adding `db` here changes nothing for the Postgres/default lane,
 # which never enables `sqlite`.
-sqlite = ["db", "diesel/sqlite", "diesel/returning_clauses_for_sqlite_3_35", "diesel-async/sync-connection-wrapper"]
+# `dep:fd-lock`: the fleet takes a cross-process lock around publishing or
+# removing a database path (issue #3228). The crate is in the lock file already
+# (through `rustyline`), so this adds no crate to the graph.
+sqlite = ["db", "diesel/sqlite", "diesel/returning_clauses_for_sqlite_3_35", "diesel-async/sync-connection-wrapper", "dep:fd-lock"]
 test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
 telemetry-otlp = [
     "dep:opentelemetry",
@@ -440,6 +443,7 @@ proptest = { version = "1.4", optional = true }
 serde_urlencoded = "0.7"
 serde_path_to_error = "0.1"
 serde_yaml = { version = "0.9", optional = true }
+fd-lock = { version = "4", optional = true }
 pulldown-cmark = { workspace = true, optional = true }
 ammonia = { workspace = true, optional = true }
 rhai = { workspace = true, optional = true }
@@ -499,6 +503,19 @@ image = { workspace = true, optional = true }
 # `dir` (no extra crate): the data-capsule reader lists a directory through
 # an open handle, so a swapped link cannot redirect it (#1811).
 nix = { version = "0.31.2", features = ["fs", "dir", "time"] }
+
+# The loom and Shuttle model checks (`tests/loom_models.rs`,
+# `tests/shuttle_models.rs`) build the library with `--cfg loom_models` or
+# `--cfg shuttle_models`. `src/sync_shim.rs` then gives the checked modules
+# the checker's locks and atomics, so the checks run the shipped code. A
+# normal build never sets these cfgs and never compiles either crate.
+[target.'cfg(loom_models)'.dependencies]
+# `futures` adds `loom::future::block_on`, which drives the async circuit
+# breaker inside a model.
+loom = { version = "0.7.2", features = ["futures"] }
+
+[target.'cfg(shuttle_models)'.dependencies]
+shuttle = "0.9.6"
 
 [target.'cfg(unix)'.dev-dependencies]
 # `getrusage` for the process CPU time that `tests/cost_reconcile.rs` checks
@@ -1255,6 +1272,15 @@ path = "tests/sim_fault_plan_db.rs"
 name = "sim_chaos_crash"
 path = "tests/sim_chaos_crash.rs"
 
+# Issue #3061 AC1: a crash between the handler commit and the response write.
+# The handler commits its response in its own `Db::tx`; a retry replays it.
+# Over the in-memory SQLite sim substrate, so no Docker. Same isolated-binary
+# rationale as `sim_chaos_crash` above. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sim_idempotency_db`.
+[[test]]
+name = "sim_idempotency_db"
+path = "tests/sim_idempotency_db.rs"
+
 # Issue #3067: several replicas on one sim clock and one SQLite database.
 # SQLite-only (the sim substrate), so a standalone target like the others.
 # `cargo test -p autumn-web --features "sqlite,test-support" --test sim_replicas`.
@@ -1419,6 +1445,11 @@ path = "tests/cache_global_integration.rs"
 name = "cached_global_backend"
 path = "tests/cached_global_backend.rs"
 
+# Isolated: installs the process-global cache backend (#2358).
+[[test]]
+name = "cached_impl_global_scope"
+path = "tests/cached_impl_global_scope.rs"
+
 # Isolated: reads/writes the process-global cache backend via
 # `cache_fragment_global`, which `TestApp::build` clears unconditionally and
 # which a concurrently running consolidated-binary test could otherwise
@@ -1444,6 +1475,14 @@ path = "tests/capsule_cache_effect.rs"
 [[test]]
 name = "loom_models"
 path = "tests/loom_models.rs"
+
+# Isolated: Shuttle checking binary. Empty under a normal build
+# (`#![cfg(shuttle_models)]`); only compiles/runs under
+# `RUSTFLAGS="--cfg shuttle_models"`, in the `shuttle` CI job. That cfg also
+# swaps the sync primitives of the checked modules (`src/sync_shim.rs`).
+[[test]]
+name = "shuttle_models"
+path = "tests/shuttle_models.rs"
 
 [lints]
 workspace = true

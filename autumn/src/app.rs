@@ -1061,6 +1061,23 @@ impl AppBuilder {
         self
     }
 
+    /// Set the limits for MCP task tools (`#[api_doc(mcp, task)]`): TTL,
+    /// poll interval, store size and per-caller quota. See
+    /// [`McpTaskConfig`](crate::mcp::McpTaskConfig).
+    ///
+    /// If no MCP endpoint is set, this call mounts it at `/mcp`. Call
+    /// [`mount_mcp`](Self::mount_mcp) to use a different path.
+    ///
+    /// Requires the `mcp` Cargo feature.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn mcp_tasks(mut self, config: crate::mcp::McpTaskConfig) -> Self {
+        self.mcp
+            .get_or_insert_with(|| crate::mcp::McpRuntime::new("/mcp"))
+            .tasks = config;
+        self
+    }
+
     /// Gate the **entire** MCP endpoint — the catalog (`initialize`/
     /// `tools/list`) as well as tool dispatch — behind a tower `layer`.
     ///
@@ -1757,6 +1774,20 @@ impl AppBuilder {
         self
     }
 
+    /// Serve plugins that `mounts` mounts while the app runs (issue #2433).
+    ///
+    /// Keep a clone of `mounts`. Call `mount` and `unmount` on it at any time,
+    /// with no restart. The configured actuator and probe paths are reserved.
+    /// See [`PluginMounts`](crate::plugin_sandbox::PluginMounts).
+    #[cfg(feature = "plugin-sandbox")]
+    #[must_use]
+    pub fn plugin_mounts(self, mounts: crate::plugin_sandbox::PluginMounts) -> Self {
+        self.state_initializer(move |state| {
+            mounts.reserve(crate::plugin_sandbox::framework_prefixes(&state.config()));
+            state.insert_extension(mounts);
+        })
+    }
+
     /// Designate a block of typed in-memory state to survive an in-place
     /// upgrade (issue #1674).
     ///
@@ -1932,6 +1963,21 @@ impl AppBuilder {
             }
             state.insert_extension(gate);
         })
+    }
+
+    /// Run `hook` after each stored session-id rotation.
+    ///
+    /// Use it to move state keyed by the session id (such as a tracked-session
+    /// row) to the new id. Hooks run after the new session is saved and are
+    /// skipped for a destroyed session. See
+    /// [`SessionRotationHooks`](crate::session::SessionRotationHooks).
+    #[must_use]
+    pub fn on_session_rotation<F, Fut>(self, hook: F) -> Self
+    where
+        F: Fn(crate::session::SessionRotation) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), crate::session::SessionRotationError>> + Send + 'static,
+    {
+        self.state_initializer(move |state| state.session_rotation_hooks().register(hook))
     }
 
     /// Store or replace a typed builder extension.
@@ -5843,6 +5889,12 @@ impl AppBuilder {
         let drain_started_at: std::sync::Arc<std::sync::OnceLock<crate::time::MonotonicInstant>> =
             std::sync::Arc::new(std::sync::OnceLock::new());
         let drain_started_clone = std::sync::Arc::clone(&drain_started_at);
+        // The same moment on the real clock. The fleet's final flush bounds
+        // blocking I/O, so it needs a reading a fixed or unadvanced injected
+        // clock cannot freeze.
+        let drain_started_real: std::sync::Arc<std::sync::OnceLock<std::time::Instant>> =
+            std::sync::Arc::new(std::sync::OnceLock::new());
+        let drain_started_real_clone = std::sync::Arc::clone(&drain_started_real);
         // The shutdown task does not capture `state`, so hand it its own handle
         // on the injected clock — the drain window is measured on the same
         // monotonic timeline `hook_budget` is computed from below.
@@ -5919,6 +5971,11 @@ impl AppBuilder {
             // Record drain-start before cancelling so main gets the right hook
             // budget even in the startup-overlap case.
             let _ = drain_started_clone.set(drain_clock_for_task.monotonic());
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "real time: the fleet flush bounds blocking I/O"
+            )]
+            let _ = drain_started_real_clone.set(std::time::Instant::now());
             shutdown_signal_token.cancel();
 
             // Phase 6: drain watchdog. If the in-flight drain exceeds the budget,
@@ -6048,12 +6105,11 @@ impl AppBuilder {
                 // process, taking anything acknowledged meanwhile with it.
                 // Refusing here ends that wait when this process exits, in ~20 ms
                 // rather than the readiness timeout, and it resumes writable.
-                match crate::upgrade::publish_upgrade_readiness() {
-                    Ok(had_predecessor) => {
-                        if had_predecessor {
-                            unfreeze_adopted_live_state(&state);
-                        }
-                    }
+                // The unfreeze runs under the handoff lock.
+                match crate::upgrade::publish_upgrade_readiness(|| {
+                    unfreeze_adopted_live_state(&state);
+                }) {
+                    Ok(_) => {}
                     Err(error) => {
                         tracing::error!(
                             error = %error,
@@ -6133,8 +6189,21 @@ impl AppBuilder {
         // and same reasoning as the control replication flush below.
         #[cfg(feature = "sqlite")]
         if let Some(maintenance) = fleet_maintenance.take() {
+            let real_elapsed = drain_started_real
+                .get()
+                .map_or(std::time::Duration::ZERO, std::time::Instant::elapsed);
+            let wait =
+                fleet_flush_budget(shutdown_budget, elapsed_since_drain_start(), real_elapsed);
+            // Fix the cutoff now. The maintenance task may wake late, and the
+            // wait above counts from here.
+            if let Some(replication) = state
+                .shards()
+                .and_then(|s| s.fleet())
+                .and_then(|f| f.replication())
+            {
+                replication.set_shutdown_deadline_in(wait);
+            }
             fleet_shutdown.cancel();
-            let wait = shutdown_budget.saturating_sub(elapsed_since_drain_start());
             if tokio::time::timeout(wait, maintenance).await.is_ok() {
                 tracing::info!("shutdown: SQLite fleet databases closed");
             } else {
@@ -10416,6 +10485,12 @@ fn unfreeze_adopted_live_state(state: &AppState) {
         return;
     }
     if let Some(registry) = state.extension::<crate::upgrade::LiveStateRegistry>() {
+        // Journal before unfreezing: no write can precede the journal, so the
+        // predecessor can take back every write this build acknowledges.
+        #[cfg(unix)]
+        if let Some(path) = crate::upgrade::journal_path() {
+            registry.start_journal(path);
+        }
         registry.unfreeze();
     }
 }
@@ -11652,6 +11727,20 @@ fn prepare_unix_socket_path(path: &std::path::Path) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// What the fleet's final flush may spend of the shutdown budget. The larger
+/// of the injected-clock and real elapsed times counts: the flush bounds
+/// blocking I/O, so a fixed or unadvanced injected clock (which reads zero
+/// while a real drain runs) must not hand it a fresh full budget, and a
+/// simulated clock that ran ahead of real time still spends its virtual time.
+#[cfg(feature = "sqlite")]
+fn fleet_flush_budget(
+    shutdown_budget: std::time::Duration,
+    injected_elapsed: std::time::Duration,
+    real_elapsed: std::time::Duration,
+) -> std::time::Duration {
+    shutdown_budget.saturating_sub(injected_elapsed.max(real_elapsed))
 }
 
 /// How long to wait for the cluster's departure notice, given how much of the
@@ -13143,13 +13232,19 @@ fn start_fleet_replication(
         .fleet
         .as_ref()
         .is_some_and(|f| f.restore_missing);
-    let replication = Arc::new(crate::db::fleet_replication::FleetReplication::new(
-        Arc::clone(runtime.replicator.destination()),
-        runtime.settings.clone(),
-        lag_alert_after,
-        restore_missing,
-        state.clock_arc(),
-    ));
+    let replication = Arc::new(
+        crate::db::fleet_replication::FleetReplication::new(
+            Arc::clone(runtime.replicator.destination()),
+            runtime.settings.clone(),
+            lag_alert_after,
+            restore_missing,
+            state.clock_arc(),
+        )
+        // The server path sets a tighter cutoff from the budget left.
+        .with_final_flush(std::time::Duration::from_secs(
+            config.server.shutdown_timeout_secs,
+        )),
+    );
     fleet
         .install_replication(Arc::clone(&replication))
         .map_err(|_| "the fleet already replicates".to_owned())?;
@@ -16002,6 +16097,21 @@ async fn canary_rollback_signal(path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
+    /// Issue #2347: `on_session_rotation` puts one hook on the shared registry
+    /// when the state initializers run.
+    #[test]
+    fn on_session_rotation_registers_hooks_on_the_state() {
+        let builder = super::app()
+            .on_session_rotation(|_| async { Ok(()) })
+            .on_session_rotation(|_| async { Ok(()) });
+        let state = crate::state::AppState::test_default();
+        assert!(state.session_rotation_hooks().is_empty());
+
+        super::run_state_initializers(builder.state_initializers, &state);
+
+        assert_eq!(state.session_rotation_hooks().len(), 2);
+    }
+
     /// Regression (#1620): DNS-01 must not silence the multi-replica warning.
     ///
     /// DNS-01 retires the HTTP-01 token-map hazard — the CA never connects to
@@ -17432,6 +17542,33 @@ mod tests {
             !server_source.contains("&config.cluster, &server_shutdown"),
             "the cluster must not ride server_shutdown: that token fires when \
              the listener closes, with the request drain still ahead of it"
+        );
+    }
+
+    /// The fleet's final flush bounds blocking I/O, so it spends the larger of
+    /// the injected-clock and the real elapsed time. A fixed or unadvanced
+    /// clock reads zero while a real drain runs, and must not hand the flush
+    /// a fresh full budget.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn the_fleet_flush_budget_counts_real_time_a_pinned_clock_misses() {
+        use std::time::Duration;
+
+        let budget = Duration::from_secs(30);
+        // A pinned injected clock: only the real reading shows the drain.
+        assert_eq!(
+            fleet_flush_budget(budget, Duration::ZERO, Duration::from_secs(25)),
+            Duration::from_secs(5)
+        );
+        // A simulated clock that ran ahead of real time wins instead.
+        assert_eq!(
+            fleet_flush_budget(budget, Duration::from_secs(20), Duration::from_secs(1)),
+            Duration::from_secs(10)
+        );
+        // Nothing is left once either reading spent the budget.
+        assert_eq!(
+            fleet_flush_budget(budget, Duration::ZERO, budget),
+            Duration::ZERO
         );
     }
 

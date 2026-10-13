@@ -34,6 +34,8 @@ mod cache_coherence;
 mod cache_invalidation_after_commit;
 #[cfg(feature = "cache-moka")]
 mod cache_stampede;
+#[cfg(feature = "cache-moka")]
+mod cached_impl_scope;
 #[cfg(all(feature = "db", feature = "cache-moka"))]
 mod cached_tenant_scope;
 mod chaos_cache_jitter_proptest;
@@ -172,7 +174,11 @@ mod htmx_serving;
 mod http_latency_histogram;
 #[cfg(feature = "i18n")]
 mod i18n_integration;
+#[cfg(feature = "db")]
+mod idempotency_db_store;
 mod idempotency_middleware;
+#[cfg(feature = "redis")]
+mod idempotency_redis_current_thread;
 mod idempotency_tenant_scope;
 mod idempotency_token_principal;
 mod impersonation;
@@ -220,6 +226,8 @@ mod maud_render;
 #[cfg(feature = "mcp")]
 mod mcp_endpoint;
 #[cfg(feature = "mcp")]
+mod mcp_modern;
+#[cfg(feature = "mcp")]
 mod mcp_plugin;
 #[cfg(all(feature = "db", feature = "mcp"))]
 mod mcp_repository;
@@ -233,6 +241,8 @@ mod mcp_step_up_guard;
 mod mcp_streaming;
 #[cfg(feature = "mcp")]
 mod mcp_structured_query;
+#[cfg(feature = "mcp")]
+mod mcp_tasks;
 #[cfg(feature = "mcp")]
 mod mcp_throttle_guard;
 mod middleware_introspection;
@@ -454,6 +464,7 @@ mod sim_deterministic_ids;
 mod sim_drain_stall;
 mod sim_fault_plan;
 mod sim_fault_plan_pg;
+mod sim_idempotency_in_flight_ttl;
 mod sim_interleave;
 mod sim_job_clock;
 mod sim_liveness_watchdog;

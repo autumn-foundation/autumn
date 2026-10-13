@@ -339,6 +339,7 @@ would the GET and the host discards the body for you.
 | `max_request_body_bytes` | the body forwarded in | 413, guest never started |
 | `max_response_bytes` | the frame accepted back | 502 for an oversized frame; 504 for one that never ends |
 | `max_concurrency` | instances alive at once | 503 with `Retry-After`; requests are shed, not queued |
+| shared guest pool | guests that run at once in the whole process, all plugins together. Default 128. Set it with `plugin_sandbox::set_guest_slots` before you build any plugin, to at most a quarter of `max_blocking_threads` | 503 with `Retry-After`. It can refuse a request that `max_concurrency` allows. The first request to arrive gets the slot, so keep each `max_concurrency` well under the limit |
 | `request_body_timeout_ms` | how long a request may take to send its body | 408, and the permit goes back |
 
 The number worth reviewing is `max_concurrency × the per-request footprint`,
@@ -717,6 +718,45 @@ middleware, because one compiled plugin serves every tenant.
 
 ---
 
+## Mount and unmount at runtime
+
+Give the app a `PluginMounts` and keep a clone:
+
+```rust,ignore
+let mounts = PluginMounts::new();
+let app = autumn_web::app().plugin_mounts(mounts.clone());
+// Later, with the app running:
+mounts.mount(&SandboxedPlugin::from_file(path)?)?;
+mounts.unmount("/hello");
+```
+
+Rules:
+
+- The app does not swap its router. The 404 fallback serves mounted plugins.
+  A request that matches a static route never reads the table.
+- A static route wins over a mounted prefix. Use a prefix that no static route
+  uses.
+- A framework prefix is refused with `MountError::Reserved`. `/static` and
+  `/_autumn` always count. `plugin_mounts` adds the configured actuator prefix,
+  the probe paths (if enabled) and the dev inspector path. A prefix that
+  contains a reserved one is refused too. Add more, such as a custom MCP path, with `PluginMounts::reserve`.
+- One plugin holds a prefix. A prefix that contains, or is inside, a held
+  prefix is refused with `MountError::PrefixTaken`.
+- **Unmount drains.** New requests get 404 immediately. A running request
+  finishes. It keeps its concurrency permit until it ends.
+- A new plugin instance at a reused prefix has its own permits. While the old
+  instance drains, both can run requests.
+- Each mount logs the capability grant and a new `generation`.
+- `PluginMounts::list` shows what is mounted now. `PluginMounts::routes` shows
+  the routes of those plugins.
+- The access log and metrics name a plugin route from its response. A request
+  that middleware rejects first, such as a bad CSRF token or a rate limit, is
+  logged as `_unmatched`.
+- `autumn routes` and `autumn plugin-check` read the build. They do not show
+  runtime mounts.
+
+---
+
 ## Limits of this slice
 
 - Sessions, mail and file storage are not "not granted" — they do not exist as
@@ -741,7 +781,8 @@ middleware, because one compiled plugin serves every tenant.
   `RecordingHttp` answers from a fixed table and is a test double. Wiring a real
   upstream means implementing `OutboundHttp` against the framework client and
   honouring the contract on the trait.
-- Upgrading a sandboxed plugin needs an app restart.
+- A plugin loaded at boot cannot be unmounted. To upgrade or remove a plugin
+  without a restart, mount it at runtime (see above).
 - There is no registry; you get artifacts the same way you get any other file.
 - An interpreter is slower than native code. For a hello-world route the
   overhead is sub-millisecond, but a sandboxed plugin is not where compute-heavy

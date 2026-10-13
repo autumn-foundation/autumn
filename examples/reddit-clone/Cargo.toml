@@ -32,7 +32,9 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-autumn-web = { path = "../../autumn", features = ["test-support"] }
+autumn-web = { path = "../../autumn", features = ["test-support", "sim-testing"] }
+proptest = "1.4"
+tower = { workspace = true, features = ["util"] }
 autumn-storage-s3 = { path = "../../autumn-storage-s3" }
 # default-features = false to avoid re-enabling aws-sdk-s3's legacy hyper 0.14 /
 # rustls 0.21 connector stack workspace-wide (features are additive); see the
@@ -64,6 +66,11 @@ system-tests = ["autumn-web/system-tests"]
 [[test]]
 name = "smoke"
 path = "tests/system/smoke.rs"
+
+# The DST nightly. `sim-nightly.yml` builds and runs it on its own.
+[[test]]
+name = "sim_nightly"
+path = "tests/sim_nightly.rs"
 
 # Determinism seam gate (autumn #1797): `clippy.toml`'s workspace-global
 # `disallowed-methods` config arms `clippy::disallowed_methods` (warn-by-default)

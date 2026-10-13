@@ -257,4 +257,17 @@ impl Route {
         self.api_doc.mcp_stream = true;
         self
     }
+
+    /// Opt this route in as an MCP *task* tool, equivalent to
+    /// `#[api_doc(mcp, task)]`.
+    ///
+    /// Implies [`mcp()`](Self::mcp). A client that declares the MCP Tasks
+    /// extension gets a task handle and polls `tasks/get` for the result.
+    /// Other clients get a blocking result.
+    #[must_use]
+    pub const fn mcp_task(mut self) -> Self {
+        self.api_doc.mcp_tool = true;
+        self.api_doc.mcp_task = true;
+        self
+    }
 }

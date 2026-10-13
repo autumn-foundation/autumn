@@ -522,6 +522,7 @@ type McpPrepared = (
     String,
     Vec<crate::mcp::McpToolInfo>,
     Option<crate::mcp::McpEndpointLayer>,
+    crate::mcp::McpTaskConfig,
 );
 
 /// Like [`try_build_router_inner`] but returns `Router<AppState>` before
@@ -664,7 +665,7 @@ fn build_router_pre_state(
         // Pass the app's OpenAPI config (if any) so MCP tool `inputSchema`s
         // reuse the same registered component schemas as the served spec.
         let tools = crate::mcp::derive_tools(&docs, rt.expose_all, ctx.openapi.as_ref());
-        Some((rt.mount_path, tools, rt.endpoint_layer))
+        Some((rt.mount_path, tools, rt.endpoint_layer, rt.tasks))
     } else {
         None
     };
@@ -895,7 +896,7 @@ fn build_router_pre_state(
     // it in *after* its own `custom_layers` reapplication.
     #[cfg(feature = "mcp")]
     let (router, deferred_mcp_router) =
-        if let Some((mount_path, tools, endpoint_layer)) = mcp_prepared {
+        if let Some((mount_path, tools, endpoint_layer, tasks)) = mcp_prepared {
             // The outermost `SecurityHeadersLayer` is applied after this clone, so
             // the dispatch snapshot would otherwise miss it. That layer also injects
             // `CspNonce` into request extensions, so a `tools/call` replay of a
@@ -943,6 +944,10 @@ fn build_router_pre_state(
                 // installed `AuditLogger` and mints its correlation id from the
                 // injected entropy seam, both reached from state.
                 state: state.clone(),
+                // Task requests are bound to the caller. The session cookie is
+                // one of the credentials in that binding.
+                session_cookie: config.session.cookie_name.clone(),
+                tasks,
             };
             let mut mcp_router =
                 crate::mcp::build_mcp_router(&mount_path, tools, dispatch, wiring, endpoint_layer);
@@ -3518,12 +3523,19 @@ impl tower_http::compression::predicate::Predicate for CompressionPredicate {
                 .headers()
                 .get(http::header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
-                .is_none_or(|content_type| {
-                    !COMPRESSION_EXCLUDED_CONTENT_TYPES
-                        .iter()
-                        .any(|excluded| content_type.starts_with(excluded))
-                })
+                .is_none_or(|content_type| !is_compression_excluded(content_type))
     }
+}
+
+/// Returns true if `content_type` starts with an excluded prefix. The match
+/// ignores ASCII case (RFC 9110 §8.3.1). The header is not changed.
+fn is_compression_excluded(content_type: &str) -> bool {
+    COMPRESSION_EXCLUDED_CONTENT_TYPES.iter().any(|excluded| {
+        content_type
+            .as_bytes()
+            .get(..excluded.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(excluded.as_bytes()))
+    })
 }
 
 fn compression_predicate() -> CompressionPredicate {
@@ -3706,10 +3718,12 @@ fn apply_submit_token_middleware<S>(
 where
     S: Clone + Send + Sync + 'static,
 {
-    Ok(match build_submit_token_layer(config, is_production)? {
-        Some(layer) => router.layer(layer),
-        None => router,
-    })
+    Ok(
+        match build_submit_token_layer(config, &AppState::for_test(), is_production)? {
+            Some(layer) => router.layer(layer),
+            None => router,
+        },
+    )
 }
 
 /// Build the one-time submit-token layer, or `None` when it is disabled.
@@ -3720,6 +3734,7 @@ where
 /// `Err`, before any layer is applied.
 fn build_submit_token_layer(
     config: &AutumnConfig,
+    state: &AppState,
     is_production: bool,
 ) -> Result<Option<crate::security::SubmitTokenLayer>, RouterBuildError> {
     let cfg = &config.security.submit_token;
@@ -3765,26 +3780,7 @@ fn build_submit_token_layer(
     // `resolved_backend` is the single source of truth so this cannot drift from
     // `build_idempotency_layers`.
     let backend = cfg.resolved_backend(config.idempotency.backend);
-    let store: std::sync::Arc<dyn IdempotencyStore> = match backend {
-        crate::config::IdempotencyBackend::Memory => {
-            std::sync::Arc::new(MemoryIdempotencyStore::new(ttl))
-        }
-        #[cfg(feature = "redis")]
-        crate::config::IdempotencyBackend::Redis => {
-            match crate::idempotency::RedisIdempotencyStore::from_config(&config.idempotency) {
-                Ok(s) => std::sync::Arc::new(s),
-                Err(e) => return Err(RouterBuildError::InvalidIdempotencyBackend(e)),
-            }
-        }
-        #[cfg(not(feature = "redis"))]
-        crate::config::IdempotencyBackend::Redis => {
-            return Err(RouterBuildError::InvalidIdempotencyBackend(
-                "submit_token backend 'redis' requires the autumn-web 'redis' feature \
-                 flag; rebuild with --features redis or switch to backend = \"memory\""
-                    .to_owned(),
-            ));
-        }
-    };
+    let store = build_idempotency_store(backend, config, state, ttl, "submit_token")?;
 
     let mut layer = crate::security::SubmitTokenLayer::new(store, cfg)
         .with_max_scan_bytes(config.security.upload.max_request_size_bytes);
@@ -3861,7 +3857,11 @@ async fn populate_rate_limit_principal(
     // principal id (see `RequireApiTokenService::call`).
     if let Some(session) = req.extensions().get::<crate::session::Session>() {
         let auth_session_key = state.auth_session_key();
-        if let Some(user_id) = session.get(auth_session_key).await {
+        // The operator's id while impersonating, so their throttle events and
+        // budget stay their own.
+        if let Some(user_id) =
+            crate::auth::impersonation::throttle_principal_id(session, auth_session_key).await
+        {
             req.extensions_mut()
                 .insert(crate::security::RateLimitPrincipal(user_id));
         }
@@ -4972,6 +4972,79 @@ fn deadline_exceeded_response(
     response
 }
 
+/// Build the store for `backend`. `label` names the config section in errors.
+fn build_idempotency_store(
+    backend: crate::config::IdempotencyBackend,
+    config: &AutumnConfig,
+    state: &AppState,
+    ttl: Duration,
+    label: &str,
+) -> Result<std::sync::Arc<dyn IdempotencyStore>, RouterBuildError> {
+    #[cfg(not(feature = "db"))]
+    let _ = state;
+    match backend {
+        crate::config::IdempotencyBackend::Memory => {
+            Ok(std::sync::Arc::new(MemoryIdempotencyStore::new(ttl)))
+        }
+        #[cfg(feature = "redis")]
+        crate::config::IdempotencyBackend::Redis => {
+            crate::idempotency::RedisIdempotencyStore::from_config(&config.idempotency)
+                .map(|store| std::sync::Arc::new(store) as std::sync::Arc<dyn IdempotencyStore>)
+                .map_err(RouterBuildError::InvalidIdempotencyBackend)
+        }
+        #[cfg(not(feature = "redis"))]
+        crate::config::IdempotencyBackend::Redis => {
+            let _ = config;
+            Err(RouterBuildError::InvalidIdempotencyBackend(format!(
+                "{label} backend 'redis' requires the autumn-web 'redis' feature \
+                 flag; rebuild with --features redis or switch to backend = \"memory\""
+            )))
+        }
+        #[cfg(feature = "db")]
+        crate::config::IdempotencyBackend::Database => state.pool().map_or_else(
+            || {
+                Err(RouterBuildError::InvalidIdempotencyBackend(format!(
+                    "{label} backend 'database' requires a configured database; \
+                     set [database] url or switch to backend = \"memory\""
+                )))
+            },
+            |pool| {
+                Ok(std::sync::Arc::new(
+                    crate::idempotency::DbIdempotencyStore::new(pool.clone(), ttl)
+                        .with_legal_holds(state),
+                ) as std::sync::Arc<dyn IdempotencyStore>)
+            },
+        ),
+        #[cfg(not(feature = "db"))]
+        crate::config::IdempotencyBackend::Database => {
+            Err(RouterBuildError::InvalidIdempotencyBackend(format!(
+                "{label} backend 'database' requires the autumn-web 'db' feature"
+            )))
+        }
+    }
+}
+
+/// Tell the operator when a request can outlive its in-flight lock. Then a
+/// retry can run the handler while the first request still runs. Only a
+/// handler that uses `IdempotencyTx::commit` on the database store is fenced.
+fn warn_on_short_in_flight_ttl(config: &AutumnConfig) {
+    let in_flight_secs = config.idempotency.in_flight_ttl_secs;
+    match config.server.timeouts.request_timeout_ms {
+        None => tracing::info!(
+            in_flight_ttl_secs = in_flight_secs,
+            "no request timeout is set; an idempotent request that runs longer than \
+             idempotency.in_flight_ttl_secs can run twice"
+        ),
+        Some(timeout_ms) if in_flight_secs.saturating_mul(1000) < timeout_ms => tracing::warn!(
+            in_flight_ttl_secs = in_flight_secs,
+            request_timeout_ms = timeout_ms,
+            "idempotency.in_flight_ttl_secs is shorter than the request timeout; \
+             a retry can run while the first request still runs"
+        ),
+        Some(_) => {}
+    }
+}
+
 /// The lowest and highest `Retry-After` seconds on a timeout `503`.
 const TIMEOUT_RETRY_AFTER_SECS: std::ops::RangeInclusive<u64> = 1..=3;
 
@@ -4997,26 +5070,14 @@ fn build_idempotency_layers(
 
     let ttl = Duration::from_secs(config.idempotency.ttl_secs);
     let in_flight_ttl = Duration::from_secs(config.idempotency.in_flight_ttl_secs);
-    let store: std::sync::Arc<dyn IdempotencyStore> = match config.idempotency.backend {
-        crate::config::IdempotencyBackend::Memory => {
-            std::sync::Arc::new(MemoryIdempotencyStore::new(ttl))
-        }
-        #[cfg(feature = "redis")]
-        crate::config::IdempotencyBackend::Redis => {
-            match crate::idempotency::RedisIdempotencyStore::from_config(&config.idempotency) {
-                Ok(s) => std::sync::Arc::new(s),
-                Err(e) => return Err(RouterBuildError::InvalidIdempotencyBackend(e)),
-            }
-        }
-        #[cfg(not(feature = "redis"))]
-        crate::config::IdempotencyBackend::Redis => {
-            return Err(RouterBuildError::InvalidIdempotencyBackend(
-                "idempotency backend 'redis' requires the autumn-web 'redis' feature \
-                 flag; rebuild with --features redis or switch to backend = \"memory\""
-                    .to_owned(),
-            ));
-        }
-    };
+    let store = build_idempotency_store(
+        config.idempotency.backend,
+        config,
+        state,
+        ttl,
+        "idempotency",
+    )?;
+    warn_on_short_in_flight_ttl(config);
 
     tracing::debug!(
         backend = ?config.idempotency.backend,
@@ -5230,7 +5291,16 @@ fn apply_middleware(
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
     // 404 fallback handler for unmatched routes must be registered BEFORE global middleware
     // so that unmatched routes are still protected by rate limiting, CSRF, CORS, etc.
-    router = router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
+    // With `plugin-sandbox`, the fallback also serves plugins mounted at runtime
+    // (issue #2433). Static routes match first, so they never reach it.
+    #[cfg(feature = "plugin-sandbox")]
+    {
+        router = router.fallback(crate::plugin_sandbox::mounts_fallback);
+    }
+    #[cfg(not(feature = "plugin-sandbox"))]
+    {
+        router = router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
+    }
 
     // Resolve signing keys once; shared across session and CSRF layers.
     let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
@@ -5287,7 +5357,7 @@ fn apply_middleware(
     // other is `build_session_layer` below). The infallible builders have side
     // effects — `tracing::info!` lines, and a lazy Redis connection manager for a
     // Redis-backed rate limiter — that must not run on the way to a fail-fast `Err`.
-    let submit_token_layer = build_submit_token_layer(config, is_production)?;
+    let submit_token_layer = build_submit_token_layer(config, state, is_production)?;
     let (body_limit, upload_config) = build_upload_layers(config);
     let trusted_host_policy = TrustedHostPolicy::from_config_with_state(config, state);
     let (rate_limit_layer, rate_limit_principal_keying) = build_rate_limit_layers(config, state);
@@ -5619,7 +5689,8 @@ fn apply_middleware(
         signing_keys_opt,
         &state.entropy_arc(),
         tenancy_session_key,
-    )?;
+    )?
+    .with_rotation_hooks(state.session_rotation_hooks());
     tracing::debug!(backend = ?config.session.backend, "Session management enabled");
 
     // Read-your-own-writes middleware: installed only when the mode is not
@@ -8255,6 +8326,8 @@ mod tests {
             envelope_rate_limited: false,
             envelope_load_shed: false,
             state: test_state(),
+            session_cookie: "autumn.sid".to_owned(),
+            tasks: crate::mcp::McpTaskConfig::default(),
         };
         let mcp_router =
             crate::mcp::build_mcp_router("/mcp", Vec::new(), axum::Router::new(), wiring, None);
@@ -10988,6 +11061,7 @@ enabled = true
                 mount_path: "/agent-tools".to_owned(),
                 expose_all: false,
                 endpoint_layer: None,
+                tasks: crate::mcp::McpTaskConfig::default(),
             });
             ctx.declared_routes = vec![declared_route(method, "/agent-tools", "evil-plugin")];
             let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
@@ -11013,6 +11087,7 @@ enabled = true
             mount_path: "/agent-tools".to_owned(),
             expose_all: false,
             endpoint_layer: None,
+            tasks: crate::mcp::McpTaskConfig::default(),
         });
         ctx.declared_routes = vec![declared_route("DELETE", "/agent-tools", "honest-plugin")];
         let _built = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
@@ -12239,6 +12314,64 @@ enabled = true
                 "{route}: raw SFNT fonts are uncompressed data and must still be \
                  gzipped — only WOFF/WOFF2 embed their own compression"
             );
+        }
+    }
+
+    /// Returns true if the predicate compresses a 4 KiB body of this type.
+    fn predicate_compresses(content_type: &str) -> bool {
+        use tower_http::compression::predicate::Predicate;
+        let response = http::Response::builder()
+            .header(http::header::CONTENT_TYPE, content_type)
+            .body(Body::from(vec![b'A'; 4096]))
+            .unwrap();
+        compression_predicate().should_compress(&response)
+    }
+
+    /// Media types are case-insensitive (RFC 9110 §8.3.1). The excluded types
+    /// must stay uncompressed in any case (#2416).
+    #[test]
+    fn compression_carve_outs_ignore_case() {
+        for ct in [
+            "Audio/MPEG",
+            "VIDEO/mp4",
+            "Application/Zip",
+            "Application/Octet-Stream",
+            "Font/WOFF2",
+            "font/WOFF",
+            "Font/Woff2; foo=bar",
+            "audio/mpeg",
+            "application/zip",
+            "font/woff2",
+        ] {
+            assert!(!predicate_compresses(ct), "{ct} must stay uncompressed");
+        }
+    }
+
+    /// Fonts that are not excluded (ttf, otf) and other types are still
+    /// compressed in any case. Near-miss prefixes (`application/zi`,
+    /// `Font/WOF`) are also compressed.
+    #[test]
+    fn compression_still_applies_to_other_types_in_any_case() {
+        for ct in [
+            "font/ttf",
+            "Font/TTF",
+            "font/otf",
+            "text/html",
+            "Text/HTML",
+            "Application/JSON; charset=utf-8",
+            "application/zi",
+            "Font/WOF",
+            "au",
+        ] {
+            assert!(predicate_compresses(ct), "{ct} must be compressed");
+        }
+    }
+
+    /// Short and non-ASCII values must not panic or match.
+    #[test]
+    fn compression_exclusion_is_safe_on_short_and_non_ascii_input() {
+        for ct in ["", "a", "au", "é", "audiö/x", "fönt/woff2"] {
+            assert!(!is_compression_excluded(ct), "{ct:?} must not match");
         }
     }
 
@@ -15093,6 +15226,7 @@ mod trusted_host_tests {
                 mount_path: "/mcp".to_owned(),
                 expose_all: true,
                 endpoint_layer: None,
+                tasks: crate::mcp::McpTaskConfig::default(),
             }),
         };
 
@@ -15250,6 +15384,7 @@ mod trusted_host_tests {
                 mount_path: "/mcp".to_owned(),
                 expose_all: true,
                 endpoint_layer: None,
+                tasks: crate::mcp::McpTaskConfig::default(),
             }),
         };
         let (_tmp, dist) = build_empty_dist();

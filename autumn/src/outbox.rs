@@ -1589,5 +1589,45 @@ impl crate::mail::MailDeliveryQueue for OutboxMailQueue {
     }
 }
 
+/// Kani proofs over the relay retry delay. Run with
+/// `cargo kani -p autumn-web --lib`.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    #[derive(Debug)]
+    struct AnyDraw(u64);
+
+    impl Entropy for AnyDraw {
+        fn next_u64(&self) -> u64 {
+            self.0
+        }
+        fn fill_bytes(&self, dest: &mut [u8]) {
+            dest.fill(0);
+        }
+    }
+
+    /// Equal jitter: the delay is in `[ceiling / 2, ceiling]` with
+    /// `ceiling = min(max, initial * 2^(attempt - 1))`, and the sum never
+    /// overflows, for every config, attempt and draw.
+    #[kani::proof]
+    fn retry_delay_is_equal_jitter_without_overflow() {
+        let config = OutboxConfig {
+            initial_backoff_ms: kani::any(),
+            max_backoff_ms: kani::any(),
+            ..OutboxConfig::default()
+        };
+        let attempt: u32 = kani::any();
+        let delay = retry_delay_ms(&config, attempt, &AnyDraw(kani::any()));
+        let exponent = attempt.saturating_sub(1).min(32);
+        let ceiling = config
+            .initial_backoff_ms
+            .saturating_mul(1_u64 << exponent)
+            .min(config.max_backoff_ms);
+        assert!(delay <= ceiling);
+        assert!(delay >= ceiling / 2);
+    }
+}
+
 #[cfg(test)]
 mod tests;

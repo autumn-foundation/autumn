@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -56,6 +56,9 @@ const STOP_POLL: Duration = Duration::from_millis(100);
 /// replicator. One tick ships at most one segment, so a backlog can take
 /// several.
 const FINAL_SHIP_MAX_TICKS: usize = 64;
+
+/// Pause between flush passes at shutdown.
+const FLUSH_RETRY: Duration = Duration::from_millis(100);
 
 /// The destination key prefix of one fleet database, under the control
 /// database's replication root.
@@ -92,6 +95,12 @@ pub struct FleetReplication {
     /// replicator back instead of starting a second one.
     parked: Mutex<HashMap<FleetDbKey, Arc<ActiveReplica>>>,
     stopped: AtomicBool,
+    /// Longest the shutdown flush keeps shipping parked replicators.
+    final_flush_ms: AtomicU64,
+    /// Names still unshipped when the last shutdown flush ended.
+    unshipped: Mutex<Vec<String>>,
+    /// When shutdown must be done. Close-time shipping stops at it.
+    shutdown_cutoff: Mutex<Option<std::time::Instant>>,
 }
 
 impl FleetReplication {
@@ -118,7 +127,114 @@ impl FleetReplication {
             active: Mutex::new(HashMap::new()),
             parked: Mutex::new(HashMap::new()),
             stopped: AtomicBool::new(false),
+            final_flush_ms: AtomicU64::new(5_000),
+            unshipped: Mutex::new(Vec::new()),
+            shutdown_cutoff: Mutex::new(None),
         }
+    }
+
+    /// Set the longest the shutdown flush keeps shipping. The default is 5
+    /// seconds.
+    #[must_use]
+    pub fn with_final_flush(self, deadline: Duration) -> Self {
+        self.set_final_flush(deadline);
+        self
+    }
+
+    /// Change the longest the shutdown flush keeps shipping. Call it before
+    /// shutdown starts, with the time the shutdown still has left.
+    pub fn set_final_flush(&self, deadline: Duration) {
+        let millis = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
+        self.final_flush_ms.store(millis, Ordering::Release);
+    }
+
+    /// Set the time by which shutdown must be done. A database that closes
+    /// after it parks its replicator and ships nothing more at close.
+    pub fn set_shutdown_cutoff(&self, cutoff: Option<std::time::Instant>) {
+        *self
+            .shutdown_cutoff
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = cutoff;
+    }
+
+    /// Set the shutdown cutoff to `left` from now. The caller does this
+    /// before it wakes the maintenance task, so the task's start-up delay is
+    /// charged to the shared budget.
+    pub fn set_shutdown_deadline_in(&self, left: Duration) {
+        // Real time on purpose: the cutoff bounds blocking I/O.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "real time: the shutdown bound covers blocking I/O"
+        )]
+        let now = std::time::Instant::now();
+        self.set_shutdown_cutoff(now.checked_add(left));
+    }
+
+    /// Time until the shutdown cutoff. `None` when none is set.
+    pub(crate) fn cutoff_left(&self) -> Option<Duration> {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "real time: the shutdown bound covers blocking I/O"
+        )]
+        let now = std::time::Instant::now();
+        self.shutdown_cutoff()
+            .map(|cutoff| cutoff.saturating_duration_since(now))
+    }
+
+    pub(crate) fn shutdown_cutoff(&self) -> Option<std::time::Instant> {
+        *self
+            .shutdown_cutoff
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The longest the shutdown flush keeps shipping.
+    #[must_use]
+    pub fn final_flush(&self) -> Duration {
+        Duration::from_millis(self.final_flush_ms.load(Ordering::Acquire))
+    }
+
+    /// Tick until no replicator is parked, or until `deadline` passes.
+    /// This call blocks. It returns the names still unshipped. Each one is
+    /// logged with `error!`. The call replaces the `unshipped` list in the
+    /// health details.
+    ///
+    /// The deadline uses real elapsed time, ticks included. A pinned or
+    /// virtual clock cannot make the loop run forever. No tick starts after
+    /// the deadline, and a replica that another thread holds is skipped. A
+    /// tick that is already running cannot be stopped, so the call can
+    /// overrun by one tick.
+    pub fn flush_closing(&self, deadline: Duration) -> Vec<String> {
+        // Real time on purpose: the wait is blocking I/O, not simulated work.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "real time: the shutdown bound covers blocking I/O"
+        )]
+        let started = std::time::Instant::now();
+        let cutoff = started.checked_add(deadline);
+        loop {
+            if expired(cutoff) {
+                break;
+            }
+            self.tick_pass(&|| cutoff);
+            if self.closing() == 0 {
+                break;
+            }
+            std::thread::sleep(FLUSH_RETRY.min(deadline.saturating_sub(started.elapsed())));
+        }
+        let mut unshipped: Vec<String> = self.parked().keys().map(FleetDbKey::name).collect();
+        unshipped.sort();
+        for name in &unshipped {
+            tracing::error!(
+                database = %name,
+                "fleet shutdown: committed WAL is not shipped and stays on this volume"
+            );
+        }
+        self.unshipped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone_from(&unshipped);
+        unshipped
     }
 
     fn root_for(&self, key: &FleetDbKey) -> String {
@@ -174,17 +290,31 @@ impl FleetReplication {
     /// Tick every registered replicator once, and retire each parked one
     /// that has caught up. Blocking. The loop calls this; tests call it to
     /// step replication without sleeping.
+    ///
+    /// After the shutdown cutoff (see
+    /// [`set_shutdown_cutoff`](Self::set_shutdown_cutoff)), it starts no work.
     pub fn tick_all(&self) {
+        self.tick_pass(&|| self.shutdown_cutoff());
+    }
+
+    /// One tick pass. `cutoff` is read again for each replica, each lock
+    /// attempt and each ship step, so a cutoff installed mid-pass takes
+    /// effect. After it, no replica starts, and a replica that another thread
+    /// holds is given up on.
+    fn tick_pass(&self, cutoff: &dyn Fn() -> Option<std::time::Instant>) {
         let active: Vec<(FleetDbKey, Arc<ActiveReplica>)> = self
             .active()
             .iter()
             .map(|(key, replica)| (key.clone(), Arc::clone(replica)))
             .collect();
         for (key, replica) in active {
-            let mut replicator = replica
-                .replicator
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let now_cutoff = cutoff();
+            if expired(now_cutoff) {
+                return;
+            }
+            let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
+                continue;
+            };
             if let Err(error) = replicator.tick() {
                 tracing::warn!(database = %key, error = %error, "fleet replication tick failed");
             }
@@ -195,13 +325,15 @@ impl FleetReplication {
             .map(|(key, replica)| (key.clone(), Arc::clone(replica)))
             .collect();
         for (key, replica) in parked {
-            let caught_up = {
-                let mut replicator = replica
-                    .replicator
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                ship_until_caught_up(&mut replicator).is_ok()
+            let now_cutoff = cutoff();
+            if expired(now_cutoff) {
+                return;
+            }
+            let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
+                continue;
             };
+            let caught_up = ship_until_caught_up(&mut replicator, cutoff).is_ok();
+            drop(replicator);
             if caught_up && self.retire_parked(&key, &replica) {
                 tracing::info!(database = %key, "fleet replication: closed database caught up");
             }
@@ -296,6 +428,14 @@ impl FleetReplication {
         details.insert("databases".to_owned(), replicas.len().into());
         details.insert("closing".to_owned(), closing.into());
         details.insert("failing".to_owned(), failing.into());
+        details.insert(
+            "unshipped".to_owned(),
+            self.unshipped
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+                .into(),
+        );
         details.insert("pending_bytes".to_owned(), pending_bytes.into());
         details.insert(
             "lag_alert_after_seconds".to_owned(),
@@ -385,13 +525,12 @@ impl FleetLifecycle for FleetReplication {
         // Every pooled connection is gone. Ship everything they committed
         // before the replicator's own connection — the last one — closes and
         // lets SQLite checkpoint.
-        let shipped = {
-            let mut replicator = replica
-                .replicator
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            ship_until_caught_up(&mut replicator)
-        };
+        // The cutoff-aware lock: another thread may hold the replica, and
+        // shutdown must not wait for it past the cutoff.
+        let shipped = lock_replicator(&replica, &|| self.shutdown_cutoff()).map_or_else(
+            || Err("the shutdown cutoff passed before the close could ship".to_owned()),
+            |mut replicator| ship_until_caught_up(&mut replicator, &|| self.shutdown_cutoff()),
+        );
         if let Err(error) = shipped {
             tracing::warn!(
                 database = %db.key(),
@@ -416,8 +555,15 @@ impl FleetLifecycle for FleetReplication {
 ///
 /// A tick failed, made no progress, or the backlog outlasted
 /// [`FINAL_SHIP_MAX_TICKS`].
-fn ship_until_caught_up(replicator: &mut Replicator) -> Result<(), String> {
+fn ship_until_caught_up(
+    replicator: &mut Replicator,
+    cutoff: &dyn Fn() -> Option<std::time::Instant>,
+) -> Result<(), String> {
     for _ in 0..FINAL_SHIP_MAX_TICKS {
+        // Read it each step: shutdown can install it while a close ships.
+        if expired(cutoff()) {
+            return Err("the shutdown flush ran out of time".to_owned());
+        }
         let report = replicator.tick().map_err(|e| e.to_string())?;
         if report.pending_bytes == 0 {
             return Ok(());
@@ -431,6 +577,41 @@ fn ship_until_caught_up(replicator: &mut Replicator) -> Result<(), String> {
         }
     }
     Err(format!("still behind after {FINAL_SHIP_MAX_TICKS} ticks"))
+}
+
+/// Whether `cutoff` has passed. Real time on purpose: the flush bounds
+/// blocking I/O, not simulated work.
+fn expired(cutoff: Option<std::time::Instant>) -> bool {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "real time: the shutdown bound covers blocking I/O"
+    )]
+    cutoff.is_some_and(|cutoff| std::time::Instant::now() >= cutoff)
+}
+
+/// Pause between lock attempts while another thread holds a replicator.
+const LOCK_POLL: Duration = Duration::from_millis(5);
+
+/// Lock a replicator. Never block without a way out: poll, and read the
+/// cutoff again on every attempt and after the lock is won. `None` once the
+/// cutoff has passed, so shutdown work cannot start late behind another
+/// thread's tick.
+fn lock_replicator<'a>(
+    replica: &'a ActiveReplica,
+    cutoff: &dyn Fn() -> Option<std::time::Instant>,
+) -> Option<std::sync::MutexGuard<'a, Replicator>> {
+    loop {
+        if expired(cutoff()) {
+            return None;
+        }
+        match replica.replicator.try_lock() {
+            Ok(guard) => return (!expired(cutoff())).then_some(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                return (!expired(cutoff())).then(|| poisoned.into_inner());
+            }
+            Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(LOCK_POLL),
+        }
+    }
 }
 
 struct FleetReplicationIndicator {
@@ -824,6 +1005,61 @@ mod tests {
         );
     }
 
+    /// Counts the `release` calls a restore makes once its drain is over.
+    #[derive(Default)]
+    struct Releases(std::sync::atomic::AtomicUsize);
+
+    impl super::FleetLifecycle for Releases {
+        fn release(&self, _key: &FleetDbKey) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_restore_still_releases_the_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let (fleet, replication) = replicated_fleet(&tmp.path().join("a"), &replicas, false);
+        let releases = Arc::new(Releases::default());
+        fleet.add_lifecycle(releases.clone());
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        exec(&db, "INSERT INTO notes VALUES ('shipped')").await;
+        crate::time::spawn_blocking(move || replication.tick_all())
+            .await
+            .unwrap();
+        // A held connection keeps the restore waiting in its drain.
+        let held = db.pool().get().await.unwrap();
+        let cancelled = tokio::time::timeout(Duration::from_millis(60), fleet.restore(&key, None))
+            .await
+            .is_err();
+        assert!(cancelled, "the restore was still draining");
+        drop(held);
+        drop(db);
+        for _ in 0..500 {
+            if fleet.stats().draining == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(fleet.stats().draining, 0, "the restore ran to the end");
+        assert_eq!(
+            releases.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the restore went on past its drain"
+        );
+        let reopened = tokio::time::timeout(Duration::from_secs(5), fleet.open(&key))
+            .await
+            .expect("open must not hang after a cancelled restore")
+            .unwrap();
+        assert_eq!(count(&reopened).await, 1);
+        drop(reopened);
+        tokio::time::timeout(Duration::from_secs(5), fleet.close_all())
+            .await
+            .expect("close_all returns");
+    }
+
     #[tokio::test]
     async fn a_concurrent_restore_keeps_the_winners_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -931,5 +1167,352 @@ mod tests {
         replication.stop();
         handle.join().unwrap();
         fleet.close_all().await;
+    }
+
+    /// A fleet whose destination is down, with a short final flush.
+    fn outage_fleet(
+        tmp: &Path,
+        final_flush: Duration,
+    ) -> (DatabaseFleet, Arc<FleetReplication>, Arc<Flaky>) {
+        let fleet = DatabaseFleet::builder(DatabaseFleetConfig {
+            mode: FleetMode::Tenant,
+            root: tmp.join("a").display().to_string(),
+            path: None,
+            max_open: 8,
+            pool_size: 2,
+            create_on_demand: Some(true),
+            idle_close_secs: 0,
+            restore_missing: false,
+        })
+        .build()
+        .unwrap();
+        let flaky = Arc::new(Flaky {
+            inner: FileDestination::new(tmp.join("replicas")).unwrap(),
+            down: AtomicBool::new(true),
+        });
+        let replication = Arc::new(
+            FleetReplication::new(
+                Arc::clone(&flaky) as Arc<dyn ReplicaDestination>,
+                settings(),
+                Duration::from_secs(30),
+                false,
+                Arc::new(crate::time::SystemClock),
+            )
+            .with_final_flush(final_flush),
+        );
+        assert!(fleet.install_replication(Arc::clone(&replication)).is_ok());
+        (fleet, replication, flaky)
+    }
+
+    /// Write a row, close the database and leave its replicator parked.
+    async fn park_one(fleet: &DatabaseFleet) -> FleetDbKey {
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        exec(&db, "INSERT INTO notes VALUES ('unshipped')").await;
+        drop(db);
+        fleet.close(&key).await;
+        key
+    }
+
+    fn recover_after(flaky: &Arc<Flaky>, delay: Duration) {
+        let flaky = Arc::clone(flaky);
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            flaky.down.store(false, Ordering::SeqCst);
+        });
+    }
+
+    #[tokio::test]
+    async fn the_final_flush_ships_once_the_destination_recovers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        park_one(&fleet).await;
+        assert_eq!(replication.closing(), 1);
+        recover_after(&flaky, Duration::from_millis(200));
+        let left = crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || replication.flush_closing(Duration::from_secs(5))
+        })
+        .await
+        .unwrap();
+        assert!(left.is_empty(), "{left:?}");
+        assert_eq!(replication.closing(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_final_flush_names_what_it_could_not_ship() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, _flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        let key = park_one(&fleet).await;
+        let left = crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || replication.flush_closing(Duration::from_millis(300))
+        })
+        .await
+        .unwrap();
+        assert_eq!(left, vec![key.name()]);
+        assert_eq!(replication.closing(), 1);
+        let health = replication.indicator().check().await;
+        assert_eq!(health.details["unshipped"], serde_json::json!([key.name()]));
+    }
+
+    #[tokio::test]
+    async fn shutdown_keeps_shipping_until_the_destination_recovers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        let shutdown = CancellationToken::new();
+        let maintenance = fleet.spawn_maintenance(shutdown.clone());
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        exec(&db, "INSERT INTO notes VALUES ('written before shutdown')").await;
+        drop(db);
+        recover_after(&flaky, Duration::from_millis(300));
+        shutdown.cancel();
+        maintenance.await.unwrap();
+        assert_eq!(replication.closing(), 0, "everything shipped");
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_a_destination_that_stays_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, _flaky) = outage_fleet(tmp.path(), Duration::from_secs(60));
+        // The shutdown shortens the deadline to what it has left.
+        replication.set_final_flush(Duration::from_millis(300));
+        let shutdown = CancellationToken::new();
+        let maintenance = fleet.spawn_maintenance(shutdown.clone());
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        drop(db);
+        shutdown.cancel();
+        maintenance.await.unwrap();
+        assert_eq!(replication.closing(), 1);
+        let health = replication.indicator().check().await;
+        assert_eq!(health.details["unshipped"], serde_json::json!([key.name()]));
+    }
+
+    #[tokio::test]
+    async fn an_expired_flush_starts_no_tick() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        let key = park_one(&fleet).await;
+        flaky.down.store(false, Ordering::SeqCst);
+        let left = crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || replication.flush_closing(Duration::ZERO)
+        })
+        .await
+        .unwrap();
+        assert_eq!(left, vec![key.name()], "no time, so no tick");
+        assert_eq!(replication.closing(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pass_past_its_cutoff_ships_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        park_one(&fleet).await;
+        flaky.down.store(false, Ordering::SeqCst);
+        crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            // The cutoff is already behind us when the pass checks it.
+            move || replication.tick_pass(&|| Some(std::time::Instant::now()))
+        })
+        .await
+        .unwrap();
+        assert_eq!(replication.closing(), 1, "the pass stopped at the cutoff");
+        crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || replication.tick_pass(&|| None)
+        })
+        .await
+        .unwrap();
+        assert_eq!(replication.closing(), 0, "an open pass ships");
+    }
+
+    #[tokio::test]
+    async fn a_close_after_the_shutdown_cutoff_parks_without_shipping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        flaky.down.store(false, Ordering::SeqCst);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        drop(db);
+        // The destination is up, but the shutdown time is already gone.
+        replication.set_shutdown_cutoff(Some(std::time::Instant::now()));
+        fleet.close(&key).await;
+        assert_eq!(replication.closing(), 1, "parked, not shipped");
+    }
+
+    #[tokio::test]
+    async fn the_background_loop_stops_ticking_at_the_shutdown_cutoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        park_one(&fleet).await;
+        flaky.down.store(false, Ordering::SeqCst);
+        replication.set_shutdown_cutoff(Some(std::time::Instant::now()));
+        crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || replication.tick_all()
+        })
+        .await
+        .unwrap();
+        assert_eq!(replication.closing(), 1, "the loop ticks nothing after it");
+        replication.set_shutdown_cutoff(None);
+        crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || replication.tick_all()
+        })
+        .await
+        .unwrap();
+        assert_eq!(replication.closing(), 0);
+    }
+
+    #[tokio::test]
+    async fn maintenance_keeps_a_cutoff_the_caller_set_before_it_woke() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The final flush alone would allow a minute.
+        let (fleet, replication, _flaky) = outage_fleet(tmp.path(), Duration::from_secs(60));
+        let shutdown = CancellationToken::new();
+        let maintenance = fleet.spawn_maintenance(shutdown.clone());
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        drop(db);
+        // The caller's deadline has already passed when maintenance wakes.
+        replication.set_shutdown_cutoff(Some(std::time::Instant::now()));
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(10), maintenance)
+            .await
+            .expect("the caller's cutoff bounds the flush")
+            .unwrap();
+        assert_eq!(replication.closing(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_ship_loop_reads_the_cutoff_on_every_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        let key = park_one(&fleet).await;
+        flaky.down.store(false, Ordering::SeqCst);
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let shipped = {
+            let replica = replication.parked().get(&key).cloned().unwrap();
+            let mut replicator = replica.replicator.lock().unwrap();
+            // No cutoff at the first read, a passed one after it.
+            ship_until_caught_up(&mut replicator, &|| {
+                if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    None
+                } else {
+                    Some(std::time::Instant::now())
+                }
+            })
+        };
+        assert!(reads.load(Ordering::SeqCst) >= 1);
+        // The destination is up: it either caught up on the first step, or
+        // it stopped at the cutoff it read on the next one.
+        if let Err(error) = shipped {
+            assert!(error.contains("ran out of time"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_running_pass_reads_a_cutoff_installed_after_it_began() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        park_one(&fleet).await;
+        flaky.down.store(false, Ordering::SeqCst);
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || {
+                // No cutoff when the pass starts; a passed one right after.
+                replication.tick_pass(&|| {
+                    if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                        None
+                    } else {
+                        Some(std::time::Instant::now())
+                    }
+                });
+            }
+        })
+        .await
+        .unwrap();
+        // The pass read the cutoff again before it shipped the parked replica.
+        assert_eq!(replication.closing(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pass_waiting_on_a_replica_lock_gives_up_at_a_new_cutoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        let key = park_one(&fleet).await;
+        flaky.down.store(false, Ordering::SeqCst);
+        // Another thread holds the replica for three seconds.
+        let replica = replication.parked().get(&key).cloned().unwrap();
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = replica.replicator.lock().unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        held.recv().unwrap();
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let began = std::time::Instant::now();
+        crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || {
+                // No cutoff at first, a passed one from the second read on.
+                replication.tick_pass(&|| {
+                    if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                        None
+                    } else {
+                        Some(std::time::Instant::now())
+                    }
+                });
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "the pass must not wait out the lock: {:?}",
+            began.elapsed()
+        );
+        holder.join().unwrap();
+        assert_eq!(replication.closing(), 1, "nothing shipped");
+    }
+
+    #[tokio::test]
+    async fn a_close_waiting_on_a_replica_lock_gives_up_at_the_cutoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        flaky.down.store(false, Ordering::SeqCst);
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.open(&key).await.unwrap();
+        exec(&db, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        drop(db);
+        // The loop thread holds the replica for three seconds.
+        let replica = replication.active().get(&key).cloned().unwrap();
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = replica.replicator.lock().unwrap();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        held.recv().unwrap();
+        replication.set_shutdown_cutoff(Some(std::time::Instant::now()));
+        let began = std::time::Instant::now();
+        fleet.close(&key).await;
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "the close must not wait out the lock: {:?}",
+            began.elapsed()
+        );
+        holder.join().unwrap();
+        assert_eq!(replication.closing(), 1, "parked, not shipped");
     }
 }
