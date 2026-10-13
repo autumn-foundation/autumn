@@ -327,12 +327,17 @@ impl FleetDatabase {
             worker.stop.cancel();
         }
         let key = &self.key;
+        let aborts: Vec<_> = workers.iter().map(|w| w.handle.abort_handle()).collect();
         let settle = futures::future::join_all(workers.into_iter().map(|w| w.handle));
         if tokio::time::timeout(WORKER_QUIESCE_TIMEOUT, settle)
             .await
             .is_err()
         {
-            tracing::warn!(database = %key, "a fleet worker did not stop in time; closing anyway");
+            tracing::warn!(database = %key, "a fleet worker did not stop in time; aborting it");
+            // A detached task would ack against a closed pool.
+            for abort in aborts {
+                abort.abort();
+            }
         }
     }
 }
@@ -1358,6 +1363,8 @@ impl DatabaseFleet {
                     if let Err(detail) = hook.on_open(&opened) {
                         // Undo the hooks that did start (a replicator that
                         // registered) before refusing the open.
+                        // Stop the workers first, as `drain` does.
+                        tokio::runtime::Handle::current().block_on(opened.quiesce_workers());
                         for hook in started {
                             hook.on_close(&opened);
                         }
@@ -3910,7 +3917,9 @@ mod tests {
         };
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!first.pool().is_closed() && !second.pool().is_closed());
-        release.notify_waiters();
+        // One permit per worker: `notify_waiters` would be lost to a late one.
+        release.notify_one();
+        release.notify_one();
         closing.await.unwrap();
         assert!(acked.load(Ordering::SeqCst));
         assert!(first.pool().is_closed() && second.pool().is_closed());
