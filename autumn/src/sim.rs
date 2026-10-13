@@ -1357,6 +1357,14 @@ impl Sim {
 
 impl Drop for Sim {
     fn drop(&mut self) {
+        // A replica is a host of the sim network, and its app holds the
+        // network: a cycle. Remove the hosts, so the replica apps drop.
+        #[cfg(feature = "http-client")]
+        if let Some(net) = &self.net {
+            for slot in self.replicas.iter().filter(|slot| slot.client.is_some()) {
+                net.remove_host(&slot.name);
+            }
+        }
         // The runtime drops the app tasks after the sim. A task with a query
         // in flight then waits for it, so let gated queries run (#3067).
         self.gate_seat.leave();
@@ -2291,5 +2299,34 @@ mod tests {
             .unwrap();
         let got = resolve_local_to_utc(local, &Utc);
         assert_eq!(got, Utc.with_ymd_and_hms(2020, 6, 1, 12, 0, 0).unwrap());
+    }
+
+    /// A replica on the sim network is a host of that network, and its app
+    /// holds the network. The sim must break that cycle when it drops, or a
+    /// seed sweep keeps every replica app of every seed in memory.
+    #[cfg(feature = "http-client")]
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_sim_frees_its_replica_apps() {
+        let marker = std::sync::Arc::new(());
+        let freed = std::sync::Arc::downgrade(&marker);
+        {
+            let mut sim = Sim::from_seed(21);
+            sim.net(super::net::SimNet::new());
+            let held = std::sync::Arc::clone(&marker);
+            let router = axum::Router::new().route(
+                "/held",
+                axum::routing::get(move || {
+                    let holders = std::sync::Arc::strong_count(&held);
+                    async move { holders.to_string() }
+                }),
+            );
+            sim.mount_replica("a", crate::test::TestApp::new().merge(router));
+            sim.mount_replica("b", crate::test::TestApp::new());
+        }
+        drop(marker);
+        assert!(
+            freed.upgrade().is_none(),
+            "the replica app is still alive after its sim dropped"
+        );
     }
 }
