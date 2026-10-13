@@ -8,6 +8,8 @@
 //!   the cutover — an isolated mid-flight reset (`ECONNRESET`/`ECONNABORTED`)
 //!   is retried once, but only up to `MAX_TOLERATED_RESETS` of them, so a
 //!   systemic source of resets still fails the run rather than being masked;
+//! * a `503` from the successor's startup barrier is retried for up to
+//!   `STARTUP_BARRIER_BUDGET`. A successor that never becomes ready fails the run;
 //! * a value written before the upgrade is readable after it (from the *new*
 //!   binary, whose state shape is different);
 //! * the state migration ran (`upgrades=1`) and the counter did not reset;
@@ -359,25 +361,19 @@ mod reset_retry_tests {
     }
 }
 
-/// How many times a single request may land on the *successor's own*
-/// startup barrier (`503 Service is still starting up` from
-/// `StartupBarrierLayer`/`router.rs`) before the test gives up and records
-/// that as the outcome.
+/// How long one request may keep hitting the successor's startup barrier
+/// (`503 Service is still starting up`). After this time, the test keeps the
+/// 503 as the result.
 ///
-/// The successor starts `accept()`-ing on the handed-over listening socket
-/// before it calls `mark_startup_complete` (that ordering is deliberate:
-/// `app.rs` only releases the predecessor *after* startup completes, but the
-/// socket handoff itself happens earlier so the successor can begin serving
-/// the moment it is ready) — so a request can land on the new process during
-/// the narrow window between "accepting connections" and "finished
-/// `on_startup` hooks". That is not a connection failure — this test's own
-/// header documents "zero refused connections", not "zero 503s" — so it is
-/// retried rather than failing the run outright, the same way
-/// `with_reset_retry` treats a mid-flight reset as expected-but-bounded
-/// rather than either silently swallowed or an unconditional hard failure.
-/// A defect that left the successor perpetually unready must still fail the
-/// test, hence the bound rather than an unbounded retry loop.
-const MAX_STARTUP_BARRIER_RETRIES: u32 = 20;
+/// The successor starts to accept connections (#2368) a little before
+/// `mark_startup_complete`. A request can arrive in that short gap. A busy CPU
+/// can make the gap long. This 503 is not a refused connection, so the test
+/// retries it.
+///
+/// The limit is time, not a count. It equals the 30 s limit in
+/// `wait_until_ready` and `wait_for_exit`. If the successor never becomes
+/// ready, the `failed.is_empty()` check fails the test.
+const STARTUP_BARRIER_BUDGET: Duration = Duration::from_secs(30);
 
 /// Whether `observation` is the startup barrier's own response, not
 /// application data that happens to also be a 503 for a different reason.
@@ -385,28 +381,151 @@ fn is_startup_barrier_response(observation: &Observation) -> bool {
     observation.status == 503 && observation.body == "Service is still starting up"
 }
 
-/// Runs `attempt` up to `MAX_STARTUP_BARRIER_RETRIES` times, retrying (with a
-/// short backoff) only while the result is the startup barrier's own
-/// response — see [`is_startup_barrier_response`]. Any other outcome (a real
-/// 200/503, or a connection error) is returned immediately without
-/// consuming a retry.
+/// Runs `attempt` again, after a short pause, while the result is the startup
+/// barrier's 503. Stops when `budget` ends and returns the last result.
+/// Returns any other result at once, including a connection error. See
+/// [`is_startup_barrier_response`].
+///
+/// After a retry, `latency` covers the whole wait, as in `with_reset_retry`.
+/// The spike check must see time spent behind the barrier.
 async fn with_startup_barrier_retry<F, Fut>(
     startup_barrier_hits: &AtomicU64,
+    budget: Duration,
     mut attempt: F,
 ) -> std::io::Result<Observation>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = std::io::Result<Observation>>,
 {
-    for _ in 0..MAX_STARTUP_BARRIER_RETRIES {
-        let observation = attempt().await?;
-        if !is_startup_barrier_response(&observation) {
+    let started = tokio::time::Instant::now();
+    let deadline = started + budget;
+    let mut retried = false;
+    loop {
+        let mut observation = attempt().await?;
+        if retried {
+            observation.latency = started.elapsed();
+        }
+        if !is_startup_barrier_response(&observation) || tokio::time::Instant::now() >= deadline {
             return Ok(observation);
         }
+        retried = true;
         startup_barrier_hits.fetch_add(1, Ordering::Relaxed);
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    attempt().await
+}
+
+#[cfg(test)]
+mod barrier_retry_tests {
+    use super::*;
+
+    fn barrier() -> Observation {
+        Observation {
+            status: 503,
+            body: "Service is still starting up".to_owned(),
+            latency: Duration::ZERO,
+        }
+    }
+
+    fn ok() -> Observation {
+        Observation {
+            status: 200,
+            body: String::new(),
+            latency: Duration::ZERO,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waits_out_a_barrier_longer_than_twenty_attempts() {
+        let attempts = AtomicU64::new(0);
+        let hits = AtomicU64::new(0);
+        let result = with_startup_barrier_retry(&hits, STARTUP_BARRIER_BUDGET, || {
+            let attempts = &attempts;
+            async move {
+                if attempts.fetch_add(1, Ordering::Relaxed) < 30 {
+                    Ok(barrier())
+                } else {
+                    Ok(ok())
+                }
+            }
+        })
+        .await
+        .expect("no connection error");
+
+        assert_eq!(result.status, 200, "a slow startup is not a failure");
+        assert_eq!(hits.load(Ordering::Relaxed), 30);
+    }
+
+    // Paused time: the 20 ms pauses run at once and the budget is exact.
+    #[tokio::test(start_paused = true)]
+    async fn gives_up_when_the_barrier_never_clears() {
+        let hits = AtomicU64::new(0);
+        let result = with_startup_barrier_retry(&hits, Duration::from_millis(100), || async {
+            Ok(barrier())
+        })
+        .await
+        .expect("no connection error");
+
+        assert!(is_startup_barrier_response(&result), "last result is kept");
+        assert_eq!(hits.load(Ordering::Relaxed), 5);
+        assert!(result.latency >= Duration::from_millis(100));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retried_success_reports_latency_spanning_the_whole_wait() {
+        let attempts = AtomicU64::new(0);
+        let hits = AtomicU64::new(0);
+        let result = with_startup_barrier_retry(&hits, STARTUP_BARRIER_BUDGET, || {
+            let attempts = &attempts;
+            async move {
+                if attempts.fetch_add(1, Ordering::Relaxed) < 10 {
+                    Ok(barrier())
+                } else {
+                    Ok(ok())
+                }
+            }
+        })
+        .await
+        .expect("no connection error");
+
+        assert_eq!(result.status, 200);
+        assert!(result.latency >= Duration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn a_non_barrier_result_is_never_retried() {
+        let attempts = AtomicU64::new(0);
+        let hits = AtomicU64::new(0);
+        let result = with_startup_barrier_retry(&hits, STARTUP_BARRIER_BUDGET, || {
+            let attempts = &attempts;
+            async move {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Ok(ok())
+            }
+        })
+        .await
+        .expect("no connection error");
+
+        assert_eq!(result.status, 200);
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(hits.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_connection_error_is_returned_at_once() {
+        let attempts = AtomicU64::new(0);
+        let hits = AtomicU64::new(0);
+        let result = with_startup_barrier_retry(&hits, STARTUP_BARRIER_BUDGET, || {
+            let attempts = &attempts;
+            async move {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Err::<Observation, _>(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+            }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
 }
 
 /// Drain the child's stdout — where Autumn's log lines go — into a shared
@@ -559,9 +678,11 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
                 // guarantees this test checks (`hits` never goes backwards,
                 // 200/503-only outcomes) hold regardless, and it mirrors how
                 // any client that retries past a reset behaves in practice.
-                match with_startup_barrier_retry(&startup_barrier_hits, || {
-                    with_reset_retry(&reset_retries, || get(&addr, path))
-                })
+                match with_startup_barrier_retry(
+                    &startup_barrier_hits,
+                    STARTUP_BARRIER_BUDGET,
+                    || with_reset_retry(&reset_retries, || get(&addr, path)),
+                )
                 .await
                 {
                     Ok(observation) => {
@@ -659,8 +780,8 @@ async fn upgrades_in_place_under_load_without_dropping_a_connection_or_the_state
     // scale with how long the successor's own `on_startup` hooks take —
     // dozens of hits across 8 polling tasks during a slow (contended)
     // startup is normal, not evidence of a defect. `with_startup_barrier_retry`
-    // already bounds each individual request to `MAX_STARTUP_BARRIER_RETRIES`
-    // attempts, and if the barrier genuinely never clears, the resulting
+    // limits each request to `STARTUP_BARRIER_BUDGET`. If the barrier never
+    // clears, the resulting
     // still-503 observation still fails the `failed.is_empty()` assertion
     // below — that is the real safety net for "this never recovered".
     assert_eq!(
