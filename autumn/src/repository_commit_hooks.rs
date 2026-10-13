@@ -1985,6 +1985,8 @@ pub async fn sqlite_drain_ready_repository_commit_hooks(
             worker_id.to_owned(),
             heartbeat_shutdown.child_token(),
         ));
+        // An aborted worker drops this future: the guard still stops the heartbeat.
+        let _heartbeat_guard = heartbeat_shutdown.clone().drop_guard();
 
         // Tenant isolation (INVIOLABLE): re-establish the SAME tenant the hook was
         // enqueued under before running it, so a `tenant_scoped` repository the
