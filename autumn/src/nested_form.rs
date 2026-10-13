@@ -1858,12 +1858,13 @@ mod tests {
         const COLLECTION: &'static str = "contacts";
     }
 
+    async fn nested_ok(_f: NestedChangesetForm<Order, LineItem>) -> &'static str {
+        "ok"
+    }
+
     #[tokio::test]
     async fn mixed_case_urlencoded_content_type_is_accepted() {
         use tower::ServiceExt;
-        async fn handler(_f: NestedChangesetForm<Order, LineItem>) -> &'static str {
-            "ok"
-        }
         let req = Request::builder()
             .method("POST")
             .uri("/t")
@@ -1871,7 +1872,7 @@ mod tests {
             .body(axum::body::Body::from("name=Order"))
             .unwrap();
         let resp = axum::Router::new()
-            .route("/t", axum::routing::post(handler))
+            .route("/t", axum::routing::post(nested_ok))
             .oneshot(req)
             .await
             .unwrap();
@@ -1881,9 +1882,6 @@ mod tests {
     #[tokio::test]
     async fn wrong_content_type_is_rejected_with_415() {
         use tower::ServiceExt;
-        async fn handler(_f: NestedChangesetForm<Order, LineItem>) -> &'static str {
-            "unreachable"
-        }
         let req = Request::builder()
             .method("POST")
             .uri("/t")
@@ -1891,7 +1889,7 @@ mod tests {
             .body(axum::body::Body::from("name=Order"))
             .unwrap();
         let resp = axum::Router::new()
-            .route("/t", axum::routing::post(handler))
+            .route("/t", axum::routing::post(nested_ok))
             .oneshot(req)
             .await
             .unwrap();
