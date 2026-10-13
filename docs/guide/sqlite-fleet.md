@@ -190,14 +190,16 @@ control database, under `<prefix>/<profile>/fleet/tenant/<id>` or
 **Only turn on `restore_missing` for keys the previous owner has stopped
 writing**, or the two copies diverge. Ownership fencing is on the roadmap.
 
-**With replication on, serve a fleet root from one process.** A `web` and a
-`worker` role sharing the root would each replicate the same databases, and a
-restore could pick the generation that missed the other's commits. Electing one
-replicator per database is tracked in
-[#3230](https://github.com/autumn-foundation/autumn/issues/3230).
+**Processes can share a replicated fleet root.** Only one process replicates a
+database. It holds the lock file `<db>.replicator.lock`. The other processes
+open the database and retry the lock on each tick. When the owner exits or
+dies, the OS frees the lock and another process takes over with a new
+generation. Use a local file system: advisory locks are not reliable on network
+file systems.
 
 `/actuator/health` reports `replication:fleet` with the number of databases
-replicating, the worst lag and which database has it.
+replicating, the number this process does not own (`unowned`), the worst lag
+and which database has it.
 
 ## Limits
 

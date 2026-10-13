@@ -19,6 +19,12 @@
 //! The databases run with `wal_autocheckpoint = 0`; the replicator is the only
 //! checkpointer, and it checkpoints only what is already offsite. That is the
 //! control database's invariant, applied per database.
+//!
+//! Processes can share a fleet root. Only one of them replicates a database:
+//! the one that holds the OS lock `<db>.replicator.lock`. The others open the
+//! database, never checkpoint it, and try the lock again on each tick. The OS
+//! frees the lock when its holder exits or dies. The new holder starts a new
+//! generation, so a restore never misses a commit.
 
 // autumn-determinism-gate: production code in this module must read time and
 // mint identifiers through the framework's injected seams (ClockSource /
@@ -72,9 +78,73 @@ pub fn replica_root(base: &str, key: &FleetDbKey) -> String {
 }
 
 struct ActiveReplica {
+    /// Never ticked while the lock is not held, so it opens no connection.
     replicator: Mutex<Replicator>,
+    /// Declared after `replicator`: the replicator's connection closes before
+    /// the lock is freed.
+    lock: Mutex<Option<ReplicaLock>>,
+    path: std::path::PathBuf,
     status: Arc<ReplicationStatus>,
     registered_at: DateTime<Utc>,
+}
+
+impl ActiveReplica {
+    fn owned(&self) -> bool {
+        self.lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Try to become the replicator of this database. `true` when this
+    /// process owns it.
+    fn claim(&self, key: &FleetDbKey) -> bool {
+        if self.owned() {
+            return true;
+        }
+        match ReplicaLock::try_acquire(&self.path) {
+            Ok(Some(held)) => {
+                tracing::info!(database = %key, "fleet replication: this process now replicates the database");
+                *self.lock.lock().unwrap_or_else(PoisonError::into_inner) = Some(held);
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(database = %key, error = %error, "fleet replication: cannot take the replicator lock");
+                false
+            }
+        }
+    }
+}
+
+/// The OS lock that makes one process the replicator of a database. The OS
+/// frees it when the file closes or the process ends.
+struct ReplicaLock {
+    _file: std::fs::File,
+}
+
+impl ReplicaLock {
+    fn try_acquire(db: &Path) -> std::io::Result<Option<Self>> {
+        let mut name = db.as_os_str().to_owned();
+        name.push(".replicator.lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(name)?;
+        let mut lock = fd_lock::RwLock::new(file);
+        match lock.try_write() {
+            // Keep the lock held: closing the file frees it, so the guard
+            // must not unlock early.
+            Ok(guard) => std::mem::forget(guard),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        Ok(Some(Self {
+            _file: lock.into_inner(),
+        }))
+    }
 }
 
 /// Replicates the open databases of one fleet. Installed by
@@ -281,10 +351,16 @@ impl FleetReplication {
         replicas
     }
 
-    /// Databases replicating now.
+    /// Open databases that another process replicates.
+    #[must_use]
+    pub fn unowned(&self) -> usize {
+        self.active().values().filter(|r| !r.owned()).count()
+    }
+
+    /// Databases this process replicates now.
     #[must_use]
     pub fn replicating(&self) -> usize {
-        self.active().len()
+        self.active().values().filter(|r| r.owned()).count()
     }
 
     /// Tick every registered replicator once, and retire each parked one
@@ -311,6 +387,10 @@ impl FleetReplication {
             let now_cutoff = cutoff();
             if expired(now_cutoff) {
                 return;
+            }
+            // A database that another process replicates is retried each tick.
+            if !replica.claim(&key) {
+                continue;
             }
             let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
                 continue;
@@ -403,7 +483,10 @@ impl FleetReplication {
     fn health(&self) -> HealthCheckOutput {
         let now = self.clock.now();
         let closing = self.closing();
-        let replicas = self.all_replicas();
+        let (replicas, unowned): (Vec<_>, Vec<_>) = self
+            .all_replicas()
+            .into_iter()
+            .partition(|(_, replica)| replica.owned());
         let mut worst: Option<(Duration, String)> = None;
         let mut failing = 0_u64;
         let mut pending_bytes = 0_u64;
@@ -427,6 +510,7 @@ impl FleetReplication {
         let mut details: HashMap<String, serde_json::Value> = HashMap::new();
         details.insert("databases".to_owned(), replicas.len().into());
         details.insert("closing".to_owned(), closing.into());
+        details.insert("unowned".to_owned(), unowned.len().into());
         details.insert("failing".to_owned(), failing.into());
         details.insert(
             "unshipped".to_owned(),
@@ -507,14 +591,16 @@ impl FleetLifecycle for FleetReplication {
         let replicator =
             Replicator::new(settings, Arc::clone(&self.destination), Arc::clone(&status))
                 .with_clock(Arc::clone(&self.clock));
-        self.active().insert(
-            db.key().clone(),
-            Arc::new(ActiveReplica {
-                replicator: Mutex::new(replicator),
-                status,
-                registered_at: self.clock.now(),
-            }),
-        );
+        let replica = Arc::new(ActiveReplica {
+            replicator: Mutex::new(replicator),
+            lock: Mutex::new(None),
+            path: db.path().to_path_buf(),
+            status,
+            registered_at: self.clock.now(),
+        });
+        // Another process may own it. The loop claims it when that one lets go.
+        replica.claim(db.key());
+        self.active().insert(db.key().clone(), replica);
         Ok(())
     }
 
@@ -522,6 +608,10 @@ impl FleetLifecycle for FleetReplication {
         let Some(replica) = self.active().remove(db.key()) else {
             return;
         };
+        // Another process replicates it: nothing to ship from here.
+        if !replica.owned() {
+            return;
+        }
         // Every pooled connection is gone. Ship everything they committed
         // before the replicator's own connection — the last one — closes and
         // lets SQLite checkpoint.
@@ -862,6 +952,84 @@ mod tests {
         assert_eq!(output.details["failing"], 0);
         assert_eq!(output.details["worst_database"], "tenant:acme");
         fleet.close_all().await;
+    }
+
+    async fn tick(replication: &Arc<FleetReplication>) {
+        crate::time::spawn_blocking({
+            let replication = Arc::clone(replication);
+            move || replication.tick_all()
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_fleets_on_one_root_elect_one_replicator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, replicas) = (tmp.path().join("shared"), tmp.path().join("replicas"));
+        let (a, ra) = replicated_fleet(&root, &replicas, false);
+        let (b, rb) = replicated_fleet(&root, &replicas, false);
+        let key = a.key_for("acme").unwrap();
+        let _db_a = a.open(&key).await.unwrap();
+        let _db_b = b.open(&key).await.unwrap();
+        assert_eq!(ra.replicating() + rb.replicating(), 1);
+        assert_eq!(ra.unowned() + rb.unowned(), 1);
+        let loser = if ra.unowned() == 1 { &rb } else { &ra };
+        assert_eq!(loser.replicating(), 1, "the other process owns it");
+    }
+
+    #[tokio::test]
+    async fn the_other_process_takes_over_and_a_restore_has_every_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, replicas) = (tmp.path().join("shared"), tmp.path().join("replicas"));
+        let (a, ra) = replicated_fleet(&root, &replicas, false);
+        let (b, rb) = replicated_fleet(&root, &replicas, false);
+        let key = a.key_for("acme").unwrap();
+        let db_a = a.open(&key).await.unwrap();
+        let db_b = b.open(&key).await.unwrap();
+        assert_eq!(
+            (ra.replicating(), rb.replicating()),
+            (1, 0),
+            "A opened first"
+        );
+
+        exec(&db_a, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        exec(&db_a, "INSERT INTO notes VALUES ('from a')").await;
+        tick(&ra).await;
+        tick(&rb).await;
+        assert_eq!(rb.replicating(), 0, "B waits while A lives");
+
+        // A closes: it ships the last frames and lets go.
+        drop(db_a);
+        a.close(&key).await;
+        tick(&rb).await;
+        assert_eq!((rb.replicating(), rb.unowned()), (1, 0), "B took over");
+        exec(&db_b, "INSERT INTO notes VALUES ('from b')").await;
+        drop(db_b);
+        b.close(&key).await;
+
+        let path = b.path_of(&key);
+        std::fs::remove_file(&path).unwrap();
+        for sidecar in crate::fleet_layout::sidecar_paths(&path) {
+            let _ = std::fs::remove_file(sidecar);
+        }
+        b.restore(&key, None).await.unwrap();
+        assert_eq!(count(&b.open(&key).await.unwrap()).await, 2);
+    }
+
+    #[tokio::test]
+    async fn health_counts_databases_this_process_does_not_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, replicas) = (tmp.path().join("shared"), tmp.path().join("replicas"));
+        let (a, _ra) = replicated_fleet(&root, &replicas, false);
+        let (b, rb) = replicated_fleet(&root, &replicas, false);
+        let key = a.key_for("acme").unwrap();
+        let _db_a = a.open(&key).await.unwrap();
+        let _db_b = b.open(&key).await.unwrap();
+        let output = rb.indicator().check().await;
+        assert_eq!(output.status, crate::actuator::HealthStatus::Up);
+        assert_eq!(output.details["unowned"], 1);
+        assert_eq!(output.details["databases"], 0);
     }
 
     /// A destination that can be switched off, for an outage mid-close.
