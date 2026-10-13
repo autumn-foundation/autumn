@@ -11453,25 +11453,42 @@ fn pg_claim_sql() -> String {
     // Only reached when `queue_order` has 2+ entries — see
     // `pg_claim_sql_single_queue` for the single-queue fast path, which is the
     // common case (no `[jobs] queues` priority config).
+    //
+    // Each queue is probed in list order with its own `ORDER BY run_at LIMIT 1`
+    // so `idx_autumn_jobs_queue_ready (queue, run_at)` serves the head of each
+    // queue and the claim touches O(queues) rows instead of sorting the whole
+    // ready backlog of every polled queue (`ORDER BY array_position(..)` is
+    // opaque to the planner). The outer `ORDER BY q.ord, picked.run_at` keeps
+    // the original order: earliest-listed queue first, oldest `run_at` within it.
+    // Row locks are taken per probe, so a probe may briefly lock the head of a
+    // lower-priority queue that the outer `LIMIT 1` then discards; the locks
+    // drop when the statement ends and only make a concurrent claim skip that
+    // row for that instant.
     format!(
         "UPDATE autumn_jobs \
          SET status = 'running', started_at = NOW(), claimed_by = $1, claimed_at = NOW(), \
              pending_unique_key = CASE WHEN unique_window = 'pending' THEN unique_key ELSE NULL END, \
              unique_key = CASE WHEN unique_window = 'pending' THEN NULL ELSE unique_key END \
          WHERE id = ( \
-           SELECT candidate.id FROM autumn_jobs candidate \
-           WHERE candidate.status = 'enqueued' AND candidate.run_at <= NOW() \
-             AND candidate.queue = ANY($2) \
-             AND (candidate.concurrency_limit IS NULL OR ( \
-               SELECT COUNT(*) FROM autumn_jobs running \
-               WHERE running.status = 'running' \
-                 AND running.name = candidate.name \
-                 AND running.concurrency_key IS NOT DISTINCT FROM candidate.concurrency_key \
-             ) < candidate.concurrency_limit) \
-             AND NOT (candidate.name = ANY($3)) \
-           ORDER BY array_position($2::text[], candidate.queue), candidate.run_at ASC \
+           SELECT picked.id \
+           FROM unnest($2::text[]) WITH ORDINALITY AS q(queue, ord) \
+           CROSS JOIN LATERAL ( \
+             SELECT candidate.id, candidate.run_at FROM autumn_jobs candidate \
+             WHERE candidate.status = 'enqueued' AND candidate.run_at <= NOW() \
+               AND candidate.queue = q.queue \
+               AND (candidate.concurrency_limit IS NULL OR ( \
+                 SELECT COUNT(*) FROM autumn_jobs running \
+                 WHERE running.status = 'running' \
+                   AND running.name = candidate.name \
+                   AND running.concurrency_key IS NOT DISTINCT FROM candidate.concurrency_key \
+               ) < candidate.concurrency_limit) \
+               AND NOT (candidate.name = ANY($3)) \
+             ORDER BY candidate.run_at ASC \
+             LIMIT 1 \
+             FOR UPDATE SKIP LOCKED \
+           ) picked \
+           ORDER BY q.ord, picked.run_at \
            LIMIT 1 \
-           FOR UPDATE SKIP LOCKED \
          ) \
          RETURNING {PG_JOB_SELECT_COLS}"
     )
