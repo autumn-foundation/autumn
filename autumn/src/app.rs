@@ -5939,6 +5939,12 @@ impl AppBuilder {
         let drain_started_at: std::sync::Arc<std::sync::OnceLock<crate::time::MonotonicInstant>> =
             std::sync::Arc::new(std::sync::OnceLock::new());
         let drain_started_clone = std::sync::Arc::clone(&drain_started_at);
+        // The same moment on the real clock. The fleet's final flush bounds
+        // blocking I/O, so it needs a reading a fixed or unadvanced injected
+        // clock cannot freeze.
+        let drain_started_real: std::sync::Arc<std::sync::OnceLock<std::time::Instant>> =
+            std::sync::Arc::new(std::sync::OnceLock::new());
+        let drain_started_real_clone = std::sync::Arc::clone(&drain_started_real);
         // The shutdown task does not capture `state`, so hand it its own handle
         // on the injected clock — the drain window is measured on the same
         // monotonic timeline `hook_budget` is computed from below.
@@ -6015,6 +6021,11 @@ impl AppBuilder {
             // Record drain-start before cancelling so main gets the right hook
             // budget even in the startup-overlap case.
             let _ = drain_started_clone.set(drain_clock_for_task.monotonic());
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "real time: the fleet flush bounds blocking I/O"
+            )]
+            let _ = drain_started_real_clone.set(std::time::Instant::now());
             shutdown_signal_token.cancel();
 
             // Phase 6: drain watchdog. If the in-flight drain exceeds the budget,
@@ -6228,8 +6239,21 @@ impl AppBuilder {
         // and same reasoning as the control replication flush below.
         #[cfg(feature = "sqlite")]
         if let Some(maintenance) = fleet_maintenance.take() {
+            let real_elapsed = drain_started_real
+                .get()
+                .map_or(std::time::Duration::ZERO, std::time::Instant::elapsed);
+            let wait =
+                fleet_flush_budget(shutdown_budget, elapsed_since_drain_start(), real_elapsed);
+            // Fix the cutoff now. The maintenance task may wake late, and the
+            // wait above counts from here.
+            if let Some(replication) = state
+                .shards()
+                .and_then(|s| s.fleet())
+                .and_then(|f| f.replication())
+            {
+                replication.set_shutdown_deadline_in(wait);
+            }
             fleet_shutdown.cancel();
-            let wait = shutdown_budget.saturating_sub(elapsed_since_drain_start());
             if tokio::time::timeout(wait, maintenance).await.is_ok() {
                 tracing::info!("shutdown: SQLite fleet databases closed");
             } else {
@@ -11808,6 +11832,20 @@ fn prepare_unix_socket_path(path: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
+/// What the fleet's final flush may spend of the shutdown budget. The larger
+/// of the injected-clock and real elapsed times counts: the flush bounds
+/// blocking I/O, so a fixed or unadvanced injected clock (which reads zero
+/// while a real drain runs) must not hand it a fresh full budget, and a
+/// simulated clock that ran ahead of real time still spends its virtual time.
+#[cfg(feature = "sqlite")]
+fn fleet_flush_budget(
+    shutdown_budget: std::time::Duration,
+    injected_elapsed: std::time::Duration,
+    real_elapsed: std::time::Duration,
+) -> std::time::Duration {
+    shutdown_budget.saturating_sub(injected_elapsed.max(real_elapsed))
+}
+
 /// How long to wait for the cluster's departure notice, given how much of the
 /// shutdown budget the request drain already spent.
 ///
@@ -13297,13 +13335,19 @@ fn start_fleet_replication(
         .fleet
         .as_ref()
         .is_some_and(|f| f.restore_missing);
-    let replication = Arc::new(crate::db::fleet_replication::FleetReplication::new(
-        Arc::clone(runtime.replicator.destination()),
-        runtime.settings.clone(),
-        lag_alert_after,
-        restore_missing,
-        state.clock_arc(),
-    ));
+    let replication = Arc::new(
+        crate::db::fleet_replication::FleetReplication::new(
+            Arc::clone(runtime.replicator.destination()),
+            runtime.settings.clone(),
+            lag_alert_after,
+            restore_missing,
+            state.clock_arc(),
+        )
+        // The server path sets a tighter cutoff from the budget left.
+        .with_final_flush(std::time::Duration::from_secs(
+            config.server.shutdown_timeout_secs,
+        )),
+    );
     fleet
         .install_replication(Arc::clone(&replication))
         .map_err(|_| "the fleet already replicates".to_owned())?;
@@ -17601,6 +17645,33 @@ mod tests {
             !server_source.contains("&config.cluster, &server_shutdown"),
             "the cluster must not ride server_shutdown: that token fires when \
              the listener closes, with the request drain still ahead of it"
+        );
+    }
+
+    /// The fleet's final flush bounds blocking I/O, so it spends the larger of
+    /// the injected-clock and the real elapsed time. A fixed or unadvanced
+    /// clock reads zero while a real drain runs, and must not hand the flush
+    /// a fresh full budget.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn the_fleet_flush_budget_counts_real_time_a_pinned_clock_misses() {
+        use std::time::Duration;
+
+        let budget = Duration::from_secs(30);
+        // A pinned injected clock: only the real reading shows the drain.
+        assert_eq!(
+            fleet_flush_budget(budget, Duration::ZERO, Duration::from_secs(25)),
+            Duration::from_secs(5)
+        );
+        // A simulated clock that ran ahead of real time wins instead.
+        assert_eq!(
+            fleet_flush_budget(budget, Duration::from_secs(20), Duration::from_secs(1)),
+            Duration::from_secs(10)
+        );
+        // Nothing is left once either reading spent the budget.
+        assert_eq!(
+            fleet_flush_budget(budget, Duration::ZERO, budget),
+            Duration::ZERO
         );
     }
 

@@ -145,7 +145,10 @@ offline-sync = ["db", "http-client"]
 # searchable repositories emit FTS5 virtual tables + bm25 ranking) is always
 # available. Adding `db` here changes nothing for the Postgres/default lane,
 # which never enables `sqlite`.
-sqlite = ["db", "diesel/sqlite", "diesel/returning_clauses_for_sqlite_3_35", "diesel-async/sync-connection-wrapper"]
+# `dep:fd-lock`: the fleet takes a cross-process lock around publishing or
+# removing a database path (issue #3228). The crate is in the lock file already
+# (through `rustyline`), so this adds no crate to the graph.
+sqlite = ["db", "diesel/sqlite", "diesel/returning_clauses_for_sqlite_3_35", "diesel-async/sync-connection-wrapper", "dep:fd-lock"]
 test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
 telemetry-otlp = [
     "dep:opentelemetry",
@@ -437,6 +440,7 @@ proptest = { version = "1.4", optional = true }
 serde_urlencoded = "0.7"
 serde_path_to_error = "0.1"
 serde_yaml = { version = "0.9", optional = true }
+fd-lock = { version = "4", optional = true }
 pulldown-cmark = { workspace = true, optional = true }
 ammonia = { workspace = true, optional = true }
 rhai = { workspace = true, optional = true }

@@ -872,6 +872,7 @@ dependencies = [
  "diesel-async",
  "diesel_migrations",
  "ed25519-dalek 2.2.0",
+ "fd-lock",
  "filetime",
  "flate2",
  "futures",

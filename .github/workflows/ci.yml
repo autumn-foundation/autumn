@@ -2252,7 +2252,7 @@ jobs:
           # lib-test build.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --lib -- db::tests::sqlite_ db::tests::percent_decode db::fleet \
-            app::fleet_boot_tests
+            fleet_layout:: app::fleet_boot_tests
           # The #1907 durable job queue and lease scheduler are a large slice of
           # sqlite-only code; without this lane Codecov reports all of it
           # uncovered.
