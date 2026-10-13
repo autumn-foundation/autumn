@@ -713,10 +713,9 @@ enum OnDisk {
     Absent,
     /// Readable text, line endings normalised.
     Text(String),
-    /// Reached through a symbolic link. The contents are known — so a link
-    /// whose target already matches the scaffold is simply current — but the
-    /// path is never written, because the write would land wherever the link
-    /// points, which need not be inside the project.
+    /// Reached through a symbolic link. The contents may be known, but the
+    /// verdict never uses them: a link is always a conflict. The path is never
+    /// written, because the write would land outside the project.
     Linked(Option<String>),
     /// Present, and untouchable for this reason.
     Opaque(ConflictReason),
@@ -843,8 +842,7 @@ pub fn classify(
             let (status, diff) = match &seen {
                 // Already what this release writes. Checked before anything
                 // else, including the pin: a pinned file that happens to match
-                // is current, not an exception. A link never counts: its
-                // target is outside the project.
+                // is current, not an exception. A link never counts.
                 OnDisk::Text(text) if *text == normalized => (Status::UpToDate, String::new()),
                 // The developer has said this one is theirs.
                 _ if pinned(path) => (Status::Pinned, String::new()),
@@ -2771,6 +2769,23 @@ mod tests {
         let entries = plan_in(tmp.path()).entries;
         assert_eq!(status_of(&entries, "clippy.toml"), &Status::Pinned);
         assert!(!drifted(&entries));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pinned_non_matching_symlink_is_pinned_and_never_written() {
+        let tmp = scaffolded(GenerateOptions::default());
+        let outside = tmp.path().join("outside.txt");
+        fs::write(&outside, "not mine to touch\n").unwrap();
+        let link = tmp.path().join("clippy.toml");
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        accept(tmp.path(), &["clippy.toml".to_owned()]).expect("accept");
+
+        let mut report = plan_in(tmp.path());
+        assert_eq!(status_of(&report.entries, "clippy.toml"), &Status::Pinned);
+        apply(&mut report).expect("apply");
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "not mine to touch\n");
     }
 
     #[cfg(unix)]
