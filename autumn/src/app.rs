@@ -2736,7 +2736,7 @@ impl AppBuilder {
     /// [`InMemoryExperimentStore`]: crate::experiments::InMemoryExperimentStore
     ///
     /// When the app installs the service, it calls
-    /// [`ExperimentStore::preload`] once and waits up to 10 seconds for it,
+    /// [`ExperimentStore::preload`](crate::experiments::ExperimentStore::preload) once and waits up to 10 seconds for it,
     /// before job workers, startup hooks and requests. A failed preload logs a
     /// warning; it does not stop startup.
     #[must_use]
