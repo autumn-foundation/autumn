@@ -1316,11 +1316,11 @@ async fn sqlite_repository_commit_hook_worker_loop(
             () = shutdown.cancelled() => break,
             () = kick.notified() => {
                 recover_stale_repository_commit_hooks(&pool, &worker_id).await;
-                sqlite_drain_ready_repository_commit_hooks(&pool, &worker_id, 32).await;
+                sqlite_drain_ready_repository_commit_hooks(&pool, &worker_id, 32, &shutdown).await;
             }
             () = tokio::time::sleep(HOOK_WORKER_IDLE_SLEEP) => {
                 recover_stale_repository_commit_hooks(&pool, &worker_id).await;
-                sqlite_drain_ready_repository_commit_hooks(&pool, &worker_id, 32).await;
+                sqlite_drain_ready_repository_commit_hooks(&pool, &worker_id, 32, &shutdown).await;
             }
         }
     }
@@ -1967,8 +1967,13 @@ pub async fn sqlite_drain_ready_repository_commit_hooks(
     pool: &RtPool,
     worker_id: &str,
     max_rows: usize,
+    stop: &CancellationToken,
 ) {
     for _ in 0..max_rows {
+        // The row in flight settles; no new row starts once `stop` fires.
+        if stop.is_cancelled() {
+            break;
+        }
         let Some(row) = sqlite_claim_next_repository_commit_hook(pool, worker_id).await else {
             break;
         };

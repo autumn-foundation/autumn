@@ -4858,7 +4858,10 @@ pub async fn drain_ready_repository_commit_hooks(
         .await;
     #[cfg(feature = "sqlite")]
     crate::repository_commit_hooks::sqlite_drain_ready_repository_commit_hooks(
-        pool, &worker_id, max_rows,
+        pool,
+        &worker_id,
+        max_rows,
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await;
 

@@ -246,9 +246,12 @@ fn io_error(op: &'static str) -> impl FnOnce(std::io::Error) -> FleetError {
 /// open.
 ///
 /// An explicit [`DatabaseFleet::close`], [`DatabaseFleet::delete`] or
-/// [`DatabaseFleet::restore`] does not wait for leases: once it runs, the
-/// pool refuses new checkouts and the next [`DatabaseFleet::open`] opens the
-/// database fresh.
+/// [`DatabaseFleet::restore`] does not wait for leases. [`DatabaseFleet::delete`]
+/// and [`DatabaseFleet::restore`] stop the workers and close the pool at once.
+/// [`DatabaseFleet::close`] first lets the workers finish their current hook
+/// (for at most [`WORKER_QUIESCE_TIMEOUT`]), then closes the pool. After
+/// that the pool refuses new checkouts and the next [`DatabaseFleet::open`]
+/// opens the database fresh.
 #[derive(Clone)]
 pub struct FleetDatabase {
     key: FleetDbKey,
@@ -315,8 +318,9 @@ impl FleetDatabase {
             .push(Worker { stop, handle });
     }
 
-    /// Stop the registered workers and wait for them, within the timeout.
-    async fn quiesce_workers(&self) {
+    /// Stop the registered workers. With `settle`, wait for them within the
+    /// timeout; without it, abort them now.
+    async fn quiesce_workers(&self, settle: bool) {
         let workers = std::mem::take(
             &mut *self
                 .workers
@@ -325,6 +329,12 @@ impl FleetDatabase {
         );
         for worker in &workers {
             worker.stop.cancel();
+        }
+        if !settle {
+            for worker in &workers {
+                worker.handle.abort();
+            }
+            return;
         }
         let key = &self.key;
         let aborts: Vec<_> = workers.iter().map(|w| w.handle.abort_handle()).collect();
@@ -1302,7 +1312,7 @@ impl DatabaseFleet {
         let applied = match self.prepare(&db).await {
             Ok(applied) => applied,
             Err(error) => {
-                db.quiesce_workers().await;
+                db.quiesce_workers(true).await;
                 db.closed.cancel();
                 let closer = db.pool.clone();
                 let _ = crate::time::spawn_blocking(move || closer.close()).await;
@@ -1364,7 +1374,7 @@ impl DatabaseFleet {
                         // Undo the hooks that did start (a replicator that
                         // registered) before refusing the open.
                         // Stop the workers first, as `drain` does.
-                        tokio::runtime::Handle::current().block_on(opened.quiesce_workers());
+                        tokio::runtime::Handle::current().block_on(opened.quiesce_workers(true));
                         for hook in started {
                             hook.on_close(&opened);
                         }
@@ -1538,18 +1548,22 @@ impl DatabaseFleet {
                 key: key.clone(),
                 drain,
             };
-            fleet.drain(&key, db).await;
+            fleet.drain(&key, db, true).await;
         });
     }
 
     /// Close one database: refuse new checkouts, wait for the in-flight ones,
     /// then run the `on_close` hooks.
-    async fn drain(&self, key: &FleetDbKey, db: Option<FleetDatabase>) {
+    ///
+    /// `settle` lets the database's workers finish their step first, so a
+    /// hook is acked. A delete or restore passes `false`: the data goes away,
+    /// and the pool must stop stale holders at once.
+    async fn drain(&self, key: &FleetDbKey, db: Option<FleetDatabase>, settle: bool) {
         let Some(db) = db else {
             return;
         };
         // Workers settle first: their last ack needs a live pool.
-        db.quiesce_workers().await;
+        db.quiesce_workers(settle).await;
         db.closed.cancel();
         // `close` drops the idle connections, and dropping a `SQLite`
         // connection can checkpoint: keep that I/O off the async workers.
@@ -1608,7 +1622,7 @@ impl DatabaseFleet {
                 key: key.clone(),
                 drain,
             };
-            self.drain(&key, db).await;
+            self.drain(&key, db, true).await;
         } else {
             let pending = self.lock_state().draining.get(key).cloned();
             if let Some(drain) = pending {
@@ -1790,7 +1804,7 @@ impl DatabaseFleet {
             drain,
         };
         let db = self.take_database(entry).await;
-        self.drain(&key, db).await;
+        self.drain(&key, db, false).await;
         // Hooks let go of the files first (a parked replicator holds one open).
         for hook in self.hooks() {
             hook.release(&key);
@@ -1978,7 +1992,7 @@ impl DatabaseFleet {
                     drain,
                 };
                 let db = self.take_database(entry).await;
-                self.drain(&key, db).await;
+                self.drain(&key, db, false).await;
                 for hook in self.hooks() {
                     hook.release(&key);
                 }
@@ -3906,6 +3920,22 @@ mod tests {
         assert!(!acked.load(Ordering::SeqCst));
     }
 
+    #[tokio::test]
+    async fn delete_stops_workers_at_once_instead_of_letting_them_settle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let (worker, _release, acked) = settling(false);
+        fleet.add_lifecycle(worker);
+        let key = FleetDbKey::Slot(29);
+        let db = fleet.open(&key).await.unwrap();
+        let deleted = tokio::time::timeout(Duration::from_secs(5), fleet.delete(&key))
+            .await
+            .expect("a delete does not wait for a worker");
+        assert!(deleted.unwrap());
+        assert!(db.pool().is_closed());
+        assert!(!acked.load(Ordering::SeqCst));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn close_all_pays_the_worker_timeout_once() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4524,7 +4554,7 @@ mod tests {
             .expect("the opened database");
         assert!(db.path().is_file());
         opener.await.unwrap().unwrap();
-        fleet.drain(&taken, Some(db)).await;
+        fleet.drain(&taken, Some(db), true).await;
         fleet.finish_drain(&taken, &drain);
     }
 
