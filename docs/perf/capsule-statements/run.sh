@@ -11,11 +11,15 @@ P -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements"
 log=$out/test.log; : > "$log"
 gate=$out/gate; rm -rf "$gate"; mkdir -p "$gate"
 export LEDGER_GATE=$gate
+# Job control puts the background job in its own process group (pgid = pid),
+# so the trap below can stop cargo AND the test binary it spawned.
+set -m
 (cd "$(git rev-parse --show-toplevel)/autumn" && cargo test --features ledger-profile --test integration_tests ledger_capsule_profile -- --ignored --nocapture >"$log" 2>&1) &
 pid=$!
 # If the driver exits for any reason (a failed psql under `set -e`, Ctrl-C),
-# do not leave the gated test polling for an ack that will never come.
-trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+# do not leave the gated test polling for an ack that will never come: kill the
+# whole group, since cargo does not forward the signal to its test binary.
+trap 'kill -- -"$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
 snap() { # phase
   P -c "COPY (SELECT calls, shared_blks_hit+shared_blks_read AS buffers, shared_blks_hit, shared_blks_read, temp_blks_written, wal_bytes, rows, left(regexp_replace(query,'\s+',' ','g'),110) AS q FROM pg_stat_statements s JOIN pg_database d ON d.oid=s.dbid WHERE d.datname IN ('ledger_src','ledger_dst') ORDER BY 2 DESC) TO STDOUT WITH CSV HEADER" > "$out/pgss-$1.csv"
 }
