@@ -497,7 +497,7 @@ for line in records(&DnsAidInput::new("https://example.com", Some("/mcp"))) {
 ```
 
 ```text
-_mcp._agents.example.com. 3600 IN SVCB 1 example.com. alpn="mcp,h2" port=443 mandatory=alpn,port key65400="https://example.com/mcp/server-card"
+_mcp._agents.example.com. 3600 IN SVCB 1 example.com. alpn="mcp,h2" port=443 mandatory=alpn,port,key65400 key65400="https://example.com/mcp/server-card"
 _index._agents.example.com. 3600 IN SVCB 1 example.com. alpn="h2" port=443
 _catalog._agents.example.com. 3600 IN TXT "url=https://example.com/.well-known/ai-catalog.json"
 ```

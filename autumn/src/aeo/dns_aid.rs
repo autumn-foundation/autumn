@@ -112,9 +112,12 @@ pub fn records(input: &DnsAidInput) -> Vec<String> {
     let ttl = input.ttl.unwrap_or(3600);
     let mut lines = Vec::new();
     if let Some(mcp) = &input.mcp_path {
+        // `key65400` (the server card) is the only way to find the MCP
+        // endpoint, so it is mandatory too (RFC 9460 §8): a client that
+        // cannot read it skips the record rather than drop the key.
         lines.push(format!(
             "_mcp._agents.{host}. {ttl} IN SVCB 1 {host}. alpn=\"mcp,{alpn}\" port={port} \
-             mandatory=alpn,port key65400=\"{base}{card}\"",
+             mandatory=alpn,port,key65400 key65400=\"{base}{card}\"",
             card = super::documents::server_card_path(mcp)
         ));
     }
@@ -161,7 +164,7 @@ mod tests {
             lines,
             vec![
                 "_mcp._agents.example.com. 3600 IN SVCB 1 example.com. alpn=\"mcp,h2\" port=443 \
-                 mandatory=alpn,port key65400=\"https://example.com/mcp/server-card\"",
+                 mandatory=alpn,port,key65400 key65400=\"https://example.com/mcp/server-card\"",
                 "_index._agents.example.com. 3600 IN SVCB 1 example.com. alpn=\"h2\" port=443",
                 "_catalog._agents.example.com. 3600 IN TXT \
                  \"url=https://example.com/.well-known/ai-catalog.json\"",
