@@ -908,9 +908,9 @@ fn target_session_values<'a>(
     &'a self,
     ctx: &'a PolicyContext,
     target: &'a ImpersonationTarget,
-) -> BoxFuture<'a, Vec<(String, String)>> {
+) -> BoxFuture<'a, Vec<(String, Option<String>)>> {
     Box::pin(async move {
-        // Read the email from your own user store.
+        // Read the email from your own user store. `None` removes the key.
         vec![("user_email".to_owned(), lookup_email(ctx, target).await)]
     })
 }

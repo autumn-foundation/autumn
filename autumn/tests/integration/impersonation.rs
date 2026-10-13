@@ -1422,8 +1422,13 @@ impl ImpersonationPolicy for WithEmailKey {
         &'a self,
         _ctx: &'a PolicyContext,
         _target: &'a ImpersonationTarget,
-    ) -> BoxFuture<'a, Vec<(String, String)>> {
-        Box::pin(async move { self.0.clone() })
+    ) -> BoxFuture<'a, Vec<(String, Option<String>)>> {
+        let values = self
+            .0
+            .iter()
+            .map(|(key, value)| (key.clone(), Some(value.clone())))
+            .collect();
+        Box::pin(async move { values })
     }
 }
 
@@ -1626,9 +1631,9 @@ impl ImpersonationPolicy for EmailForNine {
         &'a self,
         _ctx: &'a PolicyContext,
         target: &'a ImpersonationTarget,
-    ) -> BoxFuture<'a, Vec<(String, String)>> {
+    ) -> BoxFuture<'a, Vec<(String, Option<String>)>> {
         let values = if target.user_id() == "user-9" {
-            vec![("user_email".to_owned(), "nine@example.com".to_owned())]
+            vec![("user_email".to_owned(), Some("nine@example.com".to_owned()))]
         } else {
             Vec::new()
         };
@@ -1691,5 +1696,58 @@ async fn a_stale_identity_stash_is_not_restored_onto_the_next_operator() {
     assert_eq!(
         client.get("/email").send().await.text(),
         "carol@example.com"
+    );
+}
+
+/// Declares `user_email` as absent for the target.
+struct NoEmailForTarget;
+
+impl ImpersonationPolicy for NoEmailForTarget {
+    fn can_impersonate<'a>(
+        &'a self,
+        _ctx: &'a PolicyContext,
+        _target: &'a ImpersonationTarget,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async { true })
+    }
+
+    fn target_session_values<'a>(
+        &'a self,
+        _ctx: &'a PolicyContext,
+        _target: &'a ImpersonationTarget,
+    ) -> BoxFuture<'a, Vec<(String, Option<String>)>> {
+        Box::pin(async { vec![("user_email".to_owned(), None)] })
+    }
+}
+
+#[tokio::test]
+async fn an_absent_target_value_removes_the_key_and_end_restores_it() {
+    let client = TestApp::new()
+        .routes(routes![login_admin_with_email, begin, stop, email])
+        .state_initializer(|state| {
+            state.insert_extension(ImpersonationGate::custom(NoEmailForTarget));
+            state.insert_extension(
+                AuditLogger::new().with_sink(Arc::new(autumn_web::audit::TracingAuditSink)),
+            );
+        })
+        .build();
+    client
+        .post("/login-admin-with-email")
+        .send()
+        .await
+        .assert_ok();
+    client
+        .post("/impersonate")
+        .form("user_id=user-9")
+        .send()
+        .await
+        .assert_ok();
+    // The operator's email must not show while impersonating.
+    assert_eq!(client.get("/email").send().await.text(), "-");
+
+    client.post("/stop-impersonating").send().await.assert_ok();
+    assert_eq!(
+        client.get("/email").send().await.text(),
+        "admin@example.com"
     );
 }

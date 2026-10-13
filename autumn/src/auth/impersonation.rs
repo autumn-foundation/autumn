@@ -325,6 +325,8 @@ pub trait ImpersonationPolicy: Send + Sync + 'static {
     }
 
     /// Extra session keys to swap to the target, as `(key, value)` pairs.
+    /// A `None` value means the target has no value: the key is removed for the
+    /// impersonation, and the operator's value returns on the end.
     ///
     /// Use this when the app stores identity in keys other than the auth key,
     /// for example `user_email`. [`begin_impersonation`] saves the operator's
@@ -340,7 +342,7 @@ pub trait ImpersonationPolicy: Send + Sync + 'static {
         &'a self,
         _ctx: &'a PolicyContext,
         _target: &'a ImpersonationTarget,
-    ) -> BoxFuture<'a, Vec<(String, String)>> {
+    ) -> BoxFuture<'a, Vec<(String, Option<String>)>> {
         Box::pin(async { Vec::new() })
     }
 }
@@ -679,7 +681,7 @@ async fn swap_identity(
     real_id: &str,
     target_id: &str,
     target_role: Option<&str>,
-    extra: &[(String, String)],
+    extra: &[(String, Option<String>)],
 ) {
     session.insert(IMPERSONATOR_SESSION_KEY, real_id).await;
     stash_identity_keys(session, extra).await;
@@ -711,7 +713,7 @@ async fn swap_identity(
 }
 
 /// Save the operator's value for each extra key, then write the target's.
-async fn stash_identity_keys(session: &Session, extra: &[(String, String)]) {
+async fn stash_identity_keys(session: &Session, extra: &[(String, Option<String>)]) {
     // Drop a stale stash first, so an old record cannot restore its keys later.
     session.remove(IMPERSONATOR_IDENTITY_SESSION_KEY).await;
     if extra.is_empty() {
@@ -725,7 +727,7 @@ async fn stash_identity_keys(session: &Session, extra: &[(String, String)]) {
             let old = session.get(key).await;
             saved.insert(key.clone(), old.map_or(serde_json::Value::Null, Into::into));
         }
-        session.insert(key, value.as_str()).await;
+        set_or_remove(session, key, value.as_deref()).await;
     }
     session
         .insert(
