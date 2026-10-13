@@ -13389,17 +13389,23 @@ struct FleetCommitHookWorkers {
 #[cfg(feature = "sqlite")]
 impl crate::db::fleet::FleetLifecycle for FleetCommitHookWorkers {
     fn on_open(&self, db: &crate::db::fleet::FleetDatabase) -> Result<(), String> {
+        // A stop token apart from `db.closed()`: the fleet stops the worker
+        // and waits for it before it closes the pool.
+        let stop = tokio_util::sync::CancellationToken::new();
         #[cfg(feature = "ws")]
-        crate::repository_commit_hooks::start_repository_commit_hook_worker(
+        let handle = crate::repository_commit_hooks::start_repository_commit_hook_worker(
             db.pool().clone(),
             Some(self.channels.clone()),
-            db.closed().clone(),
+            stop.clone(),
         );
         #[cfg(not(feature = "ws"))]
-        crate::repository_commit_hooks::start_repository_commit_hook_worker(
+        let handle = crate::repository_commit_hooks::start_repository_commit_hook_worker(
             db.pool().clone(),
-            db.closed().clone(),
+            stop.clone(),
         );
+        if let Some(handle) = handle {
+            db.register_worker(stop, handle);
+        }
         Ok(())
     }
 

@@ -1152,14 +1152,21 @@ fn sqlite_timestamp(instant: chrono::DateTime<chrono::Utc>) -> String {
 }
 
 #[cfg(all(feature = "ws", not(feature = "sqlite")))]
+/// Start the durable commit-hook worker. Returns its handle, or `None` when no
+/// handler is registered. Cancel `shutdown`, then await the handle: the
+/// iteration in flight settles (ack or nack) first.
+#[allow(
+    clippy::must_use_candidate,
+    reason = "app-wide workers stop on shutdown; only the fleet awaits the handle"
+)]
 pub fn start_repository_commit_hook_worker(
     pool: PgPool,
     channels: Option<crate::channels::Channels>,
     shutdown: CancellationToken,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     register_inventory_repository_commit_hook_runners();
     if !should_start_repository_commit_hook_worker(&registered_handler_keys()) {
-        return;
+        return None;
     }
 
     if let Some(ch) = channels.clone() {
@@ -1168,7 +1175,7 @@ pub fn start_repository_commit_hook_worker(
     }
 
     let worker_id = repository_commit_hook_worker_id();
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         if let Some(ch) = channels {
             CURRENT_CHANNELS
                 .scope(ch, async move {
@@ -1194,18 +1201,28 @@ pub fn start_repository_commit_hook_worker(
                 }
             }
         }
-    });
+    }))
 }
 
 #[cfg(all(not(feature = "ws"), not(feature = "sqlite")))]
-pub fn start_repository_commit_hook_worker(pool: PgPool, shutdown: CancellationToken) {
+/// Start the durable commit-hook worker. Returns its handle, or `None` when no
+/// handler is registered. Cancel `shutdown`, then await the handle: the
+/// iteration in flight settles (ack or nack) first.
+#[allow(
+    clippy::must_use_candidate,
+    reason = "app-wide workers stop on shutdown; only the fleet awaits the handle"
+)]
+pub fn start_repository_commit_hook_worker(
+    pool: PgPool,
+    shutdown: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
     register_inventory_repository_commit_hook_runners();
     if !should_start_repository_commit_hook_worker(&registered_handler_keys()) {
-        return;
+        return None;
     }
 
     let worker_id = repository_commit_hook_worker_id();
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => break,
@@ -1215,7 +1232,7 @@ pub fn start_repository_commit_hook_worker(pool: PgPool, shutdown: CancellationT
                 }
             }
         }
-    });
+    }))
 }
 
 // ── `SQLite` durable worker (#1996 item 5) ─────────────────────────────────────
@@ -1229,19 +1246,26 @@ pub fn start_repository_commit_hook_worker(pool: PgPool, shutdown: CancellationT
 // ack/nack) it is on and settles it before observing `cancelled()` on the next
 // pass, so no leased row is abandoned mid-flight.
 #[cfg(all(feature = "ws", feature = "sqlite"))]
+/// Start the durable commit-hook worker. Returns its handle, or `None` when no
+/// handler is registered. Cancel `shutdown`, then await the handle: the
+/// iteration in flight settles (ack or nack) first.
+#[allow(
+    clippy::must_use_candidate,
+    reason = "app-wide workers stop on shutdown; only the fleet awaits the handle"
+)]
 pub fn start_repository_commit_hook_worker(
     pool: RtPool,
     channels: Option<crate::channels::Channels>,
     shutdown: CancellationToken,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     register_inventory_repository_commit_hook_runners();
     if !should_start_repository_commit_hook_worker(&registered_handler_keys()) {
-        return;
+        return None;
     }
 
     let worker_id = repository_commit_hook_worker_id();
     let kick = sqlite_repository_commit_hook_kick(&pool);
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         if let Some(ch) = channels {
             CURRENT_CHANNELS
                 .scope(
@@ -1252,21 +1276,31 @@ pub fn start_repository_commit_hook_worker(
         } else {
             sqlite_repository_commit_hook_worker_loop(pool, worker_id, kick, shutdown).await;
         }
-    });
+    }))
 }
 
 #[cfg(all(not(feature = "ws"), feature = "sqlite"))]
-pub fn start_repository_commit_hook_worker(pool: RtPool, shutdown: CancellationToken) {
+/// Start the durable commit-hook worker. Returns its handle, or `None` when no
+/// handler is registered. Cancel `shutdown`, then await the handle: the
+/// iteration in flight settles (ack or nack) first.
+#[allow(
+    clippy::must_use_candidate,
+    reason = "app-wide workers stop on shutdown; only the fleet awaits the handle"
+)]
+pub fn start_repository_commit_hook_worker(
+    pool: RtPool,
+    shutdown: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
     register_inventory_repository_commit_hook_runners();
     if !should_start_repository_commit_hook_worker(&registered_handler_keys()) {
-        return;
+        return None;
     }
 
     let worker_id = repository_commit_hook_worker_id();
     let kick = sqlite_repository_commit_hook_kick(&pool);
-    tokio::spawn(sqlite_repository_commit_hook_worker_loop(
+    Some(tokio::spawn(sqlite_repository_commit_hook_worker_loop(
         pool, worker_id, kick, shutdown,
-    ));
+    )))
 }
 
 #[cfg(feature = "sqlite")]
