@@ -481,14 +481,14 @@ pub mod pg {
     const CONNECT_TIMEOUT_SECS: u64 = 5;
 
     /// Statement timeout on each store connection.
-    const STATEMENT_TIMEOUT_MS: u64 = 5_000;
+    pub(crate) const STATEMENT_TIMEOUT_MS: u64 = 5_000;
 
     /// Longest wait between refresh attempts while refreshes fail.
     const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
     /// Add `connect_timeout` to `url` when it sets none, so that a refresh
     /// cannot hang on a connect.
-    fn with_connect_timeout(url: &str) -> String {
+    pub(crate) fn with_connect_timeout(url: &str) -> String {
         if has_connect_timeout(url) {
             url.to_owned()
         } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
@@ -559,7 +559,7 @@ pub mod pg {
 
     /// Wait before the next refresh attempt after `failures` failed attempts
     /// in a row: `base`, doubled for each failure, up to `MAX_RETRY_DELAY`.
-    fn retry_delay(base: Duration, failures: u32) -> Duration {
+    pub(crate) fn retry_delay(base: Duration, failures: u32) -> Duration {
         if failures == 0 {
             return base;
         }
@@ -1844,28 +1844,46 @@ pub(crate) const PRELOAD_WAIT: std::time::Duration = std::time::Duration::from_s
 /// the app.
 pub(crate) fn preload_blocking(service: &FeatureFlagService, wait: std::time::Duration) {
     let service = service.clone();
+    preload_with(
+        "feature flag",
+        "flags use declared defaults",
+        wait,
+        move || service.preload(),
+    );
+}
+
+/// Run `load` on its own thread and wait up to `wait`. `what` names the
+/// store in logs. `fallback` says what the app does without the load.
+pub(crate) fn preload_with<E: std::fmt::Display + Send + 'static>(
+    what: &'static str,
+    fallback: &'static str,
+    wait: std::time::Duration,
+    load: impl FnOnce() -> Result<(), E> + Send + 'static,
+) {
     let (done, loaded) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
-        .name("autumn-flag-preload".to_owned())
+        .name(format!("autumn-{}-preload", what.replace(' ', "-")))
         .spawn(move || {
             // The receiver can be gone after a timeout.
-            let _ = done.send(service.preload());
+            let _ = done.send(load());
         });
     if let Err(error) = spawned {
-        tracing::warn!(%error, "feature flag preload thread did not start");
+        tracing::warn!(%error, "{what} preload thread did not start");
         return;
     }
     match loaded.recv_timeout(wait) {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            tracing::warn!(%error, "feature flag preload failed; flags use declared defaults");
+            tracing::warn!(%error, "{what} preload failed; {fallback}");
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => tracing::warn!(
-            ?wait,
-            "feature flag preload is slow; the app continues with declared defaults"
-        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(
+                ?wait,
+                "{what} preload is slow; the app continues: {fallback}"
+            );
+        }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            tracing::warn!("feature flag preload panicked");
+            tracing::warn!("{what} preload panicked");
         }
     }
 }
