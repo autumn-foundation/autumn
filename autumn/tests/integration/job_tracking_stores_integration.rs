@@ -425,6 +425,31 @@ mod pg_clock_skew {
 
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
+    async fn retry_reset_uses_the_database_clock_for_expiry() {
+        let (_container, pool) = start_pool().await;
+        let writer = skewed(&pool, 60, -chrono::TimeDelta::hours(1));
+        writer
+            .create("retry", TrackedJobOwner::Anonymous)
+            .await
+            .expect("create");
+        writer.mark_running("retry").await.expect("mark_running");
+        let before = writer.get("retry").await.expect("get").expect("live");
+        writer
+            .reset_for_retry("retry", TrackedJobOwner::Anonymous, before.updated_at)
+            .await
+            .expect("reset");
+
+        let reader = PgJobTrackingStore::new(pool.clone(), 60);
+        let after = reader.get("retry").await.expect("get").expect("live");
+        assert_eq!(
+            after.status,
+            autumn_web::job_tracking::TrackedJobStatus::Pending,
+            "the reset must apply and leave a live record"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
     async fn extreme_ttl_neither_errors_nor_expires() {
         let (_container, pool) = start_pool().await;
         let store = PgJobTrackingStore::new(pool.clone(), u64::MAX);
