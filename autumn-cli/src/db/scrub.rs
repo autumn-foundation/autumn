@@ -2330,6 +2330,13 @@ fn same_database(a: &str, b: &str) -> bool {
     same_database_with(a, b, &|key| std::env::var(key).ok())
 }
 
+/// Whether two resolved hosts can name one server. The default socket
+/// directory is unknown, so an empty host may be any socket path.
+fn hosts_match(left: &str, right: &str) -> bool {
+    let is_socket = |h: &str| h.starts_with('/');
+    left == right || (left.is_empty() && is_socket(right)) || (right.is_empty() && is_socket(left))
+}
+
 /// Like [`same_database`], but the caller passes the environment lookup.
 /// Tests then do not set process environment variables.
 ///
@@ -2389,13 +2396,10 @@ fn same_database_with(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) ->
         );
         // `dbname` is presence-based. An empty name defaults to `PGDATABASE`,
         // then to the user name, then to the OS login, as in libpq.
-        let name = params.get("dbname").cloned().unwrap_or_else(|| {
-            parsed
-                .path_segments()
-                .and_then(|mut s| s.next())
-                .map(decode)
-                .unwrap_or_default()
-        });
+        let name = params
+            .get("dbname")
+            .cloned()
+            .unwrap_or_else(|| decode(parsed.path().trim_start_matches('/')));
         let name = if name.is_empty() {
             env("PGDATABASE")
                 .filter(|v| !v.is_empty())
@@ -2414,9 +2418,9 @@ fn same_database_with(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) ->
         Some((host, port, name))
     };
     match (parts(a), parts(b)) {
-        (Some(left), Some(right)) => left == right,
-        // A URL this parser cannot read matches only an identical string.
-        _ => a.contains("://") && a == b,
+        (Some((lh, lp, ln)), Some((rh, rp, rn))) => hosts_match(&lh, &rh) && lp == rp && ln == rn,
+        // A Postgres URL this parser cannot read matches only an identical string.
+        _ => (a.starts_with("postgres://") || a.starts_with("postgresql://")) && a == b,
     }
 }
 
@@ -9065,6 +9069,16 @@ mod tests {
             "postgres://prod/db1",
             &|k| (k == "PGDATABASE").then(|| "db1".to_owned())
         ));
+        // A non-Postgres scheme never names a Postgres database.
+        assert!(!same_database_with(
+            "sqlite:///app",
+            "postgres:///app",
+            &|_| None
+        ));
+    }
+
+    #[test]
+    fn libpq_defaults_and_full_paths_name_the_database() {
         // An omitted port defaults to `PGPORT`.
         assert!(same_database_with(
             "postgres://prod.example/app",
@@ -9077,10 +9091,33 @@ mod tests {
             &format!("postgres://prod.example/{}", crate::pg::current_os_user()),
             &|_| None
         ));
-        // A non-Postgres scheme never names a Postgres database.
+        // A database name may hold a slash: the whole path is the name.
+        assert!(same_database_with(
+            "postgres://prod/db/name",
+            "postgres://prod/db%2Fname",
+            &|_| None
+        ));
+        assert!(!same_database_with(
+            "postgres://prod/db/name",
+            "postgres://prod/db",
+            &|_| None
+        ));
+        // The default socket directory is unknown, so an empty host may be any
+        // socket path.
+        assert!(same_database_with(
+            "postgres:///app?host=",
+            "postgres:///app?host=/var/run/postgresql",
+            &|_| None
+        ));
+        assert!(!same_database_with(
+            "postgres:///app?host=",
+            "postgres://h.example.com/app",
+            &|_| None
+        ));
+        // The same non-Postgres URL is not a source overwrite.
         assert!(!same_database_with(
             "sqlite:///app",
-            "postgres:///app",
+            "sqlite:///app",
             &|_| None
         ));
     }
