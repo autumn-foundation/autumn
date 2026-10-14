@@ -25,7 +25,7 @@
 //! queue exactly as they would have once `accept()` stopped anyway.
 //!
 //! The serve loop adds a second layer. See "Shutdown" in `http_server.rs`.
-//! It waits for the first byte of a connection that has read nothing yet.
+//! It waits for the first request of a connection that has served none yet.
 
 use std::time::Duration;
 

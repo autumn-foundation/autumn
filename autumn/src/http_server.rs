@@ -32,8 +32,9 @@
 //! # Shutdown
 //!
 //! After `signal`, hyper closes an idle connection at once. A connection that
-//! has read no byte yet can already hold its request in the socket. So the
-//! loop waits for its first byte, up to `FRESH_GRACE`, before it drains it.
+//! has served no request yet can already hold its request in the socket. So
+//! the loop waits for its first request, up to `FRESH_GRACE` or the head
+//! timer, before it drains it.
 
 use std::convert::Infallible;
 use std::fmt::Debug;
@@ -341,14 +342,16 @@ where
             inner: service,
             timers: timers.clone(),
         };
-        let service = service.map_request(|req: axum::http::Request<hyper::body::Incoming>| {
-            req.map(axum::body::Body::new)
-        });
+        let first_request = Arc::new(FirstRequest::default());
+        let marker = Arc::clone(&first_request);
+        let service =
+            service.map_request(move |req: axum::http::Request<hyper::body::Incoming>| {
+                marker.mark();
+                req.map(axum::body::Body::new)
+            });
         let hyper_service = hyper_util::service::TowerToHyperService::new(service);
-        let first_byte = Arc::new(FirstByte::default());
         let io = TokioIo::new(ConnIo {
             inner: io,
-            first_byte: Arc::clone(&first_byte),
             timers: timers.clone(),
             _permit: permit,
         });
@@ -376,7 +379,8 @@ where
                     biased;
                     _ = conn.as_mut() => break,
                     () = &mut signal_closed, if !shutting_down => {
-                        if await_first_byte(conn.as_mut(), &first_byte).await {
+                        let timer = timers.as_ref().and_then(|t| t.deadline(None));
+                        if await_first_request(conn.as_mut(), &first_request, timer).await {
                             break;
                         }
                         grace_until = Some(Instant::now() + SHUTDOWN_GRACE);
@@ -430,26 +434,26 @@ async fn changed(timers: Option<&ConnTimers>) {
     }
 }
 
-/// How long a connection that has read no byte yet may wait for its first
-/// request after a shutdown begins. Its request can already be in the socket
+/// How long a connection that has served no request yet may wait for its
+/// first one after a shutdown begins. Its request can already be in the socket
 /// while a starved task has not read it. Closing it then resets the client.
 const FRESH_GRACE: Duration = Duration::from_millis(500);
 
-/// Whether the connection has read its first byte.
+/// Whether the connection has started its first request.
 #[derive(Default)]
-struct FirstByte {
+struct FirstRequest {
     seen: AtomicBool,
     arrived: Notify,
 }
 
-impl FirstByte {
+impl FirstRequest {
     fn mark(&self) {
         if !self.seen.swap(true, Ordering::Relaxed) {
             self.arrived.notify_waiters();
         }
     }
 
-    /// Resolves at the first byte, or at once if it is in.
+    /// Resolves at the first request, or at once if it is in.
     async fn wait(&self) {
         let arrived = self.arrived.notified();
         tokio::pin!(arrived);
@@ -464,21 +468,26 @@ impl FirstByte {
     }
 }
 
-/// Keep reading a fresh connection until its first byte or `FRESH_GRACE`.
-/// hyper closes an idle connection at once, and a fresh one may have its
-/// request in the socket. Returns `true` when the connection already closed.
-async fn await_first_byte(
+/// Keep reading a fresh connection until its first request, `FRESH_GRACE`,
+/// or `deadline` (the connection timer). hyper closes an idle connection at
+/// once, and a fresh one may have its request in the socket. Returns `true`
+/// when the connection must end now: it already closed, or it sent no complete
+/// request in time. Without this, a partial head could hold the drain open.
+async fn await_first_request(
     mut conn: Pin<&mut impl std::future::Future>,
-    first_byte: &FirstByte,
+    first_request: &FirstRequest,
+    deadline: Option<Instant>,
 ) -> bool {
-    if first_byte.is_seen() {
+    if first_request.is_seen() {
         return false;
     }
+    let limit = Instant::now() + FRESH_GRACE;
+    let limit = deadline.map_or(limit, |deadline| deadline.min(limit));
     tokio::select! {
         biased;
         _ = conn.as_mut() => true,
-        () = first_byte.wait() => false,
-        () = tokio::time::sleep(FRESH_GRACE) => false,
+        () = first_request.wait() => false,
+        () = tokio::time::sleep_until(limit) => !first_request.is_seen(),
     }
 }
 
@@ -1034,7 +1043,6 @@ impl ConnTimers {
 /// The accepted IO, with the connection permit and the read hook.
 struct ConnIo<I> {
     inner: I,
-    first_byte: Arc<FirstByte>,
     timers: Option<Arc<ConnTimers>>,
     _permit: Option<Slot>,
 }
@@ -1047,11 +1055,10 @@ impl<I: AsyncRead + Unpin> AsyncRead for ConnIo<I> {
     ) -> Poll<io::Result<()>> {
         let before = buf.filled().len();
         let result = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if buf.filled().len() > before {
-            self.first_byte.mark();
-            if let Some(timers) = &self.timers {
-                timers.on_read(&buf.filled()[before..]);
-            }
+        if buf.filled().len() > before
+            && let Some(timers) = &self.timers
+        {
+            timers.on_read(&buf.filled()[before..]);
         }
         result
     }
@@ -1724,6 +1731,102 @@ mod tests {
     }
 
     /// A fresh connection that never sends must not hold the drain open.
+    /// A partial head must not hold the drain open when no timer is set.
+    #[tokio::test]
+    async fn a_partial_head_does_not_hold_the_drain() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (addr, stop, task) = serve_for_test().await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client.write_all(b"GET / HT").await.expect("partial");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        stop.cancel();
+        let done = tokio::time::timeout(Duration::from_secs(3), task).await;
+        done.expect("the drain must end")
+            .expect("task")
+            .expect("serve");
+    }
+
+    /// The head timer still bounds a fresh connection during the drain.
+    #[tokio::test]
+    async fn the_head_timer_bounds_the_fresh_wait() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let stop = tokio_util::sync::CancellationToken::new();
+        let router = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let make_service =
+            axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
+                crate::accept_drain::TcpPeer,
+            >(router);
+        let limits = HttpLimits {
+            header_read_timeout: Some(Duration::from_millis(150)),
+            ..HttpLimits::default()
+        };
+        let task = tokio::spawn(serve(
+            crate::accept_drain::StopAcceptingOnShutdown::new(listener, stop.clone()),
+            make_service,
+            limits,
+            crate::accept_drain::drain_signal(stop.clone()),
+        ));
+        let _client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let started = Instant::now();
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("the drain must end")
+            .expect("task")
+            .expect("serve");
+        assert!(
+            started.elapsed() < FRESH_GRACE + Duration::from_millis(100),
+            "the head timer must end the wait before FRESH_GRACE, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// An HTTP/2 preface is not a request: the drain waits for the HEADERS.
+    #[tokio::test]
+    async fn an_h2_preface_alone_does_not_start_the_drain() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let (addr, stop, task) = serve_for_test().await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client.write_all(H2_PREFACE).await.expect("preface");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        stop.cancel();
+        // Settings, then HEADERS (GET /) after the settle window.
+        tokio::time::sleep(crate::accept_drain::ACCEPT_SETTLE + Duration::from_millis(50)).await;
+        let settings = [0, 0, 0, 0x4, 0, 0, 0, 0, 0]; // empty SETTINGS, stream 0
+        // HPACK: :method GET, :scheme http, :path /, :authority t
+        let headers = frame(
+            H2_FRAME_HEADERS,
+            H2_FLAG_END_HEADERS | 0x1,
+            &[0x82, 0x86, 0x84, 0x41, 0x01, b't'],
+        );
+        let _ = client.write_all(&settings).await;
+        let _ = client.write_all(&headers).await;
+        let mut raw = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut raw)).await;
+        // A response HEADERS frame (type 0x1) must be among the frames; a
+        // GOAWAY alone (type 0x7) means the request was refused.
+        let mut types = Vec::new();
+        let mut i = 0;
+        while i + 9 <= raw.len() {
+            let len = (usize::from(raw[i]) << 16)
+                | (usize::from(raw[i + 1]) << 8)
+                | usize::from(raw[i + 2]);
+            types.push(raw[i + 3]);
+            i += 9 + len;
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+        assert!(
+            types.contains(&H2_FRAME_HEADERS),
+            "no response, frame types {types:?}"
+        );
+    }
+
     /// A stuck make-service must not hang the drain.
     #[tokio::test]
     async fn a_stuck_make_service_does_not_hang_the_drain() {
