@@ -478,7 +478,8 @@ async fn a_contract_calibrated_under_another_profile_does_not_throttle() {
 fn the_public_resolvers_check_the_calibrated_profile() {
     use autumn_web::capacity::{
         AdmissionLimit, HostProfile, resolve_admission_limit_for_profile,
-        resolve_admission_limit_with_default, resolve_configured_admission_limit_for_profile,
+        resolve_admission_limit_with_default, resolve_configured_admission_limit,
+        resolve_configured_admission_limit_for_profile,
         resolve_configured_admission_limit_with_default,
     };
     let _guard = install_capture().1;
@@ -505,6 +506,10 @@ fn the_public_resolvers_check_the_calibrated_profile() {
     );
     assert_eq!(
         resolve_configured_admission_limit_with_default(None, Some(text), Some(9)),
+        AdmissionLimit::Contract(7)
+    );
+    assert_eq!(
+        resolve_configured_admission_limit(None, Some(text)),
         AdmissionLimit::Contract(7)
     );
 }
