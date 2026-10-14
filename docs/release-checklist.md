@@ -95,10 +95,11 @@ produced it.
   component-by-component, and requires its root component version to equal both
   `[workspace.package].version` and the pushed tag. The verified file is handed
   to `prepare-release` as an artifact, so what ships is exactly what passed.
-- Attestations are published by `release.yml` and `cli-release.yml`, which need
-  `id-token: write` + `attestations: write`. Both attest **before** uploading,
-  so an attestation failure stops the release rather than leaving unattested
-  assets on a live one.
+- Attestations are published by the Publish Gate: its `sbom-attest` job signs
+  the SBOM, and its `cli-binaries` job (`cli-release.yml`) builds and signs the
+  CLI archives. Both need `id-token: write` + `attestations: write`. The tag push
+  triggers them, so the provenance names the tag. `release.yml` only uploads
+  the assets. A failed build or attestation stops the release.
 
 Consumers verify with one command; the full walkthrough, including the
 negative (tampered-asset) case, is in

@@ -69,18 +69,18 @@ Loaded 1 attestation from GitHub API
 
 sha256:… was attested by:
 REPO                       PREDICATE_TYPE                  WORKFLOW
-autumn-foundation/autumn   https://slsa.dev/provenance/v1  .github/workflows/release.yml@refs/heads/trunk
+autumn-foundation/autumn   https://slsa.dev/provenance/v1  .github/workflows/cli-release.yml@refs/tags/vX.Y.Z
 ```
 
-> **What the source ref means.** The SBOM asset is attested by the Publish
-> Gate, which the tag push triggers directly, so its provenance records the tag
-> and the tagged commit. The CLI archives are attested by `cli-release.yml`,
-> which runs as a child of the `workflow_run`-triggered release workflow — and
-> GitHub always runs those in default-branch context, so their recorded ref and
-> commit name the default branch even though the build checked the tag out.
-> For those assets the subject digest, the repository and the CI run are exact;
-> the ref is not. Verify with `--repo`, and do not add `--source-ref
-> refs/tags/...` for an archive, which would fail against a genuine asset.
+Both assets are attested by workflows that the tag push triggers directly. The
+provenance records the tag and the tagged commit. To pin an archive to its
+release, add `--source-ref`:
+
+```bash
+gh attestation verify autumn-x86_64-unknown-linux-musl.tar.gz \
+  --repo autumn-foundation/autumn \
+  --source-ref refs/tags/vX.Y.Z
+```
 
 `--repo autumn-foundation/autumn` is **not optional**. Without it, an
 attestation from *any* repository would satisfy the check — including one an

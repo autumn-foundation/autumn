@@ -736,34 +736,173 @@ fn the_sbom_is_attested_in_tag_context() {
     );
 }
 
-/// A reusable workflow can only DOWNGRADE the caller job's token, so the
-/// `permissions:` block inside cli-release.yml is inert unless the calling job
-/// grants the same scopes. Without this the attestation step fails and, running
-/// before the upload, the release ends up with no CLI binaries at all.
+/// The CLI archives must be built and attested in tag context (#2380).
+/// `release.yml` is `workflow_run`-triggered, so GitHub runs it in
+/// default-branch context and the provenance would name that branch. The
+/// Publish Gate is triggered by the tag push, so it calls `cli-release.yml`.
 #[test]
-fn the_binaries_job_passes_down_the_scopes_attestation_needs() {
-    let release = code_only(&read_repo_file(".github/workflows/release.yml"));
-    let binaries = release
-        .split_once("binaries:")
-        .expect("release.yml must still have a binaries job")
-        .1;
-    let perms = binaries
-        .split_once("permissions:")
-        .expect("the binaries job must declare permissions")
-        .1;
-    // Only look at the permissions block itself, not the rest of the file.
-    let block: String = perms
-        .lines()
-        .take_while(|l| l.trim().is_empty() || l.starts_with("      "))
-        .collect::<Vec<_>>()
-        .join("\n");
-    for scope in ["id-token: write", "attestations: write", "contents: write"] {
+fn cli_archives_are_built_and_attested_in_tag_context() {
+    let gate = read_repo_file(".github/workflows/publish-gate.yml");
+    let (_, body) = workflow_jobs(&gate)
+        .into_iter()
+        .find(|(name, _)| name == "cli-binaries")
+        .expect("publish-gate.yml must have a `cli-binaries` job");
+
+    assert!(
+        body.contains("uses: ./.github/workflows/cli-release.yml"),
+        "`cli-binaries` must call cli-release.yml:\n{body}"
+    );
+    assert!(
+        body.contains("github.ref_type == 'tag'"),
+        "`cli-binaries` must run on tag pushes only. Its token is not \
+         conditional, so a skipped job is what keeps pull requests unsigned:\n{body}"
+    );
+    for scope in ["id-token: write", "attestations: write"] {
         assert!(
-            block.contains(scope),
-            "the binaries job must grant `{scope}` — a called workflow cannot add \
-             it back:\n{block}"
+            body.contains(scope),
+            "`cli-binaries` must grant `{scope}`. A called workflow cannot add it back:\n{body}"
         );
     }
+    assert!(
+        body.contains("tag: ${{ github.ref_name }}"),
+        "`cli-binaries` must pass the pushed tag:\n{body}"
+    );
+    assert!(
+        body.contains("attach_to_release: false"),
+        "`cli-binaries` must not upload. The release does not exist yet:\n{body}"
+    );
+}
+
+/// A build failure must stop the release, not publish it without binaries.
+#[test]
+fn prepare_release_waits_for_the_cli_binaries() {
+    let gate = read_repo_file(".github/workflows/publish-gate.yml");
+    let (_, body) = workflow_jobs(&gate)
+        .into_iter()
+        .find(|(name, _)| name == "prepare-release")
+        .expect("publish-gate.yml must have a `prepare-release` job");
+    let needs = body
+        .lines()
+        .find(|l| l.trim_start().starts_with("needs:"))
+        .expect("`prepare-release` must declare `needs`");
+    assert!(
+        needs.contains("cli-binaries"),
+        "`prepare-release` must need `cli-binaries`:\n{needs}"
+    );
+}
+
+/// `release.yml` only uploads the archives the gate already built and
+/// attested. Rebuilding them there would put the default branch back into
+/// the provenance. It must also fail loudly on a short download, or the
+/// release ships without binaries and breaks `scripts/install.sh`.
+#[test]
+fn release_workflow_uploads_the_gate_built_archives() {
+    let release = code_only(&read_repo_file(".github/workflows/release.yml"));
+    assert!(
+        !release.contains("cli-release.yml"),
+        "release.yml must not rebuild the CLI archives:\n{release}"
+    );
+
+    let (_, body) = workflow_jobs(&release)
+        .into_iter()
+        .find(|(name, _)| name == "binaries")
+        .expect("release.yml must still have a `binaries` job");
+
+    assert!(
+        body.contains("needs: release"),
+        "the release must exist before assets are uploaded:\n{body}"
+    );
+    for needle in [
+        "actions/download-artifact",
+        "pattern: autumn-*",
+        "merge-multiple: true",
+        "run-id: ${{ github.event.workflow_run.id }}",
+        "gh release upload",
+        "--clobber",
+    ] {
+        assert!(body.contains(needle), "`binaries` must use `{needle}`:\n{body}");
+    }
+    assert!(
+        body.contains("actions: read"),
+        "a job-level `permissions:` replaces the workflow one. Cross-run \
+         downloads need `actions: read`:\n{body}"
+    );
+    for scope in ["id-token: write", "attestations: write"] {
+        assert!(
+            !body.contains(scope),
+            "`binaries` mints nothing and must not hold `{scope}`:\n{body}"
+        );
+    }
+    assert!(
+        body.contains("TAG: ${{ needs.release.outputs.tag }}"),
+        "the tag must reach the shell through `env:`:\n{body}"
+    );
+    // One archive + one checksum for each of the five targets.
+    assert!(
+        body.contains("-ne 10") || body.contains("!= 10"),
+        "`binaries` must fail unless exactly 10 assets were downloaded:\n{body}"
+    );
+}
+
+/// `attach_to_release` defaults to true for both triggers, so the
+/// `workflow_dispatch` escape hatch still attaches when given a tag.
+#[test]
+fn cli_release_attach_step_is_optional_and_defaults_on() {
+    let cli_release = code_only(&read_repo_file(".github/workflows/cli-release.yml"));
+    assert_eq!(
+        cli_release.matches("attach_to_release:").count(),
+        2,
+        "both `workflow_call` and `workflow_dispatch` need the input:\n{cli_release}"
+    );
+    let (_, trigger) = cli_release.split_once("\non:").expect("`on:` block");
+    let trigger = trigger.split("\npermissions:").next().unwrap();
+    assert_eq!(
+        trigger.matches("default: true").count(),
+        2,
+        "`attach_to_release` must default to true in both triggers:\n{trigger}"
+    );
+    assert_eq!(
+        trigger.matches("type: boolean").count(),
+        2,
+        "`attach_to_release` must be boolean in both triggers:\n{trigger}"
+    );
+
+    let attach = cli_release
+        .split_once("name: Attach to release")
+        .expect("cli-release.yml must keep its `Attach to release` step")
+        .1;
+    let condition = attach
+        .lines()
+        .find(|l| l.trim_start().starts_with("if:"))
+        .expect("`Attach to release` must be conditional");
+    assert!(
+        condition.contains("inputs.tag != ''") && condition.contains("inputs.attach_to_release"),
+        "attach only for a real tag, and only when asked:\n{condition}"
+    );
+}
+
+/// The "default branch" caveat no longer applies. Leaving it in place would
+/// tell readers not to use `--source-ref`, which now works.
+#[test]
+fn docs_no_longer_carry_the_default_branch_caveat() {
+    let doc = read_repo_file("docs/guide/supply-chain.md");
+    assert!(
+        !doc.contains("do not add `--source-ref"),
+        "supply-chain.md must drop the `--source-ref` warning"
+    );
+    assert!(
+        doc.contains("--source-ref refs/tags/"),
+        "supply-chain.md must show `--source-ref refs/tags/<tag>`"
+    );
+    assert!(
+        !doc.contains("release.yml@refs/heads/"),
+        "the sample output must name `cli-release.yml@refs/tags/<tag>`"
+    );
+    let cli_release = read_repo_file(".github/workflows/cli-release.yml");
+    assert!(
+        !cli_release.contains("NOTE ON THE RECORDED SOURCE REF"),
+        "cli-release.yml must drop the stale caveat"
+    );
 }
 
 #[test]
