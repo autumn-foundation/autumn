@@ -57,16 +57,29 @@ struct StaticGetAttrs {
     content_type: Option<LitStr>,
 }
 
-/// Check a declared `Content-Type`. Same rule as the runtime
-/// (`usable_recorded_content_type`): non-blank, visible ASCII or tab.
-/// Keep both in step. A test in `autumn` pins the runtime byte set.
+/// A byte of an RFC 9110 token.
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
+/// Check a declared `Content-Type`.
+///
+/// The byte rule is the runtime rule (`usable_recorded_content_type`):
+/// non-blank, visible ASCII or tab. Keep both in step. A test in `autumn`
+/// pins the runtime byte set. On top of that, the part before `;` must be
+/// `type/subtype` with token bytes only, and a comma is never allowed.
 fn validate_content_type(lit: &LitStr) -> syn::Result<()> {
     let value = lit.value();
     let legal = |b: u8| b == b'\t' || (0x20..0x7f).contains(&b);
-    if value.trim().is_empty() || !value.bytes().all(legal) {
+    let essence = value.split(';').next().unwrap_or_default().trim();
+    let well_formed = essence.split_once('/').is_some_and(|(kind, subtype)| {
+        let token = |t: &str| !t.is_empty() && t.bytes().all(is_token_byte);
+        token(kind) && token(subtype)
+    });
+    if value.trim().is_empty() || !value.bytes().all(legal) || value.contains(',') || !well_formed {
         return Err(syn::Error::new(
             lit.span(),
-            "`content_type` must be a non-empty media type in visible ASCII, \
+            "`content_type` must be a media type, \
              e.g. `content_type = \"application/rss+xml\"`.",
         ));
     }
@@ -806,6 +819,14 @@ mod tests {
             quote! { "/a", content_type = "text/\u{e9}html" },
             quote! { "/a", content_type = "text/html\r\nX: y" },
             quote! { "/a", content_type = 42 },
+            quote! { "/a", content_type = "text" },
+            quote! { "/a", content_type = "/" },
+            quote! { "/a", content_type = "text/" },
+            quote! { "/a", content_type = "/plain" },
+            quote! { "/a", content_type = "a/b/c" },
+            quote! { "/a", content_type = "image/png, text/html" },
+            quote! { "/a", content_type = "text /plain" },
+            quote! { "/a", content_type = "text/plain; a=\"b\"; c=d," },
             quote! { "/a", content_type = "a/b", content_type = "c/d" },
         ] {
             let generated = expand(bad.clone());
@@ -813,6 +834,21 @@ mod tests {
                 generated.contains("compile_error"),
                 "must reject `{bad}`: {generated}"
             );
+        }
+    }
+
+    #[test]
+    fn static_get_accepts_well_formed_media_types() {
+        for good in [
+            "text/html",
+            "application/rss+xml",
+            "text/plain; charset=utf-8",
+            "application/rss+xml;\tprofile=\"x\"",
+            "image/svg+xml",
+            "  text/csv  ",
+        ] {
+            let generated = expand(quote! { "/a", content_type = #good });
+            assert!(!generated.contains("compile_error"), "{good}: {generated}");
         }
     }
 

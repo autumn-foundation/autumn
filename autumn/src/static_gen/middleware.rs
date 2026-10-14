@@ -236,8 +236,10 @@ pub fn resolved_content_type(
 /// The `Content-Type` to serve for a manifest `entry` (#2403).
 ///
 /// A declared type is served as is. An inferred one goes through
-/// [`resolved_content_type`].
-fn entry_content_type(
+/// [`resolved_content_type`]. An app that serves `dist/` itself must use this
+/// function to match Autumn.
+#[must_use]
+pub fn resolved_entry_content_type(
     entry: &ManifestEntry,
     route_path: &str,
     file_path: &Path,
@@ -406,7 +408,7 @@ impl StaticFileLayer {
             );
         }
 
-        let content_type = entry_content_type(entry, request_path, &file_path);
+        let content_type = resolved_entry_content_type(entry, request_path, &file_path);
 
         Some(ResolvedStatic {
             file_path,
@@ -1952,21 +1954,24 @@ mod tests {
     #[test]
     fn explicit_generic_type_is_served_as_declared() {
         let entry = explicit_entry("application/octet-stream", None);
-        let value = entry_content_type(&entry, "/logo.png", Path::new("logo.png/index.html"));
+        let value =
+            resolved_entry_content_type(&entry, "/logo.png", Path::new("logo.png/index.html"));
         assert_eq!(value, "application/octet-stream");
     }
 
     #[test]
     fn explicit_entry_with_an_unusable_type_still_falls_back() {
         let entry = explicit_entry("   ", None);
-        let value = entry_content_type(&entry, "/logo.png", Path::new("logo.png/index.html"));
+        let value =
+            resolved_entry_content_type(&entry, "/logo.png", Path::new("logo.png/index.html"));
         assert_eq!(value, "image/png");
     }
 
     #[test]
     fn explicit_entry_with_a_non_ascii_type_falls_back() {
         let entry = explicit_entry("image/p\u{e9}ng", None);
-        let value = entry_content_type(&entry, "/logo.png", Path::new("logo.png/index.html"));
+        let value =
+            resolved_entry_content_type(&entry, "/logo.png", Path::new("logo.png/index.html"));
         assert_eq!(value, "image/png");
     }
 
