@@ -1111,13 +1111,12 @@ where
                     .and_then(|key| data.get(key).cloned());
                 // Lock the alias before the session is visible: a request
                 // with the saved session then finds its key in flight.
-                if let Err(error) = crate::idempotency::reserve_deferred_session_replay_key(
+                if let Some(reserve) = crate::idempotency::reserve_deferred_session_replay_key(
                     &response,
                     Some(&sid),
                     primary_replay_after_guard_denial,
                     finalized_tenant.as_deref(),
-                )
-                .await
+                ) && let Err(error) = reserve.await
                 {
                     drop(inner_guard);
                     tracing::error!("session alias idempotency lock failed: {error}");

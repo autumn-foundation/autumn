@@ -1649,26 +1649,31 @@ pub(crate) fn add_deferred_session_replay_key(
 }
 
 /// Lock the alias key before the session is saved, so a request that
-/// presents the saved session finds the key in flight. `Err` means fail
-/// closed.
-pub(crate) async fn reserve_deferred_session_replay_key(
+/// presents the saved session finds the key in flight. `None` when no commit
+/// is pending; an `Err` from the future means fail closed.
+///
+/// Owns its inputs: the future must be `Send`, and `Response` is not `Sync`.
+pub(crate) fn reserve_deferred_session_replay_key(
     response: &Response<Body>,
     session_id: Option<&str>,
     primary_replay_after_guard_denial: bool,
     tenant_override: Option<&str>,
-) -> Result<(), IdempotencyStoreError> {
-    match response.extensions().get::<DeferredIdempotencyCommit>() {
-        Some(commit) => {
-            commit
-                .reserve_session_alias(
-                    session_id,
-                    primary_replay_after_guard_denial,
-                    tenant_override,
-                )
-                .await
-        }
-        None => Ok(()),
-    }
+) -> Option<IdempotencyFuture<'static, ()>> {
+    let commit = response
+        .extensions()
+        .get::<DeferredIdempotencyCommit>()?
+        .clone();
+    let session_id = session_id.map(str::to_owned);
+    let tenant_override = tenant_override.map(str::to_owned);
+    Some(Box::pin(async move {
+        commit
+            .reserve_session_alias(
+                session_id.as_deref(),
+                primary_replay_after_guard_denial,
+                tenant_override.as_deref(),
+            )
+            .await
+    }))
 }
 
 pub(crate) fn keep_deferred_session_commit_locked(response: &mut Response<Body>) {
