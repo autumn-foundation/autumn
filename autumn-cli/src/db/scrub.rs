@@ -2586,13 +2586,14 @@ fn database_endpoint(
     // rejects. Read them here and parse the rest behind a placeholder.
     let listed = authority_endpoints(&rest[..end])?;
     let parsed = url::Url::parse(&format!("{scheme}://placeholder{}", &rest[end..])).ok()?;
+    let pairs = raw_query_pairs(parsed.query().unwrap_or_default());
     let query = |key: &str| {
         // libpq takes the last nonempty occurrence of a repeated keyword.
-        parsed
-            .query_pairs()
-            .filter(|(k, v)| k == key && !v.is_empty())
-            .last()
-            .map(|(_, v)| v.into_owned())
+        pairs
+            .iter()
+            .rev()
+            .find(|(k, v)| k == key && !v.is_empty())
+            .map(|(_, v)| v.clone())
     };
     let name = query("dbname")
         .or_else(|| {
@@ -2803,10 +2804,35 @@ fn url_user(raw: &str) -> Option<String> {
     })
 }
 
-/// Whether a keyword/value connection string selects a libpq `service`.
+/// The `key=value` pairs of a URI query, percent-decoded only. A `+` stays a
+/// plus, as in the connection parser; `url::Url::query_pairs` would read it as
+/// a space.
+fn raw_query_pairs(query: &str) -> Vec<(String, String)> {
+    let decode = |text: &str| {
+        percent_encoding::percent_decode_str(text)
+            .decode_utf8_lossy()
+            .into_owned()
+    };
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (decode(key), decode(value))
+        })
+        .collect()
+}
+
+/// Whether a connection string selects a libpq `service`, as a keyword or as a
+/// URI query parameter.
 fn uses_libpq_service(raw: &str) -> bool {
-    !(raw.starts_with("postgres://") || raw.starts_with("postgresql://"))
-        && conninfo_pairs(raw).is_some_and(|pairs| pairs.iter().any(|(k, _)| k == "service"))
+    if raw.starts_with("postgres://") || raw.starts_with("postgresql://") {
+        let query = raw.split_once('?').map_or("", |(_, q)| q);
+        let query = query.split('#').next().unwrap_or_default();
+        raw_query_pairs(query).iter().any(|(k, _)| k == "service")
+    } else {
+        conninfo_pairs(raw).is_some_and(|pairs| pairs.iter().any(|(k, _)| k == "service"))
+    }
 }
 
 /// `raw` with any `user:password@` removed. An empty host with credentials
@@ -8785,7 +8811,8 @@ mod tests {
             "service=production user=app dbname=mydb"
         ));
         assert!(!uses_libpq_service("host=prod dbname=app"));
-        assert!(!uses_libpq_service("postgres://prod/app?service=x"));
+        assert!(uses_libpq_service("postgres:///app?service=production"));
+        assert!(!uses_libpq_service("postgres://prod/app?sslmode=require"));
     }
 
     #[test]
@@ -10274,6 +10301,11 @@ mod tests {
             &env
         ));
         assert!(same_database_in(
+            "postgres://db/?dbname=prod+db",
+            "postgres://db/prod+db",
+            &env
+        ));
+        assert!(same_database_in(
             "postgres://db:5432/app?port=6543",
             "postgres://db:6543/app",
             &env
@@ -10293,6 +10325,11 @@ mod tests {
             "postgres://b:6543/app",
             &env
         ));
+    }
+
+    #[test]
+    fn keyword_strings_and_ipv6_endpoints_compare_like_urls() {
+        let env = env_of(&[]);
         assert!(same_database_in(
             "host=prod dbname=app password=https://issuer",
             "postgres://prod/app",

@@ -752,7 +752,9 @@ apply-time error.
   schema in that window rolls the run back. The locks cover only the tables the
   run writes, so a change to any other table after the last comparison is not
   caught. Re-run the command. The SQL that `--dry-run` prints has the target
-  guard and the locks, but no schema-drift check.
+  guard and the locks, but no schema-drift check. The drift check covers names, hazard
+  sets (RLS, triggers, rules, views, generated columns) and nothing else: a
+  change to a key or other constraint after the probe is not detected.
 - **Encrypted columns get the same plan-time gates.** An `#[encrypted]` column
   must be `text`, `citext` or `varchar(n)`, and a `varchar(n)` must be wide
   enough for the replacement envelope (148 characters; 168 for an email-shaped
