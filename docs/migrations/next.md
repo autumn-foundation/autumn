@@ -1324,6 +1324,34 @@ minor version, before 1.0). Make the manifest again after such a release.
 
 **Automation:** `manual` - make the manifest again with the command above.
 
+### Repository: dependent cascades probe first and `delete_many` hooks parents first
+
+**Why:** A dependent cascade must fire no hook when a `restrict` blocks it, and
+`delete_by_id` and `delete_many` must fire hooks in one order (issue #2427).
+The public `DependentAction` enum gains a hidden `Probe` variant, and
+`RuntimeDependentSpec` gains a `probe` field.
+
+**Before (`0.8`):**
+
+- A `restrict` below a `destroy` leg could answer 409 after earlier hooks fired.
+- `delete_many` fired child hooks before the parents' `before_delete`.
+
+**After (`0.9`):**
+
+- Every `restrict` in the tree is probed before any hook fires.
+- `delete_many` fires every parent's `before_delete` first, as `delete_by_id` does.
+- The probe reads each `destroy` child set once more, and locks its rows.
+
+Most apps need no change. Two cases need work:
+
+- A `before_delete` hook that relied on a child hook firing first. Move that
+  logic to the child hook.
+- Code that matches `DependentAction` exhaustively, or builds a
+  `RuntimeDependentSpec` by hand. Add a wildcard arm, and set `probe: None`.
+  Both types are framework plumbing.
+
+**Automation:** `manual` — a hook-order dependency needs a human decision.
+
 ## Plugin authors
 
 Everything here is addressed to someone maintaining an `autumn-plugin-*` /

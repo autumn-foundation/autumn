@@ -854,6 +854,90 @@ async fn graceful_shutdown_settles_in_flight_hook_on_sqlite() {
     .await;
 }
 
+// ── (d2) the worker handle joins only after the in-flight hook is acked ───────
+
+#[tokio::test]
+async fn worker_handle_joins_after_the_in_flight_hook_is_acked_on_sqlite() {
+    let pool = boot("hook_handle_join").await;
+    let handler_key = unique_handler_key();
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (runner_started, runner_release) = (started.clone(), release.clone());
+    autumn_web::__private::register_repository_commit_hook_runner(
+        handler_key,
+        move |_ctx, _record| {
+            let (started, release) = (runner_started.clone(), runner_release.clone());
+            async move {
+                started.notify_one();
+                release.notified().await;
+                Ok(())
+            }
+        },
+        |_ctx, _record| async { Ok(()) },
+        |_ctx, _record| async { Ok(()) },
+    );
+    enqueue(&pool, handler_key, Some("join-1"), &json!({ "id": 1 })).await;
+
+    let stop = CancellationToken::new();
+    let handle =
+        autumn_web::__private::start_repository_commit_hook_worker(pool.clone(), stop.clone())
+            .expect("a handler is registered, so a worker starts");
+    kick(&pool);
+    started.notified().await;
+    stop.cancel();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!handle.is_finished(), "the worker waits for the hook");
+
+    release.notify_one();
+    handle.await.expect("the worker ends cleanly");
+    let row_id = single_row_id(&pool).await.expect("one queue row");
+    assert!(
+        matches!(hook_row_status(&pool, &row_id).await, Some((s, _)) if s == "completed"),
+        "the hook is acked before the handle joins"
+    );
+}
+
+// ── (d3) a stopping worker starts no new row ──────────────────────────────────
+
+#[tokio::test]
+async fn stopping_worker_claims_no_further_row_on_sqlite() {
+    let pool = boot("hook_stop_no_claim").await;
+    let handler_key = unique_handler_key();
+
+    let runs = Arc::new(AtomicU64::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (r, st, rel) = (runs.clone(), started.clone(), release.clone());
+    autumn_web::__private::register_repository_commit_hook_runner(
+        handler_key,
+        move |_ctx, _record| {
+            let (r, st, rel) = (r.clone(), st.clone(), rel.clone());
+            async move {
+                r.fetch_add(1, Ordering::SeqCst);
+                st.notify_one();
+                rel.notified().await;
+                Ok(())
+            }
+        },
+        |_ctx, _record| async { Ok(()) },
+        |_ctx, _record| async { Ok(()) },
+    );
+    enqueue(&pool, handler_key, Some("stop-1"), &json!({ "id": 1 })).await;
+    enqueue(&pool, handler_key, Some("stop-2"), &json!({ "id": 2 })).await;
+
+    let stop = CancellationToken::new();
+    let handle =
+        autumn_web::__private::start_repository_commit_hook_worker(pool.clone(), stop.clone())
+            .expect("a worker starts");
+    kick(&pool);
+    started.notified().await;
+    stop.cancel();
+    release.notify_one();
+    handle.await.expect("the worker ends cleanly");
+    assert_eq!(load(&runs), 1, "no new hook starts after the stop");
+}
+
 fn kick(pool: &SqlitePool) {
     autumn_web::__private::kick_repository_commit_hook_dispatcher(pool);
 }

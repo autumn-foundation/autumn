@@ -194,6 +194,10 @@ autumn sbom --binary my-app.arm64
 (Slices that agree are not a disagreement — a universal binary whose slices
 carry identical lists is read normally.)
 
+A fat header is always big-endian on disk. A file that starts with the
+byte-swapped magic (`be ba fe ca`) is refused with a clear error. No Apple tool
+writes it.
+
 > **If the `autumn` inside the image is older than `sbom`.** The image installs
 > the CLI at the version its Dockerfile pins, so an image scaffolded before this
 > feature shipped carries a CLI without the subcommand. The binary is still

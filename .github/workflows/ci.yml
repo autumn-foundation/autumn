@@ -2278,6 +2278,11 @@ jobs:
           # Shares the build above (same package and features).
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_fleet
+          # Issue #3231: the SQLite commit-hook worker loop (stop token, claim
+          # heartbeat guard). No other lane measures it, so Codecov reads those
+          # lines as uncovered. Same features, so no rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_commit_hook_worker
           # Issue #2319: the ledger's chain reads, paged verify and out-of-band
           # refusals run against a real database. These two targets are the
           # Docker-free half; without them Codecov reads that code as uncovered.

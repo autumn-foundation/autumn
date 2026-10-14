@@ -16,6 +16,7 @@ use autumn_web::job::{JobAdminQuery, JobAdminSnapshot, JobScheduleSummary, job_a
 use autumn_web::prelude::{HxRequest, HxResponseExt};
 use autumn_web::security::{CsrfFormField, CsrfToken, CsrfTokenHeader};
 use autumn_web::{AppState, AutumnError, AutumnResult};
+use axum::extract::rejection::ExtensionRejection;
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
@@ -104,6 +105,66 @@ impl<S: Send + Sync> FromRequestParts<S> for AdminCsrf {
     }
 }
 
+/// Per-request values shared by every admin page handler.
+///
+/// One extractor replaces the registry, prefix, CSRF and impersonation
+/// extractors each handler used to repeat. It builds the impersonation banner
+/// once. [`AdminPageCtx::chrome`] turns it into the layout input.
+pub struct AdminPageCtx {
+    registry: Arc<AdminRegistry>,
+    prefix: String,
+    actuator_prefix: String,
+    show_config: bool,
+    csrf: AdminCsrf,
+    banner: Option<templates::ImpersonationBanner>,
+}
+
+impl AdminPageCtx {
+    /// Layout input for a page that shows `messages`.
+    fn chrome<'a>(&'a self, messages: &'a [FlashMessage]) -> templates::AdminChrome<'a> {
+        templates::AdminChrome {
+            registry: &self.registry,
+            prefix: &self.prefix,
+            actuator_prefix: &self.actuator_prefix,
+            csrf_token: self.csrf.token(),
+            csrf_form_field: self.csrf.form_field(),
+            csrf_token_header: self.csrf.token_header(),
+            messages,
+            show_config: self.show_config,
+            impersonation: self.banner.as_ref(),
+        }
+    }
+}
+
+impl FromRequestParts<AppState> for AdminPageCtx {
+    type Rejection = ExtensionRejection;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let axum::Extension(registry) =
+            axum::Extension::<Arc<AdminRegistry>>::from_request_parts(parts, state).await?;
+        let axum::Extension(AdminPrefix(prefix)) =
+            axum::Extension::<AdminPrefix>::from_request_parts(parts, state).await?;
+        let axum::Extension(ActuatorPrefix(actuator_prefix)) =
+            axum::Extension::<ActuatorPrefix>::from_request_parts(parts, state).await?;
+        let axum::Extension(HasRuntimeConfig(show_config)) =
+            axum::Extension::<HasRuntimeConfig>::from_request_parts(parts, state).await?;
+        let Ok(csrf) = AdminCsrf::from_request_parts(parts, state).await;
+        let Ok(imp) = AdminImpersonation::from_request_parts(parts, state).await;
+        let banner = imp.banner(&prefix, csrf.token(), csrf.form_field());
+        Ok(Self {
+            registry,
+            prefix,
+            actuator_prefix,
+            show_config,
+            csrf,
+            banner,
+        })
+    }
+}
+
 /// Plugin-owned JS, served as an external file (not inline) so it works
 /// under the default CSP `script-src 'self'`. Installed with
 /// `AppBuilder::plugin_assets`, which gives it a content-hashed URL under
@@ -117,18 +178,32 @@ pub static ASSETS: autumn_web::assets::PluginAssets = autumn_web::assets::Plugin
 
 // ── Router construction ─────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
+/// Access-control settings for [`admin_router`].
+pub struct AdminGuards {
+    /// Session key that holds the signed-in user.
+    pub auth_session_key: String,
+    /// Role a user needs to reach the admin panel, if any.
+    pub require_role: Option<String>,
+    /// Whether mutations need a recent step-up check.
+    pub step_up_mutations: bool,
+    /// Maximum age of a step-up check, in seconds.
+    pub step_up_max_age_secs: u64,
+}
+
 pub fn admin_router(
     registry: Arc<AdminRegistry>,
     prefix: &str,
     actuator_prefix: String,
-    auth_session_key: String,
-    require_role: Option<String>,
+    guards: AdminGuards,
     config_svc: Option<Arc<RuntimeConfigService>>,
-    step_up_mutations: bool,
-    step_up_max_age_secs: u64,
     impersonation_enabled: bool,
 ) -> axum::Router<AppState> {
+    let AdminGuards {
+        auth_session_key,
+        require_role,
+        step_up_mutations,
+        step_up_max_age_secs,
+    } = guards;
     let has_config = config_svc.is_some();
     // Cloned up front: the role-check closure below takes ownership of
     // `auth_session_key`, but the actor layer needs it too.
@@ -396,54 +471,47 @@ fn render(markup: maud::Markup) -> Response {
     Html(markup.into_string()).into_response()
 }
 
+/// What failed validation, and what to show the admin again.
+struct FormFailure<'a> {
+    /// Values to put back in the form.
+    submitted: &'a Value,
+    /// Names of fields in `submitted` whose value is raw, unparsed form text
+    /// (e.g. a `Json` field that failed to parse), not a typed value. The
+    /// form page shows that text as is. Empty when `submitted` is fully
+    /// coerced (the `AdminError::Validation` case).
+    raw_fields: &'a [&'a str],
+    /// Message for the flash banner.
+    message: String,
+}
+
 /// Re-render the create/edit form after a validation failure instead of
 /// navigating away to the generic error page. Preserves every value the
 /// admin typed (`submitted`) and surfaces `error_message` through the same
 /// persistent, accessible flash banner every other page uses — no toast, no
 /// blank form, no lost input.
-#[allow(clippy::too_many_arguments)]
 fn invalid_form_response(
-    registry: &AdminRegistry,
+    ctx: &AdminPageCtx,
     slug: &str,
     model: &dyn AdminModel,
     fields: &[AdminField],
-    submitted: &Value,
-    // Names of fields in `submitted` whose value is raw, unparsed form text
-    // (e.g. a `Json` field that failed to parse) rather than a genuinely
-    // typed value — forwarded to `model_form_page` so it skips round-tripping
-    // that one field through `Value::to_string()` and shows the raw text
-    // verbatim instead. Empty when `submitted` is fully coerced/typed (the
-    // `AdminError::Validation` case).
-    raw_fields: &[&str],
-    error_message: String,
+    failure: FormFailure<'_>,
     id: Option<i64>,
-    csrf: &AdminCsrf,
-    prefix: &str,
-    actuator_prefix: &str,
-    show_config: bool,
-    imp: &AdminImpersonation,
 ) -> Response {
     let messages = [FlashMessage {
         level: FlashLevel::Error,
-        message: error_message,
+        message: failure.message,
     }];
     let markup = templates::model_form_page(
-        registry,
-        slug,
-        model.display_name(),
-        model.display_name_plural(),
-        fields,
-        Some(submitted),
-        id,
-        raw_fields,
-        &messages,
-        csrf.token(),
-        csrf.form_field(),
-        csrf.token_header(),
-        prefix,
-        actuator_prefix,
-        show_config,
-        imp.banner(prefix, csrf.token(), csrf.form_field()).as_ref(),
+        &ctx.chrome(&messages),
+        &templates::ModelFormView {
+            model_slug: slug,
+            model_name: model.display_name(),
+            model_name_plural: model.display_name_plural(),
+            fields,
+            record: Some(failure.submitted),
+            id,
+            raw_fields: failure.raw_fields,
+        },
     );
     (StatusCode::UNPROCESSABLE_ENTITY, Html(markup.into_string())).into_response()
 }
@@ -495,17 +563,12 @@ fn extract_reveal_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
 // ── Handlers ────────────────────────────────────────────────────────
 
 /// `GET /admin` — Dashboard with model counts.
-#[allow(clippy::too_many_arguments)]
 async fn dashboard(
-    imp: AdminImpersonation,
+    ctx: AdminPageCtx,
     State(state): State<AppState>,
-    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
-    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
-    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
-    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
-    csrf: AdminCsrf,
     flash: Flash,
 ) -> AutumnResult<Response> {
+    let AdminPageCtx { registry, .. } = &ctx;
     let pool = state
         .pool()
         .cloned()
@@ -525,30 +588,16 @@ async fn dashboard(
     let messages = flash.consume().await;
 
     Ok(render(templates::dashboard_page(
-        &registry,
+        &ctx.chrome(&messages),
         &counts,
-        &messages,
-        csrf.token(),
-        csrf.token_header(),
-        &prefix,
-        &actuator_prefix,
-        show_config,
-        imp.banner(&prefix, csrf.token(), csrf.form_field())
-            .as_ref(),
     )))
 }
 
 /// `GET /admin/jobs` -- built-in background jobs dashboard.
-#[allow(clippy::too_many_arguments)]
 async fn jobs_dashboard(
-    imp: AdminImpersonation,
+    ctx: AdminPageCtx,
     State(state): State<AppState>,
-    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
-    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
-    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
-    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Query(query): Query<JobsQuery>,
-    csrf: AdminCsrf,
     flash: Flash,
 ) -> AutumnResult<Response> {
     let mut snapshot = match job_admin_backend(&state) {
@@ -559,17 +608,8 @@ async fn jobs_dashboard(
     let messages = flash.consume().await;
 
     Ok(render(templates::jobs_page(
-        &registry,
+        &ctx.chrome(&messages),
         &snapshot,
-        &messages,
-        csrf.token(),
-        csrf.form_field(),
-        csrf.token_header(),
-        &prefix,
-        &actuator_prefix,
-        show_config,
-        imp.banner(&prefix, csrf.token(), csrf.form_field())
-            .as_ref(),
     )))
 }
 
@@ -653,21 +693,16 @@ fn scheduled_job_summaries(state: &AppState) -> Vec<JobScheduleSummary> {
 }
 
 /// `GET /admin/{slug}` -- Model list view.
-#[allow(clippy::too_many_arguments)]
 async fn model_list(
-    imp: AdminImpersonation,
+    ctx: AdminPageCtx,
     State(state): State<AppState>,
-    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
-    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
-    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
-    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path(slug): Path<String>,
     Query(query): Query<ListQuery>,
     Query(raw_query): Query<HashMap<String, String>>,
-    csrf: AdminCsrf,
     flash: Flash,
 ) -> AutumnResult<Response> {
-    let (pool, model) = resolve(&state, &registry, &slug)?;
+    let AdminPageCtx { registry, .. } = &ctx;
+    let (pool, model) = resolve(&state, registry, &slug)?;
 
     let ListQuery { page, q, sort, dir } = query;
     let page = page.max(1);
@@ -701,42 +736,30 @@ async fn model_list(
     let actions = model.actions();
     let messages = flash.consume().await;
     Ok(render(templates::model_list_page(
-        &registry,
-        &slug,
-        model.display_name_plural(),
-        &fields,
-        &actions,
-        &result,
-        &q,
-        sort.as_deref(),
-        dir,
-        &filters,
-        &messages,
-        csrf.token(),
-        csrf.form_field(),
-        csrf.token_header(),
-        &prefix,
-        &actuator_prefix,
-        show_config,
-        model.supports_csv_export(),
-        model.supports_csv_import(),
-        imp.banner(&prefix, csrf.token(), csrf.form_field())
-            .as_ref(),
+        &ctx.chrome(&messages),
+        &templates::ModelListView {
+            model_slug: &slug,
+            model_name_plural: model.display_name_plural(),
+            fields: &fields,
+            actions: &actions,
+            result: &result,
+            search_query: &q,
+            sort_by: sort.as_deref(),
+            sort_dir: dir,
+            filters: &filters,
+            supports_csv_export: model.supports_csv_export(),
+            supports_csv_import: model.supports_csv_import(),
+        },
     )))
 }
 
 /// `GET /admin/{slug}/new` — Create form.
-#[allow(clippy::too_many_arguments)]
 async fn model_new_form(
-    imp: AdminImpersonation,
-    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
-    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
-    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
-    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
+    ctx: AdminPageCtx,
     Path(slug): Path<String>,
-    csrf: AdminCsrf,
     flash: Flash,
 ) -> AutumnResult<Response> {
+    let AdminPageCtx { registry, .. } = &ctx;
     let model = registry
         .get(&slug)
         .ok_or_else(|| AutumnError::not_found_msg(format!("Model '{slug}' not found")))?;
@@ -744,41 +767,31 @@ async fn model_new_form(
     let fields = model.fields();
     let messages = flash.consume().await;
     Ok(render(templates::model_form_page(
-        &registry,
-        &slug,
-        model.display_name(),
-        model.display_name_plural(),
-        &fields,
-        None,
-        None,
-        &[],
-        &messages,
-        csrf.token(),
-        csrf.form_field(),
-        csrf.token_header(),
-        &prefix,
-        &actuator_prefix,
-        show_config,
-        imp.banner(&prefix, csrf.token(), csrf.form_field())
-            .as_ref(),
+        &ctx.chrome(&messages),
+        &templates::ModelFormView {
+            model_slug: &slug,
+            model_name: model.display_name(),
+            model_name_plural: model.display_name_plural(),
+            fields: &fields,
+            record: None,
+            id: None,
+            raw_fields: &[],
+        },
     )))
 }
 
 /// `POST /admin/{slug}` — Create a record.
-#[allow(clippy::too_many_arguments)]
 async fn model_create(
-    imp: AdminImpersonation,
+    ctx: AdminPageCtx,
     State(state): State<AppState>,
-    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
-    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
-    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
-    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path(slug): Path<String>,
-    csrf: AdminCsrf,
     flash: Flash,
     axum::extract::Form(form_data): axum::extract::Form<Value>,
 ) -> AutumnResult<Response> {
-    let (pool, model) = resolve(&state, &registry, &slug)?;
+    let AdminPageCtx {
+        registry, prefix, ..
+    } = &ctx;
+    let (pool, model) = resolve(&state, registry, &slug)?;
 
     let fields = model.fields();
     let submitted = strip_meta_fields(form_data, &fields, false);
@@ -786,19 +799,16 @@ async fn model_create(
         Ok(v) => v,
         Err((partial, field_names, msg)) => {
             return Ok(invalid_form_response(
-                &registry,
+                &ctx,
                 &slug,
                 model,
                 &fields,
-                &partial,
-                &field_names,
-                msg,
+                FormFailure {
+                    submitted: &partial,
+                    raw_fields: &field_names,
+                    message: msg,
+                },
                 None,
-                &csrf,
-                &prefix,
-                &actuator_prefix,
-                show_config,
-                &imp,
             ));
         }
     };
@@ -806,19 +816,16 @@ async fn model_create(
         Ok(record) => record,
         Err(AdminError::Validation(msg)) => {
             return Ok(invalid_form_response(
-                &registry,
+                &ctx,
                 &slug,
                 model,
                 &fields,
-                &form_data,
-                &[],
-                msg,
+                FormFailure {
+                    submitted: &form_data,
+                    raw_fields: &[],
+                    message: msg,
+                },
                 None,
-                &csrf,
-                &prefix,
-                &actuator_prefix,
-                show_config,
-                &imp,
             ));
         }
         Err(e) => return Err(admin_err("Create failed", e)),
@@ -879,20 +886,17 @@ async fn model_create(
 }
 
 /// `GET /admin/{slug}/{id}` — Detail view.
-#[allow(clippy::too_many_arguments)]
 async fn model_detail(
-    imp: AdminImpersonation,
+    ctx: AdminPageCtx,
     State(state): State<AppState>,
-    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
-    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
-    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
-    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path((slug, id)): Path<(String, i64)>,
     request_headers: axum::http::HeaderMap,
-    csrf: AdminCsrf,
     flash: Flash,
 ) -> AutumnResult<Response> {
-    let (pool, model) = resolve(&state, &registry, &slug)?;
+    let AdminPageCtx {
+        registry, prefix, ..
+    } = &ctx;
+    let (pool, model) = resolve(&state, registry, &slug)?;
 
     let record = model
         .get(&pool, id)
@@ -918,24 +922,17 @@ async fn model_detail(
     }
 
     let mut response = render(templates::model_detail_page(
-        &registry,
-        &slug,
-        model.display_name(),
-        model.display_name_plural(),
-        &fields,
-        &record,
-        &display,
-        id,
-        &messages,
-        csrf.token(),
-        csrf.form_field(),
-        csrf.token_header(),
-        &prefix,
-        &actuator_prefix,
-        model.has_history(),
-        show_config,
-        imp.banner(&prefix, csrf.token(), csrf.form_field())
-            .as_ref(),
+        &ctx.chrome(&messages),
+        &templates::ModelDetailView {
+            model_slug: &slug,
+            model_name: model.display_name(),
+            model_name_plural: model.display_name_plural(),
+            fields: &fields,
+            record: &record,
+            record_display: &display,
+            id,
+            has_history: model.has_history(),
+        },
     ))
     .into_response();
 
@@ -964,19 +961,14 @@ async fn model_detail(
 ///
 /// Returns 404 when the model has not opted into version history
 /// (`model.has_history()` returns `false`).
-#[allow(clippy::too_many_arguments)]
 async fn model_history(
-    imp: AdminImpersonation,
+    ctx: AdminPageCtx,
     State(state): State<AppState>,
-    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
-    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
-    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
-    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path((slug, id)): Path<(String, i64)>,
     Query(params): Query<HashMap<String, String>>,
-    csrf: AdminCsrf,
 ) -> AutumnResult<Response> {
-    let (pool, model) = resolve(&state, &registry, &slug)?;
+    let AdminPageCtx { registry, .. } = &ctx;
+    let (pool, model) = resolve(&state, registry, &slug)?;
 
     if !model.has_history() {
         return Err(AutumnError::not_found_msg(format!(
@@ -997,35 +989,24 @@ async fn model_history(
         .map_err(|e| admin_err("History", e))?;
 
     Ok(render(templates::model_history_page(
-        &registry,
+        &ctx.chrome(&[]),
         &slug,
         model.display_name(),
         model.display_name_plural(),
         id,
         &history,
-        &prefix,
-        &actuator_prefix,
-        csrf.token_header(),
-        show_config,
-        imp.banner(&prefix, csrf.token(), csrf.form_field())
-            .as_ref(),
     )))
 }
 
 /// `GET /admin/{slug}/{id}/edit` — Edit form.
-#[allow(clippy::too_many_arguments)]
 async fn model_edit_form(
-    imp: AdminImpersonation,
+    ctx: AdminPageCtx,
     State(state): State<AppState>,
-    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
-    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
-    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
-    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path((slug, id)): Path<(String, i64)>,
-    csrf: AdminCsrf,
     flash: Flash,
 ) -> AutumnResult<Response> {
-    let (pool, model) = resolve(&state, &registry, &slug)?;
+    let AdminPageCtx { registry, .. } = &ctx;
+    let (pool, model) = resolve(&state, registry, &slug)?;
 
     let record = model
         .get(&pool, id)
@@ -1038,41 +1019,31 @@ async fn model_edit_form(
     let fields = model.fields();
     let messages = flash.consume().await;
     Ok(render(templates::model_form_page(
-        &registry,
-        &slug,
-        model.display_name(),
-        model.display_name_plural(),
-        &fields,
-        Some(&record),
-        Some(id),
-        &[],
-        &messages,
-        csrf.token(),
-        csrf.form_field(),
-        csrf.token_header(),
-        &prefix,
-        &actuator_prefix,
-        show_config,
-        imp.banner(&prefix, csrf.token(), csrf.form_field())
-            .as_ref(),
+        &ctx.chrome(&messages),
+        &templates::ModelFormView {
+            model_slug: &slug,
+            model_name: model.display_name(),
+            model_name_plural: model.display_name_plural(),
+            fields: &fields,
+            record: Some(&record),
+            id: Some(id),
+            raw_fields: &[],
+        },
     )))
 }
 
 /// `POST /admin/{slug}/{id}` — Update a record.
-#[allow(clippy::too_many_arguments)]
 async fn model_update(
-    imp: AdminImpersonation,
+    ctx: AdminPageCtx,
     State(state): State<AppState>,
-    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
-    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
-    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
-    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path((slug, id)): Path<(String, i64)>,
-    csrf: AdminCsrf,
     flash: Flash,
     axum::extract::Form(form_data): axum::extract::Form<Value>,
 ) -> AutumnResult<Response> {
-    let (pool, model) = resolve(&state, &registry, &slug)?;
+    let AdminPageCtx {
+        registry, prefix, ..
+    } = &ctx;
+    let (pool, model) = resolve(&state, registry, &slug)?;
 
     let fields = model.fields();
     let submitted = strip_meta_fields(form_data, &fields, true);
@@ -1084,19 +1055,16 @@ async fn model_update(
                 Err(e) => return Err(admin_err("Update failed", e)),
             };
             return Ok(invalid_form_response(
-                &registry,
+                &ctx,
                 &slug,
                 model,
                 &fields,
-                &display,
-                &field_names,
-                msg,
+                FormFailure {
+                    submitted: &display,
+                    raw_fields: &field_names,
+                    message: msg,
+                },
                 Some(id),
-                &csrf,
-                &prefix,
-                &actuator_prefix,
-                show_config,
-                &imp,
             ));
         }
     };
@@ -1107,19 +1075,16 @@ async fn model_update(
                 Err(e) => return Err(admin_err("Update failed", e)),
             };
             return Ok(invalid_form_response(
-                &registry,
+                &ctx,
                 &slug,
                 model,
                 &fields,
-                &display,
-                &[],
-                msg,
+                FormFailure {
+                    submitted: &display,
+                    raw_fields: &[],
+                    message: msg,
+                },
                 Some(id),
-                &csrf,
-                &prefix,
-                &actuator_prefix,
-                show_config,
-                &imp,
             ));
         }
         return Err(admin_err("Update failed", e));
@@ -1241,7 +1206,6 @@ const EXPORT_PAGE_SIZE: u64 = 500;
 /// The response respects active `?q=`, `?sort=`, `?dir=`, and `?filter.*`
 /// query parameters so the exported data matches what the user sees in the
 /// list view.
-#[allow(clippy::too_many_arguments)]
 async fn model_export_csv(
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
@@ -1334,18 +1298,13 @@ async fn model_export_csv(
 }
 
 /// `GET /admin/{slug}/import` — Render the CSV import form.
-#[allow(clippy::too_many_arguments)]
 async fn model_import_form(
-    imp: AdminImpersonation,
+    ctx: AdminPageCtx,
     State(state): State<AppState>,
-    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
-    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
-    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
-    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path(slug): Path<String>,
-    csrf: AdminCsrf,
     flash: Flash,
 ) -> AutumnResult<Response> {
+    let AdminPageCtx { registry, .. } = &ctx;
     let model = registry
         .get(&slug)
         .ok_or_else(|| AutumnError::not_found_msg(format!("Model '{slug}' not found")))?;
@@ -1359,36 +1318,23 @@ async fn model_import_form(
     let _ = state; // pool not needed to render the form
     let messages = flash.consume().await;
     Ok(render(templates::model_import_form_page(
-        &registry,
+        &ctx.chrome(&messages),
         &slug,
         model.display_name_plural(),
-        &messages,
-        csrf.token(),
-        csrf.form_field(),
-        csrf.token_header(),
-        &prefix,
-        &actuator_prefix,
-        show_config,
-        imp.banner(&prefix, csrf.token(), csrf.form_field())
-            .as_ref(),
     )))
 }
 
 /// `POST /admin/{slug}/import` — Accept a multipart CSV upload and import rows.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 async fn model_import_csv(
-    imp: AdminImpersonation,
+    ctx: AdminPageCtx,
     State(state): State<AppState>,
-    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
-    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
-    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
-    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path(slug): Path<String>,
-    csrf: AdminCsrf,
     flash: Flash,
     mut multipart: Multipart,
 ) -> AutumnResult<Response> {
-    let (pool, model) = resolve(&state, &registry, &slug)?;
+    let AdminPageCtx { registry, .. } = &ctx;
+    let (pool, model) = resolve(&state, registry, &slug)?;
 
     if !model.supports_csv_import() {
         return Err(AutumnError::bad_request_msg(format!(
@@ -1481,19 +1427,11 @@ async fn model_import_csv(
 
     let messages = flash.consume().await;
     Ok(render(templates::model_import_result_page(
-        &registry,
+        &ctx.chrome(&messages),
         &slug,
         model.display_name_plural(),
         &report,
         import_mode,
-        &messages,
-        csrf.token(),
-        csrf.token_header(),
-        &prefix,
-        &actuator_prefix,
-        show_config,
-        imp.banner(&prefix, csrf.token(), csrf.form_field())
-            .as_ref(),
     )))
 }
 
@@ -1501,12 +1439,8 @@ async fn model_import_csv(
 
 /// `GET /admin/config` — List all runtime config keys with their values.
 async fn config_list(
-    imp: AdminImpersonation,
-    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
-    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
-    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    ctx: AdminPageCtx,
     axum::Extension(svc): axum::Extension<Arc<RuntimeConfigService>>,
-    csrf: AdminCsrf,
     flash: Flash,
 ) -> AutumnResult<Response> {
     let entries = svc
@@ -1514,16 +1448,8 @@ async fn config_list(
         .map_err(|e| AutumnError::internal_server_error_msg(format!("Runtime config: {e}")))?;
     let messages = flash.consume().await;
     Ok(render(templates::config_page(
-        &registry,
+        &ctx.chrome(&messages),
         &entries,
-        &messages,
-        csrf.token(),
-        csrf.form_field(),
-        csrf.token_header(),
-        &prefix,
-        &actuator_prefix,
-        imp.banner(&prefix, csrf.token(), csrf.form_field())
-            .as_ref(),
     )))
 }
 
@@ -1581,15 +1507,10 @@ async fn config_unset(
 }
 
 /// `GET /admin/config/{key}/history` — View change history for a config key.
-#[allow(clippy::too_many_arguments)]
 async fn config_key_history(
-    imp: AdminImpersonation,
-    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
-    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
-    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    ctx: AdminPageCtx,
     axum::Extension(svc): axum::Extension<Arc<RuntimeConfigService>>,
     Path(key): Path<String>,
-    csrf: AdminCsrf,
     flash: Flash,
 ) -> AutumnResult<Response> {
     let history = svc
@@ -1597,16 +1518,9 @@ async fn config_key_history(
         .map_err(|e| AutumnError::internal_server_error_msg(format!("Runtime config: {e}")))?;
     let messages = flash.consume().await;
     Ok(render(templates::config_history_page(
-        &registry,
+        &ctx.chrome(&messages),
         &key,
         &history,
-        &messages,
-        csrf.token(),
-        csrf.token_header(),
-        &prefix,
-        &actuator_prefix,
-        imp.banner(&prefix, csrf.token(), csrf.form_field())
-            .as_ref(),
     )))
 }
 
@@ -1946,11 +1860,13 @@ mod tests {
             Arc::new(registry),
             "/admin",
             "/actuator".to_owned(),
-            "user_id".to_owned(),
+            AdminGuards {
+                auth_session_key: "user_id".to_owned(),
+                require_role: None,
+                step_up_mutations: false,
+                step_up_max_age_secs: autumn_web::step_up::DEFAULT_MAX_AGE_SECS,
+            },
             None,
-            None,
-            false,
-            autumn_web::step_up::DEFAULT_MAX_AGE_SECS,
             false,
         )
         .layer(axum::Extension(session))
@@ -2173,11 +2089,13 @@ mod tests {
             std::sync::Arc::new(AdminRegistry::new()),
             "/admin",
             "/actuator".to_owned(),
-            "user_id".to_owned(),
+            AdminGuards {
+                auth_session_key: "user_id".to_owned(),
+                require_role: None,
+                step_up_mutations: false,
+                step_up_max_age_secs: autumn_web::step_up::DEFAULT_MAX_AGE_SECS,
+            },
             None,
-            None,
-            false,
-            autumn_web::step_up::DEFAULT_MAX_AGE_SECS,
             false,
         )
         .layer(axum::Extension(session))
