@@ -83,16 +83,19 @@ fn classified_field_marker_carries_model_field_and_tier() {
         CustomerEmailClassified::MODEL_PATH
     );
     // This crate is the defining crate, so its own version is the oracle.
-    let expected = format!(
-        "::data_classification@{}::Customer",
-        match (
-            env!("CARGO_PKG_VERSION_MAJOR"),
-            env!("CARGO_PKG_VERSION_MINOR")
-        ) {
-            ("0", minor) => format!("0.{minor}"),
-            (major, _) => major.to_string(),
-        }
+    let (major, minor, patch, pre) = (
+        env!("CARGO_PKG_VERSION_MAJOR"),
+        env!("CARGO_PKG_VERSION_MINOR"),
+        env!("CARGO_PKG_VERSION_PATCH"),
+        env!("CARGO_PKG_VERSION_PRE"),
     );
+    let version = match (major, minor) {
+        _ if !pre.is_empty() => format!("{major}.{minor}.{patch}-{pre}"),
+        ("0", "0") => format!("0.0.{patch}"),
+        ("0", _) => format!("0.{minor}"),
+        _ => major.to_string(),
+    };
+    let expected = format!("::data_classification@{version}::Customer");
     assert!(
         CustomerEmailClassified::MODEL_PATH.ends_with(&expected),
         "{}",

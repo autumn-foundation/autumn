@@ -16832,13 +16832,12 @@ mod tests {
              two `Customer`s cannot share a row: {generated}"
         );
         // This crate is the defining crate here, so its own version is the oracle.
-        let version = match (
+        let version = compat_version(
             env!("CARGO_PKG_VERSION_MAJOR"),
             env!("CARGO_PKG_VERSION_MINOR"),
-        ) {
-            ("0", minor) => format!("0.{minor}"),
-            (major, _) => major.to_string(),
-        };
+            env!("CARGO_PKG_VERSION_PATCH"),
+            env!("CARGO_PKG_VERSION_PRE"),
+        );
         assert_eq!(
             generated.matches(&format!("\"@{version}\"")).count(),
             2,
