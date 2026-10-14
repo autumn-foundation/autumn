@@ -5929,23 +5929,31 @@ fn emit_collaborative_items(model: &syn::Ident, fields: &[&syn::Ident]) -> Token
 
 /// The part of a crate version that must match for two versions to be
 /// compatible. It is the major version. Before 1.0 it is `0.minor`. Before 0.1
-/// it is `0.0.patch`.
-fn compat_version(major: &str, minor: &str, patch: &str) -> String {
-    match (major, minor) {
+/// it is `0.0.patch`. A prerelease tag is part of it, because Cargo does not
+/// match one prerelease with another.
+fn compat_version(major: &str, minor: &str, patch: &str, pre: &str) -> String {
+    let base = match (major, minor) {
         ("0", "0") => format!("0.0.{patch}"),
         ("0", _) => format!("0.{minor}"),
         _ => major.to_string(),
+    };
+    if pre.is_empty() {
+        base
+    } else {
+        format!("{base}-{pre}")
     }
 }
 
 /// [`compat_version`] of the crate in compilation. Cargo sets these variables
 /// for the defining crate. The macro runs in that compilation.
 fn classified_compat_version() -> String {
-    let var = |name| std::env::var(name).unwrap_or_else(|_| "0".to_string());
+    let var = |name| std::env::var(name).unwrap_or_default();
+    let number = |name| std::env::var(name).unwrap_or_else(|_| "0".to_string());
     compat_version(
-        &var("CARGO_PKG_VERSION_MAJOR"),
-        &var("CARGO_PKG_VERSION_MINOR"),
-        &var("CARGO_PKG_VERSION_PATCH"),
+        &number("CARGO_PKG_VERSION_MAJOR"),
+        &number("CARGO_PKG_VERSION_MINOR"),
+        &number("CARGO_PKG_VERSION_PATCH"),
+        &var("CARGO_PKG_VERSION_PRE"),
     )
 }
 
@@ -16849,13 +16857,17 @@ mod tests {
     #[test]
     fn compat_version_keeps_only_the_semver_incompatible_part() {
         // A patch or compatible bump must not change the manifest key.
-        assert_eq!(compat_version("2", "7", "3"), "2");
-        assert_eq!(compat_version("1", "0", "9"), "1");
+        assert_eq!(compat_version("2", "7", "3", ""), "2");
+        assert_eq!(compat_version("1", "0", "9", ""), "1");
         // Before 1.0 a minor bump is the breaking one.
-        assert_eq!(compat_version("0", "8", "4"), "0.8");
+        assert_eq!(compat_version("0", "8", "4", ""), "0.8");
         // Before 0.1 each patch release is incompatible.
-        assert_eq!(compat_version("0", "0", "1"), "0.0.1");
-        assert_eq!(compat_version("0", "0", "2"), "0.0.2");
+        assert_eq!(compat_version("0", "0", "1", ""), "0.0.1");
+        assert_eq!(compat_version("0", "0", "2", ""), "0.0.2");
+        // Cargo does not match one prerelease with another.
+        assert_eq!(compat_version("1", "0", "0", "alpha.1"), "1-alpha.1");
+        assert_eq!(compat_version("1", "0", "0", "beta.1"), "1-beta.1");
+        assert_eq!(compat_version("0", "8", "0", "rc.1"), "0.8-rc.1");
     }
 
     #[test]
