@@ -10,4 +10,4 @@
 
 - **Breaking:** `StaticRouteMeta` has a new `content_type` field. Add
   `content_type: None` to each literal
-  ([migration guide](../docs/migrations/next.md)).
+  ([migration guide](docs/migrations/next.md)).
