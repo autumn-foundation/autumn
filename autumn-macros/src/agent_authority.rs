@@ -929,6 +929,7 @@ struct Shadow {
     unread: bool,
     table: Option<(String, bool)>,
     inert: bool,
+    diesel_fn: Option<String>,
 }
 
 /// Per-name state. Autumn copies it at a branch and joins the copies after.
@@ -1077,6 +1078,7 @@ impl Analyzer {
             unread: self.unread_futures.contains(name),
             table: self.tables.get(name).cloned(),
             inert: self.inert_roots.contains(name),
+            diesel_fn: self.diesel_fns.get(name).cloned(),
         }
     }
 
@@ -1090,6 +1092,7 @@ impl Analyzer {
             unread,
             table,
             inert,
+            diesel_fn,
         } = saved;
         match handle {
             Some(handle) => self.handles.insert(name.clone(), handle),
@@ -1113,6 +1116,10 @@ impl Analyzer {
         } else {
             self.unread_futures.remove(&name);
         }
+        match diesel_fn {
+            Some(verb) => self.diesel_fns.insert(name.clone(), verb),
+            None => self.diesel_fns.remove(&name),
+        };
         if inert {
             self.inert_roots.insert(name.clone());
         } else {
@@ -1150,8 +1157,9 @@ impl Analyzer {
         if name != "tokio" {
             self.tokio_imports.remove(name);
         }
-        // A rebound name is no longer the typed parameter.
+        // A rebound name is no longer the typed parameter or the import.
         self.inert_roots.remove(name);
+        self.diesel_fns.remove(name);
     }
 
     /// A raw diesel `SELECT`/`UPDATE`/`DELETE` handed a `Db` or connection
@@ -7630,6 +7638,24 @@ mod tests {
                 Ok(())
             }"
         ));
+    }
+
+    #[test]
+    fn a_let_hides_an_imported_diesel_constructor() {
+        let handler = |binding: &str| {
+            format!(
+                "async fn h(mut db: Db) -> R {{
+                    use diesel::delete as remove;
+                    {binding}
+                    remove(refunds::table).execute(&mut *db).await?;
+                    Ok(())
+                }}"
+            )
+        };
+        let imported = expand(GRANT, &handler(""));
+        let rebound = expand(GRANT, &handler("let remove = custom_delete;"));
+        assert!(imported.contains("allows_unbounded_write"), "{imported}");
+        assert!(!rebound.contains("allows_unbounded_write"), "{rebound}");
     }
 
     #[test]
