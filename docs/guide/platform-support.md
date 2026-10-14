@@ -72,7 +72,8 @@ rustflags = ["-Clink-arg=/DEBUG:LongSymbolTruncate"]
 ```
 
 This is a `link.exe` option, the default MSVC linker. If you use `lld-link`,
-delete the file: `lld-link` rejects the flag.
+delete the file: `lld-link` rejects the flag. Cargo applies target rustflags
+to every profile, so release builds on Windows use the flag too.
 
 Less debug info alone does not clear the limit: the public symbols stay in
 the PDB. Do not rely on `CARGO_PROFILE_DEV_DEBUG`. Autumn's CI hit the limit
