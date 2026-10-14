@@ -1533,6 +1533,9 @@ impl Analyzer {
                 let handle = self.expr_handle(element);
                 self.rebind(element_pat, handle.as_ref());
                 self.mark_pattern_unread(element_pat, element);
+                if let Pat::Ident(ident) = element_pat {
+                    self.bind_callable(&ident.ident.to_string(), element);
+                }
             }
             return;
         }
@@ -1799,6 +1802,7 @@ impl Analyzer {
             Expr::Tuple(t) => t.elems.iter().any(|e| self.carries_unread(e)),
             Expr::Array(a) => a.elems.iter().any(|e| self.carries_unread(e)),
             // `jobs.0` and `jobs[i]` read a member of the container.
+            Expr::Unary(u) => self.carries_unread(&u.expr),
             Expr::Field(f) => self.carries_unread(&f.base),
             Expr::Index(i) => self.carries_unread(&i.expr),
             // `[start(); 1]` repeats one element.
@@ -1909,6 +1913,11 @@ impl Analyzer {
                 for (param, arg) in closure.inputs.iter().zip(call.args.iter()) {
                     let handle = self.container_handle(arg);
                     saved.extend(self.enter_binding_scope(param, handle.as_ref()));
+                    // The parameter holds what the argument held.
+                    self.mark_pattern_unread(param, arg);
+                    if let Pat::Ident(ident) = param {
+                        self.bind_callable(&ident.ident.to_string(), arg);
+                    }
                 }
                 for param in closure.inputs.iter().skip(call.args.len()) {
                     saved.extend(self.enter_binding_scope(param, None));
@@ -3706,6 +3715,12 @@ fn diesel_imports(
         syn::UseTree::Group(group) => {
             for item in &group.items {
                 diesel_imports(item, prefix, roots, fns);
+            }
+        }
+        // `use diesel::*;` brings every write constructor in under its own name.
+        syn::UseTree::Glob(_) if prefix.as_slice() == ["diesel"] => {
+            for verb in VERBS {
+                fns.insert((*verb).to_string(), (*verb).to_string());
             }
         }
         syn::UseTree::Glob(_) => {}
@@ -7152,6 +7167,55 @@ mod tests {
             r"async fn h(mut db: Db) -> R {
                 extern crate diesel as orm;
                 orm::delete(select_target()).execute(&mut *db).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "diesel constructors imported by a glob",
+            ExpectedKind::Rejected,
+            "select_target",
+            r"async fn h(mut db: Db) -> R {
+                use diesel::*;
+                delete(select_target()).execute(&mut *db).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future passed to an invoked closure",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                (|fut| async move { fut.await?; Ok(()) })(start_finance_job()).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "spawn passed to an invoked closure",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                (|run| { run(async { work().await }); })(tokio::spawn);
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias moved through a tuple pattern",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let (run,) = (tokio::spawn,);
+                run(async { work().await });
+                Ok(())
+            }",
+        ),
+        (
+            "unread future extracted by a dereference",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let boxed = Box::new(start_finance_job());
+                let fut = *boxed;
+                fut.await?;
                 Ok(())
             }",
         ),
