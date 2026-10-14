@@ -1937,8 +1937,8 @@ fn wait_until_booted(proc: &mut Child, ready_file: Option<&Path>, cap: Duration)
     }
 }
 
-/// Stop `child` cooperatively: request a graceful shutdown via the signal file,
-/// wait for the app to finish booting, then wait up to `budget()` for it to
+/// Stop `child` cooperatively: wait for the app to finish booting, request a
+/// graceful shutdown via the signal file, then wait up to `budget()` for it to
 /// drain. Force-kill if it does not.
 ///
 /// The caller computes `budget` after boot. It then uses the budget the app wrote.
@@ -1964,20 +1964,22 @@ fn stop_child_cooperatively(
         return StopOutcome::NotRunning;
     };
 
-    let outcome = match request_cooperative_shutdown(signal_path) {
-        Err(_) => {
-            let _ = proc.kill();
-            let _ = proc.wait();
-            StopOutcome::Unreachable
-        }
-        Ok(()) => {
-            // At the cap, assume the app is up: the ready write is best-effort,
-            // and the app may already be watching the signal file.
-            if wait_until_booted(proc, ready_file, boot_cap) == BootWait::Exited
-                || crate::process::wait_with_timeout(proc, budget()).is_ok()
-            {
+    // Ask only once the app is up. A request sent during boot makes the app
+    // skip its ready write, so the boot could not be told from a drain.
+    // At the cap, assume the app is up: the ready write is best-effort.
+    let outcome = if wait_until_booted(proc, ready_file, boot_cap) == BootWait::Exited {
+        StopOutcome::Graceful
+    } else {
+        match request_cooperative_shutdown(signal_path) {
+            Err(_) => {
+                let _ = proc.kill();
+                let _ = proc.wait();
+                StopOutcome::Unreachable
+            }
+            Ok(()) if crate::process::wait_with_timeout(proc, budget()).is_ok() => {
                 StopOutcome::Graceful
-            } else {
+            }
+            Ok(()) => {
                 let _ = proc.kill();
                 let _ = proc.wait();
                 StopOutcome::Escalated
