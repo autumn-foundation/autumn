@@ -263,6 +263,13 @@ fn stop_budget_for_running_child(
     reported.or(recorded).unwrap_or_else(resolve_now)
 }
 
+/// The directory of the selected package, or `.` when none is selected.
+fn package_dir(package: Option<&str>) -> PathBuf {
+    package
+        .and_then(find_manifest_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 /// This app's cooperative-stop budget, resolved from its own configuration.
 ///
 /// Delegates to the same profile-aware resolver `autumn serve stop` uses, so the
@@ -275,9 +282,7 @@ fn stop_budget_for_running_child(
     )
 )]
 fn resolve_cooperative_stop_budget(package: Option<&str>) -> Duration {
-    let base_dir = package
-        .and_then(find_manifest_dir)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let base_dir = package_dir(package);
     // `autumn dev` always builds in debug, so the default profile is `dev`.
     // `AUTUMN_ENV` or `AUTUMN_PROFILE` still wins.
     let profile = crate::serve::effective_profile(None, false);
@@ -1242,12 +1247,9 @@ fn start_server(
     reload_state_path: Option<&Path>,
     show_config: bool,
 ) -> Option<Child> {
-    // Only the non-Unix stop path consults the recorded budget; on Unix the
-    // parameter is carried for a uniform signature.
-    #[cfg(unix)]
-    let _ = package;
     eprintln!("  Starting server...\n");
 
+    // Read `.env` from the selected package, as the app and the stop budget do.
     // Resolve `.env` fresh right before each spawn so a hot-reload restart
     // picks up an edited `.env`. Values are injected explicitly into the child
     // process (rather than mutating this process's environment); the child also
@@ -1255,7 +1257,7 @@ fn start_server(
     // makes a bare `DATABASE_URL` visible to the child. A malformed `.env`
     // fails loudly. Applied BEFORE the explicit `.env(...)` calls below so those
     // win on any key overlap.
-    let dotenv_vars = match autumn_web::dotenv::resolve_process_dotenv() {
+    let dotenv_vars = match autumn_web::dotenv::resolve_process_dotenv_in(&package_dir(package)) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("  \u{274C} .env: {e}");

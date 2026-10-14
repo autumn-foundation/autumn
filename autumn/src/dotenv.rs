@@ -388,6 +388,19 @@ pub fn resolve_process_dotenv() -> Result<Vec<(String, String)>, DotenvError> {
     resolve_dotenv_vars(&dir, &profile, &base)
 }
 
+/// Like [`resolve_process_dotenv`], but reads `.env` from `dir`.
+///
+/// Use this when a CLI starts another package. The app reads `.env` next to its
+/// own manifest. The CLI must pass the values from that same file.
+///
+/// # Errors
+/// Returns a [`DotenvError`] on a malformed or unreadable `.env` file.
+pub fn resolve_process_dotenv_in(dir: &Path) -> Result<Vec<(String, String)>, DotenvError> {
+    let base = OsEnv;
+    let profile = resolve_profile(&base);
+    resolve_dotenv_vars(dir, &profile, &base)
+}
+
 /// The real OS environment overlaid with `.env` values, for CLI resolution that
 /// must consult `.env` (e.g. DB URL resolution in `autumn migrate`).
 ///
@@ -476,6 +489,14 @@ mod tests {
         std::fs::write(dir.path().join(".env"), "AUTUMN_TEST_2444_KEY=from-dir\n").unwrap();
         let env = os_env_with_dotenv_in(dir.path(), "dev").unwrap();
         assert_eq!(env.var("AUTUMN_TEST_2444_KEY").as_deref(), Ok("from-dir"));
+    }
+
+    #[test]
+    fn resolve_process_dotenv_in_reads_the_given_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "AUTUMN_TEST_2444_PAIR=v\n").unwrap();
+        let vars = resolve_process_dotenv_in(dir.path()).unwrap();
+        assert!(vars.contains(&("AUTUMN_TEST_2444_PAIR".to_owned(), "v".to_owned())));
     }
 
     #[test]
