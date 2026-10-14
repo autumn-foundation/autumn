@@ -4125,6 +4125,11 @@ mod tests {
         }
     }
 
+    /// How long a test waits before it calls a drain stranded. A stranded
+    /// drain never ends, so a long limit finds it too. A short one fails on a
+    /// slow runner, where a fresh open creates and migrates a file.
+    const STRANDED_DRAIN_LIMIT: Duration = Duration::from_secs(30);
+
     /// Cancel `call` after `after`, as a request timeout does.
     async fn cancelled<T>(after: Duration, call: impl Future<Output = T>) {
         assert!(
@@ -4172,13 +4177,13 @@ mod tests {
         assert!(!fleet.exists(&key), "the delete ran to the end");
         assert_eq!(fleet.stats().deleted_total, 1);
         // A slot fleet creates on demand: the key opens again, empty.
-        let fresh = tokio::time::timeout(Duration::from_secs(5), fleet.open(&key))
+        let fresh = tokio::time::timeout(STRANDED_DRAIN_LIMIT, fleet.open(&key))
             .await
             .expect("open is not stuck on a stranded drain")
             .unwrap();
         assert!(!table_exists(&fresh, "notes").await);
         drop(fresh);
-        tokio::time::timeout(Duration::from_secs(5), fleet.close_all())
+        tokio::time::timeout(STRANDED_DRAIN_LIMIT, fleet.close_all())
             .await
             .expect("close_all does not wait on a stranded drain");
     }
@@ -4197,11 +4202,11 @@ mod tests {
         drop(db);
         settle(&fleet).await;
         assert_eq!(recorder.closed.load(Ordering::SeqCst), 1);
-        tokio::time::timeout(Duration::from_secs(5), fleet.open(&key))
+        tokio::time::timeout(STRANDED_DRAIN_LIMIT, fleet.open(&key))
             .await
             .expect("open is not stuck on a stranded drain")
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), fleet.close_all())
+        tokio::time::timeout(STRANDED_DRAIN_LIMIT, fleet.close_all())
             .await
             .expect("close_all returns");
     }
