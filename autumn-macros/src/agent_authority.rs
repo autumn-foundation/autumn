@@ -1306,6 +1306,10 @@ impl Analyzer {
                 Stmt::Item(syn::Item::ExternCrate(item)) => {
                     let name = item.rename.as_ref().map_or(&item.ident, |(_, name)| name);
                     self.hide_crate(name);
+                    // `extern crate diesel as orm;` is the crate under a new name.
+                    if item.ident == "diesel" {
+                        self.diesel_roots.insert(name.to_string());
+                    }
                 }
                 // A `use` also covers the whole block, whatever its line.
                 Stmt::Item(item @ syn::Item::Use(_)) => self.nested_item(item),
@@ -1626,16 +1630,17 @@ impl Analyzer {
                     self.assign_handles(target, value);
                 }
             }
+            (Expr::Array(l), Expr::Array(r)) if l.elems.len() == r.elems.len() => {
+                for (target, value) in l.elems.iter().zip(r.elems.iter()) {
+                    self.assign_handles(target, value);
+                }
+            }
             // Autumn cannot read the right-hand side. If it is an unread call,
             // every target may hold its future.
-            (Expr::Tuple(l), _) => {
+            (Expr::Tuple(_) | Expr::Array(_), _) => {
                 let handle = self.container_handle(right);
                 let unread = self.carries_unread(right);
-                for target in &l.elems {
-                    self.assign_handle_to(target, handle.as_ref());
-                    self.assign_future_to(target, unread);
-                    self.assign_callable_to(target, None);
-                }
+                self.assign_all(left, handle.as_ref(), unread);
             }
             (target, _) => {
                 let handle = self.expr_handle(right);
@@ -1643,6 +1648,29 @@ impl Analyzer {
                 let unread = self.carries_unread(right);
                 self.assign_future_to(target, unread);
                 self.assign_callable_to(target, Some(right));
+            }
+        }
+    }
+
+    /// Give every name in a destructuring target the same handle and future
+    /// state, descending through nested tuples and arrays.
+    fn assign_all(&mut self, target: &Expr, handle: Option<&Handle>, unread: bool) {
+        match target {
+            Expr::Tuple(t) => {
+                for element in &t.elems {
+                    self.assign_all(element, handle, unread);
+                }
+            }
+            Expr::Array(a) => {
+                for element in &a.elems {
+                    self.assign_all(element, handle, unread);
+                }
+            }
+            Expr::Paren(p) => self.assign_all(&p.expr, handle, unread),
+            _ => {
+                self.assign_handle_to(target, handle);
+                self.assign_future_to(target, unread);
+                self.assign_callable_to(target, None);
             }
         }
     }
@@ -1770,6 +1798,9 @@ impl Analyzer {
             }
             Expr::Tuple(t) => t.elems.iter().any(|e| self.carries_unread(e)),
             Expr::Array(a) => a.elems.iter().any(|e| self.carries_unread(e)),
+            // `jobs.0` and `jobs[i]` read a member of the container.
+            Expr::Field(f) => self.carries_unread(&f.base),
+            Expr::Index(i) => self.carries_unread(&i.expr),
             // `[start(); 1]` repeats one element.
             Expr::Repeat(rep) => self.carries_unread(&rep.expr),
             Expr::Reference(r) => self.carries_unread(&r.expr),
@@ -3967,6 +3998,32 @@ fn strip_sql_comments(sql: &str) -> String {
                     }
                 }
                 out.push_str("''");
+            }
+            // `$$text$$` and `$tag$text$tag$`. A `$1` parameter is no quote.
+            ('$', _) if !previous_word_char.is_some_and(|c| c.is_alphanumeric() || c == '_') => {
+                let mut tag = String::new();
+                let mut ahead = chars.clone();
+                let opened = loop {
+                    match ahead.next() {
+                        Some('$') => break true,
+                        Some(c) if c.is_alphanumeric() || c == '_' => tag.push(c),
+                        _ => break false,
+                    }
+                };
+                if opened && !tag.starts_with(|c: char| c.is_ascii_digit()) {
+                    let close: Vec<char> = format!("${tag}$").chars().collect();
+                    chars = ahead;
+                    let mut tail: Vec<char> = Vec::new();
+                    for c in chars.by_ref() {
+                        tail.push(c);
+                        if tail.ends_with(&close) {
+                            break;
+                        }
+                    }
+                    out.push_str("''");
+                } else {
+                    out.push(current);
+                }
             }
             // `"quoted identifier"`: keep it, comment markers and all.
             ('"', _) => {
@@ -7067,6 +7124,38 @@ mod tests {
             }",
         ),
         (
+            "unread future moved in by an array destructuring assignment",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                let mut fut = tokio::time::sleep(d);
+                [fut] = [start_finance_job()];
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future extracted from a tuple member",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let jobs = (start_finance_job(),);
+                let fut = jobs.0;
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "diesel renamed by extern crate",
+            ExpectedKind::Rejected,
+            "select_target",
+            r"async fn h(mut db: Db) -> R {
+                extern crate diesel as orm;
+                orm::delete(select_target()).execute(&mut *db).await?;
+                Ok(())
+            }",
+        ),
+        (
             "#[agent_effect] with a blank reason",
             ExpectedKind::Rejected,
             "reason",
@@ -7713,6 +7802,36 @@ mod tests {
             !expansion.contains("\"payouts\""),
             "a string literal was read as a write: {expansion}"
         );
+    }
+
+    #[test]
+    fn a_dollar_quoted_literal_names_no_write() {
+        for literal in ["$$ UPDATE payouts $$", "$q$ UPDATE payouts $q$"] {
+            let expansion = expand(
+                GRANT,
+                &format!(
+                    r#"async fn h(mut db: Db) -> R {{
+                        diesel::sql_query("SELECT {literal} AS note")
+                            .execute(&mut *db).await?;
+                        Ok(())
+                    }}"#
+                ),
+            );
+            assert!(
+                !expansion.contains("\"payouts\""),
+                "{literal} was read as a write: {expansion}"
+            );
+        }
+        // A positional parameter is not a quote: the write stays visible.
+        let write = expand(
+            GRANT,
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("UPDATE payouts SET x = $1 WHERE y = $2")
+                    .execute(&mut *db).await?;
+                Ok(())
+            }"#,
+        );
+        assert!(write.contains("\"payouts\""), "{write}");
     }
 
     #[test]
