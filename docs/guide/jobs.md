@@ -972,6 +972,10 @@ job forever: the in-memory store sweeps them out opportunistically (amortized
 across `create` calls), the Postgres and SQLite background sweeps run every 5
 minutes to `DELETE` expired rows, and Redis expires keys natively via `EX`.
 
+The Postgres store takes "now" from the database clock only. Web and worker
+replicas can have different clocks, but a record always lives for exactly
+`ttl_secs` of database time. A TTL above 100 years is clamped to 100 years.
+
 ### Async CSV export, end to end
 
 The synchronous `GET /{plural}/export.csv` admin route runs inline on the
