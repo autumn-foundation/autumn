@@ -766,7 +766,7 @@ fn cli_archives_are_built_and_attested_in_tag_context() {
         "`cli-binaries` must run on tag pushes only. Its token is not \
          conditional, so a skipped job is what keeps pull requests unsigned:\n{body}"
     );
-    for scope in ["contents: write", "id-token: write", "attestations: write"] {
+    for scope in ["id-token: write", "attestations: write"] {
         assert!(
             body.contains(scope),
             "`cli-binaries` must grant `{scope}`. A called workflow cannot add it back:\n{body}"
@@ -777,8 +777,8 @@ fn cli_archives_are_built_and_attested_in_tag_context() {
         "`cli-binaries` must pass the pushed tag:\n{body}"
     );
     assert!(
-        body.contains("attach_to_release: false"),
-        "`cli-binaries` must not upload. The release does not exist yet:\n{body}"
+        !body.contains("contents: write"),
+        "`cli-binaries` uploads nothing. It needs no write access to contents:\n{body}"
     );
 }
 
@@ -864,42 +864,22 @@ fn release_workflow_uploads_the_gate_built_archives() {
     );
 }
 
-/// `attach_to_release` defaults to true for both triggers, so the
-/// `workflow_dispatch` escape hatch still attaches when given a tag.
+/// `cli-release.yml` builds and attests. It never uploads, so it needs no
+/// `contents: write`, and the Publish Gate can call it with read access only.
 #[test]
-fn cli_release_attach_step_is_optional_and_defaults_on() {
+fn cli_release_workflow_does_not_upload() {
     let cli_release = code_only(&read_repo_file(".github/workflows/cli-release.yml"));
-    assert_eq!(
-        cli_release.matches("attach_to_release:").count(),
-        2,
-        "both `workflow_call` and `workflow_dispatch` need the input:\n{cli_release}"
-    );
-    let (_, trigger) = cli_release.split_once("\non:").expect("`on:` block");
-    let trigger = trigger.split("\npermissions:").next().unwrap();
-    assert_eq!(
-        trigger.matches("default: true").count(),
-        2,
-        "`attach_to_release` must default to true in both triggers:\n{trigger}"
-    );
-    assert_eq!(
-        trigger.matches("type: boolean").count(),
-        2,
-        "`attach_to_release` must be boolean in both triggers:\n{trigger}"
-    );
-
-    let attach = cli_release
-        .split_once("name: Attach to release")
-        .expect("cli-release.yml must keep its `Attach to release` step")
-        .1;
-    let condition = attach
-        .lines()
-        .find(|l| l.trim_start().starts_with("if:"))
-        .expect("`Attach to release` must be conditional");
     assert!(
-        condition.contains("inputs.tag != ''")
-            && condition.contains("inputs.attach_to_release")
-            && condition.contains("github.ref == format('refs/tags/{0}', inputs.tag)"),
-        "attach only for a real tag, only when asked, and only from that tag ref:\n{condition}"
+        !cli_release.contains("gh release upload"),
+        "`release.yml` owns the upload:\n{cli_release}"
+    );
+    assert!(
+        !cli_release.contains("contents: write"),
+        "`cli-release.yml` must not hold `contents: write`:\n{cli_release}"
+    );
+    assert!(
+        !cli_release.contains("attach_to_release"),
+        "the `attach_to_release` input is gone:\n{cli_release}"
     );
 }
 
@@ -923,13 +903,6 @@ fn cli_release_workflow_attests_every_binary_archive() {
     assert!(
         cli_release.contains("attestations: write") && cli_release.contains("id-token: write"),
         "cli-release.yml needs `attestations: write` + `id-token: write`:\n{cli_release}"
-    );
-
-    let attest_at = cli_release.find("actions/attest-build-provenance").unwrap();
-    let upload_at = cli_release.find("gh release upload").unwrap();
-    assert!(
-        attest_at < upload_at,
-        "the archive must be attested before it is attached to the release"
     );
 }
 

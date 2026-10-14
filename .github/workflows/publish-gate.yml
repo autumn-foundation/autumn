@@ -401,17 +401,13 @@ jobs:
     name: CLI binaries
     if: github.ref_type == 'tag'
     needs: [semver, release-notes, smoke, examples-e2e]
-    # This job does not write contents (`attach_to_release` is false). A
-    # called workflow cannot ask for more than its caller grants.
-    # `cli-release.yml` asks for `contents: write`.
     permissions:
-      contents: write
+      contents: read
       id-token: write
       attestations: write
     uses: ./.github/workflows/cli-release.yml
     with:
       tag: ${{ github.ref_name }}
-      attach_to_release: false
 
   # ---------------------------------------------------------------------------
   # 6. Downstream smoke test
