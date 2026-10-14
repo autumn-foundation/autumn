@@ -547,6 +547,15 @@ fn no_job_that_checks_out_code_holds_attestation_credentials() {
     let gate = read_repo_file(".github/workflows/publish-gate.yml");
 
     for (name, body) in workflow_jobs(&gate) {
+        // A job that calls a local workflow runs that workflow's checkout.
+        // It must run on tag pushes only, or a pull request could sign.
+        if body.contains("uses: ./.github/workflows/") && body.contains("id-token: write") {
+            assert!(
+                body.contains("github.ref_type == 'tag'"),
+                "job `{name}` calls a local workflow with signing credentials. \
+                 Gate it on tag pushes."
+            );
+        }
         let signs = body.contains("id-token: write") || body.contains("attestations: write");
         let checks_out = body.contains("actions/checkout");
         assert!(
@@ -757,7 +766,7 @@ fn cli_archives_are_built_and_attested_in_tag_context() {
         "`cli-binaries` must run on tag pushes only. Its token is not \
          conditional, so a skipped job is what keeps pull requests unsigned:\n{body}"
     );
-    for scope in ["id-token: write", "attestations: write"] {
+    for scope in ["contents: write", "id-token: write", "attestations: write"] {
         assert!(
             body.contains(scope),
             "`cli-binaries` must grant `{scope}`. A called workflow cannot add it back:\n{body}"
@@ -799,7 +808,7 @@ fn prepare_release_waits_for_the_cli_binaries() {
 fn release_workflow_uploads_the_gate_built_archives() {
     let release = code_only(&read_repo_file(".github/workflows/release.yml"));
     assert!(
-        !release.contains("cli-release.yml"),
+        !release.contains("uses: ./.github/workflows/cli-release.yml"),
         "release.yml must not rebuild the CLI archives:\n{release}"
     );
 
@@ -817,6 +826,10 @@ fn release_workflow_uploads_the_gate_built_archives() {
         "pattern: autumn-*",
         "merge-multiple: true",
         "run-id: ${{ github.event.workflow_run.id }}",
+        "gh attestation verify",
+        "--source-ref \"refs/tags/$TAG\"",
+        "cli-release.yml",
+        "sha256sum -c",
         "gh release upload",
         "--clobber",
     ] {
@@ -842,7 +855,7 @@ fn release_workflow_uploads_the_gate_built_archives() {
     );
     // One archive + one checksum for each of the five targets.
     assert!(
-        body.contains("-ne 10") || body.contains("!= 10"),
+        body.contains("set -euo pipefail") && body.contains("-ne 10"),
         "`binaries` must fail unless exactly 10 assets were downloaded:\n{body}"
     );
 }
@@ -884,27 +897,13 @@ fn cli_release_attach_step_is_optional_and_defaults_on() {
     );
 }
 
-/// The "default branch" caveat no longer applies. Leaving it in place would
-/// tell readers not to use `--source-ref`, which now works.
+/// The default-branch caveat is gone. `--source-ref` now works.
 #[test]
-fn docs_no_longer_carry_the_default_branch_caveat() {
+fn docs_show_source_ref_verification() {
     let doc = read_repo_file("docs/guide/supply-chain.md");
-    assert!(
-        !doc.contains("do not add `--source-ref"),
-        "supply-chain.md must drop the `--source-ref` warning"
-    );
     assert!(
         doc.contains("--source-ref refs/tags/"),
         "supply-chain.md must show `--source-ref refs/tags/<tag>`"
-    );
-    assert!(
-        !doc.contains("release.yml@refs/heads/"),
-        "the sample output must name `cli-release.yml@refs/tags/<tag>`"
-    );
-    let cli_release = read_repo_file(".github/workflows/cli-release.yml");
-    assert!(
-        !cli_release.contains("NOTE ON THE RECORDED SOURCE REF"),
-        "cli-release.yml must drop the stale caveat"
     );
 }
 

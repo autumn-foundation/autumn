@@ -133,4 +133,13 @@ jobs:
             ls -la cli-archives >&2 || true
             exit 1
           fi
+          # Check each file against its attestation. This proves the bytes came
+          # from the tag build of `cli-release.yml`.
+          for f in "${assets[@]}"; do
+            gh attestation verify "$f" \
+              --repo "$GITHUB_REPOSITORY" \
+              --source-ref "refs/tags/$TAG" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/cli-release.yml"
+          done
+          (cd cli-archives && sha256sum -c -- *.sha256)
           gh release upload "$TAG" "${assets[@]}" --clobber --repo "$GITHUB_REPOSITORY"

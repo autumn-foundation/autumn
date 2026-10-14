@@ -6,7 +6,7 @@ name: CLI Release Binaries
 # Binaries correspond to DELIBERATE, TAGGED CRATE RELEASES, not trunk. The
 # Publish Gate (`publish-gate.yml`, its `cli-binaries` job) calls this workflow
 # on a `v[0-9]+.*` tag push with `attach_to_release: false`. The tag push
-# triggers the gate, so the provenance names the tag and the tagged commit
+# starts the gate. So the provenance names the tag and the tagged commit
 # (#2380). `release.yml` then downloads the archives and uploads them to the
 # release. Cutting a release is always an explicit maintainer action; there are
 # no rolling/nightly trunk-dev builds, and `releases/latest/download/...`
@@ -91,7 +91,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          # `refs/tags/` stops a branch with the same name from winning.
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.99.0
