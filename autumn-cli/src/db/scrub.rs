@@ -238,6 +238,12 @@ pub enum ScrubError {
         /// What the column is an operand of.
         kind: &'static str,
     },
+    /// The schema changed between classification and the apply transaction, so
+    /// the plan no longer covers every column.
+    SchemaChanged {
+        /// What changed, sorted.
+        entries: Vec<String>,
+    },
     /// The target holds `#[encrypted]` columns but no encryption key could be
     /// resolved, so a valid replacement envelope cannot be produced.
     EncryptionKeyUnavailable {
@@ -579,6 +585,13 @@ impl std::fmt::Display for ScrubError {
                  collide once the expression or predicate is applied).\n  \
                  Declare the column `safe` if it holds no free-form PII, or drop the \
                  constraint on the copy before scrubbing."
+            ),
+            Self::SchemaChanged { entries } => write!(
+                f,
+                "The schema changed while the scrub was running:\n{}\n  \
+                 The plan was built from an earlier snapshot and may not cover every \
+                 column now. Nothing was written. Re-run the command.",
+                bullet_list(entries),
             ),
             Self::EncryptionKeyUnavailable { profile, detail } => write!(
                 f,
@@ -3617,6 +3630,7 @@ fn classify_and_apply(
                 unpopulated: &facts.unpopulated_views,
             },
             sampling.as_ref(),
+            (&facts.public_base_tables, &facts.public_columns),
             label,
         )
         .inspect_err(|_| warn_committed(&committed))?;
@@ -4692,6 +4706,66 @@ const RLS_RESTRICTED_TABLES: &str = "SELECT rel.relname AS name FROM pg_class re
        AND NOT (pg_has_role(current_user, rel.relowner, 'USAGE') \
                 AND NOT rel.relforcerowsecurity)";
 
+/// Every base table in `public`, foreign tables included.
+const PUBLIC_BASE_TABLES: &str = "SELECT rel.relname AS name FROM pg_class rel \
+     JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+     WHERE rel.relkind IN ('r', 'p', 'f')";
+
+/// Every live column of those tables.
+const PUBLIC_COLUMNS: &str = "SELECT rel.relname AS tbl, att.attname AS col \
+     FROM pg_attribute att \
+     JOIN pg_class rel ON rel.oid = att.attrelid \
+     JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+     WHERE rel.relkind IN ('r', 'p', 'f') AND att.attnum > 0 AND NOT att.attisdropped";
+
+/// What changed between two `(tables, columns)` snapshots, sorted.
+/// [`schema_drift`] between `snapshot` and the schema as the connection sees it.
+fn live_schema_drift(
+    conn: &mut PgConnection,
+    snapshot: (&BTreeSet<String>, &BTreeSet<(String, String)>),
+) -> Result<Vec<String>, diesel::result::Error> {
+    let tables: BTreeSet<String> = sql_query(PUBLIC_BASE_TABLES)
+        .load::<NameRow>(conn)?
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+    let columns = pair_set(sql_query(PUBLIC_COLUMNS).load::<PairRow>(conn)?);
+    Ok(schema_drift(snapshot, (&tables, &columns)))
+}
+
+fn schema_drift(
+    before: (&BTreeSet<String>, &BTreeSet<(String, String)>),
+    after: (&BTreeSet<String>, &BTreeSet<(String, String)>),
+) -> Vec<String> {
+    let mut drift: Vec<String> = Vec::new();
+    drift.extend(
+        after
+            .0
+            .difference(before.0)
+            .map(|t| format!("{t} (table added)")),
+    );
+    drift.extend(
+        before
+            .0
+            .difference(after.0)
+            .map(|t| format!("{t} (table dropped)")),
+    );
+    drift.extend(
+        after
+            .1
+            .difference(before.1)
+            .map(|(t, c)| format!("{t}.{c} (column added)")),
+    );
+    drift.extend(
+        before
+            .1
+            .difference(after.1)
+            .map(|(t, c)| format!("{t}.{c} (column dropped)")),
+    );
+    drift.sort();
+    drift
+}
+
 /// Gather every catalog fact the plan validation needs.
 // One catalog read per fact; splitting it would scatter closely-related SQL
 // across helpers that each need the same connection.
@@ -5279,25 +5353,12 @@ fn probe_database_facts(
     // `f` (foreign tables) is deliberately included: introspection reads only
     // `BASE TABLE`, so a foreign table left pointing at production would be
     // classified by nothing at all and still report a clean scrub.
-    let public_base_tables = names(
-        "SELECT rel.relname AS name FROM pg_class rel \
-         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-         WHERE rel.relkind IN ('r', 'p', 'f')",
-        &mut conn,
-    )?
-    .into_iter()
-    .collect();
+    let public_base_tables = names(PUBLIC_BASE_TABLES, &mut conn)?.into_iter().collect();
 
     let public_columns = pair_set(
-        sql_query(
-            "SELECT rel.relname AS tbl, att.attname AS col \
-             FROM pg_attribute att \
-             JOIN pg_class rel ON rel.oid = att.attrelid \
-             JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-             WHERE rel.relkind IN ('r', 'p', 'f') AND att.attnum > 0 AND NOT att.attisdropped",
-        )
-        .load(&mut conn)
-        .map_err(|e| ScrubError::Sql(e.to_string()))?,
+        sql_query(PUBLIC_COLUMNS)
+            .load(&mut conn)
+            .map_err(|e| ScrubError::Sql(e.to_string()))?,
     );
 
     Ok(DatabaseFacts {
@@ -6442,12 +6503,15 @@ fn verify_sample_survived_refreshes(
 
 /// Run every statement for one database inside a single transaction, so a
 /// failure can never leave a half-scrubbed database behind.
+// One transaction, in write order; splitting it would hide that order.
+#[allow(clippy::too_many_lines)]
 fn execute(
     url: &str,
     plan: &ScrubPlan,
     purges: &[(String, String)],
     views: &ViewRefresh<'_>,
     sampling: Option<&sample::SamplePlan>,
+    snapshot: (&BTreeSet<String>, &BTreeSet<(String, String)>),
     label: &str,
 ) -> Result<Applied, ScrubError> {
     if plan.tables.is_empty() && purges.is_empty() && views.ordered.is_empty() && sampling.is_none()
@@ -6457,6 +6521,7 @@ fn execute(
     let mut conn = probe_connection(url, label, "apply the scrub")?;
     let mut counts = Vec::with_capacity(plan.tables.len());
     let mut outcome = None;
+    let mut drift: Vec<String> = Vec::new();
     // The transaction's error type carries BOTH channels, so a sample refusal
     // rolls back as itself rather than as an opaque database error.
     conn.transaction::<_, sample::SampleFailure, _>(|conn| {
@@ -6476,6 +6541,15 @@ fn execute(
         // the table emptied.
         for statement in lock_statements(plan, purges, sampling) {
             sql_query(statement).execute(conn)?;
+        }
+        // The locks above wait for a concurrent migration to commit, then see
+        // its schema. Compare against the snapshot the plan was built from, so
+        // a column added in that window cannot commit unclassified.
+        drift = live_schema_drift(conn, snapshot)?;
+        if !drift.is_empty() {
+            return Err(sample::SampleFailure::Db(
+                diesel::result::Error::RollbackTransaction,
+            ));
         }
         // Purges run FIRST so a framework-owned table that references a
         // sampled one is already empty when the sample removes its parents —
@@ -6624,6 +6698,9 @@ fn execute(
         Ok(())
     })
     .map_err(|e| match e {
+        _ if !drift.is_empty() => ScrubError::SchemaChanged {
+            entries: std::mem::take(&mut drift),
+        },
         sample::SampleFailure::Refused(refusal) => ScrubError::from(refusal),
         sample::SampleFailure::Db(error) => ScrubError::Sql(error.to_string()),
     })?;
@@ -9617,6 +9694,34 @@ mod tests {
         assert_eq!(
             scan_anonymize_tables(src).unwrap(),
             BTreeSet::from(["users".to_owned()])
+        );
+    }
+
+    #[test]
+    fn schema_drift_names_added_and_dropped_tables_and_columns() {
+        let pair = |t: &str, c: &str| (t.to_owned(), c.to_owned());
+        let before_tables = BTreeSet::from(["users".to_owned(), "old".to_owned()]);
+        let before_columns = BTreeSet::from([pair("users", "id"), pair("users", "bio")]);
+        let after_tables = BTreeSet::from(["users".to_owned(), "fresh".to_owned()]);
+        let after_columns = BTreeSet::from([pair("users", "id"), pair("users", "ssn")]);
+        assert_eq!(
+            schema_drift(
+                (&before_tables, &before_columns),
+                (&after_tables, &after_columns)
+            ),
+            vec![
+                "fresh (table added)".to_owned(),
+                "old (table dropped)".to_owned(),
+                "users.bio (column dropped)".to_owned(),
+                "users.ssn (column added)".to_owned(),
+            ]
+        );
+        assert!(
+            schema_drift(
+                (&before_tables, &before_columns),
+                (&before_tables, &before_columns)
+            )
+            .is_empty()
         );
     }
 
