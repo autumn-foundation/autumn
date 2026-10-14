@@ -235,6 +235,43 @@ fn recorded_child_stop_budget() -> Option<Duration> {
     }
 }
 
+/// Whether the running child's ready file was cleared before it spawned.
+///
+/// If an old file cannot be deleted, the app cannot replace it on Windows, so
+/// readiness is not tracked for that child.
+static CHILD_READY_TRACKABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Whether removing the old ready file left no file behind.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn ready_file_cleared(removal: &std::io::Result<()>) -> bool {
+    match removal {
+        Ok(()) => true,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// The ready file to track for the running child, if it can be trusted.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn trackable_ready_file() -> Option<&'static Path> {
+    CHILD_READY_TRACKABLE
+        .load(Ordering::SeqCst)
+        .then(dev_ready_file_path)
+        .flatten()
+}
+
 /// When the running child was spawned. `None` means "nothing recorded".
 static CHILD_SPAWNED_AT: std::sync::Mutex<Option<std::time::SystemTime>> =
     std::sync::Mutex::new(None);
@@ -297,10 +334,16 @@ fn stop_budget_for_running_child(
     reported.or(recorded).unwrap_or_else(resolve_now)
 }
 
-/// The directory of the selected package, or `.` when none is selected.
+/// The directory the app reads its config from: the selected package, else
+/// `AUTUMN_MANIFEST_DIR`, else `.`. This is the order the app itself uses.
 fn package_dir(package: Option<&str>) -> PathBuf {
     package
         .and_then(find_manifest_dir)
+        .or_else(|| {
+            std::env::var_os("AUTUMN_MANIFEST_DIR")
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from)
+        })
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
@@ -1366,9 +1409,17 @@ fn start_server(
     // first so this child cannot be stopped on its predecessor's number.
     #[cfg(not(unix))]
     if let Some(ready) = dev_ready_file_path() {
-        let _ = std::fs::remove_file(ready);
+        let cleared = ready_file_cleared(&std::fs::remove_file(ready));
+        CHILD_READY_TRACKABLE.store(cleared, Ordering::SeqCst);
         record_child_spawn_time();
-        command.env(SERVE_READY_FILE_ENV, ready);
+        if cleared {
+            command.env(SERVE_READY_FILE_ENV, ready);
+        } else {
+            eprintln!(
+                "  Warning: could not clear {}. A stop will not wait for startup.",
+                ready.display()
+            );
+        }
     }
 
     match command.spawn() {
@@ -1437,12 +1488,12 @@ fn stop_server_cooperative(child: &mut Option<Child>, package: Option<&str>) {
     let outcome = stop_child_cooperatively(
         child,
         signal_path,
-        dev_ready_file_path(),
+        trackable_ready_file(),
         recorded_child_spawn_time(),
         COOPERATIVE_STOP_BOOT_CAP,
         || {
             let resolved = stop_budget_for_running_child(
-                dev_ready_file_path().and_then(child_reported_stop_budget),
+                trackable_ready_file().and_then(child_reported_stop_budget),
                 recorded_child_stop_budget(),
                 || resolve_cooperative_stop_budget(package),
             );
@@ -2942,6 +2993,15 @@ mod tests {
         let member = root.path().join("api");
         std::fs::create_dir(&member).unwrap();
         assert_eq!(member_dir_to_watch(&member, root.path()), Some(member));
+    }
+
+    #[test]
+    fn a_ready_file_that_could_not_be_removed_is_not_cleared() {
+        let gone = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let locked = Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(ready_file_cleared(&Ok(())));
+        assert!(ready_file_cleared(&gone));
+        assert!(!ready_file_cleared(&locked));
     }
 
     #[test]
