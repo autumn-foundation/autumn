@@ -31,9 +31,9 @@
 //!
 //! # Drain of a fresh connection
 //!
-//! A connection that has read no byte is not closed at the drain signal. Its
-//! request can be in flight, and a close would reset it. Such a connection
-//! gets [`FRESH_CONN_GRACE`] to send its first byte; then the drain starts.
+//! A connection that has received no request is not closed at the drain signal. Its
+//! request can be in flight, and a close would reset it. The server waits up
+//! to [`FRESH_CONN_GRACE`] (2 s) for the first request. Then it starts the drain.
 
 use std::convert::Infallible;
 use std::fmt::Debug;
@@ -334,19 +334,19 @@ where
             Step::Shutdown => break,
             Step::TimedOut => continue,
         };
+        let first_request = Arc::new(FirstRequest::default());
         let service = Tracked {
             inner: service,
             timers: timers.clone(),
+            first_request: Arc::clone(&first_request),
         };
         let service = service.map_request(|req: axum::http::Request<hyper::body::Incoming>| {
             req.map(axum::body::Body::new)
         });
         let hyper_service = hyper_util::service::TowerToHyperService::new(service);
-        let first_byte = Arc::new(FirstByte::default());
         let io = TokioIo::new(ConnIo {
             inner: io,
             timers: timers.clone(),
-            first_byte: Arc::clone(&first_byte),
             _permit: permit,
         });
 
@@ -365,8 +365,8 @@ where
             // Set by a graceful shutdown. Until then hyper can finish its
             // GOAWAY sequence and flush the last response bytes.
             let mut grace_until: Option<Instant> = None;
-            // Set when the signal finds a connection with no byte read. Its
-            // request may be in flight, so hyper must not close it as idle.
+            // Set when the signal finds a connection with no request. Its
+            // request can be in flight. Hyper must not close it as idle.
             let mut fresh_until: Option<Instant> = None;
             loop {
                 let shutting_down = grace_until.is_some();
@@ -375,15 +375,15 @@ where
                 tokio::select! {
                     _ = conn.as_mut() => break,
                     () = &mut signal_closed, if !shutting_down && !waiting_fresh => {
-                        if first_byte.is_seen() {
+                        if first_request.is_seen() {
                             grace_until = Some(Instant::now() + SHUTDOWN_GRACE);
                             conn.as_mut().graceful_shutdown();
                         } else {
                             fresh_until = Some(Instant::now() + FRESH_CONN_GRACE);
                         }
                     }
-                    // The first byte came, or the wait ended: drain now.
-                    () = fresh_wait(&first_byte, fresh_until), if waiting_fresh && !shutting_down => {
+                    // The first request came, or the wait ended: drain now.
+                    () = fresh_wait(&first_request, fresh_until), if waiting_fresh && !shutting_down => {
                         fresh_until = None;
                         grace_until = Some(Instant::now() + SHUTDOWN_GRACE);
                         conn.as_mut().graceful_shutdown();
@@ -439,21 +439,21 @@ async fn changed(timers: Option<&ConnTimers>) {
 /// Time a connection gets to close by itself after a graceful shutdown.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// Time a connection with no byte read gets to send its request after a
-/// graceful shutdown starts. hyper closes an idle connection at once, so a
-/// request that is still in flight would be reset.
+/// Time a connection with no request can wait for its first request after a
+/// graceful shutdown starts. Hyper closes an idle connection at once. That
+/// close resets a request that is still in flight.
 const FRESH_CONN_GRACE: Duration = Duration::from_secs(2);
 
-/// Resolves at the first byte, or when the fresh-connection grace ends.
-async fn fresh_wait(first_byte: &FirstByte, until: Option<Instant>) {
+/// Resolves at the first request, or when the fresh-connection grace ends.
+async fn fresh_wait(first_request: &FirstRequest, until: Option<Instant>) {
     let Some(until) = until else {
         return std::future::pending().await;
     };
-    if first_byte.is_seen() {
+    if first_request.is_seen() {
         return;
     }
     tokio::select! {
-        () = first_byte.notify.notified() => {}
+        () = first_request.notify.notified() => {}
         () = tokio::time::sleep_until(until) => {}
     }
 }
@@ -1009,18 +1009,17 @@ impl ConnTimers {
 struct ConnIo<I> {
     inner: I,
     timers: Option<Arc<ConnTimers>>,
-    first_byte: Arc<FirstByte>,
     _permit: Option<Slot>,
 }
 
-/// Whether the connection has read a byte yet.
+/// Records the first request on a connection, and wakes a waiting task.
 #[derive(Default)]
-struct FirstByte {
+struct FirstRequest {
     seen: std::sync::atomic::AtomicBool,
     notify: Notify,
 }
 
-impl FirstByte {
+impl FirstRequest {
     fn mark(&self) {
         if !self.seen.swap(true, std::sync::atomic::Ordering::Relaxed) {
             self.notify.notify_one();
@@ -1040,11 +1039,10 @@ impl<I: AsyncRead + Unpin> AsyncRead for ConnIo<I> {
     ) -> Poll<io::Result<()>> {
         let before = buf.filled().len();
         let result = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if buf.filled().len() > before {
-            self.first_byte.mark();
-            if let Some(timers) = &self.timers {
-                timers.on_read(&buf.filled()[before..]);
-            }
+        if buf.filled().len() > before
+            && let Some(timers) = &self.timers
+        {
+            timers.on_read(&buf.filled()[before..]);
         }
         result
     }
@@ -1085,6 +1083,7 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for ConnIo<I> {
 struct Tracked<S> {
     inner: S,
     timers: Option<Arc<ConnTimers>>,
+    first_request: Arc<FirstRequest>,
 }
 
 struct InFlight(Arc<ConnTimers>);
@@ -1172,6 +1171,7 @@ where
     }
 
     fn call(&mut self, mut req: axum::extract::Request) -> Self::Future {
+        self.first_request.mark();
         let guard = self.timers.as_ref().map(|timers| {
             // A CONNECT stream gets two marks: one on the response body, as
             // for every request, and one for the tunnel, which can outlive
@@ -1277,7 +1277,7 @@ mod tests {
     }
 
     #[test]
-    fn http1_head_opens_at_the_first_byte_and_closes_at_the_blank_line() {
+    fn http1_head_opens_at_the_first_request_and_closes_at_the_blank_line() {
         let mut state = state();
         state.scan(b"POST /x HTTP/1.1\r\nHost: t\r\n");
         assert!(state.header_block_since.is_some());
@@ -1519,6 +1519,7 @@ mod tests {
         use tower::Service as _;
         let timers = idle_timers();
         let mut service = Tracked {
+            first_request: Arc::default(),
             inner: tower::service_fn(|_req: axum::extract::Request| async {
                 Ok::<_, Infallible>(
                     axum::response::Response::builder()
@@ -1539,6 +1540,7 @@ mod tests {
         let timers = idle_timers();
         let (tx, rx) = std::sync::mpsc::channel::<TunnelGuard>();
         let mut service = Tracked {
+            first_request: Arc::default(),
             inner: tower::service_fn(move |mut req: axum::extract::Request| {
                 // What the WebSocket upgrade does: keep the guard.
                 let guard = req.extensions_mut().remove::<TunnelGuard>();
@@ -1563,6 +1565,7 @@ mod tests {
         let timers = idle_timers();
         let (tx, rx) = std::sync::mpsc::channel::<KeepTunnel>();
         let mut service = Tracked {
+            first_request: Arc::default(),
             inner: tower::service_fn(move |req: axum::extract::Request| {
                 let tx = tx.clone();
                 async move {
@@ -1588,6 +1591,7 @@ mod tests {
         use tower::Service as _;
         let timers = idle_timers();
         let mut service = Tracked {
+            first_request: Arc::default(),
             // A CONNECT handler that is not a WebSocket: it drops the guard
             // and streams a body.
             inner: tower::service_fn(|_req: axum::extract::Request| async {
@@ -1702,7 +1706,7 @@ mod tests {
         let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
         tokio::time::sleep(Duration::from_millis(30)).await;
         stop.cancel();
-        // Later than any short settle window.
+        // Longer than ACCEPT_SETTLE (100 ms).
         tokio::time::sleep(Duration::from_millis(400)).await;
         let _ = client
             .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
@@ -1720,7 +1724,7 @@ mod tests {
         let _client = tokio::net::TcpStream::connect(addr).await.expect("connect");
         tokio::time::sleep(Duration::from_millis(30)).await;
         stop.cancel();
-        let done = tokio::time::timeout(FRESH_CONN_GRACE + Duration::from_secs(1), server).await;
+        let done = tokio::time::timeout(FRESH_CONN_GRACE + Duration::from_secs(3), server).await;
         assert!(
             done.is_ok(),
             "the drain must end after the fresh-connection grace"

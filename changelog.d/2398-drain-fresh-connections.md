@@ -1,5 +1,5 @@
 ### Fixed
 
-- **upgrade:** a connection accepted just before a drain or in-place upgrade
-  cutover is no longer reset. The server waits up to 2 s for its first byte,
-  then drains it (issue #2398).
+- **upgrade:** the server no longer resets a connection that it accepted just
+  before a drain or an in-place upgrade. It now waits up to 2 s for the first
+  request of that connection, then drains it (issue #2398).
