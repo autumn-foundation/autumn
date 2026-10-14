@@ -182,7 +182,7 @@ const MIN_ECHO_LEN: usize = 4;
 ///
 /// [`mask_echoes`] costs O(text × needles), so the echo set must stay bounded.
 /// Real requests carry far fewer. The cap applies to each header line. Only
-/// segments with a `=` count. The whole header value is always recorded.
+/// named `name=value` segments count. The whole header value is always recorded.
 const MAX_COOKIE_PAIRS: usize = 256;
 
 /// Build the capsule's request record, masking every sensitive value.
@@ -1166,11 +1166,12 @@ pub(crate) fn record_credential_components(name: &str, value: &[u8], values: &mu
         } else {
             MAX_COOKIE_PAIRS
         };
-        // Count only segments that hold a value. An empty or `=`-less segment
-        // must not use up the cap and hide a real cookie behind it.
+        // Count only segments with a cookie name. Handlers skip the others, so
+        // they must not use up the cap and hide a real cookie behind them.
         let cookie_values = trimmed
             .split(|byte| *byte == b';')
             .filter_map(|pair| split_once_byte(pair, b'='))
+            .filter(|(cookie_name, _)| !trim_ows(cookie_name).is_empty())
             .take(limit);
         for (_, cookie_value) in cookie_values {
             let spelled = trim_ows(cookie_value);
@@ -1440,7 +1441,7 @@ const fn is_token_byte(byte: u8) -> bool {
 ///
 /// A token holds no whitespace, so the first non-token byte must start the
 /// separator: SP, HTAB or a Unicode space. Anything else is not a scheme.
-/// `value` is already trimmed, so a shrinking `trim_ows` shows a separator.
+/// The separator is removed here, because the rest need not be UTF-8.
 fn split_scheme(value: &[u8]) -> Option<(&[u8], &[u8])> {
     let end = value
         .iter()
@@ -1448,7 +1449,28 @@ fn split_scheme(value: &[u8]) -> Option<(&[u8], &[u8])> {
         .position(|byte| !is_token_byte(byte))?;
     let scheme = value.get(..end).filter(|scheme| !scheme.is_empty())?;
     let rest = value.get(end..)?;
-    (trim_ows(rest).len() != rest.len()).then_some((scheme, rest))
+    let credential = strip_leading_whitespace(rest);
+    (credential.len() != rest.len()).then_some((scheme, credential))
+}
+
+/// Strip leading ASCII and Unicode whitespace. Only the whitespace itself must
+/// be valid UTF-8, not the bytes after it.
+fn strip_leading_whitespace(mut bytes: &[u8]) -> &[u8] {
+    loop {
+        let width = match bytes.first() {
+            Some(byte) if byte.is_ascii_whitespace() => 1,
+            Some(_) => match bytes
+                .utf8_chunks()
+                .next()
+                .and_then(|chunk| chunk.valid().chars().next().filter(|c| c.is_whitespace()))
+            {
+                Some(space) => space.len_utf8(),
+                None => return bytes,
+            },
+            None => return bytes,
+        };
+        bytes = bytes.get(width..).unwrap_or_default();
+    }
 }
 
 // ── Byte equivalents of the `str` methods the parse above needs ─────────────
@@ -3169,6 +3191,32 @@ mod tests {
             &filter_with(&[]),
         );
         assert!(values.contains(b"secretvalue"), "real cookie after junk");
+    }
+
+    /// A segment with no cookie name is not a cookie. Handlers skip it, so it
+    /// must not use up the cap.
+    #[test]
+    fn nameless_segments_do_not_use_up_the_cookie_cap() {
+        let junk = "=junk; ".repeat(MAX_COOKIE_PAIRS + 10);
+        let (_request, values) = redact(
+            Request::get("/").header(header::COOKIE, format!("{junk}session=secretvalue")),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(values.contains(b"secretvalue"), "real cookie after junk");
+    }
+
+    /// A Unicode separator is found even when the credential is not UTF-8.
+    #[test]
+    fn a_unicode_separator_survives_a_non_utf8_credential() {
+        let mut values = RedactedValues::default();
+        record_credential_components(
+            "authorization",
+            b"Digest\xc2\xa0username=\xff, response=deadbeef",
+            &mut values,
+        );
+        assert!(values.contains(b"deadbeef"));
+        assert!(values.contains(b"username=\xff, response=deadbeef"));
     }
 
     /// The quote floor counts the value, not its quotes.
