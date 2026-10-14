@@ -526,53 +526,62 @@ fn collect_disabled_modules(
     out: &mut Vec<std::path::PathBuf>,
 ) {
     let (dir, path_base) = dirs;
-    // A name declared both ways (`#[cfg(test)] mod m;` and `#[cfg(not(test))]
-    // mod m;`) loads its conventional file in production.
-    let enabled_names: Vec<String> = items
+    // The paths a module loads: its `#[path]`, else the conventional pair.
+    let paths_of = |module: &syn::ItemMod| -> Vec<std::path::PathBuf> {
+        let custom = module
+            .attrs
+            .iter()
+            .filter(|a| a.path().is_ident("path"))
+            .find_map(|a| match &a.meta {
+                syn::Meta::NameValue(nv) => match &nv.value {
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(path),
+                        ..
+                    }) => Some(path.value()),
+                    _ => None,
+                },
+                _ => None,
+            });
+        custom.map_or_else(
+            || {
+                vec![
+                    dir.join(format!("{}.rs", module.ident)),
+                    dir.join(module.ident.to_string()),
+                ]
+            },
+            |custom| vec![path_base.join(custom)],
+        )
+    };
+    // A path that an enabled declaration also loads (`#[cfg(test)] mod m;` with
+    // `#[cfg(not(test))] mod m;`) is production code.
+    let enabled_paths: Vec<std::path::PathBuf> = items
         .iter()
         .filter_map(|item| match item {
             syn::Item::Mod(m)
                 if m.content.is_none() && !parent_disabled && production_enabled(&m.attrs) =>
             {
-                Some(m.ident.to_string())
+                Some(paths_of(m))
             }
             _ => None,
         })
+        .flatten()
         .collect();
     for item in items {
         let syn::Item::Mod(module) = item else {
             continue;
         };
-        let name = module.ident.to_string();
         let disabled = parent_disabled || !production_enabled(&module.attrs);
         match &module.content {
             None if disabled => {
-                let custom = module
-                    .attrs
-                    .iter()
-                    .filter(|a| a.path().is_ident("path"))
-                    .find_map(|a| match &a.meta {
-                        syn::Meta::NameValue(nv) => match &nv.value {
-                            syn::Expr::Lit(syn::ExprLit {
-                                lit: syn::Lit::Str(path),
-                                ..
-                            }) => Some(path.value()),
-                            _ => None,
-                        },
-                        _ => None,
-                    });
-                if let Some(custom) = custom {
-                    out.push(path_base.join(custom));
-                } else if !enabled_names.contains(&name) {
-                    // The conventional paths only when no `#[path]` moves the
-                    // module and no enabled twin loads them.
-                    out.push(dir.join(format!("{name}.rs")));
-                    out.push(dir.join(&name));
-                }
+                out.extend(
+                    paths_of(module)
+                        .into_iter()
+                        .filter(|p| !enabled_paths.contains(p)),
+                );
             }
             None => {}
             Some((_, nested)) => {
-                let nested_dir = dir.join(&name);
+                let nested_dir = dir.join(module.ident.to_string());
                 collect_disabled_modules(nested, (&nested_dir, &nested_dir), disabled, out);
             }
         }
@@ -2499,6 +2508,24 @@ mod tests {
         std::fs::write(
             dir.path().join("lib.rs"),
             "#[cfg(test)] mod models;\n#[cfg(not(test))] mod models;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// Two declarations of one custom path: the enabled one keeps it.
+    #[test]
+    fn an_enabled_twin_keeps_a_shared_custom_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] #[path = \"models.rs\"] mod a;\n#[cfg(not(test))] #[path = \"models.rs\"] mod b;\n",
         )
         .unwrap();
         std::fs::write(

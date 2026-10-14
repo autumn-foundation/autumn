@@ -746,11 +746,12 @@ apply-time error.
   duration, so a row inserted between the classification snapshot and the
   rewrite cannot slip through.
 - **A schema change mid-run is refused.** After the locks are taken, the
-  transaction compares `public`'s tables and columns with the snapshot the plan
-  was built from, and compares again before commit. A migration that changed the
+  transaction compares `public`'s tables, columns and RLS state with the snapshot
+  the plan was built from, and compares again before commit. A migration that changed the
   schema in that window rolls the run back. The locks cover only the tables the
   run writes, so a change to any other table after the last comparison is not
-  caught. Re-run the command.
+  caught. Re-run the command. The SQL that `--dry-run` prints has the target
+  guard and the locks, but no schema-drift check.
 - **Encrypted columns get the same plan-time gates.** An `#[encrypted]` column
   must be `text`, `citext` or `varchar(n)`, and a `varchar(n)` must be wide
   enough for the replacement envelope (148 characters; 168 for an email-shaped

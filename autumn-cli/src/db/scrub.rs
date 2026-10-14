@@ -2578,6 +2578,7 @@ fn database_endpoint(
     if !(raw.starts_with("postgres://") || raw.starts_with("postgresql://")) {
         return conninfo_endpoint(raw, env);
     }
+    let user = url_user(raw);
     let stripped = without_userinfo(raw);
     let (scheme, rest) = stripped.split_once("://")?;
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
@@ -2592,17 +2593,21 @@ fn database_endpoint(
             .map(|(_, v)| v.into_owned())
             .filter(|v| !v.is_empty())
     };
-    let name = query("dbname").or_else(|| {
-        parsed
-            .path_segments()
-            .and_then(|mut s| s.next())
-            .map(|n| {
-                percent_encoding::percent_decode_str(n)
-                    .decode_utf8_lossy()
-                    .into_owned()
-            })
-            .filter(|n| !n.is_empty())
-    })?;
+    let name = query("dbname")
+        .or_else(|| {
+            parsed
+                .path_segments()
+                .and_then(|mut s| s.next())
+                .map(|n| {
+                    percent_encoding::percent_decode_str(n)
+                        .decode_utf8_lossy()
+                        .into_owned()
+                })
+                .filter(|n| !n.is_empty())
+        })
+        .or_else(|| env("PGDATABASE").filter(|n| !n.is_empty()))
+        .or(user)
+        .or_else(|| env("PGUSER").filter(|n| !n.is_empty()))?;
     let (hosts, own_ports): (Vec<String>, Vec<Option<u16>>) = if listed.is_empty() {
         // `hostaddr` is the network address libpq connects to; `host` is then
         // only a name.
@@ -2736,10 +2741,18 @@ fn conninfo_endpoint(
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Option<(Vec<(String, u16)>, String)> {
     let values: BTreeMap<String, String> = conninfo_pairs(raw)?.into_iter().collect();
-    let name = values.get("dbname").filter(|n| !n.is_empty())?.clone();
+    // The database defaults to the user name when none is given.
+    let name = values
+        .get("dbname")
+        .cloned()
+        .or_else(|| env("PGDATABASE"))
+        .or_else(|| values.get("user").cloned())
+        .or_else(|| env("PGUSER"))
+        .filter(|n| !n.is_empty())?;
+    // `hostaddr` is the network address libpq connects to.
     let host_list = values
-        .get("host")
-        .or_else(|| values.get("hostaddr"))
+        .get("hostaddr")
+        .or_else(|| values.get("host"))
         .cloned()
         .or_else(|| env("PGHOST").filter(|v| !v.is_empty()))
         .unwrap_or_default();
@@ -2763,6 +2776,19 @@ fn conninfo_endpoint(
         })
         .collect();
     Some((endpoints, name))
+}
+
+/// The user name of a URL, percent-decoded. The database defaults to it.
+fn url_user(raw: &str) -> Option<String> {
+    let (_, rest) = raw.split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (userinfo, _) = rest[..end].rsplit_once('@')?;
+    let user = userinfo.split(':').next()?;
+    (!user.is_empty()).then(|| {
+        percent_encoding::percent_decode_str(user)
+            .decode_utf8_lossy()
+            .into_owned()
+    })
 }
 
 /// `raw` with any `user:password@` removed. An empty host with credentials
@@ -10061,6 +10087,21 @@ mod tests {
         assert!(same_database_in(
             "postgres:///app?host=prod.example&hostaddr=10.0.0.5",
             "postgres://10.0.0.5/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "host=prod.example hostaddr=10.0.0.5 dbname=app",
+            "postgres://10.0.0.5/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "host=prod user=app",
+            "postgres://app@prod/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://app@prod",
+            "host=prod dbname=app",
             &env
         ));
         assert!(same_database_in(
