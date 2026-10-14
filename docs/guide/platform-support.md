@@ -47,17 +47,21 @@ LNK4318: Very long symbol name encountered while producing debug information
 LINK : fatal error LNK4319: A PDB limit was hit while adding public symbols
 ```
 
-It is a linker limit, not a code error. Reduce the debug info for the dev
-profile in your project's `Cargo.toml`:
+It is a linker limit, not a code error. `autumn new` already scaffolds the fix
+in your `Cargo.toml`, for your app and for its dependencies:
 
 ```toml
 [profile.dev]
-debug = "line-tables-only"   # or `0` if that is still too much
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = "line-tables-only"
 ```
 
 `line-tables-only` keeps backtraces useful (file and line, no variable
-inspection) at a fraction of the symbol count. Autumn's own `windows-tier1` CI
-job builds with `debug = 0` for this reason.
+inspection) at a fraction of the symbol count. Use `0` if that is still too
+much. If you made your project before this change, add the lines yourself.
+Autumn's own `windows-tier1` CI job builds with `debug = 0` for this reason.
 
 Set it in the **manifest**, not via `CARGO_PROFILE_DEV_DEBUG`. That environment
 variable does drop debug info, but autumn's CI hit the limit again with it set,

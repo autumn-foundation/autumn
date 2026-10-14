@@ -2039,6 +2039,42 @@ mod tests {
         }
     }
 
+    /// Windows PDBs cap public symbols (LNK4319, issue #2448). Every shape
+    /// must scaffold a reduced dev profile in the manifest, for the project
+    /// and for its dependencies.
+    #[test]
+    fn every_starter_shape_scaffolds_reduced_dev_debug_info() {
+        let shapes = [
+            ("shape-default", GenerateOptions::default()),
+            ("shape-bundled", bundled_pg_opts()),
+            ("shape-daemon", daemon_opts()),
+            (
+                "shape-api",
+                GenerateOptions {
+                    with_api: true,
+                    ..GenerateOptions::default()
+                },
+            ),
+        ];
+        for (name, opts) in shapes {
+            let tmp = TempDir::new().unwrap();
+            generate_with(name, tmp.path(), opts).unwrap();
+            let raw = fs::read_to_string(tmp.path().join(name).join("Cargo.toml")).unwrap();
+            let doc: toml::Table = raw.parse().unwrap();
+            let dev = &doc["profile"]["dev"];
+            assert_eq!(
+                dev["debug"].as_str(),
+                Some("line-tables-only"),
+                "{name}: {raw}"
+            );
+            assert_eq!(
+                dev["package"]["*"]["debug"].as_str(),
+                Some("line-tables-only"),
+                "{name}: dependencies need their own setting: {raw}"
+            );
+        }
+    }
+
     #[test]
     fn daemon_with_seed_is_rejected() {
         let tmp = TempDir::new().unwrap();
