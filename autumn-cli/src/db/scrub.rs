@@ -2335,7 +2335,8 @@ fn same_database(a: &str, b: &str) -> bool {
 /// Tests then do not set process environment variables.
 ///
 /// A hostless URL (`postgres:///db?host=/run/postgresql`) takes its host
-/// from the `hostaddr` parameter, then `host`, then `pghost`.
+/// from the `hostaddr` parameter, then `host`, then `pghost`. A `hostaddr`
+/// wins over a host in the URL authority, as in libpq.
 /// If no host is found, the host is empty and libpq uses its default socket.
 fn same_database_with(a: &str, b: &str, pghost: Option<&str>) -> bool {
     let decode = |raw: &str| {
@@ -2354,6 +2355,7 @@ fn same_database_with(a: &str, b: &str, pghost: Option<&str>) -> bool {
         let host = parsed
             .host_str()
             .map(decode)
+            .filter(|_| query("hostaddr").is_none())
             .or_else(|| query("hostaddr"))
             .or_else(|| query("host"))
             .or_else(|| pghost.filter(|h| !h.is_empty()).map(str::to_owned))
@@ -9055,6 +9057,11 @@ mod tests {
         assert!(same(
             "postgres://%2Fvar%2Frun%2Fpostgresql/prod",
             "postgres:///prod?host=/var/run/postgresql"
+        ));
+        // libpq connects to `hostaddr` even when the URL names a host.
+        assert!(same(
+            "postgres://prod.example.com/prod?hostaddr=10.0.0.1",
+            "postgres://10.0.0.1/prod"
         ));
         // A URL that does not parse still matches itself.
         assert!(same(
