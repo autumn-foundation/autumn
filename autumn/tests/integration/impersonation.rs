@@ -1651,7 +1651,7 @@ async fn login_carol_with_email(session: Session) -> &'static str {
 }
 
 #[tokio::test]
-async fn a_stale_identity_stash_is_not_restored_onto_the_next_operator() {
+async fn a_stale_identity_stash_leaves_no_values_for_the_next_operator() {
     let client = TestApp::new()
         .routes(routes![
             login_admin_with_email,
@@ -1693,10 +1693,9 @@ async fn a_stale_identity_stash_is_not_restored_onto_the_next_operator() {
         .assert_ok();
     client.post("/stop-impersonating").send().await.assert_ok();
 
-    assert_eq!(
-        client.get("/email").send().await.text(),
-        "carol@example.com"
-    );
+    // Fail closed: the stale stash named `user_email`, so the key is removed.
+    // The old target's value must not show, and it must not come back.
+    assert_eq!(client.get("/email").send().await.text(), "-");
 }
 
 /// Declares `user_email` as absent for the target.

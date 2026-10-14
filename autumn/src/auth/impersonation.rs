@@ -714,8 +714,9 @@ async fn swap_identity(
 
 /// Save the operator's value for each extra key, then write the target's.
 async fn stash_identity_keys(session: &Session, extra: &[(String, Option<String>)]) {
-    // Drop a stale stash first, so an old record cannot restore its keys later.
-    session.remove(IMPERSONATOR_IDENTITY_SESSION_KEY).await;
+    // A stale stash names keys of an old target. Remove them and the stash, so
+    // nothing of the old record shows or returns. Restore nothing.
+    drop_identity_keys(session).await;
     if extra.is_empty() {
         return;
     }
