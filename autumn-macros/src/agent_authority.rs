@@ -1291,6 +1291,10 @@ impl Analyzer {
                 Stmt::Item(syn::Item::Union(item)) => self.hide_crate(&item.ident),
                 Stmt::Item(syn::Item::Trait(item)) => self.hide_crate(&item.ident),
                 Stmt::Item(syn::Item::Type(item)) => self.hide_crate(&item.ident),
+                Stmt::Item(syn::Item::ExternCrate(item)) => {
+                    let name = item.rename.as_ref().map_or(&item.ident, |(_, name)| name);
+                    self.hide_crate(name);
+                }
                 // A `use` also covers the whole block, whatever its line.
                 Stmt::Item(item @ syn::Item::Use(_)) => self.nested_item(item),
                 _ => {}
@@ -1653,6 +1657,27 @@ impl Analyzer {
     /// `fut = start();` moves a future into a name, as a `let` does.
     /// A later await of the name is the awaited call.
     fn assign_future_to(&mut self, target: &Expr, unread: bool) {
+        // `jobs.0 = start();` and `jobs[i] = start();` write into `jobs`.
+        let mut place = target;
+        let mut inside = false;
+        loop {
+            match place {
+                Expr::Field(f) => place = &f.base,
+                Expr::Index(i) => place = &i.expr,
+                Expr::Paren(p) => place = &p.expr,
+                _ => break,
+            }
+            inside = true;
+        }
+        if inside {
+            if unread
+                && let Expr::Path(path) = place
+                && let Some(ident) = path.path.get_ident()
+            {
+                self.unread_futures.insert(ident.to_string());
+            }
+            return;
+        }
         let Expr::Path(path) = target else {
             return;
         };
@@ -3591,7 +3616,9 @@ fn diesel_imports(
         syn::UseTree::Rename(rename) => {
             let ident = rename.ident.to_string();
             let local = rename.rename.to_string();
-            if prefix.is_empty() && ident == "diesel" {
+            if prefix.is_empty() && ident == "diesel"
+                || prefix.as_slice() == ["diesel"] && ident == "self"
+            {
                 roots.insert(local);
             } else if prefix.as_slice() == ["diesel"] && VERBS.contains(&ident.as_str()) {
                 fns.insert(local, ident);
@@ -6870,6 +6897,37 @@ mod tests {
             r"async fn h() -> R {
                 let _ = std::format!();
                 mod std { pub use crate::evil as format; }
+                Ok(())
+            }",
+        ),
+        (
+            "standard macro root shadowed by extern crate",
+            ExpectedKind::Rejected,
+            "format",
+            r"async fn h() -> R {
+                let _ = std::format!();
+                extern crate evil as std;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future assigned into a tuple field",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                let mut jobs = (tokio::time::sleep(d), 1);
+                jobs.0 = start_finance_job();
+                jobs.0.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "diesel renamed through a grouped self",
+            ExpectedKind::Rejected,
+            "select_target",
+            r"async fn h(mut db: Db) -> R {
+                use diesel::{self as orm};
+                orm::delete(select_target()).execute(&mut *db).await?;
                 Ok(())
             }",
         ),
