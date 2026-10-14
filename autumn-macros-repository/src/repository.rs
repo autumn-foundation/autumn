@@ -604,6 +604,9 @@ fn cascade_mutation_registrations(
                             invalidates: &[#(#edges),*],
                             acknowledged_stale: #acknowledged,
                             location: concat!(file!(), ":", line!()),
+                            cascades_into: ::core::option::Option::Some(
+                                <#child>::__AUTUMN_REPOSITORY_NAME
+                            ),
                         }
                     }
                     }
@@ -768,6 +771,7 @@ fn generate_coherence_items(
                         invalidates: &[#(#edges),*],
                         acknowledged_stale: #acknowledged,
                         location: concat!(file!(), ":", line!()),
+                        cascades_into: ::core::option::Option::None,
                     }
                 }
             }
@@ -800,6 +804,12 @@ fn generate_coherence_items(
             #[doc(hidden)]
             pub const __AUTUMN_MODEL_NAME: fn() -> &'static ::core::primitive::str =
                 || ::core::any::type_name::<#model_name>();
+
+            /// This repository's trait name. A parent cascade publishes it
+            /// so the audit can follow the cascade down (#2364).
+            #[doc(hidden)]
+            pub const __AUTUMN_REPOSITORY_NAME: &'static ::core::primitive::str =
+                #trait_name_str;
 
             /// The model this repository writes, unqualified — the subject an
             /// agent-authority grant names (#1691). `__AUTUMN_MODEL_NAME`
@@ -21503,6 +21513,31 @@ mod tests {
         )
         .to_string();
         assert!(out.contains("import path only"), "{out}");
+    }
+
+    #[test]
+    fn a_cascade_names_its_child_repository_for_the_closure() {
+        // The parent cannot see the grandchild. It names the child so the
+        // audit can follow the chain (#2364).
+        let out = repository_macro(
+            quote! {
+                Post,
+                dependent(PgCommentRepository, fk = "post_id", on_delete = destroy),
+                dependent(PgTagRepository, fk = "post_id", on_delete = restrict)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            out.contains("cascades_into : :: core :: option :: Option :: Some (")
+                && out.contains("< PgCommentRepository > :: __AUTUMN_REPOSITORY_NAME"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("< PgTagRepository > :: __AUTUMN_REPOSITORY_NAME"),
+            "{out}"
+        );
+        assert!(out.contains("pub const __AUTUMN_REPOSITORY_NAME"), "{out}");
     }
 
     #[test]
