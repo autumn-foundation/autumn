@@ -1317,6 +1317,36 @@ Most apps need no change. Two cases need work:
 
 **Automation:** `manual` — a hook-order dependency needs a human decision.
 
+### Cache coherence: `MutationDescriptor` and `Mutation` have new fields (#2364)
+
+**Why:** The cache audit must see the writes a nested `dependent(...)` cascade
+makes below its direct child. A repository names only its own children, so each
+cascade write now names the child repository it runs. The audit follows those
+links.
+
+**Before (`0.8`):**
+
+- `MutationDescriptor` had no `cascades_into` field.
+- `Mutation` had no `cascades_into` or `cascade_recurses` field.
+- A root delete registered a write for the direct child model only.
+
+**After (`0.9`):**
+
+- A root delete registers a write for each model below it in a chain of
+  `destroy` cascades. `nullify` and `delete_all` stop the chain.
+- The root repository must declare an edge for each such model. An app that
+  had no edge for a grandchild read now fails `autumn cache audit`.
+
+Most apps need no change. Two cases need work:
+
+- A cached read of a grandchild model that the audit now flags. Add
+  `invalidates(...)` to the root repository, or `acknowledge_stale = "reason"`.
+- Code that builds `MutationDescriptor` or `Mutation` by hand. Set
+  `cascades_into: None` on both, and `cascade_recurses: false` on `Mutation`.
+  The `#[repository]` macro does this for you.
+
+**Automation:** `manual` — a flagged read needs a human decision.
+
 ## Plugin authors
 
 Everything here is addressed to someone maintaining an `autumn-plugin-*` /
