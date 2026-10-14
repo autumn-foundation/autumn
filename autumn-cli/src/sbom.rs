@@ -73,9 +73,8 @@ pub enum SbomError {
     #[error("unsupported object file format")]
     UnsupportedObjectFormat,
     #[error(
-        "byte-swapped fat Mach-O header (FAT_CIGAM): fat headers are always big-endian on \
-         disk and no Apple toolchain writes this layout — the file is corrupt or not a \
-         universal binary"
+        "byte-swapped fat Mach-O header (FAT_CIGAM). Fat headers are always big-endian. \
+         The file is corrupt or is not a universal binary"
     )]
     ByteSwappedFatMachO,
     #[error("truncated or malformed object file")]

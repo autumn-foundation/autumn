@@ -551,8 +551,8 @@ fn profile_section_from_base_toml(base: &toml::Value, profile: &str) -> Option<t
 /// `(prestop_grace_secs, shutdown_timeout_secs)` the runtime uses for `profile`
 /// when no config file or environment variable overrides them.
 ///
-/// Reads the same smart defaults the loader merges, so tooling cannot drift
-/// from the runtime. A profile without smart defaults gets the struct defaults.
+/// Read from the same table the loader uses. A profile without smart defaults
+/// gets the struct defaults.
 #[must_use]
 pub fn profile_shutdown_defaults(profile: &str) -> (u64, u64) {
     let name = normalize_profile_name(profile).unwrap_or_else(|| profile.trim().to_owned());
@@ -20570,6 +20570,20 @@ path = "/healthz"
         assert_eq!(config.security.headers.x_frame_options, "DENY");
         assert!(config.security.headers.x_content_type_options);
         assert!(!config.security.headers.content_security_policy.is_empty());
+    }
+
+    #[test]
+    fn profile_shutdown_defaults_match_the_smart_defaults() {
+        assert_eq!(profile_shutdown_defaults("dev"), (0, 1));
+        assert_eq!(profile_shutdown_defaults("development"), (0, 1));
+        assert_eq!(profile_shutdown_defaults(" dev "), (0, 1));
+        assert_eq!(profile_shutdown_defaults("prod"), (5, 35));
+        assert_eq!(profile_shutdown_defaults("production"), (5, 35));
+        let server = ServerConfig::default();
+        assert_eq!(
+            profile_shutdown_defaults("staging"),
+            (server.prestop_grace_secs, server.shutdown_timeout_secs)
+        );
     }
 
     #[test]

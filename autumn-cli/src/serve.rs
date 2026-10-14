@@ -2767,7 +2767,7 @@ mod tests {
 
     #[test]
     fn shutdown_budget_dev_profile_uses_dev_smart_defaults() {
-        // #2442: dev drains in 0 + 1 s, not the prod pair.
+        // #2442: dev uses 0 s prestop and 1 s shutdown.
         let dir = tempfile::tempdir().expect("tempdir");
         temp_env::with_vars(clear_shutdown_env(), || {
             assert_eq!(resolve_shutdown_budget(dir.path(), Some("dev")), (0, 1));
@@ -2781,12 +2781,8 @@ mod tests {
     #[test]
     fn shutdown_budget_prod_profile_matches_runtime_smart_defaults() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (prestop, shutdown) = autumn_web::config::profile_shutdown_defaults("prod");
         temp_env::with_vars(clear_shutdown_env(), || {
-            assert_eq!(
-                resolve_shutdown_budget(dir.path(), Some("prod")),
-                (prestop, shutdown)
-            );
+            assert_eq!(resolve_shutdown_budget(dir.path(), Some("prod")), (5, 35));
         });
     }
 
