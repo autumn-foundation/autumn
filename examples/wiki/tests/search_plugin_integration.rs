@@ -189,9 +189,29 @@ async fn creating_a_page_makes_it_searchable_through_the_plugin() {
         .as_i64()
         .expect("created page has an id");
 
-    // No "index is still empty" check here. The generated repository code
-    // kicks the commit-hook dispatcher after the commit, and that background
-    // drain races with any read at this point. The checks below are exact.
+    // The reindex was staged durably by `after_create_commit`, not written
+    // synchronously — the index must still be empty until the commit hook
+    // itself has run and its job has been performed.
+    with_timeout(
+        15,
+        "GET /api/v1/search (after create, before drain)",
+        async {
+            client
+                .get("/api/v1/search?q=marmot")
+                .send()
+                .await
+                .assert_ok()
+                .assert_json::<serde_json::Value, _>(|body| {
+                    assert_eq!(
+                        body["content"].as_array().expect("content array").len(),
+                        0,
+                        "nothing is indexed before the commit hook and reindex job run"
+                    );
+                });
+        },
+    )
+    .await;
+
     with_timeout(
         30,
         "run_commit_hooks after create (drain_ready_repository_commit_hooks)",
