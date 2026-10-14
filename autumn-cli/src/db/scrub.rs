@@ -4762,7 +4762,7 @@ pub struct DatabaseFacts {
     /// and be reported clean. `pg_class` shows them all, and the difference is
     /// a refusal.
     pub public_base_tables: BTreeSet<String>,
-    /// Every materialized view in `public` as `name:populated`. The drift check
+    /// Every materialized view in `public` as `name:oid:populated`. The drift check
     /// compares it, because the refresh list is fixed at probe time.
     pub public_materialized_views: BTreeSet<String>,
     /// Every user trigger and rule by identity. The drift check compares it.
@@ -4949,9 +4949,10 @@ const TRIGGER_IDENTITIES: &str = "SELECT rel.relname || ':trigger:' || t.tgname 
      JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
      WHERE r.rulename <> '_RETURN'";
 
-/// Every materialized view in `public`, with its population state. The refresh
-/// list is drawn from the probe, so a view created later would keep stale rows.
-const PUBLIC_MATVIEWS: &str = "SELECT rel.relname || ':' || rel.relispopulated::text AS name \
+/// Every materialized view in `public`, by name, OID and population state. The
+/// refresh list is drawn from the probe. A view created, or dropped and
+/// recreated under the same name (new OID), would keep stale rows.
+const PUBLIC_MATVIEWS: &str = "SELECT rel.relname || ':' || rel.oid::text || ':' || rel.relispopulated::text AS name \
      FROM pg_class rel \
      JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
      WHERE rel.relkind = 'm'";
@@ -8736,6 +8737,11 @@ mod tests {
             "{err:?}"
         );
         assert!(err.to_string().contains("ciphertext"), "{err}");
+    }
+
+    #[test]
+    fn the_matview_snapshot_changes_when_a_view_is_recreated() {
+        assert!(PUBLIC_MATVIEWS.contains("rel.oid"));
     }
 
     #[test]
