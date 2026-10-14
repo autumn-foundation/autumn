@@ -52,7 +52,9 @@ fn posts_per_page() -> i64 {
         .unwrap_or(25)
 }
 
-use super::layout::{form_error_summary, layout, layout_with_seo, time_ago, vote_controls};
+use super::layout::{
+    field_errors, form_error_summary, layout, layout_with_seo, time_ago, vote_controls,
+};
 
 // ── Front page — hot posts across all subreddits ───────────────
 
@@ -500,7 +502,10 @@ fn submit_form_markup(
     html! {
         div class="max-w-2xl mx-auto" {
             h1 class="text-2xl font-bold mb-6" { (heading) }
-            (form_error_summary(form))
+            (form_error_summary(
+                form,
+                if fixed_sub.is_some() { &["title", "url", "body"] } else { &["subreddit_id", "title", "url", "body"] },
+            ))
             (form.form_tag(&paths::submit(), "post", html! {
                 @if let Some(sub) = fixed_sub {
                     input type="hidden" name="subreddit_id" value=(sub.id);
@@ -592,8 +597,8 @@ fn submit_form_markup(
     }
 }
 
-/// Tag chips. Shows `name`, the author's spelling. `slug` is only a URL key
-/// and is a hash for names with no Latin text.
+/// Render tag chips. Show `name`, the spelling the author typed.
+/// The `slug` is a URL key only. For a name with no Latin text, it is a hash.
 fn tag_chips<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> Markup {
     html! {
         div class="flex flex-wrap gap-2 mt-3" {
@@ -606,29 +611,13 @@ fn tag_chips<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> Markup {
     }
 }
 
-/// The manage-tags input value. Uses names so a save keeps the spelling.
+/// Build the manage-tags input value from names.
+/// A re-save then keeps the author's spelling.
 fn tag_input_value<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> String {
     tags.into_iter()
         .map(|tag| tag.name.as_str())
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-/// Render one field's validation messages, in the element its control points
-/// at with `aria-describedby`.
-///
-/// `role="alert"` makes the message announced when it appears after an htmx
-/// swap; the stable `{field}-error` id is what makes it announced on focus for
-/// a full-page 422 too.
-fn field_errors<T>(field: &str, form: &ChangesetForm<T>) -> Markup {
-    let errors = form.errors_for(field);
-    html! {
-        div id=(format!("{field}-error")) {
-            @for message in errors {
-                p class="text-red-600 text-xs mb-1" role="alert" { (message) }
-            }
-        }
-    }
 }
 
 /// The submit form's shape.
@@ -1296,7 +1285,7 @@ fn edit_form_markup(form: &ChangesetForm<EditPostForm>, sub_slug: &str, post_slu
     html! {
         div class="max-w-2xl mx-auto" {
             h1 class="text-2xl font-bold mb-6" { "Edit Post" }
-            (form_error_summary(form))
+            (form_error_summary(form, &["title", "body"]))
             (form.form_tag(&paths::update(sub_slug, post_slug), "post", html! {
                 div {
                     (field_errors("title", form))
@@ -1822,6 +1811,7 @@ mod tests {
         // Saving the value again must not change a tag.
         let parsed = parse_tag_names(&tag_input_value(&tags));
         assert_eq!(parsed.name_by_slug["web-dev"], "Web Dev");
+        assert_eq!(parsed.name_by_slug[&slugify("日本語")], "日本語");
     }
 
     #[test]

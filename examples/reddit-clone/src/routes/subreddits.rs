@@ -17,7 +17,7 @@ use crate::schema::users;
 use autumn_web::widgets::{CommentThread, CommentView, comment_thread};
 use autumn_web::{contains_letter_or_number, slugify};
 
-use super::layout::{form_error_summary, layout, layout_with_seo, time_ago};
+use super::layout::{field_errors, form_error_summary, layout, layout_with_seo, time_ago};
 
 // ── List all communities ───────────────────────────────────────
 
@@ -117,19 +117,6 @@ pub struct CreateSubredditForm {
     pub description: String,
 }
 
-/// Render one field's validation messages, in the element its control points
-/// at with `aria-describedby`. Same shape as `posts::field_errors`.
-fn field_errors<T>(field: &str, form: &ChangesetForm<T>) -> Markup {
-    let errors = form.errors_for(field);
-    html! {
-        div id=(format!("{field}-error")) {
-            @for message in errors {
-                p class="text-red-600 text-xs mb-1" role="alert" { (message) }
-            }
-        }
-    }
-}
-
 /// The create-community form's markup — rendered by the GET route and
 /// re-rendered verbatim by the POST route when validation, or a duplicate
 /// name, rejects the submission. Mirrors `posts::submit_form_markup`'s
@@ -154,7 +141,7 @@ fn create_form_markup(form: &ChangesetForm<CreateSubredditForm>) -> Markup {
     html! {
         div class="max-w-lg mx-auto" {
             h1 class="text-2xl font-bold mb-6" { "Create a Community" }
-            (form_error_summary(form))
+            (form_error_summary(form, &["name", "description"]))
             (form.form_tag(&paths::create(), "post", html! {
                 div {
                     label for="name" class="block text-sm font-medium text-gray-700 mb-1" {

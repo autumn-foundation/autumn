@@ -1832,11 +1832,9 @@ jobs:
           cargo test -p autumn-cli --test flags -- --ignored
           cargo test -p autumn-cli --test config -- --ignored
           cargo test -p autumn-cli --test experiments -- --ignored
-          # `examples/reddit-clone` (#2454): bare `--ignored` sweep of its lib
-          # and `tests/` targets. Every ignored test there is a testcontainer
-          # suite (Postgres, MinIO, a webhook receiver), so a new one runs
-          # here with no workflow edit. The Chromium smoke is gated behind
-          # `system-tests`, which this build leaves off.
+          # `examples/reddit-clone` (#2454): sweep its ignored tests. All use
+          # testcontainers. The Chromium smoke needs `system-tests`, so it is
+          # not built here.
           cargo test -p reddit-clone --lib --tests -- --ignored --test-threads=1
           # Consolidated `cli_tests` binary: discover-and-run every Docker/
           # testcontainer `#[ignore]`d test the same way the autumn-web sweep
