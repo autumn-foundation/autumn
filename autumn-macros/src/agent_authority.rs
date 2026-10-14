@@ -903,6 +903,9 @@ struct Analyzer {
     /// Names bound to a call the analysis could not read. Binding a future and
     /// awaiting the *name* is the same effect as awaiting the call.
     unread_futures: HashSet<String>,
+    /// Whether a walked block's tail was an unread future, keyed by the
+    /// block's address. Read before the block's own names are restored.
+    tail_unread: HashMap<usize, bool>,
     /// Names bound to a `<table>::table` value, and whether the value already
     /// bounds the write (`let target = refunds::table;`).
     tables: HashMap<String, (String, bool)>,
@@ -998,6 +1001,7 @@ impl Analyzer {
             action,
             inert_roots,
             unread_futures: HashSet::new(),
+            tail_unread: HashMap::new(),
             tables: HashMap::new(),
             // The `tokio` crate is in scope until a name hides it.
             tokio_imports: HashSet::from(["tokio".to_string()]),
@@ -1324,6 +1328,10 @@ impl Analyzer {
             }
             self.stmt(stmt);
         }
+        // Judge the tail while the block's own names still exist.
+        let tail = self.compute_tail_unread(block);
+        self.tail_unread
+            .insert(std::ptr::from_ref(block) as usize, tail);
         // Restore the block's names first. Their saved state may hold a
         // block-local import, which the reset below then removes.
         for saved in outer.into_iter().rev() {
@@ -1678,6 +1686,13 @@ impl Analyzer {
     }
 
     fn block_tail_is_unread(&self, block: &Block) -> bool {
+        self.tail_unread
+            .get(&(std::ptr::from_ref(block) as usize))
+            .copied()
+            .unwrap_or_else(|| self.compute_tail_unread(block))
+    }
+
+    fn compute_tail_unread(&self, block: &Block) -> bool {
         matches!(block.stmts.last(), Some(Stmt::Expr(tail, None)) if self.is_unread_call(tail))
     }
 
@@ -1755,6 +1770,8 @@ impl Analyzer {
             }
             Expr::Tuple(t) => t.elems.iter().any(|e| self.carries_unread(e)),
             Expr::Array(a) => a.elems.iter().any(|e| self.carries_unread(e)),
+            // `[start(); 1]` repeats one element.
+            Expr::Repeat(rep) => self.carries_unread(&rep.expr),
             Expr::Reference(r) => self.carries_unread(&r.expr),
             Expr::Struct(s) => s.fields.iter().any(|f| self.carries_unread(&f.expr)),
             // `vec![start()]` builds a container of its elements.
@@ -3908,10 +3925,12 @@ fn sql_words(sql: &str) -> Vec<String> {
 }
 
 /// Remove `--` line comments and `/* … */` blocks, so neither can hide the
-/// leading keyword.
+/// leading keyword, and empty every string literal, so a keyword inside one
+/// is not read as a statement. A quoted identifier is kept as written.
 fn strip_sql_comments(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut chars = sql.chars().peekable();
+    let mut previous_word_char = None::<char>;
     while let Some(current) = chars.next() {
         match (current, chars.peek()) {
             ('-', Some('-')) => {
@@ -3933,8 +3952,35 @@ fn strip_sql_comments(sql: &str) -> String {
                 }
                 out.push(' ');
             }
+            // `'text'`: an `E'..'` string also treats a backslash as escape.
+            ('\'', _) => {
+                let escapes = matches!(previous_word_char, Some('e' | 'E'));
+                while let Some(c) = chars.next() {
+                    if escapes && c == '\\' {
+                        chars.next();
+                    } else if c == '\'' {
+                        if chars.peek() == Some(&'\'') {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                out.push_str("''");
+            }
+            // `"quoted identifier"`: keep it, comment markers and all.
+            ('"', _) => {
+                out.push('"');
+                for c in chars.by_ref() {
+                    out.push(c);
+                    if c == '"' {
+                        break;
+                    }
+                }
+            }
             _ => out.push(current),
         }
+        previous_word_char = (!matches!(current, '\'' | '"')).then_some(current);
     }
     out
 }
@@ -7001,6 +7047,26 @@ mod tests {
             }",
         ),
         (
+            "unread future in a repeated array",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let [fut] = [start_finance_job(); 1];
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future named inside a block tail",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = { let inner = start_finance_job(); inner };
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
             "#[agent_effect] with a blank reason",
             ExpectedKind::Rejected,
             "reason",
@@ -7630,6 +7696,22 @@ mod tests {
             expansion.contains("EffectProvenance :: Declared")
                 && !expansion.contains("EffectProvenance :: Syntactic"),
             "a proof must not demote a declaration: {expansion}"
+        );
+    }
+
+    #[test]
+    fn a_sql_string_literal_names_no_write() {
+        let expansion = expand(
+            GRANT,
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("SELECT ' UPDATE payouts' AS note, '--' AS dashes FROM t")
+                    .execute(&mut *db).await?;
+                Ok(())
+            }"#,
+        );
+        assert!(
+            !expansion.contains("\"payouts\""),
+            "a string literal was read as a write: {expansion}"
         );
     }
 
