@@ -2608,42 +2608,59 @@ fn database_endpoint(
         .or_else(|| env("PGDATABASE").filter(|n| !n.is_empty()))
         .or(user)
         .or_else(|| env("PGUSER").filter(|n| !n.is_empty()))?;
-    let (hosts, own_ports): (Vec<String>, Vec<Option<u16>>) = if listed.is_empty() {
-        // `hostaddr` is the network address libpq connects to; `host` is then
-        // only a name.
-        let list = query("hostaddr")
-            .or_else(|| query("host"))
-            .or_else(|| env("PGHOST").filter(|v| !v.is_empty()))
-            .unwrap_or_default();
+    // Named query parameters apply after the authority, so they win. `hostaddr`
+    // is the network address libpq connects to; `host` is then only a name.
+    let named = query("hostaddr").or_else(|| query("host"));
+    let (hosts, own_ports): (Vec<String>, Vec<Option<u16>>) = if let Some(list) = named {
+        let hosts: Vec<String> = list.split(',').map(normalize_host).collect();
+        let ports = if listed.len() == hosts.len() {
+            listed.iter().map(|(_, p)| *p).collect()
+        } else {
+            vec![None; hosts.len()]
+        };
+        (hosts, ports)
+    } else if listed.is_empty() {
+        let list = env("PGHOST").filter(|v| !v.is_empty()).unwrap_or_default();
         let hosts: Vec<String> = list.split(',').map(normalize_host).collect();
         let none = vec![None; hosts.len()];
         (hosts, none)
     } else {
         listed.into_iter().unzip()
     };
-    // libpq pairs a port list with the host list by position, and one port
-    // applies to every host.
-    let ports: Vec<u16> = query("port")
-        .map(|p| p.split(',').filter_map(|v| v.trim().parse().ok()).collect())
-        .filter(|p: &Vec<u16>| !p.is_empty())
-        .or_else(|| env("PGPORT").and_then(|p| p.parse().ok()).map(|p| vec![p]))
-        .unwrap_or_else(|| vec![5432]);
-    let endpoints = hosts
+    Some((pair_endpoints(hosts, own_ports, query("port"), env), name))
+}
+
+/// Pair hosts with ports as libpq does. A port list matches the host list by
+/// position, one port applies to every host, and an empty item or a missing
+/// port is the default port (`PGPORT`, else 5432).
+fn pair_endpoints(
+    hosts: Vec<String>,
+    own_ports: Vec<Option<u16>>,
+    port_list: Option<String>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, u16)> {
+    let fallback = env("PGPORT").and_then(|p| p.parse().ok()).unwrap_or(5432);
+    let items: Vec<Option<u16>> = port_list
+        .filter(|l| !l.is_empty())
+        .map(|l| l.split(',').map(|v| v.trim().parse().ok()).collect())
+        .unwrap_or_default();
+    hosts
         .into_iter()
         .zip(own_ports)
         .enumerate()
         .map(|(i, (host, own))| {
-            let port = own.unwrap_or_else(|| {
-                if ports.len() == 1 {
-                    ports[0]
-                } else {
-                    ports.get(i).copied().unwrap_or(5432)
-                }
-            });
+            let port = own
+                .or_else(|| {
+                    if items.len() == 1 {
+                        items[0]
+                    } else {
+                        items.get(i).copied().flatten()
+                    }
+                })
+                .unwrap_or(fallback);
             (host, port)
         })
-        .collect();
-    Some((endpoints, name))
+        .collect()
 }
 
 fn normalize_host(host: &str) -> String {
@@ -2756,25 +2773,9 @@ fn conninfo_endpoint(
         .cloned()
         .or_else(|| env("PGHOST").filter(|v| !v.is_empty()))
         .unwrap_or_default();
-    let ports: Vec<u16> = values
-        .get("port")
-        .map(|p| p.split(',').filter_map(|v| v.trim().parse().ok()).collect())
-        .filter(|p: &Vec<u16>| !p.is_empty())
-        .or_else(|| env("PGPORT").and_then(|p| p.parse().ok()).map(|p| vec![p]))
-        .unwrap_or_else(|| vec![5432]);
-    let endpoints = host_list
-        .split(',')
-        .map(|h| h.trim().trim_end_matches('/').to_ascii_lowercase())
-        .enumerate()
-        .map(|(i, host)| {
-            let port = if ports.len() == 1 {
-                ports[0]
-            } else {
-                ports.get(i).copied().unwrap_or(5432)
-            };
-            (host, port)
-        })
-        .collect();
+    let hosts: Vec<String> = host_list.split(',').map(normalize_host).collect();
+    let own = vec![None; hosts.len()];
+    let endpoints = pair_endpoints(hosts, own, values.get("port").cloned(), env);
     Some((endpoints, name))
 }
 
@@ -3036,11 +3037,18 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
                 |p| format!("{p:?} profile")
             )
         );
+        // Only the targets the restore will write matter to the guard. A local
+        // artifact names them up front; an offsite one is resolved later, so
+        // every configured target counts.
+        let guarded = super::backup::artifact_labels(artifact).map_or_else(
+            || targets.clone(),
+            |labels| restored_targets(targets.clone(), &labels),
+        );
         guard_configured_source(
             artifact_profile.as_deref(),
             &profile,
             Path::new("."),
-            &targets,
+            &guarded,
             args.allow_source_overwrite,
         )?;
         eprintln!(
@@ -10134,6 +10142,21 @@ mod tests {
         assert!(same_database_in(
             "postgres://app@prod",
             "host=prod dbname=app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres://prod.example/app?hostaddr=10.0.0.5",
+            "postgres://10.0.0.5/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres:///app?host=a,b&port=,6543",
+            "postgres://a:5432/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "host=a,b port=,6543 dbname=app",
+            "postgres://b:6543/app",
             &env
         ));
         assert!(same_database_in(

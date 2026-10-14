@@ -1373,6 +1373,23 @@ pub(super) fn resolve_all_target_urls(
         .collect())
 }
 
+/// The target labels a local artifact restores, read before any restore runs.
+/// `None` for an offsite reference (resolved later) or an artifact that does
+/// not parse: the caller then assumes every target.
+pub(super) fn artifact_labels(artifact: &Path) -> Option<Vec<String>> {
+    if resolve_offsite_ref(false, &artifact.to_string_lossy()).is_some() {
+        return None;
+    }
+    let plan = RestorePlan::discover(artifact, None).ok()?;
+    Some(
+        plan.select(None)
+            .ok()?
+            .into_iter()
+            .map(|entry| entry.label)
+            .collect(),
+    )
+}
+
 /// The profile a backup run directory was taken under, read from its
 /// `manifest.json`. `None` for a bare single-file artifact (which carries no
 /// manifest) or an unreadable/invalid manifest — callers treat absence as
