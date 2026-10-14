@@ -2327,19 +2327,18 @@ fn guard_scrub_target(profile: &str, force: bool) -> Result<(), ScrubError> {
 /// An unparsable URL never claims a match (the guard errs toward "different",
 /// leaving the profile guard as the enforcement).
 fn same_database(a: &str, b: &str) -> bool {
-    let pghost = std::env::var("PGHOST").ok();
-    same_database_with(a, b, pghost.as_deref())
+    same_database_with(a, b, &|key| std::env::var(key).ok())
 }
 
-/// Like [`same_database`], but the caller passes `PGHOST`.
+/// Like [`same_database`], but the caller passes the environment lookup.
 /// Tests then do not set process environment variables.
 ///
 /// A hostless URL (`postgres:///db?host=/run/postgresql`) takes its host
-/// from the `hostaddr` parameter, then `host`, then the URL authority, then
-/// `pghost`. Query parameters win over the authority, and the last repeat of a
+/// from the `hostaddr` parameter, then `PGHOSTADDR`, then `host`, then the URL
+/// authority, then `PGHOST`. Query parameters win over the authority, and the last repeat of a
 /// parameter wins, as in libpq.
 /// If no host is found, the host is empty and libpq uses its default socket.
-fn same_database_with(a: &str, b: &str, pghost: Option<&str>) -> bool {
+fn same_database_with(a: &str, b: &str, env: &dyn Fn(&str) -> Option<String>) -> bool {
     let decode = |raw: &str| {
         percent_encoding::percent_decode_str(raw)
             .decode_utf8_lossy()
@@ -2347,6 +2346,9 @@ fn same_database_with(a: &str, b: &str, pghost: Option<&str>) -> bool {
     };
     let parts = |raw: &str| -> Option<(String, u16, String)> {
         let parsed = url::Url::parse(raw).ok()?;
+        if !matches!(parsed.scheme(), "postgres" | "postgresql") {
+            return None;
+        }
         // libpq applies query parameters after the authority. The last repeat
         // wins, even when empty. Values use percent-decoding only: `+` is a
         // literal, not a space.
@@ -2360,13 +2362,14 @@ fn same_database_with(a: &str, b: &str, pghost: Option<&str>) -> bool {
             .get("hostaddr")
             .filter(|v| !v.is_empty())
             .cloned()
+            .or_else(|| env("PGHOSTADDR").filter(|v| !v.is_empty()))
             .or_else(|| {
                 params
                     .get("host")
                     .map_or_else(|| parsed.host_str().map(decode), |v| Some(v.clone()))
             })
             .filter(|h| !h.is_empty())
-            .or_else(|| pghost.filter(|h| !h.is_empty()).map(str::to_owned))
+            .or_else(|| env("PGHOST").filter(|h| !h.is_empty()))
             .unwrap_or_default();
         // A socket directory is case-sensitive. A DNS name is not. An IPv6
         // address has no brackets.
@@ -8979,29 +8982,48 @@ mod tests {
         assert!(same_database_with(
             "postgres:///prod?user=app&host=/var/run/postgresql",
             "postgres:///prod?host=/var/run/postgresql",
-            None
+            &|_| None
         ));
         assert!(!same_database_with(
             "postgres:///prod?host=/var/run/postgresql",
             "postgres:///prod?host=/tmp",
-            None
+            &|_| None
         ));
         // Bare form resolves through `PGHOST`.
         assert!(same_database_with(
             "postgres:///prod",
             "postgres://h.example.com/prod",
-            Some("h.example.com")
+            &|k| (k == "PGHOST").then(|| "h.example.com".to_owned())
         ));
         assert!(!same_database_with(
             "postgres:///prod",
             "postgres://h.example.com/prod",
-            None
+            &|_| None
         ));
         // A different database on the same socket stays different.
         assert!(!same_database_with(
             "postgres:///prod?host=/tmp",
             "postgres:///other?host=/tmp",
-            None
+            &|_| None
+        ));
+        // `PGHOSTADDR` picks the server whatever name the URL gives.
+        let addr = |k: &str| (k == "PGHOSTADDR").then(|| "10.0.0.1".to_owned());
+        assert!(same_database_with(
+            "postgres://prod.example/app",
+            "postgres://staging.example/app",
+            &addr
+        ));
+        // An inline `hostaddr` beats the environment.
+        assert!(!same_database_with(
+            "postgres://a/app?hostaddr=10.0.0.2",
+            "postgres://b/app",
+            &addr
+        ));
+        // A non-Postgres scheme never names a Postgres database.
+        assert!(!same_database_with(
+            "sqlite:///app",
+            "postgres:///app",
+            &|_| None
         ));
     }
 
@@ -9059,7 +9081,7 @@ mod tests {
 
     #[test]
     fn libpq_query_overrides_and_encoding_are_normalised() {
-        let same = |a, b| same_database_with(a, b, None);
+        let same = |a, b| same_database_with(a, b, &|_| None);
         assert!(same("postgres://h/ctl", "postgres://h/stg?dbname=ctl"));
         assert!(same("postgres://h?dbname=prod", "postgres://h/prod"));
         assert!(same(
