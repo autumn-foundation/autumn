@@ -698,9 +698,7 @@ fn model_source_files(path: &Path) -> Result<Vec<std::path::PathBuf>, SchemaPars
     }
     let mut paths = Vec::new();
     let mut stack = vec![path.to_path_buf()];
-    let mut visited = std::collections::BTreeSet::from([
-        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-    ]);
+    let root_depth = path.components().count();
     while let Some(dir) = stack.pop() {
         let read = std::fs::read_dir(&dir).map_err(|source| SchemaParseError::Io {
             path: dir.display().to_string(),
@@ -718,10 +716,14 @@ fn model_source_files(path: &Path) -> Result<Vec<std::path::PathBuf>, SchemaPars
                 continue;
             };
             if meta.is_dir() {
-                // A link back up the tree must not loop the walk.
-                if visited
-                    .insert(std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone()))
-                {
+                // A link to the directory being read, or to one above it, would
+                // loop the walk. Two links to one shared directory are distinct
+                // paths (`fixtures` and `models`), so each is walked.
+                let target =
+                    std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+                let here = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+                let too_deep = candidate.components().count() > root_depth + 64;
+                if !here.starts_with(&target) && !too_deep {
                     stack.push(candidate);
                 }
             } else if meta.is_file() && candidate.extension().is_some_and(|ext| ext == "rs") {
@@ -2673,6 +2675,7 @@ mod tests {
             .unwrap();
         std::os::unix::fs::symlink(real.path(), dir.path().join("linked")).unwrap();
         std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
+        std::os::unix::fs::symlink(real.path(), dir.path().join("alias")).unwrap();
         let found = parse_encrypted_columns_path(dir.path()).unwrap();
         assert!(found["users"]["email"], "{found:?}");
     }

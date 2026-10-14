@@ -2587,11 +2587,12 @@ fn database_endpoint(
     let listed = authority_endpoints(&rest[..end])?;
     let parsed = url::Url::parse(&format!("{scheme}://placeholder{}", &rest[end..])).ok()?;
     let query = |key: &str| {
+        // libpq takes the last nonempty occurrence of a repeated keyword.
         parsed
             .query_pairs()
-            .find(|(k, _)| k == key)
+            .filter(|(k, v)| k == key && !v.is_empty())
+            .last()
             .map(|(_, v)| v.into_owned())
-            .filter(|v| !v.is_empty())
     };
     let name = query("dbname")
         .or_else(|| {
@@ -4976,13 +4977,19 @@ const GENERATED_COLUMNS: &str = "SELECT rel.relname AS tbl, att.attname AS col \
        AND (coalesce(to_jsonb(att)->>'attgenerated', '') <> '' \
             OR to_jsonb(att)->>'attidentity' = 'a')";
 
-/// Every materialized view in `public`, by name, OID and population state. The
-/// refresh list is drawn from the probe. A view created, or dropped and
-/// recreated under the same name (new OID), would keep stale rows.
+/// Every materialized view in `public`, by name, OID and population state, and
+/// every ordinary view by definition hash. The refresh list and its order are
+/// drawn from the probe. A view created, recreated (new OID), or replaced in
+/// place would keep stale rows or reorder the refreshes.
 const PUBLIC_MATVIEWS: &str = "SELECT rel.relname || ':' || rel.oid::text || ':' || rel.relispopulated::text AS name \
      FROM pg_class rel \
      JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-     WHERE rel.relkind = 'm'";
+     WHERE rel.relkind = 'm' \
+     UNION ALL \
+     SELECT rel.relname || ':view:' || md5(pg_get_viewdef(rel.oid)) AS name \
+     FROM pg_class rel \
+     JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+     WHERE rel.relkind = 'v'";
 
 /// Every live column of those tables.
 const PUBLIC_COLUMNS: &str = "SELECT rel.relname AS tbl, att.attname AS col \
@@ -8789,6 +8796,7 @@ mod tests {
     #[test]
     fn the_matview_snapshot_changes_when_a_view_is_recreated() {
         assert!(PUBLIC_MATVIEWS.contains("rel.oid"));
+        assert!(PUBLIC_MATVIEWS.contains("pg_get_viewdef"));
     }
 
     #[test]
@@ -10257,6 +10265,11 @@ mod tests {
         ));
         assert!(same_database_in(
             "postgres://prod.example/app?hostaddr=10.0.0.5",
+            "postgres://10.0.0.5/app",
+            &env
+        ));
+        assert!(same_database_in(
+            "postgres:///app?hostaddr=10.0.0.1&hostaddr=10.0.0.5",
             "postgres://10.0.0.5/app",
             &env
         ));
