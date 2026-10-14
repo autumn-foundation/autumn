@@ -410,7 +410,7 @@ fn is_form_urlencoded(headers: &http::HeaderMap) -> bool {
     headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.starts_with("application/x-www-form-urlencoded"))
+        .is_some_and(|ct| crate::media_type::is_media_type(ct, "application/x-www-form-urlencoded"))
 }
 
 /// Is the request a same-origin browser form submission?
@@ -782,6 +782,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"created");
+    }
+
+    #[tokio::test]
+    async fn mixed_case_urlencoded_content_type_applies_override() {
+        let response = layered_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/items/1")
+                    .header("content-type", "Application/X-WWW-Form-Urlencoded")
+                    .header("sec-fetch-site", "same-origin")
+                    .body(Body::from("_method=PUT"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"put-ok");
     }
 
     #[tokio::test]

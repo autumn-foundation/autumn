@@ -788,6 +788,59 @@ async fn permanently_failing_hook_is_dead_lettered_on_sqlite() {
     );
 }
 
+// ── (c2) dead-letter survives read contention on the shared-cache table ─────────
+
+#[tokio::test]
+async fn dead_letter_survives_concurrent_readers_on_sqlite() {
+    let pool = boot("hook_dead_letter_contention").await;
+    let handler_key = unique_handler_key();
+
+    autumn_web::__private::register_repository_commit_hook_runner(
+        handler_key,
+        |_ctx, _record| async {
+            Err(autumn_web::AutumnError::internal_server_error_msg(
+                "permanent failure",
+            ))
+        },
+        |_ctx, _record| async { Ok(()) },
+        |_ctx, _record| async { Ok(()) },
+    );
+    insert_raw_row(&pool, "dead-c", handler_key, 2, 5).await;
+
+    let stop = CancellationToken::new();
+    let readers: Vec<_> = (0..3)
+        .map(|_| {
+            let pool = pool.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                while !stop.is_cancelled() {
+                    let _ = hook_row_status(&pool, "dead-c").await;
+                    tokio::task::yield_now().await;
+                }
+            })
+        })
+        .collect();
+
+    let shutdown = CancellationToken::new();
+    autumn_web::__private::start_repository_commit_hook_worker(pool.clone(), shutdown.clone());
+
+    wait_until("hook dead-lettered under read contention", {
+        let pool = pool.clone();
+        move || {
+            let pool = pool.clone();
+            async move {
+                matches!(hook_row_status(&pool, "dead-c").await, Some((s, _)) if s == "failed")
+            }
+        }
+    })
+    .await;
+    shutdown.cancel();
+    stop.cancel();
+    for reader in readers {
+        let _ = reader.await;
+    }
+}
+
 // ── (d) graceful shutdown settles in-flight work ──────────────────────────────
 
 #[tokio::test]

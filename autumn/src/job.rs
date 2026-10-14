@@ -21911,15 +21911,9 @@ mod tests {
             }
             drop(conn);
 
-            // A record whose TTL puts `expires_at` far in the past — the
-            // clock only controls what timestamp gets written, not any
-            // filtering here, since `pg_cleanup_expired_tracking_rows`
-            // compares against Postgres's real `NOW()`.
-            let long_ago = chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc);
-            let expired_store = crate::job_tracking::PgJobTrackingStore::new(pool.clone(), 60)
-                .with_clock(std::sync::Arc::new(crate::time::FixedClock::at(long_ago)));
+            // A zero TTL sets `expires_at` to the write's `NOW()`. The next
+            // read sees the row as expired.
+            let expired_store = crate::job_tracking::PgJobTrackingStore::new(pool.clone(), 0);
             expired_store
                 .create(
                     "expired-key",

@@ -903,7 +903,7 @@ where
         .to_string();
 
     #[cfg(feature = "multipart")]
-    if content_type.starts_with("multipart/form-data") {
+    if crate::media_type::is_media_type(&content_type, "multipart/form-data") {
         return decode_multipart(req, state).await;
     }
 
@@ -912,7 +912,7 @@ where
     // mime type is rejected outright, rather than being decoded anyway. `Bytes`
     // alone has no opinion on Content-Type, so this must be checked explicitly
     // now that we no longer route through `axum::extract::Form`.
-    if !content_type.starts_with("application/x-www-form-urlencoded") {
+    if !crate::media_type::is_media_type(&content_type, "application/x-www-form-urlencoded") {
         return Err((
             axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "Form requests must have `Content-Type: application/x-www-form-urlencoded`",
@@ -7107,6 +7107,52 @@ mod tests {
                 resp.status(),
                 axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
             );
+        }
+
+        #[tokio::test]
+        async fn mixed_case_urlencoded_content_type_is_accepted() {
+            // RFC 9110 8.3.1: media types are case-insensitive (issue #3267).
+            async fn handler(_form: ChangesetForm<TestForm>) -> &'static str {
+                "ok"
+            }
+            for ct in [
+                "Application/X-WWW-Form-Urlencoded",
+                "APPLICATION/X-WWW-FORM-URLENCODED; charset=UTF-8",
+            ] {
+                let req = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/test")
+                    .header("Content-Type", ct)
+                    .body(Body::from("name=Alice"))
+                    .unwrap();
+                let resp = Router::new()
+                    .route("/test", post(handler))
+                    .oneshot(req)
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), axum::http::StatusCode::OK, "{ct}");
+            }
+        }
+
+        #[cfg(feature = "multipart")]
+        #[tokio::test]
+        async fn mixed_case_multipart_content_type_is_accepted() {
+            async fn handler(_form: ChangesetForm<TestForm>) -> &'static str {
+                "ok"
+            }
+            let mut req = multipart_req("/test", "name", "Alice");
+            let ct = req.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .replace("multipart/form-data", "Multipart/Form-Data");
+            req.headers_mut()
+                .insert("content-type", ct.parse().unwrap());
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(req)
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
         }
 
         #[tokio::test]
