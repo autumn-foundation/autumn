@@ -2360,9 +2360,10 @@ fn same_database_with(a: &str, b: &str, pghost: Option<&str>) -> bool {
             .get("hostaddr")
             .filter(|v| !v.is_empty())
             .cloned()
-            .or_else(|| match params.get("host") {
-                Some(v) => Some(v.clone()),
-                None => parsed.host_str().map(decode),
+            .or_else(|| {
+                params
+                    .get("host")
+                    .map_or_else(|| parsed.host_str().map(decode), |v| Some(v.clone()))
             })
             .filter(|h| !h.is_empty())
             .or_else(|| pghost.filter(|h| !h.is_empty()).map(str::to_owned))
@@ -2376,18 +2377,17 @@ fn same_database_with(a: &str, b: &str, pghost: Option<&str>) -> bool {
                 .trim_end_matches('.')
                 .to_ascii_lowercase()
         };
-        let port = match params.get("port") {
-            Some(v) => v.parse().unwrap_or(5432),
-            None => parsed.port().unwrap_or(5432),
-        };
-        let name = match params.get("dbname") {
-            Some(v) => v.clone(),
-            None => parsed
+        let port = params.get("port").map_or_else(
+            || parsed.port().unwrap_or(5432),
+            |v| v.parse().unwrap_or(5432),
+        );
+        let name = params.get("dbname").cloned().unwrap_or_else(|| {
+            parsed
                 .path_segments()
                 .and_then(|mut s| s.next())
                 .map(decode)
-                .unwrap_or_default(),
-        };
+                .unwrap_or_default()
+        });
         if name.is_empty() {
             return None;
         }
