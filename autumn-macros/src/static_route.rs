@@ -10,6 +10,8 @@
 //! - `#[static_get("/posts/{slug}", params = list_slugs)]` -- parameterized
 //! - `#[static_get("/posts/{slug}", params = list_slugs, revalidate = 60)]` -- with ISR
 //! - `#[static_get("/about", seo(title = "About"))]` -- route-level SEO defaults
+//! - `#[static_get("/logo.png", content_type = "application/octet-stream")]` --
+//!   declared `Content-Type` (#2403)
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -51,6 +53,23 @@ struct StaticGetAttrs {
     revalidate: Option<u64>,
     /// Route-level SEO meta tag defaults from the `seo(...)` argument (#1182).
     seo: crate::parse::SeoAttrArgs,
+    /// Declared `Content-Type` from `content_type = "..."` (#2403).
+    content_type: Option<LitStr>,
+}
+
+/// Check a declared `Content-Type`. Same rule as the runtime
+/// (`usable_recorded_content_type`): non-blank, visible ASCII or tab.
+fn validate_content_type(lit: &LitStr) -> syn::Result<()> {
+    let value = lit.value();
+    let legal = |b: u8| b == b'\t' || (0x20..0x7f).contains(&b);
+    if value.trim().is_empty() || !value.bytes().all(legal) {
+        return Err(syn::Error::new(
+            lit.span(),
+            "`content_type` must be a non-empty media type in visible ASCII, \
+             e.g. `content_type = \"application/rss+xml\"`.",
+        ));
+    }
+    Ok(())
 }
 
 impl Parse for StaticGetAttrs {
@@ -61,6 +80,7 @@ impl Parse for StaticGetAttrs {
         let mut revalidate = None;
         let mut seo = crate::parse::SeoAttrArgs::default();
         let mut seen_seo = false;
+        let mut content_type: Option<LitStr> = None;
 
         while input.peek(Token![,]) {
             let _comma: Token![,] = input.parse()?;
@@ -104,12 +124,23 @@ impl Parse for StaticGetAttrs {
                     let lit: LitInt = input.parse()?;
                     revalidate = Some(lit.base10_parse::<u64>()?);
                 }
+                "content_type" => {
+                    if content_type.is_some() {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            "duplicate `content_type` argument.",
+                        ));
+                    }
+                    let lit: LitStr = input.parse()?;
+                    validate_content_type(&lit)?;
+                    content_type = Some(lit);
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
                         format!(
                             "Unknown attribute `{other}`. Expected `params`, `revalidate`, \
-                             or `seo(...)`."
+                             `content_type`, or `seo(...)`."
                         ),
                     ));
                 }
@@ -121,6 +152,7 @@ impl Parse for StaticGetAttrs {
             params_fn,
             revalidate,
             seo,
+            content_type,
         })
     }
 }
@@ -316,6 +348,10 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let path_params = crate::api_doc::extract_path_params(&path_value);
     let path_params_tokens = crate::api_doc::emit_path_param_slice(&path_params);
     let seo_defaults = attrs.seo.emit();
+    let content_type_expr = attrs.content_type.as_ref().map_or_else(
+        || quote! { ::core::option::Option::None },
+        |ct| quote! { ::core::option::Option::Some(#ct) },
+    );
 
     // ── Architecture-graph node (#1747) ─────────────────────────
     // `#[static_get]` builds its own `Route` rather than delegating to
@@ -387,6 +423,7 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 revalidate: #revalidate_expr,
                 params_fn: #params_fn_expr,
                 seo: #seo_defaults,
+                content_type: #content_type_expr,
             }
         }
     }
@@ -721,6 +758,67 @@ mod tests {
             generated.contains("compile_error"),
             "an unknown seo key must be a compile error on static routes: {generated}"
         );
+    }
+
+    // ── content_type = "..." declared media type (#2403) ────────────────────
+
+    fn expand(attr: proc_macro2::TokenStream) -> String {
+        static_get_macro(attr, quote! { async fn logo() -> &'static str { "logo" } }).to_string()
+    }
+
+    #[test]
+    fn static_get_defaults_content_type_to_none() {
+        let generated = expand(quote! { "/logo.png" });
+        assert!(
+            generated.contains("content_type : :: core :: option :: Option :: None"),
+            "no content_type argument must emit None: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_emits_declared_content_type() {
+        let generated = expand(quote! { "/logo.png", content_type = "application/octet-stream" });
+        assert!(
+            generated.contains(
+                "content_type : :: core :: option :: Option :: Some (\"application/octet-stream\")"
+            ),
+            "content_type must reach the static metadata: {generated}"
+        );
+    }
+
+    #[test]
+    fn static_get_content_type_composes_with_other_arguments() {
+        let generated = expand(quote! {
+            "/posts/{slug}", params = list_slugs, content_type = "text/markdown",
+            revalidate = 60, seo(title = "Post")
+        });
+        assert!(!generated.contains("compile_error"), "{generated}");
+        assert!(generated.contains("\"text/markdown\""), "{generated}");
+        assert!(generated.contains("list_slugs"), "{generated}");
+    }
+
+    #[test]
+    fn static_get_rejects_bad_content_type() {
+        for bad in [
+            quote! { "/a", content_type = "" },
+            quote! { "/a", content_type = "   " },
+            quote! { "/a", content_type = "text/\u{e9}html" },
+            quote! { "/a", content_type = "text/html\r\nX: y" },
+            quote! { "/a", content_type = 42 },
+            quote! { "/a", content_type = "a/b", content_type = "c/d" },
+        ] {
+            let generated = expand(bad.clone());
+            assert!(
+                generated.contains("compile_error"),
+                "must reject `{bad}`: {generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn static_get_unknown_key_error_lists_content_type() {
+        let generated = expand(quote! { "/a", mime = "a/b" });
+        assert!(generated.contains("content_type"), "{generated}");
     }
 
     // `#[static_get]` has its own attribute parser, so the rejection paths the

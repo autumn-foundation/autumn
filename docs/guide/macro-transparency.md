@@ -276,6 +276,8 @@ pub fn __autumn_static_meta_about() -> StaticRouteMeta {
         name: "about",
         revalidate: None,
         params_fn: None,
+        seo: SeoRouteDefaults::EMPTY,
+        content_type: None, // or Some("..") from `content_type = ".."`
     }
 }
 ```

@@ -582,6 +582,7 @@ mod tests {
             revalidate: None,
             params_fn: Some(doc_params),
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: None,
         };
 
         let tmp = tempfile::tempdir().unwrap();

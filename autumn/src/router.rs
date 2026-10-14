@@ -14083,6 +14083,7 @@ enabled = true
                 revalidate: None,
                 params_fn: None,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
+                content_type: None,
             }
         }
 

@@ -356,6 +356,12 @@ a type no file extension maps to — `application/rss+xml` from `/feed`,
 `text/calendar` from `/calendar` — which the extension-based heuristic could
 never produce.
 
+A route can declare its type: `#[static_get("/logo.png", content_type =
+"application/octet-stream")]` (#2403). Build records it as written and sets
+`content_type_explicit` in the entry. The serve path and ISR then skip the
+extension replacement and the type check. A manifest without the flag behaves
+as before.
+
 `content_type` is **optional**. It is absent when the manifest predates #1832
 (an existing `dist/` that has not been rebuilt), when the manifest was written
 by hand, or when the handler declared no `Content-Type` at all — in which case
