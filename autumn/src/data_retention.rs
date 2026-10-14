@@ -1181,10 +1181,10 @@ struct SweptDataset {
 /// nothing was deleted: "the policy wanted to delete this and did not" is
 /// exactly what a reviewer needs to see.
 ///
-/// If the record cannot be written, the failure is added to
-/// [`RetentionDatasetReport::error`]. Rows may already be gone, so a missing
-/// record must fail the CLI exit code and the task. The message starts with
-/// "audit record" to tell it from a sweep failure.
+/// If the write fails, the error text is added to
+/// [`RetentionDatasetReport::error`]. Rows can already be gone, so the CLI
+/// exits non-zero and the task fails. The text starts with "audit record" to
+/// separate it from a sweep error.
 async fn audit_sweep(state: &AppState, report: &mut RetentionDatasetReport) {
     let is_legal_hold = report
         .skipped
@@ -1240,10 +1240,7 @@ async fn audit_sweep(state: &AppState, report: &mut RetentionDatasetReport) {
             rows_removed = report.rows_removed,
             "retention sweep audit record could not be written"
         );
-        let audit_failure = format!(
-            "audit record not written ({} rows removed): {error}",
-            report.rows_removed
-        );
+        let audit_failure = format!("audit record not written: {error}");
         report.error = Some(match report.error.take() {
             Some(sweep_failure) => format!("{sweep_failure}; {audit_failure}"),
             None => audit_failure,
@@ -1253,10 +1250,10 @@ async fn audit_sweep(state: &AppState, report: &mut RetentionDatasetReport) {
 
 // ── Scheduled task (AC #2) ───────────────────────────────────────────────
 
-/// Turn per-dataset errors into one task error.
+/// Turn dataset errors into one task error.
 ///
-/// Runs after every dataset was processed, so one failure never stops the
-/// others. The error makes the scheduler record a failure, not a success.
+/// The caller runs this after all datasets finish, so one failure does not
+/// stop the others. The scheduler records the task as failed.
 fn fail_on_dataset_errors(reports: &[RetentionDatasetReport]) -> AutumnResult<()> {
     let failures: Vec<String> = reports
         .iter()
@@ -1299,15 +1296,6 @@ pub fn framework_retention_task(config: &RetentionConfig) -> Option<TaskInfo> {
         handler: |state| {
             Box::pin(async move {
                 let reports = run_retention(&state, &RetentionRunOptions::default()).await?;
-                for report in &reports {
-                    if let Some(error) = report.error.as_deref() {
-                        tracing::warn!(
-                            dataset = %report.dataset,
-                            error,
-                            "framework retention sweep failed for one dataset"
-                        );
-                    }
-                }
                 fail_on_dataset_errors(&reports)
             })
         },
@@ -1369,6 +1357,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_legal_hold_audit_write_sets_the_report_error() {
+        let state = state_with_sink(FailingSink);
+        let mut report = held_report();
+        report.eligible_rows = None;
+        report.rows_removed = 0;
+        report.skipped = Some("legal hold: tax records".to_owned());
+        audit_sweep(&state, &mut report).await;
+        assert!(report.error.is_some(), "{report:?}");
+    }
+
+    #[tokio::test]
     async fn a_failed_audit_write_keeps_the_sweep_error() {
         let state = state_with_sink(FailingSink);
         let mut report = held_report();
@@ -1397,12 +1396,12 @@ mod tests {
     }
 
     #[test]
-    fn handler_succeeds_when_no_dataset_failed() {
+    fn fail_on_dataset_errors_passes_when_clean() {
         assert!(fail_on_dataset_errors(&[held_report()]).is_ok());
     }
 
     #[test]
-    fn handler_fails_and_names_every_failed_dataset() {
+    fn fail_on_dataset_errors_names_every_failed_dataset() {
         let mut first = held_report();
         first.error = Some("timeout".to_owned());
         let mut second = held_report();

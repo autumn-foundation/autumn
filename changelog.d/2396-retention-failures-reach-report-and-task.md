@@ -1,7 +1,6 @@
 ### Fixed
 
-- **retention:** a failed audit write now sets the dataset `error` (issue
-  #2396). `autumn db retention --purge` exits non-zero, and the report shows
-  the failure. The `autumn-retention-sweep` task now fails when any dataset
-  reports an error, after all datasets ran. Task health and failure alerts now
-  show the fault.
+- **retention:** a failed audit write sets the dataset `error` (issue #2396).
+  `autumn db retention --purge` exits non-zero. The `autumn-retention-sweep`
+  task fails when any dataset reports an error. It runs all datasets first.
+  `/actuator/tasks` and the task failure alert show the error.
