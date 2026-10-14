@@ -1324,12 +1324,14 @@ impl Analyzer {
             }
             self.stmt(stmt);
         }
-        self.tokio_imports = imports;
-        self.shadowed_macros = macros;
-        (self.diesel_roots, self.diesel_fns) = diesel;
+        // Restore the block's names first. Their saved state may hold a
+        // block-local import, which the reset below then removes.
         for saved in outer.into_iter().rev() {
             self.unshadow(saved);
         }
+        self.tokio_imports = imports;
+        self.shadowed_macros = macros;
+        (self.diesel_roots, self.diesel_fns) = diesel;
     }
 
     fn stmt(&mut self, stmt: &Stmt) {
@@ -1560,6 +1562,23 @@ impl Analyzer {
             Expr::Path(path) if is_effect_verb_path(&path.path) => {
                 self.fn_aliases.insert(name.to_string(), path.path.clone());
             }
+            // `let second = first;` copies what `first` was bound to.
+            Expr::Path(path) if path.path.get_ident().is_some() => {
+                let source = path
+                    .path
+                    .get_ident()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                if self.spawn_aliases.contains(&source) {
+                    self.spawn_aliases.insert(name.to_string());
+                }
+                if let Some(alias) = self.fn_aliases.get(&source).cloned() {
+                    self.fn_aliases.insert(name.to_string(), alias);
+                }
+                if let Some(closure) = self.closures.get(&source).cloned() {
+                    self.closures.insert(name.to_string(), closure);
+                }
+            }
             _ => {}
         }
     }
@@ -1738,6 +1757,10 @@ impl Analyzer {
             Expr::Array(a) => a.elems.iter().any(|e| self.carries_unread(e)),
             Expr::Reference(r) => self.carries_unread(&r.expr),
             Expr::Struct(s) => s.fields.iter().any(|f| self.carries_unread(&f.expr)),
+            // `vec![start()]` builds a container of its elements.
+            Expr::Macro(m) if m.mac.path.is_ident("vec") => vec_elements(&m.mac)
+                .iter()
+                .any(|element| self.carries_unread(element)),
             _ => false,
         }
     }
@@ -4307,6 +4330,23 @@ fn tokens_contain_await(tokens: &TokenStream) -> bool {
         TokenTree::Group(group) => tokens_contain_await(&group.stream()),
         _ => false,
     })
+}
+
+/// The element expressions of a `vec![a, b]` or `vec![x; n]`. Empty when the
+/// body does not parse as either.
+fn vec_elements(mac: &syn::Macro) -> Vec<Expr> {
+    use syn::parse::Parser as _;
+    let list = syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated;
+    if let Ok(elements) = list.parse2(mac.tokens.clone()) {
+        return elements.into_iter().collect();
+    }
+    let repeat = |input: ParseStream| -> syn::Result<Expr> {
+        let element: Expr = input.parse()?;
+        input.parse::<syn::Token![;]>()?;
+        let _len: Expr = input.parse()?;
+        Ok(element)
+    };
+    repeat.parse2(mac.tokens.clone()).into_iter().collect()
 }
 
 /// A bare macro name, or one under a crate whose macros are known.
@@ -6940,6 +6980,27 @@ mod tests {
             }",
         ),
         (
+            "spawn alias copied to a second name",
+            ExpectedKind::Rejected,
+            "second",
+            r"async fn h() -> R {
+                let first = tokio::spawn;
+                let second = first;
+                second(async { work().await });
+                Ok(())
+            }",
+        ),
+        (
+            "unread future stored by vec!",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let jobs = vec![start_finance_job()];
+                jobs[0].await?;
+                Ok(())
+            }",
+        ),
+        (
             "#[agent_effect] with a blank reason",
             ExpectedKind::Rejected,
             "reason",
@@ -7656,6 +7717,19 @@ mod tests {
         let rebound = expand(GRANT, &handler("let remove = custom_delete;"));
         assert!(imported.contains("allows_unbounded_write"), "{imported}");
         assert!(!rebound.contains("allows_unbounded_write"), "{rebound}");
+    }
+
+    #[test]
+    fn a_block_local_diesel_alias_does_not_outlive_its_block() {
+        let out = expand(
+            GRANT,
+            r"async fn h(mut db: Db) -> R {
+                { use diesel::delete as remove; let remove = custom_delete; }
+                remove(refunds::table).execute(&mut *db).await?;
+                Ok(())
+            }",
+        );
+        assert!(!out.contains("allows_unbounded_write"), "{out}");
     }
 
     #[test]
