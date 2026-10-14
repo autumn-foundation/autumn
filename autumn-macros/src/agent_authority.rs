@@ -358,7 +358,6 @@ const INERT_MACROS: &[&str] = &[
     "bail",
     "ensure",
     "anyhow",
-    "dbg",
 ];
 
 /// The statement annotation that declares what the analysis cannot read.
@@ -888,7 +887,7 @@ struct Analyzer {
     /// bounds the write (`let target = refunds::table;`).
     tables: HashMap<String, (String, bool)>,
     /// Names a `use` in the handler imported from `tokio::time` / `tokio::task`.
-    /// Imports are handler-wide: a block-local `use` applies to the whole body.
+    /// A `use` lasts until the end of its block.
     tokio_imports: HashSet<String>,
 }
 
@@ -1091,6 +1090,7 @@ impl Analyzer {
         self.fn_aliases.remove(name);
         self.unread_futures.remove(name);
         self.tables.remove(name);
+        self.tokio_imports.remove(name);
         // A rebound name is no longer the typed parameter.
         self.inert_roots.remove(name);
     }
@@ -1222,9 +1222,12 @@ impl Analyzer {
             }
         }
         let outer: Vec<Shadow> = declared.iter().map(|name| self.shadow(name)).collect();
+        // A `use` in this block ends with it.
+        let imports = self.tokio_imports.clone();
         for stmt in &block.stmts {
             self.stmt(stmt);
         }
+        self.tokio_imports = imports;
         for saved in outer {
             self.unshadow(saved);
         }
@@ -6242,6 +6245,25 @@ mod tests {
                 let t = refunds::table.find(id);
                 let t: refunds::table = refunds::table;
                 diesel::delete(t).execute(&mut *db).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "dbg! wrapped around an unread future",
+            ExpectedKind::Rejected,
+            "dbg",
+            r"async fn h() -> R {
+                dbg!(start_finance_job()).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "tokio import ended with its block",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                { use tokio::time::sleep; sleep(d).await; }
+                sleep(d).await;
                 Ok(())
             }",
         ),
