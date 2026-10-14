@@ -1,6 +1,5 @@
 ### Fixed
 
-- **cli:** one-shot commands and `autumn serve` find the app binary where
-  Cargo wrote it, also when `build.target` is set (issue #2374). The CLI
-  reads the `executable` path from `cargo build` output. It no longer
-  rebuilds the path, so it cannot run a stale binary.
+- **cli:** `autumn serve` and the one-shot commands now find the app binary
+  when `build.target` is set (issue #2374). The CLI takes the `executable`
+  path from the `cargo build` output. It does not build the path itself.

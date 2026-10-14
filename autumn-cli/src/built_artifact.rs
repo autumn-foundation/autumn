@@ -1,13 +1,12 @@
 //! The executable path Cargo reports for a build.
 //!
-//! Cargo writes a binary to `<target>/<triple>/<profile>/<bin>` when
-//! `build.target` is set. `cargo metadata` does not report the triple, so
-//! rebuilding the path by hand finds the wrong file. Instead, read the
-//! `executable` field of each `compiler-artifact` record and use it.
+//! With `build.target`, Cargo writes to `<target>/<triple>/<profile>/<bin>`.
+//! `cargo metadata` does not show the triple. So the CLI reads the
+//! `executable` field of each `compiler-artifact` record instead.
 
 use std::ffi::OsStr;
-use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 
@@ -29,43 +28,63 @@ pub fn parse_executables(stdout: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Remember the executables of a finished build.
-pub fn record(executables: &[PathBuf]) {
-    if let Ok(mut built) = BUILT.lock() {
-        built.extend(executables.iter().cloned());
+/// The profile directory of an artifact path: `debug` in `.../debug/app`.
+fn profile_dir(path: &Path) -> Option<&OsStr> {
+    path.parent()?.file_name()
+}
+
+/// Add `executables` to `built`. A newer path replaces an older one with the
+/// same file name and profile directory.
+fn record_into(built: &mut Vec<PathBuf>, executables: &[PathBuf]) {
+    for exe in executables {
+        built.retain(|old| {
+            old.file_name() != exe.file_name() || profile_dir(old) != profile_dir(exe)
+        });
+        built.push(exe.clone());
     }
 }
 
-/// The newest recorded executable whose file name is `file_name`, if any.
-pub fn lookup(file_name: &OsStr) -> Option<PathBuf> {
-    let built = BUILT.lock().ok()?;
+/// The path in `built` that matches `guess` by file name and profile directory.
+fn lookup_in(built: &[PathBuf], guess: &Path) -> Option<PathBuf> {
     built
         .iter()
-        .rev()
-        .find(|path| path.file_name() == Some(file_name))
+        .find(|path| {
+            path.file_name() == guess.file_name() && profile_dir(path) == profile_dir(guess)
+        })
         .cloned()
 }
 
+/// Remember the executables of a finished build.
+pub fn record(executables: &[PathBuf]) {
+    if let Ok(mut built) = BUILT.lock() {
+        record_into(&mut built, executables);
+    }
+}
+
 /// Prefer the path Cargo reported over the rebuilt `guess`.
+///
+/// A recorded path must match the guess in file name and profile directory.
 pub fn prefer_built(guess: PathBuf) -> PathBuf {
-    guess.file_name().and_then(lookup).unwrap_or(guess)
+    BUILT
+        .lock()
+        .ok()
+        .and_then(|built| lookup_in(&built, &guess))
+        .unwrap_or(guess)
 }
 
 /// Run a `cargo build` command, record its executables, and return its status.
 ///
-/// Cargo renders diagnostics on stderr itself; stdout carries artifact records.
+/// Cargo prints diagnostics on stderr. Stdout holds the artifact records.
 pub fn run_build(cmd: &mut Command) -> std::io::Result<ExitStatus> {
     let mut child = cmd.stdout(Stdio::piped()).spawn()?;
-    let mut stdout = String::new();
-    if let Some(pipe) = child.stdout.take() {
-        for line in BufReader::new(pipe).lines().map_while(Result::ok) {
-            stdout.push_str(&line);
-            stdout.push('\n');
-        }
+    let mut bytes = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        // Drain to the end, or Cargo can block on a full pipe.
+        let _ = pipe.read_to_end(&mut bytes);
     }
     let status = child.wait()?;
     if status.success() {
-        record(&parse_executables(&stdout));
+        record(&parse_executables(&String::from_utf8_lossy(&bytes)));
     }
     Ok(status)
 }
@@ -97,14 +116,19 @@ mod tests {
     }
 
     #[test]
-    fn lookup_matches_by_file_name_and_newest_wins() {
-        record(&[PathBuf::from("/a/old/zz_bin")]);
-        record(&[PathBuf::from("/b/new/zz_bin")]);
-        assert_eq!(
-            lookup(OsStr::new("zz_bin")),
-            Some(PathBuf::from("/b/new/zz_bin"))
+    fn newer_path_replaces_older_with_same_file_name() {
+        let mut built = Vec::new();
+        record_into(
+            &mut built,
+            &[PathBuf::from("/a/debug/bin"), PathBuf::from("/a/other")],
         );
-        assert_eq!(lookup(OsStr::new("zz_missing")), None);
+        record_into(&mut built, &[PathBuf::from("/b/debug/bin")]);
+        assert_eq!(built.len(), 2);
+        assert_eq!(
+            lookup_in(&built, Path::new("/t/debug/bin")),
+            Some(PathBuf::from("/b/debug/bin"))
+        );
+        assert_eq!(lookup_in(&built, Path::new("/t/debug/missing")), None);
     }
 
     #[test]
@@ -117,6 +141,15 @@ mod tests {
     }
 
     #[test]
+    fn other_profile_is_not_swapped_in() {
+        let mut built = Vec::new();
+        record_into(&mut built, &[PathBuf::from("/t/release/app")]);
+        assert_eq!(lookup_in(&built, Path::new("/t/debug/app")), None);
+        record_into(&mut built, &[PathBuf::from("/t/triple/debug/app")]);
+        assert_eq!(built.len(), 2);
+    }
+
+    #[test]
     fn prefer_built_keeps_guess_when_nothing_recorded() {
         let guess = PathBuf::from("/t/debug/never_built");
         assert_eq!(prefer_built(guess.clone()), guess);
@@ -124,16 +157,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn run_build_records_executables_from_stdout() {
+    fn failed_build_records_nothing() {
+        let line = TRIPLE_ARTIFACT.replace("/app", "/ww_failed");
         let mut cmd = Command::new("sh");
-        cmd.args(["-c", "printf '%s\\n' \"$0\"", TRIPLE_ARTIFACT]);
-        let status = run_build(&mut cmd).expect("run");
-        assert!(status.success());
+        cmd.args(["-c", "printf '%s\\n' \"$0\"; exit 3", &line]);
+        assert!(!run_build(&mut cmd).expect("run").success());
+        let guess = PathBuf::from("/w/target/x86_64-unknown-linux-gnu/debug/ww_failed");
+        assert_eq!(prefer_built(guess.clone()), guess);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn large_and_non_utf8_output_does_not_hang_or_lose_the_artifact() {
+        let line = TRIPLE_ARTIFACT.replace("/app", "/ww_big");
+        let script = "head -c 200000 /dev/zero | tr '\\0' 'x'; printf '\\377\\n%s\\n' \"$0\"";
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", script, &line]);
+        assert!(run_build(&mut cmd).expect("run").success());
+        let guess = PathBuf::from("/w/target/debug/ww_big");
+        assert_ne!(prefer_built(guess.clone()), guess);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_build_records_executables_from_stdout() {
+        let line = TRIPLE_ARTIFACT.replace("/app", "/ww_run");
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf '%s\\n' \"$0\"", &line]);
+        assert!(run_build(&mut cmd).expect("run").success());
+        let guess = PathBuf::from("/w/target/debug/ww_run");
         assert_eq!(
-            lookup(OsStr::new("app")),
-            Some(PathBuf::from(
-                "/w/target/x86_64-unknown-linux-gnu/debug/app"
-            ))
+            prefer_built(guess),
+            PathBuf::from("/w/target/x86_64-unknown-linux-gnu/debug/ww_run")
         );
     }
 }
