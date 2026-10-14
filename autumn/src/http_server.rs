@@ -1172,6 +1172,9 @@ where
     type Future = TrackedFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+        // hyper polls readiness only for a parsed request. A busy inner
+        // service must not make that request look absent.
+        self.first_request.mark();
         self.inner.poll_ready(cx)
     }
 
@@ -1517,6 +1520,24 @@ mod tests {
 
     fn expiry(timers: &ConnTimers) -> Option<Expiry> {
         timers.deadline_and_expiry().map(|(_, expiry)| expiry)
+    }
+
+    #[tokio::test]
+    async fn a_request_waiting_for_service_readiness_counts_as_a_request() {
+        use tower::Service as _;
+        let first_request = Arc::new(FirstRequest::default());
+        let mut service = Tracked {
+            first_request: Arc::clone(&first_request),
+            inner: tower::service_fn(|_req: axum::extract::Request| async {
+                Ok::<_, Infallible>(axum::response::Response::new(axum::body::Body::empty()))
+            }),
+            timers: None,
+        };
+        // hyper polls readiness once a request is parsed, before `call`.
+        std::future::poll_fn(|cx| service.poll_ready(cx))
+            .await
+            .unwrap();
+        assert!(first_request.is_seen());
     }
 
     #[tokio::test]
