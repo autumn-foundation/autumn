@@ -73,6 +73,12 @@ const HOOK_STALE_CLAIM_AFTER: Duration = Duration::from_secs(60);
 const HOOK_CLAIM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HOOK_PENDING_FINALIZER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HOOK_AFTER_HOOK_FAILURE_MARK_RETRY_SLEEP: Duration = Duration::from_millis(100);
+// `SQLite` shared-cache table locks bypass `busy_timeout`, so a settle write can
+// fail once while a reader holds the table. Retry it briefly.
+#[cfg(feature = "sqlite")]
+const HOOK_SQLITE_SETTLE_MAX_ATTEMPTS: usize = 10;
+#[cfg(feature = "sqlite")]
+const HOOK_SQLITE_SETTLE_RETRY_SLEEP: Duration = Duration::from_millis(25);
 const HOOK_AFTER_HOOK_FAILURE_MARK_MAX_ATTEMPTS: usize = 3;
 
 // ── Backend-forked SQL (#1996 item 5) ────────────────────────────────────────
@@ -1959,6 +1965,28 @@ async fn sqlite_claim_next_repository_commit_hook(
     }
 }
 
+/// Run an ack or nack write, retrying a transient failure a few times.
+///
+/// A settle write that fails once leaves the row `running` until stale-claim
+/// recovery, so the hook would sit idle for `HOOK_STALE_CLAIM_AFTER`.
+#[cfg(feature = "sqlite")]
+async fn sqlite_settle_with_retry<F, Fut>(mut settle: F) -> AutumnResult<bool>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = AutumnResult<bool>>,
+{
+    let mut attempt = 1;
+    loop {
+        match settle().await {
+            Err(_) if attempt < HOOK_SQLITE_SETTLE_MAX_ATTEMPTS => {
+                attempt += 1;
+                tokio::time::sleep(HOOK_SQLITE_SETTLE_RETRY_SLEEP).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// `SQLite` drain loop: claim → lease heartbeat → run (under the originating tenant
 /// scope) → ack/nack, one row at a time. Mirrors the Postgres
 /// `drain_ready_repository_commit_hooks` shape.
@@ -2008,8 +2036,10 @@ pub async fn sqlite_drain_ready_repository_commit_hooks(
 
         match result {
             Ok(()) => {
-                if let Err(error) =
-                    ack_repository_commit_hook_success(pool, &row.id, worker_id).await
+                if let Err(error) = sqlite_settle_with_retry(|| {
+                    ack_repository_commit_hook_success(pool, &row.id, worker_id)
+                })
+                .await
                 {
                     tracing::warn!(
                         hook_id = %row.id,
@@ -2027,9 +2057,11 @@ pub async fn sqlite_drain_ready_repository_commit_hooks(
                     autumn.after_commit.failures_total = failures_total,
                     "repository after_commit hook failed: {error}"
                 );
-                if let Err(nack_error) = sqlite_nack_repository_commit_hook_failure(
-                    pool, &row.id, worker_id, &error, &row,
-                )
+                if let Err(nack_error) = sqlite_settle_with_retry(|| {
+                    sqlite_nack_repository_commit_hook_failure(
+                        pool, &row.id, worker_id, &error, &row,
+                    )
+                })
                 .await
                 {
                     tracing::warn!(

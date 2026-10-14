@@ -2056,10 +2056,7 @@ fn decode_mailgun_body(
     body: &[u8],
     content_type: &str,
 ) -> (HashMap<String, String>, Vec<Attachment>) {
-    if content_type
-        .to_ascii_lowercase()
-        .starts_with("multipart/form-data")
-    {
+    if crate::media_type::is_media_type(content_type, "multipart/form-data") {
         parse_mailgun_form_data(body, content_type)
     } else {
         (url_decode_form(body), Vec::new())

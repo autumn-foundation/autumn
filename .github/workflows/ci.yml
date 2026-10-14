@@ -2289,6 +2289,11 @@ jobs:
           # Same package and features as the legs above, so no rebuild.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_ledger --test sqlite_ledger_out_of_band
+          # Issue #3267: the SQLite commit-hook worker's ack/nack retry runs
+          # only inside this suite. Without this leg Codecov reads it as
+          # uncovered. Same package and features as the legs above, so no rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_commit_hook_worker
           # Issue #2108: the admin plugin's `backend_select!` sqlite arms and
           # the cross-backend model suite. Without this lane Codecov reads them
           # as a new uncovered surface. No Docker, ~0.01s of runtime.
