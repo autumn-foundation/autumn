@@ -327,7 +327,8 @@ pub fn close_cascades(mutations: &[Mutation]) -> Vec<Mutation> {
         by_repo.entry(m.repository.as_str()).or_default().push(m);
     }
     for root in mutations.iter().filter(|m| m.cascades_into.is_some()) {
-        let mut visited = std::collections::HashSet::from([root.repository.as_str()]);
+        // Not seeded with the root: a child may share its parent's trait name.
+        let mut visited = std::collections::HashSet::new();
         let mut queue: Vec<&str> = root
             .cascades_into
             .as_deref()
@@ -1912,6 +1913,34 @@ mod tests {
             .filter(|m| m.repository == "PostRepository" && m.model == "app::Like")
             .count();
         assert_eq!(like_rows, 2);
+    }
+
+    #[test]
+    fn a_child_may_share_its_parents_trait_name() {
+        // `admin::CommentRepository` destroys into `blog::CommentRepository`.
+        let muts = vec![
+            cascade(
+                "CommentRepository",
+                "delete_by_id",
+                "app::Comment",
+                "CommentRepository",
+            ),
+            Mutation {
+                location: "src/blog.rs:1".to_string(),
+                ..cascade(
+                    "CommentRepository",
+                    "delete_by_id",
+                    "app::Like",
+                    "LikeRepository",
+                )
+            },
+        ];
+        let closed = close_cascades(&muts);
+        let root_like = closed
+            .iter()
+            .filter(|m| m.model == "app::Like" && m.location == "src/repositories.rs:20")
+            .count();
+        assert_eq!(root_like, 1, "{closed:?}");
     }
 
     #[test]
