@@ -2486,13 +2486,13 @@ fn scan_anonymize_tables(root: &Path) -> Result<BTreeSet<String>, ScrubError> {
     files.sort();
 
     let mut scanned = Vec::with_capacity(files.len());
-    let mut disabled: Vec<PathBuf> = Vec::new();
+    let mut sources = Vec::with_capacity(files.len());
     for path in files {
         let src = std::fs::read_to_string(&path).map_err(|e| io_err(&path, &e))?;
-        let result = scan_anonymize_source(&src);
-        disabled.extend(crate::schema::parse::disabled_module_paths(&path, &src));
-        scanned.push((path, result));
+        scanned.push((path.clone(), scan_anonymize_source(&src)));
+        sources.push((path, src));
     }
+    let disabled = crate::schema::parse::disabled_module_paths(&sources);
 
     let mut out = BTreeSet::new();
     for (path, result) in scanned {

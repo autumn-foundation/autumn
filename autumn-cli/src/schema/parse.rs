@@ -364,6 +364,9 @@ pub fn parse_encrypted_columns(
     if production_enabled(&file.attrs) {
         syn::visit::Visit::visit_file(&mut scan, &file);
     }
+    if let Some((table, column)) = scan.conflict {
+        return Err(SchemaParseError::ConflictingEncryptedMode { table, column });
+    }
     Ok(scan.found)
 }
 
@@ -424,6 +427,8 @@ fn cfg_value(meta: &syn::Meta) -> Option<bool> {
 #[derive(Default)]
 struct EncryptedScan {
     found: BTreeMap<String, BTreeMap<String, bool>>,
+    /// The first column two models encrypt in different modes.
+    conflict: Option<(String, String)>,
 }
 
 impl<'ast> syn::visit::Visit<'ast> for EncryptedScan {
@@ -452,10 +457,12 @@ impl<'ast> syn::visit::Visit<'ast> for EncryptedScan {
                     continue;
                 }
                 if let Some(attr) = field.attrs.iter().find(|a| is_encrypted_attr(a)) {
-                    self.found.entry(table.clone()).or_default().insert(
-                        field_column_name(field, ident),
-                        is_deterministic_encrypted(attr),
-                    );
+                    let column = field_column_name(field, ident);
+                    let deterministic = is_deterministic_encrypted(attr);
+                    let known = self.found.entry(table.clone()).or_default();
+                    if known.insert(column.clone(), deterministic) == Some(!deterministic) {
+                        self.conflict.get_or_insert_with(|| (table.clone(), column));
+                    }
                 }
             }
         }
@@ -482,10 +489,7 @@ pub fn parse_encrypted_columns_path(
         sources.push((file, src));
     }
     // A file reached only through `#[cfg(test)] mod x;` is test code.
-    let disabled: Vec<std::path::PathBuf> = sources
-        .iter()
-        .flat_map(|(file, src)| disabled_module_paths(file, src))
-        .collect();
+    let disabled = disabled_module_paths(&sources);
     let mut out: BTreeMap<String, BTreeMap<String, bool>> = BTreeMap::new();
     for (file, src) in &sources {
         if disabled.iter().any(|d| file.starts_with(d)) {
@@ -503,45 +507,59 @@ pub fn parse_encrypted_columns_path(
     Ok(out)
 }
 
-/// The file and directory paths that `cfg`-disabled modules in `src` would
-/// load, for the source file `file`.
+/// The paths that `cfg`-disabled modules would load, across a set of source
+/// files `(path, source)`.
 ///
 /// A `lib`, `main` or `mod` file owns its own directory; any other file owns a
 /// directory named for its stem. A module inside a disabled inline module is
-/// disabled too, and an inline module adds its name to the path. Empty when the
-/// source does not parse: the caller reports that.
+/// disabled too, and an inline module adds its name to the path. A path that any
+/// enabled declaration also loads, in any file (`lib.rs` and `main.rs` are two
+/// crate roots), is production code and is left out. A source that does not
+/// parse adds nothing: the caller reports that.
 #[must_use]
-pub fn disabled_module_paths(file: &Path, src: &str) -> Vec<std::path::PathBuf> {
-    let Ok(parsed) = syn::parse_file(src) else {
-        return Vec::new();
-    };
-    let stem = file
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
-    let parent = file.parent().unwrap_or_else(|| Path::new(""));
-    let module_dir = if matches!(stem, "lib" | "main" | "mod") {
-        parent.to_path_buf()
-    } else {
-        parent.join(stem)
-    };
-    let mut out = Vec::new();
-    collect_disabled_modules(
-        &parsed.items,
-        (&module_dir, parent),
-        !production_enabled(&parsed.attrs),
-        &mut out,
-    );
-    out
+pub fn disabled_module_paths(sources: &[(std::path::PathBuf, String)]) -> Vec<std::path::PathBuf> {
+    let mut found = ModulePaths::default();
+    for (file, src) in sources {
+        let Ok(parsed) = syn::parse_file(src) else {
+            continue;
+        };
+        let stem = file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let parent = file.parent().unwrap_or_else(|| Path::new(""));
+        let module_dir = if matches!(stem, "lib" | "main" | "mod") {
+            parent.to_path_buf()
+        } else {
+            parent.join(stem)
+        };
+        collect_module_paths(
+            &parsed.items,
+            (&module_dir, parent),
+            !production_enabled(&parsed.attrs),
+            &mut found,
+        );
+    }
+    found
+        .disabled
+        .into_iter()
+        .filter(|p| !found.enabled.contains(p))
+        .collect()
+}
+
+#[derive(Default)]
+struct ModulePaths {
+    disabled: Vec<std::path::PathBuf>,
+    enabled: Vec<std::path::PathBuf>,
 }
 
 /// `dirs` is the directory that holds module files, and the base a `#[path]`
 /// attribute resolves against.
-fn collect_disabled_modules(
+fn collect_module_paths(
     items: &[syn::Item],
     dirs: (&Path, &Path),
     parent_disabled: bool,
-    out: &mut Vec<std::path::PathBuf>,
+    out: &mut ModulePaths,
 ) {
     let (dir, path_base) = dirs;
     // The paths a module loads: its `#[path]`, else the conventional pair.
@@ -570,37 +588,17 @@ fn collect_disabled_modules(
             |custom| vec![path_base.join(custom)],
         )
     };
-    // A path that an enabled declaration also loads (`#[cfg(test)] mod m;` with
-    // `#[cfg(not(test))] mod m;`) is production code.
-    let enabled_paths: Vec<std::path::PathBuf> = items
-        .iter()
-        .filter_map(|item| match item {
-            syn::Item::Mod(m)
-                if m.content.is_none() && !parent_disabled && production_enabled(&m.attrs) =>
-            {
-                Some(paths_of(m))
-            }
-            _ => None,
-        })
-        .flatten()
-        .collect();
     for item in items {
         let syn::Item::Mod(module) = item else {
             continue;
         };
         let disabled = parent_disabled || !production_enabled(&module.attrs);
         match &module.content {
-            None if disabled => {
-                out.extend(
-                    paths_of(module)
-                        .into_iter()
-                        .filter(|p| !enabled_paths.contains(p)),
-                );
-            }
-            None => {}
+            None if disabled => out.disabled.extend(paths_of(module)),
+            None => out.enabled.extend(paths_of(module)),
             Some((_, nested)) => {
                 let nested_dir = dir.join(module.ident.to_string());
-                collect_disabled_modules(nested, (&nested_dir, &nested_dir), disabled, out);
+                collect_module_paths(nested, (&nested_dir, &nested_dir), disabled, out);
             }
         }
     }
@@ -2603,6 +2601,40 @@ mod tests {
             .unwrap();
         std::os::unix::fs::symlink(real.path(), dir.path().join("linked")).unwrap();
         std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// Two models in one file that encrypt a column differently conflict too.
+    #[test]
+    fn conflicting_modes_in_one_file_are_an_error() {
+        let err = parse_encrypted_columns(
+            r#"
+            #[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }
+            #[cfg(feature = "fixtures")]
+            mod fixtures {
+                #[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }
+            }
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SchemaParseError::ConflictingEncryptedMode { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// `lib.rs` disables a module that `main.rs` (another crate root) enables.
+    #[test]
+    fn another_crate_root_can_enable_a_disabled_module() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "#[cfg(test)] mod models;\n").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "mod models;\n").unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
         let found = parse_encrypted_columns_path(dir.path()).unwrap();
         assert!(found["users"]["email"], "{found:?}");
     }
