@@ -1387,7 +1387,11 @@ fn start_server(
     #[cfg(not(unix))]
     if let Some(signal_path) = dev_shutdown_signal_path() {
         signal_cleared = marker_cleared(&std::fs::remove_file(signal_path));
-        command.env(DEV_SHUTDOWN_SIGNAL_ENV, signal_path);
+        // An old request that stays would drain this child at boot. Without the
+        // variable, the child does not watch the file at all.
+        if signal_cleared {
+            command.env(DEV_SHUTDOWN_SIGNAL_ENV, signal_path);
+        }
         // Resolve the child's stop budget from the config it is about to boot
         // with, and keep it for the stop. `autumn.toml` is watched, so by the
         // time this child is stopped the file may say something different — and
@@ -1408,7 +1412,7 @@ fn start_server(
             command.env(SERVE_READY_FILE_ENV, ready);
         } else {
             eprintln!(
-                "  Warning: could not clear {} or the shutdown file. A stop will not wait for startup.",
+                "  Warning: could not clear {} or the shutdown file. Close the program that holds it. Until then, a stop cannot ask the app to drain.",
                 ready.display()
             );
         }
