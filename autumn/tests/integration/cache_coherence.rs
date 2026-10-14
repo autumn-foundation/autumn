@@ -148,7 +148,7 @@ pub async fn coherence_moderated_labels(
 // ── A nested cascade (#2364) ─────────────────────────────────────────
 //
 // Blog -> Entry -> Note, `destroy` at each step. `CoherenceBlogRepository`
-// sees only `Entry`; the `Note` write exists only in the other repository.
+// names `Entry`. Only `CoherenceEntryRepository` names `Note`.
 
 #[autumn_web::model(table = "coherence_blogs")]
 pub struct CoherenceBlog {
@@ -195,12 +195,17 @@ pub async fn coherence_note_count() -> i64 {
 
 #[test]
 fn a_root_delete_mutates_the_grandchild_model() {
-    let models: Vec<String> = coherence::registered_mutations()
-        .into_iter()
-        .filter(|m| m.repository == "CoherenceBlogRepository" && m.method == "delete_by_id")
-        .map(|m| model_key(&m.model).to_string())
-        .collect();
-    assert!(models.contains(&"CoherenceNote".to_string()), "{models:?}");
+    for method in ["delete_by_id", "delete_many"] {
+        let models: Vec<String> = coherence::registered_mutations()
+            .into_iter()
+            .filter(|m| m.repository == "CoherenceBlogRepository" && m.method == method)
+            .map(|m| model_key(&m.model).to_string())
+            .collect();
+        assert!(
+            models.contains(&"CoherenceNote".to_string()),
+            "{method}: {models:?}"
+        );
+    }
 }
 
 #[test]
@@ -536,6 +541,7 @@ fn seeded_mutation(model: &str, method: &str) -> Mutation {
         acknowledged_stale: None,
         location: format!("src/{model}_repo.rs:1"),
         cascades_into: None,
+        cascade_recurses: false,
     }
 }
 

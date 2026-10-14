@@ -606,10 +606,12 @@ tell "we checked and it was fine" from "we never looked".
   write against the child model it deletes or nullifies, resolved from that
   child repository's own published model rather than guessed from its type name
   (`on_delete = restrict` is excluded — it probes and never writes). A cascade
-  of cascades is covered too. The audit follows each child's own `dependent(...)`
-  list at link time, so a root delete registers a write for every model below
-  it. The root repository must declare an edge for each one. A cycle ends the
-  walk. Two repository traits with the same name share one chain. But
+  that reaches further `destroy` cascades is also covered. The audit follows
+  each child's own `dependent(...)` list at link time. A root delete registers
+  a write for every model below it. The root must declare an edge for each one.
+  The audit matches repositories by trait name. Two traits with the same name
+  count as one. `nullify` and `delete_all` write one table, so the audit does
+  not follow them further. But
   `#[has_many(Child, dependent = destroy)]` and
   `#[belongs_to(Parent, counter_cache)]` are declared on the model, which
   `#[repository]` cannot see, so the writes they cause carry no descriptor.

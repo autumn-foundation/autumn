@@ -520,13 +520,13 @@ fn cached_read_companion_path(path: &syn::Path, prefix: &str) -> syn::Path {
 /// invalidation for a read that cannot go stale, and a gate that fails correct
 /// code is a gate that gets deleted.
 ///
-/// Returns the child repository paths, deduplicated by their rendered form. The
+/// Returns each child repository path and whether the cascade recurses into it,
+/// deduplicated by rendered form. The
 /// model is NOT inferred from the repository's type name — see
 /// `__AUTUMN_MODEL_NAME` in [`generate_coherence_items`] for why that guess is
 /// wrong exactly where it matters.
-fn dependent_child_repositories(config: &RepoConfig) -> Vec<syn::Path> {
-    let mut seen: Vec<String> = Vec::new();
-    let mut paths: Vec<syn::Path> = Vec::new();
+fn dependent_child_repositories(config: &RepoConfig) -> Vec<(syn::Path, bool)> {
+    let mut children: Vec<(String, syn::Path, bool)> = Vec::new();
     for dep in config
         .dependents
         .iter()
@@ -534,12 +534,16 @@ fn dependent_child_repositories(config: &RepoConfig) -> Vec<syn::Path> {
     {
         let child = &dep.child_repo;
         let rendered = quote!(#child).to_string();
-        if !seen.contains(&rendered) {
-            seen.push(rendered);
-            paths.push(dep.child_repo.clone());
+        // Only `destroy` runs the child's own cascade. `nullify` and
+        // `delete_all` are one statement on the child table.
+        let recurses = dep.action == DependentAction::Destroy;
+        if let Some(seen) = children.iter_mut().find(|(r, _, _)| *r == rendered) {
+            seen.2 |= recurses;
+        } else {
+            children.push((rendered, dep.child_repo.clone(), recurses));
         }
     }
-    paths
+    children.into_iter().map(|(_, p, r)| (p, r)).collect()
 }
 
 /// Write methods that run the `dependent(...)` cascade.
@@ -584,8 +588,9 @@ fn cascade_mutation_registrations(
                 );
             child_repos
                 .iter()
-                .map(|child| {
+                .map(|(child, recurses)| {
                     let (edges, acknowledged) = (edges.clone(), acknowledged.clone());
+                    let recurses = *recurses;
                     quote! {
                     ::autumn_web::reexports::inventory::submit! {
                         ::autumn_web::cache::coherence::MutationDescriptor {
@@ -605,7 +610,7 @@ fn cascade_mutation_registrations(
                             acknowledged_stale: #acknowledged,
                             location: concat!(file!(), ":", line!()),
                             cascades_into: ::core::option::Option::Some(
-                                <#child>::__AUTUMN_REPOSITORY_NAME
+                                (<#child>::__AUTUMN_REPOSITORY_NAME, #recurses)
                             ),
                         }
                     }
@@ -805,8 +810,6 @@ fn generate_coherence_items(
             pub const __AUTUMN_MODEL_NAME: fn() -> &'static ::core::primitive::str =
                 || ::core::any::type_name::<#model_name>();
 
-            /// This repository's trait name. A parent cascade publishes it
-            /// so the audit can follow the cascade down (#2364).
             #[doc(hidden)]
             pub const __AUTUMN_REPOSITORY_NAME: &'static ::core::primitive::str =
                 #trait_name_str;
@@ -21541,6 +21544,30 @@ mod tests {
     }
 
     #[test]
+    fn only_a_destroy_cascade_is_followed_down() {
+        // `nullify` and `delete_all` are one SQL statement on the child
+        // table. They never reach the child's own cascade.
+        let out = repository_macro(
+            quote! {
+                Post,
+                dependent(PgCommentRepository, fk = "post_id", on_delete = destroy),
+                dependent(PgTagRepository, fk = "post_id", on_delete = nullify),
+                dependent(PgVoteRepository, fk = "post_id", on_delete = delete_all)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let link = |child: &str, recurses: &str| {
+            out.contains(&format!(
+                "< {child} > :: __AUTUMN_REPOSITORY_NAME , {recurses})"
+            ))
+        };
+        assert!(link("PgCommentRepository", "true"), "{out}");
+        assert!(link("PgTagRepository", "false"), "{out}");
+        assert!(link("PgVoteRepository", "false"), "{out}");
+    }
+
+    #[test]
     fn a_dependent_cascade_registers_a_write_against_the_child_model() {
         // `PostRepository::delete_by_id` really does delete `Comment` rows, so
         // a cached read derived from `Comment` is stranded by it. Registering
@@ -29046,7 +29073,10 @@ mod tests {
     fn repository_expansion_stays_within_budget() {
         // (label, attribute args, ceiling in bytes of `TokenStream::to_string`)
         let budgets: Vec<(&str, proc_macro2::TokenStream, usize)> = vec![
-            ("plain", quote! { Post }, 80_000),
+            // Raised from 80_000 (#2364): each write descriptor gained a
+            // `cascades_into` field, and each repository one name const.
+            // Understood and intended: about 400 bytes.
+            ("plain", quote! { Post }, 81_000),
             ("soft_delete", quote! { Post, soft_delete }, 89_000),
             ("tenant_scoped", quote! { Post, tenant_scoped }, 103_000),
             ("api", quote! { Post, api = "/posts" }, 95_000),

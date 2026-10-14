@@ -165,10 +165,12 @@ pub struct MutationDescriptor {
     pub acknowledged_stale: Option<&'static str>,
     /// `file:line` of the declaration.
     pub location: &'static str,
-    /// For a `dependent(...)` cascade write: the child repository trait name.
+    /// For a cascade write: the child repository trait name, and whether the
+    /// cascade runs the child's own cascade.
     ///
-    /// [`close_cascades`] follows it to find grandchild writes.
-    pub cascades_into: Option<&'static str>,
+    /// The flag is `true` only for `destroy`. `nullify` and `delete_all` write
+    /// one table. [`close_cascades`] uses both to find grandchild writes.
+    pub cascades_into: Option<(&'static str, bool)>,
 }
 
 inventory::collect!(MutationDescriptor);
@@ -213,9 +215,12 @@ pub struct Mutation {
     pub acknowledged_stale: Option<String>,
     /// `file:line` of the declaration.
     pub location: String,
-    /// For a cascade write: the child repository it deletes through.
+    /// For a cascade write: the child repository it writes to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cascades_into: Option<String>,
+    /// Whether the cascade runs the child's own cascade.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cascade_recurses: bool,
 }
 
 impl Mutation {
@@ -292,40 +297,52 @@ pub fn models_match(a: &str, b: &str) -> bool {
 
 // ── Cascade closure ──────────────────────────────────────────────────
 
-/// Add the writes a `dependent(...)` cascade makes below its direct child.
+/// Add the writes a `destroy` cascade makes below its direct child.
 ///
-/// A repository sees only its own `dependent(...)` list, so its descriptor
-/// names the child but not the grandchild. Only the whole app knows both.
-/// For each cascade write, this follows `cascades_into` through the other
-/// descriptors and adds one write per model it reaches. The added writes keep
-/// the root's method, edges, acknowledgement and location, so the root must
-/// declare an edge for each reached model. A repository seen twice ends the
-/// walk, so a cycle terminates. The result is stable under a second call.
+/// A repository names only its own `dependent(...)` children. Only the full
+/// set of descriptors names the grandchildren. This function follows
+/// `cascades_into` through that set. It adds one write per model it reaches.
+///
+/// An added write keeps the root's method, edges, acknowledgement and
+/// location. So the root must declare an edge for each model it reaches.
+/// The walk visits each repository once, so a cycle ends. A second call adds
+/// nothing.
 #[must_use]
 pub fn close_cascades(mutations: &[Mutation]) -> Vec<Mutation> {
     let mut closed = mutations.to_vec();
-    let mut seen: std::collections::HashSet<(String, String, String)> = mutations
-        .iter()
-        .map(|m| (m.repository.clone(), m.method.clone(), m.model.clone()))
-        .collect();
+    // The location keeps two same-named roots apart: each owes its own edge.
+    let key = |m: &Mutation, model: &str| {
+        (
+            m.repository.clone(),
+            m.method.clone(),
+            model.to_string(),
+            m.location.clone(),
+        )
+    };
+    let mut seen: std::collections::HashSet<(String, String, String, String)> =
+        mutations.iter().map(|m| key(m, &m.model)).collect();
+    let mut by_repo: std::collections::HashMap<&str, Vec<&Mutation>> =
+        std::collections::HashMap::new();
+    for m in mutations.iter().filter(|m| m.cascades_into.is_some()) {
+        by_repo.entry(m.repository.as_str()).or_default().push(m);
+    }
     for root in mutations.iter().filter(|m| m.cascades_into.is_some()) {
         let mut visited = std::collections::HashSet::from([root.repository.as_str()]);
-        let mut queue: Vec<&str> = root.cascades_into.as_deref().into_iter().collect();
+        let mut queue: Vec<&str> = root
+            .cascades_into
+            .as_deref()
+            .filter(|_| root.cascade_recurses)
+            .into_iter()
+            .collect();
         while let Some(repo) = queue.pop() {
             if !visited.insert(repo) {
                 continue;
             }
-            for hop in mutations
-                .iter()
-                .filter(|m| m.repository == repo && m.cascades_into.is_some())
-            {
-                queue.extend(hop.cascades_into.as_deref());
-                let key = (
-                    root.repository.clone(),
-                    root.method.clone(),
-                    hop.model.clone(),
-                );
-                if seen.insert(key) {
+            for hop in by_repo.get(repo).into_iter().flatten() {
+                if hop.cascade_recurses {
+                    queue.extend(hop.cascades_into.as_deref());
+                }
+                if seen.insert(key(root, &hop.model)) {
                     closed.push(Mutation {
                         model: hop.model.clone(),
                         table: String::new(),
@@ -890,9 +907,9 @@ fn excluded_dimensions() -> Vec<ExcludedDimension> {
                      `#[has_many(Child, dependent = destroy)]` means the parent's delete writes \
                      the child's table with no descriptor for it. A cascade declared on the \
                      REPOSITORY — `#[repository(..., dependent(...))]` — IS registered against \
-                     the child model it deletes or nullifies, resolved from that child \
-                     repository's own published model, and so is each model further down a \
-                     chain of such cascades; `on_delete = restrict` is excluded because it \
+                     the child model it deletes or nullifies. So is each model further \
+                     down a chain of `destroy` cascades. The audit links the chain by \
+                     repository trait name. `on_delete = restrict` is excluded because it \
                      only probes and never writes"
                 .to_string(),
         },
@@ -1637,7 +1654,8 @@ pub fn registered_mutations() -> Vec<Mutation> {
             invalidates: d.invalidates.iter().map(|s| (*s).to_string()).collect(),
             acknowledged_stale: d.acknowledged_stale.map(ToString::to_string),
             location: d.location.to_string(),
-            cascades_into: d.cascades_into.map(ToString::to_string),
+            cascades_into: d.cascades_into.map(|(name, _)| name.to_string()),
+            cascade_recurses: d.cascades_into.is_some_and(|(_, recurses)| recurses),
         })
         .collect();
     close_cascades(&direct)
@@ -1710,6 +1728,7 @@ mod tests {
             acknowledged_stale: None,
             location: "src/repositories.rs:20".to_string(),
             cascades_into: None,
+            cascade_recurses: false,
         }
     }
 
@@ -1718,6 +1737,7 @@ mod tests {
     fn cascade(repo: &str, method: &str, model: &str, into: &str) -> Mutation {
         Mutation {
             cascades_into: Some(into.to_string()),
+            cascade_recurses: true,
             ..mutation(repo, method, model)
         }
     }
@@ -1767,7 +1787,12 @@ mod tests {
         let reads = vec![read("app::likes", &["app::Like"])];
         let mut muts = post_comment_like();
         // The edge sits on the child, not on the root.
-        muts[3].invalidates = vec!["app::likes".to_string()];
+        for m in muts
+            .iter_mut()
+            .filter(|m| m.repository == "CommentRepository")
+        {
+            m.invalidates = vec!["app::likes".to_string()];
+        }
         let findings = check(&reads, &close_cascades(&muts));
         assert!(
             findings
@@ -1785,6 +1810,11 @@ mod tests {
             m.invalidates = vec!["app::likes".to_string()];
         }
         let closed = close_cascades(&muts);
+        let like_writes = closed
+            .iter()
+            .filter(|m| m.repository == "PostRepository" && m.model == "app::Like")
+            .count();
+        assert_eq!(like_writes, 1, "{closed:?}");
         assert!(
             check(&reads, &closed)
                 .iter()
@@ -1810,12 +1840,45 @@ mod tests {
     fn a_restrict_step_adds_no_mutation() {
         // `restrict` registers no cascade descriptor, so the chain stops.
         let mut muts = post_comment_like();
-        muts.remove(3);
+        muts.retain(|m| m.cascades_into.as_deref() != Some("LikeRepository"));
         let closed = close_cascades(&muts);
         assert_eq!(
             models_of(&closed, "PostRepository", "delete_by_id"),
             ["app::Comment", "app::Post"]
         );
+    }
+
+    #[test]
+    fn a_nullify_step_is_written_but_not_followed() {
+        // Post -destroy-> Comment -nullify-> Like -destroy-> Reaction.
+        // The `nullify` leg writes `Like` only. It never reaches `Reaction`.
+        let mut muts = post_comment_like();
+        muts[3].cascade_recurses = false;
+        muts.push(cascade(
+            "LikeRepository",
+            "delete_by_id",
+            "app::Reaction",
+            "ReactionRepository",
+        ));
+        let closed = close_cascades(&muts);
+        assert_eq!(
+            models_of(&closed, "PostRepository", "delete_by_id"),
+            ["app::Comment", "app::Like", "app::Post"]
+        );
+    }
+
+    #[test]
+    fn a_cascade_link_round_trips_through_json() {
+        let m = cascade(
+            "PostRepository",
+            "delete_by_id",
+            "app::Comment",
+            "CommentRepository",
+        );
+        let back: Mutation = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        let plain = serde_json::to_string(&mutation("A", "save", "app::A")).unwrap();
+        assert!(!plain.contains("cascade"), "{plain}");
     }
 
     #[test]
@@ -1834,6 +1897,21 @@ mod tests {
             models_of(&closed, "CRepository", "delete_by_id"),
             ["app::C"]
         );
+    }
+
+    #[test]
+    fn two_same_named_roots_keep_their_own_edges() {
+        let mut a = post_comment_like();
+        let mut b = post_comment_like();
+        for m in &mut b {
+            m.location = "src/other.rs:1".to_string();
+        }
+        a.extend(b);
+        let like_rows = close_cascades(&a)
+            .iter()
+            .filter(|m| m.repository == "PostRepository" && m.model == "app::Like")
+            .count();
+        assert_eq!(like_rows, 2);
     }
 
     #[test]
