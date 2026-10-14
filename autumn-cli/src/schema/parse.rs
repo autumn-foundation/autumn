@@ -359,7 +359,7 @@ pub fn parse_encrypted_columns(
 /// Only `test` is known to be off, and `not`, `all` and `any` combine it. Other
 /// predicates (a feature, a target) are unknown and count as on. This keeps a
 /// registration the app might have: scrubbing too much is the safe error.
-pub(crate) fn production_enabled(attrs: &[syn::Attribute]) -> bool {
+pub fn production_enabled(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().filter(|a| a.path().is_ident("cfg")).all(|a| {
         a.parse_args::<syn::Meta>()
             .map_or(true, |m| cfg_value(&m) != Some(false))
@@ -2271,7 +2271,7 @@ mod tests {
             "#,
         )
         .expect("parse");
-        assert_eq!(found["users"]["email"], true, "{found:?}");
+        assert!(found["users"]["email"], "{found:?}");
     }
 
     /// A model in an inline module, at any depth, is still a model.
