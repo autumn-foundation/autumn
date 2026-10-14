@@ -803,12 +803,14 @@ impl std::fmt::Display for ScrubError {
             ),
             Self::RowLevelSecurity { tables } => write!(
                 f,
-                "{} table(s) this run reads or writes have row-level security enabled:\n{}\n  \
+                "{} table(s) this run reads or writes have row-level security that binds the \
+                 connected role:\n{}\n  \
                  A role that does not bypass RLS sees only the rows its policies expose, and \
                  every phase then reports a success it cannot stand behind: an `UPDATE` \
                  rewrites part of the PII, a `DELETE` reports a table emptied that is not, and \
                  the foreign key re-count misses the very orphan it exists to find. \
-                 Connect as the table owner or a BYPASSRLS role.",
+                 Connect as a superuser, a BYPASSRLS role, or the table owner (the owner is \
+                 still bound when the table is FORCE ROW LEVEL SECURITY).",
                 tables.len(),
                 bullet_list(tables),
             ),
@@ -4192,9 +4194,10 @@ pub struct DatabaseFacts {
     /// the parent moves each row to the partition its new key belongs to: it
     /// aborts when none exists, and collapses the table into one when one does.
     pub partition_key_columns: BTreeSet<(String, String)>,
-    /// Tables with row-level security enabled. A non-bypassing role silently
-    /// updates only the rows its policies expose — a fail-open a scrub cannot
-    /// tolerate.
+    /// Tables whose row-level security binds the connected role. Such a role
+    /// silently updates only the rows its policies expose — a fail-open a scrub
+    /// cannot tolerate. A superuser, a `BYPASSRLS` role and an unforced owner
+    /// are not bound, so their tables are absent.
     pub rls_tables: BTreeSet<String>,
     /// Legacy `INHERITS` children as `child (inherits parent)`, sorted. Empty
     /// for a declaratively partitioned schema, which the sample does model.
@@ -4467,6 +4470,20 @@ fn has_catalog_column(
     .map_err(|e| ScrubError::Sql(e.to_string()))?;
     Ok(!rows.is_empty())
 }
+
+/// Tables in `public` whose row-level security restricts the connected role.
+///
+/// RLS only binds a role the table's policies apply to. A superuser and a
+/// `BYPASSRLS` role skip it; so does the table owner, unless the table is
+/// `FORCE ROW LEVEL SECURITY`. Refusing those would make the documented remedy
+/// ("connect as the owner") a dead end. `current_user` is the role RLS checks.
+const RLS_RESTRICTED_TABLES: &str = "SELECT rel.relname AS name FROM pg_class rel \
+     JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+     WHERE rel.relrowsecurity \
+       AND NOT COALESCE((SELECT r.rolsuper OR r.rolbypassrls FROM pg_roles r \
+                         WHERE r.rolname = current_user), false) \
+       AND NOT (pg_has_role(current_user, rel.relowner, 'USAGE') \
+                AND NOT rel.relforcerowsecurity)";
 
 /// Gather every catalog fact the plan validation needs.
 // One catalog read per fact; splitting it would scatter closely-related SQL
@@ -4749,14 +4766,9 @@ fn probe_database_facts(
         names
     };
 
-    let rls_tables = names(
-        "SELECT rel.relname AS name FROM pg_class rel \
-         JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
-         WHERE rel.relrowsecurity",
-        &mut conn,
-    )?
-    .into_iter()
-    .collect();
+    let rls_tables = names(RLS_RESTRICTED_TABLES, &mut conn)?
+        .into_iter()
+        .collect();
 
     // Two questions, one shape: which tables carry a user-defined trigger at
     // all (the warning), and which carry one that fires on `DELETE` (the
@@ -8072,6 +8084,21 @@ mod tests {
             "{err:?}"
         );
         assert!(err.to_string().contains("ciphertext"), "{err}");
+    }
+
+    #[test]
+    fn the_rls_probe_asks_about_the_connected_role() {
+        for term in [
+            "rolsuper",
+            "rolbypassrls",
+            "relforcerowsecurity",
+            "relowner",
+        ] {
+            assert!(
+                RLS_RESTRICTED_TABLES.contains(term),
+                "the RLS probe must consult {term}"
+            );
+        }
     }
 
     #[test]
