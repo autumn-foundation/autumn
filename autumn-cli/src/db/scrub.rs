@@ -2397,6 +2397,17 @@ fn without_userinfo(raw: &str) -> String {
     }
 }
 
+/// The write targets an artifact restore actually wrote to.
+///
+/// A control-only or single-shard artifact leaves every other configured shard
+/// live; scrubbing those would anonymize data nobody asked to touch.
+fn restored_targets(targets: Vec<(String, String)>, restored: &[String]) -> Vec<(String, String)> {
+    targets
+        .into_iter()
+        .filter(|(label, _)| restored.contains(label))
+        .collect()
+}
+
 /// Profiles whose config could name the artifact's source: the artifact's own
 /// profile plus every profile with a config overlay, minus the destination
 /// (which is the target, never its own source) and the always-safe `dev`/`test`.
@@ -2591,7 +2602,7 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
     // data into the target. Only schema-dependent refusals can land after it.
     let sources = load_source_classification(args)?;
 
-    let targets = super::backup::resolve_all_target_urls(args.profile.as_deref())?;
+    let mut targets = super::backup::resolve_all_target_urls(args.profile.as_deref())?;
 
     let restored = if let Some(artifact) = &args.artifact {
         let artifact_profile = super::backup::artifact_source_profile(artifact);
@@ -2620,13 +2631,16 @@ fn scrub(args: &ScrubArgs) -> Result<(), ScrubError> {
             "\u{2500}\u{2500} restoring {} \u{2500}\u{2500}",
             artifact.display()
         );
-        super::backup::restore(&super::backup::RestoreArgs {
+        let restored_labels = super::backup::restore(&super::backup::RestoreArgs {
             artifact: artifact.clone(),
             profile: args.profile.clone(),
             force: args.force,
             shard: None,
             offsite: false,
         })?;
+        // Scrub only what the restore wrote. A partial artifact leaves the
+        // other configured shards live, and they are not ours to anonymize.
+        targets = restored_targets(targets, &restored_labels);
         true
     } else {
         false
@@ -9049,6 +9063,21 @@ mod tests {
             source_candidates(Some("staging"), &["staging".to_owned()], "staging"),
             Vec::<String>::new(),
             "restoring a staging artifact into staging overwrites no other source"
+        );
+    }
+
+    #[test]
+    fn only_the_targets_an_artifact_restored_are_scrubbed() {
+        let targets = vec![
+            ("control".to_owned(), "postgres://h/ctl".to_owned()),
+            ("shard:a".to_owned(), "postgres://h/a".to_owned()),
+            ("shard:b".to_owned(), "postgres://h/b".to_owned()),
+        ];
+        let kept = restored_targets(targets.clone(), &["shard:a".to_owned()]);
+        assert_eq!(kept, vec![targets[1].clone()]);
+        assert!(
+            restored_targets(targets, &[]).is_empty(),
+            "an artifact that restored nothing scrubs nothing"
         );
     }
 

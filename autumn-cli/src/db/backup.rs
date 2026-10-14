@@ -1017,7 +1017,8 @@ fn verify_plain_dump(path: &Path, db: &str) -> Result<(), BackupError> {
 
 // ─── Restore ────────────────────────────────────────────────────────────────
 
-pub(super) fn restore(args: &RestoreArgs) -> Result<(), BackupError> {
+/// Restore an artifact, returning the label of every target it wrote to.
+pub(super) fn restore(args: &RestoreArgs) -> Result<Vec<String>, BackupError> {
     // Production guard — identical to `autumn db drop` (AC #4). This guards the
     // RESTORE-TARGET profile (`--profile`), independent of any offsite source.
     let profile = migrate::effective_profile(args.profile.as_deref());
@@ -1045,7 +1046,7 @@ pub(super) fn restore(args: &RestoreArgs) -> Result<(), BackupError> {
 /// Verify every selected artifact, then restore each into its resolved database.
 /// Shared by local and offsite restore so both go through the identical
 /// verify-all-before-mutate-any protocol (AC #4).
-fn apply_restore_plan(plan: &RestorePlan, args: &RestoreArgs) -> Result<(), BackupError> {
+fn apply_restore_plan(plan: &RestorePlan, args: &RestoreArgs) -> Result<Vec<String>, BackupError> {
     let format = plan.format;
     let entries = plan.select(args.shard.as_deref())?;
 
@@ -1105,7 +1106,7 @@ fn apply_restore_plan(plan: &RestorePlan, args: &RestoreArgs) -> Result<(), Back
     }
 
     eprintln!("\n\u{2713} Restore complete ({} target(s)).", targets.len());
-    Ok(())
+    Ok(targets.into_iter().map(|(entry, _)| entry.label).collect())
 }
 
 /// Restore one artifact into one database.
@@ -2791,7 +2792,7 @@ fn is_safe_leaf_name(name: &str) -> bool {
 /// Download the referenced offsite run to a fresh temp dir and restore from it
 /// via the identical [`RestorePlan::discover`] path (AC #4). The temp dir is
 /// removed when the guard drops (after the restore completes or fails).
-fn restore_from_offsite(args: &RestoreArgs, oref: &OffsiteRef) -> Result<(), BackupError> {
+fn restore_from_offsite(args: &RestoreArgs, oref: &OffsiteRef) -> Result<Vec<String>, BackupError> {
     // Canonicalize the profile so the REMOTE key prefix matches what upload wrote
     // (P2 #22): `offsite:production/latest` reads the same `prod/…` prefix that
     // `--profile production` uploaded under.
