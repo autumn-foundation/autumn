@@ -415,7 +415,9 @@ authority under a manifest that says otherwise.
 - **A table the analysis cannot resolve** — `diesel::update(x)`,
   `diesel::delete(x)` or `diesel::insert_into(x)` where `x` is not
   `<table>::table` (or a `let` bound to it). The grant names the table, so
-  Autumn must know it.
+  Autumn must know it. Autumn reads `use diesel as orm;` and
+  `use diesel::delete as remove;` only when they sit inside the handler. A
+  macro cannot see a module-level `use`, so write `diesel::` in the handler.
 - **Branches** — Autumn joins the paths of an `if`, `match` or loop. A handle
   cleared on one path stays a handle on the other. Two kinds of handle on one
   name are refused where used.
