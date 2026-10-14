@@ -28,6 +28,12 @@
 //!   example `PING`) do not open one.
 //!
 //! The timers also run during a graceful drain.
+//!
+//! # Drain of a fresh connection
+//!
+//! A connection that has read no byte is not closed at the drain signal. Its
+//! request can be in flight, and a close would reset it. Such a connection
+//! gets [`FRESH_CONN_GRACE`] to send its first byte; then the drain starts.
 
 use std::convert::Infallible;
 use std::fmt::Debug;
@@ -253,6 +259,10 @@ fn take_handoff(handoff: Option<&SlotHandoff>) -> Option<Slot> {
 
 /// [`serve`], with the connection slots taken by the listener when
 /// `handoff` is set.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one accept loop with its per-connection drain state machine"
+)]
 pub(crate) async fn serve_with_handoff<L, M, S, F>(
     mut listener: L,
     mut make_service: M,
@@ -332,9 +342,11 @@ where
             req.map(axum::body::Body::new)
         });
         let hyper_service = hyper_util::service::TowerToHyperService::new(service);
+        let first_byte = Arc::new(FirstByte::default());
         let io = TokioIo::new(ConnIo {
             inner: io,
             timers: timers.clone(),
+            first_byte: Arc::clone(&first_byte),
             _permit: permit,
         });
 
@@ -353,12 +365,26 @@ where
             // Set by a graceful shutdown. Until then hyper can finish its
             // GOAWAY sequence and flush the last response bytes.
             let mut grace_until: Option<Instant> = None;
+            // Set when the signal finds a connection with no byte read. Its
+            // request may be in flight, so hyper must not close it as idle.
+            let mut fresh_until: Option<Instant> = None;
             loop {
                 let shutting_down = grace_until.is_some();
+                let waiting_fresh = fresh_until.is_some();
                 let deadline = timers.as_ref().and_then(|t| t.deadline(grace_until));
                 tokio::select! {
                     _ = conn.as_mut() => break,
-                    () = &mut signal_closed, if !shutting_down => {
+                    () = &mut signal_closed, if !shutting_down && !waiting_fresh => {
+                        if first_byte.is_seen() {
+                            grace_until = Some(Instant::now() + SHUTDOWN_GRACE);
+                            conn.as_mut().graceful_shutdown();
+                        } else {
+                            fresh_until = Some(Instant::now() + FRESH_CONN_GRACE);
+                        }
+                    }
+                    // The first byte came, or the wait ended: drain now.
+                    () = fresh_wait(&first_byte, fresh_until), if waiting_fresh && !shutting_down => {
+                        fresh_until = None;
                         grace_until = Some(Instant::now() + SHUTDOWN_GRACE);
                         conn.as_mut().graceful_shutdown();
                     }
@@ -412,6 +438,25 @@ async fn changed(timers: Option<&ConnTimers>) {
 
 /// Time a connection gets to close by itself after a graceful shutdown.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Time a connection with no byte read gets to send its request after a
+/// graceful shutdown starts. hyper closes an idle connection at once, so a
+/// request that is still in flight would be reset.
+const FRESH_CONN_GRACE: Duration = Duration::from_secs(2);
+
+/// Resolves at the first byte, or when the fresh-connection grace ends.
+async fn fresh_wait(first_byte: &FirstByte, until: Option<Instant>) {
+    let Some(until) = until else {
+        return std::future::pending().await;
+    };
+    if first_byte.is_seen() {
+        return;
+    }
+    tokio::select! {
+        () = first_byte.notify.notified() => {}
+        () = tokio::time::sleep_until(until) => {}
+    }
+}
 
 async fn sleep_until(deadline: Option<Instant>) {
     match deadline {
@@ -964,7 +1009,27 @@ impl ConnTimers {
 struct ConnIo<I> {
     inner: I,
     timers: Option<Arc<ConnTimers>>,
+    first_byte: Arc<FirstByte>,
     _permit: Option<Slot>,
+}
+
+/// Whether the connection has read a byte yet.
+#[derive(Default)]
+struct FirstByte {
+    seen: std::sync::atomic::AtomicBool,
+    notify: Notify,
+}
+
+impl FirstByte {
+    fn mark(&self) {
+        if !self.seen.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            self.notify.notify_one();
+        }
+    }
+
+    fn is_seen(&self) -> bool {
+        self.seen.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl<I: AsyncRead + Unpin> AsyncRead for ConnIo<I> {
@@ -975,10 +1040,11 @@ impl<I: AsyncRead + Unpin> AsyncRead for ConnIo<I> {
     ) -> Poll<io::Result<()>> {
         let before = buf.filled().len();
         let result = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if buf.filled().len() > before
-            && let Some(timers) = &self.timers
-        {
-            timers.on_read(&buf.filled()[before..]);
+        if buf.filled().len() > before {
+            self.first_byte.mark();
+            if let Some(timers) = &self.timers {
+                timers.on_read(&buf.filled()[before..]);
+            }
         }
         result
     }
@@ -1601,5 +1667,63 @@ mod tests {
         );
         state.scan(&full[10..]);
         assert!(state.header_block_since.is_none());
+    }
+
+    /// Start `serve` on a fresh port. Returns the address, the stop token and
+    /// the server task.
+    async fn start_server() -> (
+        std::net::SocketAddr,
+        tokio_util::sync::CancellationToken,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let stop = tokio_util::sync::CancellationToken::new();
+        let router = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let signal = {
+            let stop = stop.clone();
+            async move { stop.cancelled().await }
+        };
+        let server = tokio::spawn(serve(
+            listener,
+            router.into_make_service(),
+            HttpLimits::default(),
+            signal,
+        ));
+        (addr, stop, server)
+    }
+
+    #[tokio::test]
+    async fn a_fresh_connection_is_served_when_its_request_is_late() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (addr, stop, server) = start_server().await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        stop.cancel();
+        // Later than any short settle window.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let _ = client
+            .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            .await;
+        let mut raw = Vec::new();
+        let _ = client.read_to_end(&mut raw).await;
+        server.await.expect("task").expect("serve");
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.starts_with("HTTP/1.1 200"), "got {text:?}");
+    }
+
+    #[tokio::test]
+    async fn a_silent_connection_does_not_hold_the_drain_past_the_grace() {
+        let (addr, stop, server) = start_server().await;
+        let _client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        stop.cancel();
+        let done = tokio::time::timeout(FRESH_CONN_GRACE + Duration::from_secs(1), server).await;
+        assert!(
+            done.is_ok(),
+            "the drain must end after the fresh-connection grace"
+        );
     }
 }
