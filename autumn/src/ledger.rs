@@ -4613,6 +4613,10 @@ mod tests {
         Err("no rule for this shape".into())
     }
 
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the signature must match `SnapshotUpcast`"
+    )]
     fn note_from_version(from: u32, snapshot: &mut serde_json::Value) -> Result<(), String> {
         snapshot["seen"] = json!(from);
         Ok(())
