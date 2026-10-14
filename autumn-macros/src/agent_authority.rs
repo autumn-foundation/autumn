@@ -897,6 +897,8 @@ struct Analyzer {
     /// Names bound to some other effect verb as a function item, and the path
     /// they were bound to (`let schedule = NotifyFinanceJob::enqueue;`).
     fn_aliases: HashMap<String, syn::Path>,
+    /// Names bound to different effect verbs on different paths.
+    ambiguous_fns: HashSet<String>,
     /// Parameter names whose async surface is request-local plumbing
     /// (`session`, a `CookieJar`, …), read off the signature.
     inert_roots: HashSet<String>,
@@ -929,6 +931,7 @@ struct Shadow {
     closure: Option<syn::ExprClosure>,
     spawn: bool,
     alias: Option<syn::Path>,
+    ambiguous: bool,
     unread: bool,
     table: Option<(String, bool)>,
     inert: bool,
@@ -942,6 +945,7 @@ struct Bindings {
     closures: HashMap<String, syn::ExprClosure>,
     spawn_aliases: HashSet<String>,
     fn_aliases: HashMap<String, syn::Path>,
+    ambiguous_fns: HashSet<String>,
     unread_futures: HashSet<String>,
     tables: HashMap<String, (String, bool)>,
 }
@@ -980,14 +984,22 @@ impl Bindings {
                 Some(_) => {}
             }
         }
-        // Keep a name only when both paths bind the same value. Autumn drops
-        // any other name, so a later use is refused.
-        self.fn_aliases.retain(|name, path| {
-            other
-                .fn_aliases
-                .get(name)
-                .is_some_and(|p| path_string(p) == path_string(path))
-        });
+        // An effect verb on either path is an effect verb after the join.
+        // Two different verbs on two paths leave a name that no single path
+        // describes, so a later call through it is refused.
+        self.ambiguous_fns.extend(other.ambiguous_fns);
+        for (name, path) in other.fn_aliases {
+            match self.fn_aliases.get(&name) {
+                None => {
+                    self.fn_aliases.insert(name, path);
+                }
+                Some(kept) if path_string(kept) != path_string(&path) => {
+                    self.fn_aliases.remove(&name);
+                    self.ambiguous_fns.insert(name);
+                }
+                Some(_) => {}
+            }
+        }
         self.tables
             .retain(|name, table| other.tables.get(name) == Some(table));
         self
@@ -1018,6 +1030,7 @@ impl Analyzer {
             closures: HashMap::new(),
             spawn_aliases: HashSet::new(),
             fn_aliases: HashMap::new(),
+            ambiguous_fns: HashSet::new(),
         }
     }
 
@@ -1052,6 +1065,7 @@ impl Analyzer {
             closures: self.closures.clone(),
             spawn_aliases: self.spawn_aliases.clone(),
             fn_aliases: self.fn_aliases.clone(),
+            ambiguous_fns: self.ambiguous_fns.clone(),
             unread_futures: self.unread_futures.clone(),
             tables: self.tables.clone(),
         }
@@ -1062,6 +1076,7 @@ impl Analyzer {
         self.closures = bindings.closures;
         self.spawn_aliases = bindings.spawn_aliases;
         self.fn_aliases = bindings.fn_aliases;
+        self.ambiguous_fns = bindings.ambiguous_fns;
         self.unread_futures = bindings.unread_futures;
         self.tables = bindings.tables;
     }
@@ -1079,6 +1094,7 @@ impl Analyzer {
             closure: self.closures.get(name).cloned(),
             spawn: self.spawn_aliases.contains(name),
             alias: self.fn_aliases.get(name).cloned(),
+            ambiguous: self.ambiguous_fns.contains(name),
             unread: self.unread_futures.contains(name),
             table: self.tables.get(name).cloned(),
             inert: self.inert_roots.contains(name),
@@ -1093,11 +1109,17 @@ impl Analyzer {
             closure,
             spawn,
             alias,
+            ambiguous,
             unread,
             table,
             inert,
             diesel_fn,
         } = saved;
+        if ambiguous {
+            self.ambiguous_fns.insert(name.clone());
+        } else {
+            self.ambiguous_fns.remove(&name);
+        }
         match handle {
             Some(handle) => self.handles.insert(name.clone(), handle),
             None => self.handles.remove(&name),
@@ -1141,6 +1163,7 @@ impl Analyzer {
         if name != "tokio" {
             self.tokio_imports.remove(&name.to_string());
         }
+        self.diesel_fns.remove(&name.to_string());
     }
 
     fn hide_crate(&mut self, name: &syn::Ident) {
@@ -1155,6 +1178,7 @@ impl Analyzer {
         self.closures.remove(name);
         self.spawn_aliases.remove(name);
         self.fn_aliases.remove(name);
+        self.ambiguous_fns.remove(name);
         self.unread_futures.remove(name);
         self.tables.remove(name);
         // `tokio` stays: a value binding cannot hide a crate path.
@@ -1526,6 +1550,9 @@ impl Analyzer {
             self.rebind(&local.pat, Some(&handle));
             return;
         }
+        if !matches!(pat, Pat::Ident(_)) {
+            self.bind_pattern_callables(pat, &init.expr);
+        }
         if let (Pat::Tuple(pat), Expr::Tuple(tuple)) = (pat, &*init.expr) {
             // `let (store, key) = (repo, id);` — pair the pattern against the
             // initialiser so the handle keeps its identity under a new name.
@@ -1533,9 +1560,6 @@ impl Analyzer {
                 let handle = self.expr_handle(element);
                 self.rebind(element_pat, handle.as_ref());
                 self.mark_pattern_unread(element_pat, element);
-                if let Pat::Ident(ident) = element_pat {
-                    self.bind_callable(&ident.ident.to_string(), element);
-                }
             }
             return;
         }
@@ -1550,6 +1574,28 @@ impl Analyzer {
         // Shadowing: `let repo = repo.find_all().await?;` rebinds the name to
         // a `Vec`, and the old identity has to go with it.
         self.rebind(&local.pat, None);
+    }
+
+    /// Pair a destructuring pattern with its initialiser, at any depth, so a
+    /// callable moved into a tuple or array keeps its meaning under the new
+    /// name: `let ((run,), n) = ((tokio::spawn,), 1);`.
+    fn bind_pattern_callables(&mut self, pat: &Pat, init: &Expr) {
+        match (pat, strip_transparent(init)) {
+            (Pat::Ident(ident), init) => self.bind_callable(&ident.ident.to_string(), init),
+            (Pat::Type(typed), init) => self.bind_pattern_callables(&typed.pat, init),
+            (Pat::Paren(p), init) => self.bind_pattern_callables(&p.pat, init),
+            (Pat::Tuple(p), Expr::Tuple(t)) if p.elems.len() == t.elems.len() => {
+                for (element_pat, element) in p.elems.iter().zip(t.elems.iter()) {
+                    self.bind_pattern_callables(element_pat, element);
+                }
+            }
+            (Pat::Slice(p), Expr::Array(a)) if p.elems.len() == a.elems.len() => {
+                for (element_pat, element) in p.elems.iter().zip(a.elems.iter()) {
+                    self.bind_pattern_callables(element_pat, element);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Remember a name bound to a closure, `spawn` or an effect verb.
@@ -1610,6 +1656,7 @@ impl Analyzer {
         self.closures.remove(&name);
         self.spawn_aliases.remove(&name);
         self.fn_aliases.remove(&name);
+        self.ambiguous_fns.remove(&name);
         if let Some(right) = right {
             self.bind_callable(&name, right);
         }
@@ -2765,7 +2812,8 @@ impl Analyzer {
             .as_ref()
             .is_some_and(|name| !self.shadowed_macros.contains(name))
             && name.is_some_and(|name| INERT_MACROS.contains(&name.as_str()))
-            && !tokens_contain_await(&mac.tokens);
+            && !tokens_contain_await(&mac.tokens)
+            && !tokens_contain_spawn(&mac.tokens);
         inert || self.tokens_mention_handle(&mac.tokens)
     }
 
@@ -2884,6 +2932,25 @@ impl Analyzer {
         {
             let alias = ident.to_string();
             self.spawn_error(call.span(), &alias);
+            return;
+        }
+
+        // A name bound to different effect verbs on different paths: which
+        // one runs cannot be read, so the call is refused.
+        if let Expr::Path(path) = strip_transparent(&call.func)
+            && let Some(ident) = path.path.get_ident()
+            && self.ambiguous_fns.contains(&ident.to_string())
+        {
+            let (action, name) = (self.action.clone(), ident.to_string());
+            self.error(
+                call.span(),
+                format!(
+                    "agent authority: `{name}` is bound to different effect functions on \
+                     different paths, so which one this call runs cannot be read, and \
+                     `{action}`'s effects cannot be proven.\n\nCall each effect directly, or \
+                     declare the site with `#[agent_effect(..., reason = \"...\")]`. {GUIDE}"
+                ),
+            );
             return;
         }
 
@@ -7220,6 +7287,56 @@ mod tests {
             }",
         ),
         (
+            "spawn alias moved through an array pattern",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let [run] = [tokio::spawn];
+                run(async { work().await });
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias moved through a nested pattern",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let ((run,), n) = ((tokio::spawn,), 1);
+                run(async { work().await });
+                Ok(n)
+            }",
+        ),
+        (
+            "spawn inside an argument of an inert macro",
+            ExpectedKind::Rejected,
+            "assert_eq",
+            r"async fn h() -> R {
+                assert_eq!({ tokio::spawn(work()); 1 }, 1);
+                Ok(())
+            }",
+        ),
+        (
+            "unread future built by a qualified vec macro",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let jobs = std::vec![start_finance_job()];
+                jobs[0].await?;
+                Ok(())
+            }",
+        ),
+        (
+            "effect alias set on one branch only",
+            ExpectedKind::Job,
+            "ForbiddenJob",
+            r"async fn h(c: bool, job: Job) -> R {
+                let mut f = std::convert::identity(AllowedJob::enqueue);
+                if c { f = ForbiddenJob::enqueue; }
+                f(&payload).await?;
+                Ok(())
+            }",
+        ),
+        (
             "#[agent_effect] with a blank reason",
             ExpectedKind::Rejected,
             "reason",
@@ -7896,6 +8013,22 @@ mod tests {
             }"#,
         );
         assert!(write.contains("\"payouts\""), "{write}");
+    }
+
+    #[test]
+    fn a_local_fn_hides_an_imported_diesel_constructor() {
+        let out = expand(
+            GRANT,
+            r"async fn h(mut db: Db) -> R {
+                use diesel::delete as remove;
+                {
+                    fn remove(t: Table) -> Custom { custom(t) }
+                    remove(refunds::table).execute(&mut *db).await?;
+                }
+                Ok(())
+            }",
+        );
+        assert!(!out.contains("allows_unbounded_write"), "{out}");
     }
 
     #[test]
