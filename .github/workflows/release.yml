@@ -102,9 +102,11 @@ jobs:
     runs-on: ubuntu-latest
     # A job-level `permissions:` block REPLACES the workflow-level one.
     # `actions: read` lets the download read the gate run's artifacts.
+    # `attestations: read` lets `gh attestation verify` fetch the bundles.
     permissions:
       contents: write
       actions: read
+      attestations: read
     steps:
       # The archives were built and attested by the Publish Gate. Nothing is
       # rebuilt here, so the attestation stays valid for the uploaded bytes.

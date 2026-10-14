@@ -843,6 +843,10 @@ fn release_workflow_uploads_the_gate_built_archives() {
         "a job-level `permissions:` replaces the workflow one. Cross-run \
          downloads need `actions: read`:\n{body}"
     );
+    assert!(
+        body.contains("attestations: read"),
+        "`gh attestation verify` needs `attestations: read`:\n{body}"
+    );
     for scope in ["id-token: write", "attestations: write"] {
         assert!(
             !body.contains(scope),
