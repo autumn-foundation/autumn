@@ -2185,49 +2185,62 @@ fn emit_dependents_impl(model_ident: &syn::Ident, assocs: &[Association]) -> Tok
         // `dependent(...)` escape hatch instead.
         let child_repo = format_ident!("Pg{}Repository", assoc.target);
         let thunk_ident = format_ident!("__autumn_dependent_cascade_{}", i);
-        thunk_fns.push(quote! {
-            fn #thunk_ident<'__a>(
-                __pool: &'__a ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                    ::autumn_web::RuntimeConnection,
-                >,
-                __conn: &'__a mut ::autumn_web::RuntimeConnection,
-                __parent_id: i64,
-                __parent_soft: bool,
-                // Codex round-5-B: the active recursion path (cycle-break) and the
-                // monotonic HANDLED set (soft OR physical), threaded through
-                // separately. #1800 case 1: `__physical` additionally tracks only
-                // physically-removed rows for the diamond revisit-skip.
-                __path: &'__a mut ::std::collections::HashSet<(&'static str, i64)>,
-                __deleted: &'__a mut ::std::collections::HashSet<(&'static str, i64)>,
-                __physical: &'__a mut ::std::collections::HashSet<(&'static str, i64)>,
-            ) -> ::autumn_web::repository::RuntimeDependentCascadeFuture<'__a> {
-                ::std::boxed::Box::pin(async move {
-                    // Own the child repository inside the async block so the
-                    // borrow `__autumn_apply_dependent_on_conn` takes of it stays
-                    // valid for the whole (immediately awaited) cascade.
-                    let __autumn_child_repo = #child_repo::with_pool_untracked(
-                        ::core::clone::Clone::clone(__pool),
-                    );
-                    __autumn_child_repo
-                        .__autumn_apply_dependent_on_conn(
-                            __conn,
-                            #fk,
-                            __parent_id,
-                            ::autumn_web::repository::DependentAction::#action_variant,
-                            __parent_soft,
-                            __path,
-                            __deleted,
-                            __physical,
-                        )
-                        .await
-                })
-            }
-        });
+        let mut emit_thunk = |ident: &proc_macro2::Ident, variant: &proc_macro2::Ident| {
+            thunk_fns.push(quote! {
+                fn #ident<'__a>(
+                    __pool: &'__a ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                        ::autumn_web::RuntimeConnection,
+                    >,
+                    __conn: &'__a mut ::autumn_web::RuntimeConnection,
+                    __parent_id: i64,
+                    __parent_soft: bool,
+                    // Codex round-5-B: the active recursion path (cycle-break) and the
+                    // monotonic HANDLED set (soft OR physical), threaded through
+                    // separately. #1800 case 1: `__physical` additionally tracks only
+                    // physically-removed rows for the diamond revisit-skip.
+                    __path: &'__a mut ::std::collections::HashSet<(&'static str, i64)>,
+                    __deleted: &'__a mut ::std::collections::HashSet<(&'static str, i64)>,
+                    __physical: &'__a mut ::std::collections::HashSet<(&'static str, i64)>,
+                ) -> ::autumn_web::repository::RuntimeDependentCascadeFuture<'__a> {
+                    ::std::boxed::Box::pin(async move {
+                        // Own the child repository inside the async block so the
+                        // borrow `__autumn_apply_dependent_on_conn` takes of it stays
+                        // valid for the whole (immediately awaited) cascade.
+                        let __autumn_child_repo = #child_repo::with_pool_untracked(
+                            ::core::clone::Clone::clone(__pool),
+                        );
+                        __autumn_child_repo
+                            .__autumn_apply_dependent_on_conn(
+                                __conn,
+                                #fk,
+                                __parent_id,
+                                ::autumn_web::repository::DependentAction::#variant,
+                                __parent_soft,
+                                __path,
+                                __deleted,
+                                __physical,
+                            )
+                            .await
+                    })
+                }
+            });
+        };
+        emit_thunk(&thunk_ident, &action_variant);
+        // #2427: a `destroy` leg also gets a read-only twin, so the parent can
+        // probe every `restrict` below it before any hook fires.
+        let probe_expr = if action == DependentAction::Destroy {
+            let probe_ident = format_ident!("__autumn_dependent_probe_{}", i);
+            emit_thunk(&probe_ident, &format_ident!("Probe"));
+            quote! { ::core::option::Option::Some(#probe_ident) }
+        } else {
+            quote! { ::core::option::Option::None }
+        };
         spec_entries.push(quote! {
             ::autumn_web::repository::RuntimeDependentSpec {
                 fk: #fk,
                 action: ::autumn_web::repository::DependentAction::#action_variant,
                 cascade: #thunk_ident,
+                probe: #probe_expr,
             }
         });
     }

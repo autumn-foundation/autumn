@@ -899,3 +899,229 @@ async fn upsert_many_scope_reassignment_of_multiple_rows_stays_contiguous() {
          gaining 3 rows in one upsert_many call: {b_ranks:?}"
     );
 }
+
+// ── `position(...)` with a dependent cascade (issue #2427) ──────────────────
+//
+// A move never deletes a row, so `position(...)` and `dependent(...)` do not
+// interact. These tests cover the three places they could:
+//
+// - a positioned parent, with the cascade declared on the model;
+// - a positioned parent, with the cascade declared on the repository;
+// - a positioned child, whose rows the cascade destroys one at a time.
+
+mod cascade_schema {
+    autumn_web::reexports::diesel::table! {
+        position_cards (id) {
+            id -> Int8,
+            title -> Text,
+            rank -> Int8,
+            board_id -> Int8,
+        }
+    }
+    autumn_web::reexports::diesel::table! {
+        position_notes (id) {
+            id -> Int8,
+            card_id -> Int8,
+            body -> Text,
+        }
+    }
+    autumn_web::reexports::diesel::table! {
+        position_boards (id) {
+            id -> Int8,
+            title -> Text,
+        }
+    }
+}
+
+use cascade_schema::{position_boards, position_cards, position_notes};
+
+#[autumn_web::model(table = "position_cards")]
+#[has_many(PositionNote, fk = "card_id", dependent = destroy)]
+pub struct PositionCard {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    #[position]
+    pub rank: i64,
+    pub board_id: i64,
+}
+
+#[autumn_web::repository(
+    PositionCard,
+    table = "position_cards",
+    position(column = "rank", scope = "board_id")
+)]
+pub trait PositionCardRepository {}
+
+#[autumn_web::model(table = "position_cards")]
+pub struct PositionCardAttr {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    #[position]
+    pub rank: i64,
+    pub board_id: i64,
+}
+
+#[autumn_web::repository(
+    PositionCardAttr,
+    table = "position_cards",
+    position(column = "rank", scope = "board_id"),
+    dependent(PgPositionNoteRepository, fk = "card_id", on_delete = destroy)
+)]
+pub trait PositionCardAttrRepository {}
+
+#[autumn_web::model(table = "position_notes")]
+pub struct PositionNote {
+    #[id]
+    pub id: i64,
+    pub card_id: i64,
+    pub body: String,
+}
+
+#[autumn_web::repository(PositionNote, table = "position_notes")]
+pub trait PositionNoteRepository {}
+
+#[autumn_web::model(table = "position_boards")]
+#[has_many(PositionTriggeredTask, fk = "board_id", dependent = destroy)]
+pub struct PositionBoard {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::repository(PositionBoard, table = "position_boards")]
+pub trait PositionBoardRepository {}
+
+static CASCADE_SETUP_CELL: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+async fn setup_cascade_tables(db: &TestDb) {
+    CASCADE_SETUP_CELL
+        .get_or_init(|| async {
+            for sql in [
+                "CREATE TABLE IF NOT EXISTS position_cards (
+                    id BIGSERIAL PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    rank BIGINT NOT NULL,
+                    board_id BIGINT NOT NULL
+                )",
+                "CREATE TABLE IF NOT EXISTS position_notes (
+                    id BIGSERIAL PRIMARY KEY,
+                    card_id BIGINT NOT NULL REFERENCES position_cards(id),
+                    body TEXT NOT NULL
+                )",
+                "CREATE TABLE IF NOT EXISTS position_boards (
+                    id BIGSERIAL PRIMARY KEY,
+                    title TEXT NOT NULL
+                )",
+            ] {
+                db.execute_sql(sql).await;
+            }
+        })
+        .await;
+}
+
+async fn seed_card_with_note(pool: &Pool, board_id: i64, rank: i64) -> i64 {
+    let mut conn = pool.get().await.expect("checkout connection");
+    let card_id: i64 = diesel::insert_into(position_cards::table)
+        .values((
+            position_cards::title.eq("card"),
+            position_cards::rank.eq(rank),
+            position_cards::board_id.eq(board_id),
+        ))
+        .returning(position_cards::id)
+        .get_result(&mut conn)
+        .await
+        .expect("seed card");
+    diesel::insert_into(position_notes::table)
+        .values((
+            position_notes::card_id.eq(card_id),
+            position_notes::body.eq("note"),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("seed note");
+    card_id
+}
+
+async fn count_notes(pool: &Pool, card_id: i64) -> i64 {
+    let mut conn = pool.get().await.expect("checkout connection");
+    position_notes::table
+        .filter(position_notes::card_id.eq(card_id))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count notes")
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn positioned_parent_with_a_model_declared_cascade_deletes_its_children() {
+    let db = TestDb::shared().await;
+    setup_cascade_tables(db).await;
+    let card_id = seed_card_with_note(&db.pool(), 3001, 0).await;
+
+    let repo = PgPositionCardRepository::with_pool_untracked(db.pool());
+    repo.delete_by_id(card_id).await.expect("delete");
+    assert_eq!(count_notes(&db.pool(), card_id).await, 0);
+    assert!(
+        repo.find_by_id(card_id).await.expect("find").is_none(),
+        "the card must be gone"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn positioned_parent_with_a_repository_cascade_deletes_its_children() {
+    let db = TestDb::shared().await;
+    setup_cascade_tables(db).await;
+    let ids = [
+        seed_card_with_note(&db.pool(), 3002, 0).await,
+        seed_card_with_note(&db.pool(), 3002, 1).await,
+    ];
+
+    let repo = PgPositionCardAttrRepository::with_pool_untracked(db.pool());
+    repo.delete_many(&ids).await.expect("delete_many");
+    for id in ids {
+        assert_eq!(count_notes(&db.pool(), id).await, 0);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn cascade_destroying_positioned_children_keeps_other_scopes_contiguous() {
+    let db = TestDb::shared().await;
+    setup_triggered_table(db).await;
+    setup_cascade_tables(db).await;
+    let (doomed, kept) = (3003, 3004);
+    seed_triggered(&db.pool(), doomed, 4).await;
+    seed_triggered(&db.pool(), kept, 3).await;
+    db.execute_sql(&format!(
+        "INSERT INTO position_boards (id, title) VALUES ({doomed}, 'doomed') \
+         ON CONFLICT (id) DO NOTHING"
+    ))
+    .await;
+
+    let repo = PgPositionBoardRepository::with_pool_untracked(db.pool());
+    repo.delete_by_id(doomed).await.expect("cascade delete");
+
+    assert!(triggered_ranks(&db.pool(), doomed).await.is_empty());
+    let mut kept_ranks = triggered_ranks(&db.pool(), kept).await;
+    kept_ranks.sort_unstable();
+    assert_eq!(kept_ranks, vec![0, 1, 2], "other scope stays 0..n-1");
+}
+
+/// Inserts `count` triggered tasks into `board_id`; the trigger assigns ranks.
+async fn seed_triggered(pool: &Pool, board_id: i64, count: i64) {
+    let mut conn = pool.get().await.expect("checkout connection");
+    for i in 0..count {
+        diesel::insert_into(position_triggered_tasks::table)
+            .values((
+                position_triggered_tasks::title.eq(format!("t-{i}")),
+                position_triggered_tasks::board_id.eq(board_id),
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("seed triggered task");
+    }
+}

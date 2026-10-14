@@ -641,6 +641,10 @@ pub enum DependentAction {
     /// Refuse to delete the parent while any child exists, surfacing a typed
     /// `409 Conflict` error instead of orphaning or cascading.
     Restrict,
+    /// Read-only walk of a `destroy` leg. Probes every `restrict` below it,
+    /// and mutates nothing. Framework plumbing, not a user-facing action.
+    #[doc(hidden)]
+    Probe,
 }
 
 /// The boxed, `Send` future a [`RuntimeDependentCascadeFn`] returns.
@@ -718,6 +722,11 @@ pub struct RuntimeDependentSpec {
     pub action: DependentAction,
     /// Type-erased entry into the child repository's cascade leaf executor.
     pub cascade: RuntimeDependentCascadeFn,
+    /// Read-only twin of [`cascade`](RuntimeDependentSpec::cascade).
+    ///
+    /// Set for `destroy` only. It probes every `restrict` below the leg, so the
+    /// parent can reject a blocked delete before any hook fires.
+    pub probe: Option<RuntimeDependentCascadeFn>,
 }
 
 /// Exposes a model's runtime dependent-cascade specs to the parent
