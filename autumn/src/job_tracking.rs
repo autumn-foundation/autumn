@@ -1918,11 +1918,18 @@ pub(crate) fn build_redis_tracking_store(
 
 // ── Postgres store ───────────────────────────────────────────────────────────
 
+/// Maximum TTL in seconds (100 years). A larger value could overflow `timestamptz`.
+#[cfg(feature = "db")]
+const MAX_PG_TTL_SECS: i64 = 100 * 365 * 24 * 60 * 60;
+
 /// Postgres-backed [`JobTrackingStore`].
 ///
 /// Each record is a single JSONB blob in `autumn_job_tracking`, keyed by the
 /// token hash, with lazy expiry (reads filter on `expires_at`; writes refresh
 /// it). See the `create_job_tracking` framework migration.
+///
+/// The database clock (`NOW()`) sets and checks `expires_at`. Host clocks can
+/// differ, so the store never uses them for expiry (#2875).
 #[cfg(feature = "db")]
 #[derive(Clone)]
 pub struct PgJobTrackingStore {
@@ -1954,21 +1961,18 @@ impl PgJobTrackingStore {
         }
     }
 
-    /// Replace the clock used to evaluate expiry.
+    /// Replace the clock that sets `updated_at`.
     ///
-    /// Defaults to [`SystemClock`]; tests pass a
-    /// [`crate::time::FixedClock`] to make expiry deterministic.
+    /// Expiry does not use this clock. Default: [`SystemClock`].
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn ClockSource>) -> Self {
         self.clock = clock;
         self
     }
 
-    fn expires_at(&self, now: DateTime<Utc>) -> DateTime<Utc> {
-        crate::time_math::saturating_dt_add(
-            now,
-            crate::time_math::saturating_time_delta_secs(self.ttl_secs),
-        )
+    /// The TTL in seconds, limited to `MAX_PG_TTL_SECS` so `NOW() + ttl` stays valid.
+    fn ttl_secs_clamped(&self) -> i64 {
+        i64::try_from(self.ttl_secs).map_or(MAX_PG_TTL_SECS, |secs| secs.min(MAX_PG_TTL_SECS))
     }
 
     async fn conn(
@@ -1989,10 +1993,9 @@ impl PgJobTrackingStore {
         let now = self.clock.now();
         let mut conn = self.conn().await?;
         let row = diesel::sql_query(
-            "SELECT record::TEXT AS record FROM autumn_job_tracking WHERE key = $1 AND expires_at > $2",
+            "SELECT record::TEXT AS record FROM autumn_job_tracking WHERE key = $1 AND expires_at > NOW()",
         )
         .bind::<diesel::sql_types::Text, _>(key)
-        .bind::<diesel::sql_types::Timestamptz, _>(now)
         .get_result::<PgTrackingRow>(&mut *conn)
         .await
         .optional()
@@ -2018,13 +2021,14 @@ impl PgJobTrackingStore {
         })?;
 
         diesel::sql_query(
-            "UPDATE autumn_job_tracking SET record = $2::JSONB, updated_at = $3, expires_at = $4 \
-             WHERE key = $1",
+            "UPDATE autumn_job_tracking SET record = $2::JSONB, updated_at = $3, \
+             expires_at = NOW() + make_interval(secs => $4::FLOAT8) \
+             WHERE key = $1 AND expires_at > NOW()",
         )
         .bind::<diesel::sql_types::Text, _>(key)
         .bind::<diesel::sql_types::Text, _>(&payload)
         .bind::<diesel::sql_types::Timestamptz, _>(now)
-        .bind::<diesel::sql_types::Timestamptz, _>(self.expires_at(now))
+        .bind::<diesel::sql_types::BigInt, _>(self.ttl_secs_clamped())
         .execute(&mut *conn)
         .await
         .map_err(|error| {
@@ -2058,7 +2062,7 @@ impl JobTrackingStore for PgJobTrackingStore {
             let mut conn = self.conn().await?;
             diesel::sql_query(
                 "INSERT INTO autumn_job_tracking (key, record, updated_at, expires_at) \
-                 VALUES ($1, $2::JSONB, $3, $4) \
+                 VALUES ($1, $2::JSONB, $3, NOW() + make_interval(secs => $4::FLOAT8)) \
                  ON CONFLICT (key) DO UPDATE SET \
                      record = EXCLUDED.record, \
                      updated_at = EXCLUDED.updated_at, \
@@ -2067,7 +2071,7 @@ impl JobTrackingStore for PgJobTrackingStore {
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Text, _>(&payload)
             .bind::<diesel::sql_types::Timestamptz, _>(now)
-            .bind::<diesel::sql_types::Timestamptz, _>(self.expires_at(now))
+            .bind::<diesel::sql_types::BigInt, _>(self.ttl_secs_clamped())
             .execute(&mut *conn)
             .await
             .map_err(|error| {
@@ -2144,12 +2148,13 @@ impl JobTrackingStore for PgJobTrackingStore {
             // clobber a fresher terminal write with a stale reset.
             diesel::sql_query(
                 "UPDATE autumn_job_tracking SET record = $2::JSONB, updated_at = $3, \
-                 expires_at = $4 WHERE key = $1 AND updated_at = $5",
+                 expires_at = NOW() + make_interval(secs => $4::FLOAT8) \
+                 WHERE key = $1 AND updated_at = $5",
             )
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Text, _>(&payload)
             .bind::<diesel::sql_types::Timestamptz, _>(now)
-            .bind::<diesel::sql_types::Timestamptz, _>(self.expires_at(now))
+            .bind::<diesel::sql_types::BigInt, _>(self.ttl_secs_clamped())
             .bind::<diesel::sql_types::Timestamptz, _>(expected_updated_at)
             .execute(&mut *conn)
             .await
@@ -2167,13 +2172,11 @@ impl JobTrackingStore for PgJobTrackingStore {
             use diesel::OptionalExtension as _;
             use diesel_async::RunQueryDsl as _;
 
-            let now = self.clock.now();
             let mut conn = self.conn().await?;
             let row = diesel::sql_query(
-                "SELECT record::TEXT AS record FROM autumn_job_tracking WHERE key = $1 AND expires_at > $2",
+                "SELECT record::TEXT AS record FROM autumn_job_tracking WHERE key = $1 AND expires_at > NOW()",
             )
             .bind::<diesel::sql_types::Text, _>(key)
-            .bind::<diesel::sql_types::Timestamptz, _>(now)
             .get_result::<PgTrackingRow>(&mut *conn)
             .await
             .optional()

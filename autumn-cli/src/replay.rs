@@ -86,10 +86,11 @@ pub fn run(opts: &ReplayOptions<'_>) {
 
     eprintln!("autumn replay {}\n", capsule.display());
     compile_binary(opts, release);
-    let mut binary = crate::routes::find_binary(opts.package, opts.bin);
-    if release {
-        binary = release_path(binary);
-    }
+    let binary = crate::routes::find_binary_in_profile(
+        opts.package,
+        opts.bin,
+        &crate::routes::CargoProfile::from_release(release),
+    );
 
     let mut command = Command::new(&binary);
     clear_competing_one_shot_env(&mut command);
@@ -211,20 +212,11 @@ fn compile_binary(opts: &ReplayOptions<'_>, release: bool) {
         cargo.args(["--bin", bin]);
     }
 
-    let status = cargo.status().expect("failed to run cargo build");
+    let status = crate::built_artifact::run_build(&mut cargo).expect("failed to run cargo build");
     if !status.success() {
         eprintln!("\u{2717} Compilation failed");
         std::process::exit(1);
     }
-}
-
-/// Swap a resolved `<target>/debug/<bin>` path to the release directory.
-fn release_path(path: PathBuf) -> PathBuf {
-    if let (Some(target_dir), Some(bin)) = (path.parent().and_then(Path::parent), path.file_name())
-    {
-        return target_dir.join("release").join(bin);
-    }
-    path
 }
 
 /// Resolve the capsule argument to an absolute path.
@@ -298,15 +290,6 @@ mod tests {
             recorded_debug_assertions(&path),
             None,
             "capsules recorded before the field existed carry no build kind"
-        );
-    }
-
-    #[test]
-    fn release_path_swaps_only_the_profile_directory() {
-        let debug = PathBuf::from("/work/target/debug/app");
-        assert_eq!(
-            release_path(debug),
-            PathBuf::from("/work/target/release/app")
         );
     }
 
