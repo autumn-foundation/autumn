@@ -3348,8 +3348,7 @@ async fn hard_revisit_reprobes_restrict_before_child_hook_and_fk_failure() {
     );
 
     // The leaf `before_delete` hook never fires. The hard-path restrict is found
-    // by the up-front probe (#2427), so the 409 precedes every hook. Before #2427
-    // the hook fired once, on the soft branch. Before #1800 it fired twice.
+    // by the up-front probe (#2427), so the 409 precedes every hook.
     assert_eq!(
         AtomicUsize::load(&DHR_LEAF_HOOK_FIRED, Ordering::SeqCst),
         0,

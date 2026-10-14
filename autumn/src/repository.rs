@@ -53,7 +53,7 @@ pub use crate::derivation::{DerivationDef, DerivationDescriptor};
 // ── Dependent-cascade primitives (issue #2309 follow-up) ─────────────
 //
 // `dependent(...)` (#1369) generates an `__autumn_apply_dependent_on_conn`
-// method on every repository. Three of its four `DependentAction` arms —
+// method on every repository. Three of its five `DependentAction` arms —
 // restrict, nullify and delete_all — are pure dynamic SQL over a table name and
 // a foreign-key column, both of which are already runtime `&str` values in the
 // generated code. Emitting them per repository (254 lines, four
@@ -628,6 +628,9 @@ pub enum RepositoryError {
 /// The cascade runs app-side (not via a DB `ON DELETE` constraint) so that
 /// soft-delete, lifecycle/commit hooks, and counter caches stay correct — a
 /// guarantee raw `ON DELETE CASCADE` cannot provide.
+// The hidden `Probe` variant is framework plumbing. The generated cascade matches
+// every variant in the user's crate, so the enum cannot be `#[non_exhaustive]`.
+#[allow(clippy::manual_non_exhaustive)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependentAction {
     /// Delete each child through the child repository's delete path, honoring

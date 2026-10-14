@@ -14623,12 +14623,25 @@ fn emit_dependent_cascade(
 
         // The probe walk proper: lock the child ids, then probe each child's
         // `restrict` legs and recurse into its `destroy` legs.
+        //
+        // The counter-cache advisory lock comes first, as in the Destroy loop, so
+        // both passes lock in the same order. A row reached by two paths is probed
+        // once: the walk records it in `__deleted` under a `#probed` key (one per
+        // parent delete kind), or a layered diamond would cost 2^depth reads.
         let probe_walk = quote! {
             #destroy_ret_decl
+            #cc_serialize
             #destroy_select_ids
+            let __probed_table: &'static str = if __parent_soft {
+                ::core::concat!(#table_name, "#probed-soft")
+            } else {
+                ::core::concat!(#table_name, "#probed")
+            };
             for __row in &__ids {
                 let __cid = __row.id;
-                if __physical.contains(&(#table_name, __cid)) {
+                if __physical.contains(&(#table_name, __cid))
+                    || __deleted.contains(&(__probed_table, __cid))
+                {
                     continue;
                 }
                 if !__path.insert((#table_name, __cid)) {
@@ -14637,6 +14650,7 @@ fn emit_dependent_cascade(
                 #grandchild_restrict_cascade
                 #grandchild_probe_cascade
                 __path.remove(&(#table_name, __cid));
+                __deleted.insert((__probed_table, __cid));
             }
             ::core::result::Result::Ok(#destroy_ret_value)
         };
@@ -24781,11 +24795,15 @@ mod tests {
             arm.contains("__path . insert") && arm.contains("__path . remove"),
             "probe must push and pop the active path: {arm}"
         );
+        assert!(
+            arm.contains("#probed"),
+            "probe must record probed rows, or a diamond costs 2^depth reads: {arm}"
+        );
         for write in [
             "diesel :: delete",
             "diesel :: update",
             "before_delete",
-            "__deleted . insert",
+            "__physical . insert",
         ] {
             assert!(
                 !arm.contains(write),

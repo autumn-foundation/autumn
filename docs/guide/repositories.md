@@ -552,8 +552,8 @@ records no revision. See
   sibling associations, and across all parents of a `delete_many` batch. The cost
   is one extra read of each child set.
 
-  The transaction rolls back in full. A hook side effect that is not a commit hook
-  does not roll back. The up-front walk is why a blocked delete fires no hook.
+  The transaction rolls back in full. A side effect outside the database, made by
+  a hook other than a commit hook, is not undone.
 - **Both delete paths.** `delete_by_id` and the bulk `delete_many` both run the
   cascade. The children go before the parent row, so a bulk delete neither
   orphans children nor trips a foreign key. A batch is all-or-nothing: a
@@ -561,13 +561,13 @@ records no revision. See
 
   Both paths fire hooks in the same order:
 
-  1. Every `restrict` in the tree is probed. A 409 fires no hook.
+  1. Every `restrict` below a `destroy` leg is probed. A 409 fires no hook.
   2. The parent's `before_delete` runs. In a batch, every parent's hook runs
-     first, in id order. A hook that rejects the delete fires no child hook.
+     first, in id order within each chunk of 1000. A hook that rejects the delete fires no child hook.
   3. The mutating dependents run, and each `destroy`d child fires its own
      `before_delete`.
   4. After commit, each child's `after_delete_commit` runs once, from the
-     durable queue.
+     durable queue. This needs `commit_hooks = true` on the child repository.
 
   A batch root that is also another root's descendant fires its hooks once.
 - **Multi-level.** A `destroy`d child runs its **own** dependents before its row
@@ -602,8 +602,7 @@ records no revision. See
   explanation. Call `delete_many(ids)` from a hand-written `#[scheduled]` sweep
   instead.
 - `position(...)` and `dependent(...)` work together, in either declaration form.
-  A move never deletes a row, and a cascaded delete compacts the ranks of the
-  rows that stay.
+  A move never deletes a row, so the two do not interact.
 
 See also: [counter caches](counter-cache.md) (how each action moves a parent's
 `{child}_count`), [soft delete](soft-delete.md), and

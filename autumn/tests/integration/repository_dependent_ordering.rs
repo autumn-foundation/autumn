@@ -324,6 +324,7 @@ pub trait PCommentRepository {}
 diesel::table! { c_posts (id) { id -> Int8, title -> Text, } }
 diesel::table! { c_comments (id) { id -> Int8, post_id -> Int8, } }
 diesel::table! { c_locks (id) { id -> Int8, post_id -> Int8, } }
+diesel::table! { c_notes (id) { id -> Int8, comment_id -> Int8, } }
 
 #[autumn_web::model(table = "c_posts")]
 pub struct CPost {
@@ -342,6 +343,13 @@ pub struct CLock {
     #[id]
     pub id: i64,
     pub post_id: i64,
+}
+
+#[autumn_web::model(table = "c_notes")]
+pub struct CNote {
+    #[id]
+    pub id: i64,
+    pub comment_id: i64,
 }
 
 #[derive(Clone, Default)]
@@ -373,11 +381,57 @@ pub trait CPostRepository {}
     CComment,
     table = "c_comments",
     hooks = CCommentHooks,
-    commit_hooks = true
+    commit_hooks = true,
+    dependent(PgCNoteRepository, fk = "comment_id", on_delete = restrict)
 )]
 pub trait CCommentRepository {}
+#[autumn_web::repository(CNote, table = "c_notes")]
+pub trait CNoteRepository {}
 #[autumn_web::repository(CLock, table = "c_locks")]
 pub trait CLockRepository {}
+
+// ── Graph S: self-referential, hooked, with commit hooks ────────────────────
+
+diesel::table! { s_nodes (id) { id -> Int8, parent_id -> Nullable<Int8>, } }
+
+#[autumn_web::model(table = "s_nodes")]
+pub struct SNode {
+    #[id]
+    pub id: i64,
+    pub parent_id: Option<i64>,
+}
+
+#[derive(Clone, Default)]
+pub struct SNodeHooks;
+
+impl MutationHooks for SNodeHooks {
+    type Model = SNode;
+    type NewModel = NewSNode;
+    type UpdateModel = UpdateSNode;
+
+    async fn before_delete(&self, _ctx: &mut MutationContext, record: &SNode) -> AutumnResult<()> {
+        log_push(format!("snode:{}", record.id));
+        Ok(())
+    }
+
+    async fn after_delete_commit(
+        &self,
+        _ctx: &mut MutationContext,
+        record: &SNode,
+    ) -> AutumnResult<()> {
+        log_push(format!("scommit:{}", record.id));
+        Ok(())
+    }
+}
+
+#[autumn_web::repository(
+    SNode,
+    table = "s_nodes",
+    hooks = SNodeHooks,
+    commit_hooks = true,
+    dependent(PgSNodeRepository, fk = "parent_id", on_delete = destroy)
+)]
+pub trait SNodeRepository {}
 
 // ── Harness ─────────────────────────────────────────────────────────────────
 
@@ -438,6 +492,8 @@ async fn setup_pool() -> (
         "CREATE TABLE c_posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL)",
         "CREATE TABLE c_comments (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES c_posts(id))",
         "CREATE TABLE c_locks (id BIGSERIAL PRIMARY KEY, post_id BIGINT NOT NULL REFERENCES c_posts(id))",
+        "CREATE TABLE c_notes (id BIGSERIAL PRIMARY KEY, comment_id BIGINT NOT NULL REFERENCES c_comments(id))",
+        "CREATE TABLE s_nodes (id BIGSERIAL PRIMARY KEY, parent_id BIGINT REFERENCES s_nodes(id))",
     ] {
         run(&mut conn, stmt).await;
     }
@@ -724,10 +780,10 @@ async fn delete_many_parent_veto_fires_no_child_hook() {
     repo.delete_many(&[41, 42])
         .await
         .expect_err("parent vetoes");
-    let log = log_range("o", 41, 42);
-    assert!(
-        log.iter().all(|entry| entry.starts_with("opost:")),
-        "no child hook may fire after a parent veto: {log:?}"
+    assert_eq!(
+        log_range("o", 41, 42),
+        vec!["opost:41", "opost:42"],
+        "both parent hooks run, in id order, and no child hook runs"
     );
     assert_eq!(count(&mut conn, "o_posts").await, 2, "rolled back");
     assert_eq!(count(&mut conn, "o_comments").await, 2, "rolled back");
@@ -768,12 +824,13 @@ async fn model_declared_delete_many_orders_parent_hooks_first_and_honours_veto()
     repo.delete_many(&[61, 62])
         .await
         .expect_err("parent vetoes");
-    assert!(
-        log_range("p", 61, 62)
-            .iter()
-            .all(|entry| entry.starts_with("ppost:")),
+    assert_eq!(
+        log_range("p", 61, 62),
+        vec!["ppost:61", "ppost:62"],
         "no child hook may fire after a parent veto"
     );
+    assert_eq!(count(&mut conn, "p_posts").await, 2, "rolled back");
+    assert_eq!(count(&mut conn, "p_comments").await, 1, "rolled back");
 }
 
 // ── Item 5: a cascaded child's `after_delete_commit` ────────────────────────
@@ -858,4 +915,77 @@ async fn rolled_back_cascade_enqueues_no_child_commit_hook() {
     let drained = autumn_web::test::drain_ready_repository_commit_hooks(&pool, 16).await;
     assert_eq!(drained, 0);
     assert_eq!(log_range("c", 21, 21), Vec::<String>::new());
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn rolled_back_cascade_with_a_deep_restrict_enqueues_no_commit_hook() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    run(
+        &mut conn,
+        "INSERT INTO c_posts (id, title) VALUES (31, 'p')",
+    )
+    .await;
+    run(
+        &mut conn,
+        "INSERT INTO c_comments (id, post_id) VALUES (31, 31)",
+    )
+    .await;
+    run(
+        &mut conn,
+        "INSERT INTO c_notes (id, comment_id) VALUES (31, 31)",
+    )
+    .await;
+
+    let repo = PgCPostRepository::with_pool_untracked(pool.clone());
+    let err = repo.delete_by_id(31).await.expect_err("note must block");
+    assert_conflict(&err);
+    assert_eq!(count(&mut conn, "autumn_repository_commit_hooks").await, 0);
+    assert_eq!(count(&mut conn, "c_comments").await, 1);
+}
+
+/// A batch root that is also another root's descendant fires each hook once.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn delete_many_hooks_a_root_that_is_also_a_descendant_once() {
+    let (pool, _c) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    run(
+        &mut conn,
+        "INSERT INTO s_nodes (id, parent_id) VALUES (1, NULL)",
+    )
+    .await;
+    run(
+        &mut conn,
+        "INSERT INTO s_nodes (id, parent_id) VALUES (2, 1), (3, 2)",
+    )
+    .await;
+
+    let repo = PgSNodeRepository::with_pool_untracked(pool.clone());
+    repo.delete_many(&[1, 2]).await.expect("delete_many");
+    assert_eq!(
+        log_range("snode", 1, 3),
+        vec!["snode:1", "snode:2", "snode:3"],
+        "roots 1 and 2 hook once each, then descendant 3"
+    );
+    assert_eq!(count(&mut conn, "s_nodes").await, 0);
+
+    assert_eq!(
+        count(&mut conn, "autumn_repository_commit_hooks").await,
+        3,
+        "one queued commit hook per deleted node"
+    );
+    // The dispatcher kick after commit may run some hooks before this drain, so
+    // the drain count is not stable here. Wait for the log instead.
+    for _ in 0..50 {
+        autumn_web::test::drain_ready_repository_commit_hooks(&pool, 16).await;
+        if log_range("scommit", 1, 3).len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let mut commits = log_range("scommit", 1, 3);
+    commits.sort();
+    assert_eq!(commits, vec!["scommit:1", "scommit:2", "scommit:3"]);
 }
