@@ -28,6 +28,12 @@
 //!   example `PING`) do not open one.
 //!
 //! The timers also run during a graceful drain.
+//!
+//! # Drain of a fresh connection
+//!
+//! A connection that has received no request is not closed at the drain signal. Its
+//! request can be in flight, and a close would reset it. The server waits up
+//! to `FRESH_CONN_GRACE` (2 s) for the first request. Then it starts the drain.
 
 use std::convert::Infallible;
 use std::fmt::Debug;
@@ -253,6 +259,10 @@ fn take_handoff(handoff: Option<&SlotHandoff>) -> Option<Slot> {
 
 /// [`serve`], with the connection slots taken by the listener when
 /// `handoff` is set.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one accept loop with its per-connection drain state machine"
+)]
 pub(crate) async fn serve_with_handoff<L, M, S, F>(
     mut listener: L,
     mut make_service: M,
@@ -324,9 +334,11 @@ where
             Step::Shutdown => break,
             Step::TimedOut => continue,
         };
+        let first_request = Arc::new(FirstRequest::default());
         let service = Tracked {
             inner: service,
             timers: timers.clone(),
+            first_request: Arc::clone(&first_request),
         };
         let service = service.map_request(|req: axum::http::Request<hyper::body::Incoming>| {
             req.map(axum::body::Body::new)
@@ -353,12 +365,31 @@ where
             // Set by a graceful shutdown. Until then hyper can finish its
             // GOAWAY sequence and flush the last response bytes.
             let mut grace_until: Option<Instant> = None;
+            // Set when the signal finds a connection with no request. Its
+            // request can be in flight. Hyper must not close it as idle.
+            let mut fresh_until: Option<Instant> = None;
             loop {
                 let shutting_down = grace_until.is_some();
+                let waiting_fresh = fresh_until.is_some();
                 let deadline = timers.as_ref().and_then(|t| t.deadline(grace_until));
                 tokio::select! {
                     _ = conn.as_mut() => break,
-                    () = &mut signal_closed, if !shutting_down => {
+                    () = &mut signal_closed, if !shutting_down && !waiting_fresh => {
+                        if first_request.is_seen() {
+                            grace_until = Some(Instant::now() + SHUTDOWN_GRACE);
+                            conn.as_mut().graceful_shutdown();
+                        } else {
+                            fresh_until = Some(Instant::now() + FRESH_CONN_GRACE);
+                        }
+                    }
+                    // The first request came, or the wait ended: drain now.
+                    () = fresh_wait(&first_request, fresh_until), if waiting_fresh && !shutting_down => {
+                        // No request in time: close. Else a partial head
+                        // could hold the drain when no timer is set.
+                        if !first_request.is_seen() {
+                            break;
+                        }
+                        fresh_until = None;
                         grace_until = Some(Instant::now() + SHUTDOWN_GRACE);
                         conn.as_mut().graceful_shutdown();
                     }
@@ -412,6 +443,25 @@ async fn changed(timers: Option<&ConnTimers>) {
 
 /// Time a connection gets to close by itself after a graceful shutdown.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Time a connection with no request can wait for its first request after a
+/// graceful shutdown starts. Hyper closes an idle connection at once. That
+/// close resets a request that is still in flight.
+const FRESH_CONN_GRACE: Duration = Duration::from_secs(2);
+
+/// Resolves at the first request, or when the fresh-connection grace ends.
+async fn fresh_wait(first_request: &FirstRequest, until: Option<Instant>) {
+    let Some(until) = until else {
+        return std::future::pending().await;
+    };
+    if first_request.is_seen() {
+        return;
+    }
+    tokio::select! {
+        () = first_request.notify.notified() => {}
+        () = tokio::time::sleep_until(until) => {}
+    }
+}
 
 async fn sleep_until(deadline: Option<Instant>) {
     match deadline {
@@ -967,6 +1017,25 @@ struct ConnIo<I> {
     _permit: Option<Slot>,
 }
 
+/// Records the first request on a connection, and wakes a waiting task.
+#[derive(Default)]
+struct FirstRequest {
+    seen: std::sync::atomic::AtomicBool,
+    notify: Notify,
+}
+
+impl FirstRequest {
+    fn mark(&self) {
+        if !self.seen.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            self.notify.notify_one();
+        }
+    }
+
+    fn is_seen(&self) -> bool {
+        self.seen.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 impl<I: AsyncRead + Unpin> AsyncRead for ConnIo<I> {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -1019,6 +1088,7 @@ impl<I: AsyncWrite + Unpin> AsyncWrite for ConnIo<I> {
 struct Tracked<S> {
     inner: S,
     timers: Option<Arc<ConnTimers>>,
+    first_request: Arc<FirstRequest>,
 }
 
 struct InFlight(Arc<ConnTimers>);
@@ -1102,10 +1172,14 @@ where
     type Future = TrackedFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+        // hyper polls readiness only for a parsed request. A busy inner
+        // service must not make that request look absent.
+        self.first_request.mark();
         self.inner.poll_ready(cx)
     }
 
     fn call(&mut self, mut req: axum::extract::Request) -> Self::Future {
+        self.first_request.mark();
         let guard = self.timers.as_ref().map(|timers| {
             // A CONNECT stream gets two marks: one on the response body, as
             // for every request, and one for the tunnel, which can outlive
@@ -1211,7 +1285,7 @@ mod tests {
     }
 
     #[test]
-    fn http1_head_opens_at_the_first_byte_and_closes_at_the_blank_line() {
+    fn http1_head_opens_at_the_first_request_and_closes_at_the_blank_line() {
         let mut state = state();
         state.scan(b"POST /x HTTP/1.1\r\nHost: t\r\n");
         assert!(state.header_block_since.is_some());
@@ -1449,10 +1523,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_request_waiting_for_service_readiness_counts_as_a_request() {
+        use tower::Service as _;
+        let first_request = Arc::new(FirstRequest::default());
+        let mut service = Tracked {
+            first_request: Arc::clone(&first_request),
+            inner: tower::service_fn(|_req: axum::extract::Request| async {
+                Ok::<_, Infallible>(axum::response::Response::new(axum::body::Body::empty()))
+            }),
+            timers: None,
+        };
+        // hyper polls readiness once a request is parsed, before `call`.
+        std::future::poll_fn(|cx| service.poll_ready(cx))
+            .await
+            .unwrap();
+        assert!(first_request.is_seen());
+    }
+
+    #[tokio::test]
     async fn a_rejected_connect_releases_its_in_flight_mark() {
         use tower::Service as _;
         let timers = idle_timers();
         let mut service = Tracked {
+            first_request: Arc::default(),
             inner: tower::service_fn(|_req: axum::extract::Request| async {
                 Ok::<_, Infallible>(
                     axum::response::Response::builder()
@@ -1473,6 +1566,7 @@ mod tests {
         let timers = idle_timers();
         let (tx, rx) = std::sync::mpsc::channel::<TunnelGuard>();
         let mut service = Tracked {
+            first_request: Arc::default(),
             inner: tower::service_fn(move |mut req: axum::extract::Request| {
                 // What the WebSocket upgrade does: keep the guard.
                 let guard = req.extensions_mut().remove::<TunnelGuard>();
@@ -1497,6 +1591,7 @@ mod tests {
         let timers = idle_timers();
         let (tx, rx) = std::sync::mpsc::channel::<KeepTunnel>();
         let mut service = Tracked {
+            first_request: Arc::default(),
             inner: tower::service_fn(move |req: axum::extract::Request| {
                 let tx = tx.clone();
                 async move {
@@ -1522,6 +1617,7 @@ mod tests {
         use tower::Service as _;
         let timers = idle_timers();
         let mut service = Tracked {
+            first_request: Arc::default(),
             // A CONNECT handler that is not a WebSocket: it drops the guard
             // and streams a body.
             inner: tower::service_fn(|_req: axum::extract::Request| async {
@@ -1601,5 +1697,79 @@ mod tests {
         );
         state.scan(&full[10..]);
         assert!(state.header_block_since.is_none());
+    }
+
+    /// Start `serve` on a fresh port. Returns the address, the stop token and
+    /// the server task.
+    async fn start_server() -> (
+        std::net::SocketAddr,
+        tokio_util::sync::CancellationToken,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let stop = tokio_util::sync::CancellationToken::new();
+        let router = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let signal = {
+            let stop = stop.clone();
+            async move { stop.cancelled().await }
+        };
+        let server = tokio::spawn(serve(
+            listener,
+            router.into_make_service(),
+            HttpLimits::default(),
+            signal,
+        ));
+        (addr, stop, server)
+    }
+
+    #[tokio::test]
+    async fn a_fresh_connection_is_served_when_its_request_is_late() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (addr, stop, server) = start_server().await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        stop.cancel();
+        // Longer than ACCEPT_SETTLE (100 ms).
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let _ = client
+            .write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            .await;
+        let mut raw = Vec::new();
+        let _ = client.read_to_end(&mut raw).await;
+        server.await.expect("task").expect("serve");
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.starts_with("HTTP/1.1 200"), "got {text:?}");
+    }
+
+    #[tokio::test]
+    async fn a_partial_request_does_not_hold_the_drain_past_the_grace() {
+        use tokio::io::AsyncWriteExt as _;
+        let (addr, stop, server) = start_server().await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        stop.cancel();
+        // A head that never completes. No timers are set.
+        client.write_all(b"GET / HT").await.expect("write");
+        let done = tokio::time::timeout(FRESH_CONN_GRACE + Duration::from_secs(3), server).await;
+        assert!(
+            done.is_ok(),
+            "an incomplete request must not block the drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_silent_connection_does_not_hold_the_drain_past_the_grace() {
+        let (addr, stop, server) = start_server().await;
+        let _client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        stop.cancel();
+        let done = tokio::time::timeout(FRESH_CONN_GRACE + Duration::from_secs(3), server).await;
+        assert!(
+            done.is_ok(),
+            "the drain must end after the fresh-connection grace"
+        );
     }
 }

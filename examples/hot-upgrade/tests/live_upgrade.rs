@@ -160,15 +160,13 @@ async fn wait_until_ready(
 ///
 /// Autumn's in-place upgrade hands the successor the *same* listening socket
 /// by duplicating its fd across the `exec`
-/// (`HandoffSocket::from_listener`/`upgrade.rs`), not by binding a second
-/// `SO_REUSEPORT` socket — so there is no accept-queue race between two
-/// listeners to blame a reset on; predecessor and successor share one kernel
-/// socket throughout. The one observed instance of this (issue #2462, macOS
-/// only, did not reproduce on a re-run) has no confirmed root cause. Treating
-/// it as retryable-up-to-a-small-bound (`with_reset_retry`, and the count
-/// asserted against `MAX_TOLERATED_RESETS` below) means an isolated anomaly
-/// doesn't fail the run, while a systemic source of resets — which would
-/// point at a genuine defect in the handoff or drain path — still does.
+/// (`HandoffSocket::from_listener`/`upgrade.rs`). No second `SO_REUSEPORT`
+/// socket exists, so no accept-queue race between two listeners can cause a
+/// reset. Issue #2398 fixed one known cause: hyper closed an accepted
+/// connection that had received no request. Issue #2462 (macOS only, did not
+/// reproduce) has no confirmed root cause. The test retries an isolated reset
+/// (`with_reset_retry`) and fails if the count passes `MAX_TOLERATED_RESETS`.
+/// A systemic source of resets still fails the run.
 ///
 /// This is distinct from `ECONNREFUSED`, which means nothing was listening —
 /// the actual zero-downtime violation.
