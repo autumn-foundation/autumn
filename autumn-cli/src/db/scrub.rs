@@ -208,6 +208,16 @@ pub enum ScrubError {
         /// Token characters the column must still have room for.
         floor: usize,
     },
+    /// The replacement envelope of an `#[encrypted]` column is longer than its
+    /// bounded column.
+    EncryptedEnvelopeTooLong {
+        /// `table.column`.
+        column: String,
+        /// The column's character limit.
+        limit: usize,
+        /// Characters the envelope takes.
+        needed: usize,
+    },
     /// A declaration tried to write plaintext into an `#[encrypted]` column.
     PlaintextIntoEncrypted {
         /// Each entry is `table.column` plus the strategy that was declared.
@@ -532,6 +542,16 @@ impl std::fmt::Display for ScrubError {
                  Strategies by fixed overhead: `phone` (5), `name` (9), `redact` (11), \
                  `email` (25). Pick one that fits, use `null` if the column is nullable, \
                  widen the column, or declare it `safe`."
+            ),
+            Self::EncryptedEnvelopeTooLong {
+                column,
+                limit,
+                needed,
+            } => write!(
+                f,
+                "{column:?} holds at most {limit} characters, but the encrypted replacement \
+                 takes {needed}.\n  \
+                 Widen the column, or declare it `safe` to keep its ciphertext."
             ),
             Self::PlaintextIntoEncrypted { columns } => write!(
                 f,
@@ -1580,6 +1600,26 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
             }
 
             if plan.strategy == Strategy::Encrypted {
+                // The same plan-time gates the SQL strategies get: a failure at
+                // apply time can land after an artifact restored real data.
+                if !is_texty(&column.ty) {
+                    return Err(ScrubError::StrategyTypeMismatch {
+                        column: qualified,
+                        strategy: plan.strategy.as_str(),
+                        detail: format!("{:?}", column.ty),
+                    });
+                }
+                let shape = email_shaped(&column.name);
+                let needed = envelope_len(shape);
+                if let Some(limit) = char_max_len(&column.ty)
+                    && limit < needed
+                {
+                    return Err(ScrubError::EncryptedEnvelopeTooLong {
+                        column: qualified,
+                        limit,
+                        needed,
+                    });
+                }
                 // Not expressible as SQL: the replacement is an AEAD envelope
                 // produced in Rust, row by row, under the target's own key.
                 encrypted_rewrites.push(EncryptedRewrite {
@@ -1590,7 +1630,7 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
                         .and_then(|c| c.get(&column.name))
                         .copied()
                         .unwrap_or(false),
-                    shape: email_shaped(&column.name),
+                    shape,
                 });
                 resolved.push(plan);
                 continue;
@@ -6152,10 +6192,7 @@ fn rewrite_encrypted_column(
     for chunk in rows.chunks(ENCRYPTED_BATCH_ROWS) {
         let mut values = Vec::with_capacity(chunk.len());
         for row in chunk {
-            let plaintext = match rewrite.shape {
-                Strategy::Email => format!("scrubbed+{}{SCRUB_EMAIL_DOMAIN}", row.token),
-                _ => format!("[scrubbed:{}]", row.token),
-            };
+            let plaintext = encrypted_plaintext(rewrite.shape, &row.token);
             // A key ring is installed before the apply pass, so this can only
             // fail on a genuinely broken key — surfaced as a SQL-shaped error so
             // the transaction rolls back with everything else.
@@ -6183,6 +6220,24 @@ fn rewrite_encrypted_column(
         .execute(conn)?;
     }
     Ok(updated)
+}
+
+/// The plaintext sealed into an `#[encrypted]` column for one row.
+fn encrypted_plaintext(shape: Strategy, token: &str) -> String {
+    match shape {
+        Strategy::Email => format!("scrubbed+{token}{SCRUB_EMAIL_DOMAIN}"),
+        _ => format!("[scrubbed:{token}]"),
+    }
+}
+
+/// Characters of the stored base64 envelope for [`encrypted_plaintext`]: a
+/// 20-byte header, the plaintext, and a 16-byte AEAD tag. The token is two
+/// `md5` hex digests, 64 characters.
+fn envelope_len(shape: Strategy) -> usize {
+    const HEADER_AND_TAG: usize = 20 + 16;
+    const TOKEN: usize = 64;
+    let plaintext = encrypted_plaintext(shape, &"0".repeat(TOKEN)).len();
+    (HEADER_AND_TAG + plaintext).div_ceil(3) * 4
 }
 
 /// What one database's scrub wrote: `(table, rows)` per rewrite, plus the
@@ -8224,6 +8279,59 @@ mod tests {
         );
         assert!(checks.contains(&("users".to_owned(), "email".to_owned())));
         assert!(checks.contains(&("orders".to_owned(), "total".to_owned())));
+    }
+
+    #[test]
+    fn an_encrypted_declaration_on_a_non_text_column_is_refused_at_plan_time() {
+        let mut table = users_table();
+        table.columns[3].ty = ColumnType::Int64; // `bio`
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "email", "full_name"]
+            "#,
+        )
+        .unwrap();
+        let err = plan_for(
+            &[table],
+            &config,
+            &encrypted_columns_of("users", &["bio"]),
+            &no_anonymize(),
+        )
+        .expect_err("an AEAD text envelope cannot be stored in an integer column");
+        assert!(
+            matches!(err, ScrubError::StrategyTypeMismatch { ref column, strategy: "encrypted", .. } if column == "users.bio"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_envelope_that_cannot_fit_a_bounded_column_is_refused_at_plan_time() {
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "created_at", "email", "full_name"]
+            "#,
+        )
+        .unwrap();
+        let bounded = |limit: &str| {
+            let mut table = users_table();
+            table.columns[3].ty = ColumnType::Opaque {
+                pg_type: format!("varchar({limit})"),
+            };
+            plan_for(
+                &[table],
+                &config,
+                &encrypted_columns_of("users", &["bio"]),
+                &no_anonymize(),
+            )
+        };
+        let err = bounded("100").expect_err("a 148-character envelope cannot fit 100");
+        assert!(
+            matches!(err, ScrubError::EncryptedEnvelopeTooLong { ref column, limit: 100, needed: 148 } if column == "users.bio"),
+            "{err:?}"
+        );
+        bounded("148").expect("exactly enough room");
     }
 
     #[test]
