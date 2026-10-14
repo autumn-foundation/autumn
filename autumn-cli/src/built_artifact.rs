@@ -74,9 +74,13 @@ pub fn prefer_built(guess: PathBuf) -> PathBuf {
 
 /// Run a `cargo build` command, record its executables, and return its status.
 ///
-/// Cargo prints diagnostics on stderr. Stdout holds the artifact records.
+/// Adds `--message-format=json-render-diagnostics`. Cargo then prints
+/// diagnostics on stderr, and stdout holds the artifact records.
 pub fn run_build(cmd: &mut Command) -> std::io::Result<ExitStatus> {
-    let mut child = cmd.stdout(Stdio::piped()).spawn()?;
+    let mut child = cmd
+        .arg("--message-format=json-render-diagnostics")
+        .stdout(Stdio::piped())
+        .spawn()?;
     let mut bytes = Vec::new();
     if let Some(mut pipe) = child.stdout.take() {
         // Drain to the end, or Cargo can block on a full pipe.

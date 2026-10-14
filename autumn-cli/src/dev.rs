@@ -1194,7 +1194,6 @@ fn compiler_message_rendered(line: &str) -> Option<String> {
 /// Run `cargo build` for the given package. Returns true on success.
 pub fn cargo_build(package: Option<&str>, release: bool) -> bool {
     let mut cmd = build_cargo_command(package, release);
-    cmd.arg("--message-format=json-render-diagnostics");
 
     eprintln!("  Compiling...");
     match crate::built_artifact::run_build(&mut cmd) {

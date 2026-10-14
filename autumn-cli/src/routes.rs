@@ -370,13 +370,14 @@ pub fn find_binary_in_profile(
         serde_json::from_slice(&output.stdout).expect("parse cargo metadata");
     let cwd = std::env::current_dir().expect("current dir");
 
-    let guess =
-        resolve_binary_in_profile(&metadata, package, &cwd, bin, profile).unwrap_or_else(|error| {
+    // `prefer_built`: with `build.target`, use the path Cargo reported.
+    resolve_binary_in_profile(&metadata, package, &cwd, bin, profile).map_or_else(
+        |error| {
             eprintln!("\u{2717} {error}");
             std::process::exit(1);
-        });
-    // `build.target` moves the artifact under `<triple>/`; use Cargo's own path.
-    crate::built_artifact::prefer_built(guess)
+        },
+        crate::built_artifact::prefer_built,
+    )
 }
 
 fn resolve_binary_in_profile(
@@ -597,7 +598,6 @@ pub fn compile_binary_with(
     }
     cargo.args(features.to_args());
     cargo.args(profile.to_args());
-    cargo.arg("--message-format=json-render-diagnostics");
 
     let status = crate::built_artifact::run_build(&mut cargo).expect("failed to run cargo build");
     if !status.success() {

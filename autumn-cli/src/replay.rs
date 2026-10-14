@@ -212,8 +212,6 @@ fn compile_binary(opts: &ReplayOptions<'_>, release: bool) {
         cargo.args(["--bin", bin]);
     }
 
-    cargo.arg("--message-format=json-render-diagnostics");
-
     let status = crate::built_artifact::run_build(&mut cargo).expect("failed to run cargo build");
     if !status.success() {
         eprintln!("\u{2717} Compilation failed");
