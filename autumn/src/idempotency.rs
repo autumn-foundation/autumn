@@ -3493,6 +3493,114 @@ mod tests {
         );
     }
 
+    fn alias_commit(memory: &Arc<MemoryIdempotencyStore>) -> (DeferredIdempotencyCommit, String) {
+        assert!(memory.try_lock_now("primary", "me", Duration::from_secs(60)));
+        let store: Arc<dyn IdempotencyStore> = memory.clone();
+        let key_context = StorageKeyContext {
+            idempotency_key: "k".to_owned(),
+            method: Method::POST,
+            target: "/switch".to_owned(),
+            tenant: None,
+        };
+        let alias = key_context.storage_key(Some("sid"), None);
+        let commit = DeferredIdempotencyCommit::new(DeferredIdempotencyState {
+            store: Arc::clone(&store),
+            storage_key: "primary".to_owned(),
+            key_context,
+            alias_storage_keys: Vec::new(),
+            locked_alias_keys: Vec::new(),
+            in_flight_ttl: Duration::from_secs(60),
+            primary_replay_after_guard_denial: false,
+            idempotency_key: "k".to_owned(),
+            record: IdempotencyRecord {
+                status: 200,
+                headers: Vec::new(),
+                body: b"ok".to_vec(),
+                metadata: Vec::new(),
+            },
+            body_hash: Vec::new(),
+            ttl: Duration::from_secs(60),
+            lock: InFlightLock {
+                store,
+                key: "primary".to_owned(),
+                owner: "me".to_owned(),
+            },
+        });
+        (commit, alias)
+    }
+
+    /// The alias is locked from reservation, and the commit frees it.
+    #[tokio::test]
+    async fn reserved_alias_is_locked_until_commit() {
+        let memory = Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
+        let (commit, alias) = alias_commit(&memory);
+
+        commit
+            .reserve_session_alias(Some("sid"), false, None)
+            .await
+            .expect("reserve");
+        assert!(
+            !memory.try_lock_now(&alias, "other", Duration::from_secs(60)),
+            "the alias is in flight before the commit"
+        );
+
+        commit
+            .commit_with_final_headers(&HeaderMap::new())
+            .await
+            .expect("commit");
+        assert!(memory.get_now(&alias).is_some(), "the alias has a response");
+        memory.unlock_now(&alias, "other");
+        assert!(
+            memory.try_lock_now("primary", "other", Duration::from_secs(60)),
+            "the primary lock is free"
+        );
+    }
+
+    /// Another owner's lock on the alias fails the reservation.
+    #[tokio::test]
+    async fn reserve_fails_when_another_owner_holds_the_alias() {
+        let memory = Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
+        let (commit, alias) = alias_commit(&memory);
+        assert!(memory.try_lock_now(&alias, "other", Duration::from_secs(60)));
+
+        let result = commit.reserve_session_alias(Some("sid"), false, None).await;
+
+        assert!(result.is_err(), "a held alias must fail closed");
+    }
+
+    /// A failed commit keeps the alias locked until its TTL.
+    #[tokio::test]
+    async fn failed_commit_keeps_the_alias_locked() {
+        let memory = Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
+        let (commit, alias) = alias_commit(&memory);
+        commit
+            .reserve_session_alias(Some("sid"), false, None)
+            .await
+            .expect("reserve");
+        // A response from another owner fences the primary write out.
+        memory.unlock_now("primary", "me");
+        memory.set_now(
+            "primary",
+            "earlier",
+            IdempotencyRecord {
+                status: 200,
+                headers: Vec::new(),
+                body: b"earlier".to_vec(),
+                metadata: Vec::new(),
+            },
+            Vec::new(),
+            Duration::from_secs(60),
+        );
+
+        let result = commit.commit_with_final_headers(&HeaderMap::new()).await;
+
+        assert!(result.is_err(), "a fenced write must fail closed");
+        assert!(
+            !memory.try_lock_now(&alias, "other", Duration::from_secs(60)),
+            "the alias stays locked until its TTL"
+        );
+    }
+
     /// A store whose writes are always fenced out: `set` stores nothing and
     /// returns `false`, as when a newer request took the key.
     struct FencedSetStore {
