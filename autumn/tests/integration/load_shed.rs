@@ -321,7 +321,11 @@ fn write_contract(
             saturation_concurrency: admission_limit,
             admission_limit,
         },
-        calibration: autumn_web::capacity::Calibration::default(),
+        // Calibrated under the profile the test app runs as (#2418).
+        calibration: autumn_web::capacity::Calibration {
+            profile: "test".to_owned(),
+            ..autumn_web::capacity::Calibration::default()
+        },
         routes,
     };
 
