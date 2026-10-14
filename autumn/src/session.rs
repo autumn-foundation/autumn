@@ -1109,6 +1109,21 @@ where
                 let finalized_tenant = tenancy_session_key
                     .as_deref()
                     .and_then(|key| data.get(key).cloned());
+                // Lock the alias before the session is visible: a request
+                // with the saved session then finds its key in flight.
+                if let Err(error) = crate::idempotency::reserve_deferred_session_replay_key(
+                    &response,
+                    Some(&sid),
+                    primary_replay_after_guard_denial,
+                    finalized_tenant.as_deref(),
+                )
+                .await
+                {
+                    drop(inner_guard);
+                    tracing::error!("session alias idempotency lock failed: {error}");
+                    crate::idempotency::keep_deferred_session_commit_locked(&mut response);
+                    return Ok(crate::idempotency::persistence_failed_response());
+                }
                 if let Some(ref old_id) = inner_guard.old_id
                     && let Err(error) = store.destroy(old_id).await
                 {
@@ -1132,12 +1147,6 @@ where
                 if let Ok(val) = HeaderValue::from_str(&build_set_cookie(&config, &cookie_value)) {
                     response.headers_mut().append(SET_COOKIE, val);
                 }
-                crate::idempotency::add_deferred_session_replay_key(
-                    &response,
-                    Some(&sid),
-                    primary_replay_after_guard_denial,
-                    finalized_tenant.as_deref(),
-                );
             }
 
             if let Some(finalize) =

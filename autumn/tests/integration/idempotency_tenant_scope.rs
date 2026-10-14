@@ -401,8 +401,10 @@ impl SessionStore for GatedSaveStore {
     async fn load(
         &self,
         id: &str,
-    ) -> Result<Option<std::collections::HashMap<String, String>>, autumn_web::session::SessionStoreError>
-    {
+    ) -> Result<
+        Option<std::collections::HashMap<String, String>>,
+        autumn_web::session::SessionStoreError,
+    > {
         self.inner.load(id).await
     }
 
@@ -493,7 +495,6 @@ async fn concurrent_retry_during_session_commit_does_not_rerun_handler() {
     resume.notify_one();
     let first = first.await.unwrap().unwrap();
 
-    assert_eq!(first.status(), axum::http::StatusCode::OK);
     assert_eq!(
         second.status(),
         axum::http::StatusCode::CONFLICT,
@@ -504,4 +505,5 @@ async fn concurrent_retry_during_session_commit_does_not_rerun_handler() {
         1,
         "the handler must run once"
     );
+    assert_eq!(first.status(), axum::http::StatusCode::OK);
 }

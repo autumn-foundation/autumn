@@ -1424,12 +1424,37 @@ struct DeferredIdempotencyState {
     storage_key: String,
     key_context: StorageKeyContext,
     alias_storage_keys: Vec<String>,
+    /// Alias keys locked by `lock.owner`; the commit frees them.
+    locked_alias_keys: Vec<String>,
+    in_flight_ttl: Duration,
     primary_replay_after_guard_denial: bool,
     idempotency_key: String,
     record: IdempotencyRecord,
     body_hash: Vec<u8>,
     ttl: Duration,
     lock: InFlightLock,
+}
+
+impl DeferredIdempotencyState {
+    /// The alias key for a retry, or `None` when it is the primary key or
+    /// already registered. Also records a guard-denied primary replay.
+    fn alias_key(
+        &mut self,
+        session_id: Option<&str>,
+        primary_replay_after_guard_denial: bool,
+        tenant_override: Option<&str>,
+    ) -> Option<String> {
+        // Honor the override only when this request itself resolved a
+        // tenant. A `public_paths` route resolves none on any retry, so a
+        // forced tenant would make the alias unmatchable.
+        let tenant_override = tenant_override.filter(|_| self.key_context.tenant.is_some());
+        let storage_key = self.key_context.storage_key(session_id, tenant_override);
+        if primary_replay_after_guard_denial && storage_key != self.storage_key {
+            self.primary_replay_after_guard_denial = true;
+        }
+        (storage_key != self.storage_key && !self.alias_storage_keys.contains(&storage_key))
+            .then_some(storage_key)
+    }
 }
 
 impl DeferredIdempotencyCommit {
@@ -1462,6 +1487,7 @@ impl DeferredIdempotencyCommit {
         };
         let primary_record = finalized_session_record(state.record.clone(), primary_scope);
         let alias_record = finalized_session_record(state.record, FINALIZED_SESSION_CURRENT_SCOPE);
+        let locked_alias_keys = state.locked_alias_keys;
         let writes = std::iter::once((state.storage_key, primary_record)).chain(
             state
                 .alias_storage_keys
@@ -1493,7 +1519,59 @@ impl DeferredIdempotencyCommit {
                 return Err(error);
             }
         }
+        for key in &locked_alias_keys {
+            if let Err(error) = state.store.unlock(key, &state.lock.owner).await {
+                tracing::warn!(
+                    error = %error,
+                    "Idempotency alias unlock failed; the lock expires by its in-flight TTL"
+                );
+            }
+        }
         state.lock.release().await;
+        Ok(())
+    }
+
+    /// Lock the alias key a retry will use, before the session is saved.
+    ///
+    /// Fails when another owner holds the key, or the store errors: the
+    /// caller then fails closed. A held alias lock stays until the TTL when
+    /// the commit fails.
+    async fn reserve_session_alias(
+        &self,
+        session_id: Option<&str>,
+        primary_replay_after_guard_denial: bool,
+        tenant_override: Option<&str>,
+    ) -> Result<(), IdempotencyStoreError> {
+        let (store, key, owner, in_flight_ttl) = {
+            let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(state) = guard.as_mut() else {
+                return Ok(());
+            };
+            let Some(key) = state.alias_key(
+                session_id,
+                primary_replay_after_guard_denial,
+                tenant_override,
+            ) else {
+                return Ok(());
+            };
+            (
+                Arc::clone(&state.store),
+                key,
+                state.lock.owner.clone(),
+                state.in_flight_ttl,
+            )
+        };
+        if !acquire_lock(store.as_ref(), &key, &owner, in_flight_ttl).await {
+            return Err(IdempotencyStoreError::backend(
+                "another request holds the session alias idempotency key",
+            ));
+        }
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(state) = guard.as_mut() {
+            state.locked_alias_keys.push(key.clone());
+            state.alias_storage_keys.push(key);
+        }
+        drop(guard);
         Ok(())
     }
 
@@ -1507,26 +1585,12 @@ impl DeferredIdempotencyCommit {
         let Some(state) = guard.as_mut() else {
             return;
         };
-
-        // Only honor the override when the request that produced this commit
-        // itself resolved a tenant. Tenancy resolution is a property of the
-        // *path*, not of session content — a `[tenancy] public_paths` route
-        // (or a request under a non-session tenancy source) computes no
-        // tenant now and never will on retry, however a handler mutates the
-        // session. Forcing a tenant into that alias would make it un-matchable
-        // by any future request to the same always-exempt path.
-        let tenant_override = tenant_override.filter(|_| state.key_context.tenant.is_some());
-        let storage_key = state.key_context.storage_key(session_id, tenant_override);
-        if primary_replay_after_guard_denial && storage_key != state.storage_key {
-            state.primary_replay_after_guard_denial = true;
-        }
-        if storage_key != state.storage_key
-            && !state
-                .alias_storage_keys
-                .iter()
-                .any(|existing| existing == &storage_key)
-        {
-            state.alias_storage_keys.push(storage_key);
+        if let Some(key) = state.alias_key(
+            session_id,
+            primary_replay_after_guard_denial,
+            tenant_override,
+        ) {
+            state.alias_storage_keys.push(key);
         }
         drop(guard);
     }
@@ -1581,6 +1645,29 @@ pub(crate) fn add_deferred_session_replay_key(
             primary_replay_after_guard_denial,
             tenant_override,
         );
+    }
+}
+
+/// Lock the alias key before the session is saved, so a request that
+/// presents the saved session finds the key in flight. `Err` means fail
+/// closed.
+pub(crate) async fn reserve_deferred_session_replay_key(
+    response: &Response<Body>,
+    session_id: Option<&str>,
+    primary_replay_after_guard_denial: bool,
+    tenant_override: Option<&str>,
+) -> Result<(), IdempotencyStoreError> {
+    match response.extensions().get::<DeferredIdempotencyCommit>() {
+        Some(commit) => {
+            commit
+                .reserve_session_alias(
+                    session_id,
+                    primary_replay_after_guard_denial,
+                    tenant_override,
+                )
+                .await
+        }
+        None => Ok(()),
     }
 }
 
@@ -2115,7 +2202,16 @@ where
         };
 
     let probe = TxProbe::attach(&store, &mut prepared, &lock.owner, ttl, lock_deadline_ms);
-    handle_cache_miss(inner, store, ttl, prepared, metrics.as_ref(), lock, probe).await
+    handle_cache_miss(
+        inner,
+        store,
+        CacheTtls { ttl, in_flight_ttl },
+        prepared,
+        metrics.as_ref(),
+        lock,
+        probe,
+    )
+    .await
 }
 
 /// Carry the stale cookie's recovery point over to the request's key (see
@@ -2196,10 +2292,16 @@ fn take_replay_markers(extensions: &mut axum::http::Extensions) -> (Vec<(String,
     (replay_metadata, cache_committed_error)
 }
 
+/// How long a response and an in-flight lock last.
+struct CacheTtls {
+    ttl: Duration,
+    in_flight_ttl: Duration,
+}
+
 async fn handle_cache_miss<S>(
     mut inner: S,
     store: Arc<dyn IdempotencyStore>,
-    ttl: Duration,
+    CacheTtls { ttl, in_flight_ttl }: CacheTtls,
     prepared: PreparedIdempotencyRequest,
     metrics: Option<&crate::middleware::MetricsCollector>,
     lock: InFlightLock,
@@ -2290,6 +2392,8 @@ where
                     storage_key,
                     key_context,
                     alias_storage_keys: Vec::new(),
+                    locked_alias_keys: Vec::new(),
+                    in_flight_ttl,
                     primary_replay_after_guard_denial: false,
                     idempotency_key,
                     record,
@@ -3352,6 +3456,8 @@ mod tests {
                 tenant: None,
             },
             alias_storage_keys: vec!["alias".to_owned()],
+            locked_alias_keys: Vec::new(),
+            in_flight_ttl: Duration::from_secs(60),
             primary_replay_after_guard_denial: false,
             idempotency_key: "k".to_owned(),
             record: IdempotencyRecord {
