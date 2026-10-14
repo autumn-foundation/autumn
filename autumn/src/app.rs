@@ -7037,7 +7037,7 @@ impl AppBuilder {
         // the `Route` is the child path alone. Passing that through would
         // record `/items` for a tool an agent calls at `/api/v1/items`, and a
         // scope rename would then produce no drift at all.
-        let routes: Vec<crate::agent_authority::manifest::RouteSummary> = self
+        let mut routes: Vec<crate::agent_authority::manifest::RouteSummary> = self
             .routes
             .iter()
             .map(|route| agent_authority_route_summary(route, None, expose_all))
@@ -7047,6 +7047,8 @@ impl AppBuilder {
                 })
             }))
             .collect();
+        // The projector keeps the first route per tool name; so does this.
+        crate::agent_authority::manifest::dedupe_mcp_tool_names(&mut routes);
         crate::agent_authority::manifest::print_manifest_dump(
             &crate::agent_authority::manifest::build(&routes, audit_sink_configured),
         );
@@ -9127,6 +9129,7 @@ fn agent_authority_route_summary(
         module_path: route.api_doc.module_path,
         mcp_tool: exposed_by.is_some(),
         exposed_by,
+        duplicate_operation_id: false,
         // Filled by the route macro from the handler's `#[agent_operable]`
         // marker, in either attribute order.
         agent_authority: route.api_doc.agent_authority,

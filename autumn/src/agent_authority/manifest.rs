@@ -114,8 +114,42 @@ pub struct RouteSummary {
     /// agent-callable exactly like an annotated one and is the case a reviewer
     /// is least likely to know about (#1691 P2-6).
     pub exposed_by: Option<McpExposedBy>,
+    /// The route was eligible, but an earlier route took its `operation_id`.
+    ///
+    /// The MCP projector keeps the first route per tool name, so this route is
+    /// not a tool. [`dedupe_mcp_tool_names`] sets it.
+    pub duplicate_operation_id: bool,
     /// The handler's authority, when it carries `#[agent_operable]`.
     pub agent_authority: Option<&'static AgentAuthority>,
+}
+
+/// A tool beats a plain route, and a plain route beats one that lost its tool
+/// name to a duplicate.
+const fn route_rank(route: &RouteSummary) -> u8 {
+    match (route.mcp_tool, route.duplicate_operation_id) {
+        (true, _) => 2,
+        (false, false) => 1,
+        (false, true) => 0,
+    }
+}
+
+/// The caveat on a row whose route lost its tool name to an earlier route.
+pub const DUPLICATE_OPERATION_ID: &str = "duplicate-operation-id";
+
+/// Keep the first MCP tool per `operation_id`, as the projector does.
+///
+/// A later route with the same name is not a tool. It is marked
+/// [`RouteSummary::duplicate_operation_id`] so the collision stays visible.
+/// Call this on routes in the order the projector walks them.
+pub fn dedupe_mcp_tool_names(routes: &mut [RouteSummary]) {
+    let mut seen: BTreeSet<&'static str> = BTreeSet::new();
+    for route in routes.iter_mut().filter(|route| route.mcp_tool) {
+        if !seen.insert(route.operation_id) {
+            route.mcp_tool = false;
+            route.exposed_by = None;
+            route.duplicate_operation_id = true;
+        }
+    }
 }
 
 /// What made a route an MCP tool.
@@ -290,8 +324,12 @@ pub struct ActionRow {
     /// `file:line` of the handler.
     pub location: String,
     /// `"mcp-tool"`, `"http-route"`, or `"not-exposed"` when no route in this
-    /// binary reaches the handler.
+    /// binary reaches the handler, or the only one lost its tool name to a
+    /// duplicate `operation_id`.
     pub exposure: String,
+    /// Why the exposure is not what the route asked for, when it is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caveat: Option<String>,
     /// `"provable"` when every effect was derived by the analyser;
     /// `"declared"` when the author wrote any of them down by hand.
     pub provenance: String,
@@ -496,7 +534,7 @@ impl AgentAuthorityManifest {
                         slot.insert(route);
                     }
                     std::collections::btree_map::Entry::Occupied(mut slot) => {
-                        if route.mcp_tool && !slot.get().mcp_tool {
+                        if route_rank(route) > route_rank(slot.get()) {
                             slot.insert(route);
                         }
                     }
@@ -530,6 +568,9 @@ impl AgentAuthorityManifest {
                     module_path: authority.module_path.to_string(),
                     location: authority.location.to_string(),
                     exposure: exposure_of(route).to_string(),
+                    caveat: route
+                        .filter(|route| route.duplicate_operation_id)
+                        .map(|_| DUPLICATE_OPERATION_ID.to_string()),
                     provenance: row_provenance(authority).to_string(),
                     route: route.map(|route| RouteRef {
                         method: route.method.clone(),
@@ -970,6 +1011,8 @@ pub const MCP_TOOL_EXPOSURE: &str = "mcp-tool";
 const fn exposure_of(route: Option<&RouteSummary>) -> &'static str {
     match route {
         Some(route) if route.mcp_tool => MCP_TOOL_EXPOSURE,
+        // Eligible, but the projector keeps only the first route per name.
+        Some(route) if route.duplicate_operation_id => "not-exposed",
         Some(_) => "http-route",
         // Registered but unreachable: a plugin may register an action the host
         // does not mount. Reported, never a failure.
@@ -1203,6 +1246,7 @@ mod tests {
             // The fixtures speak in terms of "is a tool"; how it got that way
             // is the hatch tests' business, and they set it explicitly.
             exposed_by: mcp_tool.then_some(McpExposedBy::Attribute),
+            duplicate_operation_id: false,
             agent_authority: authority,
         }
     }
@@ -1224,6 +1268,89 @@ mod tests {
             .iter()
             .find(|row| row.action == action)
             .unwrap_or_else(|| panic!("no `{action}` row in {:?}", manifest.actions))
+    }
+
+    // ── Duplicate operation ids (#2451) ──────────────────────────────
+
+    fn routes_sharing_one_operation_id() -> Vec<RouteSummary> {
+        let mut first = route(
+            "POST",
+            "/refunds",
+            "draft_refund",
+            "billing::refunds",
+            true,
+            Some(&DRAFT_REFUND),
+        );
+        first.operation_id = "shared_tool";
+        let mut second = route(
+            "POST",
+            "/notes",
+            "edit_note",
+            "notes",
+            true,
+            Some(&EDIT_NOTE),
+        );
+        second.operation_id = "shared_tool";
+        vec![first, second]
+    }
+
+    #[test]
+    fn a_duplicate_operation_id_keeps_the_first_tool_and_hides_the_rest() {
+        let mut routes = routes_sharing_one_operation_id();
+        dedupe_mcp_tool_names(&mut routes);
+        let manifest = AgentAuthorityManifest::from_parts(
+            &[&DRAFT_REFUND, &EDIT_NOTE],
+            &[&REFUND_GRANT, &REVERSIBLE_GRANT],
+            &routes,
+            true,
+        );
+        assert_eq!(find(&manifest, "draft_refund").exposure, "mcp-tool");
+        let skipped = find(&manifest, "edit_note");
+        assert_eq!(skipped.exposure, "not-exposed");
+        assert_eq!(skipped.caveat.as_deref(), Some(DUPLICATE_OPERATION_ID));
+    }
+
+    #[test]
+    fn a_skipped_duplicate_is_not_an_ungoverned_tool() {
+        let mut routes = vec![
+            route("GET", "/a", "list_a", "m", true, None),
+            route("POST", "/b", "wipe_b", "m", true, None),
+        ];
+        routes[1].operation_id = "list_a";
+        dedupe_mcp_tool_names(&mut routes);
+        let manifest = AgentAuthorityManifest::from_parts(&[], &[], &routes, true);
+        assert_eq!(manifest.ungoverned_tools.len(), 1);
+        assert!(manifest.ungoverned_mutating_tools().is_empty());
+    }
+
+    #[test]
+    fn one_handler_mounted_twice_stays_a_tool() {
+        let mut routes = routes_sharing_one_operation_id();
+        routes[1] = route(
+            "POST",
+            "/v2/refunds",
+            "draft_refund",
+            "billing::refunds",
+            true,
+            Some(&DRAFT_REFUND),
+        );
+        routes[1].operation_id = "shared_tool";
+        dedupe_mcp_tool_names(&mut routes);
+        let manifest =
+            AgentAuthorityManifest::from_parts(&[&DRAFT_REFUND], &[&REFUND_GRANT], &routes, true);
+        assert_eq!(find(&manifest, "draft_refund").exposure, "mcp-tool");
+    }
+
+    #[test]
+    fn distinct_operation_ids_are_untouched() {
+        let mut routes = routes_sharing_one_operation_id();
+        routes[1].operation_id = "other_tool";
+        dedupe_mcp_tool_names(&mut routes);
+        assert!(
+            routes
+                .iter()
+                .all(|r| r.mcp_tool && !r.duplicate_operation_id)
+        );
     }
 
     // ── Shape of the document ────────────────────────────────────────

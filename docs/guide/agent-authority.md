@@ -392,6 +392,9 @@ authority under a manifest that says otherwise.
   that `format!` and `vec!` are *not* inert here even though they cost no
   query in [query budgets](query-budgets.md): `vec!` can carry a handle and
   `format!` launders URLs. Only pure logging, assertion and template macros are inert.
+- **A non-inert macro that is awaited or stands as a statement** —
+  `schedule!().await?`, `schedule!();`. The expansion can enqueue a job with
+  no handle in its tokens, so it needs `#[agent_effect(...)]` even then.
 - **A body-local `macro_rules!` naming a handle** — it is hygienic at its
   *definition* site, so it performs that handle's effects wherever it is
   invoked, and the invocation (`wipe!()`) mentions nothing to see.
@@ -408,6 +411,15 @@ authority under a manifest that says otherwise.
 - **A `dyn Trait`, `impl Trait` or fn-generic parameter** — any method call on
   one is opaque. (`Json<T>`, `Path<T>`, `Query<T>`, `Form<T>` and friends are
   never handles, so they never trigger this.)
+- **A table the analysis cannot resolve** — `diesel::update(x)`,
+  `diesel::delete(x)` or `diesel::insert_into(x)` where `x` is not
+  `<table>::table` (or a `let` bound to it). Which table it writes is the claim.
+- **Branches** — an assignment in one arm of an `if`, `match` or loop is joined
+  with the other path, not applied to both. A handle cleared on one path is
+  still a handle on the other, and two different kinds of handle on one name
+  are refused where they are used.
+- **A SQL statement with more than one write** — every data-changing CTE and
+  the main statement each count as an unbounded write to their own table.
 - **A detached task** — `tokio::spawn` and its relatives, as above.
 - **An awaited call the analysis cannot read** — `start_finance_job().await`,
   `svc.kick_off().await`, or a future bound to a name and awaited later. This
@@ -426,11 +438,15 @@ authority under a manifest that says otherwise.
 
   | Allowed | Why |
   |---|---|
-  | `sleep`, `sleep_until`, `yield_now`, `timeout` | scheduling, not work. `timeout` *awaits the future it is handed*, so that future is judged at the `await` instead — `timeout(d, start_finance_job()).await` is still refused |
-  | a chain whose root binding is named `session`, `flash`, `cache`, `cookies`, `cookie_jar` or `csrf` | request-local plumbing; it stores no rows a grant governs |
-  | a chain whose root parameter is typed `Session`, `Flash`, `CookieJar`, `PrivateCookieJar`, `SignedCookieJar`, `Csrf`, `CsrfToken` or `Cache…` — through any extractor wrapping it | the same allowance, for a parameter that is named something else |
-  | `.commit()` / `.rollback()` | these end a transaction rather than acting through it |
+  | `tokio::time::sleep`, `sleep_until`, `timeout`, `tokio::task::yield_now` — written with the `tokio` path, or bare after a `use tokio::time::sleep;` inside the handler | scheduling, not work. A bare `sleep(d)` can be any function, so the name alone is not enough. `timeout` *awaits the future it is handed* — a call or a name bound to one — so that future is judged at the `await` instead: `timeout(d, start_finance_job()).await` is still refused |
+  | a chain whose root parameter is typed `Session`, `Flash`, `CookieJar`, `PrivateCookieJar`, `SignedCookieJar`, `Csrf`, `CsrfToken` or `Cache…` — through any extractor wrapping it | request-local plumbing; it stores no rows a grant governs. The type decides, never the binding name |
+  | `.commit()` / `.rollback()` on a transaction: the `tx` / `tx_with` callback parameter, or `db.begin()` | these end a transaction rather than acting through it. `billing.commit()` is refused |
   | a call rooted at `autumn_web` whose function is `__`-prefixed | the guard prologue `#[secured]`, `#[authorize]`, `#[step_up]` and `#[throttle]` prepend when they stack with this macro — the framework refusing the request, not the handler acting. A `Self::__autumn_…` call is *not* covered: that is a generated repository method |
+
+  An awaited call whose callee is not a path — `(choose())().await`,
+  `callbacks[0]().await` — is refused too, unless it is a closure invoked in
+  place. A call through a name bound to an effect verb
+  (`let schedule = NotifyFinanceJob::enqueue;`) is read as that verb.
 
   Everything else is discharged the usual way: declare what the call does with
   `#[agent_effect(...)]`, or — when it is verified to do nothing an agent's
@@ -690,6 +706,11 @@ rather than merged silently.
 autumn agents manifest --release --manifest agent-authority.json   # to record
 autumn agents manifest --release --check agent-authority.json      # in CI
 ```
+
+Two routes with one `operation_id` make one tool: the first. The server keeps
+the first and skips the rest, and so does the manifest. A skipped route's
+action shows `exposure: "not-exposed"` with `caveat: "duplicate-operation-id"`.
+Give each route its own `operation_id` to expose both.
 
 `--check` fails on drift **and** on any MCP-exposed *mutating* tool (anything
 but `GET`/`HEAD`) with no envelope. A read-only ungoverned tool is warned

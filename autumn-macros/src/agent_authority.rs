@@ -44,16 +44,16 @@
 //! `spawn*`), a constructor, or on the **inert-async allowlist** — which is
 //! exactly:
 //!
-//! * `sleep`, `sleep_until`, `yield_now`, `timeout` (`tokio::time` /
-//!   `tokio::task`); `timeout` awaits the future it is handed, so that future
-//!   is judged at the `await` instead;
-//! * chains whose root binding is named `session`, `flash`, `cache`,
-//!   `cookies`, `cookie_jar` or `csrf`, or whose root parameter is typed
-//!   `Session`, `Flash`, `CookieJar`, `PrivateCookieJar`, `SignedCookieJar`,
-//!   `Csrf`, `CsrfToken` or `Cache…` (through any extractor wrapping it) —
-//!   request-local plumbing that stores no rows a grant governs;
-//! * `.commit()` / `.rollback()`, which end a transaction rather than acting
-//!   through it;
+//! * `tokio::time::sleep`, `sleep_until`, `timeout` and
+//!   `tokio::task::yield_now`, written with the `tokio` path or imported by a
+//!   `use` in the handler. A bare name can be any function. `timeout` awaits
+//!   the future it is handed, so that future is judged at the `await` instead;
+//! * chains whose root parameter is typed `Session`, `Flash`, `CookieJar`,
+//!   `PrivateCookieJar`, `SignedCookieJar`, `Csrf`, `CsrfToken` or `Cache…`
+//!   (through any extractor wrapping it) — request-local plumbing that stores
+//!   no rows a grant governs. The type decides, never the binding's name;
+//! * `.commit()` / `.rollback()` on a transaction (`db.begin()`, or the `tx`
+//!   callback parameter), which end it rather than act through it;
 //! * the guard prologue an attribute macro prepends — a call rooted at
 //!   `autumn_web` whose function is `__`-prefixed, which is what `#[secured]`,
 //!   `#[authorize]`, `#[step_up]` and `#[throttle]` emit ahead of the body.
@@ -627,7 +627,15 @@ impl Handle {
                 }
                 Self::Container(merged)
             }
-            (handle, _) => handle,
+            (Self::Repository(a), Self::Repository(b)) => Self::Repository(match (a, b) {
+                (Some(a), Some(b)) if a.key() == b.key() => Some(a),
+                (Some(_), Some(_)) => None,
+                (a, b) => a.or(b),
+            }),
+            (left, right) if std::mem::discriminant(&left) == std::mem::discriminant(&right) => {
+                left
+            }
+            (_, _) => Self::Ambiguous,
         }
     }
 }
@@ -864,6 +872,72 @@ struct Analyzer {
     /// Names bound to a call the analysis could not read. Binding a future and
     /// awaiting the *name* is the same effect as awaiting the call.
     unread_futures: HashSet<String>,
+    /// Names bound to a `<table>::table` value, and whether the value already
+    /// bounds the write (`let target = refunds::table;`).
+    tables: HashMap<String, (String, bool)>,
+    /// Names a body-local `use` imported from `tokio::time` / `tokio::task`.
+    tokio_imports: HashSet<String>,
+}
+
+/// Everything a name can carry besides a `handles` entry, saved as one unit
+/// when a scope shadows the name.
+struct Shadow {
+    name: String,
+    handle: Option<Handle>,
+    closure: Option<syn::ExprClosure>,
+    spawn: bool,
+    alias: Option<syn::Path>,
+    unread: bool,
+    table: Option<(String, bool)>,
+}
+
+/// The name-keyed provenance, copied at a branch and joined after it.
+#[derive(Clone)]
+struct Bindings {
+    handles: HashMap<String, Handle>,
+    closures: HashMap<String, syn::ExprClosure>,
+    spawn_aliases: HashSet<String>,
+    fn_aliases: HashMap<String, syn::Path>,
+    unread_futures: HashSet<String>,
+    tables: HashMap<String, (String, bool)>,
+}
+
+impl Bindings {
+    /// Join two paths. Anything either path can hold, the join holds: a name
+    /// cleared on one path is still bound on the other.
+    fn join(mut self, other: Self) -> Self {
+        let mut handles = HashMap::new();
+        for name in self.handles.keys().chain(other.handles.keys()) {
+            let joined = join_handles(
+                self.handles.get(name).cloned(),
+                other.handles.get(name).cloned(),
+            );
+            handles.extend(joined.map(|handle| (name.clone(), handle)));
+        }
+        self.handles = handles;
+        self.spawn_aliases.extend(other.spawn_aliases);
+        self.unread_futures.extend(other.unread_futures);
+        for (name, closure) in other.closures {
+            self.closures.entry(name).or_insert(closure);
+        }
+        // Two different values behind one name: keep neither. The use then
+        // fails closed, as an unresolved name does.
+        self.fn_aliases.retain(|name, path| {
+            other
+                .fn_aliases
+                .get(name)
+                .is_none_or(|p| path_string(p) == path_string(path))
+        });
+        for (name, path) in other.fn_aliases {
+            self.fn_aliases.entry(name).or_insert(path);
+        }
+        self.tables
+            .retain(|name, table| other.tables.get(name).is_none_or(|t| t == table));
+        for (name, table) in other.tables {
+            self.tables.entry(name).or_insert(table);
+        }
+        self
+    }
 }
 
 impl Analyzer {
@@ -873,6 +947,8 @@ impl Analyzer {
             action,
             inert_roots,
             unread_futures: HashSet::new(),
+            tables: HashMap::new(),
+            tokio_imports: HashSet::new(),
             effects: Vec::new(),
             seen: HashSet::new(),
             effect_free_sites: Vec::new(),
@@ -891,7 +967,8 @@ impl Analyzer {
     fn record(&mut self, kind: Kind, subject: Subject, provenance: Provenance, span: Span) {
         // Effects are a SET: a write in both arms of an `if`, or in a loop
         // body, is one authority, not two.
-        if self.seen.insert((kind, subject.key())) {
+        let key = subject.key();
+        if self.seen.insert((kind, key.clone())) {
             self.effects.push(Effect {
                 kind,
                 subject,
@@ -899,7 +976,100 @@ impl Analyzer {
                 span,
                 call: None,
             });
+        } else if provenance == Provenance::Declared
+            && let Some(kept) = self
+                .effects
+                .iter_mut()
+                .find(|e| e.kind == kind && e.subject.key() == key)
+        {
+            // A declaration must stay visible when a proof got there first.
+            kept.provenance = Provenance::Declared;
         }
+    }
+
+    fn bindings(&self) -> Bindings {
+        Bindings {
+            handles: self.handles.clone(),
+            closures: self.closures.clone(),
+            spawn_aliases: self.spawn_aliases.clone(),
+            fn_aliases: self.fn_aliases.clone(),
+            unread_futures: self.unread_futures.clone(),
+            tables: self.tables.clone(),
+        }
+    }
+
+    fn set_bindings(&mut self, bindings: Bindings) {
+        self.handles = bindings.handles;
+        self.closures = bindings.closures;
+        self.spawn_aliases = bindings.spawn_aliases;
+        self.fn_aliases = bindings.fn_aliases;
+        self.unread_futures = bindings.unread_futures;
+        self.tables = bindings.tables;
+    }
+
+    /// Join the current state with another path's.
+    fn join_with(&mut self, other: Bindings) {
+        let joined = self.bindings().join(other);
+        self.set_bindings(joined);
+    }
+
+    fn shadow(&self, name: &str) -> Shadow {
+        Shadow {
+            name: name.to_string(),
+            handle: self.handles.get(name).cloned(),
+            closure: self.closures.get(name).cloned(),
+            spawn: self.spawn_aliases.contains(name),
+            alias: self.fn_aliases.get(name).cloned(),
+            unread: self.unread_futures.contains(name),
+            table: self.tables.get(name).cloned(),
+        }
+    }
+
+    fn unshadow(&mut self, saved: Shadow) {
+        let Shadow {
+            name,
+            handle,
+            closure,
+            spawn,
+            alias,
+            unread,
+            table,
+        } = saved;
+        match handle {
+            Some(handle) => self.handles.insert(name.clone(), handle),
+            None => self.handles.remove(&name),
+        };
+        match closure {
+            Some(closure) => self.closures.insert(name.clone(), closure),
+            None => self.closures.remove(&name),
+        };
+        if spawn {
+            self.spawn_aliases.insert(name.clone());
+        } else {
+            self.spawn_aliases.remove(&name);
+        }
+        match alias {
+            Some(alias) => self.fn_aliases.insert(name.clone(), alias),
+            None => self.fn_aliases.remove(&name),
+        };
+        if unread {
+            self.unread_futures.insert(name.clone());
+        } else {
+            self.unread_futures.remove(&name);
+        }
+        match table {
+            Some(table) => self.tables.insert(name, table),
+            None => self.tables.remove(&name),
+        };
+    }
+
+    /// Drop everything a name carried, bar its handle.
+    fn forget(&mut self, name: &str) {
+        self.closures.remove(name);
+        self.spawn_aliases.remove(name);
+        self.fn_aliases.remove(name);
+        self.unread_futures.remove(name);
+        self.tables.remove(name);
     }
 
     /// A raw diesel `SELECT`/`UPDATE`/`DELETE` handed a `Db` or connection
@@ -932,14 +1102,16 @@ impl Analyzer {
             Some(SqlStatement::Read { table }) => {
                 self.record_raw_query(span, verb, table.as_deref().unwrap_or("sql_query"));
             }
-            Some(SqlStatement::Write { table }) => {
-                self.record_raw_query(span, verb, &table);
-                self.record(
-                    Kind::UnboundedWrite,
-                    Subject::Lit(table),
-                    Provenance::Syntactic,
-                    span,
-                );
+            Some(SqlStatement::Write { tables }) => {
+                for table in tables {
+                    self.record_raw_query(span, verb, &table);
+                    self.record(
+                        Kind::UnboundedWrite,
+                        Subject::Lit(table),
+                        Provenance::Syntactic,
+                        span,
+                    );
+                }
             }
             None => self.refuse_raw_sql(span, "names no statement this analysis can read"),
         }
@@ -1020,23 +1192,18 @@ impl Analyzer {
         // A block scopes the names its own `let`s introduce, but not an
         // assignment it makes to an outer name. Restore exactly the declared
         // names.
-        let outer = self.handles.clone();
         let mut declared = HashSet::new();
         for stmt in &block.stmts {
             if let Stmt::Local(local) = stmt {
                 collect_pat_idents(&local.pat, &mut declared);
             }
+        }
+        let outer: Vec<Shadow> = declared.iter().map(|name| self.shadow(name)).collect();
+        for stmt in &block.stmts {
             self.stmt(stmt);
         }
-        for name in declared {
-            match outer.get(&name) {
-                Some(handle) => {
-                    self.handles.insert(name, handle.clone());
-                }
-                None => {
-                    self.handles.remove(&name);
-                }
-            }
+        for saved in outer {
+            self.unshadow(saved);
         }
     }
 
@@ -1096,6 +1263,10 @@ impl Analyzer {
     /// it is invoked — and the invocation (`wipe!()`) mentions nothing the
     /// analysis can see.
     fn nested_item(&mut self, item: &syn::Item) {
+        if let syn::Item::Use(import) = item {
+            tokio_inert_imports(&import.tree, &mut Vec::new(), &mut self.tokio_imports);
+            return;
+        }
         let syn::Item::Macro(m) = item else {
             return;
         };
@@ -1122,7 +1293,14 @@ impl Analyzer {
         match stmt {
             Stmt::Local(local) => self.local(local),
             Stmt::Expr(expr, _) => self.expr(expr),
-            Stmt::Macro(m) => self.mac(&m.mac),
+            Stmt::Macro(m) => {
+                self.mac(&m.mac);
+                // In statement position the expansion is more statements of
+                // this body, whether or not its tokens name a handle.
+                if !self.macro_is_readable(&m.mac) {
+                    self.refuse_opaque_macro(&m.mac);
+                }
+            }
             Stmt::Item(_) => {}
         }
     }
@@ -1140,11 +1318,26 @@ impl Analyzer {
     /// Propagate handle identity from a `let`'s initialiser to its bindings.
     fn bind_handles(&mut self, local: &Local) {
         let Some(init) = &local.init else {
+            let mut names = HashSet::new();
+            collect_pat_idents(&local.pat, &mut names);
+            for name in &names {
+                self.forget(name);
+            }
             self.rebind(&local.pat, None);
             return;
         };
         if let Pat::Ident(ident) = &local.pat {
             let name = ident.ident.to_string();
+            // Read off the old bindings before the new one replaces them.
+            let unread = matches!(
+                &*init.expr,
+                Expr::Call(_) | Expr::MethodCall(_) | Expr::Macro(_)
+            ) && !self.awaited_is_readable(&init.expr);
+            let table = self.table_alias_of(&init.expr);
+            self.forget(&name);
+            if let Some(table) = table {
+                self.tables.insert(name.clone(), table);
+            }
             match strip_transparent(&init.expr) {
                 // Remembered so a transaction handed this closure by name is
                 // still walked under the rollback rule (P2-1).
@@ -1168,22 +1361,13 @@ impl Analyzer {
                 Expr::Path(path) if is_effect_verb_path(&path.path) => {
                     self.fn_aliases.insert(name.clone(), path.path.clone());
                 }
-                _ => {
-                    self.closures.remove(&name);
-                    self.spawn_aliases.remove(&name);
-                    self.fn_aliases.remove(&name);
-                }
+                _ => {}
             }
             // `let fut = start_finance_job(); fut.await;` — binding the future
             // and awaiting the name is the same effect as awaiting the call,
             // spelled so the call site carries no `.await` to read.
-            match &*init.expr {
-                head @ (Expr::Call(_) | Expr::MethodCall(_)) if !self.awaited_is_readable(head) => {
-                    self.unread_futures.insert(name.clone());
-                }
-                _ => {
-                    self.unread_futures.remove(&name);
-                }
+            if unread {
+                self.unread_futures.insert(name);
             }
         }
         if let Some(handle) = self.expr_handle(&init.expr) {
@@ -1230,17 +1414,21 @@ impl Analyzer {
                     self.assign_handles(target, value);
                 }
             }
-            // `(active, key) = pair;` — the shape of the right-hand side is
-            // not readable, so every target takes whatever it carries.
+            // The shape of the right-hand side is not readable: if it is an
+            // unread call, every target may hold its future.
             (Expr::Tuple(l), _) => {
                 let handle = self.container_handle(right);
+                let unread = self.is_unread_call(right);
                 for target in &l.elems {
                     self.assign_handle_to(target, handle.as_ref());
+                    self.assign_future_to(target, unread);
                 }
             }
             (target, _) => {
                 let handle = self.expr_handle(right);
                 self.assign_handle_to(target, handle.as_ref());
+                let unread = self.is_unread_call(right);
+                self.assign_future_to(target, unread);
             }
         }
     }
@@ -1264,9 +1452,31 @@ impl Analyzer {
         }
     }
 
+    /// Is this a call whose awaited effect the analysis has not read?
+    fn is_unread_call(&self, expr: &Expr) -> bool {
+        matches!(expr, Expr::Call(_) | Expr::MethodCall(_) | Expr::Macro(_))
+            && !self.awaited_is_readable(expr)
+    }
+
+    /// `fut = start();` — an assignment moves a future into a name exactly as
+    /// a `let` does, and a later await of the name is the awaited call.
+    fn assign_future_to(&mut self, target: &Expr, unread: bool) {
+        let Expr::Path(path) = target else {
+            return;
+        };
+        let Some(ident) = path.path.get_ident() else {
+            return;
+        };
+        if unread {
+            self.unread_futures.insert(ident.to_string());
+        } else {
+            self.unread_futures.remove(&ident.to_string());
+        }
+    }
+
     /// Bind an `if let` / `while let` pattern to the handle its scrutinee
     /// carries, for the duration of the guarded block.
-    fn bind_let_condition(&mut self, cond: &Expr) -> Vec<(String, Option<Handle>)> {
+    fn bind_let_condition(&mut self, cond: &Expr) -> Vec<Shadow> {
         let Expr::Let(l) = cond else {
             return Vec::new();
         };
@@ -1274,31 +1484,20 @@ impl Analyzer {
         self.enter_binding_scope(&l.pat, handle.as_ref())
     }
 
-    fn enter_binding_scope(
-        &mut self,
-        pat: &Pat,
-        handle: Option<&Handle>,
-    ) -> Vec<(String, Option<Handle>)> {
+    fn enter_binding_scope(&mut self, pat: &Pat, handle: Option<&Handle>) -> Vec<Shadow> {
         let mut names = HashSet::new();
         collect_pat_idents(pat, &mut names);
-        let saved: Vec<(String, Option<Handle>)> = names
-            .iter()
-            .map(|name| (name.clone(), self.handles.get(name).cloned()))
-            .collect();
+        let saved: Vec<Shadow> = names.iter().map(|name| self.shadow(name)).collect();
+        for name in &names {
+            self.forget(name);
+        }
         self.rebind(pat, handle);
         saved
     }
 
-    fn leave_binding_scope(&mut self, saved: Vec<(String, Option<Handle>)>) {
-        for (name, handle) in saved {
-            match handle {
-                Some(handle) => {
-                    self.handles.insert(name, handle);
-                }
-                None => {
-                    self.handles.remove(&name);
-                }
-            }
+    fn leave_binding_scope(&mut self, saved: Vec<Shadow>) {
+        for shadow in saved {
+            self.unshadow(shadow);
         }
     }
 
@@ -1406,30 +1605,44 @@ impl Analyzer {
 
             Expr::ForLoop(f) => {
                 self.expr(&f.expr);
+                let before = self.bindings();
                 let handle = self.container_handle(&f.expr);
                 let saved = self.enter_binding_scope(&f.pat, handle.as_ref());
                 self.block(&f.body);
                 self.leave_binding_scope(saved);
+                self.join_with(before);
             }
             Expr::While(w) => {
                 self.expr(&w.cond);
+                let before = self.bindings();
                 // `while let Some(r) = opt { … }` — the binding *is* the
                 // handle the scrutinee carries, exactly as `for` already
                 // treats its pattern.
                 let saved = self.bind_let_condition(&w.cond);
                 self.block(&w.body);
                 self.leave_binding_scope(saved);
+                self.join_with(before);
             }
-            Expr::Loop(l) => self.block(&l.body),
+            Expr::Loop(l) => {
+                let before = self.bindings();
+                self.block(&l.body);
+                self.join_with(before);
+            }
 
             Expr::If(i) => {
                 self.expr(&i.cond);
+                // An assignment in one arm is not made on the other path, so
+                // each arm starts from the same state and the two are joined.
+                let before = self.bindings();
                 let saved = self.bind_let_condition(&i.cond);
                 self.block(&i.then_branch);
                 self.leave_binding_scope(saved);
+                let then_state = self.bindings();
+                self.set_bindings(before);
                 if let Some((_, els)) = &i.else_branch {
                     self.expr(els);
                 }
+                self.join_with(then_state);
             }
             Expr::Match(m) => {
                 self.expr(&m.expr);
@@ -1438,7 +1651,10 @@ impl Analyzer {
                 // an analysis that catches one and not the other is a bypass
                 // one keystroke wide.
                 let scrutinee = self.container_handle(&m.expr);
+                let before = self.bindings();
+                let mut joined: Option<Bindings> = None;
                 for arm in &m.arms {
+                    self.set_bindings(before.clone());
                     let (pat, guard) = crate::parse::arm_pat_and_guard(arm);
                     let saved = self.enter_binding_scope(pat, scrutinee.as_ref());
                     if let Some(guard) = guard {
@@ -1450,7 +1666,13 @@ impl Analyzer {
                         self.expr(&arm.body);
                     }
                     self.leave_binding_scope(saved);
+                    let arm_state = self.bindings();
+                    joined = Some(match joined {
+                        Some(state) => state.join(arm_state),
+                        None => arm_state,
+                    });
                 }
+                self.set_bindings(joined.unwrap_or(before));
             }
 
             Expr::Block(syn::ExprBlock { block, .. })
@@ -1909,7 +2131,9 @@ impl Analyzer {
                 // The repository codegen is what adds the tenant predicate;
                 // this query has none by construction, so it reaches across
                 // tenants and is recorded as that effect.
-                let target = table_name_of(root)
+                let target = self
+                    .table_of(root)
+                    .map(|(table, _)| table)
                     .or_else(|| method.args.iter().find_map(handle_arg_name))
                     .unwrap_or_else(|| "connection".to_string());
                 self.record_raw_query(method.span(), &name, &target);
@@ -2066,7 +2290,7 @@ impl Analyzer {
             {
                 for arg in &call.args {
                     let inner = strip_transparent(arg);
-                    if matches!(inner, Expr::Call(_) | Expr::MethodCall(_))
+                    if matches!(inner, Expr::Call(_) | Expr::MethodCall(_) | Expr::Path(_))
                         && !self.awaited_is_readable(inner)
                     {
                         self.refuse_awaited(inner.span());
@@ -2075,7 +2299,11 @@ impl Analyzer {
             }
             return;
         }
-        self.refuse_awaited(head.span());
+        if let Expr::Macro(m) = head {
+            self.refuse_opaque_macro(&m.mac);
+        } else {
+            self.refuse_awaited(head.span());
+        }
     }
 
     /// Has the analysis already read what this awaited head does?
@@ -2088,6 +2316,7 @@ impl Analyzer {
                 .path
                 .get_ident()
                 .is_none_or(|ident| !self.unread_futures.contains(&ident.to_string())),
+            Expr::Macro(m) => self.macro_is_readable(&m.mac),
             // `(async move { … }).await`, `if …{…}.await` — the block's own
             // statements are walked, so there is nothing unread here.
             _ => true,
@@ -2104,14 +2333,72 @@ impl Analyzer {
         {
             return true;
         }
-        let Some(name) = call_path_name(call) else {
+        // A name bound to an effect verb is classified by `call()`, which
+        // records the effect or refuses it.
+        if let Expr::Path(path) = strip_transparent(&call.func)
+            && path
+                .path
+                .get_ident()
+                .is_some_and(|ident| self.fn_aliases.contains_key(&ident.to_string()))
+        {
             return true;
+        }
+        // A callee that is an expression (`(pick())()`, `table[0]()`) names
+        // nothing, and with no handle in its arguments nothing else reads it.
+        let Some(name) = call_path_name(call) else {
+            return false;
         };
         is_enqueue(&name)
             || SPAWN_FNS.contains(&name.as_str())
             || is_constructor_call(call)
-            || INERT_ASYNC_PATHS.contains(&name.as_str())
+            || self.is_inert_async_call(call, &name)
             || is_framework_prologue_call(call)
+    }
+
+    /// `tokio::time::sleep(..)`, or `sleep(..)` after `use tokio::time::sleep;`.
+    ///
+    /// A bare `sleep` is any function a module defines, so the name alone
+    /// proves nothing.
+    fn is_inert_async_call(&self, call: &ExprCall, name: &str) -> bool {
+        if !INERT_ASYNC_PATHS.contains(&name) {
+            return false;
+        }
+        let Expr::Path(path) = strip_transparent(&call.func) else {
+            return false;
+        };
+        let Some(first) = path.path.segments.first() else {
+            return false;
+        };
+        let first = first.ident.to_string();
+        first == "tokio" || self.tokio_imports.contains(&first)
+    }
+
+    /// Does the analysis already read, or already refuse, this macro?
+    fn macro_is_readable(&self, mac: &syn::Macro) -> bool {
+        let name = mac.path.segments.last().map(|s| s.ident.to_string());
+        let inert = name.is_some_and(|name| INERT_MACROS.contains(&name.as_str()))
+            && !tokens_contain_await(&mac.tokens);
+        inert || self.tokens_mention_handle(&mac.tokens)
+    }
+
+    /// A macro that expands to code the analysis cannot see, awaited or in
+    /// statement position, can enqueue a job with no handle in its tokens.
+    fn refuse_opaque_macro(&mut self, mac: &syn::Macro) {
+        let name = mac
+            .path
+            .segments
+            .last()
+            .map_or_else(|| "macro".to_string(), |s| s.ident.to_string());
+        let action = self.action.clone();
+        self.error(
+            mac.span(),
+            format!(
+                "agent authority: `{name}!` expands to code the analysis cannot read, and the \
+                 expansion can enqueue a job or call out with no handle in its tokens — so \
+                 `{action}`'s effects cannot be proven.\n\nInline the effect into this handler, \
+                 or declare the site with `#[agent_effect(..., reason = \"...\")]`. {GUIDE}"
+            ),
+        );
     }
 
     /// An awaited method chain: readable when it is rooted at a tracked
@@ -2134,7 +2421,6 @@ impl Analyzer {
             let name = m.method.to_string();
             is_enqueue(&name)
                 || SPAWN_FNS.contains(&name.as_str())
-                || INERT_ASYNC_VERBS.contains(&name.as_str())
                 || Self::method_handle(m).is_some()
                 || m.args.iter().any(|arg| self.carries_handle(arg))
         }) {
@@ -2146,15 +2432,12 @@ impl Analyzer {
     /// Is this chain root the request-local plumbing the allowlist names?
     fn root_is_inert(&self, root: &Expr) -> bool {
         match strip_transparent(root) {
-            Expr::Path(path) => path.path.get_ident().is_some_and(|ident| {
-                let name = ident.to_string();
-                INERT_ASYNC_ROOT_NAMES.contains(&name.as_str()) || self.inert_roots.contains(&name)
-            }),
-            // `state.session`, `self.cache` — the field names the same thing.
-            Expr::Field(field) => {
-                let name = member_name(&field.member);
-                INERT_ASYNC_ROOT_NAMES.contains(&name.as_str())
-            }
+            // Typed in the signature, never judged by the binding's name:
+            // `let cache = FinanceService::new();` is not a cache.
+            Expr::Path(path) => path
+                .path
+                .get_ident()
+                .is_some_and(|ident| self.inert_roots.contains(&ident.to_string())),
             _ => false,
         }
     }
@@ -2260,7 +2543,10 @@ impl Analyzer {
         }
         // `diesel::insert_into(...)`, `diesel::update(...)` — the write is
         // recorded where the builder reaches an executor, not here.
-        if Self::write_builder_of(call).is_some() {
+        if self.write_builder_of(call).is_some() {
+            return;
+        }
+        if self.refuse_unresolved_diesel_write(call, &name) {
             return;
         }
         if call.args.iter().any(|a| self.carries_handle(a)) {
@@ -2285,7 +2571,7 @@ impl Analyzer {
             // A static finder on a `#[model]` really is a read — and it is
             // indistinguishable from `Billing::wipe`, so it is refused too and
             // discharged with `#[agent_effect(none, reason = "...")]`.
-            if is_constructor_call(call) || Self::call_handle(call).is_some() {
+            if is_constructor_call(call) || self.call_handle(call).is_some() {
                 return;
             }
             let action = self.action.clone();
@@ -2562,11 +2848,17 @@ impl Analyzer {
                 if name == "checkout" && matches!(inner, Handle::LazyDb) {
                     return Some(Handle::Db);
                 }
+                // `db.begin()` opens a transaction on that connection. The
+                // transaction is a `Db`-rooted handle, which is what makes its
+                // `.commit()` / `.rollback()` readable.
+                if name == "begin" && matches!(inner, Handle::Db) {
+                    return Some(Handle::Db);
+                }
                 (TRANSPARENT_BUILDERS.contains(&name.as_str())
                     || CROSS_TENANT_METHODS.contains(&name.as_str()))
                 .then_some(inner)
             }
-            Expr::Call(call) => Self::call_handle(call),
+            Expr::Call(call) => self.call_handle(call),
             // A handle selected through a conditional is still a handle, and a
             // write builder joined at a branch takes the unsafe side.
             Expr::If(i) => {
@@ -2622,10 +2914,44 @@ impl Analyzer {
         None
     }
 
+    /// Refuse a `diesel::` write whose table cannot be read. Returns whether
+    /// it did.
+    fn refuse_unresolved_diesel_write(&mut self, call: &ExprCall, name: &str) -> bool {
+        let Some(arg) = self.unresolved_diesel_write(call) else {
+            return false;
+        };
+        let action = self.action.clone();
+        self.error(
+            call.span(),
+            format!(
+                "agent authority: `diesel::{name}` is handed `{arg}`, and the table that names \
+                     cannot be read, so what `{action}` writes cannot be proven.\n\nPass \
+                     `<table>::table` or a `let` bound to it, or declare the site with \
+                     `#[agent_effect(unbounded_writes(table), reason = \"...\")]`. {GUIDE}"
+            ),
+        );
+        true
+    }
+
+    /// A `diesel::`-qualified write whose target table cannot be read.
+    ///
+    /// Returns the target as source text, for the diagnostic.
+    fn unresolved_diesel_write(&self, call: &ExprCall) -> Option<String> {
+        let Expr::Path(path) = &*call.func else {
+            return None;
+        };
+        let segments = &path.path.segments;
+        let verb = segments.last()?.ident.to_string();
+        let write = matches!(verb.as_str(), "insert_into" | "update" | "delete");
+        let diesel = segments.iter().any(|segment| segment.ident == "diesel");
+        let arg = call.args.first()?;
+        (write && diesel && self.table_of(arg).is_none()).then(|| arg.to_token_stream().to_string())
+    }
+
     /// A call that produces an effect handle: an ad-hoc HTTP client, or a
     /// diesel write builder.
-    fn call_handle(call: &ExprCall) -> Option<Handle> {
-        if let Some(builder) = Self::write_builder_of(call) {
+    fn call_handle(&self, call: &ExprCall) -> Option<Handle> {
+        if let Some(builder) = self.write_builder_of(call) {
             return Some(builder);
         }
         let Expr::Path(path) = &*call.func else {
@@ -2646,22 +2972,47 @@ impl Analyzer {
             .then_some(Handle::Client)
     }
 
+    /// The table an expression names, directly (`refunds::table`) or through
+    /// a binding (`let target = refunds::table;`), and whether it already
+    /// bounds the write.
+    fn table_of(&self, expr: &Expr) -> Option<(String, bool)> {
+        match expr {
+            Expr::Path(path) => path
+                .path
+                .get_ident()
+                .and_then(|ident| self.tables.get(&ident.to_string()).cloned())
+                .or_else(|| table_name_of(expr).map(|table| (table, false))),
+            Expr::MethodCall(mc) => self
+                .table_of(&mc.receiver)
+                .map(|(table, bounded)| (table, bounded || argument_bounds_the_write(expr))),
+            Expr::Reference(r) => self.table_of(&r.expr),
+            Expr::Paren(p) => self.table_of(&p.expr),
+            Expr::Group(g) => self.table_of(&g.expr),
+            _ => None,
+        }
+    }
+
+    /// The table a `let` binds, when its initialiser names one.
+    fn table_alias_of(&self, init: &Expr) -> Option<(String, bool)> {
+        self.table_of(strip_transparent(init))
+    }
+
     /// `diesel::update(t)` / `delete(t)` / `insert_into(t)` — the start of a
     /// raw write, whose boundedness is then tracked on the binding.
-    fn write_builder_of(call: &ExprCall) -> Option<Handle> {
+    fn write_builder_of(&self, call: &ExprCall) -> Option<Handle> {
         let Expr::Path(path) = &*call.func else {
             return None;
         };
         let segments = &path.path.segments;
         let name = segments.last()?.ident.to_string();
         let qualified_by_diesel = segments.iter().any(|segment| segment.ident == "diesel");
-        let table = call.args.first().and_then(table_name_of);
+        let table = call.args.first().and_then(|arg| self.table_of(arg));
         // A bare `update(x)` is far too common to claim as a diesel write; a
         // `diesel::`-qualified call, or one handed a `<table>::table`, is not.
         if !qualified_by_diesel && table.is_none() {
             return None;
         }
-        let table = table?;
+        let (table, aliased_bound) = table?;
         match name.as_str() {
             "insert_into" => Some(Handle::WriteBuilder {
                 table,
@@ -2674,7 +3025,7 @@ impl Analyzer {
             // chain reported it as an unbounded write, which forces the widest
             // grant in the codebase for the commonest update there is.
             "update" | "delete" => Some(Handle::WriteBuilder {
-                bounded: call.args.first().is_some_and(argument_bounds_the_write),
+                bounded: aliased_bound || call.args.first().is_some_and(argument_bounds_the_write),
                 table,
                 insert: false,
             }),
@@ -2909,16 +3260,53 @@ const RAW_SQL_FNS: &[&str] = &["sql_query", "sql", "execute_raw"];
 /// handed, so that future is judged as if it were awaited at this site.
 const INERT_ASYNC_PATHS: &[&str] = &["sleep", "sleep_until", "yield_now", "timeout"];
 
+/// Paths a body-local `use` may import to make a bare `sleep(..)` the real one.
+const TOKIO_INERT_IMPORTS: &[&str] = &[
+    "tokio::time",
+    "tokio::task",
+    "tokio::time::sleep",
+    "tokio::time::sleep_until",
+    "tokio::time::timeout",
+    "tokio::task::yield_now",
+];
+
+/// Collect the names a `use` brings in from `tokio::time` / `tokio::task`.
+fn tokio_inert_imports(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut HashSet<String>) {
+    match tree {
+        syn::UseTree::Path(path) => {
+            prefix.push(path.ident.to_string());
+            tokio_inert_imports(&path.tree, prefix, out);
+            prefix.pop();
+        }
+        syn::UseTree::Name(name) => {
+            prefix.push(name.ident.to_string());
+            if TOKIO_INERT_IMPORTS.contains(&prefix.join("::").as_str()) {
+                out.insert(name.ident.to_string());
+            }
+            prefix.pop();
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                tokio_inert_imports(item, prefix, out);
+            }
+        }
+        syn::UseTree::Glob(_) => match prefix.join("::").as_str() {
+            "tokio::time" => out.extend(["sleep", "sleep_until", "timeout"].map(String::from)),
+            "tokio::task" => {
+                out.insert("yield_now".to_string());
+            }
+            _ => {}
+        },
+        syn::UseTree::Rename(_) => {}
+    }
+}
+
 /// Combinators among the above that await a future given as an argument.
 const ASYNC_COMBINATORS: &[&str] = &["timeout"];
 
-/// Root *bindings* whose async surface is request-local plumbing: it stores no
+/// Root *types* whose async surface is request-local plumbing: it stores no
 /// rows an agent's grant governs, calls nothing out, and enqueues nothing.
-const INERT_ASYNC_ROOT_NAMES: &[&str] =
-    &["session", "flash", "cache", "cookies", "cookie_jar", "csrf"];
-
-/// The types behind those names, so a differently-named parameter is covered
-/// too. Matched on the last path segment; `Cache` matches by prefix.
+/// Matched on the signature, never on a binding's name.
 const INERT_ASYNC_ROOT_TYPES: &[&str] = &[
     "Session",
     "Flash",
@@ -2928,11 +3316,6 @@ const INERT_ASYNC_ROOT_TYPES: &[&str] = &[
     "Csrf",
     "CsrfToken",
 ];
-
-/// Chain-terminal methods that end a transaction rather than acting through
-/// it. `db.tx(..)` is the shape this codebase uses, but a hand-rolled
-/// `tx.commit().await` is not an unread effect.
-const INERT_ASYNC_VERBS: &[&str] = &["commit", "rollback"];
 
 /// `dispatch(&state, topic, payload)` — the topic's argument index
 /// (`autumn/src/webhook_outbound.rs`, the one arity there is).
@@ -2959,8 +3342,9 @@ const SQL_WRITE_STATEMENTS: &[&str] = &[
 enum SqlStatement {
     /// A query. The table is only for the tenant effect's subject.
     Read { table: Option<String> },
-    /// A statement that writes, and the table it writes.
-    Write { table: String },
+    /// A statement that writes, and every table it writes: a data-changing
+    /// CTE writes its own table beside the main statement's.
+    Write { tables: Vec<String> },
 }
 
 /// The raw-statement constructor a chain is rooted at, if it is one.
@@ -2976,26 +3360,50 @@ fn raw_sql_call(root: &Expr) -> Option<&ExprCall> {
 fn classify_sql(sql: &str) -> Option<SqlStatement> {
     let words = sql_words(sql);
     let first = words.first()?.to_ascii_uppercase();
+    // `ON CONFLICT DO UPDATE` and `FOR UPDATE` repeat a keyword without
+    // naming a second table.
     let write_at = |from: usize| {
-        words.iter().enumerate().skip(from).find_map(|(at, word)| {
-            SQL_WRITE_STATEMENTS
-                .contains(&word.to_ascii_uppercase().as_str())
-                .then_some(at)
-        })
+        words
+            .iter()
+            .enumerate()
+            .skip(from)
+            .filter(|(at, word)| {
+                let upper = word.to_ascii_uppercase();
+                let before = at
+                    .checked_sub(1)
+                    .and_then(|i| words.get(i))
+                    .map(|w| w.to_ascii_uppercase());
+                SQL_WRITE_STATEMENTS.contains(&upper.as_str())
+                    && !(upper == "UPDATE"
+                        && matches!(before.as_deref(), Some("DO" | "FOR" | "KEY" | "SHARE")))
+            })
+            .map(|(at, _)| at)
+            .collect::<Vec<_>>()
     };
     if SQL_READ_STATEMENTS.contains(&first.as_str()) {
         // A CTE is a read only until it is not: `WITH x AS (...) DELETE FROM
         // payouts` is spelled like a query and erases a table. Quoting keeps a
         // `'DELETE'` *value* out of this — the token still carries its quotes.
-        if let Some(at) = write_at(1) {
-            return sql_table(&words, at).map(|table| SqlStatement::Write { table });
+        // Every data-changing body counts: the CTE's table and the main one.
+        let writes = write_at(1);
+        if !writes.is_empty() {
+            let mut tables = Vec::new();
+            for at in writes {
+                let table = sql_table(&words, at)?;
+                if !tables.contains(&table) {
+                    tables.push(table);
+                }
+            }
+            return Some(SqlStatement::Write { tables });
         }
         return Some(SqlStatement::Read {
             table: sql_table(&words, 0),
         });
     }
     if SQL_WRITE_STATEMENTS.contains(&first.as_str()) {
-        return sql_table(&words, 0).map(|table| SqlStatement::Write { table });
+        return sql_table(&words, 0).map(|table| SqlStatement::Write {
+            tables: vec![table],
+        });
     }
     None
 }
@@ -3187,7 +3595,8 @@ fn job_type_path(expr: &Expr) -> Option<syn::Path> {
         return None;
     };
     let ident = path.path.segments.last()?.ident.to_string();
-    (path.path.segments.len() == 1 && ident.starts_with(char::is_uppercase))
+    ident
+        .starts_with(char::is_uppercase)
         .then(|| path.path.clone())
 }
 
@@ -3197,7 +3606,7 @@ fn type_ident_of(expr: &Expr) -> Option<String> {
         return None;
     };
     let ident = path.path.segments.last()?.ident.to_string();
-    (path.path.segments.len() == 1 && ident.starts_with(char::is_uppercase)).then_some(ident)
+    ident.starts_with(char::is_uppercase).then_some(ident)
 }
 
 /// The qualifier of a path call, as an expression, so `NotifyFinance::enqueue`
@@ -3206,14 +3615,7 @@ fn path_qualifier(call: &ExprCall) -> Option<Expr> {
     let Expr::Path(path) = &*call.func else {
         return None;
     };
-    let mut segments = path.path.segments.clone();
-    segments.pop();
-    let last = segments.pop()?;
-    Some(Expr::Path(syn::ExprPath {
-        attrs: Vec::new(),
-        qself: None,
-        path: syn::Path::from(last),
-    }))
+    path_prefix_expr(&path.path)
 }
 
 fn path_string(path: &syn::Path) -> String {
@@ -5543,6 +5945,173 @@ mod tests {
                 Ok(())
             }",
         ),
+        // ── #2451: escape shapes found after the first corpus ──────────
+        (
+            "future assigned after declaration and awaited later",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut;
+                fut = start_finance_job();
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "future assigned through a destructuring target and awaited later",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut;
+                let n;
+                (fut, n) = (start_finance_job(), 1);
+                fut.await?;
+                Ok(n)
+            }",
+        ),
+        (
+            "awaited opaque macro with no handle",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                schedule!().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in statement position with no handle",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                schedule!();
+                Ok(())
+            }",
+        ),
+        (
+            "unread future handed to timeout",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                let fut = start_finance_job();
+                tokio::time::timeout(d, fut).await??;
+                Ok(())
+            }",
+        ),
+        (
+            "commit spelled on a receiver that is not a transaction",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(billing: BillingService) -> R {
+                billing.commit().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "custom sleep function",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                sleep(d).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "binding named cache with an unrelated type",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(cache: FinanceService) -> R {
+                cache.refresh().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "field named session on an unrelated value",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(svc: FinanceService) -> R {
+                svc.session.flush().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future shadowed in a nested block",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = start_finance_job();
+                { let fut = (); }
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "CTE that writes two tables: the CTE",
+            ExpectedKind::UnboundedWrite,
+            "allowed",
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("WITH x AS (DELETE FROM allowed RETURNING id) DELETE FROM forbidden")
+                    .execute(&mut *db).await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            "CTE that writes two tables: the main statement",
+            ExpectedKind::UnboundedWrite,
+            "forbidden",
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("WITH x AS (DELETE FROM allowed RETURNING id) DELETE FROM forbidden")
+                    .execute(&mut *db).await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            "awaited callee produced by a call, no handle",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                (choose_callback())().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "awaited callee indexed from a table, no handle",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                callbacks[0]().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "diesel delete through an aliased table",
+            ExpectedKind::UnboundedWrite,
+            "refunds",
+            r"async fn h(mut db: Db) -> R {
+                let target = refunds::table;
+                diesel::delete(target).execute(&mut *db).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "diesel update on an unresolvable target",
+            ExpectedKind::Rejected,
+            "chosen_table",
+            r"async fn h(mut db: Db) -> R {
+                diesel::update(chosen_table).set(x).execute(&mut *db).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "write builder cleared on one branch and executed on the other",
+            ExpectedKind::UnboundedWrite,
+            "refunds",
+            r"async fn h(mut db: Db, skip: bool) -> R {
+                let mut q = Some(diesel::delete(refunds::table));
+                if skip { q = None; }
+                if let Some(q) = q { q.execute(&mut *db).await?; }
+                Ok(())
+            }",
+        ),
         (
             "#[agent_effect] with a blank reason",
             ExpectedKind::Rejected,
@@ -5798,6 +6367,52 @@ mod tests {
             }",
         ),
         (
+            "job enqueued through a function-item alias and awaited",
+            r"async fn h() -> R {
+                let schedule = NotifyFinanceJob::enqueue;
+                schedule(&payload).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "job enqueued through a fully qualified type path",
+            r"async fn h() -> R {
+                crate::jobs::NotifyFinanceJob::enqueue(&payload).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "immediately invoked async closure, awaited",
+            r"async fn h() -> R {
+                (async || { Ok(()) })().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "tokio::task::yield_now is qualified",
+            r"async fn h() -> R {
+                tokio::task::yield_now().await;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future shadowed by a plain value then awaited as a value",
+            r"async fn h(repo: PgRefundRepository) -> R {
+                let n = 1;
+                { let n = start_unrelated(); let _ = n; }
+                Ok((repo.find_all().await?, n))
+            }",
+        ),
+        (
+            "write builder bounded on both branches",
+            r"async fn h(mut db: Db, id: i64, skip: bool) -> R {
+                let mut q = diesel::delete(refunds::table.find(id));
+                if skip { q = diesel::delete(refunds::table.find(0)); }
+                q.execute(&mut *db).await?;
+                Ok(())
+            }",
+        ),
+        (
             "no handles at all",
             r"async fn h() -> R { Ok(render_static()) }",
         ),
@@ -5996,6 +6611,58 @@ mod tests {
         assert!(
             expansion.contains("\"Refund\""),
             "expected the syntactic model subject: {expansion}"
+        );
+    }
+
+    // ── #2451 ────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_qualified_job_type_keeps_its_whole_path() {
+        let expansion = expand(
+            GRANT,
+            r"async fn h() -> R {
+                crate::jobs::NotifyFinanceJob::enqueue(&payload).await?;
+                Ok(())
+            }",
+        );
+        assert!(
+            expansion.contains("crate :: jobs :: NotifyFinanceJob :: __AUTUMN_JOB_NAME"),
+            "the job name constant lost its path prefix: {expansion}"
+        );
+    }
+
+    #[test]
+    fn a_proved_effect_that_is_also_declared_is_recorded_as_declared() {
+        let expansion = expand(
+            GRANT,
+            r#"async fn h(repo: RefundRepository) -> R {
+                repo.create(&b).await?;
+                #[agent_effect(writes(Refund), reason = "helper also writes a refund")]
+                let r = opaque_helper(&b);
+                Ok(r)
+            }"#,
+        );
+        assert!(
+            expansion.contains("EffectProvenance :: Declared"),
+            "the declared site was lost on de-duplication: {expansion}"
+        );
+    }
+
+    #[test]
+    fn a_declared_effect_stays_declared_when_proved_later() {
+        let expansion = expand(
+            GRANT,
+            r#"async fn h(repo: RefundRepository) -> R {
+                #[agent_effect(writes(Refund), reason = "helper also writes a refund")]
+                let r = opaque_helper(&b);
+                repo.create(&b).await?;
+                Ok(r)
+            }"#,
+        );
+        assert!(
+            expansion.contains("EffectProvenance :: Declared")
+                && !expansion.contains("EffectProvenance :: Syntactic"),
+            "a proof must not demote a declaration: {expansion}"
         );
     }
 

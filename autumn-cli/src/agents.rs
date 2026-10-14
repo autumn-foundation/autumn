@@ -816,6 +816,7 @@ mod tests {
             // The fixtures speak in terms of "is a tool"; how it got that way
             // is the hatch tests' business, and they set it explicitly.
             exposed_by: mcp_tool.then_some(McpExposedBy::Attribute),
+            duplicate_operation_id: false,
             agent_authority: authority,
         }
     }
