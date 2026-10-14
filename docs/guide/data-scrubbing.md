@@ -710,7 +710,11 @@ apply-time error.
   database that **any** non-dev/test profile's *config file* declares — every
   `autumn-<profile>.toml` in the project is checked, not just the one an
   artifact's manifest names, so a bare `.dump` with no manifest is not treated
-  as permission to continue. That guard has its own waiver,
+  as permission to continue. The control URL and every shard URL of those
+  profiles are compared, hostless libpq URLs (`postgres:///db?host=/run/pg`,
+  `PGHOST`) included. The destination profile is never its own source. With
+  `--artifact`, only the targets the artifact restored are scrubbed. That guard
+  has its own waiver,
   `--allow-source-overwrite`, rather than riding on `--force`: the staging drill
   always passes `--force`, so a guard `--force` waived would be inert in exactly
   the workflow it exists for.
