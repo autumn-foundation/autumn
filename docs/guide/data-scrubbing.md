@@ -745,6 +745,19 @@ apply-time error.
   planned tables — and the ones `[framework] purge` empties — are locked for the
   duration, so a row inserted between the classification snapshot and the
   rewrite cannot slip through.
+- **A schema change mid-run is refused.** After the locks are taken, the
+  transaction compares `public`'s tables and columns with the snapshot the plan
+  was built from. A migration that added a column in that window rolls the run
+  back, so no column commits unclassified. Re-run the command.
+- **Encrypted columns get the same plan-time gates.** An `#[encrypted]` column
+  must be `text`, `citext` or `varchar(n)`, and a `varchar(n)` must be wide
+  enough for the replacement envelope (148 characters; 168 for an email-shaped
+  column). A structural one (a referenced key, say) is declared `safe` and keeps
+  its ciphertext.
+- **Test-only registrations are ignored.** A `ModelRegistration::anonymize` call
+  under `#[cfg(test)]` (an inline module, a `#[cfg(test)] mod tests;` file, or
+  `#![cfg(test)]`) is not a production registration. Other `cfg` predicates are
+  unknown and count as on.
 - **`NULL`s stay `NULL`.** A scrub anonymizes values; it never invents them.
 - **It is atomic.** Every statement for one database runs in a single
   transaction, so a failure can never leave a half-scrubbed database behind —
