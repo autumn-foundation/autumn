@@ -73,9 +73,9 @@ pub enum SbomError {
     #[error("unsupported object file format")]
     UnsupportedObjectFormat,
     #[error(
-        "byte-swapped fat Mach-O header (FAT_CIGAM) — Apple fat headers are always \
-         big-endian on disk, so no Apple toolchain writes this; the file is corrupt \
-         or from a non-standard tool. If it is a real binary, please open an issue"
+        "file starts with a byte-swapped fat Mach-O magic (FAT_CIGAM). Fat headers are \
+         always big-endian on disk, so no Apple tool writes this. The file is not a \
+         valid fat binary"
     )]
     ByteSwappedFatMachO,
     #[error("truncated or malformed object file")]
@@ -1244,13 +1244,13 @@ fn extract_from_pe(bytes: &[u8]) -> Result<&[u8], SbomError> {
 /// and PE — i.e. every target the CLI itself ships binaries for.
 ///
 /// Fat accepts only `ca fe ba be` (`FAT_MAGIC`) and `ca fe ba bf`
-/// (`FAT_MAGIC_64`). Apple fixes fat headers as big-endian on disk;
-/// `FAT_CIGAM` is the value a reader sees, not a written layout. The swapped
-/// spellings get a dedicated refusal instead of a guess.
+/// (`FAT_MAGIC_64`). Fat headers are always big-endian on disk. `FAT_CIGAM` is
+/// only the value a little-endian reader sees. The swapped bytes get their own
+/// error.
 ///
 /// # Errors
 ///
-/// * [`SbomError::ByteSwappedFatMachO`] — a swapped fat magic (no tool writes it).
+/// * [`SbomError::ByteSwappedFatMachO`] — a swapped fat magic (Apple tools do not write it).
 /// * [`SbomError::UnsupportedObjectFormat`] — not a recognized object file.
 /// * [`SbomError::NoAuditData`] — a valid object file with no embedded list.
 /// * [`SbomError::MalformedObject`] — truncated or self-inconsistent headers.
