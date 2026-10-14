@@ -961,7 +961,8 @@ impl Analyzer {
             inert_roots,
             unread_futures: HashSet::new(),
             tables: HashMap::new(),
-            tokio_imports: HashSet::new(),
+            // The `tokio` crate is in scope until a name hides it.
+            tokio_imports: HashSet::from(["tokio".to_string()]),
             effects: Vec::new(),
             seen: HashSet::new(),
             effect_free_sites: Vec::new(),
@@ -1219,8 +1220,13 @@ impl Analyzer {
         // covers the whole block, so it hides an import before its own line.
         let imports = self.tokio_imports.clone();
         for stmt in &block.stmts {
-            if let Stmt::Item(syn::Item::Fn(item)) = stmt {
-                self.tokio_imports.remove(&item.sig.ident.to_string());
+            match stmt {
+                Stmt::Item(syn::Item::Fn(item)) => {
+                    self.tokio_imports.remove(&item.sig.ident.to_string());
+                }
+                // A `use` also covers the whole block, whatever its line.
+                Stmt::Item(item @ syn::Item::Use(_)) => self.nested_item(item),
+                _ => {}
             }
         }
         // Save a name when its `let` is reached, not at block entry: an
@@ -1394,31 +1400,7 @@ impl Analyzer {
             if let Some(table) = table {
                 self.tables.insert(name.clone(), table);
             }
-            match strip_transparent(&init.expr) {
-                // Remembered so a transaction handed this closure by name is
-                // still walked under the rollback rule (P2-1).
-                Expr::Closure(closure) => {
-                    self.closures.insert(name.clone(), closure.clone());
-                }
-                // `let s = tokio::spawn;` — an alias is still a detachment.
-                Expr::Path(path)
-                    if path
-                        .path
-                        .segments
-                        .last()
-                        .is_some_and(|s| SPAWN_FNS.contains(&s.ident.to_string().as_str())) =>
-                {
-                    self.spawn_aliases.insert(name.clone());
-                }
-                // `let schedule = NotifyFinanceJob::enqueue;` — a function
-                // item bound to a local name. The call site then mentions no
-                // verb the sweep can see, so the aliased *path* is remembered
-                // and the call is classified against it.
-                Expr::Path(path) if is_effect_verb_path(&path.path) => {
-                    self.fn_aliases.insert(name.clone(), path.path.clone());
-                }
-                _ => {}
-            }
+            self.bind_callable(&name, &init.expr);
             // `let fut = start_finance_job(); fut.await;` — binding the future
             // and awaiting the name is the same effect as awaiting the call,
             // spelled so the call site carries no `.await` to read.
@@ -1457,6 +1439,52 @@ impl Analyzer {
         self.rebind(&local.pat, None);
     }
 
+    /// Remember a name bound to a closure, `spawn` or an effect verb.
+    fn bind_callable(&mut self, name: &str, init: &Expr) {
+        match strip_transparent(init) {
+            // Remembered so a transaction handed this closure by name is
+            // still walked under the rollback rule (P2-1).
+            Expr::Closure(closure) => {
+                self.closures.insert(name.to_string(), closure.clone());
+            }
+            // `let s = tokio::spawn;` — an alias is still a detachment.
+            Expr::Path(path)
+                if path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|s| SPAWN_FNS.contains(&s.ident.to_string().as_str())) =>
+            {
+                self.spawn_aliases.insert(name.to_string());
+            }
+            // `let schedule = NotifyFinanceJob::enqueue;` — a function item
+            // bound to a local name. The call site then mentions no verb the
+            // sweep can see, so the aliased *path* is remembered and the call
+            // is classified against it.
+            Expr::Path(path) if is_effect_verb_path(&path.path) => {
+                self.fn_aliases.insert(name.to_string(), path.path.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// `schedule = other_fn;` replaces what the name was bound to.
+    fn assign_callable_to(&mut self, target: &Expr, right: Option<&Expr>) {
+        let Expr::Path(path) = target else {
+            return;
+        };
+        let Some(ident) = path.path.get_ident() else {
+            return;
+        };
+        let name = ident.to_string();
+        self.closures.remove(&name);
+        self.spawn_aliases.remove(&name);
+        self.fn_aliases.remove(&name);
+        if let Some(right) = right {
+            self.bind_callable(&name, right);
+        }
+    }
+
     /// Propagate handle identity across an assignment, element-wise.
     ///
     /// `active = repo;` makes `active` a handle just as a `let` would, and a
@@ -1483,6 +1511,7 @@ impl Analyzer {
                 for target in &l.elems {
                     self.assign_handle_to(target, handle.as_ref());
                     self.assign_future_to(target, unread);
+                    self.assign_callable_to(target, None);
                 }
             }
             (target, _) => {
@@ -1490,6 +1519,7 @@ impl Analyzer {
                 self.assign_handle_to(target, handle.as_ref());
                 let unread = self.is_unread_call(right);
                 self.assign_future_to(target, unread);
+                self.assign_callable_to(target, Some(right));
             }
         }
     }
@@ -2351,12 +2381,7 @@ impl Analyzer {
             {
                 // Only the future operand is awaited. The duration is not.
                 for arg in call.args.iter().skip(1) {
-                    let inner = strip_transparent(arg);
-                    if matches!(inner, Expr::Call(_) | Expr::MethodCall(_) | Expr::Path(_))
-                        && !self.awaited_is_readable(inner)
-                    {
-                        self.refuse_awaited(inner.span());
-                    }
+                    self.refuse_unread_operand(arg);
                 }
             }
             return;
@@ -2365,6 +2390,39 @@ impl Analyzer {
             self.refuse_opaque_macro(&m.mac);
         } else {
             self.refuse_awaited(head.span());
+        }
+    }
+
+    /// Refuse an awaited operand the analysis cannot read. A block, `if` or
+    /// `match` is judged by the values it can produce.
+    fn refuse_unread_operand(&mut self, expr: &Expr) {
+        let expr = strip_transparent(expr);
+        match expr {
+            Expr::Call(_) | Expr::MethodCall(_) | Expr::Path(_)
+                if !self.awaited_is_readable(expr) =>
+            {
+                self.refuse_awaited(expr.span());
+            }
+            Expr::Macro(m) if !self.macro_is_readable(&m.mac) => self.refuse_opaque_macro(&m.mac),
+            Expr::Block(b) => self.refuse_unread_block_tail(&b.block),
+            Expr::If(i) => {
+                self.refuse_unread_block_tail(&i.then_branch);
+                if let Some((_, other)) = &i.else_branch {
+                    self.refuse_unread_operand(other);
+                }
+            }
+            Expr::Match(m) => {
+                for arm in &m.arms {
+                    self.refuse_unread_operand(&arm.body);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn refuse_unread_block_tail(&mut self, block: &Block) {
+        if let Some(Stmt::Expr(tail, None)) = block.stmts.last() {
+            self.refuse_unread_operand(tail);
         }
     }
 
@@ -2432,7 +2490,7 @@ impl Analyzer {
             return false;
         };
         let first = first.ident.to_string();
-        first == "tokio" || self.tokio_imports.contains(&first)
+        self.tokio_imports.contains(&first)
     }
 
     /// Can the analysis read this macro? A macro naming a handle is already refused.
@@ -6336,6 +6394,55 @@ mod tests {
             r"async fn h(d: Duration) -> R {
                 use tokio::time::sleep;
                 { use crate::jobs::sleep; sleep(d).await; }
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro future handed to timeout",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h(d: Duration) -> R {
+                tokio::time::timeout(d, schedule!()).await??;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future in a block handed to timeout",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                tokio::time::timeout(d, { start_finance_job() }).await??;
+                Ok(())
+            }",
+        ),
+        (
+            "crate aliased as tokio",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                use crate::jobs as tokio;
+                tokio::time::sleep(d).await;
+                Ok(())
+            }",
+        ),
+        (
+            "effect alias reassigned to another function",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let mut schedule = NotifyFinanceJob::enqueue;
+                schedule = start_finance_job;
+                schedule(&payload).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "use item later in the block hides the tokio import",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                use tokio::time::sleep;
+                { sleep(d).await; use crate::jobs::sleep; }
                 Ok(())
             }",
         ),
