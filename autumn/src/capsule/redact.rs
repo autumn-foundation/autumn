@@ -181,8 +181,8 @@ const MIN_ECHO_LEN: usize = 4;
 /// Most `Cookie:` pairs recorded from one header.
 ///
 /// [`mask_echoes`] costs O(text × needles), so the echo set must stay bounded.
-/// Browsers send far fewer cookies per request. The whole header value is
-/// always recorded, whatever the cap.
+/// Real requests carry far fewer. The cap applies to each header line. Only
+/// segments with a `=` count. The whole header value is always recorded.
 const MAX_COOKIE_PAIRS: usize = 256;
 
 /// Build the capsule's request record, masking every sensitive value.
@@ -1099,10 +1099,11 @@ fn redact_headers(
 /// the one place valid UTF-8 is genuinely required, and a value that is not
 /// UTF-8 cannot appear in a message to be masked out of anyway.
 ///
-/// The scheme may be followed by SP, HTAB or Unicode whitespace: RFC 7235
-/// says `1*SP`, but a sloppy handler splits on any whitespace. A quoted cookie
-/// value records both the quoted and the unquoted spelling. At most
-/// [`MAX_COOKIE_PAIRS`] cookie pairs are recorded per header.
+/// RFC 7235 says the scheme ends at `1*SP`. A sloppy handler splits on any
+/// whitespace, so this does too.
+///
+/// A quoted cookie value records the quoted and the unquoted spelling. A
+/// `Cookie:` line records at most [`MAX_COOKIE_PAIRS`] values.
 pub(crate) fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedValues) {
     let trimmed = trim_ows(value);
     // Only headers whose *syntax* this understands. A custom sensitive header
@@ -1165,27 +1166,31 @@ pub(crate) fn record_credential_components(name: &str, value: &[u8], values: &mu
         } else {
             MAX_COOKIE_PAIRS
         };
-        for pair in trimmed.split(|byte| *byte == b';').take(limit) {
-            if let Some((_, cookie_value)) = split_once_byte(pair, b'=') {
-                let spelled = trim_ows(cookie_value);
-                let unquoted = trim_matches_byte(spelled, b'"');
-                record_cookie_value(unquoted, values);
-                // A handler that splits on `=` holds the quotes too. That is
-                // an inferred spelling, so it gets the same floor as a decoded
-                // one.
-                if unquoted.len() != spelled.len()
-                    && spelled.len() >= MIN_ECHO_LEN
-                    && !unquoted.iter().all(u8::is_ascii_whitespace)
-                {
-                    record_cookie_value(spelled, values);
-                }
+        // Count only segments that hold a value. An empty or `=`-less segment
+        // must not use up the cap and hide a real cookie behind it.
+        let cookie_values = trimmed
+            .split(|byte| *byte == b';')
+            .filter_map(|pair| split_once_byte(pair, b'='))
+            .take(limit);
+        for (_, cookie_value) in cookie_values {
+            let spelled = trim_ows(cookie_value);
+            let unquoted = trim_matches_byte(spelled, b'"');
+            record_cookie_value(unquoted, values);
+            // A handler that splits on `=` holds the quotes too. That is an
+            // inferred spelling, so it gets the same floor as a decoded one,
+            // measured on the value without its quotes.
+            if unquoted.len() != spelled.len()
+                && unquoted.len() >= MIN_ECHO_LEN
+                && !unquoted.iter().all(u8::is_ascii_whitespace)
+            {
+                record_cookie_value(spelled, values);
             }
         }
     }
 }
 
-/// Retain both spellings of a cookie value: the one on the wire, and the one
-/// a handler that percent-decodes holds.
+/// Retain a cookie value as sent, and as a handler that percent-decodes holds
+/// it.
 ///
 /// Percent-encoding a cookie value is a common convention, and **Autumn
 /// itself follows it** — `time_zone.rs` percent-decodes its own
@@ -1431,11 +1436,11 @@ const fn is_token_byte(byte: u8) -> bool {
         )
 }
 
-/// Split `<scheme><whitespace><rest>` at the first whitespace.
+/// Split `<scheme><whitespace><rest>` at the end of the leading token.
 ///
-/// The scheme is a token, so the first non-token byte must be whitespace:
-/// SP, HTAB or a Unicode space. Anything else is not a scheme. Splitting
-/// there cannot cut a credential, because a token holds no whitespace.
+/// A token holds no whitespace, so the first non-token byte must start the
+/// separator: SP, HTAB or a Unicode space. Anything else is not a scheme.
+/// `value` is already trimmed, so a shrinking `trim_ows` shows a separator.
 fn split_scheme(value: &[u8]) -> Option<(&[u8], &[u8])> {
     let end = value
         .iter()
@@ -1443,18 +1448,7 @@ fn split_scheme(value: &[u8]) -> Option<(&[u8], &[u8])> {
         .position(|byte| !is_token_byte(byte))?;
     let scheme = value.get(..end).filter(|scheme| !scheme.is_empty())?;
     let rest = value.get(end..)?;
-    let width = match rest.first()? {
-        b' ' | b'\t' => 1,
-        _ => rest
-            .utf8_chunks()
-            .next()?
-            .valid()
-            .chars()
-            .next()
-            .filter(|c| c.is_whitespace())?
-            .len_utf8(),
-    };
-    Some((scheme, rest.get(width..)?))
+    (trim_ows(rest).len() != rest.len()).then_some((scheme, rest))
 }
 
 // ── Byte equivalents of the `str` methods the parse above needs ─────────────
@@ -1521,7 +1515,7 @@ fn trim_end_matches_byte(bytes: &[u8], byte: u8) -> &[u8] {
 /// `HeaderValue` rejects only the C0 controls and `DEL`, so a non-breaking
 /// space is a legal (if malformed) pad *anywhere*, and `Bearer <U+00A0>hunter2`
 /// pads the credential from the inside, where trimming the whole value never
-/// reaches. A handler splits on the space and trims what it gets, holding
+/// reaches. A handler splits on whitespace and trims what it gets, holding
 /// `hunter2`; recording `\xc2\xa0hunter2` masks neither its echo nor its bind.
 /// The same goes for a padded auth-param name (which [`is_auth_scheme`] would
 /// then reject, losing the value with it), a padded param value, and a padded
@@ -2966,7 +2960,7 @@ mod tests {
     ///
     /// Padding *inside* the value is the case trimming the whole value never
     /// reaches: `Bearer <U+00A0>hunter2` pads the credential, not the header,
-    /// and a handler that splits on the space and trims what it gets holds
+    /// and a handler that splits on whitespace and trims what it gets holds
     /// `hunter2`. Every component split out of a header value therefore trims
     /// through `trim_ows`, not `trim_ascii`.
     #[test]
@@ -3064,6 +3058,26 @@ mod tests {
         assert!(params.contains(b"deadbeef"), "first param value");
         assert!(params.contains(b"cafebabe"), "param after an HTAB");
 
+        // Non-whitespace after the token, an empty credential and a stray
+        // non-UTF-8 byte record nothing and do not panic.
+        for odd in [
+            &b"Bearer\xc3\xa9tok1234"[..],
+            b"Bearer\t",
+            b"Bearer\xfftok1234",
+        ] {
+            let mut odd_values = RedactedValues::default();
+            record_credential_components("authorization", odd, &mut odd_values);
+            assert!(!odd_values.contains(b"tok1234"), "{odd:?}");
+        }
+
+        // The wide separator leaves no leading space on the credential.
+        let (_request, wide) = redact(
+            Request::get("/").header(header::AUTHORIZATION, "Bearer\u{3000}\u{a0}tok1234"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(wide.contains(b"tok1234"));
+
         // A non-token head is still not a scheme.
         let (_request, not_scheme) = redact(
             Request::get("/").header(header::AUTHORIZATION, "a=b\tvalue1234"),
@@ -3095,6 +3109,15 @@ mod tests {
             !values.contains(b"\"\""),
             "an empty quoted value is nothing"
         );
+
+        // `Set-Cookie` takes the same spelling rule on its one cookie.
+        let (_request, set_cookie) = redact(
+            Request::get("/").header("set-cookie", "s=\"abcdef\"; Path=\"/admin\""),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(set_cookie.contains(b"\"abcdef\""));
+        assert!(!set_cookie.contains(b"\"/admin\""));
 
         let mut binds = vec![BindValue::Value(b"\"abcdef\"".to_vec())];
         mask_binds(&mut binds, &values);
@@ -3130,9 +3153,34 @@ mod tests {
             "last pair under the cap"
         );
         assert!(
-            !values.contains(format!("value{:05}", MAX_COOKIE_PAIRS).as_bytes()),
+            !values.contains(format!("value{MAX_COOKIE_PAIRS:05}").as_bytes()),
             "first pair over the cap"
         );
+    }
+
+    /// Empty and `=`-less segments must not use up the cap and push a real
+    /// cookie out of the echo set.
+    #[test]
+    fn junk_segments_do_not_use_up_the_cookie_cap() {
+        let junk = "; ".repeat(MAX_COOKIE_PAIRS + 10);
+        let (_request, values) = redact(
+            Request::get("/").header(header::COOKIE, format!("a{junk}session=secretvalue")),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(values.contains(b"secretvalue"), "real cookie after junk");
+    }
+
+    /// The quote floor counts the value, not its quotes.
+    #[test]
+    fn a_quoted_cookie_value_under_the_floor_keeps_only_its_bare_form() {
+        let (_request, values) = redact(
+            Request::get("/").header(header::COOKIE, "a=\"no\""),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(values.contains(b"no"));
+        assert!(!values.contains(b"\"no\""));
     }
 
     /// The same bytes can arrive both ways — a filtered body password the
