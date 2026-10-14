@@ -300,10 +300,21 @@ fn stop_budget_for_running_child(
     reported.or(recorded).unwrap_or_else(resolve_now)
 }
 
+/// The selected package's directory, resolved once per run.
+///
+/// `find_manifest_dir` runs `cargo metadata`, which contends with the
+/// dependency audit for Cargo's package-cache lock. The package never changes
+/// during a run, so a restart reuses the first answer.
+fn selected_member_dir(package: Option<&str>) -> Option<PathBuf> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| package.and_then(find_manifest_dir))
+        .clone()
+}
+
 /// The directory the app reads its config from: the selected package, else
 /// `AUTUMN_MANIFEST_DIR`, else `.`. This is the order the app itself uses.
 fn package_dir(package: Option<&str>) -> PathBuf {
-    package_dir_from(package.and_then(find_manifest_dir))
+    package_dir_from(selected_member_dir(package))
 }
 
 /// [`package_dir`] for a member directory that is already resolved.
@@ -717,7 +728,7 @@ pub fn run(package: Option<&str>, show_config: bool) {
     // never awaited, so nothing delays startup or the rebuild loop. Quiet by
     // default: an advisory-clean, policy-clean tree adds nothing.
     // Resolve the member directory first: `cargo metadata` contends with the audit.
-    let member_dir = package.and_then(find_manifest_dir);
+    let member_dir = selected_member_dir(package);
     let mut dependency_audit = DependencyAudit::start(Path::new("."));
 
     let normalized_dirs = sanitize_custom_watch_dirs(load_dev_config(Path::new(AUTUMN_TOML)));
@@ -1316,7 +1327,7 @@ fn start_server(
 ) -> Option<Child> {
     eprintln!("  Starting server...\n");
 
-    let member_dir = package.and_then(find_manifest_dir);
+    let member_dir = selected_member_dir(package);
     // Read `.env` from the selected package, as the app and the stop budget do.
     // Resolve `.env` fresh right before each spawn so a hot-reload restart
     // picks up an edited `.env`. Values are injected explicitly into the child
