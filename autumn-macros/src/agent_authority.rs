@@ -360,6 +360,26 @@ const INERT_MACROS: &[&str] = &[
     "anyhow",
 ];
 
+/// Macros that only build a value, so expression position may use them.
+const PURE_VALUE_MACROS: &[&str] = &[
+    "format",
+    "format_args",
+    "vec",
+    "json",
+    "matches",
+    "concat",
+    "stringify",
+    "line",
+    "file",
+    "column",
+    "module_path",
+    "env",
+    "option_env",
+    "cfg",
+    "include_str",
+    "include_bytes",
+];
+
 /// The statement annotation that declares what the analysis cannot read.
 const ATTR_AGENT_EFFECT: &str = "agent_effect";
 
@@ -933,22 +953,16 @@ impl Bindings {
         for (name, closure) in other.closures {
             self.closures.entry(name).or_insert(closure);
         }
-        // Two paths bind different values to one name. Autumn drops the name,
-        // so a later use is refused.
+        // Keep a name only when both paths bind the same value. Autumn drops
+        // any other name, so a later use is refused.
         self.fn_aliases.retain(|name, path| {
             other
                 .fn_aliases
                 .get(name)
-                .is_none_or(|p| path_string(p) == path_string(path))
+                .is_some_and(|p| path_string(p) == path_string(path))
         });
-        for (name, path) in other.fn_aliases {
-            self.fn_aliases.entry(name).or_insert(path);
-        }
         self.tables
-            .retain(|name, table| other.tables.get(name).is_none_or(|t| t == table));
-        for (name, table) in other.tables {
-            self.tables.entry(name).or_insert(table);
-        }
+            .retain(|name, table| other.tables.get(name) == Some(table));
         self
     }
 }
@@ -1224,6 +1238,12 @@ impl Analyzer {
                 Stmt::Item(syn::Item::Fn(item)) => {
                     self.tokio_imports.remove(&item.sig.ident.to_string());
                 }
+                Stmt::Item(syn::Item::Const(item)) => {
+                    self.tokio_imports.remove(&item.ident.to_string());
+                }
+                Stmt::Item(syn::Item::Static(item)) => {
+                    self.tokio_imports.remove(&item.ident.to_string());
+                }
                 // A `use` also covers the whole block, whatever its line.
                 Stmt::Item(item @ syn::Item::Use(_)) => self.nested_item(item),
                 _ => {}
@@ -1391,10 +1411,7 @@ impl Analyzer {
         if let Pat::Ident(ident) = pat {
             let name = ident.ident.to_string();
             // Read the old state first. `forget` clears it.
-            let unread = matches!(
-                &*init.expr,
-                Expr::Call(_) | Expr::MethodCall(_) | Expr::Macro(_)
-            ) && !self.awaited_is_readable(&init.expr);
+            let unread = self.is_unread_call(&init.expr);
             let table = self.table_of(strip_transparent(&init.expr));
             self.forget(&name);
             if let Some(table) = table {
@@ -1545,8 +1562,25 @@ impl Analyzer {
 
     /// Is this a call whose awaited effect the analysis has not read?
     fn is_unread_call(&self, expr: &Expr) -> bool {
-        matches!(expr, Expr::Call(_) | Expr::MethodCall(_) | Expr::Macro(_))
-            && !self.awaited_is_readable(expr)
+        match strip_transparent(expr) {
+            head @ (Expr::Call(_) | Expr::MethodCall(_) | Expr::Macro(_) | Expr::Path(_)) => {
+                !self.awaited_is_readable(head)
+            }
+            // A block, `if` or `match` yields the values of its tails.
+            Expr::Block(b) => self.block_tail_is_unread(&b.block),
+            Expr::If(i) => {
+                self.block_tail_is_unread(&i.then_branch)
+                    || i.else_branch
+                        .as_ref()
+                        .is_some_and(|(_, other)| self.is_unread_call(other))
+            }
+            Expr::Match(m) => m.arms.iter().any(|arm| self.is_unread_call(&arm.body)),
+            _ => false,
+        }
+    }
+
+    fn block_tail_is_unread(&self, block: &Block) -> bool {
+        matches!(block.stmts.last(), Some(Stmt::Expr(tail, None)) if self.is_unread_call(tail))
     }
 
     /// `fut = start();` moves a future into a name, as a `let` does.
@@ -1679,7 +1713,13 @@ impl Analyzer {
                 self.leave_binding_scope(saved);
             }
             Expr::Call(call) => self.call(call),
-            Expr::Macro(m) => self.mac(&m.mac),
+            Expr::Macro(m) => {
+                self.mac(&m.mac);
+                // The expansion runs here, so it is judged like a statement.
+                if !self.expr_macro_is_readable(&m.mac) {
+                    self.refuse_opaque_macro(&m.mac);
+                }
+            }
 
             Expr::Closure(closure) => {
                 // Effects are a set, so a closure body is walked exactly like
@@ -2499,6 +2539,19 @@ impl Analyzer {
         let inert = name.is_some_and(|name| INERT_MACROS.contains(&name.as_str()))
             && !tokens_contain_await(&mac.tokens);
         inert || self.tokens_mention_handle(&mac.tokens)
+    }
+
+    /// Macros that only build a value. Expression position may use them when
+    /// no token awaits or spawns.
+    fn expr_macro_is_readable(&self, mac: &syn::Macro) -> bool {
+        let pure = mac
+            .path
+            .segments
+            .last()
+            .is_some_and(|s| PURE_VALUE_MACROS.contains(&s.ident.to_string().as_str()))
+            && !tokens_contain_await(&mac.tokens)
+            && !tokens_contain_spawn(&mac.tokens);
+        pure || self.macro_is_readable(mac)
     }
 
     /// Refuse a macro the analysis cannot read, when it is awaited or is a
@@ -4042,6 +4095,15 @@ fn tokens_contain_await(tokens: &TokenStream) -> bool {
     tokens.clone().into_iter().any(|tt| match tt {
         TokenTree::Ident(ident) => ident == "await",
         TokenTree::Group(group) => tokens_contain_await(&group.stream()),
+        _ => false,
+    })
+}
+
+/// Does a macro body name a `spawn`-family function?
+fn tokens_contain_spawn(tokens: &TokenStream) -> bool {
+    tokens.clone().into_iter().any(|tt| match tt {
+        TokenTree::Ident(ident) => SPAWN_FNS.contains(&ident.to_string().as_str()),
+        TokenTree::Group(group) => tokens_contain_spawn(&group.stream()),
         _ => false,
     })
 }
@@ -6447,6 +6509,67 @@ mod tests {
             }",
         ),
         (
+            "tokio import shadowed by a local const",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                use tokio::time::sleep;
+                { const sleep: fn() -> BoxFuture<R> = start_finance_job; sleep().await; }
+                Ok(())
+            }",
+        ),
+        (
+            "future returned through a block initialiser",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = { start_finance_job() };
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "future returned through an if initialiser",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(c: bool) -> R {
+                let fut = if c { start_a() } else { start_b() };
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future moved to a second name",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = start_finance_job();
+                let g = fut;
+                g.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in expression position",
+            ExpectedKind::Rejected,
+            "detach",
+            r"async fn h() -> R {
+                let _task = detach!();
+                Ok(())
+            }",
+        ),
+        (
+            "effect alias that differs between branches",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(c: bool) -> R {
+                let mut s = ForbiddenJob::enqueue;
+                if c { s = AllowedJob::enqueue; }
+                s(&payload).await?;
+                Ok(())
+            }",
+        ),
+        (
             "#[agent_effect] with a blank reason",
             ExpectedKind::Rejected,
             "reason",
@@ -6792,6 +6915,14 @@ mod tests {
                 tokio::time::timeout(delay, repo.find_all()).await??;
                 Ok(())
             }",
+        ),
+        (
+            "plain value macros in expression position",
+            r#"async fn h() -> R {
+                let label = format!("{}-{}", 1, 2);
+                let rows = vec![1, 2, 3];
+                Ok(json!({ "label": label, "rows": rows }))
+            }"#,
         ),
         (
             "no handles at all",
