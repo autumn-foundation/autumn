@@ -1189,6 +1189,23 @@ mod tests {
         }
     }
 
+    /// Padding around a declared value is trimmed when recorded.
+    #[tokio::test]
+    async fn declared_type_is_trimmed_when_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        let meta = declared("/data", "  text/csv  ");
+        render_static_routes(echo_router(), &[meta], &dist)
+            .await
+            .expect("render");
+
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        assert_eq!(
+            manifest.routes["/data"].content_type.as_deref(),
+            Some("text/csv")
+        );
+    }
+
     /// An inferred type is still not explicit.
     #[tokio::test]
     async fn inferred_type_is_not_marked_explicit() {

@@ -592,6 +592,8 @@ or external tooling with a stricter reader.
 | `StaticManifest::with_generated_at` | `autumn_web::static_gen` | Pins the build timestamp `new` stamped, for reproducible builds |
 | `StaticFileLayer::resolve_entry` → `ResolvedStatic` | `autumn_web::static_gen` | Returns the file path plus the ready-to-serve `Content-Type`; `resolve` remains the file-path-only shorthand |
 | `resolved_content_type` | `autumn_web::static_gen` | The decision function, public so an app serving `dist/` itself can match Autumn's behaviour exactly |
+| `StaticRouteMeta::content_type` | `autumn_web::static_gen` | `Option<&'static str>` (#2403). Set by `#[static_get(.., content_type = "..")]`. **Breaking:** a hand-built `StaticRouteMeta { .. }` must add the field |
+| `ManifestEntry::content_type_explicit` / `with_content_type_explicit` | `autumn_web::static_gen` | `bool` (#2403). `true` when the route declared the type. Absent in JSON means `false`, so old manifests load unchanged |
 
 `ResolvedStatic` is `#[non_exhaustive]` from the start, and has no public
 constructor — it is a return type, not something downstream code builds.

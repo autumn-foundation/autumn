@@ -4,7 +4,7 @@
   The declared type is recorded in `manifest.json` and served as written,
   also when it is `text/plain; charset=utf-8` or `application/octet-stream`
   on a route with an asset extension. ISR does not check the handler type for
-  such a route.
+  such a route. The type applies to the page served from `dist/` only.
 
 ### Breaking Changes
 

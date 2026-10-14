@@ -59,6 +59,7 @@ struct StaticGetAttrs {
 
 /// Check a declared `Content-Type`. Same rule as the runtime
 /// (`usable_recorded_content_type`): non-blank, visible ASCII or tab.
+/// Keep both in step. A test in `autumn` pins the runtime byte set.
 fn validate_content_type(lit: &LitStr) -> syn::Result<()> {
     let value = lit.value();
     let legal = |b: u8| b == b'\t' || (0x20..0x7f).contains(&b);

@@ -1964,6 +1964,55 @@ mod tests {
     }
 
     #[test]
+    fn explicit_entry_with_a_non_ascii_type_falls_back() {
+        let entry = explicit_entry("image/p\u{e9}ng", None);
+        let value = entry_content_type(&entry, "/logo.png", Path::new("logo.png/index.html"));
+        assert_eq!(value, "image/png");
+    }
+
+    /// The runtime byte rule the macro copies: tab and `0x20..0x7f`.
+    #[test]
+    fn legal_content_type_bytes_match_the_macro_rule() {
+        for b in 0..=255u8 {
+            let expected = b == b'\t' || (0x20..0x7f).contains(&b);
+            assert_eq!(is_legal_content_type_byte(b), expected, "byte {b:#x}");
+        }
+    }
+
+    /// Whole path: build with a declared type, serve through the layer, then
+    /// ISR with a handler that sets another header.
+    #[tokio::test]
+    async fn declared_type_survives_serving_and_isr() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dist_dir = dir.path().join("dist");
+        let router = axum::Router::new().fallback(axum::routing::get(|| async {
+            ([(axum::http::header::CONTENT_TYPE, "text/plain")], "b")
+        }));
+        let meta = crate::static_gen::StaticRouteMeta {
+            path: "/logo.png",
+            name: "logo",
+            revalidate: Some(3600),
+            params_fn: None,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: Some("application/octet-stream"),
+        };
+        crate::static_gen::render_static_routes(router.clone(), &[meta], &dist_dir)
+            .await
+            .expect("render");
+
+        let layer = StaticFileLayer::new(&dist_dir).expect("layer");
+        let hit = layer.resolve_entry("/logo.png").expect("hit");
+        assert_eq!(hit.content_type, "application/octet-stream");
+
+        let manifest = StaticManifest::load(&dist_dir.join("manifest.json")).expect("manifest");
+        let entry = &manifest.routes["/logo.png"];
+        let expected = isr_expected_content_type(entry, "/logo.png");
+        regenerate_page(&router, "/logo.png", &hit.file_path, expected)
+            .await
+            .expect("an explicit entry regenerates whatever the handler header says");
+    }
+
+    #[test]
     fn inferred_generic_type_is_still_remapped() {
         let value = resolved_content_type(
             Some("application/octet-stream"),
